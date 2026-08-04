@@ -22,37 +22,27 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  *      persists the demotion and emits for indexers.
  *
  *      SCOPE OF THE CODEHASH CHECK: EXTCODEHASH identity catches ONLY
- *      same-address bytecode mutation — i.e. metamorphic redeploys (CREATE2 +
- *      SELFDESTRUCT). It does NOT catch proxy implementation swaps: for
- *      EIP-1967 / UUPS / transparent / beacon proxies the PROXY's runtime
- *      bytecode is static across upgrades, so the certified hash keeps
- *      matching while the behavior behind it changes arbitrarily. Governance
- *      MUST NOT certify proxied adapters at tier 0/1 — an upgradeable target
- *      can never be "closed-loop" or "oracle-bounded" by inspection of frozen
- *      code. Leave proxies at the tier-2 default.
+ *      same-address bytecode mutation, i.e. metamorphic redeploys. It does NOT
+ *      catch proxy implementation swaps — a proxy's runtime bytecode is static
+ *      across upgrades, so the certified hash keeps matching while the behavior
+ *      behind it changes arbitrarily. Governance MUST NOT certify proxied
+ *      adapters at tier 0/1.
  *
- *      THIS RULE IS NOT LIMITED TO RECOGNIZED PROXY SHAPES: EXTCODEHASH
- *      attests only to unchanged bytecode, never to unchanged behavior. ANY
- *      target exposing ordinary, non-`immutable` storage that is settable
- *      after deployment and can affect fund routing — a beneficiary address,
- *      a fee sink, a swap-path parameter, and so on — can have that state
- *      rewired and be certified atomically in the same transaction, since its
- *      codehash never moves. Governance MUST treat "certifiable at tier 0/1"
- *      as bytecode-AND-storage-immutable for every fund-routing-relevant
- *      parameter, not merely "not a known proxy shape": review the target's
- *      full storage layout for post-deployment setters before certifying,
- *      not just the presence or absence of a delegatecall.
+ *      THIS RULE IS NOT LIMITED TO RECOGNIZED PROXY SHAPES. ANY target exposing
+ *      ordinary, non-`immutable` storage that is settable after deployment and
+ *      can affect fund routing — a beneficiary address, a fee sink, a swap-path
+ *      parameter — can have that state rewired and be certified atomically in
+ *      the same transaction, since its codehash never moves. Treat certifiable
+ *      at tier 0/1 as bytecode-AND-storage-immutable for every fund-routing
+ *      parameter: review the target's full storage layout for post-deployment
+ *      setters, not just the presence or absence of a delegatecall.
  *
  *      GRANTING is announced, not instant: `proposeCertification` (owner-only)
- *      records intent and pins the target's codehash and bond amount;
- *      `certify` (permissionless) executes it no earlier than `certifyDelay`
- *      later, and only if the live codehash still matches the pinned
- *      snapshot. The announcement window is the enforcement aid for the
- *      proxy-discipline rule above — anyone can inspect a queued target, in
- *      particular a proxied one, before the grant takes effect. REVOKING
- *      (`demote`, `demoteByChallenge`, `poke`) stays instant and permissionless
- *      or owner-gated exactly as before — the delay applies only to granting a
- *      lower tier, never to revoking one.
+ *      records intent and pins the target's codehash and bond amount; `certify`
+ *      executes it no earlier than `certifyDelay` later, and only if the live
+ *      codehash still matches. The announcement window is the enforcement aid
+ *      for the proxy-discipline rule above. REVOKING stays instant — the delay
+ *      applies only to granting a lower tier, never to revoking one.
  */
 contract TierRegistry is Ownable2Step {
     using SafeERC20 for IERC20;
@@ -64,27 +54,19 @@ contract TierRegistry is Ownable2Step {
     }
 
     /// @dev Submitter bond per certification. Held while certified; demotion
-    ///      starts `bondReleaseDelay`, then the submitter claims. The delay
-    ///      gives the slash mechanism a window to act before the submitter's
-    ///      bond can be pulled out from under it.
+    ///      starts `bondReleaseDelay`, then the submitter claims. The delay gives
+    ///      the slash mechanism a window to act before the bond can be pulled out
+    ///      from under it.
     ///
-    ///      `token` pins the ERC20 this specific bond was actually PULLED in
-    ///      (audit finding #3, refund half): `certify` already pins
-    ///      `PendingCertification.bondToken` so the PULL can't be silently
-    ///      repointed by an intervening `setWood` — but until this field
-    ///      existed, the REFUND in `claimSubmitterBond` read the LIVE `wood`
-    ///      state variable instead, so that pin never reached payout. Two
-    ///      certifications under two different tokens sharing this registry
-    ///      would let the first claimant drain the second submitter's
-    ///      collateral out of a shared balance; a single certification
-    ///      followed by one `setWood` would strand the bond permanently
-    ///      (claim reverts on the new token's zero balance for this key,
-    ///      `totalBondedWood` never decrements, and `setWood`'s
-    ///      `BondsOutstanding` guard can then never be satisfied again — no
-    ///      sweep function exists and the contract is non-upgradeable).
-    ///      Recording the token on the bond itself makes every later state of
-    ///      `wood` irrelevant to an already-locked bond's payout, exactly
-    ///      like `bondToken` already does for the pull.
+    ///      `token` pins the ERC20 this specific bond was actually PULLED in.
+    ///      `certify` pins `PendingCertification.bondToken` so the PULL cannot be
+    ///      repointed by an intervening `setWood`, but the REFUND reading the LIVE
+    ///      `wood` variable meant that pin never reached payout: two
+    ///      certifications under two tokens would let the first claimant drain the
+    ///      second submitter's collateral out of a shared balance, and a single
+    ///      `setWood` would strand a bond permanently (no sweep exists and the
+    ///      contract is non-upgradeable). Recording the token on the bond makes
+    ///      every later state of `wood` irrelevant to an already-locked payout.
     struct SubmitterBond {
         address submitter;
         uint96 amount;
@@ -92,18 +74,16 @@ contract TierRegistry is Ownable2Step {
         IERC20 token; // pinned at certify time (audit finding #3)
     }
 
-    /// @dev A proposed-but-not-yet-executed certification. `readyAt == 0` is
-    ///      the existence sentinel (no pending record). `codehash`,
-    ///      `bondAmount`, and `bondToken` are snapshotted/pinned at proposal
-    ///      time so that permissionless execution can only choose WHEN, never
-    ///      WHAT — see `proposeCertification` / `certify` natspec.
+    /// @dev A proposed-but-not-yet-executed certification. `readyAt == 0` is the
+    ///      existence sentinel. `codehash`, `bondAmount` and `bondToken` are
+    ///      pinned at proposal time so permissionless execution can only choose
+    ///      WHEN, never WHAT.
     ///
-    ///      `bondToken` pins the live `wood` at proposal time (audit finding
-    ///      #1): without it, an ordinary `setWood` token migration during the
-    ///      certify-delay window would make `certify` pull the pinned AMOUNT
-    ///      denominated in a token the submitter never approved against for
-    ///      this certification — `setWood`'s only guard
-    ///      (`totalBondedWood != 0`) cannot see an unexecuted pending bond.
+    ///      `bondToken` pins the live `wood` at proposal time: without it, an
+    ///      ordinary token migration during the certify-delay window would make
+    ///      `certify` pull the pinned AMOUNT denominated in a token the submitter
+    ///      never approved for this certification, and `setWood`'s only guard
+    ///      cannot see an unexecuted pending bond.
     struct PendingCertification {
         uint8 tier; // ┐
         uint16 extractableBoundBps; // │ slot 1: 1 + 2 + 20 + 8 = 31 bytes
@@ -131,18 +111,13 @@ contract TierRegistry is Ownable2Step {
     uint256 public constant MIN_CERTIFY_DELAY = 1 days;
     uint256 public constant MAX_CERTIFY_DELAY = 30 days;
 
-    /// @dev Upper bound on how long after `readyAt` a pending certification
-    ///      may still be executed (audit finding #5). Without this, `certify`
-    ///      has no upper bound at all — a submitter fully controls WHEN to
-    ///      trigger the permissionless execute and can wait out a price
-    ///      collapse on the bond token's liquidity before posting badly-stale
-    ///      collateral against an unchanged extractable bound. A fixed
-    ///      constant (not an owner-configurable delay, unlike
-    ///      `certifyDelay`) deliberately gives the owner no lever to shorten
-    ///      this window and expire someone else's pending certification
-    ///      early. 14 days is generous relative to `certifyDelay`'s 30-day
-    ///      ceiling for review, while still bounding collateral staleness to
-    ///      a fixed, known window.
+    /// @dev Upper bound on how long after `readyAt` a pending certification may
+    ///      still be executed. Without it a submitter fully controls WHEN to
+    ///      trigger the permissionless execute and can wait out a price collapse
+    ///      on the bond token before posting badly-stale collateral against an
+    ///      unchanged extractable bound. A fixed constant, not owner-configurable,
+    ///      so the owner has no lever to expire someone else's pending
+    ///      certification early.
     uint256 public constant MAX_CERTIFY_WINDOW = 14 days;
 
     /// @dev EXTCODEHASH of an EXISTING account with no code (EIP-1052). A funded
@@ -151,90 +126,62 @@ contract TierRegistry is Ownable2Step {
 
     mapping(bytes32 configKey => TierConfig) private _configs;
 
-    /// @notice Owner-managed allowlist of adapter addresses that may appear as
-    ///         the spender/recipient of value-moving ERC20 calls inside a
-    ///         governor batch (see `SyndicateVault._guardBatchCalls` PART 2b).
-    ///         A separate axis from (target, selector) tier certification: tiers
-    ///         PRICE extractable value for coverage; this list bounds WHERE
+    /// @notice Owner-managed allowlist of adapter addresses that may appear as the
+    ///         spender/recipient of value-moving ERC20 calls inside a governor
+    ///         batch. A separate axis from (target, selector) tier certification:
+    ///         tiers PRICE extractable value for coverage; this list bounds WHERE
     ///         vault funds may be approved or sent at all.
     ///
-    ///         SECOND CONSUMER (issue #166): also the predicate for whether a
-    ///         target "may be reached by a governor batch at all, and hence may
-    ///         receive vault funds" (`_guardBatchCalls` PART 2a, the callee
-    ///         gate) — same mapping, same owner ceremony, not a second
-    ///         allowlist. `asset()` is the sole callee exempt from this check
-    ///         (metered separately via the vault's own balance diff); every
-    ///         other batch target, whether or not it carries a value-moving
-    ///         selector, must clear this predicate to be callable at all.
-    ///         GOVERNANCE DISCIPLINE: exotic-asset contracts (ERC-721/1155/777
-    ///         and other non-fungible/position tokens) MUST NOT be allowlisted
-    ///         here as batch callees — their non-ERC20 selectors are not
-    ///         examined by the retained selector switch, so allowlisting one as
-    ///         a callee would open an unexamined surface. Batches reach such
-    ///         positions through allowlisted adapters instead.
+    ///         SECOND CONSUMER: also the predicate for whether a target may be
+    ///         reached by a governor batch AT ALL (`_guardBatchCalls` PART 2a) —
+    ///         same mapping, same owner ceremony, not a second allowlist.
+    ///         `asset()` is the sole exempt callee. GOVERNANCE DISCIPLINE:
+    ///         exotic-asset contracts (ERC-721/1155/777 and other position
+    ///         tokens) MUST NOT be allowlisted here as batch callees — their
+    ///         non-ERC20 selectors are not examined by the selector switch.
+    ///         Batches reach such positions through allowlisted adapters instead.
     mapping(address adapter => bool) private _adapterAllowed;
 
-    /// @dev Grant-time codehash snapshot for the allowlist axis (issue #137).
-    ///      The adversary: an allowlisted adapter whose bytecode is swapped at
-    ///      the same address (metamorphic CREATE2 + SELFDESTRUCT redeploy), or
-    ///      a codeless allowlisted address at which code later appears
-    ///      (counterfactual CREATE2), otherwise keeps the standing right to
-    ///      appear as spender/recipient of vault-fund movements until someone
-    ///      happens to persist a demotion — and `poke` is unreachable
-    ///      (`NotCertified`) for an allowlisted-but-uncertified adapter, so no
-    ///      permissionless persistence path exists at all for that case.
+    /// @dev Grant-time codehash snapshot for the allowlist axis. The adversary: an
+    ///      allowlisted adapter whose bytecode is swapped at the same address, or
+    ///      a codeless allowlisted address at which code later appears, otherwise
+    ///      keeps the standing right to receive vault-fund movements until someone
+    ///      persists a demotion — and `poke` is unreachable for an
+    ///      allowlisted-but-uncertified adapter, so no permissionless persistence
+    ///      path exists at all for that case.
     ///
-    ///      INVARIANT: meaningful only while `_adapterAllowed[adapter]` is
-    ///      true; records the effective codehash (see `_effectiveCodehash`)
-    ///      attested at the LAST grant. Inert under a cleared flag and
-    ///      unconditionally overwritten by the next grant — `_demote` and
-    ///      `setAdapterAllowed(adapter, false)` do NOT clear it (design.md D1
-    ///      of fix-adapter-allowlist-selfheal; keeps `_demote` and issue #51's
-    ///      `DEMOTION_GAS` sizing untouched).
-    ///
-    ///      DEDICATED TO THE TRANSFER-PERMISSION AXIS ONLY: a future
-    ///      certify-path audit trail (e.g. issue #45's certify timelock) MUST
-    ///      use a SEPARATE mapping — certification tier is a per-(target,
-    ///      selector) pricing axis with its own snapshot
-    ///      (`TierConfig.certifiedCodehash`); repurposing this one would
-    ///      re-couple the two axes exactly where they must stay independent.
+    ///      INVARIANT: meaningful only while `_adapterAllowed[adapter]` is true.
+    ///      Inert under a cleared flag and unconditionally overwritten by the next
+    ///      grant — `_demote` and `setAdapterAllowed(adapter, false)` do NOT clear
+    ///      it. DEDICATED TO THE TRANSFER-PERMISSION AXIS ONLY: a certify-path
+    ///      audit trail MUST use a SEPARATE mapping, since certification tier is a
+    ///      per-(target, selector) pricing axis with its own snapshot.
     mapping(address adapter => bytes32) private _adapterAllowedCodehash;
 
     IERC20 public wood;
-    /// @dev LAUNCH GATE (issue #40): a non-zero value is inert as a warranty
-    ///      — and imposes a real, currently-unrecoverable cost on adapter
-    ///      submitters — until ALL THREE hold:
-    ///        1. a guard-bypass slash function exists and can reach `_bonds`
-    ///           (the seam is here — `MIN_BOND_RELEASE_DELAY` and the
-    ///           `slash`-referencing comments throughout this file hold the
-    ///           bond long enough for it — but the function itself does not
-    ///           exist yet);
-    ///        2. a seated court can enforce a DISPUTED slash (Plan E) — per
-    ///           issue #25, a disputed challenge currently times out in the
-    ///           accused's favour, so a submitter who disputes keeps the bond
-    ///           regardless of (1);
+    /// @dev LAUNCH GATE: a non-zero value is inert as a warranty — and imposes a
+    ///      real, currently-unrecoverable cost on adapter submitters — until ALL
+    ///      THREE hold:
+    ///        1. a guard-bypass slash function exists and can reach `_bonds`;
+    ///        2. a seated court can enforce a DISPUTED slash, since a disputed
+    ///           challenge currently times out in the accused's favour;
     ///        3. third-party adapter submission actually exists, so the bond
     ///           filters submitters rather than merely deterring the only
     ///           participant with no revenue from the adapter it warrants.
-    ///      `script/Deploy.s.sol` never calls `setSubmitterBondWood`, so this
-    ///      stays `0` (unbonded, governance-judged certification) at launch —
-    ///      do not enable it from the setter without meeting the gate above.
+    ///      The deploy script never calls `setSubmitterBondWood`, so this stays
+    ///      `0` at launch — do not enable it without meeting the gate above.
     uint256 public submitterBondWood;
     uint256 public bondReleaseDelay = 14 days;
     mapping(bytes32 configKey => SubmitterBond) internal _bonds;
 
     /// @notice Sum of all bonds held (active + pending release), across every
     ///         token a bond has ever been pulled in.
-    /// @dev    NOT `wood.balanceOf(address(this)) == totalBondedWood` (spec
-    ///         §4's original phrasing, written before `SubmitterBond.token`
-    ///         existed): each bond now carries its OWN pinned token (audit
-    ///         finding #3), so once bonds under two different tokens coexist
-    ///         this sum spans balances in both and no longer equals any
-    ///         single token's `balanceOf`. What DOES still hold, per token
-    ///         `t`: `t.balanceOf(address(this)) >= sum(amount for bonds where
-    ///         token == t)`. The scalar here is used only as the
-    ///         `BondsOutstanding` existence gate in `setWood` — zero iff no
-    ///         bond, in any token, is currently held.
+    /// @dev    NOT `wood.balanceOf(address(this)) == totalBondedWood`: each bond
+    ///         carries its OWN pinned token, so once bonds under two tokens
+    ///         coexist this sum spans both balances. What holds per token `t` is
+    ///         `t.balanceOf(this) >= sum(amount for bonds where token == t)`. The
+    ///         scalar is used only as the `BondsOutstanding` existence gate in
+    ///         `setWood` — zero iff no bond, in any token, is currently held.
     uint256 public totalBondedWood;
 
     constructor(address initialOwner) Ownable(initialOwner) {}
@@ -360,34 +307,21 @@ contract TierRegistry is Ownable2Step {
     error NotSubmitter();
 
     /// @notice Set the WOOD token used for submitter bonds.
-    /// @dev    Token-swap constraint: the bond token cannot change while ANY
-    ///         bond is held (`BondsOutstanding`). This is defense-in-depth,
-    ///         not strictly load-bearing for fund safety: every bond now
-    ///         pins its OWN token at certify time (`SubmitterBond.token`,
-    ///         audit finding #3) and `claimSubmitterBond` pays out against
-    ///         that pinned field, never the live `wood` variable — so an
-    ///         already-locked bond can no longer be stranded, misdirected
-    ///         onto another bond's collateral, or pointed at a codeless
-    ///         `address(0)` by a swap here. The guard is kept anyway because
-    ///         letting bonds accumulate under multiple live tokens
-    ///         simultaneously is unmaintainable operationally (per-token
-    ///         accounting the owner would have to track off-chain) even
-    ///         though it is no longer unsafe on-chain. Drain all bonds
-    ///         (demote → timelock → claim) before swapping. Clearing the
-    ///         token to address(0) while the bond amount is still armed is
-    ///         also rejected — zero the amount first.
+    /// @dev    The bond token cannot change while ANY bond is held. This is
+    ///         defense-in-depth, not load-bearing for fund safety: every bond pins
+    ///         its OWN token at certify time and `claimSubmitterBond` pays out
+    ///         against that pinned field, so an already-locked bond can no longer
+    ///         be stranded, misdirected, or pointed at `address(0)` by a swap. The
+    ///         guard is kept because letting bonds accumulate under multiple live
+    ///         tokens is unmaintainable operationally. Drain all bonds before
+    ///         swapping; clearing the token to zero while the bond amount is still
+    ///         armed is also rejected.
     ///
-    ///         `totalBondedWood != 0` is the ONLY guard here and it is
-    ///         deliberately silent about pending (unexecuted) certifications:
-    ///         a certification proposed while `wood` was TokenA no longer
-    ///         cares what this setter does before it executes, because
-    ///         `PendingCertification.bondToken` pins TokenA at proposal time
-    ///         (audit finding #1) and `certify` pulls against that pinned
-    ///         token — and now also WRITES it onto the new bond's `token`
-    ///         field (finding #3) — never against this live variable at
-    ///         either step. Swapping `wood` here mid-window is therefore
-    ///         inert to any already-pending certification's bond economics,
-    ///         both at pull time and at every later claim, by construction.
+    ///         Deliberately silent about pending (unexecuted) certifications: one
+    ///         proposed while `wood` was TokenA pins TokenA at proposal time and
+    ///         `certify` pulls against that pinned token, then writes it onto the
+    ///         new bond, so swapping `wood` mid-window is inert to any pending
+    ///         certification's bond economics at both steps.
     function setWood(address wood_) external onlyOwner {
         if (totalBondedWood != 0) revert BondsOutstanding();
         if (wood_ == address(0) && submitterBondWood != 0) revert BondConfigUnset();
@@ -417,50 +351,36 @@ contract TierRegistry is Ownable2Step {
         emit SubmitterBondConfigSet(address(wood), submitterBondWood, delay);
     }
 
-    /// @notice Announce a certification of (target, selector) at tier 0/1 with
-    ///         its extractable bound. `onlyOwner`. Runs every input guard the
-    ///         old instant `certify` ran, snapshots the target's current
-    ///         EXTCODEHASH and the current `submitterBondWood`, and records
-    ///         `readyAt = block.timestamp + certifyDelay`. Nothing takes
-    ///         effect yet: `tierOf`, demotion, and the allowlist are all
-    ///         unaffected by a pending certification.
-    /// @dev    The adversary this two-step flow defends against is the
-    ///         certification key itself: a compromised or coerced owner
-    ///         certifying a malicious target at a loose bound would, under
-    ///         the old instant path, reprice extractable value for every
-    ///         vault in the same transaction that announces it. Splitting
-    ///         propose/execute with a mandatory delay gives guardians,
-    ///         depositors, and watchtowers a window — named in
-    ///         `CertificationProposed` — to react before the grant is live;
-    ///         see the contract-level note on the codehash check's blind spot
-    ///         (proxies) for why that window is also the only practical way
-    ///         to catch a proxied adapter queued at tier 0/1.
+    /// @notice Announce a certification of (target, selector) at tier 0/1 with its
+    ///         extractable bound. `onlyOwner`. Runs every input guard, snapshots
+    ///         the target's current EXTCODEHASH and the current
+    ///         `submitterBondWood`, and records `readyAt`. Nothing takes effect
+    ///         yet.
+    /// @dev    The adversary is the certification key itself: a compromised or
+    ///         coerced owner certifying a malicious target at a loose bound would,
+    ///         under an instant path, reprice extractable value for every vault in
+    ///         the same transaction that announces it. The mandatory delay gives
+    ///         guardians and watchtowers a window — named in
+    ///         `CertificationProposed` — to react, and it is also the only
+    ///         practical way to catch a proxied adapter queued at tier 0/1.
     ///
-    ///         Re-proposing a key with an existing pending certification
-    ///         OVERWRITES it entirely — fresh parameters, fresh codehash
-    ///         snapshot, fresh pinned bond amount, fresh `readyAt`. A
-    ///         re-announcement restarts the clock; it never shortens it.
+    ///         Re-proposing a key OVERWRITES any existing pending certification
+    ///         entirely and restarts the clock; it never shortens it.
     ///
-    ///         NOT bond-gated: this call may run while an old bond on the
-    ///         same key is still active or releasing (see D5 / the
-    ///         `BondActive`/`BondPendingRelease` guards, which live in
-    ///         `certify` where the new bond is actually written) — so the
-    ///         certify delay and the bond-release timelock can run
-    ///         concurrently instead of serializing.
+    ///         NOT bond-gated: this may run while an old bond on the same key is
+    ///         still active or releasing, so the certify delay and the
+    ///         bond-release timelock can run concurrently instead of serializing.
+    ///         The bond-conflict guards live in `certify`, where the new bond is
+    ///         actually written.
     ///
-    ///         `expectedCodehash` (audit finding #6) makes the owner's
-    ///         off-chain review cryptographically asserted rather than
-    ///         blindly re-photographed: without it, this function reads
-    ///         `target.codehash` live at its OWN mining time, not at the
-    ///         time the owner actually reviewed the bytecode. A gap between
-    ///         review and mining (mempool, multisig confirmation latency)
-    ///         lets a third party — the target's own deployer, not this
-    ///         registry's owner — redeploy different bytecode at `target`
-    ///         before the proposal transaction lands, silently pinning the
-    ///         wrong codehash. Passing the hash the owner actually reviewed
-    ///         and reverting on drift closes that gap; `certify`'s own
-    ///         `CodehashChanged` check only re-verifies THIS snapshot, so it
-    ///         can never catch a snapshot that was wrong from the start.
+    ///         `expectedCodehash` makes the owner's off-chain review
+    ///         cryptographically asserted rather than blindly re-photographed:
+    ///         reading `target.codehash` live at THIS transaction's mining time
+    ///         lets a third party — the target's own deployer — redeploy different
+    ///         bytecode before the proposal lands, silently pinning the wrong
+    ///         hash. `certify`'s own `CodehashChanged` check only re-verifies THIS
+    ///         snapshot, so it can never catch a snapshot that was wrong from the
+    ///         start.
     function proposeCertification(
         address target,
         bytes4 selector,
@@ -494,70 +414,38 @@ contract TierRegistry is Ownable2Step {
     }
 
     /// @notice Execute a pending certification once its delay has elapsed.
-    ///         PERMISSIONLESS when no bond is at stake (`p.bondAmount == 0`);
-    ///         otherwise only the pinned `submitter` may trigger it.
+    ///         PERMISSIONLESS when no bond is at stake; otherwise only the pinned
+    ///         `submitter` may trigger it.
     /// @dev    Safe to leave permissionless in the no-bond case because every
-    ///         parameter was pinned and announced at `proposeCertification`
-    ///         time: an executing third party chooses only WHEN (after
-    ///         `readyAt`), never WHAT. The owner's remedies against an
-    ///         execution it no longer wants are `cancelCertification` before
-    ///         this runs, and instant `demote` after it lands.
+    ///         parameter was pinned and announced at proposal time: an executing
+    ///         third party chooses only WHEN, never WHAT. The owner's remedies are
+    ///         `cancelCertification` before this runs and instant `demote` after.
     ///
-    ///         When a bond IS pinned, execution is restricted to
-    ///         `msg.sender == p.submitter` (audit finding #3): `submitter`
-    ///         is an arbitrary, owner-chosen parameter with no signature or
-    ///         `msg.sender` tie-in at proposal time, so without this check a
-    ///         permissionless caller could pull the pinned bond off whatever
-    ///         STANDING ERC20 allowance that address already happens to have
-    ///         on this registry — never scoped to THIS certification — even
-    ///         though that address never saw or approved this specific
-    ///         grant. Restricting the pull-triggering call to the submitter
-    ///         turns that stale allowance into live, in-the-moment consent:
-    ///         the party whose funds are actually at stake is also the only
-    ///         one who can put them at stake. This is a deliberate narrowing
-    ///         of "anyone can trigger" to "the submitter can trigger" for
-    ///         bonded certifications only — an unbonded certification still
-    ///         has no funds to consent about, so it stays fully
-    ///         permissionless.
+    ///         When a bond IS pinned, execution is restricted to the submitter:
+    ///         `submitter` is an owner-chosen parameter with no signature tie-in,
+    ///         so without this a permissionless caller could pull the pinned bond
+    ///         off whatever STANDING ERC20 allowance that address already has on
+    ///         this registry — never scoped to THIS certification — even though it
+    ///         never approved this specific grant. Restricting the trigger turns a
+    ///         stale allowance into live, in-the-moment consent.
     ///
-    ///         Reverts `NoPendingCertification` when no proposal is pending
-    ///         for the key (`readyAt == 0`), `CertifyDelayNotElapsed` before
-    ///         `readyAt`, `CertificationExpired` once `MAX_CERTIFY_WINDOW`
-    ///         has elapsed past `readyAt` (audit finding #5 — bounds how
-    ///         stale the pinned bond's real-world value may get before it can
-    ///         still post; an unbounded window lets a submitter wait out a
-    ///         price collapse on the bond token's liquidity before triggering
-    ///         with badly-stale collateral), `CodehashChanged` when the
-    ///         target's live EXTCODEHASH no longer matches the proposal-time
-    ///         snapshot — a code change mid-window voids the pending grant
-    ///         instead of certifying different bytecode under an old
-    ///         announcement — and `NotSubmitter` when a bond is pinned and
-    ///         `msg.sender != p.submitter`. A voided pending is NOT deleted
-    ///         on a failed execution (reverts don't write state): it stays
-    ///         inert unless the owner `cancelCertification`s it, the
-    ///         bytecode returns to the announced hash, or it ages past
-    ///         `MAX_CERTIFY_WINDOW` and becomes permanently unexecutable.
+    ///         Reverts `NoPendingCertification` when nothing is pending,
+    ///         `CertifyDelayNotElapsed` before `readyAt`, `CertificationExpired`
+    ///         once `MAX_CERTIFY_WINDOW` has elapsed past it, `CodehashChanged`
+    ///         when the live EXTCODEHASH no longer matches the proposal-time
+    ///         snapshot, and `NotSubmitter` when a bond is pinned and the caller
+    ///         is not the submitter. A voided pending is NOT deleted on a failed
+    ///         execution: it stays inert unless cancelled, unless the bytecode
+    ///         returns to the announced hash, or until it ages past the window.
     ///
-    ///         The bond-conflict guards live HERE, not in
-    ///         `proposeCertification`, because bond state can change during
-    ///         the window (a release timelock can lapse and be claimed) and
-    ///         this is the only place a new bond is actually recorded: ANY
-    ///         existing bond for the key blocks execution —
-    ///         `BondActive` (still held under a live certification) or
-    ///         `BondPendingRelease` (demoted, in its release timelock).
-    ///
-    ///         The bond amount AND bond token are both PINNED at proposal
-    ///         time (`p.bondAmount`, `p.bondToken` — audit finding #1) and
-    ///         pulled only now (see the requirement's rationale in
-    ///         `proposeCertification`'s natspec): reading the live `wood`
-    ///         state variable here instead of the pinned `p.bondToken` would
-    ///         let an ordinary, honest `setWood` token migration during the
-    ///         window silently repoint the pull at a token the submitter
-    ///         never approved for this certification. A submitter who
-    ///         withholds approval on the pinned token thereby withholds the
-    ///         certification: if the pull fails (allowance revoked, balance
-    ///         insufficient), this call reverts entirely and the pending
-    ///         record is untouched, retryable once approval is restored.
+    ///         The bond-conflict guards live HERE because bond state can change
+    ///         during the window: ANY existing bond for the key blocks execution,
+    ///         whether still held (`BondActive`) or in its release timelock
+    ///         (`BondPendingRelease`). Both the bond amount and token are pinned
+    ///         at proposal time and pulled only now. A submitter who withholds
+    ///         approval on the pinned token thereby withholds the certification:
+    ///         the call reverts entirely and the pending record is untouched,
+    ///         retryable once approval is restored.
     function certify(address target, bytes4 selector) external {
         bytes32 k = key(target, selector);
         PendingCertification memory p = _pending[k];
@@ -613,22 +501,17 @@ contract TierRegistry is Ownable2Step {
 
     /// @notice Set the delay between `proposeCertification` and the earliest
     ///         allowed `certify`.
-    /// @dev    Bounded to [MIN_CERTIFY_DELAY, MAX_CERTIFY_DELAY]. The floor
-    ///         guarantees every grant is announced for at least one full day
-    ///         — the delay can never be configured back into the instant
-    ///         path. The ceiling bounds governance error so a mis-set delay
-    ///         cannot stall onboarding indefinitely.
+    /// @dev    Bounded to `[MIN_CERTIFY_DELAY, MAX_CERTIFY_DELAY]`. The floor
+    ///         guarantees every grant is announced for at least a full day, so the
+    ///         delay can never be configured back into the instant path; the
+    ///         ceiling bounds governance error.
     ///
-    ///         `readyAt` is computed ONCE at proposal time from whatever
-    ///         delay is live then (same intent-time-pinning discipline as
-    ///         `releasableAt`, which reads `bondReleaseDelay` once at
-    ///         demotion): changing `certifyDelay` here NEVER moves the
-    ///         `readyAt` of an already-pending certification. The adversary
-    ///         is an owner shortening the delay to ripen an already-announced
-    ///         grant early — the emitted `readyAt` must stay trustworthy as
-    ///         the earliest possible activation. The only way to apply a new
-    ///         delay to an announced grant is to re-propose it, which
-    ///         restarts the full window.
+    ///         `readyAt` is computed ONCE at proposal time from whatever delay is
+    ///         live then, so changing this NEVER moves an already-pending
+    ///         certification's `readyAt`. The adversary is an owner shortening the
+    ///         delay to ripen an already-announced grant early — the emitted
+    ///         `readyAt` must stay trustworthy as the earliest possible
+    ///         activation. Applying a new delay requires re-proposing.
     function setCertifyDelay(uint256 delay) external onlyOwner {
         if (delay < MIN_CERTIFY_DELAY || delay > MAX_CERTIFY_DELAY) revert InvalidDelay();
         certifyDelay = delay;
@@ -653,15 +536,13 @@ contract TierRegistry is Ownable2Step {
 
     event AuthorizedDemoterSet(address indexed demoter);
 
-    /// @dev Zero is legal and deliberate — it is the UNWIRE switch, revoking
-    ///      the challenge game's demotion role while a replacement is wired.
-    ///      The unwired state fails CLOSED (nothing can demote), which is why
-    ///      this setter carries no zero-address check.
-    ///
+    /// @dev Zero is legal and deliberate — the UNWIRE switch, revoking the
+    ///      challenge game's demotion role while a replacement is wired. The
+    ///      unwired state fails CLOSED, which is why there is no zero check.
     ///      `ChallengeGame` treats the demotion call as best-effort and emits
-    ///      `AdapterDemotionFailed` on failure rather than reverting the
-    ///      verdict, so this role is safe to rotate at any time; `demote`
-    ///      below is the owner's remedy for any revocation a rotation misses.
+    ///      rather than reverting the verdict, so this role is safe to rotate at
+    ///      any time; `demote` is the owner's remedy for anything a rotation
+    ///      misses.
     function setAuthorizedDemoter(address demoter) external onlyOwner {
         authorizedDemoter = demoter;
         emit AuthorizedDemoterSet(demoter);
@@ -677,23 +558,16 @@ contract TierRegistry is Ownable2Step {
 
     /// @notice Demote (target, selector) back to the tier-2 default because a
     ///         challenge against it passed. Reuses the same `_demote` path as
-    ///         owner demotion, so the submitter-bond release timelock starts
-    ///         identically.
-    /// @dev    REQUIRES AN EXISTING CERTIFICATION, mirroring `poke`'s
-    ///         `NotCertified` guard. Without it, `_demote`'s adapter-allowlist
-    ///         clear (see its own natspec) is reachable for a `(target,
-    ///         selector)` that was never certified: `ChallengeGame.file`'s
-    ///         only check on the named pair is that it appears somewhere in
-    ///         the executed proposal's calldata, not that TierRegistry
-    ///         certified it — so a challenger could name a routine, uncertified
-    ///         selector on an otherwise-legitimate, allowlisted adapter,
-    ///         let the challenge settle on silence (`ChallengeGame`'s
-    ///         adjudication model treats an uncontested filing as convicted),
-    ///         and strip that adapter's ENTIRE fund-movement standing for
-    ///         ~1% of the proposal's coverage — without anything about the
-    ///         adapter ever actually being adjudicated. This guard confines
-    ///         the allowlist-clearing side effect to demotions of pairs that
-    ///         were real certifications.
+    ///         owner demotion, so the bond release timelock starts identically.
+    /// @dev    REQUIRES AN EXISTING CERTIFICATION, mirroring `poke`. Without it,
+    ///         `_demote`'s adapter-allowlist clear is reachable for a pair that
+    ///         was never certified: `ChallengeGame.file` only checks that the
+    ///         named pair appears somewhere in the executed proposal's calldata,
+    ///         so a challenger could name a routine, uncertified selector on an
+    ///         otherwise-legitimate allowlisted adapter, let the challenge settle
+    ///         on silence, and strip that adapter's ENTIRE fund-movement standing
+    ///         for ~1% of the proposal's coverage — without the adapter ever being
+    ///         adjudicated.
     function demoteByChallenge(address target, bytes4 selector) external {
         if (msg.sender != authorizedDemoter) revert NotAuthorizedDemoter();
         if (_configs[key(target, selector)].certifiedCodehash == bytes32(0)) revert NotCertified();
@@ -709,35 +583,26 @@ contract TierRegistry is Ownable2Step {
         _demote(target, selector);
     }
 
-    /// @dev Convergence point for all three demotion paths (owner `demote`,
-    ///      `demoteByChallenge`, `poke`). ALSO clears the target's adapter
-    ///      allowlist entry, emitting the existing `AdapterAllowedSet(target,
-    ///      false)` if (and only if) the entry was set — a never-allowlisted
-    ///      target emits no phantom event. The adversary: an adapter that was
-    ///      just convicted in a challenge, or whose bytecode was just swapped
-    ///      under it (the `poke` trigger), otherwise retains the standing
-    ///      right to appear as spender/recipient of value-moving ERC20 calls
-    ///      (approve / increaseAllowance / transfer / transferFrom-out) inside
-    ///      a governor batch — tier 2 raises the coverage price but is a
-    ///      price, not a prohibition.
+    /// @dev Convergence point for all three demotion paths. ALSO clears the
+    ///      target's adapter allowlist entry, emitting only if the entry was set.
+    ///      The adversary: an adapter just convicted in a challenge, or whose
+    ///      bytecode was just swapped under it, otherwise retains the standing
+    ///      right to receive value-moving ERC20 calls inside a governor batch —
+    ///      tier 2 raises the coverage price but is a price, not a prohibition.
     ///
-    ///      DELIBERATELY OVER-BROAD: certification is keyed `(target,
-    ///      selector)`; the allowlist is keyed by bare `address`. Demoting
-    ///      ONE selector therefore de-allowlists the WHOLE adapter, even if
-    ///      other selectors on it remain certified. This is the chosen,
-    ///      conservative direction of error — recovery is one owner
-    ///      `setAdapterAllowed(adapter, true)` call — and it is pinned by
-    ///      test. Do NOT "fix" this back to a per-selector allowlist.
+    ///      DELIBERATELY OVER-BROAD: certification is keyed `(target, selector)`
+    ///      while the allowlist is keyed by bare address, so demoting ONE selector
+    ///      de-allowlists the WHOLE adapter. This is the chosen conservative
+    ///      direction of error — recovery is one owner `setAdapterAllowed` call —
+    ///      and it is pinned by test. Do NOT change it to a per-selector
+    ///      allowlist.
     ///
-    ///      ALSO clears a same-key PENDING certification, if one exists
-    ///      (audit finding #2): without this, a "renewal" proposed while a
-    ///      certification is still live would survive that certification's
-    ///      later for-cause demotion untouched, and would go on to execute
-    ///      at `readyAt` re-certifying the just-convicted target — possibly
-    ///      at looser terms than before the conviction. `demoteByChallenge`
-    ///      has no other lever to stop this, since `cancelCertification` is
-    ///      `onlyOwner`. Reuses the existing `CertificationCancelled` event
-    ///      so watchtowers see the same signal as an owner cancel.
+    ///      ALSO clears a same-key PENDING certification: otherwise a renewal
+    ///      proposed while a certification is still live would survive that
+    ///      certification's later for-cause demotion and go on to execute at
+    ///      `readyAt`, re-certifying the just-convicted target, possibly at looser
+    ///      terms. `demoteByChallenge` has no other lever, since
+    ///      `cancelCertification` is `onlyOwner`.
     function _demote(address target, bytes4 selector) private {
         bytes32 k = key(target, selector);
         delete _configs[k];
@@ -788,50 +653,36 @@ contract TierRegistry is Ownable2Step {
 
     // ── Adapter allowlist (spender/recipient gate for value-moving selectors) ──
 
-    /// @dev EXTCODEHASH of `a`, normalized so a non-existent account
-    ///      (`bytes32(0)`, EIP-1052) and an existing account with no code
-    ///      (`_EMPTY_CODEHASH`) both read as `bytes32(0)` — "no code" is one
-    ///      value. Without this, merely funding a codeless allowlisted
-    ///      address (non-existent -> existing-codeless) would flip its raw
-    ///      EXTCODEHASH and could be used as a 1-wei donation that griefs the
-    ///      vault's funds path closed.
+    /// @dev EXTCODEHASH of `a`, normalized so a non-existent account and an
+    ///      existing account with no code both read as `bytes32(0)` — no-code is
+    ///      one value. Without this, merely funding a codeless allowlisted address
+    ///      would flip its raw EXTCODEHASH and could be used as a 1-wei donation
+    ///      that griefs the vault's funds path closed.
     function _effectiveCodehash(address a) internal view returns (bytes32) {
         bytes32 ch = a.codehash;
         return ch == _EMPTY_CODEHASH ? bytes32(0) : ch;
     }
 
-    /// @notice Allow or disallow `adapter` as the spender/recipient of
-    ///         value-moving ERC20 calls (approve / increaseAllowance /
-    ///         transfer / transferFrom-out) inside governor batches, AND
-    ///         (issue #166) as a batch callee at all — a target that fails
-    ///         this check cannot be named in a governor batch regardless of
-    ///         selector or calldata (see `isAdapterAllowed` and
-    ///         `SyndicateVault._guardBatchCalls` PART 2a). Exotic-asset
-    ///         contracts (ERC-721/1155/777, LP-position NFTs) MUST NOT be
-    ///         allowlisted here as batch callees — their non-ERC20 selectors
-    ///         are not examined by the retained PART 2b selector switch, so
-    ///         batches should reach such positions through allowlisted
-    ///         adapters instead.
-    /// @dev    The only path that SETS this to true. `_demote` is the only
-    ///         path that clears it (see `_demote` natspec for the
-    ///         over-broad-by-design clear on any demotion of the adapter).
-    ///         `certify` never touches this mapping — re-allowlisting after a
-    ///         demotion-triggered clear is always this explicit owner call,
-    ///         never a side effect of re-certification.
+    /// @notice Allow or disallow `adapter` as the spender/recipient of value-moving
+    ///         ERC20 calls inside governor batches, AND as a batch callee at all —
+    ///         a target that fails this check cannot be named in a governor batch
+    ///         regardless of selector or calldata. Exotic-asset contracts
+    ///         (ERC-721/1155/777, LP-position NFTs) MUST NOT be allowlisted here
+    ///         as batch callees; batches should reach such positions through
+    ///         allowlisted adapters instead.
+    /// @dev    The only path that SETS this to true. `_demote` is the only path
+    ///         that clears it, over-broadly by design. `certify` never touches
+    ///         this mapping — re-allowlisting after a demotion-triggered clear is
+    ///         always this explicit owner call.
     ///
-    ///         On the grant path (`allowed == true`), (re)writes
-    ///         `_adapterAllowedCodehash[adapter]` to the adapter's CURRENT
-    ///         effective codehash — every grant re-attests the code the owner
-    ///         is looking at right now. Consequences: (i) the grant MUST be
-    ///         made AFTER the adapter's final code is deployed and verified —
-    ///         granting against a predicted (counterfactual) address snapshots
-    ///         "no code" and the funds path closes the instant code appears
-    ///         there (see `isAdapterAllowed`); (ii) re-granting after a
-    ///         verified legitimate bytecode change at the adapter's address is
-    ///         the intended recovery ceremony, mirroring the demote ->
-    ///         re-certify cycle for tiers. The `false` branch does not touch
-    ///         the snapshot — it is left inert and is overwritten by the next
-    ///         grant (design.md D1 of fix-adapter-allowlist-selfheal).
+    ///         On the grant path, (re)writes `_adapterAllowedCodehash[adapter]` to
+    ///         the adapter's CURRENT effective codehash, so every grant re-attests
+    ///         the code the owner is looking at right now. Consequences: the grant
+    ///         MUST be made AFTER the adapter's final code is deployed, since
+    ///         granting against a counterfactual address snapshots no-code and the
+    ///         funds path closes the instant code appears; and re-granting after a
+    ///         verified legitimate bytecode change is the intended recovery
+    ///         ceremony. The `false` branch leaves the snapshot inert.
     function setAdapterAllowed(address adapter, bool allowed) external onlyOwner {
         _adapterAllowed[adapter] = allowed;
         if (allowed) {
@@ -840,45 +691,32 @@ contract TierRegistry is Ownable2Step {
         emit AdapterAllowedSet(adapter, allowed);
     }
 
-    /// @notice True when `adapter` may receive approvals/transfers of vault
-    ///         funds through a governor batch, AND (issue #166) whether
-    ///         `adapter` may be named as a batch callee at all —
-    ///         `SyndicateVault._guardBatchCalls` PART 2a consults this same
-    ///         read to decide callability, not just fund-destination consent;
-    ///         the two roles are deliberately the collapsed same predicate
-    ///         (design.md Decision 1 of `target-based-batch-gating`).
-    /// @dev    Fail-safe self-heal is LAZY, mirroring `tierOf`: this returns
-    ///         true only when the allowlist flag is set AND the adapter's
-    ///         live effective codehash still matches the grant-time snapshot
-    ///         — no state write in the hot path, nothing to grief, and no
-    ///         dependence on `poke` (or any demotion path) ever running.
-    ///         Persistence of a `false` result into storage still comes from
-    ///         `poke` / `demote` / `demoteByChallenge` (where a certification
-    ///         exists) or an explicit owner `setAdapterAllowed(adapter,
-    ///         false)` (the only path for an allowlisted-but-uncertified
-    ///         adapter, since `poke` reverts `NotCertified` there).
+    /// @notice True when `adapter` may receive approvals/transfers of vault funds
+    ///         through a governor batch, AND whether it may be named as a batch
+    ///         callee at all — the two roles are deliberately the collapsed same
+    ///         predicate.
+    /// @dev    Fail-safe self-heal is LAZY, mirroring `tierOf`: true only when the
+    ///         allowlist flag is set AND the adapter's live effective codehash
+    ///         still matches the grant-time snapshot — no state write in the hot
+    ///         path, nothing to grief, and no dependence on any demotion path ever
+    ///         running. Persistence of a `false` result still comes from
+    ///         `poke`/`demote`/`demoteByChallenge` where a certification exists, or
+    ///         an explicit owner `setAdapterAllowed(adapter, false)` — the only
+    ///         path for an allowlisted-but-uncertified adapter.
     ///
-    ///         The adversary: an allowlisted adapter whose bytecode is
-    ///         swapped at the same address (metamorphic CREATE2 +
-    ///         SELFDESTRUCT redeploy), or a codeless allowlisted address at
-    ///         which code later appears (counterfactual CREATE2), otherwise
-    ///         retains the standing right to appear as spender/recipient of
-    ///         vault-fund movements until someone happens to persist a
-    ///         demotion. `SyndicateVault._guardBatchCalls` is the sole `src/`
-    ///         consumer of this read and is itself `private view` — this
-    ///         function MUST stay `view` (design.md D2).
+    ///         The adversary: an allowlisted adapter whose bytecode is swapped at
+    ///         the same address, or a codeless allowlisted address at which code
+    ///         later appears, otherwise retains the standing right to receive
+    ///         vault-fund movements until someone persists a demotion.
+    ///         `SyndicateVault._guardBatchCalls` is the sole `src/` consumer and
+    ///         is itself `private view`, so this MUST stay `view`.
     ///
-    ///         SCOPE CAVEAT (same as `tierOf`, see contract natspec): this
-    ///         catches only same-address bytecode mutation, not proxy
-    ///         implementation swaps — a proxy's runtime bytecode is static
-    ///         across upgrades, so allowlisting a proxied adapter carries the
-    ///         same governance-discipline caveat as certifying one.
-    ///         CLASS FALLBACK: when no address grant resolves, the adapter is
-    ///         allowed if it is a live member of an allowlisted code class —
-    ///         same ordering as `tierOf` (address first, class second), same
-    ///         two-level membership check. This is what removes the
-    ///         per-proposal owner ceremony for clones; without it a fresh clone
-    ///         cannot be named in a governor batch at all.
+    ///         SCOPE CAVEAT, same as `tierOf`: this catches only same-address
+    ///         bytecode mutation, not proxy implementation swaps.
+    ///
+    ///         CLASS FALLBACK: on an address miss, the adapter is allowed if it
+    ///         is a live member of an allowlisted code class — same ordering as
+    ///         `tierOf` (address first, class second), same two-level check.
     function isAdapterAllowed(address adapter) external view returns (bool) {
         if (_adapterAllowed[adapter] && _effectiveCodehash(adapter) == _adapterAllowedCodehash[adapter]) {
             return true;
@@ -887,35 +725,28 @@ contract TierRegistry is Ownable2Step {
         return cch != bytes32(0) && _classAllowed[cch];
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // CODEHASH-CLASS CERTIFICATION (change: codehash-class-certification)
+    // ── CODEHASH-CLASS CERTIFICATION ──
     //
-    // Every strategy proposal deploys a fresh ERC-1167 clone at a fresh
-    // address, so address-keyed consent forces one owner ceremony per
-    // proposal, forever. Clones of one template are byte-identical, so a
-    // codehash identifies the template — and certifying that codehash
-    // certifies every clone that will ever exist, with no per-clone action.
+    // Every proposal deploys a fresh ERC-1167 clone at a fresh address, so
+    // address-keyed consent costs one owner ceremony per proposal, forever.
+    // Clones of one template are byte-identical, so a codehash identifies the
+    // template and certifying it covers every clone that will ever exist.
     //
-    // A class certification asserts a STRICTLY STRONGER claim than an
-    // address certification: that the bound holds under EVERY
-    // initialization, not merely for one deployment's stored config. Which
-    // templates may carry that claim is a governance-discipline rule stated
-    // in the tier-policy spec ("Only conformant templates may be
+    // A class certification asserts a STRICTLY STRONGER claim than an address
+    // one: that the bound holds under EVERY initialization, not for one
+    // deployment's stored config. Which templates may carry that claim is a
+    // governance rule (tier-policy: "Only conformant templates may be
     // class-certified"), not a check this contract can make.
-    // ─────────────────────────────────────────────────────────────────────
 
-    /// @dev Per-class anchor, shared by BOTH axes (tier and allowlist). Keyed
-    ///      by the clone codehash, which is the class identity.
+    /// @dev Per-class anchor, shared by both axes. Keyed by clone codehash.
     ///
-    ///      `templateCodehash` is the load-bearing field. A clone's codehash
-    ///      embeds the template's ADDRESS, not the template's CODE, so
-    ///      mutating the template in place changes every clone's behavior
-    ///      while leaving every clone's codehash identical. Without this
-    ///      snapshot the class would keep vouching for hostile code across
-    ///      every clone at once — strictly worse than the address path it
-    ///      extends. Adversary: a template whose bytecode is replaced at the
-    ///      same address (metamorphic CREATE2 + SELFDESTRUCT redeploy) after
-    ///      certification.
+    ///      `templateCodehash` is load-bearing: a clone's codehash embeds the
+    ///      template's ADDRESS, not its CODE, so mutating the template in place
+    ///      changes every clone's behaviour while leaving every clone's codehash
+    ///      identical. Without this snapshot the class would keep vouching for
+    ///      hostile code across every clone at once — strictly worse than the
+    ///      address path. Adversary: metamorphic CREATE2 redeploy of the
+    ///      template after certification.
     struct ClassAnchor {
         address template;
         bytes32 templateCodehash;
@@ -985,29 +816,18 @@ contract TierRegistry is Ownable2Step {
     event ClassDemoted(address indexed template, bytes4 indexed selector, bytes32 indexed cloneCodehash);
     event ClassAllowedSet(address indexed template, bytes32 indexed cloneCodehash, bool allowed);
 
-    /// @notice The class fingerprint `target` belongs to, or `bytes32(0)` when
-    ///         it belongs to no live class.
+    /// @notice The class fingerprint `target` belongs to, or `bytes32(0)`.
     /// @dev    THE two-level membership check, shared by `tierOf` and
-    ///         `isAdapterAllowed` so the two axes can never drift apart:
+    ///         `isAdapterAllowed` so the two axes cannot drift apart:
+    ///         (1) an anchor exists at `target.codehash` — proof of "clone of T"
+    ///         from chain state alone, no factory record, no proposer claim;
+    ///         (2) the template's live codehash still equals the snapshot (see
+    ///         `ClassAnchor.templateCodehash` — dropping it makes the class
+    ///         strictly weaker than the address path).
     ///
-    ///           level 1 — an anchor exists at `target.codehash`, i.e. the
-    ///                     target's runtime code is exactly the ERC-1167 stub
-    ///                     pointing at the certified template. This is what
-    ///                     proves "clone of T" from chain state alone, with no
-    ///                     factory record and no proposer-supplied claim.
-    ///           level 2 — the template's live codehash still equals the
-    ///                     snapshot. See `ClassAnchor.templateCodehash` for why
-    ///                     dropping this would make the class strictly weaker
-    ///                     than the address path.
-    ///
-    ///         Read-side and state-free, mirroring `tierOf`/`isAdapterAllowed`:
-    ///         no write in the hot path, nothing to grief, no dependence on any
-    ///         poke ever running. A mutated template needs no demotion — its
-    ///         clones simply stop being members, because membership IS code
-    ///         identity.
-    ///
-    ///         Lookup is O(1): the class is found BY the target's own codehash,
-    ///         not by scanning certified templates.
+    ///         Read-side and state-free. A mutated template needs no demotion:
+    ///         its clones stop being members, because membership IS code
+    ///         identity. O(1) — found BY the target's codehash, not by scan.
     function _classOf(address target) private view returns (bytes32) {
         bytes32 ch = target.codehash;
         if (ch == bytes32(0) || ch == _EMPTY_CODEHASH) return bytes32(0);
@@ -1031,23 +851,15 @@ contract TierRegistry is Ownable2Step {
 
     /// @notice Propose certifying every ERC-1167 clone of `template` for
     ///         `selector` at `tier` with `extractableBoundBps`. `onlyOwner`.
-    /// @dev    Deliberately mirrors `proposeCertification`: same delay, same
-    ///         bond pin, same `expectedTemplateCodehash` drift guard, and the
-    ///         same reason for that guard — the gap between owner review and
-    ///         mining lets the TEMPLATE's own deployer land different bytecode
-    ///         before this transaction does, silently anchoring a class to code
-    ///         the owner never reviewed.
+    /// @dev    Mirrors `proposeCertification`: same delay, same bond pin, same
+    ///         codehash-drift guard — the gap between owner review and mining
+    ///         otherwise lets the template's deployer land different bytecode
+    ///         first, anchoring a class to code the owner never reviewed.
+    ///         `NotAContract` on a codeless template, else the level-2 check
+    ///         could later be satisfied by counterfactual CREATE2 code.
     ///
-    ///         `NotAContract` on a codeless template: there is no class to
-    ///         anchor, and anchoring one would create a class whose level-2
-    ///         check could later be satisfied by whatever code appears at that
-    ///         address (counterfactual CREATE2).
-    ///
-    ///         What this cannot check, and the owner must: that `template`
-    ///         binds every init-supplied external address, and that it is not
-    ///         itself a proxy. Both are governance discipline — a proxy's
-    ///         runtime bytecode is static across implementation swaps, so
-    ///         neither membership level can observe the change.
+    ///         What the owner must check and this cannot: that `template` binds
+    ///         every init-supplied external address and is not itself a proxy.
     function proposeClassCertification(
         address template,
         bytes4 selector,
@@ -1086,17 +898,11 @@ contract TierRegistry is Ownable2Step {
     }
 
     /// @notice Execute a pending class certification once its delay elapsed.
-    /// @dev    Same execution model as `certify`: permissionless with no bond
-    ///         at stake, submitter-only when a bond is pinned, and every
-    ///         parameter fixed at proposal time so a caller chooses only WHEN,
-    ///         never WHAT. Reuses `_bonds` keyed by the class key — one bond per
-    ///         (class, selector), and any existing bond blocks re-certification
-    ///         exactly as on the address path.
-    ///
-    ///         Re-verifies the TEMPLATE's codehash, not a clone's: the class is
-    ///         anchored to the template's code, and a mid-window mutation must
-    ///         void the grant rather than certify different bytecode under an
-    ///         old announcement.
+    /// @dev    Same execution model as `certify`: permissionless without a bond,
+    ///         submitter-only with one, every parameter fixed at proposal time.
+    ///         Reuses `_bonds` keyed by the class key. Re-verifies the TEMPLATE's
+    ///         codehash — a mid-window mutation voids the grant rather than
+    ///         certifying different bytecode under an old announcement.
     function certifyClass(address template, bytes4 selector) external {
         bytes32 cch = cloneCodehashOf(template);
         bytes32 k = classKey(cch, selector);
@@ -1154,26 +960,16 @@ contract TierRegistry is Ownable2Step {
 
     /// @notice Allow or disallow every clone of `template` as a batch callee
     ///         and as spender/recipient of vault funds. `onlyOwner`.
-    /// @dev    The class analogue of `setAdapterAllowed`, and the half that
-    ///         removes the operational blocker: without it a clone cannot be
-    ///         named in a governor batch at all (`SyndicateVault`
-    ///         `_guardBatchCalls` PART 2a), which is a hard failure rather than
-    ///         a cost.
+    /// @dev    Class analogue of `setAdapterAllowed`, and the half that removes
+    ///         the operational blocker: without it a clone cannot be named in a
+    ///         governor batch at all (`_guardBatchCalls` PART 2a).
     ///
-    ///         Grantable independently of a tier certification — the two axes
-    ///         stay separate here exactly as they do on the address path — but
-    ///         the anchor must already exist, so a class must be certified
-    ///         before it can be allowlisted. That ordering is deliberate: the
-    ///         anchor is what carries the two-level check, and an allowlist
-    ///         entry without it would be a codehash match with no template
-    ///         binding at all.
-    ///
-    ///         `certifyClass` never sets this. Restoring allowlist standing
-    ///         after a demotion is always this explicit owner call, never a
-    ///         side effect of re-certification — the address path's rule,
-    ///         and the reason for it multiplies here: a submitter who gets a
-    ///         class re-certified would otherwise silently re-open the funds
-    ///         path for every clone of that template at once.
+    ///         Requires a live anchor, so a class must be certified first — the
+    ///         anchor carries the two-level check. `certifyClass` never sets
+    ///         this: restoring allowlist standing after a demotion is always an
+    ///         explicit owner call, never a side effect of re-certification. The
+    ///         address path's rule, and the reason multiplies here — the blast
+    ///         radius is every clone of the template at once.
     function setClassAllowed(address template, bool allowed) external onlyOwner {
         bytes32 cch = cloneCodehashOf(template);
         if (allowed && _classAnchors[cch].template == address(0)) revert ClassNotCertified();
@@ -1207,12 +1003,8 @@ contract TierRegistry is Ownable2Step {
     /// @notice Permissionless demotion once the certified template's live
     ///         codehash no longer matches the anchor snapshot. Persists what
     ///         `tierOf` and `isAdapterAllowed` already report lazily.
-    /// @dev    The class analogue of `poke`, and it targets level 2 of the
-    ///         membership check specifically. Level 1 has nothing to persist —
-    ///         an address either is or is not a clone of the template, and that
-    ///         cannot change for an already-deployed address. Level 2 can and
-    ///         does change, and it is the one whose failure would otherwise let
-    ///         a mutated template keep a certification record on the books.
+    /// @dev    Class analogue of `poke`, targeting level 2 specifically: level 1
+    ///         cannot change for an already-deployed address, level 2 can.
     function pokeClass(address template, bytes4 selector) external {
         bytes32 cch = cloneCodehashOf(template);
         if (_classConfigs[classKey(cch, selector)].certifiedCodehash == bytes32(0)) revert ClassNotCertified();
@@ -1221,30 +1013,19 @@ contract TierRegistry is Ownable2Step {
     }
 
     /// @dev Convergence point for all three class demotion paths, mirroring
-    ///      `_demote` field for field.
+    ///      `_demote`. Clears the CLASS allowlist and is over-broad in the same
+    ///      deliberate way: demoting one selector de-allowlists every clone even
+    ///      if other selectors stay certified. Do NOT "fix" this to a
+    ///      per-selector class allowlist — the conservative direction of error is
+    ///      the point, more so here where the blast radius is every clone.
     ///
-    ///      Clears the CLASS allowlist entry, and is over-broad in exactly the
-    ///      same deliberate way: class configs are keyed `(class, selector)`
-    ///      while the class allowlist is keyed by bare class, so demoting one
-    ///      selector de-allowlists every clone of the template even if other
-    ///      selectors stay certified. Recovery is one owner
-    ///      `setClassAllowed(template, true)`. Do NOT "fix" this to a
-    ///      per-selector class allowlist — the conservative direction of error
-    ///      is the point, and the blast radius here is every clone at once,
-    ///      which argues for more caution than the address path, not less.
+    ///      Also cancels a same-key pending certification, else a renewal
+    ///      proposed while the class was live survives a for-cause demotion and
+    ///      re-certifies a just-convicted template across every clone.
     ///
-    ///      Also cancels a same-key pending class certification, for the reason
-    ///      `_demote` does: a renewal proposed while the class was live would
-    ///      otherwise survive a for-cause demotion and execute at `readyAt`,
-    ///      re-certifying a just-convicted template — across every clone.
-    ///
-    ///      The ANCHOR is deliberately left in place. It grants nothing on its
-    ///      own (`tierOf` needs a class config, `isAdapterAllowed` needs the
-    ///      class allowlist flag), other selectors on the same class still need
-    ///      it, and `setClassAllowed` requiring a live anchor is what keeps
-    ///      re-allowlisting an explicit owner decision rather than a side
-    ///      effect. Same posture as `_adapterAllowedCodehash`, which `_demote`
-    ///      also leaves inert.
+    ///      The ANCHOR is left in place: it grants nothing alone, other selectors
+    ///      need it, and `setClassAllowed` requiring it keeps re-allowlisting an
+    ///      explicit owner decision. Same posture as `_adapterAllowedCodehash`.
     function _demoteClass(address template, bytes4 selector) private {
         bytes32 cch = cloneCodehashOf(template);
         bytes32 k = classKey(cch, selector);
@@ -1284,56 +1065,39 @@ contract TierRegistry is Ownable2Step {
         return _bonds[classKey(cloneCodehashOf(template), selector)];
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // TOKEN ↔ PRICE-SOURCE ATTESTATION
+    // ── TOKEN ↔ PRICE-SOURCE ATTESTATION ──
     //
-    // A template that prices token X with a feed describing something else
-    // computes its own slippage floor off the wrong reference — the safety
-    // rail is measured against the wrong ruler, so a trade can lose value
-    // while appearing to sit inside its configured tolerance. Nothing in
-    // Chainlink's AggregatorV3 surface answers "does this feed describe this
-    // token?" on-chain (`description()` is a human string, and the Feed
-    // Registry is not deployed on Robinhood Chain), so the pairing has to be
-    // ATTESTED by governance rather than derived.
-    //
-    // This is what lets a basket template make the class-certification claim
-    // — that its bound holds under EVERY initialization — instead of relying
-    // on a human reviewing each clone's configuration before it can move
-    // money. Without it the token list is an unbound init parameter, and an
-    // unbound external address is exactly what disqualifies a template from
-    // being class-certified (tier-policy: "Only conformant templates may be
-    // class-certified").
-    // ─────────────────────────────────────────────────────────────────────
+    // A template pricing token X with a feed describing something else derives
+    // its slippage floor from the wrong reference, so a trade can lose value
+    // while sitting inside its configured tolerance. Nothing on-chain answers
+    // "does this feed describe this token?" (`description()` is a human string,
+    // and the Feed Registry is absent on Robinhood), so the pairing is ATTESTED
+    // rather than derived. Without it the token list is an unbound init
+    // parameter, which disqualifies a template from class certification.
 
-    /// @dev token => price source => attested. The source is carried as
-    ///      `bytes32` so one mapping serves both price modes: a push-feed
-    ///      aggregator address widened to bytes32, or a Data Streams feed id
-    ///      verbatim. Callers MUST strip any packed metadata (e.g. a max-age
-    ///      field) before looking up, so the same aggregator attests
-    ///      identically regardless of the staleness bound a proposer chose.
+    /// @dev token => price source => attested. `bytes32` so one mapping serves
+    ///      both modes: a push aggregator address widened, or a Data Streams
+    ///      feed id verbatim. Callers MUST strip packed metadata (e.g. max-age)
+    ///      before lookup, so one attestation covers every staleness variant.
     mapping(address token => mapping(bytes32 priceSource => bool)) private _tokenPriceSource;
 
     event PriceSourceForTokenSet(address indexed token, bytes32 indexed priceSource, bool allowed);
 
     /// @notice Attest that `priceSource` prices `token`. `onlyOwner`.
-    /// @dev    Deliberately a separate axis from `setAdapterAllowed`: that one
-    ///         says "this price source may be used at all", this one says
-    ///         "…for THIS token". A template needs both — the source allowlist
-    ///         stops an unknown oracle, and this stops a known oracle being
-    ///         pointed at the wrong asset. Adversary: a proposer pairing a
-    ///         valuable token with a cheap asset's feed so the derived minimum
-    ///         output is far below fair value, extracting the difference on
-    ///         every rebalance while every slippage check passes.
+    /// @dev    A separate axis from `setAdapterAllowed`: that says "this source
+    ///         may be used at all", this says "…for THIS token". Adversary: a
+    ///         proposer pairing a valuable token with a cheap asset's feed, so
+    ///         the derived minimum output sits far below fair value and the
+    ///         difference is extracted while every slippage check passes.
     function setPriceSourceForToken(address token, bytes32 priceSource, bool allowed) external onlyOwner {
         _tokenPriceSource[token][priceSource] = allowed;
         emit PriceSourceForTokenSet(token, priceSource, allowed);
     }
 
     /// @notice Whether `priceSource` is attested to price `token`.
-    /// @dev    Consumed by strategy templates through a raw `staticcall` with
-    ///         an explicit returndata-length check, so a registry that
-    ///         predates this function is distinguishable from one that answers
-    ///         `false` — see `PortfolioStrategy._isPriceSourceForToken`.
+    /// @dev    Consumed via length-checked raw staticcall, so a registry
+    ///         predating this function is distinguishable from one answering
+    ///         false — see `PortfolioStrategy._isPriceSourceForToken`.
     function isPriceSourceForToken(address token, bytes32 priceSource) external view returns (bool) {
         return _tokenPriceSource[token][priceSource];
     }

@@ -27,20 +27,19 @@ interface IRequestableVault {
 /// @title VaultWithdrawalQueue (Lane B async request substrate)
 /// @notice Per-vault queue for mid-proposal LP flow. Redeems escrow shares and
 ///         deposits escrow assets while a proposal is active; at settlement the
-///         vault stamps one frozen price per proposal and each request claims
-///         at that single realized price — the entire mid-flight price
-///         manipulation surface is deleted (the vault never mints/burns against
-///         an unrealized, strategy-influenced NAV).
+///         vault stamps one frozen price per proposal and each request claims at
+///         that single realized price, so the vault never mints or burns against
+///         an unrealized, strategy-influenced NAV.
 ///
 ///         Lifecycle:
-///           REDEEM:  vault.requestRedeem → queueRedeem (shares escrowed here)
-///                    [settle → stampSettlement] → claim → vault.settleRedeem
-///           DEPOSIT: vault.requestDeposit → queueDeposit (assets escrowed here)
-///                    [settle → stampSettlement] → claim → vault.settleDeposit
+///           REDEEM:  vault.requestRedeem -> queueRedeem (shares escrowed here)
+///                    [settle -> stampSettlement] -> claim -> vault.settleRedeem
+///           DEPOSIT: vault.requestDeposit -> queueDeposit (assets escrowed here)
+///                    [settle -> stampSettlement] -> claim -> vault.settleDeposit
 ///
 ///         `cancel` is allowed ONLY before the request's proposal is stamped:
-///         once a settle price is frozen, post-settle cancel would be a free
-///         look-back option, so the request must be claimed.
+///         once a settle price is frozen, a post-settle cancel would be a free
+///         look-back option.
 contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
@@ -73,19 +72,17 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     uint256 private _pendingDepositAssets; // escrowed deposit assets
     uint256 private _reservedAssets; // frozen assets owed to stamped-unclaimed redeems
     /// @notice Escrowed redeem shares whose price is already STAMPED but which
-    ///         have not been claimed yet — the share-side counterpart of
+    ///         have not been claimed — the share-side counterpart of
     ///         `_reservedAssets`, and the exact set the vault must exclude from
-    ///         pricing (issue #92).
+    ///         pricing.
     /// @dev    A STRICT SUBSET OF `_pendingShares`, and the distinction is the
     ///         whole point: pre-stamp escrowed shares still float with the pool
     ///         and belong in the price, because their payout is not fixed yet.
     ///         Only once `stampSettlement` freezes `num/den` does a share stop
-    ///         being a claim on the pool and become a claim for a fixed number
-    ///         of assets.
-    /// @dev    NO CANCEL PATH TO UNWIND. `cancel` reverts `AlreadySettled` for a
-    ///         stamped pid, so once a share enters this counter the only exit is
-    ///         `claim`. That is why maintaining it needs exactly two hooks
-    ///         rather than three.
+    ///         being a claim on the pool and become a claim for a fixed number of
+    ///         assets.
+    /// @dev    NO CANCEL PATH TO UNWIND: `cancel` reverts for a stamped pid, so
+    ///         once a share enters this counter the only exit is `claim`.
     uint256 private _stampedUnclaimedShares;
 
     constructor(address vault_) {
@@ -174,40 +171,30 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
 
     /// @inheritdoc IVaultWithdrawalQueue
     /// @dev Claimable once the RELEVANT settlement is stamped AND the vault is
-    ///      unlocked (no active proposal) — deposit-claim assets must not land
-    ///      mid-proposal (they would mis-count as strategy profit) and
-    ///      redeem-claim float is only guaranteed available between proposals.
-    ///      "Relevant" is the request's own pid for a Redeem, but the LATEST
-    ///      stamped pid for a Deposit — see the gate below for why the two
-    ///      differ (audit-181-2, Finding A).
+    ///      unlocked — deposit-claim assets must not land mid-proposal (they would
+    ///      mis-count as strategy profit) and redeem-claim float is only
+    ///      guaranteed available between proposals. Relevant means the request's
+    ///      own pid for a Redeem, but the LATEST stamped pid for a Deposit.
     function claim(uint256 requestId) external nonReentrant returns (uint256 outAmount) {
         Request storage r = _req(requestId);
         if (r.claimed) revert AlreadyClaimed();
         if (r.cancelled) revert AlreadyCancelled();
-        // GATE ON THE PRICE THIS CLAIM ACTUALLY USES, not blindly on the
-        // request's own tagged pid (audit-181-2, Finding A).
+        // GATE ON THE PRICE THIS CLAIM ACTUALLY USES, not blindly on the request's
+        // own tagged pid.
         //
-        // Redeem claims price against their OWN pid's stamp (see the Redeem
-        // branch below) — `requestRedeem` only opens while
-        // `redemptionsLocked()` is true, i.e. the proposal it tags is already
-        // Executed, and every Executed proposal reaches Settled through
-        // exactly one of `settleProposal` / `unstick` / `finalizeEmergencySettle`
-        // (all three call `vault.onProposalSettled` before `_decOpen()`), so
-        // `r.pid` is always eventually stamped for a redeem. No hole here.
+        // Redeem claims price against their OWN pid's stamp: `requestRedeem` only
+        // opens while the proposal it tags is already Executed, and every Executed
+        // proposal reaches Settled through a path that stamps, so `r.pid` is
+        // always eventually stamped for a redeem.
         //
-        // Deposit claims price against `_lastStampedPid` instead (see the
-        // Deposit branch below for why), and `requestDeposit` opens on
-        // `openProposalCount() != 0` — Draft AND Pending, not just Executed.
-        // A proposal can leave Draft/Pending WITHOUT ever settling
-        // (cancelled / vetoed / rejected / expired all call `_decOpen()`
-        // directly, never `onProposalSettled`), so `_settlePrice[r.pid]` can
-        // be permanently unstamped for a deposit tagged to one of those.
-        // Gating on `r.pid` there reverted `NotSettled` forever with no
-        // recovery for a pay-on-behalf deposit (`cancel` is receiver-gated,
-        // `requestDeposit` pulled assets from `msg.sender`). Gating on
-        // `_lastStampedPid` instead means the claim unlocks at the NEXT real
-        // settlement, whichever proposal that turns out to be — exactly the
-        // price it is actually charged at below.
+        // Deposit claims price against `_lastStampedPid` instead, and
+        // `requestDeposit` opens on `openProposalCount() != 0` — Draft AND
+        // Pending, not just Executed. A proposal can leave Draft/Pending WITHOUT
+        // ever settling, so `_settlePrice[r.pid]` can be permanently unstamped for
+        // a deposit tagged to one of those, and gating on `r.pid` there reverted
+        // forever with no recovery for a pay-on-behalf deposit. Gating on
+        // `_lastStampedPid` unlocks the claim at the NEXT real settlement —
+        // exactly the price it is charged at below.
         uint256 pricePid = r.kind == RequestKind.Redeem ? r.pid : _lastStampedPid;
         SettlePrice memory sp = _settlePrice[pricePid];
         if (!sp.stamped) revert NotSettled();
@@ -253,28 +240,18 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             // A queued deposit has no claim deadline and `cancel` shuts once its
             // proposal stamps, so waiting is strictly free. Pricing at the
             // request's frozen pid therefore handed the depositor a perpetual
-            // look-back call on the vault's NAV: hold the request, watch the
-            // next proposal settle, and claim only when the OLD price mints
-            // more shares — diluting incumbents by the difference, repeatably,
-            // and across several requests at once by exercising only the
-            // favourable ones.
+            // look-back call on the vault's NAV: hold the request, watch the next
+            // proposal settle, and claim only when the OLD price mints more
+            // shares — repeatably, and across several requests by exercising only
+            // the favourable ones.
             //
             // The escrowed assets sat in this contract the whole time and never
-            // entered the strategy, so the honest price is the one prevailing
-            // when they actually join the pool. Claims are already confined to
-            // the gap between proposals (`redemptionsLocked` above), and in that
-            // gap the current share price IS the latest stamp. With no later
-            // settlement this is the request's own pid and nothing changes.
-            //
-            // Redeem (above) keeps its own pid deliberately: those shares left
-            // the supply at that settlement and `_pidReserved` is denominated
+            // entered the strategy, so the honest price is the one prevailing when
+            // they actually join the pool. Claims are already confined to the gap
+            // between proposals, and in that gap the current share price IS the
+            // latest stamp. Redeem keeps its own pid deliberately: those shares
+            // left the supply at that settlement and the reserve is denominated
             // against that same price.
-            //
-            // `sp` above was already fetched at `pricePid == _lastStampedPid`
-            // for a Deposit request (see the gate comment at the top of this
-            // function), so it IS the latest-stamped price already — no
-            // separate lookup or defensive fallback needed here.
-            // shares = assets * den / num (matches ERC-4626 convertToShares at settle)
             outAmount = Math.mulDiv(amount, sp.den, sp.num);
             _pendingDepositAssets -= amount;
             // Push escrowed assets into the vault, then mint at the frozen price.

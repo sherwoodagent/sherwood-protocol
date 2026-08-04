@@ -68,32 +68,27 @@ interface ISyndicateVault {
     ///         would satisfy those contracts' own trust gates.
     error DisallowedBatchTarget(address target);
     /// @notice A governor-batch call named a target that is neither the vault's
-    ///         underlying asset() nor an adapter allowlisted in the TierRegistry.
-    ///         Refused regardless of selector or calldata length — the callee
-    ///         gate is what closes the unenumerable-selector class (issue #166);
-    ///         the selector checks beneath it are defense-in-depth on allowlisted
-    ///         callees. Only raised when the calling governor resolves a nonzero
-    ///         TierRegistry (the callee gate degrades open with the rest of the
-    ///         registry-gated half).
+    ///         underlying `asset()` nor an adapter allowlisted in the TierRegistry.
+    ///         Refused regardless of selector or calldata length — the callee gate
+    ///         is what closes the unenumerable-selector class, and the selector
+    ///         checks beneath it are defense-in-depth on allowlisted callees. Only
+    ///         raised when the calling governor resolves a nonzero TierRegistry.
     error DisallowedBatchCallee(address target);
     /// @notice A governor-batch call carries a guarded value-moving selector but
     ///         its calldata is too short to hold the spender/recipient argument.
     error MalformedCall();
     /// @notice A governor-batch call targets the vault's own `asset()` with a
     ///         selector the batch guard does not recognize.
-    /// @dev    `asset()` is the sole target exempted from the PART 2a callee
-    ///         allowlist, on the premise that the outer `netOutflow` balance
-    ///         diff independently verifies it. That premise covers selectors
-    ///         which MOVE balance; it does not cover a standing AUTHORIZATION
-    ///         grant (ERC-777 `authorizeOperator`, and any allowance-delegation
-    ///         shape not enumerated in PART 2b), which moves nothing in-batch
-    ///         and is therefore invisible to a balance diff, while the
-    ///         extraction it licenses lands in a later transaction outside
-    ///         every meter. Such a call also prices to zero coverage and zero
-    ///         proposer bond and cannot be challenged, so no other layer
-    ///         catches it either. Non-`asset()` targets are already bounded by
-    ///         PART 2a, so this rejection is scoped to `asset()` alone and
-    ///         leaves ordinary adapter calls untouched.
+    /// @dev    `asset()` is the sole target exempted from the callee allowlist, on
+    ///         the premise that the outer `netOutflow` balance diff independently
+    ///         verifies it. That premise covers selectors which MOVE balance; it
+    ///         does not cover a standing AUTHORIZATION grant (ERC-777
+    ///         `authorizeOperator`, and any unenumerated allowance-delegation
+    ///         shape), which moves nothing in-batch and is invisible to a balance
+    ///         diff while the extraction it licenses lands in a later transaction.
+    ///         Such a call also prices to zero coverage and zero proposer bond and
+    ///         cannot be challenged. Non-`asset()` targets are already bounded by
+    ///         the callee gate, so this rejection is scoped to `asset()` alone.
     error UnrecognizedAssetSelector(bytes4 selector);
     /// @notice A governor-batch call carries `transferFrom` whose `from` is not
     ///         the vault itself. Unconditional: pulling a third party's ERC20

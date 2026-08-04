@@ -53,14 +53,13 @@ contract MorphoSupplyStrategy is BaseStrategy {
     ///         settlement the position is unwound by `settle`.
     error NotSettled();
 
-    // ── Events ──
-    /// @notice Settlement could not withdraw the whole supply position because
-    ///         the market lacked deliverable liquidity; `sharesRemaining` are
-    ///         still supplied and `assetsRemaining` is their redeemable value
-    ///         at settle time. Loud on purpose: `_finishSettlement` measures
-    ///         PnL from the vault's realized float, so the residue books as a
-    ///         LOSS on this proposal and is later returned to the vault
-    ///         untaxed by `sweep()`.
+    // Events
+    /// @notice Settlement could not withdraw the whole supply position because the
+    ///         market lacked deliverable liquidity; `sharesRemaining` are still
+    ///         supplied and `assetsRemaining` is their redeemable value at settle
+    ///         time. Loud on purpose: `_finishSettlement` measures PnL from the
+    ///         vault's realized float, so the residue books as a LOSS on this
+    ///         proposal and is later returned untaxed by `sweep()`.
     event SettlementIncomplete(uint256 sharesRemaining, uint256 assetsRemaining);
     /// @notice A post-settlement `sweep()` returned `assets` of the vault
     ///         asset to the vault.
@@ -127,32 +126,27 @@ contract MorphoSupplyStrategy is BaseStrategy {
 
     // ── Settle: full shares-based unwind ──
 
-    /// @dev Withdraws by SHARES, not assets: the share balance is the exact
-    ///      claim, so the withdrawal includes all interest accrued since
-    ///      execute with no dust left behind (an assets-based withdraw of a
-    ///      pre-read value would strand the accrual since the last read).
-    ///      Then pushes the strategy's entire asset balance to the vault,
-    ///      including any balance that arrived outside the supply position.
-    ///      DELIVERABLE-MAXIMUM, NOT ALL-OR-REVERT. Morpho's `withdraw`
-    ///      enforces `totalBorrowAssets <= totalSupplyAssets` after decrementing
-    ///      supply, so a market at full utilization reverts a full-position
-    ///      withdrawal. Doing that unconditionally handed any borrower a veto
-    ///      over settlement: `redemptionsLocked()` would stay true and the
-    ///      queue cannot settle — vault-wide, for as
-    ///      long as the borrower keeps utilization pinned, with no proposer
-    ///      lever (`updateParams` reverts `NoTunableParams`). Adversary: a
-    ///      borrower taking the market to ~100% utilization to hold a vault's
+    /// @dev Withdraws by SHARES, not assets: the share balance is the exact claim,
+    ///      so the withdrawal includes all interest accrued since execute with no
+    ///      dust left behind. Then pushes the strategy's entire asset balance to
+    ///      the vault, including any that arrived outside the supply position.
+    ///
+    ///      DELIVERABLE-MAXIMUM, NOT ALL-OR-REVERT. Morpho's `withdraw` enforces
+    ///      `totalBorrowAssets <= totalSupplyAssets` after decrementing supply, so
+    ///      a market at full utilization reverts a full-position withdrawal. Doing
+    ///      that unconditionally handed any borrower a veto over settlement:
+    ///      `redemptionsLocked()` would stay true vault-wide for as long as the
+    ///      borrower keeps utilization pinned, with no proposer lever. Adversary:
+    ///      a borrower taking the market to ~100% utilization to hold a vault's
     ///      whole LP base hostage for the price of the borrow interest.
     ///
     ///      So settle takes what the market can deliver now and leaves the rest
-    ///      supplied, loudly (`SettlementIncomplete`). The residue is NOT lost:
-    ///      it stays this strategy's supply position and `sweep()` returns it to
-    ///      the vault once utilization recedes. It does cost the proposal — the
-    ///      governor measures PnL from the vault's realized float, so an
-    ///      undelivered residue books as a loss on this proposal and returns
-    ///      untaxed later. That asymmetry is deliberate: a proposer who parks
-    ///      the vault in a market that cannot pay out at settlement should wear
-    ///      the mark, and it is strictly better than the whole vault freezing.
+    ///      supplied, loudly. The residue is NOT lost — `sweep()` returns it once
+    ///      utilization recedes — but it does cost the proposal, since the
+    ///      governor measures PnL from realized float. That asymmetry is
+    ///      deliberate: a proposer who parks the vault in a market that cannot pay
+    ///      out at settlement should wear the mark, and it is strictly better than
+    ///      the whole vault freezing.
     function _settle() internal override {
         (uint256 shares, uint256 own, uint256 deliverable) = _deliverableNow();
         if (shares != 0) {
@@ -175,16 +169,13 @@ contract MorphoSupplyStrategy is BaseStrategy {
         _pushAllToVault(asset);
     }
 
-    /// @notice Return any supply position left behind by an incomplete
-    ///         settlement to the vault. Permissionless and post-settlement
-    ///         only: it can move value in exactly one direction — out of this
-    ///         strategy, into the vault it was always owed to — so there is
-    ///         nothing to gate and anyone may unstick it once the market can
-    ///         pay. Before settlement the position is unwound by `settle`
-    ///         instead.
-    /// @dev    Idempotent and safe to call when there is nothing to move.
-    ///         Takes the deliverable maximum on each call, so a market that
-    ///         frees up gradually can be swept repeatedly.
+    /// @notice Return any supply position left behind by an incomplete settlement
+    ///         to the vault. Permissionless and post-settlement only: it moves
+    ///         value in exactly one direction — out of this strategy, into the
+    ///         vault it was always owed to — so there is nothing to gate.
+    /// @dev    Idempotent and safe to call when there is nothing to move. Takes the
+    ///         deliverable maximum on each call, so a market that frees up
+    ///         gradually can be swept repeatedly.
     /// @return assets The vault-asset amount pushed to the vault this call.
     function sweep() external returns (uint256 assets) {
         if (_state != State.Settled) revert NotSettled();

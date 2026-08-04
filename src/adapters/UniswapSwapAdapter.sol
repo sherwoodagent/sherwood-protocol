@@ -122,8 +122,8 @@ interface IV4Quoter {
 
 /**
  * @title UniswapSwapAdapter
- * @notice ISwapAdapter implementation supporting Uniswap V3 (single/multi-hop) and
- *         Uniswap V4 (single-hop, hookless) swaps.
+ * @notice ISwapAdapter implementation supporting Uniswap V3 (single/multi-hop)
+ *         and Uniswap V4 (single-hop, hookless) swaps.
  *
  *   extraData encoding (mode determines swap type):
  *     Mode 0 — V3 single-hop:  abi.encode(uint8(0), abi.encode(uint24 fee))
@@ -131,21 +131,18 @@ interface IV4Quoter {
  *     Mode 2 — V4 single-hop:  abi.encode(uint8(2), abi.encode(uint24 fee, int24 tickSpacing))
  *     Mode 3 — V4 multi-hop:   abi.encode(uint8(3), abi.encode(PathHop[] hops))
  *
- *   Modes 2/3 target hookless (hooks == address(0)) pools. Mode 3 supports a
- *   native-ETH (address(0)) currency as an *intermediate* hop only — endpoints
- *   (tokenIn/tokenOut) must be ERC20s (the ISwapAdapter contract guarantees
- *   this). v4 flash accounting nets the intermediate ETH to zero inside one
- *   unlock, so no ETH is ever held and no WETH wrap/unwrap is needed. V4 args
- *   (poolManager, v4Quoter) may be address(0) on chains without V4 — modes 2/3
- *   then revert.
+ *   Modes 2/3 target hookless pools. Mode 3 supports a native-ETH currency as an
+ *   INTERMEDIATE hop only — endpoints must be ERC20s. V4 flash accounting nets
+ *   the intermediate ETH to zero inside one unlock, so no ETH is ever held and no
+ *   WETH wrap is needed. V4 args may be `address(0)` on chains without V4; modes
+ *   2/3 then revert.
  *
- *   The caller (strategy) must approve this adapter to spend tokenIn before calling swap().
+ *   The caller must approve this adapter to spend `tokenIn` before `swap()`.
  */
 /// @dev One hop of a v4 multi-hop route: swap from the previous currency
-///      (tokenIn for hop 0) into `currency` in the hookless pool identified by
-///      (sorted pair, fee, tickSpacing, hooks=0). `currency` may be address(0)
-///      (native ETH) for intermediate hops; the last hop's `currency` must
-///      equal tokenOut.
+///      (`tokenIn` for hop 0) into `currency` in the hookless pool identified by
+///      (sorted pair, fee, tickSpacing, hooks = 0). `currency` may be
+///      `address(0)` for intermediate hops; the last hop's must equal `tokenOut`.
 struct PathHop {
     address currency;
     uint24 fee;
@@ -235,29 +232,18 @@ contract UniswapSwapAdapter is ISwapAdapter {
                 })
             );
         } else if (mode == 1) {
-            // V3 multi-hop via chained exactInputSingle calls.
-            // SwapRouter02's exactInput computes wrong pool addresses for certain pairs
-            // on Base, so this decomposes the path and swaps hop-by-hop using
-            // exactInputSingle, which always resolves pools correctly.
+            // V3 multi-hop via chained `exactInputSingle` calls. SwapRouter02's
+            // `exactInput` computes wrong pool addresses for certain pairs on
+            // Base, so this decomposes the path and swaps hop-by-hop, which always
+            // resolves pools correctly. Each non-terminal hop's
+            // `amountOutMinimum` is derived at swap time from a quoter pre-call.
             //
-            // extraData: `abi.encode(bytes path, uint16 perHopSlippageBps)`. Each
-            // non-terminal hop's `amountOutMinimum` is derived at swap time from a
-            // quoter pre-call (`expected * (10000 - perHopSlippageBps) / 10000`).
-            //
-            // WHAT THAT PER-HOP FLOOR IS AND IS NOT (see `_chainedSingleHops`):
-            // it is a quoter/router CONSISTENCY check, not sandwich resistance.
-            // The quote is taken in this same transaction against the same pool
-            // the hop then trades, so no third party can interleave between the
-            // two — and equally, a sandwich that front-ran this transaction has
-            // already moved the pool, so the quote reflects the manipulated
-            // price and the floor moves with the attack. A floor derived from
-            // the thing being manipulated cannot bound manipulation.
-            //
-            // The route's real economic bound is the caller-supplied
-            // `amountOutMin`, enforced on the terminal hop and therefore on the
-            // whole path. It comes from an INDEPENDENT reference — see
-            // `PortfolioStrategy._buyFloor` / `_sellFloor`, which anchor on the
-            // oracle rather than on pool state.
+            // That per-hop floor is a quoter/router CONSISTENCY check, NOT
+            // sandwich resistance: the quote is taken in this same transaction
+            // against the same pool, so a front-run that moved the pool moves the
+            // floor with it. The route's economic bound is the caller-supplied
+            // `amountOutMin` on the terminal hop, anchored on an oracle by
+            // `PortfolioStrategy._buyFloor` / `_sellFloor`.
             (bytes memory path, uint16 perHopSlippageBps) = abi.decode(routeData, (bytes, uint16));
             require(perHopSlippageBps <= 10_000, "slippage > 100%");
             address pathStart = _extractFirstAddress(path);
@@ -272,24 +258,21 @@ contract UniswapSwapAdapter is ISwapAdapter {
 
     // ── Modes 2/3: Uniswap V4 single- and multi-hop (hookless) ──
 
-    /// @dev Drive the swap through poolManager.unlock, passing the route in the
-    ///      unlock payload (a dynamic path doesn't fit fixed transient slots).
-    ///      Output is `take`n directly to the original swap() caller, matching
-    ///      mode-0 recipient semantics. `amountOutMin` is enforced on the FINAL
-    ///      output after unlock returns (still inside the revert boundary) since
-    ///      v4 core enforces none itself.
+    /// @dev Drive the swap through `poolManager.unlock`, passing the route in the
+    ///      unlock payload (a dynamic path does not fit fixed transient slots).
+    ///      Output is `take`n directly to the original `swap()` caller.
+    ///      `amountOutMin` is enforced on the FINAL output after unlock returns,
+    ///      still inside the revert boundary, since v4 core enforces none itself.
     ///
     ///      MEV note: this terminal floor bounds TOTAL route slippage to the
-    ///      caller's budget; it does NOT localize which hop was attacked (unlike
-    ///      mode 1's per-hop quoter floors). Per-hop
-    ///      floors are NOT implementable here: the V4Quoter itself drives
-    ///      poolManager.unlock, and a nested unlock reverts, so we cannot quote
-    ///      mid-callback. Pre-quoting each hop before unlock would add no security
-    ///      over the terminal floor — those quotes are computed in the same tx,
-    ///      i.e. against post-frontrun state. The binding protection for strategy
-    ///      flows is the CALLER-SIDE floor: PortfolioStrategy.rebalanceDelta
-    ///      derives minOut from Chainlink prices (oracle-anchored) and passes it
-    ///      here as amountOutMin.
+    ///      caller's budget; it does NOT localize which hop was attacked, unlike
+    ///      mode 1's per-hop quoter floors. Per-hop floors are NOT implementable
+    ///      here — the V4Quoter itself drives `poolManager.unlock` and a nested
+    ///      unlock reverts, and pre-quoting each hop before unlock would add
+    ///      nothing, since those quotes are computed against post-frontrun state.
+    ///      The binding protection for strategy flows is the CALLER-SIDE floor:
+    ///      `PortfolioStrategy.rebalanceDelta` derives `minOut` from Chainlink
+    ///      prices and passes it here.
     function _swapV4(address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOutMin, PathHop[] memory hops)
         internal
         returns (uint256 amountOut)
@@ -307,19 +290,16 @@ contract UniswapSwapAdapter is ISwapAdapter {
 
     /// @notice V4 unlock callback — only the PoolManager may call.
     /// @dev Walks the hops, feeding each hop's output into the next. Intermediate
-    ///      deltas cancel exactly (full output → next input). At the end: settle
-    ///      the original tokenIn, take the final output to the recipient. A native
-    ///      ETH (address(0)) intermediate nets to zero within this unlock — never
-    ///      settled/taken, never held.
+    ///      deltas cancel exactly. At the end: settle the original `tokenIn`, take
+    ///      the final output to the recipient. A native-ETH intermediate nets to
+    ///      zero within this unlock — never settled, taken, or held.
     ///
     ///      No per-hop slippage floor is (or can be) applied inside this loop: the
-    ///      V4Quoter drives its own poolManager.unlock, so a nested quote reverts
-    ///      here. Each hop runs to full price impact against whatever pool state
-    ///      exists at execution; the atomicity of the unlock does NOT prevent an
-    ///      intermediate-hop sandwich, it only guarantees the hops execute in one
-    ///      tx. Slippage is bounded solely by the terminal `amountOutMin` checked
-    ///      in _swapV4 (total-route budget) — and for strategy flows that budget
-    ///      is oracle-anchored caller-side (see _swapV4's MEV note).
+    ///      V4Quoter drives its own unlock, so a nested quote reverts here. Each
+    ///      hop runs to full price impact against whatever pool state exists at
+    ///      execution; the atomicity of the unlock does NOT prevent an
+    ///      intermediate-hop sandwich. Slippage is bounded solely by the terminal
+    ///      `amountOutMin` checked in `_swapV4`.
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert UnauthorizedCallback();
 
@@ -409,15 +389,13 @@ contract UniswapSwapAdapter is ISwapAdapter {
         }
     }
 
-    /// @dev Execute a multi-hop swap as sequential exactInputSingle calls.
-    ///      Intermediate tokens are held by this contract between hops. Each
-    ///      hop's `amountOutMinimum` is derived at swap time from
-    ///      `quoter.quoteExactInputSingle` against the hop's input, scaled by
-    ///      `(10_000 - perHopSlippageBps) / 10_000`. The final-hop floor also
-    ///      respects the legacy top-level `amountOutMin` (max of the two) so
-    ///      the existing slippage contract still holds. The adapter does the
-    ///      quoter calls so callers don't need to re-compute per-hop floors at
-    ///      every swap — the extraData stays static (template-friendly).
+    /// @dev Execute a multi-hop swap as sequential `exactInputSingle` calls, with
+    ///      intermediate tokens held by this contract between hops. Each hop's
+    ///      `amountOutMinimum` is derived at swap time from the quoter, scaled by
+    ///      `perHopSlippageBps`; the final-hop floor takes the max of that and the
+    ///      top-level `amountOutMin`, so the existing slippage contract still
+    ///      holds. The adapter does the quoter calls so callers need not
+    ///      re-compute per-hop floors, keeping `extraData` static.
     function _chainedSingleHops(bytes memory path, uint256 amountIn, uint256 amountOutMin, uint16 perHopSlippageBps)
         internal
         returns (uint256 amountOut)
@@ -445,30 +423,14 @@ contract UniswapSwapAdapter is ISwapAdapter {
             // slippage budget. Final hop additionally honors the top-level
             // `amountOutMin` so the legacy contract holds.
             //
-            // This floor is a quoter/router consistency check. It is NOT a
-            // slippage or MEV guard, and must not be read as one:
-            //
-            //   - The quote and the swap execute in the SAME transaction
-            //     against the SAME pool, with nothing able to interleave. The
-            //     quote is therefore a simulation of the very swap that
-            //     follows, so on any honest path the check is satisfied by
-            //     construction — it binds only when the router's execution
-            //     diverges from the quoter's simulation. That divergence is
-            //     worth catching (it is the SwapRouter02 pool-resolution bug
-            //     class this mode exists to route around), which is why the
-            //     check stays.
-            //   - Against a sandwich it does nothing. The front-run lands
-            //     BEFORE this transaction, so the quoter reads the already-moved
-            //     pool and `hopFloor` scales down with the manipulation. A
-            //     bound derived from the manipulated quantity cannot constrain
-            //     the manipulation.
-            //
-            // Intermediate hops consequently carry no independent economic
-            // floor. The route is bounded end-to-end by `amountOutMin` on the
-            // terminal hop, which the caller derives from an oracle rather than
-            // from pool state (`PortfolioStrategy._buyFloor` / `_sellFloor`).
-            // Raising `perHopSlippageBps` cannot loosen that bound; lowering it
-            // cannot tighten it either.
+            // Quote and swap run in the SAME transaction against the SAME pool,
+            // so the quote simulates the swap that follows: the floor binds only
+            // when the router diverges from the quoter (the SwapRouter02
+            // pool-resolution bug class this mode routes around — why it stays),
+            // and it gives no sandwich protection, since a front-run moves the
+            // pool the quote is read from. Intermediate hops therefore carry no
+            // independent economic floor; `amountOutMin` on the terminal hop
+            // bounds the route.
             (uint256 quoted,,,) = quoter.quoteExactInputSingle(
                 IQuoterV2.QuoteExactInputSingleParams({
                     tokenIn: hopIn, tokenOut: hopOut, amountIn: currentAmount, fee: fee, sqrtPriceLimitX96: 0

@@ -193,18 +193,12 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         `pushWiring`.
     address public bondEscrow;
 
-    /// @dev Reserved for future storage. Per-vault-governor refactor: replaced
-    ///      the single `governor` slot (1) with `beacon` (1) + `protocolConfig`
-    ///      (1) + `_governorOf` mapping (1) = net +2 slots, so the gap drops
-    ///      50 → 48 → 46 across this and prior reductions; then 46 → 45 for
-    ///      `tierRegistry` (Task 7); then 45 → 43 for `exposureLedger` +
-    ///      `bondEscrow` (Plan B Task 10); then 43 → 42 for
-    ///      `compensationEscrow`.
-    ///      RESTORED 42 → 43 by the burn-slash-proceeds change: slash proceeds
-    ///      burn, so there are no compensation cases for a queue to pay through
-    ///      and `compensationEscrow` was REMOVED rather than deprecated. Legal
-    ///      only pre-mainnet (the golden is regenerated in the same PR); from
-    ///      the first mainnet deploy onward this slot would have to stay.
+    /// @dev Reserved for future storage. Shrinks as named slots are carved off the
+    ///      FRONT of the gap, so every field behind it keeps its slot. One slot was
+    ///      RESTORED when `compensationEscrow` was removed rather than deprecated
+    ///      — legal only pre-mainnet, with the layout golden regenerated in the
+    ///      same change; from the first mainnet deploy onward that slot would have
+    ///      to stay.
     uint256[43] private __gap;
 
     // ── Events ──
@@ -388,23 +382,19 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         // roll back the whole creation tx — atomic.
         sw.bindOwnerStake(msg.sender, vault);
 
-        // Register ENS subname — vault is both address record + NFT owner.
-        //
-        // An external registrar revert (mempool front-runner claims the label
-        // upstream, or the registrar is paused) must NOT undo the fee transfer
-        // + vault/queue deploy + stake bind already done. The syndicate is
-        // fully operational without ENS — chat discovery falls back to
-        // subdomain name-match — and an operator can `register` later via the
-        // registrar directly (see `setEnsRegistrar` natspec). So we never
-        // revert `createSyndicate` for an ENS failure.
+        // Register the ENS subname — the vault is both address record and NFT
+        // owner. An external registrar revert (a mempool front-runner claiming the
+        // label, or a paused registrar) must NOT undo the fee transfer, vault and
+        // queue deploy, and stake bind already done: the syndicate is fully
+        // operational without ENS, and an operator can `register` later via the
+        // registrar directly. So `createSyndicate` never reverts for an ENS
+        // failure.
         //
         // Pre-check `available()` so a genuine label-taken front-run is
-        // distinguished (in telemetry) from an unexpected registrar fault, and
-        // the doomed `register` call is skipped. Either way we emit
-        // `EnsRegistrationFailed` for monitors. We deliberately do NOT bubble
-        // the non-front-run reverts: a paused/misconfigured registrar would
-        // then brick ALL vault creation, which is worse than shipping
-        // ENS-less + an event.
+        // distinguished in telemetry from an unexpected registrar fault, and the
+        // doomed `register` call is skipped. Non-front-run reverts are
+        // deliberately not bubbled either: a paused or misconfigured registrar
+        // would then brick ALL vault creation.
         if (address(ensRegistrar) != address(0)) {
             // The `available()` view is itself an external call into a
             // possibly-paused / misconfigured / non-conforming registrar. It
@@ -453,17 +443,13 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
 
     /// @dev Default governance parameters stamped onto each new per-vault governor
     ///      at deploy. Vault owners tune them post-creation via the governor's
-    ///      owner-instant setters (frozen while a proposal is open). All values
-    ///      sit within `GovernorParameters` bounds so the governor's
-    ///      `_validateParamBounds` at `initialize` accepts them.
-    /// @dev `maxPerformanceFeeBps` starts at the advertised headline (20%), not
-    ///      at the protocol ceiling (30%). The settle-time clamp resolves an
-    ///      over-ceiling rate silently — it emits `FeeClamped` and continues —
-    ///      so a permissive default would fail open, letting an owner quietly
-    ///      charge above the headline. Fail-closed is the right default for a
-    ///      depositor-facing rate; raising it is a separately authorized
-    ///      governor param change. Named constant, not a literal, so it cannot
-    ///      drift from `FeeConstants`.
+    ///      owner-instant setters. All values sit within `GovernorParameters`
+    ///      bounds so the governor's validation at `initialize` accepts them.
+    /// @dev `maxPerformanceFeeBps` starts at the advertised headline (20%), not at
+    ///      the protocol ceiling (30%): the settle-time clamp resolves an
+    ///      over-ceiling rate silently, so a permissive default would fail open and
+    ///      let an owner quietly charge above the headline. Named constant, not a
+    ///      literal, so it cannot drift from `FeeConstants`.
     function _defaultGovernorParams() private pure returns (ISyndicateGovernor.GovernorParams memory) {
         return ISyndicateGovernor.GovernorParams({
             votingPeriod: 24 hours,
@@ -528,17 +514,13 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         emit ExecutorImplUpdated(old, newExecutorImpl);
     }
 
-    /// @notice Re-point an EXISTING factory-deployed vault at the factory's
-    ///         CURRENT `executorImpl`, re-stamping its expected codehash
-    ///         atomically (issue #43, design.md D5 migration primitive #2).
-    /// @dev Mirrors `pushWiring`'s factory-deployed check (the unforgeable
-    ///      `governor.vault()` round-trip via `_isFactoryGovernor`... here
-    ///      applied to the VAULT: resolve its governor through `_governorOf`,
-    ///      which only ever holds proxies this factory deployed) and
-    ///      `rotateOwner`'s lifecycle gates: a re-point under a live proposal
-    ///      would swap the metering library out from under stored,
-    ///      coverage-priced calls, so both `getActiveProposal() == 0` and
-    ///      `openProposalCount() == 0` must hold on the vault's governor.
+    /// @notice Re-point an EXISTING factory-deployed vault at the factory's CURRENT
+    ///         `executorImpl`, re-stamping its expected codehash atomically.
+    /// @dev Mirrors `pushWiring`'s factory-deployed check — here applied to the
+    ///      VAULT, by resolving its governor through `_governorOf`, which only ever
+    ///      holds proxies this factory deployed — plus `rotateOwner`'s lifecycle
+    ///      gates: a re-point under a live proposal would swap the metering library
+    ///      out from under stored, coverage-priced calls.
     function pushExecutor(address vault) external onlyOwner {
         uint256 syndicateId = vaultToSyndicate[vault];
         if (syndicateId == 0) revert VaultNotDeployed();
@@ -564,14 +546,11 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     }
 
     /// @notice Update the Durin L2 Registrar used for ENS subname registration on
-    ///         new syndicates. Setting `newRegistrar` to the zero address disables
-    ///         ENS registration on `createSyndicate` (the call is guarded by an
-    ///         `address(0)` check at line 282). This setter only affects FUTURE
-    ///         syndicates — existing syndicates that were created against a
-    ///         misconfigured registrar (e.g. zero) keep their on-chain state and
-    ///         must be backfilled per-syndicate by calling
-    ///         `IL2Registrar(registrar).register(subdomain, vault)` directly
-    ///         (the registrar's `register` is permissionless).
+    ///         new syndicates. Zero disables ENS registration on
+    ///         `createSyndicate`. Only affects FUTURE syndicates — existing ones
+    ///         created against a misconfigured registrar keep their on-chain state
+    ///         and must be backfilled per-syndicate by calling the registrar's
+    ///         permissionless `register` directly.
     function setEnsRegistrar(address newRegistrar) external onlyOwner {
         address old = address(ensRegistrar);
         ensRegistrar = IL2Registrar(newRegistrar);
@@ -610,15 +589,12 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         ISyndicateGovernor(gov).forceSetParams(params);
     }
 
-    /// @notice Re-point the factory at a new guardian registry. Used when WOOD
-    ///         ships and the protocol migrates from the beta stub to the real
-    ///         `GuardianRegistry`. The governor and factory MUST share the same
-    ///         registry; flip both in the same multisig batch.
+    /// @notice Re-point the factory at a new guardian registry. The governor and
+    ///         factory MUST share the same registry; flip both in the same multisig
+    ///         batch.
     /// @dev Validates that the new registry's `factory()` view reports this
-    ///      contract — otherwise the factory and registry are misaligned and
-    ///      `bindOwnerStake` / `transferOwnerStakeSlot` will revert with
-    ///      `NotFactory`. Strict: any view-call failure (no `factory` selector,
-    ///      wrong return shape, etc.) also reverts — fail-closed.
+    ///      contract — otherwise the two are misaligned and the owner-stake binds
+    ///      revert `NotFactory`. Strict: any view-call failure also reverts.
     function setGuardianRegistry(address newRegistry) external onlyOwner {
         if (newRegistry == address(0)) revert InvalidGuardianRegistry();
         // Require the new registry to either advertise this factory
@@ -653,10 +629,9 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     /// @notice Set the aggregate-exposure ledger pushed into governors at
     ///         `createSyndicate`. `address(0)` is tolerated — it disables the
     ///         covered-TVL cap and the risk-scaled proposer bond for governors
-    ///         created afterward. Only affects governors created AFTER this
-    ///         call; existing per-vault governors are rewired via `pushWiring`.
-    /// @dev WIRING ORDER: seed the ledger's asset feeds and covered-TVL cap
-    ///      BEFORE wiring it here — the governor's gates are fail-closed, so a
+    ///         created afterward. Existing governors are rewired via `pushWiring`.
+    /// @dev WIRING ORDER: seed the ledger's asset feeds and covered-TVL cap BEFORE
+    ///      wiring it here — the governor's gates are fail-closed, so a
     ///      wired-but-unseeded ledger bricks `propose`.
     function setExposureLedger(address newLedger) external onlyOwner {
         address old = exposureLedger;
@@ -666,8 +641,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
 
     /// @notice Set the proposer-bond escrow pushed into governors at
     ///         `createSyndicate`. `address(0)` is tolerated — it disables the
-    ///         proposer bond for governors created afterward. Only affects
-    ///         governors created AFTER this call; existing per-vault governors
+    ///         proposer bond for governors created afterward. Existing governors
     ///         are rewired via `pushWiring`.
     /// @dev The escrow slot is CUSTODIAL — re-point it only at zero outstanding
     ///      bonds. Bonds already locked are released against the escrow recorded
@@ -681,28 +655,23 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
 
     /// @notice Whether `governor` is a per-vault governor deployed by THIS factory.
     /// @dev Derived from the existing `_governorOf` bookkeeping rather than a new
-    ///      membership set: a fresh `mapping(address => bool)` would only be
-    ///      populated by future `createSyndicate` calls, so it would answer
-    ///      `false` for exactly the pre-upgrade governors `pushWiring` exists to
-    ///      rescue. The round-trip `governor.vault()` → `_governorOf[vault]` is
-    ///      unforgeable: `_governorOf` only ever holds proxies this factory
-    ///      deployed, so a foreign contract can never make the equality hold for
-    ///      its own address.
+    ///      membership set, which would only be populated by future
+    ///      `createSyndicate` calls and so answer `false` for exactly the
+    ///      pre-upgrade governors `pushWiring` exists to rescue. The round-trip
+    ///      `governor.vault() -> _governorOf[vault]` is unforgeable, since
+    ///      `_governorOf` only ever holds proxies this factory deployed.
     function isFactoryGovernor(address governor) public view returns (bool) {
         return _isFactoryGovernor(governor);
     }
 
     /// @notice Push the factory's CURRENT `tierRegistry`, `exposureLedger` and
     ///         `bondEscrow` into an EXISTING governor deployed by this factory.
-    /// @dev Closes the "governor predates the registry" gap: the
-    ///      `createSyndicate` push only reaches governors created AFTER the
-    ///      addresses were set, so without this entrypoint a governor deployed
-    ///      before the registries existed would run batches unguarded forever
-    ///      with no way to fix it (the governor's setters are `onlyFactory`, and
-    ///      the factory had no path to call them post-creation).
-    /// @dev Unset factory slots are SKIPPED, never written as zero — `pushWiring`
-    ///      can only add wiring, never silently un-wire a governor that some
-    ///      other path already configured.
+    /// @dev Closes the governor-predates-the-registry gap: the `createSyndicate`
+    ///      push only reaches governors created AFTER the addresses were set, so
+    ///      without this a governor deployed before the registries existed would
+    ///      run batches unguarded forever, its own setters being `onlyFactory`.
+    /// @dev Unset factory slots are SKIPPED, never written as zero — this can only
+    ///      add wiring, never silently un-wire a governor.
     /// @param governor A per-vault governor proxy deployed by this factory.
     function pushWiring(address governor) external onlyOwner {
         if (!_isFactoryGovernor(governor)) revert NotFactoryGovernor();
@@ -729,37 +698,23 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     /// @notice Transfer a vault's ownership to `newOwner` and rebind the owner-stake
     ///         slot in the guardian registry.
     /// @dev Auth: `msg.sender` must be the vault's current owner OR the original
-    ///      syndicate creator — restricting this to the factory owner alone
-    ///      would let it unilaterally reassign vault control, a centralization
-    ///      risk. The factory owner has no privileged path here.
-    /// @dev Requires the old owner to have already unstaked (verified inline as
-    ///      `reg.ownerStake(vault) > 0`, since the registry exposes no
-    ///      `hasOwnerStake` view) — otherwise rotating would strand the old
-    ///      stake.
-    /// @dev Asserts the factory + governor point at the same registry to catch
-    ///      misconfiguration. `newOwner` must have a prepared stake sized
-    ///      ≥ `reg.minOwnerStake()`; the registry's `transferOwnerStakeSlot`
-    ///      enforces this at bind time.
-    /// @dev Forbidden while any proposal binds the vault — the new owner would
-    ///      otherwise inherit `pause()` and other owner-only powers mid-flight.
-    /// @dev INCOMING-OWNER CONSENT REQUIRED (issue #98). `newOwner` must first
-    ///      call `approveOwnerStakeBinding(vault)` on sWOOD, or this reverts
-    ///      `StakedWood.BindingNotApproved`. Rotation is not a bare title
-    ///      assignment: it SPENDS `newOwner`'s escrowed prepared stake via the
-    ///      `transferOwnerStakeSlot` call below. The auth above covers only
-    ///      `msg.sender` — the outgoing side — so without that opt-in the owner
-    ///      of any vault with an empty bond slot could bind a stranger's escrow
-    ///      to it, blocking the victim's `cancelPreparedStake` and their own
-    ///      `createSyndicate`, and exposing the bond to `slashOwnerBond` for
-    ///      the length of an owner-unstake cooldown they never chose. Consent
-    ///      is enforced at the sWOOD spend site rather than here, so any future
+    ///      syndicate creator — restricting this to the factory owner alone would
+    ///      let it unilaterally reassign vault control. Requires the old owner to
+    ///      have already unstaked, or rotating would strand the old stake, and is
+    ///      forbidden while any proposal binds the vault, or the new owner would
+    ///      inherit `pause()` and other owner-only powers mid-flight.
+    /// @dev INCOMING-OWNER CONSENT REQUIRED. `newOwner` must first call
+    ///      `approveOwnerStakeBinding(vault)` on sWOOD, or this reverts
+    ///      `BindingNotApproved`. Rotation is not a bare title assignment: it
+    ///      SPENDS `newOwner`'s escrowed prepared stake. The auth above covers only
+    ///      the outgoing side, so without that opt-in the owner of any vault with
+    ///      an empty bond slot could bind a stranger's escrow to it. Consent is
+    ///      enforced at the sWOOD spend site rather than here, so any future
     ///      factory route into `transferOwnerStakeSlot` inherits it.
-    /// @dev UX consequence: rotation is two transactions across two contracts —
-    ///      `newOwner` approves on sWOOD, then the owner/creator calls this. The
-    ///      approval is single-use (consumed by the bind) and revocable until
-    ///      then. A missing approval reverts the WHOLE call, so the
-    ///      `rotateOwnership` performed just before it unwinds atomically and
-    ///      no ownership, owner-stake, or creator-record state changes.
+    /// @dev UX consequence: rotation is two transactions across two contracts. The
+    ///      approval is single-use and revocable until consumed. A missing approval
+    ///      reverts the WHOLE call, so the `rotateOwnership` performed just before
+    ///      it unwinds atomically.
     function rotateOwner(address vault, address newOwner) external {
         if (newOwner == address(0)) revert ZeroAddress();
         uint256 syndicateId = vaultToSyndicate[vault];
@@ -788,29 +743,24 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         emit OwnerRotated(vault, newOwner);
     }
 
-    /// @notice Upgrade a vault to a new implementation. Callable by the syndicate owner (vault owner).
-    /// @dev Factory must have upgrades enabled, and `vaultImpl` must equal `expectedImpl`.
-    ///      The `expectedImpl` parameter prevents a factory owner from calling
-    ///      `setVaultImpl(newImpl)` between when the creator decides to upgrade
-    ///      and when the upgrade tx lands, landing the vault on an impl the
-    ///      creator did not opt into.
-    /// @param vault The vault proxy to upgrade
-    /// @param expectedImpl The vault implementation address the creator expects
-    ///                     to be applied. Reverts with `VaultImplMismatch` if
-    ///                     `vaultImpl` has changed since the caller observed it.
+    /// @notice Upgrade a vault to a new implementation. Callable by the vault owner.
+    /// @dev Factory upgrades must be enabled and `vaultImpl` must equal
+    ///      `expectedImpl`, which prevents a factory owner from calling
+    ///      `setVaultImpl` between the creator deciding to upgrade and the upgrade
+    ///      tx landing.
+    /// @param vault The vault proxy to upgrade.
+    /// @param expectedImpl The implementation the creator expects to be applied.
     function upgradeVault(address vault, address expectedImpl) external {
         if (!upgradesEnabled) revert UpgradesDisabled();
         uint256 syndicateId = vaultToSyndicate[vault];
         if (syndicateId == 0) revert VaultNotDeployed();
         if (syndicates[syndicateId].creator != msg.sender) revert NotCreator();
         if (vaultImpl != expectedImpl) revert VaultImplMismatch();
-        // `getActiveProposal` is set only on the Executed transition. Draft /
-        // Pending / GuardianReview / Approved keep `openProposalCount > 0`
-        // while `getActiveProposal == 0`. Without the `openProposalCount`
-        // gate, the creator could swap implementations mid-vote — LPs would
-        // have approved strategy X against impl A but execute under impl B.
-        // Mirrors the `rotateOwner` gate above — split into two distinct
-        // errors so off-chain tooling decoding the selector can tell which
+        // `getActiveProposal` is set only on the Executed transition, while Draft /
+        // Pending / GuardianReview / Approved keep `openProposalCount > 0`. Without
+        // the `openProposalCount` gate the creator could swap implementations
+        // mid-vote, so LPs would have approved strategy X against impl A but
+        // execute under impl B. Split into two errors so tooling can tell which
         // gate fired.
         address gov_ = _governorOf[vault];
         if (gov_ != address(0)) {
@@ -837,15 +787,14 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
             && (address(ensRegistrar) == address(0) || ensRegistrar.available(subdomain));
     }
 
-    /// @notice Get active syndicates with pagination (for dashboard).
-    /// @dev    Backed by `_activeSyndicateIds` (EnumerableSet) so reads are
-    ///         O(limit) instead of O(syndicateCount). `limit` is hard-capped at
-    ///         `MAX_PAGE_LIMIT` to guarantee the call stays well below block
-    ///         gas even as the set grows.
-    /// @param offset Starting index (0-based) into the active-set
-    /// @param limit  Maximum number of results to return; clamped to `MAX_PAGE_LIMIT`
-    /// @return result Array of active syndicates (in insertion order with swap-pop gaps filled)
-    /// @return total  Total count of active syndicates
+    /// @notice Get active syndicates with pagination.
+    /// @dev    Backed by an `EnumerableSet` so reads are O(limit), and `limit` is
+    ///         hard-capped at `MAX_PAGE_LIMIT` to keep the call well below block
+    ///         gas as the set grows.
+    /// @param offset Starting index (0-based) into the active set.
+    /// @param limit  Maximum results; clamped to `MAX_PAGE_LIMIT`.
+    /// @return result Active syndicates, in insertion order with swap-pop gaps.
+    /// @return total  Total count of active syndicates.
     function getActiveSyndicates(uint256 offset, uint256 limit)
         external
         view

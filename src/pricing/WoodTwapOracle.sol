@@ -5,14 +5,12 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IWoodTwapOracle} from "../interfaces/IWoodTwapOracle.sol";
 
-/// @dev The exact slice of `UniswapV2Pair` this oracle reads. The live pair
-///      (`0xBF3BB81de6285b8310A028d1C2Cd38F9419d54C1` on chain 4663) was PROVEN
-///      byte-identical to canonical `UniswapV2Pair` by CREATE2 derivation —
-///      `CREATE2(factory 0x8bcE…937f, keccak(WETH‖WOOD), canonical init-code
-///      hash 0x96e8ac42…845f)` reproduces the deployed address, and a CREATE2
-///      address commits to the exact creation bytecode. So `_update` advancing
-///      the accumulator once per block, the UQ112x112 encoding, and the 2^32
-///      timestamp wrap are all standard here (design.md risks, task 1).
+/// @dev The exact slice of `UniswapV2Pair` this oracle reads. The live pair on
+///      chain 4663 was PROVEN byte-identical to canonical `UniswapV2Pair` by
+///      CREATE2 derivation — the canonical init-code hash reproduces the deployed
+///      address, and a CREATE2 address commits to the exact creation bytecode. So
+///      the accumulator advancing once per block, the UQ112x112 encoding and the
+///      2^32 timestamp wrap are all standard here.
 ///      RE-RUN THAT DERIVATION IF THE PAIR ADDRESS EVER CHANGES.
 interface IUniswapV2PairMinimal {
     function token0() external view returns (address);
@@ -30,33 +28,24 @@ interface IAggregatorMinimal {
 /**
  * @title  WoodTwapOracle
  * @notice Time-weighted WOOD/USD price derived from the WOOD/WETH
- *         Uniswap-V2-style pair on Robinhood Chain, converted to USD through
- *         the chain's ETH/USD Chainlink feed.
+ *         Uniswap-V2-style pair on Robinhood Chain, converted to USD through the
+ *         chain's ETH/USD Chainlink feed.
  *
- * @dev    WHAT THIS IS FOR, AND WHAT IT IS NOT FOR. There is no Chainlink
- *         WOOD/USD feed on chain 4663 and none is expected by launch, which
- *         left `ExposureLedger.woodUsdPriceX8` — a manually maintained scalar —
- *         as the *primary* valuation for every guardian bond. The dangerous
- *         failure of that arrangement is silent: a manual number sitting above
- *         market makes guardians look better collateralised than they are and
- *         clears `requireApproveQuorum` on collateral that does not exist.
+ * @dev    There is no Chainlink WOOD/USD feed on chain 4663, so this contract is
+ *         the ledger's PRIMARY valuation whenever no WOOD feed is wired, and
+ *         `ExposureLedger.woodUsdPriceX8` is a pure CAP that is never served as a
+ *         price. The TWAP is admitted ONLY through a `min` against that cap, so
+ *         the market may lower the WOOD price and never raise it:
  *
- *         Under the revision-2 design (`design-revision-2026-08-01.md`) this
- *         contract is the ledger's PRIMARY valuation whenever no Chainlink WOOD
- *         feed is wired, and `woodUsdPriceX8` is demoted to a pure CAP that is
- *         never served as a price. The TWAP is admitted ONLY through a `min`
- *         against that cap, so the market may lower the WOOD price and never
- *         raise it:
- *
- *           - TWAP pushed UP   → the `min` ignores it; the attack is inert.
- *           - TWAP pushed DOWN → bonds are valued lower and quorums get harder.
+ *           - TWAP pushed UP   -> the `min` ignores it; the attack is inert.
+ *           - TWAP pushed DOWN -> bonds are valued lower and quorums get harder.
  *                                A denial-of-service with no payoff.
  *
  *         The pool is ~$437k total depth (measured 2026-08-01). Moving its spot
  *         price 2x costs ~$90.7k committed instantaneously plus a sustained
- *         arbitrage bleed for the whole averaging window. That is affordable
- *         enough that this must NEVER become an unbounded price source, and
- *         costly enough that the one-directional use is sound.
+ *         arbitrage bleed for the whole averaging window — affordable enough that
+ *         this must NEVER become an unbounded price source, and costly enough
+ *         that the one-directional use is sound.
  *
  * @dev    THREE INDEPENDENT WAYS TO BECOME UNAVAILABLE, all of which report
  *         `ok == false` rather than reverting or serving a bad number:
@@ -66,63 +55,41 @@ interface IAggregatorMinimal {
  *           3. the ETH/USD feed unset, codeless, reverting, non-positive or
  *              stale — the USD leg cannot be reconstructed from pair data.
  *
- *         UNAVAILABLE IS NO LONGER A FREE PASS. Revision 1 could fall through to
- *         a maintained fallback price; revision 2 deleted it, so an unavailable
- *         TWAP with no Chainlink WOOD feed makes `ExposureLedger._woodPrice`
- *         revert `NoWoodPrice`. That is still fail-SAFE rather than fail-open —
- *         `recordApproval` catches it and books nothing, while propose and
- *         execute halt — but it means this contract's liveness is now the
- *         protocol's liveness, and every bound below is sized with that in mind:
- *         each one must be tight enough to be meaningful and loose enough that a
- *         healthy chain never trips it.
+ *         UNAVAILABLE IS NOT A FREE PASS: with no Chainlink WOOD feed it makes
+ *         `ExposureLedger._woodPrice` revert `NoWoodPrice`. That is still
+ *         fail-SAFE rather than fail-open — `recordApproval` catches it and books
+ *         nothing, while propose and execute halt — but it means this contract's
+ *         liveness is the protocol's liveness, and every bound below is sized
+ *         accordingly: tight enough to be meaningful, loose enough that a healthy
+ *         chain never trips it.
  *
- * @dev    ══ ACCEPTED RISK: THE TWO LEGS DESCRIBE DIFFERENT PERIODS ══
+ * @dev    ACCEPTED RISK: THE TWO LEGS DESCRIBE DIFFERENT PERIODS. The WOOD/ETH
+ *         leg is a time-weighted average ending at a snapshot at most
+ *         `maxTwapAge` old — near-real-time. The ETH/USD leg is a single
+ *         Chainlink answer that may be up to one heartbeat old, and the live 4663
+ *         feed was measured 10.7 HOURS old WHILE PERFECTLY HEALTHY, so that is
+ *         the normal case, not a degraded one.
  *
- *         This price is a product of two numbers that are NOT contemporaneous:
+ *         THE CONCRETE EXPOSURE: during an ETH drawdown inside that heartbeat,
+ *         WOOD/ETH rises while the stale, pre-drawdown ETH/USD price is still the
+ *         multiplier, so the product reads HIGH by roughly the size of the ETH
+ *         move and bonds are over-valued for the remainder of the heartbeat. NO
+ *         ATTACKER CAPITAL IS REQUIRED — ordinary market movement against a slow
+ *         feed, which makes it more likely than any manipulation scenario.
  *
- *           - the WOOD/ETH leg is a time-weighted average over `twapWindow`,
- *             ending at a snapshot at most `maxTwapAge` old — near-real-time;
- *           - the ETH/USD leg is a single Chainlink answer that may be up to
- *             one heartbeat old. The live 4663 feed was measured 10.7 HOURS
- *             old WHILE PERFECTLY HEALTHY, so this is the normal case, not a
- *             degraded one.
+ *         WHY IT IS ACCEPTED RATHER THAN FIXED: requiring the ETH/USD answer to
+ *         be no older than `twapWindow` is UNSATISFIABLE against the measured
+ *         heartbeat — it forces `twapWindow >= ~12h`, and a 12-hour averaging
+ *         window means the oracle needs half a day to reflect a WOOD crash. A
+ *         crash-tracking blind spot is unbounded in magnitude and lasts a fixed
+ *         half-day; the staleness overstatement is bounded by the ETH move and by
+ *         two existing controls: the ledger's price CAP truncates anything above
+ *         it, and `woodHaircutBps` pre-funds an allowance — ZERO at its 10_000
+ *         default, 50% at the 5_000 floor.
  *
- *         THE CONCRETE EXPOSURE. During an ETH drawdown inside that heartbeat,
- *         WOOD/ETH rises (WOOD falls less than ETH, or holds) while the stale,
- *         pre-drawdown ETH/USD price is still the multiplier. The product reads
- *         HIGH by roughly the size of the ETH move, and bonds are over-valued
- *         for the remainder of the heartbeat. NO ATTACKER CAPITAL IS REQUIRED —
- *         this is ordinary market movement against a slow feed, which makes it
- *         more likely than any manipulation scenario, not less.
- *
- *         WHY IT IS ACCEPTED RATHER THAN FIXED. The obvious remedy — require
- *         the ETH/USD answer to be no older than `twapWindow` — is
- *         UNSATISFIABLE against the measured heartbeat: it forces
- *         `twapWindow >= ~12h`, and a 12-hour averaging window means the oracle
- *         needs half a day to reflect a WOOD crash. That trade is strictly
- *         worse. A crash-tracking blind spot is unbounded in magnitude and
- *         lasts a fixed half-day; the staleness overstatement is bounded in
- *         magnitude by the ETH move and by the two controls below. The whole
- *         purpose of this contract is to track a drawdown without waiting on a
- *         human, and a 12-hour window gives most of that purpose back.
- *
- *         WHAT BOUNDS IT (both already exist, neither is new):
- *
- *           1. `ExposureLedger.woodUsdPriceX8` — the cap. The overstatement is
- *              admitted only through `min(source, cap)`, so anything above the
- *              cap is truncated outright. An ETH move large enough to matter is
- *              exactly the move likely to push the product past the cap.
- *           2. `ExposureLedger.woodHaircutBps` — the allowance. It discounts
- *              every price by a fixed factor, pre-funding headroom for an
- *              overstatement of that size. THIS PARAMETER IS NOW LOAD-BEARING:
- *              at its 10_000 default (no haircut) the allowance is ZERO. 5_000
- *              absorbs a 50% error. It is also the compensating control for the
- *              residual crash lag of up to `twapWindow + maxTwapAge`.
- *
- *         `ethUsdMaxDelay` is therefore bounded ONLY by
- *         `MAX_ETH_USD_DELAY_LIMIT` and is deliberately independent of
- *         `twapWindow`, so the window can be short. Owner decision 2026-08-02;
- *         see `design-revision-2026-08-01.md` finding 4.
+ *         `ethUsdMaxDelay` is therefore bounded ONLY by `MAX_ETH_USD_DELAY_LIMIT`
+ *         and is deliberately independent of `twapWindow`, so the window can be
+ *         short.
  */
 contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
     /// @dev UQ112x112 scaling factor, the fixed-point format `UniswapV2Pair`
@@ -141,19 +108,16 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
     ///      where the ceiling stops reflecting the market.
     uint256 public constant MAX_SNAPSHOT_AGE_LIMIT = 1 days;
 
-    /// @dev Averaging window ceiling. Bounded on BOTH sides: an excessively
-    ///      long window stops tracking a real drawdown, which is the entire
-    ///      thing this oracle exists to notice.
+    /// @dev Averaging window ceiling. An excessively long window stops tracking a
+    ///      real drawdown, which is the entire thing this oracle exists to notice.
     ///
-    ///      TIED TO `MAX_SNAPSHOT_AGE_LIMIT` (finding 5). `consult()` requires
+    ///      TIED TO `MAX_SNAPSHOT_AGE_LIMIT`. `consult()` requires
     ///      `span >= twapWindow` AND `age <= maxTwapAge`, and `maxTwapAge` can
-    ///      never exceed `MAX_SNAPSHOT_AGE_LIMIT`. A window above that limit is
-    ///      therefore not merely unusual, it is STRUCTURALLY UNSATISFIABLE:
-    ///      `update()` refuses to roll a second snapshot before the window has
-    ///      elapsed, by which point the first is already older than any legal
-    ///      `maxTwapAge`. The old 3-day ceiling admitted exactly that
-    ///      configuration and produced a permanently unavailable oracle with no
-    ///      error to point at.
+    ///      never exceed that limit — so a window above it is not merely unusual
+    ///      but STRUCTURALLY UNSATISFIABLE: `update()` refuses to roll a second
+    ///      snapshot before the window has elapsed, by which point the first is
+    ///      already older than any legal `maxTwapAge`, producing a permanently
+    ///      unavailable oracle with no error to point at.
     uint256 public constant MAX_TWAP_WINDOW = MAX_SNAPSHOT_AGE_LIMIT;
 
     /// @dev Hard cap on the span `consult()` will average over, independent of
@@ -166,74 +130,55 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
 
     /// @dev Ceiling on `ethUsdMaxDelay`. Sized to admit a slow, deviation-driven
     ///      heartbeat — the live 4663 ETH/USD feed was measured 10.7 HOURS old
-    ///      while healthy on 2026-08-01 — without letting an operator disable
-    ///      the staleness check outright.
+    ///      while healthy — without letting an operator disable the staleness
+    ///      check outright.
     ///
-    ///      LOWERED 7 DAYS -> 24 HOURS. Staleness COMPOUNDS across the two legs:
-    ///      `consult()` may serve a snapshot up to `maxTwapAge` old converted by
-    ///      an ETH/USD answer up to `ethUsdMaxDelay` old, so the old pairing
-    ///      admitted a "current" WOOD/USD price assembled from data up to eight
-    ///      days stale. At 24 hours the compound bound is two days.
+    ///      Staleness COMPOUNDS across the two legs: `consult()` may serve a
+    ///      snapshot up to `maxTwapAge` old converted by an ETH/USD answer up to
+    ///      `ethUsdMaxDelay` old. At 24 hours the compound bound is two days.
     ///
     ///      THIS IS A FLOOR, NOT A PREFERENCE. Going tighter than the measured
-    ///      10.7-hour heartbeat would make the USD leg permanently unavailable
-    ///      on a HEALTHY feed, which under design revision 2 is a protocol halt
-    ///      rather than a skipped ceiling. 24 hours is the smallest value that
-    ///      clears the heartbeat with margin. It is deliberately NOT tied to
+    ///      10.7-hour heartbeat would make the USD leg permanently unavailable on
+    ///      a HEALTHY feed, which is a protocol halt. Deliberately NOT tied to
     ///      `twapWindow` — see the ACCEPTED RISK note on the contract.
     uint256 public constant MAX_ETH_USD_DELAY_LIMIT = 1 days;
 
-    /// @dev Upper bound on the ETH/USD feed's own `decimals()`, re-checked at
-    ///      READ time rather than trusted from construction.
-    ///      `_ethUsdFeedDecimals` is captured once from
-    ///      `IAggregatorMinimal(ethUsdFeed_).decimals()` and is a `uint8`, so
-    ///      nothing structurally stops it being 255 — and `10 ** 255` panics on
-    ///      overflow.
+    /// @dev Upper bound on the ETH/USD feed's own `decimals()`, re-checked at READ
+    ///      time rather than trusted from construction. `_ethUsdFeedDecimals` is a
+    ///      `uint8`, so nothing structurally stops it being 255 — and `10 ** 255`
+    ///      panics on overflow.
     ///
-    ///      THIS WAS ALREADY AN UNCATCHABLE REVERT BEFORE THE `staticcall`
-    ///      REWRITE, and it is worth being precise about why, because the
-    ///      intuitive reading is wrong. The exponentiation sat inside
-    ///      `_ethUsdX8`'s `try` block, which looks like it was covered by the
-    ///      adjacent `catch`. It was not: `catch` covers the EXTERNAL CALL
-    ///      only, never the success-block body, which executes in this
-    ///      contract's own frame. So a feed reporting absurd `decimals()`
-    ///      panicked straight out of `consult()` even with the `try` in place —
-    ///      a second, independent violation of the "reports `ok == false`
-    ///      rather than reverting" contract, living beside the decode one that
-    ///      audit #181 finding 22 describes. Verified by mutation: restoring
-    ///      the typed `try` version fails
+    ///      THAT PANIC WAS ALREADY UNCATCHABLE BEFORE THE `staticcall` REWRITE,
+    ///      and the intuitive reading is wrong: the exponentiation sat inside a
+    ///      `try` block, but `catch` covers the EXTERNAL CALL only, never the
+    ///      success-block body, which executes in this contract's own frame. So a
+    ///      feed reporting absurd `decimals()` panicked straight out of
+    ///      `consult()` even with the `try` in place. Verified by mutation:
+    ///      restoring the typed version fails
     ///      `test_ethUsdLeg_absurdFeedDecimals_reportsUnavailableInsteadOfReverting`
-    ///      with `panic 0x11`, not with a graceful `ok == false`.
-    ///
-    ///      Mirrors `ExposureLedger.MAX_FEED_DECIMALS`, which re-checks for the
-    ///      same reason.
+    ///      with `panic 0x11` rather than a graceful `ok == false`.
     uint8 internal constant MAX_FEED_DECIMALS = 18;
 
-    /// @dev How much of the averaging window a single extrapolated tail may
-    ///      account for, as a divisor: `idle * MAX_IDLE_SPAN_DIVISOR <=
-    ///      twapWindow`, i.e. at most `1/20` of the window.
+    /// @dev How much of the averaging window a single extrapolated tail may account
+    ///      for, as a divisor: `idle * MAX_IDLE_SPAN_DIVISOR <= twapWindow`, i.e.
+    ///      at most `1/20` of the window.
     ///
-    ///      WHY THE WINDOW AND NOT `maxTwapAge` (finding 8). `_currentCumulative`
-    ///      fills the gap since the pair's last interaction at CURRENT SPOT.
-    ///      Bounding that gap against `maxTwapAge` was vacuous, because
-    ///      `maxTwapAge >= twapWindow`: a pair that had not traded for the whole
-    ///      window passed the guard and produced a "TWAP" that was 100 % spot —
-    ///      exactly reproducing the manipulable quantity while still reporting
-    ///      `ok == true`. Exact accumulator math is not a defence when its
-    ///      inputs are all spot.
+    ///      WHY THE WINDOW AND NOT `maxTwapAge`. `_currentCumulative` fills the gap
+    ///      since the pair's last interaction at CURRENT SPOT, and bounding that
+    ///      gap against `maxTwapAge` was vacuous because `maxTwapAge >=
+    ///      twapWindow`: a pair that had not traded for the whole window passed the
+    ///      guard and produced a TWAP that was 100% spot — exactly the manipulable
+    ///      quantity, still reporting `ok == true`. Exact accumulator math is not a
+    ///      defence when its inputs are all spot.
     ///
-    ///      WHY 20. Each of the two snapshots carries at most one tail, and the
-    ///      difference `latest - prev` averaged over `span >= twapWindow` gives
-    ///      each tail a weight of at most `idle / span <= 1/20`, so a
-    ///      manipulator who owns both endpoints moves the average by at most
-    ///      ~10 % — small enough that the `min` against the cap plus the
-    ///      haircut absorbs it, and cheap enough to satisfy: at the 1-hour
-    ///      minimum window the pair may be idle for 3 minutes, four times the
-    ///      44 s idleness measured on the live pair, and at a 12-hour
-    ///      production window for 36 minutes. Availability is not at risk from
-    ///      a tight value either, because `update()` NO-OPS rather than
-    ///      reverting when the guard bites, so a keeper simply snapshots on the
-    ///      next block in which the pair has traded.
+    ///      WHY 20. Each snapshot carries at most one tail, and the difference
+    ///      averaged over `span >= twapWindow` gives each tail a weight of at most
+    ///      `1/20`, so a manipulator who owns both endpoints moves the average by
+    ///      at most ~10% — small enough for the cap plus haircut to absorb, and
+    ///      cheap enough to satisfy: at the 1-hour minimum window the pair may be
+    ///      idle for 3 minutes, four times the 44s idleness measured on the live
+    ///      pair. Availability is not at risk either, since `update()` NO-OPS
+    ///      rather than reverting when the guard bites.
     uint256 public constant MAX_IDLE_SPAN_DIVISOR = 20;
 
     struct Observation {
@@ -318,19 +263,12 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
         ethUsdFeed = ethUsdFeed_;
         _ethUsdFeedDecimals = IAggregatorMinimal(ethUsdFeed_).decimals();
 
-        // ORDER IS LOAD-BEARING, not stylistic. `twapWindow <= maxTwapAge`
-        // (finding 5) is checked inside `_setTwapWindow` against the CURRENT
-        // `maxTwapAge`, which is zero until seated — so `maxTwapAge` must land
-        // FIRST or the comparison is made against a zero and passes vacuously.
-        // Widest-first is that order.
-        //
-        // Constructing under the same guards the setters use is finding 5's
-        // other half: the deploy could otherwise seat a pair that no setter
-        // would ever accept, and nothing downstream revalidates it.
-        //
-        // `ethUsdMaxDelay` is order-independent — it is bounded only by
-        // `MAX_ETH_USD_DELAY_LIMIT` and constrains nothing else (owner decision
-        // 2026-08-02; see the ACCEPTED RISK note on the contract).
+        // ORDER IS LOAD-BEARING, not stylistic. `twapWindow <= maxTwapAge` is
+        // checked inside `_setTwapWindow` against the CURRENT `maxTwapAge`, which
+        // is zero until seated — so `maxTwapAge` must land FIRST or the comparison
+        // passes vacuously. Constructing under the same guards the setters use
+        // stops the deploy seating a pair no setter would ever accept.
+        // `ethUsdMaxDelay` is order-independent.
         _setMaxTwapAge(maxTwapAge_);
         _setTwapWindow(twapWindow_);
         _setEthUsdMaxDelay(ethUsdMaxDelay_);
@@ -344,20 +282,17 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
     // ── Snapshotting ──
 
     /// @inheritdoc IWoodTwapOracle
+    /// @dev NO-OP RATHER THAN REVERT on an early or unreadable call. A keeper bot
+    ///      calling on a fixed schedule must not have its transaction reverted by
+    ///      whoever happened to call one block earlier — that would hand a griefer
+    ///      a way to make the honest keeper's calls fail, and a failing keeper is
+    ///      how the oracle goes stale.
     ///
-    /// @dev NO-OP RATHER THAN REVERT on an early or unreadable call. A keeper
-    ///      bot calling on a fixed schedule must not have its transaction
-    ///      reverted by whoever happened to call one block earlier — reverting
-    ///      would hand a griefer a way to make the honest keeper's calls fail,
-    ///      and a failing keeper is how the oracle goes stale, which is the
-    ///      state this whole design exists to avoid.
-    ///
-    ///      THE SPACING RULE IS WHAT GUARANTEES THE WINDOW. A snapshot is only
-    ///      rolled in once `twapWindow` has elapsed since the last one, so the
-    ///      `(previous, latest)` pair always spans at least the configured
-    ///      window by construction. If `update()` instead always overwrote,
-    ///      anyone could shrink the span to a single block for the price of two
-    ///      calls, and either cheapen manipulation or knock the oracle offline.
+    ///      THE SPACING RULE IS WHAT GUARANTEES THE WINDOW: a snapshot is only
+    ///      rolled in once `twapWindow` has elapsed since the last, so the pair
+    ///      always spans at least the configured window by construction. If
+    ///      `update()` always overwrote, anyone could shrink the span to a single
+    ///      block for the price of two calls.
     function update() external returns (bool recorded) {
         (uint256 cumulative, uint32 nowTs, bool ok) = _currentCumulative();
         if (!ok) return false;
@@ -459,22 +394,19 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
 
     // ── Internals ──
 
-    /// @dev ONE CROSS-CONSTRAINT, AND IT IS FINDING 5: `newWindow <=
-    ///      maxTwapAge`. `consult()` demands a span of at least `twapWindow`
-    ///      and an age of at most `maxTwapAge`, and `update()` will not roll a
-    ///      second snapshot before the window elapses — so a window longer than
-    ///      the age bound describes an oracle that can never be fresh and never
-    ///      says why. Lengthening the window past `maxTwapAge` therefore
-    ///      requires raising that first: one extra owner transaction, and it
-    ///      cannot be got wrong silently.
+    /// @dev ONE CROSS-CONSTRAINT: `newWindow <= maxTwapAge`. `consult()` demands a
+    ///      span of at least `twapWindow` and an age of at most `maxTwapAge`, and
+    ///      `update()` will not roll a second snapshot before the window elapses —
+    ///      so a window longer than the age bound describes an oracle that can
+    ///      never be fresh and never says why. Lengthening past `maxTwapAge`
+    ///      requires raising that first.
     ///
-    ///      DELIBERATELY NOT TIED TO `ethUsdMaxDelay`. An earlier revision
-    ///      required `newWindow >= ethUsdMaxDelay` so the USD leg could never
-    ///      be staler than the average it converts. Against the MEASURED 10.7-
-    ///      hour ETH/USD heartbeat that forces a window of ~12 hours, which
-    ///      costs the oracle half a day of crash-tracking — a strictly worse
-    ///      exposure than the overstatement it prevented. The window must be
-    ///      free to be SHORT. See the ACCEPTED RISK note on the contract.
+    ///      DELIBERATELY NOT TIED TO `ethUsdMaxDelay`. Requiring
+    ///      `newWindow >= ethUsdMaxDelay` so the USD leg could never be staler
+    ///      than the average it converts forces a ~12-hour window against the
+    ///      measured heartbeat, costing half a day of crash-tracking — a strictly
+    ///      worse exposure than the overstatement it prevents. The window must be
+    ///      free to be SHORT.
     function _setTwapWindow(uint256 newWindow) internal {
         if (newWindow < MIN_TWAP_WINDOW || newWindow > MAX_TWAP_WINDOW) revert InvalidParameter();
         if (newWindow > maxTwapAge) revert InvalidParameter();
@@ -510,23 +442,16 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
     }
 
     /// @dev The pair's accumulator brought forward to this block, the same way
-    ///      `UniswapV2OracleLibrary.currentCumulativePrices` does it: the pair
-    ///      only advances its accumulator on the first interaction of a block,
-    ///      so the gap since `blockTimestampLast` has to be filled in at the
-    ///      current spot price.
+    ///      `UniswapV2OracleLibrary.currentCumulativePrices` does it: the pair only
+    ///      advances its accumulator on the first interaction of a block, so the
+    ///      gap since `blockTimestampLast` is filled in at the current spot price.
     ///
-    ///      THAT EXTRAPOLATION IS THE ONE PLACE SPOT LEAKS IN, and it is why a
-    ///      quiet pair is refused rather than tolerated. On a pair traded every
-    ///      few seconds (the live one was 44 s old when measured on 2026-08-01)
-    ///      the filled-in tail is negligible. On a pair that has not traded for
-    ///      hours the tail dominates and the "TWAP" quietly degrades into a spot
-    ///      oracle — the manipulable quantity — while still looking healthy.
-    ///
-    ///      THE TAIL IS BOUNDED AGAINST THE SPAN, NOT AGAINST `maxTwapAge`
-    ///      (finding 8). The original guard compared `idle` to `maxTwapAge`,
-    ///      which is `>= twapWindow` by construction and so permitted a snapshot
-    ///      whose ENTIRE contribution was extrapolated at spot. See
-    ///      `MAX_IDLE_SPAN_DIVISOR` for the weight argument and the choice of 20.
+    ///      THAT EXTRAPOLATION IS THE ONE PLACE SPOT LEAKS IN, which is why a
+    ///      quiet pair is refused rather than tolerated. On a pair traded every few
+    ///      seconds the filled-in tail is negligible; on one that has not traded
+    ///      for hours the tail dominates and the TWAP quietly degrades into a spot
+    ///      oracle while still looking healthy. The tail is bounded against the
+    ///      SPAN, not against `maxTwapAge` — see `MAX_IDLE_SPAN_DIVISOR`.
     function _currentCumulative() internal view returns (uint256 cumulative, uint32 nowTs, bool ok) {
         // forge-lint: disable-next-line(unsafe-typecast)
         nowTs = uint32(block.timestamp);
@@ -556,31 +481,24 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
     }
 
     /// @dev The USD leg, normalised to 8 decimals. Structurally identical to
-    ///      `ExposureLedger._feedPriceX8`, deliberately so: `code.length` first
-    ///      (a high-level call to a codeless address reverts in THIS frame,
-    ///      which `try` could not catch either), then a RAW `staticcall` with
-    ///      an explicit returndata-length check and a wide-type decode, then
-    ///      non-positive, stale, over-precision, and truncated-to-zero. Every
-    ///      one of them reports unavailable rather than reverting, so a sick
-    ///      ETH/USD feed costs this contract its answer rather than reverting
-    ///      inside the ledger's price path.
+    ///      `ExposureLedger._feedPriceX8`, deliberately: `code.length` first (a
+    ///      high-level call to a codeless address reverts in THIS frame, which
+    ///      `try` could not catch either), then a RAW `staticcall` with an explicit
+    ///      returndata-length check and a wide-type decode, then non-positive,
+    ///      stale, over-precision and truncated-to-zero. Every one reports
+    ///      unavailable rather than reverting, so a sick ETH/USD feed costs this
+    ///      contract its answer rather than reverting inside the ledger's price
+    ///      path.
     ///
-    ///      The raw-`staticcall` shape is load-bearing, not stylistic. This
-    ///      function previously used a typed `try ... returns (uint80, int256,
-    ///      uint256, uint256, uint80)` and claimed parity with the ledger's
-    ///      read while not having it: the declared `uint80`s are decoded after
-    ///      the call succeeds, outside `catch`'s reach, so short or
-    ///      dirty-padded returndata reverted uncatchably and broke the
-    ///      never-reverts contract this comment asserts. See the decode note
-    ///      inside the body and `MAX_FEED_DECIMALS`.
-    ///
-    /// @dev THE STALENESS BOUND IS `ethUsdMaxDelay` ALONE, and this answer may
-    ///      therefore be OLDER THAN `twapWindow` — the two legs are not
-    ///      contemporaneous, by design. That is the accepted risk documented on
-    ///      the contract: bounding it here instead would force a ~12-hour
-    ///      averaging window and cost the oracle half a day of crash tracking.
-    ///      The overstatement it admits is bounded downstream by the ledger's
-    ///      price cap and by `woodHaircutBps`.
+    ///      The raw-`staticcall` shape is load-bearing, not stylistic: a typed
+    ///      `try` decodes the declared narrow types AFTER the call succeeds,
+    ///      outside `catch`'s reach, so short or dirty-padded returndata reverted
+    ///      uncatchably and broke the never-reverts contract this comment asserts.
+    /// @dev THE STALENESS BOUND IS `ethUsdMaxDelay` ALONE, so this answer may be
+    ///      OLDER THAN `twapWindow` — the two legs are not contemporaneous, by
+    ///      design. Bounding it here would force a ~12-hour averaging window; the
+    ///      overstatement it admits is bounded downstream by the ledger's price cap
+    ///      and by `woodHaircutBps`.
     function _ethUsdX8() internal view returns (uint256 priceX8, bool ok) {
         address feed = ethUsdFeed;
         if (feed.code.length == 0) return (0, false);
@@ -591,18 +509,11 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
         // is attempted.
         if (!success || ret.length < 160) return (0, false);
         // Decoded as uint256/int256 throughout, NOT the narrower uint80 the
-        // interface declares. A sub-256-bit unsigned type is
-        // validity-constrained at decode time (the ABI decoder rejects a word
-        // whose unused high bits are not clean padding), and that decode runs
-        // AFTER the call returns — outside any `catch`'s reach. A typed
-        // `try ... returns (uint80, ...)` therefore cannot uphold this
-        // function's documented "reports ok == false rather than reverting"
-        // contract against a feed that answers with short or dirty-padded
-        // data. uint256/int256 accept any 32-byte word, so nothing below this
-        // line can revert on account of decoding. This is audit #181 finding
-        // 22, whose fix landed in `ExposureLedger._feedPriceX8` and
-        // `PortfolioStrategy._tryPushFeedPrice` but originally missed this
-        // contract.
+        // interface declares. A sub-256-bit unsigned type is validity-constrained
+        // at decode time (the ABI decoder rejects a word whose unused high bits
+        // are not clean padding), and that decode runs AFTER the call returns —
+        // outside any `catch`'s reach. uint256/int256 accept any 32-byte word, so
+        // nothing below this line can revert on account of decoding.
         (, int256 answer,, uint256 updatedAt,) = abi.decode(ret, (uint256, int256, uint256, uint256, uint256));
         if (answer <= 0) return (0, false);
         uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;

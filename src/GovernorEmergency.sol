@@ -28,34 +28,24 @@ abstract contract GovernorEmergency is ProposalLifecycle {
     // which owns the lifecycle state. What remains virtual below is governor-owned.
 
     function _getSettlementCalls(uint256) internal view virtual returns (BatchExecutorLib.Call[] storage);
-    /// @dev The RAW, propose-time-declared per-call settlement caps (issue
-    ///      #43) — i.e. `_settlementCallCaps`, before any coverage scaling
-    ///      (issue #27 design D7). No path in this abstract reads these
-    ///      directly any more: `unstick` replays the voted settlement batch
-    ///      under `_getEffectiveSettlementCallCaps` below, the SAME
-    ///      coverage-scaled caps `settleProposal` uses, so a batch that
-    ///      would revert `CallCapExceeded` under `settleProposal` cannot be
-    ///      drained for more via `unstick` either. Kept declared (not
-    ///      removed) purely so `SyndicateGovernor`'s existing override
-    ///      keeps compiling / stays available to any other caller of the
-    ///      raw declaration.
+    /// @dev The RAW, propose-time-declared per-call settlement caps, before any
+    ///      coverage scaling. No path in this abstract reads these directly:
+    ///      `unstick` replays the voted settlement batch under
+    ///      `_getEffectiveSettlementCallCaps` below, the SAME coverage-scaled caps
+    ///      `settleProposal` uses, so a batch that would revert `CallCapExceeded`
+    ///      under `settleProposal` cannot be drained for more via `unstick`. Kept
+    ///      declared so the concrete governor's override keeps compiling.
     function _getSettlementCallCaps(uint256) internal view virtual returns (uint256[] storage);
-    /// @dev The coverage-scaled per-call settlement caps (issue #27 design
-    ///      D7), i.e. `_effectiveSettlementCallCaps` — persisted ONCE at
-    ///      execute (identity copy of the raw caps when the quorum gate did
-    ///      not run or coverage was full; never left empty for an
-    ///      `Executed` proposal) and reused byte-identical by
-    ///      `settleProposal`. `unstick` MUST read from here, not from
-    ///      `_getSettlementCallCaps`: the raw declaration is priced against
-    ///      `maxCapital`, the coverage the proposal was VOTED on, not the
-    ///      coverage it actually RAISED — replaying the raw caps would let
+    /// @dev The coverage-scaled per-call settlement caps, persisted ONCE at execute
+    ///      (an identity copy of the raw caps when the quorum gate did not run or
+    ///      coverage was full, and never left empty for an `Executed` proposal)
+    ///      and reused byte-identical by `settleProposal`. `unstick` MUST read
+    ///      from here, not from `_getSettlementCallCaps`: the raw declaration is
+    ///      priced against `maxCapital`, the coverage the proposal was VOTED on,
+    ///      not the coverage it actually RAISED — replaying the raw caps would let
     ///      `unstick` drain up to the full uncovered declaration whenever a
-    ///      partially-covered proposal's scaled caps would revert
-    ///      `CallCapExceeded` under `settleProposal` (issue #181 audit-2,
-    ///      the 9-agent finding). Implemented by `SyndicateGovernor` as
-    ///      `return _effectiveSettlementCallCaps[id];` — see
-    ///      `needsOwnerDecision` in the fixing agent's report; not yet wired
-    ///      as of this edit.
+    ///      partially-covered proposal's scaled caps would revert under
+    ///      `settleProposal`.
     function _getEffectiveSettlementCallCaps(uint256) internal view virtual returns (uint256[] storage);
     function _emergencyReentrancyEnter() internal virtual;
     function _emergencyReentrancyLeave() internal virtual;
@@ -88,29 +78,22 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         _requireVaultOwner(p.vault);
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
         if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
-        // Same EFFECTIVE capital cap as settleProposal — NOT `p.maxCapital`
-        // (issue #181 audit-2): `p.maxCapital` is the propose-time
-        // declaration the vote covered; `p.effectiveMaxCapital` is that
-        // declaration scaled down to what the proposal's coverage cohort
-        // actually raised (issue #27 design D3-D5), and is the SAME value
-        // `executeProposal` and `settleProposal` are bounded by. `unstick`
-        // replaying under `p.maxCapital` would let a proposer size a
-        // settlement leg so the scaled cap reverts `CallCapExceeded` under
-        // `settleProposal` — making `settleProposal` permanently
-        // unavailable — and then drain up to the FULL uncovered
-        // declaration through this path, which requires no guardian
-        // review. An honest unwind is net-inflow and passes any finite
-        // cap regardless of its size, so this tightening costs a genuine
+        // Same EFFECTIVE capital cap as `settleProposal` — NOT `p.maxCapital`.
+        // That is the propose-time declaration the vote covered;
+        // `p.effectiveMaxCapital` is the same declaration scaled down to what the
+        // coverage cohort actually raised, and is the SAME value `executeProposal`
+        // and `settleProposal` are bounded by. Replaying under `p.maxCapital`
+        // would let a proposer size a settlement leg so the scaled cap reverts
+        // `CallCapExceeded` under `settleProposal` — making that path permanently
+        // unavailable — then drain up to the FULL uncovered declaration through
+        // this one, which requires no guardian review. An honest unwind is
+        // net-inflow and passes any finite cap, so the tightening costs a genuine
         // rescue nothing.
         //
-        // Same EFFECTIVE stored settlement caps too (issue #43 x #27
-        // design D7) — `unstick` REPLAYS the voted batch under the
-        // coverage-scaled per-call caps `settleProposal` uses, not the raw
-        // propose-time declaration: it carries the exact caps that batch
-        // would be metered against by `settleProposal`, no more. Relief
-        // from an over-tight scaled cap is the guardian-reviewed
-        // `emergencySettleWithCalls` / `finalizeEmergencySettle` path, not
-        // this one.
+        // Same EFFECTIVE stored settlement caps too: `unstick` REPLAYS the voted
+        // batch under the coverage-scaled per-call caps `settleProposal` uses, no
+        // more. Relief from an over-tight scaled cap is the guardian-reviewed
+        // `emergencySettleWithCalls` path, not this one.
         ISyndicateVault(p.vault)
             .executeGovernorBatch(
                 _getSettlementCalls(proposalId), _getEffectiveSettlementCallCaps(proposalId), p.effectiveMaxCapital
@@ -160,33 +143,26 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         (bool blocked, BatchExecutorLib.Call[] memory calls) = reg.finalizeEmergency(proposalId);
         if (blocked) revert EmergencySettleBlocked();
 
-        // Same EFFECTIVE capital cap as settleProposal/unstick — NOT
-        // `p.maxCapital` (issue #181 audit-2): using the full propose-time
-        // declaration here reopens the exact same 10x-coverage widening
-        // `unstick` had, just gated behind guardian review + owner bond
-        // instead of open to anyone. An honest emergency unwind is still
-        // net-inflow and passes any finite cap, INCLUDING a coverage-
-        // floored `effectiveMaxCapital` of zero — so this tightening does
-        // not brick a genuine rescue. It cannot, by construction: reaching
-        // `Executed` at all required the ORIGINAL execute batch to pass
-        // under this SAME `p.effectiveMaxCapital` value (it is derived
-        // once, at execute, and never recomputed), so a proposal that
-        // actually deployed real net capital necessarily has a nonzero
-        // `effectiveMaxCapital` here too — the cap is only ever zero for a
-        // proposal whose execute leg moved nothing, i.e. exactly the
-        // "propose, deploy nothing, drain on the rescue path" attack this
-        // fix closes, not a proposal with real stuck capital to recover.
+        // Same EFFECTIVE capital cap as `settleProposal`/`unstick` — NOT
+        // `p.maxCapital`: using the full propose-time declaration here reopens the
+        // same coverage widening `unstick` had, just gated behind guardian review
+        // and the owner bond instead of open to anyone. An honest emergency unwind
+        // is net-inflow and passes any finite cap, INCLUDING a coverage-floored
+        // `effectiveMaxCapital` of zero — and it cannot brick a genuine rescue by
+        // construction: reaching `Executed` required the ORIGINAL execute batch to
+        // pass under this SAME value, so a proposal that deployed real net capital
+        // necessarily has a nonzero cap here. The cap is only ever zero for a
+        // proposal whose execute leg moved nothing — exactly the
+        // deploy-nothing-drain-on-the-rescue-path attack this closes.
         //
-        // EMPTY caps (issue #43): these are owner-supplied rescue calls
-        // with no propose-time declaration to enforce — guardian review +
-        // the owner bond + the effectiveMaxCapital meter bound them
-        // instead. Must not per-call-meter here: this is precisely the
-        // escape hatch for a proposal stuck by a settlement-leg
-        // `CallCapExceeded` (design.md D3) — enforcing per-call caps on
-        // the rescue path could brick on the very declaration that
-        // stranded the proposal. The BATCH-level ceiling is tightened to
-        // `effectiveMaxCapital` regardless, since that ceiling is not what
-        // D3 was designed to relax (D3 is about the per-call caps).
+        // EMPTY caps: these are owner-supplied rescue calls with no propose-time
+        // declaration to enforce — guardian review, the owner bond and the
+        // `effectiveMaxCapital` meter bound them instead. Must NOT per-call-meter
+        // here: this is precisely the escape hatch for a proposal stuck by a
+        // settlement-leg `CallCapExceeded`, so enforcing per-call caps could brick
+        // on the very declaration that stranded the proposal. The BATCH-level
+        // ceiling is tightened regardless, since that is not what the escape hatch
+        // was designed to relax.
         ISyndicateVault(p.vault).executeGovernorBatch(calls, new uint256[](0), p.effectiveMaxCapital);
         (int256 pnl,) = _finishSettlementHook(proposalId, p);
         emit EmergencySettleFinalized(proposalId, pnl);
