@@ -18,32 +18,23 @@ interface ITokenCourt {
         Resolved
     }
 
-    /// @notice The court's own record of how ONE VOTER ruled — not a case
-    ///         outcome. `voteOf` is its only use; a case's outcome is stored
-    ///         as an `IChallengeGame.Verdict` in `Case.verdict`.
-    /// @dev    THE ORDERS ARE INVERTED, AND A CAST BETWEEN THE TWO TYPES IS
-    ///         NEVER VALID. This enum and `IChallengeGame.Verdict` name
-    ///         overlapping concepts, but they are ordered DELIBERATELY
-    ///         DIFFERENTLY and their numeric values do not correspond:
+    /// @notice The court's own record of how ONE VOTER ruled — not a case outcome.
+    ///         `voteOf` is its only use; a case's outcome is stored as an
+    ///         `IChallengeGame.Verdict` in `Case.verdict`.
+    /// @dev    THE ORDERS ARE INVERTED, AND A CAST BETWEEN THE TWO TYPES IS NEVER
+    ///         VALID:
     ///
     ///           Ruling  { None = 0,         Guilty = 1,    NotGuilty = 2 }
     ///           Verdict { Inconclusive = 0, NotGuilty = 1, Guilty = 2 }
     ///
-    ///         so `Ruling.Guilty == 1 == Verdict.NotGuilty` and
-    ///         `Ruling.NotGuilty == 2 == Verdict.Guilty` — a numeric
-    ///         conversion between them INVERTS GUILT, turning a guilty ballot
-    ///         into an acquittal and back. Nothing in this codebase casts
-    ///         between them and nothing ever should. Each enum's zero value is
-    ///         chosen for ITS OWN default semantics (`Ruling.None` = "this
-    ///         address has not voted", the sentinel `vote`'s `AlreadyVoted`
-    ///         check reads; `Verdict.Inconclusive` = "the case answered
-    ///         nothing"), and those are different meanings rather than one
-    ///         meaning spelled twice. `finalize` builds a `Verdict` from the
-    ///         TALLY directly and never converts a `Ruling` into one, which is
-    ///         why the divergence is inert today — do NOT "harmonise" the
-    ///         orders to enable a cast: the types are distinct on purpose,
-    ///         across a trust boundary, and re-ordering either one to make a
-    ///         cast typecheck is how an inert divergence becomes a
+    ///         so a numeric conversion between them INVERTS GUILT. Each enum's
+    ///         zero value is chosen for ITS OWN default semantics — `Ruling.None`
+    ///         is the not-voted sentinel `vote`'s `AlreadyVoted` check reads,
+    ///         `Verdict.Inconclusive` is the case answered nothing — so these are
+    ///         different meanings, not one meaning spelled twice. `finalize`
+    ///         builds a `Verdict` from the TALLY directly and never converts, so
+    ///         the divergence is inert. Do NOT harmonise the orders to enable a
+    ///         cast: re-ordering either one is how an inert divergence becomes a
     ///         guilt-inverting bug.
     enum Ruling {
         None,
@@ -52,73 +43,48 @@ interface ITokenCourt {
     }
 
     /// @notice Everything the court knows about one disputed challenge.
-    /// @param challengeId The `ChallengeGame` challenge this case adjudicates.
-    ///        One case per (game, challenge) — `caseOfChallenge` enforces it.
+    /// @param challengeId The `ChallengeGame` challenge this case adjudicates. One
+    ///        case per (game, challenge) — `caseOfChallenge` enforces it.
     /// @param game The `IChallengeGame` this case's verdict is delivered to,
-    ///        PINNED at `refer` from the then-current `challengeGame`. `finalize`
-    ///        calls `rule` on this address, never on the live `challengeGame` —
-    ///        `snapshotTs` and `voteWindowAtReferral` are pinned for exactly
-    ///        this class of hazard, and the game address was the one field in
-    ///        this struct that was not: an owner re-pointing `challengeGame`
-    ///        between `refer` and `finalize` would otherwise make `finalize`
-    ///        rule a DIFFERENT game's challenge at the same numeric id.
+    ///        PINNED at `refer`. `finalize` calls `rule` on this address, never on
+    ///        the live `challengeGame`: an owner re-pointing it between `refer`
+    ///        and `finalize` would otherwise make `finalize` rule a DIFFERENT
+    ///        game's challenge at the same numeric id.
     /// @param ledger The `IExposureLedger` this case's accused set was derived
-    ///        from, PINNED at `refer` from the then-current
-    ///        `IChallengeGame.exposureLedger()`. `refer` reads that pointer
-    ///        exactly once and hands the resolved address to `_recordAccused`,
-    ///        so the accused set, `accusedWeight` and this field can never come
-    ///        from three different ledgers. Without the pin the case record
-    ///        carried no evidence of WHICH ledger produced its accused set, and
-    ///        any future reader that re-resolved the pointer live — a floor
-    ///        recompute, an indexer, a follow-up feature — would silently
-    ///        adjudicate against a different set than the one `vote` bars.
-    ///        RESIDUAL WINDOW: an owner re-point strictly between `file` and
-    ///        `refer` is absorbed BY the pin rather than blocked by it — see
-    ///        `refer`'s natspec.
+    ///        from, PINNED at `refer`. That pointer is read exactly once and
+    ///        handed to `_recordAccused`, so the accused set, `accusedWeight` and
+    ///        this field can never come from three different ledgers. RESIDUAL
+    ///        WINDOW: an owner re-point strictly between `file` and `refer` is
+    ///        absorbed BY the pin rather than blocked by it.
     /// @param snapshotTs `executedAt - 1`, written ONCE in `refer` and never
-    ///        re-derived. Pinning it is what stops the owner moving a live
-    ///        case's electorate by re-pointing the governor or letting
-    ///        `executedAt` drift — see `IChallengeGame.executedAt`'s own
-    ///        rationale for the identical hazard.
-    /// @param referredAt The instant `refer` opened this case — the anchor
-    ///        the vote window counts from.
-    /// @param voteWindowAtReferral The court's `voteWindow` PINNED at
-    ///        referral. The owner cannot move a LIVE case's clock: a live
-    ///        read would let the owner retroactively shrink or stretch a
-    ///        window a party is already relying on. Only cases referred
-    ///        after a `setVoteWindow` call see the new value.
+    ///        re-derived, so the owner cannot move a live case's electorate.
+    /// @param referredAt The instant `refer` opened this case — the anchor the
+    ///        vote window counts from.
+    /// @param voteWindowAtReferral The court's `voteWindow` PINNED at referral, so
+    ///        the owner cannot retroactively shrink or stretch a window a party is
+    ///        already relying on.
     /// @param accusedWeight The raw `getPastStake` sum of the accused set at
-    ///        `snapshotTs` — same basis as `guiltyVotes`/`notGuiltyVotes`
-    ///        (aged `getPastVotes`) so the participation floor's subtraction
-    ///        never compares two different measures of the same WOOD.
+    ///        `snapshotTs`, the same basis `getPastTotalVotes` sums, so the
+    ///        participation floor's subtraction never compares two different
+    ///        measures of the same WOOD.
     /// @param guiltyVotes Aged vote weight cast for `Guilty`.
     /// @param notGuiltyVotes Aged vote weight cast for `NotGuilty`.
     /// @param phase The case's lifecycle position.
-    /// @param verdict The three-valued outcome `finalize` handed to
-    ///        `IChallengeGame.rule`. Zero (`Inconclusive`) until resolved,
-    ///        matching `Verdict`'s own harmless-default design.
-    /// @param finalizedAt The instant `finalize` closed this case, or zero
-    ///        while it is still `Voting`.
-    /// @param challenger The challenge's `IChallengeGame.Challenge.challenger`,
-    ///        PINNED at `refer` from the `Challenge` memory struct `refer`
-    ///        already reads for `executedAt` — no second external read.
-    ///        `vote` bars this address the same way it bars the accused set:
-    ///        a `Guilty` verdict pays the challenger the accused's bond plus
-    ///        the escalated pool (`IChallengeGame._settle`), so an unbarred
-    ///        challenger voting `Guilty` on its own filing is a self-dealing
-    ///        conviction, not a jury verdict (finding #7). APPENDED, not
-    ///        inserted, to keep every earlier field's position stable.
+    /// @param verdict The three-valued outcome `finalize` handed to `rule`. Zero
+    ///        (`Inconclusive`) until resolved, matching `Verdict`'s own
+    ///        harmless-default design.
+    /// @param finalizedAt The instant `finalize` closed this case, or zero.
+    /// @param challenger The challenge's own challenger, PINNED at `refer` from
+    ///        the `Challenge` struct already read there. `vote` bars this address
+    ///        like the accused set: a `Guilty` verdict pays the challenger, so an
+    ///        unbarred challenger voting on its own filing is a self-dealing
+    ///        conviction. APPENDED, not inserted, to keep earlier field positions.
     /// @param accusedWeightAtLookback The raw `getPastStake` sum of the SAME
-    ///        accused set as `accusedWeight`, but read at
-    ///        `snapshotTs - FLOOR_LOOKBACK` (clamped to 0) instead of
-    ///        `snapshotTs` — the same instant `_participationFloor`'s
-    ///        `earlier` term is measured at. Recorded so the floor's
-    ///        lookback branch can subtract the accused cohort from `earlier`
-    ///        too, at the instant `earlier` is itself measured, rather than
-    ///        leaving `earlier` un-reduced while only the same-instant branch
-    ///        carried the subtraction — see `_participationFloor` (finding
-    ///        #6). APPENDED, not inserted, for the same reason as
-    ///        `challenger` above.
+    ///        accused set, read at `snapshotTs - FLOOR_LOOKBACK` — the instant
+    ///        `_participationFloor`'s `earlier` term is measured at. Recorded so
+    ///        the lookback branch can subtract the accused cohort from `earlier`
+    ///        at the instant `earlier` itself is measured, rather than leaving one
+    ///        term un-reduced. APPENDED for the same reason.
     struct Case {
         uint256 challengeId;
         address game; // pinned IChallengeGame this case rules on, written once in refer
@@ -171,40 +137,29 @@ interface ITokenCourt {
     /// @notice `vote` called by an address in the accused set. The accused
     ///         cannot vote on their own verdict.
     error AccusedCannotVote();
-    /// @notice `vote` called by an address whose growth-gated ballot weight
-    ///         (issue #82) is zero — either it had no aged weight at
-    ///         `snapshotTs` at all, or its raw stake grew over the preceding
-    ///         `FLOOR_LOOKBACK` window and its aged weight that far back was
-    ///         zero (`rawThen == 0`, the fresh-whale signature: any raw stake
-    ///         acquired entirely inside the window carries no ballot,
-    ///         regardless of any age-floor multiplier). This is a verdict on
-    ///         the past: there is no remedy — it was never going to be a
-    ///         voter on this case.
+    /// @notice `vote` called by an address whose growth-gated ballot weight is
+    ///         zero — either it had no aged weight at `snapshotTs`, or its raw
+    ///         stake grew over the preceding `FLOOR_LOOKBACK` and its aged weight
+    ///         that far back was zero (the fresh-whale signature: raw stake
+    ///         acquired entirely inside the window carries no ballot). A verdict
+    ///         on the past — there is no remedy.
     error NoVotingPower();
-    /// @notice `vote` called by an address that had weight at `snapshotTs`
-    ///         but holds nothing NOW (`getVotes == 0`) — the present-holdings
-    ///         gate. Distinct from `NoVotingPower` because the
-    ///         remedy is the opposite: re-stake at least `minGuardianStake`
-    ///         and the address becomes votable again — at the historic raw
-    ///         checkpoint discounted to `ageFloorBps`, because the re-stake
-    ///         re-anchors `stakedAt`, not at its original historic weight.
+    /// @notice `vote` called by an address that had weight at `snapshotTs` but
+    ///         holds nothing NOW — the present-holdings gate. Distinct from
+    ///         `NoVotingPower` because the remedy is the opposite: re-stake at
+    ///         least `minGuardianStake` and the address becomes votable again, at
+    ///         the historic raw checkpoint discounted to `ageFloorBps`.
     error NoPresentHoldings();
-    /// @notice `vote` called by the challenge's own `Challenge.challenger`
-    ///         (`Case.challenger`, pinned at `refer`). A `Guilty` verdict pays
-    ///         the challenger the accused's bond plus the escalated pool
-    ///         (`IChallengeGame._settle`), so letting the challenger vote on
-    ///         its own filing is a self-dealing conviction, not a jury
-    ///         verdict — the same defect `AccusedCannotVote` closes for the
-    ///         other side of the case (finding #7).
+    /// @notice `vote` called by the challenge's own challenger. A `Guilty` verdict
+    ///         pays it the accused's bond plus the escalated pool, so letting it
+    ///         vote on its own filing is a self-dealing conviction — the same
+    ///         defect `AccusedCannotVote` closes for the other side.
     error ChallengerCannotVote();
-    /// @notice `renounceOwnership` was called. The court refuses it outright,
-    ///         for everyone including the owner: it is non-upgradeable, and an
-    ///         ownerless court can never again be re-wired
-    ///         (`setChallengeGame` / `setStakedWood`) or re-tuned
-    ///         (`setVoteWindow` / `setParticipationFloorBps`) — the rescue
-    ///         path for a compromised or redeployed dependency, and the
-    ///         counter-lever the live `participationFloorBps` read exists to
-    ///         provide, would both be gone permanently.
+    /// @notice `renounceOwnership` was called. The court refuses it outright, for
+    ///         everyone including the owner: it is non-upgradeable, so an
+    ///         ownerless court can never again be re-wired or re-tuned — losing
+    ///         both the rescue path for a compromised dependency and the
+    ///         counter-lever the live `participationFloorBps` read provides.
     error OwnershipCannotBeRenounced();
     /// @notice A setter would break the cross-contract invariant `autoSlashDelay
     ///         + voteWindow + FINALIZE_BUFFER <= disputeTimeout`. Raised by
@@ -213,12 +168,11 @@ interface ITokenCourt {
     error WindowInvariantViolated();
     /// @notice A setter would break the cross-contract invariant
     ///         `participationFloorBps < ageFloorBps`. Raised by
-    ///         `setParticipationFloorBps` (against the wired sWOOD, when one is
-    ///         wired) and `setStakedWood` (against the new sWOOD, always) — see
-    ///         the floor-invariant requirement for why the raw-turnout fraction
-    ///         needed to clear the floor is `participationFloorBps / ageFloorBps`
-    ///         and why equality already means "100% of un-accused stake voting
-    ///         at age zero", not a liveness guarantee anyone can stand on.
+    ///         `setParticipationFloorBps` (against the wired sWOOD, when one is)
+    ///         and `setStakedWood` (against the new sWOOD, always). At equality
+    ///         the raw-turnout fraction needed to clear the floor is 100% of
+    ///         un-accused stake voting at age zero, which is not a liveness
+    ///         guarantee anyone can stand on.
     error FloorInvariantViolated();
 
     /// @notice A case opened. `snapshotTs` is logged here so indexers never
@@ -254,16 +208,12 @@ interface ITokenCourt {
         uint256 notGuiltyVotes,
         uint256 floor
     );
-    /// @notice `rule` reverted with `WrongStatus` — the challenge went
-    ///         terminal on its own clock during the finalize buffer, so
-    ///         there is nothing left to rule. The case still closes and,
-    ///         with zero custody, this is bookkeeping, not fund loss. Every
-    ///         OTHER revert from `rule` — `InsufficientSlashGas` from an
-    ///         under-gassed call, or `NotCourt` from the game's `court`
-    ///         being re-pointed away while the challenge is still
-    ///         `Disputed` and fully rulable — bubbles out of `finalize`
-    ///         instead of being swallowed here, so the case stays `Voting`
-    ///         for an honest retry.
+    /// @notice `rule` reverted with `WrongStatus` — the challenge went terminal on
+    ///         its own clock during the finalize buffer, so there is nothing left
+    ///         to rule. The case still closes and, with zero custody, this is
+    ///         bookkeeping rather than fund loss. Every OTHER revert from `rule`
+    ///         bubbles out of `finalize` instead, so the case stays `Voting` for
+    ///         an honest retry.
     event ChallengeAlreadyTerminal(uint256 indexed caseId, uint256 indexed challengeId);
     /// @notice The wired `ChallengeGame` changed (or was set for the first
     ///         time, `oldGame == address(0)`).
@@ -289,15 +239,14 @@ interface ITokenCourt {
     ///         state) — it is the margin `refer`'s clock check reserves.
     function FINALIZE_BUFFER() external view returns (uint256);
     /// @notice How far before a case's `snapshotTs` the participation floor's
-    ///         electorate base is cross-checked. The base is the SMALLER of
-    ///         the UNACCUSED electorate at the snapshot and the UNACCUSED
-    ///         electorate this long before it — the accused cohort is
-    ///         subtracted at BOTH instants, each against the electorate
-    ///         measured at that same instant — so stake younger than this
-    ///         cannot RAISE the floor on EITHER side of the min. Closes the
-    ///         denial-of-quorum lever a single snapshot read left open to
-    ///         anyone staking large, from a never-approving address,
-    ///         immediately before executing their own drain (finding #6).
+    ///         electorate base is cross-checked. The base is the SMALLER of the
+    ///         UNACCUSED electorate at the snapshot and the UNACCUSED electorate
+    ///         this long before it — the accused cohort subtracted at BOTH
+    ///         instants, each against the electorate measured at that same instant
+    ///         — so stake younger than this cannot RAISE the floor on either side
+    ///         of the min. Closes the denial-of-quorum lever a single snapshot
+    ///         read left open to anyone staking large, from a never-approving
+    ///         address, immediately before executing their own drain.
     function FLOOR_LOOKBACK() external view returns (uint256);
     /// @notice The wired `IChallengeGame` this court adjudicates for and
     ///         reads challenge state from. Zero while unwired.
@@ -310,43 +259,35 @@ interface ITokenCourt {
     ///         referred under regardless of later changes here.
     function voteWindow() external view returns (uint256);
     /// @notice The anti-capture participation floor, in bps of
-    ///         `min(total(snapshotTs) - accusedWeight, total(snapshotTs -
-    ///         FLOOR_LOOKBACK) - accusedWeightAtLookback)`, where EACH
-    ///         subtraction is floored at zero and taken against the
-    ///         SAME-INSTANT accused weight BEFORE the lookback min —
-    ///         `accusedWeight` reduces the same-instant `total`,
-    ///         `accusedWeightAtLookback` reduces the lookback `total`, never
-    ///         cross-instant (finding #6: a bare `min(total(snapshotTs) -
-    ///         accusedWeight, total(snapshotTs - FLOOR_LOOKBACK))` left the
-    ///         lookback term un-reduced, so staking large from a
-    ///         never-approving address at `snapshotTs` could flip which term
-    ///         binds and inflate the floor past the honest electorate's
-    ///         reachable turnout). A NONZERO lookback term is additionally
-    ///         floored at a fixed fraction of the same-instant term before it
-    ///         competes in the min (finding #10: an exact-zero lookback term
-    ///         falls back safely to the unclamped same-instant term, but a
-    ///         merely TINY nonzero one — e.g. one unrelated guardian's dust
-    ///         stake at the lookback instant while the accused otherwise
-    ///         dominated it — is not "zero" yet rounds the floor to
-    ///         effectively nothing once scaled by bps, with no relation to
-    ///         today's actual electorate; see `TokenCourt._participationFloor`
-    ///         for the full argument). Turnout below this floor resolves
-    ///         `Inconclusive` rather than on the raw tally, so a thin,
-    ///         rented-stake vote cannot convict or acquit alone. Read LIVE at
-    ///         `finalize`, never pinned per case — which also makes it the
-    ///         owner's counter-lever if a large idle stake is observed
-    ///         inflating a live case's base.
+    ///         `min(total(snapshotTs) - accusedWeight,
+    ///         total(snapshotTs - FLOOR_LOOKBACK) - accusedWeightAtLookback)`,
+    ///         where EACH subtraction is floored at zero and taken against the
+    ///         SAME-INSTANT accused weight BEFORE the lookback min. Leaving the
+    ///         lookback term un-reduced let a large stake from a never-approving
+    ///         address at `snapshotTs` flip which term binds and inflate the floor
+    ///         past the honest electorate's reachable turnout.
+    ///
+    ///         A NONZERO lookback term is additionally floored at a fixed fraction
+    ///         of the lookback electorate before it competes: an exact-zero term
+    ///         falls back safely to the unclamped same-instant term, but a merely
+    ///         TINY nonzero one — one unrelated guardian's dust stake while the
+    ///         accused otherwise dominated that instant — is not zero yet rounds
+    ///         the floor to effectively nothing once scaled by bps.
+    ///
+    ///         Turnout below the floor resolves `Inconclusive` rather than on the
+    ///         raw tally, so a thin, rented-stake vote cannot convict or acquit
+    ///         alone. Read LIVE at `finalize`, never pinned per case — which also
+    ///         makes it the owner's counter-lever if a large idle stake is
+    ///         observed inflating a live case's base.
     function participationFloorBps() external view returns (uint256);
     /// @notice Count of cases ever referred. Case ids are 1-indexed
     ///         (`caseOfChallenge == 0` means "no case").
     function caseCount() external view returns (uint256);
-    /// @notice The case id referred for `challengeId` on `game`, or zero if
-    ///         none has been.
-    /// @dev    Keyed by (game, challengeId), NOT challengeId alone:
-    ///         `ChallengeGame` is non-upgradeable, so redeploying it is the
-    ///         migration path (`setChallengeGame`), and a fresh game's
-    ///         `challengeCount` restarts at 0 — its ids would otherwise
-    ///         collide with every case the old game ever referred.
+    /// @notice The case id referred for `challengeId` on `game`, or zero.
+    /// @dev    Keyed by (game, challengeId), NOT challengeId alone: `ChallengeGame`
+    ///         is non-upgradeable, so redeploying it is the migration path and a
+    ///         fresh game's `challengeCount` restarts at 0 — its ids would
+    ///         otherwise collide with every case the old game ever referred.
     function caseOfChallenge(address game, uint256 challengeId) external view returns (uint256);
     /// @notice Full state of one case.
     function caseOf(uint256 caseId) external view returns (Case memory);
@@ -360,61 +301,43 @@ interface ITokenCourt {
     ///         was recorded.
     function accusedOf(uint256 caseId) external view returns (address[] memory);
 
-    /// @notice Open a case for a disputed challenge. Permissionless and free
-    ///         — the entry point both the game's auto-referral and any
-    ///         manual fallback call.
-    /// @dev    Requires `challengeGame`/`stakedWood` wired, no existing case
-    ///         for this challenge on the currently-wired game, the challenge
-    ///         status `Disputed`, and the clock check (`filedAt +
-    ///         disputeTimeoutAtFiling - now >= voteWindow + FINALIZE_BUFFER`)
-    ///         — a vote that could not finish
-    ///         before the game's own timeout never opens.
-    /// @dev    PINS THE EXPOSURE LEDGER (`Case.ledger`) alongside `game` and
-    ///         `snapshotTs`: one read of `IChallengeGame.exposureLedger()`
-    ///         feeds both the stored pointer and the accused-set derivation.
-    ///         An owner `setExposureLedger` call AFTER this point cannot move
-    ///         a live case's accused set, weight, or participation floor.
-    ///         Its residual counterpart — a re-point strictly BETWEEN `file`
-    ///         and `refer` — is out of the court's reach entirely; see the
-    ///         implementation's natspec for why closing it belongs to
-    ///         `ChallengeGame`.
+    /// @notice Open a case for a disputed challenge. Permissionless and free — the
+    ///         entry point both the game's auto-referral and any manual fallback
+    ///         call.
+    /// @dev    Requires `challengeGame`/`stakedWood` wired, no existing case for
+    ///         this challenge on the currently-wired game, status `Disputed`, and
+    ///         the clock check — a vote that could not finish before the game's
+    ///         own timeout never opens.
+    /// @dev    PINS THE EXPOSURE LEDGER alongside `game` and `snapshotTs`: one
+    ///         read feeds both the stored pointer and the accused-set derivation,
+    ///         so a later `setExposureLedger` cannot move a live case's accused
+    ///         set, weight, or participation floor. Its residual counterpart — a
+    ///         re-point strictly BETWEEN `file` and `refer` — is out of the
+    ///         court's reach entirely.
     /// @return caseId The new case's id.
     function refer(uint256 challengeId) external returns (uint256 caseId);
     /// @notice Cast the one vote this address gets on `caseId`.
     /// @dev    Weight is `getPastVotes(msg.sender, case.snapshotTs)` — aged,
     ///         snapshot-fixed — UNLESS the caller's raw stake grew over the
-    ///         `FLOOR_LOOKBACK` window preceding the snapshot (issue #82), in
-    ///         which case it is the minimum of that snapshot weight and the
-    ///         caller's aged weight `FLOOR_LOOKBACK` earlier; see
-    ///         `TokenCourt.vote`'s implementation natspec for the full
-    ///         growth-gated-min rule, why it gates on raw stake rather than
-    ///         weight, and its documented residuals. Reverts outside the open
-    ///         window, for a second vote, for an accused address, for the
-    ///         case's own `challenger` (`ChallengerCannotVote` — finding #7:
-    ///         a `Guilty` verdict pays the challenger, so it may not vote on
-    ///         its own filing), for zero growth-gated weight
-    ///         (`NoVotingPower`), or for holding nothing
-    ///         at the present instant (`NoPresentHoldings`) — the caller must
-    ///         be an active guardian (present stake, no pending unstake
-    ///         request) at the moment the vote is cast, even though the
-    ///         weight it counts for is historic.
+    ///         `FLOOR_LOOKBACK` window preceding the snapshot, in which case it is
+    ///         the minimum of that weight and the caller's aged weight
+    ///         `FLOOR_LOOKBACK` earlier. Reverts outside the open window, for a
+    ///         second vote, for an accused address, for the case's own challenger,
+    ///         for zero growth-gated weight, or for holding nothing at the present
+    ///         instant — the caller must be an active guardian when the vote is
+    ///         cast, even though the weight it counts for is historic.
     function vote(uint256 caseId, bool guilty) external;
     /// @notice Close the vote window and adjudicate `caseId`.
-    /// @dev    Requires the window to have elapsed. `Inconclusive` when
-    ///         turnout is zero or below the participation floor; otherwise
-    ///         `Guilty` on a strict majority, `NotGuilty` on a tie or
-    ///         majority the other way. Writes the verdict before calling
-    ///         `IChallengeGame.rule` on `caseId`'s pinned `game` and
-    ///         SELECTIVELY tolerates that call reverting: only `WrongStatus`
-    ///         is swallowed (`ChallengeAlreadyTerminal`) — the court holds no
-    ///         WOOD, so a terminal challenge is bookkeeping, not stranded
-    ///         funds. Every other revert — `InsufficientSlashGas` from a
-    ///         deliberately under-gassed call, or `NotCourt` from the game's
-    ///         `court` being re-pointed away while the challenge is still
-    ///         `Disputed` and fully rulable — bubbles out of `finalize`
-    ///         whole so the case stays `Voting` for an honest retry — a bare
-    ///         catch there would let anyone burn a `Guilty` verdict for free
-    ///         by starving the child call's gas, or by unwiring the court.
+    /// @dev    Requires the window to have elapsed. `Inconclusive` when turnout is
+    ///         zero or below the participation floor; otherwise `Guilty` on a
+    ///         strict majority, `NotGuilty` on a tie or majority the other way.
+    ///         Writes the verdict before calling `rule` on the pinned `game` and
+    ///         SELECTIVELY tolerates that call reverting: only `WrongStatus` is
+    ///         swallowed — the court holds no WOOD, so a terminal challenge is
+    ///         bookkeeping, not stranded funds. Every other revert bubbles whole
+    ///         so the case stays `Voting` for an honest retry; a bare catch would
+    ///         let anyone burn a `Guilty` verdict for free by starving the child
+    ///         call's gas, or by unwiring the court.
     function finalize(uint256 caseId) external;
 
     /// @notice Wire (or re-wire) the challenge game this court adjudicates
@@ -425,28 +348,22 @@ interface ITokenCourt {
     ///         `finalize` to a different game.
     function setChallengeGame(address newGame) external;
     /// @notice Wire (or re-wire) the electorate source. The zero address is
-    ///         refused — an unwired court has no vote weight to read.
-    ///         Unconditionally validates the cross-contract floor invariant
-    ///         `participationFloorBps < newStakedWood.ageFloorBps()` against
-    ///         the NEW sWOOD, reverting `FloorInvariantViolated` if it does
-    ///         not hold — closing the compose-bypass where a floor raised
-    ///         while unwired is then wired to an electorate whose age floor
-    ///         it meets or exceeds (see `setChallengeGame`'s identical
-    ///         rationale for the window invariant). Also refuses a target
-    ///         that does not implement `ageFloorBps()`.
+    ///         refused. Unconditionally validates
+    ///         `participationFloorBps < newStakedWood.ageFloorBps()` against the
+    ///         NEW sWOOD, closing the compose-bypass where a floor raised while
+    ///         unwired is then wired to an electorate whose age floor it meets or
+    ///         exceeds. Also refuses a target that does not implement
+    ///         `ageFloorBps()`.
     function setStakedWood(address newStakedWood) external;
     /// @notice Set the vote window newly referred cases receive. Bounded to
     ///         `(0, MAX_VOTE_WINDOW]`; zero would open a case that could
     ///         never be voted on. Governs future referrals only — see
     ///         `voteWindowAtReferral`.
     function setVoteWindow(uint256 newWindow) external;
-    /// @notice Set the anti-capture participation floor. Bounded to
-    ///         `(0, 10_000]`; zero would let any nonzero turnout, however
-    ///         thin, reach a verdict on the merits. When an electorate is
-    ///         wired, also validates the cross-contract floor invariant
-    ///         `newBps < stakedWood.ageFloorBps()` against its LIVE age
-    ///         floor, reverting `FloorInvariantViolated` if it does not
-    ///         hold — vacuous while unwired, since there is no age floor to
-    ///         compare against yet.
+    /// @notice Set the anti-capture participation floor. Bounded to `(0, 10_000]`;
+    ///         zero would let any nonzero turnout, however thin, reach a verdict
+    ///         on the merits. When an electorate is wired, also validates
+    ///         `newBps < stakedWood.ageFloorBps()` against its LIVE age floor —
+    ///         vacuous while unwired.
     function setParticipationFloorBps(uint256 newBps) external;
 }
