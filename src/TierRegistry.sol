@@ -238,17 +238,25 @@ contract TierRegistry is Ownable2Step {
 
     /// @notice Effective tier for (target, selector). Uncertified, demoted, or
     ///         codehash-mismatched entries all report (2, 10_000).
-    /// @dev Lookup order is address entry, then code class, then the tier-2
-    ///      default. Address ALWAYS wins (design.md Decision 3): existing
-    ///      behavior is preserved by construction, the owner keeps a
-    ///      per-address override to re-price or demote one misbehaving clone
-    ///      without touching the class, and the hot path pays for the class
-    ///      lookup only on an address miss.
+    /// @dev Lookup order is address entry, then per-address DENIAL, then code
+    ///      class, then the tier-2 default. Address ALWAYS wins (design.md
+    ///      Decision 3), and that holds in BOTH directions: a live address entry
+    ///      out-prices the class, and an address demoted for cause is barred
+    ///      from reading the class at all. Without the middle step the second
+    ///      half was false — `_demote` erases the address entry, and erasure
+    ///      alone would drop the target straight into the permissive fallback,
+    ///      restoring the standing the demotion just took away.
+    ///
+    ///      The hot path pays for neither extra step on an address hit.
     function tierOf(address target, bytes4 selector) public view returns (uint8 tier, uint16 boundBps) {
-        TierConfig storage c = _configs[key(target, selector)];
+        bytes32 k = key(target, selector);
+        TierConfig storage c = _configs[k];
         if (c.certifiedCodehash != bytes32(0) && target.codehash == c.certifiedCodehash) {
             return (c.tier, c.extractableBoundBps);
         }
+        // A demotion against THIS address stops here: the class must not undo
+        // what an owner or a challenge conviction just revoked.
+        if (_classTierDenied[k]) return (TIER_ARBITRARY, FULL_NOTIONAL_BPS);
         // Class fallback. `_classOf` returns 0 unless the target is a live
         // ERC-1167 clone of a certified template whose own code is unchanged.
         bytes32 cch = _classOf(target);
@@ -552,7 +560,7 @@ contract TierRegistry is Ownable2Step {
     /// @dev    Requires an existing certification, same as `poke` — see
     ///         `demoteByChallenge`'s natspec for why this guard exists.
     function demote(address target, bytes4 selector) external onlyOwner {
-        if (_configs[key(target, selector)].certifiedCodehash == bytes32(0)) revert NotCertified();
+        if (!_isCertifiedFor(target, selector)) revert NotCertified();
         _demote(target, selector);
     }
 
@@ -568,9 +576,17 @@ contract TierRegistry is Ownable2Step {
     ///         on silence, and strip that adapter's ENTIRE fund-movement standing
     ///         for ~1% of the proposal's coverage — without the adapter ever being
     ///         adjudicated.
+    ///
+    ///         ACCEPTS A CLASS-ONLY MEMBER (see `_isCertifiedFor`). Restricting
+    ///         this to address entries made the whole class axis unreachable
+    ///         from adjudication: the normal class-certified clone has no
+    ///         address entry, so this reverted `NotCertified` into
+    ///         `ChallengeGame`'s bare catch and a won challenge produced only an
+    ///         `AdapterDemotionFailed` event. The anti-grief guard is unchanged
+    ///         in substance — an uncertified selector is still rejected.
     function demoteByChallenge(address target, bytes4 selector) external {
         if (msg.sender != authorizedDemoter) revert NotAuthorizedDemoter();
-        if (_configs[key(target, selector)].certifiedCodehash == bytes32(0)) revert NotCertified();
+        if (!_isCertifiedFor(target, selector)) revert NotCertified();
         _demote(target, selector);
     }
 
@@ -603,9 +619,28 @@ contract TierRegistry is Ownable2Step {
     ///      `readyAt`, re-certifying the just-convicted target, possibly at looser
     ///      terms. `demoteByChallenge` has no other lever, since
     ///      `cancelCertification` is `onlyOwner`.
+    ///      AND RECORDS THE ERASURE. Deleting `_configs[k]` used to be a
+    ///      complete revocation because absence WAS the tier-2 default; with a
+    ///      class fallback behind it, absence alone is no longer distinguishable
+    ///      from "never granted", and a demoted clone would read its old
+    ///      standing straight back off the class. The two denial flags are what
+    ///      make this function still mean what its name says. Both are set
+    ///      unconditionally: a target that belongs to no class pays two SSTOREs
+    ///      and is otherwise unaffected, which is well inside
+    ///      `ChallengeGame.DEMOTION_GAS` (200_000) and avoids making the
+    ///      revocation's completeness depend on class-membership state that can
+    ///      change after the fact.
     function _demote(address target, bytes4 selector) private {
         bytes32 k = key(target, selector);
         delete _configs[k];
+        if (!_classTierDenied[k]) {
+            _classTierDenied[k] = true;
+            emit ClassMemberTierDenied(target, selector);
+        }
+        if (!_classAllowDenied[target]) {
+            _classAllowDenied[target] = true;
+            emit ClassMemberAllowDenied(target, true);
+        }
         if (_pending[k].readyAt != 0) {
             delete _pending[k];
             emit CertificationCancelled(target, selector);
@@ -683,10 +718,25 @@ contract TierRegistry is Ownable2Step {
     ///         funds path closes the instant code appears; and re-granting after a
     ///         verified legitimate bytecode change is the intended recovery
     ///         ceremony. The `false` branch leaves the snapshot inert.
+    ///
+    ///         BOTH BRANCHES ALSO MOVE `_classAllowDenied`, so this call is a
+    ///         decision about the address rather than about one of the two
+    ///         paths that can grant it. `false` must SET the denial or the owner
+    ///         cannot disallow a single class member at all — the class fallback
+    ///         re-allows it on the very next read. `true` clears it, making this
+    ///         the recovery ceremony after a demotion, exactly as it already was
+    ///         for the address path.
     function setAdapterAllowed(address adapter, bool allowed) external onlyOwner {
         _adapterAllowed[adapter] = allowed;
         if (allowed) {
             _adapterAllowedCodehash[adapter] = _effectiveCodehash(adapter);
+            if (_classAllowDenied[adapter]) {
+                delete _classAllowDenied[adapter];
+                emit ClassMemberAllowDenied(adapter, false);
+            }
+        } else if (!_classAllowDenied[adapter]) {
+            _classAllowDenied[adapter] = true;
+            emit ClassMemberAllowDenied(adapter, true);
         }
         emit AdapterAllowedSet(adapter, allowed);
     }
@@ -716,11 +766,15 @@ contract TierRegistry is Ownable2Step {
     ///
     ///         CLASS FALLBACK: on an address miss, the adapter is allowed if it
     ///         is a live member of an allowlisted code class — same ordering as
-    ///         `tierOf` (address first, class second), same two-level check.
+    ///         `tierOf` (address first, class second), same two-level check, and
+    ///         the same per-address denial ahead of it, so an adapter demoted
+    ///         for cause or explicitly disallowed by the owner cannot re-acquire
+    ///         standing from its class on the next read.
     function isAdapterAllowed(address adapter) external view returns (bool) {
         if (_adapterAllowed[adapter] && _effectiveCodehash(adapter) == _adapterAllowedCodehash[adapter]) {
             return true;
         }
+        if (_classAllowDenied[adapter]) return false;
         bytes32 cch = _classOf(adapter);
         return cch != bytes32(0) && _classAllowed[cch];
     }
@@ -786,6 +840,91 @@ contract TierRegistry is Ownable2Step {
     ///      anchor's two-level check already proves the code is current, and
     ///      the class key IS a codehash.
     mapping(bytes32 cloneCodehash => bool) private _classAllowed;
+
+    // ── PER-MEMBER DENIAL (the class fallback's off switch) ──
+    //
+    // Revocation in this contract is expressed as ERASURE: `_demote` deletes
+    // `_configs[k]` and `_adapterAllowed[target]`, and the absence of a record
+    // used to BE the tier-2 default. The class fallback gave absence a second,
+    // permissive meaning, which silently converted every revocation against a
+    // class member into a no-op — the conviction still deleted a record, but
+    // the read that follows it lands on the class instead of the default.
+    //
+    // These two flags restore the invariant the erasure model depends on: a
+    // record can be absent because it was never granted, or absent because it
+    // was TAKEN AWAY, and only the first may consult the class. They are the
+    // exact mechanism behind `tierOf`'s "address ALWAYS wins" claim — which
+    // before them held for grants but not for revocations.
+
+    /// @dev `key(target, selector)` => this ADDRESS may not read its tier off a
+    ///      class. Per-selector, matching the granularity of the certification
+    ///      `_demote` erases: convicting a clone for one selector leaves its
+    ///      other selectors on the class, and leaves every sibling clone
+    ///      untouched.
+    ///
+    ///      WRITE-ONCE BY DESIGN — nothing clears it. The recovery path is the
+    ///      ordinary announced `proposeCertification` / `certify` ceremony,
+    ///      which writes an address entry that wins ahead of both this flag and
+    ///      the class. Adding a clear would be adding an INSTANT owner path to
+    ///      restore a convicted address's tier, undercutting `certifyDelay` —
+    ///      the one guarantee that every tier grant is announced in advance.
+    mapping(bytes32 configKey => bool) private _classTierDenied;
+
+    /// @dev target => this ADDRESS may not read its allowlist standing off a
+    ///      class. Per-address, matching `_adapterAllowed`, so it inherits
+    ///      `_demote`'s deliberate over-broadness: demoting one selector strips
+    ///      the whole adapter's fund-movement standing.
+    ///
+    ///      Cleared by `setAdapterAllowed(target, true)` and set by
+    ///      `setAdapterAllowed(target, false)`, so the owner's explicit
+    ///      address-level decision beats the class in BOTH directions. Without
+    ///      the `false` branch the owner could not disallow a single class
+    ///      member at all — the class would re-allow it on the next read.
+    ///
+    ///      Unlike the tier flag this is safe to clear instantly: it mirrors
+    ///      `setAdapterAllowed`'s own re-grant, which has always been an
+    ///      instant owner call with no delay to undercut.
+    mapping(address target => bool) private _classAllowDenied;
+
+    event ClassMemberTierDenied(address indexed target, bytes4 indexed selector);
+    event ClassMemberAllowDenied(address indexed target, bool denied);
+
+    /// @notice Whether `target` has been barred from reading `selector`'s tier
+    ///         off a class by a prior demotion.
+    function isClassTierDenied(address target, bytes4 selector) external view returns (bool) {
+        return _classTierDenied[key(target, selector)];
+    }
+
+    /// @notice Whether `target` has been barred from reading allowlist standing
+    ///         off a class.
+    function isClassAllowDenied(address target) external view returns (bool) {
+        return _classAllowDenied[target];
+    }
+
+    /// @dev True when (target, selector) carries a live certification through
+    ///      EITHER keying mode.
+    ///
+    ///      The demotion guards use this rather than the raw address entry so a
+    ///      CLASS-ONLY member is reachable — the normal case under class
+    ///      certification, and the case where `demoteByChallenge` otherwise
+    ///      reverts `NotCertified` into `ChallengeGame`'s bare catch, so a
+    ///      conviction lands as nothing but an `AdapterDemotionFailed` event.
+    ///
+    ///      The anti-grief property the raw guard existed for is preserved:
+    ///      `ChallengeGame.file` only checks that the named pair appears in the
+    ///      executed calldata, so the guard's job is to reject a pair that was
+    ///      never certified AT ALL. A class-certified selector is certified,
+    ///      just not at this address — naming it is legitimate grounds.
+    ///
+    ///      Address branch tests existence only, not codehash freshness,
+    ///      matching the guard it replaces: a stale entry is still an entry,
+    ///      and `poke` is the path that exists for freshness.
+    function _isCertifiedFor(address target, bytes4 selector) private view returns (bool) {
+        if (_configs[key(target, selector)].certifiedCodehash != bytes32(0)) return true;
+        bytes32 cch = _classOf(target);
+        if (cch == bytes32(0)) return false;
+        return _classConfigs[classKey(cch, selector)].certifiedCodehash != bytes32(0);
+    }
 
     error ClassNotCertified();
     error NoPendingClassCertification();
