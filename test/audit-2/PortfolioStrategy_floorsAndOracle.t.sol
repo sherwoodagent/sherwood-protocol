@@ -18,8 +18,15 @@ contract MockVaultWithGovernor {
     /// @dev `BaseStrategy.onlyProposer` re-checks the vault's live agent set on
     ///      every proposer-gated call, so a vault stand-in must answer this or
     ///      `rebalance` / `rebalanceDelta` / `updateParams` all fail closed.
-    function isAgent(address) external pure returns (bool) {
-        return true;
+    ///      Stored inverted so the zero default is "still an agent".
+    mapping(address => bool) internal _revoked;
+
+    function isAgent(address a) external view returns (bool) {
+        return !_revoked[a];
+    }
+
+    function setAgent(address a, bool allowed) external {
+        _revoked[a] = !allowed;
     }
 
     address public governor;
@@ -240,6 +247,63 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
 
         vm.prank(address(r.vault));
         r.strategy.execute();
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // pashov review finding #9 — bounded rebalancing, live proposer standing
+    // ════════════════════════════════════════════════════════════════════
+
+    /// @dev FINDING #9a. `maxSlippageBps` bounded ONE swap, but nothing bounded
+    ///      how many full-notional round trips the proposer could take, so the
+    ///      per-call allowance composed multiplicatively (`1-(1-s)^2N`) over an
+    ///      unlimited call count for the whole `strategyDuration`. None of this
+    ///      traffic passes `SyndicateVault.executeGovernorBatch`, so neither
+    ///      `BatchExecutorLib`'s per-call caps nor the vault's `maxNetOutflow`
+    ///      meter ever saw it — the capital is already inside the clone.
+    ///      `cumulativeDecayBps` charges the worst case (`2 * maxSlippageBps`
+    ///      per full rebalance) and refuses once `MAX_CUMULATIVE_DECAY_BPS` is
+    ///      spent. Pre-fix this loop never terminated.
+    function test_finding9_rebalanceDecayBudgetIsFinite() public {
+        Rig memory r = _rig();
+
+        uint256 perCall = 2 * SLIPPAGE_100;
+        uint256 allowed = r.strategy.MAX_CUMULATIVE_DECAY_BPS() / perCall;
+
+        for (uint256 i; i < allowed; ++i) {
+            vm.prank(proposer);
+            r.strategy.rebalance();
+        }
+        assertEq(r.strategy.cumulativeDecayBps(), allowed * perCall, "budget accounted exactly");
+
+        vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.DecayBudgetExhausted.selector);
+        r.strategy.rebalance();
+    }
+
+    /// @dev FINDING #9b. `_proposer` is written once at `initialize` and was
+    ///      never re-validated, while `SyndicateVault.removeAgent` — the
+    ///      owner's revocation lever — only deletes `_agents[a]` and reaches no
+    ///      already-deployed clone. A de-registered agent therefore kept
+    ///      unbounded `rebalance` / `rebalanceDelta` / `updateParams` authority
+    ///      over deployed capital for the rest of `strategyDuration`, and the
+    ///      owner's only alternatives were demoting the shared swap adapter or
+    ///      price feed (blast radius: every strategy on the protocol) or
+    ///      waiting for a permissionless settle. `rebalance` already re-checked
+    ///      the ADAPTER and the PRICE SOURCES live; the CALLER was the one
+    ///      input still trusted from init.
+    function test_finding9_removedAgentLosesProposerRightsOnLiveClone() public {
+        Rig memory r = _rig();
+
+        vm.prank(proposer);
+        r.strategy.rebalance(); // still an agent: ordinary path works
+
+        // The vault owner revokes the agent. That call touches the vault only —
+        // the live clone is untouched, which is exactly the gap.
+        r.vault.setAgent(proposer, false);
+
+        vm.prank(proposer);
+        vm.expectRevert(BaseStrategy.ProposerNoLongerAgent.selector);
+        r.strategy.rebalance();
     }
 
     // ════════════════════════════════════════════════════════════════════

@@ -646,7 +646,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // Apply the late-vote lockout to first-time votes too.
             uint256 reviewWindowDuration = uint256(r.reviewEnd) - uint256(r.voteEnd);
             uint256 lockoutStart = r.reviewEnd - (reviewWindowDuration * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
-            if (block.timestamp >= lockoutStart) revert VoteChangeLockedOut();
+            // Pause-adjusted like every other bound measured against
+            // `r.reviewEnd` — see `_effNow` (pashov review finding #7). On wall
+            // clock a pause would eat the whole votable stretch and leave only
+            // the locked-out tail, which is the same window-consumption defect
+            // one step further in.
+            if (_effNow(r.clockShiftAtRegister) >= lockoutStart) revert VoteChangeLockedOut();
 
             // First vote — snapshot own weight AT `r.openedAt`, growth-gated
             // to match the block-quorum denominator's own lookback-min
@@ -680,7 +685,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // Vote-change: must be before the late lockout window.
             uint256 reviewWindowDuration = uint256(r.reviewEnd) - uint256(r.voteEnd);
             uint256 lockoutStart = r.reviewEnd - (reviewWindowDuration * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
-            if (block.timestamp >= lockoutStart) revert VoteChangeLockedOut();
+            // Pause-adjusted like every other bound measured against
+            // `r.reviewEnd` — see `_effNow` (pashov review finding #7). On wall
+            // clock a pause would eat the whole votable stretch and leave only
+            // the locked-out tail, which is the same window-consumption defect
+            // one step further in.
+            if (_effNow(r.clockShiftAtRegister) >= lockoutStart) revert VoteChangeLockedOut();
 
             uint128 weight = _voteStake[key][msg.sender]; // preserved snapshot
             // LOAD-BEARING INVARIANT: the new-side cap is checked inline BEFORE
