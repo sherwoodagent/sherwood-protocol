@@ -20,6 +20,13 @@ import {Id, MarketParams} from "../../src/vendor/morpho/IMorpho.sol";
 /// @notice Minimal vault stand-in — the strategy reads `asset()` and, inside
 ///         `execute()`, `governor()` for BaseStrategy's active-proposal binding.
 contract VaultStub {
+    /// @dev `BaseStrategy.onlyProposer` re-checks the vault's live agent set on
+    ///      every proposer-gated call, so a vault stand-in must answer this or
+    ///      `updateParams` fails closed. Mirrors `MorphoSupplyStrategy`'s stub.
+    function isAgent(address) external pure returns (bool) {
+        return true;
+    }
+
     address internal immutable _assetToken;
     address public governor;
 
