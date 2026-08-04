@@ -242,10 +242,22 @@ contract UniswapSwapAdapter is ISwapAdapter {
             //
             // extraData: `abi.encode(bytes path, uint16 perHopSlippageBps)`. Each
             // non-terminal hop's `amountOutMinimum` is derived at swap time from a
-            // quoter pre-call (`expected * (10000 - perHopSlippageBps) / 10000`),
-            // so an MEV sandwich on any intermediate hop reverts at that hop
-            // instead of silently draining value into the next. The legacy
-            // `amountOutMin` parameter is still enforced on the terminal hop.
+            // quoter pre-call (`expected * (10000 - perHopSlippageBps) / 10000`).
+            //
+            // WHAT THAT PER-HOP FLOOR IS AND IS NOT (see `_chainedSingleHops`):
+            // it is a quoter/router CONSISTENCY check, not sandwich resistance.
+            // The quote is taken in this same transaction against the same pool
+            // the hop then trades, so no third party can interleave between the
+            // two — and equally, a sandwich that front-ran this transaction has
+            // already moved the pool, so the quote reflects the manipulated
+            // price and the floor moves with the attack. A floor derived from
+            // the thing being manipulated cannot bound manipulation.
+            //
+            // The route's real economic bound is the caller-supplied
+            // `amountOutMin`, enforced on the terminal hop and therefore on the
+            // whole path. It comes from an INDEPENDENT reference — see
+            // `PortfolioStrategy._buyFloor` / `_sellFloor`, which anchor on the
+            // oracle rather than on pool state.
             (bytes memory path, uint16 perHopSlippageBps) = abi.decode(routeData, (bytes, uint16));
             require(perHopSlippageBps <= 10_000, "slippage > 100%");
             address pathStart = _extractFirstAddress(path);
@@ -429,9 +441,34 @@ contract UniswapSwapAdapter is ISwapAdapter {
                 IERC20(hopIn).forceApprove(address(v3Router), currentAmount);
             }
 
-            // Per-hop floor from quoter pre-call, scaled by the caller's
+            // Per-hop floor from a quoter pre-call, scaled by the caller's
             // slippage budget. Final hop additionally honors the top-level
             // `amountOutMin` so the legacy contract holds.
+            //
+            // This floor is a quoter/router consistency check. It is NOT a
+            // slippage or MEV guard, and must not be read as one:
+            //
+            //   - The quote and the swap execute in the SAME transaction
+            //     against the SAME pool, with nothing able to interleave. The
+            //     quote is therefore a simulation of the very swap that
+            //     follows, so on any honest path the check is satisfied by
+            //     construction — it binds only when the router's execution
+            //     diverges from the quoter's simulation. That divergence is
+            //     worth catching (it is the SwapRouter02 pool-resolution bug
+            //     class this mode exists to route around), which is why the
+            //     check stays.
+            //   - Against a sandwich it does nothing. The front-run lands
+            //     BEFORE this transaction, so the quoter reads the already-moved
+            //     pool and `hopFloor` scales down with the manipulation. A
+            //     bound derived from the manipulated quantity cannot constrain
+            //     the manipulation.
+            //
+            // Intermediate hops consequently carry no independent economic
+            // floor. The route is bounded end-to-end by `amountOutMin` on the
+            // terminal hop, which the caller derives from an oracle rather than
+            // from pool state (`PortfolioStrategy._buyFloor` / `_sellFloor`).
+            // Raising `perHopSlippageBps` cannot loosen that bound; lowering it
+            // cannot tighten it either.
             (uint256 quoted,,,) = quoter.quoteExactInputSingle(
                 IQuoterV2.QuoteExactInputSingleParams({
                     tokenIn: hopIn, tokenOut: hopOut, amountIn: currentAmount, fee: fee, sqrtPriceLimitX96: 0
