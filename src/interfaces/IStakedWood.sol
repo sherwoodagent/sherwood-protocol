@@ -30,29 +30,25 @@ interface IStakedWood {
     ///         (`ExposureLedger.slashBpsFor` feeds vote-order arrays).
     error DuplicateApprover();
 
-    /// @notice Reverts when `slashVerdict` names an approver already slashed
-    ///         under the same `caseKey` by an EARLIER call.
-    /// @dev The intra-call dedup only bounds ONE array, so the severity ceiling
-    ///      bound per CALL rather than per verdict: `_slashOne` re-reads the
-    ///      live stake each time while sizing off the same `openedAt`
+    /// @notice Reverts when `slashVerdict` names an approver already slashed under
+    ///         the same `caseKey` by an EARLIER call.
+    /// @dev The intra-call dedup only bounds ONE array, so without this the
+    ///      severity ceiling binds per CALL rather than per verdict: `_slashOne`
+    ///      re-reads the live stake each time while sizing off the same `openedAt`
     ///      checkpoint, so repeated calls against one approver can exceed the
     ///      governance-set ceiling. Splitting a quorum-sized batch across
-    ///      transactions stays legal; replaying an approver does not. Also
-    ///      makes a retried transaction idempotent per approver.
+    ///      transactions stays legal; replaying an approver does not.
     error ApproverAlreadySlashed();
 
     event AuthorizedSlasherSet(address indexed slasher);
 
     /// @notice A verdict slash was settled: what it took, all of which was
     ///         destroyed.
-    /// @dev ONE FIELD, BECAUSE THERE IS ONE LEG. `gross == burned` by
-    ///      construction — the slash has no payee — so there is no split for an
-    ///      indexer to re-derive. `burned` is also `slashVerdict`'s return
-    ///      value. Replaces the `VerdictSlashRouted` /
-    ///      `VerdictSlashUncompensated` pair, whose whole purpose was to report
-    ///      WHETHER victims were paid — a question with one answer now. The
-    ///      prosecutor's fee is a separate leg on a separate contract and
-    ///      surfaces as `IProposerBondEscrow.ProsecutorFeePaid`.
+    /// @dev ONE FIELD, BECAUSE THERE IS ONE LEG. `gross == burned` by construction
+    ///      — the slash has no payee — so there is no split for an indexer to
+    ///      re-derive, and `burned` is also `slashVerdict`'s return value. The
+    ///      prosecutor's fee is a separate leg on a separate contract and surfaces
+    ///      as `IProposerBondEscrow.ProsecutorFeePaid`.
     event VerdictSlashBurned(bytes32 indexed caseKey, uint256 burned);
 
     // ── Guardian stake ──
@@ -107,22 +103,18 @@ interface IStakedWood {
     function slashableStakeAt(address guardian, uint256 anchor) external view returns (uint256);
 
     /// @notice Guardian's age-weighted own vote weight at a past timestamp.
-    /// @dev    Not a term of `getPastTotalVotes`: the total sums RAW own
-    ///         stake; this applies `_ageFactorBps` on top, so the two are
-    ///         different measures of the same WOOD. Correct for weighing a
-    ///         vote; wrong for a subtraction against the total — use
-    ///         `getPastStake` there. Aging only ever shrinks weight, so
-    ///         per-account weight is bounded above by raw stake, biasing
-    ///         `TokenCourt._participationFloor` too HIGH when the accused are
-    ///         freshly staked (favoring an inconclusive result).
-    /// @dev    ANCHOR-EXACT (issue #82): the age factor is evaluated against
-    ///         the `stakedAt` anchor AS IT STOOD at `timestamp`, checkpointed
-    ///         alongside the raw stake, not the live anchor. A top-up or
-    ///         unstake-request re-anchor AFTER `timestamp` can therefore
-    ///         neither inflate nor deflate an already-past read — including
-    ///         the frozen ballots `GuardianRegistry` review votes snapshot at
-    ///         `openedAt`, which previously deflated toward `ageFloorBps` if
-    ///         the same guardian topped up after the review opened.
+    /// @dev    Not a term of `getPastTotalVotes`: the total sums RAW own stake;
+    ///         this applies `_ageFactorBps` on top, so the two are different
+    ///         measures of the same WOOD. Correct for weighing a vote, wrong for a
+    ///         subtraction against the total — use `getPastStake` there. Aging
+    ///         only ever shrinks weight, so per-account weight is bounded above by
+    ///         raw stake, biasing `TokenCourt._participationFloor` too HIGH when
+    ///         the accused are freshly staked.
+    /// @dev    ANCHOR-EXACT: the age factor is evaluated against the `stakedAt`
+    ///         anchor AS IT STOOD at `timestamp`, checkpointed alongside the raw
+    ///         stake, not the live anchor — so a re-anchor AFTER `timestamp` can
+    ///         neither inflate nor deflate an already-past read, including the
+    ///         frozen ballots review votes snapshot at `openedAt`.
     function getPastVotes(address guardian, uint256 timestamp) external view returns (uint256);
 
     /// @notice A guardian's RAW votable own stake at a past timestamp — the same
@@ -167,14 +159,13 @@ interface IStakedWood {
     /// @notice Upper clamp bound (bps) for the graduated slash severity.
     function maxSlashBps() external view returns (uint256);
 
-    // ── Registry-only mutations ──
-    /// @notice Slash `approvers` for a blocked proposal. Burns `slashBps` of
-    ///         each approver's own stake. Registry-only.
-    /// @param reviewKey  Composite review key keccak256(abi.encode(governor, proposalId)) whose approvers are slashed.
-    /// @param openedAt   The review's open timestamp. `_slashOne` sizes each
-    ///                   approver's slash off their raw own-stake checkpoint
-    ///                   at this instant.
-    /// @param approvers  Plain `address[]` of approver addresses to slash.
+    // Registry-only mutations
+    /// @notice Slash `approvers` for a blocked proposal. Burns `slashBps` of each
+    ///         approver's own stake. Registry-only.
+    /// @param reviewKey  keccak256(abi.encode(governor, proposalId)).
+    /// @param openedAt   The review's open timestamp — the checkpoint each
+    ///                   approver's slash is sized off.
+    /// @param approvers  Approver addresses to slash.
     /// @param slashBps   Slash fraction in basis points.
     function slashGuardians(bytes32 reviewKey, uint256 openedAt, address[] calldata approvers, uint256 slashBps)
         external;
@@ -183,32 +174,23 @@ interface IStakedWood {
     ///         Registry-only.
     function slashOwnerBond(address vault) external;
 
-    // ── Slasher-only mutations (verdict path) ──
-    /// @notice Verdict-driven slash whose proceeds are BURNED (spec §3.8 + §4
-    ///         authorized-slasher entrypoint).
-    /// @dev PUNITIVE, NOT COMPENSATORY. Nothing is paid to the harmed vault or
-    ///      its holders — the protocol makes no compensation promise. Each
-    ///      non-zero rate is clamped to `[minSlashBps, maxSlashBps]`, the same
-    ///      severity envelope the review path's `_severityBps` enforces, and
-    ///      the production feed (`ExposureLedger.slashBpsFor`) supplies the
-    ///      ceiling for every approver still holding a live commitment.
+    // Slasher-only mutations (verdict path)
+    /// @notice Verdict-driven slash whose proceeds are BURNED.
+    /// @dev PUNITIVE, NOT COMPENSATORY. Nothing is paid to the harmed vault or its
+    ///      holders. Each non-zero rate is clamped to `[minSlashBps, maxSlashBps]`,
+    ///      the same severity envelope the review path enforces.
     ///
-    ///      `approvers` must be duplicate-free (any order) AND must not repeat
-    ///      an approver already slashed under this `caseKey` by an earlier call
-    ///      (`ApproverAlreadySlashed`) — one verdict takes one slash per
-    ///      approver, so the envelope binds per VERDICT and not merely per
-    ///      call. `openedAt` must not be in the future: an honest-caller sanity
-    ///      bound that does NOT bind a compromised slasher, which chooses it
-    ///      freely (see the implementation natspec).
+    ///      `approvers` must be duplicate-free (any order) AND must not repeat an
+    ///      approver already slashed under this `caseKey` by an earlier call — one
+    ///      verdict takes one slash per approver, so the envelope binds per VERDICT
+    ///      and not merely per call. `openedAt` must not be in the future: an
+    ///      honest-caller sanity bound that does NOT bind a compromised slasher.
     ///
-    ///      NO EXTERNAL SINK. The burn is unconditional and internal, so there
-    ///      is no child call whose revert could hold a conviction hostage, no
-    ///      allowance against sWOOD's custody balance, and no gas to reserve
-    ///      for a callee.
-    /// @return total  WOOD burned across all approvers. The slash pays no one;
-    ///                the prosecutor is paid from the convicted proposer's bond
-    ///                by `ProposerBondEscrow`, the one pot a prosecutor cannot
-    ///                fund for itself.
+    ///      NO EXTERNAL SINK. The burn is unconditional and internal, so there is
+    ///      no child call whose revert could hold a conviction hostage, no
+    ///      allowance against sWOOD's custody balance, and no gas to reserve.
+    /// @return total  WOOD burned across all approvers. The slash pays no one; the
+    ///                prosecutor is paid from the convicted proposer's bond.
     function slashVerdict(
         bytes32 caseKey,
         uint256 openedAt,

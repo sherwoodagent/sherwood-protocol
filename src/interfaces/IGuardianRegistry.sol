@@ -157,14 +157,13 @@ interface IGuardianRegistry {
     function setReviewPeriod(uint256) external;
     function setBlockQuorumBps(uint256) external;
 
-    /// @notice Wire the exposure ledger consulted on approve-side review
-    ///         votes. address(0) is rejected; address(0) as the current value
-    ///         means unset (hooks skipped).
-    /// @dev Enforces `ledger.challengeWindow() >= reviewPeriod +
-    ///      MAX_GOVERNOR_EXECUTION_WINDOW` (audit #181 finding #26) — the
-    ///      same invariant `ExposureLedger.setChallengeWindow` and
-    ///      `ExposureLedger.setGuardianRegistry` hold on their side, closing
-    ///      the fourth door this setter used to leave open. Also requires
+    /// @notice Wire the exposure ledger consulted on approve-side review votes.
+    ///         `address(0)` is rejected; `address(0)` as the current value means
+    ///         unset, with the hooks skipped.
+    /// @dev Enforces
+    ///      `ledger.challengeWindow() >= reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW`
+    ///      — the same invariant the ledger's own two setters hold, closing the
+    ///      fourth door this one used to leave open. Also requires
     ///      `ledger.guardianRegistry()` to be either unset or already this
     ///      registry, so wiring cannot seat a ledger that will reject every
     ///      `recordApproval` call from here.
@@ -200,21 +199,19 @@ interface IGuardianRegistry {
         view
         returns (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight);
 
-    /// @notice Per-proposal approver set + the COVERAGE each one actually
+    /// @notice Per-proposal approver set plus the COVERAGE each one actually
     ///         underwrote, from the exposure ledger's settled allocation.
-    /// @dev    The weight guardian fees should be paid on.
-    ///         `getApproverWeights` returns staked WOOD, which pays for parking
-    ///         capital rather than for underwriting — an approver the ledger
-    ///         booked nothing for (no free budget, unpriceable feed, zero
-    ///         coverage, beyond horizon) still appears there at full stake
-    ///         weight. Weighting on this instead pays zero for a zero-coverage
-    ///         approve without touching anyone's right to vote.
+    /// @dev    The weight guardian fees should be paid on. `getApproverWeights`
+    ///         returns staked WOOD, which pays for parking capital rather than for
+    ///         underwriting — an approver the ledger booked nothing for still
+    ///         appears there at full stake weight. Weighting on this instead pays
+    ///         zero for a zero-coverage approve without touching anyone's right to
+    ///         vote.
     /// @return approvers   Registry-side approver set for the proposal.
     /// @return coverageUsd Allocated coverage per approver, USD-18. Zero entries
     ///                     are real: that approver underwrote nothing.
-    /// @return priced      False when the ledger could not value the coverage
-    ///                     (stale/unconfigured asset feed). RETRY — do not treat
-    ///                     the zeros as a payable result.
+    /// @return priced      False when the ledger could not value the coverage.
+    ///                     RETRY — do not treat the zeros as a payable result.
     function getApproverCoverage(address governor, uint256 proposalId)
         external
         view

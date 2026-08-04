@@ -73,19 +73,14 @@ contract SyndicateVault is
     ///         `removeAgent` frees a slot.
     uint256 public constant MAX_AGENTS_PER_VAULT = 32;
 
-    /// @notice Hard cap on the vault-owner-set agent performance fee (30%),
-    ///         equal to the governor's `MAX_PERFORMANCE_FEE_CAP` — the protocol
-    ///         ceiling on `maxPerformanceFeeBps`. The governor additionally
-    ///         clamps the realized fee to its (lower, tunable) configured
-    ///         `maxPerformanceFeeBps` at settlement, so a stored value above the
-    ///         live param is never charged. Capping here at the same ceiling
-    ///         keeps `agentFeeBps()` from advertising a rate that can never be
-    ///         realized.
-    /// @dev This ceiling is a backstop, not the headline rate. A vault created
-    ///      through the factory starts with a per-vault `maxPerformanceFeeBps`
-    ///      of `FeeConstants.DEFAULT_MAX_PERFORMANCE_FEE_BPS` (20%), so setting
-    ///      above the headline here is legal but clamped at settlement until
-    ///      governance raises that param.
+    /// @notice Hard cap on the vault-owner-set agent performance fee (30%), equal
+    ///         to the protocol ceiling on the governor's `maxPerformanceFeeBps`.
+    ///         The governor additionally clamps the realized fee to its own,
+    ///         lower, configured value at settlement, so a stored value above the
+    ///         live param is never charged; capping here keeps `agentFeeBps()`
+    ///         from advertising a rate that can never be realized.
+    /// @dev A backstop, not the headline rate: a factory-created vault starts at a
+    ///      per-vault `maxPerformanceFeeBps` of 20%.
     uint256 public constant MAX_AGENT_FEE_BPS = FeeConstants.MAX_PERFORMANCE_FEE_BPS;
 
     /// @notice Cap on the owner-set idle-liquidity floor (50%).
@@ -98,36 +93,27 @@ contract SyndicateVault is
     bytes4 private constant _SEL_TRANSFER = 0xa9059cbb; // transfer(address,uint256)
     bytes4 private constant _SEL_TRANSFER_FROM = 0x23b872dd; // transferFrom(address,address,uint256)
 
-    // ── Alternate-signature "pull/push via delegated allowance" selectors ──
-    // Same guarded CAPABILITY as the four legacy-ERC20 selectors above, just
-    // exposed under different 4-byte selectors by non-legacy-ERC20 allowance
-    // routers. A post-merge audit of this PR (issue #115, PR #157) found that
-    // Permit2's AllowanceTransfer singleton — deployed at the same address on
-    // nearly every EVM chain, with huge numbers of standing LP allowances —
-    // and DSToken-lineage `pull`/`move` wrappers reproduce the exact
-    // LP-allowance-confiscation and poison-then-drain bugs Part 1b/Part 2
-    // exist to close, invisible to both because neither matched any of the
-    // four selectors above. Verified via `cast sig` (see PR #157 audit
-    // comment). Each decodes with the SAME argument layout as its legacy
-    // counterpart (source address always at bytes 4:36; destination, where
-    // present, at bytes 36:68), so they slot into the existing decode logic
-    // in `_guardBatchCalls` rather than needing bespoke offsets.
+    // Alternate-signature pull/push-via-delegated-allowance selectors: the same
+    // guarded CAPABILITY as the four legacy-ERC20 selectors above, exposed under
+    // different 4-byte selectors by non-legacy allowance routers. Permit2's
+    // AllowanceTransfer singleton — deployed at the same address on nearly every
+    // EVM chain, with huge numbers of standing LP allowances — and
+    // DSToken-lineage `pull`/`move` wrappers reproduce the exact
+    // LP-allowance-confiscation and poison-then-drain shapes Part 1b/Part 2 close,
+    // invisible to both because neither matched any legacy selector. Each decodes
+    // with the SAME argument layout as its legacy counterpart (source at bytes
+    // 4:36; destination, where present, at 36:68).
     bytes4 private constant _SEL_PERMIT2_TRANSFER_FROM = 0x36c78516; // Permit2 AllowanceTransfer.transferFrom(address from,address to,uint160,address token)
     bytes4 private constant _SEL_PERMIT2_APPROVE = 0x87517c45; // Permit2 AllowanceTransfer.approve(address token,address spender,uint160,uint48)
     bytes4 private constant _SEL_DSTOKEN_PULL = 0xf2d5d56b; // DSToken pull(address usr, uint256 wad) — pulls TO msg.sender (the vault)
     bytes4 private constant _SEL_DSTOKEN_MOVE = 0xbb35783b; // DSToken move(address src, address dst, uint256 wad)
 
-    // ── ROUND 3 (PR #157 re-audit): four MORE sibling selectors on the exact
-    // routers/standards round 2 above claims to cover, missed by the same
-    // enumeration approach. Round 2's own selector list was itself incomplete
-    // — see the RESIDUAL note further down for the corrected (per-selector,
-    // not per-router) framing. This was the round-3 evidence that motivated
-    // issue #166's Option B (target-based callee gate, `_guardBatchCalls`
-    // PART 2a): these selectors, and everything below, remain retained as the
-    // INNER boundary — still load-bearing for e.g. `approve(attacker)` on an
-    // otherwise-allowlisted token — but they are no longer the outer boundary
-    // against an unenumerated selector on an arbitrary target; the callee gate
-    // is.
+    // Four MORE sibling selectors on the exact routers/standards above, missed by
+    // the same enumeration approach — the evidence that motivated the
+    // target-based callee gate (PART 2a). These selectors, and everything below,
+    // remain the INNER boundary — still load-bearing for e.g. `approve(attacker)`
+    // on an otherwise-allowlisted token — but they are no longer the outer
+    // boundary against an unenumerated selector on an arbitrary target.
     bytes4 private constant _SEL_DSTOKEN_PUSH = 0xb753a98c; // DSToken push(address dst, uint256 wad) — transfer-lineage sibling of guarded pull/move; internally transfer(dst, wad)
     bytes4 private constant _SEL_ERC1363_TRANSFER_FROM_AND_CALL = 0xd8fbe994; // ERC1363 transferFromAndCall(address from,address to,uint256)
     bytes4 private constant _SEL_ERC1363_TRANSFER_FROM_AND_CALL_DATA = 0xc1d34b89; // ERC1363 transferFromAndCall(address from,address to,uint256,bytes) — trailing bytes arg does not shift the leading from/to offsets
@@ -135,13 +121,10 @@ contract SyndicateVault is
     bytes4 private constant _SEL_ERC1363_APPROVE_AND_CALL_DATA = 0xcae9ca51; // ERC1363 approveAndCall(address spender,uint256,bytes)
     bytes4 private constant _SEL_PERMIT2_BATCH_TRANSFER_FROM = 0x0d58b1db; // Permit2 AllowanceTransfer.transferFrom(AllowanceTransferDetails[]) — dynamic-array batch sibling of the guarded single-transfer overload; decoded via `_Permit2BatchDetail`, NOT the fixed-offset slices the other selectors share
 
-    // ── ROUND 4 (re-audit https://github.com/sherwoodagent/sherwood-protocol/pull/157#issuecomment-5166496090) ──
-    // ERC4626 withdraw/redeem: a THIRD allowance-pull shape, distinct from
-    // every selector above. `owner` (the debited source, analogous to
-    // `transferFrom`'s `from`) sits at arg 2 (bytes 68:100), not arg 0 like
-    // every previously-guarded selector — every prior round's OR-chains
-    // assumed the source was always at bytes[4:36], so these needed their
-    // own dedicated branch rather than joining an existing one.
+    // ERC4626 withdraw/redeem: a THIRD allowance-pull shape. `owner` (the debited
+    // source, analogous to `transferFrom`'s `from`) sits at arg 2 (bytes 68:100),
+    // not arg 0 — every other guarded selector assumes the source is at bytes
+    // 4:36, so these need their own branch.
     bytes4 private constant _SEL_ERC4626_WITHDRAW = 0xb460af94; // withdraw(uint256 assets, address receiver, address owner)
     bytes4 private constant _SEL_ERC4626_REDEEM = 0xba087652; // redeem(uint256 shares, address receiver, address owner) — same arg shape as withdraw
     // ERC1363 transferAndCall: push-with-callback sibling of the guarded
@@ -149,14 +132,11 @@ contract SyndicateVault is
     bytes4 private constant _SEL_ERC1363_TRANSFER_AND_CALL = 0x1296ee62; // transferAndCall(address to, uint256 value)
     bytes4 private constant _SEL_ERC1363_TRANSFER_AND_CALL_DATA = 0x4000aea0; // transferAndCall(address to, uint256 value, bytes data)
 
-    /// @dev Decode-only mirror of Permit2's `AllowanceTransferDetails` struct
-    ///      (`{address from; address to; uint160 amount; address token;}`) —
+    /// @dev Decode-only mirror of Permit2's `AllowanceTransferDetails` struct —
     ///      never used to call Permit2, only to `abi.decode` a batch
-    ///      `transferFrom` call's calldata so `_guardBatchCalls` can inspect
-    ///      every element's `from`/`to` the same way it inspects the
-    ///      single-transfer overload's fixed-offset arguments. All fields are
-    ///      static, so the array decodes as tightly-packed 128-byte elements
-    ///      with no per-element dynamic pointer.
+    ///      `transferFrom` call's calldata so `_guardBatchCalls` can inspect every
+    ///      element's `from`/`to`. All fields are static, so the array decodes as
+    ///      tightly-packed 128-byte elements with no per-element dynamic pointer.
     struct _Permit2BatchDetail {
         address from;
         address to;
@@ -208,12 +188,11 @@ contract SyndicateVault is
     address private _withdrawalQueue;
 
     /// @notice Vault-owner-set agent performance fee, stored offset-by-one so a
-    ///         single slot doubles as the "is it set?" flag: 0 = never set →
-    ///         `agentFeeBps()` returns `FeeConstants.DEFAULT_AGENT_FEE_BPS` (5%);
-    ///         otherwise the stored value is `fee + 1`, so an explicit 0% (a
-    ///         stored 1) stays distinct from unset. One SLOAD on the propose
-    ///         hot path. Snapshotted onto a proposal at propose (clamped to the
-    ///         governor's `maxPerformanceFeeBps`); set via `setAgentFeeBps`.
+    ///         single slot doubles as the is-it-set flag: 0 means never set, and
+    ///         `agentFeeBps()` returns the 5% default; otherwise the stored value
+    ///         is `fee + 1`, so an explicit 0% stays distinct from unset.
+    ///         Snapshotted onto a proposal at propose, clamped to the governor's
+    ///         `maxPerformanceFeeBps`.
     uint256 private _agentFeeBpsPlusOne;
 
     /// @notice Idle-liquidity floor (bps of pre-batch float) enforced against
@@ -315,18 +294,14 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @notice Whether `depositor` is allowed to receive shares when the vault
-    ///         is in closed-deposit mode (`_openDeposits == false`).
-    /// @dev The whitelist check in `_deposit` runs against `receiver` — the
-    ///      share holder — **not** `caller` (the asset payer). A whitelisted
-    ///      user can therefore receive shares funded by a non-whitelisted party
-    ///      (pay-on-behalf semantics), intentional for KYC flows where
-    ///      compliance attaches to the share holder (residency / accreditation
-    ///      attestations travel with the shares, not the USDC).
-    ///
-    ///      To check both sides, extend `_deposit` to also assert
-    ///      `isApprovedDepositor(caller)`. Not the default because it would
-    ///      break subsidised onboarding flows.
+    /// @notice Whether `depositor` may receive shares while the vault is in
+    ///         closed-deposit mode.
+    /// @dev The whitelist check in `_deposit` runs against `receiver` — the share
+    ///      holder — NOT `caller`, the asset payer. A whitelisted user can
+    ///      therefore receive shares funded by a non-whitelisted party
+    ///      (pay-on-behalf), intentional for KYC flows where compliance attaches
+    ///      to the share holder. Checking both sides would break subsidised
+    ///      onboarding, so it is not the default.
     function isApprovedDepositor(address depositor) external view returns (bool) {
         return _approvedDepositors.contains(depositor);
     }
@@ -379,26 +354,20 @@ contract SyndicateVault is
     // ==================== ADMIN ====================
 
     /// @inheritdoc ISyndicateVault
-    /// @dev ERC-8004 NFT ownership is verified **at registration time only**.
-    ///      If the `agentId` NFT is later transferred to a different wallet,
-    ///      the registered `agentAddress` retains its privileges on this vault
-    ///      until the owner calls `removeAgent`. Intentional trade-off:
-    ///      re-querying NFT ownership on every execution would add a per-call
-    ///      external view to the hot path, and the ERC-8004 registry is an
-    ///      external dependency the vault should not hard-couple to. Off-chain
-    ///      reputation / guardian systems should monitor NFT transfers and
-    ///      trigger `removeAgent` when an identity moves.
+    /// @dev ERC-8004 NFT ownership is verified AT REGISTRATION TIME ONLY. If the
+    ///      `agentId` NFT is later transferred, the registered `agentAddress`
+    ///      retains its privileges until the owner calls `removeAgent`.
+    ///      Re-querying on every execution would add a per-call external view to
+    ///      the hot path and hard-couple the vault to an external registry;
+    ///      off-chain monitoring should trigger `removeAgent` instead.
     function registerAgent(uint256 agentId, address agentAddress) external onlyOwner {
         SyndicateVaultAdminLib.registerAgent(_agents, _agentSet, agentId, agentAddress, _agentRegistry, owner());
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev Fully deletes the `_agents[agentAddress]` struct (not just flips
-    ///      `active = false`). This prevents stale `agentId` /
-    ///      `agentAddress` fields from being silently reused if `registerAgent`
-    ///      is later called for the same slot. After `removeAgent`,
-    ///      `isAgent(addr)` returns false, and a subsequent
-    ///      `registerAgent(newId, addr)` writes a fresh entry.
+    /// @dev Fully deletes the `_agents[agentAddress]` struct rather than flipping
+    ///      `active = false`, so stale `agentId`/`agentAddress` fields cannot be
+    ///      silently reused if `registerAgent` is later called for the same slot.
     function removeAgent(address agentAddress) external onlyOwner {
         SyndicateVaultAdminLib.removeAgent(_agents, _agentSet, agentAddress);
     }
@@ -419,16 +388,15 @@ contract SyndicateVault is
     }
 
     /// @notice Transfers vault ownership to `newOwner` via the factory.
-    /// @dev Factory-only. Used by `SyndicateFactory.rotateOwner` alongside the
-    ///      registry's `transferOwnerStakeSlot`, so the old owner's slashed /
+    /// @dev Factory-only, used by `SyndicateFactory.rotateOwner` alongside the
+    ///      registry's `transferOwnerStakeSlot`, so the old owner's slashed or
     ///      unstaked position can be rebound to a fresh operator without
     ///      redeploying the vault.
-    /// @dev Drains `_agentSet` entirely (full `delete`, not flip-only) so an
-    ///      at-cap vault doesn't brick the new owner — 32 dead entries could
-    ///      otherwise be neither re-registered (cap blocks) nor purged
-    ///      (`AgentNotActive` blocks `removeAgent`). Snapshots via `.values()`
-    ///      first so the in-loop `remove` doesn't invalidate iteration (OZ
-    ///      swap-and-pop on `at(i)`).
+    /// @dev Drains `_agentSet` entirely so an at-cap vault does not brick the new
+    ///      owner — 32 dead entries could otherwise be neither re-registered (cap
+    ///      blocks) nor purged (`AgentNotActive` blocks `removeAgent`). Snapshots
+    ///      via `.values()` first so the in-loop `remove` does not invalidate
+    ///      iteration.
     function rotateOwnership(address newOwner) external {
         if (msg.sender != _factory) revert NotFactory();
         if (newOwner == address(0)) revert ZeroAddress();
@@ -436,13 +404,12 @@ contract SyndicateVault is
         _transferOwnership(newOwner);
     }
 
-    /// @notice Blocks direct OwnableUpgradeable owner rotation. The factory's
-    ///         `rotateOwner` is the only legal route —
-    ///         it enforces `getActiveProposal == 0`, `openProposalCount == 0`,
-    ///         owner-stake clear, registry alignment, then calls
-    ///         `rotateOwnership` here. Allowing the inherited setters would
-    ///         desync factory / registry records and (via `renounceOwnership`)
-    ///         permanently orphan the vault.
+    /// @notice Blocks direct `OwnableUpgradeable` owner rotation. The factory's
+    ///         `rotateOwner` is the only legal route — it enforces no active or
+    ///         open proposal, owner-stake clear and registry alignment, then calls
+    ///         `rotateOwnership` here. The inherited setters would desync factory
+    ///         and registry records and, via `renounceOwnership`, permanently
+    ///         orphan the vault.
     function transferOwnership(address) public pure override {
         revert NotFactory();
     }
@@ -489,25 +456,16 @@ contract SyndicateVault is
     }
 
     /// @dev Proposal id to tag a queued `requestDeposit` with. `_activePid()`
-    ///      (`getActiveProposal()`) reads 0 until EXECUTE, but `requestDeposit`
-    ///      opens as soon as ANY non-terminal proposal exists
-    ///      (`openProposalCount() != 0` — see `requestDeposit`), which is
-    ///      earlier. Exactly one top-level proposal is ever open on this vault
-    ///      at a time (`propose` reverts `VaultHasOpenProposal` while
-    ///      `openProposalCount() != 0`), so the governor's monotonic
-    ///      `proposalCount()` already names that open proposal in the gap
-    ///      before `getActiveProposal()` is set. From EXECUTE onward the two
-    ///      agree (same proposal), so this collapses to `_activePid()`.
+    ///      reads 0 until EXECUTE, but `requestDeposit` opens as soon as ANY
+    ///      non-terminal proposal exists, which is earlier. Exactly one top-level
+    ///      proposal is ever open on this vault at a time, so the governor's
+    ///      monotonic `proposalCount()` already names that open proposal in the
+    ///      gap; from EXECUTE onward the two agree.
     /// @dev Deliberately a low-level staticcall, same reasoning as
-    ///      `_pricingSupply()`'s: `SyndicateGovernor.proposalCount()` is a
-    ///      real, selector-stable getter, but is not declared on
-    ///      `IProposalStatus` — that interface is intentionally narrowed to
-    ///      the three selectors the vault otherwise depends on (see its
-    ///      top-level doc), and widening it is a change to a file this fix
-    ///      does not own. A missing selector degrades to pid 0 rather than
-    ///      reverting — today unreachable (the getter has always existed on
-    ///      `SyndicateGovernor`), kept only so a nonstandard governor can
-    ///      never brick `requestDeposit`.
+    ///      `_pricingSupply()`: `proposalCount()` is selector-stable but is not
+    ///      declared on `IProposalStatus`, which is intentionally narrowed. A
+    ///      missing selector degrades to pid 0 rather than reverting, so a
+    ///      nonstandard governor can never brick `requestDeposit`.
     function _openProposalPid() private view returns (uint256) {
         address gov = _getGovernor();
         uint256 active = IProposalStatus(gov).getActiveProposal();
@@ -517,12 +475,10 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev Every delegatecall re-verifies that `_executorImpl`'s bytecode
-    ///      still matches the hash stamped at init. A factory misconfig or a
-    ///      swapped executor address cannot deflect the delegatecall to a
-    ///      different library.
-    /// @dev Gated by `whenNotPaused`. When the owner pauses the vault,
-    ///      strategy execution is halted alongside LP flow.
+    /// @dev Every delegatecall re-verifies that `_executorImpl`'s bytecode still
+    ///      matches the hash stamped at init, so a factory misconfig or a swapped
+    ///      executor address cannot deflect the delegatecall elsewhere. Gated by
+    ///      `whenNotPaused`: pausing halts strategy execution alongside LP flow.
     function executeGovernorBatch(
         BatchExecutorLib.Call[] calldata calls,
         uint256[] calldata callCaps,
@@ -553,42 +509,27 @@ contract SyndicateVault is
         // pass trivially; an execute batch that over-deploys reverts here.
         uint256 balanceAfter = IERC20(asset()).balanceOf(address(this));
         // Custody-level net-outflow ceiling. Inflow batches (settle) pass
-        // trivially; the governor passes the proposal's maxCapital on
-        // execute, settlement, and emergency paths — honest unwinds are
-        // net-inflow, so the finite cap never binds them.
-        // NOTE: this is a COARSE custody cap — it meters the vault's own
-        // asset() balance delta, so capital deployed INTO an allowlisted
-        // adapter counts as outflow the same as an extraction (conservative
-        // over-count). What the meter GUARANTEES holds only TOGETHER with the
-        // guard above (`_guardBatchCalls`): the meter bounds the asset() a
-        // single batch moves out of custody to maxCapital, and the guard
-        // closes the balance-invisible exfiltration routes — both the
-        // callee-gate's class closure (any target that is neither asset() nor
-        // TierRegistry-allowlisted is refused outright, issue #166) and the
-        // retained selector checks beneath it (approve/transfer of an
-        // allowlisted ERC20 to a non-allowlisted address). Exotic-asset
-        // contracts — ERC721/ERC1155/LP-position NFTs — are refused as
-        // callees by default under the callee gate; the residual is narrower
-        // than before: only an unenumerated selector on `asset()` itself, or
-        // on a token/adapter explicitly allowlisted via `setAdapterAllowed`,
-        // is not selector-examined (see `_guardBatchCalls` RESIDUAL). The
-        // precise extractable bound is the tier system's per-call coverage
-        // (requiredCoverage).
+        // trivially; the governor passes the proposal's maxCapital on execute,
+        // settlement and emergency paths, and honest unwinds are net-inflow, so
+        // the finite cap never binds them.
         //
-        // There are now TWO layers (issue #43, design.md D4), from finest to
-        // coarsest:
-        //   1. `BatchExecutorLib.executeBatch`'s per-call meter (this
-        //      delegatecall, above): each call's gross outflow vs. its
-        //      proposer-declared `caps[i]`, `CallCapExceeded` on breach. This
-        //      is the tier system's precise extractable bound
-        //      (`requiredCoverage = Σ cap_i * boundBps_i / 10_000`).
-        //   2. This function's `netOutflow` check (below): a batch-wide
-        //      backstop against `maxCapital`. When caps are supplied and
-        //      cover every moving call, layer 1 is strictly tighter
-        //      (`netOutflow <= Σ outflow_i <= Σ caps_i <= maxCapital`), so
-        //      layer 2 structurally cannot fire first — it only binds when
-        //      caps are empty (the emergency-rescue escape valve) or when a
-        //      batch's declared caps happen to sum right up to maxCapital.
+        // This is a COARSE custody cap — it meters the vault's own `asset()`
+        // balance delta, so capital deployed INTO an allowlisted adapter counts as
+        // outflow the same as an extraction. What it GUARANTEES holds only
+        // TOGETHER with `_guardBatchCalls`: the meter bounds the `asset()` a
+        // single batch moves out of custody, and the guard closes the
+        // balance-invisible exfiltration routes — the callee gate (any target that
+        // is neither `asset()` nor allowlisted is refused) plus the retained
+        // selector checks beneath it. The precise extractable bound is the tier
+        // system's per-call coverage.
+        //
+        // TWO LAYERS, finest to coarsest:
+        //   1. `BatchExecutorLib.executeBatch`'s per-call meter: each call's gross
+        //      outflow against its proposer-declared `caps[i]`.
+        //   2. This function's `netOutflow` check: a batch-wide backstop against
+        //      `maxCapital`. When caps cover every moving call, layer 1 is
+        //      strictly tighter, so layer 2 only binds when caps are empty (the
+        //      emergency-rescue escape valve) or sum right up to `maxCapital`.
         uint256 netOutflow = balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;
         if (netOutflow > maxNetOutflow) revert MaxNetOutflowExceeded(netOutflow, maxNetOutflow);
         uint256 reserve = reservedQueueAssets();
@@ -607,16 +548,13 @@ contract SyndicateVault is
         return _isPrivilegedBatchTarget(target);
     }
 
-    /// @notice Re-point the shared `BatchExecutorLib` and re-stamp its
-    ///         expected codehash, atomically. The migration primitive for the
-    ///         deploy-once-and-share library (issue #43, design.md D5):
-    ///         reached only through the factory's lifecycle-gated
-    ///         `pushExecutor`, never called directly by anyone else.
-    /// @dev Factory-only. Rejects zero and codeless targets — a swapped-in
-    ///      address with no code would pass every future `codehash` check
-    ///      vacuously (an EOA's codehash is the empty-code hash, and the very
-    ///      next delegatecall would just no-op against it), silently
-    ///      disabling batch execution instead of failing loudly here.
+    /// @notice Re-point the shared `BatchExecutorLib` and re-stamp its expected
+    ///         codehash, atomically. Reached only through the factory's
+    ///         lifecycle-gated `pushExecutor`.
+    /// @dev Factory-only. Rejects zero and codeless targets — a swapped-in address
+    ///      with no code would pass every future `codehash` check vacuously and
+    ///      the next delegatecall would no-op against it, silently disabling batch
+    ///      execution instead of failing loudly here.
     function setExecutorImpl(address newImpl) external {
         if (msg.sender != _factory) revert NotFactory();
         if (newImpl == address(0) || newImpl.code.length == 0) revert InvalidExecutorImpl();
@@ -627,303 +565,146 @@ contract SyndicateVault is
     }
 
     /// @dev Two-part batch gate: a privileged-TARGET denylist (Part 1, always
-    ///      runs), then the value-moving-SELECTOR allowlist (Part 2, registry-
-    ///      dependent). The two are independent — do not collapse them, and do
-    ///      not move Part 1 below Part 2's registry lookup. See the block
-    ///      comments in the body for the adversary each part answers.
+    ///      runs), then the value-moving-SELECTOR allowlist (Part 2,
+    ///      registry-dependent). The two are independent — do not collapse them,
+    ///      and do not move Part 1 below Part 2's registry lookup.
     ///
-    ///      ── PART 1: privileged-target denylist ──
-    ///
-    ///      WHY TARGETS TOO: selector-guarding is not enough, because this
-    ///      adversary needs no value-moving selector at all. The batch runs via
-    ///      delegatecall, so every sub-call reaches its target carrying
-    ///      msg.sender == vault — exactly what the withdrawal queue's
+    ///      PART 1: PRIVILEGED-TARGET DENYLIST. Selector-guarding is not enough,
+    ///      because this adversary needs no value-moving selector at all. The
+    ///      batch runs via delegatecall, so every sub-call reaches its target
+    ///      carrying `msg.sender == vault` — exactly what the withdrawal queue's
     ///      `onlyVault` gate checks. `queue.queueRedeem(attacker, victimShares,
     ///      pid)` therefore clears that gate and mints the attacker a claim on
     ///      shares the queue already escrows for someone else, while every other
     ///      guard reads it as harmless: the queue's entrypoints move ZERO vault
-    ///      asset() in-tx (the value leaves later via `queue.claim`), so the
+    ///      `asset()` in-tx (the value leaves later via `queue.claim`), so the
     ///      net-outflow meter, the queue-reserve floor and the buffer floor all
-    ///      see nothing, and coverage prices an uncertified target at tier 2 —
-    ///      requiredCoverage == maxCapital, a price a 1-wei proposal buys.
-    ///      Blocked as a target CLASS rather than a selector list, so the next
-    ///      privileged queue function is covered by default.
+    ///      see nothing, and coverage prices an uncertified target at tier 2 — a
+    ///      price a 1-wei proposal buys. Blocked as a target CLASS rather than a
+    ///      selector list, so the next privileged queue function is covered by
+    ///      default. UNCONDITIONAL, above Part 2's registry staticcall and both of
+    ///      its degrade-open returns: a queue steal is not priced, it is theft.
+    ///      SCOPE is exactly two addresses — the vault and its bound queue — not a
+    ///      target allowlist; adapters' own `onlyVault` entrypoints stay open.
     ///
-    ///      UNCONDITIONAL: Part 1 runs above Part 2's registry staticcall and
-    ///      above BOTH of its degrade-open returns. That is deliberate and is
-    ///      the point of the fix: a queue steal is not priced, it is theft, so
-    ///      a registry-less governor must not be able to skip it.
-    ///
-    ///      SCOPE: exactly two addresses — the vault and its bound queue. NOT a
-    ///      target allowlist. Strategy adapters' own `onlyVault` entrypoints
-    ///      (`BaseStrategy.execute/settle`) are the LEGITIMATE batch surface
-    ///      and stay open, bounded by Part 2, the outflow meter and tier
-    ///      pricing as before.
-    ///
-    ///      ── PART 1b: transferFrom SOURCE guard (LP-ALLOWANCE CONFISCATION) ──
-    ///
-    ///      Same loop, same unconditional posture, different adversary: the
-    ///      batch runs via delegatecall, so every sub-call carries
-    ///      msg.sender == vault. `asset.transferFrom(victim, vault, victimBal)`
-    ///      therefore spends `allowance[victim][vault]` — the very allowance
-    ///      every LP grants to deposit, which UIs routinely set to
-    ///      type(uint256).max. Every other meter is blind to it: net-outflow
-    ///      reads 0 because the vault's OWN balance rises (this reads as an
-    ///      inflow, not an exfiltration); coverage prices an uncertified
-    ///      target at tier 2 against the vault's own maxCapital, never a third
-    ///      party's wallet; and Part 2's `to == vault → continue` exemption
-    ///      (below) passes it outright as legitimate. `from` (calldata bytes
-    ///      4..36) is decoded here and MUST equal the vault itself — this is
-    ///      unconditional (runs above the registry lookup) for the identical
-    ///      reason Part 1's target denylist is: confiscating a third party's
-    ///      allowance is not a priced capability, so a registry-less governor
-    ///      must not be able to skip it either.
+    ///      PART 1b: transferFrom SOURCE GUARD (LP-ALLOWANCE CONFISCATION). Same
+    ///      loop, same unconditional posture, different adversary:
+    ///      `asset.transferFrom(victim, vault, victimBal)` spends
+    ///      `allowance[victim][vault]` — the very allowance every LP grants to
+    ///      deposit, which UIs routinely set to `type(uint256).max`. Every other
+    ///      meter is blind: net-outflow reads 0 because the vault's OWN balance
+    ///      rises, coverage prices the target against the vault's own maxCapital
+    ///      rather than a third party's wallet, and Part 2's
+    ///      `to == vault -> continue` exemption passes it outright. `from`
+    ///      (calldata bytes 4:36) is decoded here and MUST equal the vault itself.
     ///
     ///      `isAdapterAllowed` is DELIBERATELY NOT CONSULTED as a source
-    ///      allowlist. It encodes destination consent — "may *receive*
-    ///      approvals/transfers of vault funds" (see `TierRegistry`) — not
-    ///      "this address's allowances to the vault may be spent by a batch".
-    ///      No honest batch pulls FROM a non-vault address: capital deploys
-    ///      via `approve(adapter)` + the adapter pulling in its own code
-    ///      (`BaseStrategy._pullFromVault`, swap adapters' own
-    ///      `safeTransferFrom(msg.sender, ...)` — never batch calldata), and
-    ///      returns are pushes (`_pushToVault` / `withdrawTo` / `_settle`); no
-    ///      adapter grants the vault an allowance. `from == address(this)`
-    ///      stays permitted — `transferFrom(vault, x, amt)` is semantically
-    ///      `transfer(x, amt)`, spends only `allowance[vault][vault]` (which
-    ///      only a batch's own guarded self-approve can create), and `x`
-    ///      remains destination-guarded by Part 2 below.
+    ///      allowlist: it encodes DESTINATION consent, not permission to spend an
+    ///      address's allowances to the vault. No honest batch pulls FROM a
+    ///      non-vault address — capital deploys via `approve(adapter)` plus the
+    ///      adapter pulling in its own code, and returns are pushes.
+    ///      `from == address(this)` stays permitted: it is semantically
+    ///      `transfer(x, amt)`, and `x` remains destination-guarded by Part 2.
     ///
-    ///      ── ALTERNATE-SIGNATURE ALLOWANCE ROUTERS (Permit2, DSToken) ──
+    ///      PART 2a: THE CALLEE GATE (outer boundary). Runs on every call, before
+    ///      any selector is examined, and refuses any callee that is neither
+    ///      `asset()` nor TierRegistry-allowlisted — closing the
+    ///      unenumerable-selector class that repeated rounds of selector
+    ///      enumeration kept failing to cover.
     ///
-    ///      A post-merge audit of this PR (issue #115, PR #157 review round)
-    ///      found that Part 1b's `from`-decode and Part 2's destination-decode
-    ///      below both matched ONLY the four legacy-ERC20 selectors, so any
-    ///      allowance-delegation router using a different selector for the
-    ///      identical capability sailed through unguarded — chiefly Uniswap's
-    ///      Permit2 `AllowanceTransfer.transferFrom`/`.approve` (deployed at
-    ///      the same address on nearly every EVM chain; enormous numbers of
-    ///      standing LP allowances live there) and DSToken-lineage
-    ///      `pull`/`move`. Both reproduce this PR's own confiscation bug and
-    ///      the pre-existing poison-then-drain bug, just routed through a
-    ///      different target. Fixed by extending the guarded-selector set
-    ///      (`_SEL_PERMIT2_TRANSFER_FROM`, `_SEL_PERMIT2_APPROVE`,
-    ///      `_SEL_DSTOKEN_PULL`, `_SEL_DSTOKEN_MOVE` — selectors verified via
-    ///      `cast sig`, see the PR #157 audit comment) — chosen at the time as
-    ///      "Option A" (whack-a-mole, extend the selector list) over the
-    ///      audit's "Option B" (gate every batch call by TARGET regardless of
-    ///      selector). Option B was deferred rather than attempted in that PR
-    ///      because it would have required every non-value-moving adapter call
-    ///      already relying on the documented tier-2/full-notional pricing
-    ///      default (see RESIDUAL below and `SyndicateGovernor`'s
-    ///      `tierOf`-based coverage sizing) to ALSO carry an explicit
-    ///      TierRegistry `isAdapterAllowed` entry merely to remain callable —
-    ///      a larger, deliberate redesign tracked as required follow-up rather
-    ///      than silently dropped (PR #157 description). **That follow-up is
-    ///      what PART 2a below now is** (issue #166, landed): every batch
-    ///      callee — not just the ones carrying a recognized selector — must
-    ///      be `asset()` or TierRegistry-allowlisted. The selector list here
-    ///      and below did NOT become redundant: it is retained as the INNER
-    ///      boundary over the now-finite set of allowlisted callees (an
-    ///      allowlisted token still needs its `approve`/`transferFrom`
-    ///      recipient checked — the callee gate alone would pass
-    ///      `token.approve(attacker, max)` on an allowlisted token). Each
-    ///      selector below decodes with the
-    ///      SAME calldata layout as its legacy counterpart it stands in for —
-    ///      Permit2 `transferFrom(from,to,uint160,token)` and DSToken
-    ///      `move(src,dst,wad)` place source/destination at the identical
-    ///      offsets (bytes 4:36 / 36:68) as legacy `transferFrom`; DSToken
-    ///      `pull(usr,wad)` always pulls TO msg.sender (the vault under
-    ///      delegatecall), so only its source (bytes 4:36) needs checking,
-    ///      exactly like `from == address(this)` above; Permit2
-    ///      `approve(token,spender,uint160,uint48)` carries an extra leading
-    ///      `token` arg, shifting the guarded `spender` to arg 1 (bytes
-    ///      36:68) instead of arg 0 — handled explicitly in Part 2's decode
-    ///      below, NOT folded into the arg-0 branch.
+    ///      PART 2b: VALUE-MOVING-SELECTOR ALLOWLIST (inner boundary). The
+    ///      net-outflow meter only sees the vault's own `asset()` balance delta,
+    ///      so `token.approve(attacker, max)` meters zero while the attacker
+    ///      drains via `transferFrom` in a later tx. Gating the spender/recipient
+    ///      of the guarded selectors bounds ERC20 exfiltration over the
+    ///      now-finite set of allowlisted callees: for approve /
+    ///      increaseAllowance / transfer the guarded address is arg 1 (bytes
+    ///      4:36); for transferFrom (legacy and Permit2) and DSToken `move` it is
+    ///      `to`, arg 2 (bytes 36:68); for Permit2 `approve` it is `spender`, ALSO
+    ///      arg 2, since Permit2's extra leading `token` arg shifts it one slot
+    ///      right of legacy `approve`. The address must be the vault itself (with
+    ///      the `asset()` exception below) or a TierRegistry-allowlisted adapter.
+    ///      Runs on every governor batch, settlement included.
     ///
-    ///      ── PART 2: registry-gated checks, in order ──
+    ///      SELF-TRANSFER FAST-PATH SCOPED TO `asset()`: `recipient ==
+    ///      address(this) -> continue` would otherwise skip the registry check for
+    ///      ANY token whose destination decodes to the vault, not only the one
+    ///      token the outer balance-diff meter independently verifies — letting a
+    ///      non-standard token execute arbitrary logic under
+    ///      `transferFrom(vault, vault, amount)` with zero verification anywhere.
+    ///      The fast-path therefore additionally requires
+    ///      `calls[i].target == asset()`.
     ///
-    ///      Two concerns, both gated on the same registry resolution above:
-    ///      PART 2a (the callee gate, in the loop body below) is the OUTER
-    ///      boundary — it runs on every call, before any selector is even
-    ///      examined, and closes the unenumerable-selector class by refusing
-    ///      any callee that is neither `asset()` nor TierRegistry-allowlisted
-    ///      (issue #166). PART 2b (this selector-based allowlist, described
-    ///      next) is the INNER boundary — defense-in-depth on the now-finite
-    ///      set of allowlisted callees, since an allowlisted TOKEN can still
-    ///      be handed an attacker as `approve`'s spender or `transfer`'s
-    ///      recipient; only decoding the selector's argument catches that.
-    ///      Neither subsumes the other.
+    ///      RESIDUALS. (a) Exotic assets — ERC721 `setApprovalForAll`, ERC1155,
+    ///      LP-position NFTs — are refused as callees by default under PART 2a,
+    ///      closing the whole class including standards never enumerated here. If
+    ///      one is ever allowlisted anyway its non-ERC20 selectors pass this
+    ///      switch unexamined, so the operator invariant is: exotic-asset
+    ///      contracts MUST NOT be allowlisted as batch callees. (b) Coverage is
+    ///      PER-SELECTOR, NOT PER-ROUTER — do not read Permit2/DSToken/ERC1363 as
+    ///      guarded routers; only the enumerated selectors are, within the set of
+    ///      callees PART 2a admits. ERC-777 `operatorSend` and any other
+    ///      unenumerated router shape still pass unexamined on an allowlisted
+    ///      target. (c) Both parts trust calldata pattern-matching over verified
+    ///      balance movement for every token except `asset()`. (d) The
+    ///      self-transfer fast-path is structurally unreachable for
+    ///      Permit2-routed selectors, since a Permit2 call's target is the Permit2
+    ///      singleton — this fails CLOSED, so it is a possible over-restriction,
+    ///      not a fund-safety gap.
     ///
-    ///      ── PART 2b: value-moving-selector allowlist gate ──
-    ///
-    ///      WHY: the net-outflow meter above only sees the vault's own asset()
-    ///      balance delta. `token.approve(attacker, max)` moves no balance, so
-    ///      it meters zero while the attacker can drain via `transferFrom` in a
-    ///      later tx — for the vault asset and any other ERC20 the vault holds.
-    ///
-    ///      WHAT: the batch runs via delegatecall, so external targets see
-    ///      msg.sender == vault; a plain call to an arbitrary target cannot
-    ///      exfiltrate ERC20 funds unless the vault approves it or transfers to
-    ///      it. Gating the spender/recipient of the guarded value-moving
-    ///      selectors is a complete bound on ERC20 exfiltration on top of the
-    ///      callee gate above: for approve / increaseAllowance / transfer the
-    ///      guarded address is arg 1 (calldata bytes 4..36); for transferFrom
-    ///      (legacy and Permit2) and DSToken move it is `to`, arg 2 (bytes
-    ///      36..68); for Permit2 approve it is `spender`, ALSO arg 2 (bytes
-    ///      36..68 — Permit2's extra leading `token` arg shifts it one slot
-    ///      right of legacy `approve`, see the selector-family note above) —
-    ///      pulling INTO the vault (to == vault) is an inflow and passes ONLY
-    ///      when the moved token is `asset()` (see the self-transfer
-    ///      fast-path note below). (`from`/`src`/`usr`, where present, is
-    ///      guarded unconditionally in PART 1b above and is not re-checked
-    ///      here.) The address must be the vault itself (with the asset()
-    ///      exception) or an adapter allowlisted in the TierRegistry (resolved
-    ///      through the calling governor). Runs on every governor batch —
-    ///      execute, settlement, and both emergency paths — since settlement
-    ///      calls are arbitrary, pre-committed calldata too.
-    ///
-    ///      SELF-TRANSFER FAST-PATH SCOPED TO asset(): a second post-merge
-    ///      audit finding (issue #115, PR #157 review round) noted that
-    ///      `recipient == address(this) → continue` skipped the registry
-    ///      check for ANY token whose destination decodes to the vault, not
-    ///      only `asset()` — the one token the outer `netOutflow` meter in
-    ///      `executeGovernorBatch` independently verifies via a balance diff.
-    ///      A non-standard token the vault holds as a strategy position could
-    ///      execute arbitrary logic under e.g. `transferFrom(vault, vault,
-    ///      amount)` with zero verification anywhere in the pipeline. Fixed
-    ///      by additionally requiring `calls[i].target == asset()` for the
-    ///      fast-path to fire; every other token's vault-destined call now
-    ///      routes through the same TierRegistry check as any other
-    ///      destination (recipient == vault will simply need `vault` itself
-    ///      allowlisted for that token, which is not the accepted default —
-    ///      intentionally, since no honest batch has a reason to route a
-    ///      non-asset() token back to the vault via a guarded selector).
-    ///
-    ///      RESIDUAL (pre-#166, now closed by default): exotic assets — ERC721
-    ///      `setApprovalForAll` (0xa22cb465) / `approve`, ERC1155, and
-    ///      LP-position NFTs — used to be unguarded, relying on tier-2
-    ///      full-notional pricing. The PART 2a callee gate now refuses ANY
-    ///      such contract as a batch target by default (it is neither
-    ///      `asset()` nor TierRegistry-allowlisted), closing the whole class
-    ///      including standards never enumerated below (ERC-6909, future
-    ///      ones) — see issue #18, subsumed by issue #166. The residual is
-    ///      narrower and now a GOVERNANCE-DISCIPLINE requirement rather than a
-    ///      mechanical gap: if an exotic-asset contract is ever allowlisted as
-    ///      a callee anyway, its non-ERC20 selectors pass this switch
-    ///      unexamined (reverting `MalformedCall` only where calldata is too
-    ///      short to fit an assumed offset, not because the shape was
-    ///      recognized). Operator invariant: exotic-asset contracts MUST NOT
-    ///      be allowlisted as batch callees; batches reach positions through
-    ///      allowlisted adapters instead (mirrors `TierRegistry`'s own
-    ///      certify-nothing-upgradeable discipline, src/TierRegistry.sol).
-    ///
-    ///      COVERAGE IS PER-SELECTOR, NOT PER-ROUTER — read this precisely.
-    ///      A THIRD post-merge audit round (issue #115, PR #157, round 3) found
-    ///      that round 2's selector list was itself incomplete: Permit2's own
-    ///      BATCH `transferFrom` overload, DSToken's `push`, and ERC1363's
-    ///      `transferFromAndCall`/`approveAndCall` were each missed even
-    ///      though Permit2 and DSToken were already "covered" routers — a
-    ///      100% miss rate matched to that round's hit rate. Round 3 added
-    ///      these four; do NOT read "Permit2/DSToken/ERC1363 are guarded" as
-    ///      "every function on Permit2/DSToken/ERC1363 is guarded" — only the
-    ///      selectors enumerated above are, WITHIN the set of callees the
-    ///      PART 2a callee gate lets through. That round's own recommended
-    ///      durable fix — gate every batch call by TARGET regardless of
-    ///      selector — is issue #166's Option B, landed as PART 2a above; this
-    ///      selector switch is retained beneath it as the inner boundary (see
-    ///      the "PART 2: registry-gated checks, in order" note above for why
-    ///      neither layer subsumes the other). Also residual: (a) ERC-777
-    ///      `operatorSend` and any other allowance-delegation router not yet
-    ///      enumerated here still pass PART 2a's callee gate unexamined by
-    ///      this switch if their target is allowlisted — an open-ended list by
-    ///      construction, same argument as before, now bounded to allowlisted
-    ///      callees only; (b) both parts still trust calldata pattern-matching
-    ///      over verified balance movement for every token except asset() — a
-    ///      non-conforming token's `transferFrom` is free to ignore the
-    ///      calldata `from`/`to` fields for its real accounting; only
-    ///      `asset()` calls are backed by the outer balance-diff meter; (c)
-    ///      the self-transfer fast-path (`recipient == address(this) &&
-    ///      target == asset_`) is structurally unreachable for every
-    ///      Permit2-routed selector, since a Permit2 call's `target` is always
-    ///      the Permit2 singleton, never the token itself — this fails CLOSED
-    ///      (forces the full registry check, likely reverting a hypothetical
-    ///      legitimate Permit2-routed self-transfer of `asset()`) rather than
-    ///      open, so it is a possible over-restriction, not a fund-safety gap;
-    ///      no current flow is known to need that path.
-    ///
-    ///      UNSET REGISTRY: if the governor has no tier registry wired (or
-    ///      predates the getter), PART 2 cannot run and that half is skipped by
-    ///      design — the default is tier-2 / full-notional pricing anyway, and
-    ///      hard-reverting would brick vaults deployed without a registry.
-    ///      PART 1 IS NOT AFFECTED: it needs no registry, sits above both early
-    ///      returns, and still rejects the vault and its queue. Pinned by
-    ///      `test_targetGate_bitesEvenWithNoTierRegistryWired` (unset registry)
-    ///      and `test_targetGate_bitesEvenWhenGovernorHasNoTierGetter` (missing
-    ///      getter) — one per degrade-open branch, so relocating Part 1 below
-    ///      either return fails a test instead of silently re-opening the hole.
+    ///      UNSET REGISTRY: with no tier registry wired (or a governor predating
+    ///      the getter), PART 2 cannot run and is skipped by design — the default
+    ///      is tier-2 / full-notional pricing anyway, and hard-reverting would
+    ///      brick registry-less vaults. PART 1 IS NOT AFFECTED: it needs no
+    ///      registry and sits above both early returns. Pinned by
+    ///      `test_targetGate_bitesEvenWithNoTierRegistryWired` and
+    ///      `test_targetGate_bitesEvenWhenGovernorHasNoTierGetter`, one per
+    ///      degrade-open branch, so relocating Part 1 below either return fails a
+    ///      test rather than silently re-opening the hole.
     function _guardBatchCalls(BatchExecutorLib.Call[] calldata calls) private view {
-        // ── PRIVILEGED-CALLEE GATE, ahead of everything else ──
+        // PRIVILEGED-CALLEE GATE, ahead of everything else.
         //
         // The batch runs under delegatecall, so every call carries
         // `msg.sender == vault`. For the QUEUE that is decisive: its `onlyVault`
         // gate is satisfied by a batch that merely names it as a target.
         //
         // For the VAULT the reason is different, and worth stating precisely so
-        // nobody re-permits it on a wrong premise. `msg.sender == vault` does
-        // NOT open this contract's self-gated functions: `settleRedeem` /
-        // `settleDeposit` require `msg.sender == _withdrawalQueue`, which the
-        // vault is not, and it satisfies neither `onlyOwner`, `onlyGovernor` nor
-        // the factory gate. The exposure is the PERMISSIONLESS surface instead —
-        // chiefly `requestDeposit`, which anyone may call: a batch naming the
-        // vault can escrow the vault's own float into the queue while directing
-        // the resulting deposit claim to an attacker (it self-approves first,
-        // which Part 2 permits, since `recipient == address(this)` is treated as
-        // an inflow). That one IS metered — the float genuinely leaves, so the
-        // net-outflow ceiling bounds it to maxCapital — which is why blocking
-        // the vault is defense-in-depth rather than a second live hole. It
-        // removes the standing dependency on "no permissionless entrypoint ever
-        // becomes dangerous to call as ourselves".
+        // nobody re-permits it on a wrong premise. `msg.sender == vault` does NOT
+        // open this contract's self-gated functions — `settleRedeem`/
+        // `settleDeposit` require the queue, and it satisfies neither `onlyOwner`,
+        // `onlyGovernor` nor the factory gate. The exposure is the PERMISSIONLESS
+        // surface instead, chiefly `requestDeposit`: a batch naming the vault can
+        // escrow the vault's own float into the queue while directing the
+        // resulting deposit claim to an attacker. That one IS metered — the float
+        // genuinely leaves — so blocking the vault is defense-in-depth rather than
+        // a second live hole; it removes the standing dependency on no
+        // permissionless entrypoint ever becoming dangerous to call as ourselves.
         //
-        // No other meter catches it. `queue.queueRedeem(attacker, victimShares,
-        // pid)` mints a redeem claim against shares another owner escrowed
-        // while moving ZERO `asset()`: `netOutflow == 0` clears any
-        // `maxNetOutflow`, the reserve and buffer checks compare balances that
-        // never moved, and the selector is none of the four guarded below. The
-        // value leaves in a LATER transaction via `queue.claim`, which nothing
-        // meters. Coverage does not price it either — an uncertified target is
-        // tier 2, so `maxCapital = 1 wei` asks for ~$0.000002 of coverage, and
-        // any single approver clears that.
+        // No other meter catches the queue case. `queue.queueRedeem(attacker,
+        // victimShares, pid)` mints a redeem claim against shares another owner
+        // escrowed while moving ZERO `asset()`, the value leaves in a LATER
+        // transaction via `queue.claim` which nothing meters, and coverage prices
+        // an uncertified target at tier 2 — a 1-wei proposal any single approver
+        // clears.
         //
         // BEFORE THE REGISTRY LOOKUP, DELIBERATELY. The selector guard below
-        // returns early for a governor with no `tierRegistry()` getter or an
-        // unset registry, and being unguarded there is a documented, accepted
-        // default. This check must not inherit that exemption: it is not
-        // pricing a call, it is refusing a capability, and a vault deployed
-        // without a registry needs it most.
+        // returns early for a governor with no registry, and that exemption is a
+        // documented default for PRICING a call — not for refusing a capability.
         //
-        // A TARGET CLASS, NOT A SELECTOR LIST. Enumerating today's reachable
-        // privileged functions would leave the next one added unprotected, and
-        // nothing a batch legitimately does names these two addresses as a
-        // target. `stampSettlement` shows why breadth matters — it is one-shot
-        // per pid, so one batch can pre-burn the settlement slot of proposals
-        // that have not happened yet and make `onProposalSettled` revert
-        // forever.
+        // A TARGET CLASS, NOT A SELECTOR LIST: enumerating today's privileged
+        // functions would leave the next one unprotected, and nothing a batch
+        // legitimately does names these two addresses. `stampSettlement` shows why
+        // breadth matters — it is one-shot per pid, so one batch can pre-burn the
+        // settlement slot of proposals that have not happened yet.
         for (uint256 i = 0; i < calls.length; i++) {
             address target = calls[i].target;
             if (_isPrivilegedBatchTarget(target)) {
                 revert DisallowedBatchTarget(target);
             }
-            // `transferFrom` SOURCE guard — also unconditional, same pass, same
-            // rationale as the target denylist above. See the dedicated block
-            // comment further up (search "LP-ALLOWANCE CONFISCATION") for the
-            // adversary and why `isAdapterAllowed` must NOT be consulted here.
-            // Covers legacy `transferFrom` AND every alternate-signature
-            // "pull tokens via delegated allowance" selector this guard
-            // recognizes (Permit2 `AllowanceTransfer.transferFrom`, DSToken
-            // `pull`/`move`) — see the "ALTERNATE-SIGNATURE ALLOWANCE
-            // ROUTERS" note above. All four place the debited source address
-            // at the same offset (calldata bytes 4:36).
+            // `transferFrom` SOURCE guard — unconditional, same pass, same
+            // rationale as the target denylist. Covers legacy `transferFrom` AND
+            // every alternate-signature pull-via-delegated-allowance selector this
+            // guard recognizes; all place the debited source at bytes 4:36.
             bytes calldata data = calls[i].data;
             if (data.length >= 4) {
                 bytes4 sel = bytes4(data[0:4]);
@@ -936,13 +717,10 @@ contract SyndicateVault is
                     address from = address(uint160(uint256(bytes32(data[4:36]))));
                     if (from != address(this)) revert DisallowedTransferFromSource(target, from);
                 } else if (sel == _SEL_PERMIT2_BATCH_TRANSFER_FROM) {
-                    // Dynamic array, not a fixed-offset slice: decode every
-                    // element and require each one's `from` to be the vault,
-                    // same rule as the fixed-arg selectors above, applied
-                    // per-element instead of once. `abi.decode` always
-                    // returns memory for dynamic types regardless of the
-                    // input's location, so `details` is a memory copy — fine
-                    // here since it is only read, never re-encoded onward.
+                    // Dynamic array, not a fixed-offset slice: decode every element
+                    // and require each one's `from` to be the vault, per-element
+                    // instead of once. `abi.decode` always returns memory for
+                    // dynamic types, which is fine here since it is only read.
                     if (data.length < 36) revert MalformedCall();
                     _Permit2BatchDetail[] memory details = abi.decode(data[4:], (_Permit2BatchDetail[]));
                     for (uint256 j = 0; j < details.length; j++) {
@@ -1043,39 +821,25 @@ contract SyndicateVault is
             } else {
                 // UNRECOGNIZED SELECTOR ON THE ONE EXEMPT TARGET.
                 //
-                // PART 2a above lets `asset()` through without an allowlist
-                // check, on the stated premise that the outer `netOutflow`
-                // meter "independently verifies" it via a balance diff. A
-                // balance diff sees VALUE MOVEMENT. It does not see an
-                // AUTHORIZATION grant: ERC-777 `authorizeOperator(address)`
-                // (0x959b8c3f) — and any allowance-delegation shape not
-                // enumerated in the switch above — moves zero balance in-batch
-                // and licenses an unbounded pull in a LATER transaction, after
-                // every meter in this call has already passed.
-                //
-                // Nothing downstream catches it either: declared at cap 0, the
-                // tier scan prices `requiredCoverage` at 0, so no guardian
-                // books coverage, `requireApproveQuorum` is never reached, no
-                // proposer bond is locked, and `ChallengeGame.file` reverts
-                // `NothingToFreeze` on the empty approver set — the proposal is
+                // PART 2a lets `asset()` through without an allowlist check, on
+                // the premise that the outer `netOutflow` meter independently
+                // verifies it via a balance diff. A balance diff sees VALUE
+                // MOVEMENT; it does not see an AUTHORIZATION grant. ERC-777
+                // `authorizeOperator` — and any allowance-delegation shape not
+                // enumerated above — moves zero balance in-batch and licenses an
+                // unbounded pull in a LATER transaction, after every meter here
+                // has passed. Nothing downstream catches it either: declared at
+                // cap 0, `requiredCoverage` prices to 0, so no guardian books
+                // coverage, no proposer bond is locked, and `ChallengeGame.file`
+                // reverts on the empty approver set — the proposal is
                 // unchallengeable.
                 //
                 // Scoped deliberately to `asset()`: every other target already
-                // had to clear PART 2a's allowlist, and the terminal `continue`
-                // is load-bearing for them (ordinary batch calls — a strategy's
-                // `execute()`, an adapter's `swap()` — carry selectors this
-                // switch does not and should not enumerate). Turning PART 2b
-                // into a wholesale allowlist would reject those. Only the
-                // exempt target needs the stricter rule, precisely because only
-                // it skipped the outer gate.
-                //
-                // The standard ERC-20 READS are carved out: they are a closed,
-                // enumerable set, they grant nothing, and batches legitimately
-                // call them on `asset()` (a strategy reading `balanceOf` or
-                // `decimals` mid-batch). Restricting the rejection to
-                // everything else keeps it aimed at the actual hazard — a
-                // state-changing selector on the one target with no allowlist
-                // behind it.
+                // cleared PART 2a's allowlist, and the terminal `continue` is
+                // load-bearing for them, since ordinary batch calls carry
+                // selectors this switch should not enumerate. The standard ERC-20
+                // READS are carved out: a closed, enumerable set that grants
+                // nothing and that batches legitimately call on `asset()`.
                 if (target == asset_ && !_isBenignAssetRead(sel)) {
                     revert UnrecognizedAssetSelector(sel);
                 }
@@ -1095,14 +859,12 @@ contract SyndicateVault is
     }
 
     /// @dev The standard ERC-20 view selectors, which a governor batch may
-    ///      legitimately call on `asset()` and which cannot grant, move, or
-    ///      delegate anything. Enumerated as an explicit carve-out from the
-    ///      unrecognized-selector rejection above rather than left to the
-    ///      terminal `continue`, so the rejection stays pointed at
-    ///      state-changing selectors on the one target that skips PART 2a.
-    ///      Deliberately does NOT include `approve`/`transfer`/`transferFrom`
-    ///      or any of their siblings — those are handled by the branches above
-    ///      and gated on their spender/recipient.
+    ///      legitimately call on `asset()` and which cannot grant, move or
+    ///      delegate anything. An explicit carve-out from the
+    ///      unrecognized-selector rejection above, so that rejection stays pointed
+    ///      at state-changing selectors on the one target that skips PART 2a.
+    ///      Deliberately excludes `approve`/`transfer`/`transferFrom` and their
+    ///      siblings, which are gated on their spender/recipient above.
     function _isBenignAssetRead(bytes4 sel) private pure returns (bool) {
         return sel == 0x70a08231 // balanceOf(address)
             || sel == 0x313ce567 // decimals()
@@ -1124,17 +886,13 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev THE QUEUE RESERVE IS NOT SPENDABLE HERE (issue #92). This was the
-    ///      one asset-outflow path that checked only the raw balance, so a
-    ///      settlement fee — or a later `claimUnclaimedFees` — could spend float
-    ///      already frozen against stamped-unclaimed redeems, leaving the second
-    ///      claimant's `settleRedeem` to revert with no `cancel` available to it
-    ///      (`cancel` refuses a stamped pid).
-    ///
-    ///      REVERTING IS THE SAFE DIRECTION, not a lost fee: the governor's
-    ///      `_payFee` already treats a failure here as "escrow it instead", so
-    ///      the fee is deferred rather than dropped. Paying it out of a
-    ///      redeemer's reserved assets would not be.
+    /// @dev THE QUEUE RESERVE IS NOT SPENDABLE HERE. This was the one
+    ///      asset-outflow path that checked only the raw balance, so a settlement
+    ///      fee — or a later `claimUnclaimedFees` — could spend float already
+    ///      frozen against stamped-unclaimed redeems, leaving the second
+    ///      claimant's `settleRedeem` to revert with no `cancel` available to it.
+    ///      Reverting is the safe direction, not a lost fee: the governor's
+    ///      `_payFee` already treats a failure here as escrow-it-instead.
     function transferPerformanceFee(address asset_, address to, uint256 amount) external onlyGovernor {
         if (asset_ != asset()) revert InvalidAsset();
         if (to == address(0)) revert ZeroAddress();
@@ -1176,14 +934,11 @@ contract SyndicateVault is
 
     /// @dev Reads the active proposal's strategy through the governor's scalar
     ///      `strategyOf` getter. Returns `address(0)` when no proposal is active
-    ///      OR when the active proposal opted out (proposer passed `strategy=0`).
-    ///      Still wrapped in try/catch: a simple `address` return says nothing
-    ///      about EXISTENCE. The vault is a UUPS proxy and the governor is a
-    ///      BEACON proxy — they upgrade on independent paths, so a vault impl
-    ///      that calls `strategyOf` can go live before the governor beacon
-    ///      carries it, and the call then reverts with no data. Only consumer
-    ///      today is `activeStrategyAdapter()`, an off-chain-facing view — an
-    ///      uncaught revert here would brick that view rather than degrade it.
+    ///      OR when the active proposal opted out. Still wrapped in try/catch: an
+    ///      `address` return says nothing about EXISTENCE, and the vault (UUPS)
+    ///      and governor (beacon) upgrade on independent paths, so a vault impl
+    ///      calling `strategyOf` can go live before the governor beacon carries
+    ///      it. The only consumer is an off-chain-facing view.
     function _activeStrategy() internal view returns (address) {
         address gov = _getGovernor();
         if (gov == address(0)) return address(0);
@@ -1235,63 +990,43 @@ contract SyndicateVault is
     {
         super._update(from, to, value);
 
-        // HIGH-WATER MARK RESET ON FULL DRAIN (audit-181-2, Finding B).
+        // HIGH-WATER MARK RESET ON FULL DRAIN.
         //
-        // `_highWaterPricePerShare` is seeded once, at the first mint
-        // (`_initHighWaterMarkIfUnset`, called from every mint entrypoint —
-        // `_deposit` and `settleDeposit`, see both), and otherwise only ever
-        // advances (`ratchetHighWaterMark`, monotonic by construction). It was
-        // NEVER reset when `totalSupply()` returns to zero — every share
-        // burned via redemption/settlement — while the ERC-4626 share/asset
-        // SCALE is independently re-derived from `(residualAssets + 1)` on
-        // the very next deposit (the virtual-offset arithmetic in
-        // `_convertToShares`/`_convertToAssets`). The result: a re-seeding
-        // deposit's price-per-share can land at `(residualAssets+1)x` the
-        // STALE mark, and `aboveHighWaterMark` then reads almost the entire
-        // new principal as performance-fee base on a zero-P&L re-seed — up to
-        // the fee cap, charged against brand-new capital that never earned a
-        // cent. Reaching `totalSupply() == 0 && totalAssets() > 0` is not
-        // exotic: redeem-flooring dust, the queue's own deliberate
-        // `floor(sum) - sum(floor)` dust release, `_unclaimedFees` escrow, or
-        // a bare ERC20 donation to the vault all leave residual assets behind
-        // an empty share supply.
+        // `_highWaterPricePerShare` is seeded once, at the first mint, and
+        // otherwise only ever advances. It was NEVER reset when `totalSupply()`
+        // returns to zero, while the ERC-4626 share/asset SCALE is independently
+        // re-derived from `(residualAssets + 1)` on the very next deposit. The
+        // result: a re-seeding deposit's price-per-share can land at
+        // `(residualAssets + 1)x` the STALE mark, and `aboveHighWaterMark` then
+        // reads almost the entire new principal as performance-fee base on a
+        // zero-P&L re-seed — charged against brand-new capital that never earned a
+        // cent. Reaching `totalSupply() == 0 && totalAssets() > 0` is not exotic:
+        // redeem-flooring dust, the queue's deliberate dust release,
+        // `_unclaimedFees` escrow, or a bare ERC20 donation all leave residual
+        // assets behind an empty share supply.
         //
-        // Zeroing here, on EVERY burn/mint/transfer that empties supply
-        // (this hook is the single OZ chokepoint for all of them — Lane A
-        // `_withdraw`, the queue's `settleRedeem`, and any future burn path
-        // alike), makes the next mint's `_initHighWaterMarkIfUnset` treat the
-        // fund as freshly created, exactly like the very first deposit ever.
-        // A mint in the SAME call as the draining burn (impossible for a
-        // single ERC20 `_update`, which touches at most one balance
-        // direction pair) is not a concern; sequential burn-then-mint across
-        // two calls is exactly the case this closes.
+        // Zeroing here, on EVERY burn/mint/transfer that empties supply (this hook
+        // is the single OZ chokepoint for all of them), makes the next mint treat
+        // the fund as freshly created. A mint in the SAME call as the draining
+        // burn is impossible for a single ERC20 `_update`; sequential
+        // burn-then-mint across two calls is exactly the case this closes.
         if (totalSupply() == 0) {
             _highWaterPricePerShare = 0;
         }
 
         // AUTO-DELEGATE ON EVERY RECEIPT. Runs AFTER `super._update` so the
         // recipient's post-receipt balance is what checkpoints. Holders that
-        // explicitly delegated away keep their choice (`delegates(to) != 0`).
+        // explicitly delegated away keep their choice.
         //
-        // KEPT DELIBERATELY, ON A NEW JUSTIFICATION. This was introduced for
-        // The compensation escrow apportioned on
-        // `getPastVotes`, so an undelegated holder — a secondary buyer, or a
-        // queued exiter whose shares moved by plain transfer — was silently
-        // written out of victim compensation while still counted in its
-        // denominator. That consumer is gone; slash proceeds burn and nothing
-        // is apportioned against this vault at all.
-        //
-        // The behaviour stays because `getPastVotes == balance` is what makes
+        // The behaviour is kept because `getPastVotes == balance` is what makes
         // this vault's OWN governance readable: a holder who never calls
-        // `delegate` still carries weight, which is the property every
-        // snapshot-based read here assumes. Removing it would silently zero
-        // the voting weight of every non-delegating holder — a much larger
-        // change than deleting a dead dependency, and not this one's business.
+        // `delegate` still carries weight, which every snapshot-based read here
+        // assumes. Removing it would silently zero the voting weight of every
+        // non-delegating holder.
         //
-        // The heal is permissionless and needs no action from the holder: it
-        // also runs on a zero-value transfer (ERC20 permits `value == 0`), so
-        // anyone can arm a stranded undelegated holder by sending it 0 shares
-        // — a keeper can walk the holder set and heal all of it.
+        // The heal is permissionless and needs no action from the holder: it also
+        // runs on a zero-value transfer, so anyone can arm a stranded undelegated
+        // holder by sending it 0 shares.
         if (to != address(0) && delegates(to) == address(0)) {
             _delegate(to, to);
         }
@@ -1346,32 +1081,29 @@ contract SyndicateVault is
         if (!_openDeposits && !_approvedDepositors.contains(who)) revert NotApprovedDepositor();
     }
 
-    // ── nonReentrant guard on the deposit / mint path ──
+    /// @inheritdoc ERC4626Upgradeable
+    // The `nonReentrant` guard lives on the internal `_deposit` (both `deposit`
+    // and `mint` route through it), so the public entrypoints keep OZ's inherited
+    // bodies and we do not pay for two wrapper overrides (EIP-170 headroom).
+    // Defence-in-depth against cross-function reentrancy on the share-price path:
+    // a reentrant deposit during another mint could mint against a
+    // transiently-deflated NAV.
     //
-    // The guard lives on the internal `_deposit` (both `deposit` and `mint`
-    // route through it), so the public entry-points keep OZ's inherited bodies
-    // and we don't pay for two wrapper overrides (EIP-170 headroom). Defence-in-
-    // depth against cross-function reentrancy on the share-price path: a
-    // reentrant deposit during another mint could mint against a transiently-
-    // deflated NAV. The queue-side `claim` / `settleRedeem` take their own locks
-    // and `requestRedeem` is already guarded.
-    //
-    // The `withdraw` / `redeem` paths take no nonReentrant — not load-bearing.
-    // Withdraw transfers the vault asset OUT to the receiver (no asset in flight
-    // that could deflate NAV from the caller's view), the vault has no
-    // live-withdraw adapter callback, and any reentry into deposit / mint is
-    // still blocked by `_deposit`'s nonReentrant latch.
+    // The `withdraw`/`redeem` paths take no `nonReentrant` — not load-bearing.
+    // Withdraw transfers the asset OUT to the receiver, there is no live-withdraw
+    // adapter callback, and any reentry into deposit/mint is still blocked by
+    // `_deposit`'s latch.
 
     /// @inheritdoc ERC4626Upgradeable
-    /// @dev Idle float minus the queue reserve, floored at zero (issue #92).
-    ///      `stampSettlement` froze the reserved assets against a `num/den`
-    ///      that can no longer move, so they are owed in a fixed amount and are
-    ///      no longer part of what a residual share is a claim on.
+    /// @dev Idle float minus the queue reserve, floored at zero.
+    ///      `stampSettlement` froze the reserved assets against a `num/den` that
+    ///      can no longer move, so they are owed in a fixed amount and are no
+    ///      longer part of what a residual share is a claim on.
     ///
-    ///      NEVER ALONE. The matching shares must leave the pricing supply in
-    ///      the same breath — see `_pricingSupply`. Subtracting assets without
-    ///      their shares would understate the price as badly as double-counting
-    ///      them would overstate it.
+    ///      NEVER ALONE. The matching shares must leave the pricing supply in the
+    ///      same breath — see `_pricingSupply`. Subtracting assets without their
+    ///      shares would understate the price as badly as double-counting them
+    ///      would overstate it.
     function totalAssets() public view override returns (uint256) {
         uint256 gross = IERC20(asset()).balanceOf(address(this));
         uint256 owed = reservedQueueAssets();
@@ -1380,36 +1112,26 @@ contract SyndicateVault is
         return gross > owed ? gross - owed : 0;
     }
 
-    /// @dev The supply a price is actually taken against: circulating shares
-    ///      LESS the escrowed redeem shares whose settle price is already
-    ///      stamped. Those shares are still in `totalSupply()` — the vault burns
-    ///      them at `claim`, not at the stamp — but they are no longer a claim on
-    ///      the pool, so pricing must not divide by them.
+    /// @dev The supply a price is actually taken against: circulating shares LESS
+    ///      the escrowed redeem shares whose settle price is already stamped.
+    ///      Those shares are still in `totalSupply()` — the vault burns them at
+    ///      `claim`, not at the stamp — but they are no longer a claim on the pool.
     ///
-    ///      PAIRED WITH `totalAssets`, INSEPARABLY. Both legs of the same claim
-    ///      leave together, so a `claim` moves neither the price nor anyone
-    ///      else's position: `settleRedeem` removes `shares` from supply and
-    ///      `assets` from float at the same instant the queue's two counters
-    ///      drop by the same amounts.
-    ///
-    ///      PRE-STAMP ESCROW STAYS IN. A queued-but-unsettled redeem has no
-    ///      frozen price yet, so it still floats with the pool and still belongs
-    ///      in the denominator. That is why this reads
-    ///      `stampedUnclaimedShares()` rather than `pendingShares()`.
-    ///
+    ///      PAIRED WITH `totalAssets`, INSEPARABLY: both legs of the same claim
+    ///      leave together, so a `claim` moves neither the price nor anyone else's
+    ///      position. PRE-STAMP ESCROW STAYS IN — a queued-but-unsettled redeem
+    ///      has no frozen price yet and still floats with the pool, which is why
+    ///      this reads `stampedUnclaimedShares()` rather than `pendingShares()`.
     ///      FLOORED AT ZERO defensively; the counter is a subset of the balance
     ///      the queue holds, so the branch is unreachable today.
     ///
-    ///      Deliberately a low-level staticcall rather than a typed interface
-    ///      call: `VaultWithdrawalQueue` is not a proxy (plain constructor, no
-    ///      `initialize`, no upgradeability), so a queue deployed before this
-    ///      function existed can never gain the `stampedUnclaimedShares()`
-    ///      selector. A typed call would revert for that legacy pairing, and
-    ///      this sits on `_convertToShares`/`_convertToAssets`, so the revert
-    ///      would brick every deposit, withdraw, preview and fee calc. Missing
-    ///      selector degrades to 0 (today's pre-#92 blended pricing) instead —
-    ///      full remediation for an existing syndicate requires redeploying the
-    ///      vault/queue pair.
+    ///      Deliberately a low-level staticcall rather than a typed call:
+    ///      `VaultWithdrawalQueue` is not a proxy, so a queue deployed before this
+    ///      function existed can never gain the selector. A typed call would
+    ///      revert for that legacy pairing, and this sits on the conversion path,
+    ///      so the revert would brick every deposit, withdraw, preview and fee
+    ///      calc. A missing selector degrades to 0 instead; full remediation for
+    ///      an existing syndicate requires redeploying the vault/queue pair.
     function _pricingSupply() internal view returns (uint256) {
         address q = _withdrawalQueue;
         uint256 supply = totalSupply();
@@ -1534,14 +1256,11 @@ contract SyndicateVault is
     /// @inheritdoc ISyndicateVault
     /// @notice Burn-deferred redemption used while a strategy proposal is active.
     ///         Transfers `shares` from `owner_` into the queue and records a claim
-    ///         that anyone can settle once `redemptionsLocked() == false`. Standard
-    ///         `redeem`/`withdraw` should be used outside the lock window.
-    /// @dev `whenNotPaused` blocks queueing while the vault is paused (mirrors
-    ///      `_deposit` / `executeGovernorBatch`). LPs are not trapped — the
-    ///      queue's `cancel` path is unpaused and lets the owner withdraw
-    ///      escrowed shares back to themselves at any time.
+    ///         anyone can settle once `redemptionsLocked() == false`.
+    /// @dev `whenNotPaused` blocks queueing while the vault is paused. LPs are not
+    ///      trapped — the queue's `cancel` path is unpaused and returns escrowed
+    ///      shares to the owner at any time.
     /// @return requestId Always > 0 — the queue uses index 0 as a sentinel.
-    ///         Off-chain integrators may treat 0 as "no request".
     function requestRedeem(uint256 shares, address owner_)
         external
         nonReentrant
@@ -1556,15 +1275,13 @@ contract SyndicateVault is
             _spendAllowance(owner_, msg.sender, shares);
         }
         // Move shares into queue custody. `_update` auto-delegates the queue to
-        // itself, so custody shares keep checkpointed voting weight AT THE
-        // QUEUE. That weight used to be load-bearing — it was how the
-        // compensation escrow counted queued exiters at a pre-drain snapshot —
-        // and is now merely consistent: nothing is apportioned, and the queue
-        // never votes because it has no governance surface. For proposals already
-        // open at request time, the voter's checkpoint at `snapshotTimestamp` is
-        // frozen with the pre-transfer weight, so vote power is preserved for
-        // in-flight proposals. Queued shares forfeit voting power for any
-        // proposal opened after escrow. Shares are burned later by `claim`.
+        // itself, so custody shares keep checkpointed voting weight AT THE QUEUE —
+        // now merely consistent rather than load-bearing, since nothing is
+        // apportioned and the queue has no governance surface. For proposals
+        // already open at request time, the voter's checkpoint at
+        // `snapshotTimestamp` is frozen with the pre-transfer weight, so vote
+        // power is preserved for in-flight proposals; queued shares forfeit voting
+        // power for any proposal opened after escrow.
         uint256 pid = _activePid();
         _transfer(owner_, q, shares);
         requestId = IVaultWithdrawalQueue(q).queueRedeem(owner_, shares, pid);
@@ -1574,21 +1291,17 @@ contract SyndicateVault is
     /// @inheritdoc ISyndicateVault
     /// @notice Mint-deferred deposit used while a strategy proposal is active.
     ///         Escrows `assets` in the queue (off-vault, so they never inflate
-    ///         `totalAssets` nor are swept into the strategy) and records a claim
-    ///         that mints shares at the realized settle price once the proposal
-    ///         settles. Standard `deposit`/`mint` is used outside the lock window.
-    /// @dev Gated on `openProposalCount() != 0` — the SAME predicate the
-    ///      instant path (`_depositsLocked`) closes on — not `redemptionsLocked()`
-    ///      (`getActiveProposal() != 0`, true only from EXECUTE onward). Those
-    ///      two predicates diverge for the whole Pending/GuardianReview/Approved
-    ///      window: instant deposit is already closed there (`_depositsLocked`),
-    ///      but `redemptionsLocked()` was still false, so gating on it left NO
-    ///      path to deposit at all for that entire window (audit issue #181,
-    ///      finding #13). `openProposalCount()` covers exactly the window
-    ///      instant deposit is closed for, so exactly one path is always open —
-    ///      matching the redeem side, where `requestRedeem` / `maxWithdraw` /
-    ///      `maxRedeem` all already agree on `redemptionsLocked()`.
-    /// @return requestId Always > 0 (queue uses index 0 as a sentinel).
+    ///         `totalAssets` nor get swept into the strategy) and records a claim
+    ///         that mints shares at the realized settle price.
+    /// @dev Gated on `openProposalCount() != 0` — the SAME predicate the instant
+    ///      path closes on — not `redemptionsLocked()`, which is true only from
+    ///      EXECUTE onward. Those two diverge for the whole
+    ///      Pending/GuardianReview/Approved window: instant deposit is already
+    ///      closed there, so gating on `redemptionsLocked()` left NO path to
+    ///      deposit at all for that window. `openProposalCount()` covers exactly
+    ///      the window instant deposit is closed for, so exactly one path is
+    ///      always open.
+    /// @return requestId Always > 0 (the queue uses index 0 as a sentinel).
     function requestDeposit(uint256 assets, address receiver)
         external
         nonReentrant
@@ -1643,21 +1356,16 @@ contract SyndicateVault is
     /// @inheritdoc ISyndicateVault
     /// @notice Queue-only: mint `shares` to `to` at the proposal's frozen settle
     ///         price. The queue pushes the escrowed assets to the vault
-    ///         immediately before this call. Auto-delegates for voting power.
-    /// @dev No `nonReentrant`: the only STATE-MUTATING call here is the mint
-    ///      (+ delegate, in `_update`). `_initHighWaterMarkIfUnset` below reads
-    ///      `pricePerShare()`, which makes external STATICCALLs (`asset()`'s
-    ///      `balanceOf`, and the queue's own `stampedUnclaimedShares()` via
-    ///      `_pricingSupply`) — read-only, so none of them can reenter a
-    ///      state-mutating path — and the only caller, the queue's `claim`, is
-    ///      itself `nonReentrant`.
-    /// @dev Queue-originated deposits bypass `_deposit` entirely, so this is
-    ///      the ONLY other mint entrypoint and must seed the high-water mark
-    ///      itself, or a queue-only first mint (no vault ever seen a Lane A
-    ///      deposit) would settle its first performance fee against an unset
-    ///      (zero) mark — the same failure mode `_deposit` already guards
-    ///      against, and also the re-seed path for the 0 -> nonzero supply
-    ///      transition zeroed in `_update` (audit-181-2, Finding B).
+    ///         immediately before this call.
+    /// @dev No `nonReentrant`: the only state-mutating call here is the mint.
+    ///      `_initHighWaterMarkIfUnset` reads `pricePerShare()`, which makes only
+    ///      STATICCALLs, and the sole caller — the queue's `claim` — is itself
+    ///      `nonReentrant`.
+    /// @dev Queue-originated deposits bypass `_deposit` entirely, so this is the
+    ///      ONLY other mint entrypoint and must seed the high-water mark itself,
+    ///      or a queue-only first mint would settle its first performance fee
+    ///      against an unset mark. Also the re-seed path for the zero-to-nonzero
+    ///      supply transition zeroed in `_update`.
     function settleDeposit(uint256 shares, address to) external {
         if (msg.sender != _withdrawalQueue) revert NotQueue();
         _mint(to, shares);
@@ -1669,19 +1377,14 @@ contract SyndicateVault is
     ///         into the queue so every request tagged to it claims at one frozen
     ///         price. `num/den` carry the ERC-4626 virtual offsets so the queue
     ///         reproduces the vault's conversion rounding exactly.
-    /// @dev `den` MUST divide by `_pricingSupply()`, not raw `totalSupply()` —
-    ///      same rule every other conversion in this contract follows
-    ///      (`_convertToShares` / `_convertToAssets` / `aboveHighWaterMark`;
-    ///      issue #92). `num` (`totalAssets()`) already excludes assets reserved
-    ///      against prior stamped-but-unclaimed redeems; leaving their shares in
-    ///      a raw `totalSupply()` denominator deflated this stamp by the same
-    ///      shares-without-matching-assets gap `_pricingSupply()` exists to close.
+    /// @dev `den` MUST divide by `_pricingSupply()`, not raw `totalSupply()` — the
+    ///      same rule every other conversion here follows. `num` already excludes
+    ///      assets reserved against prior stamped-but-unclaimed redeems, so
+    ///      leaving their shares in a raw denominator deflates this stamp by the
+    ///      exact shares-without-matching-assets gap `_pricingSupply()` closes.
     ///      SAFE FOR THIS PROPOSAL'S OWN REDEEM SHARES BY ORDERING: below,
-    ///      `stampSettlement` increments the queue's `stampedUnclaimedShares()`
-    ///      counter for `proposalId` only AFTER it receives `num`/`den` from this
-    ///      call, so `_pricingSupply()` read here still excludes only PRIOR
-    ///      stamps and correctly leaves this settling proposal's own queued
-    ///      shares in the denominator.
+    ///      `stampSettlement` increments the queue's counter only AFTER receiving
+    ///      `num`/`den`, so the read here excludes only PRIOR stamps.
     function onProposalSettled(uint256 proposalId) external onlyGovernor {
         address q = _withdrawalQueue;
         if (q == address(0)) return;
@@ -1694,21 +1397,18 @@ contract SyndicateVault is
 
     /// @dev Close off the elapsed interval at the base that applied during it,
     ///      then restamp the base from live fund assets. Called on every
-    ///      mid-proposal event that can move the base — Lane A deposit and Lane
-    ///      A instant exit — and once more at settlement, via
-    ///      `consumeManagementAccrual`. Proposal execute opens the accrual
-    ///      rather than closing an interval, so it stamps the base directly
-    ///      through `startManagementAccrual`.
+    ///      mid-proposal event that can move the base and once more at settlement.
+    ///      Proposal execute opens the accrual rather than closing an interval, so
+    ///      it stamps the base directly through `startManagementAccrual`.
     ///
-    ///      Restamping from `totalAssets()` rather than applying a per-event
-    ///      delta is deliberate: the base is read from truth, so it stays
-    ///      correct for any caller regardless of whether that caller can
-    ///      express its own effect as an asset delta.
+    ///      Restamping from `totalAssets()` rather than applying a per-event delta
+    ///      is deliberate: the base is read from truth, so it stays correct for
+    ///      any caller regardless of whether that caller can express its own
+    ///      effect as an asset delta.
     ///
-    ///      The `_mgmtLastUpdate == 0` early return is load-bearing twice over:
-    ///      it is the "no live proposal, no fee" rule, and it keeps
-    ///      `totalAssets()` — an external call for live NAV — off the ordinary
-    ///      deposit path entirely.
+    ///      The `_mgmtLastUpdate == 0` early return is load-bearing twice: it is
+    ///      the no-live-proposal-no-fee rule, and it keeps `totalAssets()` off the
+    ///      ordinary deposit path entirely.
     function _accrueManagementFee() private {
         uint256 last = _mgmtLastUpdate;
         if (last == 0) return;
@@ -1720,19 +1420,14 @@ contract SyndicateVault is
         _stampMgmtBase();
     }
 
-    /// @dev Restamp the accrual base from live fund assets, falling back to
-    ///      idle float if the valuation is unavailable.
-    ///
-    ///      A fee accrual must never be the reason `executeProposal` or a
-    ///      settlement reverts, so the try/catch degrades the BASE rather than
-    ///      the transaction if `totalAssets()` ever reverts — the fund is
-    ///      valued at its raw float for that interval and the fee comes out
-    ///      conservative (too low), never inflated. Kept even though
-    ///      `totalAssets()` is currently a simple float-minus-reserve read
-    ///      that should not revert: this is the load-bearing backstop should
-    ///      that function ever grow an external dependency again. Routed
-    ///      through an external self-call because `try` cannot wrap an
-    ///      internal one.
+    /// @dev Restamp the accrual base from live fund assets, falling back to idle
+    ///      float if the valuation is unavailable. A fee accrual must never be the
+    ///      reason `executeProposal` or a settlement reverts, so the try/catch
+    ///      degrades the BASE rather than the transaction — the fund is valued at
+    ///      its raw float for that interval and the fee comes out conservative,
+    ///      never inflated. Kept as the backstop should `totalAssets()` ever grow
+    ///      an external dependency again. Routed through an external self-call
+    ///      because `try` cannot wrap an internal one.
     function _stampMgmtBase() private {
         uint256 base;
         try this.totalAssets() returns (uint256 a) {
@@ -1783,38 +1478,26 @@ contract SyndicateVault is
 
     // ==================== HIGH-WATER MARK ====================
 
-    /// @notice AT LEAST one whole share, in this vault's OWN decimals — never
-    ///         a smaller, arbitrary `1e18` (issue #97). Share decimals are
-    ///         `assetDecimals + _decimalsOffset()`, and this vault sets
-    ///         `_decimalsOffset()` to the asset's own decimals, so share
-    ///         decimals are `2 * assetDecimals`. A literal `1e18` is "one
-    ///         whole share" only at `assetDecimals == 9`; at 18 (WETH-like) it
-    ///         was `1e-18` of a share, and `convertToAssets` of that quantized
-    ///         to whole-integer steps of `pps` at 100% NAV moves —
-    ///         `aboveHighWaterMark` read a fund up 99% as sitting AT the mark,
-    ///         charging zero performance fee.
-    /// @dev    `max(1e18, 10 ** decimals())`, NOT bare `10 ** decimals()`. The
-    ///         obvious fix — always convert against exactly one share — is
-    ///         wrong for LOW-decimal assets: at `assetDecimals == 6` (USDC),
-    ///         `10 ** decimals() = 1e12`, a SMALLER unit than the `1e18` this
-    ///         vault always used. `convertToAssets` floors, and the absolute
-    ///         floor error in `pps` is bounded by <1 unit of THIS constant; a
-    ///         smaller unit means that same <1-unit error represents more real
-    ///         value once multiplied back out by `totalSupply()` in
-    ///         `aboveHighWaterMark`. Measured: a bare
-    ///         `10 ** decimals()` reintroduced ~$1 of drift on a $200,000 fee
-    ///         base for a 6-decimal asset (`test/fees/HighWaterMark.t.sol`),
-    ///         precision the OLD `1e18` constant never lost. The `max` floors
-    ///         at exactly `1e18` for every `assetDecimals <= 9` — which is
-    ///         every asset this protocol has ever tested against — so those
-    ///         vaults get the IDENTICAL constant, and identical numerics, they
-    ///         always had. Only `assetDecimals > 9`, where `1e18` genuinely
-    ///         stops being close to one real share, switches to the larger,
-    ///         decimals-scaled unit.
-    /// @dev    Computed, not cached: `decimals()` itself reads only cached
-    ///         immutable-like state (`_cachedDecimalsOffset` + the asset's own
-    ///         decimals, pinned at init), so this costs one `EXP` by a small
-    ///         constant and one comparison, not an external call.
+    /// @notice AT LEAST one whole share, in this vault's OWN decimals — never a
+    ///         smaller, arbitrary `1e18`. Share decimals are
+    ///         `2 * assetDecimals` here, so a literal `1e18` is one whole share
+    ///         only at `assetDecimals == 9`; at 18 it was `1e-18` of a share, and
+    ///         `convertToAssets` of that quantized to whole-integer steps of
+    ///         `pps`, so `aboveHighWaterMark` read a fund up 99% as sitting AT the
+    ///         mark and charged zero performance fee.
+    /// @dev    `max(1e18, 10 ** decimals())`, NOT bare `10 ** decimals()`. Always
+    ///         converting against exactly one share is wrong for LOW-decimal
+    ///         assets: at `assetDecimals == 6`, `10 ** decimals() = 1e12`, a
+    ///         SMALLER unit than `1e18`. `convertToAssets` floors, and the
+    ///         absolute floor error in `pps` is bounded by <1 unit of this
+    ///         constant, so a smaller unit means that same error represents more
+    ///         real value once multiplied back out by `totalSupply()` — measured
+    ///         at ~$1 of drift on a $200,000 fee base for a 6-decimal asset. The
+    ///         `max` floors at exactly `1e18` for every `assetDecimals <= 9`, so
+    ///         those vaults keep identical numerics; only `assetDecimals > 9`
+    ///         switches to the larger, decimals-scaled unit.
+    /// @dev    Computed, not cached: `decimals()` reads only pinned state, so this
+    ///         costs one `EXP` and one comparison, not an external call.
     function _pricePerShareUnit() private view returns (uint256) {
         uint256 wholeShare = 10 ** decimals();
         return wholeShare > 1e18 ? wholeShare : 1e18;
@@ -1849,12 +1532,12 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @notice Governor-only: advance the mark to the current (post-fee) price
-    ///         per share.
-    /// @dev Monotonic by construction — a loss leaves the mark where it was,
-    ///      which is what makes the recovery free. Called at settlement only;
-    ///      a partial exit must NOT ratchet, or the holders who stayed would
-    ///      start measuring from a peak the fund never actually banked.
+    /// @notice Governor-only: advance the mark to the current post-fee price per
+    ///         share.
+    /// @dev Monotonic by construction — a loss leaves the mark where it was, which
+    ///      is what makes the recovery free. Called at settlement only; a partial
+    ///      exit must NOT ratchet, or the holders who stayed would start measuring
+    ///      from a peak the fund never banked.
     function ratchetHighWaterMark() external onlyGovernor {
         uint256 pps = pricePerShare();
         if (pps > _highWaterPricePerShare) {

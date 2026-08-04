@@ -20,31 +20,24 @@ interface ILedgerFreezerMinimal {
 
 /**
  * @title ProposerBondEscrow
- * @notice Holds the risk-scaled proposer bond for the lifetime of a
- *         proposal. The proposer is the actual attacker in the threat
- *         model, so it posts capital scaled to what the proposal can
- *         extract.
+ * @notice Holds the risk-scaled proposer bond for the lifetime of a proposal.
+ *         The proposer is the actual attacker in the threat model, so it posts
+ *         capital scaled to what the proposal can extract.
  *
  *         TWO EXITS, AND ONLY TWO. `releaseBond` returns the bond to the
  *         proposer once the proposal reaches a terminal state (the governor
- *         gates WHEN — see `SyndicateGovernor.reclaimProposerBond`), and
- *         `forfeitBond` confiscates it when a challenge convicts the proposal.
- *         Neither is discretionary and this contract still has NO OWNER: the
- *         release payee is the address recorded at lock time, and the
- *         forfeiture destination is a compile-time constant. The invariant
+ *         gates WHEN), and `forfeitBond` confiscates it when a challenge
+ *         convicts. Neither is discretionary and this contract has NO OWNER: the
+ *         release payee is the address recorded at lock time, and the forfeiture
+ *         destination is a compile-time constant. The invariant
  *         `wood.balanceOf(this) >= sum of locked-unreleased bonds` holds by
- *         construction (equality absent direct transfers; surplus from
- *         donations is permanently stuck, accepted for v1a).
+ *         construction; surplus from direct donations is permanently stuck.
  *
  *         BOTH EXITS ARE REQUIRED TOGETHER. `releaseBond` alone would make a
- *         bond recoverable but never losable — a "deterrent" with no
- *         downside branch. Paired with `SyndicateGovernor`'s one-hour
- *         proposer self-settle, a proposer could execute a drain, settle its
- *         own strategy at +1h, reclaim the bond in full and be gone while the
- *         14-day challenge window was still in its first day. A confiscation
- *         function nothing can reach in time changes nothing, and a reclaim
- *         delay with nothing to confiscate at the end of it only
- *         inconveniences the honest.
+ *         bond recoverable but never losable. Paired with the governor's
+ *         one-hour proposer self-settle, a proposer could execute a drain,
+ *         settle its own strategy at +1h, reclaim the bond in full and be gone
+ *         while the challenge window was still in its first day.
  */
 contract ProposerBondEscrow is IProposerBondEscrow {
     using SafeERC20 for IERC20;
@@ -54,38 +47,28 @@ contract ProposerBondEscrow is IProposerBondEscrow {
         uint96 amount; // WOOD fits in uint96 (total supply << 2^96) — enforced by lockBond's AmountTooLarge guard, not assumed
     }
 
-    /// @dev Integration requirement: WOOD must be a standard ERC20 — no
-    ///      transfer fee, no rebasing, no hooks, AND NO BLOCKLIST.
-    ///      A fee-on-transfer token would make the escrow insolvent (recorded
-    ///      amounts exceed held balance). A blocklisting token is the quieter
-    ///      hazard: `releaseBond` pays the RECORDED proposer, so blocklisting
-    ///      that address strands the bond permanently — there is no alternate
-    ///      payee and no sweep. Informational while WOOD is in-house, and a
-    ///      hard requirement on any future bond token.
+    /// @dev Integration requirement: WOOD must be a standard ERC20 — no transfer
+    ///      fee, no rebasing, no hooks, AND NO BLOCKLIST. A fee-on-transfer token
+    ///      would make the escrow insolvent. A blocklisting token is the quieter
+    ///      hazard: `releaseBond` pays the RECORDED proposer, so blocklisting that
+    ///      address strands the bond permanently — there is no alternate payee and
+    ///      no sweep.
     IERC20 public immutable wood;
     IRegistryAuthMinimal public immutable registry;
 
-    /// @notice The singleton exposure ledger whose `coverageFreezer` this
-    ///         escrow accepts forfeitures from.
+    /// @notice The singleton exposure ledger whose `coverageFreezer` this escrow
+    ///         accepts forfeitures from.
     /// @dev    IMMUTABLE, AND THE LEDGER RATHER THAN THE GAME ITSELF. Pointing
-    ///         straight at `ChallengeGame` would be circular at deployment —
-    ///         the game must know which escrow holds a proposal's bond and the
-    ///         escrow must know which game may take it — and resolving that
-    ///         circularity is exactly what an owner-set pointer is usually for.
-    ///         This contract does not have an owner and should not grow one for
-    ///         this: an owner able to name the convictor is an owner able to
+    ///         straight at `ChallengeGame` would be circular at deployment, and
+    ///         resolving that circularity is what an owner-set pointer is usually
+    ///         for — but an owner able to name the convictor is an owner able to
     ///         name itself and destroy every open bond. The ledger breaks the
-    ///         cycle without one. It is deployed before both, it is the only
-    ///         contract that already treats the game as a privileged role, and
-    ///         rotating that role is guarded on its side (`setCoverageFreezer`
-    ///         refuses while anything is frozen), which is a
-    ///         stronger rotation guard than anything this escrow could impose.
-    /// @dev Typed `address`, not `ILedgerFreezerMinimal`, so the public
-    ///      getter satisfies `IProposerBondEscrow.exposureLedger() external
-    ///      view returns (address)` — the type a caller comparing it against
-    ///      another `address`-typed ledger reference (e.g. the governor's
-    ///      pinned `proposal.proposerBondLedger`) actually needs. Cast to
-    ///      `ILedgerFreezerMinimal` at the one call site that needs it.
+    ///         cycle without one: it deploys before both, it already treats the
+    ///         game as a privileged role, and rotating that role is guarded on its
+    ///         side more strongly than anything this escrow could impose.
+    /// @dev Typed `address`, not the narrow interface, so the public getter
+    ///      satisfies `IProposerBondEscrow.exposureLedger()` — the type a caller
+    ///      comparing it against another address-typed ledger reference needs.
     address public immutable exposureLedger;
 
     /// @dev Where a forfeited bond goes. Same sink and same constant as
@@ -94,14 +77,12 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     /// @notice Ceiling on the prosecutor's cut of a forfeited bond, in bps.
-    /// @dev    20%, mirroring the bound sWOOD puts on its own caller-named
-    ///         payout. It exists for the same reason: `forfeitBond`'s payee is
-    ///         chosen by the convictor, a replaceable role, so the escrow
-    ///         bounds how much of any ONE bond a compromised game could send to
-    ///         an address of its choosing. The remainder can only ever reach
-    ///         `BURN_ADDRESS`. This is the ONLY discretion in the contract —
-    ///         both exits are otherwise non-discretionary, and the payee is
-    ///         bounded rather than free.
+    /// @dev    Mirrors the bound sWOOD puts on its own caller-named payout, for
+    ///         the same reason: `forfeitBond`'s payee is chosen by the convictor,
+    ///         a replaceable role, so the escrow bounds how much of any ONE bond a
+    ///         compromised game could send to an address of its choosing. The
+    ///         remainder can only ever reach `BURN_ADDRESS`. This is the ONLY
+    ///         discretion in the contract.
     uint256 public constant MAX_PROSECUTOR_FEE_BPS = 2_000;
 
     mapping(bytes32 bondKey => Bond) internal _bonds;
@@ -123,15 +104,13 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     }
 
     /// @inheritdoc IProposerBondEscrow
-    /// @dev `proposer` COMES FROM THE CALLER, not from `msg.sender`.
-    ///      Any authorized governor can therefore lock a bond against any
-    ///      address that has approved this escrow — and agents hold standing
-    ///      approvals in normal operation. It is a lockup grief rather than
-    ///      theft: the bond is recorded to that address and returns to it on
-    ///      release or reclaim, so nothing can be redirected. Governors are
-    ///      factory-registered, so the caller set is not open — but a
-    ///      compromised or buggy governor can freeze a third party's WOOD for
-    ///      the life of a proposal it did not consent to.
+    /// @dev `proposer` COMES FROM THE CALLER, not from `msg.sender`. Any authorized
+    ///      governor can therefore lock a bond against any address that has
+    ///      approved this escrow, and agents hold standing approvals in normal
+    ///      operation. It is a lockup grief rather than theft — the bond is
+    ///      recorded to that address and returns to it — but a compromised or
+    ///      buggy governor can freeze a third party's WOOD for the life of a
+    ///      proposal it did not consent to.
     function lockBond(uint256 proposalId, address proposer, uint256 amount) external onlyGovernor {
         if (proposer == address(0)) revert ZeroAddress();
         if (amount > type(uint96).max) revert AmountTooLarge();
@@ -146,14 +125,13 @@ contract ProposerBondEscrow is IProposerBondEscrow {
 
     /// @inheritdoc IProposerBondEscrow
     /// @dev The governor's `reclaimProposerBond` resolves the proposal to a
-    ///      TERMINAL state before calling — the escrow does not re-derive
-    ///      lifecycle state. Deliberately NOT gated on the live registry
-    ///      check: the bond key binds to msg.sender, so only the governor
-    ///      that locked a bond can ever address it — a random caller computes
-    ///      key(caller, proposalId) and hits NoBond. Skipping the live check
-    ///      means a later-deauthorized governor can still release open bonds
-    ///      to the recorded proposer instead of stranding them forever.
-    ///      `lockBond` keeps onlyGovernor — that is where trust matters.
+    ///      TERMINAL state before calling; the escrow does not re-derive lifecycle
+    ///      state. Deliberately NOT gated on the live registry check: the bond key
+    ///      binds to `msg.sender`, so only the governor that locked a bond can
+    ///      address it, and skipping the live check means a later-deauthorized
+    ///      governor can still release open bonds to the recorded proposer instead
+    ///      of stranding them forever. `lockBond` keeps `onlyGovernor` — that is
+    ///      where trust matters.
     function releaseBond(uint256 proposalId) external {
         bytes32 key = _key(msg.sender, proposalId);
         Bond memory b = _bonds[key];
@@ -164,72 +142,42 @@ contract ProposerBondEscrow is IProposerBondEscrow {
     }
 
     /// @inheritdoc IProposerBondEscrow
-    /// @dev THE BOND'S DOWNSIDE BRANCH. Called from
-    ///      `ChallengeGame._settle`, the single point at which a proposal is
-    ///      convicted — by a guilty court ruling or by the silence verdict,
-    ///      which say the same thing about the proposal. Takes `governor`
-    ///      explicitly rather than deriving it from `msg.sender` the way
-    ///      `releaseBond` does: the convictor is the challenge game, not the
-    ///      governor that locked the bond, and the game already carries
-    ///      `(governor, proposalId)` on the challenge it is settling.
-    ///
-    /// @dev AUTHORIZATION — WHO. `msg.sender` must be the live
-    ///      `coverageFreezer` of the wired ledger, which is the challenge game
-    ///      and nothing else. The precedent is `StakedWood.slashVerdict`'s
-    ///      `authorizedSlasher`: one named contract, the one that reaches
-    ///      verdicts, may move somebody else's capital. The difference is where
-    ///      the name is kept — sWOOD keeps its own owner-set copy, this escrow
-    ///      borrows the ledger's, because a second copy of "who is the game"
-    ///      is a second thing to keep in step and an owner-set copy here would
-    ///      hand this contract the discretionary exit its whole design refuses.
-    ///
-    ///      FAILS CLOSED when the freezer is unset: `msg.sender` can never be
-    ///      `address(0)`, so an unwired protocol convicts nothing rather than
-    ///      letting anyone confiscate. That is the correct direction — an
-    ///      unreachable forfeiture leaves bonds releasable, while a
-    ///      permissive one destroys them.
-    ///
-    /// @dev DESTINATION — WHERE. Burned, less the prosecutor's fee. There is
-    ///      no compensation sink left to route to: `CompensationEscrow` was
-    ///      deleted when the slash became punitive rather than compensatory,
-    ///      so the choice is not burn-versus-compensate but burn-versus-payee.
-    ///
-    ///      Burning is independently defensible, by the same reasoning
-    ///      `forfeitBurnBps` sets out for the challenger bond, applied to a
-    ///      party that is by construction the attacker: EVERY REACHABLE PAYEE
-    ///      IS A ROUND TRIP.
-    ///        - The challenger, in FULL? Addresses are free. A proposer could
-    ///          file against its own drain and refund itself the whole bond it
-    ///          was supposed to lose, at the cost of a challenger bond it also
-    ///          gets back. This is why the prosecutor's fee is a BOUNDED slice
-    ///          and never the whole bond: at `MAX_PROSECUTOR_FEE_BPS` the
-    ///          self-filing proposer recovers at most 20% and destroys 80%, so
-    ///          the round trip exists but loses money on every pass. A capped
-    ///          leak is a different object from an open door.
-    ///        - The vault's LPs? Compensation was retired with the escrow: the
-    ///          slash is punitive now, not compensatory, and there is no
-    ///          apportionment contract left to pay into. Even when there was,
-    ///          the proposer could hold shares and recover its pro-rata slice
-    ///          from a pre-drain snapshot it had bought into before proposing.
-    ///        - A treasury? Pays whoever governs, which the attacker may be or
-    ///          may lobby.
-    ///      Destruction is the only sink with no beneficiary to be, so the
-    ///      remainder falls exactly on whoever forfeited. It is also why the
-    ///      BURN destination is a constant and not a parameter: a caller-chosen
-    ///      sink would hand a compromised game the power to redirect whole
-    ///      bonds to itself.
-    ///
+    /// @dev THE BOND'S DOWNSIDE BRANCH, called from `ChallengeGame._settle` — the
+    ///      single point at which a proposal is convicted, by a guilty ruling or
+    ///      by the silence verdict. Takes `governor` explicitly rather than
+    ///      deriving it from `msg.sender`: the convictor is the challenge game,
+    ///      not the governor that locked the bond.
+    /// @dev AUTHORIZATION — WHO. `msg.sender` must be the live `coverageFreezer`
+    ///      of the wired ledger, which is the challenge game and nothing else. The
+    ///      precedent is `StakedWood.slashVerdict`'s `authorizedSlasher`; the
+    ///      difference is where the name is kept — sWOOD keeps its own owner-set
+    ///      copy, this escrow borrows the ledger's, because a second copy is a
+    ///      second thing to keep in step and an owner-set copy here would hand
+    ///      this contract the discretionary exit its design refuses. FAILS CLOSED
+    ///      when the freezer is unset: an unwired protocol convicts nothing rather
+    ///      than letting anyone confiscate.
+    /// @dev DESTINATION — WHERE. Burned, less the prosecutor's fee. EVERY
+    ///      REACHABLE PAYEE IS A ROUND TRIP:
+    ///        - the challenger in FULL: addresses are free, so a proposer could
+    ///          file against its own drain and refund itself the whole bond. This
+    ///          is why the prosecutor's fee is a BOUNDED slice — at the ceiling a
+    ///          self-filing proposer recovers at most 20% and destroys 80%, so the
+    ///          round trip loses money on every pass.
+    ///        - the vault's LPs: compensation was retired with the escrow; the
+    ///          slash is punitive now, and even before, the proposer could hold
+    ///          shares and recover its pro-rata slice.
+    ///        - a treasury: pays whoever governs, which the attacker may be.
+    ///      Destruction is the only sink with no beneficiary to be. It is also why
+    ///      the burn destination is a constant and not a parameter.
     /// @dev NO PARTIAL FORFEIT: the whole bond always leaves the proposer. The
     ///      bond is priced at what the proposal could extract and a conviction
-    ///      means it extracted, so the proposer's loss is invariant — what
-    ///      `feeBps` decides is only how much of that loss is PAID to the
-    ///      prosecutor rather than burned, never how much the proposer keeps.
-    /// @dev THE FEE PAYEE IS CALLER-CHOSEN, deliberately, because only the
-    ///      caller knows which challenger caused this conviction — but the RATE
-    ///      is not: `MAX_PROSECUTOR_FEE_BPS` is enforced here rather than
-    ///      trusted from the game, the same way sWOOD re-clamps `slashBpsPer`
-    ///      rather than trusting `ExposureLedger`. A compromised game can
-    ///      choose who collects 20%; it cannot choose to hand over the rest.
+    ///      means it extracted, so `feeBps` decides only how much of that loss is
+    ///      PAID to the prosecutor rather than burned, never how much the proposer
+    ///      keeps.
+    /// @dev THE FEE PAYEE IS CALLER-CHOSEN, deliberately, because only the caller
+    ///      knows which challenger caused this conviction — but the RATE is not:
+    ///      `MAX_PROSECUTOR_FEE_BPS` is enforced here rather than trusted from the
+    ///      game, the same way sWOOD re-clamps `slashBpsPer`.
     function forfeitBond(address governor, uint256 proposalId, address feeTo, uint256 feeBps)
         external
         returns (address, uint256)
@@ -256,19 +204,17 @@ contract ProposerBondEscrow is IProposerBondEscrow {
         delete _bonds[key];
 
         // THE PROSECUTOR'S FEE, AND WHY IT COMES FROM HERE. Catching a bad
-        // proposal has to pay someone, and this is the only pot in the protocol
-        // that a prosecutor cannot fund for itself: to self-deal you must BE
-        // the proposer, and then you are paying yourself a fraction of a bond
-        // you forfeit in full — always a net loss while the rate is under
-        // 10_000. That makes the fee sybil-proof by construction, with no role
-        // predicate to game and no cap to tune.
+        // proposal has to pay someone, and this is the only pot a prosecutor
+        // cannot fund for itself: to self-deal you must BE the proposer, and then
+        // you are paying yourself a fraction of a bond you forfeit in full. That
+        // makes the fee sybil-proof by construction, with no role predicate to
+        // game.
         //
-        // It is deliberately NOT taken from the guardians' slash. That pot is
-        // fundable by a prosecutor willing to stake and approve the proposal it
-        // is about to accuse, which is why a slash-funded fee needed an
-        // approver-role predicate to price the sybil — and that predicate was
-        // controlled by the accused, who could zero the fee for free by
-        // funding their defence from an unrelated address.
+        // Deliberately NOT taken from the guardians' slash: that pot IS fundable
+        // by a prosecutor willing to stake and approve the proposal it is about to
+        // accuse, which is why a slash-funded fee needed an approver-role
+        // predicate — and that predicate was controlled by the accused, who could
+        // zero the fee by funding their defence from an unrelated address.
         uint256 fee;
         if (feeTo != address(0) && feeBps != 0 && b.amount != 0) {
             fee = (b.amount * feeBps) / 10_000;
