@@ -189,7 +189,7 @@ contract SyndicateVault is
 
     /// @notice Vault-owner-set agent performance fee, stored offset-by-one so a
     ///         single slot doubles as the is-it-set flag: 0 means never set, and
-    ///         `agentFeeBps()` returns the 5% default; otherwise the stored value
+    ///         `agentFeeBps()` returns the 20% default; otherwise the stored value
     ///         is `fee + 1`, so an explicit 0% stays distinct from unset.
     ///         Snapshotted onto a proposal at propose, clamped to the governor's
     ///         `maxPerformanceFeeBps`.
@@ -268,8 +268,9 @@ contract SyndicateVault is
         _openDeposits = p.openDeposits;
         _agentRegistry = IERC721(p.agentRegistry);
         _managementFeeBps = p.managementFeeBps;
-        // _agentFeeBpsPlusOne left 0 (unset) → agentFeeBps() returns the 5%
-        // default until the owner calls setAgentFeeBps (no init SSTORE needed).
+        // _agentFeeBpsPlusOne left 0 (unset) → agentFeeBps() returns the
+        // FeeConstants.DEFAULT_AGENT_FEE_BPS (20%) default until the owner calls
+        // setAgentFeeBps (no init SSTORE needed).
         _factory = msg.sender;
         _cachedDecimalsOffset = IERC20Metadata(p.asset).decimals();
     }
@@ -958,7 +959,7 @@ contract SyndicateVault is
 
     /// @inheritdoc ISyndicateVault
     function agentFeeBps() public view returns (uint256) {
-        // One SLOAD: 0 = never set → the 5% default (agent never silently
+        // One SLOAD: 0 = never set → the 20% default (agent never silently
         // unpaid); otherwise the stored value is fee+1, so an explicit 0%
         // (stored 1) stays distinct from unset.
         uint256 stored = _agentFeeBpsPlusOne;

@@ -891,7 +891,22 @@ contract DeployPlanB is Script {
         // unrunnable. Gated rather than deleted: on mainnet this require is the
         // only trace in source that the off-chain Zodiac control is owed, and
         // deleting it would leave nothing hinting anything is missing.
-        // NEVER set this on the real mainnet ceremony.
+        // NEVER set this on the real mainnet ceremony — and "never" is ENFORCED
+        // rather than requested. A comment saying "fork only" is worth nothing
+        // against an env var that survives in a shell history, a CI secret or a
+        // copied command line, and the failure it enables is silent: the run
+        // completes, the deployment looks clean, and the protocol carries
+        // NEITHER the on-chain rate limit nor the off-chain one. Robinhood
+        // mainnet is 4663; a fork runs under ROBINHOOD_FORK_CHAIN_ID (e.g.
+        // 9994663), so pinning the refusal to 4663 costs the fork ceremony
+        // nothing and closes the only path by which the bypass reaches
+        // production.
+        require(
+            !book.allowEoaLedgerOwner || block.chainid != 4663,
+            "ALLOW_EOA_LEDGER_OWNER is a fork/vnet escape hatch and MUST NOT be set on Robinhood "
+            "mainnet (4663). Run this from the owner Safe instead: bypassing here ships a deployment "
+            "with NEITHER the on-chain rate limit nor the off-chain Zodiac one."
+        );
         if (!book.allowEoaLedgerOwner) {
             require(
                 ledger.owner().code.length != 0,

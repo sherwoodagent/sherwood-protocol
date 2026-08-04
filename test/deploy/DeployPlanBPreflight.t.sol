@@ -751,6 +751,23 @@ contract DeployPlanBPreflightTest is Test {
         assertEq(swood.exposureLedger(), predicted, "the run must complete and wire the exit gate");
     }
 
+    /// @dev THE BYPASS CANNOT REACH PRODUCTION. An env var is not fork-only by
+    ///      virtue of a comment saying so — it survives shell history, CI
+    ///      secrets and copied command lines, and the deployment it produces
+    ///      looks clean while carrying NEITHER the on-chain rate limit nor the
+    ///      off-chain Zodiac one. Chain 4663 refuses it outright, which is what
+    ///      lets the sibling test above stay green on 31337.
+    function test_preflight10_bypassIsRefusedOnRobinhoodMainnet() public {
+        address predicted = vm.computeCreateAddress(DEFAULT_SENDER, vm.getNonce(DEFAULT_SENDER));
+        vm.mockCall(predicted, abi.encodeWithSignature("owner()"), abi.encode(address(0xE0A)));
+        vm.etch(predicted, "");
+
+        bookAllowEoaLedgerOwner = true;
+        vm.chainId(4663);
+
+        _runExpecting("ALLOW_EOA_LEDGER_OWNER is a fork/vnet escape hatch and MUST NOT be set on Robinhood");
+    }
+
     // ─────────────────────────────── helpers ───────────────────────────────
 
     /// @dev THE ADDRESS BOOK IS PASSED, NOT SET IN THE ENVIRONMENT. `run()`'s

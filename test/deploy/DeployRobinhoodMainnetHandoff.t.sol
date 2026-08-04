@@ -15,6 +15,22 @@ contract MockMultisig {
     receive() external payable {}
 }
 
+/// @notice A stand-in carrying the ownership SHAPE of a correctly handed-off
+///         `Ownable2Step` contract, and nothing else. Used as the decoy in the
+///         factory-pinning test: validation reads `owner()` and
+///         `pendingOwner()` before it reads `factory.tierRegistry`, so a decoy
+///         that answers neither reverts on empty returndata and hides which
+///         assert actually fired.
+contract MockOwned2Step {
+    address public owner;
+    address public pendingOwner;
+
+    constructor(address owner_, address pendingOwner_) {
+        owner = owner_;
+        pendingOwner = pendingOwner_;
+    }
+}
+
 /// @notice Exposes the two internals the ceremony's correctness actually lives
 ///         in. `run()` is not driven here: it reads its whole address book from
 ///         `vm.envAddress`, and `vm.setEnv` writes the shared process
@@ -74,9 +90,40 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
         vm.prank(address(harness));
         d = harness.deployCore(cfg);
 
-        // What `run()` does inside the broadcast before any handoff.
-        vm.prank(address(harness));
+        // What `run()` does inside the broadcast before any handoff. BOTH
+        // recipients: a zero one folds its leg into the agent's remainder
+        // instead of failing, so validation asserts both and so does the run.
+        vm.startPrank(address(harness));
         ProtocolConfig(d.protocolConfig).setProtocolFeeRecipient(address(harness));
+        ProtocolConfig(d.protocolConfig).setGuardiansFeeRecipient(address(harness));
+        vm.stopPrank();
+    }
+
+    // ── The fee recipients ──
+
+    /// @dev THE GUARDIAN LEG IS NOT OPTIONAL. `MANAGEMENT_FEE_BPS = 200` is
+    ///      sized so 20% of management funds the guardian pool, but an unset
+    ///      `guardiansFeeRecipient` does not strand that slice — the governor
+    ///      zeroes it and hands it to the agent as remainder. The failure is
+    ///      therefore invisible on-chain: fees are charged at the rate the
+    ///      guardian budget justifies, and the proposer collects the guardians'
+    ///      share.
+    function test_validate_bitesWhenTheGuardianFeeRecipientIsUnset() public {
+        vm.prank(address(harness));
+        ProtocolConfig(d.protocolConfig).setGuardiansFeeRecipient(address(0));
+
+        vm.expectRevert(bytes("protocolConfig.guardiansFeeRecipient mismatch"));
+        harness.exposed_validate(d, address(harness), address(0), address(wood));
+    }
+
+    /// @dev The complement, so the pair pins both recipients rather than only
+    ///      the one that was missing.
+    function test_validate_bitesWhenTheProtocolFeeRecipientIsUnset() public {
+        vm.prank(address(harness));
+        ProtocolConfig(d.protocolConfig).setProtocolFeeRecipient(address(0));
+
+        vm.expectRevert(bytes("protocolConfig.protocolFeeRecipient mismatch"));
+        harness.exposed_validate(d, address(harness), address(0), address(wood));
     }
 
     // ── The fork posture ──
@@ -146,14 +193,22 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
     /// @dev The factory must still point at the TierRegistry that was handed
     ///      off. A handoff of some OTHER registry would leave the live adapter
     ///      gate on the deployer key while validation read a decoy.
+    ///
+    ///      THE DECOY HAS TO ANSWER `owner()` AND `pendingOwner()`. Validation
+    ///      reads those BEFORE `factory.tierRegistry`, so a bare stub reverts on
+    ///      empty returndata and a plain `vm.expectRevert()` would go green
+    ///      without the factory check ever running — the test would pass while
+    ///      pinning nothing. Give the decoy the ownership shape of a correctly
+    ///      handed-off registry, so `factory.tierRegistry` is the only thing
+    ///      left to fail, and assert that exact string.
     function test_validate_pinsTheFactoryToTheHandedOffTierRegistry() public {
         vm.prank(address(harness));
         harness.exposed_handoff(d, address(multisig));
 
         DeploySherwood.Deployed memory decoy = d;
-        decoy.tierRegistry = address(new MockMultisig());
+        decoy.tierRegistry = address(new MockOwned2Step(address(harness), address(multisig)));
 
-        vm.expectRevert();
+        vm.expectRevert(bytes("factory.tierRegistry mismatch"));
         harness.exposed_validate(decoy, address(harness), address(multisig), address(wood));
     }
 }

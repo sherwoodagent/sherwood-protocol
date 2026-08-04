@@ -57,6 +57,13 @@ Legs must sum to exactly 10 000 bps (`src/ProtocolConfig.sol:92-97`); individual
 have no floor or ceiling. An unset (zero-address) protocol/guardian recipient folds
 that leg into the agent's remainder rather than stranding it.
 
+**That fold is a deployment hazard, not just a nicety.** `ProtocolConfig`'s
+constructor seeds the splits but leaves both recipients zero, so a ceremony that
+forgets `setGuardiansFeeRecipient` pays the guardians' 20% of management and 25% of
+performance to the *proposer* — silently, at a fee level chosen to fund a guardian
+pool that receives nothing. Deploy scripts seat both recipients inside the broadcast
+and assert both afterwards.
+
 ## Performance fee
 
 - **Rate source:** `vault.agentFeeBps()`, owner-settable. Default 20%

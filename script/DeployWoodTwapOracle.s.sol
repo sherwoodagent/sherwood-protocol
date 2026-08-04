@@ -41,12 +41,25 @@ import {WoodTwapOracle, IUniswapV2PairMinimal, IAggregatorMinimal} from "../src/
  * @dev OWNED AT BIRTH, NOT HANDED OFF. Every parameter is seated in the
  *      constructor and the owner-only surface is three re-tuning setters, so
  *      there is no wiring step the deployer has to perform afterwards. Passing
- *      the final owner as `initialOwner` therefore beats deploy-then-transfer:
- *      it removes the window in which the deployer could re-tune, and the
- *      oracle is plain `Ownable`, so a transfer would land in one step with no
- *      `acceptOwnership` receipt to prove it happened.
+ *      the final owner as `initialOwner` therefore beats deploy-then-transfer
+ *      on both counts: it removes the window in which the deployer could
+ *      re-tune, and — because `WoodTwapOracle` is `Ownable2Step` — it removes
+ *      the SECOND Safe transaction a transfer would otherwise owe. The
+ *      constructor's `Ownable(initialOwner)` seats the owner directly, so this
+ *      contract has no `acceptOwnership()` step and no window in which the
+ *      ceremony is half-transferred.
  */
 contract DeployWoodTwapOracle is ScriptBase {
+    // THE BOUNDS ARE RETYPED HERE, AND THEY HAVE TO BE. `WoodTwapOracle`
+    // declares each as a contract-level `public constant`, which Solidity does
+    // NOT expose as `WoodTwapOracle.MIN_TWAP_WINDOW` — outside an inheriting
+    // contract or a library, a constant is only reachable through the generated
+    // getter on an INSTANCE, and a pre-flight whose entire purpose is to run
+    // before anything is deployed has no instance to call. So these are a second
+    // source of truth by necessity, not by oversight; if a bound ever moves on
+    // the contract, it must be moved here in the same commit. The `_preflight`
+    // messages name the contract-side constant so the pairing is greppable.
+
     /// @dev `MIN_TWAP_WINDOW`. Short ON PURPOSE — see the `MAX_ETH_USD_DELAY_LIMIT`
     ///      reasoning on the contract: coupling the window to the ETH leg's
     ///      heartbeat would force a ~12h window, and half a day of blindness to a
@@ -55,6 +68,8 @@ contract DeployWoodTwapOracle is ScriptBase {
     /// @dev Six hours of slack over the window. This is the number the KEEPER
     ///      CADENCE must beat: snapshots older than this make `consult()` report
     ///      unavailable, which on a chain with no WOOD feed is `NoWoodPrice`.
+    ///      NOT a contract bound — a cadence choice inside the
+    ///      `MAX_SNAPSHOT_AGE_LIMIT` ceiling, which `_preflight` enforces.
     uint256 constant DEFAULT_MAX_TWAP_AGE = 6 hours;
     /// @dev `MAX_ETH_USD_DELAY_LIMIT`. The live 4663 ETH/USD feed was measured
     ///      ~10.7h old while perfectly healthy, so anything tighter would make
@@ -90,7 +105,7 @@ contract DeployWoodTwapOracle is ScriptBase {
             require(ownerMultisig.code.length > 0, "OWNER_MULTISIG must be a contract (Safe), not an EOA");
         }
 
-        deploy(
+        WoodTwapOracle oracle = deploy(
             Params({
                 pair: vm.envOr("WOOD_WETH_V2_PAIR", _readAddress("WOOD_WETH_V2_PAIR")),
                 wood: vm.envOr("WOOD_TOKEN", _readAddress("WOOD_TOKEN")),
@@ -104,14 +119,8 @@ contract DeployWoodTwapOracle is ScriptBase {
             })
         );
 
-        _patchAddress("WOOD_TWAP_ORACLE", address(_deployed));
+        _patchAddress("WOOD_TWAP_ORACLE", address(oracle));
     }
-
-    /// @dev Set by `deploy()` so `run()` can persist it. `deploy()` deliberately
-    ///      returns the oracle instead of writing the address book itself: a test
-    ///      calling it would otherwise write a junk `chains/31337.json` on every
-    ///      run. Same split, and the same reason, as `DeploySherwood.deployCore`.
-    WoodTwapOracle internal _deployed;
 
     /// @notice Pre-flights, deploy, first snapshot. Public so the tests can drive
     ///         the real thing without the process environment. Does NOT persist
@@ -132,7 +141,6 @@ contract DeployWoodTwapOracle is ScriptBase {
         vm.stopBroadcast();
 
         require(oracle.validatePair(), "post-deploy: validatePair() false");
-        _deployed = oracle;
 
         console.log("WoodTwapOracle:  %s", address(oracle));
         console.log("owner:           %s", oracle.owner());

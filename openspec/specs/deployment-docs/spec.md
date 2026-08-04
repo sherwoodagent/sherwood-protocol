@@ -60,6 +60,14 @@ The ceremony SHALL persist `TIER_REGISTRY` into `chains/{chainId}.json`. `Deploy
 - **WHEN** the core ceremony completes
 - **THEN** `chains/{chainId}.json` carries `TIER_REGISTRY`, and it equals `factory.tierRegistry()`
 
+The ceremony SHALL seat BOTH `protocolFeeRecipient` AND `guardiansFeeRecipient` on `ProtocolConfig` inside the broadcast, and validation SHALL assert both. `ProtocolConfig`'s constructor seeds only the splits, and a zero recipient does NOT strand its leg — the governor zeroes that slice and hands it to the agent as remainder, in both `_chargeManagementFee` and `_chargePerformanceFee`. An unseated recipient is therefore a SILENT RE-ROUTING to the proposer, not a missing payment. The guardian leg is the load-bearing one: `MANAGEMENT_FEE_BPS = 200` is sized so 20% of management and 25% of performance fund the guardian pool, so leaving it unset charges depositors at a rate justified by a pool that receives nothing.
+
+Both are seeded to the DEPLOYER as a placeholder, never as the destination. The runbook SHALL direct the multisig to call `setProtocolFeeRecipient` and `setGuardiansFeeRecipient` after `acceptOwnership()`; until it does, both fee legs accrue to a single EOA.
+
+#### Scenario: Unseated guardian fee recipient refused
+- **WHEN** the core ceremony completes with `guardiansFeeRecipient` still zero
+- **THEN** validation FAILS naming that leg, because the guardian budget would otherwise pay the proposer with nothing on-chain to notice
+
 #### Scenario: Post-deploy validation reads
 - **WHEN** the three scripts complete
 - **THEN** the operator verifies `factory.beacon/priceRouter/protocolConfig`, `swood.wood == WOOD`, `swood.registry == registry`, `registry.reviewPeriod == 86400`, `registry.blockQuorumBps == 3000`, `strategyFactory.approvedTemplate(PORTFOLIO) == true`, and `governorImpl.MIN_VOTING_PERIOD() == 86400`
@@ -136,7 +144,7 @@ To make guardian blocking real (not the cold-start bypass), total staked guardia
 
 The oracle requires NO Chainlink WOOD/USD feed — that is the point of it. Its inputs are the Uniswap-V2 `WOOD/WETH` pair's own cumulative-price accumulators and the chain's Chainlink **ETH/USD** feed, composed as `WOOD/USD = TWAP(WOOD per ETH) × ETH/USD`. Chain 4663 has both.
 
-The oracle SHALL be constructed with its FINAL owner rather than deployed-then-transferred: every parameter is seated in the constructor, so no post-deploy wiring step exists, and the contract is plain `Ownable` (a transfer would land in one step with no `acceptOwnership` receipt).
+The oracle SHALL be constructed with its FINAL owner rather than deployed-then-transferred: every parameter is seated in the constructor, so no post-deploy wiring step exists, and `WoodTwapOracle` is `Ownable2Step` — a transfer would owe a SECOND transaction from the Safe (`acceptOwnership()`) and leave a window in which the ceremony is half-transferred. Constructing with the final owner removes that window; the constructor's `Ownable(initialOwner)` seats the owner directly, so this contract carries no `acceptOwnership()` runbook step.
 
 Pre-flights, all PRE-broadcast:
 - The pair holds exactly `{WOOD, WETH}` with non-zero reserves. The constructor also refuses otherwise, but with a bare `PairNotUsable()` that reads identically for a wrong pool, an untraded shell, and a right-shaped pair holding unrelated tokens.

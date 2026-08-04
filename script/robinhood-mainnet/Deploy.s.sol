@@ -102,11 +102,21 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         // Called on `this` so `msg.sender` inside deployCore is the broadcaster.
         Deployed memory d = deployCore(cfg);
 
-        // ProtocolConfig ships with a ZERO fee recipient (its constructor seeds
-        // only the splits), and a zero recipient makes the protocol fee slice
-        // silently zero in SyndicateGovernor's settle path. Seat it inside the
-        // broadcast, while the deployer still owns the config.
+        // ProtocolConfig ships with ZERO fee recipients (its constructor seeds
+        // only the splits), and a zero recipient does NOT strand its leg — it
+        // FOLDS INTO THE AGENT'S REMAINDER (`SyndicateGovernor._chargeManagementFee`,
+        // and again in `_chargePerformanceFee`). So an unseated recipient is not
+        // a missing payment, it is a silent re-routing of that leg to the
+        // proposer, with nothing on-chain to notice.
+        //
+        // BOTH LEGS, NOT JUST THE PROTOCOL ONE. The guardian leg is the reason
+        // MANAGEMENT_FEE_BPS is 200: 20% of management and 25% of performance
+        // fund the guardian pool. Left unseated, that whole budget pays the
+        // agent instead, and the fee level is sized for a pool receiving
+        // nothing. Seat both inside the broadcast, while the deployer still
+        // owns the config.
         ProtocolConfig(d.protocolConfig).setProtocolFeeRecipient(deployer);
+        ProtocolConfig(d.protocolConfig).setGuardiansFeeRecipient(deployer);
 
         // Multisig handoff (final action inside the broadcast).
         if (!skipHandoff) _handoffRobinhood(d, ownerMultisig);
@@ -168,6 +178,14 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         Ownable2Step(d.protocolConfig).transferOwnership(ownerMultisig);
         Ownable2Step(d.tierRegistry).transferOwnership(ownerMultisig);
         console.log("RUNBOOK: the multisig MUST call acceptOwnership() on ProtocolConfig AND TierRegistry");
+        // BOTH FEE LEGS CURRENTLY PAY THE DEPLOYER KEY. They are seeded there
+        // because a zero recipient is worse — it folds the leg into the agent's
+        // remainder silently — but the deployer is a seed value, not the
+        // destination. Until the Safe re-points them, protocol revenue and the
+        // entire guardian budget accrue to a single EOA.
+        console.log("RUNBOOK: then, from the Safe, setProtocolFeeRecipient(treasury)");
+        console.log("RUNBOOK: and setGuardiansFeeRecipient(guardian payout address)");
+        console.log("RUNBOOK: until both are re-pointed, BOTH fee legs pay the deployer key.");
     }
 
     /// @param ownerMultisig the Safe the handoff targeted, or `address(0)` when
@@ -195,9 +213,13 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         _checkAddr("tierRegistry.owner", Ownable(d.tierRegistry).owner(), deployer);
         _checkAddr("tierRegistry.pendingOwner", Ownable2Step(d.tierRegistry).pendingOwner(), expectedPending);
 
-        _checkAddr(
-            "protocolConfig.protocolFeeRecipient", ProtocolConfig(d.protocolConfig).protocolFeeRecipient(), deployer
-        );
+        // BOTH RECIPIENTS, because a zero one folds its leg into the agent's
+        // remainder rather than failing. Asserting only the protocol leg would
+        // leave the guardian budget — the whole reason MANAGEMENT_FEE_BPS is
+        // 200 — silently payable to the proposer.
+        ProtocolConfig protocolConfig = ProtocolConfig(d.protocolConfig);
+        _checkAddr("protocolConfig.protocolFeeRecipient", protocolConfig.protocolFeeRecipient(), deployer);
+        _checkAddr("protocolConfig.guardiansFeeRecipient", protocolConfig.guardiansFeeRecipient(), deployer);
 
         _checkAddr("factory.beacon", factory.beacon(), d.beacon);
         _checkAddr("factory.tierRegistry", address(factory.tierRegistry()), d.tierRegistry);
