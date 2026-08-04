@@ -603,10 +603,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         rounds 2 and 3 fixed steps at 5% and 10%, round 4+ this
     ///         variable — no longer clamped live to `settleBurnBps`
     ///         (second-audit finding C; see `_inconclusiveBurnBpsForRound`).
-    /// @dev    Rounds 1-3 stay deliberately at or below `settleBurnBps`,
-    ///         clamped live at the point `_inconclusiveBurnBpsForRound` pins
-    ///         the rate: a non-verdict must never cost an honest, few-attempt
-    ///         filer more than a verdict that recovered real value. Round 4+
+    /// @dev    Rounds 1-3 are held at or below `settleBurnBps` BY THE CLAMP,
+    ///         not by their own literals — `_inconclusiveBurnBpsForRound`
+    ///         applies it at the point it pins the rate: a non-verdict must
+    ///         never cost an honest, few-attempt filer more than a verdict
+    ///         that recovered real value. At the live `settleBurnBps` of 500
+    ///         that clamp is load-bearing rather than a no-op, since round
+    ///         3's literal is 1,000 — see this variable's default below and
+    ///         `INCONCLUSIVE_BURN_ROUND3_BPS`. Round 4+
     ///         (this variable) is DELIBERATELY NOT bound to the live
     ///         `settleBurnBps` any more (second-audit finding C) — the old
     ///         mutual setter cross-check made the ladder's top tier
@@ -620,11 +624,20 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         verdict rate, is correct. See `setInconclusiveBurnBps` and
     ///         `_inconclusiveBurnBpsForRound` for the mechanics.
     /// @dev 1,000 (10%), lowered from 2,000 in lockstep with `settleBurnBps`
-    ///      (audit #181 finding 18a) — unchanged by the second audit; only
-    ///      the setter coupling around it changed. The 250/500/1,000 ladder
-    ///      steps are all <= this default, so at these defaults lowering
-    ///      `settleBurnBps` still does not clamp any of the fixed tiers
-    ///      below their own value.
+    ///      (audit #181 finding 18a) — unchanged by the second audit (only the
+    ///      setter coupling around it changed) and unchanged by the third,
+    ///      which moved `settleBurnBps` alone.
+    ///
+    ///      THE FIXED TIERS ARE NO LONGER ALL BELOW THE CLAMP. This paragraph
+    ///      previously read "the 250/500/1,000 ladder steps are all <= this
+    ///      default, so at these defaults lowering `settleBurnBps` still does
+    ///      not clamp any of the fixed tiers below their own value" — true
+    ///      when `settleBurnBps` was 1,000, false since the third-audit
+    ///      decision halved it to 500. Round 3's literal (1,000) is now
+    ///      clamped to 500 and the ladder realises as 250/500/500/1,000. That
+    ///      is a deliberate, documented trade — see `settleBurnBps` and
+    ///      `INCONCLUSIVE_BURN_ROUND3_BPS` — but it is a live clamp, not a
+    ///      dormant one, and this block asserted the opposite.
     uint256 public inconclusiveBurnBps = 1_000;
 
     /// @notice WOOD held on behalf of live (`Filed`/`Disputed`) challenges —
@@ -2196,10 +2209,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      result means silence is the accused's dominant strategy against
     ///      the CURRENT configuration — the opposite of what this mechanism
     ///      is meant to incentivize. At the shipped defaults
-    ///      (`challengerBondBps` 150 * `settleBurnBps` 1,000 = 150,000 vs
+    ///      (`challengerBondBps` 150 * `settleBurnBps` 500 = 75,000 vs
     ///      `proposerBondBps` 100 * `prosecutorFeeBps` 2,000 = 200,000) this
     ///      returns `true` with margin — a correct, uncontested filing is
-    ///      profitable rather than loss-making.
+    ///      profitable rather than loss-making. That worked example has gone
+    ///      stale twice now; recompute it from the four live values rather
+    ///      than trusting the literals on this line.
     ///
     ///      Those defaults were chosen together, not independently (audit #181
     ///      finding 18a). At the time, `setSettleBurnBps` and
@@ -2207,16 +2222,32 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      live value, so lowering `settleBurnBps` alone (without also
     ///      lowering `inconclusiveBurnBps`) would have been rejected outright
     ///      — that cross-check is GONE as of the second audit (finding C; see
-    ///      `setSettleBurnBps`/`setInconclusiveBurnBps`), but the REASON the
-    ///      bond was lowered instead of the burn rate still holds: buying the
+    ///      `setSettleBurnBps`/`setInconclusiveBurnBps`).
+    ///
+    ///      THE THIRD AUDIT THEN DID LOWER THE BURN RATE, and this block used
+    ///      to argue that could not be done. It read: "the REASON the bond was
+    ///      lowered instead of the burn rate still holds: buying the
     ///      break-even headroom out of `settleBurnBps` alone would have
     ///      clamped the Inconclusive ladder's 250/500/1,000 fixed tiers flat
-    ///      (`_inconclusiveBurnBpsForRound` still clamps THOSE to the live
-    ///      `settleBurnBps`) and undone the anti-grinding schedule for an
-    ///      honest, few-attempt filer. Lowering the bond instead leaves that
-    ///      ladder intact, at the cost of a cheaper entry price for a
-    ///      frivolous filing — which a losing challenger still forfeits in
-    ///      full.
+    ///      and undone the anti-grinding schedule". Two things changed under
+    ///      it. First, second-audit finding C un-clamped the round-4+ tier, so
+    ///      flattening reaches rungs 1-3 only and cannot collapse the whole
+    ///      ladder — the realised curve at `settleBurnBps` 500 is
+    ///      250/500/500/1,000, still increasing overall. Second, finding 18a's
+    ///      residual made the trade worth taking: prosecution paid ~$500 on a
+    ///      $1m proposal against $15,000 of bond tied up for weeks, and
+    ///      `prosecutorFeeBps` was already pinned at `MAX_PROSECUTOR_FEE_BPS`,
+    ///      so the cost side was the only lever left. See `settleBurnBps`.
+    ///
+    ///      WHAT WAS ACTUALLY GIVEN UP, in the units a grinder pays: reaching
+    ///      round 4 costs 250+500+500 = 1,250 bps of bond instead of
+    ///      250+500+1,000 = 1,750 — a 29% discount on the cumulative
+    ///      anti-grind deterrent, and the same 500 bps discount applies to
+    ///      every attempt at round 3 or beyond. In absolute terms that is
+    ///      ~$750 per attempt on a $1m proposal, since the bond is 1.5% of
+    ///      coverage. Judged worth the 2.5x improvement to honest prosecution;
+    ///      recorded here in full so a future reader weighs the actual number
+    ///      rather than the phrase "one rung".
     ///
     ///      This contract deliberately does NOT gate any setter on this
     ///      result. The values that would make it `true` trade off against
@@ -2254,6 +2285,18 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     }
 
     /// @inheritdoc IChallengeGame
+    /// @dev A LOWER BOUND, BECAUSE IT PRICES ONLY THE SILENCE BRANCH. The
+    ///      subtraction below is `_settle`'s `!escalated` path, where the
+    ///      challenger recovers `bond - burned`. On the escalated branch it
+    ///      instead receives `bond + pool - burned`, and `Disputed` implies
+    ///      `pool == bondWood` — so the forfeited counter-bond is pure upside
+    ///      that never enters this figure, and `settleBurnBps` is charged
+    ///      against the POOL there rather than the bond. Lowering that rate
+    ///      therefore raises the contested payoff too, by more than this view
+    ///      reports. Deliberately not modelled: the escalated branch is
+    ///      contingent on someone choosing to fund a counter-bond, so folding
+    ///      it in would make the number a forecast rather than a property of
+    ///      the current configuration.
     function honestFilingNetPayoffBps() external view returns (int256) {
         // Same two products `honestFilingBreaksEven` compares, but returned
         // as a difference rather than reduced to a sign. Both factors on
