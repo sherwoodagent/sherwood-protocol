@@ -9,8 +9,14 @@ fees, staking fees, or referral fees anywhere in the protocol.
 
 | Fee | Base | Default | Hard cap | Charged |
 |---|---|---|---|---|
-| **Management** | fund assets × time deployed (asset-seconds) | 0.5%/yr | 5%/yr | every settlement — profit, flat, or loss |
-| **Performance** | value above the fund's previous peak price per share (high-water mark) | 5% | 30% protocol ceiling (20% per-vault default cap) | profitable settlements only |
+| **Management** | fund assets × time deployed (asset-seconds) | 2%/yr | 5%/yr | every settlement — profit, flat, or loss |
+| **Performance** | value above the fund's previous peak price per share (high-water mark) | 20% | 30% protocol ceiling (20% per-vault default cap) | profitable settlements only |
+
+The headline is **2-and-20**. The management number is load-bearing for guardian
+economics rather than for revenue: 20% of it funds the guardian pool, and it is the
+only leg that pays when markets are flat or down — the performance leg pays nothing
+below the high-water mark while review workload is unchanged. See
+[guardian-network.md](guardian-network.md).
 
 ## Management fee
 
@@ -18,8 +24,12 @@ fees, staking fees, or referral fees anywhere in the protocol.
   `SyndicateFactory.managementFeeBps` (`src/SyndicateFactory.sol:342`). There is no
   per-vault setter — changing the factory value only affects *new* vaults.
 - **Bounds:** 0 → `MAX_MANAGEMENT_FEE_BPS = 500` bps (5%/yr), enforced at vault
-  `initialize` (`src/SyndicateFactory.sol:282`) and at the factory setter
-  (`src/SyndicateFactory.sol:554`). Deploy scripts seed 50 bps (0.5%/yr).
+  `initialize` (`src/SyndicateFactory.sol:276`) and at the factory setter
+  (`src/SyndicateFactory.sol:536`). Deploy scripts seed 200 bps (2%/yr).
+- **Sticky per vault:** `_managementFeeBps` is written once at `initialize`
+  (`src/SyndicateVault.sol:270`) and the vault exposes only a getter
+  (`:955`) — there is no per-vault setter, and `SyndicateFactory.setManagementFeeBps`
+  reaches new vaults only. A fund created under the wrong rate keeps it forever.
 - **Accrual:** the vault integrates *asset-seconds* — a running sum of
   `fund assets × elapsed time` (`src/SyndicateVault.sol:1554`). The clock only runs
   while a strategy is deployed: `startManagementAccrual()` starts it at
@@ -35,25 +45,40 @@ fees, staking fees, or referral fees anywhere in the protocol.
 
 | Leg | Default | Recipient |
 |---|---|---|
-| Agent | 70% | lead proposer (+ co-proposers) |
+| Agent | 60% | lead proposer (+ co-proposers) |
 | Protocol | 20% | `protocolFeeRecipient` |
-| Guardians | 10% | `guardiansFeeRecipient` |
+| Guardians | 20% | `guardiansFeeRecipient` |
+
+Seeded in the constructor (`src/ProtocolConfig.sol:76`) so a config is valid from
+birth — the contract is not upgradeable, so adopting a new split means deploying a
+fresh one and re-pointing governors via `setProtocolConfig`.
 
 Legs must sum to exactly 10 000 bps (`src/ProtocolConfig.sol:92-97`); individual legs
 have no floor or ceiling. An unset (zero-address) protocol/guardian recipient folds
 that leg into the agent's remainder rather than stranding it.
 
+**That fold is a deployment hazard, not just a nicety.** `ProtocolConfig`'s
+constructor seeds the splits but leaves both recipients zero, so a ceremony that
+forgets `setGuardiansFeeRecipient` pays the guardians' 20% of management and 25% of
+performance to the *proposer* — silently, at a fee level chosen to fund a guardian
+pool that receives nothing. Deploy scripts seat both recipients inside the broadcast
+and assert both afterwards.
+
 ## Performance fee
 
-- **Rate source:** `vault.agentFeeBps()`, owner-settable. Default 5%
-  (`FeeConstants.DEFAULT_AGENT_FEE_BPS`); explicit 0% is legal.
+- **Rate source:** `vault.agentFeeBps()`, owner-settable. Default 20%
+  (`FeeConstants.DEFAULT_AGENT_FEE_BPS = 2000`); explicit 0% is legal. Stored with a
+  +1 sentinel so an explicit zero is distinguishable from unset
+  (`src/SyndicateVault.sol:965`).
 - **Three stacked limits** (`src/FeeConstants.sol:13-19`):
   1. `MAX_PERFORMANCE_FEE_BPS = 3000` (30%) — absolute protocol ceiling, checked at
      `setAgentFeeBps` (`src/SyndicateVault.sol:1131`).
   2. Per-vault governor cap `maxPerformanceFeeBps` — default 2000 (20%), settable by
      the vault owner between proposals up to 30%
      (`src/GovernorParameters.sol:222`, `:346`).
-  3. The vault's own `agentFeeBps` — default 500 (5%).
+  3. The vault's own `agentFeeBps` — default 2000 (20%), equal to the per-vault cap
+     by design, so the default vault charges its full allowance until the owner
+     lowers either number.
 - **Double clamp:** the fee is clamped against the governor cap at **propose** time
   (snapshotted onto the proposal, `src/SyndicateGovernor.sol:325`) and re-clamped at
   **settle** against the live cap (`src/SyndicateGovernor.sol:1745`) so a later cap
@@ -68,12 +93,15 @@ that leg into the agent's remainder rather than stranding it.
 
 | Leg | Default | Recipient |
 |---|---|---|
-| Agent | 60% | lead proposer (+ co-proposers) |
+| Agent | 50% | lead proposer (+ co-proposers) |
 | Protocol | 15% | `protocolFeeRecipient` |
-| Guardians | 15% | `guardiansFeeRecipient` |
+| Guardians | 25% | `guardiansFeeRecipient` |
 | Vault owner | 10% | `vault.owner()` (read live at settle) |
 
-Sum must equal 10 000 bps (`src/ProtocolConfig.sol:103-108`).
+Seeded in the constructor (`src/ProtocolConfig.sol:80`). Sum must equal 10 000 bps
+(`src/ProtocolConfig.sol:103-108`). The vault-owner leg exists only here, not on the
+management split: the owner earns on the profit side rather than on assets under
+management.
 
 ## Settlement ordering (load-bearing)
 
@@ -123,11 +151,11 @@ Collaborative proposals sub-split the **agent slice** of both fees
 
 | Parameter | Units | Default | Min | Max | Enforced at |
 |---|---|---|---|---|---|
-| `managementFeeBps` | bps/yr | 50 | 0 | 500 | `SyndicateFactory.sol:282`, `:554` |
-| `agentFeeBps` | bps | 500 | 0 | 3 000 | `SyndicateVault.sol:1131` |
+| `managementFeeBps` | bps/yr | 200 | 0 | 500 | `SyndicateFactory.sol:276`, `:536` |
+| `agentFeeBps` | bps | 2 000 | 0 | 3 000 | `SyndicateVault.sol:1131` |
 | `maxPerformanceFeeBps` (per-vault cap) | bps | 2 000 | 0 | 3 000 | `GovernorParameters.sol:346` |
-| Mgmt split legs | bps | 7000/2000/1000 | 0/leg | sum == 10 000 | `ProtocolConfig.sol:92` |
-| Perf split legs | bps | 6000/1500/1500/1000 | 0/leg | sum == 10 000 | `ProtocolConfig.sol:103` |
+| Mgmt split legs | bps | 6000/2000/2000 | 0/leg | sum == 10 000 | `ProtocolConfig.sol:92` |
+| Perf split legs | bps | 5000/1500/2500/1000 | 0/leg | sum == 10 000 | `ProtocolConfig.sol:103` |
 | Co-proposer `splitBps` | bps | per-proposal | 100 | 9 000 total | `SyndicateGovernor.sol:1498` |
 | `creationFee` | absolute | 0 | — | unbounded | `SyndicateFactory.sol:503` |
 | `minBufferBps` | bps | 0 | 0 | 5 000 | `SyndicateVault.sol:1140` |
