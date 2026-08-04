@@ -4,7 +4,6 @@ pragma solidity 0.8.28;
 import {ScriptBase} from "./ScriptBase.sol";
 import {console} from "forge-std/console.sol";
 import {IStrategy} from "../src/interfaces/IStrategy.sol";
-import {VeniceInferenceStrategy} from "../src/strategies/VeniceInferenceStrategy.sol";
 import {PortfolioStrategy} from "../src/strategies/PortfolioStrategy.sol";
 import {UniswapSwapAdapter} from "../src/adapters/UniswapSwapAdapter.sol";
 
@@ -16,8 +15,8 @@ import {UniswapSwapAdapter} from "../src/adapters/UniswapSwapAdapter.sol";
  *         Appends new addresses and validates all templates after deployment.
  *
  *         Per-chain matrix:
- *           Chains with Uniswap V3: Venice, Portfolio + UniswapSwapAdapter
- *           Other:                  Venice (Portfolio skipped if no Uniswap V3)
+ *           Chains with Uniswap V3: Portfolio + UniswapSwapAdapter
+ *           Other:                  nothing (no template deploys without Uniswap V3)
  *
  *   Usage:
  *     forge script script/DeployTemplates.s.sol:DeployTemplates \
@@ -27,7 +26,6 @@ import {UniswapSwapAdapter} from "../src/adapters/UniswapSwapAdapter.sol";
  *     forge script script/DeployTemplates.s.sol:DeployTemplates --rpc-url base
  */
 contract DeployTemplates is ScriptBase {
-    string constant VENICE_KEY = "VENICE_INFERENCE_TEMPLATE";
     string constant PORTFOLIO_KEY = "PORTFOLIO_TEMPLATE";
     string constant UNISWAP_SWAP_ADAPTER_KEY = "UNISWAP_SWAP_ADAPTER";
 
@@ -44,7 +42,6 @@ contract DeployTemplates is ScriptBase {
     }
 
     struct Templates {
-        address venice;
         address portfolio;
         address uniswapSwapAdapter;
     }
@@ -85,14 +82,12 @@ contract DeployTemplates is ScriptBase {
 
     /// @notice Read already-deployed template addresses from the chain JSON into `t`.
     function _readExisting(Templates memory t, string memory json) internal pure {
-        t.venice = _tryReadAddress(json, VENICE_KEY);
         t.portfolio = _tryReadAddress(json, PORTFOLIO_KEY);
         t.uniswapSwapAdapter = _tryReadAddress(json, UNISWAP_SWAP_ADAPTER_KEY);
     }
 
     /// @notice Persist deployed template addresses back to the chain JSON.
     function _save(Templates memory t, string memory path, bool hasUniswapV3) internal {
-        vm.writeJson(vm.toString(t.venice), path, string.concat(".", VENICE_KEY));
         if (hasUniswapV3) {
             vm.writeJson(vm.toString(t.uniswapSwapAdapter), path, string.concat(".", UNISWAP_SWAP_ADAPTER_KEY));
             vm.writeJson(vm.toString(t.portfolio), path, string.concat(".", PORTFOLIO_KEY));
@@ -102,17 +97,6 @@ contract DeployTemplates is ScriptBase {
     /// @notice Deploy every missing template for the active chain. Returns true if anything deployed.
     function _deployAll(Templates memory t, bool hasUniswapV3) internal returns (bool anyDeployed) {
         vm.startBroadcast();
-
-        if (_needsDeploy(t.venice)) {
-            if (t.venice != address(0)) {
-                console.log("  Stale    VeniceInferenceStrategy:  %s (no code, redeploying)", t.venice);
-            }
-            t.venice = address(new VeniceInferenceStrategy());
-            console.log("  Deployed VeniceInferenceStrategy:  %s", t.venice);
-            anyDeployed = true;
-        } else {
-            console.log("  Skipped  VeniceInferenceStrategy:  %s (already deployed)", t.venice);
-        }
 
         // Portfolio + UniswapSwapAdapter ship as a pair — the strategy hardcodes
         // the adapter address into each clone's InitParams, so they're always
@@ -167,9 +151,6 @@ contract DeployTemplates is ScriptBase {
 
     /// @notice Validate all deployed templates have correct on-chain state.
     function _validate(Templates memory t, bool hasUniswapV3) internal view {
-        require(t.venice.code.length > 0, "VeniceInferenceStrategy: no code");
-        console.log("  VeniceInferenceStrategy: code OK (%s bytes)", t.venice.code.length);
-
         if (hasUniswapV3) {
             require(t.uniswapSwapAdapter.code.length > 0, "UniswapSwapAdapter: no code");
             console.log("  UniswapSwapAdapter:      code OK (%s bytes)", t.uniswapSwapAdapter.code.length);
@@ -183,10 +164,6 @@ contract DeployTemplates is ScriptBase {
             console.log("  UniswapSwapAdapter:      skipped (no Uniswap V3)");
             console.log("  PortfolioStrategy:       skipped (no Uniswap V3)");
         }
-
-        _validateName(t.venice, "Venice Inference", "VeniceInferenceStrategy");
-
-        require(IStrategy(t.venice).vault() == address(0), "VeniceInferenceStrategy: already initialized");
 
         console.log("  All templates: vault == address(0) (not initialized) OK");
     }

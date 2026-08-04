@@ -60,13 +60,12 @@ contract DeployStrategyFactory is ScriptBase {
 
     /// @dev Every template the StrategyFactory must allowlist.
     function _templateKeys() internal pure returns (string[] memory keys) {
-        keys = new string[](6);
+        keys = new string[](5);
         keys[0] = "MOONWELL_SUPPLY_TEMPLATE";
         keys[1] = "AERODROME_LP_TEMPLATE";
-        keys[2] = "VENICE_INFERENCE_TEMPLATE";
-        keys[3] = "WSTETH_MOONWELL_TEMPLATE";
-        keys[4] = "MAMO_YIELD_TEMPLATE";
-        keys[5] = "PORTFOLIO_TEMPLATE";
+        keys[2] = "WSTETH_MOONWELL_TEMPLATE";
+        keys[3] = "MAMO_YIELD_TEMPLATE";
+        keys[4] = "PORTFOLIO_TEMPLATE";
     }
 
     function _tryParseAddress(string memory json, string memory key) internal view returns (address) {
