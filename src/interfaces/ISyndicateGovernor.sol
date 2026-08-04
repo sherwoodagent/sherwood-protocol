@@ -505,6 +505,23 @@ interface ISyndicateGovernor {
     ///         `NoBond` revert from the escrow.
     event ProposerBondForfeitureAcknowledged(uint256 indexed proposalId, uint256 amount);
 
+    /// @notice The governor's best-effort self-trigger of the exposure
+    ///         ledger's `settleCoverage(governor, proposalId)` reverted —
+    ///         at settlement finalization or after a bond reclaim (issue
+    ///         #33). Mirrors the house best-effort pattern established by
+    ///         `AdapterDemotionFailed` (ChallengeGame): a bare catch, both
+    ///         identifying fields indexed, no revert-data payload, and the
+    ///         terminal path (settlement / bond release) is never bricked by
+    ///         it — the call already succeeded before this trigger ran.
+    /// @dev    Adversary statement: a caller who dials gas to starve this
+    ///         trigger achieves only the pre-change status quo — the
+    ///         cohort's reservations stay over-booked, the conservative
+    ///         direction — visibly (this event) and permissionlessly
+    ///         repairably (anyone may re-call the unchanged external
+    ///         `ExposureLedger.settleCoverage(governor, proposalId)`).
+    ///         `ledger` names the collaborator to retry against.
+    event CoverageSettleFailed(uint256 indexed proposalId, address indexed ledger);
+
     /// @notice Emitted in `_distributeFees` when `guardianFeeBps > 0`.
     ///         Guardian fee is carved from gross PnL and transferred to
     ///         `recipient` (the team `guardiansFeeRecipient` multisig). This is
