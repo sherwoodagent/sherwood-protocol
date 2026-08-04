@@ -93,6 +93,20 @@ contract PortfolioStrategy is BaseStrategy {
     ///         rationale in `_updateParams`.
     error RoutesFrozen();
     error QuoteUnavailable();
+    /// @notice Data Streams mode was paired with a swap adapter whose `quote()`
+    ///         returns 0 or reverts. In that mode `_sellFloor` / `_buyFloor`
+    ///         never reach an oracle at `execute()` / `settle()` (neither
+    ///         carries report calldata), so the adapter quote is the ONLY floor
+    ///         source on every call — and `_quoteMinOut` reverts when it is
+    ///         unavailable, from inside the `try` block's SUCCESS branch where
+    ///         its own `catch` cannot absorb it. `settle()` is the only
+    ///         non-emergency exit and `GovernorEmergency.unstick` replays the
+    ///         identical batch, so the pairing wedges the proposal in
+    ///         `Executed` permanently. Rejected at bind time, where it costs a
+    ///         re-proposal, rather than at settle time, where it costs the
+    ///         vault its liquidity. Push mode is unaffected: there the oracle
+    ///         is the primary floor and the quote is only a degrade path.
+    error AdapterCannotQuoteInDataStreamsMode(address swapAdapter);
     error InvalidPriceDecimals();
     /// @notice Feed id missing at init, or report's `feedId` doesn't match
     ///         the slot's declared `_feedIds[i]`.
@@ -401,6 +415,42 @@ contract PortfolioStrategy is BaseStrategy {
         totalAmount = totalAmount_;
         maxSlippageBps = maxSlippageBps_;
         _assetDecimals = IERC20Metadata(asset_).decimals();
+
+        // DATA STREAMS MODE REQUIRES A QUOTING ADAPTER.
+        //
+        // `_sellFloor` / `_buyFloor` are documented NON-REVERTING BY DESIGN:
+        // whenever the oracle leg is unavailable they degrade to
+        // `_quoteMinOut` "instead of stranding vault capital". In push mode
+        // that degrade is a genuine fallback — the oracle normally answers,
+        // and an adapter that cannot quote (the in-repo `SynthraDirectAdapter`
+        // returns 0 unconditionally, by design) is still a supported pairing.
+        //
+        // In Data Streams mode it is not a fallback but the only path: neither
+        // `execute()` nor `settle()` carries report calldata (both are
+        // parameterless per `IStrategy`), so the oracle branch is skipped
+        // unconditionally and EVERY call lands on `_quoteMinOut`. Paired with
+        // a non-quoting adapter that is not a degraded floor, it is a
+        // guaranteed revert on the only non-emergency exit — and `unstick`
+        // replays the same batch, so the proposal wedges in `Executed`, which
+        // holds `redemptionsLocked()` true and freezes LP exits, queue claims,
+        // rescues, new proposals and owner unstaking.
+        //
+        // Probed at the first allocation's real size rather than 1 wei: a
+        // dust-sized quote can legitimately floor to zero on a healthy pool and
+        // would false-reject a good adapter.
+        if (!pushMode) {
+            uint256 probeIn = (totalAmount_ * _allocations[0].targetWeightBps) / BPS_DENOMINATOR;
+            if (probeIn != 0) {
+                try ISwapAdapter(swapAdapter_)
+                    .quote(asset_, _allocations[0].token, probeIn, _swapExtraData[0]) returns (
+                    uint256 probeOut
+                ) {
+                    if (probeOut == 0) revert AdapterCannotQuoteInDataStreamsMode(swapAdapter_);
+                } catch {
+                    revert AdapterCannotQuoteInDataStreamsMode(swapAdapter_);
+                }
+            }
+        }
     }
 
     // ── Execute: buy basket tokens ──
@@ -411,7 +461,27 @@ contract PortfolioStrategy is BaseStrategy {
     ///      is the PERMISSIONLESS entry point (`executeProposal`), so a
     ///      quote-anchored-only floor let anyone move the pool immediately
     ///      before triggering execution and unwind against their own quote.
+    ///
+    ///      RE-CERTIFIES ADAPTER AND PRICE SOURCES, unlike `_settle`. The
+    ///      capital-hostage rationale that exempts `_settle` from these checks
+    ///      (see the binding note on `_initialize`) does NOT hold on this leg,
+    ///      and the two legs are not symmetric: blocking `settle()` strands
+    ///      capital already deployed, while blocking `execute()` strands
+    ///      nothing — no capital has moved yet, and the proposal simply
+    ///      expires at `executeBy` with the vault untouched. Leaving the check
+    ///      off here meant an adapter demoted between clone-init and execute —
+    ///      reachable with NO governance action at all via the permissionless
+    ///      `TierRegistry.poke` / `demoteByChallenge`, or via a metamorphic
+    ///      redeploy that breaks the codehash pin — still received
+    ///      `forceApprove` of the whole allocation, one hop outside the
+    ///      `_guardBatchCalls` gate that would otherwise have caught it.
+    ///      `rebalance` / `rebalanceDelta` already re-certify on every call for
+    ///      the same reason (issue #147 / Finding C); this closes the one
+    ///      remaining fail-open leg where a revert costs nothing.
     function _execute() internal override {
+        _requireAllowedAdapter(address(swapAdapter));
+        _requireAllowedPriceSources();
+
         _pullFromVault(asset, totalAmount);
 
         uint256 len = _allocations.length;
@@ -720,6 +790,22 @@ contract PortfolioStrategy is BaseStrategy {
         // sandwich can't drift output below this floor.
         uint256 minOut =
             (_tokensToValue(tokensToSell, price, i, assetDec) * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+        // FLOORED BY THE QUOTE, never replaced by it. `_priceDecimals[i]` is
+        // proposer-declared and, in Data Streams mode, cross-checked against
+        // NOTHING: the push branch asserts it against the feed's live
+        // `decimals()` at `_initialize` and again on every `_pushFeedPrice` /
+        // `_tryPushFeedPrice` read, but a Data Streams report carries no
+        // decimals field (see `ChainlinkReport`), so `_verifyPrice` returns
+        // `report.price` raw at whatever scale the slot claims. An inflated
+        // declaration shrinks `_tokensToValue` and collapses this floor —
+        // traced at a $200,000 position floored to 19 raw USDC. The quote
+        // floor derives from a different, non-proposer-declared quantity, so
+        // taking the MAX means a mis-scaled oracle can only ever raise the
+        // bar, never lower it below what the venue itself says the trade is
+        // worth. Safe to fail closed here: blocking one `rebalanceDelta`
+        // strands nothing, since `settle()` remains the untouched exit.
+        uint256 quoteFloor = _quoteMinOut(token, asset, tokensToSell, _swapExtraData[i]);
+        if (quoteFloor > minOut) minOut = quoteFloor;
         uint256 amountOut = swapAdapter.swap(token, asset, tokensToSell, minOut, _swapExtraData[i]);
         if (amountOut == 0) revert SwapFailed();
         return true;
@@ -743,6 +829,10 @@ contract PortfolioStrategy is BaseStrategy {
         uint256 assetDec = uint256(_assetDecimals);
         uint256 minOut =
             (_valueToTokens(amountToSpend, price, i, assetDec) * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+        // Floored by the quote for the same reason as `_sellOverweight`'s sell
+        // leg — see the note there on the unvalidated Data Streams price scale.
+        uint256 quoteFloor = _quoteMinOut(asset, _allocations[i].token, amountToSpend, _swapExtraData[i]);
+        if (quoteFloor > minOut) minOut = quoteFloor;
         uint256 amountOut = swapAdapter.swap(asset, _allocations[i].token, amountToSpend, minOut, _swapExtraData[i]);
         if (amountOut == 0) revert SwapFailed();
         return true;
