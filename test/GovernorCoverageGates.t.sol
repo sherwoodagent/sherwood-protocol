@@ -1115,7 +1115,8 @@ contract GovernorCoverageGatesTest is Test {
     function test_reclaimBond_unsetCoverageFreezer_reclaimsOnTheOrdinarySchedule() public {
         assertEq(ledger.coverageFreezer(), address(0), "this fixture wires no game");
         uint256 pid = _executeThenSettle();
-        uint256 opensAt = governor.getProposal(pid).executedAt + ledger.challengeWindow();
+        uint256 opensAt = governor.getProposal(pid).executedAt + governor.getProposal(pid).strategyDuration
+            + ledger.challengeWindow();
         uint256 balBefore = wood.balanceOf(agent);
 
         vm.warp(opensAt - 1);
@@ -1144,7 +1145,8 @@ contract GovernorCoverageGatesTest is Test {
         bytes32 rk = keccak256(abi.encode(address(governor), pid));
         assertEq(stubGame.challengeableUntil(rk), 0, "an untouched key reads zero");
 
-        uint256 deadline = governor.getProposal(pid).executedAt + ledger.challengeWindow();
+        uint256 deadline = governor.getProposal(pid).executedAt + governor.getProposal(pid).strategyDuration
+            + ledger.challengeWindow();
         vm.warp(deadline);
         vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
         governor.reclaimProposerBond(pid);
@@ -1153,6 +1155,52 @@ contract GovernorCoverageGatesTest is Test {
         vm.warp(deadline + 1);
         governor.reclaimProposerBond(pid);
         assertEq(wood.balanceOf(agent), balBefore + 200e18);
+    }
+
+    /// @notice SECOND-AUDIT FINDING A, GOVERNOR SIDE: the hold spans the
+    ///         STRATEGY TERM plus the window, not the window alone.
+    ///
+    ///         `ChallengeGame.file` admits challenges until `executedAt +
+    ///         strategyDuration + challengeWindow`, because a strategy's risk
+    ///         does not end the instant it is executed — it ends when the term
+    ///         is over. These gates were anchored at `executedAt +
+    ///         challengeWindow`, ignoring the term entirely, so for up to
+    ///         `maxStrategyDuration` (30d, and 7d in this fixture) the bond was
+    ///         releasable while `file` was still admitting. The proposer bond
+    ///         is exactly what a successful challenge is paid out of, so that
+    ///         gap let a proposer walk their stake out of a still-challengeable
+    ///         position and leave a later conviction with nothing to confiscate.
+    ///
+    ///         MUTATION-CHECKED: dropping `+ strategyDuration` from either gate
+    ///         makes the FIRST warp below release the bond instead of
+    ///         reverting.
+    function test_reclaimBond_holdSpansTheStrategyTermNotJustTheWindow() public {
+        uint256 pid = _executeThenSettle();
+        MockFilingDeadline stubGame = new MockFilingDeadline(ledger.challengeWindow());
+        vm.prank(ledgerOwner);
+        ledger.setCoverageFreezer(address(stubGame));
+
+        uint256 executedAt = governor.getProposal(pid).executedAt;
+        uint256 sd = governor.getProposal(pid).strategyDuration;
+        assertGt(sd, 0, "the fixture proposes a real strategy term, so the anchor is observable");
+
+        // The PRE-FIX open instant: one second past `executedAt +
+        // challengeWindow`, with the strategy term ignored. `file` still admits
+        // here, so a release would be premature.
+        vm.warp(executedAt + ledger.challengeWindow() + 1);
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        governor.reclaimProposerBond(pid);
+
+        // Still shut AT the true deadline — strict, because `file` admits while
+        // `block.timestamp <= deadline`.
+        vm.warp(executedAt + sd + ledger.challengeWindow());
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        governor.reclaimProposerBond(pid);
+
+        uint256 balBefore = wood.balanceOf(agent);
+        vm.warp(executedAt + sd + ledger.challengeWindow() + 1);
+        governor.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), balBefore + 200e18, "opens one second past the term-inclusive deadline");
     }
 
     /// @notice DESIGN D2 — why the gate is a `max` and not `challengeableUntil`
@@ -1178,6 +1226,10 @@ contract GovernorCoverageGatesTest is Test {
         ledger.setCoverageFreezer(address(stubGame));
 
         uint256 executedAt = governor.getProposal(pid).executedAt;
+        // Every deadline here is anchored at `executedAt + strategyDuration`,
+        // not `executedAt` — risk ends when the strategy's term is over AND
+        // the window on top of it has run out (second-audit finding A).
+        uint256 anchor = executedAt + governor.getProposal(pid).strategyDuration;
         assertEq(
             stubGame.challengeableUntil(keccak256(abi.encode(address(governor), pid))),
             0,
@@ -1185,18 +1237,18 @@ contract GovernorCoverageGatesTest is Test {
         );
 
         // Both original gates are open at the ledger's deadline...
-        vm.warp(executedAt + ledger.challengeWindow());
+        vm.warp(anchor + ledger.challengeWindow());
         assertFalse(ledger.isCoverageFrozen(address(governor), pid), "and nothing is frozen");
         vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
         governor.reclaimProposerBond(pid);
 
         // ...and the hold runs to the GAME's deadline, strictly.
-        vm.warp(executedAt + gameWindow);
+        vm.warp(anchor + gameWindow);
         vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
         governor.reclaimProposerBond(pid);
 
         uint256 balBefore = wood.balanceOf(agent);
-        vm.warp(executedAt + gameWindow + 1);
+        vm.warp(anchor + gameWindow + 1);
         governor.reclaimProposerBond(pid);
         assertEq(wood.balanceOf(agent), balBefore + 200e18);
     }
@@ -1321,7 +1373,8 @@ contract GovernorCoverageGatesTest is Test {
         vm.store(address(governor), _proposerBondLedgerSlot(pid), bytes32(0));
         assertEq(governor.getProposal(pid).proposerBondLedger, address(0), "simulated pre-pin record");
 
-        uint256 opensAt = governor.getProposal(pid).executedAt + ledger.challengeWindow();
+        uint256 opensAt = governor.getProposal(pid).executedAt + governor.getProposal(pid).strategyDuration
+            + ledger.challengeWindow();
         vm.warp(opensAt - 1);
         vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
         governor.reclaimProposerBond(pid);

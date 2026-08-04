@@ -1178,6 +1178,41 @@ contract SyndicateVault is
         override(ERC20Upgradeable, ERC20VotesUpgradeable)
     {
         super._update(from, to, value);
+
+        // HIGH-WATER MARK RESET ON FULL DRAIN (audit-181-2, Finding B).
+        //
+        // `_highWaterPricePerShare` is seeded once, at the first mint
+        // (`_initHighWaterMarkIfUnset`, called from every mint entrypoint —
+        // `_deposit` and `settleDeposit`, see both), and otherwise only ever
+        // advances (`ratchetHighWaterMark`, monotonic by construction). It was
+        // NEVER reset when `totalSupply()` returns to zero — every share
+        // burned via redemption/settlement — while the ERC-4626 share/asset
+        // SCALE is independently re-derived from `(residualAssets + 1)` on
+        // the very next deposit (the virtual-offset arithmetic in
+        // `_convertToShares`/`_convertToAssets`). The result: a re-seeding
+        // deposit's price-per-share can land at `(residualAssets+1)x` the
+        // STALE mark, and `aboveHighWaterMark` then reads almost the entire
+        // new principal as performance-fee base on a zero-P&L re-seed — up to
+        // the fee cap, charged against brand-new capital that never earned a
+        // cent. Reaching `totalSupply() == 0 && totalAssets() > 0` is not
+        // exotic: redeem-flooring dust, the queue's own deliberate
+        // `floor(sum) - sum(floor)` dust release, `_unclaimedFees` escrow, or
+        // a bare ERC20 donation to the vault all leave residual assets behind
+        // an empty share supply.
+        //
+        // Zeroing here, on EVERY burn/mint/transfer that empties supply
+        // (this hook is the single OZ chokepoint for all of them — Lane A
+        // `_withdraw`, the queue's `settleRedeem`, and any future burn path
+        // alike), makes the next mint's `_initHighWaterMarkIfUnset` treat the
+        // fund as freshly created, exactly like the very first deposit ever.
+        // A mint in the SAME call as the draining burn (impossible for a
+        // single ERC20 `_update`, which touches at most one balance
+        // direction pair) is not a concern; sequential burn-then-mint across
+        // two calls is exactly the case this closes.
+        if (totalSupply() == 0) {
+            _highWaterPricePerShare = 0;
+        }
+
         // AUTO-DELEGATE ON EVERY RECEIPT. Runs AFTER `super._update` so the
         // recipient's post-receipt balance is what checkpoints. Holders that
         // explicitly delegated away keep their choice (`delegates(to) != 0`).
@@ -1553,12 +1588,24 @@ contract SyndicateVault is
     /// @notice Queue-only: mint `shares` to `to` at the proposal's frozen settle
     ///         price. The queue pushes the escrowed assets to the vault
     ///         immediately before this call. Auto-delegates for voting power.
-    /// @dev No `nonReentrant`: there is no external call (mint + delegate only),
-    ///      and the only caller — the queue's `claim` — is itself `nonReentrant`.
-    ///      Auto-delegation happens in `_update`.
+    /// @dev No `nonReentrant`: the only STATE-MUTATING call here is the mint
+    ///      (+ delegate, in `_update`). `_initHighWaterMarkIfUnset` below reads
+    ///      `pricePerShare()`, which makes external STATICCALLs (`asset()`'s
+    ///      `balanceOf`, and the queue's own `stampedUnclaimedShares()` via
+    ///      `_pricingSupply`) — read-only, so none of them can reenter a
+    ///      state-mutating path — and the only caller, the queue's `claim`, is
+    ///      itself `nonReentrant`.
+    /// @dev Queue-originated deposits bypass `_deposit` entirely, so this is
+    ///      the ONLY other mint entrypoint and must seed the high-water mark
+    ///      itself, or a queue-only first mint (no vault ever seen a Lane A
+    ///      deposit) would settle its first performance fee against an unset
+    ///      (zero) mark — the same failure mode `_deposit` already guards
+    ///      against, and also the re-seed path for the 0 -> nonzero supply
+    ///      transition zeroed in `_update` (audit-181-2, Finding B).
     function settleDeposit(uint256 shares, address to) external {
         if (msg.sender != _withdrawalQueue) revert NotQueue();
         _mint(to, shares);
+        _initHighWaterMarkIfUnset();
     }
 
     /// @inheritdoc ISyndicateVault

@@ -2954,38 +2954,48 @@ contract ChallengeGameTest is Test {
         assertEq(game.inconclusiveBurnBps(), 0);
     }
 
-    /// @notice THE CROSS-SETTER ORDERING, BOTH DIRECTIONS (review round 2,
-    ///         2026-07-30). Equal ceilings (`MAX_INCONCLUSIVE_BURN_BPS ==
-    ///         MAX_SETTLE_BURN_BPS`) bound the two rates' maximums
-    ///         identically but say nothing about where the LIVE rates sit —
-    ///         each setter must additionally check the OTHER's current value,
-    ///         or the owner could legally invert the ordering one call at a
-    ///         time. This is direction 1: `setInconclusiveBurnBps` must refuse
-    ///         to rise above the live `settleBurnBps`.
-    function test_setInconclusiveBurnBps_revertsAboveTheLiveSettleBurnBps() public {
-        assertEq(game.settleBurnBps(), 1_000, "sanity: the default this bound is checked against");
+    /// @notice THE CROSS-SETTER ORDERING WAS DELIBERATELY REMOVED
+    ///         (second-audit finding C, see `setInconclusiveBurnBps`'s and
+    ///         `setSettleBurnBps`'s natspec). It used to make each setter
+    ///         additionally refuse to move past the OTHER's live value, which
+    ///         pinned `inconclusiveBurnBps <= settleBurnBps` unconditionally
+    ///         and made the Inconclusive ladder's round-4+ tier permanently
+    ///         collapse onto round 3's fixed 1,000 bps — raising it required
+    ///         raising `settleBurnBps` first, which breaks
+    ///         `honestFilingBreaksEven`. This direction now asserts the
+    ///         opposite of what it used to: `setInconclusiveBurnBps` MUST be
+    ///         free to rise above the live `settleBurnBps`, bounded only by
+    ///         its own ceiling, `MAX_INCONCLUSIVE_BURN_BPS`.
+    function test_setInconclusiveBurnBps_allowsRisingAboveTheLiveSettleBurnBps() public {
+        assertEq(game.settleBurnBps(), 1_000, "sanity: the default this used to be bound against");
         vm.startPrank(owner);
+        game.setInconclusiveBurnBps(1_001); // one bps above the live settleBurnBps — no longer reverts
+        assertEq(game.inconclusiveBurnBps(), 1_001);
+
         vm.expectRevert(IChallengeGame.InvalidParameter.selector);
-        game.setInconclusiveBurnBps(1_001); // one bps above the live settleBurnBps
-        game.setInconclusiveBurnBps(1_000); // equal to it is fine
-        assertEq(game.inconclusiveBurnBps(), 1_000);
+        game.setInconclusiveBurnBps(5_001); // still bounded by its own ceiling
+        game.setInconclusiveBurnBps(5_000); // the ceiling itself is allowed
+        assertEq(game.inconclusiveBurnBps(), 5_000);
         vm.stopPrank();
     }
 
-    /// @notice Direction 2 of the same ordering: `setSettleBurnBps` must
-    ///         refuse to drop below the live `inconclusiveBurnBps`. Both now
-    ///         default to 1,000 (audit #181 finding 18a lowered the pair in
-    ///         lockstep to close the incentive inversion; the ceiling had to
-    ///         move with `settleBurnBps` or the new configuration would be
-    ///         unreachable through these very setters), so the probe values
-    ///         shift accordingly.
-    function test_setSettleBurnBps_revertsBelowTheLiveInconclusiveBurnBps() public {
-        assertEq(game.inconclusiveBurnBps(), 1_000, "sanity: the default this bound is checked against");
+    /// @notice Direction 2 of the same removed ordering: `setSettleBurnBps`
+    ///         must now be free to drop below the live `inconclusiveBurnBps`
+    ///         — the mutual cross-check is gone from this side too, and this
+    ///         setter is bounded only by its own ceiling,
+    ///         `MAX_SETTLE_BURN_BPS`. Both still default to 1,000 (audit #181
+    ///         finding 18a lowered the pair in lockstep to close the
+    ///         incentive inversion), so the probe values shift accordingly.
+    function test_setSettleBurnBps_allowsDroppingBelowTheLiveInconclusiveBurnBps() public {
+        assertEq(game.inconclusiveBurnBps(), 1_000, "sanity: the default this used to be bound against");
         vm.startPrank(owner);
+        game.setSettleBurnBps(999); // one bps below the live inconclusiveBurnBps — no longer reverts
+        assertEq(game.settleBurnBps(), 999);
+
         vm.expectRevert(IChallengeGame.InvalidParameter.selector);
-        game.setSettleBurnBps(999); // one bps below the live inconclusiveBurnBps
-        game.setSettleBurnBps(1_000); // equal to it is fine
-        assertEq(game.settleBurnBps(), 1_000);
+        game.setSettleBurnBps(5_001); // still bounded by its own ceiling
+        game.setSettleBurnBps(5_000); // the ceiling itself is allowed
+        assertEq(game.settleBurnBps(), 5_000);
         vm.stopPrank();
     }
 

@@ -821,7 +821,12 @@ contract ChallengeEndToEndTest is Test {
         // Anchored on what the CONTRACT stored, never on a local captured
         // before a warp — the optimizer CSEs `block.timestamp` across
         // `vm.warp`, and `executedAt` is the value the gate itself reads.
-        uint256 opensAt = gov.getProposal(pid).executedAt + ledger.challengeWindow();
+        // `+ strategyDuration` (second-audit finding A): the filing deadline —
+        // and therefore this hold — runs from the end of the strategy's TERM,
+        // not from the instant it was executed. Self-settling early does not
+        // shorten it.
+        uint256 opensAt =
+            gov.getProposal(pid).executedAt + gov.getProposal(pid).strategyDuration + ledger.challengeWindow();
         vm.warp(opensAt - 1);
         vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
         gov.reclaimProposerBond(pid);

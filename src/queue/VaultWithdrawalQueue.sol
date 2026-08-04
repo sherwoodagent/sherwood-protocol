@@ -173,15 +173,43 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     // ── Claim / cancel ──
 
     /// @inheritdoc IVaultWithdrawalQueue
-    /// @dev Claimable once the request's proposal is stamped AND the vault is
+    /// @dev Claimable once the RELEVANT settlement is stamped AND the vault is
     ///      unlocked (no active proposal) — deposit-claim assets must not land
     ///      mid-proposal (they would mis-count as strategy profit) and
     ///      redeem-claim float is only guaranteed available between proposals.
+    ///      "Relevant" is the request's own pid for a Redeem, but the LATEST
+    ///      stamped pid for a Deposit — see the gate below for why the two
+    ///      differ (audit-181-2, Finding A).
     function claim(uint256 requestId) external nonReentrant returns (uint256 outAmount) {
         Request storage r = _req(requestId);
         if (r.claimed) revert AlreadyClaimed();
         if (r.cancelled) revert AlreadyCancelled();
-        SettlePrice memory sp = _settlePrice[r.pid];
+        // GATE ON THE PRICE THIS CLAIM ACTUALLY USES, not blindly on the
+        // request's own tagged pid (audit-181-2, Finding A).
+        //
+        // Redeem claims price against their OWN pid's stamp (see the Redeem
+        // branch below) — `requestRedeem` only opens while
+        // `redemptionsLocked()` is true, i.e. the proposal it tags is already
+        // Executed, and every Executed proposal reaches Settled through
+        // exactly one of `settleProposal` / `unstick` / `finalizeEmergencySettle`
+        // (all three call `vault.onProposalSettled` before `_decOpen()`), so
+        // `r.pid` is always eventually stamped for a redeem. No hole here.
+        //
+        // Deposit claims price against `_lastStampedPid` instead (see the
+        // Deposit branch below for why), and `requestDeposit` opens on
+        // `openProposalCount() != 0` — Draft AND Pending, not just Executed.
+        // A proposal can leave Draft/Pending WITHOUT ever settling
+        // (cancelled / vetoed / rejected / expired all call `_decOpen()`
+        // directly, never `onProposalSettled`), so `_settlePrice[r.pid]` can
+        // be permanently unstamped for a deposit tagged to one of those.
+        // Gating on `r.pid` there reverted `NotSettled` forever with no
+        // recovery for a pay-on-behalf deposit (`cancel` is receiver-gated,
+        // `requestDeposit` pulled assets from `msg.sender`). Gating on
+        // `_lastStampedPid` instead means the claim unlocks at the NEXT real
+        // settlement, whichever proposal that turns out to be — exactly the
+        // price it is actually charged at below.
+        uint256 pricePid = r.kind == RequestKind.Redeem ? r.pid : _lastStampedPid;
+        SettlePrice memory sp = _settlePrice[pricePid];
         if (!sp.stamped) revert NotSettled();
         if (IRequestableVault(vault).redemptionsLocked()) revert VaultLocked();
 
@@ -241,10 +269,13 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             // Redeem (above) keeps its own pid deliberately: those shares left
             // the supply at that settlement and `_pidReserved` is denominated
             // against that same price.
-            SettlePrice memory dp = _settlePrice[_lastStampedPid];
-            if (!dp.stamped) dp = sp; // defensive; `sp.stamped` was required above
+            //
+            // `sp` above was already fetched at `pricePid == _lastStampedPid`
+            // for a Deposit request (see the gate comment at the top of this
+            // function), so it IS the latest-stamped price already — no
+            // separate lookup or defensive fallback needed here.
             // shares = assets * den / num (matches ERC-4626 convertToShares at settle)
-            outAmount = Math.mulDiv(amount, dp.den, dp.num);
+            outAmount = Math.mulDiv(amount, sp.den, sp.num);
             _pendingDepositAssets -= amount;
             // Push escrowed assets into the vault, then mint at the frozen price.
             IERC20(IRequestableVault(vault).asset()).safeTransfer(vault, amount);

@@ -292,6 +292,101 @@ contract TokenCourt_floorAndProsecutorTest is Test {
         );
     }
 
+    /// @notice FINDING #10: a DUST-but-nonzero lookback remainder must not
+    ///         collapse the floor to zero.
+    ///
+    ///         The exact-zero fallback only catches `earlierReduced == 0`
+    ///         exactly. Here the accused held the entire lookback electorate
+    ///         except ONE WEI, so `earlierReduced == 1`: the fallback does not
+    ///         fire, and the raw `1` would win the min against a 100,000e18
+    ///         `reduced`. `participationFloorBps * 1 / BPS_DENOMINATOR` then
+    ///         truncates to LITERAL ZERO, admitting any nonzero turnout and
+    ///         letting a single pre-positioned voter decide a case whose
+    ///         verdict burns the accused's bond.
+    ///
+    ///         The `MIN_LOOKBACK_BASE_BPS` clamp raises the nonzero remainder
+    ///         to 10% of `earlier` (= 100,000e18) before the min, restoring a
+    ///         floor of 10,000e18.
+    ///
+    ///         MUTATION-CHECKED: deleting the clamp (letting the raw
+    ///         `earlierReduced` compete in the min unmodified) yields a floor
+    ///         of 0 and fails the assertion below.
+    function test_participationFloor_dustLookbackRemainderCannotCollapseTheFloor() public {
+        (uint256 caseId,,) = _openCase(
+            3,
+            makeAddr("challengerDust"),
+            makeAddr("accusedDust"),
+            900_000e18, // accusedStakeNow  -> reduced = 100,000e18
+            1_000_000e18 - 1, // accusedStakeThen: accused held ALL of the lookback electorate but 1 wei
+            1_000_000e18, // totalNow
+            1_000_000e18 // totalThen -> earlierReduced = 1
+        );
+
+        vm.warp(vm.getBlockTimestamp() + 5 days + 1 days);
+        uint256 floor = _finalizeAndReadFloor(caseId);
+
+        assertEq(floor, 10_000e18, "a 1-wei lookback remainder must clamp to 10% of `earlier`, not truncate to zero");
+    }
+
+    /// @notice FINDING #10's CLAMP MUST BE BASED ON `earlier`, NOT `reduced` —
+    ///         the regression that pins the defect the clamp itself shipped
+    ///         with.
+    ///
+    ///         `reduced` is measured at `snapshotTs`, so it is precisely the
+    ///         term finding #6's attacker inflates with a large, idle,
+    ///         never-approving stake. An earlier revision of this clamp used
+    ///         `minBase = reduced * MIN_LOOKBACK_BASE_BPS / BPS_DENOMINATOR`,
+    ///         which handed that attacker a bounded — but real — lever back:
+    ///         a fraction of an attacker-inflated number is still
+    ///         attacker-inflated.
+    ///
+    ///         Both cases below share an IDENTICAL lookback instant (a 1-wei
+    ///         remainder, so the clamp is what binds in each). They differ
+    ///         only in `total` at `snapshotTs`, which the attacker inflates
+    ///         from 1,000,000e18 to 5,000,000e18 with stake that never
+    ///         approved anything.
+    ///
+    ///         MUTATION-CHECKED: restoring `minBase = reduced * ...` makes the
+    ///         inflated case resolve to 41,000e18 against the clean case's
+    ///         10,000e18 — a 4.1x rise in the conviction bar, bought purely
+    ///         with fresh stake — and fails the equality below.
+    function test_participationFloor_clampBasisIsTheLookbackInstantNotTheSnapshot() public {
+        (uint256 cleanCaseId,,) = _openCase(
+            4,
+            makeAddr("challengerClamp"),
+            makeAddr("accusedClamp"),
+            900_000e18, // reduced = 100,000e18
+            1_000_000e18 - 1, // 1-wei lookback remainder -> the clamp binds
+            1_000_000e18,
+            1_000_000e18
+        );
+        vm.warp(vm.getBlockTimestamp() + 5 days + 1 days);
+        uint256 cleanFloor = _finalizeAndReadFloor(cleanCaseId);
+        assertEq(cleanFloor, 10_000e18, "clamped to 10% of `earlier`");
+
+        // Fresh block range so this case's checkpoints cannot collide with the
+        // clean case's.
+        vm.warp(vm.getBlockTimestamp() + 100 days);
+        (uint256 inflatedCaseId,,) = _openCase(
+            5,
+            makeAddr("challengerClampAttack"),
+            makeAddr("accusedClampAttack"),
+            900_000e18, // accused position UNCHANGED: the attacker never approved
+            1_000_000e18 - 1, // lookback instant IDENTICAL to the clean case
+            5_000_000e18, // totalNow inflated by a fresh 4,000,000e18 never-approving stake
+            1_000_000e18 // totalThen IDENTICAL: the attacker is absent a month earlier
+        );
+        vm.warp(vm.getBlockTimestamp() + 5 days + 1 days);
+        uint256 inflatedFloor = _finalizeAndReadFloor(inflatedCaseId);
+
+        assertEq(
+            inflatedFloor,
+            cleanFloor,
+            "fresh snapshot-instant stake must not move the clamp: its basis is `earlier`, not `reduced`"
+        );
+        assertEq(inflatedFloor, 10_000e18, "must stay at 10% of `earlier`, not rise to the reduced-based 41,000e18");
+    }
+
     /// @notice FINDING #7: the challenge's own `challenger` must be barred
     ///         from voting on its own case — the same self-dealing hazard
     ///         `AccusedCannotVote` closes from the defendant's side. `refer`

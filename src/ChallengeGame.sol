@@ -287,12 +287,19 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
     /// @dev Ceiling on `inconclusiveBurnBps`, identical to `MAX_SETTLE_BURN_BPS`:
     ///      an `Inconclusive` unwind is a non-verdict — nothing was
-    ///      adjudicated or recovered — and must never cost the challenger more
-    ///      than a verdict that actually recovered value. Equal ceilings alone
-    ///      only bound each rate's maximum; `setSettleBurnBps` and
-    ///      `setInconclusiveBurnBps` additionally cross-check each other's LIVE
-    ///      value to keep that ordering true at every point, not just at the
-    ///      ceiling.
+    ///      adjudicated or recovered — and, for the ladder's fixed early
+    ///      tiers (rounds 1-3), must never cost an honest, few-attempt
+    ///      filer more than a verdict that actually recovered value. The
+    ///      equal ceilings alone bound each rate's ABSOLUTE maximum
+    ///      identically; `setSettleBurnBps` and `setInconclusiveBurnBps` no
+    ///      longer additionally cross-check each other's LIVE value
+    ///      (second-audit finding C — that cross-check made the round-4+
+    ///      tier of the Inconclusive ladder permanently collapse onto round
+    ///      3's fixed rate, since raising it required first raising
+    ///      `settleBurnBps`, which breaks `honestFilingBreaksEven`). See
+    ///      `_inconclusiveBurnBpsForRound` for how the "never costs more
+    ///      than a verdict" property is kept anyway, for the tiers it still
+    ///      applies to.
     uint256 internal constant MAX_INCONCLUSIVE_BURN_BPS = MAX_SETTLE_BURN_BPS;
 
     /// @dev Round-1 step of the escalating Inconclusive-burn schedule (issue
@@ -307,9 +314,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      plus `challengeWindow` (14d) of frozen coverage at the cost of
     ///      gas alone. Sized at half of `INCONCLUSIVE_BURN_ROUND2_BPS`,
     ///      continuing that constant's own doubling shape backwards (250 ->
-    ///      500 -> 1,000 -> the round-4+ live ceiling, default 2,000) — no
-    ///      attempt is ever free, and the schedule still genuinely escalates
-    ///      rather than flattening its first two steps. Fixed, not
+    ///      500 -> 1,000 -> `inconclusiveBurnBps`, default 1,000 — second-
+    ///      audit finding E: this natspec previously claimed the round-4+
+    ///      default was 2,000, the pre-audit-#181-finding-18a value, and
+    ///      described the ladder as having a reachable fourth step when the
+    ///      old setter coupling made it collapse onto round 3; see
+    ///      `_inconclusiveBurnBpsForRound` and `setInconclusiveBurnBps` for
+    ///      the second-audit finding C fix that makes the fourth step
+    ///      genuinely reachable again) — no attempt is ever free, and the
+    ///      schedule still genuinely escalates rather than flattening its
+    ///      first two steps. Fixed, not
     ///      owner-settable, for the same reason as its siblings below. See
     ///      `_inconclusiveBurnBpsForRound` for how the schedule composes,
     ///      including the live clamp to `settleBurnBps` that also covers
@@ -466,10 +480,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @notice Share of a SUCCESSFUL challenger's bond burned on settle, in bps.
     /// @dev    Prices a filing in both directions: refunding the bond in full
     ///         would make the slash of the accused and the demotion of the
-    ///         named adapter come for the price of gas alone. 20% is a cost
-    ///         rather than a transfer to the accused — paying convicted
-    ///         approvers out of a correct filing would invert the incentive
-    ///         it's meant to price.
+    ///         named adapter come for the price of gas alone. 10% (the live
+    ///         default — second-audit finding E: this natspec was stale at
+    ///         "20%", the pre-audit-#181-finding-18a rate) is a cost rather
+    ///         than a transfer to the accused — paying convicted approvers
+    ///         out of a correct filing would invert the incentive it's meant
+    ///         to price.
     /// @dev    Applied on BOTH of `_settle`'s branches (issue #181 finding
     ///         18b): the BOND on the silence (`!escalated`) branch, and the
     ///         forfeited counter-bond POOL on the escalated (guilty-ruling)
@@ -494,7 +510,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     uint256 public constant MAX_PROSECUTOR_FEE_BPS = 2_000;
 
     /// @notice Slice of the convicted PROPOSER's forfeited bond paid to the
-    ///         challenger that caused the conviction, in bps. Default 5%.
+    ///         challenger that caused the conviction, in bps. Default 20%
+    ///         (second-audit finding E: this natspec was stale at "Default
+    ///         5%", the pre-audit-#181-finding-18a inherited rate).
     /// @dev    NOT a slice of the slash. The slash pays nobody — `slashVerdict`
     ///         takes no payee and burns everything it collects — and that
     ///         separation is the point. A reward funded from the slash is a pot
@@ -525,7 +543,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     uint256 public prosecutorFeeBps = 2_000;
 
     /// @notice The round-4-and-beyond steady-state share of the challenger's
-    ///         bond burned on an `Inconclusive` unwind, in bps. Default 20% —
+    ///         bond burned on an `Inconclusive` unwind, in bps. Default 10%
+    ///         (second-audit finding E: this was stale at "Default 20%",
+    ///         left over from before audit #181 finding 18a halved it) —
     ///         see `_inconclusiveBurnBpsForRound` for the full schedule (rounds
     ///         1-3 are fixed, lower steps) and `inconclusiveRounds` for what a
     ///         "round" counts.
@@ -536,23 +556,33 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         indefinitely. A flat burn rate cannot separate a genuinely
     ///         honest one-shot filer from a grinder, since it is invariant to
     ///         repetition; the rate therefore escalates with the round count
-    ///         (`inconclusiveRounds`) instead: round 1 free, round 2 and 3
-    ///         fixed steps, round 4+ this variable, clamped live to
-    ///         `settleBurnBps`.
-    /// @dev    Deliberately below `settleBurnBps` at every tier, enforced by
-    ///         both setters cross-checking each other's LIVE value (not merely
-    ///         sharing a ceiling): a non-verdict recovered nothing, so it must
-    ///         cost strictly less than a verdict that recovered real value.
-    ///         See `setInconclusiveBurnBps`/`setSettleBurnBps` for the
-    ///         enforcement and `_inconclusiveBurnBpsForRound` for why every
-    ///         tier — including the two fixed literals outside that setter
-    ///         pair — is additionally clamped there.
-    /// @dev 1,000, lowered from 2,000 in lockstep with `settleBurnBps` (audit
-    ///      #181 finding 18a). `setSettleBurnBps` refuses to drop below this
-    ///      value, so the ceiling MUST move with it or the new configuration is
-    ///      unreachable through the setters even though the constructor accepts
-    ///      it. The 250/500/1,000 ladder steps are all <= this, so lowering the
-    ///      ceiling does not clamp any of them.
+    ///         (`inconclusiveRounds`) instead: round 1 a fixed 2.5% (issue
+    ///         #181 finding 19 closed what used to be a free first attempt),
+    ///         rounds 2 and 3 fixed steps at 5% and 10%, round 4+ this
+    ///         variable — no longer clamped live to `settleBurnBps`
+    ///         (second-audit finding C; see `_inconclusiveBurnBpsForRound`).
+    /// @dev    Rounds 1-3 stay deliberately at or below `settleBurnBps`,
+    ///         clamped live at the point `_inconclusiveBurnBpsForRound` pins
+    ///         the rate: a non-verdict must never cost an honest, few-attempt
+    ///         filer more than a verdict that recovered real value. Round 4+
+    ///         (this variable) is DELIBERATELY NOT bound to the live
+    ///         `settleBurnBps` any more (second-audit finding C) — the old
+    ///         mutual setter cross-check made the ladder's top tier
+    ///         permanently collapse onto round 3's fixed rate, since raising
+    ///         it required raising `settleBurnBps` first, which breaks
+    ///         `honestFilingBreaksEven`. This tier is bounded only by
+    ///         `MAX_INCONCLUSIVE_BURN_BPS`, on the reasoning that round 4+ is
+    ///         reached only after three prior Inconclusive unwinds against
+    ///         the same proposal — by then pricing it against the anti-grind
+    ///         purpose this schedule exists for, not against the ordinary
+    ///         verdict rate, is correct. See `setInconclusiveBurnBps` and
+    ///         `_inconclusiveBurnBpsForRound` for the mechanics.
+    /// @dev 1,000 (10%), lowered from 2,000 in lockstep with `settleBurnBps`
+    ///      (audit #181 finding 18a) — unchanged by the second audit; only
+    ///      the setter coupling around it changed. The 250/500/1,000 ladder
+    ///      steps are all <= this default, so at these defaults lowering
+    ///      `settleBurnBps` still does not clamp any of the fixed tiers
+    ///      below their own value.
     uint256 public inconclusiveBurnBps = 1_000;
 
     /// @notice WOOD held on behalf of live (`Filed`/`Disputed`) challenges —
@@ -581,8 +611,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
     /// @inheritdoc IChallengeGame
     /// @dev Never read as a stored absolute — `file` always maxes this value
-    ///      against the live `executedAt + challengeWindow` baseline at the
-    ///      call site. `challengeWindow` is live, mutable state, so comparing
+    ///      against the live `executedAt + strategyDuration + challengeWindow`
+    ///      baseline at the call site (second-audit finding A). `challengeWindow`
+    ///      is live, mutable state, so comparing
     ///      only at write time would let a shortened-then-restored window
     ///      leave this mapping holding a deadline smaller than a fresh
     ///      proposal would ever compute, with no setter to fix it. This
@@ -752,18 +783,43 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (executedAt == 0) revert NotExecuted();
 
         // The filing deadline is the LARGER of the ordinary
-        // `executedAt + challengeWindow` and whatever `_refundAll` has raised
-        // `challengeableUntil` to for an earlier `Inconclusive` unwind on this
-        // proposal — without that floor, an `Inconclusive` landing late could
-        // make acquittal permanent. Recomputed as a max on every call rather
-        // than trusted as a stored absolute, since `challengeWindow` is live,
-        // mutable state and a stored value could otherwise go stale below what
-        // a fresh proposal would compute.
+        // `executedAt + strategyDuration + challengeWindow` and whatever
+        // `_refundAll` has raised `challengeableUntil` to for an earlier
+        // `Inconclusive` unwind on this proposal — without that floor, an
+        // `Inconclusive` landing late could make acquittal permanent.
+        // Recomputed as a max on every call rather than trusted as a stored
+        // absolute, since `challengeWindow` is live, mutable state and a
+        // stored value could otherwise go stale below what a fresh proposal
+        // would compute.
+        //
+        // `+ p.strategyDuration` (second-audit finding A, THE MOST SEVERE
+        // FINDING IN THE AUDIT). The old deadline was `executedAt +
+        // challengeWindow` alone — but `settleProposal` does not move any
+        // money at `executedAt`; it runs `settlementCalls` at `executedAt +
+        // p.strategyDuration` (up to `maxStrategyDuration`, 30 days at
+        // SyndicateFactory), and `_resolveTierAndCoverage` requires guardians
+        // to underwrite THAT drain too (`coverage = execCoverage +
+        // settleCoverage`). A 14-day filing window against a 30-day-out
+        // settlement closed the window 16 days before the money could even
+        // leave: the proposer reclaimed its bond, the settlement drained up
+        // to `effectiveMaxCapital`, and the guardians who underwrote it could
+        // never be held accountable — slash recovered 0, bond forfeited 0,
+        // adapter demoted: no. `ExposureLedger.recordApproval`'s own natspec
+        // already states the correct invariant this contract failed to
+        // apply: risk ends at `executeBy + strategyDuration + challengeWindow`,
+        // not `executeBy + challengeWindow`. `p.strategyDuration` is read off
+        // the SAME `getProposal` snapshot `executedAt` and `vault` already
+        // come from above, so it is pinned identically — a governor mutating
+        // it after this call cannot move the deadline this filing computed.
+        // `SyndicateGovernor.reclaimProposerBond`'s gates 1 and 3 carry the
+        // identical anchor. If this expression ever changes, change theirs in
+        // the same commit: a governor gate that lifts before this deadline
+        // releases the proposer bond a conviction would have been paid from.
         //
         // `key` is computed once here for both this gate and the
         // `AlreadyConvicted`/`AlreadyChallenged` checks below.
         bytes32 key = _reviewKey(governor, proposalId);
-        uint256 deadline = executedAt + challengeWindow;
+        uint256 deadline = executedAt + p.strategyDuration + challengeWindow;
         uint256 extended = challengeableUntil[key];
         if (extended > deadline) deadline = extended;
         if (block.timestamp > deadline) revert WindowClosed();
@@ -1091,7 +1147,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @dev THAT RISK IS REAL ONLY WHEN AN ADJUDICATOR WAS PINNED AT FILING
     ///      (`Challenge.courtAtFiling != address(0)`) — a `Guilty` ruling is
     ///      the only way the pool loses everything, and `rule` is unreachable
-    ///      with no court wired. Before `courtAtFiling` existed (issue #181
+    ///      for this challenge with no court PINNED, whether or not one is
+    ///      LIVE (second-audit finding B tightened this from "unreachable
+    ///      with no court wired" to "unreachable without this challenge's
+    ///      own `courtAtFiling`", since a court wired in AFTER a zero-pin
+    ///      filing must not retroactively expose a pool that funded itself
+    ///      believing no ruling was possible — see `ChallengeGame.rule`).
+    ///      Before `courtAtFiling` existed (issue #181
     ///      finding 2), a challenge filed against an unwired game could only
     ///      ever escalate into `Disputed` and then time out to `_fail`,
     ///      making the pool's win unconditional — a risk-free ~+80% return
@@ -1253,7 +1315,41 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     function rule(uint256 challengeId, Verdict verdict) external {
         if (msg.sender != court) revert NotCourt();
         Challenge storage c = _challenges[challengeId];
+        // SECOND-AUDIT FINDING B. The live-`court` check above is not
+        // enough on its own: it stops anyone but the CURRENT adjudicator
+        // from ruling, but says nothing about whether THIS challenge's
+        // counter-bond funders were ever exposed to a ruling at all. A
+        // challenge filed with `courtAtFiling == address(0)` pinned itself
+        // to "no adjudicator was ever guaranteed reachable" precisely so its
+        // `resolve` timeout could route to `_refundAll` (a non-verdict)
+        // instead of `_fail` (an acquittal) — see `Challenge.courtAtFiling`.
+        // Wiring a court AFTER such a filing must not retroactively turn
+        // that promise into a live `Guilty` exposure the pool's funders
+        // never priced in: they funded the defence believing the worst case
+        // was a forfeit to the challenger on timeout, not a court-forced
+        // slash. This check preserves the documented rescue path — a
+        // challenge that DID have `courtAtFiling != address(0)` may still be
+        // ruled by a REPLACEMENT court wired in after filing (the live
+        // `court` check above already allows that), only a challenge that
+        // had no adjudicator pinned at all is refused here.
+        //
+        // ORDER IS LOAD-BEARING: the status check MUST run first. Both checks
+        // together still yield `NotCourt` for every live (`Disputed`) unpinned
+        // challenge, so finding B's guarantee is untouched — but an
+        // ALREADY-TERMINAL unpinned challenge must report `WrongStatus`, not
+        // `NotCourt`. `TokenCourt.finalize` wraps this call in a catch that
+        // deliberately swallows ONLY `WrongStatus` (the benign "someone else
+        // already resolved it" race) and bubbles everything else, `NotCourt`
+        // included, because a genuine mid-dispute re-point is transient and
+        // must be retried rather than silently closed. With the checks in the
+        // other order, a challenge that was filed while the court was unwired
+        // and then timed out to `Inconclusive` on its own clock reverts
+        // `NotCourt` on a purely terminal race — which `finalize` cannot
+        // swallow, so the case reverts forever and can never be finalized.
+        // Checking status first keeps that path benign without ever weakening
+        // the pin check for a challenge that is still rulable.
         if (c.status != Status.Disputed) revert WrongStatus();
+        if (c.courtAtFiling == address(0)) revert NotCourt();
         emit ChallengeRuled(challengeId, verdict);
         if (verdict == Verdict.Guilty) {
             _settle(challengeId, c);
@@ -1750,12 +1846,19 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      ambiguity rather than trying to resolve it, as every other
     ///      terminal path in this contract already does.
     ///
-    ///      The rate is deliberately below `settleBurnBps` at every tier — a
-    ///      non-verdict recovered nothing, so it must cost strictly less than
-    ///      a verdict that recovered real value — enforced by
-    ///      `setSettleBurnBps`/`setInconclusiveBurnBps` cross-checking each
-    ///      other's live value and by `_inconclusiveBurnBpsForRound`'s own
-    ///      clamp for the tiers that setter pair doesn't reach.
+    ///      The rate is deliberately at or below `settleBurnBps` for rounds
+    ///      1-3 — a non-verdict recovered nothing, so an honest, few-attempt
+    ///      filer must never pay strictly more than a verdict that recovered
+    ///      real value — enforced by `_inconclusiveBurnBpsForRound`'s live
+    ///      clamp on those three fixed tiers. Round 4+ (`inconclusiveBurnBps`)
+    ///      is DELIBERATELY NOT bound to the live `settleBurnBps` any more
+    ///      (second-audit finding C: the old `setSettleBurnBps`/
+    ///      `setInconclusiveBurnBps` mutual cross-check made that tier
+    ///      permanently collapse onto round 3's fixed rate) — it is bounded
+    ///      only by `MAX_INCONCLUSIVE_BURN_BPS`, which still equals
+    ///      `MAX_SETTLE_BURN_BPS`, so it can never exceed the worst-case
+    ///      verdict cost even though it may exceed today's live one. See
+    ///      `_inconclusiveBurnBpsForRound` and `IChallengeGame.inconclusiveBurnBps`.
     ///
     ///      The burn escalates with the round count rather than staying flat,
     ///      because a flat rate cannot distinguish a one-shot honest filer
@@ -1792,7 +1895,8 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // Raises the re-challenge floor so a stall cannot buy a permanent
         // acquittal: the accused can stall the pool to the last legal instant
         // inside `autoSlashDelay`, and the verdict would otherwise land past
-        // `executedAt + challengeWindow` with no filing gate left standing.
+        // `executedAt + strategyDuration + challengeWindow` with no filing
+        // gate left standing.
         // Shared with `_fail`'s structurally identical non-verdict (issue
         // #181 finding 20) via `_rearmChallengeWindow` — see that function's
         // own natspec for the re-arm and skip-when-convicted mechanics.
@@ -1858,15 +1962,46 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      convicted. `INCONCLUSIVE_BURN_ROUND1_BPS` closes that; see its own
     ///      natspec for why it is sized where it is.
     ///
-    ///      Always clamped to the live `settleBurnBps`, regardless of tier —
-    ///      the round-4+ tier is also guarded at the setter level
-    ///      (`setInconclusiveBurnBps`/`setSettleBurnBps` cross-check), but the
-    ///      three fixed literals for rounds 1-3 are compile-time constants the
-    ///      setter pair never touches, so this clamp is what still keeps a
-    ///      non-verdict from costing more than a verdict that recovered real
-    ///      value if `settleBurnBps` is later lowered. Clamped, not reverted:
-    ///      a revert here would make `file` fail whenever governance set
-    ///      `settleBurnBps` low, blocking filing entirely.
+    ///      ONLY THE THREE FIXED TIERS (rounds 1-3) ARE CLAMPED TO THE LIVE
+    ///      `settleBurnBps` HERE; the round-4+ tier (`inconclusiveBurnBps`
+    ///      itself) is returned unclamped (second-audit finding C). This is
+    ///      a deliberate reversal of the pre-second-audit behaviour, which
+    ///      clamped every tier to `settleBurnBps` AND made
+    ///      `setInconclusiveBurnBps` reject any value above the LIVE
+    ///      `settleBurnBps` — the two together meant the round-4+ ceiling
+    ///      could never legally exceed round 3's fixed 1,000 bps without
+    ///      FIRST raising `settleBurnBps`, which breaks
+    ///      `honestFilingBreaksEven` (issue #181 finding 18a's inequality).
+    ///      That made the fourth rung of the ladder permanently unreachable:
+    ///      "round 4+" always collapsed onto round 3's own rate, three steps
+    ///      pretending to be four. `setInconclusiveBurnBps` and
+    ///      `setSettleBurnBps` no longer cross-check each other's live
+    ///      value; `inconclusiveBurnBps` is bounded only by its own ceiling,
+    ///      `MAX_INCONCLUSIVE_BURN_BPS`.
+    ///
+    ///      "A NON-VERDICT MUST NEVER COST MORE THAN A VERDICT" IS KEPT A
+    ///      DIFFERENT WAY, not abandoned. Two things still hold it:
+    ///        (1) `MAX_INCONCLUSIVE_BURN_BPS == MAX_SETTLE_BURN_BPS` (both
+    ///            5,000) — a non-verdict can never be configured to cost
+    ///            more than the WORST-CASE verdict this contract could ever
+    ///            charge, even when it costs more than whatever the verdict
+    ///            rate happens to be priced at RIGHT NOW.
+    ///        (2) The property was always meant for an honest, ONE-SHOT
+    ///            filer (see `INCONCLUSIVE_BURN_ROUND1_BPS`'s own natspec on
+    ///            why round 1 is priced low) — rounds 1-3 stay clamped to
+    ///            the live `settleBurnBps` exactly as before, so an honest
+    ///            filer's first few attempts against one proposal can never
+    ///            cost more than a verdict recovers. Round 4+ is reached
+    ///            only after three Inconclusive unwinds against the SAME
+    ///            proposal; by then the filer is, by construction, either a
+    ///            grinder or has been unlucky three times running, and the
+    ///            anti-grinding purpose this whole schedule exists for
+    ///            (`INCONCLUSIVE_BURN_ROUND1_BPS`'s natspec) is exactly what
+    ///            justifies pricing that tier independently of the ordinary
+    ///            verdict rate rather than re-collapsing it into round 3's.
+    ///      `bps` is still returned, never reverted, so a live
+    ///      `inconclusiveBurnBps` above `settleBurnBps` never blocks `file`
+    ///      — it only prices round 4+ higher, which is the point.
     function _inconclusiveBurnBpsForRound(uint256 priorRounds) private view returns (uint256 bps) {
         if (priorRounds == 0) {
             bps = INCONCLUSIVE_BURN_ROUND1_BPS;
@@ -1875,7 +2010,10 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         } else if (priorRounds == 2) {
             bps = INCONCLUSIVE_BURN_ROUND3_BPS;
         } else {
-            bps = inconclusiveBurnBps;
+            // Round 4+: independently bounded by `MAX_INCONCLUSIVE_BURN_BPS`
+            // via `setInconclusiveBurnBps`, deliberately NOT reclamped to
+            // `settleBurnBps` here — see this function's own natspec above.
+            return inconclusiveBurnBps;
         }
         uint256 ceiling = settleBurnBps;
         if (bps > ceiling) bps = ceiling;
@@ -2022,14 +2160,21 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      profitable rather than loss-making.
     ///
     ///      Those defaults were chosen together, not independently (audit #181
-    ///      finding 18a). The bond carries the reduction because the two rates
-    ///      are coupled: `setSettleBurnBps` refuses to drop below
-    ///      `inconclusiveBurnBps`, which ceilings the escalating Inconclusive
-    ///      ladder, so buying the headroom out of `settleBurnBps` alone would
-    ///      have clamped 250/500/1,000 flat and undone the anti-grinding
-    ///      schedule. Lowering the bond instead leaves that ladder intact, at
-    ///      the cost of a cheaper entry price for a frivolous filing — which a
-    ///      losing challenger still forfeits in full.
+    ///      finding 18a). At the time, `setSettleBurnBps` and
+    ///      `setInconclusiveBurnBps` mutually cross-checked each other's
+    ///      live value, so lowering `settleBurnBps` alone (without also
+    ///      lowering `inconclusiveBurnBps`) would have been rejected outright
+    ///      — that cross-check is GONE as of the second audit (finding C; see
+    ///      `setSettleBurnBps`/`setInconclusiveBurnBps`), but the REASON the
+    ///      bond was lowered instead of the burn rate still holds: buying the
+    ///      break-even headroom out of `settleBurnBps` alone would have
+    ///      clamped the Inconclusive ladder's 250/500/1,000 fixed tiers flat
+    ///      (`_inconclusiveBurnBpsForRound` still clamps THOSE to the live
+    ///      `settleBurnBps`) and undone the anti-grinding schedule for an
+    ///      honest, few-attempt filer. Lowering the bond instead leaves that
+    ///      ladder intact, at the cost of a cheaper entry price for a
+    ///      frivolous filing — which a losing challenger still forfeits in
+    ///      full.
     ///
     ///      This contract deliberately does NOT gate any setter on this
     ///      result. The values that would make it `true` trade off against
@@ -2046,8 +2191,37 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      fixed value, so this always reports against CURRENT policy on
     ///      both sides of the inequality, not any one challenge's
     ///      filing-time pin.
+    /// @dev    THE BOOLEAN ALONE HIDES MAGNITUDE (second-audit finding D).
+    ///         The comparison is monotone in the correct direction — a
+    ///         higher `settleBurnBps` (more cost) makes `true` harder to
+    ///         reach, a higher `prosecutorFeeBps` (more reward) makes it
+    ///         easier — but collapsing the result to `true`/`false` erases
+    ///         WHERE on that line the current configuration sits. In
+    ///         particular `settleBurnBps == 0` zeroes the whole cost side of
+    ///         the inequality and this always returns `true`: correct in
+    ///         the narrow sense that an uncontested filing then costs
+    ///         nothing, but that is a materially different governance state
+    ///         from "large positive margin at a non-trivial burn rate", and
+    ///         a caller reading only this boolean cannot tell the two apart.
+    ///         `honestFilingNetPayoffBps` reports the SIGNED difference
+    ///         instead so magnitude — not just sign — is visible; this
+    ///         function is kept, unchanged in its own logic, for backward
+    ///         compatibility with anything already reading it.
     function honestFilingBreaksEven() external view returns (bool) {
         return challengerBondBps * settleBurnBps <= exposureLedger.proposerBondBps() * prosecutorFeeBps;
+    }
+
+    /// @inheritdoc IChallengeGame
+    function honestFilingNetPayoffBps() external view returns (int256) {
+        // Same two products `honestFilingBreaksEven` compares, but returned
+        // as a difference rather than reduced to a sign. Both factors on
+        // each side are bounded well under 2^128 (every bps rate here is
+        // <= `BPS_DENOMINATOR`, and `proposerBondBps` is bounded the same
+        // way on the ledger), so neither product can approach `int256`'s
+        // range and the `uint256 -> int256` casts below can never wrap.
+        uint256 rewardBps = exposureLedger.proposerBondBps() * prosecutorFeeBps;
+        uint256 costBps = challengerBondBps * settleBurnBps;
+        return int256(rewardBps) - int256(costBps);
     }
 
     // ── Owner setters ──
@@ -2120,8 +2294,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // exposure the ledger has already aged out.
         //
         // Not the whole reachable window, deliberately: `file`'s actual
-        // deadline is `max(executedAt + challengeWindow, challengeableUntil[key])`,
-        // and an `Inconclusive` unwind can raise `challengeableUntil` well
+        // deadline is `max(executedAt + strategyDuration + challengeWindow,
+        // challengeableUntil[key])` (second-audit finding A), and an
+        // `Inconclusive` unwind can raise `challengeableUntil` well
         // past this bound (`_refundAll`'s "never shorten" guarantee is a
         // separate, already-proven property this bound does not duplicate).
         // A late re-challenge re-derives its own coverage and price live at
@@ -2263,15 +2438,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      bond is worth posting and cannot withdraw once posted, so leaving
     ///      it live would let a raise take up to half the refund of a filing
     ///      that had already turned out correct.
-    /// @dev Also refuses to drop below the live `inconclusiveBurnBps`: sharing
-    ///      a ceiling with it bounds both rates' maximums identically but says
-    ///      nothing about where either LIVE rate sits, so this cross-check —
-    ///      together with `setInconclusiveBurnBps`'s matching check on the
-    ///      far side — is what keeps a non-verdict from ever costing more than
-    ///      a verdict that recovered real value.
+    /// @dev NO LONGER CROSS-CHECKS `inconclusiveBurnBps` (second-audit
+    ///      finding C). It used to refuse dropping below the live
+    ///      `inconclusiveBurnBps`, paired with `setInconclusiveBurnBps`
+    ///      refusing to rise above the live `settleBurnBps` — together the
+    ///      two setters pinned `inconclusiveBurnBps <= settleBurnBps`
+    ///      unconditionally, which made the Inconclusive ladder's round-4+
+    ///      tier permanently unreachable above round 3's fixed 1,000 bps: to
+    ///      raise it, this setter had to move first, and moving it broke
+    ///      `honestFilingBreaksEven`. `_inconclusiveBurnBpsForRound` now
+    ///      clamps only the three FIXED tiers (rounds 1-3) to this value
+    ///      live, and leaves round 4+ (`inconclusiveBurnBps`) independently
+    ///      bounded by its own ceiling — see that function's natspec for how
+    ///      "a non-verdict must never cost more than a verdict" is kept for
+    ///      an honest, few-attempt filer without this cross-check.
     function setSettleBurnBps(uint256 newBps) external onlyOwner {
         if (newBps > MAX_SETTLE_BURN_BPS) revert InvalidParameter();
-        if (newBps < inconclusiveBurnBps) revert InvalidParameter();
         emit SettleBurnBpsSet(settleBurnBps, newBps);
         settleBurnBps = newBps;
     }
@@ -2306,19 +2488,29 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      pre-fix behaviour (the whole bond back, untouched) and is the
     ///      off-switch if this burn is ever shown to deter honest filers more
     ///      than it deters the free-freeze it prices.
-    /// @dev Also refuses to rise above the live `settleBurnBps`: sharing a
-    ///      ceiling with it bounds both rates' maximum legal values
-    ///      identically but does not stop this rate being set above an
-    ///      unchanged, lower `settleBurnBps` — this cross-check, together with
-    ///      `setSettleBurnBps`'s matching check on the far side, is what keeps
-    ///      the ordering true.
+    /// @dev NO LONGER REFUSES RISING ABOVE THE LIVE `settleBurnBps`
+    ///      (second-audit finding C). The old cross-check, paired with
+    ///      `setSettleBurnBps`'s matching check on the far side, pinned
+    ///      `inconclusiveBurnBps <= settleBurnBps` at all times — sound in
+    ///      isolation, but combined with `_inconclusiveBurnBpsForRound`
+    ///      reclamping every tier to the live `settleBurnBps` on top of
+    ///      that, it made the round-4+ tier of the escalating Inconclusive
+    ///      ladder permanently indistinguishable from round 3's fixed 1,000
+    ///      bps: raising it required raising `settleBurnBps` first, which
+    ///      breaks `honestFilingBreaksEven`. This rate is now bounded only
+    ///      by its own ceiling, `MAX_INCONCLUSIVE_BURN_BPS`, and
+    ///      `_inconclusiveBurnBpsForRound` no longer reclamps the round-4+
+    ///      tier to `settleBurnBps` at the point it is pinned — see that
+    ///      function's natspec for how "a non-verdict must never cost more
+    ///      than a verdict" is preserved for an honest, few-attempt filer
+    ///      (rounds 1-3, still clamped there) without this setter-level
+    ///      cross-check.
     /// @dev Applies to challenges FILED after the change, not ones ruled after
     ///      it — same reasoning as `setSettleBurnBps`: the challenger relies
     ///      on this rate the moment it posts the bond, with no way to
     ///      withdraw once a later court vote misses its participation floor.
     function setInconclusiveBurnBps(uint256 newBps) external onlyOwner {
         if (newBps > MAX_INCONCLUSIVE_BURN_BPS) revert InvalidParameter();
-        if (newBps > settleBurnBps) revert InvalidParameter();
         emit InconclusiveBurnBpsSet(inconclusiveBurnBps, newBps);
         inconclusiveBurnBps = newBps;
     }

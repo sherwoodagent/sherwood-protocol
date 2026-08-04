@@ -103,8 +103,11 @@ interface IExposureLedger {
     /// @notice Permissionless sweep of a dead commitment (audit #181, finding
     ///         11): once a key's booked epoch is past its challenge window,
     ///         `!isCoverageFrozen(governor, proposalId)`, and `guardian` is
-    ///         not within an active `pinCoverageUntil` deadline, anyone may
-    ///         retire it — the same unwind `releaseApproval` performs on a
+    ///         not within an active `pinCoverageUntil` deadline ON THIS
+    ///         (governor, proposalId) PAIR SPECIFICALLY — a pin from an
+    ///         unrelated proposal the same guardian also approved does not
+    ///         block this sweep (audit-181-critical-high, finding C) — anyone
+    ///         may retire it: the same unwind `releaseApproval` performs on a
     ///         vote-change, released here instead because no vote-change will
     ///         ever come.
     /// @dev    WHY THIS EXISTS: `releaseApproval` has exactly one caller —
@@ -156,18 +159,29 @@ interface IExposureLedger {
     function unfreezeCoverage(address governor, uint256 proposalId) external;
     function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool);
     /// @notice Whether ANY frozen proposal names this guardian as a covering
-    ///         approver, OR this guardian is still within a `pinCoverageUntil`
-    ///         deadline. sWOOD gates the unstake CLAIM on it, which is what
-    ///         makes the freeze load-bearing rather than decorative: epoch
-    ///         buckets age out on wall-clock and a disputed challenge outlives
-    ///         them, so `openExposureUsd` alone would let an accused guardian
-    ///         claim its bond mid-accusation.
+    ///         approver, OR this guardian is within a `pinCoverageUntil`
+    ///         deadline on ANY proposal it ever approved (the guardian-scoped
+    ///         max — see `pinCoverageUntil`). sWOOD gates the unstake CLAIM on
+    ///         it, which is what makes the freeze load-bearing rather than
+    ///         decorative: epoch buckets age out on wall-clock and a disputed
+    ///         challenge outlives them, so `openExposureUsd` alone would let
+    ///         an accused guardian claim its bond mid-accusation.
+    /// @dev    INCLUSIVE of `deadline`: a guardian counts as pinned through
+    ///         `block.timestamp == deadline`, matching `ChallengeGame.file`'s
+    ///         own inclusive filing-deadline check, so this cannot go clean
+    ///         one instant before a still-legal filing could reach it
+    ///         (audit-181-critical-high, finding B).
     function hasFrozenCoverage(address guardian) external view returns (bool);
     /// @notice Pin every approver of (governor, proposalId) as frozen through
     ///         `deadline`, regardless of `freezeCoverage`/`unfreezeCoverage`
-    ///         state. Only ever RAISES a guardian's pin; decays on its own
-    ///         once `block.timestamp` passes `deadline` — no unpin call
-    ///         exists or is needed.
+    ///         state. Raises BOTH the guardian-scoped max `hasFrozenCoverage`
+    ///         reads and a per-(governor, proposalId, guardian) value
+    ///         `retireApproval` reads instead (audit-181-critical-high,
+    ///         finding C) — a pin issued against one stale proposal must not
+    ///         block sweeping a guardian's OTHER, unrelated commitments.
+    ///         Only ever RAISES either value; each decays on its own once
+    ///         `block.timestamp` passes `deadline` — no unpin call exists or
+    ///         is needed.
     function pinCoverageUntil(address governor, uint256 proposalId, uint256 deadline) external;
     /// @dev Zero is legal and deliberate — it is the UNWIRE switch, closing
     ///      the freeze surface when the challenge game is replaced: with no

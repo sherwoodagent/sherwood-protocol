@@ -302,27 +302,45 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         address last = address(uint160(0x100000 + cap));
         _stakeGuardian(last, 10_000e18, 999);
 
-        // PROPOSAL_ID's window was already pushed in setUp (registration is
-        // immutable now), so no re-registration here. openReview still snapshots
-        // at block.timestamp - 1 = the time the 100 guardians staked, so the
-        // extra warp keeps their checkpoints visible to the cohort snapshot.
+        // audit-181-second finding A: `_growthGatedVoteWeight` clamps a
+        // voter's own numerator weight to what they held `FLOOR_LOOKBACK`
+        // before `openedAt` whenever their raw stake grew over that window
+        // (mirrors `TokenCourt.vote`, issue #82). A guardian staked only
+        // seconds before `openReview` had ZERO stake at the lookback
+        // instant, so the clamp zeroes their vote weight and
+        // `voteOnProposal` reverts `NotActiveGuardian()` on a 0-weight
+        // first vote. Age the new cohort past `FLOOR_LOOKBACK` (same 30d as
+        // this harness's `maturationPeriod`, so this also brings them to
+        // par) so their stake already existed at the lookback checkpoint
+        // and the clamp is a no-op, matching the un-gated pre-remediation
+        // behaviour this test exercises (the cap, not the clamp).
+        skip(registry.FLOOR_LOOKBACK());
+
+        // PROPOSAL_ID's window was fixed in `setUp` (24h after the ORIGINAL
+        // pre-skip `voteEnd`) and would now already be in the past, so
+        // reusing it here would revert `ReviewNotOpen` instead of exercising
+        // the cap. Register a fresh proposal id whose window starts NOW —
+        // same pattern `test_voteOnProposal_blockerCapHitEmitsEventAndReverts`
+        // below already uses — so the vote window still covers the matured cohort.
+        uint256 capPid = 43;
         vm.warp(vm.getBlockTimestamp() + 1);
-        _openReview();
+        _registerReview(capPid, vm.getBlockTimestamp(), vm.getBlockTimestamp() + REVIEW_PERIOD);
+        registry.openReview(address(governor), capPid);
 
         for (uint256 i = 0; i < cap; i++) {
             vm.prank(address(uint160(0x100000 + i)));
-            registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+            registry.voteOnProposal(address(governor), capPid, IGuardianRegistry.GuardianVoteType.Approve);
         }
 
         vm.expectEmit(true, false, false, false);
-        emit IGuardianRegistry.ApproverCapReached(PROPOSAL_ID);
+        emit IGuardianRegistry.ApproverCapReached(capPid);
         vm.prank(last);
         vm.expectRevert(IGuardianRegistry.NewSideFull.selector);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), capPid, IGuardianRegistry.GuardianVoteType.Approve);
 
         // 101st Block succeeds — blockers uncapped at this size.
         vm.prank(last);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), capPid, IGuardianRegistry.GuardianVoteType.Block);
     }
 
     /// @notice ToB I-2 regression: blockers are capped at
@@ -335,6 +353,16 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         }
         address last = address(uint160(0x300000 + cap));
         _stakeGuardian(last, 10_000e18, 999);
+
+        // audit-181-second finding A: age this cap-test cohort past
+        // `FLOOR_LOOKBACK` before opening the review, same reasoning as
+        // `test_voteOnProposal_capHitEmitsEventAndReverts` above — a
+        // freshly-staked guardian's own vote weight is growth-gate clamped
+        // to zero (`_growthGatedVoteWeight`, mirrors `TokenCourt.vote`),
+        // which would revert every vote in this loop with
+        // `NotActiveGuardian()` on a 0-weight first vote instead of
+        // exercising the blocker cap this test targets.
+        skip(registry.FLOOR_LOOKBACK());
 
         vm.warp(vm.getBlockTimestamp() + 1);
         uint256 newPid = 42;

@@ -321,7 +321,16 @@ interface ITokenCourt {
     ///         lookback term un-reduced, so staking large from a
     ///         never-approving address at `snapshotTs` could flip which term
     ///         binds and inflate the floor past the honest electorate's
-    ///         reachable turnout). Turnout below this floor resolves
+    ///         reachable turnout). A NONZERO lookback term is additionally
+    ///         floored at a fixed fraction of the same-instant term before it
+    ///         competes in the min (finding #10: an exact-zero lookback term
+    ///         falls back safely to the unclamped same-instant term, but a
+    ///         merely TINY nonzero one — e.g. one unrelated guardian's dust
+    ///         stake at the lookback instant while the accused otherwise
+    ///         dominated it — is not "zero" yet rounds the floor to
+    ///         effectively nothing once scaled by bps, with no relation to
+    ///         today's actual electorate; see `TokenCourt._participationFloor`
+    ///         for the full argument). Turnout below this floor resolves
     ///         `Inconclusive` rather than on the raw tally, so a thin,
     ///         rented-stake vote cannot convict or acquit alone. Read LIVE at
     ///         `finalize`, never pinned per case — which also makes it the

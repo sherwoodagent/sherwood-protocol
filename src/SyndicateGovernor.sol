@@ -232,6 +232,20 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         return _settlementCallCaps[id];
     }
 
+    /// @dev The COVERAGE-SCALED settlement caps — what `settleProposal` meters
+    ///      against, and now what `unstick` meters against too. Populated by
+    ///      `_deriveAndStoreEffectiveCapital` on EVERY execute path (identity
+    ///      copy when the quorum gate did not run), so it is never empty for a
+    ///      proposal in `Executed`, which is the only state `unstick` accepts.
+    ///
+    ///      Split from `_getSettlementCallCaps` rather than replacing it: the
+    ///      raw propose-time array is still the record of what was voted on,
+    ///      and conflating the two is what let issue #27's sizing be enforced
+    ///      on one replay path and not the other.
+    function _getEffectiveSettlementCallCaps(uint256 id) internal view override returns (uint256[] storage) {
+        return _effectiveSettlementCallCaps[id];
+    }
+
     function _emergencyReentrancyEnter() internal override {
         if (_reentrancyStatus == _ENTERED) revert Reentrancy();
         _reentrancyStatus = _ENTERED;
@@ -677,7 +691,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      A second call then hits the ordinary `NoBondToReclaim` path, the
     ///      same terminal answer as after a normal release.
     ///
-    ///      Settled proposals wait `challengeWindow` after `executedAt`, and
+    ///      Settled proposals wait `strategyDuration + challengeWindow` after
+    ///      `executedAt`, and
     ///      only release while the ledger's per-proposal coverage freeze is
     ///      clear — a proposer who executes a drain and self-settles within
     ///      `MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE` cannot walk away with
@@ -694,7 +709,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      while a conviction — and with it `forfeitBond` — is still
     ///      reachable. The third gate therefore asks the game itself and
     ///      mirrors `ChallengeGame.file`'s own deadline,
-    ///      `max(executedAt + game.challengeWindow(), challengeableUntil[rk])`.
+    ///      `max(executedAt + strategyDuration + game.challengeWindow(),
+    ///      challengeableUntil[rk])`. That `+ strategyDuration` term is
+    ///      load-bearing and must track `file` exactly: without it these
+    ///      gates lift up to `maxStrategyDuration` (30d) before `file` stops
+    ///      admitting, releasing the very bond a successful challenge is paid
+    ///      out of while the proposal is still challengeable.
     ///      All three gates run against `proposal.proposerBondLedger`, the
     ///      ledger PINNED at propose time (falling back to the live
     ///      `_exposureLedger` slot only for a pre-pin proposal that recorded
@@ -785,7 +805,19 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // permanently — rotating the pinned ledger's own
             // `coverageFreezer` makes it reclaimable again.
             if (ledger == address(0)) revert ExposureLedgerUnset();
-            if (block.timestamp < executedAt + IExposureLedger(ledger).challengeWindow()) {
+            // `+ strategyDuration` (second-audit finding A). Risk does not end
+            // when the strategy is executed; it ends when the strategy's term
+            // is over AND the window on top of it has run out. Anchoring these
+            // gates at `executedAt + challengeWindow` alone released the bond
+            // up to `maxStrategyDuration` (30d) BEFORE `ChallengeGame.file`
+            // stops admitting challenges against this proposal — and the
+            // proposer bond is precisely what a successful challenge is paid
+            // out of, so the gap let a proposer walk their stake out of a
+            // still-challengeable position. Read off `proposal` in the same
+            // load as `executedAt`, matching how `file` pins it off its own
+            // `getProposal` snapshot, so the two deadlines cannot diverge.
+            uint256 strategyDuration = proposal.strategyDuration;
+            if (block.timestamp < executedAt + strategyDuration + IExposureLedger(ledger).challengeWindow()) {
                 revert ChallengeWindowOpen();
             }
             if (IExposureLedger(ledger).isCoverageFrozen(address(this), proposalId)) {
@@ -795,7 +827,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // for why the two gates above are not sufficient on their own.
             address freezer = IExposureLedger(ledger).coverageFreezer();
             if (freezer != address(0)) {
-                uint256 deadline = executedAt + IChallengeGame(freezer).challengeWindow();
+                // Must reproduce `ChallengeGame.file`'s deadline EXACTLY —
+                // `executedAt + p.strategyDuration + challengeWindow`, then
+                // maxed against `challengeableUntil` — or this gate lifts
+                // while `file` is still admitting.
+                uint256 deadline = executedAt + strategyDuration + IChallengeGame(freezer).challengeWindow();
                 // Same review-key derivation as `ChallengeGame._reviewKey`
                 // (abi.encode, not encodePacked).
                 uint256 extended =

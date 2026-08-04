@@ -272,6 +272,15 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // `reviewEnd == voteEnd`), leaving every proposal unresolvable and the
         // vault permanently bound. Fail loudly at deploy instead.
         if (reviewPeriod_ < minReviewPeriod || reviewPeriod_ > 7 days) revert InvalidParameter();
+        // Mirrors `setBlockQuorumBps`'s bounds (audit-181-second finding,
+        // "initialize writes blockQuorumBps with no check"). A zero
+        // `blockQuorumBps` makes `_isBlocked` (`blockStakeWeight * 10_000 >=
+        // blockQuorumBpsAtOpen * totalStakeAtOpen`) true unconditionally —
+        // every non-cohort-too-small review resolves Blocked and slashes
+        // every approver, and every emergency settle slashes the owner bond,
+        // regardless of how anyone actually voted. Fail loudly at deploy
+        // instead.
+        if (blockQuorumBps_ < 1_000 || blockQuorumBps_ > 10_000) revert InvalidParameter();
         // The cooldown >= review invariant is enforced at the setters only —
         // the deploy script seeds compatible values, and skipping the
         // init-time check saves ~10 bytes under EIP-170.
@@ -363,24 +372,91 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         return uint256(r.blockStakeWeight) * 10_000 >= uint256(r.blockQuorumBpsAtOpen) * denom;
     }
 
-    /// @dev Shared lookback-min total-vote read for `openReview` and
-    ///      `openEmergency`'s block-quorum denominator. Returns the SMALLER
-    ///      of the electorate at `ts1` and the electorate `FLOOR_LOOKBACK`
-    ///      before it, falling back to the bare `ts1` read when there is no
-    ///      earlier checkpoint at all (`earlier == 0` — the chain's first
-    ///      `FLOOR_LOOKBACK`, where falling back to zero would disable the
-    ///      block-quorum floor outright rather than merely bootstrap it).
-    ///      Mirrors `TokenCourt._participationFloor`'s construction
-    ///      (including that same fallback) — see `FLOOR_LOOKBACK`'s natspec
-    ///      and `_participationFloor`'s @dev blocks for the full rationale.
+    /// @dev Shared lookback read for `openReview` and `openEmergency`. Returns
+    ///      TWO figures, both needed and NOT interchangeable (audit-181-second
+    ///      findings A/B):
+    ///        - `total` — the LIVE electorate at `ts1`. This is the correct
+    ///          basis for `cohortTooSmall`: "does a cohort exist right now"
+    ///          is the opposite question from "resist denominator inflation",
+    ///          and answering it off a 30-day-old figure makes `cohortTooSmall`
+    ///          a free, on-demand off-switch for the entire guardian veto
+    ///          (`resolveReview`) and the emergency owner-bond slash
+    ///          (`_resolveEmergency`) during any period where the live cohort
+    ///          has grown past the lookback figure — trivially reachable via
+    ///          `requestUnstakeGuardian`/`cancelUnstakeGuardian`, which plants
+    ///          a permanent low checkpoint at zero cost (no transfer, no
+    ///          cooldown).
+    ///        - `minTotal` — the SMALLER of `total` and the electorate
+    ///          `FLOOR_LOOKBACK` before `ts1`, falling back to the bare `ts1`
+    ///          read when there is no earlier checkpoint at all (`earlier ==
+    ///          0` — the chain's first `FLOOR_LOOKBACK`, where falling back to
+    ///          zero would disable the block-quorum floor outright rather than
+    ///          merely bootstrap it). This is the correct basis for the
+    ///          block-quorum DENOMINATOR (`Review.totalStakeAtOpen` /
+    ///          `EmergencyReview.totalStakeAtOpen`) ONLY — stake younger than
+    ///          `FLOOR_LOOKBACK` must not inflate what an honest cohort has to
+    ///          clear to block a proposal.
+    ///      Mirrors `TokenCourt._participationFloor`'s construction (including
+    ///      that same fallback) — see `FLOOR_LOOKBACK`'s natspec and
+    ///      `_participationFloor`'s @dev blocks for the full rationale.
     ///      Simpler than the court's version: there is no `accusedWeight` to
-    ///      subtract here, so this is a plain min of two raw
+    ///      subtract here, so `minTotal` is a plain min of two raw
     ///      `getPastTotalVotes` reads.
-    function _lookbackMinTotalVotes(IStakedWood sw, uint256 ts1) private view returns (uint256) {
-        uint256 total = sw.getPastTotalVotes(ts1);
+    function _lookbackMinTotalVotes(IStakedWood sw, uint256 ts1)
+        private
+        view
+        returns (uint256 total, uint256 minTotal)
+    {
+        total = sw.getPastTotalVotes(ts1);
         uint256 lookbackTs = ts1 > FLOOR_LOOKBACK ? ts1 - FLOOR_LOOKBACK : 0;
         uint256 earlier = sw.getPastTotalVotes(lookbackTs);
-        return (earlier != 0 && earlier < total) ? earlier : total;
+        minTotal = (earlier != 0 && earlier < total) ? earlier : total;
+    }
+
+    /// @dev GROWTH-GATED MIN on a voter's OWN weight at review open
+    ///      (audit-181-second finding A). Mirrors `TokenCourt.vote`'s clamp
+    ///      (issue #82), applied here for the first time — the prior
+    ///      remediation added `_lookbackMinTotalVotes` to the block-quorum
+    ///      DENOMINATOR but left this numerator read raw, so fresh stake
+    ///      discounted out of the denominator still counted in FULL on the
+    ///      numerator. That turned a mathematically impossible block
+    ///      (an attacker's own stake counted symmetrically on both sides can
+    ///      never flip `blockStakeWeight * 10_000 >= blockQuorumBps *
+    ///      totalStakeAtOpen`) into a cheap one reachable with ~1 second of
+    ///      stake age, and made `requestUnstakeGuardian` /
+    ///      `cancelUnstakeGuardian` (no transfer, no cooldown) a free way to
+    ///      plant a low denominator checkpoint to attack against.
+    ///
+    ///      Gate on RAW stake growth (`getPastStake`, the same basis
+    ///      `getPastTotalVotes` sums), strict `>`; clamp the finished,
+    ///      delegation-weighted (`getPastVotes`) reading — byte-for-byte
+    ///      `TokenCourt.vote`'s construction. The
+    ///      `getPastTotalVotes(lookbackTs) != 0` guard skips the clamp during
+    ///      the chain's bootstrap window, mirroring
+    ///      `_lookbackMinTotalVotes`'s own `earlier == 0` fallback: with no
+    ///      history at all before `FLOOR_LOOKBACK`, every early guardian's
+    ///      raw stake trivially "grew from zero" and would otherwise be
+    ///      clamped to zero voting power for the protocol's first month.
+    ///
+    ///      Shared by `voteOnProposal`'s first-vote branch and
+    ///      `voteBlockEmergencySettle` — both read a voter's own weight at a
+    ///      review's `openedAt` and both feed a denominator built from
+    ///      `_lookbackMinTotalVotes`, so both need the identical clamp.
+    ///      `voteOnProposal`'s vote-CHANGE branch does not call this: it
+    ///      reuses `_voteStake[key][msg.sender]`, the snapshot already
+    ///      clamped when the first vote was cast, and that snapshot is fixed
+    ///      for the life of the review — there is nothing to re-clamp.
+    function _growthGatedVoteWeight(IStakedWood sw, address voter, uint256 openedAt) private view returns (uint256) {
+        uint256 weight = sw.getPastVotes(voter, openedAt);
+        uint256 lookbackTs = openedAt > FLOOR_LOOKBACK ? openedAt - FLOOR_LOOKBACK : 0;
+        if (
+            sw.getPastStake(voter, openedAt) > sw.getPastStake(voter, lookbackTs)
+                && sw.getPastTotalVotes(lookbackTs) != 0
+        ) {
+            uint256 weightThen = sw.getPastVotes(voter, lookbackTs);
+            if (weightThen < weight) weight = weightThen;
+        }
+        return weight;
     }
 
     // ── sWOOD passthrough views (lets GovernorEmergency read the owner bond via the registry) ──
@@ -491,12 +567,15 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @inheritdoc IGuardianRegistry
     /// @dev First-vote path OR vote-change. Requires `openReview` to have been
     ///      called and `voteEnd <= now < reviewEnd`. Snapshots the caller's
-    ///      vote weight at `r.openedAt` (read from sWOOD's `getPastVotes`) into
-    ///      `_voteStake[key][caller]` and adds it to the chosen side's
-    ///      tally. Approvers and Blockers are each capped. Block votes carry
-    ///      no proposed severity: the slash severity is not voted — it is a
-    ///      deterministic function of block-side decisiveness computed at
-    ///      `resolveReview` (see `_severityBps`).
+    ///      vote weight at `r.openedAt`, growth-gated to the lookback-min via
+    ///      `_growthGatedVoteWeight` (see that function's natspec — finding A)
+    ///      so a voter's own numerator weight cannot outrun the block-quorum
+    ///      denominator's own dilution defense, into `_voteStake[key][caller]`
+    ///      and adds it to the chosen side's tally. Approvers and Blockers are
+    ///      each capped. Block votes carry no proposed severity: the slash
+    ///      severity is not voted — it is a deterministic function of
+    ///      block-side decisiveness computed at `resolveReview` (see
+    ///      `_severityBps`).
     function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support) external whenNotPaused {
         if (support == GuardianVoteType.None) revert();
         if (!_authorizedGovernors.contains(governor)) revert UnauthorizedGovernor();
@@ -524,8 +603,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             uint256 lockoutStart = r.reviewEnd - (reviewWindowDuration * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
             if (block.timestamp >= lockoutStart) revert VoteChangeLockedOut();
 
-            // First vote — snapshot own weight AT `r.openedAt`.
-            uint256 weight256 = swood.getPastVotes(msg.sender, uint256(r.openedAt));
+            // First vote — snapshot own weight AT `r.openedAt`, growth-gated
+            // to match the block-quorum denominator's own lookback-min
+            // (finding A; see `_growthGatedVoteWeight`).
+            uint256 weight256 = _growthGatedVoteWeight(swood, msg.sender, uint256(r.openedAt));
             if (weight256 == 0) revert NotActiveGuardian(); // no votable weight at open time
             uint128 weight = uint128(weight256);
             _voteStake[key][msg.sender] = weight;
@@ -660,9 +741,14 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // fresh, never-voting stake parked just before `openEmergency`
         // cannot inflate the denominator the owner's own block vote is
         // measured against (finding #8). See `_lookbackMinTotalVotes`.
+        //
+        // `cohortTooSmall`, in contrast, is decided off the LIVE electorate
+        // (`liveTotal`), NOT the lookback-min (`gs`) — see the second @dev
+        // block on `_lookbackMinTotalVotes` (audit-181-second finding B). The
+        // lookback-min stays reserved for the block-quorum denominator only.
         IStakedWood sw = swood;
         uint256 ts1 = block.timestamp - 1;
-        uint256 gs = _lookbackMinTotalVotes(sw, ts1);
+        (uint256 liveTotal, uint256 gs) = _lookbackMinTotalVotes(sw, ts1);
 
         er.governor = msg.sender; // stored before any external calls
         er.callsHash = callsHash;
@@ -672,7 +758,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         er.resolved = false;
         er.blocked = false;
         er.openedAt = uint64(ts1);
-        er.cohortTooSmall = gs < MIN_COHORT_STAKE_AT_OPEN;
+        er.cohortTooSmall = liveTotal < MIN_COHORT_STAKE_AT_OPEN;
         // Snapshot block-quorum threshold at open so the owner can't shift
         // it mid-review.
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -815,8 +901,17 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // parked just before `openReview` could inflate the denominator and
         // raise the absolute vote weight an honest cohort must clear to
         // block the proposal (finding #8). See `_lookbackMinTotalVotes`.
+        //
+        // `cohortTooSmall` is decided off the LIVE electorate (`liveTotal`),
+        // NOT the lookback-min stored into `r.totalStakeAtOpen` — see the
+        // second @dev block on `_lookbackMinTotalVotes` (audit-181-second
+        // finding B). The lookback-min stays reserved for the block-quorum
+        // denominator only; using it for "does a cohort exist" made
+        // `cohortTooSmall` a free, on-demand off-switch for the entire
+        // guardian veto during ordinary early growth.
         uint256 ts1 = block.timestamp - 1;
-        uint128 totalAtOpen = uint128(_lookbackMinTotalVotes(sw, ts1));
+        (uint256 liveTotal, uint256 minTotal) = _lookbackMinTotalVotes(sw, ts1);
+        uint128 totalAtOpen = uint128(minTotal);
         uint256 combinedAtOpen = uint256(totalAtOpen);
         r.opened = true;
         r.totalStakeAtOpen = totalAtOpen;
@@ -825,9 +920,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // forge-lint: disable-next-line(unsafe-typecast)
         r.blockQuorumBpsAtOpen = uint16(blockQuorumBps);
         r.openedAt = uint64(ts1);
-        if (combinedAtOpen < MIN_COHORT_STAKE_AT_OPEN) {
+        if (liveTotal < MIN_COHORT_STAKE_AT_OPEN) {
             r.cohortTooSmall = true;
-            emit CohortTooSmallToReview(proposalId, uint128(combinedAtOpen));
+            emit CohortTooSmallToReview(proposalId, combinedAtOpen);
         } else {
             emit ReviewOpened(proposalId, uint128(combinedAtOpen));
         }
@@ -1005,7 +1100,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
 
     /// @inheritdoc IGuardianRegistry
     /// @dev Active-guardian-only. Block-only side. One vote per guardian.
-    ///      Weight is read from sWOOD's `getPastVotes` at `er.openedAt`.
+    ///      Weight is read from sWOOD's `getPastVotes` at `er.openedAt`,
+    ///      growth-gated to the lookback-min via `_growthGatedVoteWeight`
+    ///      (finding A) — the emergency block-quorum denominator
+    ///      (`er.totalStakeAtOpen`) is already the lookback-min from
+    ///      `_lookbackMinTotalVotes`, so a voter's own weight must be capped
+    ///      the same way or fresh stake escapes on the numerator side only.
     function voteBlockEmergencySettle(address governor, uint256 proposalId) external whenNotPaused {
         if (!_authorizedGovernors.contains(governor)) revert UnauthorizedGovernor();
         bytes32 eKey = _reviewKey(governor, proposalId);
@@ -1022,7 +1122,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         uint256 round = er.round;
         if (_emergencyBlockVotes[eKey][round][msg.sender]) revert AlreadyVoted();
 
-        uint256 weight256 = swood.getPastVotes(msg.sender, uint256(er.openedAt));
+        uint256 weight256 = _growthGatedVoteWeight(swood, msg.sender, uint256(er.openedAt));
         if (weight256 == 0) revert NotActiveGuardian(); // no votable weight at open time
         uint128 weight = uint128(weight256);
         _emergencyBlockVotes[eKey][round][msg.sender] = true;
@@ -1170,24 +1270,18 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     function setExposureLedger(address ledger) external onlyOwner {
         if (ledger == address(0)) revert ZeroAddress();
         IExposureLedger led = IExposureLedger(ledger);
-        // Tolerant reads, mirroring `ExposureLedger.setGuardianRegistry`: this
-        // guards an ordering mistake by the owner, not an adversary, so a
-        // ledger that cannot answer is let through rather than bricking the
-        // wiring transaction. One that DOES answer is held to the floor.
-        //
-        // `code.length` first: Solidity's extcodesize guard on a high-level
-        // call to an EOA reverts in THIS frame, which `try` cannot catch, so
-        // the check must be skipped before it is attempted.
-        if (ledger.code.length != 0) {
-            try led.challengeWindow() returns (uint256 cw) {
-                if (cw < reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW) revert InvalidParameter();
-            } catch {}
-            try ILedgerRegistryPointer(ledger).guardianRegistry() returns (address boundRegistry) {
-                // Only reject a ledger already bound to a DIFFERENT registry.
-                // address(0) is the legitimate first-time-wiring state.
-                if (boundRegistry != address(0) && boundRegistry != address(this)) revert InvalidParameter();
-            } catch {}
-        }
+        // STRICT, unguarded reads — see the @dev block above. A ledger that
+        // cannot answer `challengeWindow()` or `guardianRegistry()` (no code,
+        // a CREATE2 counterfactual not yet deployed, or any other
+        // non-conforming target) reverts THIS wiring transaction rather than
+        // being admitted and bricking a later, unrelated one.
+        uint256 cw = led.challengeWindow();
+        if (cw < reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW) revert InvalidParameter();
+        // Reciprocal-grant check. Only reject a ledger already bound to a
+        // DIFFERENT registry — address(0) is the legitimate first-time-wiring
+        // state (see the @dev block above).
+        address boundRegistry = ILedgerRegistryPointer(ledger).guardianRegistry();
+        if (boundRegistry != address(0) && boundRegistry != address(this)) revert InvalidParameter();
         emit ExposureLedgerSet(address(exposureLedger), ledger);
         exposureLedger = led;
     }

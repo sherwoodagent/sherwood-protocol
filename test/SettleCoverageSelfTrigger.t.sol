@@ -479,7 +479,7 @@ contract SettleCoverageSelfTriggerTest is Test {
         vm.prank(ledgerOwner);
         ledger.setWoodUsdPrice(0); // breaks the LEDGER for the reclaim-time pass
 
-        vm.warp(executedAt + ledger.challengeWindow());
+        vm.warp(executedAt + govA.getProposal(pid).strategyDuration + ledger.challengeWindow());
         uint256 agentBalBefore = wood.balanceOf(agentA);
 
         vm.recordLogs();
@@ -575,8 +575,10 @@ contract SettleCoverageSelfTriggerTest is Test {
         govA.settleProposal(pid);
         assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "still uncollapsed after the early settle");
 
-        // Challenge window passes -> reclaim is provably past executeBy.
-        vm.warp(executedAt + ledger.challengeWindow());
+        // Strategy term + challenge window pass -> reclaim is provably past
+        // executeBy. The `+ strategyDuration` anchor (second-audit finding A)
+        // only strengthens this guarantee: the hold now ends strictly later.
+        vm.warp(executedAt + govA.getProposal(pid).strategyDuration + ledger.challengeWindow());
         assertGt(block.timestamp, executeBy, "structural guarantee (design D1): reclaim is past executeBy");
 
         vm.recordLogs();
@@ -610,7 +612,7 @@ contract SettleCoverageSelfTriggerTest is Test {
         assertEq(ledger.openExposureUsd(g1), 250e18, "settlement trigger converges, does not compound");
 
         // Reclaim trigger re-runs a third time and still converges.
-        vm.warp(executedAt + ledger.challengeWindow());
+        vm.warp(executedAt + govA.getProposal(pid).strategyDuration + ledger.challengeWindow());
         govA.reclaimProposerBond(pid);
         assertEq(ledger.openExposureUsd(g1), 250e18, "reclaim trigger converges too");
         assertEq(ledger.openExposureUsd(g2), 250e18);

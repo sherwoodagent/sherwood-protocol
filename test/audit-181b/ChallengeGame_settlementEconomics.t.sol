@@ -270,6 +270,16 @@ contract ChallengeGame_settlementEconomicsTest is Test {
         address challenger = address(0xC4A11E7);
         uint256 bondWood = _expectedBondWood();
 
+        // The court must be wired BEFORE filing: `Challenge.courtAtFiling`
+        // pins whatever `court` reads at `file()` time, and `rule` refuses to
+        // act on a challenge that pinned `address(0)` regardless of what
+        // `court` is wired to later (`ChallengeGame.rule`, second-audit
+        // finding B) — this test needs the later `game.rule(id, Guilty)`
+        // call below to actually land, so the court has to be live before
+        // `_file` pins it, not after.
+        vm.prank(owner);
+        game.setCourt(address(court));
+
         // The challenger funds BOTH legs of the trade: the bond that opens
         // the challenge (inside `_file`, mint-then-spend), and (below) the
         // entire counter-bond pool that escalates it — the exact round trip
@@ -277,9 +287,6 @@ contract ChallengeGame_settlementEconomicsTest is Test {
         // finding 18b says the ESCALATED path must price too.
         uint256 id = _file(challenger);
         assertEq(wood.balanceOf(challenger), 0, "sanity: leg 1 (the bond) fully outlaid by filing");
-
-        vm.prank(owner);
-        game.setCourt(address(court));
 
         // Fund the pool from the SAME challenger address — `dispute` is
         // permissionless, so nothing stops the challenger from being its own
@@ -327,10 +334,17 @@ contract ChallengeGame_settlementEconomicsTest is Test {
         address funder = address(0xF00DE12);
 
         uint256 bondWood = _expectedBondWood();
-        uint256 id = _file(challenger);
 
+        // The court must be wired BEFORE filing for the same reason as
+        // `test_selfFundedGuiltyRuling_burnsASlice_notTheWholeRoundTrip`
+        // above: `courtAtFiling` pins whatever `court` reads at `file()`
+        // time, and the later `game.rule(id, Inconclusive)` call below is
+        // refused (`NotCourt`) on a challenge that pinned `address(0)`,
+        // regardless of `court` being wired by the time `rule` is called.
         vm.prank(owner);
         game.setCourt(address(court));
+
+        uint256 id = _file(challenger);
 
         IChallengeGame.Challenge memory c = game.challengeOf(id);
         uint256 pinnedRate = c.inconclusiveBurnBpsAtFiling;
