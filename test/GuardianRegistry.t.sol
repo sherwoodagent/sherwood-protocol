@@ -1217,8 +1217,8 @@ contract GuardianRegistryParamTest is RegistryTestHarness {
         vm.startPrank(regOwner);
         registry.setReviewPeriod(6 hours);
         assertEq(registry.reviewPeriod(), 6 hours);
-        registry.setReviewPeriod(7 days);
-        assertEq(registry.reviewPeriod(), 7 days);
+        registry.setReviewPeriod(3 days);
+        assertEq(registry.reviewPeriod(), 3 days);
         vm.stopPrank();
     }
 
@@ -1238,7 +1238,7 @@ contract GuardianRegistryParamTest is RegistryTestHarness {
     function test_setReviewPeriod_revertsAboveCooldown() public {
         // Harness wires cooldown = 7 days. A 8d review period is out of the
         // absolute bound; lower the cooldown floor isn't possible (>= 1d), so
-        // exercise the invariant within the [6h, 7d] absolute window by
+        // exercise the invariant within the [6h, 3d] absolute window by
         // first shrinking the cooldown to 1 day.
         vm.prank(regOwner);
         swood.setCooldownPeriod(1 days);
@@ -1250,12 +1250,13 @@ contract GuardianRegistryParamTest is RegistryTestHarness {
 
     /// @notice `setReviewPeriod` succeeds when `v <= coolDownPeriod`.
     function test_setReviewPeriod_succeedsAtOrBelowCooldown() public {
-        // cooldown = 7 days from the harness; review period == cooldown is OK.
+        // cooldown = 7 days from the harness; anything within the [6h, 3d]
+        // absolute window sits below it.
         vm.startPrank(regOwner);
-        registry.setReviewPeriod(7 days);
-        assertEq(registry.reviewPeriod(), 7 days);
         registry.setReviewPeriod(3 days);
         assertEq(registry.reviewPeriod(), 3 days);
+        registry.setReviewPeriod(2 days);
+        assertEq(registry.reviewPeriod(), 2 days);
         vm.stopPrank();
     }
 

@@ -256,10 +256,9 @@ contract GovernorParametersTest is Test {
     }
 
     function test_setMaxStrategyDuration_allowsLongHorizon() public {
-        // Beyond the old 30-day cap — now allowed after raising ABSOLUTE_MAX to 3650d,
-        // so an indefinitely-lived strategy (leveraged Aerodrome CL) can run.
-        assertEq(governor.ABSOLUTE_MAX_STRATEGY_DURATION(), 3650 days);
-        uint256 longHorizon = 365 days;
+        // Up to the absolute cap (30 days). Strategies are short-lived by design.
+        assertEq(governor.ABSOLUTE_MAX_STRATEGY_DURATION(), 30 days);
+        uint256 longHorizon = 30 days;
         vm.prank(owner);
         governor.setMaxStrategyDuration(longHorizon);
         assertEq(governor.getGovernorParams().maxStrategyDuration, longHorizon);

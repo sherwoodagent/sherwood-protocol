@@ -453,9 +453,9 @@ contract DeployPlanB is Script {
         // there would brick every vault deployed before the parameter existed.
         // What is NOT correct is a fresh deployment shipping in it. With the
         // ceiling unset a vault owner may seat `maxStrategyDuration` anywhere up
-        // to `ABSOLUTE_MAX_STRATEGY_DURATION` (3,650 days) and bind the
+        // to `ABSOLUTE_MAX_STRATEGY_DURATION` (30 days) and bind the
         // APPROVING GUARDIANS — who never agreed to it and are not the party
-        // setting it — for a decade per approval. That is finding N4's enabling
+        // setting it — for the full window per approval. That is finding N4's enabling
         // condition, and the ADR's deferral of the VALUE to the multisig was
         // never a deferral of the INVARIANT.
         //
@@ -472,7 +472,7 @@ contract DeployPlanB is Script {
         require(
             maxStrategyDuration != 0,
             "PRE-FLIGHT: MAX_STRATEGY_DURATION is 0, which means NO protocol ceiling -- a vault "
-            "owner could then bind guardians for up to 3650 days per approval. Unset the variable "
+            "owner could then bind guardians for up to 30 days per approval. Unset the variable "
             "to take the 30d default, or set a non-zero value."
         );
         require(
@@ -742,7 +742,7 @@ contract DeployPlanB is Script {
         require(
             IProtocolConfigAdmin(protocolConfig).maxStrategyDuration() != 0,
             "PRE-FLIGHT: ProtocolConfig.maxStrategyDuration is still 0 after this run seated it -- "
-            "the ceiling did not land, so vault owners can bind guardians for up to 3650 days per "
+            "the ceiling did not land, so vault owners can bind guardians for up to 30 days per "
             "approval. Check PROTOCOL_CONFIG names this protocol's config, then re-run."
         );
 
