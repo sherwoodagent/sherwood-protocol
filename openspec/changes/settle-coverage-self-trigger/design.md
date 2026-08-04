@@ -200,6 +200,18 @@ cold**, so:
 These are estimates to be pinned by the gas-snapshot task (tasks §3.8) before
 merge; the design holds for any value because failure is free (see below).
 
+**Measured (tasks §3.8, `SettleCoverageSelfTrigger.t.sol::test_gasSnapshot_triggerCost_1And4Approvers`)**:
+added cost of the `settleProposal` trigger, isolated by diffing against an
+identical proposal whose trigger skips (settled at/before `executeBy`) — **1
+approver: ~28.5k gas; 4 approvers: ~82.7k gas** (~18-27k/approver marginal,
+plus a smaller fixed base than estimated). Both come in comfortably under the
+~40-60k base + ~50-120k/approver envelope above — the estimate was
+conservative. The `MAX_APPROVERS_PER_PROPOSAL = 100` worst case was not
+separately measured (would require staking and seating 100 real guardians);
+the per-approver marginal measured here (~18-27k) extrapolates to roughly
+2-3M gas at 100 approvers, still well inside the design's original 5-12M
+order-of-magnitude bound and still exactly why the trigger is best-effort.
+
 **No existing settlement gas budget to fit inside.** Verified: `gasleft()` appears
 only in ChallengeGame (:1130-1134); the issue #51 floors
 (`SLASH_GAS_PER_APPROVER = 180_000`, `SLASH_GAS_BASE = 2_000_000`,
