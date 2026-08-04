@@ -435,14 +435,25 @@ contract PortfolioStrategy is BaseStrategy {
         // holds `redemptionsLocked()` true and freezes LP exits, queue claims,
         // rescues, new proposals and owner unstaking.
         //
-        // Probed at the first allocation's real size rather than 1 wei: a
+        // Probed at each allocation's real size rather than 1 wei: a
         // dust-sized quote can legitimately floor to zero on a healthy pool and
         // would false-reject a good adapter.
+        //
+        // EVERY allocation is probed, not just the first: routes are
+        // per-allocation (`_swapExtraData[i]`), so an adapter can quote slot 0
+        // fine and still return 0 for slot 3 — and a zero-weight slot 0 would
+        // otherwise skip the probe entirely (only the weight SUM is
+        // validated). Bounded by `MAX_BASKET_SIZE`, init-only gas. A probe
+        // is still point-in-time at clone-init: a route that only gains
+        // liquidity later false-rejects, and an adapter that degrades after
+        // init can still wedge settle — the probe narrows the hazard, it
+        // cannot close it.
         if (!pushMode) {
-            uint256 probeIn = (totalAmount_ * _allocations[0].targetWeightBps) / BPS_DENOMINATOR;
-            if (probeIn != 0) {
+            for (uint256 i; i < _allocations.length; ++i) {
+                uint256 probeIn = (totalAmount_ * _allocations[i].targetWeightBps) / BPS_DENOMINATOR;
+                if (probeIn == 0) continue;
                 try ISwapAdapter(swapAdapter_)
-                    .quote(asset_, _allocations[0].token, probeIn, _swapExtraData[0]) returns (
+                    .quote(asset_, _allocations[i].token, probeIn, _swapExtraData[i]) returns (
                     uint256 probeOut
                 ) {
                     if (probeOut == 0) revert AdapterCannotQuoteInDataStreamsMode(swapAdapter_);
@@ -804,8 +815,21 @@ contract PortfolioStrategy is BaseStrategy {
         // bar, never lower it below what the venue itself says the trade is
         // worth. Safe to fail closed here: blocking one `rebalanceDelta`
         // strands nothing, since `settle()` remains the untouched exit.
-        uint256 quoteFloor = _quoteMinOut(token, asset, tokensToSell, _swapExtraData[i]);
-        if (quoteFloor > minOut) minOut = quoteFloor;
+        //
+        // DATA STREAMS MODE ONLY. Push mode needs no quote floor — the
+        // declared scale is already asserted against the feed's live
+        // `decimals()` at `_initialize` and re-asserted on every
+        // `_pushFeedPrice` read, so the collapse this floor guards against
+        // cannot happen there. And it must not run in push mode:
+        // `_quoteMinOut` reverts `QuoteUnavailable` on a non-quoting adapter,
+        // while push mode + a non-quoting adapter (the in-repo
+        // `SynthraDirectAdapter` returns 0 by design) is a supported pairing
+        // — an unconditional call would permanently brick `rebalanceDelta`
+        // for it.
+        if (chainlinkVerifier != address(0)) {
+            uint256 quoteFloor = _quoteMinOut(token, asset, tokensToSell, _swapExtraData[i]);
+            if (quoteFloor > minOut) minOut = quoteFloor;
+        }
         uint256 amountOut = swapAdapter.swap(token, asset, tokensToSell, minOut, _swapExtraData[i]);
         if (amountOut == 0) revert SwapFailed();
         return true;
@@ -829,10 +853,14 @@ contract PortfolioStrategy is BaseStrategy {
         uint256 assetDec = uint256(_assetDecimals);
         uint256 minOut =
             (_valueToTokens(amountToSpend, price, i, assetDec) * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
-        // Floored by the quote for the same reason as `_sellOverweight`'s sell
-        // leg — see the note there on the unvalidated Data Streams price scale.
-        uint256 quoteFloor = _quoteMinOut(asset, _allocations[i].token, amountToSpend, _swapExtraData[i]);
-        if (quoteFloor > minOut) minOut = quoteFloor;
+        // Floored by the quote for the same reason — and with the same
+        // Data-Streams-only scoping — as `_sellOverweight`'s sell leg; see the
+        // note there on the unvalidated Data Streams price scale and on why
+        // push mode must not reach `_quoteMinOut`.
+        if (chainlinkVerifier != address(0)) {
+            uint256 quoteFloor = _quoteMinOut(asset, _allocations[i].token, amountToSpend, _swapExtraData[i]);
+            if (quoteFloor > minOut) minOut = quoteFloor;
+        }
         uint256 amountOut = swapAdapter.swap(asset, _allocations[i].token, amountToSpend, minOut, _swapExtraData[i]);
         if (amountOut == 0) revert SwapFailed();
         return true;
