@@ -7,9 +7,9 @@ pragma solidity 0.8.28;
 ///         (issue #150, `BaseStrategy.execute()`'s `NotActiveProposalStrategy`
 ///         check). `strategyOf` answers `msg.sender` regardless of `pid` —
 ///         "whoever is asking is the active proposal's strategy" — so every
-///         existing math/lifecycle scenario in `PortfolioStrategy.t.sol` /
-///         `VeniceInferenceStrategy.t.sol` keeps exercising exactly what it
-///         always exercised, without per-call-site proposal wiring.
+///         existing math/lifecycle scenario in `PortfolioStrategy.t.sol`
+///         keeps exercising exactly what it always exercised, without
+///         per-call-site proposal wiring.
 /// @dev    NEVER use this for a test that is actually about the binding check
 ///         itself — those need precise, non-permissive wiring. See
 ///         `test/audit-fixes/Strategy_cloneRatchetBinding.t.sol` and
@@ -28,11 +28,9 @@ contract MockGovernorAlwaysActive {
 /// @notice Minimal vault stand-in exposing only `governor()` — the one hop
 ///         `BaseStrategy.execute()` reads off `vault()`. Mirrors
 ///         `MockVaultWithGovernor` (declared locally in
-///         `PortfolioStrategyAdapterAllowlist.t.sol` /
-///         `VeniceInferenceStrategyAdapterAllowlist.t.sol`, which pairs it
-///         with a DIFFERENT, non-permissive governor mock,
-///         `MockGovernorWithRegistry`, so those files keep their own copy
-///         rather than importing this one).
+///         `PortfolioStrategyAdapterAllowlist.t.sol`, which pairs it with a
+///         DIFFERENT, non-permissive governor mock, `MockGovernorWithRegistry`,
+///         so that file keeps its own copy rather than importing this one).
 contract MockVaultGovernorStub {
     address public governor;
 

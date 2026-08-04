@@ -18,7 +18,7 @@ import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 /**
  * @title BaseIntegrationTest
  * @notice Abstract base for fork-based integration tests against real Base mainnet
- *         protocols (Moonwell, Aerodrome, Venice). Deploys a FRESH Sherwood core on
+ *         protocols (Moonwell, Aerodrome). Deploys a FRESH Sherwood core on
  *         the fork via the real deploy script and creates a test syndicate with
  *         funded LPs for each test.
  *
@@ -44,8 +44,6 @@ abstract contract BaseIntegrationTest is Test {
     address constant AERO_ROUTER = 0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43;
     address constant AERO_FACTORY = 0x420DD381b31aEf6683db6B902084cB0FFECe40Da;
     address constant AERO_TOKEN = 0x940181a94A35A4569E4529A3CDfB74e38FD98631;
-    address constant VVV_TOKEN = 0xacfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf;
-    address constant SVVV = 0x321b7ff75154472B18EDb199033fF4D116F340Ff;
     address constant WST_ETH = 0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452;
     address constant UNISWAP_ROUTER = 0x2626664c2603336E57B271c5C0b26F421741e481;
 
@@ -79,7 +77,7 @@ abstract contract BaseIntegrationTest is Test {
 
     function setUp() public virtual {
         // Fork-gated: these suites need Base-mainnet protocol state (USDC,
-        // Moonwell, Aerodrome, Venice). Skip cleanly when run without a Base
+        // Moonwell, Aerodrome). Skip cleanly when run without a Base
         // fork (mirrors the env-gated skips in RobinhoodIntegrationTest /
         // LeveragedAeroForkBase) instead of dying inside deal()/venue calls.
         if (USDC.code.length == 0) {
@@ -114,7 +112,7 @@ abstract contract BaseIntegrationTest is Test {
         DeploySherwood.Config memory cfg = DeploySherwood.Config({
             ensRegistrar: address(0), // ENS identity is not under test here
             agentRegistry: AGENT_REGISTRY, // real Base ERC-8004 registry; ownerOf mocked below
-            managementFeeBps: 0, // keep settle PnL asserts exact (Venice equality asserts)
+            managementFeeBps: 0, // keep settle PnL asserts exact (no fee dilution)
             maxStrategyDays: 30,
             votingPeriod: 1 hours,
             woodToken: address(wood),

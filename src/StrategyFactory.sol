@@ -54,7 +54,7 @@ contract StrategyFactory is Ownable {
     ///         that may be cloned through this factory. Default: empty
     ///         (everything reverts). The owner (deployer / Sherwood multisig)
     ///         adds the canonical templates (Aerodrome / Moonwell / Portfolio
-    ///         / HL Grid / HL Perp / Venice / WstETH / Mamo) at deploy.
+    ///         / HL Grid / HL Perp / WstETH / Mamo) at deploy.
     mapping(address template => bool approved) public approvedTemplate;
 
     error Unauthorized();
