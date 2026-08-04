@@ -39,9 +39,12 @@ interface ITierRegistryDemoterMinimal {
  *         plus a dispute window generous relative to the auto-slash delay.
  *
  * @dev    A winning challenger's counter-bond pool forfeits to it on a guilty
- *         verdict, on top of its returned bond — the escalation costs the
- *         accused what it is worth, and the forensic work that caught it is
- *         paid by the side that was wrong.
+ *         verdict, on top of its returned bond, net of the same burn the
+ *         silence path already takes off the bond (`settleBurnBps`) — the
+ *         escalation still costs the accused what it is worth, and the
+ *         forensic work that caught it is paid by the side that was wrong,
+ *         but neither payout can be round-tripped back to a self-funding
+ *         challenger for free (issue #181 finding 18b).
  *
  * @dev    The accused's defence is bought collectively: any accused approver
  *         may contribute to a shared counter-bond pool, sized to the
@@ -87,6 +90,26 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      stays compatible with the cross-contract window invariant
     ///      (`_requireWindowFits`).
     uint256 public constant MAX_DISPUTE_TIMEOUT = 60 days;
+
+    /// @dev Minimum guaranteed runway between the worst-case referral clock
+    ///      (`autoSlash + voteWindow + FINALIZE_BUFFER`) and `disputeTimeout`
+    ///      itself — issue #181 finding 20. `_requireWindowFits` used to
+    ///      accept EQUALITY, which guarantees only ONE SECOND of slack when
+    ///      the accused stalls pool completion (and therefore the
+    ///      in-transaction auto-referral in `dispute`) to the very last legal
+    ///      instant: the disputer controls both when the pool completes and,
+    ///      via that best-effort, gas-floor-free auto-referral, whether the
+    ///      referral itself lands. `dispute`'s auto-referral can fail for
+    ///      reasons that have nothing to do with the clock (see its own
+    ///      natspec), and the permissionless retry that recovers from that
+    ///      miss (`ITokenCourt.refer`) runs in a LATER transaction, at a
+    ///      LATER `block.timestamp` — eating straight into whatever slack was
+    ///      guaranteed. One second is not enough runway for that retry to
+    ///      land; 1 hour is, and is trivial next to the days of headroom
+    ///      every shipped configuration already carries (see this
+    ///      constant's own comment above). See `_requireWindowFits`, the sole
+    ///      call site.
+    uint256 internal constant MIN_REFERRAL_SLACK = 1 hours;
 
     /// @dev THE GAS FLOOR for a permissionless `resolve`.
     ///
@@ -267,6 +290,27 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      ceiling.
     uint256 internal constant MAX_INCONCLUSIVE_BURN_BPS = MAX_SETTLE_BURN_BPS;
 
+    /// @dev Round-1 step of the escalating Inconclusive-burn schedule (issue
+    ///      #181 finding 19). The first attempt against a proposal used to
+    ///      price at 0 bps, on the theory that an honest first-time filer
+    ///      should not be taxed for a vote that simply missed quorum — but
+    ///      that theory does not survive `dispute` being open to ANYONE
+    ///      (`ChallengeGame.dispute`): an attacker can file, fund its own
+    ///      counter-bond pool in full, and let turnout miss quorum for FREE,
+    ///      re-arming `challengeableUntil` and re-pinning the ledger
+    ///      (`_rearmChallengeWindow`) for a full `disputeTimeout` (up to 60d)
+    ///      plus `challengeWindow` (14d) of frozen coverage at the cost of
+    ///      gas alone. Sized at half of `INCONCLUSIVE_BURN_ROUND2_BPS`,
+    ///      continuing that constant's own doubling shape backwards (250 ->
+    ///      500 -> 1,000 -> the round-4+ live ceiling, default 2,000) — no
+    ///      attempt is ever free, and the schedule still genuinely escalates
+    ///      rather than flattening its first two steps. Fixed, not
+    ///      owner-settable, for the same reason as its siblings below. See
+    ///      `_inconclusiveBurnBpsForRound` for how the schedule composes,
+    ///      including the live clamp to `settleBurnBps` that also covers
+    ///      this fixed literal.
+    uint256 internal constant INCONCLUSIVE_BURN_ROUND1_BPS = 250;
+
     /// @dev Round-2 step of the escalating Inconclusive-burn schedule. Fixed,
     ///      not owner-settable — the schedule's shape is a one-time design
     ///      decision; only its ceiling (`inconclusiveBurnBps`) is a governance
@@ -361,7 +405,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         Load-bearing: with no proof required this is the only cost of a
     ///         frivolous filing, and a failed challenge forfeits it to the
     ///         accused approvers.
-    uint256 public challengerBondBps = 500;
+    /// @dev 150 (1.5%), lowered from 500 as part of closing the incentive
+    ///      inversion (audit #181 finding 18a): the filer's loss on a CORRECT
+    ///      uncontested filing is `challengerBondBps * settleBurnBps`, so
+    ///      shrinking the bond buys the headroom to keep `settleBurnBps` high
+    ///      enough that the escalating Inconclusive ladder is not clamped flat.
+    ///      See `honestFilingBreaksEven`.
+    uint256 public challengerBondBps = 150;
 
     /// @notice The slice of a FAILED challenge's forfeited bond that is
     ///         destroyed rather than paid to the guardians that funded the
@@ -379,10 +429,17 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         the pot size, not who is entitled to it: a free-riding approver
     ///         still collects nothing, and a losing challenger still forfeits
     ///         the whole bond either way.
-    /// @dev    Only the forfeit is burned — a guilty ruling pays the challenger
-    ///         its bond back plus the whole pool untouched, because there the
-    ///         challenger and the accused are genuinely opposed and no round
-    ///         trip exists to price.
+    /// @dev    `forfeitBurnBps` only prices the FAIL path's round trip. THE
+    ///         ESCALATED (GUILTY-RULING) BRANCH HAS ITS OWN ROUND TRIP (issue
+    ///         #181 finding 18b) — `dispute` is open to anyone, so a
+    ///         challenger that also funds its own counter-bond pool
+    ///         round-trips its whole stake there too, and the old belief that
+    ///         "the challenger and the accused are genuinely opposed [there]
+    ///         and no round trip exists to price" did not survive that. It is
+    ///         priced with `settleBurnBpsAtFiling` instead — see
+    ///         `ChallengeGame._settle` — reusing the silence branch's rate
+    ///         rather than adding a second governance knob for the same
+    ///         problem.
     uint256 public forfeitBurnBps = 2_000;
 
     /// @notice Silence window: an uncontested challenge auto-slashes once this
@@ -408,7 +465,17 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         rather than a transfer to the accused — paying convicted
     ///         approvers out of a correct filing would invert the incentive
     ///         it's meant to price.
-    uint256 public settleBurnBps = 2_000;
+    /// @dev    Applied on BOTH of `_settle`'s branches (issue #181 finding
+    ///         18b): the BOND on the silence (`!escalated`) branch, and the
+    ///         forfeited counter-bond POOL on the escalated (guilty-ruling)
+    ///         branch — which burns the identical WOOD amount, since
+    ///         `Disputed` implies `counterBondWood == bondWood`. See
+    ///         `ChallengeGame._settle`.
+    /// @dev 1,000, halved from 2,000 (audit #181 finding 18a). Kept at 1,000
+    ///      rather than dropped further so the Inconclusive ladder's
+    ///      250/500/1,000 steps all stay at or below the live clamp and the
+    ///      anti-grinding escalation survives intact.
+    uint256 public settleBurnBps = 1_000;
 
     /// @notice Ceiling on `prosecutorFeeBps`, mirroring
     ///         `ProposerBondEscrow.MAX_PROSECUTOR_FEE_BPS`.
@@ -444,10 +511,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         a governance change cannot re-rate a challenge already in
     ///         flight. If the escrow rejects a pinned rate, `_settle` retries
     ///         the forfeiture without a fee rather than losing the conviction.
-    /// @dev    UNDERIVED. 5% is inherited from the conviction bounty this
-    ///         replaced and has never been priced against what a correct filing
-    ///         actually costs to produce. Bounded, not justified.
-    uint256 public prosecutorFeeBps = 500;
+    /// @dev    Raised to `MAX_PROSECUTOR_FEE_BPS` (2,000) from the inherited,
+    ///         underived 500 as part of closing the incentive inversion (audit
+    ///         #181 finding 18a). This is the reward side of the break-even
+    ///         inequality; at the ceiling it contributes the maximum the escrow
+    ///         will pay, which is what lets the bond and burn stay meaningful.
+    ///         See `honestFilingBreaksEven`.
+    uint256 public prosecutorFeeBps = 2_000;
 
     /// @notice The round-4-and-beyond steady-state share of the challenger's
     ///         bond burned on an `Inconclusive` unwind, in bps. Default 20% —
@@ -472,7 +542,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         enforcement and `_inconclusiveBurnBpsForRound` for why every
     ///         tier — including the two fixed literals outside that setter
     ///         pair — is additionally clamped there.
-    uint256 public inconclusiveBurnBps = 2_000;
+    /// @dev 1,000, lowered from 2,000 in lockstep with `settleBurnBps` (audit
+    ///      #181 finding 18a). `setSettleBurnBps` refuses to drop below this
+    ///      value, so the ceiling MUST move with it or the new configuration is
+    ///      unreachable through the setters even though the constructor accepts
+    ///      it. The 250/500/1,000 ladder steps are all <= this, so lowering the
+    ///      ceiling does not clamp any of them.
+    uint256 public inconclusiveBurnBps = 1_000;
 
     /// @notice WOOD held on behalf of live (`Filed`/`Disputed`) challenges —
     ///         the sum of their challenger bonds and counter-bond pools.
@@ -1112,8 +1188,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      `_refundAll`, exactly like a court's own `Inconclusive` ruling:
     ///      both sides unwind whole and the re-challenge window re-arms. A
     ///      challenge that DID have an adjudicator pinned still routes to
-    ///      `_fail` on timeout, unchanged: there, a ruling was genuinely
-    ///      possible and simply never landed.
+    ///      `_fail` on timeout — but that entry ALSO re-arms the re-challenge
+    ///      window now (issue #181 finding 20, the `unadjudicatedTimeout`
+    ///      argument below): a court WAS pinned, yet nothing ever adjudicated
+    ///      the merits, which is structurally the same non-verdict
+    ///      `_refundAll` handles, not an acquittal. Only `rule`'s genuine
+    ///      `NotGuilty` entry into `_fail` does NOT re-arm — see `_fail`'s own
+    ///      natspec.
     function resolve(uint256 challengeId) external {
         Challenge storage c = _challenges[challengeId];
         Status status = c.status;
@@ -1128,7 +1209,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
                 // function's own natspec above.
                 _refundAll(challengeId, c);
             } else {
-                _fail(challengeId, c);
+                // A court WAS pinned at filing but this timeout means it
+                // never ruled — a non-verdict, not an acquittal (issue #181
+                // finding 20). `true` tells `_fail` to also re-arm the
+                // re-challenge window, unlike `rule`'s `NotGuilty` entry.
+                _fail(challengeId, c, true);
             }
         } else {
             revert WrongStatus();
@@ -1139,9 +1224,15 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @dev The court supplies only the verdict enum. `Guilty` reuses
     ///      `_settle` verbatim — the same path an undisputed challenge takes,
     ///      so the slash is at sWOOD's `maxSlashBps` with no severity ramp.
-    ///      `NotGuilty` reuses `_fail`, the same path the timeout takes: an
-    ///      acquittal and an unruled escalation say the same thing about the
-    ///      accused. `Inconclusive` reuses `_refundAll`: the vote missed its
+    ///      `NotGuilty` reuses `_fail`'s PAYOUT — the challenger's bond
+    ///      forfeits to the defenders exactly as it does when a wired court
+    ///      simply never rules before `disputeTimeout` (`resolve`'s own
+    ///      `_fail` entry) — but NOT its re-challenge re-arm (issue #181
+    ///      finding 20): only the un-adjudicated timeout entry re-arms
+    ///      `challengeableUntil`, since here an adjudicator genuinely looked
+    ///      at the merits and cleared the accused, and re-arming after a real
+    ///      acquittal would keep a cleared proposal challengeable for no
+    ///      reason. `Inconclusive` reuses `_refundAll`: the vote missed its
     ///      participation floor, so nothing was decided on the merits and both
     ///      sides unwind whole. There is deliberately no severity parameter —
     ///      a court that could dial the slash would be negotiating with the
@@ -1162,7 +1253,10 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (verdict == Verdict.Guilty) {
             _settle(challengeId, c);
         } else if (verdict == Verdict.NotGuilty) {
-            _fail(challengeId, c);
+            // A genuine ruling on the merits — no re-arm. See `_fail`'s own
+            // natspec and `resolve`'s `true`-passing entry (issue #181
+            // finding 20).
+            _fail(challengeId, c, false);
         } else {
             _refundAll(challengeId, c);
         }
@@ -1179,10 +1273,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///
     ///      — From `Disputed` (a guilty ruling): the pool is exactly
     ///        `bondWood`, since the contribution that completed it is the one
-    ///        that flipped the status. The whole pool forfeits to the
-    ///        challenger, on top of its returned bond — the escalation costs
-    ///        what it is worth, and the challenger that was right is paid by
-    ///        the side that was wrong.
+    ///        that flipped the status. The pool forfeits to the challenger on
+    ///        top of its returned bond, net of the same `settleBurnBpsAtFiling`
+    ///        slice the silence branch below takes off the bond (issue #181
+    ///        finding 18b) — the escalation still costs what it is worth, but
+    ///        a challenger that is also its own pool's funder no longer
+    ///        round-trips its whole stake for free.
     ///
     ///      — From `Filed` (the silence verdict): the pool is strictly below
     ///        `bondWood` — zero, or a part-funded defence that ran out of
@@ -1326,7 +1422,32 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
                 ) {
                     emit ProposerBondForfeited(challengeId, governor, proposalId, bondProposer, bondAmount);
                 } catch {
-                    emit ProposerBondForfeitureFailed(challengeId, governor, proposalId, bondEscrow);
+                    // THE DOCUMENTED RETRY (issue #181 finding 18c). The
+                    // pinned fee can be rejected for reasons that have
+                    // nothing to do with whether the bond itself is still
+                    // forfeitable — e.g. a live escrow ceiling
+                    // (`MAX_PROSECUTOR_FEE_BPS`) lowered below what was
+                    // pinned at filing (`FeeBpsTooHigh`). `_settle` is
+                    // one-shot per key — `_convicted[key]` is already set in
+                    // this branch — so a bare catch here would let the
+                    // ACTUAL ATTACKER'S bond survive the conviction,
+                    // reclaimable forever, while the guardians it deceived
+                    // are slashed. Retrying at a ZERO fee removes the one
+                    // parameter THIS contract pins that the escrow could
+                    // plausibly reject on its own terms; any failure that
+                    // survives a zero-fee retry (a re-pointed escrow, a bond
+                    // already reclaimed, an authorization-side rewire such as
+                    // `NotAuthorizedConvictor` after a freezer rotation) is
+                    // about the forfeiture itself, not the rate, and is
+                    // genuinely unrecoverable from here — surfaced the same
+                    // way a first-attempt-only failure used to be.
+                    try IProposerBondEscrow(bondEscrow).forfeitBond(governor, proposalId, c.challenger, 0) returns (
+                        address bondProposer, uint256 bondAmount
+                    ) {
+                        emit ProposerBondForfeited(challengeId, governor, proposalId, bondProposer, bondAmount);
+                    } catch {
+                        emit ProposerBondForfeitureFailed(challengeId, governor, proposalId, bondEscrow);
+                    }
                 }
             }
 
@@ -1379,18 +1500,39 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             }
         }
 
-        // A correct filing is cheap, not free — but only on the UNADJUDICATED
-        // path: a filing nobody answered would otherwise get the slash and
-        // adapter demotion for the price of gas, so the burn is what makes the
-        // silence verdict cost something. A guilty COURT ruling was tested on
-        // the merits and won, so taxing it would price down the filings the
-        // mechanism wants. Hence burn on `!escalated`; on `escalated` the
-        // challenger takes its bond whole plus the pool the losing side
-        // forfeited. Exactly `bond + pool` leaves on both branches, matching
-        // the decrement above to the wei.
+        // A correct filing is cheap, not free, on BOTH branches now (issue
+        // #181 finding 18b). The escalated branch used to pay the challenger
+        // `bond + pool` untouched, on the belief that the challenger and the
+        // accused are genuinely opposed there and "no round trip exists to
+        // price" (see `settleBurnBps`'s and `forfeitBurnBps`'s natspec,
+        // corrected alongside this). That belief assumed the pool's funder is
+        // adversarial to the challenger — but `dispute` is open to ANYONE
+        // (see its natspec), so a challenger that also funds (or has a
+        // second address it controls fund) the ENTIRE counter-bond pool
+        // round-trips its whole stake on this branch: it forfeits nothing,
+        // since `bond + pool` returns to the same controller that posted
+        // both. A `msg.sender != challenger` check on `dispute` is theatre
+        // for the same reason `forfeitBurnBps`'s natspec gives on the fail
+        // path — two addresses defeat it — so the fix is the same one: burn
+        // a slice instead of paying it out whole. Both branches now burn
+        // `settleBurnBpsAtFiling` of whatever forfeits to the challenger —
+        // the BOND on the silence branch, the POOL on the escalated branch,
+        // which is exactly `bond` again since `Disputed` implies a complete
+        // pool (`pool == bondWood`) — so the two branches burn identically. A
+        // genuinely adversarial pool funder is unaffected: it never intended
+        // to reclaim this money, so shaving the pool by a governance-set rate
+        // does not change its incentive to fund a real defence. Exactly
+        // `bond + pool` still leaves the contract on both branches (some of
+        // it via `BURN_ADDRESS` instead of the challenger), matching the
+        // decrement above to the wei.
         uint256 burned;
         if (escalated) {
-            wood.safeTransfer(c.challenger, bond + pool);
+            burned = (pool * c.settleBurnBpsAtFiling) / BPS_DENOMINATOR;
+            if (burned != 0) {
+                wood.safeTransfer(BURN_ADDRESS, burned);
+                emit ChallengerBondBurned(challengeId, burned);
+            }
+            wood.safeTransfer(c.challenger, bond + pool - burned);
         } else {
             burned = (bond * c.settleBurnBpsAtFiling) / BPS_DENOMINATOR;
             if (burned != 0) {
@@ -1433,16 +1575,61 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (pool != 0) unclaimedWood += pool;
     }
 
+    /// @dev Shared by `_fail`'s un-adjudicated-timeout entry and
+    ///      `_refundAll` (issue #181 finding 20) — both unwind a proposal
+    ///      with nothing decided on the merits, and both must leave it
+    ///      legally re-challengeable rather than letting `disputeTimeout`
+    ///      (which always exceeds `challengeWindow`) run out the ordinary
+    ///      filing deadline with no gate left standing. Raises
+    ///      `challengeableUntil[rk]` to at least `block.timestamp +
+    ///      challengeWindow` (never lowers it — `file`'s gate takes the max
+    ///      of this value and the live baseline on every call, so this write
+    ///      only ever needs to avoid raising it needlessly) and mirrors that
+    ///      floor onto the ledger via `pinCoverageUntil` (issue #95: the
+    ///      re-arm alone drops `hasFrozenCoverage` via `_releaseFreeze` but
+    ///      does nothing to keep sWOOD's own unstake gate honest through the
+    ///      re-armed window unless this is COUPLED to it, not optional), so
+    ///      sWOOD's unstake gate stays honest for exactly as long as a
+    ///      conviction remains reachable, and not one second longer.
+    /// @dev Skipped when the proposal is already convicted: `file` refuses
+    ///      any further filing against a convicted proposal regardless of
+    ///      this mapping, so an unguarded write would be inert to control
+    ///      flow — but it would still advertise a live re-challenge deadline
+    ///      for a proposal that can never actually be challenged again, a
+    ///      stale signal an indexer would otherwise trust.
+    /// @dev Does NOT touch `inconclusiveRounds` — that counter drives the
+    ///      Inconclusive-burn ESCALATION schedule specifically, and only
+    ///      `_refundAll`'s caller reaches this through a genuinely FREE
+    ///      unwind. `_fail`'s timeout entry forfeits the challenger's WHOLE
+    ///      bond to the defenders; counting it as a "round" would escalate
+    ///      the burn on some unrelated LATER filer for a stall that already
+    ///      cost THIS challenger everything. `_refundAll` increments its own
+    ///      counter locally, right after calling this.
+    function _rearmChallengeWindow(bytes32 rk, address governor, uint256 proposalId) private {
+        if (_convicted[rk]) return;
+        uint256 extended = block.timestamp + challengeWindow;
+        if (extended > challengeableUntil[rk]) challengeableUntil[rk] = extended;
+        exposureLedger.pinCoverageUntil(governor, proposalId, challengeableUntil[rk]);
+    }
+
     /// @dev The fail-safe: a disputed challenge escalates to the court. Without
     ///      this path both bonds and the frozen coverage would sit stuck
     ///      forever whenever no court answered, letting anyone pin a
     ///      guardian's budget indefinitely just by filing — so an unruled
     ///      escalation fails in favour of the accused.
     ///
-    ///      Also the not-guilty verdict path: this function checks no clock,
-    ///      only unwinds the bonds and the freeze, so an acquittal and an
-    ///      unruled escalation settle identically — both say the defence was
-    ///      right.
+    ///      Also the not-guilty verdict path, and a THIRD entry besides
+    ///      (issue #181 finding 20) — `resolve`'s Disputed timeout when a
+    ///      court WAS pinned at filing but never ruled. All three unwind the
+    ///      bonds and the freeze IDENTICALLY: a `NotGuilty` ruling and an
+    ///      unruled escalation forfeit the challenger's bond to the
+    ///      defenders the same way. They no longer settle identically in
+    ///      EVERY respect, though — `unadjudicatedTimeout` additionally
+    ///      re-arms the re-challenge window (`_rearmChallengeWindow`) for the
+    ///      timeout entry only, never for a genuine ruling, because there an
+    ///      adjudicator actually looked at the merits and cleared the
+    ///      accused. See `resolve` and `rule` for how each call site sets
+    ///      this flag.
     ///
     ///      The forfeit splits pro-rata to CONTRIBUTION, not coverage: paying
     ///      by committed share would let an approver sit out the defence and
@@ -1481,7 +1668,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      pinned and genuinely never ruled — wired away before referral
     ///      landed, a `refer` call that failed and was never retried, or a
     ///      live vote that missed quorum without the court calling back
-    ///      `Inconclusive` — which is a real timeout, not a phantom one.
+    ///      `Inconclusive` — which is a real timeout, not a phantom one. THIS
+    ///      is exactly the `unadjudicatedTimeout == true` entry described
+    ///      above.
     ///      Residual: an owner that unwires the court AFTER a challenge with
     ///      `courtAtFiling != address(0)` was filed but BEFORE it is ruled
     ///      reproduces the old shape for that one challenge (`rule` becomes
@@ -1490,7 +1679,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      reachable, and the same class of residual risk already accepted
     ///      elsewhere in this file (see `_requireWindowFits`'s own residual
     ///      note).
-    function _fail(uint256 challengeId, Challenge storage c) private {
+    function _fail(uint256 challengeId, Challenge storage c, bool unadjudicatedTimeout) private {
         address governor = c.governor;
         uint256 proposalId = c.proposalId;
 
@@ -1500,7 +1689,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         c.status = Status.Failed;
         bondedWood -= (bond + pool);
 
-        _releaseFreeze(_reviewKey(governor, proposalId), governor, proposalId);
+        bytes32 rk = _reviewKey(governor, proposalId);
+        _releaseFreeze(rk, governor, proposalId);
+
+        // ISSUE #181 FINDING 20. See the function's own natspec above for
+        // why the timeout entry re-arms and the ruling entry does not.
+        if (unadjudicatedTimeout) {
+            _rearmChallengeWindow(rk, governor, proposalId);
+        }
 
         // Defensive: unreachable from `Disputed`, where the pool is by
         // construction complete and therefore funded by at least one address.
@@ -1592,37 +1788,23 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // acquittal: the accused can stall the pool to the last legal instant
         // inside `autoSlashDelay`, and the verdict would otherwise land past
         // `executedAt + challengeWindow` with no filing gate left standing.
-        // `file`'s gate takes the max of this value and the live baseline on
-        // every call, so this write only ever needs to avoid raising it
-        // needlessly, never guard against shrinking a later read.
+        // Shared with `_fail`'s structurally identical non-verdict (issue
+        // #181 finding 20) via `_rearmChallengeWindow` — see that function's
+        // own natspec for the re-arm and skip-when-convicted mechanics.
         //
-        // Skipped when the proposal is already convicted: `file` refuses any
-        // further filing against a convicted proposal regardless of this
-        // mapping, so an unguarded write would be inert to control flow — but
-        // it would still advertise a live re-challenge deadline for a
-        // proposal that can never actually be challenged again, a stale
-        // signal an indexer would otherwise trust.
+        // `inconclusiveRounds[rk]` stays LOCAL to this function rather than
+        // folding into the shared helper: every actual `Inconclusive` unwind
+        // of a contestable proposal is a repetition for the ESCALATION
+        // schedule's purposes, so it increments unconditionally inside the
+        // same `!_convicted` guard — unlike the re-arm write, which only
+        // raises when needed. `_fail`'s un-adjudicated-timeout entry does NOT
+        // reach this: that challenger forfeited its whole bond, so counting
+        // its filing as a "round" would tax an unrelated LATER filer for a
+        // stall that already cost THIS one everything (see
+        // `_rearmChallengeWindow`'s own note).
         if (!_convicted[rk]) {
-            uint256 extended = block.timestamp + challengeWindow;
-            if (extended > challengeableUntil[rk]) challengeableUntil[rk] = extended;
-            // Every actual `Inconclusive` unwind of a contestable proposal is
-            // a repetition, so this increments unconditionally inside the
-            // guard above — unlike the re-arm write, which only raises when
-            // needed.
+            _rearmChallengeWindow(rk, governor, proposalId);
             inconclusiveRounds[rk]++;
-
-            // COUPLED TO THE RE-ARM, NOT OPTIONAL (issue #95). `_releaseFreeze`
-            // above just dropped `hasFrozenCoverage` to false for every
-            // approver here, but this branch is exactly the one that keeps the
-            // proposal LEGALLY re-challengeable through `challengeableUntil[rk]`
-            // — a window `openExposureUsd`'s wall-clock epoch buckets were
-            // never built to cover, since they age out `challengeWindow` after
-            // EXECUTION, not after any later re-arm. Pinning through the
-            // JUST-WRITTEN `challengeableUntil[rk]` (not `extended` — an
-            // earlier round may have left it higher already) keeps sWOOD's
-            // unstake gate honest for exactly as long as a conviction remains
-            // reachable, and not one second longer.
-            exposureLedger.pinCoverageUntil(governor, proposalId, challengeableUntil[rk]);
         }
 
         _bookRefund(challengeId, pool);
@@ -1655,23 +1837,34 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      identically to a sequential one, so the round THIS filing is
     ///      attempting is `priorRounds + 1`:
     ///
-    ///        priorRounds == 0  ->  attempt 1  ->  0 bps (free)
+    ///        priorRounds == 0  ->  attempt 1  ->  `INCONCLUSIVE_BURN_ROUND1_BPS`
     ///        priorRounds == 1  ->  attempt 2  ->  `INCONCLUSIVE_BURN_ROUND2_BPS`
     ///        priorRounds == 2  ->  attempt 3  ->  `INCONCLUSIVE_BURN_ROUND3_BPS`
     ///        priorRounds >= 3  ->  attempt 4+ ->  `inconclusiveBurnBps`
     ///
+    ///      NO ATTEMPT IS EVER FREE (issue #181 finding 19). Attempt 1 used
+    ///      to price at 0 bps. That does not survive `dispute` being open to
+    ///      anyone: an attacker can file, fund its own counter-bond pool in
+    ///      full, and let turnout miss quorum for FREE, re-arming
+    ///      `challengeableUntil` and re-pinning the ledger
+    ///      (`_rearmChallengeWindow`) for a full `disputeTimeout` (up to 60d)
+    ///      plus `challengeWindow` (14d) of frozen coverage at the cost of
+    ///      gas alone — repeatable, since `_refundAll` never marks a proposal
+    ///      convicted. `INCONCLUSIVE_BURN_ROUND1_BPS` closes that; see its own
+    ///      natspec for why it is sized where it is.
+    ///
     ///      Always clamped to the live `settleBurnBps`, regardless of tier —
     ///      the round-4+ tier is also guarded at the setter level
     ///      (`setInconclusiveBurnBps`/`setSettleBurnBps` cross-check), but the
-    ///      two fixed literals for rounds 2 and 3 are compile-time constants
-    ///      the setter pair never touches, so this clamp is what still keeps a
+    ///      three fixed literals for rounds 1-3 are compile-time constants the
+    ///      setter pair never touches, so this clamp is what still keeps a
     ///      non-verdict from costing more than a verdict that recovered real
     ///      value if `settleBurnBps` is later lowered. Clamped, not reverted:
     ///      a revert here would make `file` fail whenever governance set
     ///      `settleBurnBps` low, blocking filing entirely.
     function _inconclusiveBurnBpsForRound(uint256 priorRounds) private view returns (uint256 bps) {
         if (priorRounds == 0) {
-            bps = 0;
+            bps = INCONCLUSIVE_BURN_ROUND1_BPS;
         } else if (priorRounds == 1) {
             bps = INCONCLUSIVE_BURN_ROUND2_BPS;
         } else if (priorRounds == 2) {
@@ -1804,6 +1997,52 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (id == 0) return 0;
         Status status = _challenges[id].status;
         return (status == Status.Filed || status == Status.Disputed) ? id : 0;
+    }
+
+    /// @inheritdoc IChallengeGame
+    /// @dev VIEW ONLY — reports the inequality from issue #181 finding 18a,
+    ///      it does not enforce it anywhere. `challengerBondBps *
+    ///      settleBurnBps <= proposerBondBps * prosecutorFeeBps` is the
+    ///      break-even condition for a CORRECT, UNCONTESTED filing: the
+    ///      challenger's net payoff on that path is `proposerBondBps *
+    ///      prosecutorFeeBps - challengerBondBps * settleBurnBps`, scaled by
+    ///      the coverage and the WOOD price (both of which cancel out of the
+    ///      SIGN, so they are irrelevant to this comparison). A `false`
+    ///      result means silence is the accused's dominant strategy against
+    ///      the CURRENT configuration — the opposite of what this mechanism
+    ///      is meant to incentivize. At the shipped defaults
+    ///      (`challengerBondBps` 150 * `settleBurnBps` 1,000 = 150,000 vs
+    ///      `proposerBondBps` 100 * `prosecutorFeeBps` 2,000 = 200,000) this
+    ///      returns `true` with margin — a correct, uncontested filing is
+    ///      profitable rather than loss-making.
+    ///
+    ///      Those defaults were chosen together, not independently (audit #181
+    ///      finding 18a). The bond carries the reduction because the two rates
+    ///      are coupled: `setSettleBurnBps` refuses to drop below
+    ///      `inconclusiveBurnBps`, which ceilings the escalating Inconclusive
+    ///      ladder, so buying the headroom out of `settleBurnBps` alone would
+    ///      have clamped 250/500/1,000 flat and undone the anti-grinding
+    ///      schedule. Lowering the bond instead leaves that ladder intact, at
+    ///      the cost of a cheaper entry price for a frivolous filing — which a
+    ///      losing challenger still forfeits in full.
+    ///
+    ///      This contract deliberately does NOT gate any setter on this
+    ///      result. The values that would make it `true` trade off against
+    ///      `challengerBondBps`'s anti-spam role, `settleBurnBps`'s own
+    ///      pricing purpose, and `proposerBondBps`'s cost to legitimate
+    ///      proposers (and `proposerBondBps` is not even a knob this contract
+    ///      owns — see below) — choosing among those tradeoffs is a
+    ///      protocol-economics decision for governance, not a constant this
+    ///      contract should pick for itself.
+    ///
+    ///      `proposerBondBps` is read LIVE from the wired `exposureLedger`
+    ///      (this contract does not store that rate, and does not pin it
+    ///      per-challenge the way it pins its own rates) rather than any
+    ///      fixed value, so this always reports against CURRENT policy on
+    ///      both sides of the inequality, not any one challenge's
+    ///      filing-time pin.
+    function honestFilingBreaksEven() external view returns (bool) {
+        return challengerBondBps * settleBurnBps <= exposureLedger.proposerBondBps() * prosecutorFeeBps;
     }
 
     // ── Owner setters ──
@@ -1944,13 +2183,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      counter-bond pool may complete as late as
     ///      `filedAt + autoSlashDelay`, and from that instant a referral needs
     ///      `voteWindow + FINALIZE_BUFFER` of runway before the challenge dies
-    ///      at `filedAt + disputeTimeout`. Violated, the referral window can go
-    ///      negative — and the accused chooses when the pool completes, so it
-    ///      would defeat adjudication unilaterally by stalling. `c` is a
-    ///      parameter rather than always read from `court` so `setCourt` can
-    ///      validate the address about to become live, not the stale one
-    ///      already in storage. Vacuous with no court wired: there is no
-    ///      referral to fit.
+    ///      at `filedAt + disputeTimeout` — PLUS `MIN_REFERRAL_SLACK` of
+    ///      genuine margin, not merely a non-negative one (issue #181 finding
+    ///      20). Violated, the referral window can go negative — and the
+    ///      accused chooses when the pool completes, so it would defeat
+    ///      adjudication unilaterally by stalling. `c` is a parameter rather
+    ///      than always read from `court` so `setCourt` can validate the
+    ///      address about to become live, not the stale one already in
+    ///      storage. Vacuous with no court wired: there is no referral to fit.
     /// @dev Residual: this binds the court's CURRENT `voteWindow`/
     ///      `FINALIZE_BUFFER` against this game's CURRENT `autoSlashDelay`/
     ///      `disputeTimeout`, not against any already-open challenge's PINNED
@@ -1965,9 +2205,19 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      this design rejects elsewhere (the pool/contributor loops removed
     ///      for the same reason), so binding setters against current state is
     ///      the achievable half of this invariant.
+    /// @dev NOTE FOR THE TOKENCOURT OWNER: `TokenCourt`'s own constructor and
+    ///      `setVoteWindow` run the mirror-image check
+    ///      (`game_.autoSlashDelay() + voteWindow + FINALIZE_BUFFER >
+    ///      game_.disputeTimeout()`) and still accept equality on THAT side —
+    ///      `ChallengeGame` does not own `TokenCourt.sol`, so it cannot add
+    ///      the same `MIN_REFERRAL_SLACK` margin there. Until it does, a
+    ///      `TokenCourt`-side `setVoteWindow` raise can still legally leave
+    ///      less than an hour of slack even though this contract's own
+    ///      setters would refuse to.
     function _requireWindowFits(address c, uint256 autoSlash, uint256 timeout) private view {
         if (c == address(0)) return;
-        if (autoSlash + ITokenCourt(c).voteWindow() + ITokenCourt(c).FINALIZE_BUFFER() > timeout) {
+        if (autoSlash + ITokenCourt(c).voteWindow() + ITokenCourt(c).FINALIZE_BUFFER() + MIN_REFERRAL_SLACK > timeout)
+        {
             revert WindowInvariantViolated();
         }
     }

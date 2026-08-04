@@ -1762,16 +1762,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         uint256 balanceAdjusted = IERC20(asset).balanceOf(vault);
         pnl = int256(balanceAdjusted) - int256(snapshot);
 
-        // Finalize state before external transfers to prevent reentrancy on stale state
-        _activeProposal = 0;
-        _transition(proposal, ProposalState.Settled);
-        delete _capitalSnapshots[proposalId];
-        // Open emergency reviews are NOT auto-cancelled here — they resolve
-        // naturally via `resolveEmergencyReview` at reviewEnd (slashing if the
-        // block quorum was met, no-op otherwise) so an owner who opened an
-        // adversarial emergency cannot dodge slash by racing a settle.
-        _decOpen();
-
         // ── Two-number fee model ──
         // Ordering is load-bearing: management fee first (it lowers assets and
         // therefore price per share), then the high-water-mark comparison, then
@@ -1802,6 +1792,28 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // queued redeemers/depositors settle against the post-fee NAV. No-op if
         // the vault has no withdrawal queue.
         ISyndicateVault(vault).onProposalSettled(proposalId);
+
+        // Release the locks LAST, after every external call above (CEI; audit
+        // issue #181 finding #24). `_activeProposal` backs the vault's
+        // `redemptionsLocked()` and `_openProposalCount` backs
+        // `_depositsLocked()` — clearing either before the fee transfers /
+        // `onProposalSettled` stamp would open a window where a
+        // callback-bearing fee recipient (a hooked asset onboarded later, or
+        // the proposer via `_distributeAgentFee`) could deposit or redeem
+        // against a NAV that is pre-fee and pre-stamp, and shift
+        // `totalSupply()` before the settle price lands — diluting this
+        // proposal's queued redeemers. `settleProposal`'s `nonReentrant` does
+        // NOT cover this: it only guards re-entry into this governor, not
+        // calls into the vault or its withdrawal queue, which are separate
+        // contracts. Open emergency reviews are NOT auto-cancelled here —
+        // they resolve naturally via `resolveEmergencyReview` at reviewEnd
+        // (slashing if the block quorum was met, no-op otherwise) so an
+        // owner who opened an adversarial emergency cannot dodge slash by
+        // racing a settle.
+        _activeProposal = 0;
+        _transition(proposal, ProposalState.Settled);
+        delete _capitalSnapshots[proposalId];
+        _decOpen();
 
         emit ProposalSettled(proposalId, vault, pnl, totalFee, block.timestamp - proposal.executedAt);
 

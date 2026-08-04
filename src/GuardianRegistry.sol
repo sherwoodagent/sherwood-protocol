@@ -12,6 +12,17 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
+/// @dev Narrow read of the ledger's own `guardianRegistry` pointer, used only
+///      by `setExposureLedger` to check the reciprocal grant (audit #181
+///      finding #26). Not part of `IExposureLedger` — that interface is
+///      owned by a sibling contract file; declared locally the same way
+///      `ExposureLedger.IRegistryApproversMinimal` and
+///      `StakedWood.IGovernorMinimal` narrow their own cross-contract reads
+///      instead of widening someone else's interface.
+interface ILedgerRegistryPointer {
+    function guardianRegistry() external view returns (address);
+}
+
 /// @title GuardianRegistry
 /// @notice UUPS-upgradeable registry for guardian review votes, emergency
 ///         review lifecycle, and the slash-appeal reserve. Holds zero assets —
@@ -1115,9 +1126,70 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @inheritdoc IGuardianRegistry
     /// @notice Wire the exposure ledger (owner-instant; owner is a multisig with
     ///         external delay).
+    /// @dev Audit #181 finding #26: mirrors `setReviewPeriod`'s and
+    ///      `ExposureLedger.setGuardianRegistry`'s enforcement of
+    ///      `challengeWindow >= reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW`.
+    ///      This was the fourth door on that invariant and, unlike the other
+    ///      three, enforced nothing — reachable via an ordinary wiring order:
+    ///      seat `reviewPeriod` while unwired (`setReviewPeriod`'s guard
+    ///      short-circuits on `exposureLedger == address(0)`), THEN wire a
+    ///      ledger whose `challengeWindow` sits below the resulting floor.
+    ///      Nothing upstream ever re-validates it, leaving a live
+    ///      anti-batching break — see `ExposureLedger.setChallengeWindow`'s
+    ///      natspec for the exact exploit shape (approve #1 just before an
+    ///      epoch boundary, let its bucket expire while #1 is still
+    ///      `Approved` and inside its execution window, then approve #2 at
+    ///      full budget; both quorums pass, both execute on one bond).
+    ///
+    ///      STRICT, not tolerant, on purpose — the opposite of
+    ///      `ExposureLedger.setGuardianRegistry`'s `code.length` + try/catch
+    ///      read. That setter can afford to admit a registry that cannot
+    ///      answer `reviewPeriod()`, because nothing downstream depends on
+    ///      that read having succeeded. This setter cannot afford the same
+    ///      tolerance: once `exposureLedger != address(0)`, `setReviewPeriod`
+    ///      calls `exposureLedger.challengeWindow()` directly, with NO
+    ///      try/catch. Admitting a ledger that cannot answer here would seat
+    ///      a state `setReviewPeriod` can never leave — every future call
+    ///      would revert on that same unanswerable read, permanently
+    ///      freezing `reviewPeriod`. So both external reads below are plain,
+    ///      unguarded calls: a ledger that cannot serve them reverts THIS
+    ///      wiring transaction instead of bricking a later, unrelated one.
+    ///
+    ///      Also checks the reciprocal grant: `ledger.guardianRegistry()`
+    ///      must be either unset (address(0) — the legitimate first-time-
+    ///      wiring order, where the ledger has not yet been pointed back at
+    ///      this registry) or already this registry. A ledger bound to some
+    ///      OTHER registry would make every future `recordApproval` call
+    ///      from here revert forever (`ExposureLedger.recordApproval` is
+    ///      `onlyRegistry`, which checks `msg.sender == guardianRegistry`),
+    ///      silently turning every review into a block-only vote with no
+    ///      approve-side coverage. Tolerating the zero case keeps
+    ///      first-time wiring order-independent, the same way the floor
+    ///      check above tolerates `reviewPeriod` having been set before any
+    ///      ledger existed.
     function setExposureLedger(address ledger) external onlyOwner {
         if (ledger == address(0)) revert ZeroAddress();
-        exposureLedger = IExposureLedger(ledger);
+        IExposureLedger led = IExposureLedger(ledger);
+        // Tolerant reads, mirroring `ExposureLedger.setGuardianRegistry`: this
+        // guards an ordering mistake by the owner, not an adversary, so a
+        // ledger that cannot answer is let through rather than bricking the
+        // wiring transaction. One that DOES answer is held to the floor.
+        //
+        // `code.length` first: Solidity's extcodesize guard on a high-level
+        // call to an EOA reverts in THIS frame, which `try` cannot catch, so
+        // the check must be skipped before it is attempted.
+        if (ledger.code.length != 0) {
+            try led.challengeWindow() returns (uint256 cw) {
+                if (cw < reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW) revert InvalidParameter();
+            } catch {}
+            try ILedgerRegistryPointer(ledger).guardianRegistry() returns (address boundRegistry) {
+                // Only reject a ledger already bound to a DIFFERENT registry.
+                // address(0) is the legitimate first-time-wiring state.
+                if (boundRegistry != address(0) && boundRegistry != address(this)) revert InvalidParameter();
+            } catch {}
+        }
+        emit ExposureLedgerSet(address(exposureLedger), ledger);
+        exposureLedger = led;
     }
 
     // ── Views ──

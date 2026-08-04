@@ -545,19 +545,30 @@ contract TokenCourtEndToEndTest is Test {
         uint256 slashedGross = (G1_STAKE * expectedBps) / 10_000;
         assertEq(swood.guardianStake(g1), G1_STAKE - slashedGross, "g1 paid exactly what it owed");
 
-        // ── The challenger is repaid its bond plus the whole forfeited pool,
-        //    plus the prosecutor's fee. THE SLASH ITSELF PAYS NO ONE: every wei
-        //    of it burns. The fee comes from the convicted proposer's forfeited
-        //    bond instead, which is the one pot a prosecutor cannot fund for
-        //    itself — so even an escalated win here is paid by the accused
-        //    proposer, never out of the guardians' slash.
+        // ── The challenger is repaid its bond plus the forfeited pool NET OF
+        //    the settle-slice burn (issue #181 finding 18b), plus the
+        //    prosecutor's fee. THE SLASH ITSELF PAYS NO ONE: every wei of it
+        //    burns. The fee comes from the convicted proposer's forfeited bond
+        //    instead, which is the one pot a prosecutor cannot fund for itself
+        //    — so even an escalated win here is paid by the accused proposer,
+        //    never out of the guardians' slash.
+        //
+        //    THE POOL NO LONGER RETURNS WHOLE: `dispute` is open to anyone, so
+        //    a challenger who also funds the counter-bond pool (directly, or
+        //    via a second address) used to round-trip its whole stake on
+        //    exactly this branch, forfeiting nothing. `_settle` now burns
+        //    `settleBurnBpsAtFiling` of the pool first — derived from the
+        //    challenge's own pinned rate below, not hardcoded, so this
+        //    survives a future rate change.
         IChallengeGame.Challenge memory c = game.challengeOf(cid);
         uint256 prosecutorFee = (proposerBond * game.prosecutorFeeBps()) / 10_000;
         assertGt(prosecutorFee, 0, "the fee is live in this fixture");
+        uint256 settleBurned = (c.counterBondWood * c.settleBurnBpsAtFiling) / 10_000;
+        assertGt(settleBurned, 0, "sanity: the default settleBurnBps actually burns something on this branch now");
         assertEq(
             wood.balanceOf(challenger),
-            challengerBalBefore + c.counterBondWood + prosecutorFee,
-            "bond back, the whole forfeited pool, and the prosecutor's cut of the proposer bond"
+            challengerBalBefore + c.counterBondWood - settleBurned + prosecutorFee,
+            "bond back, the forfeited pool net of the settle-slice burn, and the prosecutor's cut of the proposer bond"
         );
 
         // ── The named adapter lost its certification (D7).
@@ -712,18 +723,27 @@ contract TokenCourtEndToEndTest is Test {
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Inconclusive), "Inconclusive");
         assertEq(uint256(court.caseOf(caseId).verdict), uint256(IChallengeGame.Verdict.Inconclusive));
 
-        // ── The challenger's bond returns WHOLE on THIS filing specifically
-        //    (owner decision 2026-07-30, escalating the Inconclusive burn):
-        //    it is this proposal's first-ever challenge, and round 1 of the
-        //    escalating schedule is priced at 0 bps -- an honest one-shot
-        //    filer whose vote merely missed the participation floor once is
-        //    not charged. A SECOND Inconclusive round against the SAME
-        //    proposal would escalate (see `ChallengeGame.t.sol`'s
+        // ── The challenger's bond returns minus the round-1 ENTRY-TIER burn
+        //    on THIS filing specifically (issue #181 finding 19, superseding
+        //    the 2026-07-30 "round 1 is free" decision): it is this
+        //    proposal's first-ever challenge, and round 1 of the escalating
+        //    schedule is now priced at `INCONCLUSIVE_BURN_ROUND1_BPS` (250
+        //    bps) rather than 0 -- a free first unwind let anyone pin every
+        //    accused approver's stake for free, repeatably, so no attempt is
+        //    ever free anymore. A SECOND Inconclusive round against the SAME
+        //    proposal would escalate further (see `ChallengeGame.t.sol`'s
         //    `test_inconclusive_escalationSchedule` for the full ladder);
-        //    this arc test covers the single-round happy path only.
+        //    this arc test covers the single-round happy path only. The burn
+        //    is derived from the challenge's own pinned rate rather than
+        //    hardcoded, so this survives a future schedule change.
         IChallengeGame.Challenge memory c = game.challengeOf(cid);
-        assertEq(c.inconclusiveBurnBpsAtFiling, 0, "round 1 against a fresh proposal is free");
-        assertEq(wood.balanceOf(challenger), challengerBalBefore, "the whole bond came back");
+        assertEq(c.inconclusiveBurnBpsAtFiling, 250, "round 1 against a fresh proposal pins the entry tier");
+        uint256 round1Burned = (c.bondWood * c.inconclusiveBurnBpsAtFiling) / 10_000;
+        assertEq(
+            wood.balanceOf(challenger),
+            challengerBalBefore - round1Burned,
+            "the bond came back minus the round-1 entry-tier burn"
+        );
 
         // ── g1 collects EXACTLY its stake back -- no winnings, nothing was won.
         assertEq(game.claimableContribution(cid, g1), c.counterBondWood, "stake only, no forfeit to split");

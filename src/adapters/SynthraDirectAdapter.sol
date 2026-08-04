@@ -42,8 +42,13 @@ contract SynthraDirectAdapter is ISwapAdapter {
     error SwapFailed();
     error UnauthorizedCallback();
     error SlippageExceeded();
+    error CallbackAmountExceeded();
 
     // EIP-1153 transient storage slots — set during swap(), read in the callback.
+    // _TS_CALLBACK_AMOUNT bounds the callback: synthraV3SwapCallback tloads it and
+    // reverts if the pool-reported amountOwed exceeds it, so the callback can never
+    // pull more than the caller authorized via swap()'s amountIn, regardless of what
+    // the pool self-reports in amount0Delta/amount1Delta.
     bytes32 private constant _TS_CALLBACK_TOKEN = keccak256("synthra.adapter.callback.token");
     bytes32 private constant _TS_CALLBACK_AMOUNT = keccak256("synthra.adapter.callback.amount");
     bytes32 private constant _TS_EXPECTED_POOL = keccak256("synthra.adapter.expected.pool");
@@ -103,22 +108,47 @@ contract SynthraDirectAdapter is ISwapAdapter {
             tstore(amountSlot, 0)
             tstore(poolSlot, 0)
         }
+
+        // synthraV3SwapCallback bounds amountOwed by amountIn but the pool is free
+        // to pull less (e.g. it may not need the full specified input to reach the
+        // sqrtPriceLimitX96 bound). Refund any leftover tokenIn now rather than
+        // stranding it in this stateless, permissionless adapter — there is no
+        // rescue function by design, so an unswept remainder would be unrecoverable.
+        uint256 leftover = IERC20(tokenIn).balanceOf(address(this));
+        if (leftover > 0) {
+            IERC20(tokenIn).safeTransfer(msg.sender, leftover);
+        }
     }
 
     /// @notice Synthra V3 swap callback — pool calls this to pull input tokens
+    /// @dev amountOwed is bounded by the _TS_CALLBACK_AMOUNT staged in swap(): the
+    ///      pool's self-reported delta is trusted only up to the amountIn the caller
+    ///      actually authorized, never beyond it. A delta that is not strictly
+    ///      positive is rejected before casting, since a negative int256 cast to
+    ///      uint256 wraps to an astronomic value.
     function synthraV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
         bytes32 tokenSlot = _TS_CALLBACK_TOKEN;
         bytes32 amountSlot = _TS_CALLBACK_AMOUNT;
         bytes32 poolSlot = _TS_EXPECTED_POOL;
         address expectedPool;
         address callbackToken;
+        uint256 callbackAmount;
         assembly {
             expectedPool := tload(poolSlot)
             callbackToken := tload(tokenSlot)
+            callbackAmount := tload(amountSlot)
         }
         if (expectedPool == address(0) || msg.sender != expectedPool) revert UnauthorizedCallback();
 
-        uint256 amountOwed = amount0Delta > 0 ? uint256(amount0Delta) : uint256(amount1Delta);
+        // Only a strictly positive delta represents tokens owed to the pool. Do
+        // not cast a non-positive delta to uint256 — that would wrap a negative
+        // number into an enormous transfer amount.
+        int256 owedDelta = amount0Delta > 0 ? amount0Delta : amount1Delta;
+        if (owedDelta <= 0) revert SwapFailed();
+
+        uint256 amountOwed = uint256(owedDelta);
+        if (amountOwed > callbackAmount) revert CallbackAmountExceeded();
+
         IERC20(callbackToken).safeTransfer(msg.sender, amountOwed);
     }
 

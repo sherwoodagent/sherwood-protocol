@@ -19,6 +19,12 @@ import {TokenVesting} from "./TokenVesting.sol";
 contract VestingFactory {
     using SafeERC20 for IERC20;
 
+    /// @dev Mirrors `SyndicateFactory.MAX_PAGE_LIMIT` / `SyndicateVault.MAX_PAGE_LIMIT`:
+    ///      hard cap on `walletsOfPaginated`'s `limit` so the call always fits
+    ///      in a node's `eth_call` gas budget no matter how large `_walletsOf`
+    ///      grows for a given beneficiary (see `walletsOf`'s DoS note).
+    uint256 public constant MAX_PAGE_LIMIT = 100;
+
     address public immutable implementation;
 
     mapping(address beneficiary => address[] wallets) private _walletsOf;
@@ -74,9 +80,52 @@ contract VestingFactory {
         );
     }
 
+    /// @notice Unpaginated: returns the ENTIRE array for `beneficiary`.
+    /// @dev DoS HAZARD: `createVesting` is permissionless, accepts an
+    ///      arbitrary `beneficiary`, and a zero-`amount` create is a valid,
+    ///      cheap (one clone + one SSTORE) unfunded shell — so anyone can
+    ///      inflate any address's wallet list until this call exceeds a
+    ///      node's `eth_call` gas budget, breaking on-chain enumeration for
+    ///      that beneficiary. Prefer `walletsOfPaginated` (clamped to
+    ///      `MAX_PAGE_LIMIT` per call) or `walletCountOf`, or fall back to
+    ///      the indexed `VestingCreated` events. Kept for backward
+    ///      compatibility only.
     /// @return All vesting wallets ever created for `beneficiary`, in
     ///         creation order (including cancelled ones).
     function walletsOf(address beneficiary) external view returns (address[] memory) {
         return _walletsOf[beneficiary];
+    }
+
+    /// @notice Number of vesting wallets ever created for `beneficiary`
+    ///         (including cancelled ones). Use with `walletsOfPaginated` to
+    ///         enumerate without the DoS hazard of `walletsOf`.
+    function walletCountOf(address beneficiary) external view returns (uint256) {
+        return _walletsOf[beneficiary].length;
+    }
+
+    /// @notice Paginated `walletsOf`: a slice `[offset, offset +
+    ///         min(limit, MAX_PAGE_LIMIT))` clipped to the beneficiary's
+    ///         wallet count, in creation order. Returns an empty array when
+    ///         `offset >= walletCountOf(beneficiary)`. Mirrors
+    ///         `SyndicateVaultAdminLib.pageAddresses`'s clamping.
+    /// @param beneficiary Address whose wallets to page through.
+    /// @param offset Starting index (0-based) into the beneficiary's wallets.
+    /// @param limit Maximum number of results to return; clamped to
+    ///        `MAX_PAGE_LIMIT`.
+    function walletsOfPaginated(address beneficiary, uint256 offset, uint256 limit)
+        external
+        view
+        returns (address[] memory out)
+    {
+        address[] storage wallets = _walletsOf[beneficiary];
+        uint256 total = wallets.length;
+        if (offset >= total) return new address[](0);
+        if (limit > MAX_PAGE_LIMIT) limit = MAX_PAGE_LIMIT;
+        uint256 end = offset + limit;
+        if (end > total) end = total;
+        out = new address[](end - offset);
+        for (uint256 i = offset; i < end; i++) {
+            out[i - offset] = wallets[i];
+        }
     }
 }

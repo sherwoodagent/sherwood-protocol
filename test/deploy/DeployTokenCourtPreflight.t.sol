@@ -8,6 +8,7 @@ import {DeployTokenCourt, WireTokenCourt} from "../../script/DeployTokenCourt.s.
 import {TokenCourt} from "../../src/TokenCourt.sol";
 import {ITokenCourt} from "../../src/interfaces/ITokenCourt.sol";
 import {ChallengeGame} from "../../src/ChallengeGame.sol";
+import {IChallengeGame} from "../../src/interfaces/IChallengeGame.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
@@ -216,21 +217,68 @@ contract DeployTokenCourtPreflightTest is Test {
         _runWireExpecting("PRE-FLIGHT: autoSlashDelay + voteWindow + FINALIZE_BUFFER > disputeTimeout.");
     }
 
-    /// @dev PRE-FLIGHT 3c: the exact boundary `sum == disputeTimeout` PASSES
-    ///      and wires — proving the check is `<=`, not `<`. At the defaults
-    ///      the sum is `7 + 5 + 1 = 13 days`; shortening `disputeTimeout` to
-    ///      exactly that (still legal: `> autoSlashDelay`) must not refuse.
-    function test_wire_acceptsTheExactBoundary() public {
+    /// @dev PRE-FLIGHT 3c: the exact boundary `sum == disputeTimeout` USED TO
+    ///      pass and wire — the pre-fix check was `<=`, not `<`. Issue #181
+    ///      finding 20 corrected that: exact equality left only ONE SECOND of
+    ///      guaranteed runway for a dropped auto-referral to be retried, and
+    ///      the disputer controls both the stall instant AND (via the
+    ///      ungated bare `try refer`) whether the in-transaction referral
+    ///      lands. `ChallengeGame._requireWindowFits` now additionally
+    ///      demands `MIN_REFERRAL_SLACK` (1 hour) of headroom ABOVE the bare
+    ///      sum, so the exact boundary must now REVERT, and only a
+    ///      configuration with at least that much slack may wire.
+    /// @dev    THE SCRIPT'S OWN require (PRE-FLIGHT 3 above, `WireTokenCourt.run`)
+    ///         was NOT touched by this fix and still only checks the bare
+    ///         `<=` — `MIN_REFERRAL_SLACK` lives solely in
+    ///         `ChallengeGame._requireWindowFits`, reached from inside
+    ///         `setCourt` at the end of `run()`. So at the exact boundary the
+    ///         script's own require still PASSES and the call proceeds into
+    ///         `game.setCourt`, which reverts with the typed
+    ///         `WindowInvariantViolated` error rather than a string reason —
+    ///         this is why this test can no longer route through
+    ///         `_runWireExpecting`, which only catches `Error(string)`.
+    /// @dev    Renamed from `test_wire_acceptsTheExactBoundary`, which pinned
+    ///         the pre-fix "exact equality wires" behaviour this fix removes.
+    ///         `MIN_REFERRAL_SLACK` is `internal` in `ChallengeGame.sol` (no
+    ///         public getter, and adding one is a `src/` change out of this
+    ///         fix's scope), so its exact value cannot be read off the
+    ///         contract here; a generously-labelled headroom well above the
+    ///         documented 1-hour constant is used for the acceptance leg
+    ///         instead of the raw literal, so this test does not depend on
+    ///         reproducing that exact number.
+    /// @dev Split into two one-direction tests rather than one two-direction
+    ///      test: `WireTokenCourt.run()` broadcasts, and Foundry refuses a
+    ///      `vm.prank` issued after a broadcast in the same test body
+    ///      ("cannot prank for a broadcasted transaction"). Each direction
+    ///      therefore needs its own fresh fixture.
+    function test_wire_rejectsTheExactBoundary() public {
         TokenCourt court = _deployAndSetCourtEnv();
-        vm.prank(DEFAULT_SENDER);
-        game.setDisputeTimeout(13 days); // == autoSlashDelay(7d) + voteWindow(5d) + FINALIZE_BUFFER(1d)
+        uint256 bareSum = game.autoSlashDelay() + court.voteWindow() + court.FINALIZE_BUFFER();
 
+        vm.prank(DEFAULT_SENDER);
+        game.setDisputeTimeout(bareSum); // == autoSlashDelay(7d) + voteWindow(5d) + FINALIZE_BUFFER(1d)
         assertEq(
-            game.autoSlashDelay() + court.voteWindow() + court.FINALIZE_BUFFER(), game.disputeTimeout(), "boundary"
+            game.autoSlashDelay() + court.voteWindow() + court.FINALIZE_BUFFER(),
+            game.disputeTimeout(),
+            "boundary, zero slack"
         );
 
+        _setEnv();
+        vm.expectRevert(IChallengeGame.WindowInvariantViolated.selector);
         TokenCourtScriptCaller(DEFAULT_SENDER).fwd(address(wireScript), abi.encodeCall(WireTokenCourt.run, ()));
-        assertEq(game.court(), address(court), "boundary must wire");
+        assertEq(game.court(), address(0), "the exact boundary must not wire - MIN_REFERRAL_SLACK closes the last second");
+    }
+
+    function test_wire_acceptsWithSlack() public {
+        TokenCourt court = _deployAndSetCourtEnv();
+        uint256 bareSum = game.autoSlashDelay() + court.voteWindow() + court.FINALIZE_BUFFER();
+
+        vm.prank(DEFAULT_SENDER);
+        game.setDisputeTimeout(bareSum + 1 days);
+
+        _setEnv();
+        TokenCourtScriptCaller(DEFAULT_SENDER).fwd(address(wireScript), abi.encodeCall(WireTokenCourt.run, ()));
+        assertEq(game.court(), address(court), "sum + slack headroom must wire");
     }
 
     /// @dev PRE-FLIGHT 4: launch-math. Issue #84 ("enforce the floor

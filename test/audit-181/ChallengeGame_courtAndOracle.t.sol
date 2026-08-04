@@ -200,11 +200,14 @@ contract ChallengeGame_courtAndOracleTest is Test {
         wood.approve(address(game), type(uint256).max);
     }
 
-    /// @dev Expected undiscounted bond for `COVERAGE_USD` at `PRICE_X8`:
+    /// @dev Expected undiscounted bond for `COVERAGE_USD` at `priceX8`:
     ///      `coverageUsd * challengerBondBps / 10_000 * 1e8 / priceX8`, with
-    ///      the default `challengerBondBps == 500`.
-    function _expectedBondWood(uint256 priceX8) internal pure returns (uint256) {
-        return (((COVERAGE_USD * 500) / 10_000) * 1e8) / priceX8;
+    ///      `challengerBondBps` read LIVE off the contract (audit #181
+    ///      finding 18a moved the default from 500 to 150) rather than
+    ///      hardcoded, so a future parameter change does not silently break
+    ///      every fixture built on top of this.
+    function _expectedBondWood(uint256 priceX8) internal view returns (uint256) {
+        return (((COVERAGE_USD * game.challengerBondBps()) / 10_000) * 1e8) / priceX8;
     }
 
     // ── Finding #2 ──
@@ -239,8 +242,10 @@ contract ChallengeGame_courtAndOracleTest is Test {
         IChallengeGame.Challenge memory c = game.challengeOf(id);
         assertEq(c.courtAtFiling, address(0), "courtAtFiling must pin the unwired court");
         assertEq(c.bondWood, bondWood, "sanity: bond sizing");
-        // First-ever filing against this proposal: round 0, free.
-        assertEq(c.inconclusiveBurnBpsAtFiling, 0, "sanity: round-1 pinned rate is free");
+        // First-ever filing against this proposal: round 1, the entry tier
+        // (issue #181 finding 19) — no attempt is ever free, closing the
+        // free-freeze griefing path a zero-cost round 1 used to open.
+        assertEq(c.inconclusiveBurnBpsAtFiling, 250, "sanity: round-1 pinned rate is the entry tier, not free");
 
         // Fully fund the counter-bond pool — flips the challenge to Disputed
         // and (because `court == address(0)`) skips the auto-referral.
@@ -264,11 +269,21 @@ contract ChallengeGame_courtAndOracleTest is Test {
             uint8(c.status), uint8(IChallengeGame.Status.Inconclusive), "timeout with no court must be a non-verdict"
         );
 
-        // Round-1 rate is 0 bps, so the challenger's bond returns whole.
-        assertEq(wood.balanceOf(challenger) - challengerBefore, bondWood, "challenger must recover its whole bond");
+        // Round-1 now pins the entry-tier rate (issue #181 finding 19: no
+        // attempt is ever free), so the challenger's bond returns minus that
+        // slice, not whole — derived from the challenge's own pinned rate
+        // rather than hardcoded, so this survives a future schedule change.
+        uint256 round1Burned = (bondWood * c.inconclusiveBurnBpsAtFiling) / 10_000;
+        assertEq(
+            wood.balanceOf(challenger) - challengerBefore,
+            bondWood - round1Burned,
+            "challenger must recover its bond minus the round-1 entry-tier burn"
+        );
 
         // The pool funder recovers exactly its stake — no forfeit share,
-        // because nothing was forfeited.
+        // because nothing was forfeited. The inconclusive-path burn is taken
+        // off the CHALLENGER's bond only (mirroring `_settle`'s silence
+        // branch); the pool is untouched and booked whole via `_bookRefund`.
         uint256 funderBefore = wood.balanceOf(funder);
         vm.prank(funder);
         uint256 claimed = game.claimContribution(id);
@@ -326,15 +341,18 @@ contract ChallengeGame_courtAndOracleTest is Test {
 
     /// @notice Two challenges filed concurrently against the same proposal —
     ///         before either resolves — must pin DISTINCT, escalating
-    ///         `inconclusiveBurnBpsAtFiling` rates, not the same free rate.
+    ///         `inconclusiveBurnBpsAtFiling` rates, not the same round-1 rate
+    ///         twice.
     /// @dev    FAILS AGAINST THE PRE-FIX CODE: the pinned rate used to be
     ///         `_inconclusiveBurnBpsForRound(inconclusiveRounds[key])` alone,
     ///         and `inconclusiveRounds[key]` only increments in `_refundAll`
     ///         — at unwind. Neither challenge below has unwound when the
-    ///         second is filed, so the pre-fix code pins round-1 (0 bps) on
-    ///         BOTH, letting an attacker file arbitrarily many challenges
-    ///         from arbitrarily many addresses before the first ever
-    ///         resolves and pay the free rate on every one.
+    ///         second is filed, so the pre-fix code pins round-1 (0 bps, back
+    ///         when round 1 was free — issue #181 finding 19 has since made
+    ///         it the entry tier) on BOTH, letting an attacker file
+    ///         arbitrarily many challenges from arbitrarily many addresses
+    ///         before the first ever resolves and pay the free rate on every
+    ///         one.
     function test_concurrentFilings_pinDistinctEscalatingTiers() public {
         address challengerA = address(0xA11CE);
         address challengerB = address(0xB0B00);
@@ -347,9 +365,13 @@ contract ChallengeGame_courtAndOracleTest is Test {
         uint256 idA = game.file(
             address(governor), PROPOSAL_ID, IChallengeGame.Predicate.OutOfAdapterOutflow, address(0), bytes4(0), "ev"
         );
-        // First-ever filing against this proposal: round 1, free.
+        // First-ever filing against this proposal: round 1, the entry tier
+        // (250 bps == `INCONCLUSIVE_BURN_ROUND1_BPS`, issue #181 finding 19 —
+        // no attempt is ever free).
         assertEq(
-            game.challengeOf(idA).inconclusiveBurnBpsAtFiling, 0, "first concurrent filing must pin round 1 (free)"
+            game.challengeOf(idA).inconclusiveBurnBpsAtFiling,
+            250,
+            "first concurrent filing must pin round 1 (the entry tier)"
         );
         // Still live — neither settled, disputed, nor timed out.
         assertEq(uint8(game.challengeOf(idA).status), uint8(IChallengeGame.Status.Filed));
@@ -362,7 +384,7 @@ contract ChallengeGame_courtAndOracleTest is Test {
         // Second concurrent filing, still before any unwind: must escalate
         // to the round-2 fixed step (500 bps == `INCONCLUSIVE_BURN_ROUND2_BPS`
         // in `ChallengeGame.sol`; hardcoded here because that constant is
-        // `internal`), not repeat the free tier.
+        // `internal`), not repeat round 1's entry tier.
         uint256 round2Bps = 500;
         assertEq(
             game.challengeOf(idB).inconclusiveBurnBpsAtFiling,
@@ -371,7 +393,7 @@ contract ChallengeGame_courtAndOracleTest is Test {
         );
         assertTrue(
             game.challengeOf(idA).inconclusiveBurnBpsAtFiling != game.challengeOf(idB).inconclusiveBurnBpsAtFiling,
-            "concurrent filings must not both pin the free tier"
+            "concurrent filings must not both pin round 1's entry tier"
         );
     }
 }

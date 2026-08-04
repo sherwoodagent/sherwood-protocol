@@ -160,6 +160,23 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      mis-set parameter, not a conservatism policy.
     uint256 internal constant MIN_WOOD_HAIRCUT_BPS = 5_000;
 
+    /// @dev Ceiling on a feed's reported `decimals()`, enforced at
+    ///      `setWoodFeed`/`setAssetFeed` for BOTH the WOOD feed and every
+    ///      vault-asset feed (audit #181 finding 22). Real Chainlink
+    ///      aggregators report 8 or 18; 18 leaves headroom for any legitimate
+    ///      configuration while staying far below 78 — the point at which
+    ///      `10 ** feedDecimals` overflows `uint256` and panics (0x11) inside
+    ///      `_feedPriceX8`'s and `coverageUsd`'s normalization. Before this
+    ///      bound, a feed reporting `feedDecimals >= 78` (attacker-controlled
+    ///      or simply misconfigured — `setWoodFeed`/`setAssetFeed` read it
+    ///      from the feed with no upper bound at all) took `_woodPrice` down
+    ///      with a panic instead of falling through to the TWAP, exactly the
+    ///      failure mode `_feedPriceX8`'s own natspec promises never happens.
+    ///      Bounding at WRITE time closes it for every reader in one place,
+    ///      rather than requiring each of `_feedPriceX8`/`coverageUsd` to
+    ///      separately defend an unbounded config.
+    uint8 internal constant MAX_FEED_DECIMALS = 18;
+
     bytes32 public constant PARAM_CHALLENGE_WINDOW = keccak256("challengeWindow");
     bytes32 public constant PARAM_K_NUMERATOR = keccak256("kNumerator");
     bytes32 public constant PARAM_COVERED_TVL_CAP = keccak256("coveredTvlCapUsd");
@@ -585,26 +602,69 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      revert from `latestRoundData`: a reverting aggregator must fall
     ///      through to the TWAP, not take the price path down with it.
     ///
+    ///      RAW STATICCALL, NOT A TYPED `try` (audit #181 finding 22). A typed
+    ///      `try IAggregatorMinimal(feed).latestRoundData() returns (...) {
+    ///      ... } catch { ... }` only guards the CALL and its error selector —
+    ///      Solidity's own documented limitation is that a call which SUCCEEDS
+    ///      but returns too little data to decode the declared return types
+    ///      fails at ABI-DECODING, and that failure is a full, UNCAUGHT revert
+    ///      of the transaction, not a `catch`. Code that runs INSIDE a typed
+    ///      try's success block is likewise ordinary caller-frame code once
+    ///      the call itself has returned, so a panic there (see the decimals
+    ///      note below) is exactly as uncatchable. A malformed/truncated
+    ///      `latestRoundData()` return, or a stored `feedDecimals` large
+    ///      enough to overflow `10 ** feedDecimals`, therefore used to take
+    ///      the whole price path down with it — precisely the failure this
+    ///      function's own natspec promises never happens. `_twapPriceX8`
+    ///      already defends the identical decode risk the same way; this now
+    ///      matches it: staticcall, explicit length check before any decode
+    ///      is attempted, and decode ONLY into `uint256`/`int256` words (no
+    ///      validity-constrained type like `bool`/`enum`/a sub-256-bit
+    ///      integer, any of which the ABI decoder can reject as malformed and
+    ///      revert on), so once the length check passes, decoding itself
+    ///      cannot revert.
+    ///
     ///      `code.length` is checked FIRST because Solidity's extcodesize guard
     ///      on a high-level call to a codeless address reverts in THIS frame,
-    ///      which `try` cannot catch — the same reason `setGuardianRegistry`
-    ///      guards its tolerant read that way.
+    ///      which no wrapper can catch — the same reason `setGuardianRegistry`
+    ///      guards its tolerant read that way. A raw `staticcall` carries no
+    ///      such guard (it is a plain opcode, not a typed high-level call), so
+    ///      this check is still needed to tell "codeless" apart from
+    ///      "answered falsy" before the staticcall is even attempted.
+    ///
+    ///      `feedDecimals` IS RE-CHECKED AGAINST `MAX_FEED_DECIMALS` HERE, even
+    ///      though `setWoodFeed` already refuses to store a value above it:
+    ///      `setWoodFeed` is the BRACE, this is the BELT. Without it,
+    ///      `10 ** f.feedDecimals` panics (0x11) the instant `feedDecimals >=
+    ///      78`, and that panic — code past a successful external call,
+    ///      running in this frame — is exactly as uncatchable as the decode
+    ///      issue above.
     function _feedPriceX8() internal view returns (uint256 priceX8, bool ok) {
         AssetFeed storage f = _woodFeed;
         address feed = f.feed;
         if (feed == address(0) || feed.code.length == 0) return (0, false);
-        try IAggregatorMinimal(feed).latestRoundData() returns (
-            uint80, int256 answer, uint256, uint256 updatedAt, uint80
-        ) {
-            if (answer <= 0) return (0, false);
-            uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
-            if (age > f.maxDelay) return (0, false);
-            // Normalise to 8 decimals. `answer > 0` checked above.
-            // forge-lint: disable-next-line(unsafe-typecast)
-            return ((uint256(answer) * 1e8) / (10 ** f.feedDecimals), true);
-        } catch {
-            return (0, false);
-        }
+        (bool success, bytes memory ret) = feed.staticcall(abi.encodeCall(IAggregatorMinimal.latestRoundData, ()));
+        // latestRoundData returns (uint80, int256, uint256, uint256, uint80):
+        // 5 words, 160 bytes. Short/absent data is rejected before any decode
+        // is attempted, exactly as `_twapPriceX8` rejects `ret.length < 64`.
+        if (!success || ret.length < 160) return (0, false);
+        // Decoded as uint256/int256 throughout, NOT the narrower uint80 the
+        // interface declares — a sub-256-bit unsigned type is, like `bool`,
+        // validity-constrained at decode time (the ABI decoder rejects a word
+        // whose unused high bits are not clean padding), which is exactly the
+        // uncatchable-revert class this rewrite exists to close. uint256 and
+        // int256 accept any 32-byte word, so nothing below this line can
+        // revert on account of decoding.
+        (, int256 answer,, uint256 updatedAt,) = abi.decode(ret, (uint256, int256, uint256, uint256, uint256));
+        if (answer <= 0) return (0, false);
+        uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
+        if (age > f.maxDelay) return (0, false);
+        uint8 feedDecimals = f.feedDecimals;
+        if (feedDecimals > MAX_FEED_DECIMALS) return (0, false);
+        // Normalise to 8 decimals. `answer > 0` checked above; `feedDecimals`
+        // bounded above, so `10 ** feedDecimals` cannot overflow.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return ((uint256(answer) * 1e8) / (10 ** feedDecimals), true);
     }
 
     /// @dev The TWAP leg. A LOW-LEVEL STATICCALL, not a typed `try`, and the
@@ -738,6 +798,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         }
         if (maxDelay == 0 || maxDelay > type(uint64).max) revert InvalidParameter();
         uint8 feedDecimals = IAggregatorMinimal(feed).decimals();
+        // BOUNDED AT WRITE TIME (audit #181 finding 22): unbounded, a feed
+        // reporting `feedDecimals >= 78` panics `_feedPriceX8`'s
+        // normalization (`10 ** feedDecimals` overflows uint256) instead of
+        // reporting unavailable, taking `_woodPrice` down protocol-wide
+        // rather than falling through to the TWAP. See `MAX_FEED_DECIMALS`.
+        if (feedDecimals > MAX_FEED_DECIMALS) revert InvalidParameter();
         // maxDelay bounded to type(uint64).max above; cast cannot truncate.
         // forge-lint: disable-next-line(unsafe-typecast)
         _woodFeed = AssetFeed({
@@ -904,6 +970,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if (maxDelay == 0 || maxDelay > type(uint64).max) revert InvalidParameter();
         uint8 assetDec = IERC20DecimalsMinimal(asset).decimals();
         uint8 feedDec = IAggregatorMinimal(feed).decimals();
+        // BOUNDED AT WRITE TIME (audit #181 finding 22): the same
+        // `feedDecimals >= 78` overflow that `setWoodFeed` guards against
+        // panics `coverageUsd`'s normalization identically — see
+        // `MAX_FEED_DECIMALS`. `coverageUsd` is otherwise meant to revert on
+        // bad state (fail-closed), but "meant to revert cleanly" and "can be
+        // configured to panic" are different guarantees; this closes the gap
+        // at the only site that can ever introduce the bad value.
+        if (feedDec > MAX_FEED_DECIMALS) revert InvalidParameter();
         // maxDelay bounded to type(uint64).max above; cast cannot truncate.
         // forge-lint: disable-next-line(unsafe-typecast)
         uint64 maxDelay64 = uint64(maxDelay);
@@ -956,6 +1030,65 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         return (usd * 1e8) / px;
     }
 
+    /// @dev Resolves `(asset, requiredCoverage)` for `governor`/`proposalId`
+    ///      against `vault`, book/settle-NOTHING on any failure rather than
+    ///      reverting (audit #181 finding 23). Shared by `recordApproval` and
+    ///      `settleCoverage` so the hoist-and-guard shape below cannot drift
+    ///      between the two call sites — both callers already document "any
+    ///      pricing failure books/settles nothing rather than reverting", and
+    ///      this is the piece that used to quietly not honour that.
+    ///
+    ///      HOISTED OUT OF ANY `try`'s ARGUMENT LIST, DELIBERATELY. Solidity
+    ///      evaluates a call's argument expressions in the CALLER's frame,
+    ///      strictly before the call a `try` around it actually guards. Both
+    ///      callers used to write the equivalent of:
+    ///
+    ///          try this.coverageUsd(
+    ///              IVaultAssetMinimal(pv.vault).asset(),
+    ///              gov.getRequiredCoverage(proposalId)
+    ///          ) returns (uint256 v) { ... } catch { ... }
+    ///
+    ///      — with `IVaultAssetMinimal(pv.vault).asset()` evaluated before the
+    ///      guarded call even begins, and `gov.getRequiredCoverage(proposalId)`
+    ///      evaluated as an ARGUMENT to it, equally outside the guard. A
+    ///      revert from either one propagated straight through the `catch`
+    ///      exactly as if the `try` were not there, defeating the "any
+    ///      pricing failure books/settles nothing" guarantee for a dependency
+    ///      (`getRequiredCoverage`) the natspec itself calls out as latent
+    ///      today only because `SyndicateGovernor.getRequiredCoverage` is
+    ///      presently a bare storage read — it arms the moment that getter
+    ///      (or a future vault's `asset()`) gains any reverting path. Each
+    ///      read is now resolved through its OWN try/catch, ahead of and
+    ///      independent from the `coverageUsd` try each caller still performs.
+    ///
+    ///      `vault.code.length` is checked FIRST, for the same reason
+    ///      `_feedPriceX8`/`_twapPriceX8` check it before their own external
+    ///      reads: a call that succeeds against a codeless address returns no
+    ///      data, and Solidity does not route a resulting ABI-decode failure
+    ///      through `catch` — it is a full, uncaught revert of the
+    ///      transaction. `governor` needs no matching guard here: both callers
+    ///      only reach this function via a `pv` already produced by an
+    ///      earlier, UNWRAPPED call to this exact `gov`, so `gov` is proven to
+    ///      have code (and to have answered) before this function ever runs.
+    function _tryResolveCoverageInputs(ILedgerGovernorMinimal gov, uint256 proposalId, address vault)
+        internal
+        view
+        returns (address asset, uint256 requiredCoverage, bool ok)
+    {
+        if (vault.code.length == 0) return (address(0), 0, false);
+        try IVaultAssetMinimal(vault).asset() returns (address a) {
+            asset = a;
+        } catch {
+            return (address(0), 0, false);
+        }
+        try gov.getRequiredCoverage(proposalId) returns (uint256 rc) {
+            requiredCoverage = rc;
+        } catch {
+            return (address(0), 0, false);
+        }
+        ok = true;
+    }
+
     /// @inheritdoc IExposureLedger
     /// @dev Called by GuardianRegistry.voteOnProposal on the approve side.
     ///
@@ -997,20 +1130,22 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if (_reservedUsd[key][guardian] != 0) return;
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
         ILedgerGovernorMinimal.ProposalViewLite memory pv = gov.getProposalView(proposalId);
-        address asset = IVaultAssetMinimal(pv.vault).asset();
         // ANY PRICING FAILURE BOOKS NOTHING RATHER THAN REVERTING — missing
-        // feed, stale feed, or any other `coverageUsd` revert. Reverting here
-        // would take the APPROVE vote down with it while Block votes still
-        // work, turning the review block-only: guardians could veto but never
-        // endorse, and the proposal would pass optimistically anyway. Failing
-        // closed on the coverage (booking nothing, so the execute-time quorum
-        // cannot be met) is the conservative half; failing the vote is the
-        // harmful one.
+        // feed, stale feed, an unreadable vault/required-coverage read (audit
+        // #181 finding 23, see `_tryResolveCoverageInputs`), or any other
+        // `coverageUsd` revert. Reverting here would take the APPROVE vote
+        // down with it while Block votes still work, turning the review
+        // block-only: guardians could veto but never endorse, and the
+        // proposal would pass optimistically anyway. Failing closed on the
+        // coverage (booking nothing, so the execute-time quorum cannot be
+        // met) is the conservative half; failing the vote is the harmful one.
+        (address asset, uint256 requiredCoverage, bool resolved) = _tryResolveCoverageInputs(gov, proposalId, pv.vault);
+        if (!resolved) return; // unreadable right now: book nothing, let the quorum decide
         //
         // Called externally so the revert can be caught; `coverageUsd` is a view
         // on this same contract, and a same-contract call cannot be wrapped.
         uint256 needUsd;
-        try this.coverageUsd(asset, gov.getRequiredCoverage(proposalId)) returns (uint256 v) {
+        try this.coverageUsd(asset, requiredCoverage) returns (uint256 v) {
             needUsd = v;
         } catch {
             return; // unpriceable right now: book nothing, let the quorum decide
@@ -2029,10 +2164,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             return;
         }
 
+        // Same hoist-and-guard as `recordApproval` (audit #181 finding 23):
+        // the vault/required-coverage reads used to sit as inline try-call
+        // arguments, evaluated in THIS function's frame, before — and
+        // therefore outside — the `catch` below. See
+        // `_tryResolveCoverageInputs`.
+        (address asset, uint256 requiredCoverage, bool resolved) = _tryResolveCoverageInputs(gov, proposalId, pv.vault);
+        if (!resolved) return; // unreadable right now; retry later rather than mis-settle
+
         uint256 needUsd;
-        try this.coverageUsd(IVaultAssetMinimal(pv.vault).asset(), gov.getRequiredCoverage(proposalId)) returns (
-            uint256 v
-        ) {
+        try this.coverageUsd(asset, requiredCoverage) returns (uint256 v) {
             needUsd = v;
         } catch {
             return; // unpriceable right now; retry later rather than mis-settle
