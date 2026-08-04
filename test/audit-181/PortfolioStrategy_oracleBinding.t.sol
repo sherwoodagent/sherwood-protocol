@@ -134,7 +134,7 @@ contract DirectionalZeroSellAdapter {
 ///               divergence note on `_pushFeedPrice` for why the fixed
 ///               behavior accepts (age-0) rather than reverting `StalePrice`
 ///               for this case specifically, matching the repo-wide
-///               `ChainlinkReader.sol` convention.
+///               repo-wide guarded-subtraction convention.
 ///           (c) a sell-side swap that silently returns zero output must
 ///               revert `SwapFailed`, matching the buy side (Finding #10).
 contract PortfolioStrategy_oracleBindingTest is Test {
@@ -318,7 +318,7 @@ contract PortfolioStrategy_oracleBindingTest is Test {
     ///      block.timestamp` underflows a `uint256` subtraction under
     ///      checked arithmetic (Solidity 0.8.x) and reverts with a raw
     ///      Panic(0x11), not a named error. New code clamps the age to 0
-    ///      (matching the repo-wide `ChainlinkReader.sol` /
+    ///      (matching the repo-wide
     ///      `ExposureLedger.sol` convention: a feed clock ahead of a lagging
     ///      L2 `block.timestamp` is the freshest possible answer) and
     ///      completes without reverting. `rebalanceDelta` with an empty

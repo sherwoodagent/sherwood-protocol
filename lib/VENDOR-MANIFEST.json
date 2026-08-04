@@ -31,7 +31,10 @@
         "submodules": false
       },
       "compare": [
-        { "upstream": ".", "local": "." }
+        {
+          "upstream": ".",
+          "local": "."
+        }
       ],
       "pruned": [],
       "local_modifications": [],
@@ -56,7 +59,10 @@
         }
       },
       "compare": [
-        { "upstream": ".", "local": "." }
+        {
+          "upstream": ".",
+          "local": "."
+        }
       ],
       "pruned": [],
       "local_modifications": [],
@@ -82,56 +88,14 @@
         }
       },
       "compare": [
-        { "upstream": ".", "local": "." }
+        {
+          "upstream": ".",
+          "local": "."
+        }
       ],
       "pruned": [],
       "local_modifications": [],
       "verification": "Exact match, including nested submodules resolved recursively. This commit is the transpilation of openzeppelin-contracts 45f032d1, and its lib/openzeppelin-contracts submodule pin is exactly the ref pinned above - so the two OpenZeppelin trees in lib/ are mutually consistent."
-    },
-    {
-      "name": "layerzero-v2-oapp",
-      "local_path": "lib/LayerZero-v2/packages/layerzero-v2/evm/oapp",
-      "source": {
-        "type": "npm",
-        "package": "@layerzerolabs/lz-evm-oapp-v2",
-        "version": "2.3.34",
-        "tarball": "https://registry.npmjs.org/@layerzerolabs/lz-evm-oapp-v2/-/lz-evm-oapp-v2-2.3.34.tgz",
-        "integrity": "sha512-f7GaBFP3HXnegejUYGtPnuETwcnogl+J36krgNa1qe6Ucy2tUu21CE882THITUi/apbO4TStFbaASAFUh64asg==",
-        "npm_git_head": "ee18a25538d59098d022892e94d7c6f08f517e6d"
-      },
-      "compare": [
-        { "upstream": "contracts", "local": "contracts" },
-        { "upstream": "package.json", "local": "package.json" },
-        { "upstream": "CHANGELOG.md", "local": "CHANGELOG.md" }
-      ],
-      "pruned": [
-        "artifacts",
-        "contracts/oapp/examples"
-      ],
-      "local_modifications": [],
-      "verification": "Exact match against the npm tarball; the integrity above was re-derived from the downloaded tarball, not merely copied out of the registry metadata. FINDING: this dependency is NOT vendored from github.com/LayerZero-Labs/LayerZero-v2 despite the directory name. The public repo's package.json files are `private: true` with no version field, the vendored contracts tree matches no commit in that repo, and the npm dist's own gitHead (ee18a25) is not a ref that repo will serve. npm is therefore the only verifiable upstream, so this pin is a registry version plus a tarball hash rather than a git ref."
-    },
-    {
-      "name": "layerzero-v2-protocol",
-      "local_path": "lib/LayerZero-v2/packages/layerzero-v2/evm/protocol",
-      "source": {
-        "type": "npm",
-        "package": "@layerzerolabs/lz-evm-protocol-v2",
-        "version": "2.3.34",
-        "tarball": "https://registry.npmjs.org/@layerzerolabs/lz-evm-protocol-v2/-/lz-evm-protocol-v2-2.3.34.tgz",
-        "integrity": "sha512-8IK4MtGbzPNGN9nOvXgEHcuVt92s8L07R9A6xgrhEfkTbEoZPI3lMNoXJVoA4V5C1NWyrKOelyL8EeiPGU0c5A==",
-        "npm_git_head": "ee18a25538d59098d022892e94d7c6f08f517e6d"
-      },
-      "compare": [
-        { "upstream": "contracts", "local": "contracts" },
-        { "upstream": "package.json", "local": "package.json" },
-        { "upstream": "CHANGELOG.md", "local": "CHANGELOG.md" }
-      ],
-      "pruned": [
-        "artifacts"
-      ],
-      "local_modifications": [],
-      "verification": "Exact match against the npm tarball. Same sourcing finding as layerzero-v2-oapp: pinned by registry version plus tarball hash because the public GitHub repo does not contain this tree."
     }
   ]
 }

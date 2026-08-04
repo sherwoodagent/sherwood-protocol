@@ -75,10 +75,6 @@ paths = "src/TokenCourt.sol"
 via_ir = true
 
 [[profile.coverage.compilation_restrictions]]
-paths = "src/adapters/SynthraDirectAdapter.sol"
-via_ir = true
-
-[[profile.coverage.compilation_restrictions]]
 paths = "src/queue/VaultWithdrawalQueue.sol"
 via_ir = true
 
