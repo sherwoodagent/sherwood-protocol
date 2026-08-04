@@ -94,7 +94,7 @@ contract CalleeGateTest is Test {
 
     function _exec(BatchExecutorLib.Call[] memory calls) internal {
         vm.prank(address(governor));
-        vault.executeGovernorBatch(calls, type(uint256).max);
+        vault.executeGovernorBatch(calls, new uint256[](0), type(uint256).max);
     }
 
     function _expectCalleeDisallowed(address target) internal {
@@ -229,7 +229,7 @@ contract CalleeGateTest is Test {
         address randomTarget = makeAddr("degradeOpenTarget2");
         vm.prank(address(legacy));
         vault.executeGovernorBatch(
-            _one(randomTarget, abi.encodeWithSelector(bytes4(0xdeadbeef), attacker)), type(uint256).max
+            _one(randomTarget, abi.encodeWithSelector(bytes4(0xdeadbeef), attacker)), new uint256[](0), type(uint256).max
         );
     }
 

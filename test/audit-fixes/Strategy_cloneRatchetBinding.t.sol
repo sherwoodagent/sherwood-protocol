@@ -19,6 +19,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {MockStrategy} from "../mocks/MockStrategy.sol";
 import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @notice `StrategyFactory.syndicateFactory` stand-in: reports every vault as
 ///         registered so the factory's `_authClone` gate passes.
@@ -245,7 +246,16 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
         ISyndicateGovernor.CoProposer[] memory noCoProposers = _noCoProposers();
         vm.prank(agent);
         pid = governor.propose(
-            address(vault), strategy, "ipfs://p", STRATEGY_DURATION, env, executeCalls, settlementCalls, noCoProposers
+            address(vault),
+            strategy,
+            "ipfs://p",
+            STRATEGY_DURATION,
+            env,
+            executeCalls,
+            GovEnvelope.defaultCaps(env.maxCapital, executeCalls.length),
+            settlementCalls,
+            GovEnvelope.defaultCaps(env.maxCapital, settlementCalls.length),
+            noCoProposers
         );
         vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(voter);
@@ -519,7 +529,9 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
             7 days,
             env,
             executeCalls,
+            GovEnvelope.defaultCaps(env.maxCapital, executeCalls.length),
             settlementCalls,
+            GovEnvelope.defaultCaps(env.maxCapital, settlementCalls.length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -571,7 +583,9 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
             7 days,
             env,
             recoveryExecute,
+            GovEnvelope.defaultCaps(env.maxCapital, recoveryExecute.length),
             recoverySettle,
+            GovEnvelope.defaultCaps(env.maxCapital, recoverySettle.length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         vm.warp(vm.getBlockTimestamp() + 1);
