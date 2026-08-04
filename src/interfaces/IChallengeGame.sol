@@ -669,6 +669,13 @@ interface IChallengeGame {
     function forfeitBurnBps() external view returns (uint256);
     function autoSlashDelay() external view returns (uint256);
     function disputeTimeout() external view returns (uint256);
+
+    /// @notice Margin the referral window must clear ON TOP of
+    ///         `autoSlashDelay + voteWindow + FINALIZE_BUFFER`. Exposed so
+    ///         `TokenCourt` and the wiring script enforce the same margin
+    ///         `ChallengeGame._requireWindowFits` does, rather than each
+    ///         carrying its own literal.
+    function MIN_REFERRAL_SLACK() external view returns (uint256);
     /// @notice Share of a SUCCESSFUL challenger's bond burned on settle, in
     ///         bps. Applies to the settle path only: the fail path already
     ///         forfeits the whole bond to the accused.

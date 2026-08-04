@@ -239,11 +239,17 @@ contract WireTokenCourt is Script {
         uint256 voteWindow = court.voteWindow();
         uint256 finalizeBuffer = court.FINALIZE_BUFFER();
         uint256 disputeTimeout = game.disputeTimeout();
+        // Mirrors `ChallengeGame._requireWindowFits` exactly, MIN_REFERRAL_SLACK
+        // included and read from the game rather than hardcoded: without the
+        // margin this soft check passes at the bare boundary while the on-chain
+        // `setCourt` below reverts, so the script would fail late with a typed
+        // error instead of this explanatory message.
+        uint256 minReferralSlack = game.MIN_REFERRAL_SLACK();
         require(
-            autoSlashDelay + voteWindow + finalizeBuffer <= disputeTimeout,
-            "PRE-FLIGHT: autoSlashDelay + voteWindow + FINALIZE_BUFFER > disputeTimeout. The "
-            "referral window would be NEGATIVE - no referral, auto or manual, is possible, and "
-            "every disputed challenge free-wins for the accused."
+            autoSlashDelay + voteWindow + finalizeBuffer + minReferralSlack <= disputeTimeout,
+            "PRE-FLIGHT: autoSlashDelay + voteWindow + FINALIZE_BUFFER + MIN_REFERRAL_SLACK > "
+            "disputeTimeout. The referral window leaves no runway for a dropped auto-referral to "
+            "be retried, and every disputed challenge free-wins for the accused."
         );
 
         // ── Pre-flight 4: launch-math - the floor must be reachable ──

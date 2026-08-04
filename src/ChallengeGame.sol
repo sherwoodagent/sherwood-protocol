@@ -107,9 +107,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      guaranteed. One second is not enough runway for that retry to
     ///      land; 1 hour is, and is trivial next to the days of headroom
     ///      every shipped configuration already carries (see this
-    ///      constant's own comment above). See `_requireWindowFits`, the sole
-    ///      call site.
-    uint256 internal constant MIN_REFERRAL_SLACK = 1 hours;
+    ///      constant's own comment above). See `_requireWindowFits`.
+    /// @dev PUBLIC, not internal: `TokenCourt`'s mirror-image checks (its
+    ///      constructor and `setVoteWindow`) and `WireTokenCourt`'s pre-flight
+    ///      must hold the SAME margin, or a raise on the far side can seat a
+    ///      configuration this contract's own setters would refuse. Exposing
+    ///      the value keeps one source of truth instead of three literals that
+    ///      can drift apart.
+    uint256 public constant MIN_REFERRAL_SLACK = 1 hours;
 
     /// @dev THE GAS FLOOR for a permissionless `resolve`.
     ///
@@ -2205,15 +2210,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      this design rejects elsewhere (the pool/contributor loops removed
     ///      for the same reason), so binding setters against current state is
     ///      the achievable half of this invariant.
-    /// @dev NOTE FOR THE TOKENCOURT OWNER: `TokenCourt`'s own constructor and
-    ///      `setVoteWindow` run the mirror-image check
-    ///      (`game_.autoSlashDelay() + voteWindow + FINALIZE_BUFFER >
-    ///      game_.disputeTimeout()`) and still accept equality on THAT side —
-    ///      `ChallengeGame` does not own `TokenCourt.sol`, so it cannot add
-    ///      the same `MIN_REFERRAL_SLACK` margin there. Until it does, a
-    ///      `TokenCourt`-side `setVoteWindow` raise can still legally leave
-    ///      less than an hour of slack even though this contract's own
-    ///      setters would refuse to.
+    /// @dev BOTH SIDES NOW HOLD THIS MARGIN. `TokenCourt.setChallengeGame` and
+    ///      `TokenCourt.setVoteWindow` run the mirror-image check and add
+    ///      `MIN_REFERRAL_SLACK` too, reading it from this contract rather than
+    ///      duplicating the literal — which is why the constant is `public`.
+    ///      `WireTokenCourt`'s pre-flight 3 mirrors it as well, so the script's
+    ///      soft check fails with an explanatory message instead of the wiring
+    ///      reverting later with a bare typed error. A raise on either side can
+    ///      no longer seat a configuration the other would refuse.
     function _requireWindowFits(address c, uint256 autoSlash, uint256 timeout) private view {
         if (c == address(0)) return;
         if (autoSlash + ITokenCourt(c).voteWindow() + ITokenCourt(c).FINALIZE_BUFFER() + MIN_REFERRAL_SLACK > timeout)

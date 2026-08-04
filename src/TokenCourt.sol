@@ -176,7 +176,15 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     function setChallengeGame(address newGame) external onlyOwner {
         if (newGame == address(0)) revert ZeroAddress();
         IChallengeGame game_ = IChallengeGame(newGame);
-        if (game_.autoSlashDelay() + voteWindow + FINALIZE_BUFFER > game_.disputeTimeout()) {
+        // Holds the SAME margin as `ChallengeGame._requireWindowFits`, read
+        // from the game rather than duplicated as a literal here: bare
+        // equality leaves as little as one second for a dropped auto-referral
+        // to be retried, and the disputer controls both the stall instant and
+        // whether the in-transaction attempt lands.
+        if (
+            game_.autoSlashDelay() + voteWindow + FINALIZE_BUFFER + game_.MIN_REFERRAL_SLACK()
+                > game_.disputeTimeout()
+        ) {
             revert WindowInvariantViolated();
         }
         emit ChallengeGameSet(challengeGame, newGame);
@@ -236,7 +244,13 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         address g = challengeGame;
         if (g != address(0)) {
             IChallengeGame game_ = IChallengeGame(g);
-            if (game_.autoSlashDelay() + newWindow + FINALIZE_BUFFER > game_.disputeTimeout()) {
+            // Same margin as the game's own `_requireWindowFits` — see
+            // `setChallengeGame`. Without it a raise here could seat a
+            // configuration `ChallengeGame`'s setters would refuse.
+            if (
+                game_.autoSlashDelay() + newWindow + FINALIZE_BUFFER + game_.MIN_REFERRAL_SLACK()
+                    > game_.disputeTimeout()
+            ) {
                 revert WindowInvariantViolated();
             }
         }
