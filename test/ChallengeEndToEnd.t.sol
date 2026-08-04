@@ -186,7 +186,6 @@ contract ChallengeEndToEndTest is Test {
     uint256 constant REQUIRED_COVERAGE = 500e6;
     uint256 constant COVERAGE_USD = 500e18;
     uint256 constant PROPOSER_BOND = 100e18; // $500 × 1% ÷ $0.05
-    uint256 constant CHALLENGER_BOND = 500e18; // $500 × 5% ÷ $0.05
 
     /// @dev The verdict no longer takes the lot. g1 committed $1,000 of
     ///      coverage against a $1,500 slashable bond (G1_STAKE at $0.05), so the
@@ -331,10 +330,17 @@ contract ChallengeEndToEndTest is Test {
         wood.mint(agent, 1_000_000e18);
         vm.prank(agent);
         wood.approve(address(bondEscrow), type(uint256).max);
-        wood.mint(challenger, CHALLENGER_BOND);
+        // 2x, not 1x: `_driveToInconclusiveRearm` (issue #94 fixtures) files
+        // once, takes a round-1 Inconclusive burn on the refund, and a
+        // second test-body filing then needs a FULL fresh bond out of what's
+        // left — a bare 1x mint left no headroom for that once the mint
+        // amount stopped being a stale, accidentally-oversized literal (was
+        // 500e18 against a live-computed ~150e18 pull) and started tracking
+        // the real bond exactly.
+        wood.mint(challenger, _challengerBond() * 2);
         vm.prank(challenger);
         wood.approve(address(game), type(uint256).max);
-        wood.mint(g1, CHALLENGER_BOND); // counter-bond matches the challenger's
+        wood.mint(g1, _challengerBond()); // counter-bond matches the challenger's
         vm.prank(g1);
         wood.approve(address(game), type(uint256).max);
 
@@ -406,6 +412,16 @@ contract ChallengeEndToEndTest is Test {
         usdg.approve(address(vault), assets);
         vault.deposit(assets, who);
         vm.stopPrank();
+    }
+
+    /// @dev Mirrors `ChallengeGame.file`'s bond formula exactly, and reads
+    ///      `challengerBondBps` LIVE off the contract rather than hardcoding
+    ///      it — audit #181 finding 18a moved it from 500 to 150, and a
+    ///      future parameter change should not have to touch this fixture.
+    ///      Mirrors `ChallengeGame.t.sol`'s own `_expectedBondWood` /
+    ///      `_standardBondWood` helpers.
+    function _challengerBond() internal view returns (uint256) {
+        return (((COVERAGE_USD * game.challengerBondBps()) / 10_000) * 1e8) / 0.05e8;
     }
 
     /// @dev Exec batch: the certified adapter call plus an uncertified one, so
@@ -524,14 +540,14 @@ contract ChallengeEndToEndTest is Test {
         );
         assertEq(cid, 1, "the first challenge");
         assertEq(game.liveChallengeOf(address(gov), pid), cid, "and it is the live one");
-        assertEq(wood.balanceOf(address(game)), CHALLENGER_BOND, "the game custodies the bond");
-        assertEq(wood.balanceOf(challenger), challengerBalBefore - CHALLENGER_BOND, "the challenger paid it");
-        assertEq(game.bondedWood(), CHALLENGER_BOND, "and books it as live");
+        assertEq(wood.balanceOf(address(game)), _challengerBond(), "the game custodies the bond");
+        assertEq(wood.balanceOf(challenger), challengerBalBefore - _challengerBond(), "the challenger paid it");
+        assertEq(game.bondedWood(), _challengerBond(), "and books it as live");
 
         IChallengeGame.Challenge memory c = game.challengeOf(cid);
         assertEq(uint256(c.status), uint256(IChallengeGame.Status.Filed), "Filed");
         assertEq(c.frozenCoverageUsd, COVERAGE_USD, "the bond was sized against the frozen coverage");
-        assertEq(c.bondWood, CHALLENGER_BOND, "5% of $1,000 at $0.05/WOOD");
+        assertEq(c.bondWood, _challengerBond(), "challengerBondBps of $1,000 at $0.05/WOOD");
         assertEq(c.adapterTarget, address(adapter), "the filing names the adapter it accuses");
         assertEq(c.adapterSelector, adapter.poke.selector);
         assertEq(c.filedAt, vm.getBlockTimestamp());
@@ -601,7 +617,7 @@ contract ChallengeEndToEndTest is Test {
         //    and cost the filer `settleBurnBps` of its bond. The fee comes from
         //    the convicted PROPOSER's forfeited bond, the one pot a prosecutor
         //    cannot fund for itself.
-        uint256 settleBurn = (CHALLENGER_BOND * game.settleBurnBps()) / 10_000;
+        uint256 settleBurn = (_challengerBond() * game.settleBurnBps()) / 10_000;
         assertGt(settleBurn, 0, "the burn is live in this fixture");
         uint256 prosecutorFee = (PROPOSER_BOND * game.prosecutorFeeBps()) / 10_000;
         assertGt(prosecutorFee, 0, "and the fee is live too");
@@ -643,20 +659,32 @@ contract ChallengeEndToEndTest is Test {
 
     // ── 2. The bad-faith arc: the bond is a real deterrent ────────────────
 
-    /// @notice D5's fail-safe, and the reason the challenger's bond is
-    ///         load-bearing rather than ceremonial. A CLEAN proposal is
-    ///         challenged; an accused approver buys the escalation with a
-    ///         matching counter-bond, which stops the auto-slash clock. The
-    ///         court of §3.5 does not exist yet, so nobody rules — and rather
-    ///         than pinning the guardian's coverage forever, the challenge fails
-    ///         to the accused once `disputeTimeout` elapses: the challenger's
-    ///         bond forfeits pro-rata to what each accused actually committed,
-    ///         the counter-bond returns to whoever posted it, the coverage
-    ///         unfreezes, and the guardian can release it normally again.
+    /// @notice D5's fail-safe. A CLEAN proposal is challenged; an accused
+    ///         approver buys the escalation with a matching counter-bond, which
+    ///         stops the auto-slash clock. The court of §3.5 does not exist
+    ///         yet, so nobody rules — and rather than pinning the guardian's
+    ///         coverage forever, the timeout unwinds the challenge once
+    ///         `disputeTimeout` elapses.
+    ///
+    ///         A TIMEOUT WITH NO ADJUDICATOR IS A NON-VERDICT, NOT AN
+    ///         ACQUITTAL (audit #181 finding 2). This path used to reach
+    ///         `_fail`, forfeiting the challenger's whole bond to whoever
+    ///         funded the counter-bond. Because `dispute` is open to ANYONE,
+    ///         that made funding the defence of a challenge you filed yourself
+    ///         a deterministic +80% round trip at the shipped rates, paid for
+    ///         by every honest filer — so no rational party would ever file.
+    ///         `courtAtFiling` is now pinned per challenge, and when it is the
+    ///         zero address the timeout routes to `_refundAll`: both sides
+    ///         unwind whole, exactly as `Inconclusive` already behaved.
+    ///
+    ///         The challenger is not made whole to the wei — it still pays the
+    ///         round-1 anti-grinding burn (finding 19), which is what stops a
+    ///         free filing from pinning a cohort's coverage for weeks. That is
+    ///         a small toll on the filer, not a transfer to the accused.
     ///
     ///         Nothing is slashed, no case is opened, and the adapter keeps its
-    ///         certification — a failed challenge must leave no mark.
-    function test_badFaithArc_disputedChallengeTimesOutToTheAccused() public {
+    ///         certification — an unwound challenge must leave no mark.
+    function test_badFaithArc_disputedChallengeTimesOutToANonVerdict() public {
         uint256 pid = _proposeApproveExecute();
         uint256 challengerBalBefore = wood.balanceOf(challenger);
         uint256 g1BalBefore = wood.balanceOf(g1);
@@ -679,7 +707,7 @@ contract ChallengeEndToEndTest is Test {
         );
         assertTrue(ledger.isCoverageFrozen(address(gov), pid), "even a bad-faith filing pins the coverage");
         _expectReleaseBlocked(pid);
-        assertEq(game.bondedWood(), CHALLENGER_BOND);
+        assertEq(game.bondedWood(), _challengerBond());
 
         uint256 filedAt = game.challengeOf(cid).filedAt;
 
@@ -690,14 +718,14 @@ contract ChallengeEndToEndTest is Test {
         game.dispute(cid, type(uint256).max);
         IChallengeGame.Challenge memory c = game.challengeOf(cid);
         assertEq(uint256(c.status), uint256(IChallengeGame.Status.Disputed), "Disputed");
-        assertEq(c.counterBondWood, CHALLENGER_BOND, "the counter-bond pool matches the bond");
+        assertEq(c.counterBondWood, _challengerBond(), "the counter-bond pool matches the bond");
         address[] memory funders = game.counterBondContributors(cid);
         assertEq(funders.length, 1, "g1 covered all the coverage, so it funds the whole defence alone");
         assertEq(funders[0], g1);
-        assertEq(game.counterBondContributionOf(cid, g1), CHALLENGER_BOND, "the forfeit follows this, not coverage");
-        assertEq(game.bondedWood(), 2 * CHALLENGER_BOND, "both bonds are live");
-        assertEq(wood.balanceOf(address(game)), 2 * CHALLENGER_BOND);
-        assertEq(wood.balanceOf(g1), g1BalBefore - CHALLENGER_BOND, "the accused paid for the escalation");
+        assertEq(game.counterBondContributionOf(cid, g1), _challengerBond(), "the forfeit follows this, not coverage");
+        assertEq(game.bondedWood(), 2 * _challengerBond(), "both bonds are live");
+        assertEq(wood.balanceOf(address(game)), 2 * _challengerBond());
+        assertEq(wood.balanceOf(g1), g1BalBefore - _challengerBond(), "the accused paid for the escalation");
 
         // ── The dispute really did stop the auto-slash clock: at the instant the
         //    silence verdict WOULD have fired, resolve still refuses.
@@ -707,31 +735,39 @@ contract ChallengeEndToEndTest is Test {
         assertEq(swood.guardianStake(g1), g1StakeBefore, "nothing slashed while the escalation stands");
         assertEq(wood.balanceOf(address(swood)), swoodBalBefore, "and no WOOD left the custodian");
 
-        // ── Nobody rules. D5: the challenge fails safe, in favour of the accused.
+        // ── Nobody rules, and no court was ever wired — so the timeout is a
+        //    NON-VERDICT, not an acquittal. Both sides unwind.
         vm.warp(filedAt + game.disputeTimeout());
+        IChallengeGame.Challenge memory cAt = game.challengeOf(cid);
+        assertEq(cAt.courtAtFiling, address(0), "fixture: this challenge was filed against an unwired game");
         game.resolve(cid);
-        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Failed), "Failed");
+        assertEq(
+            uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Inconclusive), "unwound, not acquitted"
+        );
 
-        // ── The bond is a real cost to the challenger and a real payment to the
-        //    accused; the counter-bond is returned, not staked on the outcome.
-        assertEq(wood.balanceOf(challenger), challengerBalBefore - CHALLENGER_BOND, "the challenger forfeited it");
-        // The forfeit reaches the defence MINUS the burned slice: g1 funded 100%
-        // of the pool, so it takes 100% of what is distributed. The burn is what
-        // stops that funder from profitably being the challenger's own second
-        // address.
+        // ── The challenger keeps its bond less ONLY the round-1 anti-grinding
+        //    burn. Derived from the rate pinned at filing, not hardcoded, so a
+        //    later schedule change does not silently invalidate this.
+        uint256 burned = (_challengerBond() * cAt.inconclusiveBurnBpsAtFiling) / 10_000;
+        assertGt(burned, 0, "round 1 is priced, not free (finding 19)");
+        assertEq(
+            wood.balanceOf(challenger),
+            challengerBalBefore - burned,
+            "the challenger keeps its bond less only the anti-grinding burn"
+        );
+
+        // ── The counter-bond funder recovers exactly what it put in and NOT a
+        //    wei more. This is the assertion that proves the arbitrage is dead:
+        //    funding the defence of a challenge you filed yourself is now
+        //    strictly loss-making (you eat the burn), where it used to return
+        //    +80% at the shipped rates.
         //
-        // Collected rather than pushed — resolution records the entitlement and
-        // the funder calls for it, which is what removed the unbounded payout
-        // loop and let contribution standing open up.
+        //    Collected rather than pushed — resolution records the entitlement
+        //    and the funder calls for it, which is what removed the unbounded
+        //    payout loop and let contribution standing open up.
         vm.prank(g1);
         game.claimContribution(cid);
-
-        uint256 burned = (CHALLENGER_BOND * game.forfeitBurnBps()) / 10_000;
-        assertEq(
-            wood.balanceOf(g1),
-            g1BalBefore + CHALLENGER_BOND - burned,
-            "contribution returned plus the whole UNBURNED forfeit (g1 funded 100% of the pool)"
-        );
+        assertEq(wood.balanceOf(g1), g1BalBefore, "the defence recovers its stake exactly, with no forfeit windfall");
         assertEq(wood.balanceOf(game.BURN_ADDRESS()), burned, "and the burned slice left the system for good");
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded in the game");
         assertEq(game.bondedWood(), 0);
@@ -902,7 +938,7 @@ contract ChallengeEndToEndTest is Test {
         //    The proposer bond arrives NET of the prosecutor's fee: that slice
         //    pays the challenger rather than burning, which is the whole point
         //    of funding the fee from this pot.
-        uint256 settleBurn = (CHALLENGER_BOND * game.settleBurnBps()) / 10_000;
+        uint256 settleBurn = (_challengerBond() * game.settleBurnBps()) / 10_000;
         uint256 prosecutorFee = (PROPOSER_BOND * game.prosecutorFeeBps()) / 10_000;
         assertEq(
             wood.balanceOf(game.BURN_ADDRESS()),
@@ -1102,7 +1138,7 @@ contract ChallengeEndToEndTest is Test {
 
         // ── The bond really moved: fee to the prosecutor, remainder burned.
         uint256 prosecutorFee = (PROPOSER_BOND * game.prosecutorFeeBps()) / 10_000;
-        uint256 settleBurn = (CHALLENGER_BOND * game.settleBurnBps()) / 10_000;
+        uint256 settleBurn = (_challengerBond() * game.settleBurnBps()) / 10_000;
         assertGt(prosecutorFee, 0, "the fee is live in this fixture");
         assertEq(wood.balanceOf(address(bondEscrow)), 0, "the escrow gave the bond up");
         (address bondProposer, uint256 bondAmount) = bondEscrow.bondOf(address(gov), pid);

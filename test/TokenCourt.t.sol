@@ -40,6 +40,12 @@ contract MockGameForCourt {
     ///      `setUp`.
     uint256 public autoSlashDelay = 7 days;
     uint256 public disputeTimeout = 30 days;
+    /// @dev Mirrors the real `ChallengeGame.MIN_REFERRAL_SLACK` (issue #181
+    ///      finding 20 follow-up): `TokenCourt.setChallengeGame` now reads
+    ///      this off the wired game too, so a mock without it would revert
+    ///      every `setChallengeGame` call (including the one in `setUp`) on
+    ///      a call to a nonexistent selector, not on the invariant itself.
+    uint256 public constant MIN_REFERRAL_SLACK = 1 hours;
 
     function setExposureLedger(address l) external {
         exposureLedger = l;

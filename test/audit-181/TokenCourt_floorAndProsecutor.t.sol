@@ -20,10 +20,16 @@ contract MockGameForFloorTest {
     address public exposureLedger;
     // Mirrors the real `ChallengeGame`'s defaults so `setChallengeGame`'s
     // window-invariant check (`autoSlashDelay + voteWindow + FINALIZE_BUFFER
-    // <= disputeTimeout`) passes against the court's default 5-day
-    // `voteWindow`: 7 + 5 + 1 = 13 <= 30.
+    // + MIN_REFERRAL_SLACK <= disputeTimeout`) passes against the court's
+    // default 5-day `voteWindow`: 7d + 5d + 1d + 1h <= 30d.
     uint256 public autoSlashDelay = 7 days;
     uint256 public disputeTimeout = 30 days;
+    // MIN_REFERRAL_SLACK (issue #181 finding 20 follow-up): `setChallengeGame`
+    // now reads this off the wired game too — without it here, `setUp`'s
+    // `court.setChallengeGame(address(game))` reverts on a call to a
+    // nonexistent selector rather than exercising the invariant this file
+    // means to test.
+    uint256 public constant MIN_REFERRAL_SLACK = 1 hours;
     bool public ruled;
     uint256 public lastRuledChallenge;
     IChallengeGame.Verdict public lastVerdict;

@@ -335,8 +335,27 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
         // shared-stake denominator alongside P2's own $1,000,000, so P2's
         // share is diluted to 1,000,000 * 1,000,000 / 1,500,000 = ~666,667,
         // short of its own $1,000,000 requirement.
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
-        ledger.requireApproveQuorum(address(mgov), p2, usdgAsset, _requiredCoverage6(1_000_000e18));
+        //
+        // Post-issue #27 ("coverage-proportional effective capital"),
+        // requireApproveQuorum no longer reverts on a partial shortfall — it
+        // reports the raised aggregate and the caller decides how to size
+        // execution to it (a genuinely ZERO aggregate is still an error, the
+        // identified-bonded-signer floor). So the proof here is on the
+        // VALUE it reports, not on a revert: pre-sweep it must be short of
+        // what P2 needs, by exactly the dilution P1's dead booking causes.
+        // uint256 locals, not a literal expression: Solidity evaluates constant
+        // arithmetic as an EXACT rational, and 2e24/3 is not an integer, so the
+        // all-literal form fails to compile (error 4486). Going through
+        // variables gives the truncating integer division the contract does.
+        uint256 slashableUsd = 1_000_000e18;
+        uint256 reservedUsd = 1_000_000e18;
+        uint256 liveTotalUsd = 1_500_000e18;
+        uint256 dilutedUsd = (slashableUsd * reservedUsd) / liveTotalUsd;
+        (uint256 raisedBeforeUsd, uint256 requiredUsd) =
+            ledger.requireApproveQuorum(address(mgov), p2, usdgAsset, _requiredCoverage6(1_000_000e18));
+        assertEq(requiredUsd, 1_000_000e18, "requirement must be P2's own full $1,000,000");
+        assertEq(raisedBeforeUsd, dilutedUsd, "P1's dead booking must still dilute P2's share pre-sweep");
+        assertLt(raisedBeforeUsd, requiredUsd, "diluted share must fall short of P2's requirement");
 
         // Sweep P1 — anyone may call this, no registry/freezer role needed.
         ledger.retireApproval(address(mgov), p1, guardian);
@@ -346,8 +365,12 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
         assertEq(p1Approvers.length, 0, "retireApproval must remove the guardian from P1's approver list");
 
         // AFTER the sweep: P2 alone occupies the denominator, so it now
-        // reads its own full, undiluted $1,000,000 and the gate passes.
-        ledger.requireApproveQuorum(address(mgov), p2, usdgAsset, _requiredCoverage6(1_000_000e18));
+        // reads its own full, undiluted $1,000,000 - retiring P1 must
+        // actually RESTORE the guardian's full contribution, not merely stop
+        // reverting.
+        (uint256 raisedAfterUsd,) =
+            ledger.requireApproveQuorum(address(mgov), p2, usdgAsset, _requiredCoverage6(1_000_000e18));
+        assertEq(raisedAfterUsd, requiredUsd, "retiring P1 must restore P2's full, undiluted coverage");
     }
 
     /// @notice `retireApproval` must revert while the key is still frozen by a
