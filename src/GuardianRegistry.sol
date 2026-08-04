@@ -115,6 +115,15 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         ///      way irreversibly, since `resolveReview` commits `r.resolved`
         ///      before the slash call and short-circuits on re-entry.
         ///
+        ///      STORED PLUS ONE — a value of `n` here means a live bound of
+        ///      `n - 1`, and 0 means "this review predates the field". The
+        ///      offset exists because `0/0` is a LEGAL live envelope
+        ///      (`setMinSlashBps(0)` / `setMaxSlashBps(0)` both pass), so a
+        ///      raw snapshot could not be told apart from an unset one and
+        ///      `_severityBps`'s migration fallback would hand those reviews
+        ///      back the live, still-mutable slots. Bounds are capped at
+        ///      10_000 by their setters, so `+ 1` cannot overflow `uint16`.
+        ///
         ///      Appended at the END of the struct and packed into the free
         ///      bytes of its existing final slot, so no field declared above
         ///      moves and no top-level slot shifts.
@@ -982,13 +991,18 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // Snapshot the slash-severity envelope for the same reason and at the
         // same instant (pashov review finding #11) — see `Review`. Freezing
         // the threshold but not the penalty left the owner able to rewrite
-        // what a decided review COSTS at resolve time. Both sWOOD getters are
-        // bps and bounded by 10_000 at their setters, so the casts cannot
-        // truncate a legal value.
+        // what a decided review COSTS at resolve time.
+        //
+        // STORED PLUS ONE, so "unset" and "set to zero" are distinguishable
+        // (PR #195 re-review). Both sWOOD getters are bps bounded by 10_000 at
+        // their setters, so `+ 1` tops out at 10_001 and still fits `uint16`
+        // — and 0 in either field now means, unambiguously, that this review
+        // predates the field. See `_severityBps` for why the previous
+        // `lo == 0 && hi == 0` sentinel was not safe.
         // forge-lint: disable-next-line(unsafe-typecast)
-        r.minSlashBpsAtOpen = uint16(swood.minSlashBps());
+        r.minSlashBpsAtOpen = uint16(swood.minSlashBps() + 1);
         // forge-lint: disable-next-line(unsafe-typecast)
-        r.maxSlashBpsAtOpen = uint16(swood.maxSlashBps());
+        r.maxSlashBpsAtOpen = uint16(swood.maxSlashBps() + 1);
         r.openedAt = uint64(ts1);
         if (liveTotal < MIN_COHORT_STAKE_AT_OPEN) {
             r.cohortTooSmall = true;
@@ -1062,25 +1076,37 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      here let the owner nullify or maximise an already-decided review in
     ///      the same transaction that committed it.
     function _severityBps(Review storage r) private view returns (uint256) {
-        uint256 lo = uint256(r.minSlashBpsAtOpen);
-        uint256 hi = uint256(r.maxSlashBpsAtOpen);
         // MIGRATION GUARD (PR #195 review, item 5). `minSlashBpsAtOpen` /
         // `maxSlashBpsAtOpen` are APPENDED fields, so every review already
-        // `opened` when this upgrade lands reads them as 0/0 — and 0/0
-        // collapses every branch below to 0, which makes `_slashOne`'s
+        // `opened` when this upgrade lands reads them as 0 — and a zero
+        // envelope collapses every branch below to 0, which makes `_slashOne`'s
         // `ownSlash` zero and skips the burn entirely. That is precisely the
         // outcome the snapshot exists to prevent, handed for free to every
-        // in-flight review at the moment of the upgrade.
+        // in-flight review at the moment of the upgrade. Falling back to the
+        // live reads restores the pre-upgrade behaviour for exactly those
+        // reviews, which is strictly better than granting them immunity.
         //
-        // A genuine post-upgrade snapshot can never be 0/0: `setMinSlashBps`
-        // and `setMaxSlashBps` are the only writers of the live pair, and
-        // `openReview` copies them, so 0/0 here means "this review predates
-        // the field" — not "the owner chose zero". Falling back to the live
-        // reads restores the pre-upgrade behaviour for exactly those reviews,
-        // which is strictly better than granting them immunity.
-        if (lo == 0 && hi == 0) {
+        // THE SENTINEL IS THE OFFSET, NOT THE VALUE (PR #195 re-review).
+        // The first cut of this guard keyed on `lo == 0 && hi == 0` read
+        // straight off the live getters, and that is a LEGAL CONFIGURATION,
+        // not just an unset field: `setMinSlashBps(0)` only checks
+        // `v > maxSlashBps`, and `setMaxSlashBps(0)` only checks
+        // `v < minSlashBps`, so `0/0` is reachable and reads back as
+        // "predates the field". An owner who opened a review while the live
+        // envelope was 0/0 would hit this fallback at resolve time and get the
+        // LIVE slots back — so raising `maxSlashBps` to 10_000 between open and
+        // resolve would take every approver's whole stake, which is exactly the
+        // mid-review mutability finding #11 closes. `openReview` therefore
+        // stores each bound PLUS ONE, making 0 unreachable for any genuine
+        // snapshot and the sentinel unambiguous.
+        uint256 lo;
+        uint256 hi;
+        if (r.minSlashBpsAtOpen == 0 || r.maxSlashBpsAtOpen == 0) {
             lo = swood.minSlashBps();
             hi = swood.maxSlashBps();
+        } else {
+            lo = uint256(r.minSlashBpsAtOpen) - 1;
+            hi = uint256(r.maxSlashBpsAtOpen) - 1;
         }
         uint256 denom = uint256(r.totalStakeAtOpen);
         if (denom == 0) return lo; // defensive: a reached quorum implies denom > 0

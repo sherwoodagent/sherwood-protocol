@@ -240,6 +240,67 @@ contract GuardianRegistry_severityPauseAndBasisTest is RegistryTestHarness {
         );
     }
 
+    /// @notice PR #195 re-review: a review opened while the LIVE envelope was
+    ///         legitimately `0/0` must keep that envelope, not fall through the
+    ///         migration guard onto the still-mutable live slots.
+    /// @dev    `0/0` is a reachable configuration, not only an unset field:
+    ///         `setMinSlashBps(0)` checks `v > maxSlashBps` and
+    ///         `setMaxSlashBps(0)` checks `v < minSlashBps`, so both pass when
+    ///         the pair is already zero. The first cut of the migration guard
+    ///         keyed on `lo == 0 && hi == 0` read straight off the snapshot,
+    ///         which made that legal configuration indistinguishable from a
+    ///         pre-upgrade review — so `_severityBps` re-read the live slots and
+    ///         the owner could raise `maxSlashBps` to 10_000 between the last
+    ///         vote and `resolveReview` and take every approver's whole stake.
+    ///         That is finding #11's exact defect, surviving inside its own fix.
+    ///
+    ///         `openReview` now stores each bound PLUS ONE, so a genuine
+    ///         snapshot is never 0 and the sentinel is unambiguous. Reverting
+    ///         that offset makes this test fail: the approver gets slashed.
+    function test_reviewItem5_legalZeroEnvelopeIsNotMistakenForAnUnsetField() public {
+        _stakeGuardian(approver1, 30_000e18, 1);
+        _stakeGuardian(blocker1, 20_000e18, 2);
+
+        skip(30 days);
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        // A LEGAL live envelope of 0/0, set BEFORE the review opens so it is
+        // what `openReview` snapshots.
+        vm.startPrank(regOwner);
+        swood.setMinSlashBps(0);
+        swood.setMaxSlashBps(0);
+        vm.stopPrank();
+        assertEq(swood.maxSlashBps(), 0, "the at-open envelope really is zero");
+
+        uint256 voteEnd = vm.getBlockTimestamp();
+        uint256 reviewEnd = voteEnd + REVIEW_PERIOD;
+        _registerReview(PID, voteEnd, reviewEnd);
+        registry.openReview(address(governor), PID);
+
+        vm.prank(approver1);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve);
+        vm.prank(blocker1);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block);
+
+        // THE ATTACK, mirrored: the review is decided but not yet committed and
+        // the owner now raises the envelope to the ceiling.
+        vm.startPrank(regOwner);
+        swood.setMaxSlashBps(10_000);
+        swood.setMinSlashBps(10_000);
+        vm.stopPrank();
+
+        uint256 approverStakeBefore = swood.guardianStake(approver1);
+
+        vm.warp(reviewEnd);
+        assertTrue(registry.resolveReview(address(governor), PID), "review resolves blocked");
+
+        assertEq(
+            swood.guardianStake(approver1),
+            approverStakeBefore,
+            "a legally-zero at-open envelope must survive: raising the live slots after the last vote must not reach this review's penalty"
+        );
+    }
+
     /// @dev Writes 0/0 into `Review.minSlashBpsAtOpen`/`maxSlashBpsAtOpen`
     ///      without touching the fields packed beside them, reproducing the
     ///      post-upgrade read of a review opened before those fields existed.

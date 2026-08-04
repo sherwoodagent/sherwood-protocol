@@ -439,6 +439,62 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         assertGt(weth.balanceOf(address(r.vault)), vaultWethBefore, "honest settle must still clear once stale");
     }
 
+    /// @notice PR #195 re-review: the stale band must widen with the ANCHOR'S
+    ///         AGE, or a long outage plus an honest gap move strands capital.
+    /// @dev    `test_sellFloor_staleAnchor_stillClearsUnmanipulated` above only
+    ///         exercises an UNMOVED pool, so it cannot see this. A fixed
+    ///         `STALE_PRICE_SLIPPAGE_BPS` of 1,000 cannot tell a manipulation
+    ///         from a real move, and `_sellFloor` sits on `_settle()` — the only
+    ///         exit. An equity feed dark for a week (this contract's own
+    ///         `MAX_PUSH_PRICE_AGE` documents 77h holiday gaps) plus an
+    ///         earnings gap past 10% made every swap revert on its floor, with
+    ///         no lever to widen it: `STALE_PRICE_SLIPPAGE_BPS` is a constant,
+    ///         and finding #9's live `isAgent` re-check can strip the proposer
+    ///         of `updateParams` too. That is fail-closed on the exit path,
+    ///         which is the outcome finding #4's fix set out to avoid.
+    ///
+    ///         Both halves are asserted together because the widening is only
+    ///         correct if the ceiling stays binding: an attacker who simply
+    ///         waits out the whole ramp must still be rejected.
+    function test_reviewItem2_staleBandWidensWithAnchorAge_gapSettlesManipulationDoesNot() public {
+        // BOTH RIGS BUILT BEFORE THE WARP, and this ordering is load-bearing.
+        // `_rig()` hardcodes its feed's `updatedAt` to `START`, so a rig
+        // constructed after the warp executes against an already-stale feed,
+        // records NO anchor, and falls through to `_quoteMinOut` — the
+        // never-priced path, not the stale-anchor path this test is about.
+        // Each rig owns its own adapter and feed, so they do not interfere.
+        // (Built forward-only: `vm.warp` backwards is a no-op on forge 1.7.1.)
+        Rig memory rGap = _rig();
+        Rig memory rAttack = _rig();
+
+        // Both anchors were taken at `START` by `execute`. Age them past the
+        // full ramp, with the feeds left dark throughout.
+        vm.warp(START + 7 days + 1);
+
+        // ── Liveness: a genuine 20% gap clears once the anchor is fully aged ──
+        // The market really moved — the pool now pays 0.8 WETH per TSLA. At the
+        // fully-ramped 3,000 bps band the floor is 0.70x and this clears; at the
+        // old fixed 1,000 bps band the floor is 0.90x and `settle()` reverts,
+        // stranding the position for the length of the outage.
+        rGap.adapter.setRate(address(tsla), address(weth), 0.8e18);
+
+        uint256 vaultWethBefore = weth.balanceOf(address(rGap.vault));
+        vm.prank(address(rGap.vault));
+        rGap.strategy.settle();
+        assertEq(tsla.balanceOf(address(rGap.strategy)), 0, "an honest gap move must not strand the position");
+        assertGt(weth.balanceOf(address(rGap.vault)), vaultWethBefore, "capital must return to the vault");
+
+        // ── Security: waiting out the ramp does NOT buy an unbounded take ──
+        // Same fully-aged anchor, but the pool is pushed 2x against the vault.
+        // 0.50x is past even the `MAX_STALE_SLIPPAGE_BPS` floor of 0.70x, so the
+        // anchor still binds — the band widens, it never stops applying.
+        rAttack.adapter.setRate(address(tsla), address(weth), 0.5e18);
+
+        vm.prank(address(rAttack.vault));
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
+        rAttack.strategy.settle();
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // Finding B — buy legs must be oracle-anchored in push mode
     // ════════════════════════════════════════════════════════════════════

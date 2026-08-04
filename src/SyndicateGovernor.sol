@@ -324,7 +324,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // uncatchable revert in this frame.
         if (strategy != address(0) && strategy.code.length != 0) {
             (bool okP, bytes memory pRet) = strategy.staticcall(abi.encodeCall(IStrategy.proposer, ()));
-            if (okP && pRet.length == 32 && abi.decode(pRet, (address)) != address(0)) {
+            address declaredProposer = (okP && pRet.length == 32) ? abi.decode(pRet, (address)) : address(0);
+            if (declaredProposer != address(0)) {
                 // A ZERO PROPOSER IS NOT A VICTIM. `StrategyFactory.cloneAndInit`
                 // always writes `_proposer = msg.sender`, so every live clone
                 // carries a non-zero one; zero means the strategy was never
@@ -332,7 +333,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
                 // and no owner anyone could grief. Templates read zero too, and
                 // they set `_initialized` in their constructor so they can never
                 // become live.
-                if (abi.decode(pRet, (address)) != msg.sender) revert StrategyProposerMismatch();
+                if (declaredProposer != msg.sender) revert StrategyProposerMismatch();
                 (bool okV, bytes memory vRet) = strategy.staticcall(abi.encodeCall(IStrategy.vault, ()));
                 if (okV && vRet.length == 32 && abi.decode(vRet, (address)) != vault) {
                     revert StrategyVaultMismatch();
