@@ -956,10 +956,15 @@ contract CoverageEndToEndTest is Test {
             "total committed exposure pinned at the bond, never 2x the drain"
         );
 
-        // #1 stays covered; #2 is short and cannot clear the quorum.
+        // #1 stays fully covered; #2 is short of the requirement — a nonzero
+        // shortfall now SIZES (issue #27) rather than reverting outright, so
+        // it returns the raised/required pair reflecting only the leftover
+        // $500 of budget g1 had left to commit.
         ledger.requireApproveQuorum(address(govA), pidA, address(usdg), MAX_CAPITAL);
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
-        ledger.requireApproveQuorum(address(govB), pidB, address(usdg), MAX_CAPITAL);
+        (uint256 coverageRaisedUsd, uint256 requiredCoverageUsd) =
+            ledger.requireApproveQuorum(address(govB), pidB, address(usdg), MAX_CAPITAL);
+        assertEq(coverageRaisedUsd, 500e18, "only g1's leftover budget backs drain #2");
+        assertEq(requiredCoverageUsd, COVERAGE_USD);
 
         // Control: the shortfall was the SHARED budget, not drain #2 itself.
         // Release both bookings, re-approve #2, and it covers in full.
@@ -1068,9 +1073,12 @@ contract CoverageEndToEndTest is Test {
         (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pid);
         assertEq(approvers.length, 1, "the approver is still recorded");
 
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        // issue #27: the crashed-but-nonzero bond no longer blocks execution
+        // outright — it SIZES it. $150 of $1,000 required is 15%, so the
+        // proposal executes at 15% of its declared size rather than reverting.
         govA.executeProposal(pid);
-        assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Approved), "stays Approved, unexecuted");
+        assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Executed), "executes at the scaled size");
+        assertEq(govA.getEffectiveMaxCapital(pid), 150e6, "scaled to the crashed bond's $150 of $1,000 coverage");
     }
 
     // ── 5. The bounded (below-threshold) lane is genuinely preserved ───────
@@ -1086,6 +1094,11 @@ contract CoverageEndToEndTest is Test {
         // `block.timestamp` local — the optimizer CSEs it across `vm.warp`),
         // execute. `_propose` and every later window below reads live state
         // relative to this new baseline, so the forward shift is safe.
+        // issue #166 (target-based batch callee gate, landed after this fixture
+        // was written): the vault's outer callee check requires the adapter be
+        // allowlisted independently of certification, or the batch never
+        // reaches the tier-1 poke call at all.
+        tierRegistry.setAdapterAllowed(address(adapter), true);
         tierRegistry.proposeCertification(
             address(adapter), adapter.poke.selector, 1, 100, address(0), address(adapter).codehash
         );

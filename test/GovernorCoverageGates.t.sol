@@ -630,16 +630,173 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
     }
 
-    /// @notice Under-covering approvers are as good as none: the quorum is a
-    ///         DOLLAR test, not a headcount. One guardian at 10,000 WOOD ($500)
-    ///         cannot cover $1,000 of extractable value.
-    function test_execute_underCoveredApprovers_reverts() public {
+    /// @notice issue #27 — THE REMOVED CLIFF. Under-covering approvers used to
+    ///         block execution outright (`test_execute_underCoveredApprovers_reverts`,
+    ///         pre-#27); a nonzero shortfall now SIZES execution instead. One
+    ///         guardian at 10,000 WOOD ($500) against $1,000 of extractable
+    ///         value raises exactly half: `effectiveMaxCapital` is $500 of the
+    ///         declared $1,000, not zero and not the full amount.
+    function test_execute_underCoveredApprovers_executesAtScaledSize() public {
         uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
         address[] memory gs = new address[](1);
         gs[0] = makeAddr("g1");
         _seatApprovers(pid, gs, 10_000e18); // $500 — half the needed coverage
         _toApproved(pid);
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+
+        vm.expectEmit(true, false, false, true, address(governor));
+        emit ISyndicateGovernor.EffectiveMaxCapitalSet(pid, 1_000e6, 500e6, 500e18, 1_000e18);
+        governor.executeProposal(pid);
+
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+        assertEq(governor.getEffectiveMaxCapital(pid), 500e6, "scaled to the 50% of coverage actually raised");
+        (uint256 declaredMaxCapital,) = governor.getRiskEnvelope(pid);
+        assertEq(declaredMaxCapital, 1_000e6, "the DECLARED envelope is untouched by the scaling");
+    }
+
+    /// @notice Surplus coverage does not inflate the ceiling above the
+    ///         declared `maxCapital` (issue #27 design D3/D5): a guardian
+    ///         holding 4x the required bond still executes at exactly the
+    ///         declared size, never more.
+    function test_execute_surplusCoverage_effectiveMaxCapitalEqualsDeclared() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        address[] memory gs = new address[](1);
+        gs[0] = makeAddr("g1");
+        _seatApprovers(pid, gs, 80_000e18); // $4,000 — 4x the $1,000 needed
+        _toApproved(pid);
+        governor.executeProposal(pid);
+
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+        assertEq(governor.getEffectiveMaxCapital(pid), 1_000e6, "surplus coverage never raises the ceiling");
+    }
+
+    /// @notice Dust coverage floors `effectiveMaxCapital` to ZERO — fail-closed
+    ///         and accepted (design D5): execution still proceeds (there IS an
+    ///         identified, nonzero-bonded signer, so the R1 floor is met), but
+    ///         the batch's net-outflow ceiling is 0.
+    function test_execute_dustCoverage_floorsEffectiveMaxCapitalToZero() public {
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+        address[] memory gs = new address[](1);
+        gs[0] = makeAddr("g1");
+        // 1e12 wei WOOD ($0.00000005 at $0.05/WOOD) is nonzero but negligible
+        // next to the $1,000 required — floors to an effective cap of 0.
+        _seatApprovers(pid, gs, 1e12);
+        _toApproved(pid);
+        governor.executeProposal(pid);
+
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+        assertEq(governor.getEffectiveMaxCapital(pid), 0, "dust coverage floors to a zero net-outflow cap");
+    }
+
+    /// @notice Settlement reuses the STORED `effectiveMaxCapital` from execute
+    ///         (issue #27 design D4) — never a live recompute. A guardian
+    ///         whose bond is later slashed to ZERO (modeled here as a direct
+    ///         stake write, standing in for a real slash's effect on live
+    ///         stake, same convention `ExposureLedger.t.sol`'s finding tests
+    ///         use) does not shrink what the position can unwind: the
+    ///         settlement batch still moves exactly the $500 the proposal
+    ///         executed at, proving settle never re-queries the ledger.
+    function test_settle_reusesStoredEffectiveMaxCapital_despiteCoverageCollapsingBeforeSettle() public {
+        address sink = makeAddr("settleDrainSink");
+        uint256 maxCapital = 1_000e6;
+        address g1 = makeAddr("g1");
+
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(targetToken), data: abi.encodeCall(targetToken.approve, (address(usdg), 1)), value: 0
+        });
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(usdg), data: abi.encodeCall(usdg.transfer, (sink, 500e6)), value: 0
+        });
+
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://settle-reuse",
+            7 days,
+            _envelope(maxCapital),
+            execCalls,
+            GovEnvelope.defaultCaps(maxCapital, execCalls.length),
+            settleCalls,
+            GovEnvelope.defaultCaps(maxCapital, settleCalls.length),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+
+        address[] memory gs = new address[](1);
+        gs[0] = g1;
+        _seatApprovers(pid, gs, 10_000e18); // $500 — 50% of the $1,000 required
+        _toApproved(pid);
+        governor.executeProposal(pid);
+        assertEq(governor.getEffectiveMaxCapital(pid), 500e6, "executed at the coverage-scaled size");
+
+        // The guardian's live bond craters to zero AFTER execute. A live
+        // recompute at settle would floor `effectiveMaxCapital` to 0 and this
+        // $500 settlement drain would revert `CallCapExceeded`/
+        // `MaxNetOutflowExceeded`. It does not, because settle reuses the
+        // STORED figure from execute.
+        swood.setStake(g1, 0);
+        assertEq(ledger.slashableBondUsd(g1), 0, "sanity: coverage has fully collapsed");
+
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertEq(usdg.balanceOf(sink), 500e6, "settle moved exactly the STORED effective cap, not a recomputed 0");
+    }
+
+    /// @notice issue #43 x #27 (design D7): per-call caps scale by the SAME
+    ///         coverage ratio as `effectiveMaxCapital`. Two execute calls
+    ///         declare caps of 700/300 (of a 1,000 maxCapital); at 40%
+    ///         coverage they scale to 280/120. A call attempting to move 1
+    ///         wei more than ITS scaled cap reverts on the SCALED figure, not
+    ///         the raw declared one — proving the scaling actually applied
+    ///         rather than the raw (larger) caps merely happening to pass.
+    function test_execute_perCallCapsScaleByTheSameCoverageRatio() public {
+        uint256 maxCapital = 1_000e6;
+        address sink0 = makeAddr("capSink0");
+        address sink1 = makeAddr("capSink1");
+
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
+        // Attempts to move 1 wei MORE than call 1's scaled cap (120e6) —
+        // still well under its RAW declared cap (300e6), so this only
+        // reverts if the per-call cap was actually scaled.
+        execCalls[0] =
+            BatchExecutorLib.Call({target: address(usdg), data: abi.encodeCall(usdg.transfer, (sink0, 1)), value: 0});
+        execCalls[1] = BatchExecutorLib.Call({
+            target: address(usdg), data: abi.encodeCall(usdg.transfer, (sink1, 120e6 + 1)), value: 0
+        });
+        uint256[] memory execCaps = new uint256[](2);
+        execCaps[0] = 700e6;
+        execCaps[1] = 300e6;
+
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(usdg), data: abi.encodeCall(usdg.approve, (address(targetToken), 0)), value: 0
+        });
+        uint256[] memory settleCaps = new uint256[](1);
+        settleCaps[0] = maxCapital;
+
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://percall-scale",
+            7 days,
+            _envelope(maxCapital),
+            execCalls,
+            execCaps,
+            settleCalls,
+            settleCaps,
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+
+        address[] memory gs = new address[](1);
+        gs[0] = makeAddr("g1");
+        _seatApprovers(pid, gs, 8_000e18); // $400 — 40% of the $1,000 required
+        _toApproved(pid);
+
+        assertEq(governor.getRequiredCoverage(pid), maxCapital, "tier-2 flat coverage == maxCapital");
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, 120e6 + 1, 120e6));
         governor.executeProposal(pid);
     }
 
@@ -652,8 +809,15 @@ contract GovernorCoverageGatesTest is Test {
         vm.prank(ledgerOwner);
         ledger.setQuorumTierThreshold(3); // no tier qualifies
         _toApproved(pid);
+
+        // issue #27: the gate not running means NOTHING measured coverage, so
+        // nothing scales — `effectiveMaxCapital` is stored equal to the
+        // declared `maxCapital`, and the event reports zero USD figures.
+        vm.expectEmit(true, false, false, true, address(governor));
+        emit ISyndicateGovernor.EffectiveMaxCapitalSet(pid, 1_000e6, 1_000e6, 0, 0);
         governor.executeProposal(pid); // zero approvers, still executes
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+        assertEq(governor.getEffectiveMaxCapital(pid), 1_000e6, "ungated path stores the declared maxCapital");
     }
 
     /// @notice OPERATIONAL COUPLING, pinned deliberately: the quorum re-reads
@@ -764,6 +928,8 @@ contract GovernorCoverageGatesTest is Test {
         _toApproved(pid);
         governor.executeProposal(pid); // no approvers, still executes
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+        // issue #27: zero `requiredCoverage` skips the gate, so nothing scales.
+        assertEq(governor.getEffectiveMaxCapital(pid), 1, "ungated path stores the declared maxCapital");
     }
 
     /// @notice An unwired governor keeps Plan A behaviour — no quorum at all.
@@ -772,6 +938,8 @@ contract GovernorCoverageGatesTest is Test {
         vm.warp(unwiredGovernor.getProposal(pid).voteEnd + 1);
         unwiredGovernor.executeProposal(pid);
         assertEq(uint256(unwiredGovernor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+        // issue #27: no ledger wired skips the gate, so nothing scales.
+        assertEq(unwiredGovernor.getEffectiveMaxCapital(pid), 1_000e6, "ungated path stores the declared maxCapital");
     }
 
     /// @notice §3.9: an EXPIRED proposal returns its bond. Expiry moved no

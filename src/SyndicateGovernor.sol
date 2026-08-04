@@ -161,13 +161,23 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         `finalizeEmergencySettle` path (empty caps there — design.md D3).
     mapping(uint256 => uint256[]) private _settlementCallCaps;
 
-    /// @dev Reserved storage for future upgrades. Carved by 2 slots (from 31)
-    ///      for the two mappings above — append-only: every pre-existing
+    /// @notice Proposal ID -> per-call gross-outflow caps for the SETTLEMENT
+    ///         calls, SCALED by the same coverage ratio as `effectiveMaxCapital`
+    ///         (issue #27 design D7) and persisted at execute so `settleProposal`
+    ///         reads byte-identical caps however much later it runs, with no
+    ///         live recompute. Populated on EVERY execute path (identity copy
+    ///         of `_settlementCallCaps` when the quorum gate did not run or
+    ///         coverage was full) — never left empty for an `Executed`
+    ///         proposal.
+    mapping(uint256 => uint256[]) private _effectiveSettlementCallCaps;
+
+    /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31)
+    ///      for the three mappings above — append-only: every pre-existing
     ///      named variable keeps its slot, and the mappings occupy exactly
     ///      the front of what used to be gap space. See
     ///      `script/syndicate-governor-layout.golden.json` (regenerated,
-    ///      task 7.1).
-    uint256[29] private __gap;
+    ///      task 5.1).
+    uint256[28] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -478,31 +488,31 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // note). This gate's live read is what makes it sound to leave
         // every OTHER post-execution ledger read (`allocatedUsd`,
         // `liabilityUsd`, `settleCoverage`) anchored at `executedAt` instead:
-        // the two are provably equal at this one instant.
-        {
-            address ledger = _exposureLedger;
-            // `requiredCoverage == 0` keeps optimistic passage: a proposal
-            // that can extract nothing needs no covering signer. Reachable as
-            // of issue #43: an all-zero-cap proposal (with a wired registry)
-            // legitimately prices to zero — it declares zero asset-extractable
-            // value, and the per-call meter below enforces exactly that
-            // declaration, so no covering signer is needed for a batch that
-            // cannot move the asset out of custody.
-            if (
-                ledger != address(0) && proposal.requiredCoverage != 0
-                    && proposal.envelopeTier >= IExposureLedger(ledger).quorumTierThreshold()
-            ) {
-                IExposureLedger(ledger)
-                    .requireApproveQuorum(address(this), proposalId, asset, proposal.requiredCoverage);
-            }
-        }
+        // the two are provably equal at this one instant. Hoisted into
+        // `_deriveAndStoreEffectiveCapital` (an INTERNAL call, so the
+        // invariant's "same transaction" reach is unaffected) purely for
+        // this function's own Yul stack budget — every OTHER `SyndicateGovernor.sol`
+        // stack-budget note in this file hoists for the identical reason.
+        // Derives and stores `effectiveMaxCapital` (issue #27 design D3-D5)
+        // from the gate's raised-vs-required coverage figures — `maxCapital`
+        // unchanged when the gate does not run (no ledger wired, zero
+        // `requiredCoverage`, or tier below the quorum threshold; issue #43's
+        // all-zero-cap proposals legitimately reach here ungated, since the
+        // per-call meter already enforces zero extractable value) — and
+        // scales the stored per-call caps (issue #43) by the same factor,
+        // persisting the scaled settlement caps for `settleProposal` to reuse
+        // byte-identical, however much later it runs.
+        uint256[] memory scaledExecuteCaps =
+            _deriveAndStoreEffectiveCapital(proposalId, proposal, _exposureLedger, asset);
 
         // Execute the opening calls via the vault. The risk envelope's
-        // maxCapital caps the batch's net asset outflow (batch-level); the
-        // stored per-call caps (issue #43) additionally bound each call's own
-        // gross outflow (BatchExecutorLib-level) — two distinct accounting
-        // layers, both mandatory on this path (design.md D4).
-        ISyndicateVault(vault).executeGovernorBatch(calls, _loadCaps(_executeCallCaps, proposalId), proposal.maxCapital);
+        // effective capital (issue #27's coverage-proportional ceiling,
+        // `maxCapital` whenever coverage was full or the gate did not run)
+        // caps the batch's net asset outflow (batch-level); the
+        // coverage-scaled per-call caps (issue #43) additionally bound each
+        // call's own gross outflow (BatchExecutorLib-level) — two distinct
+        // accounting layers, both mandatory on this path (design.md D4).
+        ISyndicateVault(vault).executeGovernorBatch(calls, scaledExecuteCaps, proposal.effectiveMaxCapital);
 
         emit ProposalExecuted(proposalId, vault, balanceBefore);
     }
@@ -519,19 +529,24 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             revert StrategyDurationNotElapsed();
         }
 
-        // Run the pre-committed settlement calls under the SAME maxCapital cap
-        // as execute. An honest unwind is net-INFLOW (netOutflow == 0), so any
-        // finite cap passes it trivially — the cap only binds a malicious
-        // proposer who parked extraction in settlementCalls to self-settle
-        // after 1h and drain uncapped. The stored per-call settlement caps
-        // (issue #43) additionally bound each settlement call's own gross
-        // outflow — extraction parked in a single settlement call is bounded
-        // per call, not only by the batch-level `maxCapital`.
+        // Run the pre-committed settlement calls under the SAME effective
+        // capital cap execution ran under (issue #27 design D4) — reused
+        // from storage, NEVER recomputed, so a coverage drop between execute
+        // and settle (a guardian withdrawing, or slashed on an unrelated
+        // proposal) cannot cap the unwind below the size legitimately
+        // deployed at execution. An honest unwind is net-INFLOW (netOutflow
+        // == 0), so any finite cap passes it trivially — the cap only binds
+        // a malicious proposer who parked extraction in settlementCalls to
+        // self-settle after 1h and drain uncapped. The PERSISTED, coverage-
+        // scaled per-call settlement caps (issue #43 x #27 design D7)
+        // additionally bound each settlement call's own gross outflow —
+        // extraction parked in a single settlement call is bounded per call,
+        // not only by the batch-level effective capital.
         ISyndicateVault(proposal.vault)
             .executeGovernorBatch(
                 _loadCalls(_settlementCalls, proposalId),
-                _loadCaps(_settlementCallCaps, proposalId),
-                proposal.maxCapital
+                _loadCaps(_effectiveSettlementCallCaps, proposalId),
+                proposal.effectiveMaxCapital
             );
 
         _finishSettlement(proposalId, proposal);
@@ -979,6 +994,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     function getRiskEnvelope(uint256 proposalId) external view returns (uint256 maxCapital, uint16 maxDrawdownBps) {
         StrategyProposal storage p = _proposals[proposalId];
         return (p.maxCapital, p.maxDrawdownBps);
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function getEffectiveMaxCapital(uint256 proposalId) external view returns (uint256) {
+        return _proposals[proposalId].effectiveMaxCapital;
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -1435,6 +1455,121 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         result = new uint256[](stored.length);
         for (uint256 i = 0; i < stored.length; i++) {
             result[i] = stored[i];
+        }
+    }
+
+    /// @dev Push a MEMORY caps array into a storage mapping slot — the
+    ///      memory-argument counterpart to `_storeCaps` (which takes
+    ///      `calldata`, the only location a propose()-time param can have).
+    ///      Needed because the scaled settlement caps this change persists
+    ///      (issue #27 design D7) are computed in memory at execute, not
+    ///      received as calldata.
+    function _storeCapsMemory(mapping(uint256 => uint256[]) storage target, uint256 proposalId, uint256[] memory caps)
+        private
+    {
+        for (uint256 i = 0; i < caps.length; i++) {
+            target[proposalId].push(caps[i]);
+        }
+    }
+
+    /// @dev Derives, stores, and emits the coverage-proportional effective
+    ///      capital (issue #27 design D3-D5) at execute, and scales the
+    ///      stored per-call caps (issue #43 design D7) by the same factor,
+    ///      persisting the scaled settlement caps for `settleProposal` to
+    ///      reuse verbatim. Hoisted out of `executeProposal` to keep that
+    ///      function's local-variable count under Yul's stack budget — the
+    ///      same reason every other multi-step helper in this file is
+    ///      hoisted. An INTERNAL call, so issue #35's "same transaction"
+    ///      invariant on the `requireApproveQuorum` gate (see the call site's
+    ///      own note) is unaffected by the function boundary.
+    ///
+    ///      `effectiveMaxCapital = maxCapital` when the gate does not run (no
+    ///      ledger wired, zero `requiredCoverage`, or tier below the quorum
+    ///      threshold) or when the raised coverage is at/above what is
+    ///      required; otherwise
+    ///      `floor(maxCapital * coverageRaisedUsd / requiredCoverageUsd)`,
+    ///      which can floor to zero on dust coverage (a zero net-outflow cap
+    ///      — fail-closed, accepted per design D5). `requireApproveQuorum`
+    ///      itself already reverts on a raised aggregate of exactly zero, so
+    ///      this function is only ever reached with either a skipped gate or
+    ///      a nonzero raised figure — the division below never sees a zero
+    ///      denominator on the scaling branch (`requiredCoverageUsd == 0`
+    ///      implies the gate did not run, since `coverageUsd` is zero only
+    ///      when `requiredCoverage == 0`, which alone skips the gate).
+    function _deriveAndStoreEffectiveCapital(
+        uint256 proposalId,
+        StrategyProposal storage proposal,
+        address ledger,
+        address asset
+    ) private returns (uint256[] memory scaledExecuteCaps) {
+        uint256 maxCapital = proposal.maxCapital;
+        uint256 coverageRaisedUsd;
+        uint256 requiredCoverageUsd;
+        // `requiredCoverage == 0` keeps optimistic passage: a proposal that
+        // can extract nothing needs no covering signer. Reachable as of
+        // issue #43: an all-zero-cap proposal (with a wired registry)
+        // legitimately prices to zero — it declares zero asset-extractable
+        // value, and the per-call meter enforces exactly that declaration,
+        // so no covering signer is needed for a batch that cannot move the
+        // asset out of custody.
+        bool gated = ledger != address(0) && proposal.requiredCoverage != 0
+            && proposal.envelopeTier >= IExposureLedger(ledger).quorumTierThreshold();
+        if (gated) {
+            (coverageRaisedUsd, requiredCoverageUsd) = IExposureLedger(ledger)
+                .requireApproveQuorum(address(this), proposalId, asset, proposal.requiredCoverage);
+        }
+
+        bool scale = gated && coverageRaisedUsd < requiredCoverageUsd;
+        uint256 effectiveMaxCapital = scale ? (maxCapital * coverageRaisedUsd) / requiredCoverageUsd : maxCapital;
+        proposal.effectiveMaxCapital = effectiveMaxCapital;
+        emit EffectiveMaxCapitalSet(proposalId, maxCapital, effectiveMaxCapital, coverageRaisedUsd, requiredCoverageUsd);
+
+        uint256[] memory settlementCaps = _loadCaps(_settlementCallCaps, proposalId);
+        scaledExecuteCaps = _loadCaps(_executeCallCaps, proposalId);
+        if (scale) {
+            scaledExecuteCaps =
+                _scaleCaps(scaledExecuteCaps, coverageRaisedUsd, requiredCoverageUsd, effectiveMaxCapital);
+            settlementCaps = _scaleCaps(settlementCaps, coverageRaisedUsd, requiredCoverageUsd, effectiveMaxCapital);
+        }
+        // Persisted on EVERY path (identity copy when `scale` is false) so
+        // `settleProposal` always reads from `_effectiveSettlementCallCaps`
+        // with no branch on whether the gate ran.
+        _storeCapsMemory(_effectiveSettlementCallCaps, proposalId, settlementCaps);
+    }
+
+    /// @dev Scales each cap by `raised/required` (floor, matching
+    ///      `coverageUsd`'s own floor discipline) and defensively re-asserts
+    ///      the scaled sum against `bound` (issue #27 design D7). Term-wise
+    ///      floors cannot mathematically exceed `bound` given the
+    ///      propose-time invariant `Σ caps <= maxCapital`
+    ///      (`_validateAndStoreBatch`): `Σ floor(cap_i * s) <= floor(Σ cap_i *
+    ///      s) <= floor(maxCapital * s) == bound`. The re-assert is kept
+    ///      anyway as belt-and-braces per the spec — on a hypothetical
+    ///      violation the LARGEST scaled cap absorbs the (dust-sized) excess,
+    ///      deterministically and without touching any other term. A cap
+    ///      that floors to zero stays zero (fail-closed, design D5/D7).
+    function _scaleCaps(uint256[] memory caps, uint256 raised, uint256 required, uint256 bound)
+        private
+        pure
+        returns (uint256[] memory scaled)
+    {
+        uint256 n = caps.length;
+        scaled = new uint256[](n);
+        uint256 sum;
+        uint256 maxIdx;
+        uint256 maxVal;
+        for (uint256 i = 0; i < n; i++) {
+            uint256 c = (caps[i] * raised) / required;
+            scaled[i] = c;
+            sum += c;
+            if (c >= maxVal) {
+                maxVal = c;
+                maxIdx = i;
+            }
+        }
+        if (sum > bound) {
+            uint256 excess = sum - bound;
+            scaled[maxIdx] = excess >= maxVal ? 0 : maxVal - excess;
         }
     }
 

@@ -88,9 +88,18 @@ interface IExposureLedger {
     ///         booking horizon. Called at propose so the error lands on the
     ///         proposer rather than on the guardian cohort.
     function requireWithinCoverageHorizon(uint256 executeBy, uint256 strategyDuration) external view;
+    /// @notice Measures the covering approvers' aggregate bond against the
+    ///         proposal's required coverage instead of gating all-or-nothing
+    ///         (issue #27): returns `(coverageRaisedUsd, requiredCoverageUsd)`,
+    ///         both USD-18 from the same price read, so the caller can size
+    ///         execution to a coverage-proportional effective capital. Reverts
+    ///         `InsufficientApproveCoverage` only when the approver set is
+    ///         empty or the raised aggregate is exactly zero — a partial but
+    ///         nonzero aggregate returns instead of reverting.
     function requireApproveQuorum(address governor, uint256 proposalId, address asset, uint256 requiredCoverage)
         external
-        view;
+        view
+        returns (uint256 coverageRaisedUsd, uint256 requiredCoverageUsd);
 
     // ── Coverage freeze (challenge game) ──
     function freezeCoverage(address governor, uint256 proposalId) external;
