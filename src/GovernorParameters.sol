@@ -37,18 +37,17 @@ abstract contract GovernorParameters is ProposalLifecycle {
     /// @notice Hard floor for `votingPeriod` (per-deployment; mainnet 24h).
     /// @custom:oz-upgrades-unsafe-allow state-variable-immutable
     uint256 public immutable MIN_VOTING_PERIOD;
-    uint256 public constant MAX_VOTING_PERIOD = 30 days;
+    uint256 public constant MAX_VOTING_PERIOD = 3 days;
     uint256 public constant MIN_EXECUTION_WINDOW = 1 hours;
     uint256 public constant MAX_EXECUTION_WINDOW = 7 days;
     uint256 public constant MIN_VETO_THRESHOLD_BPS = 2000; // 20%
-    uint256 public constant MAX_VETO_THRESHOLD_BPS = 5000; // 50%
+    uint256 public constant MAX_VETO_THRESHOLD_BPS = 8000; // 80%
     uint256 public constant MAX_PERFORMANCE_FEE_CAP = FeeConstants.MAX_PERFORMANCE_FEE_BPS; // 30%
     uint256 public constant ABSOLUTE_MIN_STRATEGY_DURATION = 1 hours;
-    // ~10y: supports indefinitely-lived strategies (e.g. leveraged Aerodrome CL). Params freeze and
-    // the owner bond stays locked only WHILE a proposal is open — the proposer can self-settle 1h
-    // after execute (MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE); only a non-proposer settle waits the
-    // full duration, so the long tail binds only an abandoned proposal on a vault whose owner ≠ proposer.
-    uint256 public constant ABSOLUTE_MAX_STRATEGY_DURATION = 3650 days;
+    // Strategies are short-lived by design: the proposer can self-settle 1h after execute
+    // (MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE); a non-proposer settle waits the full
+    // duration, so this cap bounds how long an abandoned proposal can pin a vault.
+    uint256 public constant ABSOLUTE_MAX_STRATEGY_DURATION = 30 days;
     /// @notice Hard floor for `cooldownPeriod` (per-deployment; mainnet 1h).
     /// @custom:oz-upgrades-unsafe-allow state-variable-immutable
     uint256 public immutable MIN_COOLDOWN_PERIOD;

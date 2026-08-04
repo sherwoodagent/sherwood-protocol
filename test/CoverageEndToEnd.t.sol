@@ -426,28 +426,34 @@ contract CoverageEndToEndTest is Test {
         govA.setExposureLedger(address(ledger));
     }
 
-    /// @notice N11 — the propose-time horizon gate must fire on the
-    ///         COLLABORATIVE path too. `p.executeBy` is written by
-    ///         `_initPendingProposal`, which `propose` only calls on the
-    ///         non-collaborative branch; a co-proposed strategy sits in Draft
-    ///         with `executeBy == 0` until `approveCollaboration`, which re-runs
-    ///         no ledger gate.
+    /// @notice N11 — the COLLABORATIVE propose path runs the same coverage-horizon
+    ///         gate as the solo path. A co-proposed strategy sits in Draft with
+    ///         `executeBy == 0` until `approveCollaboration`, so the gate cannot
+    ///         read a real deadline; it computes the worst-case deadline instead
+    ///         (`collaborationWindow + votingPeriod + reviewPeriod + executionWindow`)
+    ///         and checks that against the horizon.
     ///
-    ///         Passing that raw zero made the check
-    ///         `strategyDuration > block.timestamp` — unsatisfiable on a real
-    ///         chain — so an over-horizon co-proposed strategy proposed
-    ///         cleanly, every approve booked zero, and it died at the
-    ///         execute-time quorum with nothing indicating why. The gate now
-    ///         computes the worst-case deadline instead.
+    ///         The over-horizon REVERT case is no longer constructible: with
+    ///         `ABSOLUTE_MAX_STRATEGY_DURATION` pinned at 30 days, the worst-case
+    ///         lifecycle (≤ 7d collab + 3d vote + 3d review + 7d execution = 20d,
+    ///         plus a 30d run = 50d) can never exceed `MAX_COVERAGE_HORIZON` (60d).
+    ///         The 30-day duration cap is now the real protection — over-horizon
+    ///         proposals are impossible at the source, so the horizon gate is a
+    ///         pure backstop. This test therefore proves the collaborative path
+    ///         PROPOSES CLEANLY within horizon; the gate's rejection arithmetic is
+    ///         still unit-tested directly in `ExposureLedger.t.sol`
+    ///         (`test_requireWithinCoverageHorizon_zeroDeadlineIsNotAFreePass`).
     ///
     ///         `vm.warp` is load-bearing: at Foundry's default `t = 1` the
-    ///         broken comparison is trivially true and the bug is invisible.
-    function test_n11_collaborativeProposalIsGatedOnTheHorizonToo() public {
+    ///         deadline math is trivially satisfied and a regression would hide.
+    function test_n11_collaborativeProposalRunsTheHorizonGate() public {
         vm.warp(1_800_000_000);
         feed.set(1e8); // re-stamp updatedAt: the warp made the fixture feed stale
 
+        // Max legal duration: exercises the horizon gate at its tightest point
+        // while staying within the 30-day cap.
         vm.prank(owner);
-        govA.setMaxStrategyDuration(365 days); // legal: no protocol ceiling seated
+        govA.setMaxStrategyDuration(30 days);
 
         // A co-proposer must be an agent registered on THIS vault; agentB is
         // vaultB's.
@@ -461,39 +467,14 @@ contract CoverageEndToEndTest is Test {
         ISyndicateGovernor.CoProposer[] memory cps = new ISyndicateGovernor.CoProposer[](1);
         cps[0] = ISyndicateGovernor.CoProposer({agent: coAgent, splitBps: 1_000});
 
-        vm.prank(agentA);
-        vm.expectRevert(IExposureLedger.CoverageHorizonExceeded.selector);
-        govA.propose(
-            address(vaultA),
-            address(0),
-            "ipfs://n11",
-            100 days,
-            // settles far past MAX_COVERAGE_HORIZON
-            ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
-            _execCalls(),
-            GovEnvelope.defaultCaps(
-                ( // settles far past MAX_COVERAGE_HORIZON
-                        ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})
-                    ).maxCapital,
-                (_execCalls()).length
-            ),
-            _settleCalls(),
-            GovEnvelope.defaultCaps(
-                ( // settles far past MAX_COVERAGE_HORIZON
-                        ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})
-                    ).maxCapital,
-                (_settleCalls()).length
-            ),
-            cps
-        );
-
-        // An in-horizon duration still proposes on the same path.
+        // A max-duration collaborative proposal passes the horizon gate on the
+        // Draft path (worst-case deadline + 30d run stays under the 60d horizon).
         vm.prank(agentA);
         govA.propose(
             address(vaultA),
             address(0),
             "ipfs://n11-ok",
-            7 days,
+            30 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             _execCalls(),
             GovEnvelope.defaultCaps(

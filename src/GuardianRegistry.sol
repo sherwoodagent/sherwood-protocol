@@ -240,12 +240,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
 
     // ── Initializer ──
     /// @param minReviewPeriod_ Per-deployment `reviewPeriod` floor (mainnet 6h).
-    /// @dev Bounded `[1 minutes, 7 days]` so an arg-less deploy reverts rather than
+    /// @dev Bounded `[1 minutes, 3 days]` so an arg-less deploy reverts rather than
     ///      silently seating a 0 floor (which would let `setReviewPeriod(0)` disable
     ///      the review window).
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor(uint256 minReviewPeriod_) {
-        if (minReviewPeriod_ < ABSOLUTE_MIN_REVIEW_FLOOR || minReviewPeriod_ > 7 days) revert InvalidParameter();
+        if (minReviewPeriod_ < ABSOLUTE_MIN_REVIEW_FLOOR || minReviewPeriod_ > 3 days) revert InvalidParameter();
         minReviewPeriod = minReviewPeriod_;
         _disableInitializers();
     }
@@ -271,7 +271,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // the governor skip `registerReview` (window collapses to
         // `reviewEnd == voteEnd`), leaving every proposal unresolvable and the
         // vault permanently bound. Fail loudly at deploy instead.
-        if (reviewPeriod_ < minReviewPeriod || reviewPeriod_ > 7 days) revert InvalidParameter();
+        if (reviewPeriod_ < minReviewPeriod || reviewPeriod_ > 3 days) revert InvalidParameter();
         // Mirrors `setBlockQuorumBps`'s bounds (audit-181-second finding,
         // "initialize writes blockQuorumBps with no check"). A zero
         // `blockQuorumBps` makes `_isBlocked` (`blockStakeWeight * 10_000 >=
@@ -1184,7 +1184,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     // ── Parameter setters (owner-instant; owner is a multisig with external delay) ──
 
     /// @inheritdoc IGuardianRegistry
-    /// @dev Enforces the absolute `[6 hours, 7 days]` bounds AND the
+    /// @dev Enforces the absolute `[6 hours, 3 days]` bounds AND the
     ///      `coolDownPeriod >= reviewPeriod` cross-contract invariant: the
     ///      review window may not exceed sWOOD's guardian unstake cooldown.
     ///      This invariant closes slash-evasion for guardian OWN stake only —
@@ -1194,7 +1194,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      Other staking params (`minGuardianStake`, `minOwnerStake`,
     ///      `coolDownPeriod`) have their own setters on sWOOD.
     function setReviewPeriod(uint256 v) external onlyOwner {
-        if (v < minReviewPeriod || v > 7 days) revert InvalidParameter();
+        if (v < minReviewPeriod || v > 3 days) revert InvalidParameter();
         IStakedWood sw = swood;
         if (address(sw) != address(0) && v > sw.coolDownPeriod()) {
             revert CooldownBelowReviewPeriod();

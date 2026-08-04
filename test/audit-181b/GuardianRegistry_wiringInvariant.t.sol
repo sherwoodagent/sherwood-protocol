@@ -35,8 +35,10 @@ import {RegistryTestHarness} from "../helpers/RegistryTestHarness.sol";
 ///         address(0)`) must still be accepted -- that is the ordinary
 ///         first-time-wiring case and must not be bricked by the new check.
 contract GuardianRegistry_wiringInvariantTest is RegistryTestHarness {
-    uint256 internal constant INITIAL_REVIEW_PERIOD = 3 days;
-    uint256 internal constant RAISED_REVIEW_PERIOD = 7 days;
+    uint256 internal constant INITIAL_REVIEW_PERIOD = 1 days;
+    /// @dev The registry's absolute `reviewPeriod` ceiling. The raise below
+    ///      must stay inside it, so this tracks that bound.
+    uint256 internal constant RAISED_REVIEW_PERIOD = 3 days;
     uint256 internal constant BLOCK_QUORUM_BPS = 2000;
     /// @dev Mirrors `GuardianRegistry.MAX_GOVERNOR_EXECUTION_WINDOW` /
     ///      `ExposureLedger.MAX_GOVERNOR_EXECUTION_WINDOW` (both `internal`,
@@ -57,10 +59,10 @@ contract GuardianRegistry_wiringInvariantTest is RegistryTestHarness {
     ///         because no revert occurred. Against the fix it reverts with
     ///         `InvalidParameter`.
     function test_setExposureLedger_revertsWhenChallengeWindowBelowReviewPeriodFloor() public {
-        // Raise reviewPeriod to 7 days while the ledger is still unwired --
+        // Raise reviewPeriod to 3 days while the ledger is still unwired --
         // `setReviewPeriod`'s ledger cross-check short-circuits on
         // `exposureLedger == address(0)`, so this legitimately succeeds and
-        // leaves the floor at 7d + 7d = 14d for whatever ledger comes next.
+        // leaves the floor at 3d + 7d = 10d for whatever ledger comes next.
         vm.prank(regOwner);
         registry.setReviewPeriod(RAISED_REVIEW_PERIOD);
 
@@ -73,7 +75,7 @@ contract GuardianRegistry_wiringInvariantTest is RegistryTestHarness {
         ledger.setChallengeWindow(belowFloor);
 
         // `belowFloor` is exactly one second short of `reviewPeriod +
-        // MAX_GOVERNOR_EXECUTION_WINDOW` (7d + 7d = 14d): wiring this ledger
+        // MAX_GOVERNOR_EXECUTION_WINDOW` (3d + 7d = 10d): wiring this ledger
         // into the registry must be refused.
         vm.prank(regOwner);
         vm.expectRevert(IGuardianRegistry.InvalidParameter.selector);
@@ -94,7 +96,7 @@ contract GuardianRegistry_wiringInvariantTest is RegistryTestHarness {
     ///         succeeds (no reciprocal check existed at all).
     function test_setExposureLedger_revertsWhenLedgerBoundToDifferentRegistry() public {
         ExposureLedger ledger = new ExposureLedger(ledgerOwner, address(swood), 28 days);
-        // Default challengeWindow (14 days) clears the 3d + 7d = 10d floor
+        // Default challengeWindow (14 days) clears the 1d + 7d = 8d floor
         // for this harness's INITIAL_REVIEW_PERIOD, so the floor check is not
         // what trips this test.
         address someOtherRegistry = makeAddr("someOtherRegistry");
