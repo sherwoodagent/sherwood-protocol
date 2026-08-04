@@ -4,7 +4,8 @@ pragma solidity 0.8.28;
 /// @title  Vendored Morpho Blue types + minimal interfaces
 /// @notice Provenance: morpho-org/morpho-blue `src/interfaces/IMorpho.sol` and
 ///         `src/interfaces/IIrm.sol` (GPL-2.0-or-later), reduced to the surface
-///         Sherwood consumes: single-market supply/withdraw plus the view state
+///         Sherwood consumes: single-market supply/withdraw, the
+///         collateral/borrow/repay side, and the view state
 ///         needed for share→asset valuation. No behavioral changes — struct
 ///         field order and widths are byte-identical to the canonical singleton
 ///         (verified against the live contract on Robinhood Chain 4663 at
@@ -44,7 +45,9 @@ struct Market {
     uint128 fee;
 }
 
-/// @notice Minimal Morpho Blue singleton interface (supply side only).
+/// @notice Minimal Morpho Blue singleton interface: the supply side
+///         `MorphoSupplyStrategy` uses, plus the collateral/borrow side
+///         `ConcentratedLiquidityStrategy` uses to fund its second leg.
 interface IMorpho {
     function market(Id id) external view returns (Market memory m);
     function position(Id id, address user) external view returns (Position memory p);
@@ -65,6 +68,41 @@ interface IMorpho {
         address onBehalf,
         address receiver
     ) external returns (uint256 assetsWithdrawn, uint256 sharesWithdrawn);
+
+    /// @notice Post `assets` of `marketParams.collateralToken` for `onBehalf`.
+    /// @dev    Upstream takes NO shares parameter — collateral is not
+    ///         share-accounted, it is a flat `uint128` on the position. That
+    ///         asymmetry with supply/withdraw is why settlement can withdraw
+    ///         collateral by exact amount but must repay debt by shares.
+    function supplyCollateral(MarketParams memory marketParams, uint256 assets, address onBehalf, bytes memory data)
+        external;
+
+    /// @notice Withdraw posted collateral to `receiver`.
+    /// @dev    Reverts upstream (`INSUFFICIENT_COLLATERAL`) when the withdrawal
+    ///         would leave the position unhealthy, so this must run AFTER the
+    ///         debt is repaid — the ordering the settlement requirement pins.
+    function withdrawCollateral(MarketParams memory marketParams, uint256 assets, address onBehalf, address receiver)
+        external;
+
+    function borrow(
+        MarketParams memory marketParams,
+        uint256 assets,
+        uint256 shares,
+        address onBehalf,
+        address receiver
+    ) external returns (uint256 assetsBorrowed, uint256 sharesBorrowed);
+
+    /// @dev Repaying by SHARES clears the debt exactly; repaying by ASSETS can
+    ///      leave dust shares behind that then block `withdrawCollateral`.
+    ///      Settlement repays by shares when it can afford the full position
+    ///      and by assets only when taking the deliverable maximum.
+    function repay(
+        MarketParams memory marketParams,
+        uint256 assets,
+        uint256 shares,
+        address onBehalf,
+        bytes memory data
+    ) external returns (uint256 assetsRepaid, uint256 sharesRepaid);
 
     function accrueInterest(MarketParams memory marketParams) external;
 }

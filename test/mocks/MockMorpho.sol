@@ -29,9 +29,12 @@ contract MockIrm is IIrm {
 ///         bookkeeping and storage-side interest accrual using the SAME
 ///         vendored math the strategy/adapter use view-side, so a view
 ///         valuation and a subsequent state-touching call must agree exactly.
-///         Borrow is simulated via `simulateBorrow` (tokens leave the mock,
-///         utilization rises) — enough for valuation-with-pending-interest,
-///         utilization-capped liquidity, and fail-closed adapter tests.
+///         Two borrow surfaces, deliberately kept separate: `simulateBorrow`
+///         moves only the market totals (a third party raising utilization —
+///         enough for valuation-with-pending-interest, utilization-capped
+///         liquidity, and fail-closed adapter tests), while `borrow`/`repay`
+///         below book the caller's OWN `borrowShares`, which is what a strategy
+///         that has to unwind its own debt needs to see go to zero.
 contract MockMorpho is IMorpho {
     using MathLib for uint256;
     using SharesMathLib for uint256;
@@ -40,6 +43,18 @@ contract MockMorpho is IMorpho {
     mapping(Id => Market) internal _market;
     mapping(Id => MarketParams) internal _idToMarketParams;
     mapping(Id => mapping(address => MorphoPosition)) internal _position;
+
+    /// @notice Ceiling on a single `withdrawCollateral`. TEST-ONLY.
+    /// @dev    The deliverable-maximum settlement path has a withdraw-short
+    ///         branch that is otherwise unreachable in a mock with no oracle:
+    ///         with debt cleared, upstream would always release the collateral.
+    ///         Lower this to force the shortfall and prove settle emits rather
+    ///         than reverts. Defaults to no cap.
+    uint256 public collateralWithdrawCap = type(uint256).max;
+
+    function setCollateralWithdrawCap(uint256 cap) external {
+        collateralWithdrawCap = cap;
+    }
 
     // ── Market administration (test-side) ──
 
@@ -184,6 +199,99 @@ contract MockMorpho is IMorpho {
 
     function accrueInterest(MarketParams memory marketParams) external {
         _accrue(marketParams, marketParams.id());
+    }
+
+    // ── IMorpho: collateral / borrow side ──
+    //
+    // Real bookkeeping, unlike `simulateBorrow` above: these move the CALLER's
+    // position, not just the market totals, because a borrower that unwinds its
+    // own debt has to see its own `borrowShares` go to zero.
+
+    function supplyCollateral(MarketParams memory marketParams, uint256 assets, address onBehalf, bytes memory)
+        external
+    {
+        Id id = marketParams.id();
+        require(_market[id].lastUpdate != 0, "MockMorpho: market not created");
+        require(assets != 0, "MockMorpho: zero assets");
+
+        _position[id][onBehalf].collateral += uint128(assets);
+        IERC20(marketParams.collateralToken).transferFrom(msg.sender, address(this), assets);
+    }
+
+    /// @dev Upstream refuses a withdrawal that would leave the position
+    ///      unhealthy. This mock has no oracle, so it enforces the ONE
+    ///      consequence the settlement ordering actually depends on — debt must
+    ///      be cleared first — rather than pretending to price collateral.
+    ///      `collateralWithdrawCap` is the separate, explicit lever for the
+    ///      withdraw-short case.
+    function withdrawCollateral(MarketParams memory marketParams, uint256 assets, address onBehalf, address receiver)
+        external
+    {
+        Id id = marketParams.id();
+        require(_market[id].lastUpdate != 0, "MockMorpho: market not created");
+        require(msg.sender == onBehalf, "MockMorpho: not authorized");
+        require(assets <= collateralWithdrawCap, "MockMorpho: withdraw capped");
+
+        _accrue(marketParams, id);
+        MorphoPosition storage pos = _position[id][onBehalf];
+        require(pos.borrowShares == 0, "MockMorpho: insufficient collateral");
+        require(pos.collateral >= assets, "MockMorpho: insufficient collateral");
+
+        pos.collateral -= uint128(assets);
+        IERC20(marketParams.collateralToken).transfer(receiver, assets);
+    }
+
+    function borrow(
+        MarketParams memory marketParams,
+        uint256 assets,
+        uint256 shares,
+        address onBehalf,
+        address receiver
+    ) external returns (uint256, uint256) {
+        Id id = marketParams.id();
+        require(_market[id].lastUpdate != 0, "MockMorpho: market not created");
+        require(msg.sender == onBehalf, "MockMorpho: not authorized");
+        require(assets != 0 && shares == 0, "MockMorpho: assets-mode only");
+
+        _accrue(marketParams, id);
+        Market storage m = _market[id];
+        uint256 mintedShares = assets.toSharesUp(m.totalBorrowAssets, m.totalBorrowShares);
+        _position[id][onBehalf].borrowShares += uint128(mintedShares);
+        m.totalBorrowAssets += uint128(assets);
+        m.totalBorrowShares += uint128(mintedShares);
+        require(m.totalBorrowAssets <= m.totalSupplyAssets, "MockMorpho: insufficient liquidity");
+
+        IERC20(marketParams.loanToken).transfer(receiver, assets);
+        return (assets, mintedShares);
+    }
+
+    /// @dev Shares-mode rounds the owed assets UP, mirroring upstream: repaying
+    ///      an exact share count must never leave the debt fractionally short,
+    ///      because a single dust share left behind blocks `withdrawCollateral`.
+    function repay(MarketParams memory marketParams, uint256 assets, uint256 shares, address onBehalf, bytes memory)
+        external
+        returns (uint256, uint256)
+    {
+        Id id = marketParams.id();
+        require(_market[id].lastUpdate != 0, "MockMorpho: market not created");
+        require((assets != 0) != (shares != 0), "MockMorpho: inconsistent input");
+
+        _accrue(marketParams, id);
+        Market storage m = _market[id];
+        if (assets != 0) {
+            shares = assets.toSharesDown(m.totalBorrowAssets, m.totalBorrowShares);
+        } else {
+            assets = shares.toAssetsUp(m.totalBorrowAssets, m.totalBorrowShares);
+        }
+
+        MorphoPosition storage pos = _position[id][onBehalf];
+        require(pos.borrowShares >= shares, "MockMorpho: repay exceeds debt");
+        pos.borrowShares -= uint128(shares);
+        m.totalBorrowAssets -= uint128(assets);
+        m.totalBorrowShares -= uint128(shares);
+
+        IERC20(marketParams.loanToken).transferFrom(msg.sender, address(this), assets);
+        return (assets, shares);
     }
 
     // ── Internal: storage-side accrual, mirror of MorphoBalancesLib ──
