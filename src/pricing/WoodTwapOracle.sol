@@ -183,6 +183,32 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
     ///      `twapWindow` — see the ACCEPTED RISK note on the contract.
     uint256 public constant MAX_ETH_USD_DELAY_LIMIT = 1 days;
 
+    /// @dev Upper bound on the ETH/USD feed's own `decimals()`, re-checked at
+    ///      READ time rather than trusted from construction.
+    ///      `_ethUsdFeedDecimals` is captured once from
+    ///      `IAggregatorMinimal(ethUsdFeed_).decimals()` and is a `uint8`, so
+    ///      nothing structurally stops it being 255 — and `10 ** 255` panics on
+    ///      overflow.
+    ///
+    ///      THIS WAS ALREADY AN UNCATCHABLE REVERT BEFORE THE `staticcall`
+    ///      REWRITE, and it is worth being precise about why, because the
+    ///      intuitive reading is wrong. The exponentiation sat inside
+    ///      `_ethUsdX8`'s `try` block, which looks like it was covered by the
+    ///      adjacent `catch`. It was not: `catch` covers the EXTERNAL CALL
+    ///      only, never the success-block body, which executes in this
+    ///      contract's own frame. So a feed reporting absurd `decimals()`
+    ///      panicked straight out of `consult()` even with the `try` in place —
+    ///      a second, independent violation of the "reports `ok == false`
+    ///      rather than reverting" contract, living beside the decode one that
+    ///      audit #181 finding 22 describes. Verified by mutation: restoring
+    ///      the typed `try` version fails
+    ///      `test_ethUsdLeg_absurdFeedDecimals_reportsUnavailableInsteadOfReverting`
+    ///      with `panic 0x11`, not with a graceful `ok == false`.
+    ///
+    ///      Mirrors `ExposureLedger.MAX_FEED_DECIMALS`, which re-checks for the
+    ///      same reason.
+    uint8 internal constant MAX_FEED_DECIMALS = 18;
+
     /// @dev How much of the averaging window a single extrapolated tail may
     ///      account for, as a divisor: `idle * MAX_IDLE_SPAN_DIVISOR <=
     ///      twapWindow`, i.e. at most `1/20` of the window.
@@ -529,13 +555,24 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
         return (cumulative, nowTs, true);
     }
 
-    /// @dev The USD leg, normalised to 8 decimals. Same degraded shapes and the
-    ///      same tolerance as `ExposureLedger`'s Chainlink read: `code.length`
-    ///      first (a high-level call to a codeless address reverts in THIS
-    ///      frame, which `try` cannot catch), then a wrapped call, then
-    ///      non-positive and stale. Every one of them reports unavailable rather
-    ///      than reverting, so a sick ETH/USD feed costs this contract its
-    ///      answer rather than reverting inside the ledger's price path.
+    /// @dev The USD leg, normalised to 8 decimals. Structurally identical to
+    ///      `ExposureLedger._feedPriceX8`, deliberately so: `code.length` first
+    ///      (a high-level call to a codeless address reverts in THIS frame,
+    ///      which `try` could not catch either), then a RAW `staticcall` with
+    ///      an explicit returndata-length check and a wide-type decode, then
+    ///      non-positive, stale, over-precision, and truncated-to-zero. Every
+    ///      one of them reports unavailable rather than reverting, so a sick
+    ///      ETH/USD feed costs this contract its answer rather than reverting
+    ///      inside the ledger's price path.
+    ///
+    ///      The raw-`staticcall` shape is load-bearing, not stylistic. This
+    ///      function previously used a typed `try ... returns (uint80, int256,
+    ///      uint256, uint256, uint80)` and claimed parity with the ledger's
+    ///      read while not having it: the declared `uint80`s are decoded after
+    ///      the call succeeds, outside `catch`'s reach, so short or
+    ///      dirty-padded returndata reverted uncatchably and broke the
+    ///      never-reverts contract this comment asserts. See the decode note
+    ///      inside the body and `MAX_FEED_DECIMALS`.
     ///
     /// @dev THE STALENESS BOUND IS `ethUsdMaxDelay` ALONE, and this answer may
     ///      therefore be OLDER THAN `twapWindow` — the two legs are not
@@ -548,17 +585,43 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
         address feed = ethUsdFeed;
         if (feed.code.length == 0) return (0, false);
         uint256 maxDelay = ethUsdMaxDelay;
-        try IAggregatorMinimal(feed).latestRoundData() returns (
-            uint80, int256 answer, uint256, uint256 updatedAt, uint80
-        ) {
-            if (answer <= 0) return (0, false);
-            uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
-            if (age > maxDelay) return (0, false);
-            // `answer > 0` checked above; the cast cannot change the value.
-            // forge-lint: disable-next-line(unsafe-typecast)
-            return ((uint256(answer) * 1e8) / (10 ** _ethUsdFeedDecimals), true);
-        } catch {
-            return (0, false);
-        }
+        (bool success, bytes memory ret) = feed.staticcall(abi.encodeCall(IAggregatorMinimal.latestRoundData, ()));
+        // latestRoundData returns (uint80, int256, uint256, uint256, uint80):
+        // 5 words, 160 bytes. Short/absent data is rejected before any decode
+        // is attempted.
+        if (!success || ret.length < 160) return (0, false);
+        // Decoded as uint256/int256 throughout, NOT the narrower uint80 the
+        // interface declares. A sub-256-bit unsigned type is
+        // validity-constrained at decode time (the ABI decoder rejects a word
+        // whose unused high bits are not clean padding), and that decode runs
+        // AFTER the call returns — outside any `catch`'s reach. A typed
+        // `try ... returns (uint80, ...)` therefore cannot uphold this
+        // function's documented "reports ok == false rather than reverting"
+        // contract against a feed that answers with short or dirty-padded
+        // data. uint256/int256 accept any 32-byte word, so nothing below this
+        // line can revert on account of decoding. This is audit #181 finding
+        // 22, whose fix landed in `ExposureLedger._feedPriceX8`,
+        // `ChainlinkReader`, and `PortfolioStrategy._tryPushFeedPrice` but
+        // originally missed this contract.
+        (, int256 answer,, uint256 updatedAt,) = abi.decode(ret, (uint256, int256, uint256, uint256, uint256));
+        if (answer <= 0) return (0, false);
+        uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
+        if (age > maxDelay) return (0, false);
+        // Bounded before the exponentiation: see `MAX_FEED_DECIMALS`. Without
+        // this, a feed reporting an absurd `decimals()` makes
+        // `10 ** _ethUsdFeedDecimals` overflow and panic. That was true of the
+        // previous typed-`try` version too — `catch` never covered this line,
+        // only the external call — so this closes a pre-existing hole rather
+        // than compensating for one the rewrite opened.
+        if (_ethUsdFeedDecimals > MAX_FEED_DECIMALS) return (0, false);
+        // `answer > 0` checked above; the cast cannot change the value.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        priceX8 = (uint256(answer) * 1e8) / (10 ** _ethUsdFeedDecimals);
+        // A source that truncated to zero is reported UNAVAILABLE rather than
+        // as a healthy zero price, matching `_feedPriceX8`. `consult` already
+        // rejects a zero product downstream; failing here is the same outcome
+        // reached one step earlier and without claiming `ok` for a price that
+        // is not one.
+        return (priceX8, priceX8 != 0);
     }
 }
