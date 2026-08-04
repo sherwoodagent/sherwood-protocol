@@ -155,7 +155,6 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
             marketParams: mp,
             collateralAmount: collateralAmount,
             borrowAmount: borrowAmount,
-            collateralValue: collateralAmount,
             tickLower: lower,
             tickUpper: upper,
             expectedLiquidity: uint128(pool.liquidity() / 100),

@@ -146,7 +146,6 @@ abstract contract CLFixture is Test {
             marketParams: mp,
             collateralAmount: COLLATERAL,
             borrowAmount: BORROW,
-            collateralValue: COLLATERAL,
             tickLower: TICK_LOWER,
             tickUpper: TICK_UPPER,
             expectedLiquidity: EXPECTED_LIQUIDITY,
@@ -220,6 +219,35 @@ contract ConcentratedLiquidityStrategyLifecycleTest is CLFixture {
         vm.expectRevert(BaseStrategy.NotActiveProposalStrategy.selector);
         strategy.execute();
         assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Pending), "ratchet flipped");
+    }
+
+    /// @dev The init-time cap bounds the agent's CLAIM; this is the enforceable
+    ///      version, checked against the liquidity actually minted and against
+    ///      the venue as it stands at execute rather than as it stood at
+    ///      proposal time. Depth that evaporated between the two must fail here.
+    function test_execute_poolShareCapIsRecheckedAgainstTheLiveVenue() public {
+        // Admissible at init against the 1e18 the pool held. By execute the
+        // venue has collapsed to a thousandth of that, so the 10% cap can no
+        // longer admit the position the borrow actually mints.
+        pool.setLiquidity(uint128(uint256(POOL_LIQUIDITY) / 1_000));
+
+        vm.prank(address(vaultStub));
+        vm.expectRevert(ConcentratedLiquidityStrategy.PositionExceedsPoolShareCap.selector);
+        strategy.execute();
+    }
+
+    /// @dev `unwindPosition` is external ONLY so `_settle` can `try/catch` it as
+    ///      a unit. It moves the position and clears `tokenId`, so anything but
+    ///      a self-call must be refused.
+    function test_unwindPosition_onlySelfReverts() public {
+        _execute();
+        vm.prank(keeper);
+        vm.expectRevert(ConcentratedLiquidityStrategy.NotSelf.selector);
+        strategy.unwindPosition();
+
+        vm.prank(proposer);
+        vm.expectRevert(ConcentratedLiquidityStrategy.NotSelf.selector);
+        strategy.unwindPosition();
     }
 
     function test_execute_twiceReverts() public {
@@ -313,25 +341,51 @@ contract ConcentratedLiquidityStrategyInitTest is CLFixture {
 
     function test_init_borrowExceedsLendableReverts() public {
         ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        // Lendable liquidity is checked BEFORE the LTV gate, so an oversized
+        // borrow trips this even though it is also far past the buffer.
         p.borrowAmount = MARKET_SUPPLY * 2;
-        p.collateralValue = MARKET_SUPPLY * 100; // keep LTV clear so this check is what fires
         _expectInitRevert(ConcentratedLiquidityStrategy.BorrowExceedsLiquidity.selector, p);
     }
 
     function test_init_ltvInsideLiquidationBufferReverts() public {
         ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
-        // lltv 91.5% - 5pp buffer = 86.5% ceiling; ask for 90%.
-        p.collateralValue = 100_000e6;
+        // lltv 91.5% - 5pp buffer = 86.5% ceiling; ask for 90% of the
+        // COLLATERAL (100_000e6), which the fee-free wrapper values 1:1.
         p.borrowAmount = 90_000e6;
         _expectInitRevert(ConcentratedLiquidityStrategy.LtvInsideLiquidationBuffer.selector, p);
     }
 
     function test_init_ltvJustInsideBufferSucceeds() public {
         ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
-        p.collateralValue = 100_000e6;
         p.borrowAmount = 86_500e6; // exactly the ceiling
         ConcentratedLiquidityStrategy s = _newStrategy(p);
         assertEq(s.borrowAmount(), 86_500e6);
+    }
+
+    /// @dev The LTV gate divides by a value READ FROM THE COLLATERAL TOKEN, not
+    ///      one supplied at init. `InitParams` carries no collateral-value field
+    ///      to overstate, so this is the only remaining way the denominator can
+    ///      move — and it moves in the wrapper's favour, never the proposer's.
+    ///
+    ///      A borrow that sits exactly at the ceiling against a fee-free wrapper
+    ///      must be REFUSED once the same wrapper charges a round-trip fee,
+    ///      because the collateral is genuinely worth less on the way out. If
+    ///      the gate were still reading an init-data figure, nothing about
+    ///      changing the wrapper would alter the verdict.
+    function test_init_ltvUsesWrapperRedemptionValueNotADeclaredOne() public {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.borrowAmount = 86_500e6; // the ceiling at a 1:1 round trip
+
+        // Same params, admissible a moment ago (test above).
+        spUsdg.setExitFeeBps(100); // 1% out; 100_000e6 now redeems for 99_000e6
+        // 86_500 / 99_000 = 87.4% > the 86.5% ceiling.
+        _expectInitRevert(ConcentratedLiquidityStrategy.LtvInsideLiquidationBuffer.selector, p);
+
+        // And the same borrow re-priced against the lower value is admissible
+        // again, so the gate is tracking the wrapper rather than just refusing.
+        p.borrowAmount = 85_600e6; // 85_600 / 99_000 = 86.46%
+        ConcentratedLiquidityStrategy s = _newStrategy(p);
+        assertEq(s.borrowAmount(), 85_600e6);
     }
 
     function test_init_exceedsPoolShareCapReverts() public {
@@ -364,6 +418,19 @@ contract ConcentratedLiquidityStrategyInitTest is CLFixture {
     function test_init_rerangeHalfWidthBelowSpacingReverts() public {
         ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
         p.rerange.halfWidthTicks = TICK_SPACING - 1;
+
+        _expectInitRevert(ConcentratedLiquidityStrategy.InvalidRerangePolicy.selector, p);
+    }
+
+    /// @dev A half-width wider than the tick domain cannot describe a band any
+    ///      voter meant to approve, and `_derivedRange` would silently clamp it
+    ///      to full-range — a materially different position from the reviewed
+    ///      one. Rejected here so the clamp only ever handles a legitimate band
+    ///      running off the domain near an extreme tick.
+    function test_init_rerangeHalfWidthAboveCeilingReverts() public {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.rerange.halfWidthTicks = template.MAX_HALF_WIDTH_TICKS() + 1;
+
         _expectInitRevert(ConcentratedLiquidityStrategy.InvalidRerangePolicy.selector, p);
     }
 

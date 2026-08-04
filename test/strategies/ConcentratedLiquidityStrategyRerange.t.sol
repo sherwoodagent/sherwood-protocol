@@ -115,10 +115,35 @@ contract ConcentratedLiquidityStrategyRerangeTest is CLFixture {
     function test_rerange_insideMinIntervalReverts() public {
         _execute();
         _moveToTrigger();
-        // No warp: execute stamped `lastRerangeAt` at 0, but the interval is
-        // measured from it, so at t=0 the hour has not elapsed.
+        // Execute stamps `lastRerangeAt`, so the hour is measured from there.
         vm.expectRevert(ConcentratedLiquidityStrategy.RerangeTooSoon.selector);
         strategy.rerange();
+    }
+
+    /// @dev The interval is documented as running "since execute or the last
+    ///      rerange", and the FIRST rerange is the case where those differ.
+    ///      Left unstamped at execute, `lastRerangeAt` stays 0 and every
+    ///      timestamp on a live chain clears `0 + minInterval` trivially — so a
+    ///      keeper could rerange in execute's own block. Warping to just before
+    ///      and just after the boundary pins that the clock starts at execute
+    ///      rather than at the epoch.
+    function test_rerange_firstRerangeIsClockedFromExecute() public {
+        _execute();
+        uint256 executedAt = vm.getBlockTimestamp();
+        assertEq(strategy.lastRerangeAt(), executedAt, "rerange clock not anchored at execute");
+
+        _moveToTrigger();
+
+        // One second short of the approved interval.
+        vm.warp(executedAt + 1 hours - 1);
+        vm.expectRevert(ConcentratedLiquidityStrategy.RerangeTooSoon.selector);
+        strategy.rerange();
+
+        // And admissible the moment it elapses.
+        vm.warp(executedAt + 1 hours);
+        vm.prank(keeper);
+        strategy.rerange();
+        assertEq(strategy.rerangeCount(), 1, "rerange did not become admissible at the boundary");
     }
 
     function test_rerange_spotOutsideTwapBoundReverts() public {
@@ -230,6 +255,32 @@ contract ConcentratedLiquidityStrategyRerangeTest is CLFixture {
         assertEq(upper % TICK_SPACING, 0, "upper not aligned");
         assertLe(lower, -855 - 1000 + TICK_SPACING, "lower snapped the wrong way");
         assertLt(lower, upper);
+    }
+
+    /// @dev A band that is perfectly legitimate mid-domain still runs past
+    ///      `MAX_TICK` once the TWAP sits near the top of the pool's range.
+    ///      Unclamped, `center + half` produces a tick the pool cannot accept —
+    ///      and in `int24` it can overflow outright, which would REVERT and
+    ///      brick `rerange()` permanently for a policy init already accepted.
+    ///      The derived range must stay inside the domain and stay non-empty at
+    ///      both extremes.
+    function test_derivedRange_clampsToTheTickDomain() public {
+        _execute();
+
+        int24 maxTick = strategy.MAX_TICK();
+        int24 minTick = strategy.MIN_TICK();
+
+        pool.setTicks(maxTick - 100, maxTick - 100);
+        (int24 lower, int24 upper) = strategy.derivedRange();
+        assertLe(upper, maxTick, "upper ran past the tick domain");
+        assertEq(upper % TICK_SPACING, 0, "clamped upper not aligned");
+        assertLt(lower, upper, "clamped range collapsed");
+
+        pool.setTicks(minTick + 100, minTick + 100);
+        (lower, upper) = strategy.derivedRange();
+        assertGe(lower, minTick, "lower ran past the tick domain");
+        assertEq(lower % TICK_SPACING, 0, "clamped lower not aligned");
+        assertLt(lower, upper, "clamped range collapsed");
     }
 
     // ── 6.7 Invariants ──

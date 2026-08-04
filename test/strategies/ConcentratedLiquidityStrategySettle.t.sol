@@ -154,6 +154,117 @@ contract ConcentratedLiquidityStrategyPartialSettleTest is SettleFixture {
         assertGt(nvda.balanceOf(address(strategy)), 0, "volatile leg should be left for sweep");
     }
 
+    /// @dev The wrapper is a THIRD PARTY on the settlement path. `spUSDG` and
+    ///      its class gate redemption behind pauses, caps and queues that this
+    ///      proposal cannot influence — so a paused wrapper must cost this
+    ///      proposal a stranded residue, never the vault its only exit.
+    ///      A typed `redeem` here would let whoever operates the wrapper freeze
+    ///      vault-wide redemption by pausing their own product.
+    function test_settle_pausedWrapperRedeemDoesNotRevert() public {
+        _execute();
+        _accrueFees(1_000e6, 0);
+        spUsdg.setRedeemPaused(true);
+
+        vm.recordLogs();
+        _settle();
+
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled), "a paused wrapper vetoed settlement");
+        assertEq(_debtShares(), 0, "debt should have cleared");
+        assertEq(_collateral(), 0, "collateral should have left Morpho");
+        assertGt(spUsdg.balanceOf(address(strategy)), 0, "test did not actually strand shares");
+        assertTrue(_sawSettlementIncomplete(), "stranded shares reported as a complete settlement");
+    }
+
+    /// @dev The residue `sweep()` can recover must not be narrower than the one
+    ///      `_settle` can create. Morpho's collateral is ZERO here — the shares
+    ///      already left it — so a retry gated on Morpho's balance would never
+    ///      fire and the shares would sit on the clone forever.
+    function test_sweep_recoversWrapperSharesOnceRedeemResumes() public {
+        _execute();
+        _accrueFees(1_000e6, 0);
+        spUsdg.setRedeemPaused(true);
+        _settle();
+
+        uint256 stranded = spUsdg.balanceOf(address(strategy));
+        assertGt(stranded, 0, "precondition: shares stranded");
+        assertEq(_collateral(), 0, "precondition: Morpho holds nothing to key a retry off");
+
+        uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
+        spUsdg.setRedeemPaused(false);
+
+        vm.prank(keeper); // anyone
+        strategy.sweep();
+
+        assertEq(spUsdg.balanceOf(address(strategy)), 0, "shares not recovered");
+        assertGt(usdg.balanceOf(address(vaultStub)), vaultBefore, "vault did not receive the redeemed collateral");
+    }
+
+    /// @dev A wrapper that will serve PART of the balance should serve that part
+    ///      now rather than failing whole and deferring everything to `sweep()`.
+    function test_settle_cappedWrapperRedeemTakesTheServablePart() public {
+        _execute();
+        _accrueFees(1_000e6, 0);
+        uint256 posted = _collateral();
+        spUsdg.setRedeemCap(posted / 4);
+
+        _settle();
+
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
+        uint256 left = spUsdg.balanceOf(address(strategy));
+        assertGt(left, 0, "cap should have left a remainder");
+        assertLt(left, posted, "the servable quarter was not taken");
+    }
+
+    /// @dev `accrueInterest` calls the market's IRM, and the IRM address is part
+    ///      of the proposer-supplied `MarketParams`. Left typed, a proposer
+    ///      could name an IRM that reverts and hold the vault's exit hostage.
+    function test_settle_revertingIrmDoesNotVetoSettlement() public {
+        _execute();
+        _accrueFees(1_000e6, 0);
+        irm.setReverting(true);
+
+        _settle();
+
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled), "a reverting IRM vetoed settlement");
+    }
+
+    /// @dev The unwind is four typed position-manager calls; any of them
+    ///      reverting used to take the whole settlement with it. Here `collect`
+    ///      cannot pay out, which is the realistic shape of that failure.
+    function test_settle_failedUnwindDoesNotVetoSettlement() public {
+        _execute();
+        uint256 tid = strategy.tokenId();
+        // Credit fees the position manager was never funded for, so `collect`
+        // tries to transfer more than it holds.
+        posm.accrueFees(tid, uint128(1_000_000e6), 0);
+
+        vm.recordLogs();
+        _settle();
+
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled), "a failed unwind vetoed settlement");
+        assertEq(strategy.tokenId(), tid, "token id cleared despite the unwind failing");
+        assertFalse(posm.isBurned(tid), "position reported burned after a failed unwind");
+    }
+
+    /// @dev And the unwind is retried by `sweep()`, not abandoned — the whole
+    ///      point of keeping `tokenId` set above.
+    function test_sweep_retriesTheUnwind() public {
+        _execute();
+        uint256 tid = strategy.tokenId();
+        posm.accrueFees(tid, uint128(1_000_000e6), 0);
+        _settle();
+        assertEq(strategy.tokenId(), tid, "precondition: position still held");
+
+        // Fund the position manager so the collect can now pay out.
+        usdg.mint(address(posm), 1_000_000e6);
+
+        vm.prank(keeper);
+        strategy.sweep();
+
+        assertEq(strategy.tokenId(), 0, "unwind not retried");
+        assertTrue(posm.isBurned(tid), "position not burned on retry");
+    }
+
     function _sawSettlementIncomplete() internal returns (bool) {
         bytes32 sig = keccak256("SettlementIncomplete(uint256,uint256)");
         Vm.Log[] memory logs = vm.getRecordedLogs();
@@ -161,6 +272,72 @@ contract ConcentratedLiquidityStrategyPartialSettleTest is SettleFixture {
             if (logs[i].topics.length != 0 && logs[i].topics[0] == sig) return true;
         }
         return false;
+    }
+}
+
+/// @notice The last-resort release path for a residue that can never be
+///         converted. Deliberately separate from `sweep()`.
+contract ConcentratedLiquidityStrategyReleaseTest is SettleFixture {
+    function test_releaseUnconvertible_beforeSettlementReverts() public {
+        _execute();
+        vm.expectRevert(ConcentratedLiquidityStrategy.NotSettled.selector);
+        strategy.releaseUnconvertible();
+    }
+
+    /// @dev `sweep()` must NOT do this itself: pushing on every sweep would move
+    ///      the residue somewhere this contract can no longer sell it, throwing
+    ///      away the conversion that a later `sweep()` would have made.
+    function test_sweep_leavesUnconvertibleResidueRecoverable() public {
+        _execute();
+        _accrueFees(0, 100e18);
+        adapter.setRate(address(nvda), address(usdg), 0);
+        _settle();
+
+        vm.prank(keeper);
+        strategy.sweep();
+
+        assertGt(nvda.balanceOf(address(strategy)), 0, "sweep foreclosed the conversion");
+    }
+
+    /// @dev Conversion is attempted FIRST every time, so a caller who reaches
+    ///      for the hatch during an outage that would have cleared gets the
+    ///      conversion instead of the release.
+    function test_releaseUnconvertible_prefersConversion() public {
+        _execute();
+        _accrueFees(0, 100e18);
+        adapter.setRate(address(nvda), address(usdg), 0);
+        _settle();
+
+        adapter.setRate(address(nvda), address(usdg), 100 * 1e18 / 1e12); // outage clears
+        uint256 vaultUsdgBefore = usdg.balanceOf(address(vaultStub));
+
+        vm.prank(keeper);
+        uint256 released = strategy.releaseUnconvertible();
+
+        assertEq(released, 0, "released unconverted despite a working adapter");
+        assertEq(nvda.balanceOf(address(vaultStub)), 0, "volatile leg pushed unconverted");
+        assertGt(usdg.balanceOf(address(vaultStub)), vaultUsdgBefore, "conversion proceeds not delivered");
+    }
+
+    /// @dev The case it exists for: an adapter that will never quote this pair
+    ///      again. Without this the residue sits on the clone permanently —
+    ///      nothing here can move a token that is neither the vault asset nor
+    ///      swappable, whereas the vault carries an owner-gated `rescueERC20`.
+    function test_releaseUnconvertible_handsResidueToTheVault() public {
+        _execute();
+        _accrueFees(0, 100e18);
+        adapter.setRate(address(nvda), address(usdg), 0);
+        _settle();
+
+        uint256 stranded = nvda.balanceOf(address(strategy));
+        assertGt(stranded, 0, "precondition: residue stranded");
+
+        vm.prank(keeper); // anyone
+        uint256 released = strategy.releaseUnconvertible();
+
+        assertEq(released, stranded, "released amount mismatch");
+        assertEq(nvda.balanceOf(address(strategy)), 0, "residue still on the clone");
+        assertEq(nvda.balanceOf(address(vaultStub)), stranded, "vault did not receive the residue");
     }
 }
 
