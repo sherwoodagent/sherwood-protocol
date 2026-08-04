@@ -31,9 +31,18 @@ library FeeConstants {
     uint256 internal constant DEFAULT_MAX_PERFORMANCE_FEE_BPS = 2000;
 
     /// @notice Default agent performance fee a vault charges until its owner
-    ///         sets one, in basis points (5%). Single source of truth for the
-    ///         vault getter's fallback (mirror it in any off-chain default).
-    uint256 internal constant DEFAULT_AGENT_FEE_BPS = 500;
+    ///         sets one, in basis points (20%) — the headline rate. Single
+    ///         source of truth for the vault getter's fallback (mirror it in
+    ///         any off-chain default).
+    /// @dev Raised from 500 (5%): the guardian pool's performance leg is a
+    ///      slice of THIS fee, and the ROE validation (ADR 2026-07-26,
+    ///      revalidated 2026-08-04) prices guardian participation at the
+    ///      two-number headline. A 5% default silently paid guardians a
+    ///      quarter of the modelled pool on any vault whose owner never set a
+    ///      rate. Equal to `DEFAULT_MAX_PERFORMANCE_FEE_BPS` by design: the
+    ///      default IS the headline; only an explicit governor param change
+    ///      goes above it.
+    uint256 internal constant DEFAULT_AGENT_FEE_BPS = 2000;
 
     /// @notice 100% in basis points, for fee arithmetic.
     /// @dev Fee math spans the vault, the governor and the protocol config;

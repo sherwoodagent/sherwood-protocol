@@ -76,14 +76,25 @@ contract FeeConstantsCapTest is Test {
         );
     }
 
-    // ── What must not have moved ──
+    // ── The default agent rate ──
 
-    function test_defaultAgentFeeIsUnchanged() public pure {
-        assertEq(FeeConstants.DEFAULT_AGENT_FEE_BPS, 500, "a vault that never sets a rate still charges 5%");
+    function test_defaultAgentFeeIsTheHeadline() public pure {
+        assertEq(FeeConstants.DEFAULT_AGENT_FEE_BPS, 2000, "a vault that never sets a rate charges the 20% headline");
     }
 
-    function test_aVaultThatNeverSetsARateChargesTheOldDefault() public view {
-        assertEq(vault.agentFeeBps(), FeeConstants.DEFAULT_AGENT_FEE_BPS, "unset vaults must not inherit the new cap");
+    /// @dev The default is deliberately AT the per-vault ceiling, never above
+    ///      it: an unset vault charges the headline exactly, and only an
+    ///      explicit governor param change can go past it.
+    function test_defaultAgentFeeDoesNotExceedThePerVaultCeiling() public pure {
+        assertLe(
+            FeeConstants.DEFAULT_AGENT_FEE_BPS,
+            FeeConstants.DEFAULT_MAX_PERFORMANCE_FEE_BPS,
+            "default rate must not start above the default ceiling"
+        );
+    }
+
+    function test_aVaultThatNeverSetsARateChargesTheDefault() public view {
+        assertEq(vault.agentFeeBps(), FeeConstants.DEFAULT_AGENT_FEE_BPS, "unset vaults must charge the default rate");
     }
 
     // ── The shared denominator ──

@@ -128,7 +128,10 @@ contract DeploySherwood is ScriptBase {
         Config memory cfg = Config({
             ensRegistrar: vm.envOr("ENS_REGISTRAR", address(0)),
             agentRegistry: vm.envOr("AGENT_REGISTRY", address(0)),
-            managementFeeBps: vm.envOr("MANAGEMENT_FEE", uint256(50)),
+            // 200 = the 2%-management headline of the two-number fee model.
+            // The prior 50 bps default starved the guardian pool 3.7× below
+            // the ROE math (tier-1 guardian ROE 2.2% vs the intended 17.5%).
+            managementFeeBps: vm.envOr("MANAGEMENT_FEE", uint256(200)),
             maxStrategyDays: vm.envOr("MAX_STRATEGY_DAYS", uint256(14)),
             votingPeriod: vm.envOr("VOTING_PERIOD", uint256(1 days)),
             // WOOD_TOKEN is required — the full GuardianRegistry stakes it.

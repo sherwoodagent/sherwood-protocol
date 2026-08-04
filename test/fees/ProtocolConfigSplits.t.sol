@@ -17,14 +17,16 @@ contract ProtocolConfigSplitsTest is Test {
     address internal owner = makeAddr("owner");
     address internal stranger = makeAddr("stranger");
 
-    // The proposed launch splits.
-    uint16 internal constant MGMT_AGENT = 7000;
+    // The launch splits — guardian-weighted so the tier-1 guardian ROE clears
+    // its hurdle at the 2-and-20 headline (ADR 2026-07-26, revalidated
+    // 2026-08-04). Must match the `ProtocolConfig` constructor seeds.
+    uint16 internal constant MGMT_AGENT = 6000;
     uint16 internal constant MGMT_PROTOCOL = 2000;
-    uint16 internal constant MGMT_GUARDIAN = 1000;
+    uint16 internal constant MGMT_GUARDIAN = 2000;
 
-    uint16 internal constant PERF_AGENT = 6000;
+    uint16 internal constant PERF_AGENT = 5000;
     uint16 internal constant PERF_PROTOCOL = 1500;
-    uint16 internal constant PERF_GUARDIAN = 1500;
+    uint16 internal constant PERF_GUARDIAN = 2500;
     uint16 internal constant PERF_OWNER = 1000;
 
     function setUp() public {
@@ -189,9 +191,15 @@ contract ProtocolConfigSplitsTest is Test {
         assertGt(m.agentBps, uint256(m.protocolBps) + m.guardianBps, "agent should out-earn the rest on management");
 
         IProtocolConfig.PerfSplit memory p = config.perfSplit();
-        assertGt(
-            p.agentBps, uint256(p.protocolBps) + p.guardianBps + p.ownerBps, "agent should out-earn the rest on carry"
+        // On carry the guardian-weighted rebalance leaves the agent with
+        // exactly half — still the largest single earner, no longer strictly
+        // more than everyone else combined.
+        assertGe(
+            p.agentBps, uint256(p.protocolBps) + p.guardianBps + p.ownerBps, "agent should take at least half the carry"
         );
+        assertGt(p.agentBps, p.protocolBps, "agent out-earns the protocol on carry");
+        assertGt(p.agentBps, p.guardianBps, "agent out-earns the guardian network on carry");
+        assertGt(p.agentBps, p.ownerBps, "agent out-earns the owner on carry");
     }
 
     function test_bothLaunchSplitsSumToFullBasisPoints() public {
