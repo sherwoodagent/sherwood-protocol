@@ -90,6 +90,36 @@ contract VaultWithdrawalQueueTest is Test {
         queue.cancel(id);
     }
 
+    /// @dev THE CONTROL THE FIRST VERSION OF THIS FIX LACKED (PR #195 review,
+    ///      blocker 1). `stampSettlement` sets `sp.stamped = true` BEFORE
+    ///      `_lastStampedPid = pid`, so `_settlePrice[_lastStampedPid].stamped`
+    ///      is true by construction from the protocol's first settlement
+    ///      onward — permanently, for every request. Gating cancel on that
+    ///      expression alone therefore bricked EVERY deposit cancel forever
+    ///      rather than closing the straddle, and the sibling test above
+    ///      passed anyway because it only ever asserted the revert.
+    ///
+    ///      A deposit created AFTER a settlement, with no settlement since,
+    ///      must still be cancellable.
+    function test_finding10_depositCancelStillOpenBeforeAnySettlementSinceRequest() public {
+        // A settlement exists before the request is even made.
+        vm.prank(address(vault));
+        queue.stampSettlement(PID, NUM, DEN);
+
+        // The deposit is tagged to the proposal open at request time, which is
+        // necessarily LATER than anything already settled — that is what
+        // `_openProposalPid` returns.
+        asset.mint(address(queue), 1_000e6);
+        vm.prank(address(vault));
+        uint256 id = queue.queueDeposit(alice, 1_000e6, PID + 1);
+
+        // Nothing has stamped SINCE. The claim price is not yet fixed for this
+        // request, so its cancel must still be open.
+        vm.prank(alice);
+        queue.cancel(id);
+        assertTrue(queue.getRequest(id).cancelled, "a deposit must be cancellable until a settlement lands after it");
+    }
+
     /// @dev The control for finding #10: a REDEEM request keeps gating on its
     ///      OWN pid. Those shares left the supply at that settlement and
     ///      `_pidReserved` is denominated against that same price, so an

@@ -1208,6 +1208,21 @@ contract PortfolioStrategy is BaseStrategy {
         // preserved here; decimal-correct scaling happens in `rebalanceDelta`
         // via `_tokensToValue` using the per-allocation `_priceDecimals`.
         price = uint256(uint192(report.price));
+        // ANCHOR THE DATA STREAMS SIDE TOO (PR #195 review, item 6). The
+        // last-good price was originally recorded only in `_sellFloor` /
+        // `_buyFloor`, both of which read the feed exclusively inside
+        // `if (chainlinkVerifier == address(0))` — so in Data Streams mode the
+        // anchor stayed 0 forever and those floors still fell through to
+        // `_quoteMinOut`, the pool-quoted floor the fix exists to remove. DS
+        // mode is the case the floors' own natspec calls "reachable without any
+        // oracle failure at all", since `execute()` / `settle()` / `rebalance()`
+        // carry no signed report.
+        //
+        // This is a DON-signed, feed-id-matched, unexpired, positive price in
+        // the slot's declared decimals — the same units and the same
+        // trustworthiness as the push-mode read, so it is a valid anchor for
+        // the calls that arrive without a report of their own.
+        _lastGoodPriceX8[i] = price;
     }
 
     // ── View functions ──

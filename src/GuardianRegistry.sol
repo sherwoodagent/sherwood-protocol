@@ -1064,6 +1064,24 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     function _severityBps(Review storage r) private view returns (uint256) {
         uint256 lo = uint256(r.minSlashBpsAtOpen);
         uint256 hi = uint256(r.maxSlashBpsAtOpen);
+        // MIGRATION GUARD (PR #195 review, item 5). `minSlashBpsAtOpen` /
+        // `maxSlashBpsAtOpen` are APPENDED fields, so every review already
+        // `opened` when this upgrade lands reads them as 0/0 — and 0/0
+        // collapses every branch below to 0, which makes `_slashOne`'s
+        // `ownSlash` zero and skips the burn entirely. That is precisely the
+        // outcome the snapshot exists to prevent, handed for free to every
+        // in-flight review at the moment of the upgrade.
+        //
+        // A genuine post-upgrade snapshot can never be 0/0: `setMinSlashBps`
+        // and `setMaxSlashBps` are the only writers of the live pair, and
+        // `openReview` copies them, so 0/0 here means "this review predates
+        // the field" — not "the owner chose zero". Falling back to the live
+        // reads restores the pre-upgrade behaviour for exactly those reviews,
+        // which is strictly better than granting them immunity.
+        if (lo == 0 && hi == 0) {
+            lo = swood.minSlashBps();
+            hi = swood.maxSlashBps();
+        }
         uint256 denom = uint256(r.totalStakeAtOpen);
         if (denom == 0) return lo; // defensive: a reached quorum implies denom > 0
         uint256 bBps = uint256(r.blockStakeWeight) * 10_000 / denom;

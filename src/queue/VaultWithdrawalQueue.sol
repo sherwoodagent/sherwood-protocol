@@ -195,7 +195,16 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         // forever with no recovery for a pay-on-behalf deposit. Gating on
         // `_lastStampedPid` unlocks the claim at the NEXT real settlement —
         // exactly the price it is charged at below.
+        //
+        // AT OR AFTER THIS REQUEST, not merely "some stamp exists". Because
+        // `stampSettlement` writes `sp.stamped` BEFORE `_lastStampedPid`,
+        // `_settlePrice[_lastStampedPid].stamped` is true by construction from
+        // the first settlement onward — on its own it is the constant `true`,
+        // not a gate. `_lastStampedPid >= r.pid` asks the real question, and
+        // makes this the exact complement of `cancel`'s gate: before that
+        // instant only cancel is open, after it only claim is.
         uint256 pricePid = r.kind == RequestKind.Redeem ? r.pid : _lastStampedPid;
+        if (r.kind == RequestKind.Deposit && _lastStampedPid < r.pid) revert NotSettled();
         SettlePrice memory sp = _settlePrice[pricePid];
         if (!sp.stamped) revert NotSettled();
         if (IRequestableVault(vault).redemptionsLocked()) revert VaultLocked();
@@ -288,8 +297,19 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         // Redeem keeps `r.pid`: those shares left the supply at that
         // settlement and `_pidReserved` is denominated against that same
         // price, so its own stamp is the correct and only meaningful gate.
-        uint256 gatePid = r.kind == RequestKind.Redeem ? r.pid : _lastStampedPid;
-        if (_settlePrice[gatePid].stamped) revert AlreadySettled();
+        // THE EXACT COMPLEMENT OF `claim`'s GATE — see the block there. Gating
+        // a Deposit on `_settlePrice[_lastStampedPid].stamped` ALONE was the
+        // first attempt at this fix and it was worse than the defect: that
+        // expression is `true` by construction after the protocol's first
+        // settlement, so it did not close the straddle, it deleted the cancel
+        // exit outright, permanently, for every deposit (PR #195 review,
+        // blocker 1). `_lastStampedPid >= r.pid` asks the question that was
+        // actually meant — has a settlement landed SINCE this request — so
+        // cancel shuts exactly when claim opens and never before.
+        bool priceFixed = r.kind == RequestKind.Redeem
+            ? _settlePrice[r.pid].stamped
+            : (_lastStampedPid >= r.pid && _settlePrice[_lastStampedPid].stamped);
+        if (priceFixed) revert AlreadySettled();
 
         r.cancelled = true;
         r.closedAt = uint48(block.timestamp);
