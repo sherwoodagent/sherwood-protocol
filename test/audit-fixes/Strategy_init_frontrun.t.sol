@@ -6,7 +6,6 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
-import {VeniceInferenceStrategy} from "../../src/strategies/VeniceInferenceStrategy.sol";
 import {MockStrategy} from "../mocks/MockStrategy.sol";
 
 /// @title Strategy_init_frontrun — MS-C3 regression
@@ -124,20 +123,5 @@ contract StrategyInitFrontrunTest is Test {
 
         PortfolioStrategy(clone).initialize(vault, proposer, initData);
         assertEq(PortfolioStrategy(clone).vault(), vault);
-    }
-
-    // ── Other concrete strategies — template lock only ──
-    // Coverage check: confirm every concrete strategy that derives from
-    // BaseStrategy is uninitializable on the template. We don't need to
-    // cover the clone-init path for these — the BaseStrategy constructor
-    // is the single mechanism, and the two cases above already prove
-    // that clones still initialize correctly.
-
-    function test_venice_template_is_locked() public {
-        VeniceInferenceStrategy template = new VeniceInferenceStrategy();
-
-        vm.prank(attacker);
-        vm.expectRevert(BaseStrategy.AlreadyInitialized.selector);
-        template.initialize(vault, proposer, "");
     }
 }

@@ -8,8 +8,8 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 
 /// @notice The one hop `execute()` walks to resolve the vault's governor:
 ///         `vault()` → `governor()`. Declared locally rather than imported,
-///         following `VeniceInferenceStrategy`'s `ITierBindingPath` precedent
-///         (src/strategies/VeniceInferenceStrategy.sol:43) — this interface
+///         following `PortfolioStrategy`'s `ITierBindingPath` precedent
+///         (src/strategies/PortfolioStrategy.sol:37) — this interface
 ///         exists to generate the selector, not to type the vault.
 interface IGovernorBinding {
     function governor() external view returns (address);

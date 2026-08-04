@@ -584,8 +584,8 @@ contract PortfolioStrategyTest is Test {
     ///         to 99.99% AFTER the proposal was reviewed and executed, then
     ///         self-settle into a sandwich they control: every floor in
     ///         `execute` / `settle` / `rebalance` / `rebalanceDelta` collapses to
-    ///         a rounding error. `VeniceInferenceStrategy` already floors its
-    ///         equivalent relaxation (Sherlock #49); this is the same class.
+    ///         a rounding error. This class of self-relaxation bug was already
+    ///         fixed once before (Sherlock #49); this is the same pattern.
     function test_updateParams_slippageCannotBeLoosened() public {
         _executeStrategy();
         assertEq(strategy.maxSlippageBps(), MAX_SLIPPAGE, "fixture starts at 1%");

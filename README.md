@@ -59,7 +59,6 @@ Lane B only, and no current template overrides it).
 |----------|-------|
 | `BaseStrategy.sol` | Abstract base (custody, state machine, proposer-tunable params) |
 | `PortfolioStrategy.sol` | Weighted basket of tokens (e.g. tokenized stocks on Robinhood Chain) — buys to target weights on execute, sells out on settle, rebalanceable by the proposer (sell-all/re-buy or delta-based off Chainlink Data Streams) |
-| `VeniceInferenceStrategy.sol` | Loan model — the vault lends asset to an agent who stakes VVV for Venice private inference and repays principal + profit in the vault's asset |
 
 ### Swap adapters (`src/adapters/`)
 
