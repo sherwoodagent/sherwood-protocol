@@ -2751,13 +2751,23 @@ contract ChallengeGameTest is Test {
         vm.prank(court);
         game.rule(r2, IChallengeGame.Verdict.Inconclusive);
 
+        // Round 3's DESIGN step is 1,000, but rounds 1-3 are clamped to the
+        // live `settleBurnBps` — halved to 500 by the third-audit decision on
+        // finding 18a's residual (prosecutor economics). So round 3 realises
+        // at 500 and charges the same as round 2. Accepted, and documented on
+        // `settleBurnBps` and `INCONCLUSIVE_BURN_ROUND3_BPS`; escalation
+        // resumes at round 4, which is not clamped.
         uint256 r3 = _fileAndDispute();
-        assertEq(game.challengeOf(r3).inconclusiveBurnBpsAtFiling, 1_000, "round 3: 10%");
+        assertEq(game.challengeOf(r3).inconclusiveBurnBpsAtFiling, 500, "round 3: clamped to the live settleBurnBps");
         vm.prank(court);
         game.rule(r3, IChallengeGame.Verdict.Inconclusive);
 
         uint256 r4 = _fileAndDispute();
-        assertEq(game.challengeOf(r4).inconclusiveBurnBpsAtFiling, 1_000, "round 4: the steady state (ceiling)");
+        assertEq(
+            game.challengeOf(r4).inconclusiveBurnBpsAtFiling,
+            1_000,
+            "round 4: the steady state (ceiling), unclamped -- where escalation resumes"
+        );
         vm.prank(court);
         game.rule(r4, IChallengeGame.Verdict.Inconclusive);
 
@@ -2793,10 +2803,25 @@ contract ChallengeGameTest is Test {
         );
     }
 
-    /// @notice THE ESCALATION IS REAL WOOD, NOT JUST A BIGGER BPS NUMBER: round
-    ///         3 must burn strictly more WOOD than round 2, on the same
-    ///         proposal with essentially the same bond size.
-    function test_inconclusive_escalationCostsMoreWoodEachRound() public {
+    /// @notice THE ESCALATION IS REAL WOOD, NOT JUST A BIGGER BPS NUMBER — and
+    ///         it survives the `settleBurnBps` halving, one round later than it
+    ///         used to.
+    ///
+    ///         Rounds 1-3 are clamped to the live `settleBurnBps`, which the
+    ///         third-audit decision on finding 18a's residual halved from
+    ///         1,000 to 500 to make honest prosecution worth doing. Round 3's
+    ///         design step of 1,000 therefore realises at 500 and burns
+    ///         EXACTLY what round 2 burned — this test asserts that equality
+    ///         rather than glossing it, because it is the accepted cost of
+    ///         that decision and must be visible if anyone changes the rate
+    ///         back.
+    ///
+    ///         Escalation is deferred, not lost: round 4+ reads
+    ///         `inconclusiveBurnBps` (1,000) and is deliberately NOT reclamped
+    ///         (second-audit finding C), so the realised curve is
+    ///         250/500/500/1,000 and still strictly increases overall. The
+    ///         round-4 leg is what keeps this test's original claim true.
+    function test_inconclusive_escalationCostsMoreWood_resumingAtRoundFour() public {
         uint256 r1 = _fileAndDispute();
         vm.prank(court);
         game.rule(r1, IChallengeGame.Verdict.Inconclusive); // round 1: entry tier, establishes the streak
@@ -2813,7 +2838,14 @@ contract ChallengeGameTest is Test {
         vm.prank(court);
         game.rule(r3, IChallengeGame.Verdict.Inconclusive);
         uint256 round3Burn = wood.balanceOf(game.BURN_ADDRESS()) - burnedBeforeR3;
-        assertGt(round3Burn, round2Burn, "round 3 burns strictly more WOOD than round 2");
+        assertEq(round3Burn, round2Burn, "round 3 is clamped flat onto round 2 at the halved settleBurnBps");
+
+        uint256 r4 = _fileAndDispute();
+        uint256 burnedBeforeR4 = wood.balanceOf(game.BURN_ADDRESS());
+        vm.prank(court);
+        game.rule(r4, IChallengeGame.Verdict.Inconclusive);
+        uint256 round4Burn = wood.balanceOf(game.BURN_ADDRESS()) - burnedBeforeR4;
+        assertGt(round4Burn, round3Burn, "round 4 burns strictly more WOOD -- the escalation is real, just deferred");
     }
 
     /// @notice The round-4+ tier's rate is pinned at filing, mirroring
@@ -2967,7 +2999,7 @@ contract ChallengeGameTest is Test {
     ///         free to rise above the live `settleBurnBps`, bounded only by
     ///         its own ceiling, `MAX_INCONCLUSIVE_BURN_BPS`.
     function test_setInconclusiveBurnBps_allowsRisingAboveTheLiveSettleBurnBps() public {
-        assertEq(game.settleBurnBps(), 1_000, "sanity: the default this used to be bound against");
+        assertEq(game.settleBurnBps(), 500, "sanity: the default this used to be bound against");
         vm.startPrank(owner);
         game.setInconclusiveBurnBps(1_001); // one bps above the live settleBurnBps — no longer reverts
         assertEq(game.inconclusiveBurnBps(), 1_001);

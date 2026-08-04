@@ -339,6 +339,18 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     uint256 internal constant INCONCLUSIVE_BURN_ROUND2_BPS = 500;
 
     /// @dev Round-3 step — see `INCONCLUSIVE_BURN_ROUND2_BPS`.
+    /// @dev NOT REACHABLE AT THE CURRENT `settleBurnBps` (500). Rounds 1-3 are
+    ///      clamped to that live value, so this literal realises as 500 and
+    ///      round 3 charges the same as round 2. That is the accepted cost of
+    ///      the third-audit decision to halve `settleBurnBps` for prosecutor
+    ///      economics — see that variable's natspec. The literal is left at
+    ///      1,000 rather than rewritten to 500 because it is the schedule's
+    ///      DESIGN shape, which the clamp reduces rather than replaces:
+    ///      raising `settleBurnBps` back to 1,000 restores a 250/500/1,000
+    ///      curve with no code change. Escalation past round 2 currently comes
+    ///      from the round-4+ tier (`inconclusiveBurnBps`, unclamped since
+    ///      second-audit finding C), so the realised curve is
+    ///      250/500/500/1,000.
     uint256 internal constant INCONCLUSIVE_BURN_ROUND3_BPS = 1_000;
 
     /// @notice Bond currency for both the challenger's bond and the accused's
@@ -480,23 +492,53 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @notice Share of a SUCCESSFUL challenger's bond burned on settle, in bps.
     /// @dev    Prices a filing in both directions: refunding the bond in full
     ///         would make the slash of the accused and the demotion of the
-    ///         named adapter come for the price of gas alone. 10% (the live
-    ///         default — second-audit finding E: this natspec was stale at
-    ///         "20%", the pre-audit-#181-finding-18a rate) is a cost rather
-    ///         than a transfer to the accused — paying convicted approvers
-    ///         out of a correct filing would invert the incentive it's meant
-    ///         to price.
+    ///         named adapter come for the price of gas alone. 5% (the live
+    ///         default — this figure has drifted twice before, so read it off
+    ///         the initialiser below rather than trusting this line) is a cost
+    ///         rather than a transfer to the accused — paying convicted
+    ///         approvers out of a correct filing would invert the incentive
+    ///         it's meant to price.
     /// @dev    Applied on BOTH of `_settle`'s branches (issue #181 finding
     ///         18b): the BOND on the silence (`!escalated`) branch, and the
     ///         forfeited counter-bond POOL on the escalated (guilty-ruling)
     ///         branch — which burns the identical WOOD amount, since
     ///         `Disputed` implies `counterBondWood == bondWood`. See
     ///         `ChallengeGame._settle`.
-    /// @dev 1,000, halved from 2,000 (audit #181 finding 18a). Kept at 1,000
-    ///      rather than dropped further so the Inconclusive ladder's
-    ///      250/500/1,000 steps all stay at or below the live clamp and the
-    ///      anti-grinding escalation survives intact.
-    uint256 public settleBurnBps = 1_000;
+    /// @dev 500. Halved from 2,000 to 1,000 by audit #181 finding 18a, then
+    ///      from 1,000 to 500 by the third-audit owner decision on the same
+    ///      finding's residual: prosecution was still barely worth doing.
+    ///
+    ///      WHY THIS KNOB AND NOT THE REWARD. An honest filer's net payoff is
+    ///      `proposerBondBps * prosecutorFeeBps - challengerBondBps *
+    ///      settleBurnBps` (see `honestFilingNetPayoffBps`). At the previous
+    ///      settings that was `100*2,000 - 150*1,000 = +50,000` bps^2 — about
+    ///      $500 on a $1m proposal, against $15,000 of bond tied up for weeks.
+    ///      The reward side could not be raised: `prosecutorFeeBps` was
+    ///      already AT `MAX_PROSECUTOR_FEE_BPS`, which `ProposerBondEscrow`
+    ///      enforces independently. Halving this cost term instead yields
+    ///      `100*2,000 - 150*500 = +125,000` bps^2, ~$1,250 on the same
+    ///      proposal — 2.5x, with no new governance surface.
+    ///
+    ///      CRUCIALLY THIS DOES NOT SUBSIDISE FABRICATED FILINGS. This rate
+    ///      burns a slice of a WINNING challenger's bond. A false accuser
+    ///      never reaches it: they lose on the merits and forfeit the WHOLE
+    ///      bond to the accused, a different path that is untouched. So the
+    ///      honest payoff rises while the deterrent against lying does not
+    ///      move.
+    ///
+    ///      ACCEPTED COST — THE LADDER'S THIRD RUNG FLATTENS. Rounds 1-3 of
+    ///      `_inconclusiveBurnBpsForRound` are clamped to this value, so the
+    ///      250/500/1,000 schedule now realises as 250/500/500: round 3 stops
+    ///      escalating past round 2. The escalation is NOT lost, only
+    ///      deferred — round 4+ reads `inconclusiveBurnBps` (1,000) and is
+    ///      deliberately NOT reclamped here (second-audit finding C), so the
+    ///      realised curve is 250/500/500/1,000 and still strictly increasing
+    ///      overall. The rung given up bites only a filer who has already
+    ///      taken three Inconclusive unwinds against the SAME proposal — a
+    ///      grinder-shaped profile the round-4+ tier still prices. Dropping
+    ///      below 500 was rejected for this reason: at 300 the schedule
+    ///      realises 250/300/300 and rung 2 collapses as well.
+    uint256 public settleBurnBps = 500;
 
     /// @notice Ceiling on `prosecutorFeeBps`, mirroring
     ///         `ProposerBondEscrow.MAX_PROSECUTOR_FEE_BPS`.

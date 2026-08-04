@@ -370,6 +370,52 @@ contract ChallengeGame_windowAndCourt is Test {
         );
     }
 
+    /// @notice THE POINT OF HALVING `settleBurnBps` — prosecutor economics,
+    ///         third-audit owner decision on audit #181 finding 18a's
+    ///         residual.
+    ///
+    ///         Finding 18a halved the rate 2,000 -> 1,000 and left prosecution
+    ///         still barely worth doing: `100*2,000 - 150*1,000 = +50,000`
+    ///         bps^2, about $500 on a $1m proposal against $15,000 of bond
+    ///         tied up for weeks. Halving again to 500 gives
+    ///         `100*2,000 - 150*500 = +125,000` — 2.5x.
+    ///
+    ///         THE COST TERM WAS THE ONLY LEVER. `prosecutorFeeBps` was
+    ///         already at `MAX_PROSECUTOR_FEE_BPS`, which `ProposerBondEscrow`
+    ///         enforces independently, so the reward side could not be raised
+    ///         without changing two contracts' ceilings. Asserted below so
+    ///         that fact stays visible.
+    ///
+    ///         AND IT DOES NOT SUBSIDISE LYING. This rate burns part of a
+    ///         WINNING challenger's bond. A false accuser never reaches it —
+    ///         they lose on the merits and forfeit the WHOLE bond to the
+    ///         accused, a different and untouched path. The honest payoff
+    ///         rises; the deterrent against fabrication does not move.
+    function test_prosecutorEconomics_halvedSettleBurnRaisesTheHonestPayoff() public view {
+        assertEq(game.settleBurnBps(), 500, "the halved rate is the live default");
+        assertEq(
+            game.prosecutorFeeBps(),
+            game.MAX_PROSECUTOR_FEE_BPS(),
+            "the reward side is pinned at its ceiling -- which is why the cost side had to move"
+        );
+        assertTrue(game.honestFilingBreaksEven(), "an honest filing must at least break even");
+
+        uint256 reward = ledger.proposerBondBps() * game.prosecutorFeeBps();
+        int256 payoffNow = game.honestFilingNetPayoffBps();
+        assertEq(
+            payoffNow,
+            int256(reward) - int256(game.challengerBondBps() * game.settleBurnBps()),
+            "the view agrees with the two products it documents"
+        );
+        assertEq(payoffNow, int256(125_000), "+125,000 bps^2, ~$1,250 on a $1m proposal");
+
+        // Fixture-independent statement of the improvement: recompute what the
+        // same configuration would pay at the old 1,000 rate.
+        int256 payoffAtOldRate = int256(reward) - int256(game.challengerBondBps() * 1_000);
+        assertEq(payoffAtOldRate, int256(50_000), "the old rate's +50,000, for comparison");
+        assertGt(payoffNow, payoffAtOldRate, "halving the burn strictly raised the honest filer's payoff");
+    }
+
     /// @notice The degenerate case the finding names: zeroing the cost side
     ///         leaves the boolean unchanged (still `true`) while the signed
     ///         payoff moves — proving it carries information the boolean
