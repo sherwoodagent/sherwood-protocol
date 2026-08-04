@@ -149,13 +149,13 @@ contract PerVaultParamsTest is Test {
 
         ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
 
-        assertEq(p.snapshotMgmtSplit.agentBps, 7000, "mgmt agent share must hold at the propose-time value");
+        assertEq(p.snapshotMgmtSplit.agentBps, 6000, "mgmt agent share must hold at the propose-time value");
         assertEq(p.snapshotMgmtSplit.protocolBps, 2000);
-        assertEq(p.snapshotMgmtSplit.guardianBps, 1000);
+        assertEq(p.snapshotMgmtSplit.guardianBps, 2000);
 
-        assertEq(p.snapshotPerfSplit.agentBps, 6000, "perf agent share must hold at the propose-time value");
+        assertEq(p.snapshotPerfSplit.agentBps, 5000, "perf agent share must hold at the propose-time value");
         assertEq(p.snapshotPerfSplit.protocolBps, 1500);
-        assertEq(p.snapshotPerfSplit.guardianBps, 1500);
+        assertEq(p.snapshotPerfSplit.guardianBps, 2500);
         assertEq(p.snapshotPerfSplit.ownerBps, 1000);
     }
 

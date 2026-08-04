@@ -202,9 +202,9 @@ contract FeeDistributionTest is Test {
         _runProposal(30 days);
 
         uint256 total = _paidOut();
-        assertApproxEqRel(usdc.balanceOf(agent), (total * 7000) / 10_000, 1e15, "agent 70%");
+        assertApproxEqRel(usdc.balanceOf(agent), (total * 6000) / 10_000, 1e15, "agent 60%");
         assertApproxEqRel(usdc.balanceOf(protocolRecipient), (total * 2000) / 10_000, 1e15, "protocol 20%");
-        assertApproxEqRel(usdc.balanceOf(guardianRecipient), (total * 1000) / 10_000, 1e15, "guardian 10%");
+        assertApproxEqRel(usdc.balanceOf(guardianRecipient), (total * 2000) / 10_000, 1e15, "guardian 20%");
         assertEq(usdc.balanceOf(owner), 0, "the owner earns only on the profit side");
     }
 

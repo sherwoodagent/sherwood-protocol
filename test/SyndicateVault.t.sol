@@ -478,8 +478,8 @@ contract SyndicateVaultTest is Test {
 
     // ==================== AGENT FEE ====================
 
-    function test_agentFeeBps_defaultsToFivePercent() public view {
-        assertEq(vault.agentFeeBps(), 500, "fresh vault defaults to 5%");
+    function test_agentFeeBps_defaultsToTheHeadline() public view {
+        assertEq(vault.agentFeeBps(), 2000, "fresh vault defaults to the 20% headline");
     }
 
     function test_setAgentFeeBps_ownerCanSet() public {

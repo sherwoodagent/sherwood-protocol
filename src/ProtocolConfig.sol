@@ -64,13 +64,20 @@ contract ProtocolConfig is Ownable2Step, IProtocolConfig {
     ///      setters' sum check, an invalid split is unreachable rather than
     ///      merely discouraged. Governance can still change either at will.
     constructor(address owner_) Ownable(owner_) {
-        // Management 70/20/10 — the agent manages the book, the protocol runs
+        // Management 60/20/20 — the agent manages the book, the protocol runs
         // the rails, the guardian network reviews. The guardian slice funds
         // review continuously: review effort does not stop when markets go flat.
-        _mgmtSplit = MgmtSplit({agentBps: 7000, protocolBps: 2000, guardianBps: 1000});
-        // Performance 60/15/15/10 — the fund owner earns only on the profit
-        // side, which is why this leg exists here and not above.
-        _perfSplit = PerfSplit({agentBps: 6000, protocolBps: 1500, guardianBps: 1500, ownerBps: 1000});
+        // Guardian at 20% (raised from 10%): with the performance slice below,
+        // the guardian pool reaches 0.9% of TVL/yr at the 2-and-20 headline,
+        // which clears the 15% tier-1 ROE hurdle (17.5%) that the 70/20/10 +
+        // 60/15/15/10 seeds missed (9.5%). Depositor net yield is untouched —
+        // the shift is agent → guardian inside the same headline fees. See the
+        // 2026-07-26 ROE validation ADR, revalidated 2026-08-04.
+        _mgmtSplit = MgmtSplit({agentBps: 6000, protocolBps: 2000, guardianBps: 2000});
+        // Performance 50/15/25/10 — the fund owner earns only on the profit
+        // side, which is why this leg exists here and not above. Guardian at
+        // 25% (raised from 15%) for the same tier-1 ROE closure as above.
+        _perfSplit = PerfSplit({agentBps: 5000, protocolBps: 1500, guardianBps: 2500, ownerBps: 1000});
     }
 
     /// @inheritdoc IProtocolConfig
