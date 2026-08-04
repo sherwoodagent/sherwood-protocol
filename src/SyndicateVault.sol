@@ -1041,6 +1041,44 @@ contract SyndicateVault is
                 }
                 continue;
             } else {
+                // UNRECOGNIZED SELECTOR ON THE ONE EXEMPT TARGET.
+                //
+                // PART 2a above lets `asset()` through without an allowlist
+                // check, on the stated premise that the outer `netOutflow`
+                // meter "independently verifies" it via a balance diff. A
+                // balance diff sees VALUE MOVEMENT. It does not see an
+                // AUTHORIZATION grant: ERC-777 `authorizeOperator(address)`
+                // (0x959b8c3f) — and any allowance-delegation shape not
+                // enumerated in the switch above — moves zero balance in-batch
+                // and licenses an unbounded pull in a LATER transaction, after
+                // every meter in this call has already passed.
+                //
+                // Nothing downstream catches it either: declared at cap 0, the
+                // tier scan prices `requiredCoverage` at 0, so no guardian
+                // books coverage, `requireApproveQuorum` is never reached, no
+                // proposer bond is locked, and `ChallengeGame.file` reverts
+                // `NothingToFreeze` on the empty approver set — the proposal is
+                // unchallengeable.
+                //
+                // Scoped deliberately to `asset()`: every other target already
+                // had to clear PART 2a's allowlist, and the terminal `continue`
+                // is load-bearing for them (ordinary batch calls — a strategy's
+                // `execute()`, an adapter's `swap()` — carry selectors this
+                // switch does not and should not enumerate). Turning PART 2b
+                // into a wholesale allowlist would reject those. Only the
+                // exempt target needs the stricter rule, precisely because only
+                // it skipped the outer gate.
+                //
+                // The standard ERC-20 READS are carved out: they are a closed,
+                // enumerable set, they grant nothing, and batches legitimately
+                // call them on `asset()` (a strategy reading `balanceOf` or
+                // `decimals` mid-batch). Restricting the rejection to
+                // everything else keeps it aimed at the actual hazard — a
+                // state-changing selector on the one target with no allowlist
+                // behind it.
+                if (target == asset_ && !_isBenignAssetRead(sel)) {
+                    revert UnrecognizedAssetSelector(sel);
+                }
                 continue;
             }
             // Self-transfer fast-path is scoped to asset() ONLY: it is the
@@ -1054,6 +1092,24 @@ contract SyndicateVault is
                 revert DisallowedTransferTarget(calls[i].target, sel, recipient);
             }
         }
+    }
+
+    /// @dev The standard ERC-20 view selectors, which a governor batch may
+    ///      legitimately call on `asset()` and which cannot grant, move, or
+    ///      delegate anything. Enumerated as an explicit carve-out from the
+    ///      unrecognized-selector rejection above rather than left to the
+    ///      terminal `continue`, so the rejection stays pointed at
+    ///      state-changing selectors on the one target that skips PART 2a.
+    ///      Deliberately does NOT include `approve`/`transfer`/`transferFrom`
+    ///      or any of their siblings — those are handled by the branches above
+    ///      and gated on their spender/recipient.
+    function _isBenignAssetRead(bytes4 sel) private pure returns (bool) {
+        return sel == 0x70a08231 // balanceOf(address)
+            || sel == 0x313ce567 // decimals()
+            || sel == 0x18160ddd // totalSupply()
+            || sel == 0xdd62ed3e // allowance(address,address)
+            || sel == 0x95d89b41 // symbol()
+            || sel == 0x06fdde03; // name()
     }
 
     /// @dev The single implementation of the privileged-batch-target
