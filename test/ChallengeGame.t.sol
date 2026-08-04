@@ -855,9 +855,7 @@ contract ChallengeGameTest is Test {
             _expectedBondWood(10_000e18, 0.04e8),
             "bond divides by the composed price, not the raw scalar"
         );
-        assertEq(
-            game.challengeOf(id).bondWood, (_standardBondWood() * 5) / 4, "20% under-charge at the raw scalar"
-        );
+        assertEq(game.challengeOf(id).bondWood, (_standardBondWood() * 5) / 4, "20% under-charge at the raw scalar");
     }
 
     function test_file_bondIsSizedOnLiabilityNotReservations() public {
@@ -1233,9 +1231,7 @@ contract ChallengeGameTest is Test {
 
         // Less the F4 settle burn: a correct filing is cheap, not free.
         uint256 settleBurn = (bond * game.settleBurnBps()) / 10_000;
-        assertEq(
-            wood.balanceOf(challenger) - challengerBefore, bond - settleBurn, "bond returned less the settle burn"
-        );
+        assertEq(wood.balanceOf(challenger) - challengerBefore, bond - settleBurn, "bond returned less the settle burn");
         _assertLiveBondsBacked();
     }
 
@@ -2455,7 +2451,9 @@ contract ChallengeGameTest is Test {
         // entry-tier rate (`INCONCLUSIVE_BURN_ROUND1_BPS`), not zero — a free
         // first unwind let anyone pin every accused approver's stake for
         // `disputeTimeout` + `challengeWindow` at the cost of gas alone.
-        assertEq(before.inconclusiveBurnBpsAtFiling, 250, "fixture: first round on a fresh proposal pins the entry tier");
+        assertEq(
+            before.inconclusiveBurnBpsAtFiling, 250, "fixture: first round on a fresh proposal pins the entry tier"
+        );
 
         uint256 challengerBefore = wood.balanceOf(challenger);
         uint256 guardianABefore = wood.balanceOf(guardianA);
@@ -3715,7 +3713,9 @@ contract ChallengeGameTest is Test {
         uint256 burned = (pool * c.settleBurnBpsAtFiling) / 10_000;
         assertGt(burned, 0, "sanity: the default settleBurnBps actually burns something");
         assertEq(
-            wood.balanceOf(challenger) - challengerBefore, bond + pool - burned, "bond back plus the pool, minus the burn"
+            wood.balanceOf(challenger) - challengerBefore,
+            bond + pool - burned,
+            "bond back plus the pool, minus the burn"
         );
         assertEq(wood.balanceOf(game.BURN_ADDRESS()), burned, "exactly settleBurnBpsAtFiling of the pool was burned");
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded");

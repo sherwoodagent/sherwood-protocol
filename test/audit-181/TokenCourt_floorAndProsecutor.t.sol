@@ -269,7 +269,9 @@ contract TokenCourt_floorAndProsecutorTest is Test {
             1_000_000e18 // totalThen — IDENTICAL to the baseline's `earlier`: the attacker's stake is not present a month earlier
         );
         assertEq(
-            court.caseOf(attackCaseId).accusedWeight, 900_000e18, "attacker never approved, so accusedWeight is untouched"
+            court.caseOf(attackCaseId).accusedWeight,
+            900_000e18,
+            "attacker never approved, so accusedWeight is untouched"
         );
         assertEq(
             court.caseOf(attackCaseId).accusedWeightAtLookback,

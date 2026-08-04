@@ -272,7 +272,9 @@ contract DeployTokenCourtPreflightTest is Test {
         _runWireExpecting(
             "PRE-FLIGHT: autoSlashDelay + voteWindow + FINALIZE_BUFFER + MIN_REFERRAL_SLACK > disputeTimeout."
         );
-        assertEq(game.court(), address(0), "the exact boundary must not wire - MIN_REFERRAL_SLACK closes the last second");
+        assertEq(
+            game.court(), address(0), "the exact boundary must not wire - MIN_REFERRAL_SLACK closes the last second"
+        );
     }
 
     /// @dev Companion to `test_wire_rejectsTheExactBoundary` above: proves the

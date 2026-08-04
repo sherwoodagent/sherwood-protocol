@@ -80,8 +80,7 @@ contract Governor_settlementOrdering_Test is Test {
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
-            (
-                ISyndicateVault.InitParams({
+            (ISyndicateVault.InitParams({
                     asset: address(hookedAsset),
                     name: "Sherwood Vault",
                     symbol: "swHUSD",
@@ -90,8 +89,7 @@ contract Governor_settlementOrdering_Test is Test {
                     openDeposits: true,
                     agentRegistry: address(agentRegistry),
                     managementFeeBps: 0
-                })
-            )
+                }))
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 

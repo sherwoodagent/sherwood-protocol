@@ -43,10 +43,7 @@ contract MaliciousDeltaSynthraPool {
         reportedAmount1 = amount1Delta;
     }
 
-    function swap(address, bool, int256, uint160, bytes calldata)
-        external
-        returns (int256 amount0, int256 amount1)
-    {
+    function swap(address, bool, int256, uint160, bytes calldata) external returns (int256 amount0, int256 amount1) {
         amount0 = reportedAmount0;
         amount1 = reportedAmount1;
         SynthraDirectAdapter(msg.sender).synthraV3SwapCallback(amount0, amount1, "");

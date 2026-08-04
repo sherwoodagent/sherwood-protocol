@@ -2220,8 +2220,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      no longer seat a configuration the other would refuse.
     function _requireWindowFits(address c, uint256 autoSlash, uint256 timeout) private view {
         if (c == address(0)) return;
-        if (autoSlash + ITokenCourt(c).voteWindow() + ITokenCourt(c).FINALIZE_BUFFER() + MIN_REFERRAL_SLACK > timeout)
-        {
+        if (autoSlash + ITokenCourt(c).voteWindow() + ITokenCourt(c).FINALIZE_BUFFER() + MIN_REFERRAL_SLACK > timeout) {
             revert WindowInvariantViolated();
         }
     }

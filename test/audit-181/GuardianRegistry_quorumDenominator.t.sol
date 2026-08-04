@@ -104,8 +104,7 @@ contract GuardianRegistry_quorumDenominatorTest is RegistryTestHarness {
         emit IGuardianRegistry.ReviewResolved(PROPOSAL_ID, true, 0);
         bool blocked = registry.resolveReview(address(governor), PROPOSAL_ID);
         assertTrue(
-            blocked,
-            "honest 40% block-side must clear a 20% quorum measured against the honest-only 1_000_000e18 base"
+            blocked, "honest 40% block-side must clear a 20% quorum measured against the honest-only 1_000_000e18 base"
         );
     }
 

@@ -141,9 +141,7 @@ contract VaultSettleStampDenominatorTest is Test {
         vm.prank(quitter);
         vault.requestRedeem(quitterShares, quitter);
         _settle(1);
-        assertEq(
-            queue.stampedUnclaimedShares(), quitterShares, "quitter's shares are stamped-unclaimed going into P2"
-        );
+        assertEq(queue.stampedUnclaimedShares(), quitterShares, "quitter's shares are stamped-unclaimed going into P2");
 
         // Proposal 2 opens; the newcomer queues a deposit tagged to it.
         _setProposal(2, 1, 2);

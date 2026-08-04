@@ -128,11 +128,7 @@ contract MockStakedWoodSE {
         authorizedSlasher = a;
     }
 
-    function slashVerdict(bytes32, uint256, address[] calldata, uint256[] calldata)
-        external
-        pure
-        returns (uint256)
-    {
+    function slashVerdict(bytes32, uint256, address[] calldata, uint256[] calldata) external pure returns (uint256) {
         return 0;
     }
 

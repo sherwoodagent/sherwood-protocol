@@ -95,7 +95,14 @@ contract DirectionalZeroSellAdapter {
         buyOut = buyOut_;
     }
 
-    function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256, /* amountOutMin */ bytes calldata)
+    function swap(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256,
+        /* amountOutMin */
+        bytes calldata
+    )
         external
         returns (uint256 amountOut)
     {

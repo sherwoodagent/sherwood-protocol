@@ -48,8 +48,7 @@ contract SynthraSwapAdapter_pathReversalTest is Test {
         token = new ERC20Mock("Token", "TOKEN", 18);
 
         storedPath = abi.encodePacked(address(asset), uint24(500), address(mid), uint24(3000), address(token));
-        expectedReversedPath =
-            abi.encodePacked(address(token), uint24(3000), address(mid), uint24(500), address(asset));
+        expectedReversedPath = abi.encodePacked(address(token), uint24(3000), address(mid), uint24(500), address(asset));
 
         // Router needs asset-side liquidity to pay out the sell leg.
         asset.mint(address(router), 1_000_000e18);
@@ -188,7 +187,10 @@ contract CapturingSynthraQuoter {
         return _lastPath;
     }
 
-    function quoteExactInput(bytes calldata path, uint256 /* amountIn */ )
+    function quoteExactInput(
+        bytes calldata path,
+        uint256 /* amountIn */
+    )
         external
         returns (
             uint256 amountOut,

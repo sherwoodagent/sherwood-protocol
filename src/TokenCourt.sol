@@ -181,10 +181,8 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // equality leaves as little as one second for a dropped auto-referral
         // to be retried, and the disputer controls both the stall instant and
         // whether the in-transaction attempt lands.
-        if (
-            game_.autoSlashDelay() + voteWindow + FINALIZE_BUFFER + game_.MIN_REFERRAL_SLACK()
-                > game_.disputeTimeout()
-        ) {
+        if (game_.autoSlashDelay() + voteWindow + FINALIZE_BUFFER + game_.MIN_REFERRAL_SLACK() > game_.disputeTimeout())
+        {
             revert WindowInvariantViolated();
         }
         emit ChallengeGameSet(challengeGame, newGame);
