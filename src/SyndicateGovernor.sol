@@ -2071,6 +2071,25 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      proposal resolves to tier 2 / full notional — the safe default, so
     ///      no zero-check (unlike `setProtocolConfig`, where zero would brick
     ///      fee snapshots).
+    ///
+    ///      "SAFE DEFAULT" IS NO LONGER THE WHOLE STORY FOR STRATEGY CLONES.
+    ///      Un-wiring stays safe in the sense that matters — no privilege is
+    ///      granted, everything prices at full notional — but it is no longer
+    ///      merely a degradation. `PortfolioStrategy._initialize` is fail-closed
+    ///      on registry resolution (change: `codehash-class-certification`), and
+    ///      it resolves through `vault() → governor() → tierRegistry()`. With
+    ///      this set to zero that walk dead-ends, so EVERY new clone bound to
+    ///      this vault reverts `TierRegistryUnresolved` at init. Existing clones
+    ///      are unaffected: they resolved at their own init, and rebalance /
+    ///      settle deliberately keep degrading open so an un-wiring can never
+    ///      strand capital inside a live strategy.
+    ///
+    ///      Operational shape of zeroing this: live positions keep working and
+    ///      can still be wound down, but no new portfolio strategy can be
+    ///      deployed on this vault until the registry is re-wired. For an
+    ///      EXISTING governor that means `SyndicateFactory.pushWiring(governor)`
+    ///      — the factory's own `setTierRegistry` only reaches governors created
+    ///      after it.
     function setTierRegistry(address newRegistry) external onlyFactory {
         emit TierRegistrySet(_tierRegistry, newRegistry);
         _tierRegistry = newRegistry;

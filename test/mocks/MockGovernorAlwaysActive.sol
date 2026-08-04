@@ -16,12 +16,41 @@ pragma solidity 0.8.28;
 ///         `test/mocks/MockProposalStatus.sol` (the real governor's and
 ///         vault's own `IProposalStatus` seam).
 contract MockGovernorAlwaysActive {
+    /// @notice Second hop of the binding walk `vault() → governor() →
+    ///         tierRegistry()`. Defaults to `address(0)`.
+    /// @dev    `PortfolioStrategy._initialize` is fail-closed on registry
+    ///         resolution, so any suite whose strategies must reach init has
+    ///         to point this at a registry. Left zero by default so this stub
+    ///         stays inert for callers that only need the `strategyOf` seam.
+    address public tierRegistry;
+
+    function setTierRegistry(address registry) external {
+        tierRegistry = registry;
+    }
+
     function getActiveProposal() external pure returns (uint256) {
         return 1;
     }
 
     function strategyOf(uint256) external view returns (address) {
         return msg.sender;
+    }
+}
+
+/// @notice Permissive tier-registry stand-in: allows every adapter and price
+///         source, and attests every token↔price-source pairing.
+/// @dev    For suites that are about strategy math, not about governance
+///         binding — it gets them past `_initialize`'s fail-closed registry
+///         resolution without each one hand-rolling a registry. A suite that
+///         is actually testing the binding needs precise, non-permissive
+///         wiring instead (see `PortfolioStrategyAdapterAllowlist.t.sol`).
+contract MockPermissiveTierRegistry {
+    function isAdapterAllowed(address) external pure returns (bool) {
+        return true;
+    }
+
+    function isPriceSourceForToken(address, bytes32) external pure returns (bool) {
+        return true;
     }
 }
 

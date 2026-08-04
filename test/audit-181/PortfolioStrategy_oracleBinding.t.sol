@@ -62,6 +62,20 @@ contract MockTierRegistry {
     function isAdapterAllowed(address a) external view returns (bool) {
         return allowed[a];
     }
+
+    /// @dev Token↔price-source attestation. Permissive by default so the
+    ///      existing oracle-binding cases keep exercising what they were
+    ///      written for; `setPriceSourceForToken` lets a test deny one
+    ///      specific pairing when that is the thing under test.
+    mapping(address => mapping(bytes32 => bool)) public deniedPair;
+
+    function setPriceSourceForToken(address token, bytes32 src, bool allow) external {
+        deniedPair[token][src] = !allow;
+    }
+
+    function isPriceSourceForToken(address token, bytes32 src) external view returns (bool) {
+        return !deniedPair[token][src];
+    }
 }
 
 /// @notice Configurable AggregatorV3-shaped push feed. `~40 lines` — exactly
@@ -307,6 +321,119 @@ contract PortfolioStrategy_oracleBindingTest is Test {
             abi.encodeWithSelector(PortfolioStrategy.PriceSourceNotAllowed.selector, verifier, address(registry))
         );
         strategy.initialize(address(vault), proposer, _dataStreamsInitData(adapter, verifier, SLIPPAGE_100));
+    }
+
+    // ── Token↔price-source pairing (change: codehash-class-certification) ──
+    //
+    // The allowlist answers "may this oracle be used at all". These cover the
+    // second question: "…for THIS token". Without the pairing, an allowlisted
+    // feed can be pointed at any token, so a slot's minimum-output floor is
+    // derived from the wrong reference and value leaks on every swap while the
+    // configured slippage tolerance still reads as satisfied.
+    //
+    // Held closed today by per-clone owner review. Codehash-class
+    // certification removes that review, which is why the guard has to exist
+    // in code before `PortfolioStrategy` can carry a class certification.
+
+    /// @dev Push mode: adapter AND feed are both allowlisted — the old checks
+    ///      pass entirely — but the feed is not attested to price `tsla`.
+    function test_init_revertsWhenPushFeedNotPairedWithToken() public {
+        MockTierRegistry registry = new MockTierRegistry();
+        address adapter = makeAddr("adapter");
+        MockAggregator feed = new MockAggregator(18, int256(1e18), START);
+        registry.setAllowed(adapter, true);
+        registry.setAllowed(address(feed), true);
+        // Everything the pre-existing guards check is satisfied; only the
+        // pairing is denied.
+        registry.setPriceSourceForToken(address(tsla), bytes32(uint256(uint160(address(feed)))), false);
+
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        PortfolioStrategy strategy = _clone();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PortfolioStrategy.PriceSourceNotPairedWithToken.selector,
+                address(tsla),
+                bytes32(uint256(uint160(address(feed)))),
+                address(registry)
+            )
+        );
+        strategy.initialize(address(vault), proposer, _pushModeInitData(adapter, address(feed), SLIPPAGE_100));
+    }
+
+    /// @dev Data Streams mode, where this matters MORE than in push mode: only
+    ///      the verifier is allowlisted, feed ids are opaque, so the pairing is
+    ///      the only thing tying a slot's report to a slot's token.
+    function test_init_revertsWhenDataStreamsFeedNotPairedWithToken() public {
+        MockTierRegistry registry = new MockTierRegistry();
+        address adapter = makeAddr("adapter");
+        address verifier = makeAddr("verifier");
+        registry.setAllowed(adapter, true);
+        registry.setAllowed(verifier, true);
+        registry.setPriceSourceForToken(address(tsla), bytes32(uint256(0xBEEF)), false);
+
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        PortfolioStrategy strategy = _clone();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PortfolioStrategy.PriceSourceNotPairedWithToken.selector,
+                address(tsla),
+                bytes32(uint256(0xBEEF)),
+                address(registry)
+            )
+        );
+        strategy.initialize(address(vault), proposer, _dataStreamsInitData(adapter, verifier, SLIPPAGE_100));
+    }
+
+    /// @dev The packed max-age must NOT be part of the attestation key: one
+    ///      attestation has to cover an aggregator regardless of the staleness
+    ///      bound a proposer chose for a given slot. Otherwise every max-age
+    ///      variant needs its own attestation and operators paper over the
+    ///      friction by attesting broadly, hollowing out the guard.
+    function test_init_pairingIgnoresPackedMaxAge() public {
+        MockTierRegistry registry = new MockTierRegistry();
+        address adapter = makeAddr("adapter");
+        MockAggregator feed = new MockAggregator(18, int256(1e18), START);
+        registry.setAllowed(adapter, true);
+        registry.setAllowed(address(feed), true);
+        // Deny by the BARE aggregator address, while the init data will carry
+        // that address packed together with a max-age.
+        registry.setPriceSourceForToken(address(tsla), bytes32(uint256(uint160(address(feed)))), false);
+
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        PortfolioStrategy strategy = _clone();
+
+        // The denial still bites, proving the lookup normalizes away the age.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PortfolioStrategy.PriceSourceNotPairedWithToken.selector,
+                address(tsla),
+                bytes32(uint256(uint160(address(feed)))),
+                address(registry)
+            )
+        );
+        strategy.initialize(address(vault), proposer, _pushModeInitData(adapter, address(feed), SLIPPAGE_100));
+    }
+
+    /// @dev Init is fail-closed on registry resolution. A clone initialized
+    ///      while the registry is unreachable would carry an adapter, price
+    ///      sources, and pairings that were never checked against governance —
+    ///      survivable under per-clone owner review, not under a class
+    ///      certification whose claim covers EVERY initialization.
+    function test_init_revertsWhenRegistryUnresolvable() public {
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(0));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+        PortfolioStrategy strategy = _clone();
+        MockAggregator feed = new MockAggregator(18, int256(1e18), START);
+
+        vm.expectRevert(PortfolioStrategy.TierRegistryUnresolved.selector);
+        strategy.initialize(
+            address(vault), proposer, _pushModeInitData(makeAddr("adapter"), address(feed), SLIPPAGE_100)
+        );
     }
 
     /// @dev Sanity companion: with BOTH the adapter and the feed allowlisted,

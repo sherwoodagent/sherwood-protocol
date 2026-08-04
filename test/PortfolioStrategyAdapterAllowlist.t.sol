@@ -80,6 +80,21 @@ contract MockTierRegistry {
     function isAdapterAllowed(address adapter) external view returns (bool) {
         return allowed[adapter];
     }
+
+    /// @dev Token↔price-source attestation, permissive by default so the
+    ///      adapter-allowlist cases keep testing the adapter axis in
+    ///      isolation. The hostile fixtures below deliberately do NOT gain
+    ///      this selector: `_requireAllowedAdapter` runs first, so those tests
+    ///      still fail where they were written to fail.
+    mapping(address => mapping(bytes32 => bool)) public deniedPair;
+
+    function setPriceSourceForToken(address token, bytes32 src, bool allow) external {
+        deniedPair[token][src] = !allow;
+    }
+
+    function isPriceSourceForToken(address token, bytes32 src) external view returns (bool) {
+        return !deniedPair[token][src];
+    }
 }
 
 /// @notice A registry whose `isAdapterAllowed` always reverts — models a
@@ -344,35 +359,52 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
 
     // ── Adapter allowlist: unresolved walk skips ──
 
-    function test_codelessVault_skipsCheck() public {
+    // ── INIT IS NOW FAIL-CLOSED ON REGISTRY RESOLUTION ──
+    //
+    // These four cases previously asserted that an unresolvable registry made
+    // `initialize` SKIP its governance bindings and succeed. That concession
+    // was deliberate and correct while every clone was individually
+    // allowlisted by the owner before it could be called — a human read the
+    // configuration first.
+    //
+    // Codehash-class certification removes that review: one certification
+    // covers every clone that will ever exist, and its claim is that the
+    // template's bound holds under EVERY initialization. A clone initialized
+    // while the registry was unreachable carries an adapter, price sources,
+    // and token↔feed pairings that were never checked against governance, yet
+    // would inherit the class bound from its bytecode. So init now refuses.
+    //
+    // The skip behavior is retained at rebalance and settle, where blocking
+    // would strand vault capital — see `_initialize`'s block comment.
+
+    function test_codelessVault_initFailsClosed() public {
         address codelessVault = makeAddr("codelessVault");
         PortfolioStrategy strategy = _clone();
-        // No registry anywhere — must NOT revert AdapterNotAllowed.
+        vm.expectRevert(PortfolioStrategy.TierRegistryUnresolved.selector);
         strategy.initialize(codelessVault, proposer, _initData(SLIPPAGE_100));
-        assertEq(strategy.vault(), codelessVault);
     }
 
-    function test_vaultGovernorReturnsZero_skipsCheck() public {
+    function test_vaultGovernorReturnsZero_initFailsClosed() public {
         MockVaultWithGovernor vault = new MockVaultWithGovernor(address(0));
         PortfolioStrategy strategy = _clone();
+        vm.expectRevert(PortfolioStrategy.TierRegistryUnresolved.selector);
         strategy.initialize(address(vault), proposer, _initData(SLIPPAGE_100));
-        assertEq(strategy.vault(), address(vault));
     }
 
-    function test_governorWithoutRegistryGetter_skipsCheck() public {
+    function test_governorWithoutRegistryGetter_initFailsClosed() public {
         MockGovernorNoRegistryGetter governor = new MockGovernorNoRegistryGetter();
         MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
         PortfolioStrategy strategy = _clone();
+        vm.expectRevert(PortfolioStrategy.TierRegistryUnresolved.selector);
         strategy.initialize(address(vault), proposer, _initData(SLIPPAGE_100));
-        assertEq(strategy.vault(), address(vault));
     }
 
-    function test_governorTierRegistryZero_skipsCheck() public {
+    function test_governorTierRegistryZero_initFailsClosed() public {
         MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(0));
         MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
         PortfolioStrategy strategy = _clone();
+        vm.expectRevert(PortfolioStrategy.TierRegistryUnresolved.selector);
         strategy.initialize(address(vault), proposer, _initData(SLIPPAGE_100));
-        assertEq(strategy.vault(), address(vault));
     }
 
     // ── Adapter allowlist: resolved-but-unreadable registry fails closed ──
@@ -429,8 +461,14 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
 
     function test_initAtExactFloor_succeeds() public {
         PortfolioStrategy strategy = _clone();
-        address codelessVault = makeAddr("codelessVault5");
-        strategy.initialize(codelessVault, proposer, _initData(strategy.MIN_SLIPPAGE_BPS()));
+        // Needs a resolvable registry now that init is fail-closed — this test
+        // is about the slippage floor, not about registry resolution.
+        MockTierRegistry registry = new MockTierRegistry();
+        registry.setAllowed(address(adapter), true);
+        registry.setAllowed(address(tsla), true);
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
+        MockVaultWithGovernor vault_ = new MockVaultWithGovernor(address(governor));
+        strategy.initialize(address(vault_), proposer, _initData(strategy.MIN_SLIPPAGE_BPS()));
         assertEq(strategy.maxSlippageBps(), strategy.MIN_SLIPPAGE_BPS());
     }
 
@@ -465,11 +503,16 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
 
     function test_floorBottomsOut_reassertSucceeds_belowFails() public {
         PortfolioStrategy strategy = _clone();
-        // Issue #150 fix: `execute()` now needs a vault whose `governor()`
-        // resolves. Registry left unset (`tierRegistry() == address(0)`)
-        // keeps the adapter-allowlist walk skipped, same as the old codeless
-        // vault — this test is about the slippage floor, not the allowlist.
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(0));
+        // Issue #150 fix: `execute()` needs a vault whose `governor()`
+        // resolves. The registry used to be left unset here so the
+        // adapter-allowlist walk would skip — that shortcut is gone now that
+        // init is fail-closed on registry resolution, so this wires a
+        // permissive registry instead. This test is still about the slippage
+        // floor, not the allowlist; the entries below just get it past init.
+        MockTierRegistry registry = new MockTierRegistry();
+        registry.setAllowed(address(adapter), true);
+        registry.setAllowed(address(tsla), true);
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
         MockVaultWithGovernor vaultStub = new MockVaultWithGovernor(address(governor));
         weth.mint(address(vaultStub), TOTAL_AMOUNT);
         vm.prank(address(vaultStub));
@@ -635,7 +678,15 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
     {
         salt; // silence unused-param warning now that makeAddr no longer consumes it
         strategy = _clone();
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(0));
+        // Init is fail-closed on registry resolution, so this fixture wires a
+        // real (permissive) registry instead of the `address(0)` stub it used
+        // while the unresolvable case merely skipped its bindings. The
+        // allowlist entries are what `_initData`'s basket needs: the swap
+        // adapter, and `tsla` doubling as its own push feed.
+        MockTierRegistry registry = new MockTierRegistry();
+        registry.setAllowed(address(adapter), true);
+        registry.setAllowed(address(tsla), true);
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
         MockVaultWithGovernor vaultStub = new MockVaultWithGovernor(address(governor));
         weth.mint(address(vaultStub), TOTAL_AMOUNT);
         vm.prank(address(vaultStub));

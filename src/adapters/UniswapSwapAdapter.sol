@@ -236,10 +236,14 @@ contract UniswapSwapAdapter is ISwapAdapter {
             // `exactInput` computes wrong pool addresses for certain pairs on
             // Base, so this decomposes the path and swaps hop-by-hop, which always
             // resolves pools correctly. Each non-terminal hop's
-            // `amountOutMinimum` is derived at swap time from a quoter pre-call,
-            // so an MEV sandwich on any intermediate hop reverts at that hop
-            // instead of silently draining value into the next; the top-level
-            // `amountOutMin` is still enforced on the terminal hop.
+            // `amountOutMinimum` is derived at swap time from a quoter pre-call.
+            //
+            // That per-hop floor is a quoter/router CONSISTENCY check, NOT
+            // sandwich resistance: the quote is taken in this same transaction
+            // against the same pool, so a front-run that moved the pool moves the
+            // floor with it. The route's economic bound is the caller-supplied
+            // `amountOutMin` on the terminal hop, anchored on an oracle by
+            // `PortfolioStrategy._buyFloor` / `_sellFloor`.
             (bytes memory path, uint16 perHopSlippageBps) = abi.decode(routeData, (bytes, uint16));
             require(perHopSlippageBps <= 10_000, "slippage > 100%");
             address pathStart = _extractFirstAddress(path);
@@ -415,9 +419,18 @@ contract UniswapSwapAdapter is ISwapAdapter {
                 IERC20(hopIn).forceApprove(address(v3Router), currentAmount);
             }
 
-            // Per-hop floor from quoter pre-call, scaled by the caller's
+            // Per-hop floor from a quoter pre-call, scaled by the caller's
             // slippage budget. Final hop additionally honors the top-level
             // `amountOutMin` so the legacy contract holds.
+            //
+            // Quote and swap run in the SAME transaction against the SAME pool,
+            // so the quote simulates the swap that follows: the floor binds only
+            // when the router diverges from the quoter (the SwapRouter02
+            // pool-resolution bug class this mode routes around — why it stays),
+            // and it gives no sandwich protection, since a front-run moves the
+            // pool the quote is read from. Intermediate hops therefore carry no
+            // independent economic floor; `amountOutMin` on the terminal hop
+            // bounds the route.
             (uint256 quoted,,,) = quoter.quoteExactInputSingle(
                 IQuoterV2.QuoteExactInputSingleParams({
                     tokenIn: hopIn, tokenOut: hopOut, amountIn: currentAmount, fee: fee, sqrtPriceLimitX96: 0

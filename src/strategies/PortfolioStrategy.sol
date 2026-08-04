@@ -37,6 +37,7 @@ interface ITierBindingPath {
     function governor() external view returns (address);
     function tierRegistry() external view returns (address);
     function isAdapterAllowed(address adapter) external view returns (bool);
+    function isPriceSourceForToken(address token, bytes32 priceSource) external view returns (bool);
 }
 
 /// @notice Decoded Chainlink Data Streams V3 report
@@ -133,6 +134,18 @@ contract PortfolioStrategy is BaseStrategy {
     ///         `rebalanceDelta` to sell it against a floor scaled to a fabricated
     ///         price.
     error PriceSourceNotAllowed(address priceSource, address registry);
+    /// @notice The tier registry could not be resolved through
+    ///         `vault() → governor() → tierRegistry()` at initialization.
+    /// @dev    Init-only. Rebalance and settle deliberately keep degrading
+    ///         open on an unresolvable registry — see the block comment in
+    ///         `_initialize` for why the balance inverts here.
+    error TierRegistryUnresolved();
+    /// @notice The price source for a basket slot is allowlisted, but is not
+    ///         governance-attested to price THAT slot's token. Adversary: a
+    ///         proposer pairing a valuable token with a cheap asset's feed so
+    ///         the slot's minimum-output floor is derived from the wrong
+    ///         reference and every slippage check still passes.
+    error PriceSourceNotPairedWithToken(address token, bytes32 priceSource, address registry);
 
     // ── Constants ──
     uint256 public constant MAX_BASKET_SIZE = 20;
@@ -409,6 +422,21 @@ contract PortfolioStrategy is BaseStrategy {
         // a monotonic decrease. Floor subsumes the previous `== 0` rejection.
         if (maxSlippageBps_ < MIN_SLIPPAGE_BPS || maxSlippageBps_ > MAX_SLIPPAGE_CEILING_BPS) revert InvalidSlippage();
 
+        // INIT IS FAIL-CLOSED ON THE REGISTRY, AND ONLY INIT. The binding
+        // helpers degrade open when it cannot be resolved, which is right at
+        // rebalance/settle — blocking those strands vault capital. Init has the
+        // opposite balance: nothing is at stake yet, and a clone initialized
+        // against an unreachable registry carries adapter, price-source and
+        // token↔feed pairings never checked against governance, which
+        // codehash-class certification would then vouch for under its
+        // "holds under EVERY initialization" claim. Do not make these symmetric.
+        //
+        // Deploy order is consequently load-bearing: the registry must resolve
+        // through vault() → governor() → tierRegistry() before any clone inits.
+        // Placed after the purely-local checks so a malformed proposal still
+        // reports its own error rather than being masked by resolution failure.
+        if (_resolveTierRegistry() == address(0)) revert TierRegistryUnresolved();
+
         // Push-feed mode when no Data Streams verifier is wired: each
         // `feedIds[i]` encodes an AggregatorV3 proxy as bytes32(uint160(feed)).
         bool pushMode = chainlinkVerifier_ == address(0);
@@ -440,6 +468,19 @@ contract PortfolioStrategy is BaseStrategy {
                 // Bind this slot's aggregator to the governance allowlist —
                 // see the ORACLE BINDING note above.
                 _requireAllowedPriceSource(feed);
+                // …and bind it to THIS slot's token. The allowlist alone lets a
+                // proposer point any allowlisted feed at any token; the pairing
+                // is what stops a valuable token being priced by a cheap
+                // asset's feed. Normalized to the bare aggregator address so
+                // one attestation covers every max-age variant of the packed
+                // feed id.
+                _requirePairedPriceSource(tokens[i], bytes32(uint256(uint160(feed))));
+            } else {
+                // Data Streams mode: the feed id is opaque, so the pairing is
+                // the ONLY thing tying this slot's report to this slot's token
+                // — the verifier is allowlisted once, globally, and says
+                // nothing about which asset a given feed id describes.
+                _requirePairedPriceSource(tokens[i], feedIds_[i]);
             }
             // Rejects duplicate token addresses: a basket like [TSLA, TSLA]
             // aggregates into a single TSLA balance while rebalance math treats
@@ -1174,6 +1215,42 @@ contract PortfolioStrategy is BaseStrategy {
         address registry = _resolveTierRegistry();
         if (registry == address(0)) return;
         if (!_isAdapterAllowed(registry, priceSource)) revert PriceSourceNotAllowed(priceSource, registry);
+    }
+
+    /// @notice Require that `priceSource` is governance-attested to price `token`.
+    /// @dev    The allowlist answers "may this oracle be used at all"; this
+    ///         answers "…for THIS token". Adversary: a proposer pairing a
+    ///         valuable basket token with a cheap asset's allowlisted feed — the
+    ///         slot's minimum-output floor is then derived from the wrong
+    ///         reference and value leaks while `maxSlippageBps` still reads as
+    ///         satisfied.
+    ///
+    ///         ATTESTED, not derived: `AggregatorV3` exposes no on-chain link
+    ///         from a feed to the asset it prices, and Chainlink's Feed Registry
+    ///         is not deployed on Robinhood Chain.
+    ///
+    ///         `priceSource` is normalized by the CALLER — a push aggregator
+    ///         widened from its address with any packed max-age stripped, or a
+    ///         Data Streams feed id verbatim — so one attestation covers an
+    ///         aggregator across every staleness variant.
+    function _requirePairedPriceSource(address token, bytes32 priceSource) private view {
+        address registry = _resolveTierRegistry();
+        if (registry == address(0)) return;
+        if (!_isPriceSourceForToken(registry, token, priceSource)) {
+            revert PriceSourceNotPairedWithToken(token, priceSource, registry);
+        }
+    }
+
+    /// @dev Length-checked raw staticcall, mirroring `_isAdapterAllowed`. A
+    ///      registry predating this function returns empty returndata and reads
+    ///      as "not attested" — fail-closed is correct here, since the pairing
+    ///      is the guard that makes this template class-certifiable.
+    function _isPriceSourceForToken(address registry, address token, bytes32 priceSource) private view returns (bool) {
+        if (registry.code.length == 0) return false;
+        (bool ok, bytes memory ret) =
+            registry.staticcall(abi.encodeCall(ITierBindingPath.isPriceSourceForToken, (token, priceSource)));
+        if (!ok || ret.length != 32) return false;
+        return abi.decode(ret, (bool));
     }
 
     /// @dev Live re-validation of every price source `rebalance`/`rebalanceDelta`
