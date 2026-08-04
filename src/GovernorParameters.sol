@@ -225,19 +225,18 @@ abstract contract GovernorParameters is ProposalLifecycle {
         emit ParameterChangeFinalized(PARAM_MAX_PERF_FEE, old, newValue);
     }
 
-    /// @dev The protocol-wide `strategyDuration` ceiling, or
-    ///      `type(uint256).max` when unset so the check is a no-op.
+    /// @dev The protocol-wide `strategyDuration` ceiling, or `type(uint256).max`
+    ///      when unset so the check is a no-op.
     ///
-    ///      Read LIVE rather than mirrored into governor storage on purpose:
-    ///      `SyndicateGovernor` is behind a beacon with a pinned layout, and a
-    ///      protocol-wide value has no business being copied per vault where it
-    ///      could drift. The cost is one external call on two owner-only paths.
+    ///      Read LIVE rather than mirrored into governor storage: the governor is
+    ///      behind a beacon with a pinned layout, and a protocol-wide value has no
+    ///      business being copied per vault where it could drift. The cost is one
+    ///      external call on two owner-only paths.
     ///
-    ///      UNSET (0) MEANS NO CEILING, not "nothing is proposable". Failing
-    ///      closed here would brick every vault deployed before this parameter
-    ///      existed the moment the config were upgraded — a fail-closed default
-    ///      is right for coverage, wrong for a bound that did not previously
-    ///      exist.
+    ///      UNSET (0) MEANS NO CEILING, not nothing-is-proposable. Failing closed
+    ///      would brick every vault deployed before this parameter existed the
+    ///      moment the config were upgraded — right for coverage, wrong for a
+    ///      bound that did not previously exist.
     function _protocolMaxStrategyDuration() private view returns (uint256) {
         address cfg = protocolConfig;
         if (cfg == address(0)) return type(uint256).max;
