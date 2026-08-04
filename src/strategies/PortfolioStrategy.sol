@@ -218,23 +218,34 @@ contract PortfolioStrategy is BaseStrategy {
     ///         actually needed bounding is the ALLOWANCE: it composed
     ///         multiplicatively (`1-(1-s)^2N`) over an unlimited call count.
     ///
-    ///         5,000 bps at the shipped 500 bps allowance is five full round
-    ///         trips; at the `MIN_SLIPPAGE_BPS` floor it is fifty. Both leave
-    ///         ordinary rebalancing room while bounding the traced drains
-    ///         (~62% of the basket in ten calls at 500 bps, ~50% in seventy at
-    ///         50 bps).
+    ///         WHAT THE BOUND ACTUALLY IS, and why this number moved. A leg
+    ///         costs its own `maxSlippageBps` and compounds at that rate, so
+    ///         with a budget `B` the reachable loss is
+    ///         `1 - (1 - s)^(B/s) ~= 1 - e^(-B/10000)` for ANY setting of `s`.
+    ///         That invariance is the point: lowering `maxSlippageBps` buys
+    ///         more calls that each bite proportionally less, so a proposer
+    ///         cannot pick a slippage figure that games the cap.
     ///
-    ///         WHAT THE BOUND ACTUALLY IS: since a leg costs its own
-    ///         `maxSlippageBps` and compounds at that rate, the reachable loss
-    ///         is `1 - (1 - s)^(5000/s) ~= 1 - e^-0.5 ~= 39%` for ANY setting
-    ///         of `s`, which is the point — the ceiling is invariant to the
-    ///         slippage the proposer chooses, so lowering `maxSlippageBps` to
-    ///         buy more calls buys no more drain. It caps the traced figures
-    ///         rather than eliminating them; a 39% worst case still wants the
-    ///         `strategyDuration` and adapter allowlist doing their share.
+    ///         It follows that the budget IS the drain ceiling, in one number.
+    ///         The first cut shipped 5,000 bps, which reads like a hard limit
+    ///         but resolves to `1 - e^-0.5 ~= 39%` of the basket — enough that
+    ///         describing it as cutting off the traced drains (~62% in ten
+    ///         calls at 500 bps, ~50% in seventy at 50 bps) overstated what one
+    ///         constant was carrying. 2,000 bps puts the ceiling at
+    ///         `1 - e^-0.2 ~= 18%`.
+    ///
+    ///         THE COST IS HEADROOM, AND IT IS REAL. At the shipped 500 bps
+    ///         allowance this is two full round trips over the clone's whole
+    ///         life (four `rebalanceDelta` calls, which are charged one leg
+    ///         rather than two); at the `MIN_SLIPPAGE_BPS` floor it is twenty
+    ///         round trips. A strategy that expects to rebalance often should
+    ///         be initialized nearer the slippage floor, where the budget buys
+    ///         an order of magnitude more calls for the same 18% ceiling.
+    ///
     ///         Exhaustion is not a brick: `settle()` never consults this meter,
-    ///         so the exit path stays open.
-    uint256 public constant MAX_CUMULATIVE_DECAY_BPS = 5_000;
+    ///         so the exit path stays open, and 18% still wants the
+    ///         `strategyDuration` and adapter allowlist doing their share.
+    uint256 public constant MAX_CUMULATIVE_DECAY_BPS = 2_000;
 
     // ── Storage (per-clone) ──
 
