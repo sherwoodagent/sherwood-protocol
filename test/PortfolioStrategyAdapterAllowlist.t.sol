@@ -175,9 +175,13 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
     }
 
     /// @dev Same single-token push-mode basket as `_initData`, but with a
-    ///      caller-supplied feed address — needed for the rebalanceDelta
-    ///      happy-path test, which (unlike `_initData`'s tsla-as-its-own-feed
-    ///      shortcut) actually calls `latestRoundData()` on the feed.
+    ///      caller-supplied feed address — needed by any test whose strategy
+    ///      reaches `latestRoundData()` on the feed, whether via
+    ///      `rebalanceDelta`'s `_verifyPrice` or via `settle()`/`rebalance()`'s
+    ///      `_sellFloor` -> `_pushFeedPrice` (Finding #10). `_initData`'s
+    ///      tsla-as-its-own-feed shortcut only works for tests that never
+    ///      reach either path, since `tsla` (`ERC20Mock`) has no
+    ///      `latestRoundData()`.
     function _initDataWithFeed(uint256 maxSlippageBps_, address feed) internal view returns (bytes memory) {
         address[] memory tokens = new address[](1);
         tokens[0] = address(tsla);
@@ -215,14 +219,31 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
     ///      `test_demotionAfterInit_doesNotBrickSettle`, so settle's
     ///      deliberate no-recheck and rebalance's new recheck are exercised
     ///      against the same kind of registry. `rebalance()` never calls
-    ///      `_verifyPrice`, so the tsla-as-its-own-feed shortcut in
-    ///      `_initData` is fine here.
+    ///      `_verifyPrice`, but its sell leg does reach `_pushFeedPrice` via
+    ///      `_sellFloor` (Finding #10), which needs a feed that actually
+    ///      implements `latestRoundData()` — hence the real
+    ///      `AllowlistMockAggregator` below rather than `_initData`'s
+    ///      tsla-as-its-own-feed shortcut.
     function _initAndExecuteWithResolvedRegistry(uint256 initSlippageBps)
         internal
         returns (PortfolioStrategy strategy, MockTierRegistry registry, MockVaultWithGovernor vault)
     {
         registry = new MockTierRegistry();
         registry.setAllowed(address(adapter), true);
+
+        // NOT `_initData`'s tsla-as-its-own-feed shortcut: `rebalance()`'s
+        // sell leg reaches `_sellFloor` -> `_pushFeedPrice`, which calls
+        // `latestRoundData()` on the push-mode feed (Finding #10's
+        // oracle-anchored sell floor, added after this fixture and its
+        // doc comment were written). `tsla` is a plain `ERC20Mock` with no
+        // `latestRoundData()`, so a strategy built with `_initData` reverts
+        // with no return data the moment `rebalance()`/`settle()` tries to
+        // sell it — a real `AllowlistMockAggregator` is needed here, the
+        // same as `_initAndExecuteWithResolvedRegistryAndAggregator` already
+        // uses for the `rebalanceDelta` happy path.
+        AllowlistMockAggregator feed = new AllowlistMockAggregator(18, int256(1e18), block.timestamp);
+        registry.setAllowed(address(feed), true);
+
         MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
         vault = new MockVaultWithGovernor(address(governor));
 
@@ -236,7 +257,7 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         adapter.setRate(address(weth), address(tsla), 1e18);
         adapter.setRate(address(tsla), address(weth), 1e18);
 
-        strategy.initialize(address(vault), proposer, _initData(initSlippageBps));
+        strategy.initialize(address(vault), proposer, _initDataWithFeed(initSlippageBps, address(feed)));
 
         vm.prank(address(vault));
         strategy.execute();
@@ -260,6 +281,11 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         vault = new MockVaultWithGovernor(address(governor));
 
         feed = new AllowlistMockAggregator(18, int256(1e18), block.timestamp);
+        // Issue #147's price-source binding (audit-181 Finding #5a): the
+        // caller-supplied feed must be allowlisted too, exactly like the
+        // adapter, or `initialize` reverts `PriceSourceNotAllowed` before the
+        // adapter allowlist re-check is ever exercised.
+        registry.setAllowed(address(feed), true);
 
         strategy = _clone();
         weth.mint(address(vault), TOTAL_AMOUNT);
@@ -295,6 +321,11 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
     function test_allowlistedAdapter_accepted() public {
         MockTierRegistry registry = new MockTierRegistry();
         registry.setAllowed(address(adapter), true);
+        // `_initData` reuses `tsla` as its own push-mode feed (see the helper's
+        // doc comment) — issue #147's price-source binding (audit-181 Finding
+        // #5a) requires that address to be allowlisted too, exactly like the
+        // adapter.
+        registry.setAllowed(address(tsla), true);
         MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
         MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
 
@@ -472,6 +503,18 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
     function test_demotionAfterInit_doesNotBrickSettle() public {
         MockTierRegistry registry = new MockTierRegistry();
         registry.setAllowed(address(adapter), true);
+
+        // NOT `_initData`'s tsla-as-its-own-feed shortcut: `settle()` reaches
+        // `_sellFloor` -> `_pushFeedPrice`, which calls `latestRoundData()`
+        // on the push-mode feed (Finding #10's oracle-anchored sell floor,
+        // added after this test and its price-source-binding comment were
+        // written). `tsla` is a plain `ERC20Mock` with no `latestRoundData()`,
+        // so it reverts with no return data the moment `settle()` tries to
+        // sell it — a real `AllowlistMockAggregator` is needed here instead,
+        // allowlisted exactly like the adapter.
+        AllowlistMockAggregator feed = new AllowlistMockAggregator(18, int256(1e18), block.timestamp);
+        registry.setAllowed(address(feed), true);
+
         MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
         MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
 
@@ -485,17 +528,19 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         adapter.setRate(address(weth), address(tsla), 1e18);
         adapter.setRate(address(tsla), address(weth), 1e18);
 
-        strategy.initialize(address(vault), proposer, _initData(SLIPPAGE_100));
+        strategy.initialize(address(vault), proposer, _initDataWithFeed(SLIPPAGE_100, address(feed)));
 
         vm.prank(address(vault));
         strategy.execute();
         assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed));
 
         // Demotion clears the allowlist entry for the adapter this strategy
-        // is already bound to.
+        // is already bound to. The price source stays allowlisted — this
+        // test is about the adapter demotion not bricking settle, not about
+        // the price-source binding.
         registry.setAllowed(address(adapter), false);
 
-        // settle() reads no allowlist — it must still complete.
+        // settle() reads no adapter allowlist — it must still complete.
         vm.prank(address(vault));
         strategy.settle();
         assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));

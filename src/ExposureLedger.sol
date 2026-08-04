@@ -1116,21 +1116,20 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         emit ExposureRecorded(guardian, key, share, epoch);
     }
 
-    /// @inheritdoc IExposureLedger
-    /// @dev Vote-change Approve→Block (or any registry-side unwind). Releases
-    ///      exactly what was committed, from the bucket it was committed into.
-    ///      No-op when nothing is recorded — never underflows. The address is
-    ///      SWAP-AND-POPPED out of `_approversOf`, so the list is bounded by the
-    ///      cohort of currently-active approvers rather than growing with every
-    ///      guardian that ever approved — that loop runs on the execute path.
-    function releaseApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
-        bytes32 key = _reviewKey(governor, proposalId);
-        // A live challenge pins this coverage (§3.4): the guardian may not
-        // release it and recycle the budget while under challenge.
-        if (_frozen[key]) revert CoverageFrozen();
-        uint256 reserved = _reservedUsd[key][guardian];
-        if (reserved == 0) return;
-        RecordedExposure memory r = _recorded[key][guardian];
+    /// @dev SHARED UNWIND, used by both `releaseApproval` and `retireApproval`
+    ///      (audit #181 finding 11) so the two paths — vote-change unwind and
+    ///      post-window sweep — can never drift apart. Clears the booking and
+    ///      the pledge, unwinds both bucket/committed counters and both
+    ///      shared-stake accumulators, and swap-and-pops the guardian out of
+    ///      the approver list.
+    ///
+    ///      PRECONDITION, NOT ENFORCED HERE: callers must already hold
+    ///      `reserved = _reservedUsd[key][guardian]` and
+    ///      `r = _recorded[key][guardian]` from BEFORE this call — freeze,
+    ///      pin, and window checks are each caller's own responsibility, since
+    ///      the two callers gate on different conditions (a live review vs. an
+    ///      elapsed challenge window).
+    function _unwindApproval(bytes32 key, address guardian, RecordedExposure memory r, uint256 reserved) internal {
         delete _recorded[key][guardian];
         delete _reservedUsd[key][guardian];
         // The BUCKET releases the live booking, `_committedUsd` releases the
@@ -1162,8 +1161,89 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             list.pop();
             delete _approverIndex[key][guardian];
         }
+    }
 
+    /// @inheritdoc IExposureLedger
+    /// @dev Vote-change Approve→Block (or any registry-side unwind). Releases
+    ///      exactly what was committed, from the bucket it was committed into.
+    ///      No-op when nothing is recorded — never underflows. The address is
+    ///      SWAP-AND-POPPED out of `_approversOf`, so the list is bounded by the
+    ///      cohort of currently-active approvers rather than growing with every
+    ///      guardian that ever approved — that loop runs on the execute path.
+    function releaseApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
+        bytes32 key = _reviewKey(governor, proposalId);
+        // A live challenge pins this coverage (§3.4): the guardian may not
+        // release it and recycle the budget while under challenge.
+        if (_frozen[key]) revert CoverageFrozen();
+        uint256 reserved = _reservedUsd[key][guardian];
+        if (reserved == 0) return;
+        RecordedExposure memory r = _recorded[key][guardian];
+        _unwindApproval(key, guardian, r, reserved);
         emit ExposureReleased(guardian, key, r.usd, r.epoch);
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev PERMISSIONLESS RETIREMENT OF A DEAD COMMITMENT (audit #181,
+    ///      finding 11). `_liveBookedUsd`/`_livePledgedUsd` — the shared-stake
+    ///      denominators `_sharedSlashableUsd` divides by — are strictly
+    ///      monotone increasing except for two decrement sites:
+    ///      `releaseApproval` and `_rebook`'s downward branch (which moves
+    ///      `_liveBookedUsd` only, and only down to a pro-rata allocation,
+    ///      never to zero on its own). `releaseApproval` has exactly ONE
+    ///      caller in the system — `GuardianRegistry.voteOnProposal`'s
+    ///      Approve→Block branch, gated on `block.timestamp < reviewEnd` — so
+    ///      once a review closes there is NO release path left at all.
+    ///      Meanwhile `openExposureUsd` (the batching-cap denominator) DOES
+    ///      decay on wall clock. The result: a guardian's share of its own
+    ///      live bond decays as ~1/N in the number of proposals it has EVER
+    ///      approved, even though every commitment older than its challenge
+    ///      window carries no collectable liability at all
+    ///      (`ChallengeGame.file` reverts `WindowClosed` past the window) —
+    ///      the denominator sums dead commitments nothing can slash.
+    ///
+    ///      This is the missing release path for exactly that state. Anyone
+    ///      may sweep a key/guardian pair once it is provably inert:
+    ///        - `!_frozen[key]` — a live challenge still pins this coverage,
+    ///          identically to `releaseApproval`'s own guard;
+    ///        - `_pinnedCoverageUntil[guardian] <= block.timestamp` — no
+    ///          `pinCoverageUntil` extension (issue #95) is still in effect;
+    ///        - `block.timestamp` is past the SAME expiry
+    ///          `openExposureUsd` itself uses for this booked epoch:
+    ///          `epochGenesis + (r.epoch + 1) * epochLength + challengeWindow`.
+    ///      It then performs `releaseApproval`'s EXACT unwind
+    ///      (`_unwindApproval`), so the two can never diverge.
+    ///
+    ///      GATED ON `reserved != 0` (`_reservedUsd[key][guardian]`), NOT ON
+    ///      `_recorded[key][guardian].usd != 0` — deliberately, diverging
+    ///      from a literal "nothing to retire when the booking reads zero".
+    ///      `_rebook` (via `settleCoverage`) can write a guardian's BOOKING
+    ///      down to zero — its own slashable bond fell, so `_allocate` scaled
+    ///      its share to nothing — while leaving its PLEDGE and its listing
+    ///      in `_approversOf` completely untouched; `_rebook` never writes
+    ///      `_reservedUsd` or the approver list. Gating on the booking would
+    ///      make exactly that guardian permanently un-retirable, leaving
+    ///      `_livePledgedUsd` — the accumulator this function exists to
+    ///      unstick — stuck forever for the guardians most likely to need it
+    ///      released. `reserved != 0` is `releaseApproval`'s own no-op test
+    ///      and is correct here for the identical reason.
+    function retireApproval(address governor, uint256 proposalId, address guardian) external {
+        bytes32 key = _reviewKey(governor, proposalId);
+        uint256 reserved = _reservedUsd[key][guardian];
+        if (reserved == 0) return; // nothing to retire; mirrors releaseApproval's no-op
+        if (_frozen[key]) revert CoverageFrozen();
+        if (_pinnedCoverageUntil[guardian] > block.timestamp) revert CoveragePinnedActive();
+        RecordedExposure memory r = _recorded[key][guardian];
+        // Same expiry `openExposureUsd` uses for this exact bucket: bucket
+        // `r.epoch` counts until its challenge window elapses at
+        // `genesis + (r.epoch + 1) * L + W`. Re-derived rather than read —
+        // there is no separately-stored per-key expiry — and keyed on the
+        // BOOKED epoch (`r.epoch`), not `currentEpoch()`, because a
+        // long-duration strategy books into a future epoch (`_coverageEpoch`).
+        if (block.timestamp <= epochGenesis + (uint256(r.epoch) + 1) * epochLength + challengeWindow) {
+            revert ChallengeWindowOpen();
+        }
+        _unwindApproval(key, guardian, r, reserved);
+        emit ExposureRetired(guardian, key, r.usd, reserved, r.epoch);
     }
 
     /// @inheritdoc IExposureLedger
@@ -1437,9 +1517,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      the dev-note on `_sharedSlashableUsd`. `_sharedSlashableUsd`
     ///      already clamps its return to `reserved`, so the old manual
     ///      `live < reserved ? live : reserved` becomes redundant and is
-    ///      dropped. `anchor = 0` (live) is unchanged and still correct for
-    ///      the reason stated above — this fix only closes the missing
-    ///      sharing, not the anchor basis, which was never in question.
+    ///      dropped.
+    ///
+    ///      SUPERSEDED (audit #181 finding 4): `anchor = 0` (live) was NOT
+    ///      correct, contrary to what this note previously said. See the
+    ///      inline comment inside the loop below — the gate now anchors at
+    ///      `block.timestamp` so a same-block stake top-up cannot pass this
+    ///      gate on collateral the matching conviction (anchored at
+    ///      `openedAt - 1` via `swood.slashableStakeAt`) can never reach.
     function requireApproveQuorum(address governor, uint256 proposalId, address asset, uint256 requiredCoverage)
         external
         view
@@ -1466,15 +1551,26 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             address g = approvers[i];
             uint256 reserved = _recorded[key][g].usd;
             if (reserved == 0) continue; // released via a vote change
-            // LIVE (anchor = 0), DELIBERATELY — see the invariant note on
-            // `SyndicateGovernor.executeProposal`'s `executedAt` stamp: this
-            // gate runs in the same transaction, immediately after the
-            // stamp, so the live read here is provably equal to the
-            // anchored read every OTHER post-execution consumer takes.
+            // ANCHORED AT `block.timestamp`, NOT LIVE (audit #181 finding 4).
+            // The old justification here — "this gate runs in the same
+            // transaction as the executedAt stamp, so live == anchored" — was
+            // wrong: `anchor = 0` reads live `guardianStake` directly, while
+            // every conviction values the SAME guardian through
+            // `swood.slashableStakeAt(g, c.executedAt)`, which resolves to
+            // `_slashableAt(g, openedAt - 1)`. `Checkpoints.upperLookupRecent`
+            // is INCLUSIVE of `key == anchor`, so a same-block top-up staked
+            // at `block.timestamp == executedAt` was COUNTED by the live read
+            // here and EXCLUDED by the verdict's `anchor - 1` lookup — the
+            // gate could certify coverage a conviction could never collect.
+            // Passing `block.timestamp` routes this through
+            // `swood.slashableStakeAt(g, block.timestamp)`, i.e.
+            // `_slashableAt(g, block.timestamp - 1)` — the same instant the
+            // verdict will anchor at once this proposal executes this block —
+            // so a same-block top-up is excluded on both sides identically.
             //
             // SHARED, NOT MERELY LIVE (Pashov re-audit of #158, finding 1) —
             // see the `@dev` block above this function.
-            haveUsd += _sharedSlashableUsd(g, reserved, priceX8, 0, _liveBookedUsd[g]);
+            haveUsd += _sharedSlashableUsd(g, reserved, priceX8, block.timestamp, _liveBookedUsd[g]);
             if (haveUsd >= requiredCoverageUsd) return (haveUsd, requiredCoverageUsd); // early exit; surplus may be clamped
         }
         // The loop early-returns on full coverage — reaching here means the

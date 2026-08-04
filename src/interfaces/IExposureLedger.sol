@@ -36,6 +36,17 @@ interface IExposureLedger {
     error NotCoverageFreezer();
     error CoverageFrozen();
 
+    /// @notice `retireApproval` called on a guardian still within an active
+    ///         `pinCoverageUntil` deadline (issue #95) — a re-armable
+    ///         challenge may still legally reach this commitment, so the
+    ///         sweep is refused until the pin decays on its own.
+    error CoveragePinnedActive();
+
+    /// @notice `retireApproval` called before the booked epoch's challenge
+    ///         window has elapsed — the same expiry `openExposureUsd` itself
+    ///         uses. Retire only what is provably past challengeability.
+    error ChallengeWindowOpen();
+
     /// @notice No source could price WOOD: the Chainlink WOOD feed is unwired
     ///         or degraded AND the TWAP oracle is unwired or unavailable — or
     ///         the price CAP `woodUsdPriceX8` is zero.
@@ -70,6 +81,14 @@ interface IExposureLedger {
     event AssetFeedSet(address indexed asset, address feed, uint256 maxDelay, uint8 assetDecimals);
     event ExposureRecorded(address indexed guardian, bytes32 indexed reviewKey, uint256 usd, uint256 epoch);
     event ExposureReleased(address indexed guardian, bytes32 indexed reviewKey, uint256 usd, uint256 epoch);
+    /// @notice A dead commitment was swept by `retireApproval` (audit #181
+    ///         finding 11) — booked coverage that was past its challenge
+    ///         window, unfrozen, and unpinned, released from both
+    ///         shared-stake accumulators the same way `ExposureReleased`
+    ///         releases a vote-change unwind.
+    event ExposureRetired(
+        address indexed guardian, bytes32 indexed reviewKey, uint256 usd, uint256 reservedUsd, uint256 epoch
+    );
     event ParameterChangeFinalized(bytes32 indexed paramKey, uint256 oldValue, uint256 newValue);
     event CoverageFreezerSet(address indexed oldFreezer, address indexed newFreezer);
     event CoverageFrozenSet(address indexed governor, uint256 indexed proposalId, bool frozen);
@@ -80,6 +99,37 @@ interface IExposureLedger {
     // ── Registry-only mutations ──
     function recordApproval(address governor, uint256 proposalId, address guardian) external;
     function releaseApproval(address governor, uint256 proposalId, address guardian) external;
+
+    /// @notice Permissionless sweep of a dead commitment (audit #181, finding
+    ///         11): once a key's booked epoch is past its challenge window,
+    ///         `!isCoverageFrozen(governor, proposalId)`, and `guardian` is
+    ///         not within an active `pinCoverageUntil` deadline, anyone may
+    ///         retire it — the same unwind `releaseApproval` performs on a
+    ///         vote-change, released here instead because no vote-change will
+    ///         ever come.
+    /// @dev    WHY THIS EXISTS: `releaseApproval` has exactly one caller —
+    ///         `GuardianRegistry.voteOnProposal`'s Approve→Block branch,
+    ///         gated on the review still being open — so a commitment that
+    ///         survives its own review has NO release path at all today.
+    ///         `_liveBookedUsd`/`_livePledgedUsd`, the shared-stake
+    ///         denominators every `_sharedSlashableUsd` caller divides by,
+    ///         are otherwise monotone non-decreasing across a guardian's
+    ///         entire history of approvals, while `openExposureUsd` (the
+    ///         batching-cap denominator) decays every challenge window. Left
+    ///         unswept, a guardian's share of its own bond decays as ~1/N in
+    ///         the number of proposals it has EVER approved, N counting
+    ///         proposals whose challenge window has long closed and which
+    ///         therefore carry no collectable liability
+    ///         (`ChallengeGame.file` reverts `WindowClosed` past the
+    ///         window).
+    ///
+    ///         PERMISSIONLESS AND SAFE TO SKIP, like `settleCoverage`: if
+    ///         nobody calls it a dead commitment keeps diluting the
+    ///         guardian's shared-stake share (conservative — quorums get
+    ///         harder to clear, never easier), but nothing is ever unsafe to
+    ///         call it early or often, since the preconditions themselves
+    ///         gate correctness.
+    function retireApproval(address governor, uint256 proposalId, address guardian) external;
 
     // ── Governor-consumed checks (view) ──
     function requireWithinCoveredTvlCap(address asset, uint256 requiredCoverage) external view;

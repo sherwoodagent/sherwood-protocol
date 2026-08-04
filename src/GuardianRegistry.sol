@@ -49,6 +49,25 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     uint256 public constant MAX_REFUND_PER_EPOCH_BPS = 2000;
     uint256 public constant DEADMAN_UNPAUSE_DELAY = 7 days;
     uint256 public constant MAX_CALLS_PER_PROPOSAL = 64;
+    /// @notice How far BEFORE the review-open instant (`ts1`) the
+    ///         block-quorum denominator's electorate base is cross-checked.
+    ///         The base fed to `openReview`/`openEmergency` is the SMALLER of
+    ///         the electorate at `ts1` and the electorate this long before
+    ///         it, so stake younger than this cannot inflate the denominator
+    ///         a proposal's block vote is measured against.
+    /// @dev Mirrors `TokenCourt.FLOOR_LOOKBACK` and `TokenCourt
+    ///      ._participationFloor`'s lookback-min construction (including its
+    ///      `earlier == 0` bootstrap fallback) — read that function first if
+    ///      touching this. Without this floor, `StakedWood.stakeAsGuardian`
+    ///      has no cap/allowlist gate, so anyone can park fresh, never-voting
+    ///      stake just before `openReview`/`openEmergency` to inflate the
+    ///      block-quorum denominator and raise the absolute vote weight an
+    ///      honest cohort must clear to block a proposal (or, at
+    ///      `openEmergency`, to clear to block its own emergency settle).
+    ///      A `constant` for the same reason `TokenCourt.FLOOR_LOOKBACK` is:
+    ///      an owner-tunable lookback could be shrunk to zero immediately
+    ///      before the attack it exists to close.
+    uint256 public constant FLOOR_LOOKBACK = 30 days;
 
     // ── Parameter keys (used as event topic discriminators) ──
     bytes32 public constant PARAM_REVIEW_PERIOD = keccak256("reviewPeriod");
@@ -97,7 +116,17 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         uint128 blockStakeWeight;
         bool resolved;
         bool blocked;
-        uint8 nonce; // bumped on open/cancel so prior block votes go stale
+        /// @dev Legacy round marker, bumped on open/cancel. NO LONGER the key
+        ///      `_emergencyBlockVotes` is keyed on (see `round` below) —
+        ///      a `uint8` bumped twice per open/cancel cycle wraps after 128
+        ///      cycles and would silently recur onto a round whose block-vote
+        ///      flags were never cleared, permanently `AlreadyVoted`-locking
+        ///      any guardian who blocked that earlier round while
+        ///      `blockStakeWeight` itself restarted at 0 (finding #25). Kept
+        ///      only as an informational counter for off-chain readers;
+        ///      changing its width would reshuffle every field below it
+        ///      within this struct's packed storage, so it stays `uint8`.
+        uint8 nonce;
         uint64 openedAt; // timestamp for checkpoint lookup of vote weight
         bool cohortTooSmall;
         /// @dev Snapshot of the block-quorum threshold at `openEmergency` so
@@ -108,12 +137,29 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         ///      to resolve the vault from `vaultOf[governor]` for the owner-bond
         ///      slash.
         address governor;
+        /// @dev The LOAD-BEARING round marker: `_emergencyBlockVotes` is keyed
+        ///      on this, not on `nonce`. Incremented in-place (`er.round++`)
+        ///      at both `openEmergency` and `cancelEmergency`, exactly where
+        ///      `nonce` used to be bumped — the only difference is the width.
+        ///      `uint256` cannot wrap in any realistic number of open/cancel
+        ///      cycles, so a round value can never recur for this key,
+        ///      closing the finding-#25 wrap without touching the packed
+        ///      layout of the fields declared before it (`round` is a NEW
+        ///      field appended at the very end of the struct, so existing
+        ///      entries — which read it as the default zero — are
+        ///      unaffected, and no top-level contract storage slot is added
+        ///      either: this stays entirely inside the struct that already
+        ///      lives inside the `_emergencyReviews` mapping).
+        uint256 round;
     }
 
     mapping(bytes32 => EmergencyReview) internal _emergencyReviews;
-    // keyed by (bytes32 key, nonce, guardian) so cancelling + re-opening starts a
-    // fresh round; prior-round votes are invisible to the new nonce.
-    mapping(bytes32 => mapping(uint8 => mapping(address => bool))) internal _emergencyBlockVotes;
+    // Keyed by (bytes32 key, round, guardian) so cancelling + re-opening
+    // starts a fresh round; prior-round votes are invisible to the new round.
+    // `round` is `EmergencyReview.round` — a per-key counter that is bumped,
+    // never reset, and wide enough to never recur (#25), unlike the old
+    // per-key `nonce` it replaces here.
+    mapping(bytes32 => mapping(uint256 => mapping(address => bool))) internal _emergencyBlockVotes;
 
     /// @dev Emergency call array — stored by governor via `openEmergency`,
     ///      returned on `finalizeEmergency`, cleared on cancel/finalize.
@@ -304,6 +350,26 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     function _isBlocked(Review storage r) private view returns (bool) {
         uint256 denom = uint256(r.totalStakeAtOpen);
         return uint256(r.blockStakeWeight) * 10_000 >= uint256(r.blockQuorumBpsAtOpen) * denom;
+    }
+
+    /// @dev Shared lookback-min total-vote read for `openReview` and
+    ///      `openEmergency`'s block-quorum denominator. Returns the SMALLER
+    ///      of the electorate at `ts1` and the electorate `FLOOR_LOOKBACK`
+    ///      before it, falling back to the bare `ts1` read when there is no
+    ///      earlier checkpoint at all (`earlier == 0` — the chain's first
+    ///      `FLOOR_LOOKBACK`, where falling back to zero would disable the
+    ///      block-quorum floor outright rather than merely bootstrap it).
+    ///      Mirrors `TokenCourt._participationFloor`'s construction
+    ///      (including that same fallback) — see `FLOOR_LOOKBACK`'s natspec
+    ///      and `_participationFloor`'s @dev blocks for the full rationale.
+    ///      Simpler than the court's version: there is no `accusedWeight` to
+    ///      subtract here, so this is a plain min of two raw
+    ///      `getPastTotalVotes` reads.
+    function _lookbackMinTotalVotes(IStakedWood sw, uint256 ts1) private view returns (uint256) {
+        uint256 total = sw.getPastTotalVotes(ts1);
+        uint256 lookbackTs = ts1 > FLOOR_LOOKBACK ? ts1 - FLOOR_LOOKBACK : 0;
+        uint256 earlier = sw.getPastTotalVotes(lookbackTs);
+        return (earlier != 0 && earlier < total) ? earlier : total;
     }
 
     // ── sWOOD passthrough views (lets GovernorEmergency read the owner bond via the registry) ──
@@ -578,10 +644,14 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (er.reviewEnd > 0 && block.timestamp < er.reviewEnd) revert EmergencyAlreadyOpen();
         // Snapshot stake totals at open and flag a cold-start cohort.
         // Denominator is read at `t-1`, matching the numerator's checkpoint
-        // anchor — symmetric flash-(de)stake defense.
+        // anchor — symmetric flash-(de)stake defense — AND is the
+        // lookback-min of the `t-1` and `t-1-FLOOR_LOOKBACK` reads, so a
+        // fresh, never-voting stake parked just before `openEmergency`
+        // cannot inflate the denominator the owner's own block vote is
+        // measured against (finding #8). See `_lookbackMinTotalVotes`.
         IStakedWood sw = swood;
         uint256 ts1 = block.timestamp - 1;
-        uint256 gs = sw.getPastTotalVotes(ts1);
+        uint256 gs = _lookbackMinTotalVotes(sw, ts1);
 
         er.governor = msg.sender; // stored before any external calls
         er.callsHash = callsHash;
@@ -598,7 +668,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         er.blockQuorumBpsAtOpen = uint16(blockQuorumBps);
         uint64 newReviewEnd = er.reviewEnd;
         unchecked {
-            er.nonce++;
+            er.nonce++; // legacy counter only, see struct @dev
+            // Mint a fresh round so `_emergencyBlockVotes` for THIS round is
+            // guaranteed unused — `uint256` cannot wrap here in practice.
+            er.round++;
         }
 
         _storeEmergencyCalls(eKey, calls);
@@ -643,7 +716,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         er.reviewEnd = uint64(block.timestamp + reviewPeriod);
         er.callsHash = bytes32(0);
         unchecked {
-            er.nonce++;
+            er.nonce++; // legacy counter only, see struct @dev
+            // Bump the round too so any block votes cast this round go
+            // stale — a future `openEmergency` on this key mints a new,
+            // never-before-used round (finding #25).
+            er.round++;
         }
         delete _emergencyCalls[eKey];
         emit EmergencyReviewCancelled(proposalId);
@@ -720,9 +797,15 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // Read denominator at the SAME `t-1` checkpoint that the numerator
         // (voter weight) lookup uses, so flash-stake in the same block as
         // openReview can't asymmetrically inflate the quorum denominator
-        // while the matching numerator weight stays at the t-1 snapshot.
+        // while the matching numerator weight stays at the t-1 snapshot. On
+        // top of that symmetric `t-1` read, take the lookback-min against
+        // `t-1-FLOOR_LOOKBACK`: `StakedWood.stakeAsGuardian` has no
+        // cap/allowlist gate, so without this a fresh, never-voting stake
+        // parked just before `openReview` could inflate the denominator and
+        // raise the absolute vote weight an honest cohort must clear to
+        // block the proposal (finding #8). See `_lookbackMinTotalVotes`.
         uint256 ts1 = block.timestamp - 1;
-        uint128 totalAtOpen = uint128(sw.getPastTotalVotes(ts1));
+        uint128 totalAtOpen = uint128(_lookbackMinTotalVotes(sw, ts1));
         uint256 combinedAtOpen = uint256(totalAtOpen);
         r.opened = true;
         r.totalStakeAtOpen = totalAtOpen;
@@ -925,13 +1008,13 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (er.resolved) revert ReviewNotOpen();
         if (er.reviewEnd == 0 || block.timestamp >= er.reviewEnd) revert ReviewNotOpen();
         if (!swood.isActiveGuardian(msg.sender)) revert NotActiveGuardian();
-        uint8 nonce = er.nonce;
-        if (_emergencyBlockVotes[eKey][nonce][msg.sender]) revert AlreadyVoted();
+        uint256 round = er.round;
+        if (_emergencyBlockVotes[eKey][round][msg.sender]) revert AlreadyVoted();
 
         uint256 weight256 = swood.getPastVotes(msg.sender, uint256(er.openedAt));
         if (weight256 == 0) revert NotActiveGuardian(); // no votable weight at open time
         uint128 weight = uint128(weight256);
-        _emergencyBlockVotes[eKey][nonce][msg.sender] = true;
+        _emergencyBlockVotes[eKey][round][msg.sender] = true;
         er.blockStakeWeight += weight;
 
         emit EmergencyBlockVoteCast(proposalId, msg.sender, weight);

@@ -29,6 +29,20 @@ contract MockSwood {
     function setStake(address g, uint256 own) external {
         guardianStake[g] = own;
     }
+
+    /// @dev Audit #181 finding 4: `requireApproveQuorum` now anchors at
+    ///      `block.timestamp` instead of `0` (live), so `_slashableBondUsd`
+    ///      calls this instead of reading `guardianStake` directly. This mock
+    ///      has no checkpoint history — `setStake` overwrites a flat value —
+    ///      and every test in this suite only ever sets a guardian's stake
+    ///      ONCE, well before the forward warp `_toApproved` applies ahead of
+    ///      `executeProposal`. There is no same-block top-up scenario in this
+    ///      file (that is `test/audit-181/ExposureLedger_anchorAndRetire.t.sol`'s
+    ///      job, with its own checkpoint-tracking `MockSwoodAnchored`), so
+    ///      collapsing every anchor to the live value is faithful here.
+    function slashableStakeAt(address g, uint256) external view returns (uint256) {
+        return guardianStake[g];
+    }
 }
 
 /// @dev Approver source for the approve-quorum check (spec §3.3a). The ledger

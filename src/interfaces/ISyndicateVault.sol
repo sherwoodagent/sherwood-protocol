@@ -39,6 +39,11 @@ interface ISyndicateVault {
     error WithdrawalQueueAlreadySet();
     error InsufficientShares();
     error RedemptionsNotLocked();
+    /// @notice `requestDeposit` was called with no non-terminal proposal open
+    ///         on the vault (`openProposalCount() == 0`) — the async path is
+    ///         only for entering while the instant `deposit`/`mint` path is
+    ///         closed by an open proposal; use those instead.
+    error NoOpenProposal();
     error QueueReserveBreached();
     error NotQueue();
     error ZeroAssets();

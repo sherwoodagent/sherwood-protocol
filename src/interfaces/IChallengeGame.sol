@@ -195,6 +195,28 @@ interface IChallengeGame {
         ///      reason: anything decoding `challengeOf()` positionally
         ///      keeps every existing tuple index.
         address proposerBondEscrow;
+        /// @dev The adjudicator wired when this challenge was FILED, pinned
+        ///      like every other `*AtFiling` term (issue #181 finding 2).
+        ///      `rule` still gates on the LIVE `court` — an adjudicator wired
+        ///      after filing can still rule, and a ruling always beats a
+        ///      timeout (see `ChallengeGame.rule`) — but `resolve`'s
+        ///      Disputed-timeout branch reads THIS pinned value instead of
+        ///      the live one to decide what an un-ruled timeout means:
+        ///      `address(0)` here means no adjudicator was ever GUARANTEED
+        ///      reachable for this dispute, so a `Guilty` ruling was never a
+        ///      real possibility the counter-bond pool's funders risked
+        ///      losing to. Left unpinned, `dispute`'s "an outside funder
+        ///      risks real capital" justification for accepting any funder
+        ///      collapses to false whenever the game is unwired, turning
+        ///      every dispute into a guaranteed forfeit funded entirely by
+        ///      the challenger. `resolve` routes that case to `_refundAll`
+        ///      instead of `_fail` — a non-verdict, not an acquittal.
+        ///
+        ///      Appended last, after `proposerBondEscrow`: this field did
+        ///      not exist when every earlier field claimed its position, so
+        ///      it is added at the end rather than inserted, for the same
+        ///      reason cited on every other field appended here.
+        address courtAtFiling;
     }
 
     // ── Errors ──
@@ -527,7 +549,11 @@ interface IChallengeGame {
     /// @notice Permissionless resolution. From `Filed` past `autoSlashDelay` the
     ///         silence is the verdict and the accused are slashed, their bonds
     ///         burned; from `Disputed` past `disputeTimeout` the challenge fails
-    ///         to the accused (D5). Reverts otherwise.
+    ///         to the accused (D5) — UNLESS no adjudicator was ever pinned at
+    ///         filing (`Challenge.courtAtFiling == address(0)`), in which case
+    ///         the timeout is a non-verdict and both sides unwind whole, the
+    ///         same as `rule`'s own `Inconclusive` (issue #181 finding 2). See
+    ///         `ChallengeGame.resolve`. Reverts otherwise.
     function resolve(uint256 challengeId) external;
 
     /// @notice The court's verdict on a DISPUTED challenge. Callable only

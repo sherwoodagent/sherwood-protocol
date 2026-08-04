@@ -179,6 +179,44 @@ contract CollaborativeProposalsTest is Test {
         );
     }
 
+    /// @dev Create a collaborative proposal with lead (40%) + THREE co-props
+    ///      (20% each) — `_createCollabProposal()` only ever has two, which
+    ///      makes a single approval already "all but one" under
+    ///      `_requireNotNearQuorum`'s `total == 2` case. A third co-proposer
+    ///      is what lets a partial-approval test land NOT near quorum (see
+    ///      `test_rejection_byLead_notNearQuorum_stillCancels`).
+    function _createThreeCoProposerCollabProposal() internal returns (uint256 proposalId) {
+        address co3 = makeAddr("co3");
+        // startPrank, not prank: `agentRegistry.mint(co3)` sits in argument
+        // position and is evaluated FIRST, so a one-shot `vm.prank` would be
+        // consumed by the mint and `registerAgent` would run unpranked.
+        // Mirrors the multi-agent registration at the bottom of this file.
+        vm.startPrank(owner);
+        vault.registerAgent(agentRegistry.mint(co3), co3);
+        vm.stopPrank();
+
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](3);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent1, splitBps: 2000});
+        coProps[1] = ISyndicateGovernor.CoProposer({agent: coAgent2, splitBps: 2000});
+        coProps[2] = ISyndicateGovernor.CoProposer({agent: co3, splitBps: 2000});
+
+        vm.prank(owner);
+        vault.setAgentFeeBps(1500);
+        vm.prank(leadAgent);
+        proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://collab3",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps
+        );
+    }
+
     /// @dev Create collab proposal, get all approvals, advance to Pending
     function _createApprovedCollabProposal() internal returns (uint256 proposalId) {
         proposalId = _createCollabProposal();
@@ -361,8 +399,48 @@ contract CollaborativeProposalsTest is Test {
         assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Cancelled));
     }
 
-    function test_rejection_byLead_afterPartialApproval_cancels() public {
+    /// @notice Audit issue #181 finding #16: `rejectCollaboration` performs the
+    ///         IDENTICAL Draft -> Cancelled transition, by the SAME actor
+    ///         (`proposal.proposer`), as `cancelProposal`'s Draft branch — but
+    ///         used to skip that branch's `_requireNotNearQuorum` guard
+    ///         entirely. `_createCollabProposal()` has exactly two
+    ///         co-proposers, so a SINGLE approval already leaves the Draft
+    ///         "all but one approved" (`_requireNotNearQuorum`'s `total == 2`
+    ///         case), which is exactly the front-run window the guard exists
+    ///         to close: without it, the lead could watch the final approval
+    ///         land in the mempool and race a `rejectCollaboration` in ahead
+    ///         of it, burning the last co-proposer's approve gas for nothing,
+    ///         at will and for free. Both entrypoints must refuse identically
+    ///         here, or a lead near quorum simply routes around whichever one
+    ///         still enforces the guard.
+    /// @dev Renamed from `test_rejection_byLead_afterPartialApproval_cancels`
+    ///      (issue #181 finding #16): the old name and body pinned the
+    ///      pre-fix behaviour — this same setup used to succeed and cancel
+    ///      the Draft. Post-fix it must revert. See
+    ///      `test_rejection_byLead_notNearQuorum_stillCancels` below for the
+    ///      companion case proving the guard is narrow, not a blanket ban on
+    ///      lead rejection.
+    function test_rejection_byLead_nearQuorum_reverts() public {
         uint256 proposalId = _createCollabProposal();
+        vm.prank(coAgent1);
+        governor.approveCollaboration(proposalId);
+        vm.prank(leadAgent);
+        vm.expectRevert(ISyndicateGovernor.CancelNotAllowedNearQuorum.selector);
+        governor.rejectCollaboration(proposalId);
+    }
+
+    /// @notice Companion to `test_rejection_byLead_nearQuorum_reverts`: the
+    ///         near-quorum guard is narrow, not a blanket ban on the lead ever
+    ///         declining a collaboration. With THREE co-proposers, one
+    ///         approval leaves two outstanding (`_requireNotNearQuorum`'s
+    ///         `approvedCount + 1 >= total` is `1 + 1 >= 3`, false), so the
+    ///         Draft is not one approval away from Pending and
+    ///         `rejectCollaboration` must still succeed exactly as it did
+    ///         before the fix. Without this case, the fix above would read as
+    ///         though the lead can never decline post-approval, which would be
+    ///         a real regression in coverage, not just a stricter guard.
+    function test_rejection_byLead_notNearQuorum_stillCancels() public {
+        uint256 proposalId = _createThreeCoProposerCollabProposal();
         vm.prank(coAgent1);
         governor.approveCollaboration(proposalId);
         vm.prank(leadAgent);

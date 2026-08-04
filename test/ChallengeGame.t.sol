@@ -937,7 +937,7 @@ contract ChallengeGameTest is Test {
     ///         because reading a live parameter let the owner change the deal
     ///         after the money was committed. The burn rates were left live on
     ///         the argument that they "price the refund rather than bound a
-    ///         window the accused is relying on" — but the challenger relied on
+    ///         window the accused is relying on" - but the challenger relied on
     ///         `settleBurnBps` when it decided to file, and it cannot withdraw.
     ///         Raising 0 -> 5,000 mid-window takes half the refund of a filing
     ///         that turned out to be correct.
@@ -1472,7 +1472,7 @@ contract ChallengeGameTest is Test {
     /// @notice 🟠F18: ANY ADDRESS MAY FUND THE DEFENCE.
     ///
     ///         This asserted the opposite until the payout became pull-based.
-    ///         The accused-only rule answered "who may BUY the escalation" —
+    ///         The accused-only rule answered "who may BUY the escalation" -
     ///         right — but with a POOL the same check also decided "who may help
     ///         FILL it", and a cohort short by a sliver could not be topped up
     ///         by anyone. The rule's other job was bounding the contributor
@@ -2381,16 +2381,66 @@ contract ChallengeGameTest is Test {
         game.resolve(id);
     }
 
-    /// @notice With no court wired, Plan D's timeout behaviour is unchanged — a
-    ///         disputed challenge still fails to the accused. This is what makes
-    ///         the court additive rather than a breaking change.
-    function test_noCourtWired_timeoutStillFailsToAccused() public {
+    /// @notice With no court wired, a disputed challenge that times out is a
+    ///         NON-VERDICT, not an acquittal (issue #181 finding 2): `rule` was
+    ///         never reachable for this challenge (`courtAtFiling ==
+    ///         address(0)`), so nothing about running out the clock says the
+    ///         accused was right. `resolve` now routes the timeout to
+    ///         `_refundAll` instead of `_fail` — both sides unwind whole
+    ///         rather than the pool forfeiting to the challenger. That is what
+    ///         makes the court ADDITIVE rather than a breaking change: wiring a
+    ///         court only narrows this path (a real verdict becomes reachable)
+    ///         instead of changing behaviour an unwired deployment already
+    ///         relied on.
+    /// @dev Renamed from `test_noCourtWired_timeoutStillFailsToAccused` (issue
+    ///      #181 finding 2). The old name and body pinned the bug this fix
+    ///      closes: a `Disputed` timeout with no adjudicator ever pinned used
+    ///      to route to `_fail`, forfeiting the challenger's whole bond to the
+    ///      pool. At the shipped `forfeitBurnBps` (20%) that paid the
+    ///      counter-bond funder a deterministic +80% on its own capital for
+    ///      doing nothing but funding the timer — zero risk, since `rule`
+    ///      could never be reached to convict it on a `Guilty` verdict. Both
+    ///      balances below must round-trip, not just the enum, or the
+    ///      arbitrage is still alive.
+    function test_noCourtWired_timeoutRefundsBothSides() public {
         vm.prank(owner);
         game.setCourt(address(0));
         uint256 id = _fileAndDispute();
+        IChallengeGame.Challenge memory before = game.challengeOf(id);
+        assertEq(before.inconclusiveBurnBpsAtFiling, 0, "fixture: first round on a fresh proposal is unescalated");
+
+        uint256 challengerBefore = wood.balanceOf(challenger);
+        uint256 guardianABefore = wood.balanceOf(guardianA);
+        uint256 stake = game.counterBondContributionOf(id, guardianA);
+        assertEq(stake, before.counterBondWood, "fixture: guardianA funded the whole pool alone");
+
         vm.warp(vm.getBlockTimestamp() + game.disputeTimeout() + 1);
         game.resolve(id);
-        assertEq(uint256(game.challengeOf(id).status), uint256(IChallengeGame.Status.Failed));
+
+        assertEq(
+            uint256(game.challengeOf(id).status),
+            uint256(IChallengeGame.Status.Inconclusive),
+            "a non-verdict, not a fail"
+        );
+        // The challenger's bond comes back whole (round 1 is unescalated, per
+        // the fixture assertion above) instead of forfeiting to the pool.
+        assertEq(wood.balanceOf(challenger) - challengerBefore, before.bondWood, "challenger bond returned whole");
+
+        // The counter-bond funder gets back exactly its own stake, no more.
+        // The pool is booked for pull-claims (`_bookRefund`), not pushed, so
+        // the balance doesn't move until `claimContribution` is called — and
+        // even then it is a wash, not the +80% the old `_fail` route paid for
+        // supplying zero-risk capital behind an unreachable `rule`.
+        assertEq(wood.balanceOf(guardianA), guardianABefore, "no push yet - pool is claimable, not paid out");
+        assertEq(game.claimableContribution(id, guardianA), stake, "claimable is exactly the stake, no profit");
+
+        vm.prank(guardianA);
+        game.claimContribution(id);
+        assertEq(
+            wood.balanceOf(guardianA) - guardianABefore, stake, "claimed exactly its stake - the arbitrage is dead"
+        );
+
+        _assertLiveBondsBacked();
     }
 
     /// @notice THE COUNTER-BOND FORFEITS TO THE CHALLENGER ON A GUILTY VERDICT.

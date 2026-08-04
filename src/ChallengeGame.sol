@@ -313,12 +313,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
     /// @notice The adjudicator for disputed challenges — the only address that
     ///         may `rule`.
-    /// @dev    The zero address leaves every disputed challenge to time out in
-    ///         favour of the accused: no caller can match it, so `rule` is
-    ///         unreachable. That makes the court additive and gives governance
+    /// @dev    The zero address leaves `rule` unreachable — no caller can match
+    ///         it — so a disputed challenge can only exit through the timeout
+    ///         in `resolve`. That makes the court additive and gives governance
     ///         an off-switch — unwire a captured court and fall back to the
-    ///         fail-safe timeout instead of being stuck with an adjudicator
-    ///         that can force slashes.
+    ///         timeout instead of being stuck with an adjudicator that can
+    ///         force slashes.
+    /// @dev    THE TIMEOUT'S OUTCOME DEPENDS ON `Challenge.courtAtFiling`, NOT
+    ///         ON THIS LIVE VALUE (issue #181 finding 2). A challenge filed
+    ///         while this was `address(0)` pins that onto itself, and its
+    ///         Disputed timeout unwinds through `_refundAll` — a non-verdict,
+    ///         not an acquittal — because a `Guilty` ruling was never a real
+    ///         possibility the counter-bond pool's funders could have lost to.
+    ///         Wiring or unwiring this address after a challenge is filed
+    ///         changes nothing about how that challenge's own timeout
+    ///         resolves — see `ChallengeGame.file`'s `courtAtFiling` pin and
+    ///         `ChallengeGame.resolve`.
     address public court;
 
     /// @notice The owner's only lever that gates NEW filings: true refuses
@@ -798,11 +808,54 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // stays in the same units as `unsharedLiabilityUsd`'s own numerator
         // and stays fresh with market stress rather than a manually-updated
         // scalar.
-        // Fails closed on both an unset price (transient, protocol-wide — wait
-        // for governance) and a bond that floors to zero (permanent,
-        // proposal-specific — no coverage or price change fixes it), named
-        // with separate selectors since the two are opposite failures.
-        uint256 priceX8 = exposureLedger.woodPriceX8();
+        //
+        // GUARDED, LIKE THE SIBLING READ ABOVE (issue #181 finding 12a).
+        // `woodPriceX8` now REVERTS `NoWoodPrice` rather than returning zero
+        // when neither the Chainlink feed nor the TWAP is live (ExposureLedger
+        // design revision 2) — `if (priceX8 == 0)` below was therefore DEAD
+        // CODE against an unguarded call: `_woodPrice` floors at 1 whenever it
+        // resolves a source at all, and a dead TWAP reverts instead of
+        // returning 0. Left unguarded, that revert propagated straight
+        // through `file`. On chain 4663 there is no WOOD/USD aggregator at
+        // all — the TWAP is the ONLY live source, and its ETH/USD leg has a
+        // ~10.7h heartbeat — and `challengeWindow` is pure wall clock,
+        // extended for nothing spent unpriceable: an outage spanning the
+        // remainder of the window turns a recoverable delay into PERMANENT
+        // immunity (the proposer reclaims its bond, every approver's
+        // coverage ages out unslashed), the same failure mode the sibling
+        // `unsharedLiabilityUsd` read above is already guarded against.
+        // Falling back to the governance cap (`woodUsdPriceX8`) keeps filing
+        // reachable: the cap is maintained ABOVE market (see
+        // `IExposureLedger.woodUsdPriceX8`), so pricing the bond off it
+        // UNDER-STATES `bondWood` for the same `coverageUsd` — conservative
+        // for the filer, never for the protocol. The guard below is live
+        // again on this branch: the cap itself can be zero
+        // (`IExposureLedger.woodUsdPriceX8` — "Zero means NoWoodPrice, not
+        // uncapped"), which is the one case left where no bond can be struck
+        // at all.
+        //
+        // NOT THE SAME MISUSE DESIGN REVISION 2 FORECLOSES. `_woodPrice`
+        // itself must never silently substitute the cap for a live market
+        // read when pricing the REAL money the ledger accounts for —
+        // coverage, allocations, quorum — because a stale cap standing in
+        // for the market fails in the dangerous direction exactly when there
+        // is nothing left to check it against. This call site differs in
+        // kind: it prices the CHALLENGER'S OWN anti-spam deposit, in THIS
+        // contract, with the divergence from `woodPriceX8`'s live-only
+        // reading spelled out here explicitly rather than the ledger doing
+        // it for every consumer silently.
+        //
+        // Fails closed on both an unpriceable bond (transient, protocol-wide
+        // — wait for governance to seed or raise the cap) and a bond that
+        // floors to zero (permanent, proposal-specific — no coverage or
+        // price change fixes it), named with separate selectors since the
+        // two are opposite failures.
+        uint256 priceX8;
+        try exposureLedger.woodPriceX8() returns (uint256 p) {
+            priceX8 = p;
+        } catch {
+            priceX8 = exposureLedger.woodUsdPriceX8();
+        }
         if (priceX8 == 0) revert WoodPriceUnset();
         uint256 bondWood = (((coverageUsd * challengerBondBps) / BPS_DENOMINATOR) * 1e8) / priceX8;
         if (bondWood == 0) revert BondTooSmall();
@@ -851,14 +904,43 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // round-4+ ceiling, whichever applies, clamped live to
             // `settleBurnBps`. Ordered last to match the struct's field order
             // — see `IChallengeGame.Challenge`.
-            inconclusiveBurnBpsAtFiling: _inconclusiveBurnBpsForRound(inconclusiveRounds[key]),
+            //
+            // `inconclusiveRounds[key]` ALONE UNDER-COUNTS (issue #181
+            // finding 12b): it only increments in `_refundAll`, at unwind, so
+            // every challenge filed BEFORE the first unwind reads it as
+            // zero. `_liveByChallenger` keys a fresh slot per challenger and
+            // `_liveCount` is uncapped, so an attacker filing N challenges
+            // from N addresses before any of them resolves pinned tier 0
+            // (free) on all N, defeating the schedule this comment
+            // describes. `_liveCount[key]` — read here BEFORE this filing's
+            // own increment below, so it counts only the OTHER challenges
+            // already live against this proposal — closes that gap: a
+            // concurrent pile-up escalates exactly like a sequential one,
+            // because this contract can no more tell the two apart than it
+            // can tell a grinder from a one-shot honest filer at any other
+            // tier.
+            inconclusiveBurnBpsAtFiling: _inconclusiveBurnBpsForRound(inconclusiveRounds[key] + _liveCount[key]),
             // The escrow holding this proposal's proposer bond, off the same
             // `getProposal` read `executedAt` and `vault` came from. Bound at
             // propose time and never re-pointed for an existing proposal, so
             // pinning it costs nothing: a verdict up to `disputeTimeout` later
             // confiscates from the escrow the bond was locked in, not whatever
             // the governor's live slot says today.
-            proposerBondEscrow: p.proposerBondEscrow
+            proposerBondEscrow: p.proposerBondEscrow,
+            // Pinned like every other `*AtFiling` term, for the same
+            // guarantee `dispute`'s "an outside funder risks real capital"
+            // reasoning depends on: `rule` is unreachable whenever `court`
+            // is unwired, so a Disputed challenge with no adjudicator
+            // AVAILABLE AT FILING can only ever exit through a timeout,
+            // never a ruling — collapsing the pool funder's supposed risk
+            // to zero and turning every dispute into a guaranteed forfeit
+            // funded by the challenger (issue #181 finding 2). `resolve`
+            // reads this pinned value, not the live `court`, so an owner
+            // wiring or unwiring the court after filing cannot
+            // retroactively change what this challenge's dispute was ever
+            // priced against — see `ChallengeGame.court` and
+            // `IChallengeGame.Challenge.courtAtFiling`.
+            courtAtFiling: court
         });
         _lastChallenge[key] = challengeId;
         _liveByChallenger[challengerKey] = challengeId;
@@ -925,6 +1007,20 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      funder risks real capital. This also lets a third party who
     ///      believes the accused innocent pay to force adjudication rather
     ///      than let an unproven silence verdict stand.
+    /// @dev THAT RISK IS REAL ONLY WHEN AN ADJUDICATOR WAS PINNED AT FILING
+    ///      (`Challenge.courtAtFiling != address(0)`) — a `Guilty` ruling is
+    ///      the only way the pool loses everything, and `rule` is unreachable
+    ///      with no court wired. Before `courtAtFiling` existed (issue #181
+    ///      finding 2), a challenge filed against an unwired game could only
+    ///      ever escalate into `Disputed` and then time out to `_fail`,
+    ///      making the pool's win unconditional — a risk-free ~+80% return
+    ///      (at the shipped `forfeitBurnBps`) funded entirely by the
+    ///      challenger's forfeited bond, so no rational party ever filed.
+    ///      `resolve` now routes an un-pinned timeout to `_refundAll`
+    ///      instead, restoring the real risk this paragraph describes:
+    ///      without a pinned adjudicator, funding the pool can only ever
+    ///      return the stake, never a share of a forfeit that no longer
+    ///      happens.
     /// @dev CEI: every storage write lands before the `transferFrom`, so the
     ///      token cannot observe or re-enter a half-updated pool.
     /// @dev Best-effort auto-referral, run LAST — after the transfer and both
@@ -1008,6 +1104,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      choose anything — the outcome is fixed by the state and the clock —
     ///      so making it open removes the last place a privileged party could
     ///      sit on a verdict.
+    /// @dev THE DISPUTED-TIMEOUT BRANCH IS TWO-WAY, NOT ONE (issue #181
+    ///      finding 2). A timeout with no adjudicator ever pinned at filing
+    ///      (`c.courtAtFiling == address(0)`) is a NON-VERDICT — `rule` was
+    ///      never reachable for this challenge, so nothing about running out
+    ///      the clock says the accused was right — and routes to
+    ///      `_refundAll`, exactly like a court's own `Inconclusive` ruling:
+    ///      both sides unwind whole and the re-challenge window re-arms. A
+    ///      challenge that DID have an adjudicator pinned still routes to
+    ///      `_fail` on timeout, unchanged: there, a ruling was genuinely
+    ///      possible and simply never landed.
     function resolve(uint256 challengeId) external {
         Challenge storage c = _challenges[challengeId];
         Status status = c.status;
@@ -1016,7 +1122,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             _settle(challengeId, c);
         } else if (status == Status.Disputed) {
             if (block.timestamp < c.filedAt + c.disputeTimeoutAtFiling) revert DelayNotElapsed();
-            _fail(challengeId, c);
+            if (c.courtAtFiling == address(0)) {
+                // No adjudicator was ever guaranteed reachable for this
+                // dispute — see `Challenge.courtAtFiling` and this
+                // function's own natspec above.
+                _refundAll(challengeId, c);
+            } else {
+                _fail(challengeId, c);
+            }
         } else {
             revert WrongStatus();
         }
@@ -1355,11 +1468,28 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      of — the bond returns to the challenger intact. `ChallengeFailed`
     ///      reports `(0, 0)` there.
     ///
-    ///      Accepted cost, scoped to an unwired game (`court == address(0)`):
-    ///      with no adjudicator, a genuinely guilty approver can still dispute
-    ///      and run out this clock — strictly better than an indefinite
-    ///      freeze, and once a court is wired `rule` beats the timeout and
-    ///      closes it.
+    ///      NO LONGER REACHED FROM A DISPUTE WITH NO ADJUDICATOR EVER PINNED
+    ///      AT FILING (issue #181 finding 2, fixed alongside `courtAtFiling`).
+    ///      `resolve` now diverts that specific Disputed timeout to
+    ///      `_refundAll` instead: with `rule` unreachable for the whole life
+    ///      of such a challenge, a `Guilty` ruling was never a real
+    ///      possibility, so treating the timeout as an acquittal made every
+    ///      dispute a guaranteed forfeit to the pool, funded entirely by the
+    ///      challenger — the non-verdict `_refundAll` gives is the correct
+    ///      treatment. This function is still reached by a Disputed timeout
+    ///      whenever `courtAtFiling != address(0)`: an adjudicator WAS
+    ///      pinned and genuinely never ruled — wired away before referral
+    ///      landed, a `refer` call that failed and was never retried, or a
+    ///      live vote that missed quorum without the court calling back
+    ///      `Inconclusive` — which is a real timeout, not a phantom one.
+    ///      Residual: an owner that unwires the court AFTER a challenge with
+    ///      `courtAtFiling != address(0)` was filed but BEFORE it is ruled
+    ///      reproduces the old shape for that one challenge (`rule` becomes
+    ///      unreachable, but the pin still points at the once-live court, so
+    ///      the timeout still lands here) — owner-only, not adversary-
+    ///      reachable, and the same class of residual risk already accepted
+    ///      elsewhere in this file (see `_requireWindowFits`'s own residual
+    ///      note).
     function _fail(uint256 challengeId, Challenge storage c) private {
         address governor = c.governor;
         uint256 proposalId = c.proposalId;
@@ -1519,8 +1649,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     }
 
     /// @dev The escalating schedule. `priorRounds` is how many times this
-    ///      proposal has already gone `Inconclusive`, so the round THIS filing
-    ///      is attempting is `priorRounds + 1`:
+    ///      proposal has already gone `Inconclusive`, PLUS how many OTHER
+    ///      challenges against it are live right now (see the call site in
+    ///      `file` and issue #181 finding 12b) — a concurrent pile-up prices
+    ///      identically to a sequential one, so the round THIS filing is
+    ///      attempting is `priorRounds + 1`:
     ///
     ///        priorRounds == 0  ->  attempt 1  ->  0 bps (free)
     ///        priorRounds == 1  ->  attempt 2  ->  `INCONCLUSIVE_BURN_ROUND2_BPS`
