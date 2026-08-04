@@ -1104,6 +1104,14 @@ contract CoverageEndToEndTest is Test {
         );
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(address(adapter), adapter.poke.selector);
+        // issue #166: certifying a (target, selector) prices it for tiering
+        // but does NOT make `target` batch-callable at all — that is the
+        // SEPARATE `isAdapterAllowed` allowlist `SyndicateVault._guardBatchCalls`
+        // PART 2a now enforces on every batch callee. `adapter` (`NoopAdapter`)
+        // is a benign, fund-neutral fixture, not an attacker probe — allowlist
+        // it or `executeProposal` below is refused with `DisallowedBatchCallee`
+        // before the bounded-tier coverage mechanics under test ever run.
+        tierRegistry.setAdapterAllowed(address(adapter), true);
 
         pid = _propose(govA, address(vaultA), agentA, _adapterCalls(), _adapterCalls());
         assertEq(govA.getProposal(pid).envelopeTier, 1, "certified tier 1");
