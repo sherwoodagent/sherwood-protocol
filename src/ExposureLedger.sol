@@ -60,12 +60,10 @@ interface IRegistryApproversMinimal {
 }
 
 /// @dev Narrow `ChallengeGame` read surface: just its own `challengeWindow`.
-///      `coverageFreezer` IS the game address (spec §3.4), and the game
-///      itself enforces `game.challengeWindow <= ledger.challengeWindow()` in
-///      three places (construction, `setExposureLedger`, and its own
-///      `setChallengeWindow`) — but none of those three re-fire when the
-///      LEDGER's window moves. Read by `setChallengeWindow` below to close
-///      that gap from this side (audit-181-critical-high, finding D).
+///      `coverageFreezer` IS the game address. The game enforces
+///      `game.challengeWindow <= ledger.challengeWindow()` at construction and
+///      in two setters, but none of those re-fire when the LEDGER's window
+///      moves — `setChallengeWindow` reads this to close that gap.
 interface IChallengeGameWindowMinimal {
     function challengeWindow() external view returns (uint256);
 }
@@ -73,92 +71,64 @@ interface IChallengeGameWindowMinimal {
 /**
  * @title ExposureLedger
  * @notice Dollar-denominated coverage accounting for the guardian
- *         economic-security model (spec §3.3, §3.3a, §3.7).
+ *         economic-security model.
  *
- *         `slashableBond(g)` (spec §3.3): ownStake(g) * priceHaircut. The
- *         guardian's own bond is the only slashable capital.
+ *         `slashableBond(g)` is `ownStake(g) * priceHaircut` — a guardian's own
+ *         bond is the only slashable capital.
  *
- *         Exposure is EPOCH-BUCKETED (spec §3.4a): an approval consumes the
- *         current epoch's bucket; open exposure = the sum of all buckets young
- *         enough that their challenge window has not elapsed. Guardian
- *         commitment per approval is therefore bounded at one epoch + challenge
- *         window regardless of strategy duration.
+ *         Exposure is EPOCH-BUCKETED: an approval consumes one bucket, and open
+ *         exposure is the sum of all buckets young enough that their challenge
+ *         window has not elapsed. Guardian commitment per approval is therefore
+ *         bounded at one epoch plus the challenge window, whatever the strategy
+ *         duration.
  *
- * @dev    WOOD IS PRICED BY THE MARKET, CAPPED BY GOVERNANCE (design revision
- *         2, 2026-08-02). `woodPriceX8()` resolves:
+ * @dev    WOOD IS PRICED BY THE MARKET, CAPPED BY GOVERNANCE. `woodPriceX8()`
+ *         resolves:
  *
  *             sourceX8 = feed fresh ? min(feedX8, woodUsdPriceX8)
  *                      : twap fresh ? min(twapX8, woodUsdPriceX8)
  *                      :              revert NoWoodPrice
  *             price    = haircut(sourceX8), floored at 1
  *
- *         `woodUsdPriceX8` is NEVER SERVED AS A PRICE. It is only ever a cap on
- *         whatever the market reports, so the market may LOWER a bond's value
- *         and never raise it, and lowering the cap is the emergency brake.
+ *         `woodUsdPriceX8` is NEVER SERVED AS A PRICE — only ever a cap, so the
+ *         market may LOWER a bond's value and never raise it, and lowering the
+ *         cap is the emergency brake. A maintained scalar serving AS the price
+ *         makes guardians look better collateralised than they are and clears
+ *         `requireApproveQuorum` on collateral that does not exist. Under the
+ *         cap-only model that drift is inert.
  *
- *         The earlier arrangement — a maintained scalar as the price, with a
- *         Chainlink feed superseding it — was inverted by the 2026-08-01 audit:
- *         a manually maintained number sitting above market makes guardians
- *         look better collateralised than they are and clears
- *         `requireApproveQuorum` on collateral that does not exist, silently
- *         and for as long as nobody notices. Under the cap-only model that
- *         drift is inert: a cap above market simply stops binding, and a cap
- *         below market only under-values bonds, which is the safe direction.
+ *         WHAT IT COSTS: there is no branch that keeps pricing when all market
+ *         data is gone, so `NoWoodPrice` is reachable in production. Halting
+ *         semantics are chosen per consumer — see `IExposureLedger.NoWoodPrice`.
+ *         In one line: votes still work, nothing new can be proposed, nothing
+ *         can execute.
  *
- *         WHAT IT COSTS: there is no longer a branch that keeps pricing when
- *         all market data is gone, so `NoWoodPrice` is reachable in production.
- *         That is deliberate and the halting semantics are chosen per consumer
- *         — see `IExposureLedger.NoWoodPrice`. In one line: votes still work,
- *         nothing new can be proposed, nothing can execute.
- *
- * @dev    ══ TRUST MODEL: THE OWNER IS UNRESTRICTED HERE, BY DESIGN ══
- *
- *         `setWoodUsdPrice` and `setWoodHaircutBps` impose NO rate limit and no
- *         per-call size ceiling. The owner may move either lever to any legal
- *         value, any number of times, within a single block.
- *
- *         THIS IS NOT AN OVERSIGHT AND IT IS NOT A REGRESSION TO FILE. Rate
- *         limiting is enforced OFF-CHAIN, by a Zodiac Delay/Roles module on the
- *         owner Safe (issue #89, owner decision 2026-08-02). Earlier revisions
- *         carried a 1-day interval plus a 2x-per-raise ceiling on the cap; both
- *         were removed together, because the interval was the only thing making
- *         the ceiling a rate limit — N calls in one multisig batch move the
- *         price 2^N — so keeping the ceiling alone would have advertised a
- *         protection its own subject can bypass.
- *
- *         The reason for moving it rather than fixing it: the interval gated
- *         BOTH directions, and after design revision 2 lowering the cap IS the
- *         emergency action. A self-limit on an already-trusted owner therefore
- *         cost crisis responsiveness — a routine morning adjustment spent the
- *         lever and left no brake that afternoon — for very little gain.
- *
- *         AUDITORS AND REVIEWERS: the control you are looking for is in the
- *         Safe's module configuration, which is invisible from this source. The
- *         requirement it must satisfy is an ASYMMETRIC delay — raises delayed,
- *         drops immediate — because a plain Delay module is symmetric and would
- *         relocate the problem rather than solve it. `DeployPlanB` asserts the
- *         owner is a contract rather than a bare EOA, which is the most this
- *         contract can check; the rest is a runbook obligation recorded in
+ * @dev    TRUST MODEL: THE OWNER IS UNRESTRICTED HERE, BY DESIGN.
+ *         `setWoodUsdPrice` and `setWoodHaircutBps` impose no rate limit and no
+ *         per-call size ceiling. Rate limiting is enforced OFF-CHAIN, by a
+ *         Zodiac Delay/Roles module on the owner Safe — the control a reviewer
+ *         is looking for is in the Safe's module configuration, invisible from
+ *         this source. It must implement an ASYMMETRIC delay (raises delayed,
+ *         drops immediate); a plain Delay module is symmetric and would relocate
+ *         the problem rather than solve it. `DeployPlanB` asserts the owner is a
+ *         contract rather than a bare EOA, which is the most this contract can
+ *         check; the rest is a runbook obligation in
  *         `openspec/specs/deployment-docs/spec.md`.
  */
 contract ExposureLedger is Ownable2Step, IExposureLedger {
     uint256 internal constant BPS_DENOMINATOR = 10_000;
 
-    /// @dev Mirrors `GovernorParameters.MAX_EXECUTION_WINDOW`. Duplicated as a
-    ///      constant rather than read across, because the ledger has no handle
-    ///      on any particular governor at `setChallengeWindow` time — the floor
-    ///      has to hold for EVERY governor the registry serves, so it is sized
-    ///      against the worst legal configuration rather than a live one. Keep
-    ///      in step if the governor's ceiling ever moves.
+    /// @dev Mirrors `GovernorParameters.MAX_EXECUTION_WINDOW`. Duplicated rather
+    ///      than read across: the ledger has no handle on any particular governor
+    ///      at `setChallengeWindow` time, so the floor is sized against the worst
+    ///      legal configuration. Keep in step if the governor's ceiling moves.
     uint256 internal constant MAX_GOVERNOR_EXECUTION_WINDOW = 7 days;
 
     /// @dev How far ahead of NOW a commitment may be dated. Expressed in TIME,
-    ///      not in epochs, on purpose: the bucket width is a tuning dial (see
-    ///      `MAX_SCAN_BUCKETS`), and an epoch-count horizon would silently
-    ///      shrink to nothing the moment someone narrowed the buckets — a 30d
-    ///      strategy would start reverting `CoverageHorizonExceeded` for no
-    ///      reason a reader could see. 60 days clears a 30d duration cap plus a
-    ///      7d execution window with room to spare.
+    ///      not epochs: the bucket width is a tuning dial, and an epoch-count
+    ///      horizon would silently shrink to nothing the moment someone narrowed
+    ///      the buckets. 60 days clears a 30d duration cap plus a 7d execution
+    ///      window with room to spare.
     uint256 internal constant MAX_COVERAGE_HORIZON = 60 days;
 
     /// @dev Hard ceiling on how many buckets `openExposureUsd` may walk, so the
@@ -172,20 +142,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     uint256 internal constant MIN_WOOD_HAIRCUT_BPS = 5_000;
 
     /// @dev Ceiling on a feed's reported `decimals()`, enforced at
-    ///      `setWoodFeed`/`setAssetFeed` for BOTH the WOOD feed and every
-    ///      vault-asset feed (audit #181 finding 22). Real Chainlink
-    ///      aggregators report 8 or 18; 18 leaves headroom for any legitimate
-    ///      configuration while staying far below 78 — the point at which
-    ///      `10 ** feedDecimals` overflows `uint256` and panics (0x11) inside
-    ///      `_feedPriceX8`'s and `coverageUsd`'s normalization. Before this
-    ///      bound, a feed reporting `feedDecimals >= 78` (attacker-controlled
-    ///      or simply misconfigured — `setWoodFeed`/`setAssetFeed` read it
-    ///      from the feed with no upper bound at all) took `_woodPrice` down
-    ///      with a panic instead of falling through to the TWAP, exactly the
-    ///      failure mode `_feedPriceX8`'s own natspec promises never happens.
-    ///      Bounding at WRITE time closes it for every reader in one place,
-    ///      rather than requiring each of `_feedPriceX8`/`coverageUsd` to
-    ///      separately defend an unbounded config.
+    ///      `setWoodFeed`/`setAssetFeed` for the WOOD feed and every vault-asset
+    ///      feed. Real Chainlink aggregators report 8 or 18; the bound stays far
+    ///      below 78, where `10 ** feedDecimals` overflows `uint256` and panics
+    ///      (0x11) inside `_feedPriceX8`'s and `coverageUsd`'s normalization —
+    ///      taking the whole price path down instead of falling through to the
+    ///      TWAP. Bounding at WRITE time closes it for every reader in one place.
     uint8 internal constant MAX_FEED_DECIMALS = 18;
 
     bytes32 public constant PARAM_CHALLENGE_WINDOW = keccak256("challengeWindow");
@@ -200,21 +162,17 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     uint256 public immutable epochLength;
     uint256 public immutable epochGenesis;
 
-    /// @notice CAP on the WOOD→USD price, 8 decimals. Never served as a price.
+    /// @notice CAP on the WOOD-to-USD price, 8 decimals. Never served as a price.
     ///
     /// @dev    SEED IT ABOVE MARKET. Its whole job is to bound how far a market
-    ///         source can be manipulated UPWARD; kept within `M×` of market,
-    ///         upward manipulation is capped at `M×`. A cap set BELOW market —
-    ///         the old "conservative, ≤ 30-day low" reading — binds
-    ///         permanently, pins every bond at the cap, and makes the market
-    ///         source inert, which is precisely the arrangement design revision
-    ///         2 replaced.
+    ///         source can be manipulated UPWARD; kept within `M x` of market,
+    ///         upward manipulation is capped at `M x`. A cap set BELOW market
+    ///         binds permanently, pins every bond at the cap, and makes the
+    ///         market source inert.
     ///
-    ///         It no longer needs ACCURACY, because it is never the valuation;
-    ///         a monthly review is sufficient, since drift degrades the cap
-    ///         gradually and never mis-prices anything. It does still need
-    ///         MAINTENANCE — it is the only thing bounding upward manipulation
-    ///         of a ~$438k pool.
+    ///         It does not need ACCURACY, because it is never the valuation; a
+    ///         monthly review suffices. It does need MAINTENANCE — it is the only
+    ///         thing bounding upward manipulation of a ~$438k pool.
     uint256 public woodUsdPriceX8;
     /// @notice Post-epoch challenge window (spec §5: 14d initial, single window
     ///         in v1 — per-tier windows are a later refinement).
@@ -226,30 +184,25 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         cap unset = NOTHING can be proposed through a wired governor —
     ///         fail-closed until governance seeds it.
     uint256 public coveredTvlCapUsd;
-    /// @notice Minimum envelopeTier at which the approve quorum is fail-closed
-    ///         (spec §3.3a + §4 gate 2). Launch value 0: every tier.
-    ///
-    /// @dev    Coverage sizing is per-tier (`requiredCoverage = maxCapital ×
-    ///         Σ boundBps / 10_000`), so a closed-loop adapter that can leak 1%
-    ///         requires 1% of coverage. Zero makes the guardian layer mandatory
-    ///         for every tier rather than advisory below the threshold.
-    ///
-    ///         `requiredCoverage == 0` still passes optimistically at every
-    ///         tier — that carve-out lives at the governor call site, not here:
-    ///         a proposal that can extract nothing has nothing to underwrite.
+    /// @notice Minimum envelopeTier at which the approve quorum is fail-closed.
+    ///         Launch value 0: every tier.
+    /// @dev    Coverage sizing is per-tier, so a closed-loop adapter that can leak
+    ///         1% requires 1% of coverage. Zero makes the guardian layer mandatory
+    ///         at every tier rather than advisory below the threshold.
+    ///         `requiredCoverage == 0` still passes optimistically at every tier —
+    ///         that carve-out lives at the governor call site: a proposal that can
+    ///         extract nothing has nothing to underwrite.
     uint8 public quorumTierThreshold = 0;
     /// @notice Proposer bond as bps of USD coverage (spec §3.9/§5). Default 1%.
     uint256 public proposerBondBps = 100;
 
     /// @notice Chainlink WOOD/USD feed. Once wired it is the PREFERRED market
-    ///         source; the TWAP oracle serves only while it is unset or
-    ///         degraded. Still capped by `woodUsdPriceX8` like every source.
+    ///         source; the TWAP oracle serves only while it is unset or degraded.
+    ///         Still capped by `woodUsdPriceX8` like every source.
     /// @dev    Reuses the same `AssetFeed` shape and staleness handling as the
-    ///         vault-asset feeds, so WOOD is priced by the machinery already
-    ///         exercised by `coverageUsd` rather than a parallel path.
-    ///         Expected to stay UNSET on chain 4663 — there is no WOOD/USD
-    ///         aggregator there — which is why the TWAP oracle is not an
-    ///         optional extra but the live source.
+    ///         vault-asset feeds. Expected to stay UNSET on chain 4663 — there is
+    ///         no WOOD/USD aggregator there — which is why the TWAP oracle is not
+    ///         an optional extra but the live source.
     AssetFeed internal _woodFeed;
 
     /// @notice The WOOD/WETH TWAP oracle (`IWoodTwapOracle`), or zero.
@@ -261,43 +214,28 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @notice Haircut applied to whichever market source won, in bps.
     ///
-    /// @dev    Collateral wants a floor, not a quote — an unhaircut oracle
-    ///         tracks WOOD UP and inflates every bond exactly when the market is
-    ///         frothy. Default 10_000 (no haircut) so wiring a source alone does
-    ///         not silently change valuations; governance sets it deliberately.
+    /// @dev    Collateral wants a floor, not a quote — an unhaircut oracle tracks
+    ///         WOOD UP and inflates every bond exactly when the market is frothy.
+    ///         Default 10_000 (no haircut) so wiring a source alone does not
+    ///         silently change valuations.
     ///
-    /// @dev    THIS PARAMETER IS LOAD-BEARING (owner decision 2026-08-02). It is
-    ///         the compensating control for the two exposures this design
-    ///         deliberately ACCEPTS rather than eliminates, and once a price has
-    ///         cleared the cap it is the only thing standing under either:
+    /// @dev    LOAD-BEARING: it is the compensating control for the two exposures
+    ///         this design ACCEPTS rather than eliminates, and once a price has
+    ///         cleared the cap it is the only thing standing under either.
     ///
     ///           1. NON-CONTEMPORANEOUS LEGS in `WoodTwapOracle`. The WOOD/ETH
-    ///              average is near-real-time; the ETH/USD answer may be up to
-    ///              one heartbeat old (~10.7h measured on 4663, WHILE HEALTHY).
-    ///              During an ETH drawdown inside that heartbeat the product
-    ///              reads HIGH by roughly the ETH move — no attacker capital
-    ///              involved. Constraining it would force a ~12-hour averaging
-    ///              window, which is worse; see that contract's ACCEPTED RISK
-    ///              note.
+    ///              average is near-real-time; the ETH/USD answer may be up to one
+    ///              heartbeat old (~10.7h on 4663, while healthy). During an ETH
+    ///              drawdown inside that heartbeat the product reads HIGH by
+    ///              roughly the ETH move, with no attacker capital involved.
     ///           2. RESIDUAL CRASH LAG of up to `twapWindow + maxTwapAge`,
-    ///              inherent to averaging and the price of manipulation
-    ///              resistance.
+    ///              inherent to averaging.
     ///
-    ///         Both OVERSTATE bond value — the dangerous direction — and the
-    ///         haircut is what pre-funds an allowance against them. AT THE
-    ///         10_000 DEFAULT THAT ALLOWANCE IS ZERO. 5_000 (the floor) absorbs
-    ///         a 50% error. Shipping at the default is a deliberate choice to
-    ///         run with no margin, not a neutral one.
+    ///         Both OVERSTATE bond value — the dangerous direction. AT THE 10_000
+    ///         DEFAULT THAT ALLOWANCE IS ZERO; 5_000 (the floor) absorbs a 50%
+    ///         error. Shipping at the default is a deliberate choice to run with
+    ///         no margin, not a neutral one.
     uint256 public woodHaircutBps = BPS_DENOMINATOR;
-
-    // `lastPriceUpdateAt` and `lastHaircutUpdateAt` were REMOVED with the
-    // in-contract rate limit (issue #89). They stamped the two setters for the
-    // 1-day interval and nothing else read them — not this contract, not
-    // `IExposureLedger`, not any script or test. Safe to delete rather than
-    // leave as dead slots because `ExposureLedger` is NOT upgradeable
-    // (constructor + immutables, deployed directly by `DeployPlanB`, no proxy)
-    // and is not among the four layouts `script/check-layout-goldens.sh` pins,
-    // so no deployed lineage stores state at these offsets.
 
     address public guardianRegistry;
 
@@ -320,24 +258,20 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     mapping(address guardian => mapping(uint256 epoch => uint256 usd)) internal _buckets;
     mapping(bytes32 reviewKey => mapping(address guardian => RecordedExposure)) internal _recorded;
 
-    /// @dev Total USD RESERVED by all approvers of a proposal — runs to A x
-    ///      coverage while the review is open, NOT to `coverage`, because each
-    ///      approver reserves up to the whole thing in case it ends up
-    ///      carrying the proposal alone.
-    ///
-    ///      Stays the reservation total for the life of the key; only
-    ///      `recordApproval` and `releaseApproval` move it. Settlement derives
-    ///      from this and `_reservedUsd` rather than overwriting it, so a
-    ///      settlement pass is always re-derivable from unchanged inputs.
+    /// @dev Total USD RESERVED by all approvers of a proposal — runs to
+    ///      `A x coverage` while the review is open, NOT to `coverage`, because
+    ///      each approver reserves up to the whole thing in case it ends up
+    ///      carrying the proposal alone. Only `recordApproval` and
+    ///      `releaseApproval` move it; settlement derives from this and
+    ///      `_reservedUsd` rather than overwriting it, so a settlement pass is
+    ///      always re-derivable from unchanged inputs.
     mapping(bytes32 reviewKey => uint256 usd) internal _committedUsd;
 
-    /// @dev The reservation `recordApproval` booked, preserved verbatim while
-    ///      the approver is listed.
-    ///
-    ///      `_recorded[key][g].usd` is the guardian's CURRENT booking, which
-    ///      `settleCoverage` rewrites; this is the immutable input that rewrite
-    ///      is derived FROM. Keeping the two apart is what makes settlement
-    ///      re-runnable rather than a latch.
+    /// @dev The reservation `recordApproval` booked, preserved verbatim while the
+    ///      approver is listed. `_recorded[key][g].usd` is the guardian's CURRENT
+    ///      booking, which `settleCoverage` rewrites; this is the immutable input
+    ///      that rewrite is derived FROM. Keeping the two apart is what makes
+    ///      settlement re-runnable rather than a latch.
     mapping(bytes32 reviewKey => mapping(address guardian => uint256 usd)) internal _reservedUsd;
 
     /// @dev Whether `settleCoverage` has run at least once for a proposal.
@@ -377,34 +311,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      double-count against the live buckets and silently tighten the
     ///      batching cap, which is a different control.
     mapping(address guardian => uint256) internal _frozenCommitments;
-    /// @notice The latest instant through which a guardian's coverage is
-    ///         pinned open, independent of whether any challenge naming them
-    ///         is currently LIVE (issue #95).
-    /// @dev A MAX, not a per-key value — and that is now DELIBERATELY narrow
-    ///      to `hasFrozenCoverage`'s binary question ("is this guardian
-    ///      pinned by ANYTHING?"), not to `retireApproval`'s per-proposal
-    ///      question. A guardian can be pinned by more than one accusation at
-    ///      once, and `pinCoverageUntil` only ever raises this — so a later
-    ///      accusation's deadline correctly outlives an earlier one's, and
-    ///      once the LATEST of them elapses, so does the pin for everyone it
-    ///      covered. No release call is needed: unlike `_frozenCommitments`,
-    ///      which requires an explicit `unfreezeCoverage` to clear, this
-    ///      decays on its own by wall-clock — the same way `openExposureUsd`'s
-    ///      epoch buckets do, and for the same reason: a value nobody has to
-    ///      remember to unwind cannot be forgotten.
-    ///
-    ///      SUPERSEDED AS `retireApproval`'s GATE (audit-181-critical-high,
-    ///      finding C). Before `_pinnedUntil` below existed, `retireApproval`
-    ///      read THIS max, so one grindable non-verdict on ANY single stale
-    ///      proposal a guardian ever approved blocked retirement of its
-    ///      ENTIRE book — reopening the ~1/N shared-stake denominator decay
-    ///      `retireApproval` exists to close, and firing with no attacker: any
-    ///      routine `Inconclusive` verdict on one proposal did it. This max is
-    ///      still exactly right for `hasFrozenCoverage`'s unstake question
-    ///      (sWOOD must refuse the claim while ANY accusation against this
-    ///      guardian is reachable, not just the ones on one proposal), so it
-    ///      stays; `retireApproval` now reads `_pinnedUntil[key][guardian]`
-    ///      instead.
+    /// @notice The latest instant through which a guardian's coverage is pinned
+    ///         open, independent of whether any challenge naming them is
+    ///         currently LIVE.
+    /// @dev A MAX, not a per-key value, and scoped to `hasFrozenCoverage`'s
+    ///      binary question (is this guardian pinned by ANYTHING?), not to
+    ///      `retireApproval`'s per-proposal question — which reads
+    ///      `_pinnedUntil[key][guardian]` instead. A guardian can be pinned by
+    ///      more than one accusation at once and `pinCoverageUntil` only ever
+    ///      raises this, so a later deadline outlives an earlier one and the pin
+    ///      decays on wall-clock with no release call to forget.
     mapping(address guardian => uint256) internal _pinnedCoverageUntil;
 
     /// @dev How many proposals are frozen right now, across every guardian.
@@ -413,113 +329,71 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     uint256 internal _frozenKeyCount;
 
     /// @notice EXACT, NON-WALL-CLOCK-DECAYING sum of `_recorded[key][guardian]
-    ///         .usd` across every key currently listing `guardian` as an
-    ///         approver (Pashov re-audit of #158, finding 2, confidence 85).
+    ///         .usd` across every key currently listing `guardian` as an approver.
     ///
-    /// @dev    THE SHARED-STAKE DENOMINATOR, BOOKING BASIS. Before this,
-    ///         `_sharedSlashableUsd` divided by `openExposureUsd(guardian)` —
-    ///         a rolling WALL-CLOCK bucket scan — as a proxy for "sum of this
-    ///         guardian's live open reservations." The proxy silently went
-    ///         stale in at least five distinct ways (ordinary bucket aging
-    ///         with no release, a frozen/pinned proposal outliving its own
-    ///         bucket, an owner `setChallengeWindow` shrink, a
-    ///         `ChallengeGame` `Inconclusive` re-arm outliving the bucket, and
-    ///         a `_recorded`/`_reservedUsd` entry that plain never gets
-    ///         released) while the NUMERATOR (`_recorded[key][g].usd`, read by
-    ///         `_effectiveTotal`/`allocatedUsd`/`requireApproveQuorum`) has no
-    ///         wall-clock decay of its own — it is cleared ONLY by an explicit
-    ///         `releaseApproval` or a `_rebook` write. A denominator that ages
-    ///         out while the numerator terms it is supposed to sum do not is
-    ///         exactly the double-count Finding 2 (D9) was written to close,
-    ///         reopened at the seam between two independently-decaying clocks.
+    /// @dev    THE SHARED-STAKE DENOMINATOR, BOOKING BASIS. Dividing instead by
+    ///         `openExposureUsd(guardian)` — a rolling wall-clock bucket scan —
+    ///         went stale in at least five ways (ordinary bucket aging with no
+    ///         release, a frozen or pinned proposal outliving its bucket, a
+    ///         `setChallengeWindow` shrink, an `Inconclusive` re-arm outliving the
+    ///         bucket, and an entry that plain never gets released) while the
+    ///         NUMERATOR has no wall-clock decay of its own — it is cleared ONLY
+    ///         by an explicit `releaseApproval` or a `_rebook` write. A
+    ///         denominator that ages out while its own numerator terms do not is
+    ///         a double-count at the seam between two independently-decaying
+    ///         clocks.
     ///
-    ///         This mapping instead mirrors `_buckets`' own writes exactly —
-    ///         incremented in `recordApproval`, decremented in
-    ///         `releaseApproval`, adjusted by `_rebook`'s delta in both
-    ///         directions — but with NO wall-clock scan and NO expiry. It is
-    ///         therefore, by construction, always EXACTLY `Σ over every key
-    ///         still listing guardian as an approver of _recorded[key]
-    ///         [guardian].usd`, which is precisely what `_sharedSlashableUsd`'s
-    ///         safety argument (`Σ reserved_i == denominator`) requires when
-    ///         `reserved_i` is read on the booking basis.
+    ///         This mapping mirrors `_buckets`' writes exactly but with NO
+    ///         wall-clock scan and no expiry, so it is by construction exactly
+    ///         `sum over every live key of _recorded[key][guardian].usd` — which
+    ///         is what `_sharedSlashableUsd`'s safety argument requires.
     ///
     ///         `openExposureUsd` ITSELF IS UNCHANGED and keeps its wall-clock
-    ///         decay — it remains the correct, DELIBERATE basis for
-    ///         `recordApproval`'s and `_rebook`'s BATCHING cap (issue #110):
-    ///         that cap's whole point is to let a guardian's budget recycle
-    ///         once a commitment ages past challengeability. The shared-stake
-    ///         denominator and the batching-cap denominator answer different
-    ///         questions ("what does this guardian's stake currently, really,
-    ///         back?" vs. "how much of this guardian's stake may still be
-    ///         newly committed?") and must not share one wall-clock-coupled
-    ///         implementation, which is the root cause this mapping removes.
+    ///         decay: it remains the correct basis for the BATCHING cap, whose
+    ///         whole point is to let a guardian's budget recycle once a
+    ///         commitment ages past challengeability. The two answer different
+    ///         questions and must not share one implementation.
     ///
-    ///         KNOWN, ACCEPTED TRADE-OFF: a guardian with an approval that is
-    ///         never released and never settled (both permissionless,
-    ///         "safe to skip" by design) stays counted here FOREVER, even long
-    ///         after its own challenge window has elapsed and it is no longer
-    ///         legally slashable. This is not a new problem: `_recorded[key]
-    ///         [g].usd` — the numerator every sharing consumer already reads —
-    ///         has the identical property today, for the identical reason
-    ///         (only `releaseApproval`/`_rebook` clear it). Making the
-    ///         denominator match the numerator's existing staleness is
-    ///         strictly more correct than the wall-clock proxy it replaces,
-    ///         never less; it does not introduce a new staleness class, it
-    ///         removes an INCONSISTENT one.
+    ///         ACCEPTED TRADE-OFF: an approval never released and never settled
+    ///         stays counted here forever, even after its challenge window has
+    ///         elapsed. `_recorded[key][g].usd` — the numerator every consumer
+    ///         already reads — has the identical property for the identical
+    ///         reason, so this makes the denominator match the numerator's
+    ///         existing staleness rather than introducing a new class of it.
     mapping(address guardian => uint256) internal _liveBookedUsd;
 
-    /// @notice EXACT, NON-WALL-CLOCK-DECAYING sum of `_reservedUsd[key]
-    ///         [guardian]` (the PLEDGE, not the current booking) across every
-    ///         key currently listing `guardian` as an approver.
+    /// @notice EXACT, NON-WALL-CLOCK-DECAYING sum of `_reservedUsd[key][guardian]`
+    ///         (the PLEDGE, not the current booking) across every key currently
+    ///         listing `guardian` as an approver.
     ///
-    /// @dev    THE SHARED-STAKE DENOMINATOR, PLEDGE BASIS — used only where
-    ///         the numerator is also read on the pledge basis
+    /// @dev    THE SHARED-STAKE DENOMINATOR, PLEDGE BASIS — used only where the
+    ///         numerator is also read on the pledge basis
     ///         (`_effectiveReservedTotal`/`settleCoverage`). `_reservedUsd` is
-    ///         written exactly once per key (`recordApproval`) and cleared
-    ///         exactly once (`releaseApproval`) — `_rebook`/`settleCoverage`
-    ///         never touch it — so this accumulator only ever moves at those
-    ///         two sites, mirroring `_reservedUsd`'s own lifecycle exactly.
+    ///         written once per key and cleared once, and `_rebook` never touches
+    ///         it, so this accumulator mirrors that lifecycle exactly.
     ///
-    ///         WHY TWO ACCUMULATORS RATHER THAN ONE (Pashov re-audit of #158,
-    ///         finding 4, confidence 75). `_effectiveReservedTotal` used to
-    ///         divide the frozen PLEDGE numerator by the live BOOKING
-    ///         denominator (`openExposureUsd`, which tracks `_recorded`, not
-    ///         `_reservedUsd`) — a basis mismatch that could push the "shares
-    ///         sum to <= 1" partition-of-unity property above 1 once a prior
-    ///         `settleCoverage` pass had diverged the two bases on some OTHER
-    ///         proposal sharing this guardian. Keeping a dedicated
-    ///         pledge-basis accumulator for the pledge-basis callers (this
-    ///         one) and a dedicated booking-basis accumulator
-    ///         (`_liveBookedUsd`) for the booking-basis callers makes every
-    ///         `_sharedSlashableUsd` call site divide by a denominator built
-    ///         from EXACTLY the same basis as its own numerator, closing
-    ///         finding 4 as a side effect of closing finding 2 rather than
-    ///         needing a second, targeted fix — see design.md D10 for the
-    ///         full reasoning and the regression test that proves it.
+    ///         WHY TWO ACCUMULATORS RATHER THAN ONE: dividing a frozen PLEDGE
+    ///         numerator by the live BOOKING denominator is a basis mismatch that
+    ///         can push the shares-sum-to-at-most-1 property above 1 once a prior
+    ///         `settleCoverage` pass has diverged the two bases on some OTHER
+    ///         proposal sharing this guardian. A dedicated accumulator per basis
+    ///         makes every `_sharedSlashableUsd` call site divide by a denominator
+    ///         built from exactly the same writes as its own numerator.
     mapping(address guardian => uint256) internal _livePledgedUsd;
 
-    /// @notice Per-(reviewKey, guardian) counterpart of `_pinnedCoverageUntil`
-    ///         (audit-181-critical-high, finding C: PIN GRANULARITY). APPENDED
-    ///         here, after every pre-existing storage variable, to preserve
-    ///         the storage layout — see notes to the orchestrator on the
-    ///         layout golden.
-    ///
-    /// @dev    Written by `pinCoverageUntil` ALONGSIDE the per-guardian max in
-    ///         `_pinnedCoverageUntil`, with the identical monotonic-raise
-    ///         semantics, but scoped to the one proposal the pin was actually
-    ///         issued for. `retireApproval` reads THIS, not the max: its
-    ///         question is "may THIS proposal's commitment be swept?", and a
-    ///         pin issued against a guardian's OTHER stale proposal must not
-    ///         block that — before this mapping existed, `retireApproval` read
-    ///         the per-guardian max, so one grindable non-verdict on ANY
-    ///         single stale proposal blocked retirement of the guardian's
-    ///         ENTIRE book (a routine `Inconclusive`, no attacker required),
-    ///         reopening the ~1/N shared-stake denominator decay
-    ///         `retireApproval` exists to close. `hasFrozenCoverage` keeps
-    ///         reading the max in `_pinnedCoverageUntil`, because its
-    ///         question — "is this guardian's collateral reachable by ANY
-    ///         live accusation?" — is genuinely guardian-scoped, not
-    ///         key-scoped, and must stay that way.
+    /// @notice Per-(reviewKey, guardian) counterpart of `_pinnedCoverageUntil`.
+    ///         APPENDED after every pre-existing storage variable to preserve the
+    ///         storage layout.
+    /// @dev    Written by `pinCoverageUntil` alongside the per-guardian max, with
+    ///         identical monotonic-raise semantics but scoped to the one proposal
+    ///         the pin was issued for. `retireApproval` reads THIS, not the max:
+    ///         its question is whether THIS proposal's commitment may be swept,
+    ///         and a pin against a guardian's OTHER stale proposal must not block
+    ///         that — otherwise one routine `Inconclusive` anywhere in a
+    ///         guardian's history blocks retirement of its entire book, reopening
+    ///         the ~1/N shared-stake decay `retireApproval` exists to close.
+    ///         `hasFrozenCoverage` keeps reading the max, because its question is
+    ///         genuinely guardian-scoped.
     mapping(bytes32 reviewKey => mapping(address guardian => uint256)) internal _pinnedUntil;
 
     // ── Modifiers / helpers ──
@@ -571,57 +445,48 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @notice The WOOD/USD price every bond is valued at, 8 decimals.
     ///
     /// @dev    MARKET-PRICED, GOVERNANCE-CAPPED. A live source tracks a crash
-    ///         immediately, which is the direction where lag actually hurts:
-    ///         under a manual number somebody has to notice and transact while
-    ///         bonds stay over-valued in the meantime. The cap is what keeps
-    ///         the market source from being trusted UPWARD — the WOOD/WETH pool
-    ///         is ~$438k deep, so an unbounded read from it would make that pool
-    ///         the valuation basis for every guardian bond in the protocol.
+    ///         immediately, which is the direction where lag actually hurts. The
+    ///         cap is what keeps the market source from being trusted UPWARD —
+    ///         the WOOD/WETH pool is ~$438k deep, so an unbounded read from it
+    ///         would make that pool the valuation basis for every guardian bond.
     ///
     ///         REVERTS `NoWoodPrice` when no source can price WOOD. See
-    ///         `IExposureLedger.NoWoodPrice` for why that is fail-safe rather
-    ///         than a halt, and which single consumer catches it.
+    ///         `IExposureLedger.NoWoodPrice` for why that is fail-safe.
     function woodPriceX8() public view returns (uint256) {
         (uint256 price,,) = _woodPrice();
         return price;
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev Exists because both degraded states are otherwise invisible: there
-    ///      is no event on either, and `woodUsdPriceX8` carries no `updatedAt`
-    ///      of its own, so "TWAP healthy" and "cap has drifted under market and
-    ///      has been pinning every bond for a month" read identically from
-    ///      outside. §6 monitoring cannot alert on a condition it cannot
-    ///      observe.
+    /// @dev Exists because both degraded states are otherwise invisible: there is
+    ///      no event on either, and `woodUsdPriceX8` carries no `updatedAt`, so
+    ///      TWAP-healthy and cap-has-drifted-under-market-for-a-month read
+    ///      identically from outside.
     function woodPriceDetail() external view returns (uint256 price, bool fromFeed, bool capBinding) {
         return _woodPrice();
     }
 
-    /// @dev THE RESOLUTION ORDER, and why each branch is where it is:
+    /// @dev THE RESOLUTION ORDER:
     ///
-    ///        cap == 0                 -> revert (finding 7)
+    ///        cap == 0                 -> revert NoWoodPrice
     ///        feed fresh               -> min(feed, cap)
     ///        else twap fresh          -> min(twap, cap)
     ///        else                     -> revert NoWoodPrice
     ///
-    ///      ZERO CAP IS A REVERT, NOT "UNCAPPED". Treating it as "no ceiling"
-    ///      would make the single most likely misconfiguration — a ledger
-    ///      deployed before governance seeded the number — the one state in
-    ///      which a ~$438k pool prices every bond without bound. Fail-closed is
-    ///      the only safe reading, and `DeployPlanB` asserts the cap
-    ///      post-broadcast so the revert is a configuration guard rather than a
-    ///      live failure mode.
+    ///      ZERO CAP IS A REVERT, NOT UNCAPPED. Treating it as no ceiling would
+    ///      make the single most likely misconfiguration — a ledger deployed
+    ///      before governance seeded the number — the one state in which a ~$438k
+    ///      pool prices every bond without bound.
     ///
-    ///      THE `min` IS THE WHOLE SAFETY ARGUMENT. Push the market source UP
-    ///      and the `min` ignores it — the attack is inert. Push it DOWN and
-    ///      bonds are valued lower and quorums get harder: a denial of service
-    ///      with no payoff. This is the invariant the change exists for, and it
-    ///      is only a real bound because the cap is maintained ABOVE market.
+    ///      THE `min` IS THE WHOLE SAFETY ARGUMENT. Push the market source UP and
+    ///      the `min` ignores it; push it DOWN and bonds are valued lower and
+    ///      quorums get harder — a denial of service with no payoff. It is only a
+    ///      real bound because the cap is maintained ABOVE market.
     ///
-    ///      NEITHER SOURCE FALLS BACK TO THE CAP. That was revision 1's error:
-    ///      the cap is chosen high and non-binding, so serving it as a price
-    ///      when market data stops arriving fails in the dangerous direction at
-    ///      exactly the moment there is nothing to check it against.
+    ///      NEITHER SOURCE FALLS BACK TO THE CAP: the cap is chosen high and
+    ///      non-binding, so serving it as a price when market data stops arriving
+    ///      fails in the dangerous direction at exactly the moment there is
+    ///      nothing to check it against.
     function _woodPrice() internal view returns (uint256 price, bool fromFeed, bool capBinding) {
         uint256 cap = woodUsdPriceX8;
         if (cap == 0) revert NoWoodPrice();
@@ -637,14 +502,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         capBinding = cap < marketX8;
         uint256 sourceX8 = capBinding ? cap : marketX8;
         price = _haircut(sourceX8);
-        // FLOOR AT 1 (finding 6). `_haircut` truncates, so a source small
-        // enough — below 2 wei-X8 at the 5,000 bps floor — resolves to a price
-        // of exactly zero, and zero is not "very cheap" to the consumers: it
-        // reverts `WoodPriceUnset` in `ChallengeGame.file` and makes
-        // `proposerBondWood` revert `InvalidParameter`. One wei-X8 keeps those
-        // paths alive at a valuation that is still, correctly, negligible.
-        // Guarded on `sourceX8 != 0` so a genuinely zero source stays zero
-        // rather than being invented into existence.
+        // FLOOR AT 1. `_haircut` truncates, so a source below 2 wei-X8 at the
+        // 5,000 bps floor resolves to exactly zero — and zero is not very cheap
+        // to the consumers: it reverts `WoodPriceUnset` in `ChallengeGame.file`
+        // and `InvalidParameter` in `proposerBondWood`. Guarded on
+        // `sourceX8 != 0` so a genuinely zero source stays zero.
         if (price == 0 && sourceX8 != 0) price = 1;
     }
 
@@ -653,63 +515,34 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      revert from `latestRoundData`: a reverting aggregator must fall
     ///      through to the TWAP, not take the price path down with it.
     ///
-    ///      RAW STATICCALL, NOT A TYPED `try` (audit #181 finding 22). A typed
-    ///      `try IAggregatorMinimal(feed).latestRoundData() returns (...) {
-    ///      ... } catch { ... }` only guards the CALL and its error selector —
-    ///      Solidity's own documented limitation is that a call which SUCCEEDS
-    ///      but returns too little data to decode the declared return types
-    ///      fails at ABI-DECODING, and that failure is a full, UNCAUGHT revert
-    ///      of the transaction, not a `catch`. Code that runs INSIDE a typed
-    ///      try's success block is likewise ordinary caller-frame code once
-    ///      the call itself has returned, so a panic there (see the decimals
-    ///      note below) is exactly as uncatchable. A malformed/truncated
-    ///      `latestRoundData()` return, or a stored `feedDecimals` large
-    ///      enough to overflow `10 ** feedDecimals`, therefore used to take
-    ///      the whole price path down with it — precisely the failure this
-    ///      function's own natspec promises never happens. `_twapPriceX8`
-    ///      already defends the identical decode risk the same way; this now
-    ///      matches it: staticcall, explicit length check before any decode
-    ///      is attempted, and decode ONLY into `uint256`/`int256` words (no
-    ///      validity-constrained type like `bool`/`enum`/a sub-256-bit
-    ///      integer, any of which the ABI decoder can reject as malformed and
-    ///      revert on), so once the length check passes, decoding itself
-    ///      cannot revert.
+    ///      RAW STATICCALL, NOT A TYPED `try`. A typed try guards only the CALL
+    ///      and its error selector — a call that SUCCEEDS but returns too little
+    ///      data to decode fails at ABI-DECODING, which is a full, UNCAUGHT
+    ///      revert, not a `catch`. Code inside the success block is ordinary
+    ///      caller-frame code, so a panic there is equally uncatchable. Hence:
+    ///      staticcall, explicit length check before any decode, and decode ONLY
+    ///      into `uint256`/`int256` words — never a validity-constrained type
+    ///      like `bool`, an enum, or a sub-256-bit integer, any of which the ABI
+    ///      decoder can reject as malformed.
     ///
     ///      `code.length` is checked FIRST because Solidity's extcodesize guard
     ///      on a high-level call to a codeless address reverts in THIS frame,
-    ///      which no wrapper can catch — the same reason `setGuardianRegistry`
-    ///      guards its tolerant read that way. A raw `staticcall` carries no
-    ///      such guard (it is a plain opcode, not a typed high-level call), so
-    ///      this check is still needed to tell "codeless" apart from
-    ///      "answered falsy" before the staticcall is even attempted.
+    ///      which no wrapper can catch. A raw staticcall carries no such guard,
+    ///      so the check is still needed to tell codeless apart from answered
+    ///      falsy.
     ///
-    ///      `feedDecimals` IS RE-CHECKED AGAINST `MAX_FEED_DECIMALS` HERE, even
-    ///      though `setWoodFeed` already refuses to store a value above it:
-    ///      `setWoodFeed` is the BRACE, this is the BELT. Without it,
-    ///      `10 ** f.feedDecimals` panics (0x11) the instant `feedDecimals >=
-    ///      78`, and that panic — code past a successful external call,
-    ///      running in this frame — is exactly as uncatchable as the decode
-    ///      issue above.
+    ///      `feedDecimals` IS RE-CHECKED against `MAX_FEED_DECIMALS` here even
+    ///      though `setWoodFeed` refuses to store a larger value: that setter is
+    ///      the brace, this is the belt, and `10 ** f.feedDecimals` panics
+    ///      uncatchably the instant it exceeds 77.
     ///
-    ///      A POSITIVE ANSWER CAN STILL NORMALISE TO ZERO
-    ///      (audit-181-critical-high, "ALSO" finding), and `ok` MUST TRACK
-    ///      THAT — checked here rather than left implicit, because `answer >
-    ///      0` was already verified above and would otherwise read as proof
-    ///      the result is usable. At `feedDecimals` up to `MAX_FEED_DECIMALS`
-    ///      (18), a small enough positive `answer` (e.g. `answer == 1`,
-    ///      `feedDecimals == 18`) truncates `(answer * 1e8) / 10**feedDecimals`
-    ///      to exactly 0 wei-X8. Returning `(0, true)` used to report the feed
-    ///      HEALTHY at a price of zero: `_woodPrice` takes `fromFeed == true`
-    ///      to mean "do not fall through to the TWAP", so this skipped the
-    ///      fallback `_twapPriceX8` exists for, and its own floor-at-1 is
-    ///      gated on `sourceX8 != 0` — a source that is genuinely zero is left
-    ///      zero, not floored — so `woodPriceX8()` silently resolved to 0
-    ///      instead of reverting `NoWoodPrice` or falling through, halting
-    ///      `propose` (`proposerBondWood`), `execute`
-    ///      (`requireApproveQuorum`) and challenge filing (`ChallengeGame.
-    ///      file`'s `WoodPriceUnset`) alike, with no path back except
-    ///      re-wiring the feed. `_twapPriceX8` already guards exactly this
-    ///      case (`twapX8 == 0` reports unavailable); this now matches it.
+    ///      A POSITIVE ANSWER CAN STILL NORMALISE TO ZERO, and `ok` must track
+    ///      that. Returning `(0, true)` reports the feed HEALTHY at a price of
+    ///      zero: `_woodPrice` takes `fromFeed == true` to mean do not fall
+    ///      through to the TWAP, and its floor-at-1 is gated on `sourceX8 != 0`,
+    ///      so `woodPriceX8()` would silently resolve to 0 — halting `propose`,
+    ///      `execute` and challenge filing alike, with no path back except
+    ///      re-wiring the feed.
     function _feedPriceX8() internal view returns (uint256 priceX8, bool ok) {
         AssetFeed storage f = _woodFeed;
         address feed = f.feed;
@@ -741,21 +574,17 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         return (priceX8, priceX8 != 0);
     }
 
-    /// @dev The TWAP leg. A LOW-LEVEL STATICCALL, not a typed `try`, and the
-    ///      `ok` flag is decoded as a `uint256`.
-    ///
-    ///      `abi.decode(ret, (uint256, bool))` REVERTS — uncatchably, in this
-    ///      frame — on any second word that is not 0 or 1. A wired contract
-    ///      whose `consult()` returns a dirty word would therefore take the
-    ///      entire price path down, which is exactly the failure this defensive
-    ///      wrapper exists to prevent. Decoding both words as `uint256` and
-    ///      comparing the flag against 1 cannot revert on any return data, and
-    ///      treats anything that is not a clean `true` as unavailable.
+    /// @dev The TWAP leg. A LOW-LEVEL STATICCALL, not a typed `try`, and the `ok`
+    ///      flag is decoded as a `uint256`: `abi.decode(ret, (uint256, bool))`
+    ///      reverts — uncatchably, in this frame — on any second word that is not
+    ///      0 or 1, so a wired contract returning a dirty word would take the
+    ///      entire price path down. Comparing the flag against 1 cannot revert on
+    ///      any return data and treats anything but a clean `true` as unavailable.
     ///
     ///      `code.length` first, for the same extcodesize reason as
-    ///      `_feedPriceX8`; a short return is rejected before decoding; and a
-    ///      zero price is rejected because `min(0, cap)` would drag every bond
-    ///      to nothing exactly as silently as the failure this replaced.
+    ///      `_feedPriceX8`; a short return is rejected before decoding; and a zero
+    ///      price is rejected because `min(0, cap)` would drag every bond to
+    ///      nothing exactly as silently.
     function _twapPriceX8() internal view returns (uint256 priceX8, bool ok) {
         address oracle = woodTwapOracle;
         if (oracle == address(0) || oracle.code.length == 0) return (0, false);
@@ -778,19 +607,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @dev `slashableBondUsd` with the loop-invariant price passed in, so a
     ///      multi-approver quorum reads it once instead of once per approver.
     ///
-    ///      ANCHOR-AWARE (issue #35). `anchor == 0` reads LIVE
-    ///      `guardianStake` — the pre-execution basis, used where no verdict
-    ///      anchor exists yet (`recordApproval`'s budget cap,
-    ///      `requireApproveQuorum`'s execute-time gate, and the public
-    ///      `slashableBondUsd` view) and where any stake present is still
-    ///      reachable. `anchor != 0` reads `swood.slashableStakeAt(guardian,
-    ///      anchor)` instead — `min(snapshot at anchor, live)`, exactly what a
-    ///      verdict slash anchored at that instant (`StakedWood._slashOne`)
-    ///      can recover — so a guardian who tops up stake AFTER the anchor
-    ///      is never counted as coverage the conviction cannot reach. Every
-    ///      post-execution ledger read (`allocatedUsd`, `_effectiveTotal`,
-    ///      `settleCoverage`, `_effectiveReservedTotal`) passes
-    ///      `pv.executedAt` as the anchor.
+    ///      ANCHOR-AWARE. `anchor == 0` reads LIVE `guardianStake` — the
+    ///      pre-execution basis, used where no verdict anchor exists yet.
+    ///      `anchor != 0` reads `swood.slashableStakeAt(guardian, anchor)`:
+    ///      `min(snapshot at anchor, live)`, exactly what a verdict slash anchored
+    ///      at that instant can recover — so a guardian who tops up stake AFTER
+    ///      the anchor is never counted as coverage the conviction cannot reach.
+    ///      Every post-execution ledger read passes `pv.executedAt`.
     function _slashableBondUsd(address guardian, uint256 priceX8, uint256 anchor) internal view returns (uint256) {
         uint256 stake = anchor == 0 ? swood.guardianStake(guardian) : swood.slashableStakeAt(guardian, anchor);
         return (stake * priceX8) / 1e8;
@@ -798,47 +621,30 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     // ── Owner setters ──
 
-    /// @notice Set the price CAP. This is the emergency brake: lowering it
-    ///         lowers every bond's valuation immediately, in the safe
-    ///         direction, without bound and without delay.
+    /// @notice Set the price CAP. This is the emergency brake: lowering it lowers
+    ///         every bond's valuation immediately, in the safe direction, without
+    ///         bound and without delay.
     ///
-    /// @dev ══ NO RATE LIMIT HERE, AND THAT IS DELIBERATE (issue #89) ══
+    /// @dev    NO RATE LIMIT AND NO SIZE CEILING, DELIBERATELY. An owner may set
+    ///         any value, any number of times, in the same block. Rate limiting is
+    ///         enforced off-chain by a Zodiac Delay/Roles module on the owner
+    ///         Safe — see `openspec/specs/deployment-docs/spec.md`.
     ///
-    ///      THIS FUNCTION IMPOSES NO RATE LIMIT AND NO SIZE CEILING. An owner
-    ///      may set any value, any number of times, in the same block. Rate
-    ///      limiting is enforced OFF-CHAIN, by a Zodiac Delay/Roles module on
-    ///      the owner Safe. A reader looking for the self-limit that used to be
-    ///      here should look at the Safe's module configuration, not at this
-    ///      contract — see `openspec/specs/deployment-docs/spec.md`.
+    ///         A 2x-per-raise ceiling with no time component is not a rate limit
+    ///         at all, since N calls in one multisig batch move the price 2^N, so
+    ///         it could not be kept once the interval went: it would advertise a
+    ///         protection the exact party it constrains can trivially bypass.
+    ///         The interval itself gated BOTH directions, and lowering this cap IS
+    ///         the emergency action — a routine morning adjustment spent the lever
+    ///         and left no brake that afternoon.
     ///
-    ///      WHAT WAS REMOVED, AND WHY BOTH HAD TO GO TOGETHER. There was a
-    ///      1-day `MIN_PRICE_UPDATE_INTERVAL` plus a `newPriceX8 <= current * 2`
-    ///      ceiling on upward moves. The interval was what made the ceiling a
-    ///      rate limit at all — a 2x cap with no time component is not one,
-    ///      since N calls in a single multisig batch move the price 2^N. So the
-    ///      ceiling could not be kept alone: it would have advertised a
-    ///      protection that the exact party it constrains can trivially bypass,
-    ///      which is worse than no protection, because a reviewer stops looking.
+    ///         WHAT THE OFF-CHAIN CONTROL MUST PRESERVE: an ASYMMETRIC delay,
+    ///         raises delayed and drops immediate. A plain Zodiac Delay module is
+    ///         symmetric and would relocate this problem rather than fix it.
     ///
-    ///      WHY IT WENT RATHER THAN BEING FIXED. The interval gated BOTH
-    ///      directions while the size ceiling gated only one, so the code
-    ///      limited the size of a move by direction but its timing regardless.
-    ///      After design revision 2, lowering this cap IS the emergency action,
-    ///      so the limit sat directly on crisis response: a routine morning
-    ///      adjustment spent the lever and left no brake that afternoon. A
-    ///      self-limit on an already-trusted owner bought little and cost
-    ///      exactly the responsiveness it most needed to preserve.
-    ///
-    ///      WHAT THE OFF-CHAIN CONTROL MUST PRESERVE: the delay has to be
-    ///      ASYMMETRIC — raises delayed, drops immediate. A plain Zodiac Delay
-    ///      module is symmetric and would relocate this bug rather than fix it.
-    ///
-    ///      ZERO IS STILL ALLOWED, and under design revision 2 it is a HARD
-    ///      STOP rather than a $0 valuation: `_woodPrice` reverts `NoWoodPrice`
-    ///      on a zero cap, so proposing and executing halt while votes continue
-    ///      to land. Rejecting zero would not prevent stopping the protocol —
-    ///      1 wei-X8 comes close enough — and would strand the cap with no way
-    ///      back up.
+    ///         ZERO IS STILL ALLOWED, and is a HARD STOP rather than a $0
+    ///         valuation: `_woodPrice` reverts `NoWoodPrice` on a zero cap, so
+    ///         proposing and executing halt while votes continue to land.
     function setWoodUsdPrice(uint256 newPriceX8) external onlyOwner {
         uint256 current = woodUsdPriceX8;
         emit WoodUsdPriceSet(current, newPriceX8);
@@ -848,19 +654,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @notice Wire (or UNWIRE) the Chainlink WOOD/USD feed.
     ///
     /// @dev    ZERO IS THE UNWIRE SWITCH and it is load-bearing: it is the
-    ///         governance path back from a bad aggregator, since every coverage
-    ///         path prices bonds through `_woodPrice`.
-    ///
-    ///         Unwiring is safe ONLY WHILE A TWAP ORACLE IS WIRED — it drops to
-    ///         that source, capped on the same terms. With neither wired there
-    ///         is no market data and every price read reverts `NoWoodPrice`, so
-    ///         an operator clearing a bad aggregator must confirm
-    ///         `woodTwapOracle` is live first.
+    ///         governance path back from a bad aggregator. Unwiring is safe ONLY
+    ///         WHILE A TWAP ORACLE IS WIRED — with neither wired there is no
+    ///         market data and every price read reverts `NoWoodPrice`.
     ///
     ///         UNWIRING MUST BE SPELLED `setWoodFeed(address(0), 0)`. `maxDelay`
     ///         is REQUIRED to be zero rather than merely ignored, so a mis-typed
-    ///         feed address paired with a real delay reverts instead of
-    ///         silently dropping the ledger onto the governance price.
+    ///         feed address paired with a real delay reverts instead of silently
+    ///         dropping the ledger onto the governance price.
     function setWoodFeed(address feed, uint256 maxDelay) external onlyOwner {
         if (feed == address(0)) {
             // `maxDelay` must be zero too: a mis-typed address paired with a real
@@ -872,11 +673,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         }
         if (maxDelay == 0 || maxDelay > type(uint64).max) revert InvalidParameter();
         uint8 feedDecimals = IAggregatorMinimal(feed).decimals();
-        // BOUNDED AT WRITE TIME (audit #181 finding 22): unbounded, a feed
-        // reporting `feedDecimals >= 78` panics `_feedPriceX8`'s
-        // normalization (`10 ** feedDecimals` overflows uint256) instead of
-        // reporting unavailable, taking `_woodPrice` down protocol-wide
-        // rather than falling through to the TWAP. See `MAX_FEED_DECIMALS`.
+        // BOUNDED AT WRITE TIME: unbounded, a feed reporting `feedDecimals >= 78`
+        // panics `_feedPriceX8`'s normalization instead of reporting unavailable,
+        // taking `_woodPrice` down protocol-wide. See `MAX_FEED_DECIMALS`.
         if (feedDecimals > MAX_FEED_DECIMALS) revert InvalidParameter();
         // maxDelay bounded to type(uint64).max above; cast cannot truncate.
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -891,29 +690,22 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @inheritdoc IExposureLedger
     ///
-    /// @dev THE PAIR IS VALIDATED BEFORE IT IS TRUSTED. Four WOOD/WETH Uniswap
-    ///      V3 pools exist on chain 4663 and all four are initialised-but-never-
-    ///      traded shells: `getPool` returns a non-zero address, so "does the
-    ///      pool exist?" passes and the price read comes back garbage. The V2
-    ///      analogue — an oracle pointed at a pair of the right shape holding
-    ///      the wrong tokens, or holding nothing — would price guardian
-    ///      collateral off an unrelated market. `validatePair()` re-checks the
-    ///      token ordering, both reserves and the accumulator, and wiring is
-    ///      refused unless it answers a clean `true`.
+    /// @dev THE PAIR IS VALIDATED BEFORE IT IS TRUSTED. Four WOOD/WETH Uniswap V3
+    ///      pools exist on chain 4663 and all four are initialised-but-never-
+    ///      traded shells: `getPool` returns a non-zero address, so a pool-exists
+    ///      check passes and the price read comes back garbage. `validatePair()`
+    ///      re-checks the token ordering, both reserves and the accumulator, and
+    ///      wiring is refused unless it answers a clean `true`.
     ///
-    ///      PROBED, NOT CALLED TYPED, and the answer decoded as a `uint256`.
-    ///      Identical reasoning to `_twapPriceX8` and to `DeployPlanB`'s
-    ///      delegation probe: `abi.decode` into a `bool` reverts on any word
-    ///      that is not 0 or 1, so a malformed answer would become an
-    ///      undecodable revert instead of the refusal it should be. Anything
-    ///      that is not exactly 1 is refused.
+    ///      PROBED, NOT CALLED TYPED, and the answer decoded as a `uint256`:
+    ///      `abi.decode` into a `bool` reverts on any word that is not 0 or 1, so
+    ///      a malformed answer would become an undecodable revert instead of the
+    ///      refusal it should be. `code.length` FIRST — the extcodesize guard on a
+    ///      high-level call to a codeless address reverts in this frame, which no
+    ///      `try` can catch.
     ///
-    ///      `code.length` FIRST — the extcodesize guard on a high-level call to
-    ///      a codeless address reverts in this frame, which no `try` can catch.
-    ///
-    ///      UNWIRING TO ZERO IS ACCEPTED and validates nothing, because there
-    ///      is nothing to validate. It is not a safe resting state on 4663; see
-    ///      the interface note.
+    ///      UNWIRING TO ZERO IS ACCEPTED and validates nothing. It is not a safe
+    ///      resting state on 4663.
     function setWoodTwapOracle(address oracle) external onlyOwner {
         if (oracle != address(0)) {
             if (oracle.code.length == 0) revert InvalidParameter();
@@ -925,20 +717,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         woodTwapOracle = oracle;
     }
 
-    /// @dev BOUNDED, BUT NOT RATE-LIMITED (issue #89). The `[MIN_WOOD_HAIRCUT_BPS,
-    ///      BPS_DENOMINATOR]` range stays — a haircut below the floor values
-    ///      every bond under half of market, which is a mis-set parameter
-    ///      rather than a policy, and above 100% would value bonds ABOVE market
-    ///      and overstate coverage. Those are VALUE bounds and they cost
-    ///      nothing in a crisis.
-    ///
-    ///      The 1-day interval that used to sit here is GONE, for the same
-    ///      reason it left `setWoodUsdPrice`: rate limiting is enforced
-    ///      off-chain by a Zodiac module on the owner Safe, and this contract
-    ///      deliberately imposes none. The interval was doubly awkward here —
-    ///      it gated the two levers independently, so spending one did not
-    ///      unlock the other, and tightening the haircut is a safe-direction
-    ///      move that a crisis is exactly when you want.
+    /// @dev BOUNDED, BUT NOT RATE-LIMITED. The
+    ///      `[MIN_WOOD_HAIRCUT_BPS, BPS_DENOMINATOR]` range stays: below the floor
+    ///      values every bond under half of market, which is a mis-set parameter
+    ///      rather than a policy, and above 100% would value bonds ABOVE market.
+    ///      Those are VALUE bounds and cost nothing in a crisis. Rate limiting is
+    ///      enforced off-chain — see `setWoodUsdPrice`. Tightening the haircut is
+    ///      a safe-direction move a crisis is exactly when you want.
     function setWoodHaircutBps(uint256 newBps) external onlyOwner {
         if (newBps < MIN_WOOD_HAIRCUT_BPS || newBps > BPS_DENOMINATOR) revert InvalidParameter();
         emit ParameterChangeFinalized(keccak256("woodHaircutBps"), woodHaircutBps, newBps);
@@ -947,19 +732,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     function setGuardianRegistry(address registry) external onlyOwner {
         if (registry == address(0)) revert ZeroAddress();
-        // RE-CHECKS THE FLOOR: `setChallengeWindow` skips it while no registry
-        // is wired, so an owner could set a short window before wiring a
-        // registry whose `reviewPeriod` makes the floor longer, leaving the
-        // window under-floored with nothing revalidating.
+        // RE-CHECKS THE FLOOR: `setChallengeWindow` skips it while no registry is
+        // wired, so an owner could set a short window before wiring a registry
+        // whose `reviewPeriod` makes the floor longer.
         //
         // Tolerant read on purpose — this guards against an ordering mistake by
         // the owner, not an adversary: a registry that cannot answer
         // `reviewPeriod()` is let through rather than bricking the wiring
-        // transaction; one that does answer is held to the floor.
-        //
-        // `registry.code.length` first: Solidity's extcodesize guard on a
-        // high-level call to an EOA reverts in THIS frame, which `try` cannot
-        // catch, so the check must be skipped before it is attempted.
+        // transaction. `registry.code.length` first, because Solidity's
+        // extcodesize guard on a high-level call to an EOA reverts in THIS frame,
+        // which `try` cannot catch.
         if (registry != address(0) && registry.code.length != 0) {
             try IRegistryApproversMinimal(registry).reviewPeriod() returns (uint256 rp) {
                 if (challengeWindow < rp + MAX_GOVERNOR_EXECUTION_WINDOW) revert InvalidParameter();
@@ -969,66 +751,47 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         guardianRegistry = registry;
     }
 
-    /// @dev The window applies RETROACTIVELY to already-booked buckets:
-    ///      shrinking it instantly expires buckets recorded under the longer
-    ///      window (frees coverage early); growing it re-counts buckets that
-    ///      had already expired (conservative). Governance should change it
-    ///      between epochs or at low open exposure.
+    /// @dev The window applies RETROACTIVELY to already-booked buckets: shrinking
+    ///      it instantly expires buckets recorded under the longer window (frees
+    ///      coverage early); growing it re-counts buckets that had already expired
+    ///      (conservative). Change it between epochs or at low open exposure.
     ///
-    ///      TWO LOWER BOUNDS, BOTH TOLERANT READS OF AN EXTERNAL POINTER —
-    ///      picking ONE convention for "pointer wired but cannot answer" and
-    ///      applying it to both (audit-181-critical-high, CAUTION resolution).
-    ///      `setGuardianRegistry` admits a registry TOLERANTLY: a wired
-    ///      address that is codeless or reverts on `reviewPeriod()` is let
-    ///      through rather than bricking the wiring call, because that setter
-    ///      guards against an ordering mistake by the owner, not an
-    ///      adversary. Reading that same pointer STRICTLY here — as this
-    ///      function used to for bound #1 — contradicts that: a registry the
-    ///      tolerant setter admitted (codeless, or a contract that reverts on
-    ///      `reviewPeriod()`) made `IRegistryApproversMinimal(reg)
-    ///      .reviewPeriod()` revert in THIS frame on every subsequent call,
-    ///      permanently bricking `setChallengeWindow` rather than merely
-    ///      declining to floor it. Liveness of a governance setter must not
-    ///      depend on a foreign contract answering a view call, so both
-    ///      bounds below use the identical `code.length` + try/catch shape:
-    ///      an unanswerable pointer is treated as "no floor from this side"
-    ///      rather than as a revert.
+    ///      TWO LOWER BOUNDS, BOTH TOLERANT READS OF AN EXTERNAL POINTER. Reading
+    ///      a pointer STRICTLY here while `setGuardianRegistry` admits it
+    ///      TOLERANTLY is a contradiction: a registry the tolerant setter admitted
+    ///      (codeless, or reverting on `reviewPeriod()`) would then make this
+    ///      function revert in THIS frame on every subsequent call, permanently
+    ///      bricking it rather than merely declining to floor it. Liveness of a
+    ///      governance setter must not depend on a foreign contract answering a
+    ///      view call, so both bounds use the same `code.length` + try/catch
+    ///      shape: an unanswerable pointer means no floor from that side.
     function setChallengeWindow(uint256 newWindow) external onlyOwner {
         // Zero would free coverage instantly. The upper bound is whatever keeps
         // `openExposureUsd`'s walk inside `MAX_SCAN_BUCKETS`.
         if (newWindow == 0) revert InvalidParameter();
         _requireScanBounded(newWindow, epochLength);
-        // LOWER BOUND #1: the anti-batching property depends on a bucket
-        // outliving the proposal it backs. A window shorter than the
-        // approve->execute gap lets one bond cover two live drains — approve
-        // #1 just before an epoch boundary, let the bucket expire while #1 is
-        // still Approved and inside its execution window, then approve #2 at
-        // full budget; both quorums pass, both execute.
-        //
-        // `registry.code.length` first, for the same extcodesize reason as
-        // `setGuardianRegistry`'s own read: a call to a codeless address
-        // reverts in THIS frame, which no `try` can catch.
+        // LOWER BOUND #1: the anti-batching property depends on a bucket outliving
+        // the proposal it backs. A window shorter than the approve-to-execute gap
+        // lets one bond cover two live drains — approve #1 just before an epoch
+        // boundary, let the bucket expire while #1 is still Approved and inside
+        // its execution window, then approve #2 at full budget; both quorums pass,
+        // both execute. `code.length` first, for the same extcodesize reason as
+        // `setGuardianRegistry`.
         address reg = guardianRegistry;
         if (reg != address(0) && reg.code.length != 0) {
             try IRegistryApproversMinimal(reg).reviewPeriod() returns (uint256 rp) {
                 if (newWindow < rp + MAX_GOVERNOR_EXECUTION_WINDOW) revert InvalidParameter();
             } catch {}
         }
-        // LOWER BOUND #2 (audit-181-critical-high, finding D: WINDOW COUPLING
-        // IS ONE-SIDED). `ChallengeGame` enforces `game.challengeWindow <=
-        // ledger.challengeWindow()` at construction, at `setExposureLedger`,
-        // and at its own `setChallengeWindow` — all THREE only check at the
-        // instant they run. None of them re-fire when the LEDGER's window
-        // moves afterward, so shrinking it here (legal: only floored by
-        // `_requireScanBounded` and bound #1 above) could silently open a gap
-        // where `game.challengeWindow > ledger.challengeWindow()`:
+        // LOWER BOUND #2: WINDOW COUPLING IS ONE-SIDED. `ChallengeGame` enforces
+        // `game.challengeWindow <= ledger.challengeWindow()` in three places, but
+        // all three only check at the instant they run — none re-fire when the
+        // LEDGER's window moves. Shrinking it here could silently open a gap where
         // `retireApproval`'s gate (keyed off THIS window) opens before
-        // `ChallengeGame.file`'s own filing deadline (keyed off the GAME's
-        // window) closes, so a sweep can empty `_approversOf` while the
-        // proposal is still, legally, filable — permanently unchallengeable
-        // the moment it happens. Mirroring the game's own check back onto
-        // this side closes the gap symmetrically. `coverageFreezer` IS the
-        // game address (spec §3.4).
+        // `ChallengeGame.file`'s deadline (keyed off the GAME's) closes, so a
+        // sweep can empty `_approversOf` while the proposal is still legally
+        // filable — permanently unchallengeable the moment it happens.
+        // `coverageFreezer` IS the game address.
         address freezer = coverageFreezer;
         if (freezer != address(0) && freezer.code.length != 0) {
             try IChallengeGameWindowMinimal(freezer).challengeWindow() returns (uint256 gameWindow) {
@@ -1039,16 +802,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         challengeWindow = newWindow;
     }
 
-    /// @dev REFUSED WHILE ANYTHING IS FROZEN. `unfreezeCoverage` is
-    ///      `onlyFreezer` and the challenge game is its only caller, so
-    ///      rotating this role mid-challenge would strand every live freeze:
-    ///      the old game's `resolve()` could never call the new freezer, both
-    ///      bonds would be stuck with no withdrawal path, and every accused
-    ///      approver would be permanently barred from `claimUnstakeGuardian`.
-    ///
-    ///      Zero is still legal as the unwire switch; it just cannot be thrown
-    ///      while it would strand a live freeze. The only reachable order is to
-    ///      drain live challenges first, then re-point.
+    /// @dev REFUSED WHILE ANYTHING IS FROZEN. `unfreezeCoverage` is `onlyFreezer`
+    ///      and the challenge game is its only caller, so rotating this role
+    ///      mid-challenge would strand every live freeze: the old game could never
+    ///      call the new freezer, both bonds would be stuck with no withdrawal
+    ///      path, and every accused approver would be permanently barred from
+    ///      `claimUnstakeGuardian`. Zero is still legal as the unwire switch; the
+    ///      only reachable order is to drain live challenges first.
     function setCoverageFreezer(address freezer) external onlyOwner {
         if (_frozenKeyCount != 0) revert CoverageFrozen();
         emit CoverageFreezerSet(coverageFreezer, freezer);
@@ -1087,13 +847,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if (maxDelay == 0 || maxDelay > type(uint64).max) revert InvalidParameter();
         uint8 assetDec = IERC20DecimalsMinimal(asset).decimals();
         uint8 feedDec = IAggregatorMinimal(feed).decimals();
-        // BOUNDED AT WRITE TIME (audit #181 finding 22): the same
-        // `feedDecimals >= 78` overflow that `setWoodFeed` guards against
-        // panics `coverageUsd`'s normalization identically — see
-        // `MAX_FEED_DECIMALS`. `coverageUsd` is otherwise meant to revert on
-        // bad state (fail-closed), but "meant to revert cleanly" and "can be
-        // configured to panic" are different guarantees; this closes the gap
-        // at the only site that can ever introduce the bad value.
+        // BOUNDED AT WRITE TIME: the same `feedDecimals >= 78` overflow that
+        // `setWoodFeed` guards against panics `coverageUsd`'s normalization
+        // identically. `coverageUsd` is meant to revert on bad state, but meant to
+        // revert cleanly and can be configured to panic are different guarantees.
         if (feedDec > MAX_FEED_DECIMALS) revert InvalidParameter();
         // maxDelay bounded to type(uint64).max above; cast cannot truncate.
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -1104,18 +861,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev USD-18 value of `amount` of `asset`. Fail-closed on unconfigured
-    ///      asset or stale feed — a proposal in an unpriceable asset cannot be
-    ///      coverage-checked and therefore cannot proceed.
-    ///      All conversions FLOOR (sub-wei dust, accepted), and so does
-    ///      `proposerBondWood`, which floors twice on top of this. Floor is
-    ///      accepted there too: a coverage small enough to floor the bond to
-    ///      zero (below ~1e-14 USD at the shipped bps/price scales) has
-    ///      negligible extractable value, so nothing meaningful goes unbonded.
-    ///      Accepted v1 risks: Chainlink aggregators clamp at min/maxAnswer,
-    ///      so a clamped price understates coverage (anti-conservative); and
-    ///      Robinhood 4663 has no L2 sequencer-uptime feed to gate reads.
-    ///      Both accepted for v1 — revisit when a sequencer feed exists.
+    /// @dev USD-18 value of `amount` of `asset`. Fail-closed on an unconfigured
+    ///      asset or a stale feed — a proposal in an unpriceable asset cannot be
+    ///      coverage-checked and therefore cannot proceed. All conversions FLOOR
+    ///      (sub-wei dust, accepted), and so does `proposerBondWood`.
+    ///      Accepted v1 risks: Chainlink aggregators clamp at min/maxAnswer, so a
+    ///      clamped price understates coverage (anti-conservative); and Robinhood
+    ///      4663 has no L2 sequencer-uptime feed to gate reads.
     function coverageUsd(address asset, uint256 amount) public view returns (uint256) {
         AssetFeed storage f = _assetFeeds[asset];
         if (f.feed == address(0)) revert FeedNotConfigured();
@@ -1149,44 +901,23 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @dev Resolves `(asset, requiredCoverage)` for `governor`/`proposalId`
     ///      against `vault`, book/settle-NOTHING on any failure rather than
-    ///      reverting (audit #181 finding 23). Shared by `recordApproval` and
-    ///      `settleCoverage` so the hoist-and-guard shape below cannot drift
-    ///      between the two call sites — both callers already document "any
-    ///      pricing failure books/settles nothing rather than reverting", and
-    ///      this is the piece that used to quietly not honour that.
+    ///      reverting. Shared by `recordApproval` and `settleCoverage` so the
+    ///      hoist-and-guard shape cannot drift between the two call sites.
     ///
     ///      HOISTED OUT OF ANY `try`'s ARGUMENT LIST, DELIBERATELY. Solidity
     ///      evaluates a call's argument expressions in the CALLER's frame,
-    ///      strictly before the call a `try` around it actually guards. Both
-    ///      callers used to write the equivalent of:
+    ///      strictly before the call a `try` around it actually guards, so a
+    ///      revert from `IVaultAssetMinimal(pv.vault).asset()` or from
+    ///      `gov.getRequiredCoverage(proposalId)` written inline propagated
+    ///      straight through the `catch` as if the `try` were not there. Each read
+    ///      is now resolved through its OWN try/catch, ahead of and independent
+    ///      from the `coverageUsd` try each caller still performs.
     ///
-    ///          try this.coverageUsd(
-    ///              IVaultAssetMinimal(pv.vault).asset(),
-    ///              gov.getRequiredCoverage(proposalId)
-    ///          ) returns (uint256 v) { ... } catch { ... }
-    ///
-    ///      — with `IVaultAssetMinimal(pv.vault).asset()` evaluated before the
-    ///      guarded call even begins, and `gov.getRequiredCoverage(proposalId)`
-    ///      evaluated as an ARGUMENT to it, equally outside the guard. A
-    ///      revert from either one propagated straight through the `catch`
-    ///      exactly as if the `try` were not there, defeating the "any
-    ///      pricing failure books/settles nothing" guarantee for a dependency
-    ///      (`getRequiredCoverage`) the natspec itself calls out as latent
-    ///      today only because `SyndicateGovernor.getRequiredCoverage` is
-    ///      presently a bare storage read — it arms the moment that getter
-    ///      (or a future vault's `asset()`) gains any reverting path. Each
-    ///      read is now resolved through its OWN try/catch, ahead of and
-    ///      independent from the `coverageUsd` try each caller still performs.
-    ///
-    ///      `vault.code.length` is checked FIRST, for the same reason
-    ///      `_feedPriceX8`/`_twapPriceX8` check it before their own external
-    ///      reads: a call that succeeds against a codeless address returns no
-    ///      data, and Solidity does not route a resulting ABI-decode failure
-    ///      through `catch` — it is a full, uncaught revert of the
-    ///      transaction. `governor` needs no matching guard here: both callers
-    ///      only reach this function via a `pv` already produced by an
-    ///      earlier, UNWRAPPED call to this exact `gov`, so `gov` is proven to
-    ///      have code (and to have answered) before this function ever runs.
+    ///      `vault.code.length` is checked FIRST: a call that succeeds against a
+    ///      codeless address returns no data, and Solidity does not route the
+    ///      resulting ABI-decode failure through `catch`. `governor` needs no
+    ///      matching guard — both callers only reach this via a `pv` already
+    ///      produced by an earlier unwrapped call to that same `gov`.
     function _tryResolveCoverageInputs(ILedgerGovernorMinimal gov, uint256 proposalId, address vault)
         internal
         view
@@ -1207,36 +938,30 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev Called by GuardianRegistry.voteOnProposal on the approve side.
+    /// @dev Called by `GuardianRegistry.voteOnProposal` on the approve side.
     ///
-    ///      An approver RESERVES `min(free bond, the proposal's full
-    ///      coverage)` — not merely what is still uncovered. Reserving less
-    ///      would let the first approver absorb the whole coverage while later
-    ///      ones book zero and are never listed, so flipping the first approver
-    ///      to Block releases the entire commitment with nobody left to cover
-    ///      it — a costless veto by a single guardian.
+    ///      An approver RESERVES `min(free bond, the proposal's full coverage)` —
+    ///      not merely what is still uncovered. Reserving less would let the first
+    ///      approver absorb the whole coverage while later ones book zero and are
+    ///      never listed, so flipping the first approver to Block releases the
+    ///      entire commitment with nobody left to cover it: a costless veto by a
+    ///      single guardian.
     ///
-    ///      Reserving per approver costs budget — A approvers tie up A x
-    ///      coverage until `settleCoverage` runs — and buys the property that
-    ///      there is nothing to squat. The real split is the pro-rata
-    ///      `allocatedUsd`, so §3.3a's *aggregate* quorum still aggregates: two
-    ///      guardians holding $600k each jointly cover a $1M proposal, because a
-    ///      conviction slashes EVERY approver of that proposal and recovery is
-    ///      the SUM of their bonds (spec §2: "coalition loss >= Σ dollar value
-    ///      of slashable approver stake").
+    ///      Reserving per approver costs budget — A approvers tie up
+    ///      `A x coverage` until `settleCoverage` runs — and buys the property
+    ///      that there is nothing to squat. The real split is the pro-rata
+    ///      `allocatedUsd`, so the aggregate quorum still aggregates: a conviction
+    ///      slashes EVERY approver and recovery is the SUM of their bonds.
     ///
-    ///      TWO DIFFERENT RULES. §3.3's cap exists to stop ONE guardian backing
-    ///      MANY proposals ("approve N drains in one window, lose one bond
-    ///      once"). It does NOT require one guardian to single-handedly cover
+    ///      TWO DIFFERENT RULES. The cap exists to stop ONE guardian backing MANY
+    ///      proposals; it does NOT require one guardian to single-handedly cover
     ///      ONE proposal. Reserving the full coverage per approver enforces the
-    ///      cap without imposing the second reading, because the reservation is
-    ///      an upper bound on liability and `allocatedUsd` is the actual
-    ///      per-guardian split.
+    ///      cap without imposing the second reading, because the reservation is an
+    ///      upper bound on liability and `allocatedUsd` is the actual split.
     ///
     ///      Consequence: an under-bonded guardian is not rejected at vote time —
-    ///      it commits what it can, and the proposal fails the execute-time
-    ///      quorum unless other approvers make up the rest. A guardian with NO
-    ///      free budget books nothing and returns; the cap is enforced by
+    ///      it commits what it can, and the proposal fails the execute-time quorum
+    ///      unless other approvers make up the rest. The cap is enforced by
     ///      committing zero, not by reverting the vote.
     function recordApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
         bytes32 key = _reviewKey(governor, proposalId);
@@ -1247,15 +972,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if (_reservedUsd[key][guardian] != 0) return;
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
         ILedgerGovernorMinimal.ProposalViewLite memory pv = gov.getProposalView(proposalId);
-        // ANY PRICING FAILURE BOOKS NOTHING RATHER THAN REVERTING — missing
-        // feed, stale feed, an unreadable vault/required-coverage read (audit
-        // #181 finding 23, see `_tryResolveCoverageInputs`), or any other
-        // `coverageUsd` revert. Reverting here would take the APPROVE vote
-        // down with it while Block votes still work, turning the review
-        // block-only: guardians could veto but never endorse, and the
-        // proposal would pass optimistically anyway. Failing closed on the
-        // coverage (booking nothing, so the execute-time quorum cannot be
-        // met) is the conservative half; failing the vote is the harmful one.
+        // ANY PRICING FAILURE BOOKS NOTHING RATHER THAN REVERTING — missing feed,
+        // stale feed, an unreadable vault or required-coverage read, or any other
+        // `coverageUsd` revert. Reverting here would take the APPROVE vote down
+        // while Block votes still work, turning the review block-only: guardians
+        // could veto but never endorse, and the proposal would pass optimistically
+        // anyway. Failing closed on the coverage is the conservative half.
         (address asset, uint256 requiredCoverage, bool resolved) = _tryResolveCoverageInputs(gov, proposalId, pv.vault);
         if (!resolved) return; // unreadable right now: book nothing, let the quorum decide
         //
@@ -1270,32 +992,21 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if (needUsd == 0) return; // zero-coverage: nothing to book
 
         // RESERVATION, NOT ALLOCATION: books the MOST this guardian could ever
-        // carry (the whole proposal, if every other approver walks away); the
-        // final split is computed at read time by `allocatedUsd`. This makes
-        // the batching cap STRICTER — every approval consumes budget up to the
-        // full coverage rather than the leftover — but the excess is not
-        // stranded: it clears when the epoch bucket expires, or immediately on
-        // a vote change.
+        // carry — the whole proposal, if every other approver walks away. The
+        // final split is computed at read time by `allocatedUsd`. This makes the
+        // batching cap STRICTER, but the excess is not stranded: it clears when
+        // the epoch bucket expires, or immediately on a vote change.
         //
-        // AN UNPRICEABLE WOOD BOOKS NOTHING RATHER THAN REVERTING — the same
-        // treatment, and the same argument, as the `coverageUsd` wrap above.
-        // Under design revision 2 `_woodPrice` REVERTS `NoWoodPrice` when no
-        // market source can price WOOD (there is no fallback scalar any more),
-        // and that revert reaches here through `slashableBondUsd`. Letting it
-        // propagate would fail the APPROVE vote while Block votes kept landing,
-        // turning the review block-only: guardians could veto but never
-        // endorse, and the proposal would pass optimistically anyway. That is
-        // the failure reviews M3, N1 and N4 each removed, and it must not be
-        // reintroduced by the price path.
+        // AN UNPRICEABLE WOOD BOOKS NOTHING RATHER THAN REVERTING — same
+        // treatment and same argument as the `coverageUsd` wrap above. Booking
+        // nothing is the conservative half: this guardian commits no coverage, so
+        // `requireApproveQuorum` cannot be met at execute and fails loudly there,
+        // where reverting is the safe direction.
         //
-        // Booking nothing is the conservative half: this guardian commits no
-        // coverage, so `requireApproveQuorum` cannot be met at execute and
-        // fails loudly there — where reverting is the safe direction.
-        //
-        // Called through `this` so the revert is catchable; a same-contract
-        // call cannot be wrapped. Only the PRICE is wrapped, not the sWOOD
-        // read: a reverting `guardianStake` is a broken core dependency, not an
-        // oracle outage, and should not be silently absorbed.
+        // Called through `this` so the revert is catchable; a same-contract call
+        // cannot be wrapped. Only the PRICE is wrapped, not the sWOOD read: a
+        // reverting `guardianStake` is a broken core dependency, not an oracle
+        // outage, and should not be silently absorbed.
         uint256 priceX8;
         try this.woodPriceX8() returns (uint256 p) {
             priceX8 = p;
@@ -1303,18 +1014,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             return; // no WOOD price right now: book nothing, let the quorum decide
         }
 
-        // Free budget = k * bond - open exposure. Zero free budget is the
-        // batching attack's boundary: this guardian's bond is already fully
-        // spoken for by its other open approvals, so it cannot back another drain.
-        // LIVE (anchor = 0): pre-execution, no verdict anchor exists yet.
+        // Free budget = k * bond - open exposure. Zero free budget is the batching
+        // attack's boundary: this guardian's bond is already fully spoken for by
+        // its other open approvals. LIVE (anchor = 0): pre-execution, no verdict
+        // anchor exists yet.
         uint256 capUsd = kNumerator * _slashableBondUsd(guardian, priceX8, 0);
         uint256 open = openExposureUsd(guardian);
-        // NO FREE BUDGET -> BOOK NOTHING, DON'T REVERT. Reverting here would
-        // silence the approve side entirely for a guardian whose budget is
-        // spent, while Block votes still work — disenfranchisement, not a cap.
-        // The cap still binds: this guardian commits nothing, so its bond still
-        // cannot back two drains; enforcement moves to `requireApproveQuorum` at
-        // execute, which fails loudly with the shortfall visible.
+        // NO FREE BUDGET -> BOOK NOTHING, DON'T REVERT. Reverting would silence
+        // the approve side entirely for a guardian whose budget is spent while
+        // Block votes still work — disenfranchisement, not a cap. The cap still
+        // binds, and enforcement moves to `requireApproveQuorum` at execute.
         if (open >= capUsd) return;
         uint256 free = capUsd - open;
 
@@ -1326,19 +1035,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // happened to land in. The commitment must survive until the drain it
         // backs can no longer be challenged:
         //
-        //     risk ends at   executeBy + strategyDuration + challengeWindow
+        //     risk ends at        executeBy + strategyDuration + challengeWindow
         //     bucket expires at   bucketEnd + challengeWindow
         //
         // so the bucket must contain `executeBy + strategyDuration`. Keying on
-        // `currentEpoch()` would release a guardian's budget as early as
-        // `approval + challengeWindow` — before the challenge window on their
-        // own approval had closed.
-        //
-        // `executeBy` rather than `executedAt`: at approve time the proposal has
-        // not executed and may never, so the deadline is the conservative
-        // anchor. Horizon failures book nothing rather than reverting —
-        // `SyndicateGovernor.propose` rejects an out-of-horizon duration up
-        // front, so this is the belt to that braces.
+        // `currentEpoch()` would release the budget as early as
+        // `approval + challengeWindow`. `executeBy` rather than `executedAt`
+        // because at approve time the proposal has not executed and may never.
         (uint256 epoch, bool withinHorizon) = _coverageEpochOrSkip(pv);
         if (!withinHorizon) return;
         _buckets[guardian][epoch] += share;
@@ -1368,19 +1071,15 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         emit ExposureRecorded(guardian, key, share, epoch);
     }
 
-    /// @dev SHARED UNWIND, used by both `releaseApproval` and `retireApproval`
-    ///      (audit #181 finding 11) so the two paths — vote-change unwind and
-    ///      post-window sweep — can never drift apart. Clears the booking and
-    ///      the pledge, unwinds both bucket/committed counters and both
-    ///      shared-stake accumulators, and swap-and-pops the guardian out of
-    ///      the approver list.
+    /// @dev SHARED UNWIND, used by both `releaseApproval` and `retireApproval` so
+    ///      the vote-change unwind and the post-window sweep cannot drift apart.
+    ///      Clears the booking and the pledge, unwinds both bucket/committed
+    ///      counters and both shared-stake accumulators, and swap-and-pops the
+    ///      guardian out of the approver list.
     ///
-    ///      PRECONDITION, NOT ENFORCED HERE: callers must already hold
-    ///      `reserved = _reservedUsd[key][guardian]` and
-    ///      `r = _recorded[key][guardian]` from BEFORE this call — freeze,
-    ///      pin, and window checks are each caller's own responsibility, since
-    ///      the two callers gate on different conditions (a live review vs. an
-    ///      elapsed challenge window).
+    ///      PRECONDITION, NOT ENFORCED HERE: callers must already hold `reserved`
+    ///      and `r` from BEFORE this call, and freeze/pin/window checks are each
+    ///      caller's own responsibility — the two gate on different conditions.
     function _unwindApproval(bytes32 key, address guardian, RecordedExposure memory r, uint256 reserved) internal {
         delete _recorded[key][guardian];
         delete _reservedUsd[key][guardian];
@@ -1397,10 +1096,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         _liveBookedUsd[guardian] -= r.usd;
         _livePledgedUsd[guardian] -= reserved;
 
-        // Swap-and-pop out of the approver list, so it stays bounded by the
-        // cohort rather than growing with every guardian that ever approved.
-        // Order carries no meaning: every consumer sums over the list or
-        // returns it alongside per-guardian values.
+        // Swap-and-pop out of the approver list, so it stays bounded by the cohort
+        // rather than growing with every guardian that ever approved. Order
+        // carries no meaning: every consumer sums over the list.
         uint256 idx = _approverIndex[key][guardian];
         if (idx != 0) {
             address[] storage list = _approversOf[key];
@@ -1416,12 +1114,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev Vote-change Approve→Block (or any registry-side unwind). Releases
+    /// @dev Vote-change Approve-to-Block, or any registry-side unwind. Releases
     ///      exactly what was committed, from the bucket it was committed into.
-    ///      No-op when nothing is recorded — never underflows. The address is
-    ///      SWAP-AND-POPPED out of `_approversOf`, so the list is bounded by the
-    ///      cohort of currently-active approvers rather than growing with every
-    ///      guardian that ever approved — that loop runs on the execute path.
+    ///      No-op when nothing is recorded — never underflows.
     function releaseApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
         bytes32 key = _reviewKey(governor, proposalId);
         // A live challenge pins this coverage (§3.4): the guardian may not
@@ -1435,73 +1130,43 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev PERMISSIONLESS RETIREMENT OF A DEAD COMMITMENT (audit #181,
-    ///      finding 11). `_liveBookedUsd`/`_livePledgedUsd` — the shared-stake
-    ///      denominators `_sharedSlashableUsd` divides by — are strictly
-    ///      monotone increasing except for two decrement sites:
-    ///      `releaseApproval` and `_rebook`'s downward branch (which moves
-    ///      `_liveBookedUsd` only, and only down to a pro-rata allocation,
-    ///      never to zero on its own). `releaseApproval` has exactly ONE
-    ///      caller in the system — `GuardianRegistry.voteOnProposal`'s
-    ///      Approve→Block branch, gated on `block.timestamp < reviewEnd` — so
-    ///      once a review closes there is NO release path left at all.
-    ///      Meanwhile `openExposureUsd` (the batching-cap denominator) DOES
-    ///      decay on wall clock. The result: a guardian's share of its own
-    ///      live bond decays as ~1/N in the number of proposals it has EVER
-    ///      approved, even though every commitment older than its challenge
-    ///      window carries no collectable liability at all
-    ///      (`ChallengeGame.file` reverts `WindowClosed` past the window) —
-    ///      the denominator sums dead commitments nothing can slash.
+    /// @dev PERMISSIONLESS RETIREMENT OF A DEAD COMMITMENT.
+    ///      `_liveBookedUsd`/`_livePledgedUsd` are monotone increasing except at
+    ///      two decrement sites: `releaseApproval` and `_rebook`'s downward
+    ///      branch. `releaseApproval` has exactly ONE caller in the system, gated
+    ///      on `block.timestamp < reviewEnd`, so once a review closes there is no
+    ///      release path left — while `openExposureUsd` (the batching-cap
+    ///      denominator) DOES decay on wall clock. A guardian's share of its own
+    ///      live bond therefore decays as ~1/N in the number of proposals it has
+    ///      EVER approved, even though a commitment older than its challenge
+    ///      window carries no collectable liability at all.
     ///
-    ///      This is the missing release path for exactly that state. Anyone
-    ///      may sweep a key/guardian pair once it is provably inert:
-    ///        - `!_frozen[key]` — a live challenge still pins this coverage,
-    ///          identically to `releaseApproval`'s own guard;
-    ///        - `_pinnedUntil[key][guardian] < block.timestamp` — no
-    ///          `pinCoverageUntil` extension against THIS proposal (issue #95)
-    ///          is still in effect. PER-KEY, NOT THE PER-GUARDIAN MAX
-    ///          (audit-181-critical-high, finding C): a pin recorded against
-    ///          some OTHER stale proposal the same guardian once approved must
-    ///          not block sweeping this one, or a single grindable
-    ///          non-verdict anywhere in a guardian's history — an ordinary
-    ///          `Inconclusive`, no attacker required — permanently blocks
-    ///          retirement of its entire book, reopening the ~1/N
-    ///          shared-stake decay this function exists to close. See the
-    ///          storage doc on `_pinnedUntil`.
-    ///        - `block.timestamp` is past the SAME expiry
-    ///          `openExposureUsd` itself uses for this booked epoch:
-    ///          `epochGenesis + (r.epoch + 1) * epochLength + challengeWindow`.
-    ///      It then performs `releaseApproval`'s EXACT unwind
-    ///      (`_unwindApproval`), so the two can never diverge.
+    ///      Anyone may sweep a key/guardian pair once it is provably inert:
+    ///        - `!_frozen[key]`, identically to `releaseApproval`'s own guard;
+    ///        - `_pinnedUntil[key][guardian] < block.timestamp` — PER-KEY, not the
+    ///          per-guardian max: a pin against some OTHER stale proposal the same
+    ///          guardian once approved must not block sweeping this one, or a
+    ///          single routine `Inconclusive` anywhere in its history blocks
+    ///          retirement of the entire book;
+    ///        - `block.timestamp` past the SAME expiry `openExposureUsd` uses for
+    ///          this booked epoch.
+    ///      It then performs `releaseApproval`'s exact unwind, so the two cannot
+    ///      diverge.
     ///
-    ///      GATED ON `reserved != 0` (`_reservedUsd[key][guardian]`), NOT ON
-    ///      `_recorded[key][guardian].usd != 0` — deliberately, diverging
-    ///      from a literal "nothing to retire when the booking reads zero".
-    ///      `_rebook` (via `settleCoverage`) can write a guardian's BOOKING
-    ///      down to zero — its own slashable bond fell, so `_allocate` scaled
-    ///      its share to nothing — while leaving its PLEDGE and its listing
-    ///      in `_approversOf` completely untouched; `_rebook` never writes
-    ///      `_reservedUsd` or the approver list. Gating on the booking would
-    ///      make exactly that guardian permanently un-retirable, leaving
-    ///      `_livePledgedUsd` — the accumulator this function exists to
-    ///      unstick — stuck forever for the guardians most likely to need it
-    ///      released. `reserved != 0` is `releaseApproval`'s own no-op test
-    ///      and is correct here for the identical reason.
+    ///      GATED ON `reserved != 0`, NOT on the booking. `_rebook` can write a
+    ///      guardian's BOOKING down to zero while leaving its PLEDGE and its
+    ///      listing untouched, so gating on the booking would make exactly that
+    ///      guardian permanently un-retirable — leaving `_livePledgedUsd` stuck
+    ///      forever for the guardians most likely to need it released.
     ///
-    ///      PIN BOUNDARY IS INCLUSIVE OF `deadline` (audit-181-critical-high,
-    ///      finding B). `ChallengeGame.file` refuses a new filing only
-    ///      STRICTLY past its deadline (`if (block.timestamp > deadline)
-    ///      revert`), so a filing at `block.timestamp == deadline` is still
-    ///      legal. The read here must therefore stay pinned THROUGH that same
-    ///      instant — `_pinnedUntil[key][guardian] < block.timestamp`, not
-    ///      `<=` — matching the bucket-expiry check three lines below, which
-    ///      already used the inclusive form (`<=` blocks retirement through
-    ///      the expiry instant). Before this fix the pin used the exclusive
-    ///      form while the bucket check used the inclusive one — two
-    ///      conventions in one function — and the boundary second was legal
-    ///      to challenge but no longer pinned: a sweep in that same block
-    ///      could empty `_approversOf` out from under a same-block `file()`,
-    ///      making the proposal permanently unchallengeable.
+    ///      PIN BOUNDARY IS INCLUSIVE OF `deadline`. `ChallengeGame.file` refuses
+    ///      a filing only STRICTLY past its deadline, so a filing at
+    ///      `block.timestamp == deadline` is still legal and this read must stay
+    ///      pinned through that same instant. Mixing an exclusive pin check with
+    ///      an inclusive bucket check left the boundary second legal to challenge
+    ///      but no longer pinned: a same-block sweep could empty `_approversOf`
+    ///      out from under a `file()`, making the proposal permanently
+    ///      unchallengeable.
     function retireApproval(address governor, uint256 proposalId, address guardian) external {
         bytes32 key = _reviewKey(governor, proposalId);
         uint256 reserved = _reservedUsd[key][guardian];
@@ -1511,10 +1176,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         RecordedExposure memory r = _recorded[key][guardian];
         // Same expiry `openExposureUsd` uses for this exact bucket: bucket
         // `r.epoch` counts until its challenge window elapses at
-        // `genesis + (r.epoch + 1) * L + W`. Re-derived rather than read —
-        // there is no separately-stored per-key expiry — and keyed on the
-        // BOOKED epoch (`r.epoch`), not `currentEpoch()`, because a
-        // long-duration strategy books into a future epoch (`_coverageEpoch`).
+        // `genesis + (r.epoch + 1) * L + W`. Keyed on the BOOKED epoch, not
+        // `currentEpoch()`, because a long-duration strategy books into a future
+        // epoch.
         if (block.timestamp <= epochGenesis + (uint256(r.epoch) + 1) * epochLength + challengeWindow) {
             revert ChallengeWindowOpen();
         }
@@ -1537,23 +1201,17 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev The same list `approversOf` returns, paired with the PLEDGE
-    ///      (`_reservedUsd`) instead of the live booking (`_recorded.usd`).
-    ///      The two numbers are equal until `settleCoverage` first runs and
-    ///      diverge afterwards, which is the entire reason this view exists
-    ///      separately: `settleCoverage` is permissionless, re-runnable and
-    ///      deliberately NOT freeze-gated, so the booking is a number anyone
-    ///      may move while a challenge is live. The pledge is not —
-    ///      `recordApproval` is its only writer and `releaseApproval` its only
-    ///      eraser, and a live challenge blocks the latter outright
-    ///      (`CoverageFrozen`).
+    /// @dev The same list `approversOf` returns, paired with the PLEDGE instead of
+    ///      the live booking. The two are equal until `settleCoverage` first runs
+    ///      and diverge afterwards, which is why this view exists separately:
+    ///      `settleCoverage` is permissionless, re-runnable and deliberately NOT
+    ///      freeze-gated, so the booking is a number anyone may move while a
+    ///      challenge is live. The pledge is not.
     ///
-    ///      A caller asking "did this guardian underwrite this proposal?" must
-    ///      ask it of the pledge. `TokenCourt._recordAccused` — which decides
-    ///      who may not vote on the case their own approval caused — asked it
-    ///      of the booking, so a guardian convicted on a SEPARATE, concurrent
-    ///      challenge could be settled down to a zero booking on THIS one by
-    ///      anyone and drop straight out of the accused set (issue #83).
+    ///      A caller asking whether a guardian underwrote this proposal must ask
+    ///      it of the pledge: asked of the booking, a guardian convicted on a
+    ///      separate concurrent challenge could be settled down to a zero booking
+    ///      by anyone and drop straight out of the accused set.
     function pledgedOf(address governor, uint256 proposalId)
         external
         view
@@ -1568,37 +1226,24 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev Spec §3.4 freeze scope: this pins ONE proposal's committed
-    ///      coverage. It deliberately does not touch the guardian's stake or
-    ///      its other open approvals — a challenge freezes the coverage it
-    ///      accuses, not the guardian.
+    /// @dev Freeze scope: this pins ONE proposal's committed coverage. It
+    ///      deliberately does not touch the guardian's stake or its other open
+    ///      approvals — a challenge freezes the coverage it accuses, not the
+    ///      guardian.
     /// @dev THE FREEZE PINS THE UNSTAKE CLAIM. `openExposureUsd` sums epoch
     ///      buckets on pure wall-clock, so a guardian's exposure ages out
     ///      `challengeWindow` after its epoch whether or not it is under
-    ///      accusation — and a disputed challenge can outlive that. Counting
-    ///      frozen commitments per guardian closes the gap: while any proposal
-    ///      naming them is frozen, sWOOD refuses the unstake claim and the
-    ///      collateral cannot walk out from under a live accusation.
-    ///
-    ///      Idempotent on both sides — the counters move only when the flag
-    ///      actually flips, so a repeated freeze/unfreeze cannot drift them.
-    ///
-    ///      GATED ON THE PLEDGE (`_reservedUsd`), NOT THE BOOKING
-    ///      (`_recorded[key][g].usd`) (audit-181-critical-high, finding A).
-    ///      `settleCoverage` is permissionless, re-runnable, and deliberately
-    ///      NOT freeze-gated (see its own natspec), and it rewrites the
-    ///      booking in BOTH directions — including to zero, for a guardian
-    ///      whose slashable bond has fallen. Gating the freeze on the booking
-    ///      would let a guardian whose booking transits through zero while
-    ///      this proposal is under active challenge slip past both branches
-    ///      of `if (_recorded[key][g].usd == 0) continue;` here, so
-    ///      `_frozenCommitments[g]` is never incremented for them — and
-    ///      `StakedWood.claimUnstakeGuardian`'s gate, which reads exactly that
-    ///      counter, comes back clean while the accusation naming them is
-    ///      still live. Issue #83 moved `TokenCourt._recordAccused` off this
-    ///      identical predicate onto the pledge for the identical reason —
-    ///      see `pledgedOf`'s own natspec — and this call site and
-    ///      `pinCoverageUntil` below were the two the original sweep missed.
+    ///      accusation — and a disputed challenge can outlive that. While any
+    ///      proposal naming them is frozen, sWOOD refuses the unstake claim.
+    ///      Idempotent on both sides: the counters move only when the flag
+    ///      actually flips.
+    /// @dev GATED ON THE PLEDGE, NOT THE BOOKING. `settleCoverage` is
+    ///      permissionless, re-runnable and not freeze-gated, and rewrites the
+    ///      booking in both directions including to zero. Gating on the booking
+    ///      would let a guardian whose booking transits through zero during an
+    ///      active challenge skip the increment entirely, so
+    ///      `StakedWood.claimUnstakeGuardian`'s gate comes back clean while the
+    ///      accusation naming them is still live.
     function freezeCoverage(address governor, uint256 proposalId) external onlyFreezer {
         bytes32 key = _reviewKey(governor, proposalId);
         if (!_frozen[key]) {
@@ -1618,10 +1263,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @inheritdoc IExposureLedger
     /// @dev Walks the SAME list `freezeCoverage` walked and clears only the
-    ///      entries it actually set, so the two are exactly symmetric even if
-    ///      the list moved. It cannot move while frozen in any case:
-    ///      `releaseApproval` is the only path that shrinks it, and that is the
-    ///      path the freeze blocks.
+    ///      entries it actually set, so the two are exactly symmetric even if the
+    ///      list moved. It cannot move while frozen in any case: `releaseApproval`
+    ///      is the only path that shrinks it, and that is the path the freeze
+    ///      blocks.
     function unfreezeCoverage(address governor, uint256 proposalId) external onlyFreezer {
         bytes32 key = _reviewKey(governor, proposalId);
         if (_frozen[key]) {
@@ -1639,53 +1284,35 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev PIN BOUNDARY IS INCLUSIVE OF `deadline` (audit-181-critical-high,
-    ///      finding B) — see the matching note on `retireApproval`. Using
-    ///      `>=` rather than `>` keeps this read pinned through the same
-    ///      instant `ChallengeGame.file`'s own inclusive deadline check
-    ///      (`if (block.timestamp > deadline) revert`) still allows a filing,
-    ///      so a guardian cannot pass the unstake gate one second before a
-    ///      still-legal filing could reach it.
+    /// @dev PIN BOUNDARY IS INCLUSIVE OF `deadline` — `>=`, not `>` — so this read
+    ///      stays pinned through the same instant `ChallengeGame.file`'s own
+    ///      inclusive deadline check still allows a filing, and a guardian cannot
+    ///      pass the unstake gate one second before a still-legal filing could
+    ///      reach it.
     function hasFrozenCoverage(address guardian) external view returns (bool) {
         return _frozenCommitments[guardian] != 0 || _pinnedCoverageUntil[guardian] >= block.timestamp;
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev EXTENDS THE FREEZE'S REACH PAST ITS OWN RELEASE (issue #95).
-    ///      `unfreezeCoverage` drops the moment no challenge against this key
-    ///      is LIVE — but `ChallengeGame` can re-arm a legal re-challenge
-    ///      window (`challengeableUntil`) that outlives the live challenge
-    ///      that just resolved `Inconclusive`. Without this, both of sWOOD's
-    ///      unstake gates (`openExposureUsd`, which ages out on its own
-    ///      wall-clock tied to `challengeWindow` from EXECUTION, not from any
-    ///      re-arm) and `hasFrozenCoverage` (which just went false) can read
-    ///      clean while a conviction is still legally reachable — the accused
-    ///      claims its stake, and the eventual verdict recovers nothing.
+    /// @dev EXTENDS THE FREEZE'S REACH PAST ITS OWN RELEASE. `unfreezeCoverage`
+    ///      drops the moment no challenge against this key is LIVE — but
+    ///      `ChallengeGame` can re-arm a legal re-challenge window that outlives
+    ///      the challenge that just resolved `Inconclusive`. Without this, both of
+    ///      sWOOD's unstake gates read clean while a conviction is still legally
+    ///      reachable: the accused claims its stake and the eventual verdict
+    ///      recovers nothing.
     ///
-    ///      Walks the SAME `_approversOf[key]` list `freezeCoverage` walks,
-    ///      for the same reason: only guardians who actually committed
-    ///      coverage to this proposal are the ones a still-open accusation
-    ///      can slash. `deadline` only ever RAISES `_pinnedCoverageUntil` (and
-    ///      its per-key counterpart `_pinnedUntil`, see below), mirroring
-    ///      `challengeableUntil`'s own monotonic-raise semantics one layer up
-    ///      — a later, larger extension must not be shadowed by an earlier,
-    ///      smaller one still in effect.
+    ///      Walks the SAME `_approversOf[key]` list `freezeCoverage` walks, for
+    ///      the same reason. `deadline` only ever RAISES the pins, mirroring
+    ///      `challengeableUntil`'s own monotonic-raise semantics one layer up.
     ///
-    ///      GATED ON THE PLEDGE (`_reservedUsd`), NOT THE BOOKING
-    ///      (`_recorded[key][g].usd`) (audit-181-critical-high, finding A) —
-    ///      identical reasoning and identical fix to `freezeCoverage` above:
-    ///      `settleCoverage` can rewrite a guardian's booking to zero while
-    ///      the pledge and the `_approversOf` listing survive, and a guardian
-    ///      whose booking transits through zero must still be pinned while
-    ///      this proposal remains challengeable.
+    ///      GATED ON THE PLEDGE, NOT THE BOOKING — identical reasoning and fix to
+    ///      `freezeCoverage` above.
     ///
-    ///      WRITES BOTH THE PER-GUARDIAN MAX AND THE PER-KEY VALUE
-    ///      (audit-181-critical-high, finding C). `_pinnedCoverageUntil[g]` is
-    ///      `hasFrozenCoverage`'s max-across-every-proposal read; `_pinnedUntil
-    ///      [key][g]` is `retireApproval`'s new per-proposal read. Both are
-    ///      monotonic raises from the SAME `deadline`, so they can never
-    ///      disagree about what THIS call pinned — they differ only in scope,
-    ///      not in value, going forward.
+    ///      WRITES BOTH THE PER-GUARDIAN MAX AND THE PER-KEY VALUE:
+    ///      `_pinnedCoverageUntil[g]` is `hasFrozenCoverage`'s read,
+    ///      `_pinnedUntil[key][g]` is `retireApproval`'s. Both are monotonic
+    ///      raises from the SAME `deadline`, so they differ only in scope.
     function pinCoverageUntil(address governor, uint256 proposalId, uint256 deadline) external onlyFreezer {
         bytes32 key = _reviewKey(governor, proposalId);
         address[] storage listed = _approversOf[key];
@@ -1717,15 +1344,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev Refuses a proposal whose settlement lands beyond the ledger's
-    ///      booking horizon, AT PROPOSE. Otherwise `recordApproval` cannot book
-    ///      it, leaving a block-only review where guardians can veto but never
-    ///      endorse. Failing here puts the error on the proposer, who chose the
-    ///      duration and can change it, instead of on a cohort that cannot.
-    ///
-    ///      Reachable at defaults: `ProtocolConfig.maxStrategyDuration` ships
-    ///      UNSET, so a vault owner may seat any duration up to
-    ///      `ABSOLUTE_MAX_STRATEGY_DURATION`.
+    /// @dev Refuses a proposal whose settlement lands beyond the booking horizon,
+    ///      AT PROPOSE. Otherwise `recordApproval` cannot book it, leaving a
+    ///      block-only review where guardians can veto but never endorse. Failing
+    ///      here puts the error on the proposer, who chose the duration and can
+    ///      change it, instead of on a cohort that cannot. Reachable at defaults:
+    ///      `ProtocolConfig.maxStrategyDuration` ships UNSET.
     function requireWithinCoverageHorizon(uint256 executeBy, uint256 strategyDuration) external view {
         if (executeBy + strategyDuration > block.timestamp + MAX_COVERAGE_HORIZON) {
             revert CoverageHorizonExceeded();
@@ -1733,116 +1357,55 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev Spec §3.3a: measures whether the covering approvers' AGGREGATE
-    ///      bond meets the proposal's coverage, returning the raised and
-    ///      required figures instead of gating all-or-nothing (issue #27) —
-    ///      the caller derives a coverage-proportional effective capital from
-    ///      the ratio, rather than being refused outright on a shortfall.
-    ///      Each approver contributes
-    ///      `min(what it committed at vote time, what its bond is worth NOW)`:
-    ///
-    ///        - the committed leg is what makes the aggregate meaningful — a
-    ///          guardian only ever backs a proposal up to the free budget it
-    ///          actually pledged, so the same bond cannot cover two drains
-    ///          (the batching attack);
-    ///        - the LIVE leg keeps the dollar requirement honest — a bond that
-    ///          shrank since the vote (unstaking, or a WOOD price crash) counts
-    ///          at its shrunken value, so coverage must still hold in dollars
-    ///          at execution.
+    /// @dev Measures whether the covering approvers' AGGREGATE bond meets the
+    ///      proposal's coverage, returning the raised and required figures instead
+    ///      of gating all-or-nothing — the caller derives a coverage-proportional
+    ///      effective capital from the ratio rather than being refused outright on
+    ///      a shortfall. Each approver contributes `min(what it committed at vote
+    ///      time, what its bond is worth NOW)`: the committed leg is what makes
+    ///      the aggregate meaningful (the same bond cannot cover two drains), and
+    ///      the live leg keeps the dollar requirement honest (a bond that shrank
+    ///      since the vote counts at its shrunken value).
     ///
     ///      Approvers come from the ledger's OWN `_approversOf` list, never from
     ///      the registry: the ledger booked the commitments itself, so the
-    ///      ledger's and governor's registry pointers can never diverge about
-    ///      who approved. The list is bounded by the registry's own
-    ///      `MAX_APPROVERS_PER_PROPOSAL`.
+    ///      ledger's and governor's registry pointers cannot diverge about who
+    ///      approved. The list is bounded by `MAX_APPROVERS_PER_PROPOSAL`.
+    ///
+    /// @dev THIS IS A COVERAGE MEASUREMENT WITH A ZERO FLOOR, NOT AN INDEMNITY.
+    ///      `coverageRaisedUsd` answers how much bonded conviction stands behind
+    ///      this proposal right now — it does NOT promise that a later slash
+    ///      recovers the loss, and nothing downstream tries to: slash proceeds are
+    ///      burned, not paid to anyone harmed. Read `requiredCoverage` as the
+    ///      price of admission to a tier, expressed in the same dollars the loss
+    ///      would be because that is the natural scale, not because the two net
+    ///      out. `maxSlashBps` therefore does not enter this gate: what the
+    ///      ceiling governs is how hard the punishment bites, a
+    ///      deterrence-calibration question rather than a solvency one.
     ///
     ///      Zero committed coverage ALWAYS reverts, even at zero required
-    ///      coverage — a tier-gated proposal requires an identified signer.
-    ///      A NONZERO-but-partial aggregate no longer reverts (issue #27): it
-    ///      returns `(coverageRaisedUsd, requiredCoverageUsd)` so the governor
-    ///      can size execution to the coverage actually raised instead of
-    ///      blocking it outright. Called by `SyndicateGovernor.executeProposal`
-    ///      for proposals with `envelopeTier >= quorumTierThreshold`.
-    ///
-    /// @dev THIS IS A COVERAGE MEASUREMENT WITH A ZERO FLOOR, NOT AN INDEMNITY
-    ///      (issue #27 reframe of the prior "eligibility floor" framing). The
-    ///      returned `coverageRaisedUsd` answers "how much bonded conviction
-    ///      stands behind this proposal right now?" — it does NOT promise
-    ///      that a later slash recovers the loss, and nothing downstream tries
-    ///      to. Slash proceeds are burned, not paid to anyone harmed, and the
-    ///      protocol makes no compensation promise to depositors. Below full
-    ///      coverage the caller sizes execution to the fraction actually
-    ///      raised instead of refusing outright; only a raised aggregate of
-    ///      exactly zero is treated as no signer at all and reverts.
-    ///
-    ///      Read `requiredCoverage` accordingly: it is the price of admission
-    ///      to a tier, expressed in the same dollars the loss would be, because
-    ///      that is the natural scale for "how much skin should this decision
-    ///      require" — not because the two are meant to net out.
-    ///
-    ///      RESOLVED BY THE BURN — the `maxSlashBps` shortfall no
-    ///      longer applies. That finding observed that this gate does not price
-    ///      in `maxSlashBps`, so a cohort clearing it could still be slashed
-    ///      `1 - maxSlashBps/10_000` short of the loss (80% recovery against a
-    ///      $2,000 loss at a ceiling of 8,000). It was a real defect while the
-    ///      protocol owed depositors a recovery. It is now a non-sequitur:
-    ///      there is no recovery to fall short of, and `slashBpsFor` no longer
-    ///      derives a rate from `needUsd` at all. What the ceiling governs is
-    ///      how hard the punishment bites, which is a deterrence-calibration
-    ///      question (how large must a bond be to outweigh the extractable
-    ///      value?) rather than a solvency one.
-    ///
-    ///      Zero committed coverage still ALWAYS reverts, even at zero required
-    ///      coverage. That rule survives BOTH reframes (the burn, and #27's
-    ///      partial-sizing change) unchanged: R1 wants an identified, bonded
-    ///      signer behind anything tier-gated into this check, and an
-    ///      unbonded approver is exactly what the punitive slash has no grip
-    ///      on. A nonzero-but-partial aggregate is a different case entirely —
-    ///      see the return-instead-of-revert framing above.
+    ///      coverage — anything tier-gated into this check wants an identified,
+    ///      bonded signer, and an unbonded approver is exactly what a punitive
+    ///      slash has no grip on. A nonzero-but-partial aggregate is reported to
+    ///      the caller instead, so execution can size to the coverage raised.
     ///
     /// @dev LETS `NoWoodPrice` PROPAGATE, deliberately. This gate runs at
-    ///      execution, where reverting is the safe direction: with no source
-    ///      able to price WOOD there is no proof that anyone's bond covers
-    ///      anything, and executing on an unprovable coverage claim is the
-    ///      exact outcome the gate exists to refuse. `recordApproval` is the
-    ///      one consumer that catches instead — see `IExposureLedger`.
+    ///      execution, where reverting is the safe direction: with no source able
+    ///      to price WOOD there is no proof anyone's bond covers anything.
     ///
-    /// @dev SHARED ACROSS OPEN PROPOSALS TOO (Pashov re-audit of #158, finding
-    ///      1, confidence 88 — the HIGHEST-severity gap in that re-audit).
-    ///      This is the ACTUAL execute-time gate — `SyndicateGovernor.
-    ///      executeProposal` calls exactly this to decide whether a proposal
-    ///      may execute at all — and it was the one post-execution consumer
-    ///      of a guardian's slashable bond that hardening #35's shared-stake
-    ///      fix (D9) never reached: it kept computing `live =
-    ///      _slashableBondUsd(g, priceX8, 0)` and clamping only
-    ///      `min(live, reserved)` for THIS ONE proposal, with no awareness of
-    ///      what the same live stake was simultaneously backing on every
-    ///      OTHER open proposal. Two proposals sole-approved by the same
-    ///      guardian could therefore EACH independently pass this gate and
-    ///      execute against a stake that, once shared, covers only one of
-    ///      them — the exact double-count D9 exists to prevent, reopened at
-    ///      the one call site that actually gates execution. The natspec
-    ///      comment on the old `live` read ("provably equal to the anchored
-    ///      read every OTHER post-execution consumer takes") was true and
-    ///      irrelevant: it establishes temporal/price consistency for THIS
-    ///      proposal's own anchor, and says nothing about a SECOND proposal
-    ///      reading the same guardian's stake with nothing decremented
-    ///      between the two checks.
+    /// @dev SHARED ACROSS OPEN PROPOSALS. This is the ACTUAL execute-time gate,
+    ///      and it was the one post-execution consumer of a guardian's slashable
+    ///      bond the shared-stake fix never reached: it clamped only
+    ///      `min(live, reserved)` for THIS proposal, with no awareness of what the
+    ///      same live stake was simultaneously backing on every OTHER open one, so
+    ///      two proposals sole-approved by the same guardian could EACH pass this
+    ///      gate against a stake that covers only one. It now routes through
+    ///      `_sharedSlashableUsd` on the BOOKING basis, which already clamps its
+    ///      return to `reserved`.
     ///
-    ///      FIX: route through `_sharedSlashableUsd` exactly like every other
-    ///      consumer, on the BOOKING basis (`reserved` is `_recorded[key]
-    ///      [g].usd` here, so the denominator is `_liveBookedUsd[g]`) — see
-    ///      the dev-note on `_sharedSlashableUsd`. `_sharedSlashableUsd`
-    ///      already clamps its return to `reserved`, so the old manual
-    ///      `live < reserved ? live : reserved` becomes redundant and is
-    ///      dropped.
-    ///
-    ///      SUPERSEDED (audit #181 finding 4): `anchor = 0` (live) was NOT
-    ///      correct, contrary to what this note previously said. See the
-    ///      inline comment inside the loop below — the gate now anchors at
-    ///      `block.timestamp` so a same-block stake top-up cannot pass this
-    ///      gate on collateral the matching conviction (anchored at
-    ///      `openedAt - 1` via `swood.slashableStakeAt`) can never reach.
+    ///      The gate anchors at `block.timestamp`, not live, so a same-block stake
+    ///      top-up cannot pass on collateral the matching conviction can never
+    ///      reach — see the inline comment in the loop.
     function requireApproveQuorum(address governor, uint256 proposalId, address asset, uint256 requiredCoverage)
         external
         view
@@ -1858,45 +1421,32 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // re-read it once per approver.
         uint256 priceX8 = woodPriceX8();
 
-        // Summed over RESERVATIONS, not allocations. The question here is
-        // "can the approvers who are still committed cover this?", and a
-        // reservation is exactly each one's answer. Summing allocations instead
-        // would be circular AND wrong: they are scaled to total `needUsd` and
-        // round down, so a fully-subscribed proposal would fail its own quorum
-        // by the truncation dust.
+        // Summed over RESERVATIONS, not allocations. The question here is whether
+        // the approvers who are still committed can cover this, and a reservation
+        // is exactly each one's answer. Summing allocations would be circular AND
+        // wrong: they are scaled to total `needUsd` and round down, so a
+        // fully-subscribed proposal would fail its own quorum by the dust.
         uint256 haveUsd;
         for (uint256 i = 0; i < n; i++) {
             address g = approvers[i];
             uint256 reserved = _recorded[key][g].usd;
             if (reserved == 0) continue; // released via a vote change
-            // ANCHORED AT `block.timestamp`, NOT LIVE (audit #181 finding 4).
-            // The old justification here — "this gate runs in the same
-            // transaction as the executedAt stamp, so live == anchored" — was
-            // wrong: `anchor = 0` reads live `guardianStake` directly, while
-            // every conviction values the SAME guardian through
-            // `swood.slashableStakeAt(g, c.executedAt)`, which resolves to
-            // `_slashableAt(g, openedAt - 1)`. `Checkpoints.upperLookupRecent`
-            // is INCLUSIVE of `key == anchor`, so a same-block top-up staked
-            // at `block.timestamp == executedAt` was COUNTED by the live read
-            // here and EXCLUDED by the verdict's `anchor - 1` lookup — the
-            // gate could certify coverage a conviction could never collect.
-            // Passing `block.timestamp` routes this through
-            // `swood.slashableStakeAt(g, block.timestamp)`, i.e.
-            // `_slashableAt(g, block.timestamp - 1)` — the same instant the
-            // verdict will anchor at once this proposal executes this block —
-            // so a same-block top-up is excluded on both sides identically.
-            //
-            // SHARED, NOT MERELY LIVE (Pashov re-audit of #158, finding 1) —
-            // see the `@dev` block above this function.
+            // ANCHORED AT `block.timestamp`, NOT LIVE. `anchor = 0` reads live
+            // `guardianStake`, while every conviction values the SAME guardian
+            // through `swood.slashableStakeAt(g, c.executedAt)`, resolving to
+            // `_slashableAt(g, openedAt - 1)`. `upperLookupRecent` is INCLUSIVE of
+            // `key == anchor`, so a same-block top-up staked at
+            // `block.timestamp == executedAt` was COUNTED by the live read and
+            // EXCLUDED by the verdict's lookup — the gate could certify coverage a
+            // conviction could never collect. Passing `block.timestamp` excludes
+            // it on both sides identically.
             haveUsd += _sharedSlashableUsd(g, reserved, priceX8, block.timestamp, _liveBookedUsd[g]);
             if (haveUsd >= requiredCoverageUsd) return (haveUsd, requiredCoverageUsd); // early exit; surplus may be clamped
         }
-        // The loop early-returns on full coverage — reaching here means the
-        // covering approvers' aggregate fell short of `requiredCoverageUsd`.
-        // A genuinely zero aggregate is still an error (R1's identified-
-        // bonded-signer floor, issue #27 design D2); any nonzero-but-partial
-        // aggregate is reported to the caller instead of reverting, so
-        // execution can size to the coverage actually raised.
+        // The loop early-returns on full coverage, so reaching here means the
+        // aggregate fell short. A genuinely zero aggregate is still an error; any
+        // nonzero-but-partial one is reported to the caller instead of reverting,
+        // so execution can size to the coverage actually raised.
         if (haveUsd == 0) revert InsufficientApproveCoverage();
         return (haveUsd, requiredCoverageUsd);
     }
@@ -1904,52 +1454,32 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @inheritdoc IExposureLedger
     /// @dev PUNITIVE, NOT COMPENSATORY. Every approver still holding a live
     ///      commitment is slashed at the severity ceiling. The rate does not
-    ///      depend on the size of the loss, on the proposal's required
-    ///      coverage, or on any per-approver allocation of either.
+    ///      depend on the size of the loss, on the required coverage, or on any
+    ///      per-approver allocation of either.
     ///
-    ///      This is the deliberate consequence of burning slash proceeds
-    ///      instead of routing them to a compensation escrow. A compensatory
-    ///      sink cannot pay a victim more than their loss without creating a
-    ///      windfall, which bounded the slash at 1x damages and left an
-    ///      approver of a value-`V` attack roughly break-even. A burn has no
-    ///      counterparty, so the bound is gone and the rate can be set where it
-    ///      deters: the whole bond. Deterrence now reads "bond exceeds
-    ///      maximum extractable value", not "slash covers the realized loss".
-    ///
-    ///      A corollary worth stating: because the rate ignores
-    ///      `getRequiredCoverage`, a proposal that UNDERSTATES what it can
-    ///      actually extract no longer shrinks its approvers' slash. Under the
-    ///      allocation this view used to perform, mis-declaring coverage was a
-    ///      direct discount on the penalty.
+    ///      This follows from burning slash proceeds instead of routing them to a
+    ///      compensation escrow. A compensatory sink cannot pay a victim more than
+    ///      their loss without creating a windfall, which bounded the slash at 1x
+    ///      damages and left an approver of a value-`V` attack roughly break-even.
+    ///      A burn has no counterparty, so the rate can be set where it deters:
+    ///      the whole bond. A corollary: because the rate ignores
+    ///      `getRequiredCoverage`, a proposal that UNDERSTATES what it can extract
+    ///      no longer shrinks its approvers' slash.
     ///
     ///      RETURNS `BPS_DENOMINATOR`, NOT `maxSlashBps`. `_slashOne` already
-    ///      clamps every incoming rate into `[minSlashBps, maxSlashBps]`, so
-    ///      the ceiling is applied at exactly one governance-controlled site.
-    ///      Reading sWOOD's ceiling here as well would duplicate that authority
-    ///      and let the two drift — the divergence class where this site and
-    ///      the coverage gate price the same bond differently.
+    ///      clamps every incoming rate into `[minSlashBps, maxSlashBps]`, so the
+    ///      ceiling is applied at exactly one governance-controlled site; reading
+    ///      it here too would duplicate that authority and let the two drift.
     ///
     ///      NO PRICE READ, AND THAT IS A LIVENESS FIX. The allocation this
-    ///      replaced priced BOTH operands: the numerator through `coverageUsd`
-    ///      (a Chainlink read behind a `StalePrice` gate) and the denominator
-    ///      through `woodPriceX8()`. A stale asset feed therefore made a
-    ///      conviction UNPRICEABLE and reverted this view — and feed outages
-    ///      correlate with exactly the market stress a drain happens in. The
-    ///      slash path no longer has a feed dependency of its own. The coverage
-    ///      GATE (`requireApproveQuorum`) still prices, but it runs at
-    ///      execution, where reverting is the safe direction.
+    ///      replaced priced both operands, so a stale asset feed made a conviction
+    ///      unpriceable — and feed outages correlate with exactly the market
+    ///      stress a drain happens in. The coverage GATE still prices, but it runs
+    ///      at execution, where reverting is the safe direction.
     ///
-    ///      Approvers come from the ledger's OWN `_approversOf`, exactly as
-    ///      `requireApproveQuorum` does and for the same reason. A guardian holding a zero commitment — released by a vote
-    ///      change, or an approval that landed after coverage was already met —
-    ///      yields 0 bps and is slashed nothing. That is unchanged and remains
-    ///      the intended semantics: liability follows the commitment, and an
-    ///      approver who consumed none of their budget underwrote none of it.
-    ///
-    ///      The saturating cases the allocation needed — `committed >= live`
-    ///      and `live == 0` — are gone with the division. Both pinned the rate
-    ///      at 100%, which is now simply the rate. `_slashOne` still clamps to
-    ///      live stake, so a shrunken bond yields whatever remains of it.
+    ///      A guardian holding a zero commitment — released by a vote change, or
+    ///      an approval that landed after coverage was met — yields 0 bps and is
+    ///      slashed nothing: liability follows the commitment.
     function slashBpsFor(address governor, uint256 proposalId)
         external
         view
@@ -1974,35 +1504,24 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev What `guardian` actually carries on this proposal, as opposed to
-    ///      what `recordApproval` reserved. Reservations are deliberately
-    ///      over-sized (each approver reserves up to the FULL coverage), so the
-    ///      real split is this pro-rata scale-back, computed at read time from
-    ///      whoever is still an approver right now.
+    /// @dev What `guardian` actually carries on this proposal, as opposed to what
+    ///      `recordApproval` reserved. Reservations are deliberately over-sized,
+    ///      so the real split is this pro-rata scale-back, computed at read time
+    ///      from whoever is still an approver right now.
     ///
     ///      Computing it lazily rather than writing it down closes the
-    ///      squat-then-release veto: there is no stored allocation for an
-    ///      attacker to capture early and hand back late. Flipping to Block
-    ///      deletes the reservation, `_committedUsd` drops, and every remaining
-    ///      approver's allocation scales UP on the next read — a departing
-    ///      approver hands their share to the others instead of voiding the
-    ///      proposal.
-    ///
-    ///      It also means no keeper is required: execution reads the allocation
-    ///      directly, so a settlement transaction can never be withheld to
-    ///      strand a proposal.
-    /// @dev ORACLE ASYMMETRY, AND IT IS DELIBERATE. `recordApproval` books
-    ///      nothing when the price is unreadable; this function REVERTS. The
-    ///      conservative direction is opposite on each path: booking nothing
-    ///      merely declines to extend coverage, whereas returning a made-up
-    ///      number here would size a SLASH off a price nobody can vouch for.
-    ///
-    ///      Operational consequence: a conviction cannot be computed while the
-    ///      asset feed is stale. That is a delay UNLESS the outage outlasts the
-    ///      remaining challenge window — bucket expiry is pure wall-clock and
-    ///      does not pause for an outage, and `claimUnstakeGuardian` releases
-    ///      the stake the instant it reads zero. A long enough outage converts
-    ///      the delay into a loss with no attacker involved.
+    ///      squat-then-release veto: there is no stored allocation for an attacker
+    ///      to capture early and hand back late. Flipping to Block deletes the
+    ///      reservation and every remaining approver's allocation scales UP on the
+    ///      next read. It also means no keeper is required.
+    /// @dev ORACLE ASYMMETRY, DELIBERATE. `recordApproval` books nothing when the
+    ///      price is unreadable; this REVERTS. The conservative direction is
+    ///      opposite on each path: booking nothing merely declines to extend
+    ///      coverage, whereas returning a made-up number here would size a SLASH
+    ///      off a price nobody can vouch for. Consequence: a conviction cannot be
+    ///      computed while the asset feed is stale — a delay UNLESS the outage
+    ///      outlasts the remaining challenge window, since bucket expiry does not
+    ///      pause for an outage.
     function allocatedUsd(address governor, uint256 proposalId, address guardian) public view returns (uint256) {
         bytes32 key = _reviewKey(governor, proposalId);
         uint256 reserved = _recorded[key][guardian].usd;
@@ -2012,36 +1531,29 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         address asset = IVaultAssetMinimal(pv.vault).asset();
         uint256 needUsd = coverageUsd(asset, gov.getRequiredCoverage(proposalId));
         uint256 priceX8 = woodPriceX8();
-        // ANCHORED (issue #35): once executed, a post-execution top-up must
-        // not inflate what this guardian carries — see `_slashableBondUsd`.
-        // SHARED ACROSS OPEN PROPOSALS (Pashov audit finding 2, hardening
-        // #35): `_sharedSlashableUsd` additionally pro-rates this guardian's
-        // slashable basis against every OTHER proposal it currently backs, so
-        // this proposal cannot claim more of the guardian's one bond than its
-        // own share of it — see the invariant note above `_sharedSlashableUsd`.
+        // ANCHORED: once executed, a post-execution top-up must not inflate what
+        // this guardian carries. SHARED ACROSS OPEN PROPOSALS:
+        // `_sharedSlashableUsd` pro-rates this guardian's slashable basis against
+        // every OTHER proposal it currently backs, so this proposal cannot claim
+        // more of the guardian's one bond than its own share of it.
         uint256 mine = _sharedSlashableUsd(guardian, reserved, priceX8, pv.executedAt, _liveBookedUsd[guardian]);
         if (mine == 0) return 0;
         return _allocate(mine, _effectiveTotal(key, priceX8, pv.executedAt), needUsd);
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev Mirrors `slashBpsFor`'s own basis exactly — the same `needUsd`, the
-    ///      same `_effectiveTotal` — so the figure a challenger is charged
-    ///      against and the figure a conviction takes cannot drift apart.
-    ///      `ChallengeGame.file()` must not sum the RESERVATION while slashing
-    ///      prices the ALLOCATION.
+    /// @dev Mirrors `slashBpsFor`'s basis exactly — the same `needUsd`, the same
+    ///      `_effectiveTotal` — so the figure a challenger is charged against and
+    ///      the figure a conviction takes cannot drift apart.
     ///
-    ///      ANCHORED AT `executedAt` (issue #35), not live. Without the
-    ///      anchor, an accused cohort could permissionlessly top up its
-    ///      stake AFTER the drain to price up its own filing bond with
-    ///      capital the eventual verdict slash (itself anchored at
-    ///      `executedAt`, `StakedWood._slashOne`) can never reach. Once both
-    ///      sides read the same anchor, they cannot drift apart.
+    ///      ANCHORED AT `executedAt`, not live: without the anchor, an accused
+    ///      cohort could permissionlessly top up its stake AFTER the drain to
+    ///      price up its own filing bond with capital the verdict slash can never
+    ///      reach.
     ///
     ///      Reverts rather than returning a stale figure when the asset feed is
-    ///      down, inheriting `coverageUsd`'s `StalePrice` gate. A caller that
-    ///      must stay live through a feed outage has to say so explicitly — see
-    ///      `ChallengeGame.file()`, which catches and falls back.
+    ///      down. A caller that must stay live through a feed outage has to say so
+    ///      explicitly — see `ChallengeGame.file()`, which catches and falls back.
     function liabilityUsd(address governor, uint256 proposalId) external view returns (uint256) {
         bytes32 key = _reviewKey(governor, proposalId);
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
@@ -2057,36 +1569,21 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
-    /// @dev UNSHARED, DELIBERATELY (Pashov re-audit of #158, finding 3,
-    ///      confidence 78). `liabilityUsd` above is the right basis for
-    ///      pricing what a CONVICTION on this proposal can actually recover —
-    ///      it is MEANT to shrink under D9's pro-rata sharing once the same
-    ///      guardian(s) also back other open proposals, because a conviction
-    ///      can only ever take one real, shared bond no matter how many
-    ///      proposals claim a piece of it.
+    /// @dev UNSHARED, DELIBERATELY. `liabilityUsd` is the right basis for pricing
+    ///      what a CONVICTION can recover — it is MEANT to shrink under pro-rata
+    ///      sharing, because a conviction can only ever take one real, shared bond
+    ///      however many proposals claim a piece of it.
     ///
-    ///      `ChallengeGame.file()`'s challenger bond is a DIFFERENT quantity:
-    ///      an anti-frivolous-filing deterrent sized off what THIS FILING
-    ///      freezes for THIS accused cohort. It must NOT shrink merely
-    ///      because the same guardians happen to be juggling other open
-    ///      commitments under `kNumerator > 1` — an entirely ordinary,
-    ///      legitimate operating condition that D9's sharing fix exists
-    ///      specifically to accommodate elsewhere, not a reason to charge
-    ///      less to accuse THIS cohort. Feeding the shared figure into the
-    ///      bond let a guardian's own, unrelated multi-proposal activity
-    ///      dilute the deterrent against filing on any ONE of its proposals —
-    ///      and `slashVerdict`'s actual punitive take is NOT pro-rated
-    ///      either, so the bond tracked something smaller than what a
-    ///      conviction can still actually take.
+    ///      `ChallengeGame.file()`'s challenger bond is a DIFFERENT quantity: an
+    ///      anti-frivolous-filing deterrent sized off what THIS FILING freezes for
+    ///      THIS accused cohort. It must not shrink merely because the same
+    ///      guardians are juggling other open commitments — an ordinary operating
+    ///      condition — and `slashVerdict`'s punitive take is not pro-rated
+    ///      either, so a shared-basis bond tracked something strictly smaller than
+    ///      what a conviction can still take.
     ///
-    ///      Same shape as `liabilityUsd` — `min(needUsd, Σ over approvers of
-    ///      min(reserved, slashableBondUsd(g, anchor)))` — but through
-    ///      `_unsharedEffectiveTotal` instead of `_effectiveTotal`: exactly
-    ///      `_effectiveTotal`'s PRE-D9 behaviour, i.e. the figure
-    ///      `liabilityUsd` itself returned before the shared-stake fix.
-    ///      `ChallengeGame.file` is the intended caller; every other
-    ///      consumer of a guardian's recoverable bond keeps reading the
-    ///      shared figure via `liabilityUsd`/`allocatedUsd`.
+    ///      Same shape as `liabilityUsd` but through `_unsharedEffectiveTotal`:
+    ///      exactly `_effectiveTotal`'s pre-sharing behaviour.
     function unsharedLiabilityUsd(address governor, uint256 proposalId) external view returns (uint256) {
         bytes32 key = _reviewKey(governor, proposalId);
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
@@ -2098,29 +1595,19 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         return needUsd < effectiveTotal ? needUsd : effectiveTotal;
     }
 
-    /// @dev Sum of `min(reserved, slashable bond)` across a proposal's
-    ///      approvers — what the cohort can ACTUALLY pay, not what it
-    ///      pledged.
+    /// @dev Sum of `min(reserved, slashable bond)` across a proposal's approvers —
+    ///      what the cohort can ACTUALLY pay, not what it pledged. Using raw
+    ///      `_committedUsd` as the denominator would let a guardian who unstaked
+    ///      or was devalued after approving keep diluting everyone else's share.
+    ///      `requireApproveQuorum` already discounts by `min(live, reserved)`;
+    ///      this applies the same discount to the split so the two agree.
     ///
-    ///      Using raw `_committedUsd` as the denominator would let a guardian
-    ///      who unstaked or was devalued after approving keep diluting
-    ///      everyone else's share, so the recoverable total would fall short
-    ///      of the loss by more than rounding. `requireApproveQuorum` already
-    ///      discounts by `min(live, reserved)`; this applies the same discount
-    ///      to the split, so the two agree about the same guardian.
-    ///
-    ///      ANCHORED (issue #35): `anchor` is `pv.executedAt`, threaded from
-    ///      the caller rather than re-read per guardian — 0 (unexecuted)
-    ///      keeps every term on the live basis, unchanged from before this
-    ///      change. Once executed, the "slashable bond" term is
-    ///      `min(snapshot at executedAt, live)` rather than raw live stake, so
-    ///      the adversary this closes — an accused approver topping up AFTER
-    ///      the drain to inflate its own share of `needUsd` — is priced at
-    ///      what the verdict can reach, not at what it can stake.
-    ///
-    /// @dev SHARED ACROSS OPEN PROPOSALS (Pashov audit finding 2, hardening
-    ///      #35): each term now goes through `_sharedSlashableUsd` instead of
-    ///      a bare `min(live, reserved)` — see the invariant note there. A
+    ///      ANCHORED: `anchor` is `pv.executedAt`, threaded from the caller — 0
+    ///      (unexecuted) keeps every term live. Once executed, the slashable-bond
+    ///      term is `min(snapshot at executedAt, live)`, so an accused approver
+    ///      topping up AFTER the drain is priced at what the verdict can reach.
+    /// @dev SHARED ACROSS OPEN PROPOSALS: each term goes through
+    ///      `_sharedSlashableUsd` rather than a bare `min(live, reserved)`. A
     ///      guardian backing only this one proposal sees no change.
     function _effectiveTotal(bytes32 key, uint256 priceX8, uint256 anchor) internal view returns (uint256 total) {
         address[] storage listed = _approversOf[key];
@@ -2137,14 +1624,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         }
     }
 
-    /// @dev `_effectiveTotal`'s PRE-D9 computation — `min(reserved,
+    /// @dev `_effectiveTotal`'s pre-sharing computation — `min(reserved,
     ///      slashableBondUsd(g, anchor))` per approver, with NO cross-proposal
-    ///      sharing — kept alive exclusively for `unsharedLiabilityUsd`. See
-    ///      the invariant note there (Pashov re-audit of #158, finding 3) for
-    ///      why `ChallengeGame.file`'s bond basis must NOT go through
-    ///      `_sharedSlashableUsd`: the challenger bond prices what this one
-    ///      filing freezes for this one accused cohort, and must not shrink
-    ///      just because the same guardians also back other open proposals.
+    ///      sharing — kept alive exclusively for `unsharedLiabilityUsd`. See that
+    ///      function for why `ChallengeGame.file`'s bond basis must not go through
+    ///      `_sharedSlashableUsd`.
     function _unsharedEffectiveTotal(bytes32 key, uint256 priceX8, uint256 anchor)
         internal
         view
@@ -2161,90 +1645,45 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         }
     }
 
-    /// @dev THE SHARED-STAKE INVARIANT (Pashov audit finding 2, hardening
-    ///      #35). Before this, `_effectiveTotal`/`_effectiveReservedTotal`
-    ///      (and `allocatedUsd`/`settleCoverage`'s own per-guardian clamps)
-    ///      computed a guardian's contribution to ONE proposal independently
-    ///      as `min(reserved, slashableBondUsd(g, anchor))` — using the
-    ///      guardian's CURRENT total live/anchored stake with zero awareness
-    ///      of what that SAME stake is simultaneously backing on every OTHER
-    ///      still-open, already-executed proposal it also approved. Two
-    ///      individually-correct anchored reads can therefore sum to more
-    ///      than the guardian's one, finite, shared recoverable pool: PROVEN
-    ///      (guardian stakes 1,000 WOOD, books $400 + $400 legally across two
-    ///      proposals under the k-multiplier sharing design, is then slashed
-    ///      $400 elsewhere leaving only $600 live — yet both proposals
-    ///      independently reported $400 "recoverable", $800 claimed against
-    ///      $600 real). This requires no privileged action at all: it fires
-    ///      from ordinary, legitimate multi-proposal operation combined with
-    ///      an unrelated conviction landing in between.
+    /// @dev THE SHARED-STAKE INVARIANT. Computing a guardian's contribution to ONE
+    ///      proposal independently as `min(reserved, slashableBondUsd(g, anchor))`
+    ///      uses that guardian's CURRENT stake with zero awareness of what the
+    ///      SAME stake is simultaneously backing on every other still-open
+    ///      proposal. Two individually-correct anchored reads can therefore sum to
+    ///      more than the guardian's one finite pool: a guardian stakes 1,000
+    ///      WOOD, legally books $400 + $400 across two proposals, is then slashed
+    ///      $400 elsewhere leaving $600 live — yet both proposals independently
+    ///      report $400 recoverable, $800 claimed against $600 real. No privileged
+    ///      action is required; it fires from ordinary multi-proposal operation
+    ///      plus an unrelated conviction landing in between.
     ///
-    ///      INVARIANT THIS ENFORCES: for any guardian g, the sum over all
-    ///      currently-open anchored proposals of that proposal's
-    ///      claimed-recoverable-from-g must never exceed g's actual
-    ///      live/anchored recoverable stake.
+    ///      INVARIANT: for any guardian g, the sum over all currently-open
+    ///      anchored proposals of that proposal's claimed-recoverable-from-g must
+    ///      never exceed g's actual recoverable stake.
     ///
-    ///      HOW (option (a), pro-rata distribution — chosen over an explicit
-    ///      escrow ledger or first-settled-wins because it reuses bookkeeping
-    ///      shape this contract already pays for elsewhere, rather than
-    ///      adding an unbounded new ledger): the caller passes `liveTotal`, an
-    ///      EXACT, non-wall-clock-decaying sum (`_liveBookedUsd[g]` or
-    ///      `_livePledgedUsd[g]`, see the dedicated dev-note below) of every
-    ///      still-open reservation this SAME guardian holds, on the same
-    ///      basis as `reserved`. That sum is exactly the shared denominator
-    ///      g's slashable stake must be split across: `share = slashable *
-    ///      reserved / liveTotal`, clamped to `reserved`. Two proposals
-    ///      reading independently read the SAME `liveTotal`, so their shares
-    ///      can sum to at most `slashable` — never more than the one bond
-    ///      that actually backs both. Generalizes to N simultaneously-open
-    ///      proposals for the same guardian, since the accumulator already
-    ///      sums over all of them (O(1) storage read, no scan).
+    ///      HOW: pro-rata distribution, chosen over an explicit escrow ledger or
+    ///      first-settled-wins because it reuses bookkeeping this contract already
+    ///      pays for. The caller passes `liveTotal`, an EXACT, non-decaying sum of
+    ///      every still-open reservation this guardian holds ON THE SAME BASIS as
+    ///      `reserved`, so `share = slashable * reserved / liveTotal` clamped to
+    ///      `reserved`. Two proposals read the SAME `liveTotal`, so their shares
+    ///      sum to at most `slashable`. Generalises to N proposals at O(1).
     ///
-    ///      ORIGINALLY (`hardening #35`) this reused `openExposureUsd(g)`'s
-    ///      existing wall-clock bucket scan directly instead of a dedicated
-    ///      accumulator, on the theory that it already summed exactly this
-    ///      guardian's open reservations. A Pashov re-audit of that version
-    ///      (#158) found the reuse unsound in five distinct ways — see the
-    ///      dev-note below — which is why the denominator is now a
-    ///      caller-supplied EXACT accumulator instead.
+    ///      A GUARDIAN WITH ONLY ONE OPEN PROPOSAL SEES NO CHANGE: `reserved ==
+    ///      liveTotal`, so `share` reduces to `slashable` un-scaled. `liveTotal ==
+    ///      0` falls back to the unshared `min(reserved, slashable)` rather than
+    ///      dividing by zero — unreachable in practice, kept as a defensive floor.
     ///
-    ///      A GUARDIAN WITH ONLY ONE OPEN PROPOSAL SEES NO CHANGE: `reserved
-    ///      == liveTotal` exactly, so `share` reduces algebraically to
-    ///      `slashable` un-scaled — identical to the pre-fix `min(reserved,
-    ///      slashable)`. The sharing only ever bites when a guardian is
-    ///      genuinely juggling more than one open commitment, which is
-    ///      exactly the case the invariant exists for.
-    ///
-    ///      `liveTotal == 0` falls back to the un-shared `min(reserved,
-    ///      slashable)` rather than dividing by zero; unreachable in practice
-    ///      (every caller only invokes this with `reserved != 0`, and
-    ///      `liveTotal` — `_liveBookedUsd[guardian]` or
-    ///      `_livePledgedUsd[guardian]`, see the caller — is by construction
-    ///      >= `reserved` whenever `reserved` is itself a live summand of it),
-    ///      kept as a defensive floor rather than an assumed invariant.
-    ///
-    /// @dev DENOMINATOR IS CALLER-SUPPLIED, ON PURPOSE (Pashov re-audit of
-    ///      #158, findings 2 and 4). This used to read `openExposureUsd
-    ///      (guardian)` internally — a single, WALL-CLOCK-DECAYING bucket
-    ///      scan reused as the denominator for every caller regardless of
-    ///      which basis (booking vs. pledge) that caller's own `reserved`
-    ///      term was read on. Two problems followed from sharing one
-    ///      denominator across two bases: (1) the scan's wall-clock decay let
-    ///      a proposal's OWN contribution silently exit the sum while its
-    ///      `_recorded`/`_reservedUsd` entry — and therefore its numerator
-    ///      claim — stayed fully live (finding 2); (2) `_effectiveReservedTotal`
-    ///      fed this function a PLEDGE numerator against a BOOKING
-    ///      denominator, breaking the "shares sum to <= 1" partition-of-unity
-    ///      property whenever a sibling proposal's settlement had diverged
-    ///      the two bases (finding 4). Requiring the caller to pass its own
-    ///      basis-matched, non-decaying accumulator (`_liveBookedUsd` for
-    ///      booking-basis callers, `_livePledgedUsd` for pledge-basis ones)
-    ///      fixes both at once: every call site now divides a `reserved` term
-    ///      by a `liveTotal` built from EXACTLY the same underlying writes,
-    ///      so `Σ reserved_i == liveTotal` holds by construction for that
-    ///      basis, and `Σ share_i <= slashable` follows algebraically. See
-    ///      design.md D10 for the full comparison against the audit's Option
-    ///      A/B framing and the regression tests that prove each trigger.
+    /// @dev DENOMINATOR IS CALLER-SUPPLIED, ON PURPOSE. Reading
+    ///      `openExposureUsd(guardian)` internally shared one WALL-CLOCK-DECAYING
+    ///      scan across callers whose `reserved` terms were read on different
+    ///      bases, which broke two ways: the decay let a proposal's own
+    ///      contribution exit the denominator while its numerator claim stayed
+    ///      live, and `_effectiveReservedTotal` fed a PLEDGE numerator against a
+    ///      BOOKING denominator. Requiring each caller to pass its own
+    ///      basis-matched accumulator makes `sum of reserved_i == liveTotal` hold
+    ///      by construction, so `sum of share_i <= slashable` follows
+    ///      algebraically.
     function _sharedSlashableUsd(address guardian, uint256 reserved, uint256 priceX8, uint256 anchor, uint256 liveTotal)
         internal
         view
@@ -2259,65 +1698,39 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @dev Returns the over-reservation once the approver set is FINAL.
     ///
     ///      `recordApproval` reserves up to the whole coverage from every
-    ///      approver, since at vote time any one of them might end up carrying
-    ///      it alone — there is no leftover to squat, but it means A approvers
-    ///      tie up A x coverage of aggregate cohort budget for the whole bucket
-    ///      lifetime, which can exhaust a busy cohort's approve capacity.
+    ///      approver, since at vote time any one of them might carry it alone —
+    ///      but that ties up `A x coverage` of aggregate cohort budget for the
+    ///      whole bucket lifetime. Once the review window shuts nobody can join or
+    ///      leave, so the worst case each approver reserved against can no longer
+    ///      happen: this collapses each reservation to its pro-rata allocation and
+    ///      hands the difference back.
     ///
-    ///      Once the review window shuts, nobody can join or leave, so the
-    ///      worst case each approver was reserving against can no longer
-    ///      happen. This collapses each reservation to its actual pro-rata
-    ///      allocation and hands the difference back — over-reservation now
-    ///      lasts the REVIEW WINDOW rather than the coverage window (days
-    ///      instead of weeks), since the bottleneck is budget being unavailable
-    ///      for the NEXT proposal.
+    ///      Deliberately NOT reserve-only-the-remainder-and-top-survivors-up: that
+    ///      reserves everything against the FIRST approver and nothing against
+    ///      later ones, reintroducing first-mover-takes-the-line.
     ///
-    ///      Deliberately NOT "reserve only the uncovered remainder, top
-    ///      survivors up on release": that reserves everything against the
-    ///      FIRST approver and nothing against later ones, reintroducing
-    ///      first-mover-takes-the-line — under a coverage-weighted premium the
-    ///      whole payment goes to whoever is fastest. Keeping equal
-    ///      reservations and settling afterwards buys the same budget relief
-    ///      without the ordering race, and keeps the loop off the vote path.
+    ///      PERMISSIONLESS and SAFE TO SKIP: if nobody calls it, the budget stays
+    ///      over-reserved until the bucket expires — conservative, never unsafe.
     ///
-    ///      PERMISSIONLESS and SAFE TO SKIP: if nobody ever calls it, the budget
-    ///      stays over-reserved until the bucket expires — conservative, never
-    ///      unsafe. No keeper is load-bearing.
-    ///
-    /// @dev RE-RUNNABLE, AND THAT IS THE SECURITY PROPERTY. There is no instant
-    ///      that is right in advance for a write-down: the split depends on a
-    ///      WOOD price and an asset price that both keep moving after settling,
-    ///      so any single pass is only a guess at that moment. `_reservedUsd`
-    ///      keeps the pledges the pass divides, so every call re-derives the
-    ///      whole split from unchanged inputs at the CURRENT price, up or down,
-    ///      and no earlier pass can bind a later one — a settlement taken at a
-    ///      trough is a stale number anyone can refresh.
+    /// @dev RE-RUNNABLE, AND THAT IS THE SECURITY PROPERTY. No instant is right in
+    ///      advance for a write-down, since the split depends on two prices that
+    ///      keep moving. `_reservedUsd` keeps the pledges the pass divides, so
+    ///      every call re-derives the whole split from unchanged inputs at the
+    ///      current price and no earlier pass can bind a later one.
     ///
     ///      DELIBERATELY NOT GATED ON `_frozen`. Freezing the numbers during a
-    ///      challenge sounds protective and is backwards here: a trough pass
-    ///      happens BEFORE the challenge exists (the drain has to happen
-    ///      first), so a freeze gate would latch exactly the figure that needs
-    ///      correcting, at exactly the moment correcting it matters.
-    ///      Re-derivation is monotone-optimal instead — each run books every
-    ///      approver at `min(live bond, pledge)` scaled to the need, the most
-    ///      the cohort can pay at that instant — so an adversarial re-run never
-    ///      helps: at a trough the live bonds are low too, and the slash clamps
-    ///      to them either way.
+    ///      challenge sounds protective and is backwards: a trough pass happens
+    ///      BEFORE the challenge exists, so a freeze gate would latch exactly the
+    ///      figure that needs correcting. Re-derivation is monotone-optimal
+    ///      instead — each run books every approver at `min(live bond, pledge)`
+    ///      scaled to the need — so an adversarial re-run never helps.
     ///
-    ///      The remaining cost of re-running is that a booking can grow again,
-    ///      re-consuming budget and holding the exit gate. It is bounded by the
-    ///      guardian's own pledge — exactly what they would be holding had
-    ///      nobody ever settled — so it can only walk back toward the
-    ///      un-settled baseline and never past it.
-    ///
-    ///      THE PLEDGE IS NOT THE ONLY BOUND, because the guardian may have
-    ///      spent the freed budget in the meantime. `_rebook` clamps every
-    ///      upward move to `kNumerator * slashableBondUsd` less the guardian's
-    ///      exposure elsewhere (issue #110) — without it, a re-run could push a
-    ///      guardian past the batching cap that `recordApproval` enforces, using
-    ///      nothing but gas. The clamp binds only when the guardian genuinely
-    ///      over-committed elsewhere; with no competing exposure the walk-up is
-    ///      unrestricted and the repair property above is untouched.
+    ///      The remaining cost is that a booking can grow again, re-consuming
+    ///      budget. It is bounded by the guardian's own pledge, and `_rebook`
+    ///      additionally clamps every upward move to `kNumerator *
+    ///      slashableBondUsd` less the guardian's exposure elsewhere — without
+    ///      which a re-run could push a guardian past the batching cap using
+    ///      nothing but gas.
     function settleCoverage(address governor, uint256 proposalId) external {
         bytes32 key = _reviewKey(governor, proposalId);
 
@@ -2326,19 +1739,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // The set must be FINAL. Settling mid-review would hand budget back to
         // approvers who could still be left carrying the proposal alone.
         //
-        // GATED ON `executeBy`, NOT `reviewEnd`. Before it, each approver holds
-        // a full-coverage reservation, so `requireApproveQuorum` sums an A-fold
-        // cushion; settling collapses that to EXACTLY `needUsd` priced at settle
-        // time, while the quorum re-derives `needUsd` from the live feed at
-        // execute. Settling right after review close would let any price rise
-        // before `executeBy` fail the quorum and brick an otherwise-covered
-        // proposal. Nothing needs the relief before `executeBy`: by then the
-        // proposal has executed or expired, so collapsing its reservations can
-        // no longer change any quorum.
-        //
-        // STRICTLY AFTER `executeBy`: a proposal is executable while
-        // `block.timestamp <= executeBy`, so settling must not overlap that
-        // last executable instant.
+        // GATED ON `executeBy`, NOT `reviewEnd`. Before it, each approver holds a
+        // full-coverage reservation, so the quorum sums an A-fold cushion;
+        // settling collapses that to EXACTLY `needUsd` priced at settle time,
+        // while the quorum re-derives `needUsd` from the live feed at execute. So
+        // settling right after review close would let any price rise before
+        // `executeBy` fail the quorum and brick an otherwise-covered proposal.
+        // STRICTLY after `executeBy`, since a proposal is executable while
+        // `block.timestamp <= executeBy`.
         if (pv.executeBy == 0 || block.timestamp <= pv.executeBy) revert ReviewNotClosed();
 
         uint256 reservedTotal = _committedUsd[key];
@@ -2347,11 +1755,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             return;
         }
 
-        // Same hoist-and-guard as `recordApproval` (audit #181 finding 23):
-        // the vault/required-coverage reads used to sit as inline try-call
-        // arguments, evaluated in THIS function's frame, before — and
-        // therefore outside — the `catch` below. See
-        // `_tryResolveCoverageInputs`.
+        // Same hoist-and-guard as `recordApproval`: the vault/required-coverage
+        // reads used to sit as inline try-call arguments, evaluated in THIS
+        // frame — before, and therefore outside, the `catch`.
         (address asset, uint256 requiredCoverage, bool resolved) = _tryResolveCoverageInputs(gov, proposalId, pv.vault);
         if (!resolved) return; // unreadable right now; retry later rather than mis-settle
 
@@ -2365,17 +1771,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         address[] storage listed = _approversOf[key];
         uint256 n = listed.length;
         uint256 assigned;
-        // Same effective basis as `allocatedUsd`: a guardian whose bond has
-        // gone must not dilute the survivors' shares. Summed over the PLEDGES
-        // rather than the live bookings, since the bookings are what this
-        // function is about to rewrite — dividing by them would make each pass
-        // depend on the last.
+        // Same effective basis as `allocatedUsd`: a guardian whose bond has gone
+        // must not dilute the survivors' shares. Summed over the PLEDGES rather
+        // than the live bookings, since the bookings are what this function is
+        // about to rewrite.
         // REVERTS ON `NoWoodPrice` rather than settling at a price nobody can
-        // vouch for. Settlement is permissionless and safe to skip — a pass
-        // that does not happen leaves the budget over-reserved, which is the
-        // conservative state — so an outage costs a retry, not a stuck
-        // proposal. Contrast `recordApproval`, where declining to act would
-        // disenfranchise a voter rather than merely delay a refund.
+        // vouch for. Settlement is permissionless and safe to skip, so an outage
+        // costs a retry, not a stuck proposal — unlike `recordApproval`, where
+        // declining to act would disenfranchise a voter.
         uint256 priceX8 = woodPriceX8();
         // ANCHORED (issue #35): `pv.executedAt` is 0 for a proposal that
         // never executed (expired unexecuted, window merely closed) — the
@@ -2397,22 +1800,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             uint256 reserved = _reservedUsd[key][g];
             if (reserved == 0) continue; // released via a vote change
 
-            // SHARED ACROSS OPEN PROPOSALS (Pashov audit finding 2, hardening
-            // #35) — see `_sharedSlashableUsd`: this guardian's slashable
-            // basis is pro-rated against every other proposal it currently
-            // backs, not clamped to this proposal's reservation alone.
-            // PLEDGE BASIS: `reserved` here is `_reservedUsd[key][g]`, so the
-            // denominator must be `_livePledgedUsd`, not `_liveBookedUsd`
-            // (Pashov re-audit of #158, finding 4 — a pledge numerator over a
-            // booking denominator is exactly the basis mismatch that finding
-            // proved).
+            // SHARED ACROSS OPEN PROPOSALS: this guardian's slashable basis is
+            // pro-rated against every other proposal it currently backs. PLEDGE
+            // BASIS — `reserved` is `_reservedUsd[key][g]`, so the denominator
+            // must be `_livePledgedUsd`, never `_liveBookedUsd`.
             uint256 mine = _sharedSlashableUsd(g, reserved, priceX8, pv.executedAt, _livePledgedUsd[g]);
             uint256 alloc = _allocate(mine, effectiveTotal, needUsd);
             // BOOKED, NOT ALLOCATED. `_rebook` clamps an upward move to the
-            // guardian's free budget (issue #110), so what it returns can be
-            // below `alloc`. Accruing the allocation instead would overstate
-            // `assigned`, understate the residue, and put a number in
-            // `CoverageSettled` that no bucket holds.
+            // guardian's free budget, so what it returns can be below `alloc`.
+            // Accruing the allocation instead would overstate `assigned`,
+            // understate the residue, and emit a number no bucket holds.
             uint256 booked = _rebook(key, g, alloc, priceX8);
             assigned += booked;
             // `_allocate` never scales up (alloc <= mine) and the clamp only
@@ -2420,33 +1817,23 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             headroom[i] = mine - booked;
         }
 
-        // Truncation leaves the total a few wei under `needUsd`. Hand the
-        // residue out rather than leaving it short: the quorum compares this
-        // same aggregate against `needUsd`, so a rounded-down sum would make a
+        // Truncation leaves the total a few wei under `needUsd`. Hand the residue
+        // out rather than leaving it short: the quorum compares this same
+        // aggregate against `needUsd`, so a rounded-down sum would make a
         // fully-subscribed proposal fail its own coverage check after settling.
         //
         // BOUNDED BY EACH HOLDER'S OWN HEADROOM. The residue is dust only when
         // `effectiveTotal > needUsd`. When the cohort's live value has fallen
-        // BELOW the need, `_allocate` returns `mine` for everyone, `assigned`
-        // is the whole `effectiveTotal`, and the "residue" is the entire
-        // COHORT SHORTFALL — handing that to one guardian would scale its
-        // booking above its own pledge and past `k x bond`, inventing
-        // collateral nobody pledged.
+        // BELOW the need, `_allocate` returns `mine` for everyone and the residue
+        // is the entire COHORT SHORTFALL — handing that to one guardian would
+        // scale its booking above its own pledge and past `k x bond`, inventing
+        // collateral nobody pledged. Capping each top-up at `mine - alloc` bounds
+        // the booking by `min(slashable bond, pledge)`.
         //
-        // Capping each top-up at `mine - alloc` bounds the booking by
-        // `min(slashable bond, pledge)` — the most a conviction could ever
-        // take from it, TRUE again under the anchored basis (issue #35):
-        // once executed, `mine` is already capped at
-        // `min(snapshot at executedAt, live)`, so this residue credit cannot be
-        // inflated by a stake top-up an accused approver adds after the
-        // drain. Crediting past that bound would consume budget that buys no
-        // recovery.
-        // In the shortfall case every headroom is zero, so nothing is handed
-        // out and the aggregate lands UNDER `needUsd`: `requireApproveQuorum`
-        // sums `min(live, booked)`, the same `effectiveTotal` it would have
-        // summed had this never run, so the proposal fails its coverage check
-        // exactly as it already would have. Settling neither creates nor
-        // destroys coverage — it only stops over-reserving for it.
+        // In the shortfall case every headroom is zero, so nothing is handed out
+        // and the aggregate lands under `needUsd` — the same figure
+        // `requireApproveQuorum` would have summed had this never run. Settling
+        // neither creates nor destroys coverage; it only stops over-reserving.
         if (assigned < needUsd) {
             uint256 residue = needUsd - assigned;
             for (uint256 i = 0; i < n && residue != 0; i++) {
@@ -2454,12 +1841,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
                 if (room == 0) continue;
                 uint256 take = room < residue ? room : residue;
                 address g = listed[i];
-                // AND BOUNDED A SECOND TIME BY THE BATCHING CAP. `room` bounds
-                // the top-up by what this guardian could PAY; `_rebook`'s clamp
-                // bounds it by what this guardian may still UNDERWRITE (issue
-                // #110). Credit only what the bucket actually took, or a
-                // guardian already at its cap would silently swallow the residue
-                // and starve the approvers behind it in the list.
+                // AND BOUNDED A SECOND TIME BY THE BATCHING CAP. `room` bounds the
+                // top-up by what this guardian could PAY; `_rebook`'s clamp bounds
+                // it by what it may still UNDERWRITE. Credit only what the bucket
+                // actually took, or a guardian already at its cap would swallow
+                // the residue and starve the approvers behind it.
                 uint256 before = uint256(_recorded[key][g].usd);
                 uint256 gained = _rebook(key, g, before + take, priceX8) - before;
                 residue -= gained;
@@ -2473,23 +1859,15 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @dev Move a guardian's live booking to `target`, keeping its epoch bucket
     ///      in step, and return what was ACTUALLY booked. Both directions:
-    ///      settlement is re-runnable, so a booking that was written down at a
-    ///      bad price has to be able to walk back up.
+    ///      settlement is re-runnable, so a booking written down at a bad price
+    ///      has to be able to walk back up. `target` is bounded by
+    ///      `_reservedUsd[key][g]`, itself bounded to `uint192`, so neither the
+    ///      cast nor the bucket arithmetic can misbehave.
     ///
-    ///      `target` is bounded by `_reservedUsd[key][g]`, which `recordApproval`
-    ///      bounded to `uint192`, so neither the cast nor the bucket arithmetic
-    ///      can misbehave — the bucket was incremented by the pledge and every
-    ///      subsequent booking is a fraction of it. The RETURN VALUE may be
-    ///      strictly below `target`; see the clamp.
-    ///
-    /// @dev THE BATCHING CAP IS RE-CHECKED ON THE WAY UP (issue #110).
-    ///      `_buckets` is §3.3's state — `openExposureUsd(g) <= kNumerator *
-    ///      slashableBondUsd(g)` is a property of it — and this function is the
-    ///      only writer of it besides `recordApproval`. Enforcing the cap only at
-    ///      approve time left a hole, because the pledge a settlement pass walks
-    ///      a booking back up to was checked against the guardian's exposure AS
-    ///      IT WAS AT THE VOTE, and an earlier pass may have freed budget the
-    ///      guardian has since legally spent elsewhere:
+    /// @dev THE BATCHING CAP IS RE-CHECKED ON THE WAY UP. Enforcing it only at
+    ///      approve time left a hole, because the pledge a settlement pass walks a
+    ///      booking back up to was checked against the guardian's exposure AS IT
+    ///      WAS AT THE VOTE:
     ///
     ///        1. g1 and g2 each reserve the full coverage of P1; g1 is at its cap.
     ///        2. Anyone settles P1: both bookings are written DOWN pro-rata and
@@ -2497,45 +1875,29 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///        3. g1 approves P2 with it. Legal — `recordApproval`'s check passes.
     ///        4. g2 is slashed to zero on an unrelated conviction.
     ///        5. Anyone re-runs settlement on P1. `_effectiveReservedTotal` sums
-    ///           over LIVE bonds, so it has fallen, so `_allocate` hands g1 more
-    ///           and this function books it — g1 now backs 1.5x its own bond.
+    ///           over LIVE bonds, so it has fallen, `_allocate` hands g1 more, and
+    ///           g1 now backs 1.5x its own bond.
     ///
-    ///      Step 5 is permissionless and step 4 is ordinary operation, so the
-    ///      state `recordApproval`'s natspec calls unreachable was reachable
-    ///      without capital, manipulation, or a privileged role.
+    ///      Step 5 is permissionless and step 4 is ordinary operation.
     ///
-    ///      CLAMPED, NOT REVERTED, matching `recordApproval`: a guardian with no
-    ///      free budget books nothing there rather than taking the vote down, and
-    ///      a settlement that reverted would be one an adversary could brick for
-    ///      a whole cohort by parking exposure on a single approver. The clamp
-    ///      costs an `openExposureUsd` bucket scan, so it is paid ONLY on the
-    ///      upward branch — shrinking a booking can never breach the cap, and the
-    ///      first pass on any proposal is all shrink.
+    ///      CLAMPED, NOT REVERTED, matching `recordApproval`: a settlement that
+    ///      reverted would be one an adversary could brick for a whole cohort by
+    ///      parking exposure on a single approver. The clamp costs a bucket scan,
+    ///      so it is paid ONLY on the upward branch.
     ///
-    ///      `openExposureUsd(g)` ALREADY counts this key's current booking, so
-    ///      the bound is `current + (cap - open)` and not `cap - open`;
-    ///      subtracting the booking twice would clamp repairs that breach
-    ///      nothing. This also keeps the clamp a CLAMP rather than a freeze: with
-    ///      no competing exposure `open == current`, the bound is the full cap,
-    ///      and a written-down booking still walks all the way back to its
-    ///      pledge.
-    ///
-    ///      A clamp can leave the cohort's aggregate under `needUsd`. That is the
-    ///      same honest shortfall the residue top-up already produces when the
-    ///      cohort's live value has fallen below the need: `requireApproveQuorum`
-    ///      sums the bookings and fails loudly at execute. Settling still neither
-    ///      creates nor destroys coverage.
+    ///      `openExposureUsd(g)` ALREADY counts this key's current booking, so the
+    ///      bound is `current + (cap - open)`, not `cap - open`; subtracting the
+    ///      booking twice would clamp repairs that breach nothing. That also keeps
+    ///      it a CLAMP rather than a freeze: with no competing exposure the bound
+    ///      is the full cap and a written-down booking walks all the way back.
     function _rebook(bytes32 key, address g, uint256 target, uint256 priceX8) internal returns (uint256) {
         RecordedExposure memory r = _recorded[key][g];
         uint256 current = uint256(r.usd);
         if (target > current) {
-            // LIVE (anchor = 0), DELIBERATELY (issue #35, design D6). This is
-            // the #110 BATCHING cap — how much of this guardian's bond is
-            // free across ALL its open proposals right now — not a
-            // per-proposal verdict-recovery bound, so it stays on the same
-            // basis `recordApproval`'s original cap uses. Anchoring it would
-            // change #110's re-check semantics, which this change is
-            // designed not to disturb.
+            // LIVE (anchor = 0), DELIBERATELY. This is the BATCHING cap — how much
+            // of this guardian's bond is free across ALL its open proposals right
+            // now — not a per-proposal verdict-recovery bound, so it stays on the
+            // same basis `recordApproval`'s original cap uses.
             uint256 capUsd = kNumerator * _slashableBondUsd(g, priceX8, 0);
             uint256 open = openExposureUsd(g);
             uint256 headroom = capUsd > open ? capUsd - open : 0;
@@ -2545,12 +1907,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if (target == current) return current;
         if (target < current) {
             _buckets[g][r.epoch] -= (current - target);
-            // Mirrors the bucket write on the SAME delta — keeps
-            // `_liveBookedUsd` (the booking-basis shared-stake denominator,
-            // Pashov re-audit of #158 finding 2) exactly equal to `Σ
-            // _recorded[key][g].usd` at every instant, in both directions.
-            // `_livePledgedUsd`/`_reservedUsd` are untouched here: settlement
-            // never rewrites the pledge, only the booking.
+            // Mirrors the bucket write on the SAME delta, keeping `_liveBookedUsd`
+            // exactly equal to the sum of `_recorded[key][g].usd` at every instant,
+            // in both directions. The pledge accumulators are untouched here:
+            // settlement never rewrites the pledge, only the booking.
             _liveBookedUsd[g] -= (current - target);
         } else {
             _buckets[g][r.epoch] += (target - current);
@@ -2561,18 +1921,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         return target;
     }
 
-    /// @dev `_effectiveTotal` over the PLEDGES rather than the live bookings.
-    ///      The two coincide until `settleCoverage` first runs and diverge
-    ///      afterwards; settlement needs this one, because it is rewriting the
-    ///      very numbers `_effectiveTotal` reads and must divide by an input its
-    ///      own previous passes did not move.
-    ///
-    ///      ANCHORED (issue #35): same `anchor` threading as `_effectiveTotal`
-    ///      — `pv.executedAt`, 0 (live) for a proposal that never executed.
-    ///
-    /// @dev SHARED ACROSS OPEN PROPOSALS (Pashov audit finding 2, hardening
-    ///      #35): same `_sharedSlashableUsd` treatment as `_effectiveTotal`,
-    ///      see the invariant note there.
+    /// @dev `_effectiveTotal` over the PLEDGES rather than the live bookings. The
+    ///      two coincide until `settleCoverage` first runs and diverge afterwards;
+    ///      settlement needs this one, because it is rewriting the very numbers
+    ///      `_effectiveTotal` reads and must divide by an input its own previous
+    ///      passes did not move. Anchored and shared exactly as `_effectiveTotal`
+    ///      is.
     function _effectiveReservedTotal(bytes32 key, uint256 priceX8, uint256 anchor)
         internal
         view
@@ -2596,20 +1950,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      reservation and the quorum fails on the aggregate — scaling UP to
     ///      cover a shortfall would invent collateral nobody pledged.
     ///
-    ///      Rounds DOWN, and the residue is deliberate: allocations must never
-    ///      sum above `needUsd`, or approvers would jointly owe more than the
-    ///      loss and the surplus would have no claimant. The truncated dust
-    ///      leaves the aggregate a few wei short of `needUsd`, which the caller
-    ///      absorbs — `requireApproveQuorum` compares against the same rounded
-    ///      sum it just built, so the comparison stays self-consistent.
+    ///      Rounds DOWN, deliberately: allocations must never sum above `needUsd`,
+    ///      or approvers would jointly owe more than the loss and the surplus
+    ///      would have no claimant.
     ///
-    ///      TWO REGIMES, and `settleCoverage`'s residue top-up must not conflate
-    ///      them. Above `needUsd` the shortfall this leaves really is dust, at
-    ///      most one wei per approver. At or below it the function returns
-    ///      `reserved` untouched, `assigned` comes out equal to the cohort's
-    ///      whole effective total, and the gap to `needUsd` is the cohort
-    ///      SHORTFALL rather than rounding — not something a top-up may paper
-    ///      over, because the collateral to cover it does not exist.
+    ///      TWO REGIMES, which `settleCoverage`'s residue top-up must not
+    ///      conflate. Above `needUsd` the shortfall really is dust, at most one wei
+    ///      per approver. At or below it the function returns `reserved`
+    ///      untouched and the gap to `needUsd` is the cohort SHORTFALL rather than
+    ///      rounding — not something a top-up may paper over, because the
+    ///      collateral to cover it does not exist.
     function _allocate(uint256 reserved, uint256 reservedTotal, uint256 needUsd) internal pure returns (uint256) {
         if (reservedTotal <= needUsd) return reserved;
         return (reserved * needUsd) / reservedTotal;
@@ -2628,10 +1978,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // Scans FORWARD as well as back. Approvals are booked into the bucket
         // covering settlement, which is in the future at vote time, so a
         // backward-only sum would miss every live commitment and report a
-        // guardian's budget as free while it is fully pledged — the batching cap
-        // would then wave through exactly what it exists to stop.
-        // `MAX_COVERAGE_HORIZON` bounds the span, and `_coverageEpoch` refuses to
-        // book beyond it, so the two together keep this loop fixed-width.
+        // guardian's budget as free while it is fully pledged.
+        // `MAX_COVERAGE_HORIZON` bounds the span and `_coverageEpoch` refuses to
+        // book beyond it, so the two keep this loop fixed-width.
         uint256 to = (elapsed + MAX_COVERAGE_HORIZON) / epochLength;
         for (uint256 e = from; e <= to; e++) {
             total += _buckets[guardian][e];
@@ -2646,20 +1995,17 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if ((window + MAX_COVERAGE_HORIZON) / length + 2 > MAX_SCAN_BUCKETS) revert InvalidParameter();
     }
 
-    /// @dev The bucket whose expiry covers this proposal's settlement, floored
-    ///      at the current epoch (a proposal already past its deadline must not
-    ///      book into the past, where the bucket may have expired already).
+    /// @dev The bucket whose expiry covers this proposal's settlement, floored at
+    ///      the current epoch (a proposal already past its deadline must not book
+    ///      into the past, where the bucket may have expired).
     ///
     ///      Reverts rather than clamping when settlement lands beyond
-    ///      `MAX_COVERAGE_HORIZON`. Clamping would silently under-cover the tail
-    ///      of a long strategy, which is the very bug this replaced; refusing
-    ///      the approval instead surfaces a mis-set duration ceiling as a failed
-    ///      vote rather than as a hole nobody sees. At the shipped 28d epoch
-    ///      this permits ~84 days of horizon, comfortably above the 30d duration
-    ///      cap plus a 7d execution window.
+    ///      `MAX_COVERAGE_HORIZON`: clamping would silently under-cover the tail of
+    ///      a long strategy, while refusing surfaces a mis-set duration ceiling as
+    ///      a failed vote rather than a hole nobody sees.
     /// @dev `_coverageEpoch` without the revert — returns `(epoch, false)` when
-    ///      settlement lands beyond the horizon so `recordApproval` can decline
-    ///      to book instead of taking the vote down with it.
+    ///      settlement lands beyond the horizon so `recordApproval` can decline to
+    ///      book instead of taking the vote down with it.
     function _coverageEpochOrSkip(ILedgerGovernorMinimal.ProposalViewLite memory pv)
         internal
         view
