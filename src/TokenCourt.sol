@@ -357,7 +357,17 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // `turnout`, converting an unpaid `Inconclusive` into a paid
         // `NotGuilty`. Read the game pinned on the case (`c.game`), never the
         // live `challengeGame` pointer, for the same reason `finalize` does.
-        if (IChallengeGame(c.game).counterBondContributionOf(c.challengeId, msg.sender) != 0) {
+        // RAW STATICCALL — same doctrine as `ExposureLedger._feedPriceX8` and
+        // `SyndicateVault._openProposalPid`. A typed call into a game that does
+        // not answer this selector reverts in THIS frame with no data, turning
+        // a missing selector into an undecodable failure of ALL voting rather
+        // than a stated one. Decoding explicitly makes the failure branch a
+        // decision, and the decision is CLOSED: a game that cannot tell us
+        // whether the caller funded the counter-bond cannot clear them to vote
+        // on it either.
+        (bool okCb, bytes memory cbRet) =
+            c.game.staticcall(abi.encodeCall(IChallengeGame.counterBondContributionOf, (c.challengeId, msg.sender)));
+        if (!okCb || cbRet.length != 32 || abi.decode(cbRet, (uint256)) != 0) {
             revert CounterBondContributorCannotVote();
         }
 
@@ -544,11 +554,29 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // answers the same question, how much of THIS instant's electorate is
         // unaccused, before the min ever compares them.
         //
-        // GROWTH-CAP THE SNAPSHOT TOTAL (pashov review finding #1). The `min`
-        // below is monotone increasing in BOTH operands, so when `reduced`
-        // binds, idle stake planted before `executedAt` raises it and lifts the
-        // floor — while `vote`'s growth gate denies that same stake a ballot.
-        if (earlier != 0 && total > earlier) total = earlier;
+        // PASHOV REVIEW FINDING #1, EXAMINED AND NOT ACTED ON (tracked in
+        // #200). The observation is correct: `min` is monotone increasing in
+        // BOTH operands, so when `reduced` binds, idle never-approving stake
+        // planted before `executedAt` raises it and lifts the floor, while
+        // `vote`'s growth gate denies that same stake a ballot. But the ceiling
+        // on that lift is `flooredEarlierReduced`, which IS the intended
+        // anti-capture bar — what an attacker buys is the removal of a LIVENESS
+        // CONCESSION, not a bar beyond the design's intent.
+        //
+        // Both candidate fixes were implemented and measured against this
+        // file's fixtures, and both are worse than the defect. Dropping the min
+        // pins the floor permanently at the value the attacker was reaching
+        // for. Capping `total` at `earlier` before subtracting `accusedWeight`
+        // collapses the floor to ZERO whenever the electorate grew past the
+        // lookback (`test_finalize_floorSurvivesElectorateGrowthPastTheLookback`:
+        // earlier 60k, total 560k, accused 300k -> 6k becomes 0), and a zero
+        // floor means any nonzero turnout convicts. The mutant
+        // `base = (earlier != 0 && earlier < total) ? earlier : reduced` is
+        // already pinned as wrong by the regression test below.
+        //
+        // A correct fix needs a votable-weight denominator — the aggregate of
+        // per-voter `min(now, then)` — which is not computable on-chain from
+        // the aggregate checkpoints available here.
         uint256 reduced = total > accusedWeight ? total - accusedWeight : 0;
         uint256 earlierReduced = earlier > accusedWeightAtLookback ? earlier - accusedWeightAtLookback : 0;
         // The smaller of the two unaccused electorates, except when there is no

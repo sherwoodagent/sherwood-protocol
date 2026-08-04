@@ -47,6 +47,22 @@ contract MockGameForCourt {
     ///      a call to a nonexistent selector, not on the invariant itself.
     uint256 public constant MIN_REFERRAL_SLACK = 1 hours;
 
+    /// @dev What `setChallenge` pins as `courtAtFiling`. The real
+    ///      `ChallengeGame.file` ALWAYS pins this from its live `court` slot,
+    ///      so a challenge that ever reaches a court carries a non-zero value.
+    ///      Leaving it at the struct default made every fixture here describe
+    ///      the one shape `refer` must now refuse (`ChallengeNotRulable`):
+    ///      `rule` authorises against this pin, so a zero-pin case would take
+    ///      real votes and then never be adjudicable. Non-zero by default so
+    ///      the ordinary fixtures describe an ordinary filing;
+    ///      `setCourtAtFiling(address(0))` opts one test back into the
+    ///      un-pinned shape.
+    address public courtAtFiling = address(uint160(uint256(keccak256("MockGameForCourt.court"))));
+
+    function setCourtAtFiling(address c) external {
+        courtAtFiling = c;
+    }
+
     function setExposureLedger(address l) external {
         exposureLedger = l;
     }
@@ -91,10 +107,27 @@ contract MockGameForCourt {
         c.filedAt = filedAt;
         c.disputeTimeoutAtFiling = disputeTimeoutAtFiling;
         c.executedAt = executedAt;
+        // Mirrors `ChallengeGame.file`, which pins this on every filing — see
+        // `courtAtFiling` above for why the zero default was the wrong fixture.
+        c.courtAtFiling = courtAtFiling;
     }
 
     function challengeOf(uint256 id) external view returns (IChallengeGame.Challenge memory) {
         return _challenges[id];
+    }
+
+    /// @dev `TokenCourt.vote` bars counter-bond contributors — the side a
+    ///      `NotGuilty` verdict pays — so this mock must answer the same
+    ///      question the real game does. Zero for everyone unless a test sets
+    ///      it, which is the ordinary case: most voters funded nothing.
+    mapping(uint256 => mapping(address => uint256)) internal _counterBond;
+
+    function counterBondContributionOf(uint256 challengeId, address contributor) external view returns (uint256) {
+        return _counterBond[challengeId][contributor];
+    }
+
+    function setCounterBondContribution(uint256 challengeId, address contributor, uint256 amount) external {
+        _counterBond[challengeId][contributor] = amount;
     }
 
     function rule(uint256 challengeId, IChallengeGame.Verdict verdict) external {

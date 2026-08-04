@@ -14,6 +14,13 @@ import {Id, MarketParams, Market} from "../../src/vendor/morpho/IMorpho.sol";
 ///         `execute()`, `governor()` (BaseStrategy's active-proposal binding,
 ///         issue #150); lifecycle calls are pranked as this address.
 contract VaultStub {
+    /// @dev `BaseStrategy.onlyProposer` re-checks the vault's live agent set on
+    ///      every proposer-gated call, so a vault stand-in must answer this or
+    ///      `rebalance` / `rebalanceDelta` / `updateParams` all fail closed.
+    function isAgent(address) external pure returns (bool) {
+        return true;
+    }
+
     address internal immutable _assetToken;
     address public governor;
 

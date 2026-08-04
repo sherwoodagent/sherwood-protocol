@@ -15,6 +15,13 @@ import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 ///         fixture shape — declared locally rather than imported, since this
 ///         suite must not depend on a file another agent may be editing.
 contract MockVaultWithGovernor {
+    /// @dev `BaseStrategy.onlyProposer` re-checks the vault's live agent set on
+    ///      every proposer-gated call, so a vault stand-in must answer this or
+    ///      `rebalance` / `rebalanceDelta` / `updateParams` all fail closed.
+    function isAgent(address) external pure returns (bool) {
+        return true;
+    }
+
     address public governor;
 
     constructor(address governor_) {
@@ -312,14 +319,23 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         assertEq(weth.balanceOf(address(r.vault)), vaultWethBefore + TOTAL_AMOUNT);
     }
 
-    /// @dev THE BOUNDARY SECOND, made observable. At the exact instant the
-    ///      feed is still fresh, `_sellFloor` is oracle-anchored and must
-    ///      reject a swap against a manipulated pool. One tick past
-    ///      `MAX_PUSH_PRICE_AGE`, the SAME manipulated pool must be allowed
-    ///      through via the quote-anchored fallback — proving the two
-    ///      branches of `_sellFloor` actually diverge at the boundary,
-    ///      rather than one of them being dead code.
-    function test_sellFloor_boundary_freshRejectsManipulation_staleAllowsIt() public {
+    /// @dev THE BOUNDARY SECOND, made observable — REWRITTEN for pashov review
+    ///      finding #4. This test used to assert that one tick past
+    ///      `MAX_PUSH_PRICE_AGE` the SAME manipulated pool was ALLOWED
+    ///      through, via the quote-anchored fallback. That allowance WAS the
+    ///      finding: the fallback derives `minOut` from a quote taken in the
+    ///      same transaction against the very pool the swap is about to hit,
+    ///      so `maxSlippageBps` bounded drift from a price the attacker had
+    ///      just set. `_sellFloor` now falls back to the last price this
+    ///      contract itself observed from the allowlisted feed —
+    ///      attacker-independent however stale — so BOTH sides of the boundary
+    ///      reject the manipulation.
+    ///
+    ///      `test_sellFloor_staleAnchor_stillClearsUnmanipulated` below pins
+    ///      the other half, which is why this is not simply a fail-closed
+    ///      change: a stale feed must still let an HONEST settle through, or
+    ///      capital is stranded for the length of the outage.
+    function test_sellFloor_boundary_freshAndStaleBothRejectManipulation() public {
         // ── Fresh side: oracle floor rejects a pool moved to half price ──
         Rig memory rFresh = _rig();
         rFresh.adapter.setRate(address(tsla), address(weth), 0.5e18); // pool moved 2x against the vault
@@ -333,10 +349,30 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         rStale.adapter.setRate(address(tsla), address(weth), 0.5e18);
         rStale.feed.setUpdatedAt(START - DEFAULT_MAX_AGE - 1);
         vm.warp(START + 1);
-        uint256 vaultWethBefore = weth.balanceOf(address(rStale.vault));
+        // Post-finding-#4: the stale branch no longer quotes the pool it is
+        // about to trade. It anchors to the last price observed from the feed
+        // during execute, which the manipulation cannot move, so the same 2x
+        // pool move is rejected here exactly as on the fresh side above.
         vm.prank(address(rStale.vault));
-        rStale.strategy.settle(); // now succeeds: quote-anchored fallback matches the manipulated rate
-        assertGt(weth.balanceOf(address(rStale.vault)), vaultWethBefore, "settle must still clear once stale");
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
+        rStale.strategy.settle();
+    }
+
+    /// @dev The liveness half of finding #4, and the reason the fix is a
+    ///      stale-price ANCHOR rather than a fail-closed revert. With the feed
+    ///      one tick past its max age and the pool NOT manipulated, settle must
+    ///      still clear — otherwise a routine equity-feed gap (this contract's
+    ///      own `MAX_PUSH_PRICE_AGE` notes 77h over holiday weekends) would
+    ///      strand the vault's capital for the length of the outage.
+    function test_sellFloor_staleAnchor_stillClearsUnmanipulated() public {
+        Rig memory r = _rig();
+        r.feed.setUpdatedAt(START - DEFAULT_MAX_AGE - 1);
+        vm.warp(START + 1);
+
+        uint256 vaultWethBefore = weth.balanceOf(address(r.vault));
+        vm.prank(address(r.vault));
+        r.strategy.settle();
+        assertGt(weth.balanceOf(address(r.vault)), vaultWethBefore, "honest settle must still clear once stale");
     }
 
     // ════════════════════════════════════════════════════════════════════

@@ -298,9 +298,46 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // recovery needs a redeploy plus a fresh `setAdapterAllowed` and, if
         // tier-certified, a new `proposeCertification` + `certifyDelay`.
         // `address(0)` stays legal — a proposal need not name a strategy.
-        if (strategy != address(0)) {
-            if (IStrategy(strategy).proposer() != msg.sender) revert StrategyProposerMismatch();
-            if (IStrategy(strategy).vault() != vault) revert StrategyVaultMismatch();
+        // Only a CONTRACT can be bricked, so only a contract is checked. A
+        // codeless `strategy` is a label and nothing more — `BaseStrategy`'s
+        // ratchet needs code to flip, `executeCalls` needs code to call — and
+        // `propose` has always accepted one (see
+        // `test_propose_eoaStrategySucceedsAtPropose`). Raw staticcall rather
+        // than a typed call for the same reason as everywhere else in this
+        // repo: a contract that does not answer `proposer()` would otherwise
+        // revert here with no data. It fails CLOSED — something with code that
+        // cannot identify its own proposer must not be declared as one.
+        // ENFORCED ONLY WHERE THERE IS SOMETHING TO PROTECT. The attack this
+        // closes needs a `BaseStrategy` clone: `execute()`'s guard is
+        // `strategyOf(activePid) == address(this)`, and what gets stolen is
+        // that clone's one-way Pending -> Executed ratchet. An address that
+        // does not answer `proposer()` has no such ratchet — it is a plain
+        // adapter pointer or an EOA label, both long-standing legitimate uses
+        // of this field (`test_propose_eoaStrategySucceedsAtPropose`,
+        // `test_vault_activeStrategyAdapter_*`) — so there is nothing for this
+        // guard to defend and refusing it would break callers for no gain.
+        //
+        // When the address DOES answer, the binding is mandatory: that is
+        // exactly the clone case, and `StrategyFactory.cloneAndInit` already
+        // pinned `_proposer` to whoever cloned it. Raw staticcall throughout,
+        // so "does not answer" is a decodable state rather than an
+        // uncatchable revert in this frame.
+        if (strategy != address(0) && strategy.code.length != 0) {
+            (bool okP, bytes memory pRet) = strategy.staticcall(abi.encodeCall(IStrategy.proposer, ()));
+            if (okP && pRet.length == 32 && abi.decode(pRet, (address)) != address(0)) {
+                // A ZERO PROPOSER IS NOT A VICTIM. `StrategyFactory.cloneAndInit`
+                // always writes `_proposer = msg.sender`, so every live clone
+                // carries a non-zero one; zero means the strategy was never
+                // initialized and therefore has no ratchet anyone could steal
+                // and no owner anyone could grief. Templates read zero too, and
+                // they set `_initialized` in their constructor so they can never
+                // become live.
+                if (abi.decode(pRet, (address)) != msg.sender) revert StrategyProposerMismatch();
+                (bool okV, bytes memory vRet) = strategy.staticcall(abi.encodeCall(IStrategy.vault, ()));
+                if (okV && vRet.length == 32 && abi.decode(vRet, (address)) != vault) {
+                    revert StrategyVaultMismatch();
+                }
+            }
         }
         if (strategyDuration > _params.maxStrategyDuration) revert StrategyDurationTooLong();
         if (strategyDuration < _params.minStrategyDuration) revert StrategyDurationTooShort();

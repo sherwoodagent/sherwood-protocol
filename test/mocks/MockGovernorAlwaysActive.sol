@@ -34,7 +34,23 @@ contract MockGovernorAlwaysActive {
 contract MockVaultGovernorStub {
     address public governor;
 
+    /// @dev `BaseStrategy.onlyProposer` re-checks the vault's live agent set on
+    ///      every proposer-gated call, so a vault stub must answer `isAgent` or
+    ///      every `rebalance` / `rebalanceDelta` / `updateParams` fails closed.
+    ///      Stored inverted so the zero-value default is "still an agent" — the
+    ///      ordinary case — with `setAgent(a, false)` for tests that want the
+    ///      revoked-agent path.
+    mapping(address => bool) internal _revoked;
+
     constructor(address governor_) {
         governor = governor_;
+    }
+
+    function isAgent(address a) external view returns (bool) {
+        return !_revoked[a];
+    }
+
+    function setAgent(address a, bool allowed) external {
+        _revoked[a] = !allowed;
     }
 }

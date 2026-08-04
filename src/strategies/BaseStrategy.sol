@@ -116,9 +116,22 @@ abstract contract BaseStrategy is IStrategy {
     ///      for the CALLER, which was the one input still trusted from init.
     ///      Failing closed strands nothing: `settle()` is `onlyVault` and never
     ///      consults this modifier, so the exit path is unaffected.
+    ///      RAW STATICCALL, NOT A HIGH-LEVEL CALL — same doctrine as
+    ///      `SyndicateVault._openProposalPid` / `_pricingSupply` and
+    ///      `ExposureLedger._feedPriceX8`. A typed call into a vault that does
+    ///      not answer `isAgent` reverts in THIS frame with no data, which
+    ///      turns a missing selector into an undecodable failure of every
+    ///      proposer-gated path rather than a stated one. Decoding the answer
+    ///      explicitly keeps the failure branch a DECISION: a vault that says
+    ///      `false`, and a vault that cannot answer at all, both fail closed
+    ///      here with a named error — closed rather than open because the
+    ///      whole point is that revocation must bite, and blocking a
+    ///      rebalance strands nothing (`settle()` is `onlyVault` and never
+    ///      consults this modifier).
     modifier onlyProposer() {
         if (msg.sender != _proposer) revert NotProposer();
-        if (!IAgentSet(_vault).isAgent(_proposer)) revert ProposerNoLongerAgent();
+        (bool ok, bytes memory ret) = _vault.staticcall(abi.encodeCall(IAgentSet.isAgent, (_proposer)));
+        if (!ok || ret.length != 32 || !abi.decode(ret, (bool))) revert ProposerNoLongerAgent();
         _;
     }
 

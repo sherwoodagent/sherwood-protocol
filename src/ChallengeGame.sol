@@ -699,7 +699,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // `_liveCount` uncapped, so cheap filings are repeatable per
             // address. Re-applying the haircut keeps both branches in the same
             // units and leaves only the intended cap/market conservatism.
-            priceX8 = (exposureLedger.woodUsdPriceX8() * exposureLedger.woodHaircutBps()) / BPS_DENOMINATOR;
+            //
+            // Raw staticcall for the haircut, degrading to "no haircut": this
+            // whole branch exists BECAUSE the ledger is already answering
+            // badly, so a typed call here would reintroduce the revert the
+            // catch is meant to absorb. Degrading to `BPS_DENOMINATOR`
+            // reproduces exactly the pre-fix figure, so the worst case is the
+            // behaviour this branch already had — never a larger bond than
+            // intended.
+            uint256 haircutBps = BPS_DENOMINATOR;
+            (bool okHc, bytes memory hcRet) =
+                address(exposureLedger).staticcall(abi.encodeCall(IExposureLedger.woodHaircutBps, ()));
+            if (okHc && hcRet.length == 32) {
+                uint256 hc = abi.decode(hcRet, (uint256));
+                if (hc != 0 && hc <= BPS_DENOMINATOR) haircutBps = hc;
+            }
+            priceX8 = (exposureLedger.woodUsdPriceX8() * haircutBps) / BPS_DENOMINATOR;
         }
         if (priceX8 == 0) revert WoodPriceUnset();
         uint256 bondWood = (((coverageUsd * challengerBondBps) / BPS_DENOMINATOR) * 1e8) / priceX8;
@@ -886,9 +901,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // `Voting` until the dispute timeout discards the whole tally.
             // Reading the pin keeps referral and adjudication on one basis.
             address courtAddr = c.courtAtFiling;
+            // TWO conditions, and they are different questions. WHICH court is
+            // the pin, because that is the only one `rule` will authorise.
+            // WHETHER to refer at all still consults the LIVE slot, because
+            // unwiring `court` is the operator's kill switch for referrals and
+            // must keep working for challenges already in flight — reading
+            // only the pin silently took that lever away.
+            //
             // No court pinned means no referral is possible either way — the
             // timeout remains the only path out of `Disputed`.
-            if (courtAddr != address(0)) {
+            if (courtAddr != address(0) && court != address(0)) {
                 try ITokenCourt(courtAddr).refer(challengeId) {}
                 catch {
                     emit AutoReferFailed(challengeId);
