@@ -84,6 +84,12 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         // Called on `this` so `msg.sender` inside deployCore is the broadcaster.
         Deployed memory d = deployCore(cfg);
 
+        // ProtocolConfig ships with a ZERO fee recipient (its constructor seeds
+        // only the splits), and a zero recipient makes the protocol fee slice
+        // silently zero in SyndicateGovernor's settle path. Seat it inside the
+        // broadcast, while the deployer still owns the config.
+        ProtocolConfig(d.protocolConfig).setProtocolFeeRecipient(deployer);
+
         // Multisig handoff (final action inside the broadcast).
         address effectiveOwner = deployer;
         if (!skipHandoff) {
@@ -119,6 +125,10 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         _patchAddress("GOVERNOR_BEACON", d.beacon);
         _patchAddress("PROTOCOL_CONFIG", d.protocolConfig);
         _patchAddress("GUARDIAN_REGISTRY", d.registryProxy);
+        // TIER_REGISTRY is read as an env address by DeployPlanD and
+        // WireTokenCourt; without this key the later phases have nothing to
+        // read and the operator has to recover it from broadcast logs.
+        _patchAddress("TIER_REGISTRY", d.tierRegistry);
         _patchAddress("STAKED_WOOD", d.swoodProxy);
         _patchAddress("WOOD_TOKEN", woodToken);
 

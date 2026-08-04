@@ -54,6 +54,12 @@ The fork ceremony SHALL run three scripts in order, each broadcast with the flag
 
 `DeployWood` SHALL be skipped — WOOD is already live on the fork. CREATE3 makes the core addresses order-independent. With handoff skipped, the deployer retains ownership of beacon / factory / registry / sWOOD / ProtocolConfig / PriceRouter (needed for fork admin); on the real mainnet ceremony `SKIP_MULTISIG_HANDOFF` SHALL NOT be used and `OWNER_MULTISIG` MUST be a contract (Safe), not an EOA.
 
+The ceremony SHALL persist `TIER_REGISTRY` into `chains/{chainId}.json`. `DeployPlanD` and `WireTokenCourt` both read that key as an env address, so omitting it leaves the later phases with nothing to read and forces the operator to recover the address from broadcast logs.
+
+#### Scenario: TierRegistry reaches the address book
+- **WHEN** the core ceremony completes
+- **THEN** `chains/{chainId}.json` carries `TIER_REGISTRY`, and it equals `factory.tierRegistry()`
+
 #### Scenario: Post-deploy validation reads
 - **WHEN** the three scripts complete
 - **THEN** the operator verifies `factory.beacon/priceRouter/protocolConfig`, `swood.wood == WOOD`, `swood.registry == registry`, `registry.reviewPeriod == 86400`, `registry.blockQuorumBps == 3000`, `strategyFactory.approvedTemplate(PORTFOLIO) == true`, and `governorImpl.MIN_VOTING_PERIOD() == 86400`
@@ -123,6 +129,32 @@ To make guardian blocking real (not the cold-start bypass), total staked guardia
 - PRE-FLIGHT 8 (POST-broadcast, design revision 2): `ledger.woodUsdPriceX8() != 0` AND the composed `ledger.woodPriceX8()` SHALL resolve to a non-zero price. These are two independent failures with different remedies. The first is the price CAP being unset, which under the cap-only model is a revert (`NoWoodPrice`) rather than "uncapped" — reading zero as "no ceiling" would make the likeliest misconfiguration the one state in which a ~$438k pool prices every guardian bond without bound. The second is a CAP configured with nothing priced beneath it, which a cap-only check misses entirely. `woodPriceX8()` SHALL be read by low-level probe rather than a typed call, because it now reverts instead of returning zero when unpriceable, and a bare revert would surface as an opaque script failure with no instruction attached.
 - The env key is `WOOD_PRICE_CAP_X8`, RENAMED from `WOOD_PRICE_HAIRCUT_X8` because the number's meaning inverted: it is a ceiling on manipulation, never served as a price, and SHALL be seeded **ABOVE** market — 1.25–2× is the intended band, reviewed monthly. The old "≤ 30-day low" instruction is now exactly backwards: a cap below market binds permanently, pins every bond at the cap and makes the market source inert.
 - `WOOD_TWAP_ORACLE` SHALL name a `WoodTwapOracle` that ALREADY HAS A COMPLETED AVERAGING WINDOW. The oracle needs at least `twapWindow` of keeper activity before `consult()` answers, so the ceremony ordering is: deploy the oracle → run the keeper → run Plan B. Pre-flight 8 enforces this rather than merely documenting it.
+
+### Requirement: The WOOD TWAP oracle has its own deploy step
+
+`script/DeployWoodTwapOracle.s.sol:DeployWoodTwapOracle` SHALL deploy the `WoodTwapOracle`, record the first observation, and persist `WOOD_TWAP_ORACLE` to `chains/{chainId}.json`. It runs AFTER the three core phases and BEFORE `DeployPlanB`.
+
+The oracle requires NO Chainlink WOOD/USD feed — that is the point of it. Its inputs are the Uniswap-V2 `WOOD/WETH` pair's own cumulative-price accumulators and the chain's Chainlink **ETH/USD** feed, composed as `WOOD/USD = TWAP(WOOD per ETH) × ETH/USD`. Chain 4663 has both.
+
+The oracle SHALL be constructed with its FINAL owner rather than deployed-then-transferred: every parameter is seated in the constructor, so no post-deploy wiring step exists, and the contract is plain `Ownable` (a transfer would land in one step with no `acceptOwnership` receipt).
+
+Pre-flights, all PRE-broadcast:
+- The pair holds exactly `{WOOD, WETH}` with non-zero reserves. The constructor also refuses otherwise, but with a bare `PairNotUsable()` that reads identically for a wrong pool, an untraded shell, and a right-shaped pair holding unrelated tokens.
+- WOOD and WETH SHALL share a decimals count. `consult()` multiplies the pair's raw UQ112x112 ratio by ETH/USD with no decimals normalisation, so a mismatch prices WOOD off by orders of magnitude while every other check passes. Nothing in the oracle asserts this.
+- `idle × MAX_IDLE_SPAN_DIVISOR (20) <= twapWindow`, where `idle` is `block.timestamp - blockTimestampLast`. THIS IS THE CHECK THE STEP EXISTS FOR: `validatePair()` passes on a pool that stopped trading weeks ago, so the constructor accepts it and `update()` then no-ops forever because `_currentCumulative` refuses to extrapolate across a long idle span.
+- The ETH/USD feed answers positive and is no staler than `ETH_USD_MAX_DELAY`. The constructor reads only its `decimals()`.
+
+#### Scenario: Deploy lays a baseline but leaves the oracle unpriced
+- **WHEN** the script completes
+- **THEN** `latestObservation` is set, `consult()` still reports unavailable, and `DeployPlanB` pre-flight 8 still refuses — an operator cannot mistake the deploy for a primed oracle
+
+#### Scenario: Idle pool refused before deploying
+- **GIVEN** the `WOOD/WETH` pair has not traded within `twapWindow / 20`
+- **THEN** the script refuses PRE-broadcast, naming that `update()` would no-op forever and that a fork/vnet pool does not trade at all
+
+#### Scenario: Fork cannot prime the oracle
+- **GIVEN** a Tenderly vnet, where the pool stops trading at the fork point and `idle` grows without bound
+- **THEN** no amount of keeper activity primes the oracle there, and the vnet SHALL either generate swaps against the pair or wire a Chainlink-shaped WOOD feed via `ledger.setWoodFeed` instead — on mainnet the pair trades continuously (measured 2026-08-04: 10s idle), so the guard is near-free in production
 
 #### Scenario: Unset price cap refused post-broadcast
 - **WHEN** `DeployPlanB` completes its broadcast with `woodUsdPriceX8` still zero
@@ -293,6 +325,11 @@ This is a TRUST-MODEL CHANGE and SHALL be documented as one in both the setter n
 #### Scenario: EOA owner refused at deploy
 - **WHEN** `DeployPlanB` completes with an externally-owned account as the ledger owner
 - **THEN** pre-flight 10 FAILS, naming that the protocol would carry neither the on-chain limit nor the off-chain one
+
+#### Scenario: Fork bypass for a vnet with no Safe
+- **GIVEN** a Tenderly vnet, whose deployer is an impersonated EOA and where no Safe exists
+- **WHEN** the operator sets `ALLOW_EOA_LEDGER_OWNER=true`
+- **THEN** pre-flight 10 is waived with a printed warning and the run completes — the check is GATED, not deleted, so the mainnet ceremony (which SHALL NOT set the key) keeps the refusal and the source keeps its only trace that the off-chain Zodiac control is owed
 
 #### Scenario: Symmetric delay module configured
 - **GIVEN** the Safe carries a plain Zodiac Delay module applying the same delay to every call

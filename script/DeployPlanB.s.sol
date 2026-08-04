@@ -332,6 +332,11 @@ contract DeployPlanB is Script {
         ///      wired by hand before pre-flight 8's composed-price assert runs —
         ///      and chain 4663 has no such feed, so in practice this is required.
         address woodTwapOracle;
+        /// @dev FORK / VNET ONLY. Bypasses pre-flight 10's requirement that the
+        ///      ledger owner be a contract. A Tenderly vnet has no Safe and its
+        ///      deployer is an impersonated EOA, so the check makes the fork
+        ///      ceremony unrunnable. Never true on the mainnet ceremony.
+        bool allowEoaLedgerOwner;
     }
 
     function run() external {
@@ -367,7 +372,11 @@ contract DeployPlanB is Script {
                 // is what actually refuses a ledger with no live price source —
                 // so the requirement is expressed once, as a property of the
                 // deployed state, rather than twice as an env precondition too.
-                woodTwapOracle: vm.envOr("WOOD_TWAP_ORACLE", address(0))
+                woodTwapOracle: vm.envOr("WOOD_TWAP_ORACLE", address(0)),
+                // `envOr` false: the mainnet ceremony needs no new key and keeps
+                // the refusal. Fork/vnet runs set it explicitly. Read HERE, in
+                // the env adapter, never inside `deploy()` — see `AddressBook`.
+                allowEoaLedgerOwner: vm.envOr("ALLOW_EOA_LEDGER_OWNER", false)
             })
         );
     }
@@ -876,14 +885,26 @@ contract DeployPlanB is Script {
         // ASYMMETRIC (raises delayed, drops immediate), which no on-chain probe
         // can establish. The asymmetry stays a runbook obligation; see
         // openspec/specs/deployment-docs/spec.md.
-        require(
-            ledger.owner().code.length != 0,
-            "PRE-FLIGHT: ExposureLedger owner is an EOA, not a contract. Rate limiting on "
-            "setWoodUsdPrice/setWoodHaircutBps was moved OFF-CHAIN to a Zodiac module on the owner "
-            "Safe (issue #89), so an EOA owner means the protocol has NEITHER the on-chain limit "
-            "nor the off-chain one. Run this from the owner Safe. The module's delay must be "
-            "ASYMMETRIC -- raises delayed, drops immediate -- which this script cannot verify."
-        );
+        // ESCAPE HATCH FOR FORK / VNET RUNS ONLY. A Tenderly vnet has no Safe
+        // and its deployer is an impersonated EOA, so this check makes the fork
+        // ceremony documented in openspec/specs/deployment-docs/spec.md
+        // unrunnable. Gated rather than deleted: on mainnet this require is the
+        // only trace in source that the off-chain Zodiac control is owed, and
+        // deleting it would leave nothing hinting anything is missing.
+        // NEVER set this on the real mainnet ceremony.
+        if (!book.allowEoaLedgerOwner) {
+            require(
+                ledger.owner().code.length != 0,
+                "PRE-FLIGHT: ExposureLedger owner is an EOA, not a contract. Rate limiting on "
+                "setWoodUsdPrice/setWoodHaircutBps was moved OFF-CHAIN to a Zodiac module on the owner "
+                "Safe (issue #89), so an EOA owner means the protocol has NEITHER the on-chain limit "
+                "nor the off-chain one. Run this from the owner Safe. The module's delay must be "
+                "ASYMMETRIC -- raises delayed, drops immediate -- which this script cannot verify. "
+                "Fork/vnet runs only: set ALLOW_EOA_LEDGER_OWNER=true to bypass."
+            );
+        } else {
+            console.log("WARN: ALLOW_EOA_LEDGER_OWNER set - ledger owner EOA check bypassed (fork only).");
+        }
 
         console.log("ExposureLedger:     %s", address(ledger));
         console.log("ProposerBondEscrow: %s", address(escrow));
