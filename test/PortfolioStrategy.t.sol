@@ -8,7 +8,11 @@ import {BaseStrategy} from "../src/strategies/BaseStrategy.sol";
 import {MockSwapAdapter} from "./mocks/MockSwapAdapter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
-import {MockGovernorAlwaysActive, MockVaultGovernorStub} from "./mocks/MockGovernorAlwaysActive.sol";
+import {
+    MockGovernorAlwaysActive,
+    MockVaultGovernorStub,
+    MockPermissiveTierRegistry
+} from "./mocks/MockGovernorAlwaysActive.sol";
 
 /// @notice Mock Chainlink Data Streams verifier proxy.
 /// @dev Sherlock #56: signed reports now carry a `feedId` so the strategy can
@@ -104,7 +108,14 @@ contract PortfolioStrategyTest is Test {
 
     function setUp() public {
         // Issue #150 fix wiring: vault -> governor() -> permissive strategyOf.
-        vault = address(new MockVaultGovernorStub(address(new MockGovernorAlwaysActive())));
+        // The governor also has to answer `tierRegistry()` now: init is
+        // fail-closed on registry resolution, so a strategy whose walk dead-ends
+        // reverts `TierRegistryUnresolved` before any of this suite's math runs.
+        // This suite is about strategy math, not governance binding, so it
+        // points at a permissive registry.
+        MockGovernorAlwaysActive governorStub = new MockGovernorAlwaysActive();
+        governorStub.setTierRegistry(address(new MockPermissiveTierRegistry()));
+        vault = address(new MockVaultGovernorStub(address(governorStub)));
 
         // Deploy mock tokens
         weth = new ERC20Mock("Wrapped Ether", "WETH", 18);

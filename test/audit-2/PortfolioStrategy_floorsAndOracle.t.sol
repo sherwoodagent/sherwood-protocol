@@ -55,6 +55,18 @@ contract MockTierRegistry {
     function isAdapterAllowed(address a) external view returns (bool) {
         return allowed[a];
     }
+
+    /// @dev Token↔price-source attestation, permissive by default so the
+    ///      floors/oracle cases keep testing what they were written for.
+    mapping(address => mapping(bytes32 => bool)) public deniedPair;
+
+    function setPriceSourceForToken(address token, bytes32 src, bool allow) external {
+        deniedPair[token][src] = !allow;
+    }
+
+    function isPriceSourceForToken(address token, bytes32 src) external view returns (bool) {
+        return !deniedPair[token][src];
+    }
 }
 
 /// @notice Configurable AggregatorV3-shaped push feed: settable answer,

@@ -7,6 +7,11 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
 import {MockStrategy} from "../mocks/MockStrategy.sol";
+import {
+    MockGovernorAlwaysActive,
+    MockVaultGovernorStub,
+    MockPermissiveTierRegistry
+} from "../mocks/MockGovernorAlwaysActive.sol";
 
 /// @title Strategy_init_frontrun — MS-C3 regression
 /// @notice Verifies that every concrete strategy template is *uninitializable*
@@ -121,7 +126,16 @@ contract StrategyInitFrontrunTest is Test {
             feedIds
         );
 
-        PortfolioStrategy(clone).initialize(vault, proposer, initData);
-        assertEq(PortfolioStrategy(clone).vault(), vault);
+        // `PortfolioStrategy._initialize` is fail-closed on registry
+        // resolution, so the shared codeless `vault` above no longer gets a
+        // clone through init. This test is about the front-run window, not
+        // about governance binding, so it wires the minimum that resolves:
+        // vault -> governor() -> tierRegistry() -> permissive answers.
+        MockGovernorAlwaysActive governorStub = new MockGovernorAlwaysActive();
+        governorStub.setTierRegistry(address(new MockPermissiveTierRegistry()));
+        address wiredVault = address(new MockVaultGovernorStub(address(governorStub)));
+
+        PortfolioStrategy(clone).initialize(wiredVault, proposer, initData);
+        assertEq(PortfolioStrategy(clone).vault(), wiredVault);
     }
 }

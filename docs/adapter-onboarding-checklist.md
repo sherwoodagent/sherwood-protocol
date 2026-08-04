@@ -492,6 +492,103 @@ an owner rescue).
 
 ---
 
+## 4b. Class certification (strategy templates)
+
+Everything above is keyed by **address**. Strategy clones defeat that: every
+proposal deploys a fresh ERC-1167 clone at a fresh address, so the dual-gate
+would have to be run once per proposal, forever.
+
+Class certification keys by **code** instead. All clones of one template are
+byte-identical, so they share one `EXTCODEHASH`, and that hash identifies the
+template. Certify it once and every clone that will ever exist inherits both
+gates with no per-clone write.
+
+### Eligibility — check this before certifying anything
+
+A class certification asserts the bound holds under **every** initialization,
+not just one deployment's configuration. Only certify a template where:
+
+1. Every external address it touches is either `immutable` in the template's
+   own bytecode, or bound to the registry at `initialize`. A template that
+   accepts an external protocol address and then validates it *by asking that
+   address* is disqualified — see `MorphoSupplyStrategy`, which does exactly
+   that and stays address-certifiable only.
+2. Price sources are bound to the tokens they price, not merely allowlisted.
+3. It is cloned with `Clones.clone` / `cloneDeterministic` only. Any
+   clone-with-immutable-args variant gives each clone distinct bytecode, which
+   dissolves the class **silently** — proposals keep working, they just fall
+   back to tier 2 with the per-call cap reinstated, and nothing reverts.
+4. It is not itself a proxy. A proxy's runtime bytecode is static across
+   implementation swaps, so neither membership level can see the change.
+
+### The writes
+
+| step | call | notes |
+|---|---|---|
+| 1 | `proposeClassCertification(template, selector, tier, boundBps, submitter, expectedTemplateCodehash)` | `onlyOwner`. Same `certifyDelay` and bond machinery as the address path. Reverts `CodehashChanged` if the template's code drifted since you reviewed it. |
+| 2 | `certifyClass(template, selector)` | After `readyAt`. Permissionless with no bond, submitter-only with one. Re-verifies the **template's** codehash. |
+| 3 | `setClassAllowed(template, true)` | `onlyOwner`. Separate axis, exactly like `setAdapterAllowed`. Requires the class to be certified first. |
+
+Step 3 is what **replaces `setAdapterAllowed(clone, true)` per proposal**.
+
+### Verification reads
+
+```
+cast call $REGISTRY "classOf(address)(bytes32)"        $CLONE     # non-zero => live member
+cast call $REGISTRY "tierOf(address,bytes4)(uint8,uint16)" $CLONE $SEL
+cast call $REGISTRY "isAdapterAllowed(address)(bool)"  $CLONE
+```
+
+A clone reading `(2, 10000)` while the class is certified means the membership
+check failed — either it is not a clone of that template, or the template's own
+code changed since certification.
+
+### Rollback
+
+`demoteClass(template, selector)` returns every clone to the tier-2 default and
+clears the class allowlist. That is the state clones are in today, so rollback
+is never worse than the status quo — and existing per-clone address grants keep
+working throughout, because the address path always wins over the class.
+
+Re-certifying does **not** restore allowlist standing. That is deliberate and
+matters more here than on the address path: the blast radius is every clone of
+the template at once.
+
+### Deploy order is load-bearing
+
+`PortfolioStrategy._initialize` is fail-closed on registry resolution. The tier
+registry must be wired and reachable through `vault() → governor() →
+tierRegistry()` **before any clone is initialized**, or every clone deploy
+reverts `TierRegistryUnresolved`.
+
+**This is per-vault, not a one-time global step.** Each vault's governor holds
+its own `_tierRegistry`. `SyndicateFactory.setTierRegistry` stamps the value
+into governors created *after* the call; an existing governor is rewired with
+`pushWiring(governor)`. So a vault created while the factory's `tierRegistry`
+was unset cannot run portfolio strategies until that vault's governor is
+rewired — even if every other vault is fine.
+
+The same applies to deliberately zeroing a governor's registry. It stays safe in
+the sense that matters (no privilege granted, everything prices at tier 2 /
+full notional), but it now also blocks new clone deploys on that vault. Live
+positions are unaffected and can still be wound down: existing clones resolved
+at their own init, and rebalance/settle deliberately still degrade open —
+blocking those would strand vault capital. Only init refuses.
+
+### Token↔price-source pairing
+
+`setPriceSourceForToken(token, priceSource, true)` attests that a feed prices a
+given token. Required by any template that derives swap floors from an oracle:
+the allowlist alone says "this feed may be used", not "…for this token", and a
+valuable token paired with a cheap asset's allowlisted feed produces a floor
+computed off the wrong reference while every slippage check still passes.
+
+Pass the **bare** aggregator address widened to `bytes32` (push mode) or the
+feed id verbatim (Data Streams). Do not include any packed max-age — one
+attestation is meant to cover every staleness variant of the same aggregator.
+
+---
+
 ## 5. What is *not* enforced
 
 Stated plainly, because the checklist above is only as good as the reader's

@@ -38,6 +38,7 @@ interface ITierBindingPath {
     function governor() external view returns (address);
     function tierRegistry() external view returns (address);
     function isAdapterAllowed(address adapter) external view returns (bool);
+    function isPriceSourceForToken(address token, bytes32 priceSource) external view returns (bool);
 }
 
 /// @notice Decoded Chainlink Data Streams V3 report
@@ -137,6 +138,18 @@ contract PortfolioStrategy is BaseStrategy {
     ///         to a fabricated price. See the ORACLE BINDING note on
     ///         `_initialize`.
     error PriceSourceNotAllowed(address priceSource, address registry);
+    /// @notice The tier registry could not be resolved through
+    ///         `vault() → governor() → tierRegistry()` at initialization.
+    /// @dev    Init-only. Rebalance and settle deliberately keep degrading
+    ///         open on an unresolvable registry — see the block comment in
+    ///         `_initialize` for why the balance inverts here.
+    error TierRegistryUnresolved();
+    /// @notice The price source for a basket slot is allowlisted, but is not
+    ///         governance-attested to price THAT slot's token. Adversary: a
+    ///         proposer pairing a valuable token with a cheap asset's feed so
+    ///         the slot's minimum-output floor is derived from the wrong
+    ///         reference and every slippage check still passes.
+    error PriceSourceNotPairedWithToken(address token, bytes32 priceSource, address registry);
 
     // ── Constants ──
     uint256 public constant MAX_BASKET_SIZE = 20;
@@ -347,6 +360,30 @@ contract PortfolioStrategy is BaseStrategy {
         );
 
         if (asset_ == address(0) || swapAdapter_ == address(0)) revert ZeroAddress();
+        // INIT IS FAIL-CLOSED ON THE REGISTRY, AND ONLY INIT.
+        //
+        // The binding helpers below degrade open when the registry cannot be
+        // resolved, which is correct where they run at rebalance and settle:
+        // blocking those would strand vault capital behind a revert, and a
+        // liveness failure there is worse than a stale binding. Initialization
+        // has the opposite balance. Nothing is at stake yet — no capital has
+        // moved — and a clone initialized while the registry was unreachable
+        // carries adapter, price-source, and token↔feed pairings that were
+        // never checked against governance at all.
+        //
+        // That is survivable while every clone is individually allowlisted by
+        // the owner before it can be called, because a human reads the
+        // configuration first. It is NOT survivable under codehash-class
+        // certification, whose whole claim is that the template's bound holds
+        // under EVERY initialization: an unbound clone would inherit that
+        // bound from its bytecode with nobody having checked anything. So the
+        // hole is closed here rather than documented (design.md Decision 5 of
+        // `codehash-class-certification`, inverted once redeployment made it
+        // available).
+        //
+        // Operational consequence: deploy order is load-bearing. The tier
+        // registry must be wired and reachable through vault() → governor() →
+        // tierRegistry() before any clone is initialized.
         // Bind the proposer's swap adapter to the governance allowlist before
         // anything else is written (see the swap-adapter binding note above).
         _requireAllowedAdapter(swapAdapter_);
@@ -358,6 +395,13 @@ contract PortfolioStrategy is BaseStrategy {
         // 100% so the tighten-only guard in `_updateParams` has room to enforce
         // a monotonic decrease. Floor subsumes the previous `== 0` rejection.
         if (maxSlippageBps_ < MIN_SLIPPAGE_BPS || maxSlippageBps_ > MAX_SLIPPAGE_CEILING_BPS) revert InvalidSlippage();
+
+        // Placed AFTER every purely-local parameter check so a malformed
+        // proposal still reports the specific thing that is wrong with it
+        // (`InvalidSlippage`, `LengthMismatch`, …) rather than being masked by
+        // a registry-resolution failure. Ordering only — the guard itself is
+        // unconditional from here on.
+        if (_resolveTierRegistry() == address(0)) revert TierRegistryUnresolved();
 
         // Push-feed mode when no Data Streams verifier is wired: each
         // `feedIds[i]` encodes an AggregatorV3 proxy as bytes32(uint160(feed)).
@@ -390,6 +434,19 @@ contract PortfolioStrategy is BaseStrategy {
                 // Bind this slot's aggregator to the governance allowlist —
                 // see the ORACLE BINDING note above.
                 _requireAllowedPriceSource(feed);
+                // …and bind it to THIS slot's token. The allowlist alone lets a
+                // proposer point any allowlisted feed at any token; the pairing
+                // is what stops a valuable token being priced by a cheap
+                // asset's feed. Normalized to the bare aggregator address so
+                // one attestation covers every max-age variant of the packed
+                // feed id.
+                _requirePairedPriceSource(tokens[i], bytes32(uint256(uint160(feed))));
+            } else {
+                // Data Streams mode: the feed id is opaque, so the pairing is
+                // the ONLY thing tying this slot's report to this slot's token
+                // — the verifier is allowlisted once, globally, and says
+                // nothing about which asset a given feed id describes.
+                _requirePairedPriceSource(tokens[i], feedIds_[i]);
             }
             // Rejects duplicate token addresses: a basket like [TSLA, TSLA]
             // aggregates into a single TSLA balance while rebalance math treats
@@ -1125,6 +1182,59 @@ contract PortfolioStrategy is BaseStrategy {
         address registry = _resolveTierRegistry();
         if (registry == address(0)) return;
         if (!_isAdapterAllowed(registry, priceSource)) revert PriceSourceNotAllowed(priceSource, registry);
+    }
+
+    /// @notice Require that `priceSource` is governance-attested to price
+    ///         `token`.
+    /// @dev    The allowlist above answers "may this oracle be used at all";
+    ///         this answers "…for THIS token". Both are needed. Adversary: a
+    ///         proposer who pairs a valuable basket token with a cheap asset's
+    ///         allowlisted feed — every slot passes the allowlist, but the
+    ///         derived minimum output is computed off the wrong price, so the
+    ///         swap can bleed value while `maxSlippageBps` still reads as
+    ///         satisfied. The slippage rail is only as good as the reference
+    ///         it is measured against.
+    ///
+    ///         The pairing is ATTESTED, not derived: `AggregatorV3` exposes no
+    ///         on-chain link from a feed to the asset it prices
+    ///         (`description()` is a human string), and Chainlink's Feed
+    ///         Registry is not deployed on Robinhood Chain.
+    ///
+    ///         `priceSource` is normalized to bytes32 by the CALLER — a push
+    ///         aggregator widened from its address with any packed max-age
+    ///         stripped, or a Data Streams feed id verbatim — so one
+    ///         attestation covers an aggregator regardless of the staleness
+    ///         bound a proposer chose for a given slot.
+    ///
+    ///         Degrade-open on an unresolvable registry, identical to
+    ///         `_requireAllowedAdapter` / `_requireAllowedPriceSource`. This
+    ///         is the documented exception to the class-certification
+    ///         guarantee (design.md Decision 5 of
+    ///         `codehash-class-certification`), inherited deliberately rather
+    ///         than diverging from the file's established posture: a clone
+    ///         initialized while the registry is unreachable carries unbound
+    ///         pairings. On a wired deployment that is not a state an attacker
+    ///         can induce.
+    function _requirePairedPriceSource(address token, bytes32 priceSource) private view {
+        address registry = _resolveTierRegistry();
+        if (registry == address(0)) return;
+        if (!_isPriceSourceForToken(registry, token, priceSource)) {
+            revert PriceSourceNotPairedWithToken(token, priceSource, registry);
+        }
+    }
+
+    /// @dev Length-checked raw staticcall, mirroring `_isAdapterAllowed`. A
+    ///      registry that predates this function returns empty returndata and
+    ///      is treated as "not attested" — fail-closed, which for a registry
+    ///      that resolved but cannot answer is the correct direction: the
+    ///      pairing is the guard that makes this template class-certifiable,
+    ///      so an unanswerable pairing must not pass.
+    function _isPriceSourceForToken(address registry, address token, bytes32 priceSource) private view returns (bool) {
+        if (registry.code.length == 0) return false;
+        (bool ok, bytes memory ret) =
+            registry.staticcall(abi.encodeCall(ITierBindingPath.isPriceSourceForToken, (token, priceSource)));
+        if (!ok || ret.length != 32) return false;
+        return abi.decode(ret, (bool));
     }
 
     /// @dev Live re-validation of every price source `rebalance` /

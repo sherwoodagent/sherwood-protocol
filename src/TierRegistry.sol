@@ -243,14 +243,73 @@ contract TierRegistry is Ownable2Step {
         return keccak256(abi.encodePacked(target, selector));
     }
 
+    /// @notice The runtime EXTCODEHASH every ERC-1167 minimal-proxy clone of
+    ///         `template` will have.
+    /// @dev    OpenZeppelin `Clones.clone` (OZ 5.6.1,
+    ///         lib/openzeppelin-contracts/contracts/proxy/Clones.sol) deploys the
+    ///         standard 45-byte ERC-1167 runtime:
+    ///
+    ///             363d3d373d3d3d363d73 <template:20> 5af43d82803e903d91602b57fd5bf3
+    ///
+    ///         The implementation address is baked into the bytecode, so every
+    ///         clone of one template is byte-identical and a matching codehash
+    ///         is self-verifying proof of "clone of `template`" — no factory
+    ///         record and no proposer-supplied claim (design.md Decision 1).
+    ///
+    ///         PURE, and deliberately so: it derives what a clone WOULD hash to,
+    ///         never reads chain state. Membership is decided by the caller
+    ///         comparing this against a live `EXTCODEHASH` — see
+    ///         `_classMemberOf`, which also carries the second-level template
+    ///         check this derivation cannot provide.
+    ///
+    ///         The byte layout is pinned by test against a real
+    ///         `StrategyFactory` clone. If the factory ever moves to a clone
+    ///         variant that writes per-instance data into the clone's bytecode
+    ///         (clones-with-immutable-args), every clone gets a distinct
+    ///         codehash, this derivation silently matches nothing, and every
+    ///         class dissolves to the tier-2 default with no revert anywhere —
+    ///         which is why that migration is barred by spec, not by comment
+    ///         (tier-policy: "Class-certifiable templates are cloned without
+    ///         per-instance bytecode").
+    function cloneCodehashOf(address template) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(hex"363d3d373d3d3d363d73", template, hex"5af43d82803e903d91602b57fd5bf3"));
+    }
+
+    /// @notice Config key for a code class. Distinct namespace from `key`.
+    /// @dev    Class entries live in their own mapping (`_classConfigs`), so
+    ///         aliasing between the two keying modes is structurally impossible
+    ///         rather than merely improbable — an address entry cannot be
+    ///         written or demoted through a class entry point, or vice versa
+    ///         (tier-policy: "Address and class keys never collide"). The
+    ///         preimages also differ in length (24 vs 36 bytes), so even a
+    ///         shared mapping could not be made to collide through
+    ///         `encodePacked` ambiguity; the separate mapping is belt and
+    ///         braces on a security boundary.
+    function classKey(bytes32 cloneCodehash, bytes4 selector) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(cloneCodehash, selector));
+    }
+
     /// @notice Effective tier for (target, selector). Uncertified, demoted, or
     ///         codehash-mismatched entries all report (2, 10_000).
+    /// @dev Lookup order is address entry, then code class, then the tier-2
+    ///      default. Address ALWAYS wins (design.md Decision 3): existing
+    ///      behavior is preserved by construction, the owner keeps a
+    ///      per-address override to re-price or demote one misbehaving clone
+    ///      without touching the class, and the hot path pays for the class
+    ///      lookup only on an address miss.
     function tierOf(address target, bytes4 selector) public view returns (uint8 tier, uint16 boundBps) {
         TierConfig storage c = _configs[key(target, selector)];
-        if (c.certifiedCodehash == bytes32(0) || target.codehash != c.certifiedCodehash) {
-            return (TIER_ARBITRARY, FULL_NOTIONAL_BPS);
+        if (c.certifiedCodehash != bytes32(0) && target.codehash == c.certifiedCodehash) {
+            return (c.tier, c.extractableBoundBps);
         }
-        return (c.tier, c.extractableBoundBps);
+        // Class fallback. `_classOf` returns 0 unless the target is a live
+        // ERC-1167 clone of a certified template whose own code is unchanged.
+        bytes32 cch = _classOf(target);
+        if (cch != bytes32(0)) {
+            TierConfig storage cc = _classConfigs[classKey(cch, selector)];
+            if (cc.certifiedCodehash != bytes32(0)) return (cc.tier, cc.extractableBoundBps);
+        }
+        return (TIER_ARBITRARY, FULL_NOTIONAL_BPS);
     }
 
     event TierCertified(
@@ -814,7 +873,468 @@ contract TierRegistry is Ownable2Step {
     ///         implementation swaps — a proxy's runtime bytecode is static
     ///         across upgrades, so allowlisting a proxied adapter carries the
     ///         same governance-discipline caveat as certifying one.
+    ///         CLASS FALLBACK: when no address grant resolves, the adapter is
+    ///         allowed if it is a live member of an allowlisted code class —
+    ///         same ordering as `tierOf` (address first, class second), same
+    ///         two-level membership check. This is what removes the
+    ///         per-proposal owner ceremony for clones; without it a fresh clone
+    ///         cannot be named in a governor batch at all.
     function isAdapterAllowed(address adapter) external view returns (bool) {
-        return _adapterAllowed[adapter] && _effectiveCodehash(adapter) == _adapterAllowedCodehash[adapter];
+        if (_adapterAllowed[adapter] && _effectiveCodehash(adapter) == _adapterAllowedCodehash[adapter]) {
+            return true;
+        }
+        bytes32 cch = _classOf(adapter);
+        return cch != bytes32(0) && _classAllowed[cch];
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // CODEHASH-CLASS CERTIFICATION (change: codehash-class-certification)
+    //
+    // Every strategy proposal deploys a fresh ERC-1167 clone at a fresh
+    // address, so address-keyed consent forces one owner ceremony per
+    // proposal, forever. Clones of one template are byte-identical, so a
+    // codehash identifies the template — and certifying that codehash
+    // certifies every clone that will ever exist, with no per-clone action.
+    //
+    // A class certification asserts a STRICTLY STRONGER claim than an
+    // address certification: that the bound holds under EVERY
+    // initialization, not merely for one deployment's stored config. Which
+    // templates may carry that claim is a governance-discipline rule stated
+    // in the tier-policy spec ("Only conformant templates may be
+    // class-certified"), not a check this contract can make.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// @dev Per-class anchor, shared by BOTH axes (tier and allowlist). Keyed
+    ///      by the clone codehash, which is the class identity.
+    ///
+    ///      `templateCodehash` is the load-bearing field. A clone's codehash
+    ///      embeds the template's ADDRESS, not the template's CODE, so
+    ///      mutating the template in place changes every clone's behavior
+    ///      while leaving every clone's codehash identical. Without this
+    ///      snapshot the class would keep vouching for hostile code across
+    ///      every clone at once — strictly worse than the address path it
+    ///      extends. Adversary: a template whose bytecode is replaced at the
+    ///      same address (metamorphic CREATE2 + SELFDESTRUCT redeploy) after
+    ///      certification.
+    struct ClassAnchor {
+        address template;
+        bytes32 templateCodehash;
+    }
+
+    /// @dev A proposed-but-not-yet-executed class certification. Mirrors
+    ///      `PendingCertification` field-for-field on the bond/timelock half —
+    ///      same pins, same rationale — and adds the template identity the
+    ///      address form has no need for. `readyAt == 0` is the existence
+    ///      sentinel.
+    struct PendingClassCertification {
+        uint8 tier;
+        uint16 extractableBoundBps;
+        address submitter;
+        uint64 readyAt;
+        uint96 bondAmount;
+        IERC20 bondToken;
+        address template;
+        bytes32 templateCodehash;
+    }
+
+    /// @dev class fingerprint (clone codehash) => anchor. One per class,
+    ///      shared by the tier and allowlist axes.
+    mapping(bytes32 cloneCodehash => ClassAnchor) private _classAnchors;
+
+    /// @dev `classKey(cloneCodehash, selector)` => tier config. A SEPARATE
+    ///      mapping from `_configs`, so an address entry can never be written
+    ///      or demoted through a class entry point or vice versa — namespace
+    ///      isolation is structural here, not merely improbable.
+    mapping(bytes32 classConfigKey => TierConfig) private _classConfigs;
+
+    /// @dev `classKey(cloneCodehash, selector)` => pending class certification.
+    mapping(bytes32 classConfigKey => PendingClassCertification) private _classPending;
+
+    /// @dev class fingerprint => allowlist flag. The class analogue of
+    ///      `_adapterAllowed`. No separate codehash snapshot is needed: the
+    ///      anchor's two-level check already proves the code is current, and
+    ///      the class key IS a codehash.
+    mapping(bytes32 cloneCodehash => bool) private _classAllowed;
+
+    error ClassNotCertified();
+    error NoPendingClassCertification();
+    /// @notice The certified template's live codehash no longer matches the
+    ///         snapshot taken at certification.
+    error TemplateCodehashChanged();
+
+    event ClassCertificationProposed(
+        address indexed template,
+        bytes4 indexed selector,
+        bytes32 indexed cloneCodehash,
+        uint8 tier,
+        uint16 extractableBoundBps,
+        address submitter,
+        uint256 bondAmount,
+        bytes32 templateCodehash,
+        uint64 readyAt
+    );
+    event ClassCertified(
+        address indexed template,
+        bytes4 indexed selector,
+        bytes32 indexed cloneCodehash,
+        uint8 tier,
+        uint16 extractableBoundBps,
+        bytes32 templateCodehash
+    );
+    event ClassCertificationCancelled(address indexed template, bytes4 indexed selector);
+    event ClassDemoted(address indexed template, bytes4 indexed selector, bytes32 indexed cloneCodehash);
+    event ClassAllowedSet(address indexed template, bytes32 indexed cloneCodehash, bool allowed);
+
+    /// @notice The class fingerprint `target` belongs to, or `bytes32(0)` when
+    ///         it belongs to no live class.
+    /// @dev    THE two-level membership check, shared by `tierOf` and
+    ///         `isAdapterAllowed` so the two axes can never drift apart:
+    ///
+    ///           level 1 — an anchor exists at `target.codehash`, i.e. the
+    ///                     target's runtime code is exactly the ERC-1167 stub
+    ///                     pointing at the certified template. This is what
+    ///                     proves "clone of T" from chain state alone, with no
+    ///                     factory record and no proposer-supplied claim.
+    ///           level 2 — the template's live codehash still equals the
+    ///                     snapshot. See `ClassAnchor.templateCodehash` for why
+    ///                     dropping this would make the class strictly weaker
+    ///                     than the address path.
+    ///
+    ///         Read-side and state-free, mirroring `tierOf`/`isAdapterAllowed`:
+    ///         no write in the hot path, nothing to grief, no dependence on any
+    ///         poke ever running. A mutated template needs no demotion — its
+    ///         clones simply stop being members, because membership IS code
+    ///         identity.
+    ///
+    ///         Lookup is O(1): the class is found BY the target's own codehash,
+    ///         not by scanning certified templates.
+    function _classOf(address target) private view returns (bytes32) {
+        bytes32 ch = target.codehash;
+        if (ch == bytes32(0) || ch == _EMPTY_CODEHASH) return bytes32(0);
+        ClassAnchor storage a = _classAnchors[ch];
+        address t = a.template;
+        if (t == address(0)) return bytes32(0);
+        if (t.codehash != a.templateCodehash) return bytes32(0);
+        return ch;
+    }
+
+    /// @notice Public view of the class `target` currently belongs to.
+    ///         `bytes32(0)` when it belongs to none. Operator/watchtower read.
+    function classOf(address target) external view returns (bytes32) {
+        return _classOf(target);
+    }
+
+    /// @notice Full anchor for a class fingerprint; zeroed when no class exists.
+    function classAnchorOf(bytes32 cloneCodehash) external view returns (ClassAnchor memory) {
+        return _classAnchors[cloneCodehash];
+    }
+
+    /// @notice Propose certifying every ERC-1167 clone of `template` for
+    ///         `selector` at `tier` with `extractableBoundBps`. `onlyOwner`.
+    /// @dev    Deliberately mirrors `proposeCertification`: same delay, same
+    ///         bond pin, same `expectedTemplateCodehash` drift guard, and the
+    ///         same reason for that guard — the gap between owner review and
+    ///         mining lets the TEMPLATE's own deployer land different bytecode
+    ///         before this transaction does, silently anchoring a class to code
+    ///         the owner never reviewed.
+    ///
+    ///         `NotAContract` on a codeless template: there is no class to
+    ///         anchor, and anchoring one would create a class whose level-2
+    ///         check could later be satisfied by whatever code appears at that
+    ///         address (counterfactual CREATE2).
+    ///
+    ///         What this cannot check, and the owner must: that `template`
+    ///         binds every init-supplied external address, and that it is not
+    ///         itself a proxy. Both are governance discipline — a proxy's
+    ///         runtime bytecode is static across implementation swaps, so
+    ///         neither membership level can observe the change.
+    function proposeClassCertification(
+        address template,
+        bytes4 selector,
+        uint8 tier,
+        uint16 extractableBoundBps,
+        address submitter,
+        bytes32 expectedTemplateCodehash
+    ) external onlyOwner {
+        if (tier >= TIER_ARBITRARY) revert InvalidTier();
+        if (extractableBoundBps == 0 || extractableBoundBps >= FULL_NOTIONAL_BPS) revert BoundRequired();
+        bytes32 tch = template.codehash;
+        if (tch == bytes32(0) || tch == _EMPTY_CODEHASH) revert NotAContract();
+        if (tch != expectedTemplateCodehash) revert CodehashChanged();
+        uint256 bondAmount = submitterBondWood;
+        if (bondAmount != 0 && submitter == address(0)) revert ZeroAddressSubmitter();
+
+        bytes32 cch = cloneCodehashOf(template);
+        bytes32 k = classKey(cch, selector);
+        uint64 readyAt = uint64(block.timestamp + certifyDelay);
+        _classPending[k] = PendingClassCertification({
+            tier: tier,
+            extractableBoundBps: extractableBoundBps,
+            submitter: submitter,
+            readyAt: readyAt,
+            // casting to 'uint96' is safe because setSubmitterBondWood rejects
+            // amounts above type(uint96).max (BondTooLarge)
+            // forge-lint: disable-next-line(unsafe-typecast)
+            bondAmount: uint96(bondAmount),
+            bondToken: wood,
+            template: template,
+            templateCodehash: tch
+        });
+        emit ClassCertificationProposed(
+            template, selector, cch, tier, extractableBoundBps, submitter, bondAmount, tch, readyAt
+        );
+    }
+
+    /// @notice Execute a pending class certification once its delay elapsed.
+    /// @dev    Same execution model as `certify`: permissionless with no bond
+    ///         at stake, submitter-only when a bond is pinned, and every
+    ///         parameter fixed at proposal time so a caller chooses only WHEN,
+    ///         never WHAT. Reuses `_bonds` keyed by the class key — one bond per
+    ///         (class, selector), and any existing bond blocks re-certification
+    ///         exactly as on the address path.
+    ///
+    ///         Re-verifies the TEMPLATE's codehash, not a clone's: the class is
+    ///         anchored to the template's code, and a mid-window mutation must
+    ///         void the grant rather than certify different bytecode under an
+    ///         old announcement.
+    function certifyClass(address template, bytes4 selector) external {
+        bytes32 cch = cloneCodehashOf(template);
+        bytes32 k = classKey(cch, selector);
+        PendingClassCertification memory p = _classPending[k];
+        if (p.readyAt == 0) revert NoPendingClassCertification();
+        if (block.timestamp < p.readyAt) revert CertifyDelayNotElapsed();
+        if (block.timestamp > p.readyAt + MAX_CERTIFY_WINDOW) revert CertificationExpired();
+        if (template.codehash != p.templateCodehash) revert TemplateCodehashChanged();
+        if (p.bondAmount != 0 && msg.sender != p.submitter) revert NotSubmitter();
+
+        SubmitterBond storage existing = _bonds[k];
+        if (existing.amount != 0) {
+            if (existing.releasableAt != 0) revert BondPendingRelease();
+            revert BondActive();
+        }
+        delete _classPending[k];
+        if (p.bondAmount != 0) {
+            _bonds[k] =
+                SubmitterBond({submitter: p.submitter, amount: p.bondAmount, releasableAt: 0, token: p.bondToken});
+            totalBondedWood += p.bondAmount;
+            p.bondToken.safeTransferFrom(p.submitter, address(this), p.bondAmount);
+            emit SubmitterBondLocked(template, selector, p.submitter, p.bondAmount);
+        }
+        _classAnchors[cch] = ClassAnchor({template: p.template, templateCodehash: p.templateCodehash});
+        _classConfigs[k] =
+            TierConfig({tier: p.tier, extractableBoundBps: p.extractableBoundBps, certifiedCodehash: cch});
+        emit ClassCertified(template, selector, cch, p.tier, p.extractableBoundBps, p.templateCodehash);
+    }
+
+    /// @notice Withdraw a pending class certification before it executes.
+    function cancelClassCertification(address template, bytes4 selector) external onlyOwner {
+        bytes32 k = classKey(cloneCodehashOf(template), selector);
+        if (_classPending[k].readyAt == 0) revert NoPendingClassCertification();
+        delete _classPending[k];
+        emit ClassCertificationCancelled(template, selector);
+    }
+
+    /// @notice Full pending class-certification record; zeroed struct
+    ///         (`readyAt == 0`) when nothing is pending.
+    function pendingClassCertificationOf(address template, bytes4 selector)
+        external
+        view
+        returns (PendingClassCertification memory)
+    {
+        return _classPending[classKey(cloneCodehashOf(template), selector)];
+    }
+
+    /// @notice Effective tier for a class's `selector`, ignoring membership.
+    ///         `(2, 10_000)` when the class carries no certification.
+    function classTierOf(address template, bytes4 selector) external view returns (uint8, uint16) {
+        TierConfig storage c = _classConfigs[classKey(cloneCodehashOf(template), selector)];
+        if (c.certifiedCodehash == bytes32(0)) return (TIER_ARBITRARY, FULL_NOTIONAL_BPS);
+        return (c.tier, c.extractableBoundBps);
+    }
+
+    /// @notice Allow or disallow every clone of `template` as a batch callee
+    ///         and as spender/recipient of vault funds. `onlyOwner`.
+    /// @dev    The class analogue of `setAdapterAllowed`, and the half that
+    ///         removes the operational blocker: without it a clone cannot be
+    ///         named in a governor batch at all (`SyndicateVault`
+    ///         `_guardBatchCalls` PART 2a), which is a hard failure rather than
+    ///         a cost.
+    ///
+    ///         Grantable independently of a tier certification — the two axes
+    ///         stay separate here exactly as they do on the address path — but
+    ///         the anchor must already exist, so a class must be certified
+    ///         before it can be allowlisted. That ordering is deliberate: the
+    ///         anchor is what carries the two-level check, and an allowlist
+    ///         entry without it would be a codehash match with no template
+    ///         binding at all.
+    ///
+    ///         `certifyClass` never sets this. Restoring allowlist standing
+    ///         after a demotion is always this explicit owner call, never a
+    ///         side effect of re-certification — the address path's rule,
+    ///         and the reason for it multiplies here: a submitter who gets a
+    ///         class re-certified would otherwise silently re-open the funds
+    ///         path for every clone of that template at once.
+    function setClassAllowed(address template, bool allowed) external onlyOwner {
+        bytes32 cch = cloneCodehashOf(template);
+        if (allowed && _classAnchors[cch].template == address(0)) revert ClassNotCertified();
+        _classAllowed[cch] = allowed;
+        emit ClassAllowedSet(template, cch, allowed);
+    }
+
+    /// @notice Whether every clone of `template` is currently allowlisted.
+    function isClassAllowed(address template) external view returns (bool) {
+        return _classAllowed[cloneCodehashOf(template)];
+    }
+
+    /// @notice Demote a class for `selector`. `onlyOwner`. Instant.
+    function demoteClass(address template, bytes4 selector) external onlyOwner {
+        if (_classConfigs[classKey(cloneCodehashOf(template), selector)].certifiedCodehash == bytes32(0)) {
+            revert ClassNotCertified();
+        }
+        _demoteClass(template, selector);
+    }
+
+    /// @notice Demote a class for `selector` on a challenge conviction.
+    ///         Restricted to `authorizedDemoter`, mirroring `demoteByChallenge`.
+    function demoteClassByChallenge(address template, bytes4 selector) external {
+        if (msg.sender != authorizedDemoter) revert NotAuthorizedDemoter();
+        if (_classConfigs[classKey(cloneCodehashOf(template), selector)].certifiedCodehash == bytes32(0)) {
+            revert ClassNotCertified();
+        }
+        _demoteClass(template, selector);
+    }
+
+    /// @notice Permissionless demotion once the certified template's live
+    ///         codehash no longer matches the anchor snapshot. Persists what
+    ///         `tierOf` and `isAdapterAllowed` already report lazily.
+    /// @dev    The class analogue of `poke`, and it targets level 2 of the
+    ///         membership check specifically. Level 1 has nothing to persist —
+    ///         an address either is or is not a clone of the template, and that
+    ///         cannot change for an already-deployed address. Level 2 can and
+    ///         does change, and it is the one whose failure would otherwise let
+    ///         a mutated template keep a certification record on the books.
+    function pokeClass(address template, bytes4 selector) external {
+        bytes32 cch = cloneCodehashOf(template);
+        if (_classConfigs[classKey(cch, selector)].certifiedCodehash == bytes32(0)) revert ClassNotCertified();
+        if (template.codehash == _classAnchors[cch].templateCodehash) revert CodehashMatches();
+        _demoteClass(template, selector);
+    }
+
+    /// @dev Convergence point for all three class demotion paths, mirroring
+    ///      `_demote` field for field.
+    ///
+    ///      Clears the CLASS allowlist entry, and is over-broad in exactly the
+    ///      same deliberate way: class configs are keyed `(class, selector)`
+    ///      while the class allowlist is keyed by bare class, so demoting one
+    ///      selector de-allowlists every clone of the template even if other
+    ///      selectors stay certified. Recovery is one owner
+    ///      `setClassAllowed(template, true)`. Do NOT "fix" this to a
+    ///      per-selector class allowlist — the conservative direction of error
+    ///      is the point, and the blast radius here is every clone at once,
+    ///      which argues for more caution than the address path, not less.
+    ///
+    ///      Also cancels a same-key pending class certification, for the reason
+    ///      `_demote` does: a renewal proposed while the class was live would
+    ///      otherwise survive a for-cause demotion and execute at `readyAt`,
+    ///      re-certifying a just-convicted template — across every clone.
+    ///
+    ///      The ANCHOR is deliberately left in place. It grants nothing on its
+    ///      own (`tierOf` needs a class config, `isAdapterAllowed` needs the
+    ///      class allowlist flag), other selectors on the same class still need
+    ///      it, and `setClassAllowed` requiring a live anchor is what keeps
+    ///      re-allowlisting an explicit owner decision rather than a side
+    ///      effect. Same posture as `_adapterAllowedCodehash`, which `_demote`
+    ///      also leaves inert.
+    function _demoteClass(address template, bytes4 selector) private {
+        bytes32 cch = cloneCodehashOf(template);
+        bytes32 k = classKey(cch, selector);
+        delete _classConfigs[k];
+        if (_classPending[k].readyAt != 0) {
+            delete _classPending[k];
+            emit ClassCertificationCancelled(template, selector);
+        }
+        SubmitterBond storage b = _bonds[k];
+        if (b.amount != 0 && b.releasableAt == 0) {
+            uint64 releasableAt = uint64(block.timestamp + bondReleaseDelay);
+            b.releasableAt = releasableAt;
+            emit SubmitterBondReleaseStarted(template, selector, b.submitter, releasableAt);
+        }
+        if (_classAllowed[cch]) {
+            delete _classAllowed[cch];
+            emit ClassAllowedSet(template, cch, false);
+        }
+        emit ClassDemoted(template, selector, cch);
+    }
+
+    /// @notice Release a demoted class bond to its submitter. Permissionless,
+    ///         same model as `claimSubmitterBond` on the address path.
+    function claimClassSubmitterBond(address template, bytes4 selector) external {
+        bytes32 k = classKey(cloneCodehashOf(template), selector);
+        SubmitterBond memory b = _bonds[k];
+        if (b.amount == 0) revert NotCertified();
+        if (b.releasableAt == 0 || block.timestamp < b.releasableAt) revert BondNotReleasable();
+        delete _bonds[k];
+        totalBondedWood -= b.amount;
+        b.token.safeTransfer(b.submitter, b.amount);
+        emit SubmitterBondClaimed(template, selector, b.submitter, b.amount);
+    }
+
+    /// @notice Bond record for a (class, selector); zeroed when none.
+    function classBondOf(address template, bytes4 selector) external view returns (SubmitterBond memory) {
+        return _bonds[classKey(cloneCodehashOf(template), selector)];
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TOKEN ↔ PRICE-SOURCE ATTESTATION
+    //
+    // A template that prices token X with a feed describing something else
+    // computes its own slippage floor off the wrong reference — the safety
+    // rail is measured against the wrong ruler, so a trade can lose value
+    // while appearing to sit inside its configured tolerance. Nothing in
+    // Chainlink's AggregatorV3 surface answers "does this feed describe this
+    // token?" on-chain (`description()` is a human string, and the Feed
+    // Registry is not deployed on Robinhood Chain), so the pairing has to be
+    // ATTESTED by governance rather than derived.
+    //
+    // This is what lets a basket template make the class-certification claim
+    // — that its bound holds under EVERY initialization — instead of relying
+    // on a human reviewing each clone's configuration before it can move
+    // money. Without it the token list is an unbound init parameter, and an
+    // unbound external address is exactly what disqualifies a template from
+    // being class-certified (tier-policy: "Only conformant templates may be
+    // class-certified").
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// @dev token => price source => attested. The source is carried as
+    ///      `bytes32` so one mapping serves both price modes: a push-feed
+    ///      aggregator address widened to bytes32, or a Data Streams feed id
+    ///      verbatim. Callers MUST strip any packed metadata (e.g. a max-age
+    ///      field) before looking up, so the same aggregator attests
+    ///      identically regardless of the staleness bound a proposer chose.
+    mapping(address token => mapping(bytes32 priceSource => bool)) private _tokenPriceSource;
+
+    event PriceSourceForTokenSet(address indexed token, bytes32 indexed priceSource, bool allowed);
+
+    /// @notice Attest that `priceSource` prices `token`. `onlyOwner`.
+    /// @dev    Deliberately a separate axis from `setAdapterAllowed`: that one
+    ///         says "this price source may be used at all", this one says
+    ///         "…for THIS token". A template needs both — the source allowlist
+    ///         stops an unknown oracle, and this stops a known oracle being
+    ///         pointed at the wrong asset. Adversary: a proposer pairing a
+    ///         valuable token with a cheap asset's feed so the derived minimum
+    ///         output is far below fair value, extracting the difference on
+    ///         every rebalance while every slippage check passes.
+    function setPriceSourceForToken(address token, bytes32 priceSource, bool allowed) external onlyOwner {
+        _tokenPriceSource[token][priceSource] = allowed;
+        emit PriceSourceForTokenSet(token, priceSource, allowed);
+    }
+
+    /// @notice Whether `priceSource` is attested to price `token`.
+    /// @dev    Consumed by strategy templates through a raw `staticcall` with
+    ///         an explicit returndata-length check, so a registry that
+    ///         predates this function is distinguishable from one that answers
+    ///         `false` — see `PortfolioStrategy._isPriceSourceForToken`.
+    function isPriceSourceForToken(address token, bytes32 priceSource) external view returns (bool) {
+        return _tokenPriceSource[token][priceSource];
     }
 }
