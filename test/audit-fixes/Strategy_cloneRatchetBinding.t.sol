@@ -19,7 +19,6 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {MockStrategy} from "../mocks/MockStrategy.sol";
 import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
-import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
 /// @notice `StrategyFactory.syndicateFactory` stand-in: reports every vault as
 ///         registered so the factory's `_authClone` gate passes.
@@ -252,9 +251,9 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
             STRATEGY_DURATION,
             env,
             executeCalls,
-            GovEnvelope.defaultCaps(env.maxCapital, executeCalls.length),
+            new uint256[](executeCalls.length),
             settlementCalls,
-            GovEnvelope.defaultCaps(env.maxCapital, settlementCalls.length),
+            new uint256[](settlementCalls.length),
             noCoProposers
         );
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -521,13 +520,12 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
             target: address(usdc), value: 0, data: abi.encodeCall(usdc.balanceOf, (address(vault)))
         });
 
-        // NOT GovEnvelope.defaultCaps here: that helper puts the full cap on
-        // the FIRST call and zero on the rest, but in THIS batch the fund
-        // mover is executeCalls[1] (`clone.execute()`, which pulls `amount`
-        // via the approval set at index 0 -- itself a zero-balance-delta
-        // call). An index-0-weighted default would starve the real mover.
+        // executeCalls[0] (approve) moves no vault asset, so a zero cap is
+        // legal; executeCalls[1] (clone.execute()) is the real fund-pulling
+        // call this test is about, so it needs a cap covering the amount
+        // actually pulled — issue #43 caps are enforced against genuine
+        // outflow, unlike executeGovernorBatch's own all-empty escape valve.
         uint256[] memory executeCallCaps = new uint256[](2);
-        executeCallCaps[0] = 0;
         executeCallCaps[1] = amount;
 
         vm.prank(agent);
@@ -540,7 +538,7 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
             executeCalls,
             executeCallCaps,
             settlementCalls,
-            GovEnvelope.defaultCaps(env.maxCapital, settlementCalls.length),
+            new uint256[](settlementCalls.length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -592,9 +590,9 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
             7 days,
             env,
             recoveryExecute,
-            GovEnvelope.defaultCaps(env.maxCapital, recoveryExecute.length),
+            new uint256[](recoveryExecute.length),
             recoverySettle,
-            GovEnvelope.defaultCaps(env.maxCapital, recoverySettle.length),
+            new uint256[](recoverySettle.length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         vm.warp(vm.getBlockTimestamp() + 1);
