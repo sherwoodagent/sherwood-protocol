@@ -634,6 +634,18 @@ contract PerCallCapitalDeclarationsTest is Test {
         // tier/coverage arithmetic, not whether the demoted contract remains
         // independently callable.
         vm.etch(address(mockAdapter), address(new HarmlessFallback()).code);
+        // issue #166: the etch above changes `mockAdapter`'s codehash, which
+        // the pre-existing codehash-drift self-heal (issue #137) correctly
+        // reads as revoking `isAdapterAllowed` -- that check is now ALSO the
+        // batch callee gate (Part 2a), not just the fund-destination check
+        // Part 2b already was, so an un-re-attested etch would refuse the
+        // whole batch with `DisallowedBatchCallee` before execution even
+        // reaches the tier/coverage arithmetic this test is about (see the
+        // comment above: "not whether the demoted contract remains
+        // independently callable"). Re-snapshot the new (harmless) code,
+        // mirroring the owner re-attestation ceremony `setAdapterAllowed`'s
+        // natspec documents for a verified legitimate bytecode change.
+        tierRegistry.setAdapterAllowed(address(mockAdapter), true);
         governor.executeProposal(pid);
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Executed));
     }

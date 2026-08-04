@@ -245,7 +245,16 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
         ISyndicateGovernor.CoProposer[] memory noCoProposers = _noCoProposers();
         vm.prank(agent);
         pid = governor.propose(
-            address(vault), strategy, "ipfs://p", STRATEGY_DURATION, env, executeCalls, settlementCalls, noCoProposers
+            address(vault),
+            strategy,
+            "ipfs://p",
+            STRATEGY_DURATION,
+            env,
+            executeCalls,
+            new uint256[](executeCalls.length),
+            settlementCalls,
+            new uint256[](settlementCalls.length),
+            noCoProposers
         );
         vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(voter);
@@ -511,6 +520,14 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
             target: address(usdc), value: 0, data: abi.encodeCall(usdc.balanceOf, (address(vault)))
         });
 
+        // executeCalls[0] (approve) moves no vault asset, so a zero cap is
+        // legal; executeCalls[1] (clone.execute()) is the real fund-pulling
+        // call this test is about, so it needs a cap covering the amount
+        // actually pulled — issue #43 caps are enforced against genuine
+        // outflow, unlike executeGovernorBatch's own all-empty escape valve.
+        uint256[] memory executeCallCaps = new uint256[](2);
+        executeCallCaps[1] = amount;
+
         vm.prank(agent);
         uint256 pid1 = governor.propose(
             address(vault),
@@ -519,7 +536,9 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
             7 days,
             env,
             executeCalls,
+            executeCallCaps,
             settlementCalls,
+            new uint256[](settlementCalls.length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -571,7 +590,9 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
             7 days,
             env,
             recoveryExecute,
+            new uint256[](recoveryExecute.length),
             recoverySettle,
+            new uint256[](recoverySettle.length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         vm.warp(vm.getBlockTimestamp() + 1);

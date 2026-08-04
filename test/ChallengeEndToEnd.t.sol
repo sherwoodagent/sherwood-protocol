@@ -316,6 +316,15 @@ contract ChallengeEndToEndTest is Test {
         );
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(address(adapter), adapter.poke.selector);
+        // issue #166: certifying a (target, selector) prices it for tiering
+        // but does NOT make `target` batch-callable at all — that is a
+        // SEPARATE allowlist (`isAdapterAllowed`) `SyndicateVault._guardBatchCalls`
+        // PART 2a now enforces on every batch callee. `adapter` is this
+        // suite's real, benign (fund-neutral) production-shaped adapter, not
+        // an attacker probe — it must be explicitly allowlisted here or every
+        // proposal touching it (execute AND settlement calls) is refused with
+        // `DisallowedBatchCallee` before any challenge/coverage mechanics run.
+        tierRegistry.setAdapterAllowed(address(adapter), true);
 
         // ── WOOD for the proposer's bond, the challenger's bond, and the
         //    accused guardian's counter-bond.
@@ -901,6 +910,20 @@ contract ChallengeEndToEndTest is Test {
             "proposer bond net of the fee, plus the settle burn, plus the whole slashed guardian bond"
         );
         assertEq(wood.balanceOf(agent), agentBalAfterBond, "the proposer got nothing back");
+
+        // The conviction above demoted `adapter`'s certification, which (by
+        // design — `TierRegistry._demote`'s natspec, "DELIBERATELY
+        // OVER-BROAD") ALSO cleared its batch-callee allowlist entry
+        // entirely. The pre-committed settlement batch (`_settleCalls()`,
+        // set at propose time) still names `adapter`, so self-settle would
+        // now hit the SAME `DisallowedBatchCallee` a fresh, never-certified
+        // target would — this is issue #166's gate doing exactly its job on
+        // a demoted target. The natspec's own documented recovery is one
+        // owner `setAdapterAllowed` call; this test is not about that
+        // recovery ceremony (it is about proposer-bond forfeiture / reclaim
+        // mechanics), so perform it here to reach self-settle, same as a
+        // real owner would before an already-convicted proposal is unstuck.
+        tierRegistry.setAdapterAllowed(address(adapter), true);
 
         // Reclaim's forfeiture-acknowledge path only applies from a TERMINAL
         // state (design D3, same terminal gate every other reclaim path
