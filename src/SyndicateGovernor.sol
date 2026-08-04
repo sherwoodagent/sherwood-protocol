@@ -167,10 +167,18 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         so it is never empty for an `Executed` proposal.
     mapping(uint256 => uint256[]) private _effectiveSettlementCallCaps;
 
-    /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31) for
-    ///      the three mappings above — append-only. See
-    ///      `script/syndicate-governor-layout.golden.json`.
-    uint256[28] private __gap;
+    /// @notice Outstanding escrowed fee liability per `(vault, token)` — the
+    ///         aggregate `_unclaimedFees` never had (pashov review finding #3).
+    /// @dev `_unclaimedFees` is keyed per RECIPIENT with no total, so the vault
+    ///      holding the escrowed assets could not see that it owed them and
+    ///      `totalAssets()` counted them as LP equity. Appended before `__gap`,
+    ///      which shrinks 28 -> 27; every pre-existing variable keeps its slot.
+    mapping(address vault => mapping(address token => uint256)) private _escrowedFees;
+
+    /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31)
+    ///      for the three mappings above, then 1 more for `_escrowedFees` —
+    ///      append-only. See `script/syndicate-governor-layout.golden.json`.
+    uint256[27] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -1967,6 +1975,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             return true;
         } catch {
             _unclaimedFees[_unclaimedKey(vault, recipient, asset)] += amount;
+            // Mirror into the per-(vault, token) aggregate so the vault can
+            // net this liability out of `totalAssets()` — see `_escrowedFees`
+            // (pashov review finding #3). Both writes stay in lockstep: this
+            // one and the matching decrement in `claimUnclaimedFees` are the
+            // only places either mapping moves on the escrow path.
+            _escrowedFees[vault][asset] += amount;
             emit FeeTransferFailed(recipient, asset, amount);
             return false;
         }
@@ -1984,6 +1998,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         uint256 amt = _unclaimedFees[k];
         if (amt == 0) return;
         _unclaimedFees[k] = 0;
+        // Released before the external call, alongside the per-recipient slot,
+        // so the vault stops reserving it the instant it stops being owed —
+        // and so CEI covers both writes identically.
+        _escrowedFees[vault][token] -= amt;
         ISyndicateVault(vault).transferPerformanceFee(token, msg.sender, amt);
         emit FeeClaimed(msg.sender, token, amt);
     }
@@ -1991,6 +2009,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @inheritdoc ISyndicateGovernor
     function unclaimedFees(address vault, address recipient, address token) external view returns (uint256) {
         return _unclaimedFees[_unclaimedKey(vault, recipient, token)];
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function outstandingEscrow(address vault, address token) external view returns (uint256) {
+        return _escrowedFees[vault][token];
     }
 
     function _unclaimedKey(address vault, address recipient, address token) private pure returns (bytes32) {

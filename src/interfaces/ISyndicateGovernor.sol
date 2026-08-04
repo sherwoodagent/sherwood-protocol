@@ -762,4 +762,13 @@ interface ISyndicateGovernor {
     ///         awaiting a retryable claim. Zero for `(vault, recipient, token)`
     ///         tuples that never had a failed transfer.
     function unclaimedFees(address vault, address recipient, address token) external view returns (uint256);
+
+    /// @notice Total escrowed fee liability against `vault` in `token`, summed
+    ///         over every recipient — the aggregate `unclaimedFees` never had.
+    /// @dev    Read by `SyndicateVault.totalAssets()` so escrowed fees stop
+    ///         counting as LP equity (pashov review finding #3). The assets
+    ///         sit in the vault but are owed to fee recipients, so a vault that
+    ///         cannot see this figure prices its shares above its real equity
+    ///         and lets redeemers take the difference.
+    function outstandingEscrow(address vault, address token) external view returns (uint256);
 }

@@ -1104,12 +1104,32 @@ contract SyndicateVault is
     ///      same breath — see `_pricingSupply`. Subtracting assets without their
     ///      shares would understate the price as badly as double-counting them
     ///      would overstate it.
+    ///      THE QUEUE RESERVE IS NOT THE ONLY LIABILITY (pashov review finding
+    ///      #3). A fee whose transfer failed is escrowed by
+    ///      `SyndicateGovernor._payFee` and LEFT HERE — owed exactly like a
+    ///      queue reserve, but previously counted as LP equity, so redeemers in
+    ///      the post-settle window took a slice of the fee recipient's money.
     function totalAssets() public view override returns (uint256) {
         uint256 gross = IERC20(asset()).balanceOf(address(this));
-        uint256 owed = reservedQueueAssets();
+        uint256 owed = reservedQueueAssets() + _escrowedFeeLiability();
         // Cannot legitimately underflow — the reserve tracks assets the vault
         // holds — but under-reporting beats inventing value if it ever did.
         return gross > owed ? gross - owed : 0;
+    }
+
+    /// @dev Escrowed fee liability this vault owes, read from its governor.
+    ///      Low-level staticcall degrading to zero on any failure, matching
+    ///      `_openProposalPid` and `_pricingSupply`: `totalAssets()` sits on
+    ///      every pricing path in this contract, so a governor predating
+    ///      `outstandingEscrow` — or any nonstandard implementation — must not
+    ///      brick deposits, redemptions and settlement. Degrading to zero
+    ///      reproduces exactly the previous behaviour, never anything worse.
+    function _escrowedFeeLiability() private view returns (uint256) {
+        address gov = _getGovernor();
+        if (gov == address(0)) return 0;
+        (bool ok, bytes memory ret) =
+            gov.staticcall(abi.encodeCall(ISyndicateGovernor.outstandingEscrow, (address(this), asset())));
+        return (ok && ret.length == 32) ? abi.decode(ret, (uint256)) : 0;
     }
 
     /// @dev The supply a price is actually taken against: circulating shares LESS
