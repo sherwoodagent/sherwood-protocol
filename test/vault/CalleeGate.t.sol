@@ -229,7 +229,9 @@ contract CalleeGateTest is Test {
         address randomTarget = makeAddr("degradeOpenTarget2");
         vm.prank(address(legacy));
         vault.executeGovernorBatch(
-            _one(randomTarget, abi.encodeWithSelector(bytes4(0xdeadbeef), attacker)), new uint256[](0), type(uint256).max
+            _one(randomTarget, abi.encodeWithSelector(bytes4(0xdeadbeef), attacker)),
+            new uint256[](0),
+            type(uint256).max
         );
     }
 

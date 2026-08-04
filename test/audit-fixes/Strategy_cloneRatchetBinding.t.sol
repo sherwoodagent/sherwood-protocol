@@ -521,6 +521,15 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
             target: address(usdc), value: 0, data: abi.encodeCall(usdc.balanceOf, (address(vault)))
         });
 
+        // NOT GovEnvelope.defaultCaps here: that helper puts the full cap on
+        // the FIRST call and zero on the rest, but in THIS batch the fund
+        // mover is executeCalls[1] (`clone.execute()`, which pulls `amount`
+        // via the approval set at index 0 -- itself a zero-balance-delta
+        // call). An index-0-weighted default would starve the real mover.
+        uint256[] memory executeCallCaps = new uint256[](2);
+        executeCallCaps[0] = 0;
+        executeCallCaps[1] = amount;
+
         vm.prank(agent);
         uint256 pid1 = governor.propose(
             address(vault),
@@ -529,7 +538,7 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
             7 days,
             env,
             executeCalls,
-            GovEnvelope.defaultCaps(env.maxCapital, executeCalls.length),
+            executeCallCaps,
             settlementCalls,
             GovEnvelope.defaultCaps(env.maxCapital, settlementCalls.length),
             new ISyndicateGovernor.CoProposer[](0)
