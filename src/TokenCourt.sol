@@ -230,6 +230,19 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // Only a contested challenge escalates: a `Filed` one is still inside
         // its auto-slash clock, and a terminal one has nothing left to decide.
         if (ch.status != IChallengeGame.Status.Disputed) revert ChallengeNotDisputed();
+        // AND ONE THAT CAN ACTUALLY BE RULED. `ChallengeGame.rule` authorises
+        // against the challenge's OWN `courtAtFiling` pin, not against whoever
+        // is wired live — a challenge filed while the game had no court pinned
+        // itself at zero and stays unrulable forever, even after `setCourt`.
+        // Referring it anyway opens a case, takes real votes, and then wedges:
+        // `finalize` re-raises every revert except `WrongStatus`, so `rule`'s
+        // `NotCourt` rolls back the `phase = Resolved` write and the case can
+        // never leave `Voting`. The tally is discarded either way, since the
+        // dispute timeout routes a zero-pin challenge to `_refundAll`.
+        // `ChallengeGame.dispute` now auto-refers against this same pin; THIS
+        // guard is the load-bearing one, because `refer` is permissionless and
+        // reachable directly regardless of how the case got escalated.
+        if (ch.courtAtFiling == address(0)) revert ChallengeNotRulable();
 
         // The clock check: a vote that could not finish before the
         // challenge's own timeout never opens.
@@ -329,6 +342,24 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // `total - accusedWeight` shape makes a unilateral conviction easier
         // the more approvers the challenge names. Pinned in `refer`.
         if (msg.sender == c.challenger) revert ChallengerCannotVote();
+        // AND NEITHER MAY THE SIDE A `NotGuilty` VERDICT PAYS. The two bars
+        // above cover both beneficiaries of a `Guilty` ruling (the accused
+        // avoid the slash, the challenger takes the forfeited pool) but left
+        // the beneficiary of the OPPOSITE ruling unbarred. `dispute` is open
+        // to anyone by design, and `_fail`'s payout is pro-rata to
+        // CONTRIBUTION with no accused-membership filter — so a guardian who
+        // never approved the proposal (hence `isAccused` false) can fund the
+        // entire counter-bond alone, vote its own acquittal, and claim
+        // `contributed + forfeitPayoutWood` — a net `+0.8x` of its stake at
+        // the shipped `forfeitBurnBps`, taken from the honest challenger's
+        // forfeited bond. It only has to MATCH the guilty tally, since
+        // `finalize` acquits on a tie, and its ballot also counts toward
+        // `turnout`, converting an unpaid `Inconclusive` into a paid
+        // `NotGuilty`. Read the game pinned on the case (`c.game`), never the
+        // live `challengeGame` pointer, for the same reason `finalize` does.
+        if (IChallengeGame(c.game).counterBondContributionOf(c.challengeId, msg.sender) != 0) {
+            revert CounterBondContributorCannotVote();
+        }
 
         IStakedWood swood = IStakedWood(stakedWood);
         uint256 weight = swood.getPastVotes(msg.sender, c.snapshotTs);
@@ -512,6 +543,12 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // subtracted from the total taken at its OWN instant, so every operand
         // answers the same question, how much of THIS instant's electorate is
         // unaccused, before the min ever compares them.
+        //
+        // GROWTH-CAP THE SNAPSHOT TOTAL (pashov review finding #1). The `min`
+        // below is monotone increasing in BOTH operands, so when `reduced`
+        // binds, idle stake planted before `executedAt` raises it and lifts the
+        // floor — while `vote`'s growth gate denies that same stake a ballot.
+        if (earlier != 0 && total > earlier) total = earlier;
         uint256 reduced = total > accusedWeight ? total - accusedWeight : 0;
         uint256 earlierReduced = earlier > accusedWeightAtLookback ? earlier - accusedWeightAtLookback : 0;
         // The smaller of the two unaccused electorates, except when there is no

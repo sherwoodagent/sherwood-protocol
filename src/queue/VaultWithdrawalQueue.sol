@@ -269,7 +269,27 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         if (msg.sender != r.owner) revert NotQueueOwner();
         if (r.claimed) revert AlreadyClaimed();
         if (r.cancelled) revert AlreadyCancelled();
-        if (_settlePrice[r.pid].stamped) revert AlreadySettled();
+        // GATE ON THE PID `claim` PRICES AGAINST, NOT THE REQUEST'S OWN
+        // (pashov review finding #10). `claim` was moved onto
+        // `_lastStampedPid` for Deposits precisely because a deposit's own
+        // `r.pid` may never be stamped — cancelled / vetoed / rejected /
+        // expired proposals all call `_decOpen()` and never
+        // `onProposalSettled` — but this gate was left on `r.pid`, which for
+        // exactly that class reads false FOREVER. Both exits therefore stayed
+        // open at once and the depositor held a costless permanent straddle
+        // worth `amount * max(1, ppsNow / ppsStamp)`, the upside leg funded by
+        // the incumbent shareholders. That is the same "perpetual look-back
+        // call on the vault's NAV" the `_lastStampedPid` change closed on the
+        // claim side, reopened through the un-migrated cancel side — and it
+        // falsifies `claim`'s own natspec, which asserts "`cancel` shuts once
+        // its proposal stamps, so waiting is strictly free". Keying both gates
+        // to one pid makes that sentence true again.
+        //
+        // Redeem keeps `r.pid`: those shares left the supply at that
+        // settlement and `_pidReserved` is denominated against that same
+        // price, so its own stamp is the correct and only meaningful gate.
+        uint256 gatePid = r.kind == RequestKind.Redeem ? r.pid : _lastStampedPid;
+        if (_settlePrice[gatePid].stamped) revert AlreadySettled();
 
         r.cancelled = true;
         r.closedAt = uint48(block.timestamp);

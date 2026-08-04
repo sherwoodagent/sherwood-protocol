@@ -85,6 +85,10 @@ contract PortfolioStrategy is BaseStrategy {
     error TooManyTokens();
     error SwapFailed();
     error RebalancingInProgress();
+    /// @notice `rebalance` / `rebalanceDelta` would push `cumulativeDecayBps`
+    ///         past `MAX_CUMULATIVE_DECAY_BPS`. The clone has spent its
+    ///         lifetime slippage allowance; `settle()` is unaffected.
+    error DecayBudgetExhausted();
     error StalePrice();
     error InvalidSlippage();
     /// @notice `_updateParams` was passed a non-empty `swapExtraData`. Routes are
@@ -161,6 +165,36 @@ contract PortfolioStrategy is BaseStrategy {
     /// @notice Bounds for a per-slot push-feed max age packed into `_feedIds[i]`.
     uint256 public constant MIN_PUSH_PRICE_AGE = 1 hours;
     uint256 public constant MAX_PUSH_PRICE_AGE_CAP = 30 days;
+    /// @notice Slippage band applied when a floor is anchored to a STALE
+    ///         last-good oracle price rather than a live one (pashov review
+    ///         finding #4). Wider than `maxSlippageBps` because the anchor may
+    ///         predate a genuine move — equity feeds stop heartbeating outside
+    ///         US market hours (see `MAX_PUSH_PRICE_AGE`) — but still a fixed,
+    ///         attacker-independent number, which is the whole point: the old
+    ///         fallback derived its floor from a quote taken against the very
+    ///         pool the swap was about to hit, so the bound moved with the
+    ///         attacker. Set at the ceiling so honest settlement stays live.
+    uint256 public constant STALE_PRICE_SLIPPAGE_BPS = MAX_SLIPPAGE_CEILING_BPS;
+    /// @notice Ceiling on `cumulativeDecayBps` across a clone's whole life
+    ///         (pashov review finding #9).
+    ///
+    ///         WHAT IS METERED IS THE ALLOWANCE, NOT THE REALIZED LOSS. Each
+    ///         `rebalance` is charged `2 * maxSlippageBps` (a sell leg and a
+    ///         re-buy leg, each permitted to land that far below the
+    ///         oracle-implied value) and each `rebalanceDelta` one leg's worth.
+    ///         That is the worst case, so an honest rebalance that clears at
+    ///         mid is over-charged — deliberate, because the alternative is
+    ///         valuing the whole basket on every call, and the quantity that
+    ///         actually needed bounding is the ALLOWANCE: it composed
+    ///         multiplicatively (`1-(1-s)^2N`) over an unlimited call count.
+    ///
+    ///         5,000 bps at the shipped 500 bps allowance is five full round
+    ///         trips; at the `MIN_SLIPPAGE_BPS` floor it is fifty. Both leave
+    ///         ordinary rebalancing room while cutting off the traced drains
+    ///         (~62% of the basket in ten calls at 500 bps, ~50% in seventy at
+    ///         50 bps). Exhaustion is not a brick: `settle()` never consults
+    ///         this meter, so the exit path stays open.
+    uint256 public constant MAX_CUMULATIVE_DECAY_BPS = 5_000;
 
     // ── Storage (per-clone) ──
 
@@ -182,6 +216,23 @@ contract PortfolioStrategy is BaseStrategy {
     uint256 public maxSlippageBps;
 
     bool private _rebalancing;
+
+    /// @dev Last price a push feed successfully returned for allocation `i`, in
+    ///      that slot's declared `_priceDecimals` scale. Written by
+    ///      `_sellFloor` / `_buyFloor` whenever `_tryPushFeedPrice` reports
+    ///      `ok`, and read by those same two when it does not (pashov review
+    ///      finding #4). Zero means "this slot has never been priced" — the
+    ///      only case still degrading to the quote-anchored floor.
+    mapping(uint256 allocationIndex => uint256 priceInFeedScale) private _lastGoodPriceX8;
+
+    /// @notice Running sum, in bps, of oracle-valued NAV given up across every
+    ///         `rebalance` / `rebalanceDelta` on this clone (pashov review
+    ///         finding #9). `maxSlippageBps` bounds ONE swap; nothing bounded
+    ///         the NUMBER of full-notional round trips, so the per-call
+    ///         allowance composed multiplicatively over an unlimited call count
+    ///         for the whole `strategyDuration`. Checked against
+    ///         `MAX_CUMULATIVE_DECAY_BPS`.
+    uint256 public cumulativeDecayBps;
 
     /// @dev Cached `decimals()` of the vault asset, read once at init so the
     ///      rebalance decimal-scaling math avoids a per-read external call.
@@ -521,6 +572,13 @@ contract PortfolioStrategy is BaseStrategy {
         // would keep `forceApprove`-ing the demoted adapter. Blocking a rebalance
         // strands nothing, since `settle()` remains the exit path either way, so
         // this fails CLOSED rather than degrading open.
+        // Charge this call's worst-case slippage allowance against the clone's
+        // lifetime budget (pashov review finding #9). `maxSlippageBps` bounds
+        // ONE swap; nothing bounded the number of full-notional round trips, so
+        // the per-call allowance composed multiplicatively over an unlimited
+        // call count. None of this traffic passes `executeGovernorBatch`, so
+        // neither the per-call caps nor `maxNetOutflow` ever observed it.
+        _chargeDecayBudget(2 * maxSlippageBps);
         _requireAllowedAdapter(address(swapAdapter));
         // Live re-check of the oracle itself. The adapter check above
         // re-certifies the swap VENUE on every call, but the price SOURCE
@@ -611,6 +669,12 @@ contract PortfolioStrategy is BaseStrategy {
     function rebalanceDelta(bytes[] calldata priceReports) external onlyProposer {
         if (_state != State.Executed) revert NotExecuted();
         if (_rebalancing) revert RebalancingInProgress();
+        // One leg's worth — see the identical charge on `rebalance()` above and
+        // `MAX_CUMULATIVE_DECAY_BPS` for what is metered and why (pashov review
+        // finding #9). A delta rebalance trades only the over/under-weight
+        // remainder rather than the full basket, so it is charged half of what
+        // the full round trip is.
+        _chargeDecayBudget(maxSlippageBps);
         // Live re-check, fail-closed on demotion — see the identical guard on
         // `rebalance()` above for the full rationale (issue #147).
         _requireAllowedAdapter(address(swapAdapter));
@@ -861,9 +925,31 @@ contract PortfolioStrategy is BaseStrategy {
         if (chainlinkVerifier == address(0)) {
             (uint256 price, bool ok) = _tryPushFeedPrice(i);
             if (ok) {
+                _lastGoodPriceX8[i] = price;
                 uint256 value = _tokensToValue(bal, price, i, uint256(_assetDecimals));
                 return (value * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
             }
+        }
+        // STALE ORACLE BEATS NO ORACLE (pashov review finding #4). The old
+        // fallback went straight to `_quoteMinOut`, whose floor is derived from
+        // a quote taken in the SAME transaction against the SAME pool the swap
+        // is about to hit — so `maxSlippageBps` bounded drift from a price the
+        // attacker had just set, not from a fair one. That path is reachable
+        // without any oracle failure at all in Data Streams mode (neither
+        // `execute()` nor `settle()` nor `rebalance()` carries a signed
+        // report), and in push mode on any stale/mismatched/codeless feed —
+        // which this contract's own `MAX_PUSH_PRICE_AGE` notes is routine for
+        // equity feeds ("observed 77h gaps over holiday weekends").
+        //
+        // A price this contract ITSELF observed from an allowlisted feed is
+        // attacker-independent, however old it is, so it is a strictly better
+        // anchor than the counterparty's quote. Fail-closed was the other
+        // option and was rejected deliberately: it would brick `settle()` for
+        // the entire duration of a feed outage, stranding capital.
+        uint256 lastGood = _lastGoodPriceX8[i];
+        if (lastGood != 0) {
+            uint256 staleValue = _tokensToValue(bal, lastGood, i, uint256(_assetDecimals));
+            return (staleValue * (BPS_DENOMINATOR - STALE_PRICE_SLIPPAGE_BPS)) / BPS_DENOMINATOR;
         }
         return _quoteMinOut(token, asset, bal, _swapExtraData[i]);
     }
@@ -886,9 +972,18 @@ contract PortfolioStrategy is BaseStrategy {
         if (chainlinkVerifier == address(0)) {
             (uint256 price, bool ok) = _tryPushFeedPrice(i);
             if (ok) {
+                _lastGoodPriceX8[i] = price;
                 uint256 tokensExpected = _valueToTokens(amountIn, price, i, uint256(_assetDecimals));
                 return (tokensExpected * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
             }
+        }
+        // Mirrors `_sellFloor`'s stale-anchor fallback exactly — see the block
+        // there for why a price this contract already observed beats a quote
+        // taken against the pool being traded (pashov review finding #4).
+        uint256 lastGood = _lastGoodPriceX8[i];
+        if (lastGood != 0) {
+            uint256 staleTokens = _valueToTokens(amountIn, lastGood, i, uint256(_assetDecimals));
+            return (staleTokens * (BPS_DENOMINATOR - STALE_PRICE_SLIPPAGE_BPS)) / BPS_DENOMINATOR;
         }
         return _quoteMinOut(asset, _allocations[i].token, amountIn, _swapExtraData[i]);
     }
@@ -912,6 +1007,17 @@ contract PortfolioStrategy is BaseStrategy {
     ///      at decode time. Comparing `dec` as a `uint256` is exactly correct: a
     ///      legitimate declared value is always `< 256`, so a dirty word can never
     ///      false-positive a match.
+    /// @dev Accrues `spendBps` against the clone's lifetime slippage allowance
+    ///      and refuses once `MAX_CUMULATIVE_DECAY_BPS` is exhausted (pashov
+    ///      review finding #9). See that constant for what is metered, why the
+    ///      worst case rather than the realized loss, and why exhaustion is not
+    ///      a brick.
+    function _chargeDecayBudget(uint256 spendBps) private {
+        uint256 spent = cumulativeDecayBps + spendBps;
+        if (spent > MAX_CUMULATIVE_DECAY_BPS) revert DecayBudgetExhausted();
+        cumulativeDecayBps = spent;
+    }
+
     function _tryPushFeedPrice(uint256 i) private view returns (uint256 price, bool ok) {
         (address feed, uint256 maxAge) = _decodePushFeed(_feedIds[i]);
         if (feed.code.length == 0) return (0, false);

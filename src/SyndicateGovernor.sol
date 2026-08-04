@@ -9,6 +9,7 @@ import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
 import {IProposerBondEscrow} from "./interfaces/IProposerBondEscrow.sol";
+import {IStrategy} from "./interfaces/IStrategy.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
@@ -270,6 +271,29 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Draft co-proposals do not count toward openProposalCount and are
         // independently gated at their Draft -> Pending transition.
         if (_openProposalCount != 0) revert VaultHasOpenProposal();
+        // BIND THE DECLARED STRATEGY TO ITS CALLER (pashov review finding #8).
+        // `StrategyFactory.cloneAndInit` enforces `proposer == msg.sender` so
+        // `_proposer` is "a known authorized address", and
+        // `BaseStrategy.execute()` treats `strategyOf(activePid) ==
+        // address(this)` as the security boundary — issue #150's fix, "this
+        // check IS the security boundary here". But the governor never
+        // preserved the binding those two ends assume: `p.strategy` was
+        // written verbatim from calldata, so the equality held BY
+        // CONSTRUCTION for whoever declared the clone, not for whoever owns
+        // it. `IStrategy.proposer()` had zero call sites in `src/`, and
+        // `StrategyFactory` records the governor-side check as "deferred".
+        //
+        // Unbound, any registered agent could name a rival's pre-deployed,
+        // governance-allowlisted clone as its own proposal's strategy and
+        // drive it Pending -> Executed. The ratchet is one-way, so the rightful
+        // proposer's own later proposal then reverts `AlreadyExecuted` forever:
+        // recovery needs a redeploy plus a fresh `setAdapterAllowed` and, if
+        // tier-certified, a new `proposeCertification` + `certifyDelay`.
+        // `address(0)` stays legal — a proposal need not name a strategy.
+        if (strategy != address(0)) {
+            if (IStrategy(strategy).proposer() != msg.sender) revert StrategyProposerMismatch();
+            if (IStrategy(strategy).vault() != vault) revert StrategyVaultMismatch();
+        }
         if (strategyDuration > _params.maxStrategyDuration) revert StrategyDurationTooLong();
         if (strategyDuration < _params.minStrategyDuration) revert StrategyDurationTooShort();
         if (executeCalls.length == 0) revert EmptyExecuteCalls();
