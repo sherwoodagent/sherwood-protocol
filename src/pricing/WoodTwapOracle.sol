@@ -600,9 +600,9 @@ contract WoodTwapOracle is Ownable2Step, IWoodTwapOracle {
         // contract against a feed that answers with short or dirty-padded
         // data. uint256/int256 accept any 32-byte word, so nothing below this
         // line can revert on account of decoding. This is audit #181 finding
-        // 22, whose fix landed in `ExposureLedger._feedPriceX8`,
-        // `ChainlinkReader`, and `PortfolioStrategy._tryPushFeedPrice` but
-        // originally missed this contract.
+        // 22, whose fix landed in `ExposureLedger._feedPriceX8` and
+        // `PortfolioStrategy._tryPushFeedPrice` but originally missed this
+        // contract.
         (, int256 answer,, uint256 updatedAt,) = abi.decode(ret, (uint256, int256, uint256, uint256, uint256));
         if (answer <= 0) return (0, false);
         uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;

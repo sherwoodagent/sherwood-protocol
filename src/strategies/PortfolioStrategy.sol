@@ -1112,8 +1112,8 @@ contract PortfolioStrategy is BaseStrategy {
         (, int256 answer,, uint256 updatedAt,) = AggregatorV3Interface(feed).latestRoundData();
         if (answer <= 0) revert InvalidAmount();
         // Guarded subtraction, matching the identical convention at
-        // ExposureLedger.sol:600/933 and libraries/ChainlinkReader.sol:37 (the
-        // ONLY other unguarded-staleness sites in the repo): a future
+        // ExposureLedger.sol:600/933 (the ONLY other unguarded-staleness sites
+        // in the repo): a future
         // `updatedAt` (feed clock ahead of a lagging L2 `block.timestamp`) is
         // the freshest possible answer → age 0, never underflow into a panic
         // (0x11). This is a deliberate divergence from the audit finding's
