@@ -1120,6 +1120,76 @@ contract StakedWoodTest is Test {
         vm.prank(alice);
         swood.requestUnstakeOwner(vault);
     }
+
+    /// @notice DESIGN PIN — third-audit finding 2, resolved as INTENDED
+    ///         behaviour rather than as a bug.
+    ///
+    ///         `_isActiveGuardian` tests only "nonzero stake AND no pending
+    ///         unstake". `minGuardianStake` gates ENTRY (`stakeAsGuardian`) and
+    ///         is never re-checked, so a guardian can sit below the floor and
+    ///         stay active. Both routes into that state are pinned here:
+    ///         governance raising the floor, and slashing grinding the stake
+    ///         down to a positive residual.
+    ///
+    ///         THIS TEST EXISTS TO FAIL LOUDLY IF SOMEONE "FIXES" THE
+    ///         PREDICATE. Adding `stakedAmount >= minGuardianStake` to
+    ///         `_isActiveGuardian` alone desynchronises `totalGuardianStake`:
+    ///         `_slashOne` decrements that aggregate ONLY on its still-active
+    ///         branch, so a newly-inactive-by-predicate guardian would leave
+    ///         stake in the quorum DENOMINATOR that can no longer produce a
+    ///         ballot — the denominator outruns the real votable cohort and
+    ///         quorum gets harder to reach than intended. A corrected version
+    ///         must deactivate AND decrement in the same step, and must decide
+    ///         what to do about route 1, where no slash event ever fires. See
+    ///         `_isActiveGuardian`'s @dev block.
+    function test_isActiveGuardian_staysActiveBelowMinStake_byDesign() public {
+        address registry = address(0x9E915);
+
+        // ── Route 1: governance raises the floor under a seated guardian ──
+        vm.prank(alice);
+        swood.stakeAsGuardian(10_000e18, 42);
+        assertTrue(swood.isActiveGuardian(alice), "seated at exactly the entry floor");
+
+        vm.prank(owner);
+        swood.setMinGuardianStake(50_000e18); // 5x raise, no slash involved
+
+        assertLt(swood.guardianStake(alice), swood.minGuardianStake(), "alice is now far below the floor");
+        assertTrue(swood.isActiveGuardian(alice), "a raised floor must NOT retroactively deactivate a seated guardian");
+        assertEq(
+            swood.totalGuardianStake(),
+            10_000e18,
+            "her stake stays in the quorum denominator, matching that she can still vote"
+        );
+
+        // ── Route 2: slashing grinds the stake to a positive residual ──
+        vm.prank(owner);
+        swood.setMinGuardianStake(10_000e18); // restore the original floor
+        vm.prank(owner);
+        swood.setRegistry(registry);
+
+        // Mature the stake, then anchor the slash basis at a past checkpoint,
+        // mirroring the registry's own call shape in StakedWoodSlashing.t.sol.
+        vm.warp(vm.getBlockTimestamp() + 30 days);
+        uint256 anchor = vm.getBlockTimestamp();
+        vm.warp(anchor + 1);
+
+        address[] memory approvers = new address[](1);
+        approvers[0] = alice;
+        vm.prank(registry);
+        swood.slashGuardians(bytes32(uint256(1)), anchor, approvers, 9_000); // 90%
+
+        assertEq(swood.guardianStake(alice), 1_000e18, "ground down to a positive residual");
+        assertLt(swood.guardianStake(alice), swood.minGuardianStake(), "and now below the entry floor");
+        assertTrue(swood.isActiveGuardian(alice), "a slashed-down guardian keeps its seat and its vote, by design");
+
+        // The reason the predicate is left alone: the aggregate tracked the
+        // slash exactly, so denominator and votable cohort still agree.
+        assertEq(
+            swood.totalGuardianStake(),
+            1_000e18,
+            "totalGuardianStake tracked the slash, so quorum denominator == votable cohort"
+        );
+    }
 }
 
 /// @notice Sherlock #16 — `coolDownPeriod >= reviewPeriod` cross-contract

@@ -584,8 +584,41 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         _registrySet = true;
     }
 
-    /// @dev Active iff the guardian holds stake >= `minGuardianStake` and has no
-    ///      pending unstake request.
+    /// @dev Active iff the guardian holds ANY nonzero stake and has no pending
+    ///      unstake request. `minGuardianStake` is an ENTRY requirement, not a
+    ///      continuing one: `stakeAsGuardian` is its only enforcer, and nothing
+    ///      re-checks it afterwards. A guardian CAN sit below the minimum and
+    ///      remain active. Two ways in, one adversarial and one not:
+    ///
+    ///        1. SLASHING. `_slashOne` reduces `stakedAmount` to any positive
+    ///           residual and deliberately keeps the guardian on its "Still
+    ///           active" branch. A guardian ground down to 1 wei keeps voting
+    ///           rights.
+    ///        2. A RAISED FLOOR. Governance can raise `minGuardianStake`
+    ///           (`PARAM_MIN_GUARDIAN_STAKE`), stranding every guardian who
+    ///           entered under the old, lower bar. No attacker involved.
+    ///
+    ///      THIS IS DELIBERATE, AND THE PREDICATE MUST NOT BE MADE MIN-AWARE ON
+    ///      ITS OWN. `totalGuardianStake` is the quorum denominator, and
+    ///      `_slashOne` decrements it ONLY on the branch where the guardian is
+    ///      still active. Adding `stakedAmount >= minGuardianStake` here —
+    ///      without simultaneously moving that stake out of the aggregate —
+    ///      leaves stake in the denominator that can no longer produce a
+    ///      ballot, so the denominator outruns the real votable cohort and
+    ///      quorum becomes harder to reach than intended (unreachable, if
+    ///      enough is stranded). That is the exact failure the `stakeAsGuardian`
+    ///      top-up note above already warns about, in mirror image. Any future
+    ///      change here must deactivate AND decrement in the same step, and must
+    ///      also decide what happens to guardians stranded by case 2, for whom
+    ///      no slash event ever fires.
+    ///
+    ///      ACCEPTED CONSEQUENCE: a sub-minimum guardian still consumes one of
+    ///      the capped `MAX_APPROVERS_PER_PROPOSAL` /
+    ///      `MAX_BLOCKERS_PER_PROPOSAL` review seats. Their INFLUENCE is
+    ///      negligible — vote weight is stake-proportional, so dust stake
+    ///      carries dust weight — but the SEAT is real, which makes seat
+    ///      exhaustion the residual surface here rather than vote capture.
+    ///      Pinned by `test_isActiveGuardian_staysActiveBelowMinStake_byDesign`.
     function _isActiveGuardian(address g) internal view returns (bool) {
         Guardian storage gs = _guardians[g];
         return gs.stakedAmount > 0 && gs.unstakeRequestedAt == 0;
@@ -805,7 +838,12 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         return getPastTotalVotes(timestamp);
     }
 
-    /// @notice True iff `guardian` has an active stake and no pending unstake.
+    /// @notice True iff `guardian` holds any nonzero stake and has no pending
+    ///         unstake request. NOT a `minGuardianStake` check — that floor
+    ///         gates entry only, so a slashed-down or floor-raised guardian
+    ///         reads active here. See `_isActiveGuardian` for why that is
+    ///         deliberate and what a corrected version would have to change
+    ///         alongside it.
     function isActiveGuardian(address guardian) external view returns (bool) {
         return _isActiveGuardian(guardian);
     }
