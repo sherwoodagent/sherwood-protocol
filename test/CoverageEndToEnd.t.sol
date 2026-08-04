@@ -843,7 +843,9 @@ contract CoverageEndToEndTest is Test {
         // ── Bond returns in full once the challenge window has run out from
         //    execution: settlement is not a conviction, it just is not proof of
         //    innocence on the hour either.
-        vm.warp(govA.getProposal(pid).executedAt + ledger.challengeWindow());
+        // `+ strategyDuration` (second-audit finding A): the hold runs from the
+        // end of the strategy's TERM, not from execution.
+        vm.warp(govA.getProposal(pid).executedAt + govA.getProposal(pid).strategyDuration + ledger.challengeWindow());
         govA.reclaimProposerBond(pid);
         assertEq(wood.balanceOf(agentA), agentBalBefore, "bond refunded in full");
         assertEq(wood.balanceOf(address(escrow)), 0, "escrow drained");

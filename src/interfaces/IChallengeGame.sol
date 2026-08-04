@@ -163,8 +163,10 @@ interface IChallengeGame {
         ///      and cannot withdraw once a court vote misses its
         ///      participation floor. Not a flat rate — the value pinned
         ///      here is whatever `ChallengeGame._inconclusiveBurnBpsForRound`
-        ///      computed for this proposal's round count at filing time (0
-        ///      on a proposal's first attempt, escalating from there), so
+        ///      computed for this proposal's round count at filing time (a
+        ///      positive fixed rate from a proposal's very first attempt,
+        ///      escalating from there — issue #181 finding 19 closed what
+        ///      used to be a free first round), so
         ///      two challenges against the same proposal can carry
         ///      different pinned rates depending on how many prior
         ///      `Inconclusive` rounds preceded each. See
@@ -195,6 +197,36 @@ interface IChallengeGame {
         ///      reason: anything decoding `challengeOf()` positionally
         ///      keeps every existing tuple index.
         address proposerBondEscrow;
+        /// @dev The adjudicator wired when this challenge was FILED, pinned
+        ///      like every other `*AtFiling` term (issue #181 finding 2).
+        ///      `rule` gates on BOTH the LIVE `court` AND this pinned value
+        ///      (second-audit finding A — the original remediation pinned
+        ///      this field but never taught `rule` to read it, so a court
+        ///      wired AFTER a zero-`courtAtFiling` filing could still hand
+        ///      down `Guilty` against pool funders who were promised no
+        ///      ruling was possible). A REPLACEMENT adjudicator wired after
+        ///      filing can still rule a challenge that HAD a non-zero
+        ///      `courtAtFiling` — a ruling always beats a timeout either way
+        ///      (see `ChallengeGame.rule`) — but a challenge filed with this
+        ///      pinned to `address(0)` can never reach `rule` at all,
+        ///      regardless of what gets wired later. `resolve`'s
+        ///      Disputed-timeout branch reads THIS pinned value the same
+        ///      way, to decide what an un-ruled timeout means:
+        ///      `address(0)` here means no adjudicator was ever GUARANTEED
+        ///      reachable for this dispute, so a `Guilty` ruling was never a
+        ///      real possibility the counter-bond pool's funders risked
+        ///      losing to. Left unpinned, `dispute`'s "an outside funder
+        ///      risks real capital" justification for accepting any funder
+        ///      collapses to false whenever the game is unwired, turning
+        ///      every dispute into a guaranteed forfeit funded entirely by
+        ///      the challenger. `resolve` routes that case to `_refundAll`
+        ///      instead of `_fail` — a non-verdict, not an acquittal.
+        ///
+        ///      Appended last, after `proposerBondEscrow`: this field did
+        ///      not exist when every earlier field claimed its position, so
+        ///      it is added at the end rather than inserted, for the same
+        ///      reason cited on every other field appended here.
+        address courtAtFiling;
     }
 
     // ── Errors ──
@@ -244,6 +276,13 @@ interface IChallengeGame {
     /// @dev    Also what an unwired game reverts with, since `court` is
     ///         then the zero address and no caller can match it — the
     ///         timeout stays the only way out of `Disputed`.
+    /// @dev    ALSO what the LIVE court itself gets back for a challenge
+    ///         filed with `courtAtFiling == address(0)` (second-audit
+    ///         finding B): the live-court identity check alone does not
+    ///         mean the pool's funders were ever exposed to a ruling on
+    ///         THIS challenge, and only `Challenge.courtAtFiling` answers
+    ///         that. The timeout stays the only way out of `Disputed` for
+    ///         such a challenge too — see `ChallengeGame.rule`.
     error NotCourt();
     /// @dev `resolve` was called with too little gas to guarantee the slash
     ///      loop can finish, or — on a challenge naming an adapter — too
@@ -268,10 +307,12 @@ interface IChallengeGame {
     ///         flag.
     error FilingsPaused();
     /// @notice A setter would break the cross-contract invariant
-    ///         `autoSlashDelay + voteWindow + FINALIZE_BUFFER <=
-    ///         disputeTimeout`. Raised by `setAutoSlashDelay` and
-    ///         `setDisputeTimeout` — see `ChallengeGame._requireWindowFits`
-    ///         for why neither contract can hold this alone.
+    ///         `autoSlashDelay + voteWindow + FINALIZE_BUFFER +
+    ///         MIN_REFERRAL_SLACK <= disputeTimeout`. Raised by
+    ///         `setAutoSlashDelay`, `setDisputeTimeout` and `setCourt` — see
+    ///         `ChallengeGame._requireWindowFits` for why neither contract
+    ///         can hold this alone, and `ChallengeGame.MIN_REFERRAL_SLACK`
+    ///         for why equality is no longer enough (issue #181 finding 20).
     error WindowInvariantViolated();
     /// @notice A role setter was pointed at a contract that has not granted
     ///         this game the reciprocal role it needs there — a ledger
@@ -345,15 +386,18 @@ interface IChallengeGame {
     ///        forfeited bond instead and never touches this figure — see
     ///        `IProposerBondEscrow.ProsecutorFeePaid` for that leg.
     event ChallengeSettled(uint256 indexed challengeId, uint256 slashedWood);
-    /// @dev The slice of the challenger's bond burned on the SETTLE path
-    ///      (`settleBurnBps`) or the INCONCLUSIVE unwind path
-    ///      (`inconclusiveBurnBps`) — a filing is never free on either path
-    ///      where the challenger did nothing wrong, because an unanswered
-    ///      or unresolved filing still froze a cohort's coverage for the
-    ///      price of gas. Distinct from `ChallengeFailed.burnedWood`, which
-    ///      is the FAIL-path burn (`forfeitBurnBps`) charged to a
-    ///      challenger who was actually wrong; a challenge only ever takes
-    ///      one of the three paths.
+    /// @dev The slice burned on a SETTLE (`settleBurnBps`) or INCONCLUSIVE
+    ///      unwind (`inconclusiveBurnBps`) — a filing is never free on either
+    ///      path where the challenger did nothing wrong, because an
+    ///      unanswered or unresolved filing still froze a cohort's coverage
+    ///      for the price of gas. On a settle this is a slice of the
+    ///      CHALLENGER'S BOND on the silence branch, and — since issue #181
+    ///      finding 18b — the identically-sized slice of the forfeited
+    ///      COUNTER-BOND POOL on the escalated (guilty-ruling) branch, which
+    ///      closed a self-funded challenger's round trip on that path.
+    ///      Distinct from `ChallengeFailed.burnedWood`, which is the
+    ///      FAIL-path burn (`forfeitBurnBps`) charged to a challenger who was
+    ///      actually wrong.
     event ChallengerBondBurned(uint256 indexed challengeId, uint256 burnedWood);
     /// @dev A settle that convicted nothing because an earlier challenge on the
     ///      same proposal already did. The approvers' liability is one
@@ -527,24 +571,51 @@ interface IChallengeGame {
     /// @notice Permissionless resolution. From `Filed` past `autoSlashDelay` the
     ///         silence is the verdict and the accused are slashed, their bonds
     ///         burned; from `Disputed` past `disputeTimeout` the challenge fails
-    ///         to the accused (D5). Reverts otherwise.
+    ///         to the accused (D5) — UNLESS no adjudicator was ever pinned at
+    ///         filing (`Challenge.courtAtFiling == address(0)`), in which case
+    ///         the timeout is a non-verdict and both sides unwind whole, the
+    ///         same as `rule`'s own `Inconclusive` (issue #181 finding 2).
+    ///         When a court WAS pinned but simply never ruled, the timeout
+    ///         still fails the challenge to the accused, but — because
+    ///         nothing was actually adjudicated — it ALSO re-arms the
+    ///         proposal's re-challenge window exactly like an Inconclusive
+    ///         unwind, unlike a genuine `NotGuilty` ruling from `rule` (issue
+    ///         #181 finding 20). See `ChallengeGame.resolve`. Reverts
+    ///         otherwise.
     function resolve(uint256 challengeId) external;
 
     /// @notice The court's verdict on a DISPUTED challenge. Callable only
     ///         by `court`, and only from `Disputed` — a `Filed` challenge
     ///         is still inside its own auto-slash clock and has not been
     ///         escalated to anyone.
+    /// @dev    ALSO REQUIRES `Challenge.courtAtFiling != address(0)`
+    ///         (second-audit finding B). The live-`court` identity check is
+    ///         necessary but not sufficient: it says who may rule right now,
+    ///         not whether THIS challenge's counter-bond funders were ever
+    ///         exposed to a ruling at all. A challenge filed while no
+    ///         adjudicator was wired pins that onto itself so its dispute
+    ///         timeout unwinds as a non-verdict (`_refundAll`) rather than an
+    ///         acquittal-by-timeout (`_fail`) — see `Challenge.courtAtFiling`
+    ///         — and a court wired in afterward must not retroactively turn
+    ///         that into a live `Guilty` exposure nobody priced in when
+    ///         funding the defence. A challenge that DID have an adjudicator
+    ///         pinned at filing may still be ruled by a REPLACEMENT court.
     /// @dev    THE COURT SUPPLIES ONLY THE VERDICT ENUM and can vary
     ///         nothing else. `Guilty` takes the identical path an
     ///         UNDISPUTED challenge takes — slash at sWOOD's `maxSlashBps`
     ///         with no severity ramp, the named adapter demoted, the
-    ///         challenger's bond returned — `NotGuilty` the identical path
-    ///         the timeout takes, and `Inconclusive` unwinds BOTH sides
-    ///         whole: no slash, no demotion, no conviction, because the
-    ///         vote missed its participation floor and never reached a
-    ///         verdict on the merits at all. There is deliberately no
-    ///         severity argument: a court that could dial the slash would
-    ///         be negotiating with the accused rather than ruling on them.
+    ///         challenger's bond returned (net of `settleBurnBps` of the
+    ///         forfeited counter-bond pool — issue #181 finding 18b) —
+    ///         `NotGuilty` the identical PAYOUT the timeout takes (the
+    ///         challenger's bond forfeits to the defenders), but NOT the
+    ///         timeout's re-challenge re-arm, since here a real adjudicator
+    ///         looked at the merits (issue #181 finding 20). `Inconclusive`
+    ///         unwinds BOTH sides whole: no slash, no demotion, no
+    ///         conviction, because the vote missed its participation floor
+    ///         and never reached a verdict on the merits at all. There is
+    ///         deliberately no severity argument: a court that could dial the
+    ///         slash would be negotiating with the accused rather than ruling
+    ///         on them.
     /// @dev    A RULING BEATS THE TIMEOUT. All three outcomes are
     ///         terminal, and `resolve` only acts on `Filed`/`Disputed`, so
     ///         once the court has ruled the clock can no longer overwrite
@@ -625,6 +696,13 @@ interface IChallengeGame {
     function forfeitBurnBps() external view returns (uint256);
     function autoSlashDelay() external view returns (uint256);
     function disputeTimeout() external view returns (uint256);
+
+    /// @notice Margin the referral window must clear ON TOP of
+    ///         `autoSlashDelay + voteWindow + FINALIZE_BUFFER`. Exposed so
+    ///         `TokenCourt` and the wiring script enforce the same margin
+    ///         `ChallengeGame._requireWindowFits` does, rather than each
+    ///         carrying its own literal.
+    function MIN_REFERRAL_SLACK() external view returns (uint256);
     /// @notice Share of a SUCCESSFUL challenger's bond burned on settle, in
     ///         bps. Applies to the settle path only: the fail path already
     ///         forfeits the whole bond to the accused.
@@ -641,9 +719,9 @@ interface IChallengeGame {
     function prosecutorFeeBps() external view returns (uint256);
     /// @notice The ROUND-4-AND-BEYOND steady-state share of the
     ///         challenger's bond burned on an `Inconclusive` unwind, in
-    ///         bps. Rounds 1-3 follow a fixed, lower schedule (round 1
-    ///         free, rising through fixed 5%/10% steps) before reaching
-    ///         this ceiling — see `inconclusiveRounds` and
+    ///         bps. Rounds 1-3 follow a fixed, lower schedule (2.5%/5%/10% —
+    ///         issue #181 finding 19 closed what used to be a free round 1)
+    ///         before reaching this ceiling — see `inconclusiveRounds` and
     ///         `ChallengeGame._inconclusiveBurnBpsForRound` for the full
     ///         schedule.
     /// @dev    Every OTHER terminal path prices the freeze a filing buys —
@@ -652,20 +730,34 @@ interface IChallengeGame {
     ///         verdict charges nothing because the filing was right.
     ///         `Inconclusive` escalates with the round count instead of a
     ///         flat rate, since a flat percentage cannot distinguish an
-    ///         honest one-shot filer from a grinder. Deliberately kept
-    ///         BELOW the LIVE `settleBurnBps`, never above it — a
-    ///         non-verdict recovered nothing, so it must never cost the
-    ///         challenger more than a verdict that actually recovered
-    ///         value. Enforced by
-    ///         `setInconclusiveBurnBps`/`setSettleBurnBps` each
-    ///         cross-checking the OTHER's current value — sharing a
-    ///         ceiling bounds both rates' maximums identically but says
-    ///         nothing about where either live rate actually sits, which a
-    ///         ceiling-only check on each setter would leave open. That
-    ///         cross-check covers ONLY this round-4+ tier — rounds 2 and 3
-    ///         are fixed constants outside the setter pair, additionally
-    ///         clamped live at the point the rate is computed (see
-    ///         `_inconclusiveBurnBpsForRound`).
+    ///         honest one-shot filer from a grinder.
+    /// @dev    NO LONGER KEPT BELOW THE LIVE `settleBurnBps` AT THIS TIER
+    ///         (second-audit finding C). `setInconclusiveBurnBps` and
+    ///         `setSettleBurnBps` used to cross-check each other's current
+    ///         value so this rate could never legally exceed
+    ///         `settleBurnBps` — which meant raising this tier past round
+    ///         3's fixed 1,000 bps required raising `settleBurnBps` first,
+    ///         and doing that breaks `honestFilingBreaksEven`
+    ///         (issue #181 finding 18a's inequality). The ladder's fourth
+    ///         rung was therefore permanently unreachable: round 4+ always
+    ///         collapsed onto round 3's own rate. This rate is now bounded
+    ///         only by its own ceiling
+    ///         (`ChallengeGame.MAX_INCONCLUSIVE_BURN_BPS`), independent of
+    ///         `settleBurnBps`. The "a non-verdict must never cost more than
+    ///         a verdict" property still holds for rounds 1-3 — those fixed
+    ///         constants are clamped live to `settleBurnBps` at the point
+    ///         the rate is pinned (see
+    ///         `ChallengeGame._inconclusiveBurnBpsForRound`) — and, at the
+    ///         ABSOLUTE ceiling, for this tier too: `MAX_INCONCLUSIVE_BURN_BPS
+    ///         == MAX_SETTLE_BURN_BPS`, so round 4+ can never be configured
+    ///         to cost more than the worst-case verdict this contract could
+    ///         ever charge, even when it costs more than whatever
+    ///         `settleBurnBps` happens to be priced at right now. Round 4+ is
+    ///         reached only after three Inconclusive unwinds against the
+    ///         SAME proposal, at which point pricing it against the
+    ///         anti-grind purpose this schedule exists for — rather than
+    ///         re-collapsing it onto the ordinary verdict rate — is the
+    ///         correct tradeoff.
     function inconclusiveBurnBps() external view returns (uint256);
     /// @notice WOOD the game holds on behalf of live (`Filed`/`Disputed`)
     ///         challenges. The invariant is `wood.balanceOf(game) >=
@@ -687,9 +779,16 @@ interface IChallengeGame {
     /// @notice Per-proposal deadline for NEW filings, raised (never
     ///         lowered) whenever a challenge on that proposal unwinds
     ///         `Inconclusive`. `file` gates on the LARGER of this value and
-    ///         `executedAt + challengeWindow` — zero is not a sentinel
-    ///         here, it is simply what an untouched key contributes to
-    ///         that max.
+    ///         `executedAt + strategyDuration + challengeWindow` — zero is
+    ///         not a sentinel here, it is simply what an untouched key
+    ///         contributes to that max.
+    /// @dev    THE `+ strategyDuration` TERM IS LOAD-BEARING (second-audit
+    ///         finding A). `settleProposal` moves money at `executedAt +
+    ///         strategyDuration`, not at `executedAt` — a filing deadline of
+    ///         `executedAt + challengeWindow` alone could close BEFORE the
+    ///         settlement calls the ledger required guardians to underwrite
+    ///         ever ran, making a drain permanently unchallengeable the
+    ///         instant it executed.
     /// @dev    WITHOUT A RAISED FLOOR, `INCONCLUSIVE` IS A PERMANENT
     ///         ACQUITTAL. Reaching it takes anywhere from `voteWindow` (the
     ///         accused's counter-bond pool may complete the instant it is
@@ -706,7 +805,9 @@ interface IChallengeGame {
     ///         the last time the re-challenge window lapsed with nobody
     ///         refiling inside it. Drives the escalating Inconclusive-burn
     ///         schedule (`ChallengeGame._inconclusiveBurnBpsForRound`) —
-    ///         round 1 (count 0) is free, and the rate climbs from there.
+    ///         round 1 (count 0) already burns at a fixed, positive rate
+    ///         (issue #181 finding 19 closed the free first attempt), and the
+    ///         rate climbs from there.
     /// @dev    KEYED ON THE PROPOSAL ALONE, not `(reviewKey, challenger)` —
     ///         the same tradeoff `_convicted` and `challengeableUntil`
     ///         already make: a per-challenger counter would let a sybil
@@ -717,6 +818,41 @@ interface IChallengeGame {
     ///         condition is what "the grind stopped" means here, as
     ///         opposed to a simpler elapsed-time clock.
     function inconclusiveRounds(bytes32 reviewKey) external view returns (uint256);
+
+    /// @notice Whether an honest, UNCONTESTED filing currently breaks even or
+    ///         better under the live settle-path parameters — i.e. whether
+    ///         `challengerBondBps * settleBurnBps <= proposerBondBps *
+    ///         prosecutorFeeBps` (`proposerBondBps` read live from the wired
+    ///         `exposureLedger`, which owns that rate). `false` means a
+    ///         guilty approver's dominant strategy is silence, because the
+    ///         challenger who correctly calls it net-loses WOOD even after a
+    ///         conviction (issue #181 finding 18a). VIEW ONLY: no setter here
+    ///         enforces this inequality — the parameter choices that would
+    ///         satisfy it are a protocol-economics decision for governance.
+    ///         See `ChallengeGame.honestFilingBreaksEven`.
+    /// @dev    A BARE BOOLEAN CANNOT DISTINGUISH MAGNITUDE FROM A TRIVIAL
+    ///         PASS (second-audit finding D) — e.g. `settleBurnBps == 0`
+    ///         zeroes the cost side and this always reads `true`, which is
+    ///         locally correct but easy to over-read as "comfortably
+    ///         healthy" rather than "currently free". Prefer
+    ///         `honestFilingNetPayoffBps` when the MAGNITUDE of the margin
+    ///         matters, not just its sign; this function is kept for
+    ///         backward compatibility.
+    function honestFilingBreaksEven() external view returns (bool);
+    /// @notice The SIGNED net WOOD-bps payoff to a challenger for a CORRECT,
+    ///         UNCONTESTED filing under the live settle-path parameters:
+    ///         `proposerBondBps * prosecutorFeeBps - challengerBondBps *
+    ///         settleBurnBps`. Positive means the filer profits, negative
+    ///         means it loses WOOD even after a correct, unanswered
+    ///         accusation, zero is the exact break-even point.
+    /// @dev    Added second-audit finding D, as the fix for
+    ///         `honestFilingBreaksEven`'s inability to expose magnitude: two
+    ///         configurations that both read `true` there — one trivially
+    ///         (both sides near zero) and one with a wide genuine margin —
+    ///         are indistinguishable through the boolean alone but read
+    ///         apart here. VIEW ONLY, exactly like `honestFilingBreaksEven`:
+    ///         no setter enforces any bound on this value.
+    function honestFilingNetPayoffBps() external view returns (int256);
 
     // ── Owner setters ──
     /// @notice Wire (or unwire) the court. The zero address is
@@ -740,11 +876,19 @@ interface IChallengeGame {
     function setForfeitBurnBps(uint256 newBps) external;
     function setAutoSlashDelay(uint256 newDelay) external;
     function setDisputeTimeout(uint256 newTimeout) external;
-    /// @notice Set the settle-path burn. ALSO REJECTS dropping below the
-    ///         LIVE `inconclusiveBurnBps`: the two rates share a ceiling,
-    ///         but a ceiling-only check on this setter would let it fall
-    ///         below an unchanged `inconclusiveBurnBps`, inverting the
-    ///         ordering that burn exists to guarantee.
+    /// @notice Set the settle-path burn.
+    /// @dev    NO LONGER REJECTS dropping below the live `inconclusiveBurnBps`
+    ///         (second-audit finding C). The two rates shared a ceiling AND
+    ///         used to cross-check each other's live value, which pinned
+    ///         `inconclusiveBurnBps <= settleBurnBps` at all times — sound in
+    ///         isolation, but it made the Inconclusive ladder's round-4+ tier
+    ///         permanently unreachable above round 3's fixed 1,000 bps:
+    ///         raising it required raising this rate first, which breaks
+    ///         `honestFilingBreaksEven`. See `inconclusiveBurnBps` and
+    ///         `ChallengeGame._inconclusiveBurnBpsForRound` for how the
+    ///         "non-verdict never costs more than a verdict" property is
+    ///         kept for the tiers it still applies to, without this
+    ///         cross-check.
     /// @dev    OPERATOR NOTE: a call that would have succeeded before the
     ///         Inconclusive burn existed can fail today purely because
     ///         `inconclusiveBurnBps` (the escalating schedule's round-4+
@@ -758,13 +902,14 @@ interface IChallengeGame {
     function setFilingsPaused(bool paused) external;
     function setProsecutorFeeBps(uint256 newBps) external;
     /// @notice Set the round-4-and-beyond steady state of the escalating
-    ///         Inconclusive-burn schedule. Bounded by a ceiling at or below
-    ///         `settleBurnBps`'s own, AND rejects rising above the LIVE
-    ///         `settleBurnBps` itself — a non-verdict must never be
-    ///         allowed to cost more than a verdict that actually recovered
-    ///         value, and the shared ceiling alone does not guarantee that
-    ///         ordering against the live rates. Zero is legal and floors
-    ///         the round-4+ tier to nothing (rounds 1-3 are unaffected —
-    ///         they are fixed constants, not derived from this variable).
+    ///         Inconclusive-burn schedule. Bounded ONLY by its own ceiling,
+    ///         `MAX_INCONCLUSIVE_BURN_BPS` — NO LONGER additionally rejects
+    ///         rising above the live `settleBurnBps` (second-audit finding
+    ///         C). See `inconclusiveBurnBps` for why that cross-check was
+    ///         removed (it made the ladder's top tier unreachable) and how
+    ///         the "non-verdict never costs more than a verdict" property is
+    ///         kept anyway. Zero is legal and floors the round-4+ tier to
+    ///         nothing (rounds 1-3 are unaffected — they are fixed
+    ///         constants, not derived from this variable).
     function setInconclusiveBurnBps(uint256 newBps) external;
 }

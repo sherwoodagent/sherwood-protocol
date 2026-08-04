@@ -942,11 +942,20 @@ contract ExposureLedgerTest is Test {
         vm.prank(freezer);
         ledger.freezeCoverage(address(mgov), 1);
         assertTrue(ledger.hasFrozenCoverage(g2), "the freeze is what pins a live approver");
-        // ...and it pins only guardians still carrying something, so a booking
-        // settled to zero is outside even that. A guardian whose bond is gone
-        // has nothing to hold; the loss is booked against the cohort, not
-        // recovered from them.
-        assertFalse(ledger.hasFrozenCoverage(guardian), "a zero booking is not frozen either");
+        // ...and it STILL pins the collapsed guardian too, even though
+        // `settleCoverage` zeroed their BOOKING (`_recorded[key][g].usd`).
+        // `freezeCoverage` gates on the PLEDGE (`_reservedUsd[key][g]`), not
+        // the booking (audit-181-critical-high, finding A) — precisely so a
+        // guardian cannot dodge a live freeze by having settleCoverage
+        // (permissionless, NOT freeze-gated) zero their booking out from
+        // under an active accusation. This guardian's pledge is untouched by
+        // settlement (`_reservedUsd` is written once by `recordApproval` and
+        // cleared once by `releaseApproval` — `_rebook` never touches it), so
+        // the freeze still reaches them even though they can pay nothing.
+        assertTrue(
+            ledger.hasFrozenCoverage(guardian),
+            "a zero booking is still frozen: the gate is the pledge, not the booking"
+        );
 
         // ...and the proposal is still genuinely covered, where it was not before.
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
@@ -975,8 +984,16 @@ contract ExposureLedgerTest is Test {
         vm.warp(deadline - 1);
         assertTrue(ledger.hasFrozenCoverage(guardian), "one second before the deadline: still pinned");
 
+        // PIN BOUNDARY IS INCLUSIVE OF `deadline` (audit-181-critical-high,
+        // finding B): `hasFrozenCoverage` reads `_pinnedCoverageUntil[g] >=
+        // block.timestamp`, matching `ChallengeGame.file`'s own inclusive
+        // deadline check (`> deadline` reverts, so a filing AT the deadline
+        // is still legal) — the pin must still hold at that same instant.
         vm.warp(deadline);
-        assertFalse(ledger.hasFrozenCoverage(guardian), "at the deadline: decayed with no unpin call");
+        assertTrue(ledger.hasFrozenCoverage(guardian), "at the deadline itself: still pinned (inclusive boundary)");
+
+        vm.warp(deadline + 1);
+        assertFalse(ledger.hasFrozenCoverage(guardian), "one second past the deadline: decayed with no unpin call");
     }
 
     /// @notice ONLY EVER RAISES, mirroring `ChallengeGame.challengeableUntil`'s
@@ -1001,8 +1018,15 @@ contract ExposureLedgerTest is Test {
         vm.warp(far - 1);
         assertTrue(ledger.hasFrozenCoverage(guardian), "the earlier, LARGER pin survives the smaller call");
 
+        // Inclusive boundary (finding B, matching `retireApproval`/
+        // `hasFrozenCoverage`'s `>=` read): still pinned AT `far` itself.
         vm.warp(far);
-        assertFalse(ledger.hasFrozenCoverage(guardian), "and decays at its own instant, not the smaller one's");
+        assertTrue(ledger.hasFrozenCoverage(guardian), "at its own instant: still pinned (inclusive boundary)");
+
+        vm.warp(far + 1);
+        assertFalse(
+            ledger.hasFrozenCoverage(guardian), "and decays one second past its own instant, not the smaller one's"
+        );
     }
 
     /// @notice ONLY GUARDIANS WHO ACTUALLY COMMITTED are pinned — mirroring
@@ -1049,8 +1073,12 @@ contract ExposureLedgerTest is Test {
 
         assertTrue(ledger.hasFrozenCoverage(guardian), "the pin holds even though the live freeze was JUST released");
 
+        // Inclusive boundary (finding B): still pinned AT the deadline itself.
         vm.warp(deadline);
-        assertFalse(ledger.hasFrozenCoverage(guardian), "and finally releases at the pinned instant");
+        assertTrue(ledger.hasFrozenCoverage(guardian), "still pinned at the deadline itself (inclusive boundary)");
+
+        vm.warp(deadline + 1);
+        assertFalse(ledger.hasFrozenCoverage(guardian), "and finally releases one second past the pinned instant");
     }
 
     /// @notice H1 — `settleCoverage` was a ONE-SHOT priced at the caller's

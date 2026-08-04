@@ -112,6 +112,17 @@ contract PortfolioStrategy is BaseStrategy {
     ///         would otherwise have caught it. See the binding note on
     ///         `_initialize`.
     error AdapterNotAllowed(address swapAdapter, address registry);
+    /// @notice The proposer-supplied Chainlink price source — the Data
+    ///         Streams `chainlinkVerifier_`, or, in push mode, a per-slot
+    ///         aggregator decoded from `feedIds_` — is not allowlisted in the
+    ///         same `TierRegistry` the swap adapter is bound against.
+    ///         Adversary: a proposer wiring a price source they control (a
+    ///         ~40-line mock aggregator is enough in push mode), then
+    ///         combined with `updateParams` re-weighting a holding to 0%,
+    ///         authorizing `rebalanceDelta` to sell it against a floor scaled
+    ///         to a fabricated price. See the ORACLE BINDING note on
+    ///         `_initialize`.
+    error PriceSourceNotAllowed(address priceSource, address registry);
 
     // ── Constants ──
     uint256 public constant MAX_BASKET_SIZE = 20;
@@ -123,7 +134,9 @@ contract PortfolioStrategy is BaseStrategy {
     ///         a quote taken in the same transaction as the swap, so this bounds
     ///         drift from that quote, not from a fair price. The oracle-anchored
     ///         floor is `rebalanceDelta`, which prices off signed Chainlink
-    ///         reports; see the note on `_quoteMinOut`.
+    ///         reports, and — in push mode — `_settle`/`rebalance`'s sell leg via
+    ///         `_sellFloor` and `_execute`/`rebalance`'s buy leg via `_buyFloor`;
+    ///         see the note on `_quoteMinOut`.
     uint256 public constant MAX_SLIPPAGE_CEILING_BPS = 1_000;
     /// @notice Hard floor on the swap slippage tolerance, at init and on every
     ///         update (50 bps). `rebalanceDelta` floors its `minOut` against
@@ -275,6 +288,34 @@ contract PortfolioStrategy is BaseStrategy {
     ///         hard: governance must allowlist the swap adapter, the same
     ///         one-line action it already performs for the strategy clone
     ///         itself so the batch's `asset.approve(strategy, …)` can pass.
+    ///
+    ///         ORACLE BINDING. `chainlinkVerifier_` (Data Streams mode) and,
+    ///         in push mode, each `feedIds_[i]`-encoded aggregator are also
+    ///         proposer input. `rebalanceDelta` is cited elsewhere (see
+    ///         `MAX_SLIPPAGE_CEILING_BPS`, `_quoteMinOut`) as THE
+    ///         oracle-anchored remedy for `_quoteMinOut`'s quote-anchored
+    ///         floor — worthless if the oracle itself is attacker-chosen.
+    ///         Concretely: `updateParams` lets the proposer re-weight a
+    ///         holding to 0%, then `rebalanceDelta` — `onlyProposer` — against
+    ///         a self-controlled feed reporting a fraction of the true price
+    ///         authorizes selling the position against a floor scaled to that
+    ///         fabricated price. Bound exactly like `swapAdapter_`: every
+    ///         non-zero `chainlinkVerifier_` and every push-mode aggregator
+    ///         must be allowlisted in the same `TierRegistry`, via
+    ///         `_requireAllowedPriceSource`, with the identical
+    ///         skip-when-unresolved behavior as `_requireAllowedAdapter`
+    ///         (same reasoning: the walk starts at `vault()`, not proposer
+    ///         input, and an unresolved registry is the exact condition under
+    ///         which `_guardBatchCalls` already disables itself). The push-mode
+    ///         sentinel `chainlinkVerifier_ == address(0)` is exempt from this
+    ///         check on itself — it names no contract — but every aggregator
+    ///         it implies is bound individually, per slot, in the loop below.
+    ///         This binding is re-certified LIVE on every `rebalance` /
+    ///         `rebalanceDelta` call, not just here at init (Finding C /
+    ///         `_requireAllowedPriceSources`) — the adapter got the same
+    ///         upgrade for the same reason (issue #147) and, unlike the
+    ///         adapter, the oracle is what actually anchors the floor a
+    ///         demoted registry entry would otherwise keep authorizing.
     function _initialize(bytes calldata data) internal override {
         (
             address asset_,
@@ -307,6 +348,13 @@ contract PortfolioStrategy is BaseStrategy {
         // Push-feed mode when no Data Streams verifier is wired: each
         // `feedIds[i]` encodes an AggregatorV3 proxy as bytes32(uint160(feed)).
         bool pushMode = chainlinkVerifier_ == address(0);
+        // Bind the Data Streams verifier to the governance allowlist before
+        // any allocation is written — same registry, same
+        // skip-when-unresolved behavior as the swap-adapter binding above
+        // (see the ORACLE BINDING note). `address(0)` is the push-mode
+        // sentinel, not a price source, so it's exempt here; each push-mode
+        // aggregator is bound individually below, per slot.
+        if (!pushMode) _requireAllowedPriceSource(chainlinkVerifier_);
 
         uint256 weightSum;
         for (uint256 i; i < tokens.length; ++i) {
@@ -325,6 +373,9 @@ contract PortfolioStrategy is BaseStrategy {
                     revert InvalidPriceAge();
                 }
                 if (AggregatorV3Interface(feed).decimals() != priceDecimals_[i]) revert InvalidPriceDecimals();
+                // Bind this slot's aggregator to the governance allowlist —
+                // see the ORACLE BINDING note above.
+                _requireAllowedPriceSource(feed);
             }
             // Rejects duplicate token addresses: a basket like [TSLA, TSLA]
             // aggregates into a single TSLA balance while rebalance math treats
@@ -354,6 +405,12 @@ contract PortfolioStrategy is BaseStrategy {
 
     // ── Execute: buy basket tokens ──
 
+    /// @dev Buy-side floor uses `_buyFloor` (oracle-anchored in push mode,
+    ///      quote-anchored fallback in Data Streams mode — see `_buyFloor`),
+    ///      not the bare `_quoteMinOut` this leg used before Finding B: this
+    ///      is the PERMISSIONLESS entry point (`executeProposal`), so a
+    ///      quote-anchored-only floor let anyone move the pool immediately
+    ///      before triggering execution and unwind against their own quote.
     function _execute() internal override {
         _pullFromVault(asset, totalAmount);
 
@@ -364,7 +421,7 @@ contract PortfolioStrategy is BaseStrategy {
             if (allocation == 0) continue;
 
             IERC20(asset).forceApprove(address(swapAdapter), allocation);
-            uint256 minOut = _quoteMinOut(asset, alloc.token, allocation, _swapExtraData[i]);
+            uint256 minOut = _buyFloor(i, allocation);
             uint256 amountOut = swapAdapter.swap(asset, alloc.token, allocation, minOut, _swapExtraData[i]);
             if (amountOut == 0) revert SwapFailed();
 
@@ -377,6 +434,17 @@ contract PortfolioStrategy is BaseStrategy {
 
     // ── Settle: sell all basket tokens ──
 
+    /// @dev Sell-side floor uses `_sellFloor` (oracle-anchored in push mode,
+    ///      quote-anchored fallback in Data Streams mode — see `_sellFloor`),
+    ///      not the plain `_quoteMinOut` the buy side used before Finding B;
+    ///      see Finding #10 / the note on `_quoteMinOut` for why the settle
+    ///      window is uniquely exposed to a proposer-timed sandwich. The swap
+    ///      return is captured and checked like the buy side (`_execute`),
+    ///      rather than discarded.
+    ///      `_sellFloor`'s push-mode oracle read never reverts here: `settle()`
+    ///      is the only non-emergency exit, so a stale/mid-upgrade feed
+    ///      degrades to the quote-anchored floor instead of stranding vault
+    ///      capital behind a revert (Finding A).
     function _settle() internal override {
         uint256 len = _allocations.length;
         for (uint256 i; i < len; ++i) {
@@ -385,8 +453,9 @@ contract PortfolioStrategy is BaseStrategy {
             if (bal == 0) continue;
 
             IERC20(alloc.token).forceApprove(address(swapAdapter), bal);
-            uint256 minOut = _quoteMinOut(alloc.token, asset, bal, _swapExtraData[i]);
-            swapAdapter.swap(alloc.token, asset, bal, minOut, _swapExtraData[i]);
+            uint256 minOut = _sellFloor(i, alloc.token, bal);
+            uint256 amountOut = swapAdapter.swap(alloc.token, asset, bal, minOut, _swapExtraData[i]);
+            if (amountOut == 0) revert SwapFailed();
 
             alloc.tokenAmount = 0;
         }
@@ -455,6 +524,18 @@ contract PortfolioStrategy is BaseStrategy {
         // CLOSED here rather than degrade-open. Reuses `_requireAllowedAdapter`
         // unchanged: same skip-when-unresolved behavior, just a new call site.
         _requireAllowedAdapter(address(swapAdapter));
+        // Live re-check of the oracle itself (Finding C). The adapter check
+        // above re-certifies the swap VENUE on every call, but the price
+        // SOURCE anchoring `_sellFloor`/`_buyFloor` was, before this fix,
+        // certified once at `_initialize` and never again — a revoked or
+        // compromised feed kept anchoring every rebalance for the strategy's
+        // lifetime. Same registry, same skip-when-unresolved, fail-closed
+        // behavior as `_requireAllowedAdapter`; see
+        // `_requireAllowedPriceSources`. Blocking here strands nothing —
+        // `settle()` remains the untouched exit path, and Finding A restores
+        // that guarantee for push-mode feeds specifically (it no longer
+        // reverts there on a stale/mid-upgrade feed).
+        _requireAllowedPriceSources();
         _rebalancing = true;
 
         uint256 len = _allocations.length;
@@ -471,15 +552,22 @@ contract PortfolioStrategy is BaseStrategy {
             oldBalances[i] = IERC20(_allocations[i].token).balanceOf(address(this));
         }
 
-        // Sell all positions back to asset
+        // Sell all positions back to asset via `_sellFloor` (oracle-anchored
+        // in push mode; see Finding #10 / the note on `_quoteMinOut`). The
+        // buy leg below uses the mirror `_buyFloor` (Finding B) rather than
+        // bare `_quoteMinOut`, for the same reason: this whole flow is
+        // proposer-only but the pool state it quotes against is not
+        // otherwise anchored. Return captured and checked like the buy leg,
+        // rather than discarded.
         for (uint256 i; i < len; ++i) {
             TokenAllocation storage alloc = _allocations[i];
             uint256 bal = IERC20(alloc.token).balanceOf(address(this));
             if (bal == 0) continue;
 
             IERC20(alloc.token).forceApprove(address(swapAdapter), bal);
-            uint256 minOut = _quoteMinOut(alloc.token, asset, bal, _swapExtraData[i]);
-            swapAdapter.swap(alloc.token, asset, bal, minOut, _swapExtraData[i]);
+            uint256 minOut = _sellFloor(i, alloc.token, bal);
+            uint256 amountOut = swapAdapter.swap(alloc.token, asset, bal, minOut, _swapExtraData[i]);
+            if (amountOut == 0) revert SwapFailed();
             alloc.tokenAmount = 0;
             alloc.investedAmount = 0;
         }
@@ -492,7 +580,7 @@ contract PortfolioStrategy is BaseStrategy {
             if (allocation == 0) continue;
 
             IERC20(asset).forceApprove(address(swapAdapter), allocation);
-            uint256 minOut = _quoteMinOut(asset, alloc.token, allocation, _swapExtraData[i]);
+            uint256 minOut = _buyFloor(i, allocation);
             uint256 amountOut = swapAdapter.swap(asset, alloc.token, allocation, minOut, _swapExtraData[i]);
             if (amountOut == 0) revert SwapFailed();
 
@@ -537,6 +625,13 @@ contract PortfolioStrategy is BaseStrategy {
         // Live re-check, fail-closed on demotion — see the identical guard on
         // `rebalance()` above for the full rationale (issue #147).
         _requireAllowedAdapter(address(swapAdapter));
+        // Live re-check of the oracle itself (Finding C) — see the identical
+        // guard and full rationale on `rebalance()` above. In Data Streams
+        // mode this re-certifies `chainlinkVerifier` (the reports are signed
+        // by the DON, but the VERIFIER contract that checks those signatures
+        // is itself proposer-supplied governance-bound state, same as a
+        // push-mode aggregator).
+        _requireAllowedPriceSources();
         _rebalancing = true;
 
         uint256 len = _allocations.length;
@@ -625,7 +720,8 @@ contract PortfolioStrategy is BaseStrategy {
         // sandwich can't drift output below this floor.
         uint256 minOut =
             (_tokensToValue(tokensToSell, price, i, assetDec) * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
-        swapAdapter.swap(token, asset, tokensToSell, minOut, _swapExtraData[i]);
+        uint256 amountOut = swapAdapter.swap(token, asset, tokensToSell, minOut, _swapExtraData[i]);
+        if (amountOut == 0) revert SwapFailed();
         return true;
     }
 
@@ -716,12 +812,21 @@ contract PortfolioStrategy is BaseStrategy {
     ///      The oracle-anchored path is `rebalanceDelta`, which derives its
     ///      floors from signed Chainlink reports via `_verifyPrice` /
     ///      `_tokensToValue` and does not consult the adapter quote at all.
-    ///      Extending that anchoring to `execute` / `settle` / `rebalance`
-    ///      requires price data at those call sites, which their `IStrategy`
-    ///      signatures do not carry — tracked separately. Until then the
-    ///      exposure is bounded by `MAX_SLIPPAGE_CEILING_BPS`, by the routes
-    ///      being frozen at execute, and by the guardian review of the routes
-    ///      the proposal declared.
+    ///      `_settle` / `rebalance`'s sell leg reach an oracle-anchored floor
+    ///      through `_sellFloor`, and `_execute` / `rebalance`'s re-buy leg
+    ///      through the mirror `_buyFloor` (Finding B — both call sites are
+    ///      reachable without a signed report because push mode reads
+    ///      `latestRoundData()` directly; see `_tryPushFeedPrice`), in push
+    ///      mode only. In Data Streams mode neither `_sellFloor` nor
+    ///      `_buyFloor` has a report to verify against at those call sites
+    ///      (`execute()` / `settle()` are parameterless per `IStrategy`), so
+    ///      both fall back to THIS quote-anchored floor and inherit its
+    ///      NOT-SANDWICH-PROTECTION caveat above. A full Data Streams-mode fix
+    ///      needs `execute()` / `settle()` to carry report calldata, which is
+    ///      `BaseStrategy` / `IStrategy` surface this contract doesn't own.
+    ///      Until then the exposure there is bounded by
+    ///      `MAX_SLIPPAGE_CEILING_BPS`, by the routes being frozen at execute,
+    ///      and by the guardian review of the routes the proposal declared.
     function _quoteMinOut(address tokenIn, address tokenOut, uint256 amountIn, bytes memory extraData)
         internal
         returns (uint256)
@@ -734,20 +839,144 @@ contract PortfolioStrategy is BaseStrategy {
         }
     }
 
-    // ── Swap-adapter binding (see the binding note on `_initialize`) ──
+    /// @dev Sell-side floor for `_settle` and `rebalance`'s sell leg (Finding
+    ///      #10). Neither call site carries signed price reports —
+    ///      `settle()` / `rebalance()` are parameterless per `IStrategy` /
+    ///      this contract's own external signature — unlike `rebalanceDelta`,
+    ///      which receives one report per allocation. In push mode that's not
+    ///      a blocker: `_tryPushFeedPrice` reads `latestRoundData()` directly
+    ///      with no external report needed, so an oracle-anchored floor
+    ///      (identical math to `_sellOverweight`'s) is reachable here too —
+    ///      when the read succeeds.
+    ///
+    ///      NON-REVERTING BY DESIGN (Finding A). Unlike `_verifyPrice` /
+    ///      `_pushFeedPrice` (used by `rebalanceDelta`, where blocking a call
+    ///      strands nothing because `settle()` remains available), `settle()`
+    ///      IS the non-emergency exit — the strategy's own natspec notes
+    ///      equity feeds stop heartbeating outside market hours ("observed
+    ///      77h gaps over holiday weekends" against a 26h default maxAge, see
+    ///      `MAX_PUSH_PRICE_AGE`). A hard revert here on a routine feed gap
+    ///      would strand vault capital, recoverable only via owner-multisig
+    ///      emergency settle. So a stale, mismatched-decimals, or codeless
+    ///      feed degrades to the quote-anchored `_quoteMinOut` floor instead
+    ///      of reverting — same fallback Data Streams mode always used, and
+    ///      it inherits that path's NOT-SANDWICH-PROTECTION caveat (see
+    ///      `_quoteMinOut`). A full Data Streams-mode fix needs `settle()` to
+    ///      carry report calldata, which is `BaseStrategy` / `IStrategy`
+    ///      surface this contract doesn't own.
+    function _sellFloor(uint256 i, address token, uint256 bal) private returns (uint256 minOut) {
+        if (chainlinkVerifier == address(0)) {
+            (uint256 price, bool ok) = _tryPushFeedPrice(i);
+            if (ok) {
+                uint256 value = _tokensToValue(bal, price, i, uint256(_assetDecimals));
+                return (value * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+            }
+        }
+        return _quoteMinOut(token, asset, bal, _swapExtraData[i]);
+    }
+
+    /// @dev Buy-side floor for `_execute` and `rebalance`'s re-buy leg
+    ///      (Finding B). Mirrors `_sellFloor` exactly — same non-reverting
+    ///      push-mode oracle read via `_tryPushFeedPrice`, same
+    ///      quote-anchored fallback in Data Streams mode or on an
+    ///      unreadable/stale/mismatched-decimals push feed. Neither
+    ///      `execute()` nor `rebalance()` carries signed price reports
+    ///      (parameterless per `IStrategy` / this contract's own external
+    ///      signature), so — like `_sellFloor` — this can only reach the
+    ///      oracle in push mode.
+    ///
+    ///      Before this fix both call sites derived `minOut` purely from
+    ///      `_quoteMinOut`, i.e. from a quote taken against the SAME pool
+    ///      state as the swap that follows it. `executeProposal` is
+    ///      PERMISSIONLESS, so anyone could move the pool immediately before
+    ///      triggering execution and unwind the vault's allocation against
+    ///      their own quote — traced: a 1,000,000 USDC allocation with the
+    ///      pool pushed 100x nets the vault ~10,000 USDC of tokens. Adding
+    ///      the oracle floor here closes that for push-mode baskets the same
+    ///      way `_sellFloor` already closed the settle-side sandwich.
+    /// @param i        Allocation index.
+    /// @param amountIn Asset amount about to be spent buying allocation `i`.
+    function _buyFloor(uint256 i, uint256 amountIn) private returns (uint256 minOut) {
+        if (chainlinkVerifier == address(0)) {
+            (uint256 price, bool ok) = _tryPushFeedPrice(i);
+            if (ok) {
+                uint256 tokensExpected = _valueToTokens(amountIn, price, i, uint256(_assetDecimals));
+                return (tokensExpected * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+            }
+        }
+        return _quoteMinOut(asset, _allocations[i].token, amountIn, _swapExtraData[i]);
+    }
+
+    /// @dev Non-reverting push-feed read for `_sellFloor` / `_buyFloor`
+    ///      (Finding A / Finding B). Mirrors `_pushFeedPrice`'s checks
+    ///      exactly (live `decimals()` match, `answer > 0`, guarded-
+    ///      subtraction staleness against the per-slot max age) but reports
+    ///      failure via `ok == false` instead of reverting, so its callers —
+    ///      which sit on the settle/execute liveness path — can degrade to
+    ///      the quote-anchored floor rather than brick. `_pushFeedPrice`
+    ///      itself is UNCHANGED and keeps reverting: it backs `_verifyPrice`,
+    ///      whose only caller (`rebalanceDelta`) can safely fail closed
+    ///      because blocking one call strands nothing (see the note on
+    ///      `_requireAllowedAdapter`).
+    ///
+    ///      RAW STATICCALL, NOT A TYPED `try` — mirrors
+    ///      `ExposureLedger._feedPriceX8` (audit #181 finding 22), the exact
+    ///      precedent this repo already carries for this mistake: a typed
+    ///      `try IFace(feed).f() returns (...) { ... } catch { ... }` only
+    ///      guards the CALL and its error selector. A call that SUCCEEDS but
+    ///      returns too-short/malformed data fails at ABI-DECODING, and that
+    ///      failure is a full, UNCAUGHT revert of the transaction — not
+    ///      something `catch` sees. `code.length == 0` is checked FIRST
+    ///      because the codesize guard Solidity inserts on a high-level call
+    ///      to a codeless address reverts in THIS frame, uncatchable by any
+    ///      wrapper here. Every decode target is `uint256`/`int256`, never
+    ///      the narrower `uint8`/`uint80` the interface declares: a
+    ///      sub-256-bit type is validity-constrained at decode time (the ABI
+    ///      decoder rejects a word whose unused high bits aren't clean
+    ///      padding) — precisely the uncatchable-revert class this function
+    ///      exists to close. Comparing `dec` against `_priceDecimals[i]` as
+    ///      a `uint256` is not just safe but exactly correct: a legitimate
+    ///      declared value is always `< 256`, so a dirty word can never
+    ///      false-positive a match.
+    function _tryPushFeedPrice(uint256 i) private view returns (uint256 price, bool ok) {
+        (address feed, uint256 maxAge) = _decodePushFeed(_feedIds[i]);
+        if (feed.code.length == 0) return (0, false);
+
+        (bool decOk, bytes memory decRet) = feed.staticcall(abi.encodeCall(AggregatorV3Interface.decimals, ()));
+        if (!decOk || decRet.length < 32) return (0, false);
+        uint256 dec = abi.decode(decRet, (uint256));
+        if (dec != uint256(_priceDecimals[i])) return (0, false);
+
+        (bool rdOk, bytes memory rdRet) = feed.staticcall(abi.encodeCall(AggregatorV3Interface.latestRoundData, ()));
+        // latestRoundData returns (uint80, int256, uint256, uint256, uint80):
+        // 5 words, 160 bytes. Short/absent data is rejected before any decode
+        // is attempted.
+        if (!rdOk || rdRet.length < 160) return (0, false);
+        (, int256 answer,, uint256 updatedAt,) = abi.decode(rdRet, (uint256, int256, uint256, uint256, uint256));
+        if (answer <= 0) return (0, false);
+        // Same guarded subtraction / future-timestamp convention as
+        // `_pushFeedPrice` — see its natspec for the rationale.
+        uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
+        if (updatedAt == 0 || age > maxAge) return (0, false);
+        return (uint256(answer), true);
+    }
+
+    // ── Governance-allowlist binding (see the binding notes on `_initialize`) ──
 
     /// @dev Reverts unless `swapAdapter_` is allowlisted in the `TierRegistry`
     ///      the vault's own governor gates batch approvals against, resolved
-    ///      `vault() → governor() → tierRegistry()`. Skips only when that walk
-    ///      yields no registry — the same condition under which
-    ///      `SyndicateVault._guardBatchCalls` disables itself, and one the
-    ///      proposer cannot steer because no hop of the walk is proposer input.
-    ///      A registry that IS resolved but whose `isAdapterAllowed` is
-    ///      unreadable (wrong address wired, non-registry contract) fails
-    ///      CLOSED: a registry that cannot vouch for the adapter has not
-    ///      vouched for it. Every hop is a length-checked raw staticcall so a
-    ///      codeless or hostile target reads as unresolved rather than
-    ///      reverting some unrelated deployment.
+    ///      via `_resolveTierRegistry` (`vault() → governor() → tierRegistry()`).
+    ///      Skips only when that walk yields no registry — the same condition
+    ///      under which `SyndicateVault._guardBatchCalls` disables itself, and
+    ///      one the proposer cannot steer because no hop of the walk is
+    ///      proposer input. A registry that IS resolved but whose
+    ///      `isAdapterAllowed` is unreadable (wrong address wired,
+    ///      non-registry contract) fails CLOSED: a registry that cannot vouch
+    ///      for the adapter has not vouched for it. Every hop is a
+    ///      length-checked raw staticcall so a codeless or hostile target
+    ///      reads as unresolved rather than reverting some unrelated
+    ///      deployment. `_requireAllowedPriceSource` below shares this exact
+    ///      resolution and fail-closed behavior for Chainlink price sources.
     ///
     ///      Called from THREE sites, each with different intent:
     ///        - `_initialize`: certifies provenance once, at binding time.
@@ -758,11 +987,72 @@ contract PortfolioStrategy is BaseStrategy {
     ///      `_execute`/`_settle` deliberately do NOT call this: see the
     ///      capital-hostage rationale on the `_initialize` binding note.
     function _requireAllowedAdapter(address swapAdapter_) private view {
-        address governor_ = _readAddress(vault(), abi.encodeCall(ITierBindingPath.governor, ()));
-        if (governor_ == address(0)) return;
-        address registry = _readAddress(governor_, abi.encodeCall(ITierBindingPath.tierRegistry, ()));
+        address registry = _resolveTierRegistry();
         if (registry == address(0)) return;
         if (!_isAdapterAllowed(registry, swapAdapter_)) revert AdapterNotAllowed(swapAdapter_, registry);
+    }
+
+    /// @dev Same registry resolution and skip-when-unresolved behavior as
+    ///      `_requireAllowedAdapter`, for binding a Chainlink price source
+    ///      (Data Streams verifier or push-mode aggregator) instead of a swap
+    ///      adapter — see the ORACLE BINDING note on `_initialize`. Kept
+    ///      separate from `_requireAllowedAdapter` (rather than reused
+    ///      directly) purely so a revert names the actual offending role:
+    ///      `PriceSourceNotAllowed`, not `AdapterNotAllowed`.
+    ///
+    ///      Called from `_initialize` (once, at binding time) and from
+    ///      `_requireAllowedPriceSources` below (live, on every
+    ///      `rebalance`/`rebalanceDelta` call — Finding C).
+    function _requireAllowedPriceSource(address priceSource) private view {
+        address registry = _resolveTierRegistry();
+        if (registry == address(0)) return;
+        if (!_isAdapterAllowed(registry, priceSource)) revert PriceSourceNotAllowed(priceSource, registry);
+    }
+
+    /// @dev Live re-validation of every price source `rebalance` /
+    ///      `rebalanceDelta` depend on (Finding C, companion to issue #147's
+    ///      adapter re-check). Before this, `_requireAllowedPriceSource` was
+    ///      called only from `_initialize` — a revoked or compromised feed
+    ///      kept anchoring `_sellFloor`/`_buyFloor`/`_verifyPrice` for the
+    ///      strategy's entire lifetime, invisible to every later rebalance.
+    ///      `_pushFeedPrice`/`_tryPushFeedPrice` already re-read `decimals()`
+    ///      live on every call, i.e. the code already accepts that feed state
+    ///      can change post-init; this just extends that same acceptance to
+    ///      governance's allowlist decision about the feed.
+    ///
+    ///      Data Streams mode re-certifies `chainlinkVerifier` once (it's the
+    ///      price source for every allocation). Push mode re-certifies EVERY
+    ///      slot's aggregator, since both `rebalance` and `rebalanceDelta`
+    ///      touch every allocation each call — there is no "untouched slot"
+    ///      to skip.
+    ///
+    ///      Deliberately NOT called from `_execute`/`_settle`: same
+    ///      capital-hostage rationale that exempts them from the adapter
+    ///      re-check (see `_requireAllowedAdapter`) — blocking `settle()`
+    ///      would strand vault capital, which is exactly what Finding A's
+    ///      non-reverting `_sellFloor` fallback exists to avoid.
+    function _requireAllowedPriceSources() private view {
+        if (chainlinkVerifier == address(0)) {
+            uint256 len = _allocations.length;
+            for (uint256 i; i < len; ++i) {
+                (address feed,) = _decodePushFeed(_feedIds[i]);
+                _requireAllowedPriceSource(feed);
+            }
+        } else {
+            _requireAllowedPriceSource(chainlinkVerifier);
+        }
+    }
+
+    /// @dev Shared `vault() → governor() → tierRegistry()` walk used by both
+    ///      `_requireAllowedAdapter` and `_requireAllowedPriceSource`.
+    ///      Returns `address(0)` when unresolved (no `governor()` surface, a
+    ///      governor predating the getter, or `tierRegistry() == 0`) — the
+    ///      condition under which callers skip their check entirely; see the
+    ///      fail-open-only-here rationale on `_requireAllowedAdapter`.
+    function _resolveTierRegistry() private view returns (address registry) {
+        address governor_ = _readAddress(vault(), abi.encodeCall(ITierBindingPath.governor, ()));
+        if (governor_ == address(0)) return address(0);
+        registry = _readAddress(governor_, abi.encodeCall(ITierBindingPath.tierRegistry, ()));
     }
 
     /// @dev Staticcall-safe `isAdapterAllowed`. Unreadable → `false` (see the
@@ -800,15 +1090,61 @@ contract PortfolioStrategy is BaseStrategy {
         maxAge = age == 0 ? MAX_PUSH_PRICE_AGE : age;
     }
 
+    /// @dev Read and validate allocation `i`'s push-feed price. Extracted out
+    ///      of `_verifyPrice` originally so the same read could serve
+    ///      `_settle` / `rebalance` too; that non-reverting need is now
+    ///      served by the sibling `_tryPushFeedPrice` (Finding A/B) instead —
+    ///      this HARD-REVERTING function is called ONLY from `_verifyPrice`
+    ///      (via `rebalanceDelta`), where blocking one call strands nothing
+    ///      (see the note on `_requireAllowedAdapter`), so it keeps reverting
+    ///      rather than degrading. `_sellFloor`/`_buyFloor` no longer call
+    ///      this directly; they call `_tryPushFeedPrice`, which duplicates
+    ///      the same checks in non-reverting form.
+    ///      Reverts `InvalidPriceDecimals` / `InvalidAmount` / `StalePrice` —
+    ///      identical checks and guarded-subtraction staleness math as the
+    ///      push branch previously inlined in `_verifyPrice`.
+    function _pushFeedPrice(uint256 i) private view returns (uint256 price) {
+        (address feed, uint256 maxAge) = _decodePushFeed(_feedIds[i]);
+        // Re-check decimals live every call: a proxy upgrade to a different
+        // scale would otherwise silently mis-scale NAV against the init
+        // snapshot (mirrors the Data Streams path's per-call feedId bind).
+        if (AggregatorV3Interface(feed).decimals() != _priceDecimals[i]) revert InvalidPriceDecimals();
+        (, int256 answer,, uint256 updatedAt,) = AggregatorV3Interface(feed).latestRoundData();
+        if (answer <= 0) revert InvalidAmount();
+        // Guarded subtraction, matching the identical convention at
+        // ExposureLedger.sol:600/933 and libraries/ChainlinkReader.sol:37 (the
+        // ONLY other unguarded-staleness sites in the repo): a future
+        // `updatedAt` (feed clock ahead of a lagging L2 `block.timestamp`) is
+        // the freshest possible answer → age 0, never underflow into a panic
+        // (0x11). This is a deliberate divergence from the audit finding's
+        // literal one-liner, which read as implying a future timestamp should
+        // itself revert `StalePrice` — that would be inconsistent with every
+        // other staleness guard in this codebase, all of which clamp rather
+        // than reject. The bug being fixed is the panic, not the accept.
+        uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
+        if (updatedAt == 0 || age > maxAge) revert StalePrice();
+        return uint256(answer);
+    }
+
     // ── Chainlink price verification ──
 
     /// @param i             Allocation index — used to check `report.feedId`
     ///                      against the slot's expected feed id.
-    /// @param signedReport  LayerZero-style signed Chainlink Data Streams report.
+    /// @param signedReport  LayerZero-style signed Chainlink Data Streams
+    ///                      report. In push mode, ignored: pass empty bytes.
     /// @dev Verifies the report's `feedId` matches the slot's expected id
     ///      before returning the price, so a valid-but-mismatched report
     ///      (e.g. WBTC's report accepted into the AAPL slot) cannot inflate
-    ///      cached NAV.
+    ///      cached NAV. Called from `rebalanceDelta` — one signed report per
+    ///      allocation. The push-mode branch delegates to the HARD-REVERTING
+    ///      `_pushFeedPrice`; `_sellFloor`/`_buyFloor` reach the same
+    ///      oracle-anchored price in push mode via the sibling
+    ///      NON-reverting `_tryPushFeedPrice` instead (bypassing both this
+    ///      function and `_pushFeedPrice`), since neither `_settle` nor
+    ///      `rebalance`/`_execute` carries a `priceReports` parameter AND
+    ///      neither may brick on a stale feed the way this hard-reverting
+    ///      path safely can — see `_pushFeedPrice`'s and
+    ///      `_tryPushFeedPrice`'s own natspec.
     function _verifyPrice(uint256 i, bytes calldata signedReport) internal returns (uint256 price) {
         // Push-feed mode: `_feedIds[i]` packs an AggregatorV3 proxy (low 160
         // bits) + an optional per-slot max age (upper 96 bits). No signed
@@ -816,15 +1152,7 @@ contract PortfolioStrategy is BaseStrategy {
         // report would imply a Data Streams path that isn't taken).
         if (chainlinkVerifier == address(0)) {
             if (signedReport.length != 0) revert InvalidFeedId();
-            (address feed, uint256 maxAge) = _decodePushFeed(_feedIds[i]);
-            // Re-check decimals live every call: a proxy upgrade to a different
-            // scale would otherwise silently mis-scale NAV against the init
-            // snapshot (mirrors the Data Streams path's per-call feedId bind).
-            if (AggregatorV3Interface(feed).decimals() != _priceDecimals[i]) revert InvalidPriceDecimals();
-            (, int256 answer,, uint256 updatedAt,) = AggregatorV3Interface(feed).latestRoundData();
-            if (answer <= 0) revert InvalidAmount();
-            if (updatedAt == 0 || block.timestamp - updatedAt > maxAge) revert StalePrice();
-            return uint256(answer);
+            return _pushFeedPrice(i);
         }
 
         bytes memory verifierResponse = IVerifierProxy(chainlinkVerifier).verify(signedReport);

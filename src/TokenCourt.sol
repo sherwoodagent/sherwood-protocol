@@ -92,9 +92,12 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     /// @dev Basis-point denominator shared by `participationFloorBps`.
     uint256 internal constant BPS_DENOMINATOR = 10_000;
     /// @notice How far BEFORE a case's snapshot the participation floor's
-    ///         electorate base is cross-checked. The base is the SMALLER
-    ///         of the electorate at the snapshot and the electorate this long
-    ///         before it, so stake younger than this cannot raise the floor.
+    ///         electorate base is cross-checked. The base is the SMALLER of
+    ///         the UNACCUSED electorate at the snapshot and the UNACCUSED
+    ///         electorate this long before it — the accused cohort is
+    ///         subtracted at BOTH instants, each against the electorate
+    ///         measured at that same instant (finding #6) — so stake younger
+    ///         than this cannot raise the floor on EITHER side of the min.
     ///         (issue #82) `vote`'s own ballot weight is bounded by the same
     ///         lookback: a caller's raw stake growth over this window gates a
     ///         min against the caller's aged weight this long ago, so the
@@ -109,6 +112,33 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         of the "pin it at `refer`" discipline, since a value that
     ///         cannot change cannot move under a live case at all.
     uint256 public constant FLOOR_LOOKBACK = 30 days;
+    /// @notice Lower bound, in bps of `earlier` (the TOTAL electorate at the
+    ///         lookback instant), that the lookback term `earlierReduced` is
+    ///         floored at before it is allowed to win the participation
+    ///         floor's min (finding #10). Exists because `earlierReduced == 0`
+    ///         is not the only way the lookback term can be unrelated to the
+    ///         electorate present at `snapshotTs`: it can also be a tiny
+    ///         POSITIVE residual — e.g. one unrelated guardian holding 1 wei
+    ///         at `lookbackTs` while the accused otherwise dominated that
+    ///         instant's electorate — which sails past the exact-zero
+    ///         fallback and then gets rounded to a near-zero or literal-zero
+    ///         floor by `* participationFloorBps / BPS_DENOMINATOR`,
+    ///         regardless of how large `reduced` actually is. See
+    ///         `_participationFloor` for the full argument, including why
+    ///         this clamp does NOT apply to the genuine `earlierReduced == 0`
+    ///         case (true bootstrap or an accused-dominated lookback
+    ///         electorate), which still falls back to the unclamped `reduced`
+    ///         exactly as before this finding.
+    /// @dev    Measured against `earlier` and NOT against `reduced`, which is
+    ///         load-bearing: `reduced` is a `snapshotTs` reading and so is
+    ///         attacker-inflatable, and clamping to a fraction of it
+    ///         reintroduces finding #6 in bounded form. See
+    ///         `_participationFloor`'s finding #10 block for the worked
+    ///         counterexample.
+    /// @dev    A `constant`, for the same reason `FLOOR_LOOKBACK` is: an owner
+    ///         lever to shrink this to zero immediately before a drain would
+    ///         reopen finding #10 at the owner's discretion.
+    uint256 internal constant MIN_LOOKBACK_BASE_BPS = 1_000; // 10%
 
     /// @notice The wired `IChallengeGame` this court adjudicates for and
     ///         reads challenge state from. Zero while unwired.
@@ -120,8 +150,15 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         referred under regardless of later changes here.
     uint256 public voteWindow = 5 days;
     /// @notice The anti-capture participation floor, in bps of
-    ///         `min(earlier, total - accusedWeight)` — see
-    ///         `_participationFloor` for the full lookback-min rationale.
+    ///         `min(total - accusedWeight, earlier - accusedWeightAtLookback)`
+    ///         — each subtraction floored at zero and taken against its OWN
+    ///         instant's accused weight before the lookback min, and a
+    ///         NONZERO lookback term is additionally floored at
+    ///         `MIN_LOOKBACK_BASE_BPS` of the lookback instant's TOTAL
+    ///         electorate before it can win the min (finding #10) — never
+    ///         against the same-instant term, which would be
+    ///         attacker-inflatable — see `_participationFloor` for the
+    ///         full lookback-min rationale.
     uint256 public participationFloorBps = 1_000;
 
     /// @notice Count of cases ever referred. Case ids are 1-indexed.
@@ -171,7 +208,13 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     function setChallengeGame(address newGame) external onlyOwner {
         if (newGame == address(0)) revert ZeroAddress();
         IChallengeGame game_ = IChallengeGame(newGame);
-        if (game_.autoSlashDelay() + voteWindow + FINALIZE_BUFFER > game_.disputeTimeout()) {
+        // Holds the SAME margin as `ChallengeGame._requireWindowFits`, read
+        // from the game rather than duplicated as a literal here: bare
+        // equality leaves as little as one second for a dropped auto-referral
+        // to be retried, and the disputer controls both the stall instant and
+        // whether the in-transaction attempt lands.
+        if (game_.autoSlashDelay() + voteWindow + FINALIZE_BUFFER + game_.MIN_REFERRAL_SLACK() > game_.disputeTimeout())
+        {
             revert WindowInvariantViolated();
         }
         emit ChallengeGameSet(challengeGame, newGame);
@@ -231,7 +274,13 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         address g = challengeGame;
         if (g != address(0)) {
             IChallengeGame game_ = IChallengeGame(g);
-            if (game_.autoSlashDelay() + newWindow + FINALIZE_BUFFER > game_.disputeTimeout()) {
+            // Same margin as the game's own `_requireWindowFits` — see
+            // `setChallengeGame`. Without it a raise here could seat a
+            // configuration `ChallengeGame`'s setters would refuse.
+            if (
+                game_.autoSlashDelay() + newWindow + FINALIZE_BUFFER + game_.MIN_REFERRAL_SLACK()
+                    > game_.disputeTimeout()
+            ) {
                 revert WindowInvariantViolated();
             }
         }
@@ -382,6 +431,14 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         c.referredAt = block.timestamp;
         c.voteWindowAtReferral = window;
         c.phase = ITokenCourt.Phase.Voting;
+        // Pinned from the SAME `ch` memory struct read above for
+        // `executedAt` - no second external read. `vote` bars this address
+        // exactly like it bars the accused set: a `Guilty` verdict pays the
+        // challenger the accused's bond plus the escalated pool
+        // (`IChallengeGame._settle`), so an unbarred challenger voting
+        // `Guilty` on its own filing would be a self-dealing conviction, not
+        // a jury verdict (finding #7).
+        c.challenger = ch.challenger;
 
         emit CaseReferred(caseId, challengeId, ch.governor, ch.proposalId, snapshotTs);
 
@@ -457,7 +514,9 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         would re-admit exactly the fresh-whale ballot this clamp
     ///         exists to remove, since a zero lookback position is the
     ///         attack's own signature. Mirrors `_participationFloor`'s own
-    ///         `earlier == 0` fallback (below) for the identical reason:
+    ///         zero-lookback-electorate fallback (`earlier == 0`, which
+    ///         forces `earlierReduced == 0` too — see that function) below
+    ///         for the identical reason:
     ///         without it, every case referred inside the protocol's first
     ///         `FLOOR_LOOKBACK` of staking history would be unvotable by
     ///         anyone, a guaranteed `Inconclusive`.
@@ -492,6 +551,16 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         carry the vote: an accused address that can outvote its own
     ///         jury inverts the layer, turning "the electorate judges the
     ///         accused" into "the accused judges itself".
+    /// @dev    NOR MAY THE PROSECUTOR (finding #7) — the same inversion from
+    ///         the opposite side. `AccusedCannotVote` and
+    ///         `ChallengerCannotVote` are two halves of one rule: neither
+    ///         party with a direct payout riding on the verdict may cast a
+    ///         ballot on it. Without this bar a challenger could self-fund a
+    ///         majority with as little as `participationFloorBps` of the
+    ///         unaccused electorate (10% at deployed values, and LESS the
+    ///         more approvers its own filing names, since the floor's base is
+    ///         `total - accusedWeight`) and be paid the accused's bond by its
+    ///         own vote.
     /// @dev    OPEN LIMITATION: THE BAR IS ON THE APPROVING ADDRESS, NOT THE
     ///         PARTY BEHIND IT. `isAccused` is
     ///         built from the ledger's approver list — addresses — and
@@ -502,17 +571,23 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///         bar outright: none of the beneficiary's other addresses are in
     ///         the accused set, so they vote freely. The floor mechanics make
     ///         this worse, not neutral: `_participationFloor` subtracts the
-    ///         accused set's raw stake from the total, same-instant, and
-    ///         clamps that subtraction at zero, so once the REDUCED branch
-    ///         binds (`total - accusedWeight <= earlier`), every address the
+    ///         accused set's raw stake from each side's own-instant total,
+    ///         same-instant on both, and clamps each subtraction at zero, so
+    ///         once the REDUCED branch binds (`total - accusedWeight <=
+    ///         earlier - accusedWeightAtLookback`), every address the
     ///         accused set DOES name shrinks the floor the siblings'
     ///         un-accused addresses must clear to carry the vote — all the
     ///         way down to a floor of zero once the named cohort covers the
-    ///         base. (While the EARLIER branch still binds, naming more
-    ///         accused has no effect on the floor at all — see the lookback
-    ///         rationale below.) A larger accused cohort never raises the
-    ///         bar the remaining electorate must clear, only lowers or holds
-    ///         it, once it moves the floor at all. This is
+    ///         base. (While the EARLIER-REDUCED branch binds instead, naming
+    ///         an address that already held stake at the LOOKBACK instant
+    ///         shrinks `accusedWeightAtLookback` the same way — lowering
+    ///         `earlierReduced` — but naming one that only acquired stake
+    ///         inside the lookback window moves `accusedWeightAtLookback` not
+    ///         at all, since that read is fixed to the past; see the lookback
+    ///         rationale below.) In neither branch does a larger accused
+    ///         cohort ever raise the bar the remaining electorate must clear —
+    ///         it only lowers or holds it, once it moves the floor at all.
+    ///         This is
     ///         likely unfixable under permissionless staking (there is no
     ///         on-chain notion of
     ///         "the same party"); the natspec must not claim the bar covers a
@@ -574,6 +649,17 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         if (block.timestamp >= c.referredAt + c.voteWindowAtReferral) revert WindowClosed();
         if (voteOf[caseId][msg.sender] != ITokenCourt.Ruling.None) revert AlreadyVoted();
         if (isAccused[caseId][msg.sender]) revert AccusedCannotVote();
+        // THE PROSECUTOR MAY NOT VOTE EITHER (finding #7). `AccusedCannotVote`
+        // bars the defendant; nothing barred the challenger, even though a
+        // `Guilty` verdict pays `c.challenger` the accused's bond plus the
+        // escalated pool (`IChallengeGame._settle`'s escalated branch) - an
+        // unbarred challenger voting `Guilty` on its own filing is a
+        // self-dealing conviction, not a jury verdict, and the floor's own
+        // `total - accusedWeight` shape makes a unilateral conviction easier
+        // the more approvers the challenge names, not harder. `c.challenger`
+        // is pinned once in `refer` from the same `Challenge` memory struct
+        // read there for `executedAt` - see that pin's own rationale.
+        if (msg.sender == c.challenger) revert ChallengerCannotVote();
 
         IStakedWood swood = IStakedWood(stakedWood);
         uint256 weight = swood.getPastVotes(msg.sender, c.snapshotTs);
@@ -695,7 +781,7 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         uint256 guiltyVotes = c.guiltyVotes;
         uint256 notGuiltyVotes = c.notGuiltyVotes;
         uint256 turnout = guiltyVotes + notGuiltyVotes;
-        uint256 floor = _participationFloor(c.snapshotTs, c.accusedWeight);
+        uint256 floor = _participationFloor(c.snapshotTs, c.accusedWeight, c.accusedWeightAtLookback);
 
         IChallengeGame.Verdict verdict;
         if (turnout == 0 || turnout < floor) {
@@ -738,24 +824,51 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         }
     }
 
-    /// @dev THE FLOOR'S BASE IS `min(earlier, max(0, total - accusedWeight))`
-    ///      — `total` and `accusedWeight` are reduced against EACH OTHER
-    ///      FIRST, at the SAME INSTANT (`snapshotTs`), and only that
-    ///      same-instant result is then subjected to the `earlier` lookback
-    ///      min below. `accusedWeight` sums `getPastStake` over the accused
-    ///      set, the exact same raw-own-stake basis `getPastTotalVotes` sums
-    ///      over the whole electorate — so the two operands of the
-    ///      subtraction are the same measure of the same WOOD at the same
-    ///      timestamp. Reducing against a DIFFERENT instant (an earlier
-    ///      revision of this function subtracted `accusedWeight` from
-    ///      `min(earlier, total)` rather than from `total` alone) mixes two
-    ///      timestamps: in a growing protocol, "the accused today" routinely
-    ///      exceeds "the whole electorate a month ago" with no attacker
-    ///      action at all, which read as `base == 0` and collapsed the floor
-    ///      to nothing while a large, honest, unaccused electorate stood by
-    ///      unable to move it — the fix for #96 was found to introduce this
-    ///      failure and was corrected before merge.
-    /// @dev THE CLAMP IS DEFENCE-IN-DEPTH, NOT A LIVE BRANCH:
+    /// @dev THE FLOOR'S BASE IS `min(earlierReduced, reduced)`, FLOORED
+    ///      (finding #10): a nonzero `earlierReduced` is first raised to at
+    ///      least `MIN_LOOKBACK_BASE_BPS` of `earlier` before the min runs,
+    ///      and the exact-zero fallback below still returns unclamped
+    ///      `reduced` — see the dedicated finding #10 @dev block after "WHY
+    ///      THE MIN AND NOT THE EARLIER-REDUCED READ ALONE" for the full
+    ///      argument. Everywhere else in this block, `reduced = max(0, total
+    ///      - accusedWeight)` and
+    ///      `earlierReduced = max(0, earlier - accusedWeightAtLookback)` —
+    ///      EVERY subtraction is same-instant: `total` and `accusedWeight`
+    ///      are reduced against EACH OTHER at `snapshotTs`, and, SEPARATELY,
+    ///      `earlier` and `accusedWeightAtLookback` are reduced against each
+    ///      other at `snapshotTs - FLOOR_LOOKBACK`; only the two
+    ///      already-reduced, same-instant results are then subjected to the
+    ///      lookback min below. `accusedWeight`/`accusedWeightAtLookback` sum
+    ///      `getPastStake` over the accused set at `snapshotTs`/its lookback
+    ///      respectively, the exact same raw-own-stake basis
+    ///      `getPastTotalVotes` sums over the whole electorate — so every
+    ///      subtraction compares the same measure of the same WOOD at the
+    ///      same timestamp.
+    ///
+    ///      TWO DISTINCT BUGS WERE FOUND IN EARLIER REVISIONS OF THIS
+    ///      SUBTRACTION, and both taught the same lesson — same-instant or
+    ///      nothing:
+    ///        (1) `#96`: subtracting `accusedWeight` from `min(earlier,
+    ///            total)` rather than from `total` alone mixed two
+    ///            timestamps — in a growing protocol, "the accused today"
+    ///            routinely exceeds "the whole electorate a month ago" with
+    ///            no attacker action at all, which read as `base == 0` and
+    ///            collapsed the floor to nothing while a large, honest,
+    ///            unaccused electorate stood by unable to move it.
+    ///        (2) finding #6: the #96 fix corrected (1) but left `earlier`
+    ///            itself un-reduced by ANY accused-weight term — only
+    ///            `reduced` subtracted the accused cohort, so `earlier` and
+    ///            `reduced` were not the same KIND of number, and an
+    ///            attacker could choose which one bound the min by staking
+    ///            large from a never-approving address at `snapshotTs`:
+    ///            that raises `total` (and so `reduced`) without moving
+    ///            `earlier` at all, which can flip the min from the
+    ///            (small, accused-reduced) `reduced` term to the (large,
+    ///            un-reduced) `earlier` term — inflating the floor past what
+    ///            the honest unaccused electorate could ever reach.
+    ///            `accusedWeightAtLookback` closes it by giving `earlier` the
+    ///            same same-instant reduction `reduced` already had.
+    /// @dev BOTH CLAMPS ARE DEFENCE-IN-DEPTH, NOT A LIVE BRANCH:
     ///      `accusedWeight` sums `getPastStake` over the accused set, which
     ///      is a SUBSET of the addresses `total` (`getPastTotalVotes`) sums,
     ///      read from the same source at the same instant `snapshotTs` — a
@@ -764,9 +877,15 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///      consistently-wired `StakedWood`. `max(0, total - accusedWeight)`
     ///      never actually clamps in normal operation; it exists for the one
     ///      path that could desynchronize the subset relationship — a
-    ///      `setStakedWood` re-point (`:748-760`) landing between the two
-    ///      reads, so `accusedWeight` and `total` briefly come from different
-    ///      sources.
+    ///      `setStakedWood` re-point landing between the two reads, so
+    ///      `accusedWeight` and `total` briefly come from different sources.
+    ///      The SAME argument holds one lookback instant earlier:
+    ///      `accusedWeightAtLookback` sums `getPastStake` over the identical
+    ///      accused set at `snapshotTs - FLOOR_LOOKBACK`, a subset of what
+    ///      `earlier` (`getPastTotalVotes` at that same instant) sums, so
+    ///      `accusedWeightAtLookback <= earlier` holds by the same structural
+    ///      argument and `max(0, earlier - accusedWeightAtLookback)` is, in
+    ///      normal operation, likewise a clamp that never fires.
     ///      MONOTONICITY HOLDS, BUT NOT VIA STAKING: an accused approver
     ///      cannot lower the base by staking more, because staking raises
     ///      `total` by exactly the same amount it raises `accusedWeight`
@@ -783,37 +902,59 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///      that claim is now TRUE rather than merely asserted: because the
     ///      subtraction is same-instant, `base == 0` if and only if
     ///      `accusedWeight >= total`, i.e. the accused genuinely ARE the
-    ///      entire snapshot electorate. `finalize`'s `turnout == 0` check
-    ///      sits ahead of the `turnout < floor` comparison and forces
-    ///      `Inconclusive` on a silent electorate no matter what this
-    ///      returns, so a zero floor can never let a zero-turnout case
-    ///      resolve on the merits — and when it is non-zero-but-thin AND the
-    ///      REDUCED branch binds (`total - accusedWeight <= earlier`), the
-    ///      single unaccused voter it admits is genuinely the entire
-    ///      unaccused electorate at `snapshotTs`, not an artifact of
-    ///      comparing stake at two different timestamps. When the EARLIER
-    ///      branch binds instead, the floor is a month-old snapshot value
-    ///      unrelated to today's unaccused stake — that is the lookback
-    ///      trading precision for anti-inflation, not a claim about who is
-    ///      currently in the room.
-    /// @dev THE BASE IS THE MIN OVER A LOOKBACK. The snapshot defends the
-    ///      NUMERATOR: vote weight is read at `executedAt - 1`, so post-drain
-    ///      buyers and flash loans
+    ///      entire snapshot electorate — this STILL holds after finding #10's
+    ///      clamp: the clamp raises only `flooredEarlierReduced`, and the min
+    ///      below still caps the result at `reduced`, so `reduced == 0`
+    ///      forces `base == 0` on the clamped branch no matter how large
+    ///      `earlierReduced` or `minBase` are. (This is why the clamp must
+    ///      stay INSIDE the min rather than being applied to `base` after
+    ///      it: an `earlier`-based `minBase` is NOT itself bounded by
+    ///      `reduced`, so a clamp applied after the min would resurrect a
+    ///      nonzero floor over a provably empty electorate.)
+    ///      `finalize`'s `turnout == 0` check sits ahead of the `turnout <
+    ///      floor` comparison and forces `Inconclusive` on a silent
+    ///      electorate no matter what this returns, so a zero floor can
+    ///      never let a zero-turnout case resolve on the merits — and when it
+    ///      is non-zero-but-thin AND the REDUCED branch binds (`reduced <=
+    ///      max(earlierReduced, minBase)`), the single unaccused voter it
+    ///      admits is genuinely the entire unaccused electorate at
+    ///      `snapshotTs`, not an artifact of comparing stake at two different
+    ///      timestamps. When the EARLIER-REDUCED branch binds instead
+    ///      (`earlierReduced < reduced` after flooring, i.e. the RAW
+    ///      `earlierReduced` was already at least `minBase`), the floor is a
+    ///      month-old value too — but, since finding #6, it is the month-old
+    ///      UNACCUSED electorate (`earlier - accusedWeightAtLookback`), not
+    ///      the bare month-old total: it IS related to who was unaccused,
+    ///      just at the lookback instant rather than today's. That is the
+    ///      lookback trading precision for anti-inflation, not a claim about
+    ///      who is currently in the room. The THIRD case, finding #10's
+    ///      clamped branch (`0 < earlierReduced < minBase`), binds on
+    ///      `minBase = earlier * MIN_LOOKBACK_BASE_BPS / BPS_DENOMINATOR`
+    ///      instead — still month-old data, just the lookback TOTAL rather
+    ///      than the lookback UNACCUSED remainder, because that remainder
+    ///      was too thin to be meaningful; see the dedicated @dev block
+    ///      below finding #10 for why the clamp's basis must be a
+    ///      lookback-instant quantity and never `reduced`.
+    /// @dev THE BASE IS THE MIN OVER A LOOKBACK, OF TWO ACCUSED-REDUCED
+    ///      READS, NOT ONE. The snapshot defends the NUMERATOR: vote weight
+    ///      is read at `executedAt - 1`, so post-drain buyers and flash loans
     ///      count for nothing. The DENOMINATOR had the opposite exposure
-    ///      profile, and a single `getPastTotalVotes(snapshotTs)` read was
-    ///      wide open to it: the base is RAISED by anyone staked BEFORE
-    ///      `executedAt`, and the attacker is exactly the party who knows when
+    ///      profile, and a single `getPastTotalVotes(snapshotTs)` read minus
+    ///      same-instant `accusedWeight` was wide open to it: the base is
+    ///      RAISED by anyone staked BEFORE `executedAt` FROM A NEVER-APPROVING
+    ///      ADDRESS, and the attacker is exactly the party who knows when
     ///      `executedAt` will be, because it is their own drain.
     ///
-    ///      The attack the min closes: stake large from an address that never
-    ///      approves anything, immediately before executing the malicious
-    ///      proposal. `StakedWood.stakeAsGuardian` is permissionless — no
-    ///      registry gate, no cap, only a `minGuardianStake` floor — and
-    ///      `_recordAccused` subtracts only LEDGER APPROVERS, so that stake is
-    ///      never subtracted back out. With `E` the honest electorate's raw
-    ///      stake and `f` the turnout achievable after age-weighting, denial
-    ///      needs only `X > (10f - 1) * E` (roughly `2E` at `f ~ 0.3` and the
-    ///      default 10% floor) to put the floor beyond ANY achievable turnout.
+    ///      The attack the two-sided min closes: stake large from an address
+    ///      that never approves anything, immediately before executing the
+    ///      malicious proposal. `StakedWood.stakeAsGuardian` is
+    ///      permissionless — no registry gate, no cap, only a
+    ///      `minGuardianStake` floor — and `_recordAccused` subtracts only
+    ///      LEDGER APPROVERS, so that stake is never subtracted back out of
+    ///      `reduced`. With `E` the honest electorate's raw stake and `f` the
+    ///      turnout achievable after age-weighting, denial needs only
+    ///      `X > (10f - 1) * E` (roughly `2E` at `f ~ 0.3` and the default
+    ///      10% floor) to put `reduced` beyond ANY achievable turnout.
     ///      `finalize` then returns `Inconclusive` — no slash, no `_convicted`
     ///      mark, no adapter demotion, counter-bond returned whole, coverage
     ///      freeze released — and the attacker never voted, never coordinated,
@@ -827,23 +968,133 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///      needing no voters at all, and it lands on `Inconclusive` rather
     ///      than `NotGuilty` — a different outcome with a different unwind.
     ///
-    ///      Taking the min with the electorate `FLOOR_LOOKBACK` earlier makes
-    ///      the base insensitive to a late pre-drain surge: the attacker's
-    ///      stake has to be present at BOTH instants to move it, so an
-    ///      inflating stake must sit on-chain, visible and idle, for a month
-    ///      before the drain it exists to protect. Reading two immutable
-    ///      historical checkpoints costs one extra staticcall and no new
-    ///      state.
-    /// @dev WHY THE MIN AND NOT THE EARLIER READ ALONE. The min is what makes
-    ///      the defence one-directional. Reading only `snapshotTs -
-    ///      FLOOR_LOOKBACK` would let an attacker stake before that instant
-    ///      and `requestUnstakeGuardian` after it — inflating the base while
-    ///      holding the capital for a fraction of the window — and would also
-    ///      raise the floor whenever the electorate legitimately SHRANK over
-    ///      the month. The min can only ever lower the base relative to
-    ///      today's behaviour, which is the safe direction for the one
-    ///      property that must hold: a pre-drain staker must not be able to
-    ///      push the floor out of reach.
+    ///      FINDING #6 — WHY `reduced` ALONE WAS NOT ENOUGH. Taking the min
+    ///      of `reduced` with the BARE `earlier` (the pre-fix shape) did not
+    ///      close the attack above; it only relocated it. `earlier` carried
+    ///      no accused subtraction at all, so it was a DIFFERENT KIND of
+    ///      number than `reduced` — and the min between an accused-reduced
+    ///      quantity and a non-reduced one is not a floor on "unaccused
+    ///      turnout a month apart", it is whichever of the two the attacker
+    ///      makes smaller. The same fresh, never-approving stake `X` that
+    ///      inflates `reduced` above `earlier` (by raising `total` alone)
+    ///      flips the min to `earlier` — a term the attack does NOT need to
+    ///      touch at all, because `earlier` was never reduced by the accused
+    ///      cohort in the first place. So the natspec claim that "an
+    ///      inflating stake must sit on-chain, visible and idle, for a month"
+    ///      was FALSE under that shape: `X` never had to appear in `earlier`,
+    ///      only to move `reduced` far enough to change which term the min
+    ///      selects — turnout then had to clear a floor sized off the WHOLE
+    ///      month-old electorate, unreachable once the honest cohort is a
+    ///      minority of it. `accusedWeightAtLookback` fixes this by giving
+    ///      `earlier` the identical same-instant reduction `reduced` already
+    ///      had, so BOTH terms of the min are now "unaccused electorate at an
+    ///      instant" — the same kind of number — and an attacker's fresh
+    ///      stake can inflate at most one of the two terms without also
+    ///      appearing (and being reduced) in the other. Reading two extra
+    ///      immutable historical checkpoints (`earlier`,
+    ///      `accusedWeightAtLookback`) costs staticcalls, not new state.
+    /// @dev WHY THE MIN AND NOT THE EARLIER-REDUCED READ ALONE. The min is
+    ///      what makes the defence one-directional. Reading only
+    ///      `earlierReduced` would let an attacker stake before
+    ///      `snapshotTs - FLOOR_LOOKBACK` and `requestUnstakeGuardian` after
+    ///      it — inflating the base while holding the capital for a fraction
+    ///      of the window — and would also raise the floor whenever the
+    ///      electorate legitimately SHRANK over the month. The min can only
+    ///      ever lower the base relative to today's behaviour, which is the
+    ///      safe direction for the one property that must hold: a pre-drain
+    ///      staker must not be able to push the floor out of reach.
+    /// @dev FINDING #10 — WHY A NONZERO `earlierReduced` STILL NEEDS A FLOOR.
+    ///      The exact-zero fallback (see "THE ZERO FALLBACK" below) only
+    ///      catches `earlierReduced == 0` exactly. `accusedWeightAtLookback
+    ///      <= earlier` always holds (subset-sum, see the defence-in-depth
+    ///      @dev block above), so `earlierReduced == 0` exactly requires the
+    ///      accused to have consumed the ENTIRE lookback electorate down to
+    ///      the last wei — a genuine structural zero. But "the accused
+    ///      dominated the lookback electorate" and "the accused consumed it
+    ///      EXACTLY" are different conditions, and only the second one is
+    ///      caught. A proposal approved by the guardians who held nearly all
+    ///      of the electorate at `snapshotTs - FLOOR_LOOKBACK` — with a
+    ///      single unrelated guardian holding as little as 1 wei at that
+    ///      instant — produces `earlierReduced == 1`: the fallback does not
+    ///      fire, `earlierReduced` wins the (pre-finding-#10) min whenever
+    ///      `1 < reduced` (i.e. essentially always, since `reduced` is the
+    ///      CURRENT honest, unaccused electorate and can be in the millions
+    ///      of WOOD), and `participationFloorBps * 1 / BPS_DENOMINATOR`
+    ///      rounds to LITERAL ZERO for any `participationFloorBps <
+    ///      BPS_DENOMINATOR`. The floor then admits any nonzero turnout,
+    ///      letting a single pre-positioned voter decide the case — on a
+    ///      contract whose entire premise (see the contract-level docs) is
+    ///      that convictions burn the accused's bond and that burn is a
+    ///      PROFIT, not merely a fairness question. The natspec claim this
+    ///      violated — "base == 0 if and only if accusedWeight >= total" —
+    ///      was written for the same-instant `reduced` term (see the
+    ///      defence-in-depth @dev block above); it never held for
+    ///      `earlierReduced`, which is bounded by the LOOKBACK electorate and
+    ///      carries no relation to who is in the room at `snapshotTs`.
+    ///
+    ///      THE FIX: a NONZERO `earlierReduced` is floored at
+    ///      `MIN_LOOKBACK_BASE_BPS` of `earlier` — `minBase = earlier *
+    ///      MIN_LOOKBACK_BASE_BPS / BPS_DENOMINATOR` — before it competes in
+    ///      the min, so the lookback term can still LOWER the base, but a
+    ///      tiny, unrelated residual can no longer collapse the base to a
+    ///      near-zero value.
+    ///
+    ///      THE CLAMP'S BASIS MUST BE A LOOKBACK-INSTANT QUANTITY, AND
+    ///      `earlier` IS THE ONLY ONE AVAILABLE. An earlier revision of this
+    ///      fix clamped against `reduced` instead, and that silently
+    ///      REINTRODUCED FINDING #6. `reduced` is measured at `snapshotTs`,
+    ///      so it is exactly the term an attacker inflates by staking a
+    ///      large, idle, never-approving position immediately before
+    ///      `executedAt`; flooring the lookback term at a FRACTION of that
+    ///      term still lets the attacker raise the floor, merely bounded by
+    ///      `MIN_LOOKBACK_BASE_BPS` instead of unbounded. Concretely, with a
+    ///      900k-of-1M accused cohort and a 100k honest remainder, a fresh
+    ///      1M never-approving stake moved the floor from 10,000e18 to
+    ///      11,000e18 — a 10% inflation of the conviction bar, bought with
+    ///      stake that never approved anything. "A fraction of an
+    ///      attacker-controlled quantity is still attacker-controlled" is
+    ///      the whole lesson: bounding an attacker's leverage is not the
+    ///      same as removing it, and finding #6's invariant is the strict
+    ///      one — NOTHING observable only at `snapshotTs` may RAISE the
+    ///      floor. Clamping against `earlier` restores that invariant
+    ///      exactly: both `earlierReduced` and `minBase` are then pure
+    ///      `lookbackTs` readings, fixed a month before the attacker could
+    ///      act, and `reduced` survives only as the min's upper cap — a
+    ///      position from which it can lower the base but never raise it.
+    ///
+    ///      GENUINE BOOTSTRAP IS UNCHANGED. This clamp only applies inside
+    ///      the `earlierReduced != 0` branch. True bootstrap
+    ///      (`earlier == 0`, nobody had staked yet at `lookbackTs`) and the
+    ///      accused-consumed-the-whole-lookback-electorate case
+    ///      (`accusedWeightAtLookback >= earlier > 0`) both still land in
+    ///      the EXACT-ZERO fallback and still return the unclamped `reduced`,
+    ///      never reaching the clamp at all — so this fix does not raise the
+    ///      bar for a conviction during a young protocol's first
+    ///      `FLOOR_LOOKBACK`; it only prevents a tiny nonzero lookback
+    ///      reading from pulling the bar BELOW where bootstrap already
+    ///      conservatively sets it. (True bootstrap is also the one case
+    ///      where an `earlier`-based clamp would be vacuous anyway:
+    ///      `earlier == 0` makes `minBase == 0`, which is precisely why the
+    ///      exact-zero branch must keep its own `reduced` fallback rather
+    ///      than being folded into the clamped branch.)
+    ///
+    ///      WHY A FRACTION OF `earlier` AND NOT SOME ABSOLUTE WOOD AMOUNT:
+    ///      `earlier` is the largest lookback-instant quantity available
+    ///      here, so it is the one number that both scales with the protocol
+    ///      and is immune to anything the attacker does at `snapshotTs`. An
+    ///      absolute WOOD floor would either be too small to matter once the
+    ///      protocol grows (the exact failure mode this finding closes) or
+    ///      would need owner upkeep to track growth — reintroducing the
+    ///      "owner lever right before a drain" hazard `FLOOR_LOOKBACK` and
+    ///      this constant are both deliberately `constant` to avoid.
+    ///
+    ///      Note the clamp can exceed the raw lookback remainder — that is
+    ///      its entire purpose — but it can never exceed `reduced`, because
+    ///      the min below still caps the base at today's unaccused
+    ///      electorate. So the clamped branch says "the month-old unaccused
+    ///      remainder was too thin to trust, so fall back to a fixed
+    ///      fraction of the month-old electorate, but never demand more
+    ///      participation than the room actually holds today."
     /// @dev WHY 30 DAYS. It is the maturation horizon the NUMERATOR already
     ///      uses: `StakedWood._ageFactorBps` ramps a stake's vote weight from
     ///      `ageFloorBps` to par linearly over `maturationPeriod`, whose
@@ -863,12 +1114,21 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     /// @dev THE ZERO FALLBACK, AND THE ONE RESIDUAL IT LEAVES. When the
     ///      lookback instant predates the FIRST guardian stake ever
     ///      (`getPastTotalVotes` returns 0 — checkpoint traces read zero
-    ///      before their first entry) there is no earlier electorate to
-    ///      compare against, and the code falls back to the snapshot total
-    ///      rather than to a base of zero. `snapshotTs < FLOOR_LOOKBACK` (a
-    ///      proposal executing in the chain's first month) clamps the lookback
-    ///      instant to 0 and lands in the same branch, which is also what
-    ///      keeps the subtraction from underflowing.
+    ///      before their first entry, so `earlier == 0` and, necessarily,
+    ///      `accusedWeightAtLookback == 0` too — nobody, accused or not,
+    ///      existed yet) there is no earlier electorate to compare against,
+    ///      and the code falls back to `reduced` — the same-instant,
+    ///      already-accused-reduced value — rather than to a base of zero.
+    ///      `snapshotTs < FLOOR_LOOKBACK` (a proposal executing in the
+    ///      chain's first month) clamps the lookback instant to 0 and lands
+    ///      in the same branch, which is also what keeps both subtractions
+    ///      from underflowing. The fallback is keyed on `earlierReduced == 0`
+    ///      exactly, and that condition is true in bootstrap (`0 - 0 == 0`)
+    ///      whether or not it is ALSO true in the non-bootstrap edge case
+    ///      where the accused happened to be the entire lookback electorate
+    ///      (`accusedWeightAtLookback >= earlier > 0`) — either way the
+    ///      fallback lands on `reduced`, never on a bare, un-reduced
+    ///      `earlier`.
     ///
     ///      Falling back to ZERO would be the wrong failure. It would disable
     ///      the anti-capture floor outright for the protocol's first
@@ -876,23 +1136,34 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///      guardian carry a case alone — and a wrongful `Guilty` destroys an
     ///      honest guardian's entire stake, which is strictly more destructive
     ///      than the forced `Inconclusive` the fallback leaves possible.
-    ///      Falling back to the total during bootstrap never produces a
-    ///      higher floor than the ordinary min-based branch would elsewhere.
-    ///      The residual is the bootstrap window only, it shrinks to nothing
-    ///      once the protocol has a month of stake history, and it is the
-    ///      period in which TVL — and therefore the payoff for denying a
-    ///      verdict — is smallest.
+    ///      Falling back to `reduced` during bootstrap never produces a
+    ///      higher floor than the ordinary min-based branch would elsewhere,
+    ///      because `reduced` is always one of the two operands the min would
+    ///      have chosen from anyway. The residual is the bootstrap window
+    ///      only, it shrinks to nothing once the protocol has a month of
+    ///      stake history, and it is the period in which TVL — and therefore
+    ///      the payoff for denying a verdict — is smallest.
+    ///
+    ///      THIS SECTION COVERS ONLY THE EXACT-ZERO CASE. A separate residual
+    ///      — `earlierReduced` landing on a tiny NONZERO value with no
+    ///      relation to today's electorate — is NOT caught by the
+    ///      `earlierReduced == 0` test above and needed its own fix; see the
+    ///      dedicated "FINDING #10" @dev block above "WHY 30 DAYS" for that
+    ///      argument and the `MIN_LOOKBACK_BASE_BPS` clamp it introduces.
     /// @dev THE ACCUSED'S OWN TOP-UP IS ALREADY NEUTRAL, WITH OR WITHOUT THE
     ///      MIN: an accused approver topping up its stake just before the
     ///      drain raises `total` and `accusedWeight` together, by the same
-    ///      amount, so `total - accusedWeight` — and therefore the base — is
-    ///      unchanged regardless of which branch binds. A NON-approving
-    ///      sibling address topping up raises only `total`, which raises
-    ///      `total - accusedWeight` immediately, with no lookback delay,
-    ///      WHENEVER THE REDUCED BRANCH BINDS. The min only withholds that
-    ///      immediate effect while the EARLIER branch still binds — in that
-    ///      regime alone, a same-block top-up moves the base by nothing
-    ///      unless it was already staked a month earlier.
+    ///      amount, so `total - accusedWeight` (`reduced`) — and therefore the
+    ///      base — is unchanged regardless of which branch binds; `earlier`
+    ///      and `accusedWeightAtLookback` are historical checkpoint reads a
+    ///      present-tense top-up cannot touch at all. A NON-approving sibling
+    ///      address topping up NOW raises only `total`, which raises `reduced`
+    ///      immediately, with no lookback delay, WHENEVER THE REDUCED BRANCH
+    ///      BINDS. The min only withholds that immediate effect while the
+    ///      EARLIER-REDUCED branch still binds — in that regime alone, a
+    ///      same-block top-up moves the base by nothing unless it was already
+    ///      staked (and, if by an accused approver, already counted in
+    ///      `accusedWeightAtLookback`) a month earlier.
     /// @dev THE FLOOR READS THE LIVE `participationFloorBps`, DELIBERATELY NOT
     ///      PINNED per-case. This is the opposite choice from `snapshotTs` and
     ///      `voteWindowAtReferral`, which ARE pinned at `refer` — and the
@@ -927,50 +1198,111 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///       trusted with every other live-read parameter in this contract
     ///       family.
     /// @dev  `stakedWood` IS LIKEWISE READ LIVE HERE, not pinned per-case: this
-    ///       `total` comes from whichever contract `stakedWood` names at
-    ///       `finalize` time, while `accusedWeight` was already fixed against
-    ///       whatever `stakedWood` named back at `refer`, and the votes summed
-    ///       into `guiltyVotes`/`notGuiltyVotes` were weighed against whatever
-    ///       it named at each `vote` call. A `setStakedWood` re-point between
-    ///       `vote` and `finalize` therefore changes the floor's basis to a
-    ///       different contract's checkpoints than the ones the cast votes
-    ///       were weighed against. Accepted for the same reason the game's own
-    ///       wiring setters (`setChallengeGame`, `setStakedWood`) stay live
-    ///       rather than pinned per-case: they are the owner's rescue path for
-    ///       a compromised or upgraded dependency, and the owner is trusted.
+    ///       `total`/`earlier` come from whichever contract `stakedWood` names
+    ///       at `finalize` time, while `accusedWeight`/`accusedWeightAtLookback`
+    ///       were already fixed against whatever `stakedWood` named back at
+    ///       `refer`, and the votes summed into `guiltyVotes`/`notGuiltyVotes`
+    ///       were weighed against whatever it named at each `vote` call. A
+    ///       `setStakedWood` re-point between `vote` and `finalize` therefore
+    ///       changes the floor's basis to a different contract's checkpoints
+    ///       than the ones the cast votes were weighed against. Accepted for
+    ///       the same reason the game's own wiring setters
+    ///       (`setChallengeGame`, `setStakedWood`) stay live rather than
+    ///       pinned per-case: they are the owner's rescue path for a
+    ///       compromised or upgraded dependency, and the owner is trusted.
     ///       Flagged here as a deliberately deferred hazard, not an oversight.
-    function _participationFloor(uint256 snapshotTs, uint256 accusedWeight) internal view returns (uint256) {
+    function _participationFloor(uint256 snapshotTs, uint256 accusedWeight, uint256 accusedWeightAtLookback)
+        internal
+        view
+        returns (uint256)
+    {
         IStakedWood swood = IStakedWood(stakedWood);
         uint256 total = swood.getPastTotalVotes(snapshotTs);
         // Clamped, never subtracted below zero: a proposal executing in the
         // chain's first `FLOOR_LOOKBACK` reads the trace at 0, which is empty
-        // by definition and lands in the `earlier == 0` fallback below.
+        // by definition and lands in the `earlierReduced == 0` fallback below.
         uint256 lookbackTs = snapshotTs > FLOOR_LOOKBACK ? snapshotTs - FLOOR_LOOKBACK : 0;
         uint256 earlier = swood.getPastTotalVotes(lookbackTs);
-        // SAME-INSTANT SUBTRACTION, THEN THE LOOKBACK MIN — order matters.
-        // `accusedWeight` is always measured at `snapshotTs`. Subtracting it
-        // from a 30-day-old `earlier` compares two different instants: in a
-        // growing protocol, "the accused today" routinely exceeds "the whole
-        // electorate a month ago" with no attacker action at all, and an
-        // earlier revision of this function read that state as `base == 0`
-        // — collapsing the floor to nothing while a large, honest, unaccused
-        // electorate stood by unable to move it. Reducing `total` first
-        // keeps both operands at `snapshotTs`, so the subtraction answers
-        // "how much of TODAY's electorate is unaccused" — the question the
-        // floor is actually supposed to ask.
+        // SAME-INSTANT SUBTRACTION, THEN THE LOOKBACK MIN — order matters,
+        // and it now applies IDENTICALLY on both sides of the min (finding
+        // #6). `accusedWeight` is always measured at `snapshotTs`, and
+        // `accusedWeightAtLookback` is the SAME accused set measured at
+        // `lookbackTs` — each is subtracted from the total taken at its OWN
+        // instant, never cross-instant. Subtracting a same-instant
+        // `accusedWeight` from a 30-day-old `earlier` (or not subtracting
+        // anything from `earlier` at all) compares two different instants:
+        // in a growing protocol, "the accused today" routinely exceeds "the
+        // whole electorate a month ago" with no attacker action at all
+        // (issue #96), and leaving `earlier` un-reduced let a fresh,
+        // never-approving stake at `snapshotTs` inflate `reduced` past
+        // `earlier` and flip the min to the un-reduced term instead (finding
+        // #6) — collapsing the floor's protection either way, by feeding the
+        // min two operands that were not the same kind of number. Reducing
+        // each `total` against its OWN instant's accused weight first keeps
+        // every operand answering the same question — "how much of THIS
+        // instant's electorate is unaccused" — before the lookback min ever
+        // compares them.
         uint256 reduced = total > accusedWeight ? total - accusedWeight : 0;
-        // B2: the smaller of the two electorates, EXCEPT when there is no
-        // earlier electorate at all to compare against (`earlier == 0`), in
-        // which case the same-instant reduction stands — see the fallback
-        // rationale above for why zero is the wrong failure there.
+        uint256 earlierReduced = earlier > accusedWeightAtLookback ? earlier - accusedWeightAtLookback : 0;
+        // The smaller of the two UNACCUSED electorates, EXCEPT when there is
+        // no earlier electorate at all to compare against
+        // (`earlierReduced == 0`), in which case the same-instant reduction
+        // stands unclamped — see the fallback rationale above for why zero is
+        // the wrong failure there. `earlierReduced == 0` also covers,
+        // harmlessly, the edge case where the accused were themselves the
+        // entire lookback electorate (`accusedWeightAtLookback >= earlier >
+        // 0`): the fallback to `reduced` is correct there too, since
+        // `reduced` is never larger than the min would otherwise have
+        // picked. Both are STRUCTURAL zeros — neither is reachable by
+        // planting dust stake, because `accusedWeightAtLookback <= earlier`
+        // always (subset-sum), so `earlierReduced` can only be EXACTLY zero
+        // when the accused truly consumed the entire lookback electorate.
+        //
+        // A NONZERO `earlierReduced`, however, is not automatically a safe
+        // pick for the min just because it is nonzero (finding #10): the
+        // accused can dominate the lookback electorate ALMOST entirely,
+        // leaving a tiny positive residual from a single unrelated guardian
+        // with dust stake at `lookbackTs` — the exact-zero test above does
+        // not catch that, and `* participationFloorBps / BPS_DENOMINATOR`'s
+        // integer division rounds any `base` under `BPS_DENOMINATOR /
+        // participationFloorBps` straight to a floor of ZERO, no matter how
+        // large today's honest, unaccused `reduced` electorate is. That
+        // residual carries no relation to who is actually present at
+        // `snapshotTs` — it is bounded by the LOOKBACK electorate alone —
+        // so it must not be allowed to single-handedly collapse the floor.
+        // Floor a nonzero `earlierReduced` at `MIN_LOOKBACK_BASE_BPS` of
+        // `earlier` — the lookback instant's TOTAL electorate — before it
+        // competes in the min. Both operands of the max are then pure
+        // `lookbackTs` readings, fixed a month before an attacker could act,
+        // so finding #6's invariant survives intact: nothing observable only
+        // at `snapshotTs` can RAISE the floor, and `reduced` enters only as
+        // the min's cap, where it can lower the base but never raise it.
+        //
+        // Do NOT clamp against `reduced` here. It reads as the natural
+        // choice — it is "today's honest electorate" — but it is measured at
+        // `snapshotTs` and is therefore exactly what a large, idle,
+        // never-approving stake inflates; a fraction of an attacker-inflated
+        // number is still attacker-inflated, and that revision reintroduced
+        // finding #6 in bounded form. See the finding #10 @dev block above
+        // for the worked counterexample.
         //
         // Monotone non-increasing in `accusedWeight` by construction, and it
-        // now reaches zero ONLY when the accused genuinely are the entire
-        // snapshot electorate (`accusedWeight >= total`) — the one case
-        // where `finalize`'s `turnout == 0` guard correctly and truthfully
-        // covers an empty room, rather than merely a floor that says nothing
-        // about who could have voted.
-        uint256 base = (earlier != 0 && earlier < reduced) ? earlier : reduced;
+        // still reaches zero ONLY when the accused genuinely are the entire
+        // snapshot electorate (`accusedWeight >= total`, so `reduced == 0`)
+        // — the one case where `finalize`'s `turnout == 0` guard correctly
+        // and truthfully covers an empty room, rather than merely a floor
+        // that says nothing about who could have voted. (`reduced == 0`
+        // forces `base == 0` on both branches below: the fallback returns
+        // `reduced` directly, and the clamped branch's `minBase` is itself
+        // `0` when `reduced` is `0`, so `base <= reduced == 0`.)
+        uint256 base;
+        if (earlierReduced == 0) {
+            base = reduced;
+        } else {
+            uint256 minBase = earlier * MIN_LOOKBACK_BASE_BPS / BPS_DENOMINATOR;
+            uint256 flooredEarlierReduced = earlierReduced > minBase ? earlierReduced : minBase;
+            base = flooredEarlierReduced < reduced ? flooredEarlierReduced : reduced;
+        }
         return participationFloorBps * base / BPS_DENOMINATOR;
     }
 
@@ -1062,12 +1394,16 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///       `ChallengeGame`: either an at-`file` pin in the `Challenge`
     ///       struct, or a live-challenge guard on `setExposureLedger`. Both
     ///       are deliberately out of scope here.
-    /// @dev  WEIGHT IS SUMMED AT `snapshotTs`, the case's stored instant, so
-    ///       the number subtracted from the floor is measured on exactly the
-    ///       same electorate as the votes it is compared against. RAW
-    ///       `getPastStake`, not aged `getPastVotes`: `_participationFloor`
-    ///       subtracts this sum from `getPastTotalVotes`, which sums raw own
-    ///       stake — the two must be the same basis or the subtraction
+    /// @dev  WEIGHT IS SUMMED AT `snapshotTs` AND, SEPARATELY, AT
+    ///       `snapshotTs - FLOOR_LOOKBACK` (finding #6), the two instants
+    ///       `_participationFloor` reduces its own `total`/`earlier` reads
+    ///       against — so the numbers subtracted from the floor are measured
+    ///       on exactly the same electorates the floor's two terms are drawn
+    ///       from, at the SAME accused set both times (one loop, two sums,
+    ///       never two different membership lists). RAW `getPastStake`, not
+    ///       aged `getPastVotes`, for BOTH sums: `_participationFloor`
+    ///       subtracts each from a `getPastTotalVotes` read, which sums raw
+    ///       own stake — the two must be the same basis or the subtraction
     ///       compares two different measures of the same WOOD. The raw basis
     ///       is not merely a units argument — it also denies the accused a
     ///       free lever on its own conviction threshold. If this summed aged
@@ -1092,13 +1428,14 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///       `proposalId`: `pledgedOf` returns the same list
     ///       `GuardianRegistry` walks on every approve/settle, which is capped
     ///       at `MAX_APPROVERS_PER_PROPOSAL = 100` (`GuardianRegistry.sol`).
-    ///       So this loop is at most 100 iterations, each one `getPastStake`
-    ///       staticcall.
+    ///       So this loop is at most 100 iterations, each one now TWO
+    ///       `getPastStake` staticcalls (`snapshotTs` and, since finding #6,
+    ///       `snapshotTs - FLOOR_LOOKBACK`) rather than one.
     /// @dev  NO GAS STIPEND IS SIZED FOR THIS LOOP, DELIBERATELY. The
     ///       auto-referral path does run `refer` (and this loop) inside
     ///       `ChallengeGame.dispute`'s try/catch, which pays for up to ~100
-    ///       `getPastStake` staticcalls in the worst case — but no gas floor
-    ///       fronts that call. `dispute` is how the accused BUY
+    ///       PAIRS of `getPastStake` staticcalls in the worst case — but no
+    ///       gas floor fronts that call. `dispute` is how the accused BUY
     ///       their defence: a reverting `dispute` denies it outright and the
     ///       accused is slashed by the silence verdict without ever reaching
     ///       adjudication, which is unrecoverable. A skipped referral is not —
@@ -1109,8 +1446,11 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
     ///       try/catch in `ChallengeGame.dispute` stays broad and ungated. In
     ///       practice an ordinary caller's gas budget is enough anyway: this
     ///       loop's cost is bounded by the same 100-approver cap referenced
-    ///       above, measured at ~5.06M gas at that cap — well inside what a
-    ///       real transaction forwards. See `ChallengeGame.dispute`'s own
+    ///       above; the second `getPastStake` staticcall per approver added
+    ///       for finding #6 roughly doubles the loop's prior ~5.06M-gas
+    ///       measurement at that cap, which is still well inside what a real
+    ///       transaction forwards. Re-measure at the 100-approver cap before
+    ///       relying on an exact figure — see `ChallengeGame.dispute`'s own
     ///       natspec for the full argument.
     function _recordAccused(
         uint256 caseId,
@@ -1124,7 +1464,13 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
             IExposureLedger(ledger).pledgedOf(governor, proposalId);
 
         address swood = stakedWood;
+        // Same lookback instant `_participationFloor` reduces `earlier`
+        // against — computed once here so the accused set's weight at BOTH
+        // instants comes from one loop over one membership list (finding
+        // #6).
+        uint256 lookbackTs = snapshotTs > FLOOR_LOOKBACK ? snapshotTs - FLOOR_LOOKBACK : 0;
         uint256 weight;
+        uint256 weightAtLookback;
         uint256 count;
         for (uint256 i; i < approvers.length; ++i) {
             // The PLEDGE, not the live booking: a release before the filing
@@ -1138,9 +1484,11 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
             _accused[caseId].push(approver);
             count += 1;
             weight += IStakedWood(swood).getPastStake(approver, snapshotTs);
+            weightAtLookback += IStakedWood(swood).getPastStake(approver, lookbackTs);
         }
 
         c.accusedWeight = weight;
+        c.accusedWeightAtLookback = weightAtLookback;
         emit AccusedSetRecorded(caseId, count, weight);
     }
 }

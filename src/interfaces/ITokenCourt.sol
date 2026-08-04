@@ -99,6 +99,26 @@ interface ITokenCourt {
     ///        matching `Verdict`'s own harmless-default design.
     /// @param finalizedAt The instant `finalize` closed this case, or zero
     ///        while it is still `Voting`.
+    /// @param challenger The challenge's `IChallengeGame.Challenge.challenger`,
+    ///        PINNED at `refer` from the `Challenge` memory struct `refer`
+    ///        already reads for `executedAt` — no second external read.
+    ///        `vote` bars this address the same way it bars the accused set:
+    ///        a `Guilty` verdict pays the challenger the accused's bond plus
+    ///        the escalated pool (`IChallengeGame._settle`), so an unbarred
+    ///        challenger voting `Guilty` on its own filing is a self-dealing
+    ///        conviction, not a jury verdict (finding #7). APPENDED, not
+    ///        inserted, to keep every earlier field's position stable.
+    /// @param accusedWeightAtLookback The raw `getPastStake` sum of the SAME
+    ///        accused set as `accusedWeight`, but read at
+    ///        `snapshotTs - FLOOR_LOOKBACK` (clamped to 0) instead of
+    ///        `snapshotTs` — the same instant `_participationFloor`'s
+    ///        `earlier` term is measured at. Recorded so the floor's
+    ///        lookback branch can subtract the accused cohort from `earlier`
+    ///        too, at the instant `earlier` is itself measured, rather than
+    ///        leaving `earlier` un-reduced while only the same-instant branch
+    ///        carried the subtraction — see `_participationFloor` (finding
+    ///        #6). APPENDED, not inserted, for the same reason as
+    ///        `challenger` above.
     struct Case {
         uint256 challengeId;
         address game; // pinned IChallengeGame this case rules on, written once in refer
@@ -112,6 +132,8 @@ interface ITokenCourt {
         Phase phase;
         IChallengeGame.Verdict verdict;
         uint256 finalizedAt;
+        address challenger; // pinned Challenge.challenger, written once in refer (finding #7)
+        uint256 accusedWeightAtLookback; // raw getPastStake sum at snapshotTs - FLOOR_LOOKBACK, same accused set as accusedWeight (finding #6)
     }
 
     /// @notice A wiring setter was handed the zero address.
@@ -167,6 +189,14 @@ interface ITokenCourt {
     ///         checkpoint discounted to `ageFloorBps`, because the re-stake
     ///         re-anchors `stakedAt`, not at its original historic weight.
     error NoPresentHoldings();
+    /// @notice `vote` called by the challenge's own `Challenge.challenger`
+    ///         (`Case.challenger`, pinned at `refer`). A `Guilty` verdict pays
+    ///         the challenger the accused's bond plus the escalated pool
+    ///         (`IChallengeGame._settle`), so letting the challenger vote on
+    ///         its own filing is a self-dealing conviction, not a jury
+    ///         verdict — the same defect `AccusedCannotVote` closes for the
+    ///         other side of the case (finding #7).
+    error ChallengerCannotVote();
     /// @notice `renounceOwnership` was called. The court refuses it outright,
     ///         for everyone including the owner: it is non-upgradeable, and an
     ///         ownerless court can never again be re-wired
@@ -259,12 +289,15 @@ interface ITokenCourt {
     ///         state) — it is the margin `refer`'s clock check reserves.
     function FINALIZE_BUFFER() external view returns (uint256);
     /// @notice How far before a case's `snapshotTs` the participation floor's
-    ///         electorate base is cross-checked. The base is the SMALLER
-    ///         of the electorate at the snapshot and the electorate this long
-    ///         before it, so stake younger than this cannot RAISE the floor —
-    ///         closing the denial-of-quorum lever a single snapshot read left
-    ///         open to anyone staking large, from a never-approving address,
-    ///         immediately before executing their own drain.
+    ///         electorate base is cross-checked. The base is the SMALLER of
+    ///         the UNACCUSED electorate at the snapshot and the UNACCUSED
+    ///         electorate this long before it — the accused cohort is
+    ///         subtracted at BOTH instants, each against the electorate
+    ///         measured at that same instant — so stake younger than this
+    ///         cannot RAISE the floor on EITHER side of the min. Closes the
+    ///         denial-of-quorum lever a single snapshot read left open to
+    ///         anyone staking large, from a never-approving address,
+    ///         immediately before executing their own drain (finding #6).
     function FLOOR_LOOKBACK() external view returns (uint256);
     /// @notice The wired `IChallengeGame` this court adjudicates for and
     ///         reads challenge state from. Zero while unwired.
@@ -278,10 +311,26 @@ interface ITokenCourt {
     function voteWindow() external view returns (uint256);
     /// @notice The anti-capture participation floor, in bps of
     ///         `min(total(snapshotTs) - accusedWeight, total(snapshotTs -
-    ///         FLOOR_LOOKBACK))`, where the subtraction is floored at zero
-    ///         and taken BEFORE the lookback min — `accusedWeight` is always
-    ///         reduced against the same-instant `total`, never against the
-    ///         earlier one. Turnout below this floor resolves
+    ///         FLOOR_LOOKBACK) - accusedWeightAtLookback)`, where EACH
+    ///         subtraction is floored at zero and taken against the
+    ///         SAME-INSTANT accused weight BEFORE the lookback min —
+    ///         `accusedWeight` reduces the same-instant `total`,
+    ///         `accusedWeightAtLookback` reduces the lookback `total`, never
+    ///         cross-instant (finding #6: a bare `min(total(snapshotTs) -
+    ///         accusedWeight, total(snapshotTs - FLOOR_LOOKBACK))` left the
+    ///         lookback term un-reduced, so staking large from a
+    ///         never-approving address at `snapshotTs` could flip which term
+    ///         binds and inflate the floor past the honest electorate's
+    ///         reachable turnout). A NONZERO lookback term is additionally
+    ///         floored at a fixed fraction of the same-instant term before it
+    ///         competes in the min (finding #10: an exact-zero lookback term
+    ///         falls back safely to the unclamped same-instant term, but a
+    ///         merely TINY nonzero one — e.g. one unrelated guardian's dust
+    ///         stake at the lookback instant while the accused otherwise
+    ///         dominated it — is not "zero" yet rounds the floor to
+    ///         effectively nothing once scaled by bps, with no relation to
+    ///         today's actual electorate; see `TokenCourt._participationFloor`
+    ///         for the full argument). Turnout below this floor resolves
     ///         `Inconclusive` rather than on the raw tally, so a thin,
     ///         rented-stake vote cannot convict or acquit alone. Read LIVE at
     ///         `finalize`, never pinned per case — which also makes it the
@@ -340,8 +389,11 @@ interface ITokenCourt {
     ///         `TokenCourt.vote`'s implementation natspec for the full
     ///         growth-gated-min rule, why it gates on raw stake rather than
     ///         weight, and its documented residuals. Reverts outside the open
-    ///         window, for a second vote, for an accused address, for zero
-    ///         growth-gated weight (`NoVotingPower`), or for holding nothing
+    ///         window, for a second vote, for an accused address, for the
+    ///         case's own `challenger` (`ChallengerCannotVote` — finding #7:
+    ///         a `Guilty` verdict pays the challenger, so it may not vote on
+    ///         its own filing), for zero growth-gated weight
+    ///         (`NoVotingPower`), or for holding nothing
     ///         at the present instant (`NoPresentHoldings`) — the caller must
     ///         be an active guardian (present stake, no pending unstake
     ///         request) at the moment the vote is cast, even though the

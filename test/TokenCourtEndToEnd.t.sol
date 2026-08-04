@@ -159,7 +159,6 @@ contract TokenCourtEndToEndTest is Test {
     ///      derivation.
     uint256 constant REQUIRED_COVERAGE = 500e6;
     uint256 constant COVERAGE_USD = 500e18;
-    uint256 constant CHALLENGER_BOND = 500e18; // $500 x 5% / $0.05
 
     uint16 constant CERTIFIED_BOUND_BPS = 5_000;
 
@@ -288,13 +287,13 @@ contract TokenCourtEndToEndTest is Test {
         wood.mint(agent, 1_000_000e18);
         vm.prank(agent);
         wood.approve(address(bondEscrow), type(uint256).max);
-        wood.mint(challenger, CHALLENGER_BOND * 5);
+        wood.mint(challenger, _challengerBond() * 5);
         vm.prank(challenger);
         wood.approve(address(game), type(uint256).max);
-        wood.mint(challengerB, CHALLENGER_BOND * 5);
+        wood.mint(challengerB, _challengerBond() * 5);
         vm.prank(challengerB);
         wood.approve(address(game), type(uint256).max);
-        wood.mint(g1, CHALLENGER_BOND * 5);
+        wood.mint(g1, _challengerBond() * 5);
         vm.prank(g1);
         wood.approve(address(game), type(uint256).max);
 
@@ -360,6 +359,15 @@ contract TokenCourtEndToEndTest is Test {
         usdg.approve(address(vault), assets);
         vault.deposit(assets, who);
         vm.stopPrank();
+    }
+
+    /// @dev Mirrors `ChallengeGame.file`'s bond formula exactly, and reads
+    ///      `challengerBondBps` LIVE off the contract rather than hardcoding
+    ///      it — audit #181 finding 18a moved it from 500 to 150. Mirrors
+    ///      `ChallengeGame.t.sol`'s own `_expectedBondWood` / `_standardBondWood`
+    ///      helpers and `ChallengeEndToEndTest`'s identical `_challengerBond`.
+    function _challengerBond() internal view returns (uint256) {
+        return (((COVERAGE_USD * game.challengerBondBps()) / 10_000) * 1e8) / 0.05e8;
     }
 
     /// @dev Exec batch: the certified adapter call plus an uncertified one, so
@@ -545,19 +553,30 @@ contract TokenCourtEndToEndTest is Test {
         uint256 slashedGross = (G1_STAKE * expectedBps) / 10_000;
         assertEq(swood.guardianStake(g1), G1_STAKE - slashedGross, "g1 paid exactly what it owed");
 
-        // ── The challenger is repaid its bond plus the whole forfeited pool,
-        //    plus the prosecutor's fee. THE SLASH ITSELF PAYS NO ONE: every wei
-        //    of it burns. The fee comes from the convicted proposer's forfeited
-        //    bond instead, which is the one pot a prosecutor cannot fund for
-        //    itself — so even an escalated win here is paid by the accused
-        //    proposer, never out of the guardians' slash.
+        // ── The challenger is repaid its bond plus the forfeited pool NET OF
+        //    the settle-slice burn (issue #181 finding 18b), plus the
+        //    prosecutor's fee. THE SLASH ITSELF PAYS NO ONE: every wei of it
+        //    burns. The fee comes from the convicted proposer's forfeited bond
+        //    instead, which is the one pot a prosecutor cannot fund for itself
+        //    — so even an escalated win here is paid by the accused proposer,
+        //    never out of the guardians' slash.
+        //
+        //    THE POOL NO LONGER RETURNS WHOLE: `dispute` is open to anyone, so
+        //    a challenger who also funds the counter-bond pool (directly, or
+        //    via a second address) used to round-trip its whole stake on
+        //    exactly this branch, forfeiting nothing. `_settle` now burns
+        //    `settleBurnBpsAtFiling` of the pool first — derived from the
+        //    challenge's own pinned rate below, not hardcoded, so this
+        //    survives a future rate change.
         IChallengeGame.Challenge memory c = game.challengeOf(cid);
         uint256 prosecutorFee = (proposerBond * game.prosecutorFeeBps()) / 10_000;
         assertGt(prosecutorFee, 0, "the fee is live in this fixture");
+        uint256 settleBurned = (c.counterBondWood * c.settleBurnBpsAtFiling) / 10_000;
+        assertGt(settleBurned, 0, "sanity: the default settleBurnBps actually burns something on this branch now");
         assertEq(
             wood.balanceOf(challenger),
-            challengerBalBefore + c.counterBondWood + prosecutorFee,
-            "bond back, the whole forfeited pool, and the prosecutor's cut of the proposer bond"
+            challengerBalBefore + c.counterBondWood - settleBurned + prosecutorFee,
+            "bond back, the forfeited pool net of the settle-slice burn, and the prosecutor's cut of the proposer bond"
         );
 
         // ── The named adapter lost its certification (D7).
@@ -644,7 +663,7 @@ contract TokenCourtEndToEndTest is Test {
         assertEq(uint256(court.caseOf(caseId).verdict), uint256(IChallengeGame.Verdict.NotGuilty));
 
         // ── The challenger's bond is gone outright -- no refund on a failed challenge.
-        assertEq(wood.balanceOf(challenger), challengerBalBefore - CHALLENGER_BOND, "the bond forfeited");
+        assertEq(wood.balanceOf(challenger), challengerBalBefore - _challengerBond(), "the bond forfeited");
 
         // ── g1 funded the whole pool alone, so `claimContribution` gives it
         //    its stake back plus its whole (burn-adjusted) pro-rata slice.
@@ -653,7 +672,7 @@ contract TokenCourtEndToEndTest is Test {
         // `forfeitBurnBps`, g1's payout is exactly 80% of the bond. A
         // zeroed-out burn rate would still clear `assertGt(..., 0)`, so the
         // literal is what actually pins the rate rather than merely its sign.
-        assertEq(c.forfeitPayoutWood, (CHALLENGER_BOND * 8_000) / 10_000, "80% of the bond, net of the 20% burn");
+        assertEq(c.forfeitPayoutWood, (_challengerBond() * 8_000) / 10_000, "80% of the bond, net of the 20% burn");
         uint256 expectedClaim = c.counterBondWood + c.forfeitPayoutWood;
         assertEq(game.claimableContribution(cid, g1), expectedClaim);
         uint256 g1BalBeforeClaim = wood.balanceOf(g1);
@@ -712,18 +731,27 @@ contract TokenCourtEndToEndTest is Test {
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Inconclusive), "Inconclusive");
         assertEq(uint256(court.caseOf(caseId).verdict), uint256(IChallengeGame.Verdict.Inconclusive));
 
-        // ── The challenger's bond returns WHOLE on THIS filing specifically
-        //    (owner decision 2026-07-30, escalating the Inconclusive burn):
-        //    it is this proposal's first-ever challenge, and round 1 of the
-        //    escalating schedule is priced at 0 bps -- an honest one-shot
-        //    filer whose vote merely missed the participation floor once is
-        //    not charged. A SECOND Inconclusive round against the SAME
-        //    proposal would escalate (see `ChallengeGame.t.sol`'s
+        // ── The challenger's bond returns minus the round-1 ENTRY-TIER burn
+        //    on THIS filing specifically (issue #181 finding 19, superseding
+        //    the 2026-07-30 "round 1 is free" decision): it is this
+        //    proposal's first-ever challenge, and round 1 of the escalating
+        //    schedule is now priced at `INCONCLUSIVE_BURN_ROUND1_BPS` (250
+        //    bps) rather than 0 -- a free first unwind let anyone pin every
+        //    accused approver's stake for free, repeatably, so no attempt is
+        //    ever free anymore. A SECOND Inconclusive round against the SAME
+        //    proposal would escalate further (see `ChallengeGame.t.sol`'s
         //    `test_inconclusive_escalationSchedule` for the full ladder);
-        //    this arc test covers the single-round happy path only.
+        //    this arc test covers the single-round happy path only. The burn
+        //    is derived from the challenge's own pinned rate rather than
+        //    hardcoded, so this survives a future schedule change.
         IChallengeGame.Challenge memory c = game.challengeOf(cid);
-        assertEq(c.inconclusiveBurnBpsAtFiling, 0, "round 1 against a fresh proposal is free");
-        assertEq(wood.balanceOf(challenger), challengerBalBefore, "the whole bond came back");
+        assertEq(c.inconclusiveBurnBpsAtFiling, 250, "round 1 against a fresh proposal pins the entry tier");
+        uint256 round1Burned = (c.bondWood * c.inconclusiveBurnBpsAtFiling) / 10_000;
+        assertEq(
+            wood.balanceOf(challenger),
+            challengerBalBefore - round1Burned,
+            "the bond came back minus the round-1 entry-tier burn"
+        );
 
         // ── g1 collects EXACTLY its stake back -- no winnings, nothing was won.
         assertEq(game.claimableContribution(cid, g1), c.counterBondWood, "stake only, no forfeit to split");
@@ -805,9 +833,23 @@ contract TokenCourtEndToEndTest is Test {
         vm.expectRevert(IChallengeGame.WrongStatus.selector);
         game.resolve(cidA); // nothing left for the timeout to do
 
-        // ── (b): the challenge's own clock beats a late `finalize`.
+        // ── (b): the challenge's own clock beats a late `finalize`, and lands
+        //    a NON-VERDICT, not an acquittal (issue #181 finding 20). The
+        //    court is unwired BEFORE this filing, so `courtAtFiling` pins to
+        //    `address(0)` for this challenge -- permanently, regardless of
+        //    the later re-wire below. That is the exact shape `resolve`'s
+        //    `_refundAll` branch exists for ("no adjudicator was ever
+        //    guaranteed reachable"), so THIS challenge's timeout resolves
+        //    `Inconclusive` even though a real case does go on to open and
+        //    even collect a vote -- `resolve` reads the pin taken at filing,
+        //    not that later history. A wired court whose adjudicator simply
+        //    never rules in time takes the identical non-verdict path via
+        //    `_fail`'s `unadjudicatedTimeout` re-arm; only a court's genuine
+        //    `NotGuilty` ruling (arc (a) above) is a real acquittal that
+        //    forfeits the challenger's bond.
         vm.prank(owner);
         game.setCourt(address(0)); // suppress auto-referral -- the referral instant below is chosen by hand
+        uint256 challengerBBalBeforeFile = wood.balanceOf(challengerB);
         vm.prank(challengerB);
         uint256 cidB = game.file(
             address(gov),
@@ -832,16 +874,43 @@ contract TokenCourtEndToEndTest is Test {
         uint256 lastLegal = filedAtB + disputeTimeoutAtFilingB - court.voteWindow() - court.FINALIZE_BUFFER();
         vm.warp(lastLegal);
         vm.prank(owner);
-        game.setCourt(address(court)); // re-wire just before the manual referral
+        game.setCourt(address(court)); // re-wire just before the manual referral -- courtAtFiling stays pinned at 0
         uint256 caseIdB = court.refer(cidB); // the last legal instant, per test_refer_clockCheckBoundary
         assertEq(court.caseOf(caseIdB).referredAt, lastLegal);
 
         vm.prank(g3);
-        court.vote(caseIdB, true); // the tally is moot -- the timeout wins this race regardless
+        court.vote(caseIdB, true); // the tally is moot -- the game's own clock resolves this first regardless
 
+        assertEq(wood.balanceOf(challengerB), challengerBBalBeforeFile - _challengerBond(), "the bond is out on loan");
         vm.warp(filedAtB + disputeTimeoutAtFilingB); // exactly the challenge's own (pinned) timeout
-        game.resolve(cidB); // Disputed, clock elapsed -> _fail
-        assertEq(uint256(game.challengeOf(cidB).status), uint256(IChallengeGame.Status.Failed), "timeout won the race");
+        game.resolve(cidB); // Disputed, clock elapsed, courtAtFiling == 0 -> _refundAll
+        assertEq(
+            uint256(game.challengeOf(cidB).status),
+            uint256(IChallengeGame.Status.Inconclusive),
+            "the game's own clock resolved this challenge first, as a non-verdict, not an acquittal"
+        );
+
+        // ── BOTH SIDES UNWIND WHOLE, proven in WOOD rather than inferred
+        //    from the status alone. The challenger gets its bond back minus
+        //    only the small, escalating anti-grinding burn (never forfeited
+        //    to the defence, unlike arc (a)'s real acquittal), and g1 -- the
+        //    pool's sole funder -- gets its whole counter-bond contribution
+        //    back with no burn on that side at all. Derived from the
+        //    challenge's own pinned rate, not hardcoded, so this survives a
+        //    future schedule change.
+        IChallengeGame.Challenge memory cb = game.challengeOf(cidB);
+        uint256 inconclusiveBurnedB = (cb.bondWood * cb.inconclusiveBurnBpsAtFiling) / 10_000;
+        assertEq(
+            wood.balanceOf(challengerB),
+            challengerBBalBeforeFile - inconclusiveBurnedB,
+            "the challenger's bond came back whole, less only the anti-grinding burn"
+        );
+        assertEq(game.claimableContribution(cidB, g1), cb.counterBondWood, "g1's pool contribution, stake only");
+        uint256 g1BalBeforeClaim = wood.balanceOf(g1);
+        vm.prank(g1);
+        uint256 gotB = game.claimContribution(cidB);
+        assertEq(gotB, cb.counterBondWood);
+        assertEq(wood.balanceOf(g1), g1BalBeforeClaim + cb.counterBondWood, "g1's whole defence contribution returned");
 
         vm.expectEmit(true, true, false, false);
         emit ITokenCourt.ChallengeAlreadyTerminal(caseIdB, cidB);

@@ -230,6 +230,22 @@ interface ISyndicateGovernor {
     ///         that the tier-only check waves through while the aggregate
     ///         cap would still trust the stale, lower snapshot.
     error CoverageRegressed();
+    /// @notice Fail-safe sibling to `TierRegressed`/`CoverageRegressed`:
+    ///         revert at execute if `proposal.maxCapital` now exceeds the
+    ///         LIVE `totalAssets() * maxCapitalBps / 10_000` ceiling (audit
+    ///         issue #181 finding #9). The propose-time `MaxCapitalExceedsCeiling`
+    ///         check alone is not sufficient: `_depositsLocked()` (which gates
+    ///         new deposits) rises at PROPOSE via `openProposalCount()`, but
+    ///         `redemptionsLocked()` only rises at EXECUTE via
+    ///         `getActiveProposal()` — so between propose and execute a
+    ///         proposer can inflate `totalAssets()` with its own deposit to
+    ///         pass the propose-time ratio, then redeem that same deposit
+    ///         during the vote, shrinking the denominator the ceiling was
+    ///         computed against. Re-running the SAME ratio check immediately
+    ///         before dispatch closes that window. Distinct error from
+    ///         `MaxCapitalExceedsCeiling` so callers/indexers can tell a
+    ///         propose-time rejection from an execute-time regression.
+    error MaxCapitalCeilingRegressed();
     error StrategyAlreadyActive();
     error CooldownNotElapsed();
     error ProposalNotExecuted();
@@ -572,6 +588,19 @@ interface ISyndicateGovernor {
 
     function vote(uint256 proposalId, VoteType support) external;
 
+    /// @dev Re-checks `maxCapital` against the LIVE `totalAssets() *
+    ///      maxCapitalBps / 10_000` ceiling immediately before dispatching
+    ///      the execute batch, in addition to `TierRegressed`/
+    ///      `CoverageRegressed`. The propose-time `MaxCapitalExceedsCeiling`
+    ///      gate alone is not sufficient (audit issue #181 finding #9): a
+    ///      proposer can inflate `totalAssets()` with its own deposit right
+    ///      before proposing, then redeem that same deposit during the vote
+    ///      — `_depositsLocked()` blocks new deposits from PROPOSE, but
+    ///      `redemptionsLocked()` only blocks withdrawals from EXECUTE, so
+    ///      the proposer's own capital is free to leave in between. Reverts
+    ///      `MaxCapitalCeilingRegressed` (distinct from the propose-time
+    ///      error) when the live ratio no longer covers the snapshotted
+    ///      `maxCapital`.
     function executeProposal(uint256 proposalId) external;
 
     function settleProposal(uint256 proposalId) external;
@@ -598,6 +627,14 @@ interface ISyndicateGovernor {
     // ── Collaborative proposal functions ──
 
     function approveCollaboration(uint256 proposalId) external;
+    /// @dev Lead-only Draft -> Cancelled transition, gated by the SAME
+    ///      near-quorum guard `cancelProposal`'s Draft branch enforces
+    ///      (`CancelNotAllowedNearQuorum` when more than one co-proposer
+    ///      exists and all-but-one has already approved). Audit issue #181
+    ///      finding #16: this is the identical actor performing the
+    ///      identical state transition as `cancelProposal`'s Draft branch,
+    ///      so the two must share one check or a lead could dodge the guard
+    ///      by calling whichever of the two entrypoints it doesn't cover.
     function rejectCollaboration(uint256 proposalId) external;
 
     // ── Setters (owner-instant; owner is a multisig with external delay) ──

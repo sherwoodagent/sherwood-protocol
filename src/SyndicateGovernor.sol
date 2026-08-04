@@ -232,6 +232,20 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         return _settlementCallCaps[id];
     }
 
+    /// @dev The COVERAGE-SCALED settlement caps — what `settleProposal` meters
+    ///      against, and now what `unstick` meters against too. Populated by
+    ///      `_deriveAndStoreEffectiveCapital` on EVERY execute path (identity
+    ///      copy when the quorum gate did not run), so it is never empty for a
+    ///      proposal in `Executed`, which is the only state `unstick` accepts.
+    ///
+    ///      Split from `_getSettlementCallCaps` rather than replacing it: the
+    ///      raw propose-time array is still the record of what was voted on,
+    ///      and conflating the two is what let issue #27's sizing be enforced
+    ///      on one replay path and not the other.
+    function _getEffectiveSettlementCallCaps(uint256 id) internal view override returns (uint256[] storage) {
+        return _effectiveSettlementCallCaps[id];
+    }
+
     function _emergencyReentrancyEnter() internal override {
         if (_reentrancyStatus == _ENTERED) revert Reentrancy();
         _reentrancyStatus = _ENTERED;
@@ -475,6 +489,25 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (liveTier > proposal.envelopeTier) revert TierRegressed();
         if (liveCoverage > proposal.requiredCoverage) revert CoverageRegressed();
 
+        // Fail-safe sibling to the two regression checks above (audit issue
+        // #181 finding #9). The propose-time `_checkMaxCapitalCeiling` call
+        // (via `_snapshotTierAndGate`) alone is NOT sufficient: it prices
+        // `maxCapital` against `totalAssets()` at PROPOSE, and nothing stops
+        // the proposer from inflating that denominator with its own deposit
+        // right before proposing, then withdrawing the same deposit during
+        // the 24h vote. The two capital locks read different counters —
+        // `_depositsLocked()` (blocks new deposits) rises at PROPOSE via
+        // `openProposalCount() != 0`, while `redemptionsLocked()` (blocks
+        // withdrawals) rises only at EXECUTE via `getActiveProposal() != 0`
+        // — so the proposer's own capital is free to leave in the gap,
+        // shrinking the float the ceiling was computed against while
+        // `maxCapital` itself stays pinned at its inflated-denominator value.
+        // Re-running the identical ratio check here, against LIVE
+        // `totalAssets()`, immediately before the batch is dispatched,
+        // closes that window. Distinct revert from the propose-time
+        // `MaxCapitalExceedsCeiling` so the two are never conflated off-chain.
+        if (proposal.maxCapital > _capitalCeiling()) revert MaxCapitalCeilingRegressed();
+
         // A coverage-consuming proposal at/above the tier threshold cannot
         // execute without a bond-encumbered approve quorum: silence alone no
         // longer passes it, so an identified, stake-backed approver is always
@@ -595,10 +628,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // preventing a front-run of the final approve tx. A single
             // co-proposer Draft (total == 1) stays cancellable — "all but one"
             // is zero approvals there, which must not lock the lead out.
-            uint256 total = _coProposers[proposalId].length;
-            if (total > 1 && _approvedCount[proposalId] + 1 >= total) {
-                revert CancelNotAllowedNearQuorum();
-            }
+            // Shared with `rejectCollaboration`'s IDENTICAL Draft -> Cancelled
+            // transition (audit issue #181 finding #16) so the two lead-abort
+            // paths can never drift apart.
+            _requireNotNearQuorum(proposalId);
             // Draft binds the vault — decrement on cancel.
             _decOpen();
         } else {
@@ -658,7 +691,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      A second call then hits the ordinary `NoBondToReclaim` path, the
     ///      same terminal answer as after a normal release.
     ///
-    ///      Settled proposals wait `challengeWindow` after `executedAt`, and
+    ///      Settled proposals wait `strategyDuration + challengeWindow` after
+    ///      `executedAt`, and
     ///      only release while the ledger's per-proposal coverage freeze is
     ///      clear — a proposer who executes a drain and self-settles within
     ///      `MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE` cannot walk away with
@@ -675,7 +709,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      while a conviction — and with it `forfeitBond` — is still
     ///      reachable. The third gate therefore asks the game itself and
     ///      mirrors `ChallengeGame.file`'s own deadline,
-    ///      `max(executedAt + game.challengeWindow(), challengeableUntil[rk])`.
+    ///      `max(executedAt + strategyDuration + game.challengeWindow(),
+    ///      challengeableUntil[rk])`. That `+ strategyDuration` term is
+    ///      load-bearing and must track `file` exactly: without it these
+    ///      gates lift up to `maxStrategyDuration` (30d) before `file` stops
+    ///      admitting, releasing the very bond a successful challenge is paid
+    ///      out of while the proposal is still challengeable.
     ///      All three gates run against `proposal.proposerBondLedger`, the
     ///      ledger PINNED at propose time (falling back to the live
     ///      `_exposureLedger` slot only for a pre-pin proposal that recorded
@@ -766,7 +805,19 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // permanently — rotating the pinned ledger's own
             // `coverageFreezer` makes it reclaimable again.
             if (ledger == address(0)) revert ExposureLedgerUnset();
-            if (block.timestamp < executedAt + IExposureLedger(ledger).challengeWindow()) {
+            // `+ strategyDuration` (second-audit finding A). Risk does not end
+            // when the strategy is executed; it ends when the strategy's term
+            // is over AND the window on top of it has run out. Anchoring these
+            // gates at `executedAt + challengeWindow` alone released the bond
+            // up to `maxStrategyDuration` (30d) BEFORE `ChallengeGame.file`
+            // stops admitting challenges against this proposal — and the
+            // proposer bond is precisely what a successful challenge is paid
+            // out of, so the gap let a proposer walk their stake out of a
+            // still-challengeable position. Read off `proposal` in the same
+            // load as `executedAt`, matching how `file` pins it off its own
+            // `getProposal` snapshot, so the two deadlines cannot diverge.
+            uint256 strategyDuration = proposal.strategyDuration;
+            if (block.timestamp < executedAt + strategyDuration + IExposureLedger(ledger).challengeWindow()) {
                 revert ChallengeWindowOpen();
             }
             if (IExposureLedger(ledger).isCoverageFrozen(address(this), proposalId)) {
@@ -776,7 +827,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // for why the two gates above are not sufficient on their own.
             address freezer = IExposureLedger(ledger).coverageFreezer();
             if (freezer != address(0)) {
-                uint256 deadline = executedAt + IChallengeGame(freezer).challengeWindow();
+                // Must reproduce `ChallengeGame.file`'s deadline EXACTLY —
+                // `executedAt + p.strategyDuration + challengeWindow`, then
+                // maxed against `challengeableUntil` — or this gate lifts
+                // while `file` is still admitting.
+                uint256 deadline = executedAt + strategyDuration + IChallengeGame(freezer).challengeWindow();
                 // Same review-key derivation as `ChallengeGame._reviewKey`
                 // (abi.encode, not encodePacked).
                 uint256 extended =
@@ -884,6 +939,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     }
 
     /// @inheritdoc ISyndicateGovernor
+    /// @dev Same Draft -> Cancelled transition, by the same actor
+    ///      (`proposal.proposer == msg.sender`), as `cancelProposal`'s Draft
+    ///      branch — gated by the identical `_requireNotNearQuorum` guard
+    ///      (audit issue #181 finding #16). Without it, a lead near quorum
+    ///      could dodge `cancelProposal`'s `CancelNotAllowedNearQuorum` by
+    ///      calling this entrypoint instead, keeping a free last-instant
+    ///      abort and burning co-proposers' approve gas at will.
     function rejectCollaboration(uint256 proposalId) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (_commitState(proposal) != ProposalState.Draft) revert NotDraftState();
@@ -891,6 +953,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Lead-only. A dissenting co-proposer simply withholds approval (the
         // Draft lapses at the collaboration window).
         if (proposal.proposer != msg.sender) revert NotLeadProposer();
+
+        _requireNotNearQuorum(proposalId);
 
         _transition(proposal, ProposalState.Cancelled);
         // Draft binds the vault — decrement on reject.
@@ -1122,17 +1186,38 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
     }
 
-    /// @dev Without a ceiling, a proposer declares maxCapital = uint256.max
-    ///      and the net-outflow cap (vault-enforced on execute AND settlement
-    ///      batches) never binds. Ceiling =
-    ///      `maxCapitalBps` (governor param, default 100%) of the vault's
-    ///      totalAssets() at propose time. Hoisted out of `propose` to stay
-    ///      under Yul's stack budget (see `_initPendingProposal`); reads the
-    ///      vault from storage (validated == the propose arg at the top of
-    ///      `propose`) for the same reason — one fewer stack slot.
+    /// @dev Shared ratio: `maxCapitalBps` (governor param, default 100%) of
+    ///      the vault's LIVE `totalAssets()`. Both call sites below re-derive
+    ///      this from live state rather than a snapshot, so they only differ
+    ///      in WHEN they run and WHICH error they revert with.
+    function _capitalCeiling() private view returns (uint256) {
+        return (IERC4626(GovernorParameters.vault).totalAssets() * maxCapitalBps()) / BPS_DENOMINATOR;
+    }
+
+    /// @dev Propose-time half of the maxCapital ceiling. Without it, a
+    ///      proposer declares maxCapital = uint256.max and the net-outflow
+    ///      cap (vault-enforced on execute AND settlement batches) never
+    ///      binds. Hoisted out of `propose` to stay under Yul's stack budget
+    ///      (see `_initPendingProposal`); reads the vault from storage
+    ///      (validated == the propose arg at the top of `propose`) for the
+    ///      same reason — one fewer stack slot.
+    ///
+    ///      NOT sufficient on its own (audit issue #181 finding #9): this
+    ///      check prices `maxCapital` against `totalAssets()` at PROPOSE, and
+    ///      the vault's two capital locks read different counters —
+    ///      deposits are blocked from `openProposalCount() != 0` (set here,
+    ///      at propose), but redemptions are blocked only from
+    ///      `getActiveProposal() != 0` (set later, at execute). A proposer
+    ///      can inflate `totalAssets()` with its own deposit immediately
+    ///      before proposing, pass this gate, then withdraw that same
+    ///      deposit during the vote — shrinking the float this ratio was
+    ///      computed against while `maxCapital` stays pinned at its
+    ///      inflated-denominator value. `executeProposal` re-runs the same
+    ///      `_capitalCeiling()` ratio against live totals immediately before
+    ///      dispatch (`MaxCapitalCeilingRegressed`) to close that window —
+    ///      see the natspec there.
     function _checkMaxCapitalCeiling(uint256 maxCapital) private view {
-        uint256 ceiling = (IERC4626(GovernorParameters.vault).totalAssets() * maxCapitalBps()) / BPS_DENOMINATOR;
-        if (maxCapital > ceiling) revert MaxCapitalExceedsCeiling();
+        if (maxCapital > _capitalCeiling()) revert MaxCapitalExceedsCeiling();
     }
 
     /// @dev Propose-time half of issue #118's fix: rejects any target in
@@ -1607,6 +1692,24 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         revert NotCoProposer();
     }
 
+    /// @dev Anti-front-run guard for the lead's Draft -> Cancelled abort,
+    ///      shared by `cancelProposal`'s Draft branch and
+    ///      `rejectCollaboration` (audit issue #181 finding #16). Both are
+    ///      the SAME actor (`proposal.proposer`) performing the SAME
+    ///      transition on the SAME state, so they must share one check or a
+    ///      lead near quorum could always route around whichever entrypoint
+    ///      enforces it. Blocks the lead once all-but-one co-proposer has
+    ///      approved, preventing a front-run of the final approve tx. A
+    ///      single co-proposer Draft (`total == 1`) stays cancellable —
+    ///      "all but one" is zero approvals there, which must not lock the
+    ///      lead out.
+    function _requireNotNearQuorum(uint256 proposalId) private view {
+        uint256 total = _coProposers[proposalId].length;
+        if (total > 1 && _approvedCount[proposalId] + 1 >= total) {
+            revert CancelNotAllowedNearQuorum();
+        }
+    }
+
     /// @dev Store co-proposers, emit event. `collaborationDeadline` is NOT set
     ///      here — `propose` writes it in the `isCollaborative` branch, before
     ///      any external call, so the Draft is never observable with a zero
@@ -1695,16 +1798,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         uint256 balanceAdjusted = IERC20(asset).balanceOf(vault);
         pnl = int256(balanceAdjusted) - int256(snapshot);
 
-        // Finalize state before external transfers to prevent reentrancy on stale state
-        _activeProposal = 0;
-        _transition(proposal, ProposalState.Settled);
-        delete _capitalSnapshots[proposalId];
-        // Open emergency reviews are NOT auto-cancelled here — they resolve
-        // naturally via `resolveEmergencyReview` at reviewEnd (slashing if the
-        // block quorum was met, no-op otherwise) so an owner who opened an
-        // adversarial emergency cannot dodge slash by racing a settle.
-        _decOpen();
-
         // ── Two-number fee model ──
         // Ordering is load-bearing: management fee first (it lowers assets and
         // therefore price per share), then the high-water-mark comparison, then
@@ -1735,6 +1828,28 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // queued redeemers/depositors settle against the post-fee NAV. No-op if
         // the vault has no withdrawal queue.
         ISyndicateVault(vault).onProposalSettled(proposalId);
+
+        // Release the locks LAST, after every external call above (CEI; audit
+        // issue #181 finding #24). `_activeProposal` backs the vault's
+        // `redemptionsLocked()` and `_openProposalCount` backs
+        // `_depositsLocked()` — clearing either before the fee transfers /
+        // `onProposalSettled` stamp would open a window where a
+        // callback-bearing fee recipient (a hooked asset onboarded later, or
+        // the proposer via `_distributeAgentFee`) could deposit or redeem
+        // against a NAV that is pre-fee and pre-stamp, and shift
+        // `totalSupply()` before the settle price lands — diluting this
+        // proposal's queued redeemers. `settleProposal`'s `nonReentrant` does
+        // NOT cover this: it only guards re-entry into this governor, not
+        // calls into the vault or its withdrawal queue, which are separate
+        // contracts. Open emergency reviews are NOT auto-cancelled here —
+        // they resolve naturally via `resolveEmergencyReview` at reviewEnd
+        // (slashing if the block quorum was met, no-op otherwise) so an
+        // owner who opened an adversarial emergency cannot dodge slash by
+        // racing a settle.
+        _activeProposal = 0;
+        _transition(proposal, ProposalState.Settled);
+        delete _capitalSnapshots[proposalId];
+        _decOpen();
 
         emit ProposalSettled(proposalId, vault, pnl, totalFee, block.timestamp - proposal.executedAt);
 
@@ -2007,6 +2122,20 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      double-count the burn — the lead would be credited what was skimmed and
     ///      under-paid to match. USDC (the only V1 asset) is non-FOT; this branch
     ///      stays pinned by the `non-FOT` asset requirement in the vault audit.
+    /// @dev The split is agreed and validated at PROPOSE time
+    ///      (`_validateCoProposers`, against each co-proposer's THEN-live
+    ///      agent status) — settle honours that recorded split rather than
+    ///      re-resolving it against a possibly-mutated LIVE status. A
+    ///      co-proposer removed after propose (`removeAgent` is `onlyOwner`
+    ///      with no lifecycle gate) still does not get paid, but its earned
+    ///      share is FORFEITED back to the vault (left undistributed) rather
+    ///      than folded into the lead's remainder (audit issue #181 finding
+    ///      #17): folding it into `leadShare` would let an owner who has
+    ///      seated itself as lead strip co-proposers right before settle to
+    ///      redirect their already-earned entitlement to itself. The lead's
+    ///      own `leadShare` is therefore always exactly its propose-time
+    ///      split (`agentFee - Σ co-proposer shares`, active or not),
+    ///      independent of which co-proposers are still active at settle.
     function _distributeAgentFee(uint256 proposalId, address vault, address asset, address proposer, uint256 agentFee)
         internal
     {
@@ -2014,23 +2143,31 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         CoProposer[] storage coProps = _coProposers[proposalId];
         if (coProps.length > 0) {
             uint256 distributed = 0;
+            uint256 forfeited = 0;
             for (uint256 i = 0; i < coProps.length; i++) {
                 // Stop once the budget is exhausted — otherwise a later
-                // co-proposer's non-zero share could push `distributed` past
-                // `agentFee`.
-                if (distributed >= agentFee) break;
-                bool active = ISyndicateVault(vault).isAgent(coProps[i].agent);
-                if (!active) continue;
+                // co-proposer's non-zero share could push `distributed +
+                // forfeited` past `agentFee`.
+                if (distributed + forfeited >= agentFee) break;
                 uint256 share = (agentFee * coProps[i].splitBps) / BPS_DENOMINATOR;
                 if (share == 0) share = 1;
                 // Cap to remaining budget — handles both the rounding-floor pad
                 // (share = 1) and any splitBps overflow.
-                uint256 remaining = agentFee - distributed;
+                uint256 remaining = agentFee - distributed - forfeited;
                 if (share > remaining) share = remaining;
-                _payFee(vault, asset, coProps[i].agent, share);
-                distributed += share;
+                if (ISyndicateVault(vault).isAgent(coProps[i].agent)) {
+                    _payFee(vault, asset, coProps[i].agent, share);
+                    distributed += share;
+                } else {
+                    // Forfeited, not redirected — stays undistributed in the
+                    // vault. See the function-level note above.
+                    forfeited += share;
+                }
             }
-            uint256 leadShare = agentFee - distributed;
+            // The lead's fixed propose-time share. Subtracting `forfeited`
+            // here (not just `distributed`) is what keeps a removed
+            // co-proposer's entitlement OUT of the lead's payout.
+            uint256 leadShare = agentFee - distributed - forfeited;
             if (leadShare > 0) {
                 _payFee(vault, asset, proposer, leadShare);
             }

@@ -5,6 +5,29 @@ import {Test} from "forge-std/Test.sol";
 import {GuardianRegistry} from "../src/GuardianRegistry.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
+/// @notice Minimal answering stub for `GuardianRegistry.setExposureLedger`'s
+///         STRICT post-audit-#181-finding-#26 validation (see that function's
+///         natspec in `src/GuardianRegistry.sol`). The setter now calls INTO
+///         the ledger with no try/catch, so a codeless sentinel address
+///         reverts the wiring outright — this test only cares about the
+///         STORAGE SLOT the ledger address lands in, so any contract that
+///         answers the two calls the setter makes is sufficient:
+///           - `challengeWindow()` must be >= `reviewPeriod +
+///             MAX_GOVERNOR_EXECUTION_WINDOW` (24h review + 7d window here,
+///             so 30 days clears it with margin).
+///           - `guardianRegistry()` must be `address(0)` (unset) or the
+///             calling registry — `address(0)` is the legitimate
+///             first-time-wiring reading this fixture exercises.
+contract MockExposureLedgerMinimal {
+    function challengeWindow() external pure returns (uint256) {
+        return 30 days;
+    }
+
+    function guardianRegistry() external pure returns (address) {
+        return address(0);
+    }
+}
+
 /// @notice Raw-slot pins for `GuardianRegistry`'s UUPS-upgraded storage layout —
 ///         the in-`forge test` layer of the golden guard (the field-by-field JSON
 ///         diff lives in `script/check-layout-goldens.sh` against
@@ -48,7 +71,11 @@ contract GuardianRegistryLayoutPinsTest is Test {
     address constant SWOOD_SENTINEL = address(0x5000D);
     address constant GOV_SENTINEL = address(0x60F);
     address constant VAULT_SENTINEL = address(0xFA017);
-    address constant LEDGER_SENTINEL = address(0x1ED6E);
+    /// @dev NOT a bare sentinel address — `setExposureLedger` now calls INTO
+    ///      the ledger (`challengeWindow()`, `guardianRegistry()`), so this
+    ///      must be a deployed, answering contract. See
+    ///      `MockExposureLedgerMinimal` above.
+    address LEDGER_SENTINEL;
 
     uint256 constant REVIEW_PERIOD = 24 hours;
     uint256 constant BLOCK_QUORUM_BPS = 3000;
@@ -60,6 +87,7 @@ contract GuardianRegistryLayoutPinsTest is Test {
             (OWNER_SENTINEL, FACTORY_SENTINEL, SWOOD_SENTINEL, REVIEW_PERIOD, BLOCK_QUORUM_BPS)
         );
         registry = GuardianRegistry(address(new ERC1967Proxy(address(impl), init)));
+        LEDGER_SENTINEL = address(new MockExposureLedgerMinimal());
     }
 
     function _slot(uint256 index) internal view returns (bytes32) {

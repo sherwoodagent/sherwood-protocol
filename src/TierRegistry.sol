@@ -67,10 +67,29 @@ contract TierRegistry is Ownable2Step {
     ///      starts `bondReleaseDelay`, then the submitter claims. The delay
     ///      gives the slash mechanism a window to act before the submitter's
     ///      bond can be pulled out from under it.
+    ///
+    ///      `token` pins the ERC20 this specific bond was actually PULLED in
+    ///      (audit finding #3, refund half): `certify` already pins
+    ///      `PendingCertification.bondToken` so the PULL can't be silently
+    ///      repointed by an intervening `setWood` — but until this field
+    ///      existed, the REFUND in `claimSubmitterBond` read the LIVE `wood`
+    ///      state variable instead, so that pin never reached payout. Two
+    ///      certifications under two different tokens sharing this registry
+    ///      would let the first claimant drain the second submitter's
+    ///      collateral out of a shared balance; a single certification
+    ///      followed by one `setWood` would strand the bond permanently
+    ///      (claim reverts on the new token's zero balance for this key,
+    ///      `totalBondedWood` never decrements, and `setWood`'s
+    ///      `BondsOutstanding` guard can then never be satisfied again — no
+    ///      sweep function exists and the contract is non-upgradeable).
+    ///      Recording the token on the bond itself makes every later state of
+    ///      `wood` irrelevant to an already-locked bond's payout, exactly
+    ///      like `bondToken` already does for the pull.
     struct SubmitterBond {
         address submitter;
         uint96 amount;
         uint64 releasableAt; // 0 while certified; set on demotion
+        IERC20 token; // pinned at certify time (audit finding #3)
     }
 
     /// @dev A proposed-but-not-yet-executed certification. `readyAt == 0` is
@@ -204,8 +223,18 @@ contract TierRegistry is Ownable2Step {
     uint256 public bondReleaseDelay = 14 days;
     mapping(bytes32 configKey => SubmitterBond) internal _bonds;
 
-    /// @notice Sum of all bonds held (active + pending release). Invariant
-    ///         (spec §4): `wood.balanceOf(address(this)) == totalBondedWood`.
+    /// @notice Sum of all bonds held (active + pending release), across every
+    ///         token a bond has ever been pulled in.
+    /// @dev    NOT `wood.balanceOf(address(this)) == totalBondedWood` (spec
+    ///         §4's original phrasing, written before `SubmitterBond.token`
+    ///         existed): each bond now carries its OWN pinned token (audit
+    ///         finding #3), so once bonds under two different tokens coexist
+    ///         this sum spans balances in both and no longer equals any
+    ///         single token's `balanceOf`. What DOES still hold, per token
+    ///         `t`: `t.balanceOf(address(this)) >= sum(amount for bonds where
+    ///         token == t)`. The scalar here is used only as the
+    ///         `BondsOutstanding` existence gate in `setWood` — zero iff no
+    ///         bond, in any token, is currently held.
     uint256 public totalBondedWood;
 
     constructor(address initialOwner) Ownable(initialOwner) {}
@@ -273,12 +302,21 @@ contract TierRegistry is Ownable2Step {
 
     /// @notice Set the WOOD token used for submitter bonds.
     /// @dev    Token-swap constraint: the bond token cannot change while ANY
-    ///         bond is held (`BondsOutstanding`) — outstanding bonds are
-    ///         denominated in the OLD token and a swap would strand them (the
-    ///         claim path pays out in the new token, whose balance is zero).
-    ///         Drain all bonds (demote → timelock → claim) before swapping.
-    ///         Clearing the token to address(0) while the bond amount is still
-    ///         armed is also rejected — zero the amount first.
+    ///         bond is held (`BondsOutstanding`). This is defense-in-depth,
+    ///         not strictly load-bearing for fund safety: every bond now
+    ///         pins its OWN token at certify time (`SubmitterBond.token`,
+    ///         audit finding #3) and `claimSubmitterBond` pays out against
+    ///         that pinned field, never the live `wood` variable — so an
+    ///         already-locked bond can no longer be stranded, misdirected
+    ///         onto another bond's collateral, or pointed at a codeless
+    ///         `address(0)` by a swap here. The guard is kept anyway because
+    ///         letting bonds accumulate under multiple live tokens
+    ///         simultaneously is unmaintainable operationally (per-token
+    ///         accounting the owner would have to track off-chain) even
+    ///         though it is no longer unsafe on-chain. Drain all bonds
+    ///         (demote → timelock → claim) before swapping. Clearing the
+    ///         token to address(0) while the bond amount is still armed is
+    ///         also rejected — zero the amount first.
     ///
     ///         `totalBondedWood != 0` is the ONLY guard here and it is
     ///         deliberately silent about pending (unexecuted) certifications:
@@ -286,10 +324,11 @@ contract TierRegistry is Ownable2Step {
     ///         cares what this setter does before it executes, because
     ///         `PendingCertification.bondToken` pins TokenA at proposal time
     ///         (audit finding #1) and `certify` pulls against that pinned
-    ///         token, never against this live variable. Swapping `wood` here
-    ///         mid-window is therefore inert to any already-pending
-    ///         certification's bond economics by construction, not merely by
-    ///         accident of timing.
+    ///         token — and now also WRITES it onto the new bond's `token`
+    ///         field (finding #3) — never against this live variable at
+    ///         either step. Swapping `wood` here mid-window is therefore
+    ///         inert to any already-pending certification's bond economics,
+    ///         both at pull time and at every later claim, by construction.
     function setWood(address wood_) external onlyOwner {
         if (totalBondedWood != 0) revert BondsOutstanding();
         if (wood_ == address(0) && submitterBondWood != 0) revert BondConfigUnset();
@@ -478,7 +517,8 @@ contract TierRegistry is Ownable2Step {
         }
         delete _pending[k];
         if (p.bondAmount != 0) {
-            _bonds[k] = SubmitterBond({submitter: p.submitter, amount: p.bondAmount, releasableAt: 0});
+            _bonds[k] =
+                SubmitterBond({submitter: p.submitter, amount: p.bondAmount, releasableAt: 0, token: p.bondToken});
             totalBondedWood += p.bondAmount;
             p.bondToken.safeTransferFrom(p.submitter, address(this), p.bondAmount);
             emit SubmitterBondLocked(target, selector, p.submitter, p.bondAmount);
@@ -671,7 +711,12 @@ contract TierRegistry is Ownable2Step {
         if (b.releasableAt == 0 || block.timestamp < b.releasableAt) revert BondNotReleasable();
         delete _bonds[k];
         totalBondedWood -= b.amount;
-        wood.safeTransfer(b.submitter, b.amount);
+        // Pays out in the token THIS bond was pulled in (`b.token`, audit
+        // finding #3), never the live `wood` state variable: `wood` can have
+        // been repointed by `setWood` any number of times since this bond was
+        // locked (see `SubmitterBond.token` natspec for why the live variable
+        // is unsafe here — cross-token drain / permanent stranding).
+        b.token.safeTransfer(b.submitter, b.amount);
         emit SubmitterBondClaimed(target, selector, b.submitter, b.amount);
     }
 

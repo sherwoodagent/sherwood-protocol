@@ -488,6 +488,34 @@ contract SyndicateVault is
         return IProposalStatus(_getGovernor()).getActiveProposal();
     }
 
+    /// @dev Proposal id to tag a queued `requestDeposit` with. `_activePid()`
+    ///      (`getActiveProposal()`) reads 0 until EXECUTE, but `requestDeposit`
+    ///      opens as soon as ANY non-terminal proposal exists
+    ///      (`openProposalCount() != 0` — see `requestDeposit`), which is
+    ///      earlier. Exactly one top-level proposal is ever open on this vault
+    ///      at a time (`propose` reverts `VaultHasOpenProposal` while
+    ///      `openProposalCount() != 0`), so the governor's monotonic
+    ///      `proposalCount()` already names that open proposal in the gap
+    ///      before `getActiveProposal()` is set. From EXECUTE onward the two
+    ///      agree (same proposal), so this collapses to `_activePid()`.
+    /// @dev Deliberately a low-level staticcall, same reasoning as
+    ///      `_pricingSupply()`'s: `SyndicateGovernor.proposalCount()` is a
+    ///      real, selector-stable getter, but is not declared on
+    ///      `IProposalStatus` — that interface is intentionally narrowed to
+    ///      the three selectors the vault otherwise depends on (see its
+    ///      top-level doc), and widening it is a change to a file this fix
+    ///      does not own. A missing selector degrades to pid 0 rather than
+    ///      reverting — today unreachable (the getter has always existed on
+    ///      `SyndicateGovernor`), kept only so a nonstandard governor can
+    ///      never brick `requestDeposit`.
+    function _openProposalPid() private view returns (uint256) {
+        address gov = _getGovernor();
+        uint256 active = IProposalStatus(gov).getActiveProposal();
+        if (active != 0) return active;
+        (bool ok, bytes memory ret) = gov.staticcall(abi.encodeWithSignature("proposalCount()"));
+        return (ok && ret.length == 32) ? abi.decode(ret, (uint256)) : 0;
+    }
+
     /// @inheritdoc ISyndicateVault
     /// @dev Every delegatecall re-verifies that `_executorImpl`'s bytecode
     ///      still matches the hash stamped at init. A factory misconfig or a
@@ -1150,6 +1178,41 @@ contract SyndicateVault is
         override(ERC20Upgradeable, ERC20VotesUpgradeable)
     {
         super._update(from, to, value);
+
+        // HIGH-WATER MARK RESET ON FULL DRAIN (audit-181-2, Finding B).
+        //
+        // `_highWaterPricePerShare` is seeded once, at the first mint
+        // (`_initHighWaterMarkIfUnset`, called from every mint entrypoint —
+        // `_deposit` and `settleDeposit`, see both), and otherwise only ever
+        // advances (`ratchetHighWaterMark`, monotonic by construction). It was
+        // NEVER reset when `totalSupply()` returns to zero — every share
+        // burned via redemption/settlement — while the ERC-4626 share/asset
+        // SCALE is independently re-derived from `(residualAssets + 1)` on
+        // the very next deposit (the virtual-offset arithmetic in
+        // `_convertToShares`/`_convertToAssets`). The result: a re-seeding
+        // deposit's price-per-share can land at `(residualAssets+1)x` the
+        // STALE mark, and `aboveHighWaterMark` then reads almost the entire
+        // new principal as performance-fee base on a zero-P&L re-seed — up to
+        // the fee cap, charged against brand-new capital that never earned a
+        // cent. Reaching `totalSupply() == 0 && totalAssets() > 0` is not
+        // exotic: redeem-flooring dust, the queue's own deliberate
+        // `floor(sum) - sum(floor)` dust release, `_unclaimedFees` escrow, or
+        // a bare ERC20 donation to the vault all leave residual assets behind
+        // an empty share supply.
+        //
+        // Zeroing here, on EVERY burn/mint/transfer that empties supply
+        // (this hook is the single OZ chokepoint for all of them — Lane A
+        // `_withdraw`, the queue's `settleRedeem`, and any future burn path
+        // alike), makes the next mint's `_initHighWaterMarkIfUnset` treat the
+        // fund as freshly created, exactly like the very first deposit ever.
+        // A mint in the SAME call as the draining burn (impossible for a
+        // single ERC20 `_update`, which touches at most one balance
+        // direction pair) is not a concern; sequential burn-then-mint across
+        // two calls is exactly the case this closes.
+        if (totalSupply() == 0) {
+            _highWaterPricePerShare = 0;
+        }
+
         // AUTO-DELEGATE ON EVERY RECEIPT. Runs AFTER `super._update` so the
         // recipient's post-receipt balance is what checkpoints. Holders that
         // explicitly delegated away keep their choice (`delegates(to) != 0`).
@@ -1458,6 +1521,17 @@ contract SyndicateVault is
     ///         `totalAssets` nor are swept into the strategy) and records a claim
     ///         that mints shares at the realized settle price once the proposal
     ///         settles. Standard `deposit`/`mint` is used outside the lock window.
+    /// @dev Gated on `openProposalCount() != 0` — the SAME predicate the
+    ///      instant path (`_depositsLocked`) closes on — not `redemptionsLocked()`
+    ///      (`getActiveProposal() != 0`, true only from EXECUTE onward). Those
+    ///      two predicates diverge for the whole Pending/GuardianReview/Approved
+    ///      window: instant deposit is already closed there (`_depositsLocked`),
+    ///      but `redemptionsLocked()` was still false, so gating on it left NO
+    ///      path to deposit at all for that entire window (audit issue #181,
+    ///      finding #13). `openProposalCount()` covers exactly the window
+    ///      instant deposit is closed for, so exactly one path is always open —
+    ///      matching the redeem side, where `requestRedeem` / `maxWithdraw` /
+    ///      `maxRedeem` all already agree on `redemptionsLocked()`.
     /// @return requestId Always > 0 (queue uses index 0 as a sentinel).
     function requestDeposit(uint256 assets, address receiver)
         external
@@ -1467,10 +1541,13 @@ contract SyndicateVault is
     {
         address q = _withdrawalQueue;
         if (q == address(0)) revert WithdrawalQueueNotSet();
-        if (!redemptionsLocked()) revert RedemptionsNotLocked();
+        if (IProposalStatus(_getGovernor()).openProposalCount() == 0) revert NoOpenProposal();
         if (assets == 0) revert ZeroAssets();
         _requireApprovedDepositor(receiver);
-        uint256 pid = _activePid();
+        // Tag with the currently open proposal's id (see `_openProposalPid`) —
+        // NOT `_activePid()`, which is still 0 for any request placed before
+        // EXECUTE.
+        uint256 pid = _openProposalPid();
         // Escrow assets in the queue (off-vault custody — never counted in
         // totalAssets, never swept into the strategy).
         IERC20(asset()).safeTransferFrom(msg.sender, q, assets);
@@ -1511,12 +1588,24 @@ contract SyndicateVault is
     /// @notice Queue-only: mint `shares` to `to` at the proposal's frozen settle
     ///         price. The queue pushes the escrowed assets to the vault
     ///         immediately before this call. Auto-delegates for voting power.
-    /// @dev No `nonReentrant`: there is no external call (mint + delegate only),
-    ///      and the only caller — the queue's `claim` — is itself `nonReentrant`.
-    ///      Auto-delegation happens in `_update`.
+    /// @dev No `nonReentrant`: the only STATE-MUTATING call here is the mint
+    ///      (+ delegate, in `_update`). `_initHighWaterMarkIfUnset` below reads
+    ///      `pricePerShare()`, which makes external STATICCALLs (`asset()`'s
+    ///      `balanceOf`, and the queue's own `stampedUnclaimedShares()` via
+    ///      `_pricingSupply`) — read-only, so none of them can reenter a
+    ///      state-mutating path — and the only caller, the queue's `claim`, is
+    ///      itself `nonReentrant`.
+    /// @dev Queue-originated deposits bypass `_deposit` entirely, so this is
+    ///      the ONLY other mint entrypoint and must seed the high-water mark
+    ///      itself, or a queue-only first mint (no vault ever seen a Lane A
+    ///      deposit) would settle its first performance fee against an unset
+    ///      (zero) mark — the same failure mode `_deposit` already guards
+    ///      against, and also the re-seed path for the 0 -> nonzero supply
+    ///      transition zeroed in `_update` (audit-181-2, Finding B).
     function settleDeposit(uint256 shares, address to) external {
         if (msg.sender != _withdrawalQueue) revert NotQueue();
         _mint(to, shares);
+        _initHighWaterMarkIfUnset();
     }
 
     /// @inheritdoc ISyndicateVault
@@ -1524,11 +1613,24 @@ contract SyndicateVault is
     ///         into the queue so every request tagged to it claims at one frozen
     ///         price. `num/den` carry the ERC-4626 virtual offsets so the queue
     ///         reproduces the vault's conversion rounding exactly.
+    /// @dev `den` MUST divide by `_pricingSupply()`, not raw `totalSupply()` —
+    ///      same rule every other conversion in this contract follows
+    ///      (`_convertToShares` / `_convertToAssets` / `aboveHighWaterMark`;
+    ///      issue #92). `num` (`totalAssets()`) already excludes assets reserved
+    ///      against prior stamped-but-unclaimed redeems; leaving their shares in
+    ///      a raw `totalSupply()` denominator deflated this stamp by the same
+    ///      shares-without-matching-assets gap `_pricingSupply()` exists to close.
+    ///      SAFE FOR THIS PROPOSAL'S OWN REDEEM SHARES BY ORDERING: below,
+    ///      `stampSettlement` increments the queue's `stampedUnclaimedShares()`
+    ///      counter for `proposalId` only AFTER it receives `num`/`den` from this
+    ///      call, so `_pricingSupply()` read here still excludes only PRIOR
+    ///      stamps and correctly leaves this settling proposal's own queued
+    ///      shares in the denominator.
     function onProposalSettled(uint256 proposalId) external onlyGovernor {
         address q = _withdrawalQueue;
         if (q == address(0)) return;
         uint256 num = totalAssets() + 1;
-        uint256 den = totalSupply() + 10 ** _decimalsOffset();
+        uint256 den = _pricingSupply() + 10 ** _decimalsOffset();
         IVaultWithdrawalQueue(q).stampSettlement(proposalId, num, den);
     }
 

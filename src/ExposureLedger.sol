@@ -59,6 +59,17 @@ interface IRegistryApproversMinimal {
     function reviewPeriod() external view returns (uint256);
 }
 
+/// @dev Narrow `ChallengeGame` read surface: just its own `challengeWindow`.
+///      `coverageFreezer` IS the game address (spec §3.4), and the game
+///      itself enforces `game.challengeWindow <= ledger.challengeWindow()` in
+///      three places (construction, `setExposureLedger`, and its own
+///      `setChallengeWindow`) — but none of those three re-fire when the
+///      LEDGER's window moves. Read by `setChallengeWindow` below to close
+///      that gap from this side (audit-181-critical-high, finding D).
+interface IChallengeGameWindowMinimal {
+    function challengeWindow() external view returns (uint256);
+}
+
 /**
  * @title ExposureLedger
  * @notice Dollar-denominated coverage accounting for the guardian
@@ -159,6 +170,23 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @dev Floor on `woodHaircutBps`. Valuing bonds below half of market is a
     ///      mis-set parameter, not a conservatism policy.
     uint256 internal constant MIN_WOOD_HAIRCUT_BPS = 5_000;
+
+    /// @dev Ceiling on a feed's reported `decimals()`, enforced at
+    ///      `setWoodFeed`/`setAssetFeed` for BOTH the WOOD feed and every
+    ///      vault-asset feed (audit #181 finding 22). Real Chainlink
+    ///      aggregators report 8 or 18; 18 leaves headroom for any legitimate
+    ///      configuration while staying far below 78 — the point at which
+    ///      `10 ** feedDecimals` overflows `uint256` and panics (0x11) inside
+    ///      `_feedPriceX8`'s and `coverageUsd`'s normalization. Before this
+    ///      bound, a feed reporting `feedDecimals >= 78` (attacker-controlled
+    ///      or simply misconfigured — `setWoodFeed`/`setAssetFeed` read it
+    ///      from the feed with no upper bound at all) took `_woodPrice` down
+    ///      with a panic instead of falling through to the TWAP, exactly the
+    ///      failure mode `_feedPriceX8`'s own natspec promises never happens.
+    ///      Bounding at WRITE time closes it for every reader in one place,
+    ///      rather than requiring each of `_feedPriceX8`/`coverageUsd` to
+    ///      separately defend an unbounded config.
+    uint8 internal constant MAX_FEED_DECIMALS = 18;
 
     bytes32 public constant PARAM_CHALLENGE_WINDOW = keccak256("challengeWindow");
     bytes32 public constant PARAM_K_NUMERATOR = keccak256("kNumerator");
@@ -352,15 +380,31 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @notice The latest instant through which a guardian's coverage is
     ///         pinned open, independent of whether any challenge naming them
     ///         is currently LIVE (issue #95).
-    /// @dev A MAX, not a per-key value. A guardian can be pinned by more than
-    ///      one accusation at once, and `pinCoverageUntil` only ever raises
-    ///      this — so a later accusation's deadline correctly outlives an
-    ///      earlier one's, and once the LATEST of them elapses, so does the
-    ///      pin for everyone it covered. No release call is needed: unlike
-    ///      `_frozenCommitments`, which requires an explicit `unfreezeCoverage`
-    ///      to clear, this decays on its own by wall-clock — the same way
-    ///      `openExposureUsd`'s epoch buckets do, and for the same reason: a
-    ///      value nobody has to remember to unwind cannot be forgotten.
+    /// @dev A MAX, not a per-key value — and that is now DELIBERATELY narrow
+    ///      to `hasFrozenCoverage`'s binary question ("is this guardian
+    ///      pinned by ANYTHING?"), not to `retireApproval`'s per-proposal
+    ///      question. A guardian can be pinned by more than one accusation at
+    ///      once, and `pinCoverageUntil` only ever raises this — so a later
+    ///      accusation's deadline correctly outlives an earlier one's, and
+    ///      once the LATEST of them elapses, so does the pin for everyone it
+    ///      covered. No release call is needed: unlike `_frozenCommitments`,
+    ///      which requires an explicit `unfreezeCoverage` to clear, this
+    ///      decays on its own by wall-clock — the same way `openExposureUsd`'s
+    ///      epoch buckets do, and for the same reason: a value nobody has to
+    ///      remember to unwind cannot be forgotten.
+    ///
+    ///      SUPERSEDED AS `retireApproval`'s GATE (audit-181-critical-high,
+    ///      finding C). Before `_pinnedUntil` below existed, `retireApproval`
+    ///      read THIS max, so one grindable non-verdict on ANY single stale
+    ///      proposal a guardian ever approved blocked retirement of its
+    ///      ENTIRE book — reopening the ~1/N shared-stake denominator decay
+    ///      `retireApproval` exists to close, and firing with no attacker: any
+    ///      routine `Inconclusive` verdict on one proposal did it. This max is
+    ///      still exactly right for `hasFrozenCoverage`'s unstake question
+    ///      (sWOOD must refuse the claim while ANY accusation against this
+    ///      guardian is reachable, not just the ones on one proposal), so it
+    ///      stays; `retireApproval` now reads `_pinnedUntil[key][guardian]`
+    ///      instead.
     mapping(address guardian => uint256) internal _pinnedCoverageUntil;
 
     /// @dev How many proposals are frozen right now, across every guardian.
@@ -453,6 +497,30 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         needing a second, targeted fix — see design.md D10 for the
     ///         full reasoning and the regression test that proves it.
     mapping(address guardian => uint256) internal _livePledgedUsd;
+
+    /// @notice Per-(reviewKey, guardian) counterpart of `_pinnedCoverageUntil`
+    ///         (audit-181-critical-high, finding C: PIN GRANULARITY). APPENDED
+    ///         here, after every pre-existing storage variable, to preserve
+    ///         the storage layout — see notes to the orchestrator on the
+    ///         layout golden.
+    ///
+    /// @dev    Written by `pinCoverageUntil` ALONGSIDE the per-guardian max in
+    ///         `_pinnedCoverageUntil`, with the identical monotonic-raise
+    ///         semantics, but scoped to the one proposal the pin was actually
+    ///         issued for. `retireApproval` reads THIS, not the max: its
+    ///         question is "may THIS proposal's commitment be swept?", and a
+    ///         pin issued against a guardian's OTHER stale proposal must not
+    ///         block that — before this mapping existed, `retireApproval` read
+    ///         the per-guardian max, so one grindable non-verdict on ANY
+    ///         single stale proposal blocked retirement of the guardian's
+    ///         ENTIRE book (a routine `Inconclusive`, no attacker required),
+    ///         reopening the ~1/N shared-stake denominator decay
+    ///         `retireApproval` exists to close. `hasFrozenCoverage` keeps
+    ///         reading the max in `_pinnedCoverageUntil`, because its
+    ///         question — "is this guardian's collateral reachable by ANY
+    ///         live accusation?" — is genuinely guardian-scoped, not
+    ///         key-scoped, and must stay that way.
+    mapping(bytes32 reviewKey => mapping(address guardian => uint256)) internal _pinnedUntil;
 
     // ── Modifiers / helpers ──
 
@@ -585,26 +653,92 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      revert from `latestRoundData`: a reverting aggregator must fall
     ///      through to the TWAP, not take the price path down with it.
     ///
+    ///      RAW STATICCALL, NOT A TYPED `try` (audit #181 finding 22). A typed
+    ///      `try IAggregatorMinimal(feed).latestRoundData() returns (...) {
+    ///      ... } catch { ... }` only guards the CALL and its error selector —
+    ///      Solidity's own documented limitation is that a call which SUCCEEDS
+    ///      but returns too little data to decode the declared return types
+    ///      fails at ABI-DECODING, and that failure is a full, UNCAUGHT revert
+    ///      of the transaction, not a `catch`. Code that runs INSIDE a typed
+    ///      try's success block is likewise ordinary caller-frame code once
+    ///      the call itself has returned, so a panic there (see the decimals
+    ///      note below) is exactly as uncatchable. A malformed/truncated
+    ///      `latestRoundData()` return, or a stored `feedDecimals` large
+    ///      enough to overflow `10 ** feedDecimals`, therefore used to take
+    ///      the whole price path down with it — precisely the failure this
+    ///      function's own natspec promises never happens. `_twapPriceX8`
+    ///      already defends the identical decode risk the same way; this now
+    ///      matches it: staticcall, explicit length check before any decode
+    ///      is attempted, and decode ONLY into `uint256`/`int256` words (no
+    ///      validity-constrained type like `bool`/`enum`/a sub-256-bit
+    ///      integer, any of which the ABI decoder can reject as malformed and
+    ///      revert on), so once the length check passes, decoding itself
+    ///      cannot revert.
+    ///
     ///      `code.length` is checked FIRST because Solidity's extcodesize guard
     ///      on a high-level call to a codeless address reverts in THIS frame,
-    ///      which `try` cannot catch — the same reason `setGuardianRegistry`
-    ///      guards its tolerant read that way.
+    ///      which no wrapper can catch — the same reason `setGuardianRegistry`
+    ///      guards its tolerant read that way. A raw `staticcall` carries no
+    ///      such guard (it is a plain opcode, not a typed high-level call), so
+    ///      this check is still needed to tell "codeless" apart from
+    ///      "answered falsy" before the staticcall is even attempted.
+    ///
+    ///      `feedDecimals` IS RE-CHECKED AGAINST `MAX_FEED_DECIMALS` HERE, even
+    ///      though `setWoodFeed` already refuses to store a value above it:
+    ///      `setWoodFeed` is the BRACE, this is the BELT. Without it,
+    ///      `10 ** f.feedDecimals` panics (0x11) the instant `feedDecimals >=
+    ///      78`, and that panic — code past a successful external call,
+    ///      running in this frame — is exactly as uncatchable as the decode
+    ///      issue above.
+    ///
+    ///      A POSITIVE ANSWER CAN STILL NORMALISE TO ZERO
+    ///      (audit-181-critical-high, "ALSO" finding), and `ok` MUST TRACK
+    ///      THAT — checked here rather than left implicit, because `answer >
+    ///      0` was already verified above and would otherwise read as proof
+    ///      the result is usable. At `feedDecimals` up to `MAX_FEED_DECIMALS`
+    ///      (18), a small enough positive `answer` (e.g. `answer == 1`,
+    ///      `feedDecimals == 18`) truncates `(answer * 1e8) / 10**feedDecimals`
+    ///      to exactly 0 wei-X8. Returning `(0, true)` used to report the feed
+    ///      HEALTHY at a price of zero: `_woodPrice` takes `fromFeed == true`
+    ///      to mean "do not fall through to the TWAP", so this skipped the
+    ///      fallback `_twapPriceX8` exists for, and its own floor-at-1 is
+    ///      gated on `sourceX8 != 0` — a source that is genuinely zero is left
+    ///      zero, not floored — so `woodPriceX8()` silently resolved to 0
+    ///      instead of reverting `NoWoodPrice` or falling through, halting
+    ///      `propose` (`proposerBondWood`), `execute`
+    ///      (`requireApproveQuorum`) and challenge filing (`ChallengeGame.
+    ///      file`'s `WoodPriceUnset`) alike, with no path back except
+    ///      re-wiring the feed. `_twapPriceX8` already guards exactly this
+    ///      case (`twapX8 == 0` reports unavailable); this now matches it.
     function _feedPriceX8() internal view returns (uint256 priceX8, bool ok) {
         AssetFeed storage f = _woodFeed;
         address feed = f.feed;
         if (feed == address(0) || feed.code.length == 0) return (0, false);
-        try IAggregatorMinimal(feed).latestRoundData() returns (
-            uint80, int256 answer, uint256, uint256 updatedAt, uint80
-        ) {
-            if (answer <= 0) return (0, false);
-            uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
-            if (age > f.maxDelay) return (0, false);
-            // Normalise to 8 decimals. `answer > 0` checked above.
-            // forge-lint: disable-next-line(unsafe-typecast)
-            return ((uint256(answer) * 1e8) / (10 ** f.feedDecimals), true);
-        } catch {
-            return (0, false);
-        }
+        (bool success, bytes memory ret) = feed.staticcall(abi.encodeCall(IAggregatorMinimal.latestRoundData, ()));
+        // latestRoundData returns (uint80, int256, uint256, uint256, uint80):
+        // 5 words, 160 bytes. Short/absent data is rejected before any decode
+        // is attempted, exactly as `_twapPriceX8` rejects `ret.length < 64`.
+        if (!success || ret.length < 160) return (0, false);
+        // Decoded as uint256/int256 throughout, NOT the narrower uint80 the
+        // interface declares — a sub-256-bit unsigned type is, like `bool`,
+        // validity-constrained at decode time (the ABI decoder rejects a word
+        // whose unused high bits are not clean padding), which is exactly the
+        // uncatchable-revert class this rewrite exists to close. uint256 and
+        // int256 accept any 32-byte word, so nothing below this line can
+        // revert on account of decoding.
+        (, int256 answer,, uint256 updatedAt,) = abi.decode(ret, (uint256, int256, uint256, uint256, uint256));
+        if (answer <= 0) return (0, false);
+        uint256 age = block.timestamp > updatedAt ? block.timestamp - updatedAt : 0;
+        if (age > f.maxDelay) return (0, false);
+        uint8 feedDecimals = f.feedDecimals;
+        if (feedDecimals > MAX_FEED_DECIMALS) return (0, false);
+        // Normalise to 8 decimals. `answer > 0` checked above; `feedDecimals`
+        // bounded above, so `10 ** feedDecimals` cannot overflow.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        priceX8 = (uint256(answer) * 1e8) / (10 ** feedDecimals);
+        // A source that truncated to zero is reported UNAVAILABLE, not a
+        // healthy zero price — see the dev-note above.
+        return (priceX8, priceX8 != 0);
     }
 
     /// @dev The TWAP leg. A LOW-LEVEL STATICCALL, not a typed `try`, and the
@@ -738,6 +872,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         }
         if (maxDelay == 0 || maxDelay > type(uint64).max) revert InvalidParameter();
         uint8 feedDecimals = IAggregatorMinimal(feed).decimals();
+        // BOUNDED AT WRITE TIME (audit #181 finding 22): unbounded, a feed
+        // reporting `feedDecimals >= 78` panics `_feedPriceX8`'s
+        // normalization (`10 ** feedDecimals` overflows uint256) instead of
+        // reporting unavailable, taking `_woodPrice` down protocol-wide
+        // rather than falling through to the TWAP. See `MAX_FEED_DECIMALS`.
+        if (feedDecimals > MAX_FEED_DECIMALS) revert InvalidParameter();
         // maxDelay bounded to type(uint64).max above; cast cannot truncate.
         // forge-lint: disable-next-line(unsafe-typecast)
         _woodFeed = AssetFeed({
@@ -834,23 +974,66 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      window (frees coverage early); growing it re-counts buckets that
     ///      had already expired (conservative). Governance should change it
     ///      between epochs or at low open exposure.
+    ///
+    ///      TWO LOWER BOUNDS, BOTH TOLERANT READS OF AN EXTERNAL POINTER —
+    ///      picking ONE convention for "pointer wired but cannot answer" and
+    ///      applying it to both (audit-181-critical-high, CAUTION resolution).
+    ///      `setGuardianRegistry` admits a registry TOLERANTLY: a wired
+    ///      address that is codeless or reverts on `reviewPeriod()` is let
+    ///      through rather than bricking the wiring call, because that setter
+    ///      guards against an ordering mistake by the owner, not an
+    ///      adversary. Reading that same pointer STRICTLY here — as this
+    ///      function used to for bound #1 — contradicts that: a registry the
+    ///      tolerant setter admitted (codeless, or a contract that reverts on
+    ///      `reviewPeriod()`) made `IRegistryApproversMinimal(reg)
+    ///      .reviewPeriod()` revert in THIS frame on every subsequent call,
+    ///      permanently bricking `setChallengeWindow` rather than merely
+    ///      declining to floor it. Liveness of a governance setter must not
+    ///      depend on a foreign contract answering a view call, so both
+    ///      bounds below use the identical `code.length` + try/catch shape:
+    ///      an unanswerable pointer is treated as "no floor from this side"
+    ///      rather than as a revert.
     function setChallengeWindow(uint256 newWindow) external onlyOwner {
         // Zero would free coverage instantly. The upper bound is whatever keeps
         // `openExposureUsd`'s walk inside `MAX_SCAN_BUCKETS`.
         if (newWindow == 0) revert InvalidParameter();
         _requireScanBounded(newWindow, epochLength);
-        // LOWER BOUND: the anti-batching property depends on a bucket outliving
-        // the proposal it backs. A window shorter than the approve->execute gap
-        // lets one bond cover two live drains — approve #1 just before an epoch
-        // boundary, let the bucket expire while #1 is still Approved and inside
-        // its execution window, then approve #2 at full budget; both quorums
-        // pass, both execute.
+        // LOWER BOUND #1: the anti-batching property depends on a bucket
+        // outliving the proposal it backs. A window shorter than the
+        // approve->execute gap lets one bond cover two live drains — approve
+        // #1 just before an epoch boundary, let the bucket expire while #1 is
+        // still Approved and inside its execution window, then approve #2 at
+        // full budget; both quorums pass, both execute.
+        //
+        // `registry.code.length` first, for the same extcodesize reason as
+        // `setGuardianRegistry`'s own read: a call to a codeless address
+        // reverts in THIS frame, which no `try` can catch.
         address reg = guardianRegistry;
-        if (
-            reg != address(0)
-                && newWindow < IRegistryApproversMinimal(reg).reviewPeriod() + MAX_GOVERNOR_EXECUTION_WINDOW
-        ) {
-            revert InvalidParameter();
+        if (reg != address(0) && reg.code.length != 0) {
+            try IRegistryApproversMinimal(reg).reviewPeriod() returns (uint256 rp) {
+                if (newWindow < rp + MAX_GOVERNOR_EXECUTION_WINDOW) revert InvalidParameter();
+            } catch {}
+        }
+        // LOWER BOUND #2 (audit-181-critical-high, finding D: WINDOW COUPLING
+        // IS ONE-SIDED). `ChallengeGame` enforces `game.challengeWindow <=
+        // ledger.challengeWindow()` at construction, at `setExposureLedger`,
+        // and at its own `setChallengeWindow` — all THREE only check at the
+        // instant they run. None of them re-fire when the LEDGER's window
+        // moves afterward, so shrinking it here (legal: only floored by
+        // `_requireScanBounded` and bound #1 above) could silently open a gap
+        // where `game.challengeWindow > ledger.challengeWindow()`:
+        // `retireApproval`'s gate (keyed off THIS window) opens before
+        // `ChallengeGame.file`'s own filing deadline (keyed off the GAME's
+        // window) closes, so a sweep can empty `_approversOf` while the
+        // proposal is still, legally, filable — permanently unchallengeable
+        // the moment it happens. Mirroring the game's own check back onto
+        // this side closes the gap symmetrically. `coverageFreezer` IS the
+        // game address (spec §3.4).
+        address freezer = coverageFreezer;
+        if (freezer != address(0) && freezer.code.length != 0) {
+            try IChallengeGameWindowMinimal(freezer).challengeWindow() returns (uint256 gameWindow) {
+                if (newWindow < gameWindow) revert InvalidParameter();
+            } catch {}
         }
         emit ParameterChangeFinalized(PARAM_CHALLENGE_WINDOW, challengeWindow, newWindow);
         challengeWindow = newWindow;
@@ -904,6 +1087,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if (maxDelay == 0 || maxDelay > type(uint64).max) revert InvalidParameter();
         uint8 assetDec = IERC20DecimalsMinimal(asset).decimals();
         uint8 feedDec = IAggregatorMinimal(feed).decimals();
+        // BOUNDED AT WRITE TIME (audit #181 finding 22): the same
+        // `feedDecimals >= 78` overflow that `setWoodFeed` guards against
+        // panics `coverageUsd`'s normalization identically — see
+        // `MAX_FEED_DECIMALS`. `coverageUsd` is otherwise meant to revert on
+        // bad state (fail-closed), but "meant to revert cleanly" and "can be
+        // configured to panic" are different guarantees; this closes the gap
+        // at the only site that can ever introduce the bad value.
+        if (feedDec > MAX_FEED_DECIMALS) revert InvalidParameter();
         // maxDelay bounded to type(uint64).max above; cast cannot truncate.
         // forge-lint: disable-next-line(unsafe-typecast)
         uint64 maxDelay64 = uint64(maxDelay);
@@ -956,6 +1147,65 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         return (usd * 1e8) / px;
     }
 
+    /// @dev Resolves `(asset, requiredCoverage)` for `governor`/`proposalId`
+    ///      against `vault`, book/settle-NOTHING on any failure rather than
+    ///      reverting (audit #181 finding 23). Shared by `recordApproval` and
+    ///      `settleCoverage` so the hoist-and-guard shape below cannot drift
+    ///      between the two call sites — both callers already document "any
+    ///      pricing failure books/settles nothing rather than reverting", and
+    ///      this is the piece that used to quietly not honour that.
+    ///
+    ///      HOISTED OUT OF ANY `try`'s ARGUMENT LIST, DELIBERATELY. Solidity
+    ///      evaluates a call's argument expressions in the CALLER's frame,
+    ///      strictly before the call a `try` around it actually guards. Both
+    ///      callers used to write the equivalent of:
+    ///
+    ///          try this.coverageUsd(
+    ///              IVaultAssetMinimal(pv.vault).asset(),
+    ///              gov.getRequiredCoverage(proposalId)
+    ///          ) returns (uint256 v) { ... } catch { ... }
+    ///
+    ///      — with `IVaultAssetMinimal(pv.vault).asset()` evaluated before the
+    ///      guarded call even begins, and `gov.getRequiredCoverage(proposalId)`
+    ///      evaluated as an ARGUMENT to it, equally outside the guard. A
+    ///      revert from either one propagated straight through the `catch`
+    ///      exactly as if the `try` were not there, defeating the "any
+    ///      pricing failure books/settles nothing" guarantee for a dependency
+    ///      (`getRequiredCoverage`) the natspec itself calls out as latent
+    ///      today only because `SyndicateGovernor.getRequiredCoverage` is
+    ///      presently a bare storage read — it arms the moment that getter
+    ///      (or a future vault's `asset()`) gains any reverting path. Each
+    ///      read is now resolved through its OWN try/catch, ahead of and
+    ///      independent from the `coverageUsd` try each caller still performs.
+    ///
+    ///      `vault.code.length` is checked FIRST, for the same reason
+    ///      `_feedPriceX8`/`_twapPriceX8` check it before their own external
+    ///      reads: a call that succeeds against a codeless address returns no
+    ///      data, and Solidity does not route a resulting ABI-decode failure
+    ///      through `catch` — it is a full, uncaught revert of the
+    ///      transaction. `governor` needs no matching guard here: both callers
+    ///      only reach this function via a `pv` already produced by an
+    ///      earlier, UNWRAPPED call to this exact `gov`, so `gov` is proven to
+    ///      have code (and to have answered) before this function ever runs.
+    function _tryResolveCoverageInputs(ILedgerGovernorMinimal gov, uint256 proposalId, address vault)
+        internal
+        view
+        returns (address asset, uint256 requiredCoverage, bool ok)
+    {
+        if (vault.code.length == 0) return (address(0), 0, false);
+        try IVaultAssetMinimal(vault).asset() returns (address a) {
+            asset = a;
+        } catch {
+            return (address(0), 0, false);
+        }
+        try gov.getRequiredCoverage(proposalId) returns (uint256 rc) {
+            requiredCoverage = rc;
+        } catch {
+            return (address(0), 0, false);
+        }
+        ok = true;
+    }
+
     /// @inheritdoc IExposureLedger
     /// @dev Called by GuardianRegistry.voteOnProposal on the approve side.
     ///
@@ -997,20 +1247,22 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         if (_reservedUsd[key][guardian] != 0) return;
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
         ILedgerGovernorMinimal.ProposalViewLite memory pv = gov.getProposalView(proposalId);
-        address asset = IVaultAssetMinimal(pv.vault).asset();
         // ANY PRICING FAILURE BOOKS NOTHING RATHER THAN REVERTING — missing
-        // feed, stale feed, or any other `coverageUsd` revert. Reverting here
-        // would take the APPROVE vote down with it while Block votes still
-        // work, turning the review block-only: guardians could veto but never
-        // endorse, and the proposal would pass optimistically anyway. Failing
-        // closed on the coverage (booking nothing, so the execute-time quorum
-        // cannot be met) is the conservative half; failing the vote is the
-        // harmful one.
+        // feed, stale feed, an unreadable vault/required-coverage read (audit
+        // #181 finding 23, see `_tryResolveCoverageInputs`), or any other
+        // `coverageUsd` revert. Reverting here would take the APPROVE vote
+        // down with it while Block votes still work, turning the review
+        // block-only: guardians could veto but never endorse, and the
+        // proposal would pass optimistically anyway. Failing closed on the
+        // coverage (booking nothing, so the execute-time quorum cannot be
+        // met) is the conservative half; failing the vote is the harmful one.
+        (address asset, uint256 requiredCoverage, bool resolved) = _tryResolveCoverageInputs(gov, proposalId, pv.vault);
+        if (!resolved) return; // unreadable right now: book nothing, let the quorum decide
         //
         // Called externally so the revert can be caught; `coverageUsd` is a view
         // on this same contract, and a same-contract call cannot be wrapped.
         uint256 needUsd;
-        try this.coverageUsd(asset, gov.getRequiredCoverage(proposalId)) returns (uint256 v) {
+        try this.coverageUsd(asset, requiredCoverage) returns (uint256 v) {
             needUsd = v;
         } catch {
             return; // unpriceable right now: book nothing, let the quorum decide
@@ -1116,21 +1368,20 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         emit ExposureRecorded(guardian, key, share, epoch);
     }
 
-    /// @inheritdoc IExposureLedger
-    /// @dev Vote-change Approve→Block (or any registry-side unwind). Releases
-    ///      exactly what was committed, from the bucket it was committed into.
-    ///      No-op when nothing is recorded — never underflows. The address is
-    ///      SWAP-AND-POPPED out of `_approversOf`, so the list is bounded by the
-    ///      cohort of currently-active approvers rather than growing with every
-    ///      guardian that ever approved — that loop runs on the execute path.
-    function releaseApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
-        bytes32 key = _reviewKey(governor, proposalId);
-        // A live challenge pins this coverage (§3.4): the guardian may not
-        // release it and recycle the budget while under challenge.
-        if (_frozen[key]) revert CoverageFrozen();
-        uint256 reserved = _reservedUsd[key][guardian];
-        if (reserved == 0) return;
-        RecordedExposure memory r = _recorded[key][guardian];
+    /// @dev SHARED UNWIND, used by both `releaseApproval` and `retireApproval`
+    ///      (audit #181 finding 11) so the two paths — vote-change unwind and
+    ///      post-window sweep — can never drift apart. Clears the booking and
+    ///      the pledge, unwinds both bucket/committed counters and both
+    ///      shared-stake accumulators, and swap-and-pops the guardian out of
+    ///      the approver list.
+    ///
+    ///      PRECONDITION, NOT ENFORCED HERE: callers must already hold
+    ///      `reserved = _reservedUsd[key][guardian]` and
+    ///      `r = _recorded[key][guardian]` from BEFORE this call — freeze,
+    ///      pin, and window checks are each caller's own responsibility, since
+    ///      the two callers gate on different conditions (a live review vs. an
+    ///      elapsed challenge window).
+    function _unwindApproval(bytes32 key, address guardian, RecordedExposure memory r, uint256 reserved) internal {
         delete _recorded[key][guardian];
         delete _reservedUsd[key][guardian];
         // The BUCKET releases the live booking, `_committedUsd` releases the
@@ -1162,8 +1413,113 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             list.pop();
             delete _approverIndex[key][guardian];
         }
+    }
 
+    /// @inheritdoc IExposureLedger
+    /// @dev Vote-change Approve→Block (or any registry-side unwind). Releases
+    ///      exactly what was committed, from the bucket it was committed into.
+    ///      No-op when nothing is recorded — never underflows. The address is
+    ///      SWAP-AND-POPPED out of `_approversOf`, so the list is bounded by the
+    ///      cohort of currently-active approvers rather than growing with every
+    ///      guardian that ever approved — that loop runs on the execute path.
+    function releaseApproval(address governor, uint256 proposalId, address guardian) external onlyRegistry {
+        bytes32 key = _reviewKey(governor, proposalId);
+        // A live challenge pins this coverage (§3.4): the guardian may not
+        // release it and recycle the budget while under challenge.
+        if (_frozen[key]) revert CoverageFrozen();
+        uint256 reserved = _reservedUsd[key][guardian];
+        if (reserved == 0) return;
+        RecordedExposure memory r = _recorded[key][guardian];
+        _unwindApproval(key, guardian, r, reserved);
         emit ExposureReleased(guardian, key, r.usd, r.epoch);
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev PERMISSIONLESS RETIREMENT OF A DEAD COMMITMENT (audit #181,
+    ///      finding 11). `_liveBookedUsd`/`_livePledgedUsd` — the shared-stake
+    ///      denominators `_sharedSlashableUsd` divides by — are strictly
+    ///      monotone increasing except for two decrement sites:
+    ///      `releaseApproval` and `_rebook`'s downward branch (which moves
+    ///      `_liveBookedUsd` only, and only down to a pro-rata allocation,
+    ///      never to zero on its own). `releaseApproval` has exactly ONE
+    ///      caller in the system — `GuardianRegistry.voteOnProposal`'s
+    ///      Approve→Block branch, gated on `block.timestamp < reviewEnd` — so
+    ///      once a review closes there is NO release path left at all.
+    ///      Meanwhile `openExposureUsd` (the batching-cap denominator) DOES
+    ///      decay on wall clock. The result: a guardian's share of its own
+    ///      live bond decays as ~1/N in the number of proposals it has EVER
+    ///      approved, even though every commitment older than its challenge
+    ///      window carries no collectable liability at all
+    ///      (`ChallengeGame.file` reverts `WindowClosed` past the window) —
+    ///      the denominator sums dead commitments nothing can slash.
+    ///
+    ///      This is the missing release path for exactly that state. Anyone
+    ///      may sweep a key/guardian pair once it is provably inert:
+    ///        - `!_frozen[key]` — a live challenge still pins this coverage,
+    ///          identically to `releaseApproval`'s own guard;
+    ///        - `_pinnedUntil[key][guardian] < block.timestamp` — no
+    ///          `pinCoverageUntil` extension against THIS proposal (issue #95)
+    ///          is still in effect. PER-KEY, NOT THE PER-GUARDIAN MAX
+    ///          (audit-181-critical-high, finding C): a pin recorded against
+    ///          some OTHER stale proposal the same guardian once approved must
+    ///          not block sweeping this one, or a single grindable
+    ///          non-verdict anywhere in a guardian's history — an ordinary
+    ///          `Inconclusive`, no attacker required — permanently blocks
+    ///          retirement of its entire book, reopening the ~1/N
+    ///          shared-stake decay this function exists to close. See the
+    ///          storage doc on `_pinnedUntil`.
+    ///        - `block.timestamp` is past the SAME expiry
+    ///          `openExposureUsd` itself uses for this booked epoch:
+    ///          `epochGenesis + (r.epoch + 1) * epochLength + challengeWindow`.
+    ///      It then performs `releaseApproval`'s EXACT unwind
+    ///      (`_unwindApproval`), so the two can never diverge.
+    ///
+    ///      GATED ON `reserved != 0` (`_reservedUsd[key][guardian]`), NOT ON
+    ///      `_recorded[key][guardian].usd != 0` — deliberately, diverging
+    ///      from a literal "nothing to retire when the booking reads zero".
+    ///      `_rebook` (via `settleCoverage`) can write a guardian's BOOKING
+    ///      down to zero — its own slashable bond fell, so `_allocate` scaled
+    ///      its share to nothing — while leaving its PLEDGE and its listing
+    ///      in `_approversOf` completely untouched; `_rebook` never writes
+    ///      `_reservedUsd` or the approver list. Gating on the booking would
+    ///      make exactly that guardian permanently un-retirable, leaving
+    ///      `_livePledgedUsd` — the accumulator this function exists to
+    ///      unstick — stuck forever for the guardians most likely to need it
+    ///      released. `reserved != 0` is `releaseApproval`'s own no-op test
+    ///      and is correct here for the identical reason.
+    ///
+    ///      PIN BOUNDARY IS INCLUSIVE OF `deadline` (audit-181-critical-high,
+    ///      finding B). `ChallengeGame.file` refuses a new filing only
+    ///      STRICTLY past its deadline (`if (block.timestamp > deadline)
+    ///      revert`), so a filing at `block.timestamp == deadline` is still
+    ///      legal. The read here must therefore stay pinned THROUGH that same
+    ///      instant — `_pinnedUntil[key][guardian] < block.timestamp`, not
+    ///      `<=` — matching the bucket-expiry check three lines below, which
+    ///      already used the inclusive form (`<=` blocks retirement through
+    ///      the expiry instant). Before this fix the pin used the exclusive
+    ///      form while the bucket check used the inclusive one — two
+    ///      conventions in one function — and the boundary second was legal
+    ///      to challenge but no longer pinned: a sweep in that same block
+    ///      could empty `_approversOf` out from under a same-block `file()`,
+    ///      making the proposal permanently unchallengeable.
+    function retireApproval(address governor, uint256 proposalId, address guardian) external {
+        bytes32 key = _reviewKey(governor, proposalId);
+        uint256 reserved = _reservedUsd[key][guardian];
+        if (reserved == 0) return; // nothing to retire; mirrors releaseApproval's no-op
+        if (_frozen[key]) revert CoverageFrozen();
+        if (_pinnedUntil[key][guardian] >= block.timestamp) revert CoveragePinnedActive();
+        RecordedExposure memory r = _recorded[key][guardian];
+        // Same expiry `openExposureUsd` uses for this exact bucket: bucket
+        // `r.epoch` counts until its challenge window elapses at
+        // `genesis + (r.epoch + 1) * L + W`. Re-derived rather than read —
+        // there is no separately-stored per-key expiry — and keyed on the
+        // BOOKED epoch (`r.epoch`), not `currentEpoch()`, because a
+        // long-duration strategy books into a future epoch (`_coverageEpoch`).
+        if (block.timestamp <= epochGenesis + (uint256(r.epoch) + 1) * epochLength + challengeWindow) {
+            revert ChallengeWindowOpen();
+        }
+        _unwindApproval(key, guardian, r, reserved);
+        emit ExposureRetired(guardian, key, r.usd, reserved, r.epoch);
     }
 
     /// @inheritdoc IExposureLedger
@@ -1226,6 +1582,23 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///
     ///      Idempotent on both sides — the counters move only when the flag
     ///      actually flips, so a repeated freeze/unfreeze cannot drift them.
+    ///
+    ///      GATED ON THE PLEDGE (`_reservedUsd`), NOT THE BOOKING
+    ///      (`_recorded[key][g].usd`) (audit-181-critical-high, finding A).
+    ///      `settleCoverage` is permissionless, re-runnable, and deliberately
+    ///      NOT freeze-gated (see its own natspec), and it rewrites the
+    ///      booking in BOTH directions — including to zero, for a guardian
+    ///      whose slashable bond has fallen. Gating the freeze on the booking
+    ///      would let a guardian whose booking transits through zero while
+    ///      this proposal is under active challenge slip past both branches
+    ///      of `if (_recorded[key][g].usd == 0) continue;` here, so
+    ///      `_frozenCommitments[g]` is never incremented for them — and
+    ///      `StakedWood.claimUnstakeGuardian`'s gate, which reads exactly that
+    ///      counter, comes back clean while the accusation naming them is
+    ///      still live. Issue #83 moved `TokenCourt._recordAccused` off this
+    ///      identical predicate onto the pledge for the identical reason —
+    ///      see `pledgedOf`'s own natspec — and this call site and
+    ///      `pinCoverageUntil` below were the two the original sweep missed.
     function freezeCoverage(address governor, uint256 proposalId) external onlyFreezer {
         bytes32 key = _reviewKey(governor, proposalId);
         if (!_frozen[key]) {
@@ -1234,7 +1607,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             address[] storage listed = _approversOf[key];
             for (uint256 i = 0; i < listed.length; i++) {
                 address g = listed[i];
-                if (_recorded[key][g].usd == 0) continue;
+                if (_reservedUsd[key][g] == 0) continue;
                 if (_frozenFor[key][g]) continue;
                 _frozenFor[key][g] = true;
                 _frozenCommitments[g]++;
@@ -1266,8 +1639,15 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     }
 
     /// @inheritdoc IExposureLedger
+    /// @dev PIN BOUNDARY IS INCLUSIVE OF `deadline` (audit-181-critical-high,
+    ///      finding B) — see the matching note on `retireApproval`. Using
+    ///      `>=` rather than `>` keeps this read pinned through the same
+    ///      instant `ChallengeGame.file`'s own inclusive deadline check
+    ///      (`if (block.timestamp > deadline) revert`) still allows a filing,
+    ///      so a guardian cannot pass the unstake gate one second before a
+    ///      still-legal filing could reach it.
     function hasFrozenCoverage(address guardian) external view returns (bool) {
-        return _frozenCommitments[guardian] != 0 || _pinnedCoverageUntil[guardian] > block.timestamp;
+        return _frozenCommitments[guardian] != 0 || _pinnedCoverageUntil[guardian] >= block.timestamp;
     }
 
     /// @inheritdoc IExposureLedger
@@ -1285,17 +1665,35 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      Walks the SAME `_approversOf[key]` list `freezeCoverage` walks,
     ///      for the same reason: only guardians who actually committed
     ///      coverage to this proposal are the ones a still-open accusation
-    ///      can slash. `deadline` only ever RAISES `_pinnedCoverageUntil`,
-    ///      mirroring `challengeableUntil`'s own monotonic-raise semantics one
-    ///      layer up — a later, larger extension must not be shadowed by an
-    ///      earlier, smaller one still in effect.
+    ///      can slash. `deadline` only ever RAISES `_pinnedCoverageUntil` (and
+    ///      its per-key counterpart `_pinnedUntil`, see below), mirroring
+    ///      `challengeableUntil`'s own monotonic-raise semantics one layer up
+    ///      — a later, larger extension must not be shadowed by an earlier,
+    ///      smaller one still in effect.
+    ///
+    ///      GATED ON THE PLEDGE (`_reservedUsd`), NOT THE BOOKING
+    ///      (`_recorded[key][g].usd`) (audit-181-critical-high, finding A) —
+    ///      identical reasoning and identical fix to `freezeCoverage` above:
+    ///      `settleCoverage` can rewrite a guardian's booking to zero while
+    ///      the pledge and the `_approversOf` listing survive, and a guardian
+    ///      whose booking transits through zero must still be pinned while
+    ///      this proposal remains challengeable.
+    ///
+    ///      WRITES BOTH THE PER-GUARDIAN MAX AND THE PER-KEY VALUE
+    ///      (audit-181-critical-high, finding C). `_pinnedCoverageUntil[g]` is
+    ///      `hasFrozenCoverage`'s max-across-every-proposal read; `_pinnedUntil
+    ///      [key][g]` is `retireApproval`'s new per-proposal read. Both are
+    ///      monotonic raises from the SAME `deadline`, so they can never
+    ///      disagree about what THIS call pinned — they differ only in scope,
+    ///      not in value, going forward.
     function pinCoverageUntil(address governor, uint256 proposalId, uint256 deadline) external onlyFreezer {
         bytes32 key = _reviewKey(governor, proposalId);
         address[] storage listed = _approversOf[key];
         for (uint256 i = 0; i < listed.length; i++) {
             address g = listed[i];
-            if (_recorded[key][g].usd == 0) continue;
+            if (_reservedUsd[key][g] == 0) continue;
             if (deadline > _pinnedCoverageUntil[g]) _pinnedCoverageUntil[g] = deadline;
+            if (deadline > _pinnedUntil[key][g]) _pinnedUntil[key][g] = deadline;
         }
         emit CoveragePinned(governor, proposalId, deadline);
     }
@@ -1437,9 +1835,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      the dev-note on `_sharedSlashableUsd`. `_sharedSlashableUsd`
     ///      already clamps its return to `reserved`, so the old manual
     ///      `live < reserved ? live : reserved` becomes redundant and is
-    ///      dropped. `anchor = 0` (live) is unchanged and still correct for
-    ///      the reason stated above — this fix only closes the missing
-    ///      sharing, not the anchor basis, which was never in question.
+    ///      dropped.
+    ///
+    ///      SUPERSEDED (audit #181 finding 4): `anchor = 0` (live) was NOT
+    ///      correct, contrary to what this note previously said. See the
+    ///      inline comment inside the loop below — the gate now anchors at
+    ///      `block.timestamp` so a same-block stake top-up cannot pass this
+    ///      gate on collateral the matching conviction (anchored at
+    ///      `openedAt - 1` via `swood.slashableStakeAt`) can never reach.
     function requireApproveQuorum(address governor, uint256 proposalId, address asset, uint256 requiredCoverage)
         external
         view
@@ -1466,15 +1869,26 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             address g = approvers[i];
             uint256 reserved = _recorded[key][g].usd;
             if (reserved == 0) continue; // released via a vote change
-            // LIVE (anchor = 0), DELIBERATELY — see the invariant note on
-            // `SyndicateGovernor.executeProposal`'s `executedAt` stamp: this
-            // gate runs in the same transaction, immediately after the
-            // stamp, so the live read here is provably equal to the
-            // anchored read every OTHER post-execution consumer takes.
+            // ANCHORED AT `block.timestamp`, NOT LIVE (audit #181 finding 4).
+            // The old justification here — "this gate runs in the same
+            // transaction as the executedAt stamp, so live == anchored" — was
+            // wrong: `anchor = 0` reads live `guardianStake` directly, while
+            // every conviction values the SAME guardian through
+            // `swood.slashableStakeAt(g, c.executedAt)`, which resolves to
+            // `_slashableAt(g, openedAt - 1)`. `Checkpoints.upperLookupRecent`
+            // is INCLUSIVE of `key == anchor`, so a same-block top-up staked
+            // at `block.timestamp == executedAt` was COUNTED by the live read
+            // here and EXCLUDED by the verdict's `anchor - 1` lookup — the
+            // gate could certify coverage a conviction could never collect.
+            // Passing `block.timestamp` routes this through
+            // `swood.slashableStakeAt(g, block.timestamp)`, i.e.
+            // `_slashableAt(g, block.timestamp - 1)` — the same instant the
+            // verdict will anchor at once this proposal executes this block —
+            // so a same-block top-up is excluded on both sides identically.
             //
             // SHARED, NOT MERELY LIVE (Pashov re-audit of #158, finding 1) —
             // see the `@dev` block above this function.
-            haveUsd += _sharedSlashableUsd(g, reserved, priceX8, 0, _liveBookedUsd[g]);
+            haveUsd += _sharedSlashableUsd(g, reserved, priceX8, block.timestamp, _liveBookedUsd[g]);
             if (haveUsd >= requiredCoverageUsd) return (haveUsd, requiredCoverageUsd); // early exit; surplus may be clamped
         }
         // The loop early-returns on full coverage — reaching here means the
@@ -1933,10 +2347,16 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             return;
         }
 
+        // Same hoist-and-guard as `recordApproval` (audit #181 finding 23):
+        // the vault/required-coverage reads used to sit as inline try-call
+        // arguments, evaluated in THIS function's frame, before — and
+        // therefore outside — the `catch` below. See
+        // `_tryResolveCoverageInputs`.
+        (address asset, uint256 requiredCoverage, bool resolved) = _tryResolveCoverageInputs(gov, proposalId, pv.vault);
+        if (!resolved) return; // unreadable right now; retry later rather than mis-settle
+
         uint256 needUsd;
-        try this.coverageUsd(IVaultAssetMinimal(pv.vault).asset(), gov.getRequiredCoverage(proposalId)) returns (
-            uint256 v
-        ) {
+        try this.coverageUsd(asset, requiredCoverage) returns (uint256 v) {
             needUsd = v;
         } catch {
             return; // unpriceable right now; retry later rather than mis-settle

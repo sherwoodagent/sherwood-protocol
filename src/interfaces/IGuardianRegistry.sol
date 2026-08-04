@@ -96,6 +96,9 @@ interface IGuardianRegistry {
     event SlashAppealReserveFunded(address indexed by, uint256 amount);
     event SlashAppealRefunded(address indexed recipient, uint256 amount, uint256 epochId);
     event ParameterChangeFinalized(bytes32 indexed paramKey, uint256 oldValue, uint256 newValue);
+    /// @notice The exposure ledger was (re)wired. `oldLedger` is address(0)
+    ///         on first-time wiring.
+    event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
 
     // ── Guardian fns ──
     /// @notice Cast or change a guardian review vote on a proposal. Vote weight
@@ -157,6 +160,14 @@ interface IGuardianRegistry {
     /// @notice Wire the exposure ledger consulted on approve-side review
     ///         votes. address(0) is rejected; address(0) as the current value
     ///         means unset (hooks skipped).
+    /// @dev Enforces `ledger.challengeWindow() >= reviewPeriod +
+    ///      MAX_GOVERNOR_EXECUTION_WINDOW` (audit #181 finding #26) — the
+    ///      same invariant `ExposureLedger.setChallengeWindow` and
+    ///      `ExposureLedger.setGuardianRegistry` hold on their side, closing
+    ///      the fourth door this setter used to leave open. Also requires
+    ///      `ledger.guardianRegistry()` to be either unset or already this
+    ///      registry, so wiring cannot seat a ledger that will reject every
+    ///      `recordApproval` call from here.
     function setExposureLedger(address ledger) external;
     /// @dev Returns the interface-typed handle (matches the `IExposureLedger
     ///      public exposureLedger` state variable getter, mirroring the

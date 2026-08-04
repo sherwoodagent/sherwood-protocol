@@ -579,6 +579,21 @@ contract ChallengeGameTest is Test {
         return game.challengeOf(challengeId).filedAt;
     }
 
+    /// @dev Mirrors `ChallengeGame.file`'s bond formula exactly, including its
+    ///      integer-division order, and reads `challengerBondBps` LIVE off the
+    ///      contract rather than hardcoding it — audit #181 finding 18a moved
+    ///      it from 500 to 150, and a future parameter change should not have
+    ///      to touch every fixture built on top of this.
+    function _expectedBondWood(uint256 coverageUsd, uint256 priceX8) internal view returns (uint256) {
+        return (((coverageUsd * game.challengerBondBps()) / 10_000) * 1e8) / priceX8;
+    }
+
+    /// @dev The bond `_fileStandard` produces: $10,000 of coverage at the
+    ///      governance haircut price wired in `setUp` (0.05e8).
+    function _standardBondWood() internal view returns (uint256) {
+        return _expectedBondWood(10_000e18, 0.05e8);
+    }
+
     // ── Filing ──
 
     /// @notice §3.4: filing pulls the bond, pins the accused coverage, and lands
@@ -588,10 +603,11 @@ contract ChallengeGameTest is Test {
         _execute(PROPOSAL);
 
         uint256 challengerBefore = wood.balanceOf(challenger);
+        uint256 expectedBond = _standardBondWood();
 
         vm.expectEmit(true, true, true, true, address(game));
         emit IChallengeGame.ChallengeFiled(
-            1, address(gov), PROPOSAL, challenger, IChallengeGame.Predicate.OutOfAdapterOutflow, 10_000e18, EVIDENCE
+            1, address(gov), PROPOSAL, challenger, IChallengeGame.Predicate.OutOfAdapterOutflow, expectedBond, EVIDENCE
         );
         vm.prank(challenger);
         uint256 id = game.file(
@@ -605,7 +621,7 @@ contract ChallengeGameTest is Test {
         assertEq(c.governor, address(gov));
         assertEq(c.proposalId, PROPOSAL);
         assertEq(c.challenger, challenger);
-        assertEq(c.bondWood, 10_000e18);
+        assertEq(c.bondWood, expectedBond);
         assertEq(c.counterBondWood, 0, "nobody has disputed yet");
         assertEq(uint8(c.predicate), uint8(IChallengeGame.Predicate.OutOfAdapterOutflow));
         assertEq(uint8(c.status), uint8(IChallengeGame.Status.Filed));
@@ -615,13 +631,13 @@ contract ChallengeGameTest is Test {
         assertTrue(ledger.isCoverageFrozen(address(gov), PROPOSAL), "coverage pinned by the live challenge");
         assertEq(game.liveChallengeOf(address(gov), PROPOSAL), id);
 
-        assertEq(wood.balanceOf(address(game)), 10_000e18, "bond custodied by the game");
-        assertEq(challengerBefore - wood.balanceOf(challenger), 10_000e18, "bond pulled from the challenger");
+        assertEq(wood.balanceOf(address(game)), expectedBond, "bond custodied by the game");
+        assertEq(challengerBefore - wood.balanceOf(challenger), expectedBond, "bond pulled from the challenger");
     }
 
     /// @notice D4: with no proof required, the bond is the ONLY thing deterring
     ///         a frivolous filing, so it must scale with the exposure it freezes.
-    ///         $10,000 x 500 bps = $500, at $0.05/WOOD = 10,000 WOOD.
+    ///         $10,000 x `challengerBondBps` at $0.05/WOOD.
     function test_file_bondScalesWithFrozenExposure() public {
         _setCoverage(PROPOSAL, 6_000e18, 4_000e18); // $10,000
         _execute(PROPOSAL);
@@ -638,11 +654,15 @@ contract ChallengeGameTest is Test {
         uint256 bigBond = game.challengeOf(big).bondWood;
 
         // The arithmetic itself, not just the ordering: usd * bps / 10_000 * 1e8 / priceX8.
-        assertEq(smallBond, ((10_000e18 * 500) / 10_000) * 1e8 / 0.05e8, "500 USD at 0.05 USD/WOOD");
-        assertEq(smallBond, 10_000e18);
-        assertEq(bigBond, 20_000e18);
+        assertEq(
+            smallBond,
+            ((10_000e18 * game.challengerBondBps()) / 10_000) * 1e8 / 0.05e8,
+            "coverageUsd * challengerBondBps at 0.05 USD/WOOD"
+        );
+        assertEq(smallBond, _standardBondWood());
+        assertEq(bigBond, _expectedBondWood(20_000e18, 0.05e8));
         assertEq(bigBond, 2 * smallBond, "twice the frozen exposure, twice the bond");
-        assertEq(wood.balanceOf(address(game)), 30_000e18, "both bonds custodied");
+        assertEq(wood.balanceOf(address(game)), smallBond + bigBond, "both bonds custodied");
     }
 
     /// @notice A challenge accuses an EXECUTED proposal — there is no drain to
@@ -826,10 +846,16 @@ contract ChallengeGameTest is Test {
             address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
         );
 
-        // 5% of $10,000 = $500. At the composed $0.04 that is 12,500 WOOD; at
-        // the raw $0.05 it would be 10,000 — a 20% under-charge. The bond
-        // DIVIDES by the price, so a stale-high scalar always under-charges.
-        assertEq(game.challengeOf(id).bondWood, 12_500e18, "bond divides by the composed price, not the raw scalar");
+        // `challengerBondBps` of $10,000, converted at the composed $0.04
+        // rather than the raw $0.05 — a stale-high scalar would under-charge
+        // by exactly the same 20% either way. The bond DIVIDES by the price,
+        // so the composed (lower) price yields the LARGER WOOD amount.
+        assertEq(
+            game.challengeOf(id).bondWood,
+            _expectedBondWood(10_000e18, 0.04e8),
+            "bond divides by the composed price, not the raw scalar"
+        );
+        assertEq(game.challengeOf(id).bondWood, (_standardBondWood() * 5) / 4, "20% under-charge at the raw scalar");
     }
 
     function test_file_bondIsSizedOnLiabilityNotReservations() public {
@@ -845,9 +871,14 @@ contract ChallengeGameTest is Test {
             address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
         );
 
-        // 5% of $8,000 at $0.05/WOOD = 8,000 WOOD. Against the reservations it
-        // would have been 10,000 — a 25% over-charge on this cohort alone.
-        assertEq(game.challengeOf(id).bondWood, 8_000e18, "the bond follows the liability, not the reservations");
+        // `challengerBondBps` of $8,000 at $0.05/WOOD. Against the
+        // reservations it would have been the $10,000 figure instead — a 25%
+        // over-charge on this cohort alone.
+        assertEq(
+            game.challengeOf(id).bondWood,
+            _expectedBondWood(8_000e18, 0.05e8),
+            "the bond follows the liability, not the reservations"
+        );
         assertEq(game.challengeOf(id).frozenCoverageUsd, 8_000e18, "and the recorded coverage is the liability too");
     }
 
@@ -867,7 +898,7 @@ contract ChallengeGameTest is Test {
             address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
         );
 
-        assertEq(game.challengeOf(id).bondWood, 10_000e18, "capped by the cohort, never inflated by the need");
+        assertEq(game.challengeOf(id).bondWood, _standardBondWood(), "capped by the cohort, never inflated by the need");
     }
 
     function test_file_revertsWhenNothingToFreeze() public {
@@ -895,7 +926,7 @@ contract ChallengeGameTest is Test {
             uint256 id = game.file(address(gov), proposalId, IChallengeGame.Predicate(i), ADAPTER, SELECTOR, EVIDENCE);
             IChallengeGame.Challenge memory c = game.challengeOf(id);
             assertEq(uint8(c.predicate), uint8(i));
-            assertEq(c.bondWood, 10_000e18, "identical bond regardless of predicate");
+            assertEq(c.bondWood, _standardBondWood(), "identical bond regardless of predicate");
             assertEq(uint8(c.status), uint8(IChallengeGame.Status.Filed));
         }
     }
@@ -937,7 +968,7 @@ contract ChallengeGameTest is Test {
     ///         because reading a live parameter let the owner change the deal
     ///         after the money was committed. The burn rates were left live on
     ///         the argument that they "price the refund rather than bound a
-    ///         window the accused is relying on" — but the challenger relied on
+    ///         window the accused is relying on" - but the challenger relied on
     ///         `settleBurnBps` when it decided to file, and it cannot withdraw.
     ///         Raising 0 -> 5,000 mid-window takes half the refund of a filing
     ///         that turned out to be correct.
@@ -1145,6 +1176,7 @@ contract ChallengeGameTest is Test {
     ///         and the challenger gets its bond back.
     function test_resolve_undisputedSlashesDemotesAndReturnsBond() public {
         uint256 id = _fileStandard(PROPOSAL);
+        uint256 bond = game.challengeOf(id).bondWood;
         uint256 executedAt = _executedAt(PROPOSAL);
         uint256 filedAt = _filedAt(id);
         assertEq(filedAt, executedAt + 3 days, "the filing trails execution, so the two are distinguishable");
@@ -1198,7 +1230,8 @@ contract ChallengeGameTest is Test {
         assertEq(game.liveChallengeOf(address(gov), PROPOSAL), 0, "no longer live");
 
         // Less the F4 settle burn: a correct filing is cheap, not free.
-        assertEq(wood.balanceOf(challenger) - challengerBefore, 8_000e18, "bond returned less the 20% burn");
+        uint256 settleBurn = (bond * game.settleBurnBps()) / 10_000;
+        assertEq(wood.balanceOf(challenger) - challengerBefore, bond - settleBurn, "bond returned less the settle burn");
         _assertLiveBondsBacked();
     }
 
@@ -1220,6 +1253,7 @@ contract ChallengeGameTest is Test {
     ///         failure is surfaced as an event rather than swallowed.
     function test_resolve_settlesEvenWhenTheDemoterRoleWasRevoked() public {
         uint256 id = _fileStandard(PROPOSAL);
+        uint256 bond = game.challengeOf(id).bondWood;
         uint256 challengerBefore = wood.balanceOf(challenger);
 
         // Governance rotates the demoter role out from under the live challenge.
@@ -1237,7 +1271,8 @@ contract ChallengeGameTest is Test {
         assertEq(uint8(c.status), uint8(IChallengeGame.Status.Settled), "the verdict still lands");
         assertEq(swood.callCount(), 1, "the slash still executed");
         assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "the coverage is still released");
-        assertEq(wood.balanceOf(challenger) - challengerBefore, 8_000e18, "the bond still comes back");
+        uint256 settleBurn = (bond * game.settleBurnBps()) / 10_000;
+        assertEq(wood.balanceOf(challenger) - challengerBefore, bond - settleBurn, "the bond still comes back");
         assertEq(tiers.demoteCount(), 0, "and the demotion is the only thing lost");
         _assertLiveBondsBacked();
     }
@@ -1439,21 +1474,22 @@ contract ChallengeGameTest is Test {
     ///         stops the auto-slash clock and escalates to the court.
     function test_dispute_stopsTheAutoSlashClock() public {
         uint256 id = _fileStandard(PROPOSAL);
+        uint256 target = game.challengeOf(id).bondWood;
         uint256 filedAt = vm.getBlockTimestamp();
         uint256 guardianBefore = wood.balanceOf(guardianA);
 
         vm.expectEmit(true, true, true, true, address(game));
-        emit IChallengeGame.CounterBondContributed(id, guardianA, 10_000e18, 10_000e18);
+        emit IChallengeGame.CounterBondContributed(id, guardianA, target, target);
         vm.expectEmit(true, true, true, true, address(game));
-        emit IChallengeGame.ChallengeDisputed(id, 10_000e18);
+        emit IChallengeGame.ChallengeDisputed(id, target);
         vm.prank(guardianA);
         game.dispute(id, type(uint256).max);
 
         IChallengeGame.Challenge memory c = game.challengeOf(id);
         assertEq(uint8(c.status), uint8(IChallengeGame.Status.Disputed));
         assertEq(c.counterBondWood, c.bondWood, "the pool matches the challenger's bond");
-        assertEq(game.counterBondContributionOf(id, guardianA), 10_000e18, "and guardianA funded all of it");
-        assertEq(guardianBefore - wood.balanceOf(guardianA), 10_000e18, "counter-bond pulled");
+        assertEq(game.counterBondContributionOf(id, guardianA), target, "and guardianA funded all of it");
+        assertEq(guardianBefore - wood.balanceOf(guardianA), target, "counter-bond pulled");
         _assertLiveBondsBacked();
 
         // The clock is stopped: the auto-slash deadline passes with no effect.
@@ -1472,7 +1508,7 @@ contract ChallengeGameTest is Test {
     /// @notice 🟠F18: ANY ADDRESS MAY FUND THE DEFENCE.
     ///
     ///         This asserted the opposite until the payout became pull-based.
-    ///         The accused-only rule answered "who may BUY the escalation" —
+    ///         The accused-only rule answered "who may BUY the escalation" -
     ///         right — but with a POOL the same check also decided "who may help
     ///         FILL it", and a cohort short by a sliver could not be topped up
     ///         by anyone. The rule's other job was bounding the contributor
@@ -1699,6 +1735,7 @@ contract ChallengeGameTest is Test {
     function test_resolve_disputedPastTimeoutFailsToTheAccused() public {
         uint256 challengerBefore = wood.balanceOf(challenger); // before the bond is pulled
         uint256 id = _fileStandard(PROPOSAL); // $6,000 / $4,000 → 60/40 by COVERAGE
+        uint256 bond = game.challengeOf(id).bondWood;
         uint256 filedAt = _filedAt(id);
         uint256 aBefore = wood.balanceOf(guardianA);
         uint256 bBefore = wood.balanceOf(guardianB);
@@ -1707,8 +1744,9 @@ contract ChallengeGameTest is Test {
         game.dispute(id, type(uint256).max);
 
         vm.warp(filedAt + game.disputeTimeout());
+        uint256 forfeitBurn = (bond * game.forfeitBurnBps()) / 10_000;
         vm.expectEmit(true, true, true, true, address(game));
-        emit IChallengeGame.ChallengeFailed(id, 10_000e18, 2_000e18);
+        emit IChallengeGame.ChallengeFailed(id, bond, forfeitBurn);
         game.resolve(id);
         _claimAll(id); // pull-payment: funders collect before balances are asserted
 
@@ -1721,15 +1759,17 @@ contract ChallengeGameTest is Test {
         // The challenger paid for the freeze it bought — the whole bond, exactly
         // as before the burn existed. The burn moves who RECEIVES the forfeit,
         // never what filing costs.
-        assertEq(challengerBefore - wood.balanceOf(challenger), 10_000e18, "bond forfeited in full");
+        assertEq(challengerBefore - wood.balanceOf(challenger), bond, "bond forfeited in full");
         // guardianA carried the defence alone, so it takes all of the DISTRIBUTED
-        // upside: its contribution back (net 0) plus 100% of the 80% that was not
+        // upside: its contribution back (net 0) plus 100% of what was not
         // burned.
-        assertEq(wood.balanceOf(guardianA) - aBefore, 8_000e18, "contribution returned plus the unburned forfeit");
+        assertEq(
+            wood.balanceOf(guardianA) - aBefore, bond - forfeitBurn, "contribution returned plus the unburned forfeit"
+        );
         assertEq(
             wood.balanceOf(guardianB) - bBefore, 0, "40% of the coverage but 0% of the defence, so 0% of the winnings"
         );
-        assertEq(wood.balanceOf(game.BURN_ADDRESS()), 2_000e18, "and 20% of the forfeit left the system entirely");
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), forfeitBurn, "and the forfeit burn left the system entirely");
         _assertLiveBondsBacked();
     }
 
@@ -1888,7 +1928,7 @@ contract ChallengeGameTest is Test {
 
         uint256 id = _fileStandard(PROPOSAL);
         uint256 bond = game.challengeOf(id).bondWood;
-        assertEq(bond, 10_000e18);
+        assertEq(bond, _standardBondWood(), "fixture: $10,000 coverage at the live challengerBondBps");
 
         uint256 before = wood.balanceOf(challenger);
         uint256 burnBefore = wood.balanceOf(0x000000000000000000000000000000000000dEaD);
@@ -1898,9 +1938,8 @@ contract ChallengeGameTest is Test {
         // A CORRECT FILING IS CHEAP, NOT FREE (review 🟠F4). The full refund
         // made an attacker whose payoff is the CONSEQUENCE — the approvers
         // slashed, the named adapter demoted — fully subsidised: the whole
-        // attack cost gas. 20% of the bond burns; the rest comes back.
+        // attack cost gas. `settleBurnBps` of the bond burns; the rest comes back.
         uint256 burned = (bond * game.settleBurnBps()) / 10_000;
-        assertEq(burned, 2_000e18, "20% of a 10,000 WOOD bond");
         assertEq(wood.balanceOf(challenger) - before, bond - burned, "the bond back less the burn, to the wei");
         assertEq(wood.balanceOf(0x000000000000000000000000000000000000dEaD) - burnBefore, burned, "the slice is burned");
         assertEq(game.bondedWood(), 0, "no challenge is live");
@@ -2213,12 +2252,13 @@ contract ChallengeGameTest is Test {
     ///         at all now — the fee is paid by `ProposerBondEscrow`, which
     ///         bounds it itself on every forfeiture.
     function test_setStakedWood_doesNotConstrainTheProsecutorFee() public {
+        uint256 feeBefore = game.prosecutorFeeBps();
         MockChallengeStakedWood other = new MockChallengeStakedWood();
         other.setAuthorizedSlasher(address(game));
         vm.prank(owner);
         game.setStakedWood(address(other)); // no rate check to fail
         assertEq(address(game.stakedWood()), address(other), "re-point accepted");
-        assertEq(game.prosecutorFeeBps(), 500, "and the fee rate is untouched");
+        assertEq(game.prosecutorFeeBps(), feeBefore, "and the fee rate is untouched");
     }
 
     /// @notice The defaults ship with a dispute window generous relative to the
@@ -2381,16 +2421,80 @@ contract ChallengeGameTest is Test {
         game.resolve(id);
     }
 
-    /// @notice With no court wired, Plan D's timeout behaviour is unchanged — a
-    ///         disputed challenge still fails to the accused. This is what makes
-    ///         the court additive rather than a breaking change.
-    function test_noCourtWired_timeoutStillFailsToAccused() public {
+    /// @notice With no court wired, a disputed challenge that times out is a
+    ///         NON-VERDICT, not an acquittal (issue #181 finding 2): `rule` was
+    ///         never reachable for this challenge (`courtAtFiling ==
+    ///         address(0)`), so nothing about running out the clock says the
+    ///         accused was right. `resolve` now routes the timeout to
+    ///         `_refundAll` instead of `_fail` — both sides unwind whole
+    ///         rather than the pool forfeiting to the challenger. That is what
+    ///         makes the court ADDITIVE rather than a breaking change: wiring a
+    ///         court only narrows this path (a real verdict becomes reachable)
+    ///         instead of changing behaviour an unwired deployment already
+    ///         relied on.
+    /// @dev Renamed from `test_noCourtWired_timeoutStillFailsToAccused` (issue
+    ///      #181 finding 2). The old name and body pinned the bug this fix
+    ///      closes: a `Disputed` timeout with no adjudicator ever pinned used
+    ///      to route to `_fail`, forfeiting the challenger's whole bond to the
+    ///      pool. At the shipped `forfeitBurnBps` (20%) that paid the
+    ///      counter-bond funder a deterministic +80% on its own capital for
+    ///      doing nothing but funding the timer — zero risk, since `rule`
+    ///      could never be reached to convict it on a `Guilty` verdict. Both
+    ///      balances below must round-trip, not just the enum, or the
+    ///      arbitrage is still alive.
+    function test_noCourtWired_timeoutRefundsBothSides() public {
         vm.prank(owner);
         game.setCourt(address(0));
         uint256 id = _fileAndDispute();
+        IChallengeGame.Challenge memory before = game.challengeOf(id);
+        // Issue #181 finding 19: round 1 against a fresh proposal now pins the
+        // entry-tier rate (`INCONCLUSIVE_BURN_ROUND1_BPS`), not zero — a free
+        // first unwind let anyone pin every accused approver's stake for
+        // `disputeTimeout` + `challengeWindow` at the cost of gas alone.
+        assertEq(
+            before.inconclusiveBurnBpsAtFiling, 250, "fixture: first round on a fresh proposal pins the entry tier"
+        );
+
+        uint256 challengerBefore = wood.balanceOf(challenger);
+        uint256 guardianABefore = wood.balanceOf(guardianA);
+        uint256 stake = game.counterBondContributionOf(id, guardianA);
+        assertEq(stake, before.counterBondWood, "fixture: guardianA funded the whole pool alone");
+
         vm.warp(vm.getBlockTimestamp() + game.disputeTimeout() + 1);
         game.resolve(id);
-        assertEq(uint256(game.challengeOf(id).status), uint256(IChallengeGame.Status.Failed));
+
+        assertEq(
+            uint256(game.challengeOf(id).status),
+            uint256(IChallengeGame.Status.Inconclusive),
+            "a non-verdict, not a fail"
+        );
+        // The challenger's bond comes back minus the round-1 entry-tier burn
+        // (per the fixture assertion above), not whole — but still nowhere
+        // near forfeiting the whole bond to the pool the way the pre-fix
+        // `_fail` route did. Derived from the pinned rate rather than
+        // hardcoded, so this survives a future change to the schedule.
+        uint256 round1Burned = (before.bondWood * before.inconclusiveBurnBpsAtFiling) / 10_000;
+        assertEq(
+            wood.balanceOf(challenger) - challengerBefore,
+            before.bondWood - round1Burned,
+            "challenger bond returned minus the round-1 entry-tier burn"
+        );
+
+        // The counter-bond funder gets back exactly its own stake, no more.
+        // The pool is booked for pull-claims (`_bookRefund`), not pushed, so
+        // the balance doesn't move until `claimContribution` is called — and
+        // even then it is a wash, not the +80% the old `_fail` route paid for
+        // supplying zero-risk capital behind an unreachable `rule`.
+        assertEq(wood.balanceOf(guardianA), guardianABefore, "no push yet - pool is claimable, not paid out");
+        assertEq(game.claimableContribution(id, guardianA), stake, "claimable is exactly the stake, no profit");
+
+        vm.prank(guardianA);
+        game.claimContribution(id);
+        assertEq(
+            wood.balanceOf(guardianA) - guardianABefore, stake, "claimed exactly its stake - the arbitrage is dead"
+        );
+
+        _assertLiveBondsBacked();
     }
 
     /// @notice THE COUNTER-BOND FORFEITS TO THE CHALLENGER ON A GUILTY VERDICT.
@@ -2402,10 +2506,18 @@ contract ChallengeGameTest is Test {
     ///         challenger got only its own bond back and so had no on-chain
     ///         reason to do forensic work at all. Forfeited, the escalation costs
     ///         the accused what it is worth and pays the party that was right.
+    /// @dev Issue #181 finding 18b: the pool now forfeits NET of a
+    ///      `settleBurnBpsAtFiling` slice, burned first — `dispute` is open to
+    ///      anyone, so a challenger who also funds (directly, or via a second
+    ///      address it controls) the ENTIRE counter-bond pool used to
+    ///      round-trip its whole stake on exactly this branch, forfeiting
+    ///      nothing. The expected burn is derived from the challenge's own
+    ///      pinned rate, not hardcoded, so this survives a future rate change.
     function test_rule_guiltyForfeitsThePoolToTheChallenger() public {
         uint256 id = _fileAndDispute();
-        uint256 bond = game.challengeOf(id).bondWood;
-        uint256 pool = game.challengeOf(id).counterBondWood;
+        IChallengeGame.Challenge memory c = game.challengeOf(id);
+        uint256 bond = c.bondWood;
+        uint256 pool = c.counterBondWood;
         assertEq(pool, bond, "a complete pool matches the challenger's bond");
 
         uint256 challengerBefore = wood.balanceOf(challenger);
@@ -2414,10 +2526,15 @@ contract ChallengeGameTest is Test {
         vm.prank(court);
         game.rule(id, IChallengeGame.Verdict.Guilty);
 
+        uint256 burned = (pool * c.settleBurnBpsAtFiling) / 10_000;
+        assertGt(burned, 0, "sanity: the default settleBurnBps actually burns something on this branch now");
         assertEq(
-            wood.balanceOf(challenger) - challengerBefore, bond + pool, "its own bond back PLUS the forfeited pool"
+            wood.balanceOf(challenger) - challengerBefore,
+            bond + pool - burned,
+            "its own bond back PLUS the forfeited pool, net of the settle-slice burn"
         );
         assertEq(wood.balanceOf(guardianA), disputerBefore, "the accused loses the counter-bond it staked");
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), burned, "the settle slice actually left for the dead address");
         _assertLiveBondsBacked();
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded once the ruling is terminal");
     }
@@ -2439,15 +2556,17 @@ contract ChallengeGameTest is Test {
     ///      `test_inconclusive_*` block below). "Both sides whole" stopped
     ///      being true the moment the freeze itself got priced.
     /// @dev ROUND 2, NOT ROUND 1 (owner decision 2026-07-30, review round 3):
-    ///      round 1 against a fresh proposal is priced at 0 bps under the
-    ///      escalating schedule (see `_inconclusiveBurnBpsForRound`), so
-    ///      measuring this property on a single `_fileAndDispute()` would
-    ///      exercise only the degenerate zero-burn case. A first, unmeasured
-    ///      round establishes the escalation before the assertions below run.
+    ///      round 1 against a fresh proposal is priced at the entry tier under
+    ///      the escalating schedule (see `_inconclusiveBurnBpsForRound` and
+    ///      `INCONCLUSIVE_BURN_ROUND1_BPS`, issue #181 finding 19), and this
+    ///      test cares about the STEP from one escalated round to the next, not
+    ///      the entry tier itself (already covered by the `test_inconclusive_*`
+    ///      block below). A first, unmeasured round establishes the escalation
+    ///      before the assertions below run.
     function test_rule_inconclusive_poolWholeChallengerBondMinusBurn() public {
         uint256 firstRoundId = _fileAndDispute();
         vm.prank(court);
-        game.rule(firstRoundId, IChallengeGame.Verdict.Inconclusive); // round 1: free, unmeasured
+        game.rule(firstRoundId, IChallengeGame.Verdict.Inconclusive); // round 1: entry tier, unmeasured
 
         uint256 id = _fileAndDispute(); // round 2: escalated, this is what the test measures
         uint256 challengerBefore = wood.balanceOf(challenger);
@@ -2582,34 +2701,47 @@ contract ChallengeGameTest is Test {
     // Review #1 (2026-07-30) — the Inconclusive path prices the freeze too
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice ROUND 1 IS FREE (owner decision 2026-07-30, review round 3 —
-    ///         escalating the Inconclusive burn). A proposal's first-ever
-    ///         attempt — or its first since the escalation last reset — is not
-    ///         charged: an honest one-shot filer whose vote merely missed the
-    ///         participation floor pays nothing, exactly as before review #1.
-    ///         The escalation prices REPETITION, not a single unlucky vote.
-    function test_inconclusive_firstRoundIsFree() public {
+    /// @notice ROUND 1 IS PRICED AT THE ENTRY TIER, NOT FREE (issue #181
+    ///         finding 19, superseding the 2026-07-30 "round 1 is free"
+    ///         decision). A free first unwind let anyone pin every accused
+    ///         approver's stake for `disputeTimeout` (30-60d) plus
+    ///         `challengeWindow` (14d), repeatably, at the cost of gas alone:
+    ///         file, fully fund your own counter-bond pool, let turnout miss
+    ///         quorum for free, repeat. `INCONCLUSIVE_BURN_ROUND1_BPS` (250,
+    ///         half of round 2's rate, continuing the schedule's doubling
+    ///         shape backwards) closes that — an honest one-shot filer whose
+    ///         vote merely missed the participation floor now pays a small,
+    ///         non-zero entry fee rather than nothing.
+    /// @dev Renamed from `test_inconclusive_firstRoundIsFree` — that name
+    ///      asserted the property this fix removes.
+    function test_inconclusive_firstRoundPricedAtEntryTier() public {
         uint256 id = _fileAndDispute();
-        assertEq(game.challengeOf(id).inconclusiveBurnBpsAtFiling, 0, "round 1 pins a free rate");
+        IChallengeGame.Challenge memory c = game.challengeOf(id);
+        assertEq(c.inconclusiveBurnBpsAtFiling, 250, "round 1 pins the entry-tier rate, not free");
 
         uint256 before = wood.balanceOf(challenger);
         vm.prank(court);
         game.rule(id, IChallengeGame.Verdict.Inconclusive);
-        assertEq(wood.balanceOf(challenger) - before, game.challengeOf(id).bondWood, "the whole bond came back");
+        uint256 burned = (c.bondWood * c.inconclusiveBurnBpsAtFiling) / 10_000;
+        assertEq(
+            wood.balanceOf(challenger) - before, c.bondWood - burned, "the bond came back minus the entry-tier burn"
+        );
     }
 
-    /// @notice THE FULL SCHEDULE, ROUND BY ROUND: 1 free, 2 at 5%, 3 at 10%,
-    ///         4 (and beyond) at the `inconclusiveBurnBps` steady state (20%
-    ///         by default). Each round reuses `_fileAndDispute`, which
-    ///         re-executes the same proposal (`_fileStandard` always
-    ///         re-stamps `executedAt`) and refiles well inside the window
-    ///         `_refundAll` just re-armed, so `inconclusiveRounds` climbs by
-    ///         exactly one per round without ever resetting.
+    /// @notice THE FULL SCHEDULE, ROUND BY ROUND: 1 at 2.5% (the entry tier,
+    ///         issue #181 finding 19), 2 at 5%, 3 at 10%, 4 (and beyond) at the
+    ///         `inconclusiveBurnBps` steady state (20% by default) — each step
+    ///         double the one before it, continuing round 1's own halving of
+    ///         round 2. Each round reuses `_fileAndDispute`, which re-executes
+    ///         the same proposal (`_fileStandard` always re-stamps
+    ///         `executedAt`) and refiles well inside the window `_refundAll`
+    ///         just re-armed, so `inconclusiveRounds` climbs by exactly one per
+    ///         round without ever resetting.
     function test_inconclusive_escalationSchedule() public {
         bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
 
         uint256 r1 = _fileAndDispute();
-        assertEq(game.challengeOf(r1).inconclusiveBurnBpsAtFiling, 0, "round 1: free");
+        assertEq(game.challengeOf(r1).inconclusiveBurnBpsAtFiling, 250, "round 1: 2.5% entry tier, not free");
         vm.prank(court);
         game.rule(r1, IChallengeGame.Verdict.Inconclusive);
         assertEq(game.inconclusiveRounds(key), 1, "one round recorded");
@@ -2625,12 +2757,12 @@ contract ChallengeGameTest is Test {
         game.rule(r3, IChallengeGame.Verdict.Inconclusive);
 
         uint256 r4 = _fileAndDispute();
-        assertEq(game.challengeOf(r4).inconclusiveBurnBpsAtFiling, 2_000, "round 4: the steady state");
+        assertEq(game.challengeOf(r4).inconclusiveBurnBpsAtFiling, 1_000, "round 4: the steady state (ceiling)");
         vm.prank(court);
         game.rule(r4, IChallengeGame.Verdict.Inconclusive);
 
         uint256 r5 = _fileAndDispute();
-        assertEq(game.challengeOf(r5).inconclusiveBurnBpsAtFiling, 2_000, "round 5 (4+): stays at the steady state");
+        assertEq(game.challengeOf(r5).inconclusiveBurnBpsAtFiling, 1_000, "round 5 (4+): stays at the steady state");
     }
 
     // ── Issue #95: an Inconclusive re-arm must pin exposure to match ──
@@ -2667,7 +2799,7 @@ contract ChallengeGameTest is Test {
     function test_inconclusive_escalationCostsMoreWoodEachRound() public {
         uint256 r1 = _fileAndDispute();
         vm.prank(court);
-        game.rule(r1, IChallengeGame.Verdict.Inconclusive); // round 1: free, establishes the streak
+        game.rule(r1, IChallengeGame.Verdict.Inconclusive); // round 1: entry tier, establishes the streak
 
         uint256 r2 = _fileAndDispute();
         uint256 burnedBeforeR2 = wood.balanceOf(game.BURN_ADDRESS());
@@ -2702,16 +2834,17 @@ contract ChallengeGameTest is Test {
         game.rule(r3, IChallengeGame.Verdict.Inconclusive);
 
         uint256 id = _fileAndDispute(); // round 4: reads inconclusiveBurnBps at filing
+        uint256 rateAtFiling = game.inconclusiveBurnBps(); // captured BEFORE the lowering below
         vm.prank(owner);
         game.setInconclusiveBurnBps(500); // lower AFTER filing (still legal: <= live settleBurnBps)
         uint256 before = wood.balanceOf(challenger);
         vm.prank(court);
         game.rule(id, IChallengeGame.Verdict.Inconclusive);
         IChallengeGame.Challenge memory c = game.challengeOf(id);
-        assertEq(c.inconclusiveBurnBpsAtFiling, 2_000, "the challenge keeps its filing-time rate");
+        assertEq(c.inconclusiveBurnBpsAtFiling, rateAtFiling, "the challenge keeps its filing-time rate");
         assertEq(
             wood.balanceOf(challenger) - before,
-            c.bondWood - (c.bondWood * 2_000 / 10_000),
+            c.bondWood - (c.bondWood * rateAtFiling / 10_000),
             "burned at the pinned rate, not the lowered one"
         );
     }
@@ -2720,7 +2853,10 @@ contract ChallengeGameTest is Test {
     ///         decision 2026-07-30): if nobody refiles before the re-armed
     ///         `challengeableUntil` passes, the repetition streak is over, so
     ///         an old, cold proposal must not keep punishing a later,
-    ///         unrelated legitimate filer at an escalated rate forever.
+    ///         unrelated legitimate filer at an escalated rate forever — it
+    ///         drops back to the round-1 ENTRY TIER (issue #181 finding 19),
+    ///         not to a free re-filing; only the escalation above the entry
+    ///         tier resets.
     function test_inconclusive_roundsResetAfterTheWindowLapsesNaturally() public {
         uint256 r1 = _fileAndDispute();
         vm.prank(court);
@@ -2733,7 +2869,11 @@ contract ChallengeGameTest is Test {
 
         uint256 r2 = _fileAndDispute(); // a fresh execution makes this legal again
         assertEq(game.inconclusiveRounds(key), 0, "the streak reset before this filing incremented anything");
-        assertEq(game.challengeOf(r2).inconclusiveBurnBpsAtFiling, 0, "priced as a fresh round 1, not round 2");
+        assertEq(
+            game.challengeOf(r2).inconclusiveBurnBpsAtFiling,
+            250,
+            "priced as a fresh round 1 (entry tier), not round 2's escalated rate"
+        );
     }
 
     /// @notice SYBIL-RESISTANCE: the escalation is keyed on the PROPOSAL
@@ -2814,37 +2954,48 @@ contract ChallengeGameTest is Test {
         assertEq(game.inconclusiveBurnBps(), 0);
     }
 
-    /// @notice THE CROSS-SETTER ORDERING, BOTH DIRECTIONS (review round 2,
-    ///         2026-07-30). Equal ceilings (`MAX_INCONCLUSIVE_BURN_BPS ==
-    ///         MAX_SETTLE_BURN_BPS`) bound the two rates' maximums
-    ///         identically but say nothing about where the LIVE rates sit —
-    ///         each setter must additionally check the OTHER's current value,
-    ///         or the owner could legally invert the ordering one call at a
-    ///         time. This is direction 1: `setInconclusiveBurnBps` must refuse
-    ///         to rise above the live `settleBurnBps`.
-    function test_setInconclusiveBurnBps_revertsAboveTheLiveSettleBurnBps() public {
-        assertEq(game.settleBurnBps(), 2_000, "sanity: the default this bound is checked against");
+    /// @notice THE CROSS-SETTER ORDERING WAS DELIBERATELY REMOVED
+    ///         (second-audit finding C, see `setInconclusiveBurnBps`'s and
+    ///         `setSettleBurnBps`'s natspec). It used to make each setter
+    ///         additionally refuse to move past the OTHER's live value, which
+    ///         pinned `inconclusiveBurnBps <= settleBurnBps` unconditionally
+    ///         and made the Inconclusive ladder's round-4+ tier permanently
+    ///         collapse onto round 3's fixed 1,000 bps — raising it required
+    ///         raising `settleBurnBps` first, which breaks
+    ///         `honestFilingBreaksEven`. This direction now asserts the
+    ///         opposite of what it used to: `setInconclusiveBurnBps` MUST be
+    ///         free to rise above the live `settleBurnBps`, bounded only by
+    ///         its own ceiling, `MAX_INCONCLUSIVE_BURN_BPS`.
+    function test_setInconclusiveBurnBps_allowsRisingAboveTheLiveSettleBurnBps() public {
+        assertEq(game.settleBurnBps(), 1_000, "sanity: the default this used to be bound against");
         vm.startPrank(owner);
+        game.setInconclusiveBurnBps(1_001); // one bps above the live settleBurnBps — no longer reverts
+        assertEq(game.inconclusiveBurnBps(), 1_001);
+
         vm.expectRevert(IChallengeGame.InvalidParameter.selector);
-        game.setInconclusiveBurnBps(2_001); // one bps above the live settleBurnBps
-        game.setInconclusiveBurnBps(2_000); // equal to it is fine
-        assertEq(game.inconclusiveBurnBps(), 2_000);
+        game.setInconclusiveBurnBps(5_001); // still bounded by its own ceiling
+        game.setInconclusiveBurnBps(5_000); // the ceiling itself is allowed
+        assertEq(game.inconclusiveBurnBps(), 5_000);
         vm.stopPrank();
     }
 
-    /// @notice Direction 2 of the same ordering: `setSettleBurnBps` must
-    ///         refuse to drop below the live `inconclusiveBurnBps`. Both
-    ///         default to 2,000 now (owner decision 2026-07-30 changed
-    ///         `inconclusiveBurnBps`'s default from 500 to 2,000, repurposing
-    ///         it as the round-4+ steady state), so the probe values shift
-    ///         accordingly from the review-round-2 version of this test.
-    function test_setSettleBurnBps_revertsBelowTheLiveInconclusiveBurnBps() public {
-        assertEq(game.inconclusiveBurnBps(), 2_000, "sanity: the default this bound is checked against");
+    /// @notice Direction 2 of the same removed ordering: `setSettleBurnBps`
+    ///         must now be free to drop below the live `inconclusiveBurnBps`
+    ///         — the mutual cross-check is gone from this side too, and this
+    ///         setter is bounded only by its own ceiling,
+    ///         `MAX_SETTLE_BURN_BPS`. Both still default to 1,000 (audit #181
+    ///         finding 18a lowered the pair in lockstep to close the
+    ///         incentive inversion), so the probe values shift accordingly.
+    function test_setSettleBurnBps_allowsDroppingBelowTheLiveInconclusiveBurnBps() public {
+        assertEq(game.inconclusiveBurnBps(), 1_000, "sanity: the default this used to be bound against");
         vm.startPrank(owner);
+        game.setSettleBurnBps(999); // one bps below the live inconclusiveBurnBps — no longer reverts
+        assertEq(game.settleBurnBps(), 999);
+
         vm.expectRevert(IChallengeGame.InvalidParameter.selector);
-        game.setSettleBurnBps(1_999); // one bps below the live inconclusiveBurnBps
-        game.setSettleBurnBps(2_000); // equal to it is fine
-        assertEq(game.settleBurnBps(), 2_000);
+        game.setSettleBurnBps(5_001); // still bounded by its own ceiling
+        game.setSettleBurnBps(5_000); // the ceiling itself is allowed
+        assertEq(game.settleBurnBps(), 5_000);
         vm.stopPrank();
     }
 
@@ -3055,29 +3206,36 @@ contract ChallengeGameTest is Test {
     function test_dispute_poolAccumulatesAndOpensTheDisputeOnCompletion() public {
         uint256 id = _fileStandard(PROPOSAL);
         uint256 bond = game.challengeOf(id).bondWood;
+        // Proportional to whatever the live bond is (30% / 10% / 60% of the
+        // target), rather than hardcoded absolutes tied to the pre-audit-#181
+        // bond size — the sequence only needs to stay short of the target
+        // until the last contribution completes it.
+        uint256 firstChunk = (bond * 30) / 100;
+        uint256 topUp = (bond * 10) / 100;
+        uint256 completing = bond - firstChunk - topUp;
 
         vm.prank(guardianA);
-        game.dispute(id, 3_000e18);
+        game.dispute(id, firstChunk);
         IChallengeGame.Challenge memory mid = game.challengeOf(id);
         assertEq(uint8(mid.status), uint8(IChallengeGame.Status.Filed), "still Filed - the pool is short");
-        assertEq(mid.counterBondWood, 3_000e18);
-        assertEq(game.bondedWood(), bond + 3_000e18, "the partial pool is custodied and accounted");
-        assertEq(wood.balanceOf(address(game)), bond + 3_000e18);
+        assertEq(mid.counterBondWood, firstChunk);
+        assertEq(game.bondedWood(), bond + firstChunk, "the partial pool is custodied and accounted");
+        assertEq(wood.balanceOf(address(game)), bond + firstChunk);
         _assertLiveBondsBacked();
 
         // A top-up from the SAME guardian must not append a second list entry.
         vm.prank(guardianA);
-        game.dispute(id, 1_000e18);
-        assertEq(game.counterBondContributionOf(id, guardianA), 4_000e18, "topped up in place");
+        game.dispute(id, topUp);
+        assertEq(game.counterBondContributionOf(id, guardianA), firstChunk + topUp, "topped up in place");
         assertEq(game.counterBondContributors(id).length, 1, "and listed only once");
 
         // The completing contribution flips the status.
         vm.expectEmit(true, true, true, true, address(game));
-        emit IChallengeGame.CounterBondContributed(id, guardianB, 6_000e18, bond);
+        emit IChallengeGame.CounterBondContributed(id, guardianB, completing, bond);
         vm.expectEmit(true, true, true, true, address(game));
         emit IChallengeGame.ChallengeDisputed(id, bond);
         vm.prank(guardianB);
-        game.dispute(id, 6_000e18);
+        game.dispute(id, completing);
 
         IChallengeGame.Challenge memory done = game.challengeOf(id);
         assertEq(uint8(done.status), uint8(IChallengeGame.Status.Disputed), "the pool bought the escalation");
@@ -3104,12 +3262,17 @@ contract ChallengeGameTest is Test {
         uint256 bBefore = wood.balanceOf(guardianB);
         uint256 challengerBefore = wood.balanceOf(challenger);
 
-        // Unequal partial contributions that together fall short of the target.
+        // Unequal partial contributions (25% / 15% of the target, as before)
+        // that together fall short of it — derived from the live bond so a
+        // future re-sizing of `challengerBondBps` cannot accidentally make
+        // this pool complete instead of falling short.
+        uint256 aPut = (bond * 25) / 100;
+        uint256 bPut = (bond * 15) / 100;
         vm.prank(guardianA);
-        game.dispute(id, 2_500e18);
+        game.dispute(id, aPut);
         vm.prank(guardianB);
-        game.dispute(id, 1_500e18);
-        assertEq(game.challengeOf(id).counterBondWood, 4_000e18, "a pool short of the 10,000 target");
+        game.dispute(id, bPut);
+        assertEq(game.challengeOf(id).counterBondWood, aPut + bPut, "a pool short of the target");
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Filed), "so no dispute was bought");
 
         // The clock runs out on the part-funded defence.
@@ -3121,8 +3284,8 @@ contract ChallengeGameTest is Test {
         assertEq(swood.callCount(), 1, "the contributors are still slashed - the refund is not an acquittal");
 
         // Exact balances: each contributor is made whole, to the wei.
-        assertEq(wood.balanceOf(guardianA), aBefore, "guardianA's 2,500 came back");
-        assertEq(wood.balanceOf(guardianB), bBefore, "guardianB's 1,500 came back");
+        assertEq(wood.balanceOf(guardianA), aBefore, "guardianA's contribution came back");
+        assertEq(wood.balanceOf(guardianB), bBefore, "guardianB's contribution came back");
         // Less F4's settle burn. This is the UNADJUDICATED path, which is
         // exactly the scope that burn has: a filing nobody answered used to buy
         // the slash and the demotion for the price of gas. The pool is still not
@@ -3144,20 +3307,22 @@ contract ChallengeGameTest is Test {
     function test_dispute_overContributionTakesOnlyTheShortfall() public {
         uint256 id = _fileStandard(PROPOSAL);
         uint256 bond = game.challengeOf(id).bondWood;
+        uint256 aPut = (bond * 90) / 100; // 90% of the target, as before
 
         vm.prank(guardianA);
-        game.dispute(id, 9_000e18);
+        game.dispute(id, aPut);
 
+        uint256 shortfall = bond - aPut;
         uint256 bBefore = wood.balanceOf(guardianB);
-        // Asks for far more than the 1,000 still needed.
+        // Asks for far more than what's still needed.
         vm.expectEmit(true, true, true, true, address(game));
-        emit IChallengeGame.CounterBondContributed(id, guardianB, 1_000e18, bond);
+        emit IChallengeGame.CounterBondContributed(id, guardianB, shortfall, bond);
         vm.prank(guardianB);
         game.dispute(id, 500_000e18);
 
-        assertEq(bBefore - wood.balanceOf(guardianB), 1_000e18, "only the shortfall was pulled");
+        assertEq(bBefore - wood.balanceOf(guardianB), shortfall, "only the shortfall was pulled");
         assertEq(game.challengeOf(id).counterBondWood, bond, "the pool never exceeds its target");
-        assertEq(game.counterBondContributionOf(id, guardianB), 1_000e18);
+        assertEq(game.counterBondContributionOf(id, guardianB), shortfall);
         _assertLiveBondsBacked();
     }
 
@@ -3177,18 +3342,19 @@ contract ChallengeGameTest is Test {
     function test_dispute_revertsAfterTheDeadlineEvenWithAPartialPool() public {
         uint256 id = _fileStandard(PROPOSAL);
         uint256 filedAt = _filedAt(id);
+        uint256 bond = game.challengeOf(id).bondWood;
         vm.prank(guardianA);
-        game.dispute(id, 4_000e18);
+        game.dispute(id, (bond * 40) / 100); // partial, as before
 
         vm.warp(filedAt + game.autoSlashDelay());
         vm.prank(guardianB);
         vm.expectRevert(IChallengeGame.WindowClosed.selector);
-        game.dispute(id, 6_000e18);
+        game.dispute(id, bond); // would otherwise complete the pool
 
         // Same for a top-up from the guardian that already paid in.
         vm.prank(guardianA);
         vm.expectRevert(IChallengeGame.WindowClosed.selector);
-        game.dispute(id, 6_000e18);
+        game.dispute(id, bond);
     }
 
     /// @notice SPLITTING AN IDENTITY BUYS NO DISCOUNT. This is the constraint
@@ -3429,24 +3595,28 @@ contract ChallengeGameTest is Test {
 
         address sybil1 = makeAddr("sybil1");
         _fund(sybil1);
-        // $10,000.000...027 of coverage → a bond that is not a round number.
-        _setCoverage3(PROPOSAL, guardianA, 4_000e18 + 7, sybil1, 3_000e18 + 11, 3_000e18 + 9);
+        // $10,000 of coverage plus a small, deliberately non-round remainder
+        // spread unevenly across the three approvers, so the resulting bond
+        // is not a round number regardless of the live `challengerBondBps`.
+        _setCoverage3(PROPOSAL, guardianA, 4_000e18 + 400, sybil1, 3_000e18 + 350, 3_000e18 + 250);
         _execute(PROPOSAL);
         vm.prank(challenger);
         uint256 id =
             game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, ADAPTER, SELECTOR, EVIDENCE);
         uint256 bond = game.challengeOf(id).bondWood;
-        assertEq(bond, 10_000e18 + 20, "an odd bond, so the rounding has somewhere to hide");
+        assertEq(bond, _standardBondWood() + 300, "an odd bond, so the rounding has somewhere to hide");
         assertTrue((bond * 1_777) % 10_000 != 0, "and the burn itself truncates");
 
         uint256 aBefore = wood.balanceOf(guardianA);
         uint256 sBefore = wood.balanceOf(sybil1);
         uint256 bBefore = wood.balanceOf(guardianB);
 
-        // Three unequal, deliberately un-round contributions. guardianB takes the
-        // clamped shortfall, so it is last in the list and absorbs the remainder.
-        uint256 aPut = 1_234e18 + 7;
-        uint256 sPut = 4_321e18 + 11;
+        // Three unequal, deliberately un-round contributions — 12.34% / 43.21%
+        // of the LIVE bond plus a wei-scale offset, rather than absolutes
+        // pinned to the pre-audit-#181 bond size. guardianB takes the clamped
+        // shortfall, so it is last in the list and absorbs the remainder.
+        uint256 aPut = (bond * 1_234) / 10_000 + 7;
+        uint256 sPut = (bond * 4_321) / 10_000 + 11;
         vm.prank(guardianA);
         game.dispute(id, aPut);
         vm.prank(sybil1);
@@ -3526,21 +3696,38 @@ contract ChallengeGameTest is Test {
         _assertLiveBondsBacked();
     }
 
-    /// @notice The winning path is UNTOUCHED by the burn: a guilty ruling still
-    ///         pays the challenger its bond back plus the whole pool. The burn
-    ///         prices a round trip that only exists on the failure path, where
-    ///         the forfeit flows back toward the side that posted it.
-    function test_rule_guiltyPathBurnsNothing() public {
+    /// @notice THE GUILTY PATH NOW BURNS A SLICE TOO (issue #181 finding 18b).
+    ///         The pre-fix belief was that the escalated branch has no round
+    ///         trip to price, because the challenger and the pool's funder are
+    ///         genuinely opposed there — but `dispute` is open to ANYONE, so a
+    ///         challenger that also funds (or has a second address fund) the
+    ///         entire counter-bond pool forfeits nothing on a Guilty verdict,
+    ///         round-tripping its whole stake. The fix burns
+    ///         `settleBurnBpsAtFiling` of the pool first, exactly mirroring the
+    ///         silence branch's burn on the bond.
+    /// @dev Renamed from `test_rule_guiltyPathBurnsNothing` — that name and
+    ///      body pinned the pre-fix behaviour this fix removes. The expected
+    ///      burn is derived from the challenge's own pinned
+    ///      `settleBurnBpsAtFiling` rather than a hardcoded `18000e18`, so the
+    ///      test survives a future rate change.
+    function test_rule_guiltyPathBurnsTheSettleSlice() public {
         uint256 id = _fileAndDispute();
-        uint256 bond = game.challengeOf(id).bondWood;
-        uint256 pool = game.challengeOf(id).counterBondWood;
+        IChallengeGame.Challenge memory c = game.challengeOf(id);
+        uint256 bond = c.bondWood;
+        uint256 pool = c.counterBondWood;
         uint256 challengerBefore = wood.balanceOf(challenger);
 
         vm.prank(court);
         game.rule(id, IChallengeGame.Verdict.Guilty);
 
-        assertEq(wood.balanceOf(challenger) - challengerBefore, bond + pool, "bond back plus the WHOLE pool");
-        assertEq(wood.balanceOf(game.BURN_ADDRESS()), 0, "a settled challenge burns nothing");
+        uint256 burned = (pool * c.settleBurnBpsAtFiling) / 10_000;
+        assertGt(burned, 0, "sanity: the default settleBurnBps actually burns something");
+        assertEq(
+            wood.balanceOf(challenger) - challengerBefore,
+            bond + pool - burned,
+            "bond back plus the pool, minus the burn"
+        );
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), burned, "exactly settleBurnBpsAtFiling of the pool was burned");
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded");
     }
 
@@ -3714,13 +3901,14 @@ contract ChallengeGameTest is Test {
     ///         is priced against — a live read would change what the challenger
     ///         stood to collect on a conviction it had already bonded against.
     function test_prosecutorFee_pinnedAtFiling() public {
+        uint256 defaultRate = game.prosecutorFeeBps();
         uint256 id = _fileStandard(PROPOSAL);
-        assertEq(game.challengeOf(id).prosecutorFeeBpsAtFiling, 500, "pinned at the filing rate");
+        assertEq(game.challengeOf(id).prosecutorFeeBpsAtFiling, defaultRate, "pinned at the filing rate");
 
         vm.prank(owner);
         game.setProsecutorFeeBps(1_000);
 
-        assertEq(game.challengeOf(id).prosecutorFeeBpsAtFiling, 500, "the open challenge keeps its rate");
+        assertEq(game.challengeOf(id).prosecutorFeeBpsAtFiling, defaultRate, "the open challenge keeps its rate");
         uint256 later = _fileStandard(2);
         assertEq(game.challengeOf(later).prosecutorFeeBpsAtFiling, 1_000, "a later filing takes the new one");
     }

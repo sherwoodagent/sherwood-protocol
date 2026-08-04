@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
+import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {IVotes} from "@openzeppelin/contracts/governance/utils/IVotes.sol";
 
 /// @title ProposalLifecycle
@@ -82,13 +83,29 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
 
             // Voting ended — optimistic: approved unless AGAINST votes reach the
             // veto threshold.
-            // Skip the veto check when pastTotalSupply == 0, otherwise the
+            // Skip the veto check when liveSupply == 0, otherwise the
             // threshold collapses to 0 and every proposal auto-rejects.
             // Reads the vetoThresholdBps snapshot taken at Draft -> Pending,
             // not a live param, so mid-vote finalizes don't move the bar.
             uint256 pastTotalSupply = IVotes(p.vault).getPastTotalSupply(p.snapshotTimestamp);
-            if (pastTotalSupply > 0) {
-                uint256 vetoThreshold = (pastTotalSupply * p.vetoThresholdBps) / BPS_DENOMINATOR;
+            // Escrowed redeem-queue shares are checkpointed into
+            // getPastTotalSupply (the queue burns them at CLAIM, not at the
+            // settle stamp) but the withdrawal queue auto-delegates to
+            // itself and never votes, and every escrowed share already has
+            // its settle price stamped and its assets reserved — zero
+            // remaining exposure, zero governance surface. Left in the
+            // denominator, they inflate the veto threshold against LPs who
+            // hold 100% of the live economics; a whale who queues and
+            // stamps a large enough redeem without claiming can make veto
+            // arithmetically impossible for the honest remainder. Net them
+            // out via the queue's own checkpointed voting weight, which
+            // equals its escrowed custody balance exactly because it never
+            // votes and never delegates elsewhere.
+            address queue = ISyndicateVault(p.vault).withdrawalQueue();
+            uint256 queueVotes = queue == address(0) ? 0 : IVotes(p.vault).getPastVotes(queue, p.snapshotTimestamp);
+            uint256 liveSupply = pastTotalSupply > queueVotes ? pastTotalSupply - queueVotes : 0;
+            if (liveSupply > 0) {
+                uint256 vetoThreshold = (liveSupply * p.vetoThresholdBps) / BPS_DENOMINATOR;
                 if (p.votesAgainst >= vetoThreshold) {
                     // Veto rejection never traversed guardian review.
                     return (ProposalState.Rejected, false);
