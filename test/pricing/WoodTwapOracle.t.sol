@@ -482,4 +482,124 @@ contract WoodTwapOracleTest is Test {
         pair.setTokens(weth, makeAddr("imposter"));
         assertFalse(oracle.validatePair(), "a re-pointed pair must not validate");
     }
+
+    // ── audit #181 finding 22, applied to this contract ──
+
+    /// @dev Rebuilds the fixture against a hostile ETH/USD feed and primes a
+    ///      completed window. Pair and every other parameter match `setUp`'s,
+    ///      so any behaviour difference is attributable to the feed alone.
+    function _oracleWithFeed(address feed) internal returns (WoodTwapOracle o) {
+        MockUniswapV2Pair p = new MockUniswapV2Pair(weth, wood, RESERVE_WETH, RESERVE_WOOD);
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        p.touch();
+        o = new WoodTwapOracle(owner, address(p), wood, weth, feed, WINDOW, MAX_AGE, ETH_DELAY);
+        p.touch();
+        o.update();
+        vm.warp(vm.getBlockTimestamp() + WINDOW + 1);
+        p.touch();
+        o.update();
+    }
+
+    /// @notice A feed answering with FEWER than five words must report
+    ///         unavailable, not revert.
+    ///
+    ///         This is the shape a typed `try ... returns (uint80, int256,
+    ///         uint256, uint256, uint80)` cannot survive: the call SUCCEEDS, so
+    ///         `catch` is never entered, and the revert lands afterwards while
+    ///         ABI-decoding the too-short returndata. `consult`'s documented
+    ///         contract is that a sick feed costs it its answer, so a revert
+    ///         here would propagate into the ledger's price path instead.
+    function test_ethUsdLeg_shortReturndata_reportsUnavailableInsteadOfReverting() public {
+        WoodTwapOracle o = _oracleWithFeed(address(new ShortReturndataFeed()));
+        (uint256 priceX8, bool ok) = o.consult();
+        assertFalse(ok, "a feed returning 3 words must read unavailable");
+        assertEq(priceX8, 0, "and price zero");
+    }
+
+    /// @notice A feed answering with the right length but DIRTY high bits in
+    ///         the `uint80` slots must still price normally.
+    ///
+    ///         The narrow `uint80`s are the trap: the ABI decoder rejects a
+    ///         word whose unused high bits are not clean padding, so the old
+    ///         typed decode reverted uncatchably on this input. Decoding every
+    ///         slot as `uint256`/`int256` accepts any 32-byte word, and both
+    ///         round-id fields are unused anyway — so the correct outcome is
+    ///         not merely "no revert" but a fully healthy price.
+    function test_ethUsdLeg_dirtyPaddedRoundIds_stillPrices() public {
+        WoodTwapOracle o = _oracleWithFeed(address(new DirtyPaddedFeed()));
+        (uint256 priceX8, bool ok) = o.consult();
+        assertTrue(ok, "dirty padding in the unused round-id words must not deny an answer");
+
+        uint256 expected = (uint256(RESERVE_WETH) * uint256(ETH_USD_ANSWER)) / uint256(RESERVE_WOOD);
+        assertApproxEqRel(priceX8, expected, 1e12, "and the price must be the ordinary one");
+    }
+
+    /// @notice A feed reporting absurd `decimals()` must report unavailable,
+    ///         not revert on `10 ** decimals` overflow.
+    ///
+    ///         `_ethUsdFeedDecimals` is captured once at construction and is a
+    ///         `uint8`, so 200 is representable.
+    ///
+    ///         MUTATION-CHECKED, AND THE RESULT CORRECTED AN ASSUMPTION:
+    ///         restoring the typed-`try` version fails this test with
+    ///         `panic 0x11`, NOT with a graceful `ok == false`. The `try` never
+    ///         protected the exponentiation — `catch` covers the external call
+    ///         only, never the success-block body, which runs in the calling
+    ///         contract's own frame. So this bound closes a second,
+    ///         pre-existing uncatchable-revert path rather than compensating
+    ///         for one the `staticcall` rewrite introduced.
+    function test_ethUsdLeg_absurdFeedDecimals_reportsUnavailableInsteadOfReverting() public {
+        WoodTwapOracle o = _oracleWithFeed(address(new AbsurdDecimalsFeed()));
+        (uint256 priceX8, bool ok) = o.consult();
+        assertFalse(ok, "a feed claiming 200 decimals must read unavailable");
+        assertEq(priceX8, 0, "and price zero");
+    }
+}
+
+/// @notice Answers `latestRoundData()` with three words instead of five.
+contract ShortReturndataFeed {
+    function decimals() external pure returns (uint8) {
+        return 8;
+    }
+
+    fallback() external {
+        assembly ("memory-safe") {
+            mstore(0x80, 1)
+            mstore(0xa0, 186755036180)
+            mstore(0xc0, timestamp())
+            return(0x80, 0x60)
+        }
+    }
+}
+
+/// @notice Answers with five full words, but with garbage in the high bits of
+///         the two `uint80` round-id slots — valid for a `uint256` decode,
+///         fatal for a `uint80` one.
+contract DirtyPaddedFeed {
+    function decimals() external pure returns (uint8) {
+        return 8;
+    }
+
+    fallback() external {
+        assembly ("memory-safe") {
+            mstore(0x80, not(0)) // roundId: every bit set
+            mstore(0xa0, 186755036180) // answer
+            mstore(0xc0, timestamp()) // startedAt
+            mstore(0xe0, timestamp()) // updatedAt
+            mstore(0x100, not(0)) // answeredInRound: every bit set
+            return(0x80, 0xa0)
+        }
+    }
+}
+
+/// @notice A well-formed feed that claims 200 decimals, so `10 ** decimals`
+///         would overflow.
+contract AbsurdDecimalsFeed {
+    function decimals() external pure returns (uint8) {
+        return 200;
+    }
+
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
+        return (1, 186755036180, block.timestamp, block.timestamp, 1);
+    }
 }
