@@ -223,7 +223,7 @@ contract PortfolioStrategy is BaseStrategy {
     ///      `ok`, and read by those same two when it does not (pashov review
     ///      finding #4). Zero means "this slot has never been priced" — the
     ///      only case still degrading to the quote-anchored floor.
-    mapping(uint256 allocationIndex => uint256 priceInFeedScale) private _lastGoodPriceX8;
+    mapping(uint256 allocationIndex => uint256 priceInFeedScale) private _lastGoodPrice;
 
     /// @notice Running sum, in bps, of oracle-valued NAV given up across every
     ///         `rebalance` / `rebalanceDelta` on this clone (pashov review
@@ -565,6 +565,12 @@ contract PortfolioStrategy is BaseStrategy {
     function rebalance() external onlyProposer {
         if (_state != State.Executed) revert NotExecuted();
         if (_rebalancing) revert RebalancingInProgress();
+        // The decay budget is charged at the END of this function, per LEG
+        // THAT ACTUALLY SWAPPED — see the charge site below. Charging up front
+        // billed a rebalance that moved nothing the full `2 * maxSlippageBps`,
+        // which at the `MAX_SLIPPAGE_CEILING_BPS` of 1_000 is two no-op calls
+        // to exhaust a 30-day strategy (PR #195 review, minor 1). Charging
+        // after is equally safe: a revert unwinds the swaps it refuses to pay.
         // Live re-check. Unlike `_execute`/`_settle`'s one-shot check,
         // `rebalance`/`rebalanceDelta` are proposer-callable an unbounded number
         // of times while `Executed`, with no time limit — a demotion that lands
@@ -572,13 +578,6 @@ contract PortfolioStrategy is BaseStrategy {
         // would keep `forceApprove`-ing the demoted adapter. Blocking a rebalance
         // strands nothing, since `settle()` remains the exit path either way, so
         // this fails CLOSED rather than degrading open.
-        // Charge this call's worst-case slippage allowance against the clone's
-        // lifetime budget (pashov review finding #9). `maxSlippageBps` bounds
-        // ONE swap; nothing bounded the number of full-notional round trips, so
-        // the per-call allowance composed multiplicatively over an unlimited
-        // call count. None of this traffic passes `executeGovernorBatch`, so
-        // neither the per-call caps nor `maxNetOutflow` ever observed it.
-        _chargeDecayBudget(2 * maxSlippageBps);
         _requireAllowedAdapter(address(swapAdapter));
         // Live re-check of the oracle itself. The adapter check above
         // re-certifies the swap VENUE on every call, but the price SOURCE
@@ -608,6 +607,7 @@ contract PortfolioStrategy is BaseStrategy {
         // push mode). The buy leg below uses the mirror `_buyFloor` rather than a
         // bare `_quoteMinOut`, for the same reason: this flow is proposer-only but
         // the pool state it quotes against is not otherwise anchored.
+        bool soldAny;
         for (uint256 i; i < len; ++i) {
             TokenAllocation storage alloc = _allocations[i];
             uint256 bal = IERC20(alloc.token).balanceOf(address(this));
@@ -619,10 +619,12 @@ contract PortfolioStrategy is BaseStrategy {
             if (amountOut == 0) revert SwapFailed();
             alloc.tokenAmount = 0;
             alloc.investedAmount = 0;
+            soldAny = true;
         }
 
         // Re-buy at current target weights
         uint256 assetBalance = IERC20(asset).balanceOf(address(this));
+        bool boughtAny;
         for (uint256 i; i < len; ++i) {
             TokenAllocation storage alloc = _allocations[i];
             uint256 allocation = (assetBalance * alloc.targetWeightBps) / BPS_DENOMINATOR;
@@ -635,7 +637,18 @@ contract PortfolioStrategy is BaseStrategy {
 
             alloc.tokenAmount = amountOut;
             alloc.investedAmount = allocation;
+            boughtAny = true;
         }
+
+        // PER LEG THAT ACTUALLY SWAPPED (PR #195 review, minor 1). The unit of
+        // the allowance is a LEG, not a swap: `maxSlippageBps` bounds how far
+        // below the oracle-implied value one side of the round trip may land,
+        // and every swap inside a leg is bounded individually by its own
+        // floor. Charging per SWAP would scale the bill with basket size and
+        // exhaust a 3-token basket in a single call; charging a flat
+        // `2 * maxSlippageBps` billed no-op rebalances. This bills what ran.
+        uint256 legs = (soldAny ? maxSlippageBps : 0) + (boughtAny ? maxSlippageBps : 0);
+        if (legs != 0) _chargeDecayBudget(legs);
 
         // Snapshot after balances for event
         uint256[] memory newBalances = new uint256[](len);
@@ -669,12 +682,14 @@ contract PortfolioStrategy is BaseStrategy {
     function rebalanceDelta(bytes[] calldata priceReports) external onlyProposer {
         if (_state != State.Executed) revert NotExecuted();
         if (_rebalancing) revert RebalancingInProgress();
-        // One leg's worth — see the identical charge on `rebalance()` above and
-        // `MAX_CUMULATIVE_DECAY_BPS` for what is metered and why (pashov review
-        // finding #9). A delta rebalance trades only the over/under-weight
-        // remainder rather than the full basket, so it is charged half of what
-        // the full round trip is.
-        _chargeDecayBudget(maxSlippageBps);
+        // Charged at the END, and only if a swap actually ran — see the charge
+        // site in `rebalance()` and `MAX_CUMULATIVE_DECAY_BPS` for what is
+        // metered and why (pashov review finding #9, refined by PR #195 review
+        // minor 1). A delta rebalance trades only the over/under-weight
+        // remainder rather than the full basket, so it is charged one leg's
+        // worth where the full round trip is charged two. A delta call whose
+        // every allocation is already within threshold swaps nothing and is
+        // therefore free.
         // Live re-check, fail-closed on demotion — see the identical guard on
         // `rebalance()` above for the full rationale (issue #147).
         _requireAllowedAdapter(address(swapAdapter));
@@ -725,6 +740,10 @@ contract PortfolioStrategy is BaseStrategy {
             _allocations[i].tokenAmount = bal;
             newBalances[i] = bal;
         }
+
+        // See the note at the top of this function: one leg's worth, and only
+        // when something actually traded.
+        if (swapsExecuted != 0) _chargeDecayBudget(maxSlippageBps);
 
         _rebalancing = false;
         emit RebalancedDelta(
@@ -925,7 +944,7 @@ contract PortfolioStrategy is BaseStrategy {
         if (chainlinkVerifier == address(0)) {
             (uint256 price, bool ok) = _tryPushFeedPrice(i);
             if (ok) {
-                _lastGoodPriceX8[i] = price;
+                _lastGoodPrice[i] = price;
                 uint256 value = _tokensToValue(bal, price, i, uint256(_assetDecimals));
                 return (value * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
             }
@@ -946,7 +965,7 @@ contract PortfolioStrategy is BaseStrategy {
         // anchor than the counterparty's quote. Fail-closed was the other
         // option and was rejected deliberately: it would brick `settle()` for
         // the entire duration of a feed outage, stranding capital.
-        uint256 lastGood = _lastGoodPriceX8[i];
+        uint256 lastGood = _lastGoodPrice[i];
         if (lastGood != 0) {
             uint256 staleValue = _tokensToValue(bal, lastGood, i, uint256(_assetDecimals));
             return (staleValue * (BPS_DENOMINATOR - STALE_PRICE_SLIPPAGE_BPS)) / BPS_DENOMINATOR;
@@ -972,7 +991,7 @@ contract PortfolioStrategy is BaseStrategy {
         if (chainlinkVerifier == address(0)) {
             (uint256 price, bool ok) = _tryPushFeedPrice(i);
             if (ok) {
-                _lastGoodPriceX8[i] = price;
+                _lastGoodPrice[i] = price;
                 uint256 tokensExpected = _valueToTokens(amountIn, price, i, uint256(_assetDecimals));
                 return (tokensExpected * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
             }
@@ -980,7 +999,7 @@ contract PortfolioStrategy is BaseStrategy {
         // Mirrors `_sellFloor`'s stale-anchor fallback exactly — see the block
         // there for why a price this contract already observed beats a quote
         // taken against the pool being traded (pashov review finding #4).
-        uint256 lastGood = _lastGoodPriceX8[i];
+        uint256 lastGood = _lastGoodPrice[i];
         if (lastGood != 0) {
             uint256 staleTokens = _valueToTokens(amountIn, lastGood, i, uint256(_assetDecimals));
             return (staleTokens * (BPS_DENOMINATOR - STALE_PRICE_SLIPPAGE_BPS)) / BPS_DENOMINATOR;
@@ -1222,7 +1241,7 @@ contract PortfolioStrategy is BaseStrategy {
         // the slot's declared decimals — the same units and the same
         // trustworthiness as the push-mode read, so it is a valid anchor for
         // the calls that arrive without a report of their own.
-        _lastGoodPriceX8[i] = price;
+        _lastGoodPrice[i] = price;
     }
 
     // ── View functions ──

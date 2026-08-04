@@ -1281,6 +1281,26 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // gives every review whose clock was already running the time back,
         // while reviews registered later start from the new baseline and are
         // unaffected.
+        //
+        // ACCEPTED TRADEOFF: THIS TURNS A FAIL-OPEN INTO A GRIEFABLE
+        // FAIL-CLOSED (PR #195 review, item 7). `resolveReview` now requires
+        // `_effNow >= r.reviewEnd`, so each pause/unpause cycle pushes every
+        // in-flight review's resolution further out, and nothing stops the
+        // owner re-pausing the moment `DEADMAN_UNPAUSE_DELAY` lets a stranger
+        // unpause. An owner can therefore defer guardian resolution
+        // indefinitely — including past a proposal's own wall-clock
+        // `executeBy`, since that deadline lives on the governor and is NOT
+        // pause-adjusted, so the proposal expires rather than executing.
+        //
+        // Deliberate, on two grounds. The failure direction is now REFUSAL
+        // rather than an unearned `Cleared` — a deferred review approves
+        // nothing, whereas the old behaviour executed proposals no guardian
+        // could vote on. And the lever is already held: this owner can pause
+        // indefinitely regardless, which halts `voteOnProposal`,
+        // `resolveReview` and `openReview` outright. The registry's whole
+        // pause design sits under the trusted-owner doctrine; this adds no
+        // capability, only a longer tail on one that exists.
+        // `test_finding7_repeatedPauseCyclesCompound` pins the compounding.
         pauseShiftTotal += uint64(block.timestamp - uint256(pausedAt));
         paused = false;
         pausedAt = 0;

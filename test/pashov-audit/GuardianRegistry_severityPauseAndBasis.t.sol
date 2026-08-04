@@ -147,6 +147,118 @@ contract GuardianRegistry_severityPauseAndBasisTest is RegistryTestHarness {
     ///      returns `Cleared`. The proposal executed with a guardian review
     ///      that structurally could not happen — and an ordinary incident
     ///      pause does it, no malice required.
+    /// @notice The accepted downside of finding #7's fix, pinned so it is a
+    ///         known property rather than a surprise (PR #195 review, item 7).
+    /// @dev    Each pause/unpause cycle adds to `pauseShiftTotal`, so an owner
+    ///         who re-pauses can defer every in-flight review's resolution
+    ///         indefinitely — including past a proposal's own wall-clock
+    ///         `executeBy`, which lives on the governor and is NOT
+    ///         pause-adjusted. Deliberate: the failure direction is now REFUSAL
+    ///         rather than an unearned `Cleared`, and this owner can already
+    ///         halt everything by simply staying paused. See `unpause`.
+    ///
+    ///         Two cycles here; resolution must still be refused after the
+    ///         raw `reviewEnd` has passed by the sum of both.
+    function test_finding7_repeatedPauseCyclesCompound() public {
+        _stakeGuardian(approver1, 30_000e18, 1);
+        _stakeGuardian(blocker1, 20_000e18, 2);
+
+        skip(30 days);
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        uint256 voteEnd = vm.getBlockTimestamp();
+        uint256 reviewEnd = voteEnd + REVIEW_PERIOD;
+        _registerReview(PID, voteEnd, reviewEnd);
+        registry.openReview(address(governor), PID);
+
+        // Cycle 1: paused for the full review period.
+        vm.prank(regOwner);
+        registry.pause();
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
+        vm.prank(regOwner);
+        registry.unpause();
+        uint256 shiftAfterFirst = registry.pauseShiftTotal();
+        assertEq(shiftAfterFirst, REVIEW_PERIOD, "first cycle accrues its full span");
+
+        // Cycle 2: immediately again.
+        vm.prank(regOwner);
+        registry.pause();
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
+        vm.prank(regOwner);
+        registry.unpause();
+        assertEq(registry.pauseShiftTotal(), 2 * REVIEW_PERIOD, "cycles COMPOUND, they do not overwrite");
+
+        // Wall clock is far past the raw `reviewEnd`, but the effective clock
+        // is not — resolution is still refused.
+        assertGt(vm.getBlockTimestamp(), reviewEnd, "wall clock really is past the raw deadline");
+        vm.expectRevert(IGuardianRegistry.ReviewNotReadyForResolve.selector);
+        registry.resolveReview(address(governor), PID);
+    }
+
+    /// @notice PR #195 review, item 5: the upgrade window must not hand out
+    ///         zero-slash convictions.
+    /// @dev    `minSlashBpsAtOpen` / `maxSlashBpsAtOpen` are APPENDED fields, so
+    ///         a review already `opened` when the upgrade lands reads them as
+    ///         0/0 — which collapses every branch of `_severityBps` to 0, makes
+    ///         `_slashOne`'s `ownSlash` zero, and skips the burn entirely. That
+    ///         is exactly the immunity finding #11 exists to prevent, granted
+    ///         free to every in-flight review at the instant of the upgrade.
+    ///
+    ///         Simulated by writing 0/0 straight into the packed slot of a
+    ///         review that has already opened and voted — the state an
+    ///         in-flight review genuinely has post-upgrade — then asserting the
+    ///         slash still lands via the live-read fallback.
+    function test_reviewItem5_inFlightReviewFallsBackToLiveEnvelope() public {
+        _stakeGuardian(approver1, 30_000e18, 1);
+        _stakeGuardian(blocker1, 20_000e18, 2);
+
+        skip(30 days);
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        uint256 voteEnd = vm.getBlockTimestamp();
+        uint256 reviewEnd = voteEnd + REVIEW_PERIOD;
+        _registerReview(PID, voteEnd, reviewEnd);
+        registry.openReview(address(governor), PID);
+
+        vm.prank(approver1);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve);
+        vm.prank(blocker1);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block);
+
+        // The pre-upgrade state: both appended fields read zero.
+        _zeroSeverityEnvelopeAtOpen(PID);
+
+        uint256 approverStakeBefore = swood.guardianStake(approver1);
+
+        vm.warp(reviewEnd);
+        assertTrue(registry.resolveReview(address(governor), PID), "review resolves blocked");
+
+        assertLt(
+            swood.guardianStake(approver1),
+            approverStakeBefore,
+            "a review that predates the appended fields must fall back to the live envelope, not be granted immunity"
+        );
+    }
+
+    /// @dev Writes 0/0 into `Review.minSlashBpsAtOpen`/`maxSlashBpsAtOpen`
+    ///      without touching the fields packed beside them, reproducing the
+    ///      post-upgrade read of a review opened before those fields existed.
+    ///
+    ///      Offsets taken from `script/guardian-registry-layout.golden.json`,
+    ///      which the CI layout gate pins: `_reviews` is storage slot 0, and
+    ///      within a `Review` both fields are `uint16` at bytes 26 and 28 of
+    ///      the struct's slot 2 (after `openedAt`, `blockQuorumBpsAtOpen`,
+    ///      `voteEnd`, `reviewEnd`). If that golden changes, this mask must be
+    ///      re-derived — the gate will flag the layout move, not this test.
+    function _zeroSeverityEnvelopeAtOpen(uint256 proposalId) internal {
+        bytes32 key = keccak256(abi.encode(address(governor), proposalId));
+        bytes32 base = keccak256(abi.encode(key, uint256(0)));
+        bytes32 packedSlot = bytes32(uint256(base) + 2);
+        uint256 word = uint256(vm.load(address(registry), packedSlot));
+        uint256 mask = ~((uint256(0xFFFF) << (26 * 8)) | (uint256(0xFFFF) << (28 * 8)));
+        vm.store(address(registry), packedSlot, bytes32(word & mask));
+    }
+
     function test_finding7_pauseDefersReviewWindow_ratherThanClearingIt() public {
         _stakeGuardian(approver1, 30_000e18, 1);
         _stakeGuardian(blocker1, 20_000e18, 2);

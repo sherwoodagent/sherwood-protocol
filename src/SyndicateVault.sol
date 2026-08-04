@@ -1124,6 +1124,14 @@ contract SyndicateVault is
     ///      `outstandingEscrow` — or any nonstandard implementation — must not
     ///      brick deposits, redemptions and settlement. Degrading to zero
     ///      reproduces exactly the previous behaviour, never anything worse.
+    /// @dev COST, measured (PR #195 review, minor 4): ~5,535 gas the first time
+    ///      the governor is touched in a transaction (cold account access) and
+    ///      ~896 gas on every subsequent `totalAssets()` in that same
+    ///      transaction, once the address is warm. Since `totalAssets()` sits
+    ///      on the deposit / redeem / preview / settle paths, the realistic
+    ///      per-transaction cost is one cold hit plus warm repeats — the
+    ///      governor is already touched by most of those flows for other
+    ///      reasons, so in practice this is usually the warm figure.
     function _escrowedFeeLiability() private view returns (uint256) {
         address gov = _getGovernor();
         if (gov == address(0)) return 0;
