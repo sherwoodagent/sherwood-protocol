@@ -272,6 +272,15 @@ contract TokenCourtEndToEndTest is Test {
         );
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(address(adapter), adapter.poke.selector);
+        // issue #166: certifying a (target, selector) prices it for tiering
+        // but does NOT make `target` batch-callable at all — that is a
+        // SEPARATE allowlist (`isAdapterAllowed`) `SyndicateVault._guardBatchCalls`
+        // PART 2a now enforces on every batch callee. `adapter` is this
+        // suite's real, benign (fund-neutral) production-shaped adapter, not
+        // an attacker probe — it must be explicitly allowlisted here or every
+        // proposal touching it (execute AND settlement calls) is refused with
+        // `DisallowedBatchCallee` before any challenge/court mechanics run.
+        tierRegistry.setAdapterAllowed(address(adapter), true);
 
         // ── WOOD for the proposer's bond, both challengers' bonds, and g1's
         //    counter-bond pool contributions (sized generously: some arcs have
