@@ -1399,7 +1399,7 @@ contract PortfolioStrategy is BaseStrategy {
     ///         Adversary: a proposer sneaking a feed that quotes something
     ///         other than the token beside it. The binding check on
     ///         `_initialize` rejects that on-chain; this getter is what lets a
-    ///         guardian, a monitor, or `DeployLaneA.checkStrategyCoverage`
+    ///         guardian, a monitor, or an off-chain coverage check
     ///         SEE the declared feed rather than take the check on faith —
     ///         including for the slots the bind deliberately skips (token not
     ///         yet in the registry) and for the whole Data Streams mode, where

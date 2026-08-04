@@ -3,8 +3,6 @@ pragma solidity 0.8.28;
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
-import {Position} from "../interfaces/IPriceRouter.sol";
-import {PositionKinds} from "../libraries/PositionKinds.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -13,13 +11,11 @@ import {MarketParamsLib, MorphoBalancesLib, SharesMathLib} from "../vendor/morph
 
 /**
  * @title MorphoSupplyStrategy
- * @notice Lane-A-capable strategy: supplies the vault asset to exactly one
- *         Morpho Blue lending market, fixed at initialization. The companion
- *         `MorphoSupplyAdapter` prices the supply position from market state
- *         alone (no external oracle), and the position is venue-liquid up to
- *         the market's unborrowed liquidity — so this strategy overrides the
- *         full instant-lane surface: `positions()`, `availableLiquidity()`,
- *         and `withdrawTo()`.
+ * @notice Queue-lane strategy: supplies the vault asset to exactly one
+ *         Morpho Blue lending market, fixed at initialization. Uses the
+ *         BaseStrategy defaults for the instant-lane surface (no priceable
+ *         positions, no on-demand exit) — funds come back to the vault only
+ *         through `settle()` (and `sweep()` for a post-settlement residue).
  *
  *   Execute: pull `supplyAmount` of the vault asset → supply to the market
  *            (onBehalf = this strategy).
@@ -56,7 +52,7 @@ contract MorphoSupplyStrategy is BaseStrategy {
     ///         settle; `updateParams` always reverts.
     error NoTunableParams();
     /// @notice `sweep()` is the post-settlement recovery path only — before
-    ///         settlement the position is unwound by `settle` / `withdrawTo`.
+    ///         settlement the position is unwound by `settle`.
     error NotSettled();
 
     // ── Events ──
@@ -143,8 +139,8 @@ contract MorphoSupplyStrategy is BaseStrategy {
     ///      enforces `totalBorrowAssets <= totalSupplyAssets` after decrementing
     ///      supply, so a market at full utilization reverts a full-position
     ///      withdrawal. Doing that unconditionally handed any borrower a veto
-    ///      over settlement: `redemptionsLocked()` would stay true, instant
-    ///      exits stay shut and the queue cannot settle — vault-wide, for as
+    ///      over settlement: `redemptionsLocked()` would stay true and the
+    ///      queue cannot settle — vault-wide, for as
     ///      long as the borrower keeps utilization pinned, with no proposer
     ///      lever (`updateParams` reverts `NoTunableParams`). Adversary: a
     ///      borrower taking the market to ~100% utilization to hold a vault's
@@ -186,8 +182,8 @@ contract MorphoSupplyStrategy is BaseStrategy {
     ///         only: it can move value in exactly one direction — out of this
     ///         strategy, into the vault it was always owed to — so there is
     ///         nothing to gate and anyone may unstick it once the market can
-    ///         pay. Before settlement the position is unwound by `settle` /
-    ///         `withdrawTo` instead.
+    ///         pay. Before settlement the position is unwound by `settle`
+    ///         instead.
     /// @dev    Idempotent and safe to call when there is nothing to move.
     ///         Takes the deliverable maximum on each call, so a market that
     ///         frees up gradually can be swept repeatedly.
@@ -210,16 +206,11 @@ contract MorphoSupplyStrategy is BaseStrategy {
     }
 
     /// @dev (own supply shares, their redeemable value, the amount the market
-    ///      can actually pay out right now). Shared core for `_settle`, `sweep`,
-    ///      and `availableLiquidity` — deliberately WITHOUT a `_state` gate and
-    ///      WITHOUT the router's per-kind instant cap, so each caller applies
-    ///      only what belongs to it:
-    ///        - `_settle`/`sweep` run in `State.Settled` (see `BaseStrategy.settle`,
-    ///          which flips state BEFORE calling `_settle`), so a state gate here
-    ///          would zero them out entirely.
-    ///        - the per-kind cap bounds instant EXIT size against DEX depth; a
-    ///          terminal unwind is not an instant exit, so `_settle`/`sweep` must
-    ///          NOT be throttled by it — only `availableLiquidity` applies it.
+    ///      can actually pay out right now). Shared core for `_settle` and
+    ///      `sweep` — deliberately WITHOUT a `_state` gate: both run in
+    ///      `State.Settled` (see `BaseStrategy.settle`, which flips state
+    ///      BEFORE calling `_settle`), so a state gate here would zero them
+    ///      out entirely.
     function _deliverableNow() private view returns (uint256 shares, uint256 own, uint256 deliverable) {
         MarketParams memory mp = _marketParams;
         (uint256 totalSupplyAssets, uint256 totalSupplyShares, uint256 totalBorrowAssets,) =
@@ -238,89 +229,5 @@ contract MorphoSupplyStrategy is BaseStrategy {
     /// @dev Nothing is tunable between execute and settle.
     function _updateParams(bytes calldata) internal pure override {
         revert NoTunableParams();
-    }
-
-    // ── Lane A surface ──
-
-    /// @inheritdoc IStrategy
-    /// @dev One Morpho supply position while shares are outstanding, else
-    ///      empty. `ref` carries the market id so the adapter can bind the
-    ///      valuation to this exact market's state.
-    function positions() external view override returns (Position[] memory ps) {
-        if (address(morpho) == address(0)) return ps;
-        uint256 shares = morpho.position(marketId, address(this)).supplyShares;
-        if (shares == 0) return ps;
-        ps = new Position[](1);
-        ps[0] = Position({
-            venue: address(morpho), kind: PositionKinds.MORPHO_BLUE_SUPPLY, ref: abi.encode(Id.unwrap(marketId))
-        });
-    }
-
-    /// @inheritdoc IStrategy
-    /// @dev min(own redeemable supply value, market unborrowed liquidity,
-    ///      Morpho's actual idle loan-token balance, the router's per-kind
-    ///      instant cap). The utilization cap is the spec's adversary guard: a
-    ///      highly utilized market must not advertise liquidity Morpho cannot
-    ///      pay out (the vault verifies delivery by balance diff and reverts
-    ///      `UnwindShortfall` on a lying strategy). The token-balance cap is
-    ///      belt-and-suspenders against accounting/balance divergence on the
-    ///      singleton.
-    ///
-    ///      The per-kind cap is enforced HERE rather than in
-    ///      `PriceRouter._priceOne`, which prices truthfully and never sees an
-    ///      exit size: a cap applied at valuation could only bound the position,
-    ///      and only by declaring it unpriceable — which closed the whole
-    ///      vault's instant lane whenever a position outgrew it, griefable by
-    ///      anyone able to inflate that position (see the note on `_priceOne`).
-    ///      Unlike the spot side there is no per-token registry here, so this
-    ///      per-kind bound is the only depth limit on a Morpho unwind. A cap of
-    ///      0 means "no bound configured", matching the router's own
-    ///      convention; the market and utilization caps above still apply.
-    function availableLiquidity() external view override returns (uint256) {
-        if (_state != State.Executed) return 0;
-        (,, uint256 deliverable) = _deliverableNow();
-
-        uint256 kindCap = _instantKindCap();
-        if (kindCap != 0 && kindCap < deliverable) deliverable = kindCap;
-        return deliverable;
-    }
-
-    /// @dev The router's per-kind instant cap for `MORPHO_BLUE_SUPPLY`, or 0
-    ///      when unresolvable. Staticcall-safe at every hop: this feeds
-    ///      `SyndicateVault.maxWithdraw`, so an unreachable factory or router
-    ///      must degrade the bound, never revert the vault's view. An
-    ///      unresolvable router also means the vault cannot price this strategy
-    ///      at all, so Lane A is already shut and the bound is moot.
-    function _instantKindCap() private view returns (uint256) {
-        address factory_ = _readAddress(vault(), abi.encodeWithSignature("factory()"));
-        if (factory_ == address(0)) return 0;
-        address router = _readAddress(factory_, abi.encodeWithSignature("priceRouter()"));
-        if (router == address(0)) return 0;
-        (bool ok, bytes memory ret) =
-            router.staticcall(abi.encodeWithSignature("instantCap(bytes32)", PositionKinds.MORPHO_BLUE_SUPPLY));
-        if (!ok || ret.length < 32) return 0;
-        return abi.decode(ret, (uint256));
-    }
-
-    /// @dev Staticcall-safe address read: codeless target, revert, short return
-    ///      or dirty upper bits all resolve to `address(0)`.
-    function _readAddress(address target, bytes memory data) private view returns (address) {
-        if (target.code.length == 0) return address(0);
-        (bool ok, bytes memory ret) = target.staticcall(data);
-        if (!ok || ret.length < 32) return address(0);
-        uint256 word = abi.decode(ret, (uint256));
-        if (word >> 160 != 0) return address(0);
-        return address(uint160(word));
-    }
-
-    /// @inheritdoc IStrategy
-    /// @dev Exact-assets withdraw straight to the vault (receiver = vault) in
-    ///      the same transaction. Morpho itself reverts when the market lacks
-    ///      the liquidity or this strategy lacks the position — all-or-revert,
-    ///      never partial delivery.
-    function withdrawTo(uint256 assets) external override onlyVault {
-        if (_state != State.Executed) revert NotExecuted();
-        if (assets == 0) revert InvalidAmount();
-        morpho.withdraw(_marketParams, assets, 0, address(this), vault());
     }
 }

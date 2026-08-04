@@ -54,10 +54,11 @@ contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPri
     ///             hitting its own token's bound). Changing it will not change
     ///             stock-basket exit capacity — change the adapter's per-token
     ///             cap instead.
-    ///           - `MORPHO_BLUE_SUPPLY`: LOAD-BEARING. There is no per-token
-    ///             registry on the Morpho side, so this is the only depth bound
-    ///             on a Morpho unwind (`MorphoSupplyStrategy.availableLiquidity`
-    ///             reads it). Setting it to 0 removes that bound entirely.
+    ///           - `MORPHO_BLUE_SUPPLY`: INERT today. No in-tree strategy
+    ///             reads it (`MorphoSupplyStrategy` is queue-only and reports
+    ///             no positions); it becomes load-bearing only if a
+    ///             Morpho-position strategy with an instant-lane surface is
+    ///             introduced.
     mapping(bytes32 kind => uint256 cap) public instantCap;
     /// @notice kind => whether the instant (Lane A) lane is governance-enabled.
     ///         Default false: a position is instant-eligible only after governance
@@ -156,7 +157,6 @@ contract PriceRouter is Initializable, OwnableUpgradeable, UUPSUpgradeable, IPri
     ///
     ///      The cap is instead published (`instantCap` is public) and enforced
     ///      by the consumers that actually size exits — see
-    ///      `MorphoSupplyStrategy.availableLiquidity`, and
     ///      `PortfolioStrategy.availableLiquidity`, which binds tighter still
     ///      via the spot adapter's per-token depth caps.
     function _priceOne(Position memory p, address holder) private view returns (uint256, bool) {

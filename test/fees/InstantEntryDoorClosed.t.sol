@@ -38,7 +38,7 @@ contract MockBasketStrategy {
 ///         executable value. Anything below models the regime
 ///         `Erc20SpotAdapter`'s divergence gate DELIBERATELY tolerates: the
 ///         oracle mark and the pool price are allowed to disagree by up to
-///         `maxDivergenceBps` (100bps as seeded by `script/DeployLaneA.s.sol`)
+///         `maxDivergenceBps` (100bps as seeded at deployment, param G4)
 ///         and Lane A stays open across that whole band. `markBps = 9_900` is
 ///         the gate sitting exactly on its bound with the mark BELOW
 ///         executable — the would-be-entrant-favourable side.
@@ -94,7 +94,7 @@ contract InstantEntryDoorClosedTest is Test {
     address internal constant MOCK_GOVERNOR = address(0xF00D);
     uint256 internal constant PID = 1;
 
-    /// @dev The exit-side toll `DeployLaneA` G1 wires, and the vault's hard cap.
+    /// @dev The deployment-seeded exit-side toll (param G1), and the vault's hard cap.
     uint16 internal constant TOLL_BPS = 200;
     /// @dev `Erc20SpotAdapter`'s seeded divergence bound (G4). The mark may sit
     ///      this far below executable value with Lane A still open.

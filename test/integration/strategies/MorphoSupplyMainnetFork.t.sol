@@ -101,8 +101,6 @@ contract MorphoSupplyMainnetForkTest is LaneAFixture {
         strategy.initialize(address(vaultStub), proposer, abi.encode(MORPHO, mp, SUPPLY_AMOUNT));
 
         adapter = new MorphoSupplyAdapter(MORPHO);
-        _deployRouter();
-        _registerKind(PositionKinds.MORPHO_BLUE_SUPPLY, address(adapter), true);
 
         forkReady = true;
     }
@@ -113,7 +111,11 @@ contract MorphoSupplyMainnetForkTest is LaneAFixture {
         if (!forkReady) vm.skip(true);
     }
 
-    // ── Full lifecycle: supply → warp/value → partial withdrawTo → settle ──
+    // ── Full lifecycle: supply → warp/value → settle ──
+
+    function _livePosition() internal view returns (Position memory) {
+        return Position({venue: MORPHO, kind: PositionKinds.MORPHO_BLUE_SUPPLY, ref: abi.encode(MARKET_ID)});
+    }
 
     function test_fork_fullLifecycle() public {
         _requireFork();
@@ -129,21 +131,16 @@ contract MorphoSupplyMainnetForkTest is LaneAFixture {
         assertGt(shares, 0, "supply shares minted on live morpho");
         assertEq(IERC20(USDG).balanceOf(strat), 0, "nothing stranded on strategy");
 
-        Position[] memory ps = strategy.positions();
-        assertEq(ps.length, 1, "one live position");
-        assertEq(ps[0].venue, MORPHO, "venue = canonical singleton");
-
-        // Value now via the real PriceRouter + adapter: instantOK with Lane A
-        // enabled; value = principal minus at most share-rounding dust.
-        (uint256 v0, bool ok0) = router.valueStrategy(strat);
-        assertTrue(ok0, "lane A open on live market");
+        // Value now via the adapter: principal minus at most share-rounding dust.
+        (uint256 v0, bool ok0) = adapter.value(_livePosition(), strat);
+        assertTrue(ok0, "priceable on live market");
         assertGe(v0 + 2, SUPPLY_AMOUNT, "initial value ~= principal");
         assertLe(v0, SUPPLY_AMOUNT, "no free value at entry");
         console2.log("Value at entry:", v0);
 
         // Warp a week: active borrows → supply-side interest accrues.
         vm.warp(vm.getBlockTimestamp() + 7 days);
-        (uint256 v1, bool ok1) = router.valueStrategy(strat);
+        (uint256 v1, bool ok1) = adapter.value(_livePosition(), strat);
         assertTrue(ok1, "still priceable after warp");
         assertGt(v1, v0, "interest accrued over 7 days");
         console2.log("Value after 7d:", v1);
@@ -151,39 +148,20 @@ contract MorphoSupplyMainnetForkTest is LaneAFixture {
         // View-accrual port vs the real singleton: accrue on-chain (live
         // AdaptiveCurve IRM), then the storage-derived value must equal the
         // adapter's pre-accrual view valuation.
-        (uint256 viewValue, bool okAdapter) = adapter.value(ps[0], strat);
-        assertTrue(okAdapter, "adapter prices directly");
         IMorpho(MORPHO).accrueInterest(mp);
         Market memory m = IMorpho(MORPHO).market(Id.wrap(MARKET_ID));
         uint256 stateValue = shares.toAssetsDown(m.totalSupplyAssets, m.totalSupplyShares);
-        assertEq(viewValue, stateValue, "vendored view accrual == live singleton accrual");
-
-        // Partial instant exit: exact delivery straight to the vault.
-        uint256 avail = strategy.availableLiquidity();
-        assertGt(avail, 0, "instant liquidity advertised");
-        console2.log("availableLiquidity:", avail);
-        uint256 part = SUPPLY_AMOUNT / 2;
-        assertLe(part, avail, "partial request within advertised liquidity");
-        uint256 balBefore = IERC20(USDG).balanceOf(address(vaultStub));
-        vm.prank(address(vaultStub));
-        strategy.withdrawTo(part);
-        assertEq(IERC20(USDG).balanceOf(address(vaultStub)) - balBefore, part, "exact partial delivery");
+        assertEq(v1, stateValue, "vendored view accrual == live singleton accrual");
 
         // Settle: full shares-based unwind, interest included.
         vm.prank(address(vaultStub));
         strategy.settle();
         assertEq(IMorpho(MORPHO).position(Id.wrap(MARKET_ID), strat).supplyShares, 0, "position closed");
         assertEq(IERC20(USDG).balanceOf(strat), 0, "strategy fully drained");
-        assertEq(strategy.positions().length, 0, "no positions after settle");
 
         uint256 finalBal = IERC20(USDG).balanceOf(address(vaultStub));
         console2.log("Vault USDG after settle:", finalBal);
         assertGt(finalBal, SUPPLY_AMOUNT, "principal + 7d interest returned");
-
-        // Post-settle the router degrades to Lane B (no positions).
-        (uint256 vEnd, bool okEnd) = router.valueStrategy(strat);
-        assertFalse(okEnd, "lane B after full unwind");
-        assertEq(vEnd, 0, "no residual value");
     }
 
     // ── Fail-closed on the live chain: spoofed venue never prices ──

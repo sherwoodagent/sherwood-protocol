@@ -97,7 +97,7 @@ abstract contract MorphoSupplyFixture is LaneAFixture {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Strategy: init validation, lifecycle, Lane A surface
+// Strategy: init validation, lifecycle
 // ═══════════════════════════════════════════════════════════════════════
 
 contract MorphoSupplyStrategyTest is MorphoSupplyFixture {
@@ -188,102 +188,15 @@ contract MorphoSupplyStrategyTest is MorphoSupplyFixture {
         strategy.updateParams("");
     }
 
-    // ── positions() enumeration ──
+    // ── BaseStrategy defaults: no instant-lane surface ──
 
-    function test_positions_emptyBeforeExecute() public view {
-        assertEq(strategy.positions().length, 0, "no position pre-execute");
-        assertEq(template.positions().length, 0, "uninitialized template is empty");
-    }
-
-    function test_positions_onePositionWhileSupplied() public {
+    function test_defaults_noPositions_noLiquidity_noOnDemandExit() public {
         _approveAndExecute();
-        Position[] memory ps = strategy.positions();
-        assertEq(ps.length, 1, "exactly one position");
-        assertEq(ps[0].venue, address(mockMorpho), "venue = morpho singleton");
-        assertEq(ps[0].kind, PositionKinds.MORPHO_BLUE_SUPPLY, "kind = MORPHO_BLUE_SUPPLY");
-        assertEq(ps[0].ref, abi.encode(Id.unwrap(marketId)), "ref = abi.encode(marketId)");
-    }
-
-    function test_positions_emptyAfterSettle() public {
-        _approveAndExecute();
+        assertEq(strategy.positions().length, 0, "queue-only: no priceable positions");
+        assertEq(strategy.availableLiquidity(), 0, "queue-only: no instant liquidity");
         vm.prank(address(vaultStub));
-        strategy.settle();
-        assertEq(strategy.positions().length, 0, "empty after full unwind");
-    }
-
-    // ── availableLiquidity() ──
-
-    function test_availableLiquidity_zeroBeforeExecute() public view {
-        assertEq(strategy.availableLiquidity(), 0, "pending strategy advertises nothing");
-    }
-
-    function test_availableLiquidity_unborrowedEqualsSupply() public {
-        _approveAndExecute();
-        assertEq(strategy.availableLiquidity(), SUPPLY, "sole supplier, zero utilization");
-    }
-
-    function test_availableLiquidity_utilizationCaps() public {
-        _approveAndExecute();
-        mockMorpho.simulateBorrow(mp, 80_000e6, borrower);
-        // Own value (100k) > unborrowed (20k) → report the market's liquidity.
-        assertEq(strategy.availableLiquidity(), 20_000e6, "capped at unborrowed liquidity");
-    }
-
-    function test_availableLiquidity_idleBalanceCaps() public {
-        _approveAndExecute();
-        // Accounting says 100k liquid, but force the singleton's actual token
-        // balance lower — the conservative min must win.
-        deal(address(usdg), address(mockMorpho), 30_000e6);
-        assertEq(strategy.availableLiquidity(), 30_000e6, "capped at real token balance");
-    }
-
-    function test_availableLiquidity_zeroAfterSettle() public {
-        _approveAndExecute();
-        vm.prank(address(vaultStub));
-        strategy.settle();
-        assertEq(strategy.availableLiquidity(), 0, "settled strategy advertises nothing");
-    }
-
-    // ── withdrawTo() ──
-
-    function test_withdrawTo_deliversExactAssets() public {
-        _approveAndExecute();
-        uint256 balBefore = usdg.balanceOf(address(vaultStub));
-        vm.prank(address(vaultStub));
-        strategy.withdrawTo(40_000e6);
-        assertEq(usdg.balanceOf(address(vaultStub)) - balBefore, 40_000e6, "exact delivery to vault");
-        assertApproxEqAbs(strategy.availableLiquidity(), 60_000e6, 1, "remainder still supplied");
-        assertEq(usdg.balanceOf(address(strategy)), 0, "nothing routed through strategy");
-    }
-
-    function test_withdrawTo_onlyVault() public {
-        _approveAndExecute();
-        vm.prank(proposer);
-        vm.expectRevert(BaseStrategy.NotVault.selector);
+        vm.expectRevert(BaseStrategy.OnDemandExitUnsupported.selector);
         strategy.withdrawTo(1e6);
-    }
-
-    function test_withdrawTo_revertsBeforeExecute() public {
-        vm.prank(address(vaultStub));
-        vm.expectRevert(BaseStrategy.NotExecuted.selector);
-        strategy.withdrawTo(1e6);
-    }
-
-    function test_withdrawTo_revertsOnZero() public {
-        _approveAndExecute();
-        vm.prank(address(vaultStub));
-        vm.expectRevert(MorphoSupplyStrategy.InvalidAmount.selector);
-        strategy.withdrawTo(0);
-    }
-
-    function test_withdrawTo_revertsBeyondMarketLiquidity() public {
-        _approveAndExecute();
-        mockMorpho.simulateBorrow(mp, 80_000e6, borrower);
-        // 30k requested > 20k unborrowed → the venue cannot deliver → revert,
-        // never partial delivery.
-        vm.prank(address(vaultStub));
-        vm.expectRevert("MockMorpho: insufficient liquidity");
-        strategy.withdrawTo(30_000e6);
     }
 }
 
@@ -363,22 +276,6 @@ contract MorphoSupplyAdapterTest is MorphoSupplyFixture {
         (uint256 v, bool ok) = adapter.value(_livePosition(), address(strategy));
         assertTrue(ok, "no-position holder is still priceable");
         assertEq(v, 0, "zero shares -> zero value");
-    }
-
-    function test_router_valueStrategy_instantOK() public {
-        _approveAndExecute();
-        (uint256 v, bool ok) = router.valueStrategy(address(strategy));
-        assertTrue(ok, "lane A open end-to-end");
-        assertEq(v, SUPPLY, "router reports supply value");
-    }
-
-    function test_router_valueStrategy_laneBAfterSettle() public {
-        _approveAndExecute();
-        vm.prank(address(vaultStub));
-        strategy.settle();
-        (uint256 v, bool ok) = router.valueStrategy(address(strategy));
-        assertFalse(ok, "no positions -> lane B");
-        assertEq(v, 0, "no value reported");
     }
 
     // ── Fail-closed matrix ──
@@ -568,7 +465,7 @@ contract MorphoSupplySettlementTest is MorphoSupplyFixture {
     }
 
     /// @notice `sweep` is a post-settlement recovery path only — before
-    ///         settlement the position is unwound by `settle`/`withdrawTo`.
+    ///         settlement the position is unwound by `settle`.
     function test_sweep_revertsBeforeSettlement() public {
         _approveAndExecute();
         vm.expectRevert(MorphoSupplyStrategy.NotSettled.selector);
