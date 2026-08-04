@@ -194,6 +194,11 @@ contract DeployPlanBPreflightTest is Test {
     ///      unset `WOOD_HAIRCUT_BPS` produces; a test that wants pre-flight 9
     ///      raises it to the ledger's 10,000 no-allowance default.
     uint256 internal bookHaircutBps;
+    /// @dev Pre-flight 10's fork bypass. FALSE here on purpose: the default is
+    ///      the mainnet posture, so every other test in this suite still runs
+    ///      against the refusing branch and `test_preflight10_bites_*` keeps
+    ///      meaning what it meant. Only the bypass test raises it.
+    bool internal bookAllowEoaLedgerOwner;
 
     function setUp() public {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
@@ -717,6 +722,52 @@ contract DeployPlanBPreflightTest is Test {
         _runExpecting("PRE-FLIGHT: ExposureLedger owner is an EOA, not a contract.");
     }
 
+    /// @dev THE FORK BYPASS. A Tenderly vnet has no Safe and its deployer is an
+    ///      impersonated EOA, so pre-flight 10 makes the fork ceremony in
+    ///      openspec/specs/deployment-docs/spec.md unrunnable. `ALLOW_EOA_LEDGER_OWNER`
+    ///      (surfaced here as `book.allowEoaLedgerOwner`) waives it.
+    ///
+    ///      SAME FIXTURE AS THE REFUSING TEST ABOVE, deliberately: identical
+    ///      setup, one flag flipped, so what this pins is the flag and nothing
+    ///      else. If the bypass ever stops covering exactly the branch that test
+    ///      exercises, one of the two fails.
+    ///
+    ///      The flag rides in the `AddressBook` rather than being read from the
+    ///      process environment inside `deploy()`. `vm.setEnv` writes one shared
+    ///      mutable global that forge does not roll back between tests, so an
+    ///      env-based bypass set here would leak into the sibling suites and
+    ///      could turn the refusing test above green for the wrong reason.
+    function test_preflight10_bypassedWhenTheForkFlagIsSet() public {
+        address predicted = vm.computeCreateAddress(DEFAULT_SENDER, vm.getNonce(DEFAULT_SENDER));
+        address eoa = address(0xE0A);
+        assertEq(eoa.code.length, 0, "the fixture must be a genuine EOA for this to mean anything");
+
+        vm.mockCall(predicted, abi.encodeWithSignature("owner()"), abi.encode(eoa));
+        vm.etch(predicted, "");
+
+        bookAllowEoaLedgerOwner = true;
+        _run();
+
+        assertEq(swood.exposureLedger(), predicted, "the run must complete and wire the exit gate");
+    }
+
+    /// @dev THE BYPASS CANNOT REACH PRODUCTION. An env var is not fork-only by
+    ///      virtue of a comment saying so — it survives shell history, CI
+    ///      secrets and copied command lines, and the deployment it produces
+    ///      looks clean while carrying NEITHER the on-chain rate limit nor the
+    ///      off-chain Zodiac one. Chain 4663 refuses it outright, which is what
+    ///      lets the sibling test above stay green on 31337.
+    function test_preflight10_bypassIsRefusedOnRobinhoodMainnet() public {
+        address predicted = vm.computeCreateAddress(DEFAULT_SENDER, vm.getNonce(DEFAULT_SENDER));
+        vm.mockCall(predicted, abi.encodeWithSignature("owner()"), abi.encode(address(0xE0A)));
+        vm.etch(predicted, "");
+
+        bookAllowEoaLedgerOwner = true;
+        vm.chainId(4663);
+
+        _runExpecting("ALLOW_EOA_LEDGER_OWNER is a fork/vnet escape hatch and MUST NOT be set on Robinhood");
+    }
+
     // ─────────────────────────────── helpers ───────────────────────────────
 
     /// @dev THE ADDRESS BOOK IS PASSED, NOT SET IN THE ENVIRONMENT. `run()`'s
@@ -749,7 +800,8 @@ contract DeployPlanBPreflightTest is Test {
             coveredTvlCapUsd: bookCap,
             protocolConfig: address(protocolConfig),
             maxStrategyDuration: bookMaxStrategyDuration,
-            woodTwapOracle: bookTwapOracle
+            woodTwapOracle: bookTwapOracle,
+            allowEoaLedgerOwner: bookAllowEoaLedgerOwner
         });
     }
 

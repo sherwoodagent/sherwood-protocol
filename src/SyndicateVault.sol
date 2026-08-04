@@ -189,7 +189,7 @@ contract SyndicateVault is
 
     /// @notice Vault-owner-set agent performance fee, stored offset-by-one so a
     ///         single slot doubles as the is-it-set flag: 0 means never set, and
-    ///         `agentFeeBps()` returns the 5% default; otherwise the stored value
+    ///         `agentFeeBps()` returns the 20% default; otherwise the stored value
     ///         is `fee + 1`, so an explicit 0% stays distinct from unset.
     ///         Snapshotted onto a proposal at propose, clamped to the governor's
     ///         `maxPerformanceFeeBps`.
@@ -268,8 +268,9 @@ contract SyndicateVault is
         _openDeposits = p.openDeposits;
         _agentRegistry = IERC721(p.agentRegistry);
         _managementFeeBps = p.managementFeeBps;
-        // _agentFeeBpsPlusOne left 0 (unset) → agentFeeBps() returns the 5%
-        // default until the owner calls setAgentFeeBps (no init SSTORE needed).
+        // _agentFeeBpsPlusOne left 0 (unset) → agentFeeBps() returns the
+        // FeeConstants.DEFAULT_AGENT_FEE_BPS (20%) default until the owner calls
+        // setAgentFeeBps (no init SSTORE needed).
         _factory = msg.sender;
         _cachedDecimalsOffset = IERC20Metadata(p.asset).decimals();
     }
@@ -958,7 +959,7 @@ contract SyndicateVault is
 
     /// @inheritdoc ISyndicateVault
     function agentFeeBps() public view returns (uint256) {
-        // One SLOAD: 0 = never set → the 5% default (agent never silently
+        // One SLOAD: 0 = never set → the 20% default (agent never silently
         // unpaid); otherwise the stored value is fee+1, so an explicit 0%
         // (stored 1) stays distinct from unset.
         uint256 stored = _agentFeeBpsPlusOne;
@@ -1104,12 +1105,40 @@ contract SyndicateVault is
     ///      same breath — see `_pricingSupply`. Subtracting assets without their
     ///      shares would understate the price as badly as double-counting them
     ///      would overstate it.
+    ///      THE QUEUE RESERVE IS NOT THE ONLY LIABILITY (pashov review finding
+    ///      #3). A fee whose transfer failed is escrowed by
+    ///      `SyndicateGovernor._payFee` and LEFT HERE — owed exactly like a
+    ///      queue reserve, but previously counted as LP equity, so redeemers in
+    ///      the post-settle window took a slice of the fee recipient's money.
     function totalAssets() public view override returns (uint256) {
         uint256 gross = IERC20(asset()).balanceOf(address(this));
-        uint256 owed = reservedQueueAssets();
+        uint256 owed = reservedQueueAssets() + _escrowedFeeLiability();
         // Cannot legitimately underflow — the reserve tracks assets the vault
         // holds — but under-reporting beats inventing value if it ever did.
         return gross > owed ? gross - owed : 0;
+    }
+
+    /// @dev Escrowed fee liability this vault owes, read from its governor.
+    ///      Low-level staticcall degrading to zero on any failure, matching
+    ///      `_openProposalPid` and `_pricingSupply`: `totalAssets()` sits on
+    ///      every pricing path in this contract, so a governor predating
+    ///      `outstandingEscrow` — or any nonstandard implementation — must not
+    ///      brick deposits, redemptions and settlement. Degrading to zero
+    ///      reproduces exactly the previous behaviour, never anything worse.
+    /// @dev COST, measured (PR #195 review, minor 4): ~5,535 gas the first time
+    ///      the governor is touched in a transaction (cold account access) and
+    ///      ~896 gas on every subsequent `totalAssets()` in that same
+    ///      transaction, once the address is warm. Since `totalAssets()` sits
+    ///      on the deposit / redeem / preview / settle paths, the realistic
+    ///      per-transaction cost is one cold hit plus warm repeats — the
+    ///      governor is already touched by most of those flows for other
+    ///      reasons, so in practice this is usually the warm figure.
+    function _escrowedFeeLiability() private view returns (uint256) {
+        address gov = _getGovernor();
+        if (gov == address(0)) return 0;
+        (bool ok, bytes memory ret) =
+            gov.staticcall(abi.encodeCall(ISyndicateGovernor.outstandingEscrow, (address(this), asset())));
+        return (ok && ret.length == 32) ? abi.decode(ret, (uint256)) : 0;
     }
 
     /// @dev The supply a price is actually taken against: circulating shares LESS

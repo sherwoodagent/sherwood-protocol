@@ -630,9 +630,28 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // during exactly the market stress a drain happens in. Falling back to
         // the reservation sum over-charges the challenger, which is recoverable;
         // being unable to file at all is not.
+        //
+        // THE CATCH MUST STILL LAND ON A LIABILITY-SCALE NUMBER (pashov review
+        // finding #5). Keeping the RESERVATION sum on the fallback path
+        // reinstates the cohort-size inversion this call exists to remove: the
+        // basis becomes `A * needUsd` for `A` approvers (`A <= 100`). And the
+        // over-charge is not confined to the filer — `dispute`'s pool target IS
+        // `c.bondWood`, so an A-fold bond demands an A-fold counter-bond from a
+        // cohort whose per-guardian free WOOD is sized to `needUsd`. Price the
+        // accused out of adjudication and `_settle`'s silence branch convicts
+        // them at `slashBpsFor`'s ceiling.
+        //
+        // Dividing by the accused count restores the ORDER of the quantity
+        // without the feed the clamp could not read. The skew is one-sided:
+        // each approver books at most `needUsd`, so the quotient can never
+        // exceed the true ceiling — it can only under-charge, worst case by
+        // `accusedN`, which lowers `dispute`'s target in exact proportion.
         try exposureLedger.unsharedLiabilityUsd(governor, proposalId) returns (uint256 liability) {
             if (liability != 0 && liability < coverageUsd) coverageUsd = liability;
-        } catch {}
+        } catch {
+            uint256 accusedN = accused.length;
+            if (accusedN > 1) coverageUsd /= accusedN;
+        }
 
         // The bond scales with the exposure the filing freezes, converted at the
         // ledger's composed WOOD/USD price (X8) - the same haircut-applied price
@@ -662,7 +681,40 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         try exposureLedger.woodPriceX8() returns (uint256 p) {
             priceX8 = p;
         } catch {
-            priceX8 = exposureLedger.woodUsdPriceX8();
+            // APPLY THE HAIRCUT THE PRIMARY READ APPLIES (pashov review
+            // finding #5). `woodPriceX8()` is `haircut(min(market, cap))`;
+            // `woodUsdPriceX8` is the BARE cap, and `_haircut` is reached only
+            // from inside `_woodPrice`. Substituting one for the other changes
+            // the KIND of quantity, not just its freshness, so the "the cap is
+            // seeded above market, therefore this under-states the bond
+            // conservatively" argument above understates by a further
+            // `BPS_DENOMINATOR / woodHaircutBps` — up to 2x at the
+            // `woodHaircutBps` floor of 5_000, on top of the cap/market ratio.
+            //
+            // Under-stating this bond is NOT conservative for the protocol:
+            // it is the anti-spam deposit on a filing that freezes the accused
+            // cohort's coverage and bars every named approver from
+            // `claimUnstakeGuardian` for `autoSlashDelay` — and
+            // `_liveByChallenger` gives each address its own slot with
+            // `_liveCount` uncapped, so cheap filings are repeatable per
+            // address. Re-applying the haircut keeps both branches in the same
+            // units and leaves only the intended cap/market conservatism.
+            //
+            // Raw staticcall for the haircut, degrading to "no haircut": this
+            // whole branch exists BECAUSE the ledger is already answering
+            // badly, so a typed call here would reintroduce the revert the
+            // catch is meant to absorb. Degrading to `BPS_DENOMINATOR`
+            // reproduces exactly the pre-fix figure, so the worst case is the
+            // behaviour this branch already had — never a larger bond than
+            // intended.
+            uint256 haircutBps = BPS_DENOMINATOR;
+            (bool okHc, bytes memory hcRet) =
+                address(exposureLedger).staticcall(abi.encodeCall(IExposureLedger.woodHaircutBps, ()));
+            if (okHc && hcRet.length == 32) {
+                uint256 hc = abi.decode(hcRet, (uint256));
+                if (hc != 0 && hc <= BPS_DENOMINATOR) haircutBps = hc;
+            }
+            priceX8 = (exposureLedger.woodUsdPriceX8() * haircutBps) / BPS_DENOMINATOR;
         }
         if (priceX8 == 0) revert WoodPriceUnset();
         uint256 bondWood = (((coverageUsd * challengerBondBps) / BPS_DENOMINATOR) * 1e8) / priceX8;
@@ -840,10 +892,25 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
         // Best-effort, deliberately unguarded - see the function natspec.
         if (complete) {
-            address courtAddr = court;
-            // No court wired means no referral is possible either way — the
+            // THE PIN, NOT THE LIVE POINTER. `rule` authorises against
+            // `c.courtAtFiling` (see its `NotCourt` guard), so referring a
+            // zero-pin challenge to a court wired in AFTER filing opens a case
+            // that can never be ruled: `TokenCourt.finalize` filters only
+            // `WrongStatus` out of `rule`'s revert, so `NotCourt` bubbles and
+            // rolls back the `phase = Resolved` write, wedging the case in
+            // `Voting` until the dispute timeout discards the whole tally.
+            // Reading the pin keeps referral and adjudication on one basis.
+            address courtAddr = c.courtAtFiling;
+            // TWO conditions, and they are different questions. WHICH court is
+            // the pin, because that is the only one `rule` will authorise.
+            // WHETHER to refer at all still consults the LIVE slot, because
+            // unwiring `court` is the operator's kill switch for referrals and
+            // must keep working for challenges already in flight — reading
+            // only the pin silently took that lever away.
+            //
+            // No court pinned means no referral is possible either way — the
             // timeout remains the only path out of `Disputed`.
-            if (courtAddr != address(0)) {
+            if (courtAddr != address(0) && court != address(0)) {
                 try ITokenCourt(courtAddr).refer(challengeId) {}
                 catch {
                     emit AutoReferFailed(challengeId);

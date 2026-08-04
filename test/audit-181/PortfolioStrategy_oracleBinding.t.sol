@@ -15,6 +15,13 @@ import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 ///         `vault()`. Mirrors `test/PortfolioStrategyAdapterAllowlist.t.sol`'s
 ///         fixture shape exactly, so this file needs no shared-mock edits.
 contract MockVaultWithGovernor {
+    /// @dev `BaseStrategy.onlyProposer` re-checks the vault's live agent set on
+    ///      every proposer-gated call, so a vault stand-in must answer this or
+    ///      `rebalance` / `rebalanceDelta` / `updateParams` all fail closed.
+    function isAgent(address) external pure returns (bool) {
+        return true;
+    }
+
     address public governor;
 
     constructor(address governor_) {

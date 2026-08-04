@@ -115,6 +115,16 @@ interface ITokenCourt {
     ///         not `Disputed` — there is nothing to adjudicate yet (still
     ///         `Filed`) or nothing left to adjudicate (already terminal).
     error ChallengeNotDisputed();
+    /// @notice `refer` called on a challenge that pinned NO adjudicator at
+    ///         filing (`IChallengeGame.Challenge.courtAtFiling == address(0)`).
+    ///         `ChallengeGame.rule` authorises against that pin, so such a
+    ///         challenge is structurally unrulable: a case opened for it would
+    ///         take votes and then wedge in `Voting` forever, because
+    ///         `finalize` re-raises everything except `WrongStatus` and
+    ///         `rule`'s `NotCourt` therefore rolls back the `Resolved` write.
+    ///         Refuse at the door rather than burn a case id and every voter's
+    ///         gas on a verdict that can never be delivered.
+    error ChallengeNotRulable();
     /// @notice `refer`'s clock check failed: the challenge's own timeout does
     ///         not leave `voteWindow + FINALIZE_BUFFER` of room, so a vote
     ///         opened now could never finish before the game's permissionless
@@ -155,6 +165,13 @@ interface ITokenCourt {
     ///         vote on its own filing is a self-dealing conviction — the same
     ///         defect `AccusedCannotVote` closes for the other side.
     error ChallengerCannotVote();
+    /// @notice `vote` called by an address holding a counter-bond contribution
+    ///         on this case's challenge. `AccusedCannotVote` and
+    ///         `ChallengerCannotVote` bar the two parties a `Guilty` verdict
+    ///         pays; this bars the party a `NotGuilty` verdict pays — a
+    ///         non-accused funder could otherwise fund the whole pool and vote
+    ///         its own acquittal, collecting the challenger's forfeited bond.
+    error CounterBondContributorCannotVote();
     /// @notice `renounceOwnership` was called. The court refuses it outright, for
     ///         everyone including the owner: it is non-upgradeable, so an
     ///         ownerless court can never again be re-wired or re-tuned — losing

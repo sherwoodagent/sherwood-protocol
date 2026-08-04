@@ -230,6 +230,19 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // Only a contested challenge escalates: a `Filed` one is still inside
         // its auto-slash clock, and a terminal one has nothing left to decide.
         if (ch.status != IChallengeGame.Status.Disputed) revert ChallengeNotDisputed();
+        // AND ONE THAT CAN ACTUALLY BE RULED. `ChallengeGame.rule` authorises
+        // against the challenge's OWN `courtAtFiling` pin, not against whoever
+        // is wired live — a challenge filed while the game had no court pinned
+        // itself at zero and stays unrulable forever, even after `setCourt`.
+        // Referring it anyway opens a case, takes real votes, and then wedges:
+        // `finalize` re-raises every revert except `WrongStatus`, so `rule`'s
+        // `NotCourt` rolls back the `phase = Resolved` write and the case can
+        // never leave `Voting`. The tally is discarded either way, since the
+        // dispute timeout routes a zero-pin challenge to `_refundAll`.
+        // `ChallengeGame.dispute` now auto-refers against this same pin; THIS
+        // guard is the load-bearing one, because `refer` is permissionless and
+        // reachable directly regardless of how the case got escalated.
+        if (ch.courtAtFiling == address(0)) revert ChallengeNotRulable();
 
         // The clock check: a vote that could not finish before the
         // challenge's own timeout never opens.
@@ -329,6 +342,34 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // `total - accusedWeight` shape makes a unilateral conviction easier
         // the more approvers the challenge names. Pinned in `refer`.
         if (msg.sender == c.challenger) revert ChallengerCannotVote();
+        // AND NEITHER MAY THE SIDE A `NotGuilty` VERDICT PAYS. The two bars
+        // above cover both beneficiaries of a `Guilty` ruling (the accused
+        // avoid the slash, the challenger takes the forfeited pool) but left
+        // the beneficiary of the OPPOSITE ruling unbarred. `dispute` is open
+        // to anyone by design, and `_fail`'s payout is pro-rata to
+        // CONTRIBUTION with no accused-membership filter — so a guardian who
+        // never approved the proposal (hence `isAccused` false) can fund the
+        // entire counter-bond alone, vote its own acquittal, and claim
+        // `contributed + forfeitPayoutWood` — a net `+0.8x` of its stake at
+        // the shipped `forfeitBurnBps`, taken from the honest challenger's
+        // forfeited bond. It only has to MATCH the guilty tally, since
+        // `finalize` acquits on a tie, and its ballot also counts toward
+        // `turnout`, converting an unpaid `Inconclusive` into a paid
+        // `NotGuilty`. Read the game pinned on the case (`c.game`), never the
+        // live `challengeGame` pointer, for the same reason `finalize` does.
+        // RAW STATICCALL — same doctrine as `ExposureLedger._feedPriceX8` and
+        // `SyndicateVault._openProposalPid`. A typed call into a game that does
+        // not answer this selector reverts in THIS frame with no data, turning
+        // a missing selector into an undecodable failure of ALL voting rather
+        // than a stated one. Decoding explicitly makes the failure branch a
+        // decision, and the decision is CLOSED: a game that cannot tell us
+        // whether the caller funded the counter-bond cannot clear them to vote
+        // on it either.
+        (bool okCb, bytes memory cbRet) =
+            c.game.staticcall(abi.encodeCall(IChallengeGame.counterBondContributionOf, (c.challengeId, msg.sender)));
+        if (!okCb || cbRet.length != 32 || abi.decode(cbRet, (uint256)) != 0) {
+            revert CounterBondContributorCannotVote();
+        }
 
         IStakedWood swood = IStakedWood(stakedWood);
         uint256 weight = swood.getPastVotes(msg.sender, c.snapshotTs);
@@ -512,6 +553,30 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // subtracted from the total taken at its OWN instant, so every operand
         // answers the same question, how much of THIS instant's electorate is
         // unaccused, before the min ever compares them.
+        //
+        // PASHOV REVIEW FINDING #1, EXAMINED AND NOT ACTED ON (tracked in
+        // #200). The observation is correct: `min` is monotone increasing in
+        // BOTH operands, so when `reduced` binds, idle never-approving stake
+        // planted before `executedAt` raises it and lifts the floor, while
+        // `vote`'s growth gate denies that same stake a ballot. But the ceiling
+        // on that lift is `flooredEarlierReduced`, which IS the intended
+        // anti-capture bar — what an attacker buys is the removal of a LIVENESS
+        // CONCESSION, not a bar beyond the design's intent.
+        //
+        // Both candidate fixes were implemented and measured against this
+        // file's fixtures, and both are worse than the defect. Dropping the min
+        // pins the floor permanently at the value the attacker was reaching
+        // for. Capping `total` at `earlier` before subtracting `accusedWeight`
+        // collapses the floor to ZERO whenever the electorate grew past the
+        // lookback (`test_finalize_floorSurvivesElectorateGrowthPastTheLookback`:
+        // earlier 60k, total 560k, accused 300k -> 6k becomes 0), and a zero
+        // floor means any nonzero turnout convicts. The mutant
+        // `base = (earlier != 0 && earlier < total) ? earlier : reduced` is
+        // already pinned as wrong by the regression test below.
+        //
+        // A correct fix needs a votable-weight denominator — the aggregate of
+        // per-voter `min(now, then)` — which is not computable on-chain from
+        // the aggregate checkpoints available here.
         uint256 reduced = total > accusedWeight ? total - accusedWeight : 0;
         uint256 earlierReduced = earlier > accusedWeightAtLookback ? earlier - accusedWeightAtLookback : 0;
         // The smaller of the two unaccused electorates, except when there is no

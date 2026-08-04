@@ -47,6 +47,22 @@ contract MockGameForCourt {
     ///      a call to a nonexistent selector, not on the invariant itself.
     uint256 public constant MIN_REFERRAL_SLACK = 1 hours;
 
+    /// @dev What `setChallenge` pins as `courtAtFiling`. The real
+    ///      `ChallengeGame.file` ALWAYS pins this from its live `court` slot,
+    ///      so a challenge that ever reaches a court carries a non-zero value.
+    ///      Leaving it at the struct default made every fixture here describe
+    ///      the one shape `refer` must now refuse (`ChallengeNotRulable`):
+    ///      `rule` authorises against this pin, so a zero-pin case would take
+    ///      real votes and then never be adjudicable. Non-zero by default so
+    ///      the ordinary fixtures describe an ordinary filing;
+    ///      `setCourtAtFiling(address(0))` opts one test back into the
+    ///      un-pinned shape.
+    address public courtAtFiling = address(uint160(uint256(keccak256("MockGameForCourt.court"))));
+
+    function setCourtAtFiling(address c) external {
+        courtAtFiling = c;
+    }
+
     function setExposureLedger(address l) external {
         exposureLedger = l;
     }
@@ -91,10 +107,27 @@ contract MockGameForCourt {
         c.filedAt = filedAt;
         c.disputeTimeoutAtFiling = disputeTimeoutAtFiling;
         c.executedAt = executedAt;
+        // Mirrors `ChallengeGame.file`, which pins this on every filing — see
+        // `courtAtFiling` above for why the zero default was the wrong fixture.
+        c.courtAtFiling = courtAtFiling;
     }
 
     function challengeOf(uint256 id) external view returns (IChallengeGame.Challenge memory) {
         return _challenges[id];
+    }
+
+    /// @dev `TokenCourt.vote` bars counter-bond contributors — the side a
+    ///      `NotGuilty` verdict pays — so this mock must answer the same
+    ///      question the real game does. Zero for everyone unless a test sets
+    ///      it, which is the ordinary case: most voters funded nothing.
+    mapping(uint256 => mapping(address => uint256)) internal _counterBond;
+
+    function counterBondContributionOf(uint256 challengeId, address contributor) external view returns (uint256) {
+        return _counterBond[challengeId][contributor];
+    }
+
+    function setCounterBondContribution(uint256 challengeId, address contributor, uint256 amount) external {
+        _counterBond[challengeId][contributor] = amount;
     }
 
     function rule(uint256 challengeId, IChallengeGame.Verdict verdict) external {
@@ -729,6 +762,75 @@ contract TokenCourtTest is Test {
         assertEq(secondCase, 2, "the new game's challenge gets its own case");
         assertEq(court.caseOfChallenge(address(game2), CHALLENGE_ID), secondCase);
         assertEq(court.caseOfChallenge(address(game), CHALLENGE_ID), firstCase, "the old mapping is intact");
+    }
+
+    /// @notice PASHOV REVIEW FINDING #2: the court bars both parties a `Guilty`
+    ///         verdict pays — the accused and the challenger — but left the
+    ///         party a `NotGuilty` verdict pays entirely unbarred.
+    /// @dev    `ChallengeGame.dispute` is open to anyone by design, and
+    ///         `_fail`'s payout is pro-rata to CONTRIBUTION with no
+    ///         accused-membership filter. So a guardian who never approved the
+    ///         proposal (hence `isAccused` false, and not the challenger
+    ///         either) could fund the entire counter-bond alone, vote its own
+    ///         acquittal, and collect `contributed + forfeitPayoutWood` — a net
+    ///         `+0.8x` of its stake at the shipped `forfeitBurnBps`, taken from
+    ///         the honest challenger's forfeited bond. It only had to MATCH the
+    ///         guilty tally, since `finalize` acquits on a tie, and its ballot
+    ///         also counted toward `turnout`, converting an unpaid
+    ///         `Inconclusive` into a paid `NotGuilty`.
+    ///
+    ///         Revert the fix and this vote succeeds.
+    function test_finding2_counterBondContributorCannotVoteItsOwnAcquittal() public {
+        _disputedChallenge();
+
+        address funder = makeAddr("counterBondFunder");
+        address[] memory a = new address[](1);
+        uint256[] memory cm = new uint256[](1);
+        a[0] = accusedG;
+        cm[0] = 100e18;
+        ledger.setApprovers(a, cm);
+
+        uint256 snap = vm.getBlockTimestamp() - 1 days - 1;
+        swood.setPastStake(accusedG, snap, 500e18);
+        swood.setPastStake(funder, snap, 900e18);
+        swood.setPastVotes(funder, snap, 900e18);
+
+        uint256 caseId = court.refer(CHALLENGE_ID);
+
+        // The funder is NOT accused (it never approved) and is NOT the
+        // challenger — both existing bars miss it entirely.
+        assertFalse(court.isAccused(caseId, funder), "fixture: the funder is not in the accused set");
+        assertTrue(funder != court.caseOf(caseId).challenger, "fixture: the funder is not the challenger");
+
+        // It funded the pool, so a `NotGuilty` verdict pays it.
+        game.setCounterBondContribution(CHALLENGE_ID, funder, 1e18);
+
+        vm.prank(funder);
+        vm.expectRevert(ITokenCourt.CounterBondContributorCannotVote.selector);
+        court.vote(caseId, false);
+    }
+
+    /// @notice PASHOV REVIEW FINDING #6: a challenge that pinned NO adjudicator
+    ///         at filing is structurally unrulable, so opening a case for it
+    ///         burns a case id and every voter's gas on a verdict that can
+    ///         never be delivered.
+    /// @dev    `ChallengeGame.rule` authorises against `courtAtFiling`, not the
+    ///         live `court` slot, so wiring a court in AFTER a zero-pin filing
+    ///         does not make that challenge rulable. `finalize` re-raises
+    ///         everything except `WrongStatus`, so `rule`'s `NotCourt` would
+    ///         roll back the `phase = Resolved` write and wedge the case in
+    ///         `Voting` until the dispute timeout discarded the whole tally.
+    ///         `refer` now refuses the shape at the door.
+    function test_finding6_referRefusesAChallengeThatPinnedNoCourt() public {
+        game.setCourtAtFiling(address(0));
+        _disputedChallenge();
+
+        vm.expectRevert(ITokenCourt.ChallengeNotRulable.selector);
+        court.refer(CHALLENGE_ID);
+
+        assertEq(
+            court.caseOfChallenge(address(game), CHALLENGE_ID), 0, "no case id may be burned on an unrulable challenge"
+        );
     }
 
     /// @notice ISSUE #83, the seam in one assertion: the accused set is derived

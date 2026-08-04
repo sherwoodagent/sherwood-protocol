@@ -9,6 +9,7 @@ import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
 import {IProposerBondEscrow} from "./interfaces/IProposerBondEscrow.sol";
+import {IStrategy} from "./interfaces/IStrategy.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
@@ -166,10 +167,18 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         so it is never empty for an `Executed` proposal.
     mapping(uint256 => uint256[]) private _effectiveSettlementCallCaps;
 
-    /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31) for
-    ///      the three mappings above — append-only. See
-    ///      `script/syndicate-governor-layout.golden.json`.
-    uint256[28] private __gap;
+    /// @notice Outstanding escrowed fee liability per `(vault, token)` — the
+    ///         aggregate `_unclaimedFees` never had (pashov review finding #3).
+    /// @dev `_unclaimedFees` is keyed per RECIPIENT with no total, so the vault
+    ///      holding the escrowed assets could not see that it owed them and
+    ///      `totalAssets()` counted them as LP equity. Appended before `__gap`,
+    ///      which shrinks 28 -> 27; every pre-existing variable keeps its slot.
+    mapping(address vault => mapping(address token => uint256)) private _escrowedFees;
+
+    /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31)
+    ///      for the three mappings above, then 1 more for `_escrowedFees` —
+    ///      append-only. See `script/syndicate-governor-layout.golden.json`.
+    uint256[27] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -270,6 +279,67 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Draft co-proposals do not count toward openProposalCount and are
         // independently gated at their Draft -> Pending transition.
         if (_openProposalCount != 0) revert VaultHasOpenProposal();
+        // BIND THE DECLARED STRATEGY TO ITS CALLER (pashov review finding #8).
+        // `StrategyFactory.cloneAndInit` enforces `proposer == msg.sender` so
+        // `_proposer` is "a known authorized address", and
+        // `BaseStrategy.execute()` treats `strategyOf(activePid) ==
+        // address(this)` as the security boundary — issue #150's fix, "this
+        // check IS the security boundary here". But the governor never
+        // preserved the binding those two ends assume: `p.strategy` was
+        // written verbatim from calldata, so the equality held BY
+        // CONSTRUCTION for whoever declared the clone, not for whoever owns
+        // it. `IStrategy.proposer()` had zero call sites in `src/`, and
+        // `StrategyFactory` records the governor-side check as "deferred".
+        //
+        // Unbound, any registered agent could name a rival's pre-deployed,
+        // governance-allowlisted clone as its own proposal's strategy and
+        // drive it Pending -> Executed. The ratchet is one-way, so the rightful
+        // proposer's own later proposal then reverts `AlreadyExecuted` forever:
+        // recovery needs a redeploy plus a fresh `setAdapterAllowed` and, if
+        // tier-certified, a new `proposeCertification` + `certifyDelay`.
+        // `address(0)` stays legal — a proposal need not name a strategy.
+        // Only a CONTRACT can be bricked, so only a contract is checked. A
+        // codeless `strategy` is a label and nothing more — `BaseStrategy`'s
+        // ratchet needs code to flip, `executeCalls` needs code to call — and
+        // `propose` has always accepted one (see
+        // `test_propose_eoaStrategySucceedsAtPropose`). Raw staticcall rather
+        // than a typed call for the same reason as everywhere else in this
+        // repo: a contract that does not answer `proposer()` would otherwise
+        // revert here with no data. It fails CLOSED — something with code that
+        // cannot identify its own proposer must not be declared as one.
+        // ENFORCED ONLY WHERE THERE IS SOMETHING TO PROTECT. The attack this
+        // closes needs a `BaseStrategy` clone: `execute()`'s guard is
+        // `strategyOf(activePid) == address(this)`, and what gets stolen is
+        // that clone's one-way Pending -> Executed ratchet. An address that
+        // does not answer `proposer()` has no such ratchet — it is a plain
+        // adapter pointer or an EOA label, both long-standing legitimate uses
+        // of this field (`test_propose_eoaStrategySucceedsAtPropose`,
+        // `test_vault_activeStrategyAdapter_*`) — so there is nothing for this
+        // guard to defend and refusing it would break callers for no gain.
+        //
+        // When the address DOES answer, the binding is mandatory: that is
+        // exactly the clone case, and `StrategyFactory.cloneAndInit` already
+        // pinned `_proposer` to whoever cloned it. Raw staticcall throughout,
+        // so "does not answer" is a decodable state rather than an
+        // uncatchable revert in this frame.
+        if (strategy != address(0) && strategy.code.length != 0) {
+            (bool okP, bytes memory pRet) = strategy.staticcall(abi.encodeCall(IStrategy.proposer, ()));
+            address declaredProposer = (okP && pRet.length == 32) ? abi.decode(pRet, (address)) : address(0);
+            if (declaredProposer != address(0)) {
+                // A ZERO PROPOSER IS NOT A VICTIM. `StrategyFactory.cloneAndInit`
+                // always writes `_proposer = msg.sender`, so every live clone
+                // carries a non-zero one; zero means the strategy was never
+                // initialized and therefore has no ratchet anyone could steal
+                // and no owner anyone could grief. Templates read zero too, and
+                // they set `_initialized` in their constructor so they can never
+                // become live.
+                if (declaredProposer != msg.sender) revert StrategyProposerMismatch();
+                (bool okV, bytes memory vRet) = strategy.staticcall(abi.encodeCall(IStrategy.vault, ()));
+                if (okV && vRet.length == 32 && abi.decode(vRet, (address)) != vault) {
+                    revert StrategyVaultMismatch();
+                }
+            }
+        }
         if (strategyDuration > _params.maxStrategyDuration) revert StrategyDurationTooLong();
         if (strategyDuration < _params.minStrategyDuration) revert StrategyDurationTooShort();
         if (executeCalls.length == 0) revert EmptyExecuteCalls();
@@ -1943,6 +2013,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             return true;
         } catch {
             _unclaimedFees[_unclaimedKey(vault, recipient, asset)] += amount;
+            // Mirror into the per-(vault, token) aggregate so the vault can
+            // net this liability out of `totalAssets()` — see `_escrowedFees`
+            // (pashov review finding #3). Both writes stay in lockstep: this
+            // one and the matching decrement in `claimUnclaimedFees` are the
+            // only places either mapping moves on the escrow path.
+            _escrowedFees[vault][asset] += amount;
             emit FeeTransferFailed(recipient, asset, amount);
             return false;
         }
@@ -1960,6 +2036,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         uint256 amt = _unclaimedFees[k];
         if (amt == 0) return;
         _unclaimedFees[k] = 0;
+        // Released before the external call, alongside the per-recipient slot,
+        // so the vault stops reserving it the instant it stops being owed —
+        // and so CEI covers both writes identically.
+        _escrowedFees[vault][token] -= amt;
         ISyndicateVault(vault).transferPerformanceFee(token, msg.sender, amt);
         emit FeeClaimed(msg.sender, token, amt);
     }
@@ -1967,6 +2047,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @inheritdoc ISyndicateGovernor
     function unclaimedFees(address vault, address recipient, address token) external view returns (uint256) {
         return _unclaimedFees[_unclaimedKey(vault, recipient, token)];
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function outstandingEscrow(address vault, address token) external view returns (uint256) {
+        return _escrowedFees[vault][token];
     }
 
     function _unclaimedKey(address vault, address recipient, address token) private pure returns (bytes32) {

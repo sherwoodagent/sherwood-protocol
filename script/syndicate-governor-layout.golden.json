@@ -199,10 +199,16 @@
       "type": "t_mapping(t_uint256,t_array(t_uint256)dyn_storage)"
     },
     {
-      "label": "__gap",
+      "label": "_escrowedFees",
       "slot": "64",
       "offset": 0,
-      "type": "t_array(t_uint256)28_storage"
+      "type": "t_mapping(t_address,t_mapping(t_address,t_uint256))"
+    },
+    {
+      "label": "__gap",
+      "slot": "65",
+      "offset": 0,
+      "type": "t_array(t_uint256)27_storage"
     }
   ],
   "types": {

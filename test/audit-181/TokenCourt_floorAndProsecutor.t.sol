@@ -16,6 +16,29 @@ import {MockStakedWood} from "test/mocks/MockStakedWood.sol";
 ///      set before finding #7), the `exposureLedger` pointer, and a no-op
 ///      `rule` recorder.
 contract MockGameForFloorTest {
+    /// @dev The real `ChallengeGame.file` pins `courtAtFiling` on every
+    ///      filing, and `refer` now refuses a zero pin because `rule`
+    ///      authorises against it — a zero-pin case could take votes and never
+    ///      be adjudicable. Non-zero here so ordinary fixtures describe an
+    ///      ordinary filing.
+    address public courtAtFiling = address(uint160(uint256(keccak256("MockGame.court"))));
+
+    function setCourtAtFiling(address c) external {
+        courtAtFiling = c;
+    }
+
+    /// @dev `TokenCourt.vote` bars counter-bond contributors, so a game
+    ///      stand-in must answer this. Zero unless a test sets it.
+    mapping(uint256 => mapping(address => uint256)) internal _counterBond;
+
+    function counterBondContributionOf(uint256 challengeId, address contributor) external view returns (uint256) {
+        return _counterBond[challengeId][contributor];
+    }
+
+    function setCounterBondContribution(uint256 challengeId, address contributor, uint256 amount) external {
+        _counterBond[challengeId][contributor] = amount;
+    }
+
     mapping(uint256 => IChallengeGame.Challenge) internal _challenges;
     address public exposureLedger;
     // Mirrors the real `ChallengeGame`'s defaults so `setChallengeGame`'s
@@ -56,6 +79,8 @@ contract MockGameForFloorTest {
         c.filedAt = filedAt;
         c.disputeTimeoutAtFiling = disputeTimeoutAtFiling;
         c.executedAt = executedAt;
+        // Mirrors `ChallengeGame.file`, which pins this on every filing.
+        c.courtAtFiling = courtAtFiling;
     }
 
     function challengeOf(uint256 id) external view returns (IChallengeGame.Challenge memory) {

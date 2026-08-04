@@ -12,6 +12,13 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 ///         one hop `_requireAllowedAdapter` reads off `vault()`. Has code
 ///         (unlike `makeAddr`) so the walk's first hop can resolve.
 contract MockVaultWithGovernor {
+    /// @dev `BaseStrategy.onlyProposer` re-checks the vault's live agent set on
+    ///      every proposer-gated call, so a vault stand-in must answer this or
+    ///      `rebalance` / `rebalanceDelta` / `updateParams` all fail closed.
+    function isAgent(address) external pure returns (bool) {
+        return true;
+    }
+
     address public governor;
 
     constructor(address governor_) {
