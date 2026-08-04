@@ -875,11 +875,19 @@ contract TokenCourtEndToEndTest is Test {
         vm.warp(lastLegal);
         vm.prank(owner);
         game.setCourt(address(court)); // re-wire just before the manual referral -- courtAtFiling stays pinned at 0
-        uint256 caseIdB = court.refer(cidB); // the last legal instant, per test_refer_clockCheckBoundary
-        assertEq(court.caseOf(caseIdB).referredAt, lastLegal);
-
-        vm.prank(g3);
-        court.vote(caseIdB, true); // the tally is moot -- the game's own clock resolves this first regardless
+        // REFUSED AT THE DOOR NOW (pashov review finding #6). This arc used to
+        // open a case here and even collect a vote, then watch the game's own
+        // clock discard the whole thing. That WAS the defect: `rule`
+        // authorises against `courtAtFiling`, pinned at 0 for this challenge
+        // forever, so the case could never be adjudicated -- `finalize`
+        // re-raises everything except `WrongStatus`, so `rule`'s `NotCourt`
+        // would roll back the `Resolved` write and wedge the case in `Voting`.
+        // `refer` now rejects that shape outright: no case id burned, no voter
+        // paying gas for a verdict that cannot be delivered. The arc's actual
+        // subject is unchanged -- the timeout below still reads the pin and
+        // lands a NON-VERDICT.
+        vm.expectRevert(ITokenCourt.ChallengeNotRulable.selector);
+        court.refer(cidB);
 
         assertEq(wood.balanceOf(challengerB), challengerBBalBeforeFile - _challengerBond(), "the bond is out on loan");
         vm.warp(filedAtB + disputeTimeoutAtFilingB); // exactly the challenge's own (pinned) timeout
@@ -912,10 +920,15 @@ contract TokenCourtEndToEndTest is Test {
         assertEq(gotB, cb.counterBondWood);
         assertEq(wood.balanceOf(g1), g1BalBeforeClaim + cb.counterBondWood, "g1's whole defence contribution returned");
 
-        vm.expectEmit(true, true, false, false);
-        emit ITokenCourt.ChallengeAlreadyTerminal(caseIdB, cidB);
-        court.finalize(caseIdB); // must not revert: WrongStatus from `rule` is swallowed
-        assertEq(uint256(court.caseOf(caseIdB).phase), uint256(ITokenCourt.Phase.Resolved), "the case still closes");
+        // No case was ever opened for this challenge — `refer` refused the
+        // zero-pin shape above (pashov review finding #6) — so there is no
+        // `finalize` to drive here and nothing to observe closing. The
+        // `ChallengeAlreadyTerminal` swallow-path that used to be exercised
+        // here is still covered by arc (a) and by
+        // `test_finalize_terminalRace_caseClosesViaCatch` in
+        // test/TokenCourt.t.sol, both of which reach it on a challenge that
+        // DID pin an adjudicator — the only shape that could ever get there.
+        assertEq(court.caseOfChallenge(address(game), cidB), 0, "no case id was burned on an unrulable challenge");
 
         assertEq(wood.balanceOf(address(court)), 0, "court custody is zero, always");
     }

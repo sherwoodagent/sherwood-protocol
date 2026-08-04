@@ -54,6 +54,88 @@ contract VaultWithdrawalQueueTest is Test {
         queue.stampSettlement(PID, NUM, DEN);
     }
 
+    /// @notice PASHOV REVIEW FINDING #10: a deposit's `claim` and `cancel`
+    ///         gates keyed on DIFFERENT pids, so both exits stayed open at once
+    ///         and the depositor held a costless permanent straddle.
+    /// @dev    `claim` was moved onto `_lastStampedPid` for Deposits precisely
+    ///         because a deposit's own `r.pid` may never be stamped —
+    ///         cancelled / vetoed / rejected / expired proposals all call
+    ///         `_decOpen()` and never `onProposalSettled`. `cancel` was left on
+    ///         `r.pid`, which for exactly that class reads false FOREVER. The
+    ///         holder could wait, watch the price, and take whichever leg paid
+    ///         (`amount * max(1, ppsNow / ppsStamp)`), the upside funded by the
+    ///         incumbent shareholders — the same "perpetual look-back call on
+    ///         the vault's NAV" the `_lastStampedPid` change closed on the
+    ///         claim side, reopened through the un-migrated cancel side. It
+    ///         also falsified `claim`'s own natspec: "`cancel` shuts once its
+    ///         proposal stamps, so waiting is strictly free".
+    ///
+    ///         A LATER, UNRELATED settlement arms the claim leg here —
+    ///         `pidOther`, never the request's own pid, which never stamps.
+    ///         Once claim is exercisable, cancel must be shut.
+    function test_finding10_depositCancelShutsOnceClaimIsExercisable() public {
+        uint256 pidOther = PID + 1;
+        uint256 id = _queueDeposit(alice, 1_000e6);
+
+        // The request's OWN proposal never settles. A different one does.
+        vm.prank(address(vault));
+        queue.stampSettlement(pidOther, NUM, DEN);
+
+        assertFalse(queue.getRequest(id).claimed, "fixture: not yet claimed");
+
+        // Cancel must now be CLOSED. Pre-fix it stayed open forever, because
+        // `_settlePrice[r.pid].stamped` was false and always would be.
+        vm.prank(alice);
+        vm.expectRevert(IVaultWithdrawalQueue.AlreadySettled.selector);
+        queue.cancel(id);
+    }
+
+    /// @dev THE CONTROL THE FIRST VERSION OF THIS FIX LACKED (PR #195 review,
+    ///      blocker 1). `stampSettlement` sets `sp.stamped = true` BEFORE
+    ///      `_lastStampedPid = pid`, so `_settlePrice[_lastStampedPid].stamped`
+    ///      is true by construction from the protocol's first settlement
+    ///      onward — permanently, for every request. Gating cancel on that
+    ///      expression alone therefore bricked EVERY deposit cancel forever
+    ///      rather than closing the straddle, and the sibling test above
+    ///      passed anyway because it only ever asserted the revert.
+    ///
+    ///      A deposit created AFTER a settlement, with no settlement since,
+    ///      must still be cancellable.
+    function test_finding10_depositCancelStillOpenBeforeAnySettlementSinceRequest() public {
+        // A settlement exists before the request is even made.
+        vm.prank(address(vault));
+        queue.stampSettlement(PID, NUM, DEN);
+
+        // The deposit is tagged to the proposal open at request time, which is
+        // necessarily LATER than anything already settled — that is what
+        // `_openProposalPid` returns.
+        asset.mint(address(queue), 1_000e6);
+        vm.prank(address(vault));
+        uint256 id = queue.queueDeposit(alice, 1_000e6, PID + 1);
+
+        // Nothing has stamped SINCE. The claim price is not yet fixed for this
+        // request, so its cancel must still be open.
+        vm.prank(alice);
+        queue.cancel(id);
+        assertTrue(queue.getRequest(id).cancelled, "a deposit must be cancellable until a settlement lands after it");
+    }
+
+    /// @dev The control for finding #10: a REDEEM request keeps gating on its
+    ///      OWN pid. Those shares left the supply at that settlement and
+    ///      `_pidReserved` is denominated against that same price, so an
+    ///      unrelated settlement must not shut its cancel.
+    function test_finding10_redeemCancelStillGatesOnItsOwnPid() public {
+        uint256 pidOther = PID + 1;
+        uint256 id = _queueRedeem(alice, 100e18);
+
+        vm.prank(address(vault));
+        queue.stampSettlement(pidOther, NUM, DEN);
+
+        vm.prank(alice);
+        queue.cancel(id); // must NOT revert
+        assertTrue(queue.getRequest(id).cancelled, "an unrelated stamp cannot shut a redeem's cancel");
+    }
+
     // ── queueing ──
 
     function test_queueRedeem_recordsRequest() public {

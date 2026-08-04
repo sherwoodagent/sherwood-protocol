@@ -85,6 +85,10 @@ contract PortfolioStrategy is BaseStrategy {
     error TooManyTokens();
     error SwapFailed();
     error RebalancingInProgress();
+    /// @notice `rebalance` / `rebalanceDelta` would push `cumulativeDecayBps`
+    ///         past `MAX_CUMULATIVE_DECAY_BPS`. The clone has spent its
+    ///         lifetime slippage allowance; `settle()` is unaffected.
+    error DecayBudgetExhausted();
     error StalePrice();
     error InvalidSlippage();
     /// @notice `_updateParams` was passed a non-empty `swapExtraData`. Routes are
@@ -161,6 +165,87 @@ contract PortfolioStrategy is BaseStrategy {
     /// @notice Bounds for a per-slot push-feed max age packed into `_feedIds[i]`.
     uint256 public constant MIN_PUSH_PRICE_AGE = 1 hours;
     uint256 public constant MAX_PUSH_PRICE_AGE_CAP = 30 days;
+    /// @notice Slippage band applied when a floor is anchored to a STALE
+    ///         last-good oracle price rather than a live one (pashov review
+    ///         finding #4). Wider than `maxSlippageBps` because the anchor may
+    ///         predate a genuine move — equity feeds stop heartbeating outside
+    ///         US market hours (see `MAX_PUSH_PRICE_AGE`) — but still an
+    ///         attacker-independent number, which is the whole point: the old
+    ///         fallback derived its floor from a quote taken against the very
+    ///         pool the swap was about to hit, so the bound moved with the
+    ///         attacker. This is the band at the instant the anchor is taken;
+    ///         it widens with the anchor's age, see `STALE_WIDEN_PERIOD`.
+    uint256 public constant STALE_PRICE_SLIPPAGE_BPS = MAX_SLIPPAGE_CEILING_BPS;
+    /// @notice Ceiling the stale band widens to (PR #195 re-review).
+    ///
+    ///         A FIXED 1,000 BPS BAND CANNOT TELL A MANIPULATION FROM A GAP.
+    ///         The stale anchor is a price this contract observed, so it does
+    ///         not move with an attacker — but it also does not move with the
+    ///         MARKET, and `_sellFloor` sits on `_settle()`, the only exit. A
+    ///         feed outage of the length this contract's own
+    ///         `MAX_PUSH_PRICE_AGE` documents as routine ("77h gaps over
+    ///         holiday weekends") coinciding with a genuine move past the band
+    ///         — an earnings gap on an equity — made every swap revert on its
+    ///         floor, stranding the vault's capital for the length of the
+    ///         outage. That is the fail-closed outcome finding #4's fix
+    ///         explicitly set out to avoid, reached by a different route.
+    ///
+    ///         Widening linearly in the ANCHOR'S AGE separates the two cases on
+    ///         the axis that actually distinguishes them. A pool manipulated in
+    ///         the settle transaction is judged against a fresh anchor and a
+    ///         near-`STALE_PRICE_SLIPPAGE_BPS` band, which is what rejects it;
+    ///         a week-long outage earns the full ceiling. The ceiling stays
+    ///         well below `BPS_DENOMINATOR`, so the floor never degenerates to
+    ///         zero and the anchor never stops binding — an attacker who waits
+    ///         out the whole ramp still cannot take more than 30%, against the
+    ///         unbounded take the pre-fix quote-anchored floor allowed.
+    uint256 public constant MAX_STALE_SLIPPAGE_BPS = 3_000;
+    /// @notice Span of anchor staleness over which the band ramps from
+    ///         `STALE_PRICE_SLIPPAGE_BPS` to `MAX_STALE_SLIPPAGE_BPS`. Sized
+    ///         past the longest documented equity-feed gap so an ordinary
+    ///         holiday weekend lands mid-ramp rather than at the ceiling.
+    uint256 public constant STALE_WIDEN_PERIOD = 7 days;
+    /// @notice Ceiling on `cumulativeDecayBps` across a clone's whole life
+    ///         (pashov review finding #9).
+    ///
+    ///         WHAT IS METERED IS THE ALLOWANCE, NOT THE REALIZED LOSS. Each
+    ///         `rebalance` is charged `2 * maxSlippageBps` (a sell leg and a
+    ///         re-buy leg, each permitted to land that far below the
+    ///         oracle-implied value) and each `rebalanceDelta` one leg's worth.
+    ///         That is the worst case, so an honest rebalance that clears at
+    ///         mid is over-charged — deliberate, because the alternative is
+    ///         valuing the whole basket on every call, and the quantity that
+    ///         actually needed bounding is the ALLOWANCE: it composed
+    ///         multiplicatively (`1-(1-s)^2N`) over an unlimited call count.
+    ///
+    ///         WHAT THE BOUND ACTUALLY IS, and why this number moved. A leg
+    ///         costs its own `maxSlippageBps` and compounds at that rate, so
+    ///         with a budget `B` the reachable loss is
+    ///         `1 - (1 - s)^(B/s) ~= 1 - e^(-B/10000)` for ANY setting of `s`.
+    ///         That invariance is the point: lowering `maxSlippageBps` buys
+    ///         more calls that each bite proportionally less, so a proposer
+    ///         cannot pick a slippage figure that games the cap.
+    ///
+    ///         It follows that the budget IS the drain ceiling, in one number.
+    ///         The first cut shipped 5,000 bps, which reads like a hard limit
+    ///         but resolves to `1 - e^-0.5 ~= 39%` of the basket — enough that
+    ///         describing it as cutting off the traced drains (~62% in ten
+    ///         calls at 500 bps, ~50% in seventy at 50 bps) overstated what one
+    ///         constant was carrying. 2,000 bps puts the ceiling at
+    ///         `1 - e^-0.2 ~= 18%`.
+    ///
+    ///         THE COST IS HEADROOM, AND IT IS REAL. At the shipped 500 bps
+    ///         allowance this is two full round trips over the clone's whole
+    ///         life (four `rebalanceDelta` calls, which are charged one leg
+    ///         rather than two); at the `MIN_SLIPPAGE_BPS` floor it is twenty
+    ///         round trips. A strategy that expects to rebalance often should
+    ///         be initialized nearer the slippage floor, where the budget buys
+    ///         an order of magnitude more calls for the same 18% ceiling.
+    ///
+    ///         Exhaustion is not a brick: `settle()` never consults this meter,
+    ///         so the exit path stays open, and 18% still wants the
+    ///         `strategyDuration` and adapter allowlist doing their share.
+    uint256 public constant MAX_CUMULATIVE_DECAY_BPS = 2_000;
 
     // ── Storage (per-clone) ──
 
@@ -182,6 +267,30 @@ contract PortfolioStrategy is BaseStrategy {
     uint256 public maxSlippageBps;
 
     bool private _rebalancing;
+
+    /// @dev Last price a push feed successfully returned for allocation `i`, in
+    ///      that slot's declared `_priceDecimals` scale. Written by
+    ///      `_sellFloor` / `_buyFloor` whenever `_tryPushFeedPrice` reports
+    ///      `ok`, and read by those same two when it does not (pashov review
+    ///      finding #4). Zero means "this slot has never been priced" — the
+    ///      only case still degrading to the quote-anchored floor.
+    mapping(uint256 allocationIndex => uint256 priceInFeedScale) private _lastGoodPrice;
+
+    /// @dev `block.timestamp` at which `_lastGoodPrice[i]` was recorded, written
+    ///      in lockstep with it at every site (PR #195 re-review). The stale
+    ///      band is a function of this age — see `MAX_STALE_SLIPPAGE_BPS` — so
+    ///      an anchor and its age must never diverge. Zero exactly when
+    ///      `_lastGoodPrice[i]` is zero, i.e. the slot has never been priced.
+    mapping(uint256 allocationIndex => uint256 recordedAt) private _lastGoodAt;
+
+    /// @notice Running sum, in bps, of oracle-valued NAV given up across every
+    ///         `rebalance` / `rebalanceDelta` on this clone (pashov review
+    ///         finding #9). `maxSlippageBps` bounds ONE swap; nothing bounded
+    ///         the NUMBER of full-notional round trips, so the per-call
+    ///         allowance composed multiplicatively over an unlimited call count
+    ///         for the whole `strategyDuration`. Checked against
+    ///         `MAX_CUMULATIVE_DECAY_BPS`.
+    uint256 public cumulativeDecayBps;
 
     /// @dev Cached `decimals()` of the vault asset, read once at init so the
     ///      rebalance decimal-scaling math avoids a per-read external call.
@@ -514,6 +623,12 @@ contract PortfolioStrategy is BaseStrategy {
     function rebalance() external onlyProposer {
         if (_state != State.Executed) revert NotExecuted();
         if (_rebalancing) revert RebalancingInProgress();
+        // The decay budget is charged at the END of this function, per LEG
+        // THAT ACTUALLY SWAPPED — see the charge site below. Charging up front
+        // billed a rebalance that moved nothing the full `2 * maxSlippageBps`,
+        // which at the `MAX_SLIPPAGE_CEILING_BPS` of 1_000 is two no-op calls
+        // to exhaust a 30-day strategy (PR #195 review, minor 1). Charging
+        // after is equally safe: a revert unwinds the swaps it refuses to pay.
         // Live re-check. Unlike `_execute`/`_settle`'s one-shot check,
         // `rebalance`/`rebalanceDelta` are proposer-callable an unbounded number
         // of times while `Executed`, with no time limit — a demotion that lands
@@ -550,6 +665,7 @@ contract PortfolioStrategy is BaseStrategy {
         // push mode). The buy leg below uses the mirror `_buyFloor` rather than a
         // bare `_quoteMinOut`, for the same reason: this flow is proposer-only but
         // the pool state it quotes against is not otherwise anchored.
+        bool soldAny;
         for (uint256 i; i < len; ++i) {
             TokenAllocation storage alloc = _allocations[i];
             uint256 bal = IERC20(alloc.token).balanceOf(address(this));
@@ -561,10 +677,12 @@ contract PortfolioStrategy is BaseStrategy {
             if (amountOut == 0) revert SwapFailed();
             alloc.tokenAmount = 0;
             alloc.investedAmount = 0;
+            soldAny = true;
         }
 
         // Re-buy at current target weights
         uint256 assetBalance = IERC20(asset).balanceOf(address(this));
+        bool boughtAny;
         for (uint256 i; i < len; ++i) {
             TokenAllocation storage alloc = _allocations[i];
             uint256 allocation = (assetBalance * alloc.targetWeightBps) / BPS_DENOMINATOR;
@@ -577,7 +695,18 @@ contract PortfolioStrategy is BaseStrategy {
 
             alloc.tokenAmount = amountOut;
             alloc.investedAmount = allocation;
+            boughtAny = true;
         }
+
+        // PER LEG THAT ACTUALLY SWAPPED (PR #195 review, minor 1). The unit of
+        // the allowance is a LEG, not a swap: `maxSlippageBps` bounds how far
+        // below the oracle-implied value one side of the round trip may land,
+        // and every swap inside a leg is bounded individually by its own
+        // floor. Charging per SWAP would scale the bill with basket size and
+        // exhaust a 3-token basket in a single call; charging a flat
+        // `2 * maxSlippageBps` billed no-op rebalances. This bills what ran.
+        uint256 legs = (soldAny ? maxSlippageBps : 0) + (boughtAny ? maxSlippageBps : 0);
+        if (legs != 0) _chargeDecayBudget(legs);
 
         // Snapshot after balances for event
         uint256[] memory newBalances = new uint256[](len);
@@ -611,6 +740,14 @@ contract PortfolioStrategy is BaseStrategy {
     function rebalanceDelta(bytes[] calldata priceReports) external onlyProposer {
         if (_state != State.Executed) revert NotExecuted();
         if (_rebalancing) revert RebalancingInProgress();
+        // Charged at the END, and only if a swap actually ran — see the charge
+        // site in `rebalance()` and `MAX_CUMULATIVE_DECAY_BPS` for what is
+        // metered and why (pashov review finding #9, refined by PR #195 review
+        // minor 1). A delta rebalance trades only the over/under-weight
+        // remainder rather than the full basket, so it is charged one leg's
+        // worth where the full round trip is charged two. A delta call whose
+        // every allocation is already within threshold swaps nothing and is
+        // therefore free.
         // Live re-check, fail-closed on demotion — see the identical guard on
         // `rebalance()` above for the full rationale (issue #147).
         _requireAllowedAdapter(address(swapAdapter));
@@ -661,6 +798,10 @@ contract PortfolioStrategy is BaseStrategy {
             _allocations[i].tokenAmount = bal;
             newBalances[i] = bal;
         }
+
+        // See the note at the top of this function: one leg's worth, and only
+        // when something actually traded.
+        if (swapsExecuted != 0) _chargeDecayBudget(maxSlippageBps);
 
         _rebalancing = false;
         emit RebalancedDelta(
@@ -861,9 +1002,34 @@ contract PortfolioStrategy is BaseStrategy {
         if (chainlinkVerifier == address(0)) {
             (uint256 price, bool ok) = _tryPushFeedPrice(i);
             if (ok) {
+                _lastGoodPrice[i] = price;
+                _lastGoodAt[i] = block.timestamp;
                 uint256 value = _tokensToValue(bal, price, i, uint256(_assetDecimals));
                 return (value * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
             }
+        }
+        // STALE ORACLE BEATS NO ORACLE (pashov review finding #4). The old
+        // fallback went straight to `_quoteMinOut`, whose floor is derived from
+        // a quote taken in the SAME transaction against the SAME pool the swap
+        // is about to hit — so `maxSlippageBps` bounded drift from a price the
+        // attacker had just set, not from a fair one. That path is reachable
+        // without any oracle failure at all in Data Streams mode (neither
+        // `execute()` nor `settle()` nor `rebalance()` carries a signed
+        // report), and in push mode on any stale/mismatched/codeless feed —
+        // which this contract's own `MAX_PUSH_PRICE_AGE` notes is routine for
+        // equity feeds ("observed 77h gaps over holiday weekends").
+        //
+        // A price this contract ITSELF observed from an allowlisted feed is
+        // attacker-independent, however old it is, so it is a strictly better
+        // anchor than the counterparty's quote. Fail-closed was the other
+        // option and was rejected deliberately: it would brick `settle()` for
+        // the entire duration of a feed outage, stranding capital — which is
+        // also why the band around the anchor widens with the anchor's age
+        // rather than staying fixed. See `_staleSlippageBps`.
+        uint256 lastGood = _lastGoodPrice[i];
+        if (lastGood != 0) {
+            uint256 staleValue = _tokensToValue(bal, lastGood, i, uint256(_assetDecimals));
+            return (staleValue * (BPS_DENOMINATOR - _staleSlippageBps(i))) / BPS_DENOMINATOR;
         }
         return _quoteMinOut(token, asset, bal, _swapExtraData[i]);
     }
@@ -886,11 +1052,40 @@ contract PortfolioStrategy is BaseStrategy {
         if (chainlinkVerifier == address(0)) {
             (uint256 price, bool ok) = _tryPushFeedPrice(i);
             if (ok) {
+                _lastGoodPrice[i] = price;
+                _lastGoodAt[i] = block.timestamp;
                 uint256 tokensExpected = _valueToTokens(amountIn, price, i, uint256(_assetDecimals));
                 return (tokensExpected * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
             }
         }
+        // Mirrors `_sellFloor`'s stale-anchor fallback exactly — see the block
+        // there for why a price this contract already observed beats a quote
+        // taken against the pool being traded (pashov review finding #4).
+        uint256 lastGood = _lastGoodPrice[i];
+        if (lastGood != 0) {
+            uint256 staleTokens = _valueToTokens(amountIn, lastGood, i, uint256(_assetDecimals));
+            return (staleTokens * (BPS_DENOMINATOR - _staleSlippageBps(i))) / BPS_DENOMINATOR;
+        }
         return _quoteMinOut(asset, _allocations[i].token, amountIn, _swapExtraData[i]);
+    }
+
+    /// @dev The stale band for allocation `i`, ramping linearly from
+    ///      `STALE_PRICE_SLIPPAGE_BPS` at a zero-age anchor to
+    ///      `MAX_STALE_SLIPPAGE_BPS` once the anchor is `STALE_WIDEN_PERIOD`
+    ///      old, and flat at the ceiling thereafter (PR #195 re-review). See
+    ///      `MAX_STALE_SLIPPAGE_BPS` for why the age is the right axis.
+    ///
+    ///      `_lastGoodAt[i]` is written in lockstep with `_lastGoodPrice[i]` at
+    ///      every site, and this is only reached when the latter is non-zero,
+    ///      so the former is non-zero too and `age` is a real elapsed span. The
+    ///      `>` guard is belt-and-braces against a same-block read, not a case
+    ///      that can legitimately arise.
+    function _staleSlippageBps(uint256 i) private view returns (uint256) {
+        uint256 recordedAt = _lastGoodAt[i];
+        uint256 age = block.timestamp > recordedAt ? block.timestamp - recordedAt : 0;
+        if (age >= STALE_WIDEN_PERIOD) return MAX_STALE_SLIPPAGE_BPS;
+        return
+            STALE_PRICE_SLIPPAGE_BPS + ((MAX_STALE_SLIPPAGE_BPS - STALE_PRICE_SLIPPAGE_BPS) * age) / STALE_WIDEN_PERIOD;
     }
 
     /// @dev Non-reverting push-feed read for `_sellFloor`/`_buyFloor`. Mirrors
@@ -912,6 +1107,17 @@ contract PortfolioStrategy is BaseStrategy {
     ///      at decode time. Comparing `dec` as a `uint256` is exactly correct: a
     ///      legitimate declared value is always `< 256`, so a dirty word can never
     ///      false-positive a match.
+    /// @dev Accrues `spendBps` against the clone's lifetime slippage allowance
+    ///      and refuses once `MAX_CUMULATIVE_DECAY_BPS` is exhausted (pashov
+    ///      review finding #9). See that constant for what is metered, why the
+    ///      worst case rather than the realized loss, and why exhaustion is not
+    ///      a brick.
+    function _chargeDecayBudget(uint256 spendBps) private {
+        uint256 spent = cumulativeDecayBps + spendBps;
+        if (spent > MAX_CUMULATIVE_DECAY_BPS) revert DecayBudgetExhausted();
+        cumulativeDecayBps = spent;
+    }
+
     function _tryPushFeedPrice(uint256 i) private view returns (uint256 price, bool ok) {
         (address feed, uint256 maxAge) = _decodePushFeed(_feedIds[i]);
         if (feed.code.length == 0) return (0, false);
@@ -1102,6 +1308,25 @@ contract PortfolioStrategy is BaseStrategy {
         // preserved here; decimal-correct scaling happens in `rebalanceDelta`
         // via `_tokensToValue` using the per-allocation `_priceDecimals`.
         price = uint256(uint192(report.price));
+        // ANCHOR THE DATA STREAMS SIDE TOO (PR #195 review, item 6). The
+        // last-good price was originally recorded only in `_sellFloor` /
+        // `_buyFloor`, both of which read the feed exclusively inside
+        // `if (chainlinkVerifier == address(0))` — so in Data Streams mode the
+        // anchor stayed 0 forever and those floors still fell through to
+        // `_quoteMinOut`, the pool-quoted floor the fix exists to remove. DS
+        // mode is the case the floors' own natspec calls "reachable without any
+        // oracle failure at all", since `execute()` / `settle()` / `rebalance()`
+        // carry no signed report.
+        //
+        // This is a DON-signed, feed-id-matched, unexpired, positive price in
+        // the slot's declared decimals — the same units and the same
+        // trustworthiness as the push-mode read, so it is a valid anchor for
+        // the calls that arrive without a report of their own.
+        _lastGoodPrice[i] = price;
+        // In lockstep, always — `_staleSlippageBps` derives the band from this
+        // age, so an anchor recorded without its timestamp would be judged as
+        // maximally stale and get the widest band on its very first use.
+        _lastGoodAt[i] = block.timestamp;
     }
 
     // ── View functions ──

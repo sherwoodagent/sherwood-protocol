@@ -189,6 +189,22 @@ interface ISyndicateGovernor {
     error VaultNotRegistered();
     error VaultAlreadyRegistered();
     error NotRegisteredAgent();
+    /// @notice `propose` named a `strategy` clone whose `proposer()` is not the
+    ///         caller. `StrategyFactory.cloneAndInit` binds `_proposer` to the
+    ///         cloning caller (`ProposerMustBeSender`) so that it is "a known
+    ///         authorized address", and `BaseStrategy.execute()` then trusts
+    ///         `strategyOf(activePid) == address(this)` as its whole
+    ///         authorisation. Without this check the governor broke that
+    ///         chain: `strategy` was a label written by the proposer and
+    ///         consumed as an authorisation fact, so any registered agent
+    ///         could name a RIVAL agent's allowlisted clone and drive it to
+    ///         `State.Executed` — permanently bricking it (`AlreadyExecuted`
+    ///         thereafter) and round-tripping the vault's capital through its
+    ///         swap legs on the way.
+    error StrategyProposerMismatch();
+    /// @notice `propose` named a `strategy` clone initialized against a
+    ///         different vault than the one being proposed to.
+    error StrategyVaultMismatch();
     error StrategyDurationTooLong();
     error StrategyDurationTooShort();
     error EmptyExecuteCalls();
@@ -746,4 +762,13 @@ interface ISyndicateGovernor {
     ///         awaiting a retryable claim. Zero for `(vault, recipient, token)`
     ///         tuples that never had a failed transfer.
     function unclaimedFees(address vault, address recipient, address token) external view returns (uint256);
+
+    /// @notice Total escrowed fee liability against `vault` in `token`, summed
+    ///         over every recipient — the aggregate `unclaimedFees` never had.
+    /// @dev    Read by `SyndicateVault.totalAssets()` so escrowed fees stop
+    ///         counting as LP equity (pashov review finding #3). The assets
+    ///         sit in the vault but are owed to fee recipients, so a vault that
+    ///         cannot see this figure prices its shares above its real equity
+    ///         and lets redeemers take the difference.
+    function outstandingEscrow(address vault, address token) external view returns (uint256);
 }

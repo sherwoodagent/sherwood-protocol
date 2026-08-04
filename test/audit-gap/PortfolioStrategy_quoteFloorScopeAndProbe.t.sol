@@ -15,6 +15,13 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 ///         as `test/audit-2/PortfolioStrategy_floorsAndOracle.t.sol`, declared
 ///         locally so this suite has no cross-file test dependency.
 contract MockVaultWithGovernor {
+    /// @dev `BaseStrategy.onlyProposer` re-checks the vault's live agent set on
+    ///      every proposer-gated call, so a vault stand-in must answer this or
+    ///      `rebalance` / `rebalanceDelta` / `updateParams` all fail closed.
+    function isAgent(address) external pure returns (bool) {
+        return true;
+    }
+
     address public governor;
 
     constructor(address governor_) {

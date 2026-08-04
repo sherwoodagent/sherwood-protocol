@@ -1498,7 +1498,28 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             // underwrote this proposal and is slashed at the ceiling; a
             // released one means they did not and owe nothing. Nothing about
             // the SIZE of the loss enters the rate.
-            if (_recorded[key][g].usd == 0) continue;
+            //
+            // THE PREDICATE IS THE PLEDGE, NOT THE BOOKING (pashov review
+            // finding #13) — the same correction issue #83 made to
+            // `TokenCourt._recordAccused`, and audit-181 findings A/C made to
+            // `freezeCoverage` and `pinCoverageUntil`. `_recorded.usd` is
+            // rewritten in BOTH directions by `settleCoverage`, which is
+            // permissionless, re-runnable, and deliberately NOT freeze-gated —
+            // "a number anyone may move while a challenge is live", in
+            // `pledgedOf`'s own words. `_reservedUsd` is written only by
+            // `recordApproval` and erased only by `releaseApproval`, which a
+            // filed challenge blocks outright with `CoverageFrozen`.
+            //
+            // This is the site that decides WHO A CONVICTION SLASHES, and the
+            // rate it hands back is binary — `BPS_DENOMINATOR` or nothing — so
+            // a single floored division inside `_allocate` was the whole
+            // difference between a guardian losing 100% of a live stake and
+            // losing nothing, on a basis a stranger could recompute at will.
+            // Whether that floor is reachable today rests on operand
+            // magnitudes rather than on any enforced invariant, which is the
+            // wrong thing to depend on; keying the predicate to the pledge
+            // removes the dependency instead of re-arguing it.
+            if (_reservedUsd[key][g] == 0) continue;
             bps[i] = BPS_DENOMINATOR;
         }
     }

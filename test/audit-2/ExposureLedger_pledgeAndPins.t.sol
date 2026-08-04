@@ -259,6 +259,53 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
         assertEq(ledger.frozenCoverageCount(), 1);
     }
 
+    /// @notice PASHOV REVIEW FINDING #13: the LAST consumer still keyed on the
+    ///         booking was `slashBpsFor` — the one that decides WHO A
+    ///         CONVICTION SLASHES.
+    /// @dev    Issue #83 moved `TokenCourt._recordAccused` off the booking, and
+    ///         audit-181 findings A/C moved `freezeCoverage` and
+    ///         `pinCoverageUntil` (the tests either side of this one). This
+    ///         site was left behind, so the same permissionless, re-runnable,
+    ///         deliberately-not-freeze-gated `settleCoverage` those fixes
+    ///         defend against could still drop a guardian out of the slash set
+    ///         entirely. The rate is BINARY — `BPS_DENOMINATOR` or nothing — so
+    ///         one integer division floored to zero was the whole difference
+    ///         between losing 100% of a live stake and losing none of it.
+    ///
+    ///         Same fixture as the `freezeCoverage` test above, one assertion
+    ///         further along: booking zero, pledge intact, guardian still named
+    ///         at the ceiling.
+    function test_finding13_slashBpsForNamesGuardianWhoseBookingWasSettledToZero() public {
+        address g2 = makeAddr("g2");
+        swood.setStake(guardian, 5_000e18);
+        swood.setStake(g2, 5_000e18);
+        mgov.set(_requiredCoverage6(10_000e18));
+        mgov.setSchedule(block.timestamp + 1 days, 3 days);
+
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, g2);
+        vm.stopPrank();
+
+        skip(31 days);
+
+        swood.setStake(guardian, 0);
+        ledger.settleCoverage(address(mgov), 1);
+
+        (, uint256[] memory booked) = ledger.approversOf(address(mgov), 1);
+        assertEq(booked[0], 0, "fixture: the live booking really is zero");
+        (, uint256[] memory pledged) = ledger.pledgedOf(address(mgov), 1);
+        assertEq(pledged[0], 10_000e18, "fixture: the pledge is untouched");
+
+        (address[] memory accused, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(accused[0], guardian, "the guardian is still listed");
+        assertEq(
+            bps[0],
+            10_000,
+            "a zeroed BOOKING must not drop a pledged guardian out of the slash set: the predicate is the pledge"
+        );
+    }
+
     /// @notice The `pinCoverageUntil` sibling of the same defect: a pin issued
     ///         while the guardian's booking reads zero (but its pledge does
     ///         not) must still raise the pin, not silently skip the guardian.

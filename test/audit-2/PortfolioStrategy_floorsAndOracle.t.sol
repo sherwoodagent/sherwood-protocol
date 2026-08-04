@@ -15,6 +15,20 @@ import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 ///         fixture shape — declared locally rather than imported, since this
 ///         suite must not depend on a file another agent may be editing.
 contract MockVaultWithGovernor {
+    /// @dev `BaseStrategy.onlyProposer` re-checks the vault's live agent set on
+    ///      every proposer-gated call, so a vault stand-in must answer this or
+    ///      `rebalance` / `rebalanceDelta` / `updateParams` all fail closed.
+    ///      Stored inverted so the zero default is "still an agent".
+    mapping(address => bool) internal _revoked;
+
+    function isAgent(address a) external view returns (bool) {
+        return !_revoked[a];
+    }
+
+    function setAgent(address a, bool allowed) external {
+        _revoked[a] = !allowed;
+    }
+
     address public governor;
 
     constructor(address governor_) {
@@ -236,6 +250,63 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // pashov review finding #9 — bounded rebalancing, live proposer standing
+    // ════════════════════════════════════════════════════════════════════
+
+    /// @dev FINDING #9a. `maxSlippageBps` bounded ONE swap, but nothing bounded
+    ///      how many full-notional round trips the proposer could take, so the
+    ///      per-call allowance composed multiplicatively (`1-(1-s)^2N`) over an
+    ///      unlimited call count for the whole `strategyDuration`. None of this
+    ///      traffic passes `SyndicateVault.executeGovernorBatch`, so neither
+    ///      `BatchExecutorLib`'s per-call caps nor the vault's `maxNetOutflow`
+    ///      meter ever saw it — the capital is already inside the clone.
+    ///      `cumulativeDecayBps` charges the worst case (`2 * maxSlippageBps`
+    ///      per full rebalance) and refuses once `MAX_CUMULATIVE_DECAY_BPS` is
+    ///      spent. Pre-fix this loop never terminated.
+    function test_finding9_rebalanceDecayBudgetIsFinite() public {
+        Rig memory r = _rig();
+
+        uint256 perCall = 2 * SLIPPAGE_100;
+        uint256 allowed = r.strategy.MAX_CUMULATIVE_DECAY_BPS() / perCall;
+
+        for (uint256 i; i < allowed; ++i) {
+            vm.prank(proposer);
+            r.strategy.rebalance();
+        }
+        assertEq(r.strategy.cumulativeDecayBps(), allowed * perCall, "budget accounted exactly");
+
+        vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.DecayBudgetExhausted.selector);
+        r.strategy.rebalance();
+    }
+
+    /// @dev FINDING #9b. `_proposer` is written once at `initialize` and was
+    ///      never re-validated, while `SyndicateVault.removeAgent` — the
+    ///      owner's revocation lever — only deletes `_agents[a]` and reaches no
+    ///      already-deployed clone. A de-registered agent therefore kept
+    ///      unbounded `rebalance` / `rebalanceDelta` / `updateParams` authority
+    ///      over deployed capital for the rest of `strategyDuration`, and the
+    ///      owner's only alternatives were demoting the shared swap adapter or
+    ///      price feed (blast radius: every strategy on the protocol) or
+    ///      waiting for a permissionless settle. `rebalance` already re-checked
+    ///      the ADAPTER and the PRICE SOURCES live; the CALLER was the one
+    ///      input still trusted from init.
+    function test_finding9_removedAgentLosesProposerRightsOnLiveClone() public {
+        Rig memory r = _rig();
+
+        vm.prank(proposer);
+        r.strategy.rebalance(); // still an agent: ordinary path works
+
+        // The vault owner revokes the agent. That call touches the vault only —
+        // the live clone is untouched, which is exactly the gap.
+        r.vault.setAgent(proposer, false);
+
+        vm.prank(proposer);
+        vm.expectRevert(BaseStrategy.ProposerNoLongerAgent.selector);
+        r.strategy.rebalance();
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // Finding A — _sellFloor must degrade, not revert, on a broken push feed
     // ════════════════════════════════════════════════════════════════════
 
@@ -312,14 +383,23 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         assertEq(weth.balanceOf(address(r.vault)), vaultWethBefore + TOTAL_AMOUNT);
     }
 
-    /// @dev THE BOUNDARY SECOND, made observable. At the exact instant the
-    ///      feed is still fresh, `_sellFloor` is oracle-anchored and must
-    ///      reject a swap against a manipulated pool. One tick past
-    ///      `MAX_PUSH_PRICE_AGE`, the SAME manipulated pool must be allowed
-    ///      through via the quote-anchored fallback — proving the two
-    ///      branches of `_sellFloor` actually diverge at the boundary,
-    ///      rather than one of them being dead code.
-    function test_sellFloor_boundary_freshRejectsManipulation_staleAllowsIt() public {
+    /// @dev THE BOUNDARY SECOND, made observable — REWRITTEN for pashov review
+    ///      finding #4. This test used to assert that one tick past
+    ///      `MAX_PUSH_PRICE_AGE` the SAME manipulated pool was ALLOWED
+    ///      through, via the quote-anchored fallback. That allowance WAS the
+    ///      finding: the fallback derives `minOut` from a quote taken in the
+    ///      same transaction against the very pool the swap is about to hit,
+    ///      so `maxSlippageBps` bounded drift from a price the attacker had
+    ///      just set. `_sellFloor` now falls back to the last price this
+    ///      contract itself observed from the allowlisted feed —
+    ///      attacker-independent however stale — so BOTH sides of the boundary
+    ///      reject the manipulation.
+    ///
+    ///      `test_sellFloor_staleAnchor_stillClearsUnmanipulated` below pins
+    ///      the other half, which is why this is not simply a fail-closed
+    ///      change: a stale feed must still let an HONEST settle through, or
+    ///      capital is stranded for the length of the outage.
+    function test_sellFloor_boundary_freshAndStaleBothRejectManipulation() public {
         // ── Fresh side: oracle floor rejects a pool moved to half price ──
         Rig memory rFresh = _rig();
         rFresh.adapter.setRate(address(tsla), address(weth), 0.5e18); // pool moved 2x against the vault
@@ -333,10 +413,86 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         rStale.adapter.setRate(address(tsla), address(weth), 0.5e18);
         rStale.feed.setUpdatedAt(START - DEFAULT_MAX_AGE - 1);
         vm.warp(START + 1);
-        uint256 vaultWethBefore = weth.balanceOf(address(rStale.vault));
+        // Post-finding-#4: the stale branch no longer quotes the pool it is
+        // about to trade. It anchors to the last price observed from the feed
+        // during execute, which the manipulation cannot move, so the same 2x
+        // pool move is rejected here exactly as on the fresh side above.
         vm.prank(address(rStale.vault));
-        rStale.strategy.settle(); // now succeeds: quote-anchored fallback matches the manipulated rate
-        assertGt(weth.balanceOf(address(rStale.vault)), vaultWethBefore, "settle must still clear once stale");
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
+        rStale.strategy.settle();
+    }
+
+    /// @dev The liveness half of finding #4, and the reason the fix is a
+    ///      stale-price ANCHOR rather than a fail-closed revert. With the feed
+    ///      one tick past its max age and the pool NOT manipulated, settle must
+    ///      still clear — otherwise a routine equity-feed gap (this contract's
+    ///      own `MAX_PUSH_PRICE_AGE` notes 77h over holiday weekends) would
+    ///      strand the vault's capital for the length of the outage.
+    function test_sellFloor_staleAnchor_stillClearsUnmanipulated() public {
+        Rig memory r = _rig();
+        r.feed.setUpdatedAt(START - DEFAULT_MAX_AGE - 1);
+        vm.warp(START + 1);
+
+        uint256 vaultWethBefore = weth.balanceOf(address(r.vault));
+        vm.prank(address(r.vault));
+        r.strategy.settle();
+        assertGt(weth.balanceOf(address(r.vault)), vaultWethBefore, "honest settle must still clear once stale");
+    }
+
+    /// @notice PR #195 re-review: the stale band must widen with the ANCHOR'S
+    ///         AGE, or a long outage plus an honest gap move strands capital.
+    /// @dev    `test_sellFloor_staleAnchor_stillClearsUnmanipulated` above only
+    ///         exercises an UNMOVED pool, so it cannot see this. A fixed
+    ///         `STALE_PRICE_SLIPPAGE_BPS` of 1,000 cannot tell a manipulation
+    ///         from a real move, and `_sellFloor` sits on `_settle()` — the only
+    ///         exit. An equity feed dark for a week (this contract's own
+    ///         `MAX_PUSH_PRICE_AGE` documents 77h holiday gaps) plus an
+    ///         earnings gap past 10% made every swap revert on its floor, with
+    ///         no lever to widen it: `STALE_PRICE_SLIPPAGE_BPS` is a constant,
+    ///         and finding #9's live `isAgent` re-check can strip the proposer
+    ///         of `updateParams` too. That is fail-closed on the exit path,
+    ///         which is the outcome finding #4's fix set out to avoid.
+    ///
+    ///         Both halves are asserted together because the widening is only
+    ///         correct if the ceiling stays binding: an attacker who simply
+    ///         waits out the whole ramp must still be rejected.
+    function test_reviewItem2_staleBandWidensWithAnchorAge_gapSettlesManipulationDoesNot() public {
+        // BOTH RIGS BUILT BEFORE THE WARP, and this ordering is load-bearing.
+        // `_rig()` hardcodes its feed's `updatedAt` to `START`, so a rig
+        // constructed after the warp executes against an already-stale feed,
+        // records NO anchor, and falls through to `_quoteMinOut` — the
+        // never-priced path, not the stale-anchor path this test is about.
+        // Each rig owns its own adapter and feed, so they do not interfere.
+        // (Built forward-only: `vm.warp` backwards is a no-op on forge 1.7.1.)
+        Rig memory rGap = _rig();
+        Rig memory rAttack = _rig();
+
+        // Both anchors were taken at `START` by `execute`. Age them past the
+        // full ramp, with the feeds left dark throughout.
+        vm.warp(START + 7 days + 1);
+
+        // ── Liveness: a genuine 20% gap clears once the anchor is fully aged ──
+        // The market really moved — the pool now pays 0.8 WETH per TSLA. At the
+        // fully-ramped 3,000 bps band the floor is 0.70x and this clears; at the
+        // old fixed 1,000 bps band the floor is 0.90x and `settle()` reverts,
+        // stranding the position for the length of the outage.
+        rGap.adapter.setRate(address(tsla), address(weth), 0.8e18);
+
+        uint256 vaultWethBefore = weth.balanceOf(address(rGap.vault));
+        vm.prank(address(rGap.vault));
+        rGap.strategy.settle();
+        assertEq(tsla.balanceOf(address(rGap.strategy)), 0, "an honest gap move must not strand the position");
+        assertGt(weth.balanceOf(address(rGap.vault)), vaultWethBefore, "capital must return to the vault");
+
+        // ── Security: waiting out the ramp does NOT buy an unbounded take ──
+        // Same fully-aged anchor, but the pool is pushed 2x against the vault.
+        // 0.50x is past even the `MAX_STALE_SLIPPAGE_BPS` floor of 0.70x, so the
+        // anchor still binds — the band widens, it never stops applying.
+        rAttack.adapter.setRate(address(tsla), address(weth), 0.5e18);
+
+        vm.prank(address(rAttack.vault));
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
+        rAttack.strategy.settle();
     }
 
     // ════════════════════════════════════════════════════════════════════

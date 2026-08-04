@@ -133,6 +133,12 @@
       "type": "t_contract(IExposureLedger)"
     },
     {
+      "label": "pauseShiftTotal",
+      "slot": "21",
+      "offset": 20,
+      "type": "t_uint64"
+    },
+    {
       "label": "__gap",
       "slot": "22",
       "offset": 0,
@@ -240,6 +246,12 @@
         "slot": "4",
         "offset": 0,
         "type": "t_uint256"
+      },
+      {
+        "label": "clockShiftAtOpen",
+        "slot": "5",
+        "offset": 0,
+        "type": "t_uint64"
       }
     ],
     "t_struct(Review)_storage": [
@@ -307,6 +319,24 @@
         "label": "reviewEnd",
         "slot": "2",
         "offset": 18,
+        "type": "t_uint64"
+      },
+      {
+        "label": "minSlashBpsAtOpen",
+        "slot": "2",
+        "offset": 26,
+        "type": "t_uint16"
+      },
+      {
+        "label": "maxSlashBpsAtOpen",
+        "slot": "2",
+        "offset": 28,
+        "type": "t_uint16"
+      },
+      {
+        "label": "clockShiftAtRegister",
+        "slot": "3",
+        "offset": 0,
         "type": "t_uint64"
       }
     ],

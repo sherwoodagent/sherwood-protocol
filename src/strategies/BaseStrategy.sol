@@ -15,6 +15,15 @@ interface IGovernorBinding {
     function governor() external view returns (address);
 }
 
+/// @notice The vault's live agent set, consulted by `onlyProposer` so that a
+///         de-registered agent loses its standing on already-deployed clones
+///         (pashov review finding #9). Declared locally for the same reason
+///         `IGovernorBinding` is: to generate the selector, not to type the
+///         vault.
+interface IAgentSet {
+    function isAgent(address agentAddress) external view returns (bool);
+}
+
 /**
  * @title BaseStrategy
  * @notice Abstract base for strategy contracts. The vault calls execute() and
@@ -39,6 +48,9 @@ abstract contract BaseStrategy is IStrategy {
     // ── Errors ──
     error AlreadyInitialized();
     error NotProposer();
+    /// @notice The clone's pinned `_proposer` is no longer in the vault's live
+    ///         agent set. See the `onlyProposer` natspec.
+    error ProposerNoLongerAgent();
     error NotVault();
     error NotExecuted();
     error AlreadyExecuted();
@@ -87,8 +99,39 @@ abstract contract BaseStrategy is IStrategy {
         _initialized = true;
     }
 
+    /// @dev RE-CHECKED LIVE, NOT JUST AGAINST THE PIN (pashov review finding
+    ///      #9). `_proposer` is written once at `initialize` and never
+    ///      revisited, while `SyndicateVault.removeAgent` — the owner's
+    ///      revocation lever — only deletes `_agents[a]` and reaches no
+    ///      already-deployed clone. A de-registered agent therefore kept
+    ///      unbounded `updateParams` / `rebalance` / `rebalanceDelta` authority
+    ///      over deployed capital for the rest of `strategyDuration` (30 days
+    ///      by factory default, up to `ABSOLUTE_MAX_STRATEGY_DURATION`), and
+    ///      the owner's only alternatives were demoting the shared swap adapter
+    ///      or price feed — whose blast radius is every strategy on the
+    ///      protocol — or waiting for a permissionless settle.
+    ///
+    ///      `PortfolioStrategy.rebalance` already re-checks the swap ADAPTER
+    ///      and the price SOURCES live on every call; this closes the same gap
+    ///      for the CALLER, which was the one input still trusted from init.
+    ///      Failing closed strands nothing: `settle()` is `onlyVault` and never
+    ///      consults this modifier, so the exit path is unaffected.
+    ///      RAW STATICCALL, NOT A HIGH-LEVEL CALL — same doctrine as
+    ///      `SyndicateVault._openProposalPid` / `_pricingSupply` and
+    ///      `ExposureLedger._feedPriceX8`. A typed call into a vault that does
+    ///      not answer `isAgent` reverts in THIS frame with no data, which
+    ///      turns a missing selector into an undecodable failure of every
+    ///      proposer-gated path rather than a stated one. Decoding the answer
+    ///      explicitly keeps the failure branch a DECISION: a vault that says
+    ///      `false`, and a vault that cannot answer at all, both fail closed
+    ///      here with a named error — closed rather than open because the
+    ///      whole point is that revocation must bite, and blocking a
+    ///      rebalance strands nothing (`settle()` is `onlyVault` and never
+    ///      consults this modifier).
     modifier onlyProposer() {
         if (msg.sender != _proposer) revert NotProposer();
+        (bool ok, bytes memory ret) = _vault.staticcall(abi.encodeCall(IAgentSet.isAgent, (_proposer)));
+        if (!ok || ret.length != 32 || !abi.decode(ret, (bool))) revert ProposerNoLongerAgent();
         _;
     }
 
