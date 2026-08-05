@@ -439,6 +439,105 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         return true;
     }
 
+    // ―――――――――――― One-shot latches (ghost-backed) ――――――――――――
+    // Each of these guards a fact the protocol commits to ONCE. State alone
+    // cannot prove a latch was never re-opened — only a remembered previous
+    // observation can — so these read and update a ghost, and are therefore
+    // deliberately NOT `view`, matching the existing GL-23/26/30/31 pattern.
+
+    /// @notice GL-25 `SHOULD-HOLD` — `proposal.executedAt` is a one-shot latch.
+    /// @dev It is the pre-drain snapshot basis every slash is measured against,
+    ///      and `ChallengeGame.file` pins it onto the challenge precisely so a
+    ///      governor cannot move it afterwards. If it could be rewritten while a
+    ///      challenge is live, the accusation would be re-anchored to a
+    ///      different moment than the one it was filed about.
+    function property_GL25_executedAtIsOneShot() public returns (bool) {
+        uint256 n = governor.proposalCount();
+        for (uint256 pid = 1; pid <= n; pid++) {
+            uint256 cur = governor.getProposal(pid).executedAt;
+            uint256 prev = ghosts.lastExecutedAt[pid];
+            if (prev != 0 && cur != prev) return false;
+            if (cur != 0) ghosts.lastExecutedAt[pid] = cur;
+        }
+        return true;
+    }
+
+    /// @notice GL-32 `SHOULD-HOLD` — `caseOfChallenge` is set once per
+    ///         challenge.
+    /// @dev A second referral would hand one challenge two adjudications, and
+    ///      the two verdicts could disagree — `rule` would then be callable
+    ///      twice against the same bond. Relevant because referral has TWO
+    ///      entry points: the auto-referral inside `dispute` and the explicit
+    ///      `TokenCourt.refer`.
+    function property_GL32_caseOfChallengeSetOnce() public returns (bool) {
+        uint256 n = game.challengeCount();
+        for (uint256 id = 1; id <= n; id++) {
+            uint256 cur = court.caseOfChallenge(address(game), id);
+            uint256 prev = ghosts.lastCaseOfChallenge[id];
+            if (prev != 0 && cur != prev) return false;
+            if (cur != 0) ghosts.lastCaseOfChallenge[id] = cur;
+        }
+        return true;
+    }
+
+    /// @notice GL-33 `SHOULD-HOLD` — `isAccused` is never cleared mid-case.
+    /// @dev The bar exists so an approver cannot vote on their own conviction.
+    ///      Clearing it before `finalize` would let the accused cohort acquit
+    ///      itself, which is the single most valuable state to reach for an
+    ///      attacker in the whole court.
+    function property_GL33_accusedFlagNeverCleared() public returns (bool) {
+        uint256 n = court.caseCount();
+        for (uint256 id = 1; id <= n; id++) {
+            for (uint256 a; a < actors.length; a++) {
+                bool cur = court.isAccused(id, actors[a]);
+                if (cur) {
+                    ghosts.everAccused[id][actors[a]] = true;
+                } else if (ghosts.everAccused[id][actors[a]]) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// @notice GL-35 `SHOULD-HOLD` — x-ray G-19: a proposal's settle price is
+    ///         stamped at most once.
+    /// @dev The queue reserves assets at the stamped price, so re-stamping
+    ///      would re-price redemptions that already have a claim against the
+    ///      old one — the mid-flight NAV re-pricing surface the single stamp
+    ///      exists to close.
+    function property_GL35_settlePriceStampIsOneShot() public returns (bool) {
+        uint256 n = governor.proposalCount();
+        for (uint256 pid = 1; pid <= n; pid++) {
+            bool cur = queue.getSettlePrice(pid).stamped;
+            if (cur) {
+                ghosts.everStamped[pid] = true;
+            } else if (ghosts.everStamped[pid]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// @notice GL-37 `SHOULD-HOLD` — `Review.opened` and `Review.resolved` are
+    ///         each one-shot.
+    /// @dev Re-opening a resolved review would re-run the slash path over a
+    ///      cohort already judged, and re-opening an opened one would reset the
+    ///      window guardians are voting inside. Both flags gate
+    ///      `slashGuardians`, so neither may fall back to false.
+    function property_GL37_reviewFlagsAreOneShot() public returns (bool) {
+        uint256 n = governor.proposalCount();
+        for (uint256 pid = 1; pid <= n; pid++) {
+            bytes32 key = keccak256(abi.encode(address(governor), pid));
+            (bool opened, bool resolved,,) = registry.getReviewState(address(governor), pid);
+            if (opened) ghosts.everOpened[key] = true;
+            else if (ghosts.everOpened[key]) return false;
+            if (resolved) ghosts.everResolved[key] = true;
+            else if (ghosts.everResolved[key]) return false;
+        }
+        return true;
+    }
+
     /// @notice GL-03 `SHOULD-HOLD` — the escrow's WOOD balance always covers
     ///         every bond it still owes.
     /// @dev Solvency in the same shape as GL-01: a bond that is still locked is
@@ -459,19 +558,41 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     /// @notice GL-10 `SHOULD-HOLD` — vault asset accounting never creates or
     ///         destroys the underlying: every minted asset sits in exactly one
     ///         known holder.
+    ///
     /// @dev The asset is a mock whose only mint path is `deal` at setup, so
-    ///      `totalSupply()` is the closed universe. Holders are the six actors
-    ///      plus the three contracts that can custody assets — vault, queue
-    ///      escrow, and the batch adapter. Equality (not `<=`) is safe here
-    ///      because, unlike GL-09's share set, no handler can route assets to an
-    ///      address outside this list: transfers go through vault entry points
-    ///      whose destinations are all enumerated above.
+    ///      `totalSupply()` is a closed universe and equality is the right
+    ///      shape — but only if the holder set is genuinely complete.
+    ///
+    ///      IT WAS NOT, on the first campaign. This originally counted actors
+    ///      plus vault/queue/adapter/governor, with a docstring asserting that
+    ///      "no handler can route assets to an address outside this list". The
+    ///      fuzzer refuted that in three calls
+    ///      (`donateERC20 -> lifecycle_toExecuted -> lifecycle_toSettled`):
+    ///      SETTLEMENT PAYS FEES. The management fee goes to the vault owner —
+    ///      which in this harness is the test contract itself — and the
+    ///      protocol/guardian legs go to whatever `ProtocolConfig` names. None
+    ///      of those was counted, so a settled proposal always "lost" assets.
+    ///
+    ///      The recipients are read LIVE rather than hardcoded, because the
+    ///      secondary dispatcher can re-point them mid-campaign. Zero addresses
+    ///      are skipped: an unseated recipient does not strand its leg, the
+    ///      governor hands that slice to the proposer as remainder, and the
+    ///      proposer is already an actor.
+    ///
+    ///      Kept as `==`, not relaxed to `<=`. A future failure means either
+    ///      conservation genuinely broke or a NEW asset sink was introduced —
+    ///      and the counterexample sequence distinguishes them immediately, as
+    ///      it did here. That is worth more than a bound that can never fire.
     function property_GL10_assetSupplyConserved() public view returns (bool) {
         uint256 sum = asset.balanceOf(address(vault)) + asset.balanceOf(address(queue))
-            + asset.balanceOf(address(adapter)) + asset.balanceOf(address(governor));
+            + asset.balanceOf(address(adapter)) + asset.balanceOf(address(governor)) + asset.balanceOf(address(this)); // vault owner: management-fee sink
         for (uint256 i; i < actors.length; i++) {
             sum += asset.balanceOf(actors[i]);
         }
+        address p = protocolConfig.protocolFeeRecipient();
+        address g = protocolConfig.guardiansFeeRecipient();
+        if (p != address(0) && p != address(this)) sum += asset.balanceOf(p);
+        if (g != address(0) && g != address(this) && g != p) sum += asset.balanceOf(g);
         return sum == asset.totalSupply();
     }
 

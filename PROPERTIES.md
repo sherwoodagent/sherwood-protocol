@@ -82,7 +82,7 @@ Checked after every call sequence.
   `Draft→{Pending,Cancelled,Expired}`, `Pending→{GuardianReview,Approved,Rejected,Expired,Cancelled}`,
   `GuardianReview→{Approved,Rejected,Expired,Cancelled}`, `Approved→{Executed,Expired,Cancelled}`,
   `Executed→{Settled}`.
-- [ ] **GL-25** `SHOULD-HOLD` — `proposal.executedAt` is a one-shot latch, never reset or overwritten.
+- [x] **GL-25** `SHOULD-HOLD` — `proposal.executedAt` is a one-shot latch, never reset or overwritten.
   `ChallengeGame.file` and `TokenCourt.refer` both derive snapshots from it.
 - [x] **GL-26** `SHOULD-HOLD` — a challenge reaches exactly one terminal status and never
   changes after (x-ray I-25).
@@ -95,14 +95,14 @@ Checked after every call sequence.
 - [x] **GL-30** `SHOULD-HOLD` — a court case's phase goes `Voting→Resolved` once, never back.
 - [x] **GL-31** `SHOULD-HOLD` — `voteOf[caseId][voter]` is one-shot: NatSpec says
   "NO VOTE CHANGES" (x-ray I-26).
-- [ ] **GL-32** `SHOULD-HOLD` — `caseOfChallenge[game][challengeId]` is set once.
-- [ ] **GL-33** `SHOULD-HOLD` — `isAccused[caseId][addr]` is never cleared mid-case.
+- [x] **GL-32** `SHOULD-HOLD` — `caseOfChallenge[game][challengeId]` is set once.
+- [x] **GL-33** `SHOULD-HOLD` — `isAccused[caseId][addr]` is never cleared mid-case.
 - [x] **GL-34** `SHOULD-HOLD` — a queue request's `claimed` and `cancelled` are mutually
   exclusive and each one-shot.
-- [ ] **GL-35** `SHOULD-HOLD` — `_settlePrice[pid].stamped` is one-shot (x-ray G-19).
+- [x] **GL-35** `SHOULD-HOLD` — `_settlePrice[pid].stamped` is one-shot (x-ray G-19).
 - [x] **GL-36** `SHOULD-HOLD` — a bond record goes `0 → proposer → 0` via exactly one of
   release XOR forfeit (x-ray I-24).
-- [ ] **GL-37** `SHOULD-HOLD` — `Review.opened` and `Review.resolved` are each one-shot.
+- [x] **GL-37** `SHOULD-HOLD` — `Review.opened` and `Review.resolved` are each one-shot.
 - [ ] **GL-38** `SHOULD-HOLD` — a TierRegistry bond's `releasableAt` is one-shot per bond
   instance; a fresh bond is a new struct, not a reset.
 
@@ -135,6 +135,27 @@ Checked after every call sequence.
   <= their slashable stake. This is x-ray X-8, flagged On-chain=**No** — the
   mathematical core of E-1 that nothing currently asserts.
 
+  **VIOLATED — counterexample found (deep campaign, 2026-08-05).** Shrunk to
+  exactly two calls:
+  `syndicateGovernor_lifecycle_toExecuted` then
+  `challengeGame_lifecycle_toConviction`.
+
+  The mechanism is the one the EXPLORATORY tag anticipated: `recordApproval`
+  enforces `open < kNumerator * slashableBondUsd` **at booking time**, but the
+  right-hand side is a LIVE read. A conviction slashes the approving guardians,
+  their slashable bond falls, and the coverage already booked against it does
+  not move — so the cohort ends the sequence carrying more booked coverage than
+  the stake now backing it.
+
+  Not automatically a bug: the exposure covers a proposal whose challenge has
+  already been adjudicated, so the two figures arguably describe different
+  moments. What it does establish is that X-8 does **not** hold as a standing
+  invariant — only as a booking-time precondition — and that the gap is
+  reachable in two calls from a clean state, with no adversarial parameter
+  tuning. Since E-1 rests on this, whether post-slash exposure should be
+  unwound (or the claim restated) is worth a decision rather than an
+  assumption.
+
 ### Liveness and economics
 
 - [ ] **GL-50** `EXPLORATORY` — an `Executed` proposal can always reach `Settled` through
@@ -149,6 +170,21 @@ Checked after every call sequence.
   and no single setter can enforce the condition because its inputs span two
   independently-owned contracts. A counterexample names a parameter tuple
   governance must not ship — it is not a protocol bug.
+
+  **VIOLATED, as designed — counterexample found (deep campaign, 2026-08-05).**
+  Shrunk to a SINGLE owner call from deploy defaults:
+  `setChallengerBondBps(3238)` → `honestFilingNetPayoffBps() == -1_419_000`.
+
+  With the shipped defaults (`proposerBondBps` 100, `prosecutorFeeBps` 2000,
+  `settleBurnBps` 500) the break-even challenger bond is
+  `100 * 2000 / 500 = 400` bps. The default is 150 — safe, with 2.7× margin —
+  but `setChallengerBondBps` accepts anything up to 10 000, i.e. **25× past the
+  point where filing an honest challenge stops paying**, and nothing on-chain
+  or in the setter warns. One owner transaction, no timelock on this surface,
+  silently switches the challenge game off: filing still works, it just never
+  makes sense to do it, and the protocol's only enforcement mechanism is
+  economic. Recommend a documented operating band for these four parameters, or
+  a monitored alert on `honestFilingBreaksEven()`.
 
 ---
 

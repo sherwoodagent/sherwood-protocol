@@ -128,6 +128,23 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         // bond that took both exits.
         mapping(bytes32 => bool) bondReleased;
         mapping(bytes32 => bool) bondForfeited;
+        // GL-25: proposalId => last observed `executedAt`. A one-shot latch:
+        // once non-zero it must never change, or a challenge's slash basis
+        // could be moved out from under it after the fact.
+        mapping(uint256 => uint256) lastExecutedAt;
+        // GL-32: challengeId => last observed caseId. Set once; a second
+        // referral would give one challenge two adjudications.
+        mapping(uint256 => uint256) lastCaseOfChallenge;
+        // GL-33: caseId => account => whether `isAccused` was EVER observed
+        // true. Clearing it mid-case would let an approver vote on their own
+        // conviction.
+        mapping(uint256 => mapping(address => bool)) everAccused;
+        // GL-35: pid => whether the settle price was EVER observed stamped.
+        // Re-stamping would re-price already-settled redemptions.
+        mapping(uint256 => bool) everStamped;
+        // GL-37: reviewKey => whether opened/resolved were EVER observed true.
+        mapping(bytes32 => bool) everOpened;
+        mapping(bytes32 => bool) everResolved;
         // GL-39: last observed value of each monotonic counter.
         uint256 lastProposalCount;
         uint256 lastChallengeCount;
