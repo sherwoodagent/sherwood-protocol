@@ -47,10 +47,12 @@ On the fork the deployer (`0x5A00afAecE9CF61A768E2AE2713084C8d354DF94`) SHALL be
 - **THEN** the first broadcast fails for gas; funding via `tenderly_setBalance` then re-running succeeds
 
 ### Requirement: Deploy ceremony order and skip rules
-The fork ceremony SHALL run three scripts in order, each broadcast with the flags above:
+The fork ceremony SHALL run five scripts in order, each broadcast with the flags above:
 1. `script/robinhood-mainnet/Deploy.s.sol:DeployRobinhoodMainnet` with `WOOD_TOKEN=<live WOOD>`, `SKIP_MULTISIG_HANDOFF=true`, `ROBINHOOD_FORK_CHAIN_ID=9994663` — core + zero-adapter PriceRouter; no ENS/ERC-8004 (both registrar addresses are `address(0)` on Robinhood).
 2. `script/robinhood-mainnet/DeployPortfolioStrategy.s.sol` — UniswapSwapAdapter (v3+v4) + PortfolioStrategy template.
-3. `script/DeployStrategyFactory.s.sol` with `SKIP_MULTISIG_HANDOFF=true` — keyless-clone StrategyFactory + template approvals.
+3. `script/robinhood-mainnet/DeployMorphoStrategy.s.sol` — MorphoSupplyStrategy template. Separate from step 2 because that script reads four Uniswap addresses to build its adapter and this template needs none of them.
+4. `script/robinhood-mainnet/DeployConcentratedLiquidityStrategy.s.sol` — ConcentratedLiquidityStrategy template. It reads `UNISWAP_V3_POSITION_MANAGER`, `UNISWAP_V3_FACTORY` and `MORPHO_BLUE` from the address book and asserts the position manager's identity, not merely its code presence; the first and third keys SHALL be seeded before this step runs.
+5. `script/DeployStrategyFactory.s.sol` with `SKIP_MULTISIG_HANDOFF=true` — keyless-clone StrategyFactory + template approvals.
 
 `DeployWood` SHALL be skipped — WOOD is already live on the fork. CREATE3 makes the core addresses order-independent. With handoff skipped, the deployer retains ownership of beacon / factory / registry / sWOOD / ProtocolConfig / PriceRouter (needed for fork admin); on the real mainnet ceremony `SKIP_MULTISIG_HANDOFF` SHALL NOT be used and `OWNER_MULTISIG` MUST be a contract (Safe), not an EOA.
 
@@ -69,12 +71,28 @@ Both are seeded to the DEPLOYER as a placeholder, never as the destination. The 
 - **THEN** validation FAILS naming that leg, because the guardian budget would otherwise pay the proposer with nothing on-chain to notice
 
 #### Scenario: Post-deploy validation reads
-- **WHEN** the three scripts complete
+- **WHEN** the five scripts complete
 - **THEN** the operator verifies `factory.beacon/priceRouter/protocolConfig`, `swood.wood == WOOD`, `swood.registry == registry`, `registry.reviewPeriod == 86400`, `registry.blockQuorumBps == 3000`, `strategyFactory.approvedTemplate(PORTFOLIO) == true`, and `governorImpl.MIN_VOTING_PERIOD() == 86400`
 
 #### Scenario: Mainnet ceremony with EOA multisig refused
 - **WHEN** `OWNER_MULTISIG` is an EOA and handoff is not skipped
 - **THEN** the deploy reverts "OWNER_MULTISIG must be a contract (Safe), not an EOA"
+
+### Requirement: The strategy template allowlist names only live templates
+
+`DeployStrategyFactory._templateKeys()` IS the allowlist. `StrategyFactory`'s approval map starts empty and nothing else populates it, so a template absent from that list can never be cloned by a proposal — and the deploy loop SKIPS keys it cannot resolve, requiring only `approved > 0`, so a missing entry degrades silently rather than failing the run.
+
+The list SHALL name `PORTFOLIO_TEMPLATE`, `MORPHO_SUPPLY_TEMPLATE` and `CONCENTRATED_LIQUIDITY_TEMPLATE`, and nothing else — every key on it has a live contract in `src/strategies/` and a script that deploys it. `MOONWELL_SUPPLY_TEMPLATE`, `AERODROME_LP_TEMPLATE`, `WSTETH_MOONWELL_TEMPLATE` and `MAMO_YIELD_TEMPLATE` were REMOVED (deprecated, 2026-08-04): none has a contract remaining in `src/strategies/`, they resolve only in the legacy Base books (`chains/8453.json`, `chains/84532.json`), and removal affects only a NEW `StrategyFactory` — already-deployed factories keep the approvals they were given.
+
+`MorphoSupplyStrategy` requires NO Morpho address and NO market params at deploy time. It is an ERC-1167 template: the Morpho singleton, the `MarketParams` tuple and the supply amount all arrive per clone via `_initialize(bytes)`, so they are proposal inputs. The template is deliberately left uninitialized, which is the correct resting state for a clone source.
+
+#### Scenario: Morpho template reaches the allowlist
+- **WHEN** the ceremony completes
+- **THEN** `chains/{chainId}.json` carries `MORPHO_SUPPLY_TEMPLATE`, `_templateKeys()` names it, and `StrategyFactory.templateApproved` is true for it
+
+#### Scenario: Deprecated template keys refused entry
+- **WHEN** a deprecated key is re-added to `_templateKeys()`
+- **THEN** the exact-set assertion in `test/deploy/DeployMorphoStrategy.t.sol` FAILS, because a key with no backing contract overstates what the protocol can propose
 
 ### Requirement: Core wiring order inside deployCore
 The canonical `DeploySherwood.deployCore` SHALL wire in this order: executor lib and vault impl; ProtocolConfig (plain Ownable, fee params seeded when non-zero); governor impl wrapped in a `GovernorBeacon` (per-vault governors are `BeaconProxy`s minted at `createSyndicate` — no singleton governor proxy is deployed); **sWOOD proxy before the registry proxy** (the registry's `initialize` takes the sWOOD address; the registry↔sWOOD cycle resolves via the set-once `StakedWood.setRegistry` call after the registry exists); factory proxy (address predicted by CREATE3 and asserted); then `TierRegistry` deployed owner-as-deployer and wired via the factory-only `setTierRegistry` BEFORE the multisig handoff. The `SYNDICATE_GOVERNOR` address-book slot SHALL be persisted as zero — governors are per-vault, resolved via `factory.governorOf(vault)`.
