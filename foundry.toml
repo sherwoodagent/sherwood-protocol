@@ -82,6 +82,10 @@ via_ir = true
 paths = "src/strategies/PortfolioStrategy.sol"
 via_ir = true
 
+[[profile.coverage.compilation_restrictions]]
+paths = "src/strategies/ConcentratedLiquidityStrategy.sol"
+via_ir = true
+
 # Profile used by the Medusa/Echidna harness under test/fizz/. The fuzzers compile
 # through crytic-compile, which shells out to this profile.
 #
