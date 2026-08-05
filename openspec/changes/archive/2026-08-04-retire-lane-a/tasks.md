@@ -1,5 +1,17 @@
 # Tasks
 
+> **Applied and archived 2026-08-04.** Sections 0-7 (the code deletion) landed
+> across earlier PRs; this branch closed section 8.1, the spec sync, which had
+> been left outstanding — `openspec/specs/` still described Lane A months after
+> the code was gone. Every code-side box below was checked against the tree's
+> END STATE, not by replaying the steps: the seven Lane-A test files are absent,
+> the four do-not-delete suites and both `WoodTwapOracle` files are present, the
+> two new behaviour-preservation tests from 3.4 exist, `IPriceRouter`/
+> `PriceRouter` are deleted, and the dead-symbol sweep leaves only comment-only
+> notes that document the retirement. Task 8.2's warning that stacked PRs get no
+> CI no longer holds — `.github/workflows/ci.yml` has since dropped the
+> `branches: [main]` filter from its `pull_request` trigger.
+
 **Ordering is load-bearing. The tree MUST compile after every numbered section**
 (src + test + script — forge builds all three), because the implementer works
 against a contended build lock where a mid-way break is expensive. The order below
@@ -25,12 +37,12 @@ is dependency-driven; do not reorder:
 
 ## 0. Preliminaries
 
-- [ ] 0.1 Rebase this branch onto `main` AFTER #147
+- [x] 0.1 Rebase this branch onto `main` AFTER #147
       (`fix/issue-147-swap-adapter-allowlist`) merges. Then re-run the design-Q8
       guard: `grep -n "positions\|availableLiquidity\|withdrawTo\|Position" src/strategies/PortfolioStrategy.sol`
       must return no hook overrides and no `Position` import. If #147 added any,
       STOP and re-run the Q1 consumer enumeration before proceeding.
-- [ ] 0.2 Build discipline for every forge invocation in this file: foreground
+- [x] 0.2 Build discipline for every forge invocation in this file: foreground
       only with a generous timeout (never background-and-wait), serialized behind
       the shared lock (`while pgrep -x forge >/dev/null; do sleep 30; done`, or a
       PID-stamped `mkdir` lock with a cleanup trap), and never judge a build by a
@@ -40,7 +52,7 @@ is dependency-driven; do not reorder:
 
 ## 1. Test pre-surgery (removals only — compile-safe before any src change)
 
-- [ ] 1.1 Delete the 7 Lane-A-only test files whole (design Q6 table):
+- [x] 1.1 Delete the 7 Lane-A-only test files whole (design Q6 table):
       `test/SyndicateVault.LaneA.t.sol`,
       `test/pricing/PriceRouter.t.sol`,
       `test/invariants/InstantLiquidityInvariants.t.sol`,
@@ -50,7 +62,7 @@ is dependency-driven; do not reorder:
       `test/fees/InstantExitFee.t.sol`,
       `test/audit-fixes/Vault_withdrawLaneStateConsistency.t.sol` (its inline mock
       implements `withdrawTo` — goes with the file).
-- [ ] 1.2 `test/SyndicateVault.InstantLiquidity.t.sol` is MIXED — do NOT delete
+- [x] 1.2 `test/SyndicateVault.InstantLiquidity.t.sol` is MIXED — do NOT delete
       the file. Delete exactly the 13 Lane-A tests named in design Q6
       (`test_baseStrategy_*`, `test_maxWithdraw_includesStrategyLiquidity`,
       `test_withdraw_pullsShortfallFromStrategy`, `test_withdraw_floatOnly_noStrategyCall`,
@@ -61,7 +73,7 @@ is dependency-driven; do not reorder:
       `MockRouter` contract and the `priceRouter()` mockCall arming. KEEP the 10
       general `minBufferBps` / idle-float / `governorBatch` tests listed in Q6 —
       they pin the surviving instant-liquidity behaviour.
-- [ ] 1.3 `test/fees/MgmtFeeAccrual.t.sol` is KEPT (the prior blast-radius
+- [x] 1.3 `test/fees/MgmtFeeAccrual.t.sol` is KEPT (the prior blast-radius
       analysis's "full delete" was wrong — design Errata 4). Delete only the 4
       Lane-A tests (`test_capitalAddedMidProposalIsChargedOnlyForItsTime`,
       `test_aLateDepositorIsNotChargedForTimeBeforeTheDeposit`,
@@ -70,11 +82,11 @@ is dependency-driven; do not reorder:
       the `priceRouter()` mockCall; rename `_executeWithLaneA` → `_executeProposal`
       (locked + `startManagementAccrual`, no router arming). The 9 kept tests must
       still pass unmodified — they cover the surviving `management-fee` spec.
-- [ ] 1.4 `test/audit-fixes/Vault_batchQueueTargets.t.sol`: in
+- [x] 1.4 `test/audit-fixes/Vault_batchQueueTargets.t.sol`: in
       `test_adapterOnlyVaultEntrypointsStayReachable`, drop only the
       `withdrawTo`/`OnDemandExitUnsupported` probe leg (`:307-315`); the
       `execute()` and `settle()` legs fully prove the denylist property (Q1).
-- [ ] 1.5 Do-NOT-delete guard, then checkpoint. Confirm untouched:
+- [x] 1.5 Do-NOT-delete guard, then checkpoint. Confirm untouched:
       `test/pricing/WoodTwapOracle.t.sol` (WOOD/USD guardian-bond feed — NOT Lane
       A), `test/SyndicateVault.AsyncRedeem.t.sol`, `test/fees/HighWaterMark.t.sol`,
       `test/fees/FeeDistribution.t.sol`. Checkpoint (build 1): run the four edited
@@ -84,7 +96,7 @@ is dependency-driven; do not reorder:
 
 ## 2. Vault core — SyndicateVault + ISyndicateVault + SyndicateGovernor (ONE atomic step)
 
-- [ ] 2.1 `src/SyndicateVault.sol` — delete: the `IPriceRouter` import,
+- [x] 2.1 `src/SyndicateVault.sol` — delete: the `IPriceRouter` import,
       `_laneState`, `_getPriceRouter`, `_isLaneALocked` + `_laneALockPid`,
       `_laneBOnly`, `_strategyLiquidity`, `_pullFromStrategy`, the Lane A branch
       of `_deposit` (incl. the `_interimNetFlow +=` block), `_interimNetFlow` +
@@ -95,7 +107,7 @@ is dependency-driven; do not reorder:
       (orphaned helper — Errata 2), `_crystallizedMgmt` / `_crystallizedPerf` +
       views + `consumeCrystallizedMgmt` / `consumeCrystallizedPerf`, the
       `previewRedeem` / `previewWithdraw` overrides and `previewExitFees`.
-- [ ] 2.2 Replacements (exact shapes in design Q3/Q4):
+- [x] 2.2 Replacements (exact shapes in design Q3/Q4):
       `maxWithdraw`/`maxRedeem` non-queue branch → `if (redemptionsLocked()) return 0;`
       (queue bypass stays ABOVE it; `GovernorNotSet` fail-closed surface
       preserved); instant capacity → `_availableFloat()` alone; `_withdraw`
@@ -106,48 +118,48 @@ is dependency-driven; do not reorder:
       idle balance minus `reservedQueueAssets()`, floored at zero (live-NAV and
       crystallized-fee terms gone; `_pricingSupply()` pairing and
       `_stampMgmtBase()` try/catch untouched).
-- [ ] 2.3 KEEP (consumed by the surviving settlement fee path — design
+- [x] 2.3 KEEP (consumed by the surviving settlement fee path — design
       "Crystallization reachability" KEEP list): `agentFeeBps()`,
       `pricePerShare()`, `managementAssetSeconds()`, `aboveHighWaterMark()`,
       `ratchetHighWaterMark()`, `_accrueManagementFee()`,
       `_initHighWaterMarkIfUnset()`, the `_mgmtAssetSeconds`/`_mgmtBase`/
       `_mgmtLastUpdate` trio, and `minHoldingPeriod`/`lastDepositAt`
       (future cooldown on the general path — out of scope).
-- [ ] 2.4 `src/interfaces/ISyndicateVault.sol` — remove the matching functions,
+- [x] 2.4 `src/interfaces/ISyndicateVault.sol` — remove the matching functions,
       events (`ExitFeesCrystallized`, `InstantExitFeeUpdated`) and errors
       (`SharesLocked`, `InstantExitFeeTooHigh`, `UnwindShortfall`).
       `QueueReserveBreached` STAYS (still thrown by `_withdraw`).
-- [ ] 2.5 `src/SyndicateGovernor.sol` — exactly three sites (design Q5):
+- [x] 2.5 `src/SyndicateGovernor.sol` — exactly three sites (design Q5):
       drop the `interimNetFlow()` subtraction in `_finishSettlement`
       (`pnl = int256(balanceAdjusted) - int256(snapshot);`); delete the
       `consumeCrystallizedMgmt()` netting block in `_chargeManagementFee`; delete
       the `consumeCrystallizedPerf()` line in `_chargePerformanceFee`. Rewrite
       `_chargePerformanceFee`'s NatSpec always-call rationale from "release
       crystallized fees" to the high-water-mark ratchet.
-- [ ] 2.6 Vault storage hygiene: grow `__gap` `uint256[28]` → `uint256[31]`
+- [x] 2.6 Vault storage hygiene: grow `__gap` `uint256[28]` → `uint256[31]`
       (3 slots freed: `_laneALockPid`, `_interimNetFlow`,
       `_crystallizedMgmt`+`_crystallizedPerf`; `instantExitFeeBps` frees none —
       packed). Legal only because no vault proxy is live.
-- [ ] 2.7 Reference sweep (no build needed):
+- [x] 2.7 Reference sweep (no build needed):
       `grep -rn "interimNetFlow\|consumeCrystallized\|previewExitFees\|instantExitFeeBps\|_laneState\|SharesLocked\|UnwindShortfall\|ExitFeesCrystallized" src/ test/ script/`
       → only hits allowed: none (comment mentions get fixed in section 6).
-- [ ] 2.8 Checkpoint (build 2): `forge build` — the tree compiles with the vault
+- [x] 2.8 Checkpoint (build 2): `forge build` — the tree compiles with the vault
       float-NAV-only. From here the strategy hooks have zero src callers.
 
 ## 3. Strategy hooks + behaviour-preservation pins
 
-- [ ] 3.1 `src/interfaces/IStrategy.sol` — remove `positions()`,
+- [x] 3.1 `src/interfaces/IStrategy.sol` — remove `positions()`,
       `availableLiquidity()`, `withdrawTo()` and the
       `import {Position} from "./IPriceRouter.sol";` line. `Position` is NOT
       relocated (design Q1: zero non-Lane-A consumers; V2 reintroduces the hook
       with its consumer).
-- [ ] 3.2 `src/strategies/BaseStrategy.sol` — remove the three virtual defaults,
+- [x] 3.2 `src/strategies/BaseStrategy.sol` — remove the three virtual defaults,
       the `Position` import, and `OnDemandExitUnsupported`. Do not touch
       `PortfolioStrategy.sol` / `VeniceInferenceStrategy.sol` (they override
       none of the hooks — verified Q1/Q8).
-- [ ] 3.3 `test/mocks/MockStrategyAdapter.sol` — drop the three stubs and the
+- [x] 3.3 `test/mocks/MockStrategyAdapter.sol` — drop the three stubs and the
       `Position` import.
-- [ ] 3.4 NEW behaviour-preservation tests (in
+- [x] 3.4 NEW behaviour-preservation tests (in
       `test/SyndicateVault.AsyncRedeem.t.sol` or the InstantLiquidity file):
       `test_maxWithdrawAndMaxRedeem_zeroDuringActiveProposal` (re-pins the
       surviving property the deleted
@@ -160,20 +172,20 @@ is dependency-driven; do not reorder:
 These move together: the deploy scripts call `factory.setPriceRouter` /
 `factory.priceRouter()`, so factory surface and scripts cannot be split.
 
-- [ ] 4.1 `src/SyndicateFactory.sol` — `address public priceRouter;` (slot 7) →
+- [x] 4.1 `src/SyndicateFactory.sol` — `address public priceRouter;` (slot 7) →
       `address private __deprecated_priceRouter;` (same slot, same type — the
       factory IS deployed and golden-pinned; NEVER vacate or reorder slot 7).
       Delete `setPriceRouter` and `event PriceRouterUpdated`; fix the field's
       Lane-A NatSpec.
-- [ ] 4.2 `src/interfaces/ISyndicateFactory.sol` — remove `priceRouter()`.
-- [ ] 4.3 Scripts (design Q7 table): `script/robinhood-mainnet/Deploy.s.sol` —
+- [x] 4.2 `src/interfaces/ISyndicateFactory.sol` — remove `priceRouter()`.
+- [x] 4.3 Scripts (design Q7 table): `script/robinhood-mainnet/Deploy.s.sol` —
       remove the `PriceRouter` import, deploy+wire block, ownership handoff, log
       lines, the `PRICE_ROUTER` persist patch, and the two `_validate` checks +
       param; rewrite the header comment. `script/robinhood-testnet/DeployV2.s.sol`
       — same removals. `script/robinhood-testnet/RedeployShimAdapter.s.sol:13` —
       comment only. `script/deploy-vnet.sh:40` — remove the stale
       `DeployPriceRouter` line (script it names doesn't exist on main).
-- [ ] 4.4 Regenerate `script/syndicate-factory-layout.golden.json` via
+- [x] 4.4 Regenerate `script/syndicate-factory-layout.golden.json` via
       `./script/check-layout-goldens.sh --update-golden` (this builds — lock
       discipline per 0.2). Verify the diff is LABEL-ONLY on slot 7
       (`priceRouter` → `__deprecated_priceRouter`); any slot/offset/type change
@@ -181,13 +193,13 @@ These move together: the deploy scripts call `factory.setPriceRouter` /
 
 ## 5. Delete the pricing files (LAST source deletion)
 
-- [ ] 5.1 Pre-delete gate: `grep -rln "IPriceRouter\|PriceRouter" src/ script/ test/`
+- [x] 5.1 Pre-delete gate: `grep -rln "IPriceRouter\|PriceRouter" src/ script/ test/`
       must return exactly `src/pricing/PriceRouter.sol` and
       `src/interfaces/IPriceRouter.sol` (plus any comment-only mentions slated
       for section 6). If anything else appears, a consumer was missed — stop.
-- [ ] 5.2 Delete `src/pricing/PriceRouter.sol` and
+- [x] 5.2 Delete `src/pricing/PriceRouter.sol` and
       `src/interfaces/IPriceRouter.sol`.
-- [ ] 5.3 DO-NOT-DELETE guard: `src/pricing/WoodTwapOracle.sol` and
+- [x] 5.3 DO-NOT-DELETE guard: `src/pricing/WoodTwapOracle.sol` and
       `src/interfaces/IWoodTwapOracle.sol` MUST remain. They are independent of
       Lane A — wired only into `ExposureLedger` for the WOOD/USD guardian-bond
       feed (import `ExposureLedger.sol:6`, storage `:217`, consult `:526-533`,
@@ -196,16 +208,16 @@ These move together: the deploy scripts call `factory.setPriceRouter` /
 
 ## 6. Comment-only touch-ups
 
-- [ ] 6.1 `src/interfaces/ISyndicateGovernor.sol:79` — drop the PriceRouter
+- [x] 6.1 `src/interfaces/ISyndicateGovernor.sol:79` — drop the PriceRouter
       mention from the `strategy` field NatSpec.
-- [ ] 6.2 Optional riders (no logic changes; may be skipped): the seven
+- [x] 6.2 Optional riders (no logic changes; may be skipped): the seven
       comment-only test/file mentions listed at the end of design Q6.
 
 ## 7. Verification — proving the invariant that must not regress
 
-- [ ] 7.1 Full gate (build 3): `forge build` clean, then the full non-fork
+- [x] 7.1 Full gate (build 3): `forge build` clean, then the full non-fork
       `forge test` suite green, foreground, lock-disciplined.
-- [ ] 7.2 **Ordinary-redemption invariant — explicit, not inferred from "tests
+- [x] 7.2 **Ordinary-redemption invariant — explicit, not inferred from "tests
       pass"** (several deleted files were the old coverage). Prove: with no
       active proposal, exits are still instant against idle float, capped by
       `_availableFloat()`. Evidence required, all three legs:
@@ -219,30 +231,30 @@ These move together: the deploy scripts call `factory.setPriceRouter` /
       `_availableFloat()`);
       (c) mid-proposal leg: `Vault_redemptionLockSemantics` suite green
       (deposits revert `DepositsLocked`; `requestRedeem` path intact).
-- [ ] 7.3 Dead-symbol sweep:
+- [x] 7.3 Dead-symbol sweep:
       `grep -rn "laneA\|LaneA\|IPriceRouter\|instantExitFee\|crystalliz\|interimNetFlow\|_exitPenalty\|withdrawTo\|availableLiquidity\|OnDemandExitUnsupported" src/ script/ test/`
       → zero hits (case-sensitive; `positions()` checked separately against the
       unrelated `StakedWood` "Positional" comments).
-- [ ] 7.4 `./script/check-layout-goldens.sh` passes (factory golden re-baselined
+- [x] 7.4 `./script/check-layout-goldens.sh` passes (factory golden re-baselined
       in 4.4; governor/registry/sWOOD goldens untouched — this change deletes no
       governor storage). Note the 98,304-byte Robinhood size gate only gets
       easier (~300 vault lines removed).
-- [ ] 7.5 `forge fmt` with a CI-matching forge (CI checks `src/`, `test/`, AND
+- [x] 7.5 `forge fmt` with a CI-matching forge (CI checks `src/`, `test/`, AND
       `script/`; a version-mismatched local fmt actively breaks CI).
 
 ## 8. Spec sync + bookkeeping
 
-- [ ] 8.1 `openspec validate retire-lane-a --strict` passes. At sync/archive:
+- [x] 8.1 `openspec validate retire-lane-a --strict` passes. At sync/archive:
       apply the 5 deltas; `instant-exit-fees` ends with zero requirements —
       delete `openspec/specs/instant-exit-fees/spec.md` entirely, and move its
       "Deposits are not charged a fee" requirement into `syndicate-vault` (ADDED
       there).
-- [ ] 8.2 Commit on this branch referencing #54; open the PR against `main`
+- [x] 8.2 Commit on this branch referencing #54; open the PR against `main`
       (stacked PRs get NO CI in this repo — verify locally if ever retargeted).
-- [ ] 8.3 Record this change on #148 as the motivating example: the outright
+- [x] 8.3 Record this change on #148 as the motivating example: the outright
       vault field deletions are safe only because no vault proxy exists; a vault
       layout golden would make this class of change mechanically verifiable.
-- [ ] 8.4 **#151 interaction — flag, do not fold in.** #151 (delete
+- [x] 8.4 **#151 interaction — flag, do not fold in.** #151 (delete
       `selfManagesFees`) is specced in parallel and touches the governor fee path
       near `chargeNew`. This change removes `chargeNew`'s second purpose
       (releasing crystallized instant-exiter fees via the always-call of

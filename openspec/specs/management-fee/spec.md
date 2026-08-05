@@ -34,10 +34,13 @@ positive, zero, or negative. The management fee MUST NOT be gated on profit.
 
 ### Requirement: The management fee base is time-weighted over deployed capital
 
-The fee owed SHALL be proportional to the integral of deployed capital over time — the
-product of capital and the duration it was deployed — annualized at the configured rate.
-Capital that was deployed for a shorter time MUST owe proportionally less than the same
-capital deployed for the full proposal.
+The fee owed SHALL be proportional to the integral of deployed capital over time —
+the product of capital and the duration it was deployed — annualized at the
+configured rate. Capital that was deployed for a shorter time MUST owe
+proportionally less than the same capital deployed for the full proposal. Within a
+single proposal the base is fixed at execution: deposits are locked while a proposal
+is open and exits route through the settlement queue, so no flow can change the
+deployed base mid-proposal.
 
 #### Scenario: Half the duration owes half the fee
 
@@ -45,23 +48,11 @@ capital deployed for the full proposal.
   identical proposal deploys the same base for 15 days
 - **THEN** the second proposal's management fee is half the first's
 
-#### Scenario: Capital added mid-proposal is charged only for the time it was present
+#### Scenario: Queued mid-proposal exits do not change the accrual base
 
-- **WHEN** capital is deployed for a proposal and additional capital arrives partway through
-- **THEN** the fee reflects the original base for the whole period plus the added capital
-  for the remaining period only
-
-#### Scenario: Capital withdrawn mid-proposal stops accruing at withdrawal
-
-- **WHEN** a depositor exits instantly partway through a proposal, reducing deployed capital
-- **THEN** accrual continues on the reduced base from that moment, and the withdrawn
-  capital accrues nothing for the remainder
-
-#### Scenario: A late depositor is not charged for time before the deposit
-
-- **WHEN** a depositor enters near the end of a proposal
-- **THEN** the management fee attributable to that capital covers only the days it was
-  actually in the fund
+- **WHEN** a holder requests a redemption through the queue while a proposal is live
+- **THEN** the shares sit in queue escrow, the deployed base and its accrual are
+  unchanged for the remainder of the proposal, and the exit is priced at settlement
 
 ### Requirement: Accrual is consumed and reset at settlement
 

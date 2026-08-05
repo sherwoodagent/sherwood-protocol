@@ -7,6 +7,31 @@ import {IChallengeGame} from "../../../src/interfaces/IChallengeGame.sol";
 
 /// @notice Handles the interaction with ChallengeGame
 abstract contract ChallengeGameHandler is Properties {
+    // ―――――――――――――――――― Challenge economics (GL-51) ―――――――――――――――――
+    // Three of the four inputs to `honestFilingNetPayoffBps` (the fourth,
+    // `proposerBondBps`, lives on ExposureLedger). Without these the property
+    // is vacuous: it would re-check one fixed deploy configuration forever.
+    // The harness is the games's owner, so no prank is needed.
+    //
+    // Each is clamped to its OWN setter's bounds, deliberately not to the
+    // break-even condition — the whole question GL-51 asks is whether a
+    // configuration the setters accept can drive the payoff negative, so
+    // clamping to keep it non-negative would assume the answer.
+
+    function challengeGame_setChallengerBondBps(uint256 bps) public {
+        // Zero is rejected by the setter (it would make the coverage freeze
+        // free), hence a floor of 1 rather than 0.
+        game.setChallengerBondBps(clampBetween(bps, 1, 10_000));
+    }
+
+    function challengeGame_setSettleBurnBps(uint256 bps) public {
+        game.setSettleBurnBps(clampBetween(bps, 0, 5_000)); // MAX_SETTLE_BURN_BPS
+    }
+
+    function challengeGame_setProsecutorFeeBps(uint256 bps) public {
+        game.setProsecutorFeeBps(clampBetween(bps, 0, game.MAX_PROSECUTOR_FEE_BPS()));
+    }
+
     // ――――――――――――――――――――――――― Clamped ――――――――――――――――――――――――――
 
     /// @dev `challengeId` is 1-indexed and `challengeCount` is the high-water

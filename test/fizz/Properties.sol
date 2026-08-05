@@ -436,6 +436,38 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         return true;
     }
 
+    /// @notice GL-51 `EXPLORATORY` — under every configuration the four
+    ///         setters accept, filing an honest challenge is not a losing
+    ///         trade: `honestFilingNetPayoffBps() >= 0`.
+    ///
+    /// @dev EXPLORATORY, NOT SHOULD-HOLD — a counterexample is a question, not
+    ///      a bug, and the expected outcome here is that this DOES fail. Three
+    ///      reasons it is still worth running:
+    ///
+    ///      1. It prices only the SILENCE branch, where the challenger
+    ///         recovers `bond - burned`. On the escalated branch it also takes
+    ///         the forfeited counter-bond (`Disputed` implies
+    ///         `pool == bondWood`), which the contract deliberately does not
+    ///         model. So negative here does not prove a losing game overall.
+    ///      2. No setter can enforce it. `proposerBondBps` lives on
+    ///         `ExposureLedger` and the other three on `ChallengeGame`, so
+    ///         there is no single owner to check the product against — and a
+    ///         per-setter guard would brick reconfiguration, since moving
+    ///         between two sound configurations can require an intermediate
+    ///         that violates the condition.
+    ///      3. What the counterexample IS good for: the exact parameter tuple
+    ///         the fuzzer reaches is the one governance must not ship. That
+    ///         makes this a monitoring surface — which is what
+    ///         `honestFilingBreaksEven` was built to be.
+    ///
+    ///      Reachability depends on the four setter handlers added alongside
+    ///      this (three in `ChallengeGameHandler`, one in
+    ///      `ExposureLedgerHandler`). Without them this reduces to a single
+    ///      fixed deploy configuration and proves nothing.
+    function property_GL51_honestFilingNeverLoses() public view returns (bool) {
+        return game.honestFilingNetPayoffBps() >= 0;
+    }
+
     // ――――――――――――――――――― Specific properties ――――――――――――――――――――
     // These properties must hold after specific function calls.
     // They MUST BE INTERNAL and called at the end of the relevant handlers.
