@@ -178,6 +178,29 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         // arm is executable, so the fail-closed direction is unchanged — do NOT
         // restore Approved here on the grounds that (a) is unreachable.
         if (o == IGuardianRegistry.ReviewOutcome.Unresolved) {
+            // Separating (a) from (b) needs one fact the outcome enum does not
+            // carry: whether a window was ever registered. RAW staticcall with
+            // an explicit returndata check, not a typed call — `reviewWindow`
+            // has no callers in `src/` today, so a typed call would revert
+            // undecodably in THIS frame against every registry stand-in that
+            // does not implement the selector.
+            //
+            // DEGRADES TO (a). An unreachable or malformed probe answers
+            // "no window", i.e. the pre-existing terminal-Expired behaviour:
+            // fail-closed, and the vault binding is released rather than held
+            // to `executeBy` on the strength of a reply we could not read.
+            bool windowRegistered;
+            (bool probeOk, bytes memory ret) =
+                address(reg).staticcall(abi.encodeCall(IGuardianRegistry.reviewWindow, (address(this), p.id)));
+            if (probeOk && ret.length >= 64) {
+                (, uint64 registeredReviewEnd) = abi.decode(ret, (uint64, uint64));
+                windowRegistered = registeredReviewEnd != 0;
+            }
+            // (a) no record: terminal immediately, so `_commitState` releases the
+            // vault binding rather than stranding it for the execution window.
+            if (!windowRegistered) return (ProposalState.Expired, false);
+            // (b) registered and merely deferred: still in review, and still
+            // subject to the governor's own unmoved deadline.
             return (block.timestamp > p.executeBy ? ProposalState.Expired : ProposalState.GuardianReview, false);
         }
         // A paused registry cannot accept the economic commit: `resolveReview` is
