@@ -7,11 +7,26 @@ import {ISwapAdapter} from "../interfaces/ISwapAdapter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {IMorpho, Id, MarketParams, Market} from "../vendor/morpho/IMorpho.sol";
 import {MarketParamsLib} from "../vendor/morpho/MorphoLibs.sol";
 import {IUniswapV3Pool} from "../vendor/uniswap/IUniswapV3Pool.sol";
 import {INonfungiblePositionManager} from "../vendor/uniswap/INonfungiblePositionManager.sol";
+
+/// @notice The `vault() -> governor() -> tierRegistry() -> isAdapterAllowed(x)`
+///         walk. The SAME registry, reached the same way, that
+///         `SyndicateVault._guardBatchCalls` gates batch approvals against.
+/// @dev    Declared locally rather than imported, mirroring
+///         `PortfolioStrategy.ITierBindingPath`: every hop is a length-checked
+///         raw staticcall, so this template takes on no type dependency and no
+///         hop can revert `_initialize` undecodably. Exists to generate
+///         selectors, not to type the responses.
+interface ITierBindingPath {
+    function governor() external view returns (address);
+    function tierRegistry() external view returns (address);
+    function isAdapterAllowed(address adapter) external view returns (bool);
+}
 
 /**
  * @title ConcentratedLiquidityStrategy
@@ -145,6 +160,17 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         check, a `liquidity()` large enough to clear the pool-share cap,
     ///         and an `observe` whose TWAP always equals its own spot.
     error PoolNotFromFactory();
+    /// @notice A proposer-supplied counterparty is not allowlisted in the
+    ///         `TierRegistry` the vault's own governor gates batch approvals
+    ///         against. Covers `swapAdapter`, `positionManager`, `morpho` and
+    ///         `marketParams.collateralToken` — every address this contract
+    ///         approves or calls with vault funds.
+    error CounterpartyNotAllowed(address counterparty, address registry);
+    /// @notice The `vault() -> governor() -> tierRegistry()` walk yielded no
+    ///         registry, so no counterparty can be vouched for. Fails closed at
+    ///         binding time rather than deploying capital through unvetted
+    ///         addresses.
+    error TierRegistryUnresolved();
     /// @notice The lending market's loan token is not the vault asset.
     error LoanAssetMismatch();
     /// @notice The market's collateral token is neither the vault asset nor an
@@ -386,6 +412,35 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         address vaultAsset = IERC4626(vault()).asset();
 
+        // (0) GOVERNANCE BINDING — must run BEFORE any of the checks below,
+        //     because every one of them resolves through an address the
+        //     proposer chose. `pool_.factory() != p.uniswapFactory` compares an
+        //     attacker's pool's answer against an attacker's own parameter;
+        //     `market(id).lastUpdate` asks an attacker's Morpho whether an
+        //     attacker's market exists; `_isWrapperOf` asks an attacker's token
+        //     what it wraps. Self-consistent by construction, all of them.
+        //
+        //     The vault's batch guard cannot substitute. `_guardBatchCalls`
+        //     PART 2a checks the CLONE is an allowlisted callee; the approvals
+        //     that actually move money — `forceApprove(collateralToken)` in
+        //     `_postCollateral`, `forceApprove(swapAdapter)` in
+        //     `_rebalanceToTarget` — are issued INSIDE this contract, one hop
+        //     past anything the governor batch names.
+        //
+        //     FAIL CLOSED on an unresolvable registry, matching
+        //     `PortfolioStrategy._initialize`. Binding time is the cheap place
+        //     to refuse: it costs a re-proposal, where discovering it at
+        //     execute costs the deployed capital. No hop is proposer input, so
+        //     the proposer cannot steer the walk into the skip.
+        {
+            address registry = _resolveTierRegistry();
+            if (registry == address(0)) revert TierRegistryUnresolved();
+            _requireAllowedAdapter(registry, p.swapAdapter);
+            _requireAllowedAdapter(registry, p.positionManager);
+            _requireAllowedAdapter(registry, p.morpho);
+            _requireAllowedAdapter(registry, p.marketParams.collateralToken);
+        }
+
         // (1) The pool exists and one of its two tokens is the vault asset.
         //     The factory check comes first: without it every other read below
         //     is attacker-chosen, because a contract can answer all of these
@@ -485,6 +540,13 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      An adapter whose `quote()` returns 0 or reverts cannot guarantee
     ///      slippage at all, so there is nothing to degrade TO — the caller
     ///      decides whether that is fatal.
+    ///
+    ///      NOT SANDWICH PROTECTION ON ITS OWN, and it must not be described as
+    ///      such: the quote is taken in the same transaction, through the same
+    ///      `swapExtraData` route, as the swap it bounds, so a searcher who
+    ///      moves that venue first gets a quote at the moved price and a floor
+    ///      derived from it. `_poolAnchoredMinOut` is the answer to that; every
+    ///      call site takes the MAX of the two.
     function _quoteMinOut(address tokenIn, address tokenOut, uint256 amountIn, uint256 slippageBps)
         private
         returns (uint256)
@@ -495,6 +557,68 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         } catch {
             revert QuoteUnavailable();
         }
+    }
+
+    /// @dev Floor derived from the CONFIGURED POOL's own price, independent of
+    ///      whatever venue `swapExtraData` routes through.
+    ///
+    ///      THE GAP THIS CLOSES (pashov 2026-08 finding #4). `swapExtraData` is
+    ///      stored verbatim at `_initialize` and nothing ties it to `pool`: the
+    ///      adapter may route a different fee tier, a V4 pool, or a multi-hop
+    ///      path. `_requireSpotNearTwap` reads `pool.slot0()` — the LP venue —
+    ///      so it never observed the venue the swap actually crossed, and
+    ///      `_quoteMinOut` took both of its operands from that unobserved
+    ///      venue. Every swap floor in this contract therefore moved with the
+    ///      attacker, on a `rerange()` that is permissionless by design.
+    ///
+    ///      WHY sqrtPriceX96 AND NOT THE TWAP TICK. Converting a tick to a
+    ///      price needs `TickMath.getSqrtRatioAtTick`, which this contract
+    ///      deliberately does not vendor (see `_derivedRange`). `slot0()`
+    ///      already returns `sqrtPriceX96` directly, and every caller of this
+    ///      helper runs behind `_requireSpotNearTwap()`, which bounds that spot
+    ///      to the TWAP within `maxTwapDeviationBps`. So the anchor is a
+    ///      TWAP-verified pool price reached without new price math.
+    ///
+    ///      `price(token1 per token0) = sqrtPriceX96^2 / 2^192`, split into two
+    ///      `mulDiv`s by 2^96 so the intermediate never overflows.
+    ///      Decimals need no handling: `sqrtPriceX96` encodes the ratio of RAW
+    ///      token amounts, so both legs' scales are already baked in.
+    ///
+    ///      Returns 0 when the pool price is unreadable or the result rounds to
+    ///      nothing — the caller then falls back to the quote floor alone,
+    ///      which is the pre-existing behaviour rather than a new brick.
+    function _poolAnchoredMinOut(address tokenIn, uint256 amountIn, uint256 slippageBps)
+        private
+        view
+        returns (uint256)
+    {
+        (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+        if (sqrtPriceX96 == 0) return 0;
+
+        uint256 sp = uint256(sqrtPriceX96);
+        uint256 expected;
+        // token0 -> token1 multiplies by the price; token1 -> token0 divides.
+        if (tokenIn == (assetIsToken0 ? asset : otherToken)) {
+            expected = Math.mulDiv(Math.mulDiv(amountIn, sp, 1 << 96), sp, 1 << 96);
+        } else {
+            expected = Math.mulDiv(Math.mulDiv(amountIn, 1 << 96, sp), 1 << 96, sp);
+        }
+        if (expected == 0) return 0;
+        return (expected * (BPS_DENOMINATOR - slippageBps)) / BPS_DENOMINATOR;
+    }
+
+    /// @dev `max(quote floor, pool-anchored floor)`. The quote floor alone is
+    ///      defeated by moving the routed venue; the pool floor alone would be
+    ///      defeated by a routed venue that is legitimately cheaper than the LP
+    ///      pool. Taking the max means an attacker must beat BOTH, and a
+    ///      mis-scaled or unreadable pool read can only ever raise the bar.
+    function _floorFor(address tokenIn, address tokenOut, uint256 amountIn, uint256 slippageBps)
+        private
+        returns (uint256 minOut)
+    {
+        minOut = _quoteMinOut(tokenIn, tokenOut, amountIn, slippageBps);
+        uint256 anchored = _poolAnchoredMinOut(tokenIn, amountIn, slippageBps);
+        if (anchored > minOut) minOut = anchored;
     }
 
     /// @dev The deadline settlement stamps onto its position calls.
@@ -522,6 +646,53 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         (bool ok, bytes memory ret) = token.staticcall(abi.encodeCall(IERC4626.asset, ()));
         if (!ok || ret.length != 32) return false;
         return abi.decode(ret, (address)) == underlying;
+    }
+
+    // ── Governance-allowlist binding (see check (0) in `_initialize`) ──
+
+    /// @dev Reverts unless `counterparty` is allowlisted in `registry`. An
+    ///      unreadable `isAdapterAllowed` fails CLOSED: a registry that cannot
+    ///      vouch for an address has not vouched for it. Mirrors
+    ///      `PortfolioStrategy._requireAllowedAdapter`, but takes the registry
+    ///      as an argument since `_initialize` binds four counterparties and
+    ///      re-walking `vault() -> governor() -> tierRegistry()` per address
+    ///      would be three redundant staticcall pairs.
+    function _requireAllowedAdapter(address registry, address counterparty) private view {
+        if (!_isAdapterAllowed(registry, counterparty)) revert CounterpartyNotAllowed(counterparty, registry);
+    }
+
+    /// @dev The `vault() -> governor() -> tierRegistry()` walk. `address(0)`
+    ///      when unresolved (no `governor()` surface, a governor predating the
+    ///      getter, or `tierRegistry() == 0`); `_initialize` treats that as
+    ///      fatal rather than as a skip.
+    function _resolveTierRegistry() private view returns (address registry) {
+        address governor_ = _readAddress(vault(), abi.encodeCall(ITierBindingPath.governor, ()));
+        if (governor_ == address(0)) return address(0);
+        registry = _readAddress(governor_, abi.encodeCall(ITierBindingPath.tierRegistry, ()));
+    }
+
+    /// @dev Staticcall-safe `isAdapterAllowed`. Unreadable → `false`.
+    function _isAdapterAllowed(address registry, address adapter) private view returns (bool) {
+        if (registry.code.length == 0) return false;
+        (bool ok, bytes memory ret) = registry.staticcall(abi.encodeCall(ITierBindingPath.isAdapterAllowed, (adapter)));
+        if (!ok || ret.length != 32) return false;
+        return abi.decode(ret, (bool));
+    }
+
+    /// @dev Staticcall-safe address read: codeless target, revert, short
+    ///      return, or dirty upper bits all resolve to `address(0)`.
+    function _readAddress(address target, bytes memory data) private view returns (address) {
+        if (target.code.length == 0) return address(0);
+        (bool ok, bytes memory ret) = target.staticcall(data);
+        if (!ok || ret.length < 32) return address(0);
+        uint256 word;
+        // Reads the first return word directly: `abi.decode` cannot express
+        // "leading word of a longer payload".
+        assembly ("memory-safe") {
+            word := mload(add(ret, 0x20))
+        }
+        if (word >> 160 != 0) return address(0);
+        return address(uint160(word));
     }
 
     /// @dev The collateral's worth in vault-asset units, READ FROM THE CHAIN.
@@ -753,7 +924,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             uint256 toSwap = targetOtherValue - otherValue; // asset units
             if (toSwap > assetBal) toSwap = assetBal;
             if (toSwap == 0) return;
-            uint256 minOut = _quoteMinOut(asset, otherToken, toSwap, slippageBps);
+            uint256 minOut = _floorFor(asset, otherToken, toSwap, slippageBps);
             IERC20(asset).forceApprove(address(swapAdapter), toSwap);
             swapAdapter.swap(asset, otherToken, toSwap, minOut, swapExtraData);
             // Leave no standing allowance to an adapter that consumed less than
@@ -766,7 +937,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             // ratio is the conversion and no separate price read is needed.
             uint256 toSwap = (otherBal * excessValue) / otherValue;
             if (toSwap == 0) return;
-            uint256 minOut = _quoteMinOut(otherToken, asset, toSwap, slippageBps);
+            uint256 minOut = _floorFor(otherToken, asset, toSwap, slippageBps);
             IERC20(otherToken).forceApprove(address(swapAdapter), toSwap);
             swapAdapter.swap(otherToken, asset, toSwap, minOut, swapExtraData);
             IERC20(otherToken).forceApprove(address(swapAdapter), 0);
@@ -1061,6 +1232,19 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         } catch {
             return;
         }
+        // The exit leg was the one swap with NO anchor at all: unlike `_execute`
+        // and `rerange`, `_settle`/`sweep` never call `_requireSpotNearTwap`, so
+        // this floor was purely the routed venue quoting itself. Raise it to the
+        // configured pool's own price when that is higher.
+        //
+        // NON-REVERTING, unlike the `_rebalanceToTarget` sites. Everything on
+        // this path degrades rather than blocks — `settle()` is the vault's exit
+        // and the deliverable-maximum design exists so a bad venue cannot veto
+        // it. A higher floor here means the swap may simply not fill, leaving
+        // the residue for `sweep()` to retry, which is the existing behaviour
+        // for an unfillable quote.
+        uint256 anchored = _poolAnchoredMinOut(otherToken, bal, slippageBps);
+        if (anchored > minOut) minOut = anchored;
 
         IERC20(otherToken).forceApprove(address(swapAdapter), bal);
         // The swap itself is also allowed to fail: a quote that stood a moment
