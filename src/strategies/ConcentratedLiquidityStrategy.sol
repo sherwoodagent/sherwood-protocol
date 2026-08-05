@@ -807,6 +807,45 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         registry = _readAddress(governor_, abi.encodeCall(ITierBindingPath.tierRegistry, ()));
     }
 
+    /// @dev RE-CERTIFY AT EVERY FUND-MOVING ENTRYPOINT, not just at init.
+    ///      `_initialize` was the only place this template consulted the tier
+    ///      registry, so a counterparty revoked AFTERWARDS still received
+    ///      `forceApprove` of this clone's whole balance — and revocation needs
+    ///      no governance action at all: `TierRegistry.poke` and
+    ///      `demoteByChallenge` are both permissionless, and the owner's
+    ///      `setAdapterAllowed(x, false)` is one call. Both sibling templates
+    ///      already do this and spell out why —
+    ///      `MorphoSupplyStrategy._execute`'s `_requireAllowedMorpho` ("a
+    ///      singleton demoted between clone-init and execute ... would still
+    ///      receive `forceApprove` of the whole supply, one hop outside the
+    ///      vault's batch gate") and `PortfolioStrategy`'s
+    ///      `_requireAllowedAdapter` at `_execute`/`rebalance`/`rebalanceDelta`.
+    ///      This template was the one left on a point-in-time check, and it is
+    ///      the one where the exposure is largest: `_rebalanceToTarget` discards
+    ///      the swap's return value entirely and takes `minOut` enforcement from
+    ///      inside the adapter, so a revoked adapter can take `toSwap` and
+    ///      deliver nothing with no local check firing.
+    ///
+    ///      The vault's batch guard cannot substitute, as `_initialize`'s own
+    ///      note already records: the approvals that move money are issued
+    ///      INSIDE this contract, one hop past anything the governor batch names.
+    ///
+    ///      SCOPED TO THE ENTRY PATHS ON PURPOSE. `_settle`, `sweep` and
+    ///      `releaseUnconvertible` stay unguarded under the existing
+    ///      capital-hostage rationale: blocking an EXIT because a counterparty
+    ///      was demoted strands the very funds the demotion is meant to protect.
+    ///      Unresolved registry → skip, matching `_requireAllowedAdapter`'s own
+    ///      shape; resolved-but-unvouched → revert.
+    function _requireCounterpartiesStillAllowed() private view {
+        address registry = _resolveTierRegistry();
+        if (registry == address(0)) return;
+        _requireAllowedAdapter(registry, address(swapAdapter));
+        _requireAllowedCounterparty(registry, address(positionManager));
+        _requireAllowedCounterparty(registry, address(morpho));
+        address coll = _marketParams.collateralToken;
+        if (coll != asset) _requireAllowedCounterparty(registry, coll);
+    }
+
     /// @dev Staticcall-safe boolean read, shared by both allowlist axes.
     ///      Unreadable → `false`, so a registry that cannot answer has not
     ///      vouched.
@@ -1059,6 +1098,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     // ── Execute ──
 
     function _execute() internal override nonReentrant {
+        _requireCounterpartiesStillAllowed();
         _requireSpotNearTwap();
 
         // Snapshot the venue BEFORE this strategy touches it. Read back after
@@ -1299,6 +1339,12 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     function rerange() external nonReentrant returns (uint256 newTokenId) {
         // (1) Executed.
         if (_state != State.Executed) revert NotExecutedForRerange();
+        // (1b) The counterparties are STILL certified. See
+        //      `_requireCounterpartiesStillAllowed` — this entrypoint is
+        //      permissionless and re-issues `forceApprove` to `swapAdapter` on
+        //      every call, so a demoted adapter could otherwise drive the drain
+        //      itself, up to `maxReranges` times.
+        _requireCounterpartiesStillAllowed();
         // (3) The minimum interval has elapsed since execute or the last rerange.
         if (block.timestamp < lastRerangeAt + _rerange.minInterval) revert RerangeTooSoon();
         // (4) The count is below the approved maximum.
@@ -1749,6 +1795,11 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     function releaseUnconvertible() external nonReentrant returns (uint256 released) {
         if (_state != State.Settled) revert NotSettled();
 
+        // Retry the wrapper first: redemption may have reopened since settle,
+        // and unwrapped collateral leaves as `asset` below, which is strictly
+        // better for the vault than receiving the shares.
+        _tryRedeemWrapper();
+
         _trySwapToAsset(settleSlippageBps);
 
         // Deliver whatever the conversion DID produce before releasing the rest.
@@ -1759,6 +1810,28 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         if (assets != 0) {
             _pushAllToVault(asset);
             emit ResidualSwept(assets);
+        }
+
+        // THE COLLATERAL WRAPPER TOO — not just `otherToken`. This hatch was
+        // built for the LP-fee-sized `otherToken` residue and omitted the ERC-4626
+        // collateral shares, which are the proposal's ENTIRE principal. Those
+        // shares are only ever disposed of by `_tryRedeemWrapper`, and this
+        // template's own note concedes the wrappers it targets "gate redemption
+        // behind pauses, caps, queues and underlying liquidity, none of which
+        // this proposal can influence" — so a wrapper that stops redeeming for
+        // good stranded the whole principal on a clone that carries no rescue
+        // surface, while `SyndicateVault.rescueERC20` can only reach tokens the
+        // VAULT holds. The argument this function already makes for itself
+        // applies verbatim and with far larger stakes: the vault is the strictly
+        // better custodian, because it has an owner-gated rescue and this clone
+        // has none.
+        address coll = _marketParams.collateralToken;
+        if (coll != asset) {
+            uint256 collBal = IERC20(coll).balanceOf(address(this));
+            if (collBal != 0) {
+                _pushAllToVault(coll);
+                emit UnconvertibleReleased(coll, collBal);
+            }
         }
 
         released = IERC20(otherToken).balanceOf(address(this));

@@ -21,6 +21,14 @@ interface IStakedWoodAgeFloor {
     function ageFloorBps() external view returns (uint256);
 }
 
+/// @notice The proposer-bond record, read in `refer` to identify the party a
+///         verdict pays. Kept local and minimal for the same reason as the two
+///         interfaces above: this contract needs one selector, not the whole
+///         escrow surface.
+interface IProposerBondRecord {
+    function bondOf(address governor, uint256 proposalId) external view returns (address proposer, uint256 amount);
+}
+
 /**
  * @title TokenCourt
  * @notice Single-layer WOOD-vote adjudication of disputed `ChallengeGame`
@@ -278,6 +286,47 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // the accused's bond, so an unbarred challenger voting `Guilty` on its
         // own filing would be a self-dealing conviction, not a jury verdict.
         c.challenger = ch.challenger;
+        // AND SO IS THE PROPOSER — the largest verdict-contingent payee of all.
+        // `_settle` confiscates its ENTIRE bond on `Guilty` and every other
+        // outcome returns it whole, so on the exact principle the challenger bar
+        // states ("a direct payout riding on the verdict") it must not vote.
+        // See `ProposerCannotVote` for why `isAccused` cannot reach it.
+        //
+        // PINNED HERE, NOT READ AT VOTE TIME, matching `challenger`: a verdict
+        // can land a full `disputeTimeout` after filing, and the bond record is
+        // deleted by `releaseBond`/`forfeitBond`, so a live read would go blind
+        // exactly when it matters.
+        //
+        // SOURCED FROM THE BOND RECORD, not from the governor's `proposer`
+        // field. The escrow entry is the authoritative statement of WHO posted
+        // the capital this verdict destroys — the same `(governor, proposalId)`
+        // binding `_settle`'s `forfeitBond` acts on — so the bar tracks the
+        // payout by construction rather than by two sources happening to agree.
+        //
+        // RAW STATICCALL — same doctrine as the `counterBondContributionOf`
+        // probe in `vote` and `ExposureLedger._feedPriceX8`. A typed call into an
+        // escrow that does not answer this selector reverts in THIS frame with
+        // no data, turning a missing selector into an undecodable failure of all
+        // referral.
+        //
+        // THE FAILURE BRANCH IS A STATED DECISION, and here it is OPEN — no bar
+        // — because the branch means there is no payout to bar. `ch.proposerBondEscrow`
+        // is documented as "Zero when the proposal locked no bond, which the
+        // settle path treats as nothing-to-forfeit rather than an error", and an
+        // `amount == 0` record says the same thing: no bond at stake, no
+        // verdict-contingent interest, nothing this bar is protecting against.
+        // An escrow that cannot answer at all is a strictly narrower case still
+        // — `_settle`'s own `forfeitBond` call cannot survive it either, so such
+        // a challenge never reaches a paying verdict in the first place.
+        address escrow = ch.proposerBondEscrow;
+        if (escrow != address(0)) {
+            (bool okBond, bytes memory bondRet) =
+                escrow.staticcall(abi.encodeCall(IProposerBondRecord.bondOf, (ch.governor, ch.proposalId)));
+            if (okBond && bondRet.length == 64) {
+                (address bondProposer, uint256 bondAmount) = abi.decode(bondRet, (address, uint256));
+                if (bondAmount != 0) c.proposer = bondProposer;
+            }
+        }
 
         emit CaseReferred(caseId, challengeId, ch.governor, ch.proposalId, snapshotTs);
 
@@ -342,6 +391,11 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         // `total - accusedWeight` shape makes a unilateral conviction easier
         // the more approvers the challenge names. Pinned in `refer`.
         if (msg.sender == c.challenger) revert ChallengerCannotVote();
+        // AND NEITHER MAY THE PROPOSER, whose whole bond the verdict destroys or
+        // returns. Pinned in `refer` from the bond record; zero means no bond
+        // was locked, hence no payout and no bar — and zero can never match a
+        // caller, since `address(0)` cannot originate a call.
+        if (msg.sender == c.proposer) revert ProposerCannotVote();
         // AND NEITHER MAY THE SIDE A `NotGuilty` VERDICT PAYS. The two bars
         // above cover both beneficiaries of a `Guilty` ruling (the accused
         // avoid the slash, the challenger takes the forfeited pool) but left

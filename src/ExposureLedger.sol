@@ -809,8 +809,42 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      path, and every accused approver would be permanently barred from
     ///      `claimUnstakeGuardian`. Zero is still legal as the unwire switch; the
     ///      only reachable order is to drain live challenges first.
+    /// @dev AND IT RE-ASSERTS THE WINDOW INVARIANT ON THE INCOMING GAME.
+    ///      `game.challengeWindow <= ledger.challengeWindow` is guarded in three
+    ///      places — the `ChallengeGame` constructor, `ChallengeGame.setExposureLedger`,
+    ///      and `setChallengeWindow`'s LOWER BOUND #2 — and this setter was the
+    ///      fourth corner, left open. Worse, bound #2 is CONDITIONAL on a freezer
+    ///      being wired, so the three calls
+    ///      `setCoverageFreezer(0)` -> `setChallengeWindow(small)` ->
+    ///      `setCoverageFreezer(game)` walk straight through every existing check
+    ///      and seat a ledger window BELOW the game's. `DeployPlanD` wires the
+    ///      freezer LAST by design ("nothing can be frozen before the verdict path
+    ///      is complete"), so the unwired state is ordinary operation, not an
+    ///      exotic one, and the script's equality assertion is a `require` in the
+    ///      script — it does not re-fire on any later rotation.
+    ///
+    ///      What the inversion costs, in `setChallengeWindow`'s own words: "a
+    ///      sweep can empty `_approversOf` while the proposal is still legally
+    ///      filable — permanently unchallengeable the moment it happens." The
+    ///      permissionless `retireApproval` opens at
+    ///      `epochGenesis + (epoch+1)*epochLength + W_ledger` while
+    ///      `ChallengeGame.file` closes at
+    ///      `executedAt + strategyDuration + W_game`, so the gap is the full
+    ///      `W_game - W_ledger`. The recovery direction does not close it either:
+    ///      `ChallengeGame.setChallengeWindow` only refuses a window ABOVE the
+    ///      ledger's, so the game may lower itself to match but is never forced
+    ///      to, and nothing detects the inversion once seated.
+    ///
+    ///      Same tolerant shape as bound #2 — an unanswerable pointer must not
+    ///      brick the rotation, since that would reintroduce the stranded-freeze
+    ///      hazard this setter's guard above exists to prevent.
     function setCoverageFreezer(address freezer) external onlyOwner {
         if (_frozenKeyCount != 0) revert CoverageFrozen();
+        if (freezer != address(0) && freezer.code.length != 0) {
+            try IChallengeGameWindowMinimal(freezer).challengeWindow() returns (uint256 gameWindow) {
+                if (challengeWindow < gameWindow) revert InvalidParameter();
+            } catch {}
+        }
         emit CoverageFreezerSet(coverageFreezer, freezer);
         coverageFreezer = freezer;
     }
@@ -1650,6 +1684,23 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      sharing — kept alive exclusively for `unsharedLiabilityUsd`. See that
     ///      function for why `ChallengeGame.file`'s bond basis must not go through
     ///      `_sharedSlashableUsd`.
+    ///
+    ///      PLEDGE BASIS, NOT THE BOOKING. Reading `_recorded[key][g].usd` here
+    ///      would defeat the entire point of this function: `settleCoverage`'s
+    ///      `_rebook` writes the BOOKING down to the guardian's cross-proposal
+    ///      pro-rata allocation (`_sharedSlashableUsd`), and it never touches the
+    ///      pledge — see the note in `_rebook`. So once settlement has run, the
+    ///      booking IS the shared figure, and an "unshared" total computed over it
+    ///      silently returns exactly the diluted number `unsharedLiabilityUsd`
+    ///      exists to avoid, collapsing `ChallengeGame.file`'s challenger bond to
+    ///      `1/K` for a guardian backing K siblings. That is not a rare race:
+    ///      `SyndicateGovernor._finishSettlement` and `reclaimProposerBond` both
+    ///      call `_settleCoverageBestEffort`, so for any normally-settled proposal
+    ///      the write-down has already landed before a challenger can file. Every
+    ///      other challenge-path consumer is already on `_reservedUsd` for the same
+    ///      reason (`slashBpsFor`, `freezeCoverage`/`pinCoverageUntil`,
+    ///      `TokenCourt._recordAccused`, and `file`'s own `pledgedOf` read); this
+    ///      site was the last one left on the booking.
     function _unsharedEffectiveTotal(bytes32 key, uint256 priceX8, uint256 anchor)
         internal
         view
@@ -1659,7 +1710,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 n = listed.length;
         for (uint256 i = 0; i < n; i++) {
             address g = listed[i];
-            uint256 reserved = _recorded[key][g].usd;
+            uint256 reserved = _reservedUsd[key][g];
             if (reserved == 0) continue;
             uint256 slashable = _slashableBondUsd(g, priceX8, anchor);
             total += slashable < reserved ? slashable : reserved;

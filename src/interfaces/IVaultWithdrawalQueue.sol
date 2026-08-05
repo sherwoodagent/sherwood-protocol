@@ -21,6 +21,11 @@ interface IVaultWithdrawalQueue {
     error VaultLocked();
     error NotSettled();
     error AlreadySettled();
+    /// @notice `stampSettlement` called with a pid below the highest already
+    ///         stamped. `_lastStampedPid` is a high-water mark that `claim` and
+    ///         `cancel` use as exact complements, so a backwards stamp would
+    ///         hold both exits open for the same deposit.
+    error StampOutOfOrder();
     error ZeroShares();
     error ZeroAssets();
     error InsufficientShares();

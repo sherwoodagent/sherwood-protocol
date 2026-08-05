@@ -1339,6 +1339,31 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             true
         );
         p.envelopeTier = tier_;
+        // A BATCH THAT MOVES CALLS MUST PRICE ABOVE ZERO. `_resolveTierAndCoverage`
+        // sums `cap_i * boundBps_i / 10_000`, so a proposal declaring every cap
+        // at 0 prices at 0 for ANY bound — and zero is not inert, it is the
+        // value at which three independent controls switch themselves off at
+        // once: `_deriveAndStoreEffectiveCapital`'s `gated` goes false so the
+        // approve quorum never runs and `effectiveMaxCapital` stays at the full
+        // `maxCapital`; `proposerBondWood(asset, 0)` returns 0 before it even
+        // reads a price, so no bond is locked; and `ExposureLedger.recordApproval`
+        // returns early on `needUsd == 0`, leaving `_approversOf` empty so
+        // `ChallengeGame.file` reverts `NothingToFreeze` and the proposal is
+        // unchallengeable for life.
+        //
+        // Zero-cap is NOT the same as harmless. `BatchExecutorLib` meters
+        // `balanceBefore - balanceAfter` of the vault asset only, so a call whose
+        // capability is an AUTHORIZATION rather than a transfer — `approve` to an
+        // allowlisted adapter is a recognized selector that passes the vault's
+        // recipient check — truthfully declares `cap = 0` and truthfully meters 0,
+        // while licensing an unbounded pull in a later transaction outside every
+        // meter. The declaration is honest; the metric is what cannot see it.
+        //
+        // Refusing at propose rather than patching the three consumers keeps the
+        // invariant in one place: a proposal carrying execute calls always has a
+        // priced envelope behind it. A genuinely no-op batch has no execute calls
+        // and is unaffected.
+        if (execCalls.length != 0 && coverage_ == 0) revert UnpricedCapability();
         p.requiredCoverage = coverage_;
         // Skipped when unwired — the pre-ledger safe default matches the
         // tierRegistry pattern.
@@ -2071,6 +2096,45 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         try ISyndicateVault(vault).transferPerformanceFee(asset, recipient, amount) {
             return true;
         } catch {
+            // ESCROW ONLY WHAT THE VAULT CAN BACK. The catch cannot see WHY the
+            // transfer failed, and the two reasons want opposite treatment. A
+            // blacklisted recipient means the money IS here and the full amount
+            // must be held for them. `AmountExceedsBalance` means the vault does
+            // NOT have it — and escrowing the full amount then books a liability
+            // that is unbacked by construction, with three compounding effects:
+            // `_escrowedFees` feeds the vault's `_escrowedFeeLiability()`, which
+            // `totalAssets()` subtracts, so an oversized escrow pins
+            // `totalAssets()` to 0 — zeroing every LP's conversion AND stamping
+            // the settle price at `num == 1` for this proposal's whole queued
+            // flow, with `cancel` already closed by `AlreadySettled`; and
+            // `claimUnclaimedFees` re-requests the SAME full amount, so it fails
+            // the same comparison permanently, while `rescueERC20` refuses the
+            // vault asset. Traced: a 1,000,000 USDC float at the 500bps cap over
+            // 30d charges 4,109 USDC of management fee; if the strategy returns
+            // 1,000 USDC the escrow books 3,288 against a real balance of 179.
+            //
+            // A fee is charged against assets under management and cannot exceed
+            // them. Capping here forfeits the unbacked remainder — bounded, and
+            // computed off a base that no longer exists — instead of minting a
+            // permanent claim on money that was never there.
+            //
+            // RAW STATICCALL, DEGRADING TO THE FULL AMOUNT. Same doctrine as the
+            // vault's own `_escrowedFeeLiability()`: a vault that cannot answer
+            // reproduces exactly the pre-existing behaviour rather than getting a
+            // stricter one invented for it, so this cannot regress an integration
+            // that works today.
+            uint256 escrowAmount = amount;
+            (bool okCap, bytes memory capRet) = vault.staticcall(abi.encodeCall(ISyndicateVault.spendableFee, (asset)));
+            if (okCap && capRet.length == 32) {
+                uint256 spendable = abi.decode(capRet, (uint256));
+                if (spendable < escrowAmount) escrowAmount = spendable;
+            }
+            if (escrowAmount != amount) emit FeeEscrowCapped(recipient, asset, amount, escrowAmount);
+            if (escrowAmount == 0) {
+                emit FeeTransferFailed(recipient, asset, amount);
+                return false;
+            }
+            amount = escrowAmount;
             _unclaimedFees[_unclaimedKey(vault, recipient, asset)] += amount;
             // Mirror into the per-(vault, token) aggregate so the vault can
             // net this liability out of `totalAssets()` — see `_escrowedFees`
