@@ -275,6 +275,17 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         uint256 swapFractionBps;
     }
 
+    /// @notice The pre-rerange half of `PositionReranged`, held in memory.
+    /// @dev    Exists for the stack, not for the interface — see `rerange()`.
+    struct RerangeLog {
+        uint256 oldTokenId;
+        int24 oldLower;
+        int24 oldUpper;
+        int24 twap;
+        uint128 liquidityBefore;
+        uint128 liquidityAfter;
+    }
+
     struct InitParams {
         address pool;
         address positionManager;
@@ -898,12 +909,20 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // (2) Price has reached the approved trigger fraction of the range.
         _requireTriggerReached(twap);
 
-        int24 oldLower = tickLower;
-        int24 oldUpper = tickUpper;
-        uint256 oldTokenId = tokenId;
+        // Carried in MEMORY, not as ten live locals. `PositionReranged` reports
+        // both ranges, both liquidities and the centering tick, and holding all
+        // of that on the stack across the close and the re-mint overflows the
+        // 16-slot limit under the NON-via-ir pipeline `forge coverage` uses —
+        // the contract built fine under the project's `via_ir = true` while
+        // `forge coverage` could not compile it at all.
+        RerangeLog memory log;
+        log.oldTokenId = tokenId;
+        log.oldLower = tickLower;
+        log.oldUpper = tickUpper;
+        log.twap = twap;
+        (log.liquidityBefore,) = _positionLiquidity(log.oldTokenId);
 
-        (uint128 liquidityBefore,) = _positionLiquidity(oldTokenId);
-        _closePosition(oldTokenId);
+        _closePosition(log.oldTokenId);
 
         (int24 newLower, int24 newUpper) = _derivedRange(twap);
 
@@ -912,10 +931,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // holds only the vault asset (see `_rebalanceToTarget`). The borrow and
         // the collateral are untouched by construction: no Morpho call appears
         // anywhere in this path.
-        (uint256 tid, uint128 liquidityAfter) =
+        (newTokenId, log.liquidityAfter) =
             _mintPosition(newLower, newUpper, _rerange.swapFractionBps, _rerange.slippageBps);
 
-        tokenId = tid;
+        tokenId = newTokenId;
         tickLower = newLower;
         tickUpper = newUpper;
         lastRerangeAt = block.timestamp;
@@ -923,10 +942,24 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             rerangeCount++;
         }
 
+        _emitReranged(log);
+    }
+
+    /// @dev Reads the post-rerange half of the event from STORAGE rather than
+    ///      taking it as arguments, so the caller need not keep it live.
+    function _emitReranged(RerangeLog memory log) private {
         emit PositionReranged(
-            rerangeCount, oldTokenId, tid, oldLower, oldUpper, newLower, newUpper, twap, liquidityBefore, liquidityAfter
+            rerangeCount,
+            log.oldTokenId,
+            tokenId,
+            log.oldLower,
+            log.oldUpper,
+            tickLower,
+            tickUpper,
+            log.twap,
+            log.liquidityBefore,
+            log.liquidityAfter
         );
-        return tid;
     }
 
     /// @dev Price must have travelled `triggerBps` of the way from the range's
