@@ -601,7 +601,7 @@ contract PortfolioStrategy is BaseStrategy {
             if (allocation == 0) continue;
 
             IERC20(asset).forceApprove(address(swapAdapter), allocation);
-            uint256 minOut = _buyFloor(i, allocation);
+            uint256 minOut = _buyFloor(i, allocation, type(uint256).max);
             uint256 amountOut = swapAdapter.swap(asset, alloc.token, allocation, minOut, _swapExtraData[i]);
             if (amountOut == 0) revert SwapFailed();
 
@@ -629,7 +629,7 @@ contract PortfolioStrategy is BaseStrategy {
             if (bal == 0) continue;
 
             IERC20(alloc.token).forceApprove(address(swapAdapter), bal);
-            uint256 minOut = _sellFloor(i, alloc.token, bal);
+            uint256 minOut = _sellFloor(i, alloc.token, bal, type(uint256).max);
             uint256 amountOut = swapAdapter.swap(alloc.token, asset, bal, minOut, _swapExtraData[i]);
             if (amountOut == 0) revert SwapFailed();
 
@@ -738,7 +738,7 @@ contract PortfolioStrategy is BaseStrategy {
             if (bal == 0) continue;
 
             IERC20(alloc.token).forceApprove(address(swapAdapter), bal);
-            uint256 minOut = _sellFloor(i, alloc.token, bal);
+            uint256 minOut = _sellFloor(i, alloc.token, bal, maxSlippageBps);
             uint256 amountOut = swapAdapter.swap(alloc.token, asset, bal, minOut, _swapExtraData[i]);
             if (amountOut == 0) revert SwapFailed();
             alloc.tokenAmount = 0;
@@ -755,7 +755,7 @@ contract PortfolioStrategy is BaseStrategy {
             if (allocation == 0) continue;
 
             IERC20(asset).forceApprove(address(swapAdapter), allocation);
-            uint256 minOut = _buyFloor(i, allocation);
+            uint256 minOut = _buyFloor(i, allocation, maxSlippageBps);
             uint256 amountOut = swapAdapter.swap(asset, alloc.token, allocation, minOut, _swapExtraData[i]);
             if (amountOut == 0) revert SwapFailed();
 
@@ -1130,7 +1130,32 @@ contract PortfolioStrategy is BaseStrategy {
     ///      owner-multisig emergency settle. So a stale, mismatched-decimals or
     ///      codeless feed degrades to the quote-anchored `_quoteMinOut` floor and
     ///      inherits that path's NOT-SANDWICH-PROTECTION caveat.
-    function _sellFloor(uint256 i, address token, uint256 bal) private returns (uint256 minOut) {
+    /// @param bandCap The WIDEST band this caller will accept, and therefore
+    ///        the widest it is willing to be BILLED for (pashov 2026-08
+    ///        finding #14). The stale-anchor branch widens with anchor age up
+    ///        to `MAX_STALE_SLIPPAGE_BPS`, which does not scale with
+    ///        `maxSlippageBps` — so a metered caller billing
+    ///        `2 * maxSlippageBps` while enforcing up to 3_000 was billing a
+    ///        band it did not enforce, by a ratio reaching 60x. That is the
+    ///        finding.
+    ///
+    ///        Resolved at the SPLIT rather than at the meter, because the two
+    ///        callers want opposite things. `settle()` is the only
+    ///        non-emergency exit and passes `type(uint256).max`: it must take
+    ///        the widened band, since failing closed there strands capital and
+    ///        is exactly what the age ramp was introduced to prevent.
+    ///        `rebalance()` is discretionary and passes `maxSlippageBps`:
+    ///        blocking one rebalance strands nothing, so it refuses a trade it
+    ///        cannot bill for rather than taking a 30% band on a 0.5% budget.
+    ///
+    ///        With the cap in place the metered path's enforced band IS
+    ///        `maxSlippageBps`, so the existing charge is correct and
+    ///        `MAX_CUMULATIVE_DECAY_BPS` needs no re-sizing. Billing the wide
+    ///        band instead — the other candidate fix — made the FIRST
+    ///        `rebalance()` revert `DecayBudgetExhausted` at any anchor age
+    ///        above ~303 seconds, removing the function rather than metering
+    ///        it.
+    function _sellFloor(uint256 i, address token, uint256 bal, uint256 bandCap) private returns (uint256 minOut) {
         if (chainlinkVerifier == address(0)) {
             (uint256 price, bool ok) = _tryPushFeedPrice(i);
             if (ok) {
@@ -1161,7 +1186,9 @@ contract PortfolioStrategy is BaseStrategy {
         uint256 lastGood = _lastGoodPrice[i];
         if (lastGood != 0) {
             uint256 staleValue = _tokensToValue(bal, lastGood, i, uint256(_assetDecimals));
-            uint256 staleFloor = (staleValue * (BPS_DENOMINATOR - _staleSlippageBps(i))) / BPS_DENOMINATOR;
+            uint256 band = _staleSlippageBps(i);
+            if (band > bandCap) band = bandCap;
+            uint256 staleFloor = (staleValue * (BPS_DENOMINATOR - band)) / BPS_DENOMINATOR;
             // FLOORED BY THE QUOTE in Data Streams mode, for exactly the reason
             // `_sellOverweight` does it: `_priceDecimals[i]` is proposer-declared
             // and cross-checked against NOTHING there (a DS report carries no
@@ -1204,7 +1231,8 @@ contract PortfolioStrategy is BaseStrategy {
     ///      allocation with the pool pushed 100x nets ~10,000 USDC of tokens).
     /// @param i        Allocation index.
     /// @param amountIn Asset amount about to be spent buying allocation `i`.
-    function _buyFloor(uint256 i, uint256 amountIn) private returns (uint256 minOut) {
+    /// @param bandCap As `_sellFloor` — see the note there.
+    function _buyFloor(uint256 i, uint256 amountIn, uint256 bandCap) private returns (uint256 minOut) {
         if (chainlinkVerifier == address(0)) {
             (uint256 price, bool ok) = _tryPushFeedPrice(i);
             if (ok) {
@@ -1220,7 +1248,9 @@ contract PortfolioStrategy is BaseStrategy {
         uint256 lastGood = _lastGoodPrice[i];
         if (lastGood != 0) {
             uint256 staleTokens = _valueToTokens(amountIn, lastGood, i, uint256(_assetDecimals));
-            uint256 staleFloor = (staleTokens * (BPS_DENOMINATOR - _staleSlippageBps(i))) / BPS_DENOMINATOR;
+            uint256 band = _staleSlippageBps(i);
+            if (band > bandCap) band = bandCap;
+            uint256 staleFloor = (staleTokens * (BPS_DENOMINATOR - band)) / BPS_DENOMINATOR;
             // Floored by the quote in Data Streams mode for the same reason, and
             // with the same non-reverting degradation, as `_sellFloor`; see the
             // note there on the unvalidated Data Streams price scale.
