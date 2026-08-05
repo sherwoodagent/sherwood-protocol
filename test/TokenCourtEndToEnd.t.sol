@@ -573,10 +573,19 @@ contract TokenCourtEndToEndTest is Test {
         assertGt(prosecutorFee, 0, "the fee is live in this fixture");
         uint256 settleBurned = (c.counterBondWood * c.settleBurnBpsAtFiling) / 10_000;
         assertGt(settleBurned, 0, "sanity: the default settleBurnBps actually burns something on this branch now");
+        // BURN MODEL (pashov 2026-08 finding #10). The counter-bond pool no
+        // longer forfeits TO the challenger on conviction -- it is burned. The
+        // challenger recovers its own bond net of the settle slice, plus the
+        // prosecutor's cut of the proposer bond, and nothing from the pool.
+        //
+        // The self-dealing round trip this comment block is about is closed
+        // HARDER by that, not softer: funding your own pool through a second
+        // address now loses the pool outright instead of returning it net of a
+        // slice. See test_rule_selfFilingCohortRecoversNothingFromTheBurnedPool.
         assertEq(
             wood.balanceOf(challenger),
-            challengerBalBefore + c.counterBondWood - settleBurned + prosecutorFee,
-            "bond back, the forfeited pool net of the settle-slice burn, and the prosecutor's cut of the proposer bond"
+            challengerBalBefore + c.bondWood - settleBurned + prosecutorFee,
+            "own bond net of the settle-slice burn, plus the prosecutor's cut -- the pool is burned, not paid out"
         );
 
         // ── The named adapter lost its certification (D7).
@@ -1021,10 +1030,20 @@ contract TokenCourtEndToEndTest is Test {
         // yet.
         vm.prank(owner);
         game.setCourt(address(0));
-        vm.startPrank(g1);
+        // ONE contribution answers BOTH filings now (pashov 2026-08 finding
+        // #10): the counter-bond pool is keyed per PROPOSAL, not per challenge,
+        // so completing it through cidA leaves cidB Disputed as well. A second
+        // `dispute` on the same key therefore reverts `WrongStatus` -- cidB is
+        // no longer `Filed`. That is the fix working; before it, the accused
+        // had to fund a separate pool per filing, which is exactly the N-fold
+        // cost the finding is about.
+        vm.prank(g1);
         game.dispute(cidA, type(uint256).max);
-        game.dispute(cidB, type(uint256).max);
-        vm.stopPrank();
+        assertEq(
+            uint8(game.challengeOf(cidB).status),
+            uint8(IChallengeGame.Status.Disputed),
+            "the shared pool answers the sibling filing too"
+        );
 
         // ── The stranger-can-refer half, proven FIRST, while cidB's own
         //    clock is still fresh (filed only seconds after cidA, under the

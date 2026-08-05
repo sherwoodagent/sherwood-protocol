@@ -320,7 +320,13 @@ contract ChallengeGame_settlementEconomicsTest is Test {
         uint256 settleBurnBpsAtFiling = game.challengeOf(id).settleBurnBpsAtFiling;
         uint256 expectedBurn = (bondWood * settleBurnBpsAtFiling) / 10_000;
         assertGt(expectedBurn, 0, "fixture must exercise a non-zero burn rate");
-        uint256 expectedReceipt = 2 * bondWood - expectedBurn;
+        // BURN MODEL (pashov 2026-08 finding #10). The pool is burned on
+        // conviction rather than forfeited to the challenger, so a self-funded
+        // round trip recovers only its own BOND net of the slice -- it does not
+        // get the pool back at all. That makes issue #181 finding 18b STRICTLY
+        // STRONGER than when this test was written: the round trip used to cost
+        // the slice alone, and now costs the whole pool plus the slice.
+        uint256 expectedReceipt = bondWood - expectedBurn;
 
         vm.prank(address(court));
         game.rule(id, IChallengeGame.Verdict.Guilty);
@@ -332,6 +338,7 @@ contract ChallengeGame_settlementEconomicsTest is Test {
         uint256 received = wood.balanceOf(challenger);
         assertEq(received, expectedReceipt, "the round trip must cost exactly the settle-burn slice, not zero");
         assertLt(received, 2 * bondWood, "THE ROUND TRIP MUST NOT BE FREE (issue #181 finding 18b)");
+        assertLt(received, bondWood, "and under the burn model it does not even recover its own bond");
         assertEq(wood.balanceOf(game.BURN_ADDRESS()), expectedBurn, "the slice must actually be destroyed");
     }
 
