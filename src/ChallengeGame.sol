@@ -992,12 +992,29 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      pool and rides to `_fail`. `dispute` accepts the payment without
     ///      signalling any of this.
     ///
-    ///      Kept as a stated rule rather than a refusal in `dispute` because the
-    ///      alternative — rejecting a contribution whenever some live sibling's
-    ///      window has already closed — hands any challenger a cheap way to
-    ///      block the defence entirely by filing early and waiting. Closing it
-    ///      properly means pricing the burn per-challenge rather than
-    ///      per-pool, which is a design change, not a guard.
+    ///      OPEN, KNOWINGLY, AND NOT BECAUSE A GUARD WOULD BE UNSAFE. The
+    ///      obvious guard — refuse the contribution in `dispute` whenever some
+    ///      LIVE challenge's window has already closed — does not enable the
+    ///      denial it looks like it might. The instant that window closes,
+    ///      `resolve` is permissionless and the silence verdict is automatic, so
+    ///      the challenger's move is to CONVICT, not to sit still; and once it
+    ///      does, `_convicted[rk]` makes every other challenge on the key moot.
+    ///      The refusal window is therefore a window in which paying was already
+    ///      pointless. All the guard would really remove is the accused's gamble
+    ///      that nobody collects a verdict already sitting there for the taking
+    ///      — a weak gamble, but not literally nothing, which is the only force
+    ///      the denial argument has.
+    ///
+    ///      What actually keeps this open is the burn: closing the hole means
+    ///      pricing the burn PER-CHALLENGE rather than per-pool, so a pool that
+    ///      backed a sibling is not destroyed by a conviction it never
+    ///      defended. That is a redesign, not a guard, and the guard alone would
+    ///      leave the burn wrong in every other staggered case.
+    ///
+    ///      Stated plainly rather than argued away: the behaviour is pinned by
+    ///      `test_settle_poolCompletedTooLateForTheEarliestChallengeStillBurns`,
+    ///      and a reviewer should read this as a known open issue with a named
+    ///      fix, not as a closed question.
     function _poolBacked(Challenge storage c, CounterBondPool storage p) private view returns (bool) {
         uint256 completedAt = p.completedAt;
         return completedAt != 0 && completedAt < c.filedAt + c.autoSlashDelayAtFiling;
