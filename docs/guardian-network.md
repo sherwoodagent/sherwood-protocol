@@ -22,7 +22,7 @@ means `stakedAmount > 0` and no pending unstake request.
 |---|---|---|---|---|
 | `minGuardianStake` | 10 000 WOOD | 1 WOOD | — | `StakedWood.sol:818` |
 | `coolDownPeriod` (unstake delay) | 7 d | 1 d | 30 d, and ≥ `registry.reviewPeriod` | `StakedWood.sol:833` |
-| `minOwnerStake` (vault-owner bond) | 10 000 WOOD | 0 (open onboarding) or ≥ 1 000 | — | `StakedWood.sol:848` |
+| `minOwnerStake` (vault-owner bond at creation) | 10 000 WOOD | 0 (open onboarding) or ≥ 1 000 | — | `StakedWood.sol:848` |
 | `minSlashBps` | 10% | 0 | ≤ `maxSlashBps` | `StakedWood.sol:858` |
 | `maxSlashBps` | 100% | ≥ `minSlashBps` | 100% | `StakedWood.sol:867` |
 | `ageFloorBps` (new-stake vote weight) | 25% | > 0 | 100% | `StakedWood.sol:874` |
@@ -193,10 +193,36 @@ the verdict. No panel, no appeal.
 - `unstick` — vault owner replays the already-voted settlement calls after
   `strategyDuration`. No review: the calldata was already reviewed.
 - `emergencySettleWithCalls` — vault owner submits **new** calls; requires the
-  owner's sWOOD bond (`requiredOwnerBond`, currently flat `minOwnerStake`) and opens
+  owner's sWOOD bond (`requiredOwnerBond` = `max(minOwnerStake, 1 000 WOOD)`,
+  and the posted bond must be strictly positive) and opens
   a fresh guardian review (block-only voting). A block slashes the **owner's bond**,
   not guardians. Finalize executes with per-call caps disabled — the escape hatch
   for a settlement leg stuck on a cap.
+
+### Migrating a vault created under the zero-bond sentinel
+
+`minOwnerStake` may legally be `0` — the deliberate open-onboarding sentinel for
+vault creation. Before the `MIN_OWNER_BOND_FLOOR`, that made the emergency gate
+evaluate `0 < 0` and pass with **no bond posted**, while `slashOwnerBond`
+returned early on `amount == 0`. The deterrent on the one path that runs
+owner-supplied calldata with per-call metering disabled was a complete no-op.
+
+Flooring `requiredOwnerBond` fixes that, and it is a **behaviour change for
+vaults already created under the sentinel**: `bindOwnerStake` only sets
+`p.bound = true` when `p.amount != 0`, so those vaults hold an unbound,
+zero-amount slot and `emergencySettleWithCalls` now reverts
+`OwnerBondInsufficient` for them until a real bond is posted.
+
+The way back is a three-step, `onlyFactory`-gated ceremony, and it works
+because `transferOwnerStakeSlot`'s `PriorStakeNotCleared` guard passes at zero:
+
+1. `prepareOwnerStake(amount)` with `amount >= requiredOwnerBond(vault)`
+2. `approvedBindVault` to bind the funded slot
+3. `rotateOwner` to the same address, re-binding it
+
+Until that runs, the affected vault keeps `unstick` — which carries no bond gate
+— so a settlement replay of already-reviewed calldata is unaffected. Only the
+new-calldata escape hatch is gated.
 
 ## How guardians get paid
 

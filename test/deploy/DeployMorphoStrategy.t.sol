@@ -9,6 +9,7 @@ import {MorphoSupplyStrategy} from "../../src/strategies/MorphoSupplyStrategy.so
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockMorpho, MockIrm} from "../mocks/MockMorpho.sol";
+import {MockPermissiveTierRegistry} from "../mocks/MockPermissiveTierRegistry.sol";
 import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
 import {Id, MarketParams} from "../../src/vendor/morpho/IMorpho.sol";
 
@@ -80,7 +81,11 @@ contract DeployMorphoStrategyTest is Test {
         });
         mockMorpho.createMarket(mp);
 
-        vaultStub = new VaultStub(address(usdg), address(new MockProposalStatus()));
+        // `_initialize` fails CLOSED when `vault() -> governor() -> tierRegistry()`
+        // yields nothing, so the governor stand-in must seat a registry.
+        MockProposalStatus status = new MockProposalStatus();
+        status.setTierRegistry(address(new MockPermissiveTierRegistry()));
+        vaultStub = new VaultStub(address(usdg), address(status));
     }
 
     // ── The template ──

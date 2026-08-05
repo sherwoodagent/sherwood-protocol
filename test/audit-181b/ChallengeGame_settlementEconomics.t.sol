@@ -86,6 +86,22 @@ contract MockLedgerSE {
         }
     }
 
+    /// @dev `ChallengeGame.file` reads the PLEDGE, not the booking (pashov
+    ///      2026-08 finding #24). This stub does not model `settleCoverage`, so
+    ///      the two never diverge here — present so the typed call resolves.
+    function pledgedOf(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory guardians, uint256[] memory pledgedUsd)
+    {
+        bytes32 k = _key(governor, proposalId);
+        guardians = _approvers[k];
+        pledgedUsd = new uint256[](guardians.length);
+        for (uint256 i = 0; i < guardians.length; i++) {
+            pledgedUsd[i] = _committed[k][guardians[i]];
+        }
+    }
+
     /// @dev Zero means "no override" at the `file()` call site — the raw
     ///      `approversOf` sum is used as-is.
     function unsharedLiabilityUsd(address, uint256) external pure returns (uint256) {

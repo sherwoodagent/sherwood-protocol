@@ -128,6 +128,16 @@ contract GuardianRegistry_quorumDenominatorTest is RegistryTestHarness {
     function test_voteBlockEmergencySettle_roundCannotWrapOntoAUsedRound() public {
         uint256 wrapCycles = 128;
         _stakeGuardian(honestBlocker, 10_000e18, 1);
+        // A silent majority, so the single block vote below does NOT itself
+        // reach quorum. Without it `cancelEmergency` refuses in cycle 1: with
+        // the cold-start waiver removed, a lone blocker in a lone-guardian
+        // cohort is 100% of the electorate and the owner may not cancel out
+        // from under a met quorum. That gate is the point of `cancelEmergency`;
+        // this test is about the ROUND KEY never recurring, so the fixture is
+        // sized to leave the gate open rather than to fight it. This suite runs
+        // a 20% quorum (not the 30% default), so 10k of 100k is 10% — clear of
+        // it with margin.
+        _stakeGuardian(honestSilent, 90_000e18, 2);
         // Mature past maturationPeriod so the guardian's vote weight is
         // stable (full par) for both the cycle-1 vote and the cycle-129 vote.
         vm.warp(vm.getBlockTimestamp() + 31 days);

@@ -389,11 +389,95 @@ contract UniswapSwapAdapterHarness is UniswapSwapAdapter {
         return _reversePath(path);
     }
 
+    function requireEndpoints(bytes memory path, address tokenIn, address tokenOut) external pure {
+        _requireEndpoints(path, tokenIn, tokenOut);
+    }
+
     function orientHops(PathHop[] memory hops, address tokenIn, address tokenOut)
         external
         pure
         returns (PathHop[] memory)
     {
         return _orientHops(hops, tokenIn, tokenOut);
+    }
+}
+
+/// @notice Pashov 2026-08 finding #4 — mode 1 never bound the path's TAIL to
+///         `tokenOut`.
+/// @dev    `swap` mode 1 checked only that the packed path STARTS at `tokenIn`
+///         (reversing it if not) and never referenced `tokenOut` at all, while
+///         `_chainedSingleHops` derives every hop from the path bytes and pays
+///         the terminal token to `msg.sender`. So the route decided what the
+///         caller received, and `amountOutMin` — computed by the caller in
+///         `tokenOut` units, oracle-anchored in `PortfolioStrategy._buyFloor` /
+///         `_sellFloor` — was enforced by the router against a DIFFERENT
+///         token's units, which any freely-mintable token clears trivially.
+///
+///         `quote` mode 1 had the same gap with a sharper consequence:
+///         `quoteExactInput` prices the path's terminal token, so callers built
+///         slippage floors out of a mis-denominated number rather than failing.
+///
+///         Modes 0, 2 and 3 all bind `tokenOut` already (`exactInputSingle`'s
+///         struct field, `hops[0].currency`, and `_orientHops`' own endpoint
+///         check); mode 1 was the sole exception.
+contract UniswapAdapterEndpointBindingTest is Test {
+    UniswapSwapAdapterHarness adapter;
+
+    address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
+    address constant WETH = 0x4200000000000000000000000000000000000006;
+    address constant TSLA = 0xf30Bf00edd0C22db54C9274B90D2A4C21FC09b07;
+    /// @dev The attacker's own freely-mintable token — the terminal hop a
+    ///      mis-bound route redirects into.
+    address constant ATK = 0x00000000000000000000000000000000DeaDBeef;
+
+    function setUp() public {
+        adapter = new UniswapSwapAdapterHarness(address(1), address(2), address(0), address(0));
+    }
+
+    function test_singleHop_matchingEndpoints_accepted() public view {
+        bytes memory path = abi.encodePacked(USDC, uint24(500), TSLA);
+        adapter.requireEndpoints(path, USDC, TSLA);
+    }
+
+    function test_multiHop_matchingEndpoints_accepted() public view {
+        bytes memory path = abi.encodePacked(USDC, uint24(500), WETH, uint24(3000), TSLA);
+        adapter.requireEndpoints(path, USDC, TSLA);
+    }
+
+    /// @dev THE finding: head matches, tail does not. Pre-fix this was accepted
+    ///      and the caller received ATK while its floor was denominated in TSLA.
+    function test_headMatchesButTailRedirected_rejected() public {
+        bytes memory path = abi.encodePacked(USDC, uint24(500), ATK);
+        vm.expectRevert(UniswapSwapAdapter.InvalidPath.selector);
+        adapter.requireEndpoints(path, USDC, TSLA);
+    }
+
+    /// @dev Same redirect hidden behind an honest-looking intermediate hop.
+    function test_multiHopTailRedirected_rejected() public {
+        bytes memory path = abi.encodePacked(USDC, uint24(500), WETH, uint24(3000), ATK);
+        vm.expectRevert(UniswapSwapAdapter.InvalidPath.selector);
+        adapter.requireEndpoints(path, USDC, TSLA);
+    }
+
+    /// @dev The head is re-asserted here rather than trusted from the caller's
+    ///      orientation `if`, so the helper states the whole invariant alone.
+    function test_headMismatch_rejected() public {
+        bytes memory path = abi.encodePacked(WETH, uint24(500), TSLA);
+        vm.expectRevert(UniswapSwapAdapter.InvalidPath.selector);
+        adapter.requireEndpoints(path, USDC, TSLA);
+    }
+
+    /// @dev A degenerate 20-byte path is head AND tail at once, so it is only
+    ///      valid when both endpoints are the same token — which is not a swap.
+    function test_degenerateSingleAddressPath_rejectedForDistinctTokens() public {
+        bytes memory path = abi.encodePacked(USDC);
+        vm.expectRevert(UniswapSwapAdapter.InvalidPath.selector);
+        adapter.requireEndpoints(path, USDC, TSLA);
+    }
+
+    function test_shortPath_rejected() public {
+        bytes memory path = hex"00112233";
+        vm.expectRevert(UniswapSwapAdapter.InvalidPath.selector);
+        adapter.requireEndpoints(path, USDC, TSLA);
     }
 }

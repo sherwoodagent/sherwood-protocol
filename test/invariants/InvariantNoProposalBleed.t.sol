@@ -51,7 +51,7 @@ contract ProposalBleedHandler is Test {
     function openReview(uint256 seed) external {
         MockGovernorMinimal gov = _gov(seed);
         uint256 pid = 1 + (seed % PID_SPACE);
-        (bool opened,,,) = registry.getReviewState(address(gov), pid);
+        (bool opened,,) = registry.getReviewState(address(gov), pid);
         if (opened) return;
         uint256 ve = vm.getBlockTimestamp();
         vm.prank(address(gov));
@@ -63,7 +63,7 @@ contract ProposalBleedHandler is Test {
         MockGovernorMinimal gov = _gov(seed);
         uint256 pid = 1 + (seed % PID_SPACE);
         address g = guardians[(seed / 7) % 3];
-        (bool opened, bool resolved,,) = registry.getReviewState(address(gov), pid);
+        (bool opened, bool resolved,) = registry.getReviewState(address(gov), pid);
         if (!opened || resolved) return;
         // Skip if this guardian already voted under (gov, pid) or the window closed.
         if (approvedUnder[address(gov)][pid][g]) return;

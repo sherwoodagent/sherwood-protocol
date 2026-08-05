@@ -224,15 +224,9 @@
         "type": "t_uint64"
       },
       {
-        "label": "cohortTooSmall",
-        "slot": "2",
-        "offset": 27,
-        "type": "t_bool"
-      },
-      {
         "label": "blockQuorumBpsAtOpen",
         "slot": "2",
-        "offset": 28,
+        "offset": 27,
         "type": "t_uint16"
       },
       {
@@ -274,15 +268,9 @@
         "type": "t_bool"
       },
       {
-        "label": "cohortTooSmall",
-        "slot": "0",
-        "offset": 3,
-        "type": "t_bool"
-      },
-      {
         "label": "totalStakeAtOpen",
         "slot": "0",
-        "offset": 4,
+        "offset": 3,
         "type": "t_uint128"
       },
       {
@@ -337,6 +325,12 @@
         "label": "clockShiftAtRegister",
         "slot": "3",
         "offset": 0,
+        "type": "t_uint64"
+      },
+      {
+        "label": "snapshotAt",
+        "slot": "3",
+        "offset": 8,
         "type": "t_uint64"
       }
     ],

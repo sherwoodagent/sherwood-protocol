@@ -69,7 +69,6 @@ interface IGuardianRegistry {
     /// @notice Governor pushed a proposal's review window at propose time.
     event ReviewRegistered(address indexed governor, uint256 indexed proposalId, uint64 voteEnd, uint64 reviewEnd);
     event ReviewOpened(uint256 indexed proposalId, uint128 totalStakeAtOpen);
-    event CohortTooSmallToReview(uint256 indexed proposalId, uint256 totalStakeAtOpen);
     event GuardianVoteCast(
         uint256 indexed proposalId, address indexed guardian, GuardianVoteType support, uint128 weight
     );
@@ -178,11 +177,10 @@ interface IGuardianRegistry {
     /// @return opened Whether `openReview` was called
     /// @return resolved Whether `resolveReview` has finalized the review
     /// @return blocked Whether guardians reached the block quorum (requires resolved)
-    /// @return cohortTooSmall Whether the cohort at open was below MIN_COHORT_STAKE_AT_OPEN
     function getReviewState(address governor, uint256 proposalId)
         external
         view
-        returns (bool opened, bool resolved, bool blocked, bool cohortTooSmall);
+        returns (bool opened, bool resolved, bool blocked);
 
     /// @notice The guardian review's verdict on a proposal, as a pure view.
     ///         Mirrors `resolveReview`'s committed result WITHOUT mutating or

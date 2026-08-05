@@ -523,7 +523,12 @@ contract GuardianReviewLifecycleTest is Test {
     /// @notice When the guardian cohort is below MIN_COHORT_STAKE_AT_OPEN at
     ///         openReview time, the review auto-resolves to Approved with zero
     ///         slashing regardless of how any vote shakes out.
-    function test_lifecycle_cohortTooSmall_autoApproves_noSlashing() public {
+    /// @dev Inverted with the removal of the cold-start waiver. A thin cohort
+    ///      no longer auto-approves: whoever is staked decides. Nobody votes
+    ///      here, so the review clears and the proposal executes — but it
+    ///      clears because there were no BLOCK votes, not because the cohort
+    ///      was waived through.
+    function test_lifecycle_thinCohortStillReviewsNormally() public {
         // Drain the cohort below 50k: request unstake from 3 guardians so only
         // g1 + g2 remain active (40k < 50k).
         vm.prank(g3);
@@ -539,8 +544,8 @@ contract GuardianReviewLifecycleTest is Test {
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
         registry.openReview(address(governor), pid);
 
-        (,,, bool cohortTooSmall) = registry.getReviewState(address(governor), pid);
-        assertTrue(cohortTooSmall, "cohort flagged as too small");
+        (bool opened,,) = registry.getReviewState(address(governor), pid);
+        assertTrue(opened, "a thin cohort opens a real review rather than being waived");
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
@@ -604,7 +609,15 @@ contract GuardianReviewLifecycleTest is Test {
 
         // Age-weighted voting: mature the freshly staked blockers to par so
         // their block votes carry full weight against the raw denominator.
-        skip(30 days);
+        //
+        // 31 days, not 30, and the extra day is load-bearing. Vote weight is
+        // now read at the PROPOSE-time snapshot rather than at review-open, so
+        // the growth gate's `snapshot - FLOOR_LOOKBACK` lookback lands a
+        // voting period earlier than it used to. At exactly 30 days that
+        // lookback falls just BEFORE these guardians staked, so the gate reads
+        // their stake as having grown from zero and clamps them to zero —
+        // `NotActiveGuardian`. That is the gate working, not a regression.
+        skip(31 days);
 
         uint256 pid = _propose();
         _voteFor(pid);
@@ -743,12 +756,10 @@ contract GuardianReviewLifecycleTest is Test {
         );
 
         // Registry review is now cached as resolved=true, blocked=false, opened=false.
-        (bool opened, bool resolved, bool blocked, bool cohortTooSmall) =
-            registry.getReviewState(address(governor), pid);
+        (bool opened, bool resolved, bool blocked) = registry.getReviewState(address(governor), pid);
         assertFalse(opened, "review never opened");
         assertTrue(resolved, "review cached resolved");
         assertFalse(blocked, "review not blocked");
-        assertFalse(cohortTooSmall, "cohortTooSmall flag stays unset when !opened");
 
         // No guardian slashing occurred.
         assertEq(swood.guardianStake(g1), GUARDIAN_STAKE, "g1 stake untouched");

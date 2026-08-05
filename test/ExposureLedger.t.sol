@@ -728,6 +728,50 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.allocatedUsd(address(mgov), 1, guardian), 500e18, "settles once execution is moot");
     }
 
+    /// @notice PASHOV 2026-08 FINDING #24 — the booking and the pledge diverge,
+    ///         and `ChallengeGame.file` must read the PLEDGE.
+    /// @dev    Teeth for a change that is otherwise behaviourally invisible:
+    ///         the two `ChallengeGame` test stubs implement `pledgedOf` by
+    ///         returning the booking, so they can never show the divergence.
+    ///         This drives it against the REAL ledger.
+    ///
+    ///         `settleCoverage` is permissionless, re-runnable and deliberately
+    ///         NOT freeze-gated, so a stranger can move `_recorded` — which
+    ///         `approversOf` returns — while `_reservedUsd`, which `pledgedOf`
+    ///         returns, stands. `file` sized the challenger bond, its
+    ///         `NothingToFreeze` gate, and its accused set from the movable
+    ///         one, and could therefore diverge from the set `_settle` actually
+    ///         slashes, since `slashBpsFor` is already pledge-based.
+    function test_finding24_settleCoverageMovesTheBookingButNotThePledge() public {
+        _wireRecording();
+        address g2 = makeAddr("g2");
+        swood.setStake(g2, 100_000e18);
+        mgov.set(1_000e6);
+        mgov.setScheduleFull(block.timestamp + 20 days, 3 days, block.timestamp + 1 days);
+
+        vm.startPrank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        ledger.recordApproval(address(mgov), 1, g2);
+        vm.stopPrank();
+
+        (, uint256[] memory bookedBefore) = ledger.approversOf(address(mgov), 1);
+        (, uint256[] memory pledgedBefore) = ledger.pledgedOf(address(mgov), 1);
+        assertEq(bookedBefore[0], pledgedBefore[0], "the two agree until settleCoverage first runs");
+        assertGt(pledgedBefore[0], 0, "fixture booked nothing, the divergence could not show");
+
+        // Anyone, unprompted, past executeBy.
+        skip(25 days);
+        ledger.settleCoverage(address(mgov), 1);
+
+        (address[] memory afterList, uint256[] memory bookedAfter) = ledger.approversOf(address(mgov), 1);
+        (, uint256[] memory pledgedAfter) = ledger.pledgedOf(address(mgov), 1);
+
+        assertEq(afterList.length, 2, "the approver list itself is untouched");
+        assertTrue(bookedAfter[0] != bookedBefore[0], "settleCoverage must actually have moved the booking");
+        assertEq(pledgedAfter[0], pledgedBefore[0], "the pledge is not movable by a stranger");
+        assertEq(pledgedAfter[1], pledgedBefore[1], "neither is the second approver's");
+    }
+
     /// @notice N6 — the haircut is the second multiplier on the same quantity,
     ///         so its VALUE bounds still matter: an unbounded multiplier would
     ///         move every bond's valuation 10,000x in one transaction.

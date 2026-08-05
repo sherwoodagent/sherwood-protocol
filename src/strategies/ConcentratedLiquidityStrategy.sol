@@ -233,7 +233,9 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @notice The approved maximum rerange count has been reached. The position
     ///         stays in its last range and remains settleable.
     error RerangeCapReached();
-    /// @notice A parameter update tried to change something the review approved.
+    /// @notice A parameter update tried to change something the review approved
+    ///         — including loosening a bound in the risk-INCREASING direction,
+    ///         which is the same thing by another route.
     error ImmutableParam();
     /// @notice `sweep()` is the post-settlement recovery path only.
     error NotSettled();
@@ -549,7 +551,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         _requireValidRange(p.tickLower, p.tickUpper, spacing);
 
         _requireValidBounds(p);
-        _requireValidRerangePolicy(p.rerange, spacing);
+        _requireValidRerangePolicy(p.rerange, spacing, p.tickLower, p.tickUpper);
 
         pool = pool_;
         positionManager = INonfungiblePositionManager(p.positionManager);
@@ -845,13 +847,44 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         if (p.twapWindow < MIN_TWAP_WINDOW) revert InvalidBound();
         if (p.maxTwapDeviationBps == 0 || p.maxTwapDeviationBps > MAX_TWAP_DEVIATION_BPS) revert InvalidBound();
         if (p.mintSlippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
-        if (p.settleSlippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
+        // ZERO IS NOT A LEGAL INIT VALUE, because `_updateParams` reads zero as
+        // "keep current" and is otherwise a one-way ratchet. A clone
+        // initialized at 0 could therefore never be corrected: every later
+        // `slippageBps > 0` trips `ImmutableParam` against a stored 0, and the
+        // sentinel path leaves it at 0. The keep-sentinel closes the
+        // pass-0-to-change-only-the-deadline trap; this closes the init one.
+        if (p.settleSlippageBps == 0 || p.settleSlippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
         if (p.swapFractionBps > BPS_DENOMINATOR) revert InvalidBound();
     }
 
-    function _requireValidRerangePolicy(RerangePolicy memory r, int24 spacing) private pure {
+    function _requireValidRerangePolicy(RerangePolicy memory r, int24 spacing, int24 lower, int24 upper) private pure {
         // A half-width below one tick spacing cannot snap to a non-empty range.
         if (r.halfWidthTicks < spacing) revert InvalidRerangePolicy();
+        // THE RERANGE BAND MAY NOT BE NARROWER THAN THE APPROVED ONE (pashov
+        // 2026-08 finding #17, structural half).
+        //
+        // `_execute` enforces `MAX_POOL_SHARE_BPS` on the liquidity it actually
+        // mints; `rerange` re-mints through the same `_mintPosition` and cannot
+        // re-check it without introducing a permanent brick (see the block in
+        // `rerange`). So the cap is preserved HERE instead, at bind time, where
+        // refusing costs a re-proposal rather than stranding a live position.
+        //
+        // For fixed token amounts, liquidity scales inversely with band width:
+        // `L ≈ amount / (sqrt(Pu) - sqrt(Pl))`. A rerange band at least as wide
+        // as the initial one therefore mints at most the liquidity the initial
+        // mint did, and that figure already cleared the cap at `_execute`. This
+        // closes the structural case the finding turns on — a wide initial
+        // range plus `halfWidthTicks == tickSpacing`, which passed every check
+        // and then concentrated the same notional into a single spacing.
+        //
+        // What it does NOT close, stated so the gap is not mistaken for
+        // covered: venue depth FALLING between execute and rerange breaches the
+        // cap with an unchanged band, and no bind-time rule can see that. That
+        // residual needs the runtime check, which needs the zero-liquidity
+        // brick solved first.
+        if (uint256(int256(r.halfWidthTicks)) * 2 < uint256(int256(upper - lower))) {
+            revert InvalidRerangePolicy();
+        }
         if (r.halfWidthTicks > MAX_HALF_WIDTH_TICKS) revert InvalidRerangePolicy();
         if (r.triggerBps == 0 || r.triggerBps > BPS_DENOMINATOR) revert InvalidRerangePolicy();
         if (r.maxReranges > MAX_RERANGE_LIMIT) revert InvalidRerangePolicy();
@@ -1084,6 +1117,17 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             // it was offered.
             IERC20(asset).forceApprove(address(swapAdapter), 0);
         } else {
+            // NOTHING HELD MEANS NOTHING TO SELL, and it must be answered BEFORE
+            // the division below rather than by the `toSwap == 0` guard after
+            // it. `otherValue` stays 0 whenever `otherBal` is 0 (the quote is
+            // skipped), and this branch is still reached in that state because
+            // `targetOtherValue > otherValue` is `0 > 0` — false. The single-
+            // sided LP configuration `_requireValidBounds` accepts
+            // (`swapFractionBps == 0`) lands here on its very first mint, so
+            // without this the whole of `execute()` panics 0x12 with the
+            // proposer's bond already locked, and permissionless `rerange()`
+            // panics the same way on a position holding only the vault asset.
+            if (otherValue == 0) return;
             uint256 excessValue = otherValue - targetOtherValue; // asset units
             // Convert the excess back into `otherToken` units proportionally —
             // `otherValue` is the adapter's price for exactly `otherBal`, so the
@@ -1239,6 +1283,42 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         (uint256 tid, uint128 liquidityAfter) =
             _mintPosition(newLower, newUpper, _rerange.swapFractionBps, _rerange.slippageBps);
 
+        // PASHOV 2026-08 FINDING #17 IS REAL AND IS NOT FIXED HERE. `_execute`
+        // ends with `_requireWithinPoolShare` on the actually-minted liquidity;
+        // this path re-mints through the same `_mintPosition` and does not, so
+        // a wide initial range plus a `halfWidthTicks` of one tick spacing
+        // clears init and execute and then concentrates the same notional far
+        // above `MAX_POOL_SHARE_BPS`. Depth falling between execute and rerange
+        // breaches it on its own.
+        //
+        // The obvious enforcement — `_requireWithinPoolShare(snapshot,
+        // liquidityAfter)` right here — was written, tested, reviewed and
+        // WITHDRAWN. It reverts, and both of its revert paths are permanent:
+        //
+        //   1. The breach it names as its motivating case is STRUCTURAL, not
+        //      transient. `_requireValidRerangePolicy` accepts
+        //      `halfWidthTicks == tickSpacing` and nothing couples that policy
+        //      to `MAX_POOL_SHARE_BPS`, so the same notability in the same one
+        //      spacing produces the same over-cap L on EVERY attempt. The clone
+        //      is then dead on arrival: every `rerange()` reverts for the whole
+        //      proposal lifetime, the position sits out of range earning no
+        //      fees, and the Morpho borrow keeps accruing against it.
+        //   2. `_requireWithinPoolShare` treats `poolLiquidity == 0` as
+        //      unsatisfiable. On a live pool `_closePosition`'s
+        //      `decreaseLiquidity` removes this position from
+        //      `pool.liquidity()`, so a strategy that is the only in-range LP
+        //      reads zero after the close and is bricked. `MockUniswapV3Pool`
+        //      exposes `liquidity` as a plain settable field that
+        //      `decreaseLiquidity` never touches, so NO test against these
+        //      mocks can reach that branch — it is not merely uncovered, it is
+        //      structurally untestable here.
+        //
+        // Trading an over-cap position for a permanently frozen one is not a
+        // fix. The enforcement this needs is at BIND time — reject a rerange
+        // policy that cannot satisfy the cap — which requires coupling
+        // `halfWidthTicks` to `MAX_POOL_SHARE_BPS` through liquidity math this
+        // template deliberately does not carry, plus a fork test for (2).
+        // Left open rather than closed badly.
         tokenId = tid;
         tickLower = newLower;
         tickUpper = newUpper;
@@ -1658,10 +1738,56 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         review would not have approved. That is why the range is not
     ///         settable here even though `rerange()` changes it: `rerange()`
     ///         cannot be steered, and this could be.
+    ///         RISK-REDUCING IS ENFORCED, NOT ASSERTED. The ceiling alone is not
+    ///         that claim: it lets a proposal reviewed at a tight settlement band
+    ///         be widened all the way to `MAX_SLIPPAGE_BPS` after approval, and
+    ///         `settleProposal` is proposer-callable an hour after execute — so
+    ///         the same address that widened the band is the one that then
+    ///         settles through it, into a sandwich it controls, with nobody
+    ///         reviewing the change. `settleSlippageBps` is therefore
+    ///         TIGHTEN-ONLY, mirroring `PortfolioStrategy._updateParams`, which
+    ///         names the identical adversary.
+    ///
+    ///         NO FLOOR, deliberately, and this is where it departs from
+    ///         `PortfolioStrategy`'s `MIN_SLIPPAGE_BPS`. There an over-tight
+    ///         value is irreversible AND bricks `rebalanceDelta`. Here the only
+    ///         consumer is `_trySwapToAsset`, which DEGRADES: a floor nothing
+    ///         can fill skips the conversion and leaves the residue to `sweep()`
+    ///         and `releaseUnconvertible()`. Self-inflicted and recoverable does
+    ///         not need to be a rejected input.
+    ///
+    ///         `settleDeadline` needs no such rule: `_deadline()` returns
+    ///         `max(settleDeadline, block.timestamp)`, so the field can never
+    ///         resolve to the past and lowering it only narrows how late a
+    ///         settlement batch may land — the risk-reducing direction already.
     function _updateParams(bytes calldata data) internal override {
         (uint256 slippageBps, uint256 deadline) = abi.decode(data, (uint256, uint256));
-        if (slippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
-        settleSlippageBps = slippageBps;
+        // ZERO KEEPS THE CURRENT BAND — it does not set a zero one.
+        //
+        // `PortfolioStrategy._updateParams` documents this repo's convention as
+        // "Pass empty arrays / 0 to keep current values", and without the
+        // sentinel the tighten-only ratchet below turns that convention into a
+        // one-way trap: a proposer shortening only the deadline writes
+        // `abi.encode(0, newDeadline)`, pins `settleSlippageBps` at 0 for the
+        // clone's lifetime, and every later call reverts `ImmutableParam`
+        // unless it also passes 0. `_trySwapToAsset` then computes
+        // `minOut = expected * (10_000 - 0) / 10_000 == expected`, a
+        // zero-tolerance floor no real fill clears, so the volatile leg stops
+        // converting at settlement and is left to `sweep()` every time.
+        //
+        // The sibling's answer to the same hazard is `MIN_SLIPPAGE_BPS`, which
+        // makes a too-low value a REJECTED input rather than a permanent
+        // self-brick. A keep-sentinel is the better fit here because this
+        // template's consumer degrades rather than reverts, so there is no
+        // value worth rejecting outright — only one worth not writing by
+        // accident.
+        if (slippageBps != 0) {
+            // Ceiling first, so an out-of-range value keeps answering
+            // `InvalidBound` rather than being absorbed by the ratchet below.
+            if (slippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
+            if (slippageBps > settleSlippageBps) revert ImmutableParam();
+            settleSlippageBps = slippageBps;
+        }
         settleDeadline = deadline;
     }
 }

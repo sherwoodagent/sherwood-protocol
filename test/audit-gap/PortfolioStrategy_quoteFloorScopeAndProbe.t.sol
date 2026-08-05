@@ -685,3 +685,247 @@ contract PortfolioStrategy_quoteFloorScopeAndProbeTest is Test {
         strategy.execute();
     }
 }
+
+/// @notice Pashov 2026-08 finding #20 — `rebalanceDelta` billed ONE leg for a
+///         call that can execute a full sell-and-rebuy rotation.
+/// @dev    The old charge was a flat `maxSlippageBps` however many legs traded,
+///         on the premise stated in `rebalanceDelta`'s own natspec that a delta
+///         rebalance trades only the over/under-weight remainder rather than
+///         the full basket.
+///
+///         Nothing enforces that partiality. `_updateParams` accepts any weight
+///         vector summing to `BPS_DENOMINATOR`, so `[0, 10_000]` on a 50/50
+///         basket makes `_sellOverweight` sell the entire slot and
+///         `_buyUnderweight` spend the entire proceeds — the same two legs
+///         `rebalance()` bills at `2 * maxSlippageBps`.
+///
+///         Billed at half rate the reachable lifetime loss is
+///         `1 - (1-s)^(2B/s)` rather than `1 - (1-s)^(B/s)`: ~33% against the
+///         ~18% `MAX_CUMULATIVE_DECAY_BPS` documents, and alternating
+///         `[0,10_000]` / `[10_000,0]` rotates the basket every call.
+contract PortfolioStrategy_deltaLegBillingTest is Test {
+    PortfolioStrategy public template;
+    ERC20Mock public weth;
+    ERC20Mock public tsla;
+    ERC20Mock public msft;
+
+    address public proposer = makeAddr("proposer");
+
+    uint256 constant TOTAL_AMOUNT = 10e18;
+    uint256 constant SLIPPAGE_100 = 100;
+    uint256 constant START = 10_000_000;
+
+    function setUp() public {
+        weth = new ERC20Mock("Wrapped Ether", "WETH", 18);
+        tsla = new ERC20Mock("Tesla Token", "TSLA", 18);
+        msft = new ERC20Mock("Microsoft Token", "MSFT", 18);
+        template = new PortfolioStrategy();
+        vm.warp(START);
+    }
+
+    function test_rebalanceDelta_fullRotationIsBilledTwoLegsNotOne() public {
+        MockSwapAdapter adapter = new MockSwapAdapter();
+        adapter.setRate(address(weth), address(tsla), 1e18);
+        adapter.setRate(address(weth), address(msft), 1e18);
+        adapter.setRate(address(tsla), address(weth), 1e18);
+        adapter.setRate(address(msft), address(weth), 1e18);
+        tsla.mint(address(adapter), 1_000_000e18);
+        msft.mint(address(adapter), 1_000_000e18);
+        weth.mint(address(adapter), 1_000_000e18);
+
+        MockVerifierProxy verifier = new MockVerifierProxy();
+        MockTierRegistry registry = new MockTierRegistry();
+        registry.setAllowed(address(adapter), true);
+        registry.setAllowed(address(verifier), true);
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tsla);
+        tokens[1] = address(msft);
+        uint256[] memory weights = new uint256[](2);
+        weights[0] = 5_000;
+        weights[1] = 5_000;
+        bytes32[] memory feedIds = new bytes32[](2);
+        feedIds[0] = bytes32(uint256(1));
+        feedIds[1] = bytes32(uint256(2));
+
+        bytes[] memory extra = new bytes[](2);
+        uint8[] memory priceDecs = new uint8[](2);
+        for (uint256 i; i < 2; ++i) {
+            extra[i] = "";
+            priceDecs[i] = 18;
+        }
+
+        PortfolioStrategy strategy = PortfolioStrategy(Clones.clone(address(template)));
+        weth.mint(address(vault), TOTAL_AMOUNT);
+        vm.prank(address(vault));
+        weth.approve(address(strategy), type(uint256).max);
+        strategy.initialize(
+            address(vault),
+            proposer,
+            abi.encode(
+                address(weth),
+                address(adapter),
+                address(verifier),
+                tokens,
+                weights,
+                TOTAL_AMOUNT,
+                SLIPPAGE_100,
+                extra,
+                priceDecs,
+                feedIds
+            )
+        );
+        vm.prank(address(vault));
+        strategy.execute();
+
+        // Drive slot 0 to zero weight and slot 1 to everything: a full
+        // rotation, not a remainder trade. Both legs must run.
+        uint256[] memory rotated = new uint256[](2);
+        rotated[0] = 0;
+        rotated[1] = 10_000;
+        // `_updateParams` decodes (uint256[] weights, uint256 maxSlippageBps,
+        // bytes[] routes). Empty routes keeps the frozen ones; the slippage is
+        // tighten-only so it is passed unchanged.
+        bytes[] memory keepRoutes = new bytes[](0);
+        vm.prank(proposer);
+        strategy.updateParams(abi.encode(rotated, SLIPPAGE_100, keepRoutes));
+
+        uint256 before = strategy.cumulativeDecayBps();
+
+        bytes[] memory reports = new bytes[](2);
+        reports[0] = abi.encode(bytes32(uint256(1)), int192(1e18));
+        reports[1] = abi.encode(bytes32(uint256(2)), int192(1e18));
+        vm.prank(proposer);
+        strategy.rebalanceDelta(reports);
+
+        uint256 charged = strategy.cumulativeDecayBps() - before;
+        assertEq(
+            charged, 2 * SLIPPAGE_100, "a sell-and-rebuy rotation must be billed both legs; pre-fix this was one leg"
+        );
+    }
+}
+
+/// @notice Pashov 2026-08 finding #14 — the decay meter billed a band the
+///         metered path did not enforce.
+/// @dev    `rebalance()` charges `2 * maxSlippageBps` against
+///         `MAX_CUMULATIVE_DECAY_BPS`, but the stale-anchor branch of
+///         `_sellFloor`/`_buyFloor` widens with anchor age up to
+///         `MAX_STALE_SLIPPAGE_BPS = 3_000` and does NOT scale with
+///         `maxSlippageBps`. At the `MIN_SLIPPAGE_BPS` floor of 50 the ratio
+///         reaches 60x, and `MAX_CUMULATIVE_DECAY_BPS`'s "reachable loss is
+///         invariant in the slippage figure" argument fails by exactly that.
+///
+///         Fixed at the SPLIT, not at the meter: `settle()` still takes the
+///         widened band (it is the only exit), `rebalance()` caps at
+///         `maxSlippageBps` and refuses a trade it cannot bill for. The
+///         alternative — billing the wide band — made the FIRST `rebalance()`
+///         revert `DecayBudgetExhausted` at any anchor age above ~303s.
+contract PortfolioStrategy_meteredBandCapTest is Test {
+    PortfolioStrategy public template;
+    ERC20Mock public weth;
+    ERC20Mock public tsla;
+    ERC20Mock public msft;
+
+    address public proposer = makeAddr("proposer");
+
+    uint256 constant TOTAL_AMOUNT = 10e18;
+    uint256 constant TIGHT_SLIPPAGE = 50; // MIN_SLIPPAGE_BPS — the worst ratio
+    uint256 constant START = 10_000_000;
+
+    function setUp() public {
+        weth = new ERC20Mock("Wrapped Ether", "WETH", 18);
+        tsla = new ERC20Mock("Tesla Token", "TSLA", 18);
+        msft = new ERC20Mock("Microsoft Token", "MSFT", 18);
+        template = new PortfolioStrategy();
+        vm.warp(START);
+    }
+
+    /// @dev The venue fills at 90% — inside the 1_000 bps stale band the settle
+    ///      path would accept, far outside the 50 bps the metered path bills.
+    ///      Pre-fix `rebalance()` took that trade and charged 100 bps for it.
+    ///      Post-fix the floor is capped at what is billed, so the fill is
+    ///      refused and the budget cannot be under-charged.
+    function test_rebalance_cannotEnforceAWiderBandThanItBills() public {
+        QuotesFairFillsShortAdapter adapter = new QuotesFairFillsShortAdapter();
+        adapter.setRate(address(weth), address(tsla), 1e18);
+        adapter.setRate(address(weth), address(msft), 1e18);
+        adapter.setRate(address(tsla), address(weth), 1e18);
+        adapter.setRate(address(msft), address(weth), 1e18);
+        tsla.mint(address(adapter), 1_000_000e18);
+        msft.mint(address(adapter), 1_000_000e18);
+        weth.mint(address(adapter), 1_000_000e18);
+
+        MockAggregator feed0 = new MockAggregator(18, int256(1e18), START);
+        MockAggregator feed1 = new MockAggregator(18, int256(1e18), START);
+
+        address[] memory allow = new address[](3);
+        allow[0] = address(adapter);
+        allow[1] = address(feed0);
+        allow[2] = address(feed1);
+        MockTierRegistry registry = new MockTierRegistry();
+        for (uint256 i; i < allow.length; ++i) {
+            registry.setAllowed(allow[i], true);
+        }
+        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
+        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
+
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tsla);
+        tokens[1] = address(msft);
+        uint256[] memory weights = new uint256[](2);
+        weights[0] = 5_000;
+        weights[1] = 5_000;
+        bytes32[] memory feedIds = new bytes32[](2);
+        feedIds[0] = bytes32(uint256(uint160(address(feed0))));
+        feedIds[1] = bytes32(uint256(uint160(address(feed1))));
+        bytes[] memory extra = new bytes[](2);
+        uint8[] memory priceDecs = new uint8[](2);
+        for (uint256 i; i < 2; ++i) {
+            extra[i] = "";
+            priceDecs[i] = 18;
+        }
+
+        PortfolioStrategy strategy = PortfolioStrategy(Clones.clone(address(template)));
+        weth.mint(address(vault), TOTAL_AMOUNT);
+        vm.prank(address(vault));
+        weth.approve(address(strategy), type(uint256).max);
+        strategy.initialize(
+            address(vault),
+            proposer,
+            abi.encode(
+                address(weth),
+                address(adapter),
+                address(0), // push mode
+                tokens,
+                weights,
+                TOTAL_AMOUNT,
+                TIGHT_SLIPPAGE,
+                extra,
+                priceDecs,
+                feedIds
+            )
+        );
+        vm.prank(address(vault));
+        strategy.execute();
+
+        // Let both feeds go stale so the floors take the widened stale branch,
+        // then have the venue fill 10% short of its own quote.
+        vm.warp(vm.getBlockTimestamp() + 40 hours);
+        adapter.setFillBps(9_000);
+
+        // The metered path refuses: 1_000 bps of slippage is inside the band
+        // `settle()` would accept but far outside the 50 bps being billed.
+        vm.prank(proposer);
+        vm.expectRevert(QuotesFairFillsShortAdapter.SlippageExceeded.selector);
+        strategy.rebalance();
+
+        // ...and the exit still works at the SAME staleness and the SAME venue,
+        // which is the half that must not regress: capping the metered path
+        // must not fail-close the only way capital comes home.
+        vm.prank(address(vault));
+        strategy.settle();
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled), "settle must still take the wide band");
+    }
+}

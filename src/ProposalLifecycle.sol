@@ -219,7 +219,7 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         // `resolveReview` slash via cancel, and a pause outliving `executeBy`
         // still lands on Expired once it lifts.
         if (reg.paused()) {
-            (, bool alreadyResolved,,) = reg.getReviewState(address(this), p.id);
+            (, bool alreadyResolved,) = reg.getReviewState(address(this), p.id);
             if (!alreadyResolved) return (ProposalState.GuardianReview, false);
         }
         if (o == IGuardianRegistry.ReviewOutcome.Blocked) return (ProposalState.Rejected, true);
@@ -264,7 +264,7 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         // mutating entrypoint for this proposal revert until unpause — and if
         // `executeBy` elapsed meanwhile, strand it as Expired.
         if (reviewConcluded && stored != resolved) {
-            (, bool alreadyResolved,,) = IGuardianRegistry(_guardianRegistry).getReviewState(address(this), p.id);
+            (, bool alreadyResolved,) = IGuardianRegistry(_guardianRegistry).getReviewState(address(this), p.id);
             if (!alreadyResolved) {
                 bool blocked = IGuardianRegistry(_guardianRegistry).resolveReview(address(this), p.id);
                 emit GuardianReviewResolved(p.id, blocked);

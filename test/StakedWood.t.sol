@@ -1050,11 +1050,17 @@ contract StakedWoodTest is Test {
         assertTrue(swood.canCreateVault(alice));
     }
 
-    /// @notice Test 2: at a zero bond the emergency-settle bond re-check in
+    /// @notice Test 2, REVISED (pashov 2026-08 finding 22): at a zero bond the
+    ///         emergency-settle bond re-check in
     ///         `GovernorEmergency.emergencySettleWithCalls` — `ownerStake(vault)
-    ///         < requiredOwnerBond(vault)` (GovernorEmergency.sol:78) — evaluates
-    ///         `0 < 0`, i.e. FALSE, so the guard passes (does not revert).
-    function test_zeroBond_emergencySettleBondRecheckPasses() public {
+    ///         < requiredOwnerBond(vault)` — used to evaluate `0 < 0`, i.e.
+    ///         FALSE, so the guard PASSED with no bond posted and the slash it
+    ///         backs was a no-op (see `test_zeroBond_slashOwnerBondIsNoop`).
+    ///         `requiredOwnerBond` now floors at `MIN_OWNER_BOND_FLOOR`
+    ///         unconditionally, so the open-onboarding sentinel governs vault
+    ///         CREATION only and the guard now BLOCKS. The creation half of the
+    ///         sentinel is unchanged and still pinned by the tests above.
+    function test_zeroBond_emergencySettleBondRecheckBlocks() public {
         address vault = address(0xBEEF);
 
         vm.prank(owner);
@@ -1062,10 +1068,12 @@ contract StakedWoodTest is Test {
         vm.prank(factory);
         swood.bindOwnerStake(alice, vault);
 
+        // Creation still works at floor 0 — the sentinel is intact.
         assertEq(swood.ownerStake(vault), 0);
-        assertEq(swood.requiredOwnerBond(vault), 0);
-        // The exact boolean the guard evaluates — must be false at zero bond.
-        assertFalse(swood.ownerStake(vault) < swood.requiredOwnerBond(vault));
+        // …but the emergency-settle requirement does not follow it down.
+        assertEq(swood.requiredOwnerBond(vault), swood.MIN_OWNER_BOND_FLOOR());
+        // The exact boolean the guard evaluates — must be TRUE at zero bond.
+        assertTrue(swood.ownerStake(vault) < swood.requiredOwnerBond(vault));
     }
 
     /// @notice Test 3: `slashOwnerBond` on a zero-bond vault is a no-op — early

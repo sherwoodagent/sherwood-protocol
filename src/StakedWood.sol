@@ -196,6 +196,19 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @notice Parameter key for `minOwnerStake`.
     bytes32 public constant PARAM_MIN_OWNER_STAKE = keccak256("minOwnerStake");
 
+    /// @notice The smallest owner bond this contract treats as a bond at all.
+    /// @dev    Two jobs, one number. (1) `setMinOwnerStake` / `initialize` reject
+    ///         any NONZERO `minOwnerStake` below it, so a token-dust creation
+    ///         floor cannot be seated by mistake — this is the pre-existing
+    ///         `1_000 * 1e18` literal, now named. (2) `requiredOwnerBond` floors
+    ///         at it UNCONDITIONALLY, including under the `minOwnerStake == 0`
+    ///         open-onboarding sentinel, so the owner-supplied emergency-settle
+    ///         path always has a slashable bond behind it. Matches the published
+    ///         parameter range in `docs/guardian-network.md` ("0 (open
+    ///         onboarding) or ≥ 1 000"), i.e. 1 000 WOOD is already the
+    ///         protocol's own notion of the smallest meaningful bond.
+    uint256 public constant MIN_OWNER_BOND_FLOOR = 1_000 * 1e18;
+
     /// @notice Parameter key for `minSlashBps`.
     /// @dev Floor of the registry's deterministic slash-severity ramp.
     bytes32 public constant PARAM_MIN_SLASH_BPS = keccak256("minSlashBps");
@@ -495,6 +508,11 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         factory = p.factory;
         minGuardianStake = p.minGuardianStake;
         coolDownPeriod = p.coolDownPeriod;
+        // Same admission rule `setMinOwnerStake` enforces, applied at deploy
+        // time too: `0` stays the open-onboarding sentinel, any NONZERO value
+        // must clear the 1_000 WOOD dust floor. Without this a deploy could
+        // seat a token-dust floor that no later setter would ever accept.
+        if (p.minOwnerStake != 0 && p.minOwnerStake < MIN_OWNER_BOND_FLOOR) revert InvalidParameter();
         minOwnerStake = p.minOwnerStake;
         // Severity ceiling may be a full 100% (own stake is a plain integer
         // subtraction with no share math to brick).
@@ -761,10 +779,16 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @notice Set the minimum WOOD a vault owner must bond at vault creation.
     /// @dev Owner-only. `v == 0` is the deliberate open-onboarding sentinel — a 0-WOOD
     ///      creator can then open a vault (`bindOwnerStake` binds a zero bond).
-    ///      Any nonzero value still floors at 1_000 WOOD so a token-dust bond
-    ///      can't be set by mistake.
+    ///      Any nonzero value still floors at `MIN_OWNER_BOND_FLOOR` so a
+    ///      token-dust bond can't be set by mistake.
+    ///
+    ///      SCOPE OF THE SENTINEL: it governs vault CREATION only. It does NOT
+    ///      reach `requiredOwnerBond`, which floors at `MIN_OWNER_BOND_FLOOR`
+    ///      unconditionally — open onboarding lets anyone open a vault without a
+    ///      bond, it does not hand them the owner-supplied emergency-settle
+    ///      escape hatch for free. See `requiredOwnerBond`.
     function setMinOwnerStake(uint256 v) external onlyOwner {
-        if (v != 0 && v < 1_000 * 1e18) revert InvalidParameter();
+        if (v != 0 && v < MIN_OWNER_BOND_FLOOR) revert InvalidParameter();
         emit ParameterChangeFinalized(PARAM_MIN_OWNER_STAKE, minOwnerStake, v);
         minOwnerStake = v;
     }
@@ -1112,15 +1136,50 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         emit OwnerStakeSlotTransferred(vault, oldOwner, newOwner);
     }
 
-    /// @notice The owner bond a vault must hold.
-    /// @dev TVL scaling is not implemented in V1; the bond is unconditionally
-    ///      `minOwnerStake`. The `vault` parameter is retained for ABI /
-    ///      forward-compatibility. Declared as an explicit view so callers
-    ///      (`GovernorEmergency`, `SyndicateFactory`) can repoint registry →
-    ///      sWOOD without depending on storage-variable visibility.
+    /// @notice The owner bond a vault must hold to open an owner-supplied
+    ///         emergency settle.
+    /// @dev TVL scaling is not implemented in V1; the bond is
+    ///      `max(minOwnerStake, MIN_OWNER_BOND_FLOOR)`. The `vault` parameter is
+    ///      retained for ABI / forward-compatibility. Declared as an explicit
+    ///      view so callers (`GovernorEmergency`, `SyndicateFactory`) can
+    ///      repoint registry → sWOOD without depending on storage-variable
+    ///      visibility.
+    ///
+    ///      WHY THE FLOOR IS UNCONDITIONAL, i.e. why this does NOT honour the
+    ///      `minOwnerStake == 0` open-onboarding sentinel. The consumer that
+    ///      matters is `GovernorEmergency.emergencySettleWithCalls`'s gate
+    ///      `ownerStake(vault) < requiredOwnerBond(vault)`. Returning
+    ///      `minOwnerStake` verbatim made that gate evaluate `0 < 0` — false —
+    ///      for every vault created under the sentinel, so the gate passed with
+    ///      NO bond posted, `bindOwnerStake` had bound a zero-amount stake, and
+    ///      `slashOwnerBond` returned early on `amount == 0`: a complete no-op
+    ///      deterrent that, because the slot is deleted after any successful
+    ///      slash, kept passing forever. What it was deterring is
+    ///      `finalizeEmergencySettle`, which runs OWNER-SUPPLIED calldata with
+    ///      EMPTY per-call caps (`BatchExecutorLib` metering off entirely),
+    ///      bounded only by `effectiveMaxCapital` — up to 100% of vault assets.
+    ///
+    ///      Splitting the two decisions is the fix: the sentinel keeps meaning
+    ///      "anyone may OPEN a vault" (`bindOwnerStake` / `prepareOwnerStake` /
+    ///      `canCreateVault` all still read `minOwnerStake` directly and are
+    ///      untouched), while the escape hatch always costs a slashable bond.
+    ///      A zero-bond vault is not stranded by this: `unstick` replays the
+    ///      already-voted settlement batch with no bond requirement, and the
+    ///      route back to a funded slot is `rotateOwner` →
+    ///      `transferOwnerStakeSlot`, whose incoming owner may be the outgoing
+    ///      one.
+    ///
+    ///      TVL SCALING IS STILL NOT IMPLEMENTED and is deliberately out of
+    ///      scope here: a bond proportional to vault assets changes the value
+    ///      `bindOwnerStake`/`transferOwnerStakeSlot` must check at bind time
+    ///      (when `totalAssets()` is 0) versus at emergency time, i.e. it needs
+    ///      a top-up path on a live vault that does not exist today. A flat
+    ///      floor is a strictly smaller change than that, and it is what closes
+    ///      the zero-bond hole.
     function requiredOwnerBond(address vault) external view returns (uint256) {
-        vault; // unused — bond is the flat `minOwnerStake` floor in V1.
-        return minOwnerStake;
+        vault; // unused — no TVL scaling in V1.
+        uint256 v = minOwnerStake;
+        return v < MIN_OWNER_BOND_FLOOR ? MIN_OWNER_BOND_FLOOR : v;
     }
 
     /// @notice A vault's bound owner stake.

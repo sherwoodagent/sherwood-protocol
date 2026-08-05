@@ -114,7 +114,25 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
 
         IGuardianRegistry reg = IGuardianRegistry(_guardianRegistry);
-        if (reg.ownerStake(p.vault) < reg.requiredOwnerBond(p.vault)) revert OwnerBondInsufficient();
+        // STRICTLY POSITIVE, not merely "meets the requirement". `posted == 0`
+        // is checked on its own rather than left to the comparison because the
+        // comparison alone is satisfiable at zero: a registry (or sWOOD) whose
+        // `requiredOwnerBond` reads 0 makes this `0 < 0` — false — so the gate
+        // passed with nothing bonded, `slashOwnerBond` returned early on
+        // `amount == 0`, and the deterrent behind `finalizeEmergencySettle` —
+        // owner-supplied calldata run with EMPTY per-call caps, bounded only by
+        // `effectiveMaxCapital` — was a no-op. sWOOD's `requiredOwnerBond` now
+        // floors at `MIN_OWNER_BOND_FLOOR` and so can no longer report 0, but
+        // `_guardianRegistry` is a settable pointer and this is a security gate:
+        // it states the invariant locally and fails closed on any registry that
+        // stops enforcing it. Deliberately redundant with the sWOOD floor.
+        //
+        // Strands nothing that matters: `unstick` replays the ALREADY-VOTED
+        // settlement batch above with no bond requirement at all, so the honest
+        // stuck-proposal path is untouched. This gate covers only the path that
+        // lets the owner write the calldata.
+        uint256 posted = reg.ownerStake(p.vault);
+        if (posted == 0 || posted < reg.requiredOwnerBond(p.vault)) revert OwnerBondInsufficient();
 
         bytes32 h = keccak256(abi.encode(calls));
         reg.openEmergency(proposalId, h, calls);

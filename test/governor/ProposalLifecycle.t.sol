@@ -426,7 +426,7 @@ contract ProposalLifecycleTest is Test {
         // without touching a bond. The property under test is unchanged and is
         // asserted directly above and below: no `GuardianReviewResolved`, no
         // slash. What must never happen is the review resolving as BLOCKED.
-        (, bool reviewResolved, bool reviewBlocked,) = registry.getReviewState(address(governor), pid);
+        (, bool reviewResolved, bool reviewBlocked) = registry.getReviewState(address(governor), pid);
         assertTrue(reviewResolved, "a veto-rejected proposal's review must be closed, not left open to a keeper");
         assertFalse(reviewBlocked, "closing must never adjudicate the review as blocked");
 
@@ -462,7 +462,7 @@ contract ProposalLifecycleTest is Test {
         _warpPast(p.reviewEnd);
 
         // No mutating call has run: the registry review is still uncommitted...
-        (, bool reviewResolved,,) = registry.getReviewState(address(governor), pid);
+        (, bool reviewResolved,) = registry.getReviewState(address(governor), pid);
         assertFalse(reviewResolved, "precondition: registry review must still be uncommitted");
         assertEq(
             uint256(registry.outcomeOf(address(governor), pid)),
@@ -506,7 +506,7 @@ contract ProposalLifecycleTest is Test {
         _warpPast(p.reviewEnd);
 
         // Nothing has committed yet — no slashing, no registry resolution.
-        (, bool reviewResolved,,) = registry.getReviewState(address(governor), pid);
+        (, bool reviewResolved,) = registry.getReviewState(address(governor), pid);
         assertFalse(reviewResolved, "precondition: registry review must still be uncommitted");
         _assertNoGuardianSlashing("no commit has run yet");
 
@@ -659,13 +659,13 @@ contract ProposalLifecycleTest is Test {
         vm.prank(agent);
         governor.cancelProposal(pid);
 
-        (, bool resolved,,) = registry.getReviewState(address(governor), pid);
+        (, bool resolved,) = registry.getReviewState(address(governor), pid);
         assertTrue(resolved, "cancelling out of Pending must close the review");
 
         // The proof that matters: it can never be opened afterwards.
         _warpPast(uint256(ve));
         registry.openReview(address(governor), pid); // idempotent no-op
-        (bool opened,,,) = registry.getReviewState(address(governor), pid);
+        (bool opened,,) = registry.getReviewState(address(governor), pid);
         assertFalse(opened, "a cancelled proposal's review must never open");
     }
 
@@ -677,12 +677,12 @@ contract ProposalLifecycleTest is Test {
         vm.prank(owner);
         governor.vetoProposal(pid);
 
-        (, bool resolved,,) = registry.getReviewState(address(governor), pid);
+        (, bool resolved,) = registry.getReviewState(address(governor), pid);
         assertTrue(resolved, "vetoing out of Pending must close the review");
 
         _warpPast(uint256(ve));
         registry.openReview(address(governor), pid);
-        (bool opened,,,) = registry.getReviewState(address(governor), pid);
+        (bool opened,,) = registry.getReviewState(address(governor), pid);
         assertFalse(opened, "a vetoed proposal's review must never open");
     }
 
@@ -698,11 +698,11 @@ contract ProposalLifecycleTest is Test {
         governor.resolveProposalState(pid);
         _assertState(pid, ISyndicateGovernor.ProposalState.Rejected, "AGAINST weight rejects at voteEnd");
 
-        (, bool resolved,,) = registry.getReviewState(address(governor), pid);
+        (, bool resolved,) = registry.getReviewState(address(governor), pid);
         assertTrue(resolved, "a veto-rejected proposal must not leave an open review");
 
         registry.openReview(address(governor), pid);
-        (bool opened,,,) = registry.getReviewState(address(governor), pid);
+        (bool opened,,) = registry.getReviewState(address(governor), pid);
         assertFalse(opened, "a veto-rejected proposal's review must never open");
 
         // The economic path stays closed exactly as before -- closing the review
@@ -788,7 +788,7 @@ contract ProposalLifecycleTest is Test {
 
         governor.resolveProposalState(pid);
         _assertState(pid, ISyndicateGovernor.ProposalState.Approved, "commit agrees with the view after unpause");
-        (, bool resolved,,) = registry.getReviewState(address(governor), pid);
+        (, bool resolved,) = registry.getReviewState(address(governor), pid);
         assertTrue(resolved, "the economic commit lands once the registry is live again");
     }
 

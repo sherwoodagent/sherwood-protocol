@@ -357,7 +357,7 @@ contract SwoodReviewSlashTest is Test {
 
         // ── Assert: proposal rejected/blocked ──
         assertTrue(blocked, "review resolved as blocked");
-        (, bool resolved, bool blockedFlag,) = registry.getReviewState(address(governor), pid);
+        (, bool resolved, bool blockedFlag) = registry.getReviewState(address(governor), pid);
         assertTrue(resolved, "review resolved");
         assertTrue(blockedFlag, "review blocked flag set");
         assertEq(

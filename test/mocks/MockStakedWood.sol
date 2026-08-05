@@ -185,6 +185,13 @@ contract MockStakedWood is IStakedWood {
         return perVault != 0 ? perVault : flatRequiredOwnerBond;
     }
 
+    /// @dev The vault-CREATION floor, distinct from `requiredOwnerBond`'s
+    ///      emergency-gate figure. This stub keeps them equal — the two only
+    ///      diverge in the real contract under the open-onboarding sentinel.
+    function minOwnerStake() external view returns (uint256) {
+        return flatRequiredOwnerBond;
+    }
+
     function isActiveGuardian(address guardian) external view returns (bool) {
         return _isActiveGuardian[guardian];
     }

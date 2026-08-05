@@ -258,6 +258,31 @@ contract PortfolioStrategy is BaseStrategy {
     ///         Exhaustion is not a brick: `settle()` never consults this meter,
     ///         so the exit path stays open, and 18% still wants the
     ///         `strategyDuration` and adapter allowlist doing their share.
+    ///
+    ///         CALL BUDGET AFTER PER-LEG BILLING (pashov 2026-08 finding #20).
+    ///         `rebalanceDelta` used to bill one leg per call however many legs
+    ///         traded; it now bills each leg that ran, which is what
+    ///         `rebalance()` always did. The constant was NOT re-sized, so the
+    ///         lifetime call count for a two-sided delta rebalance halves:
+    ///
+    ///           maxSlippageBps  50 -> 20 calls    (was 40)
+    ///                          200 ->  5 calls    (was 10)
+    ///                        1_000 ->  1 call     (was 2)
+    ///
+    ///         AT THE `MAX_SLIPPAGE_CEILING_BPS` CEILING THAT IS EXACTLY ONE
+    ///         two-sided delta rebalance per clone, and every later call
+    ///         reverts `DecayBudgetExhausted`. Deliberate, not an oversight: a
+    ///         proposal that reserved the right to lose 10% per leg has spent
+    ///         the entire 18% lifetime allowance the moment it uses it twice,
+    ///         and the budget is a cap on REACHABLE LOSS rather than on
+    ///         activity. Raising the constant to restore the old call count
+    ///         would raise that reachable loss by the same factor, which is the
+    ///         thing the cap exists to bound.
+    ///
+    ///         A proposal that wants many rebalances asks for a tighter
+    ///         `maxSlippageBps`, which is also the direction that makes each
+    ///         one cheaper. Unlike the withdrawn finding #14 change, nothing
+    ///         here reverts on the FIRST call at any legal parameterisation.
     uint256 public constant MAX_CUMULATIVE_DECAY_BPS = 2_000;
 
     // ── Storage (per-clone) ──
@@ -576,7 +601,7 @@ contract PortfolioStrategy is BaseStrategy {
             if (allocation == 0) continue;
 
             IERC20(asset).forceApprove(address(swapAdapter), allocation);
-            uint256 minOut = _buyFloor(i, allocation);
+            uint256 minOut = _buyFloor(i, allocation, type(uint256).max);
             uint256 amountOut = swapAdapter.swap(asset, alloc.token, allocation, minOut, _swapExtraData[i]);
             if (amountOut == 0) revert SwapFailed();
 
@@ -604,7 +629,7 @@ contract PortfolioStrategy is BaseStrategy {
             if (bal == 0) continue;
 
             IERC20(alloc.token).forceApprove(address(swapAdapter), bal);
-            uint256 minOut = _sellFloor(i, alloc.token, bal);
+            uint256 minOut = _sellFloor(i, alloc.token, bal, type(uint256).max);
             uint256 amountOut = swapAdapter.swap(alloc.token, asset, bal, minOut, _swapExtraData[i]);
             if (amountOut == 0) revert SwapFailed();
 
@@ -713,7 +738,7 @@ contract PortfolioStrategy is BaseStrategy {
             if (bal == 0) continue;
 
             IERC20(alloc.token).forceApprove(address(swapAdapter), bal);
-            uint256 minOut = _sellFloor(i, alloc.token, bal);
+            uint256 minOut = _sellFloor(i, alloc.token, bal, maxSlippageBps);
             uint256 amountOut = swapAdapter.swap(alloc.token, asset, bal, minOut, _swapExtraData[i]);
             if (amountOut == 0) revert SwapFailed();
             alloc.tokenAmount = 0;
@@ -730,7 +755,7 @@ contract PortfolioStrategy is BaseStrategy {
             if (allocation == 0) continue;
 
             IERC20(asset).forceApprove(address(swapAdapter), allocation);
-            uint256 minOut = _buyFloor(i, allocation);
+            uint256 minOut = _buyFloor(i, allocation, maxSlippageBps);
             uint256 amountOut = swapAdapter.swap(asset, alloc.token, allocation, minOut, _swapExtraData[i]);
             if (amountOut == 0) revert SwapFailed();
 
@@ -823,13 +848,21 @@ contract PortfolioStrategy is BaseStrategy {
 
         // Sell overweight positions.
         uint256 swapsExecuted;
+        bool soldAny;
+        bool boughtAny;
         for (uint256 i; i < len; ++i) {
-            if (_sellOverweight(i, totalValue, snap.currentValues[i], snap.prices[i])) ++swapsExecuted;
+            if (_sellOverweight(i, totalValue, snap.currentValues[i], snap.prices[i])) {
+                ++swapsExecuted;
+                soldAny = true;
+            }
         }
 
         // Buy underweight positions with available asset.
         for (uint256 i; i < len; ++i) {
-            if (_buyUnderweight(i, totalValue, snap.currentValues[i], snap.prices[i])) ++swapsExecuted;
+            if (_buyUnderweight(i, totalValue, snap.currentValues[i], snap.prices[i])) {
+                ++swapsExecuted;
+                boughtAny = true;
+            }
         }
 
         // Update stored token amounts and snapshot post-balances.
@@ -840,9 +873,29 @@ contract PortfolioStrategy is BaseStrategy {
             newBalances[i] = bal;
         }
 
-        // See the note at the top of this function: one leg's worth, and only
-        // when something actually traded.
-        if (swapsExecuted != 0) _chargeDecayBudget(maxSlippageBps);
+        // ONE CHARGE PER LEG THAT ACTUALLY RAN, not one per call (pashov
+        // 2026-08 finding #20).
+        //
+        // This used to bill a flat `maxSlippageBps` however many legs traded,
+        // on the premise stated at the top of this function that a delta
+        // rebalance trades only the over/under-weight remainder rather than the
+        // full basket. NOTHING ENFORCES THAT PARTIALITY: `_updateParams`
+        // accepts any weight vector summing to `BPS_DENOMINATOR`, so `[0,
+        // 10_000]` on a 50/50 basket makes `_sellOverweight` sell the entire
+        // slot and `_buyUnderweight` spend the entire proceeds — the same two
+        // legs `rebalance()` bills at `2 * maxSlippageBps`.
+        //
+        // Billed at half rate, the reachable lifetime loss becomes
+        // `1 - (1-s)^(2B/s)` instead of `1 - (1-s)^(B/s)`: about 33% against
+        // the ~18% `MAX_CUMULATIVE_DECAY_BPS` documents, and alternating
+        // `[0,10_000]` / `[10_000,0]` rotates the whole basket every call.
+        //
+        // Deliberately counts LEGS, not swaps: a basket with eight overweight
+        // slots still crosses the spread twice, once in each direction, which
+        // is what `rebalance()` charges and what the budget's arithmetic
+        // assumes.
+        uint256 legs = (soldAny ? maxSlippageBps : 0) + (boughtAny ? maxSlippageBps : 0);
+        if (legs != 0) _chargeDecayBudget(legs);
 
         _rebalancing = false;
         emit RebalancedDelta(
@@ -1077,7 +1130,32 @@ contract PortfolioStrategy is BaseStrategy {
     ///      owner-multisig emergency settle. So a stale, mismatched-decimals or
     ///      codeless feed degrades to the quote-anchored `_quoteMinOut` floor and
     ///      inherits that path's NOT-SANDWICH-PROTECTION caveat.
-    function _sellFloor(uint256 i, address token, uint256 bal) private returns (uint256 minOut) {
+    /// @param bandCap The WIDEST band this caller will accept, and therefore
+    ///        the widest it is willing to be BILLED for (pashov 2026-08
+    ///        finding #14). The stale-anchor branch widens with anchor age up
+    ///        to `MAX_STALE_SLIPPAGE_BPS`, which does not scale with
+    ///        `maxSlippageBps` — so a metered caller billing
+    ///        `2 * maxSlippageBps` while enforcing up to 3_000 was billing a
+    ///        band it did not enforce, by a ratio reaching 60x. That is the
+    ///        finding.
+    ///
+    ///        Resolved at the SPLIT rather than at the meter, because the two
+    ///        callers want opposite things. `settle()` is the only
+    ///        non-emergency exit and passes `type(uint256).max`: it must take
+    ///        the widened band, since failing closed there strands capital and
+    ///        is exactly what the age ramp was introduced to prevent.
+    ///        `rebalance()` is discretionary and passes `maxSlippageBps`:
+    ///        blocking one rebalance strands nothing, so it refuses a trade it
+    ///        cannot bill for rather than taking a 30% band on a 0.5% budget.
+    ///
+    ///        With the cap in place the metered path's enforced band IS
+    ///        `maxSlippageBps`, so the existing charge is correct and
+    ///        `MAX_CUMULATIVE_DECAY_BPS` needs no re-sizing. Billing the wide
+    ///        band instead — the other candidate fix — made the FIRST
+    ///        `rebalance()` revert `DecayBudgetExhausted` at any anchor age
+    ///        above ~303 seconds, removing the function rather than metering
+    ///        it.
+    function _sellFloor(uint256 i, address token, uint256 bal, uint256 bandCap) private returns (uint256 minOut) {
         if (chainlinkVerifier == address(0)) {
             (uint256 price, bool ok) = _tryPushFeedPrice(i);
             if (ok) {
@@ -1108,7 +1186,9 @@ contract PortfolioStrategy is BaseStrategy {
         uint256 lastGood = _lastGoodPrice[i];
         if (lastGood != 0) {
             uint256 staleValue = _tokensToValue(bal, lastGood, i, uint256(_assetDecimals));
-            uint256 staleFloor = (staleValue * (BPS_DENOMINATOR - _staleSlippageBps(i))) / BPS_DENOMINATOR;
+            uint256 band = _staleSlippageBps(i);
+            if (band > bandCap) band = bandCap;
+            uint256 staleFloor = (staleValue * (BPS_DENOMINATOR - band)) / BPS_DENOMINATOR;
             // FLOORED BY THE QUOTE in Data Streams mode, for exactly the reason
             // `_sellOverweight` does it: `_priceDecimals[i]` is proposer-declared
             // and cross-checked against NOTHING there (a DS report carries no
@@ -1151,7 +1231,8 @@ contract PortfolioStrategy is BaseStrategy {
     ///      allocation with the pool pushed 100x nets ~10,000 USDC of tokens).
     /// @param i        Allocation index.
     /// @param amountIn Asset amount about to be spent buying allocation `i`.
-    function _buyFloor(uint256 i, uint256 amountIn) private returns (uint256 minOut) {
+    /// @param bandCap As `_sellFloor` — see the note there.
+    function _buyFloor(uint256 i, uint256 amountIn, uint256 bandCap) private returns (uint256 minOut) {
         if (chainlinkVerifier == address(0)) {
             (uint256 price, bool ok) = _tryPushFeedPrice(i);
             if (ok) {
@@ -1167,7 +1248,9 @@ contract PortfolioStrategy is BaseStrategy {
         uint256 lastGood = _lastGoodPrice[i];
         if (lastGood != 0) {
             uint256 staleTokens = _valueToTokens(amountIn, lastGood, i, uint256(_assetDecimals));
-            uint256 staleFloor = (staleTokens * (BPS_DENOMINATOR - _staleSlippageBps(i))) / BPS_DENOMINATOR;
+            uint256 band = _staleSlippageBps(i);
+            if (band > bandCap) band = bandCap;
+            uint256 staleFloor = (staleTokens * (BPS_DENOMINATOR - band)) / BPS_DENOMINATOR;
             // Floored by the quote in Data Streams mode for the same reason, and
             // with the same non-reverting degradation, as `_sellFloor`; see the
             // note there on the unvalidated Data Streams price scale.

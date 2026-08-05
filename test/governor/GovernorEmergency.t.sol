@@ -366,6 +366,81 @@ contract GovernorEmergencyTest is Test {
         governor.emergencySettleWithCalls(pid, _customCalls());
     }
 
+    /// @notice pashov 2026-08 finding 22. Under the documented `minOwnerStake ==
+    ///         0` open-onboarding sentinel, `requiredOwnerBond` used to collapse
+    ///         to 0 with it, so this gate evaluated `0 < 0` — FALSE — and opened
+    ///         an emergency review with NO bond posted. `bindOwnerStake` had
+    ///         bound a zero-amount stake and `slashOwnerBond` returns early on
+    ///         `amount == 0`, so the deterrent behind `finalizeEmergencySettle`
+    ///         (owner-supplied calldata, per-call metering off, bounded only by
+    ///         `effectiveMaxCapital`) was a complete no-op — and, since the slot
+    ///         is deleted after any successful slash, it stayed one forever.
+    ///
+    ///         sWOOD's `requiredOwnerBond` now floors at `MIN_OWNER_BOND_FLOOR`
+    ///         regardless of the sentinel. The sentinel's other half — anyone
+    ///         may OPEN a vault with no bond — is untouched.
+    function test_emergencySettleWithCalls_revertsAtZeroBondUnderOpenOnboarding() public {
+        // The protocol-wide creation floor drops to the open-onboarding sentinel…
+        vm.prank(owner);
+        swood.setMinOwnerStake(0);
+        // …and this vault holds no bond at all.
+        _zeroOwnerStake(address(vault));
+        assertEq(registry.ownerStake(address(vault)), 0, "no bond posted");
+        assertEq(swood.minOwnerStake(), 0, "sentinel active");
+        assertEq(
+            registry.requiredOwnerBond(address(vault)),
+            swood.MIN_OWNER_BOND_FLOOR(),
+            "emergency requirement does not follow the sentinel to zero"
+        );
+
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.OwnerBondInsufficient.selector);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+    }
+
+    /// @notice The governor-local half of the same fix: `posted == 0` is checked
+    ///         on its own, not left to `posted < required`. `_guardianRegistry`
+    ///         is a settable pointer, so a registry that stops enforcing the
+    ///         bond (here: one reporting a zero requirement) must not be able to
+    ///         reopen the hole. Deliberately redundant with the sWOOD floor —
+    ///         this is a security gate and it fails closed on its own terms.
+    function test_emergencySettleWithCalls_revertsAtZeroBondEvenIfRegistryReportsNoRequirement() public {
+        _zeroOwnerStake(address(vault));
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.mockCall(
+            address(registry),
+            abi.encodeCall(IGuardianRegistry.requiredOwnerBond, (address(vault))),
+            abi.encode(uint256(0))
+        );
+        assertEq(registry.requiredOwnerBond(address(vault)), 0, "registry reports no requirement");
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.OwnerBondInsufficient.selector);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+    }
+
+    /// @notice Positive control for both tests above: with a real bond posted
+    ///         the escape hatch still opens. Guards against the gate degrading
+    ///         into "always revert".
+    function test_emergencySettleWithCalls_stillOpensAtZeroSentinelWithARealBond() public {
+        vm.prank(owner);
+        swood.setMinOwnerStake(0);
+        // The vault's bond from setUp (MIN_OWNER_STAKE) is left in place.
+        assertGe(registry.ownerStake(address(vault)), swood.MIN_OWNER_BOND_FLOOR());
+
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+        assertTrue(registry.isEmergencyOpen(address(governor), pid), "review opened");
+    }
+
     // ──────────────────────────────────────────────────────────────
     // cancelEmergencySettle
     // ──────────────────────────────────────────────────────────────
