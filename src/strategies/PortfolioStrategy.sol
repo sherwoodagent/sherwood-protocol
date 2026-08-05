@@ -1025,6 +1025,27 @@ contract PortfolioStrategy is BaseStrategy {
         }
     }
 
+    /// @dev Non-reverting sibling of `_quoteMinOut`, for the stale-anchor branch
+    ///      of `_sellFloor`/`_buyFloor`. Those sit on `settle()` — the only
+    ///      non-emergency exit — so they cannot adopt `_quoteMinOut`'s
+    ///      fail-closed contract; they need the quote as an ADDITIONAL floor
+    ///      that is simply absent when unavailable, never as a revert.
+    ///
+    ///      `ok == false` covers both a reverting adapter (non-quoting adapters
+    ///      are a supported pairing) and a zero quote, and leaves the caller's
+    ///      oracle-derived floor standing unchanged.
+    function _tryQuoteMinOut(address tokenIn, address tokenOut, uint256 amountIn, bytes memory extraData)
+        private
+        returns (uint256 floor, bool ok)
+    {
+        try swapAdapter.quote(tokenIn, tokenOut, amountIn, extraData) returns (uint256 expected) {
+            if (expected == 0) return (0, false);
+            return ((expected * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR, true);
+        } catch {
+            return (0, false);
+        }
+    }
+
     /// @dev Sell-side floor for `_settle` and `rebalance`'s sell leg. Neither call
     ///      site carries signed price reports (both are parameterless), unlike
     ///      `rebalanceDelta`. In push mode that is not a blocker:
@@ -1070,7 +1091,31 @@ contract PortfolioStrategy is BaseStrategy {
         uint256 lastGood = _lastGoodPrice[i];
         if (lastGood != 0) {
             uint256 staleValue = _tokensToValue(bal, lastGood, i, uint256(_assetDecimals));
-            return (staleValue * (BPS_DENOMINATOR - _staleSlippageBps(i))) / BPS_DENOMINATOR;
+            uint256 staleFloor = (staleValue * (BPS_DENOMINATOR - _staleSlippageBps(i))) / BPS_DENOMINATOR;
+            // FLOORED BY THE QUOTE in Data Streams mode, for exactly the reason
+            // `_sellOverweight` does it: `_priceDecimals[i]` is proposer-declared
+            // and cross-checked against NOTHING there (a DS report carries no
+            // decimals field), so an inflated declaration shrinks
+            // `_tokensToValue` and collapses this floor — to literal 0 at the
+            // declaration ceiling of 36 against an 8-decimal report.
+            //
+            // Reachable the moment an anchor exists: `_verifyPrice` seeds
+            // `_lastGoodPrice[i]` in DS mode, and a `rebalanceDelta` that
+            // executes ZERO swaps still seeds it (the same mis-scale floors
+            // every `currentValues[i]` to 0, so every allocation reads
+            // on-target and no decay is charged). One such call arms this
+            // branch, after which `settleProposal` — proposer-callable an hour
+            // after execute — sells the basket at `minOut = 0`.
+            //
+            // NON-REVERTING, unlike `_sellOverweight`'s version: blocking one
+            // `rebalanceDelta` strands nothing, but this sits on `settle()`,
+            // the only non-emergency exit. So an unavailable quote leaves the
+            // stale floor standing rather than bricking the exit.
+            if (chainlinkVerifier != address(0)) {
+                (uint256 quoteFloor, bool quoted) = _tryQuoteMinOut(token, asset, bal, _swapExtraData[i]);
+                if (quoted && quoteFloor > staleFloor) staleFloor = quoteFloor;
+            }
+            return staleFloor;
         }
         return _quoteMinOut(token, asset, bal, _swapExtraData[i]);
     }
@@ -1105,7 +1150,16 @@ contract PortfolioStrategy is BaseStrategy {
         uint256 lastGood = _lastGoodPrice[i];
         if (lastGood != 0) {
             uint256 staleTokens = _valueToTokens(amountIn, lastGood, i, uint256(_assetDecimals));
-            return (staleTokens * (BPS_DENOMINATOR - _staleSlippageBps(i))) / BPS_DENOMINATOR;
+            uint256 staleFloor = (staleTokens * (BPS_DENOMINATOR - _staleSlippageBps(i))) / BPS_DENOMINATOR;
+            // Floored by the quote in Data Streams mode for the same reason, and
+            // with the same non-reverting degradation, as `_sellFloor`; see the
+            // note there on the unvalidated Data Streams price scale.
+            if (chainlinkVerifier != address(0)) {
+                (uint256 quoteFloor, bool quoted) =
+                    _tryQuoteMinOut(asset, _allocations[i].token, amountIn, _swapExtraData[i]);
+                if (quoted && quoteFloor > staleFloor) staleFloor = quoteFloor;
+            }
+            return staleFloor;
         }
         return _quoteMinOut(asset, _allocations[i].token, amountIn, _swapExtraData[i]);
     }

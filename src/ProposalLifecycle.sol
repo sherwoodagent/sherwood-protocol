@@ -145,24 +145,40 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         }
         IGuardianRegistry reg = IGuardianRegistry(_guardianRegistry);
         IGuardianRegistry.ReviewOutcome o = reg.outcomeOf(address(this), p.id);
-        // Unresolved past `reviewEnd` means `outcomeOf` found no window, i.e. no
-        // review was ever registered. `reviewConcluded` is FALSE.
+        // `Unresolved` past `reviewEnd` carries TWO meanings, and they must not
+        // share an outcome:
         //
-        // TERMINAL AND CLOSED — deliberate asymmetry with the collapsed window
-        // above. Both mean no registry record, but here the governor believes a
-        // review exists and the registry disagrees; that disagreement must never
-        // produce an executable proposal, so this reports Expired rather than
-        // Cleared — answering Cleared would approve a proposal no guardian ever
-        // reviewed. Expired is terminal, so `_commitState` releases the vault
-        // binding rather than leaving both stuck.
+        //   (a) the registry holds no window at all — no review was ever
+        //       registered. The governor believes one exists and the registry
+        //       disagrees; that disagreement must never produce an executable
+        //       proposal. Unreachable on any deployment this code can produce
+        //       (governor and registry deploy in lockstep, both push sites
+        //       register under the identical predicate, `_guardianRegistry` is
+        //       write-once, no governor-removal path), kept as defence in depth.
         //
-        // Unreachable on any deployment this code can produce: governor and
-        // registry deploy in lockstep, both push sites register under the
-        // identical predicate, `_guardianRegistry` is write-once, and there is no
-        // governor-removal path. Kept as defence in depth: do NOT restore Approved
-        // here on the grounds that the branch is unreachable.
+        //   (b) the window is REGISTERED AND STILL OPEN on the registry's
+        //       pause-adjusted clock. `outcomeOf` answers `Unresolved` while
+        //       `_effNow(clockShiftAtRegister) < r.reviewEnd`, so after any
+        //       `unpause` this branch is live for exactly `pauseShiftTotal`
+        //       seconds past the governor's WALL-CLOCK `reviewEnd` — the two
+        //       contracts measure one deadline on two clocks.
+        //
+        // Reporting Expired unconditionally answered (b) as if it were (a): a
+        // 60-second incident pause permanently killed every in-flight proposal
+        // the moment wall time crossed `reviewEnd`, with the whole execution
+        // window still ahead of it, latched by the permissionless
+        // `resolveProposalState`. Gate on `executeBy` instead — the one deadline
+        // that is unambiguously the governor's own.
+        //
+        // This PRESERVES the accepted tradeoff recorded in
+        // `GuardianRegistry.unpause` and pinned by
+        // `test_reviewItem7_pauseSpanningReviewWindow_expiresProposal_neverClearsIt`:
+        // a pause outliving `executeBy` still lands on terminal Expired. It only
+        // stops a pause SHORTER than the execution window from doing so. Neither
+        // arm is executable, so the fail-closed direction is unchanged — do NOT
+        // restore Approved here on the grounds that (a) is unreachable.
         if (o == IGuardianRegistry.ReviewOutcome.Unresolved) {
-            return (ProposalState.Expired, false);
+            return (block.timestamp > p.executeBy ? ProposalState.Expired : ProposalState.GuardianReview, false);
         }
         // A paused registry cannot accept the economic commit: `resolveReview` is
         // `whenNotPaused` while `outcomeOf` is not. Reporting Approved would hand

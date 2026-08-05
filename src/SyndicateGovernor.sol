@@ -605,6 +605,41 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
                 proposal.effectiveMaxCapital
             );
 
+        // THE SETTLE PRICE MAY NOT BE STAMPED AGAINST AN UNREALIZED UNWIND.
+        // `_finishSettlement` calls `vault.onProposalSettled`, which freezes
+        // `num = totalAssets() + 1` as the price EVERY queued deposit and redeem
+        // for this proposal is later paid at — and settlement is
+        // deliverable-maximum at the strategy layer, not all-or-revert
+        // (`MorphoSupplyStrategy` and `ConcentratedLiquidityStrategy` both emit
+        // `SettlementIncomplete` and continue). `MorphoSupplyStrategy` further
+        // caps delivery at Morpho's own idle balance, which is exactly what a
+        // fee-free `flashLoan` removes for one callback frame.
+        //
+        // So without this gate an unprivileged caller settles from inside a
+        // flash-loan callback, the strategy delivers ~0, and the stamp becomes
+        // `num == 1`: queued depositors mint against a near-zero price (traced:
+        // 1e29 shares against a 1e18 supply) and queued redeemers burn for zero
+        // assets, with `cancel` already closed by `AlreadySettled`.
+        //
+        // `maxDrawdownBps` is the envelope voters and guardians actually
+        // approved, and until now it was validated at propose and never read
+        // again. Enforcing it here is what makes it load-bearing.
+        //
+        // SCOPED TO THIS PATH ON PURPOSE. `unstick` and `finalizeEmergencySettle`
+        // route through `_finishSettlementHook` and stay ungated: they are the
+        // owner-multisig escape hatch for a genuine loss that exceeds the
+        // envelope, and gating them would wedge exactly the position that most
+        // needs to exit. A proposal that trips this gate is not stuck — it is
+        // redirected to the path where a human looks at it.
+        {
+            uint256 deployed = _capitalSnapshots[proposalId];
+            if (deployed != 0 && proposal.maxDrawdownBps < 10_000) {
+                uint256 realized = IERC20(IERC4626(proposal.vault).asset()).balanceOf(proposal.vault);
+                uint256 floor = deployed - (deployed * proposal.maxDrawdownBps) / 10_000;
+                if (realized < floor) revert SettlementBelowDrawdownFloor(realized, floor);
+            }
+        }
+
         _finishSettlement(proposalId, proposal);
     }
 

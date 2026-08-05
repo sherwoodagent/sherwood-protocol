@@ -153,6 +153,63 @@ contract SwapsButNeverQuotesAdapter is ISwapAdapter {
     }
 }
 
+/// @notice Quotes at the FAIR rate, fills at `fillBps` of it.
+/// @dev    `MockSwapAdapter` serves one rate to both `quote` and `swap`, so a
+///         floor derived from its quote always matches its fill and the mock
+///         cannot distinguish a held floor from a collapsed one. This one can:
+///         the quote is the honest reference an oracle-independent floor is
+///         built from, and the fill is the shortfall that floor must reject.
+///
+///         That split is the whole point of the quote floor. It is NOT sandwich
+///         protection — a venue that lies consistently in both directions defeats
+///         it by construction, and the contract says so. What it defends is the
+///         proposer-declared PRICE SCALE: when an inflated `priceDecimals`
+///         collapses the oracle-derived floor toward zero, a floor derived from
+///         a quantity the proposer does not declare still has to be cleared.
+contract QuotesFairFillsShortAdapter is ISwapAdapter {
+    using SafeERC20 for IERC20;
+
+    mapping(bytes32 => uint256) public rates;
+    uint256 public fillBps = 10_000;
+
+    uint256 public constant RATE_PRECISION = 1e18;
+
+    error RateNotSet();
+    error SlippageExceeded();
+
+    function setRate(address tokenIn, address tokenOut, uint256 rate) external {
+        rates[keccak256(abi.encodePacked(tokenIn, tokenOut))] = rate;
+    }
+
+    function setFillBps(uint256 bps) external {
+        fillBps = bps;
+    }
+
+    function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOutMin, bytes calldata)
+        external
+        override
+        returns (uint256 amountOut)
+    {
+        uint256 rate = rates[keccak256(abi.encodePacked(tokenIn, tokenOut))];
+        if (rate == 0) revert RateNotSet();
+        amountOut = (((amountIn * rate) / RATE_PRECISION) * fillBps) / 10_000;
+        if (amountOut < amountOutMin) revert SlippageExceeded();
+        IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
+        IERC20(tokenOut).safeTransfer(msg.sender, amountOut);
+    }
+
+    function quote(address tokenIn, address tokenOut, uint256 amountIn, bytes calldata)
+        external
+        view
+        override
+        returns (uint256)
+    {
+        uint256 rate = rates[keccak256(abi.encodePacked(tokenIn, tokenOut))];
+        if (rate == 0) revert RateNotSet();
+        return (amountIn * rate) / RATE_PRECISION;
+    }
+}
+
 /// @title PortfolioStrategy_quoteFloorScopeAndProbe
 /// @notice Design-pin suite for the audit-gap fixes (PR #196) plus the two
 ///         review corrections layered on top of them:
@@ -380,6 +437,68 @@ contract PortfolioStrategy_quoteFloorScopeAndProbeTest is Test {
         vm.prank(proposer);
         vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
         strategy.rebalanceDelta(reports);
+    }
+
+    /// @dev Pashov 2026-08 finding #5 — the SAME collapse, on the settle path.
+    ///      `_sellOverweight`/`_buyUnderweight` (the `rebalanceDelta` legs
+    ///      pinned above) take `max(oracleFloor, quoteFloor)` in Data Streams
+    ///      mode precisely because the declared scale is cross-checked against
+    ///      nothing there. `_sellFloor`/`_buyFloor` reached `_quoteMinOut` only
+    ///      when NO anchor existed, so the moment `_verifyPrice` seeded
+    ///      `_lastGoodPrice` the settle path fell onto the unguarded
+    ///      stale-anchor branch and the same 1e10 collapse went unfloored.
+    ///
+    ///      That seeding is free: a `rebalanceDelta` that executes ZERO swaps
+    ///      still writes the anchor. And `settleProposal` is proposer-callable
+    ///      an hour after execute, so the proposer both arms and fires it.
+    ///
+    ///      Post-fix the quote floor — derived from a quantity the proposer
+    ///      does not declare — must reject the adversarial fill here too.
+    function test_settle_dataStreams_quoteFloorBlocksSkimUnderMisscaledDecimals() public {
+        QuotesFairFillsShortAdapter adapter = new QuotesFairFillsShortAdapter();
+        adapter.setRate(address(weth), address(tsla), 1e18);
+        adapter.setRate(address(weth), address(msft), 1e18);
+        adapter.setRate(address(tsla), address(weth), 1e18);
+        adapter.setRate(address(msft), address(weth), 1e18);
+        tsla.mint(address(adapter), 1_000_000e18);
+        msft.mint(address(adapter), 1_000_000e18);
+        weth.mint(address(adapter), 1_000_000e18);
+
+        MockVerifierProxy verifier = new MockVerifierProxy();
+
+        address[] memory allow = new address[](2);
+        allow[0] = address(adapter);
+        allow[1] = address(verifier);
+        (, MockVaultWithGovernor vault) = _trio(allow);
+
+        (address[] memory tokens, uint256[] memory weights, bytes32[] memory feedIds) =
+            _twoTokens(5_000, 5_000, bytes32(uint256(1)), bytes32(uint256(2)));
+
+        PortfolioStrategy strategy = _clone();
+        _fundVaultAndApprove(address(vault), strategy);
+        strategy.initialize(
+            address(vault), proposer, _initData(address(adapter), address(verifier), tokens, weights, feedIds)
+        );
+        vm.prank(address(vault));
+        strategy.execute();
+
+        // ARM: one honest, on-target `rebalanceDelta` seeds `_lastGoodPrice`
+        // for both slots. Prices are equal and weights are equal, so this moves
+        // nothing — the anchor is seeded regardless, which is the whole point.
+        bytes[] memory reports = new bytes[](2);
+        reports[0] = abi.encode(bytes32(uint256(1)), int192(1e8));
+        reports[1] = abi.encode(bytes32(uint256(2)), int192(1e8));
+        vm.prank(proposer);
+        strategy.rebalanceDelta(reports);
+
+        // FIRE: the venue starts filling at half its own quote and the proposer
+        // self-settles. The stale-anchor floor computes in the collapsed 1e8
+        // scale — 1e10 too small — so on its own it cannot stop the skim.
+        adapter.setFillBps(5_000);
+
+        vm.prank(address(vault));
+        vm.expectRevert(QuotesFairFillsShortAdapter.SlippageExceeded.selector);
+        strategy.settle();
     }
 
     // ════════════════════════════════════════════════════════════════════

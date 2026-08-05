@@ -589,6 +589,97 @@ contract SyndicateGovernorTest is Test {
         governor.settleProposal(proposalId);
     }
 
+    /// @dev Propose with a REAL drawdown envelope. Every other helper in this
+    ///      file goes through `GovEnvelope.permissive`, which declares
+    ///      `maxDrawdownBps = 10_000` — a 100% loss is inside the envelope, so
+    ///      the settle-time floor never binds. These tests need it to bind.
+    function _createAndExecuteProposalWithDrawdown(uint16 maxDrawdownBps) internal returns (uint256 proposalId) {
+        // Hoisted: the `totalAssets()` staticcall would otherwise consume the
+        // one-shot prank armed for `propose`.
+        uint256 ceiling = vault.totalAssets();
+        ISyndicateGovernor.RiskEnvelope memory env =
+            ISyndicateGovernor.RiskEnvelope({maxCapital: ceiling, maxDrawdownBps: maxDrawdownBps});
+        vm.prank(agent);
+        proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://drawdown",
+            7 days,
+            env,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps(env.maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps(env.maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(proposalId);
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+    }
+
+    /// @notice Pashov 2026-08 finding #1 — `settleProposal` must not freeze the
+    ///         Lane B settle price against an unrealized unwind.
+    /// @dev    `onProposalSettled` stamps `num = totalAssets() + 1` as the price
+    ///         EVERY queued deposit and redeem for this proposal is later paid
+    ///         at, and settlement is deliverable-maximum at the strategy layer
+    ///         rather than all-or-revert. `MorphoSupplyStrategy` additionally
+    ///         caps delivery at Morpho's idle balance — exactly what a fee-free
+    ///         `flashLoan` removes for one callback frame — so an unprivileged
+    ///         caller could settle a strategy that delivered ~0 and stamp
+    ///         `num == 1`, minting near-unbounded shares to a queued depositor
+    ///         and burning queued redeemers for zero.
+    ///
+    ///         The shortfall is modelled directly on the vault balance here:
+    ///         what the gate reads is the realized balance, and how it got low
+    ///         (flash loan, genuine loss, a strategy that simply did not
+    ///         deliver) is not something the governor can or should distinguish.
+    function test_pashovFinding1_settleBelowDrawdownFloor_reverts() public {
+        uint256 pid = _createAndExecuteProposalWithDrawdown(2_000); // 20%
+        uint256 deployed = governor.getCapitalSnapshot(pid);
+        assertEq(deployed, 100_000e6, "snapshot is the pre-execute vault balance");
+        uint256 floor = deployed - (deployed * 2_000) / 10_000;
+
+        // The unwind delivers one unit less than the approved envelope allows.
+        deal(address(usdc), address(vault), floor - 1);
+        vm.prank(agent);
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateGovernor.SettlementBelowDrawdownFloor.selector, floor - 1, floor)
+        );
+        governor.settleProposal(pid);
+
+        // Still Executed — the stamp never landed, so no queued claim was
+        // priced against the incomplete unwind.
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Executed),
+            "a refused settle must not advance the proposal"
+        );
+
+        // Exactly at the floor it settles: the gate is the declared envelope,
+        // not a demand that the strategy be profitable.
+        deal(address(usdc), address(vault), floor);
+        vm.prank(agent);
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
+    /// @notice The gate must not bind a proposal whose voters accepted a total
+    ///         loss (`maxDrawdownBps == 10_000`) — that is the envelope working
+    ///         as declared, not a bug. Also pins that the ubiquitous
+    ///         `GovEnvelope.permissive` fixture is unaffected by the fix.
+    function test_pashovFinding1_fullDrawdownEnvelope_settlesAtAnyBalance() public {
+        uint256 pid = _createAndExecuteProposalWithDrawdown(10_000);
+        deal(address(usdc), address(vault), 0);
+        vm.prank(agent);
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
     // Legacy `emergencySettle(uint256, Call[])` is a revert stub as of Task 24.
     // See `test/governor/GovernorEmergency.t.sol` for the new 4-way lifecycle tests
     // (unstick / emergencySettleWithCalls / cancelEmergencySettle / finalizeEmergencySettle).
