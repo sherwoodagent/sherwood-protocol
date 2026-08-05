@@ -386,7 +386,28 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // `openReview`, because the window this review is judged against is
         // defined here: a pause landing between propose and open would
         // otherwise eat into `[voteEnd, reviewEnd)` uncredited.
-        r.clockShiftAtRegister = pauseShiftTotal;
+        //
+        // INCLUDE THE PAUSE IN PROGRESS (pashov 2026-08 finding #21).
+        // `registerReview` is the only review-clock writer without
+        // `whenNotPaused` — `openReview`, `openEmergency`, `voteOnProposal` and
+        // `resolveReview` all carry it — so it is the one that can land MID
+        // pause. `pauseShiftTotal` is only advanced by `unpause`, so reading it
+        // bare during a pause snapshots the PRE-pause figure; `unpause` then
+        // adds the entire outage, and `_effNow` credits this review with all of
+        // it rather than with the part that actually overlapped its own clock.
+        // A pause from T to T+10h with a `propose` at T+9h gave that review 10h
+        // of credit for 1h of lost window.
+        //
+        // That over-credit is not cosmetic: it widens the span in which the
+        // governor's wall-clock `reviewEnd` has passed while the registry's
+        // effective clock has not — the window behind the terminal-Expired race
+        // and the cancel/resolve deadlock this contract has already had to fix.
+        //
+        // Adding `whenNotPaused` here was the other option and was REJECTED: it
+        // would make `SyndicateGovernor.propose` revert for the duration of any
+        // registry pause, since propose is what pushes this window. Stamping the
+        // in-progress span costs nothing and changes no liveness.
+        r.clockShiftAtRegister = paused ? pauseShiftTotal + uint64(block.timestamp - uint256(pausedAt)) : pauseShiftTotal;
         emit ReviewRegistered(msg.sender, proposalId, uint64(voteEnd), uint64(reviewEnd));
     }
 
@@ -951,8 +972,31 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // Reject after the review window has closed: the proposer has had the
         // entire window to bail out; permitting cancel after `reviewEnd` would
         // let the proposer race a pending `resolveReview` slash.
+        //
+        // MEASURED ON THE PAUSE-ADJUSTED CLOCK (pashov 2026-08 finding #6).
+        // This was the last reader of `reviewEnd` still on the wall clock:
+        // `openReview`, `voteOnProposal`, `resolveReview`, `outcomeOf` and the
+        // declared mirror `cancelEmergency` all use `_effNow`. In the deferred
+        // span `[reviewEnd, reviewEnd + pauseShiftTotal)` that split left the
+        // review neither cancellable (wall clock says too late) nor resolvable
+        // (effective clock says too early), while `voteOnProposal` kept
+        // ACCEPTING block votes — so the proposer lost their exit while the
+        // votes that slash their approvers kept accumulating.
+        //
+        // Two concrete consequences, both closed by this one line:
+        //   - `SyndicateGovernor.cancelProposal`'s GuardianReview branch calls
+        //     `cancelReview` UNWRAPPED, so the whole cancel reverted.
+        //   - `ProposalLifecycle._closeReviewIfRegistered` calls it inside a
+        //     bare `try`, so the failure was SILENT: the review stayed open on
+        //     a proposal that had already gone terminal, and a later
+        //     `resolveReview` still slashed its approvers — precisely the harm
+        //     that cleanup exists to prevent.
+        //
+        // The stated rationale above is unchanged in intent: the proposer still
+        // gets exactly one review window and still cannot race a pending
+        // slash. It is now the same window everyone else is measuring.
         uint256 ve = r.reviewEnd;
-        if (ve > 0 && block.timestamp >= ve) revert ReviewNotOpen();
+        if (ve > 0 && _effNow(r.clockShiftAtRegister) >= ve) revert ReviewNotOpen();
         // A never-opened review has nothing to block, and `_isBlocked` must not
         // be asked: on a zero-valued Review it evaluates `0 >= 0` and reports
         // "blocked" vacuously, which would reject a perfectly legitimate cancel

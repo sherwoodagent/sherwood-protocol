@@ -587,7 +587,32 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // exactly those keeps recovery equal to the sum of their bonds. A
         // released commitment reports zero and contributes nothing to the
         // frozen total.
-        (address[] memory covering, uint256[] memory committedUsd) = exposureLedger.approversOf(governor, proposalId);
+        //
+        // READ THE PLEDGE, NOT THE BOOKING (pashov 2026-08 finding #24).
+        // `approversOf` pairs the list with `_recorded[key][g].usd`, the LIVE
+        // booking, which `settleCoverage` — permissionless, re-runnable and
+        // deliberately NOT freeze-gated — may move in either direction while a
+        // challenge is live. `pledgedOf` pairs it with `_reservedUsd`, which
+        // nobody can move. `ExposureLedger.pledgedOf`'s own natspec states the
+        // rule this site was violating: "A caller asking whether a guardian
+        // underwrote this proposal must ask it of the pledge: asked of the
+        // booking, a guardian convicted on a separate concurrent challenge
+        // could be settled down to a zero booking by anyone and drop straight
+        // out of the accused set."
+        //
+        // Three things here are decided from this number and all three were
+        // stranger-movable: `coverageUsd` (which sizes the challenger's bond,
+        // and therefore the counter-bond the accused must match), the
+        // `NothingToFreeze` gate, and the accused set that
+        // `_verdictAlreadyCollected` is checked against — which could diverge
+        // from the set `_settle` actually slashes, since `slashBpsFor` is
+        // already pledge-based.
+        //
+        // The last site to migrate: `slashBpsFor` (pashov review finding #13),
+        // `freezeCoverage` and `pinCoverageUntil` (audit-181 findings A/C) and
+        // `TokenCourt._recordAccused` (issue #83) all moved to the pledge for
+        // exactly this reason and this one was missed.
+        (address[] memory covering, uint256[] memory committedUsd) = exposureLedger.pledgedOf(governor, proposalId);
         uint256 coverageUsd;
         uint256 accusedCount;
         for (uint256 i = 0; i < committedUsd.length; i++) {

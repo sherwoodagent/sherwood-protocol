@@ -95,6 +95,25 @@ contract MockLedgerForOracleTest {
         }
     }
 
+    /// @dev `ChallengeGame.file` reads the PLEDGE, not the booking (pashov
+    ///      2026-08 finding #24). This stub does not model `settleCoverage`, so
+    ///      the two never diverge here and the pledge is the same figure — the
+    ///      point of the finding is that in the REAL ledger they diverge and
+    ///      anyone can move the booking. Present so the typed call resolves;
+    ///      without it every test in this file reverts undecodably.
+    function pledgedOf(address governor, uint256 proposalId)
+        external
+        view
+        returns (address[] memory guardians, uint256[] memory pledgedUsd)
+    {
+        bytes32 k = _key(governor, proposalId);
+        guardians = _approvers[k];
+        pledgedUsd = new uint256[](guardians.length);
+        for (uint256 i = 0; i < guardians.length; i++) {
+            pledgedUsd[i] = _committed[k][guardians[i]];
+        }
+    }
+
     /// @dev Zero means "no override" at the `file()` call site — the raw
     ///      `approversOf` sum is used as-is, which keeps this mock's bond
     ///      arithmetic simple and predictable for the tests below.
