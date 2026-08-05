@@ -764,19 +764,51 @@ contract ChallengeGameTest is Test {
         );
         assertEq(game.liveChallengeCountOf(address(gov), PROPOSAL), 2);
 
+        // ONE POOL PER PROPOSAL (pashov 2026-08 finding #10): the squat's pool
+        // is the proposal's pool, so the honest filing is ADOPTED by it and is
+        // `Disputed` the moment it lands, without the accused paying a second
+        // counter-bond. That is the deliberate consequence of pricing the
+        // defence per proposal rather than per challenge — the cohort answers
+        // one accusation's worth however many accusations are open — and the
+        // route left to a conviction is the court, not the silence clock.
+        assertEq(
+            uint8(game.challengeOf(honest).status),
+            uint8(IChallengeGame.Status.Disputed),
+            "the standing pool disputes the new filing too"
+        );
+
         // The squat times out to the accused, as designed — and takes nothing
-        // with it: coverage stays frozen for the honest filing behind it.
+        // with it: coverage stays frozen for the honest filing behind it, and
+        // the pool is NOT released while that filing is still live, or the
+        // ruling below would have nothing left to burn.
         vm.warp(_filedAt(squat) + game.disputeTimeout());
         game.resolve(squat);
         assertEq(uint8(game.challengeOf(squat).status), uint8(IChallengeGame.Status.Failed));
         assertTrue(ledger.isCoverageFrozen(address(gov), PROPOSAL), "the honest challenge still pins the coverage");
         assertEq(game.liveChallengeCountOf(address(gov), PROPOSAL), 1);
+        (uint256 poolStillHeld,,,,) = game.counterBondPoolOf(honest);
+        assertGt(poolStillHeld, 0, "the shared pool survives the squat's own resolution");
 
-        // And the honest challenge still convicts.
-        vm.warp(_filedAt(honest) + game.autoSlashDelay());
-        game.resolve(honest);
+        // And the honest challenge still convicts — through the court now
+        // rather than through silence.
+        vm.prank(court);
+        game.rule(honest, IChallengeGame.Verdict.Guilty);
         assertEq(swood.callCount(), 1, "the squat delayed the verdict; it did not prevent it");
         assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "last one out unfreezes");
+        (uint256 poolAfter,,,, bool poolBurned) = game.counterBondPoolOf(honest);
+        assertEq(poolAfter, 0, "and the conviction burned the pool the squat funded");
+        assertTrue(poolBurned);
+
+        // The funder keeps only what the squat's own failure won it — the
+        // forfeited challenger bond — and never gets the staked pool back,
+        // because the conviction burned it.
+        IChallengeGame.Challenge memory sq = game.challengeOf(squat);
+        uint256 forfeitPayout = sq.bondWood - (sq.bondWood * sq.forfeitBurnBpsAtFiling) / 10_000;
+        assertEq(
+            game.claimableContribution(squat, guardianA),
+            forfeitPayout,
+            "the squat's forfeited bond only, never the staked pool"
+        );
     }
 
     /// @notice 🔴F3 corollary: two concurrent challenges must not slash the same
@@ -1131,13 +1163,31 @@ contract ChallengeGameTest is Test {
     ///      `>=` rather than `==` on custody: lazy pro-rata shares floor-divide
     ///      independently, so wei-scale dust from a failed challenge stays
     ///      accounted in `unclaimedWood` and is never claimable.
+    ///      ONE POOL PER PROPOSAL since pashov 2026-08 finding #10: the
+    ///      counter-bond is keyed per review key, so adding each live
+    ///      challenge's `counterBondWood` would count a pool that two concurrent
+    ///      filings share twice over. The pool is added once per distinct
+    ///      proposal, read from `counterBondPoolOf` — which reports zero for a
+    ///      pool a conviction already burned out from under a still-live
+    ///      sibling, exactly as `bondedWood` does.
     function _assertLiveBondsBacked() internal view {
+        uint256 n = game.challengeCount();
         uint256 live;
-        for (uint256 i = 1; i <= game.challengeCount(); i++) {
+        bytes32[] memory seen = new bytes32[](n);
+        uint256 seenN;
+        for (uint256 i = 1; i <= n; i++) {
             IChallengeGame.Challenge memory c = game.challengeOf(i);
-            if (c.status == IChallengeGame.Status.Filed || c.status == IChallengeGame.Status.Disputed) {
-                live += c.bondWood + c.counterBondWood;
+            if (c.status != IChallengeGame.Status.Filed && c.status != IChallengeGame.Status.Disputed) continue;
+            live += c.bondWood;
+            bytes32 key = keccak256(abi.encode(c.governor, c.proposalId));
+            bool counted;
+            for (uint256 j; j < seenN; j++) {
+                if (seen[j] == key) counted = true;
             }
+            if (counted) continue;
+            seen[seenN++] = key;
+            (uint256 poolWood,,,,) = game.counterBondPoolOf(i);
+            live += poolWood;
         }
         assertEq(game.bondedWood(), live, "accounted bonds != live bonds");
         assertGe(
@@ -2497,23 +2547,26 @@ contract ChallengeGameTest is Test {
         _assertLiveBondsBacked();
     }
 
-    /// @notice THE COUNTER-BOND FORFEITS TO THE CHALLENGER ON A GUILTY VERDICT.
-    ///         This is the on-chain detector incentive, and it REVERSES the rule
-    ///         this test used to pin (the pool returning to whoever posted it).
-    ///         A refunded counter-bond did no work: disputing turned a certain
-    ///         slash into a delayed one with some chance the court errs, at zero
-    ///         bond cost, so a guilty approver always disputed — while a winning
-    ///         challenger got only its own bond back and so had no on-chain
-    ///         reason to do forensic work at all. Forfeited, the escalation costs
-    ///         the accused what it is worth and pays the party that was right.
-    /// @dev Issue #181 finding 18b: the pool now forfeits NET of a
-    ///      `settleBurnBpsAtFiling` slice, burned first — `dispute` is open to
-    ///      anyone, so a challenger who also funds (directly, or via a second
-    ///      address it controls) the ENTIRE counter-bond pool used to
-    ///      round-trip its whole stake on exactly this branch, forfeiting
-    ///      nothing. The expected burn is derived from the challenge's own
-    ///      pinned rate, not hardcoded, so this survives a future rate change.
-    function test_rule_guiltyForfeitsThePoolToTheChallenger() public {
+    /// @notice THE COUNTER-BOND IS DESTROYED ON A GUILTY VERDICT — it is not
+    ///         refunded to the accused (the rule before issue #181) and it is no
+    ///         longer forfeited TO THE CHALLENGER either (the rule between #181
+    ///         and pashov 2026-08 finding #10). Both of the first two rules were
+    ///         reachable round trips:
+    ///
+    ///         - Refunded, disputing turned a certain slash into a delayed one
+    ///           at zero bond cost, so a guilty approver always disputed.
+    ///         - Paid to the challenger, and with ONE POOL PER PROPOSAL, a
+    ///           guilty cohort self-files from a fresh address, funds the
+    ///           proposal's only pool through that filing, adopts the honest
+    ///           challenge for free, and takes the pool back AS THE CHALLENGER
+    ///           on the very ruling that convicts it.
+    ///
+    ///         Burned, the escalation costs the accused exactly what it is worth
+    ///         and there is no recipient left for either side to be. The
+    ///         challenger's incentive is unchanged and lives where it always
+    ///         did: the prosecutor fee out of the convicted PROPOSER's bond, the
+    ///         one pot a prosecutor cannot fund for itself.
+    function test_rule_guiltyBurnsThePoolAndPaysNoOne() public {
         uint256 id = _fileAndDispute();
         IChallengeGame.Challenge memory c = game.challengeOf(id);
         uint256 bond = c.bondWood;
@@ -2526,15 +2579,20 @@ contract ChallengeGameTest is Test {
         vm.prank(court);
         game.rule(id, IChallengeGame.Verdict.Guilty);
 
-        uint256 burned = (pool * c.settleBurnBpsAtFiling) / 10_000;
-        assertGt(burned, 0, "sanity: the default settleBurnBps actually burns something on this branch now");
+        uint256 burned = (bond * c.settleBurnBpsAtFiling) / 10_000;
+        assertGt(burned, 0, "sanity: the default settleBurnBps actually burns something");
         assertEq(
             wood.balanceOf(challenger) - challengerBefore,
-            bond + pool - burned,
-            "its own bond back PLUS the forfeited pool, net of the settle-slice burn"
+            bond - burned,
+            "its own bond back net of the settle slice, and NOT the pool"
         );
         assertEq(wood.balanceOf(guardianA), disputerBefore, "the accused loses the counter-bond it staked");
-        assertEq(wood.balanceOf(game.BURN_ADDRESS()), burned, "the settle slice actually left for the dead address");
+        assertEq(game.claimableContribution(id, guardianA), 0, "and cannot claim it back either");
+        assertEq(
+            wood.balanceOf(game.BURN_ADDRESS()),
+            burned + pool,
+            "the dead address got the settle slice AND the whole pool"
+        );
         _assertLiveBondsBacked();
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded once the ruling is terminal");
     }
@@ -3279,15 +3337,31 @@ contract ChallengeGameTest is Test {
         _assertLiveBondsBacked();
     }
 
-    /// @notice THE PARTIAL-POOL REFUND, which is where this design most easily
-    ///         strands funds forever. The pool never reached its target, so it
-    ///         never bought a dispute: the auto-slash clock ran out and `_settle`
-    ///         is entered from `Filed` WITH MONEY IN THE POOL — a state Plan D
-    ///         and Plan E could both assume was impossible. Those contributions
-    ///         must go back to the people who made them. Forfeiting them to the
-    ///         challenger would charge for a good never delivered; keeping them
-    ///         would break §4's custody invariant permanently.
-    function test_resolve_undisputedRefundsAPartialPool() public {
+    /// @notice THE PARTIAL POOL IS RETURNED TO ITS FUNDERS ON A SILENCE
+    ///         CONVICTION, not burned.
+    ///
+    ///         This briefly pinned the opposite. The argument for burning was
+    ///         that with ONE POOL PER PROPOSAL (pashov 2026-08 finding #10) a
+    ///         settle leaving the pool SPENDABLE lets contributions continue
+    ///         after the proposal is already convicted — the pool could then
+    ///         complete, a sibling become `Disputed` on it, and a `Guilty`
+    ///         ruling pay out a pool the first conviction already accounted for.
+    ///
+    ///         That argument is sound but it argues for CLOSING the pool, which
+    ///         `Released` does exactly as `Burned` does: `dispute` reverts on any
+    ///         outcome other than `Open`, so the sibling-completion path is shut
+    ///         either way (pinned by
+    ///         `test_settle_releasedPoolRefusesFurtherContribution`). Burning
+    ///         additionally took money from the accused for a defence they never
+    ///         received — an incomplete pool fails `_poolBacked`, so it never
+    ///         made any challenge `Disputed` and cannot be why the conviction
+    ///         landed — and was grindable, since `file` raises `pool.target`
+    ///         while the pool is incomplete.
+    ///
+    ///         What this test pins either way is that the pool is NOT the
+    ///         CHALLENGER'S: it goes back to the people who put it in, and the
+    ///         challenger's own payout is unchanged.
+    function test_resolve_undisputedReturnsAPartialPool() public {
         uint256 id = _fileStandard(PROPOSAL);
         uint256 bond = game.challengeOf(id).bondWood;
         uint256 aBefore = wood.balanceOf(guardianA);
@@ -3313,11 +3387,19 @@ contract ChallengeGameTest is Test {
         _claimAll(id); // pull-payment: funders collect before balances are asserted
 
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "silence was the verdict");
-        assertEq(swood.callCount(), 1, "the contributors are still slashed - the refund is not an acquittal");
+        assertEq(swood.callCount(), 1, "the contributors are slashed as well as losing the pool");
 
-        // Exact balances: each contributor is made whole, to the wei.
-        assertEq(wood.balanceOf(guardianA), aBefore, "guardianA's contribution came back");
-        assertEq(wood.balanceOf(guardianB), bBefore, "guardianB's contribution came back");
+        // Exact balances: both contributors are made whole, because the pool
+        // they part-funded never bought a dispute. `_claimAll` above already
+        // pulled it, so the balances are back where they started.
+        assertEq(wood.balanceOf(guardianA), aBefore, "guardianA's contribution is returned, not destroyed");
+        assertEq(wood.balanceOf(guardianB), bBefore, "guardianB's contribution is returned, not destroyed");
+        assertEq(game.claimableContribution(id, guardianA), 0, "and nothing is left owing after the claim");
+        assertEq(game.claimableContribution(id, guardianB), 0);
+        (uint256 poolWood,,,, bool burned) = game.counterBondPoolOf(id);
+        assertEq(poolWood, 0, "the pool holds nothing once released");
+        assertFalse(burned, "released, NOT burned -- an incomplete pool bought no defence");
+
         // Less F4's settle burn. This is the UNADJUDICATED path, which is
         // exactly the scope that burn has: a filing nobody answered used to buy
         // the slash and the demotion for the price of gas. The pool is still not
@@ -3328,8 +3410,14 @@ contract ChallengeGameTest is Test {
             bond - settleBurn,
             "the challenger gets its bond less the settle burn, and NOT the pool"
         );
+        assertEq(
+            wood.balanceOf(game.BURN_ADDRESS()),
+            settleBurn,
+            "only the settle slice burns -- the part-funded pool went back to its funders"
+        );
 
         assertEq(game.bondedWood(), 0, "nothing left accounted");
+        assertEq(game.unclaimedWood(), 0, "and nothing left booked, since _claimAll already pulled the release");
         assertEq(wood.balanceOf(address(game)), 0, "and nothing left stranded");
         _assertLiveBondsBacked();
     }
@@ -3742,6 +3830,10 @@ contract ChallengeGameTest is Test {
     ///      burn is derived from the challenge's own pinned
     ///      `settleBurnBpsAtFiling` rather than a hardcoded `18000e18`, so the
     ///      test survives a future rate change.
+    /// @dev The slice is taken off the CHALLENGER'S BOND on this branch since
+    ///      finding #10 — an identical amount, since a complete pool equals the
+    ///      bond, but a different pot: the pool itself is burned in full
+    ///      alongside it rather than being paid to the challenger.
     function test_rule_guiltyPathBurnsTheSettleSlice() public {
         uint256 id = _fileAndDispute();
         IChallengeGame.Challenge memory c = game.challengeOf(id);
@@ -3752,14 +3844,14 @@ contract ChallengeGameTest is Test {
         vm.prank(court);
         game.rule(id, IChallengeGame.Verdict.Guilty);
 
-        uint256 burned = (pool * c.settleBurnBpsAtFiling) / 10_000;
+        uint256 burned = (bond * c.settleBurnBpsAtFiling) / 10_000;
         assertGt(burned, 0, "sanity: the default settleBurnBps actually burns something");
+        assertEq(wood.balanceOf(challenger) - challengerBefore, bond - burned, "bond back, minus the burn");
         assertEq(
-            wood.balanceOf(challenger) - challengerBefore,
-            bond + pool - burned,
-            "bond back plus the pool, minus the burn"
+            wood.balanceOf(game.BURN_ADDRESS()),
+            burned + pool,
+            "settleBurnBpsAtFiling of the bond, plus the whole forfeited pool"
         );
-        assertEq(wood.balanceOf(game.BURN_ADDRESS()), burned, "exactly settleBurnBpsAtFiling of the pool was burned");
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded");
     }
 
@@ -4049,7 +4141,9 @@ contract ChallengeGameTest is Test {
     ///
     ///         THE MONEY IS THE ASSERTION: the challenge reaches `Settled`, the
     ///         challenger is refunded all but the pinned `settleBurnBps`, the
-    ///         part-funded pool is claimable back to its contributor, and the
+    ///         part-funded pool is BURNED like on any other conviction (see
+    ///         `test_resolve_undisputedBurnsAPartialPool` — a diverted settle
+    ///         still records the conviction and still closes the pool), and the
     ///         coverage genuinely unfreezes — proven through a real
     ///         `releaseApproval`, not a flag.
     function test_settle_divertsWhenTheVerdictWasCollectedAfterFiling() public {
@@ -4087,12 +4181,26 @@ contract ChallengeGameTest is Test {
         uint256 burned = (bond * filed.settleBurnBpsAtFiling) / 10_000;
         assertEq(wood.balanceOf(challenger) - challengerBefore, bond - burned, "challenger refunded");
 
-        // The part-funded pool is claimable, which `ChallengeNotTerminal` made
-        // impossible for the whole life of the wedge.
-        assertEq(game.claimableContribution(id, guardianB), partialPool, "pool owed back");
+        // The part-funded pool is RETURNED, not burned. A diverted settle is
+        // still a conviction on the books (`_convicted[key]` is set) and still
+        // CLOSES the pool — but closing is `Released` here, because the pool
+        // never completed and so never bought the accused a dispute. Burning it
+        // would charge them for a defence they did not get; see `_settle`'s
+        // branch on `completedAt`.
+        assertEq(
+            game.claimableContribution(id, guardianB),
+            partialPool,
+            "an incomplete pool is returned to its funder, not destroyed"
+        );
+        // Pull-payment, as everywhere else: the release moves the WOOD to
+        // `unclaimedWood` and the funder collects, so one reverting recipient
+        // cannot brick the resolution.
         vm.prank(guardianB);
         game.claimContribution(id);
-        assertEq(wood.balanceOf(guardianB) - guardianBefore, partialPool, "pool returned");
+        assertEq(wood.balanceOf(guardianB) - guardianBefore, partialPool, "the funder collects exactly what it put in");
+        assertEq(game.claimableContribution(id, guardianB), 0, "and only once");
+        (,,,, bool poolBurned) = game.counterBondPoolOf(id);
+        assertFalse(poolBurned, "released, not burned");
 
         // And the freeze is genuinely gone.
         assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "unfrozen");
@@ -4292,5 +4400,312 @@ contract ChallengeGameTest is Test {
         vm.prank(successor);
         game.acceptOwnership();
         assertEq(game.owner(), successor, "transfer still works");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // pashov 2026-08 finding #10 — the counter-bond pool is per PROPOSAL, and a
+    // conviction BURNS it
+    //
+    // The bug: `_liveByChallenger` gives every address its own filing slot and
+    // `_liveCount` is uncapped, so N addresses opened N concurrent challenges
+    // against one proposal — and `dispute`'s target was `c.bondWood` PER
+    // CHALLENGE. The accused cohort had to raise N counter-bonds in liquid WOOD
+    // inside `autoSlashDelay`, while the filings' own coverage freeze barred
+    // every named approver from `claimUnstakeGuardian` and so from paying out of
+    // stake. One filing they could not answer auto-slashed the whole cohort at
+    // the severity ceiling.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev N concurrent filings from N distinct addresses against one proposal,
+    ///      answered by ONE fully-funded pool. Returns the ids and the pool
+    ///      target, which is one challenger bond regardless of N.
+    function _fileNAndFundOnePool(uint256 n) internal returns (uint256[] memory ids, uint256 target) {
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
+        _execute(PROPOSAL);
+
+        ids = new uint256[](n);
+        for (uint256 i; i < n; i++) {
+            address filer = makeAddr(string.concat("concurrentFiler", vm.toString(i)));
+            _fund(filer);
+            vm.prank(filer);
+            ids[i] =
+                game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, ADAPTER, SELECTOR, EVIDENCE);
+        }
+
+        (, target,,,) = game.counterBondPoolOf(ids[0]);
+        vm.prank(guardianA);
+        game.dispute(ids[0], type(uint256).max);
+    }
+
+    /// @notice THE FINDING ITSELF. Five addresses file against one proposal and
+    ///         the accused answer all five with a SINGLE counter-bond — one
+    ///         bond's worth of liquid WOOD, not five. Every filing is `Disputed`
+    ///         the instant the pool completes, so none of them can reach
+    ///         `_settle`'s silence branch and convict the cohort on an
+    ///         unanswered assertion.
+    ///
+    ///         The audit's numbers were 67 filings demanding 502,500 USD of
+    ///         fresh liquid WOOD against 500,000 USD of frozen stake, for
+    ///         ~25,000 USD of attacker cost. What makes that arithmetic
+    ///         impossible is the pool being keyed per PROPOSAL: the accused
+    ///         cost stops scaling with N entirely, which is the same symmetry
+    ///         the design already gave the defenders' own Sybil split.
+    function test_dispute_nConcurrentFilingsAreAnsweredByOneCounterBondPool() public {
+        uint256 n = 5;
+        uint256 guardianBefore = wood.balanceOf(guardianA);
+        (uint256[] memory ids, uint256 target) = _fileNAndFundOnePool(n);
+
+        assertEq(game.liveChallengeCountOf(address(gov), PROPOSAL), n, "N live challenges, one slot per address");
+        assertEq(target, _standardBondWood(), "the pool is sized to ONE challenger bond, not to N of them");
+        assertEq(guardianBefore - wood.balanceOf(guardianA), target, "and the cohort paid exactly that once");
+
+        uint256 bondsPosted;
+        for (uint256 i; i < n; i++) {
+            IChallengeGame.Challenge memory c = game.challengeOf(ids[i]);
+            assertEq(
+                uint8(c.status), uint8(IChallengeGame.Status.Disputed), "every concurrent filing is disputed at once"
+            );
+            bondsPosted += c.bondWood;
+
+            // Every challenge reports the SAME pool — the identity that makes
+            // the cost stop scaling with N.
+            (uint256 poolWood, uint256 targetWood, uint256 raisedWood, uint256 completedAt,) =
+                game.counterBondPoolOf(ids[i]);
+            assertEq(poolWood, target, "one shared pool, seen from every challenge");
+            assertEq(targetWood, target);
+            assertEq(raisedWood, target);
+            assertEq(completedAt, vm.getBlockTimestamp(), "completed once, in one call");
+        }
+
+        // N bonds are in, and exactly ONE pool on top of them.
+        assertEq(game.bondedWood(), bondsPosted + target, "N challenger bonds plus a single counter-bond");
+        assertEq(bondsPosted, n * target, "sanity: the attacker really did post N bonds");
+        _assertLiveBondsBacked();
+
+        // And the silence branch is closed on all of them: none can be settled
+        // by running out the auto-slash clock.
+        vm.warp(_filedAt(ids[0]) + game.autoSlashDelay());
+        for (uint256 i; i < n; i++) {
+            vm.expectRevert(IChallengeGame.DelayNotElapsed.selector);
+            game.resolve(ids[i]);
+        }
+        assertEq(swood.callCount(), 0, "not one of the N unanswered filings slashed the cohort");
+    }
+
+    /// @notice THE BURN IS REAL, AND IT IS THE WHOLE POOL. A conviction sends
+    ///         the counter-bond to `BURN_ADDRESS` rather than to any challenger,
+    ///         and it does so ONCE for the shared pool however many concurrent
+    ///         challenges are riding on it. The siblings that settle afterwards
+    ///         pay nothing out of it a second time.
+    function test_rule_convictionBurnsTheSharedPoolExactlyOnce() public {
+        (uint256[] memory ids, uint256 target) = _fileNAndFundOnePool(3);
+        IChallengeGame.Challenge memory c0 = game.challengeOf(ids[0]);
+        uint256 settleSlice = (c0.bondWood * c0.settleBurnBpsAtFiling) / 10_000;
+        uint256 burnBefore = wood.balanceOf(game.BURN_ADDRESS());
+        uint256 funderBefore = wood.balanceOf(guardianA);
+
+        vm.prank(court);
+        game.rule(ids[0], IChallengeGame.Verdict.Guilty);
+
+        assertEq(
+            wood.balanceOf(game.BURN_ADDRESS()) - burnBefore,
+            target + settleSlice,
+            "the dead address got the WHOLE pool plus the settle slice of the bond"
+        );
+        (uint256 poolWood,,,, bool burned) = game.counterBondPoolOf(ids[1]);
+        assertEq(poolWood, 0, "seen from a sibling too: nothing left in the pool");
+        assertTrue(burned, "burned, not released");
+        assertEq(game.claimableContribution(ids[0], guardianA), 0, "the funder cannot claw any of it back");
+
+        // The two siblings still terminate — and neither pays the pool out
+        // again. This is the A-guilty-then-B case: `_burnPool` is idempotent, so
+        // the second and third settles decrement nothing.
+        for (uint256 i = 1; i < ids.length; i++) {
+            vm.prank(court);
+            game.rule(ids[i], IChallengeGame.Verdict.Guilty);
+            assertEq(
+                uint8(game.challengeOf(ids[i]).status), uint8(IChallengeGame.Status.Settled), "the sibling terminates"
+            );
+            assertEq(game.claimableContribution(ids[i], guardianA), 0, "and pays out no pool of its own");
+        }
+        assertEq(swood.callCount(), 1, "one liability, collected once");
+        assertEq(wood.balanceOf(guardianA), funderBefore, "the funder is flat on the pool: it is simply gone");
+        assertEq(game.bondedWood(), 0, "nothing left accounted");
+        assertEq(game.unclaimedWood(), 0, "and nothing booked for a claim that can never come");
+        assertEq(wood.balanceOf(address(game)), 0, "nothing stranded");
+    }
+
+    /// @notice THE CLAWBACK, PROVEN CLOSED WITH NUMBERS. The attack the burn
+    ///         exists for: a GUILTY cohort self-files from a fresh address, funds
+    ///         the proposal's only pool through that filing, and adopts the
+    ///         honest challenge for free — then takes the pool back AS THE
+    ///         CHALLENGER when its own filing is ruled on.
+    ///
+    ///         At this fixture's parameters the bond is 3,000 WOOD ($10,000 of
+    ///         coverage at 150 bps, priced at $0.05) and `settleBurnBps` is 500:
+    ///
+    ///           attacker pays  3,000 (its own filing's bond)
+    ///                        + 3,000 (the proposal's only counter-bond pool)
+    ///                        = 6,000
+    ///
+    ///           paying the pool to the ruled challenger returned
+    ///                          3,000 + 3,000 - 150  = 5,850
+    ///                          net cost               150  — a 5% deposit
+    ///
+    ///           burning it returns
+    ///                          3,000 - 150          = 2,850
+    ///                          net cost             3,150  — pool + slice
+    ///
+    ///         The counter-bond stops being refundable, which is the whole
+    ///         point: there is no recipient left for the attacker to be.
+    function test_rule_selfFilingCohortRecoversNothingFromTheBurnedPool() public {
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
+        _execute(PROPOSAL);
+
+        // The honest challenger files first.
+        vm.prank(challenger);
+        uint256 honest = game.file(
+            address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE
+        );
+
+        // The cohort self-files from a fresh address and funds the ONE pool
+        // through it. `sybil` and `guardianA` are ONE economic actor, so the
+        // snapshot spans both addresses — and it is taken BEFORE either of them
+        // spends anything. Taking it after the self-filing bond is paid leaves
+        // that outflow outside the measurement while the refund lands inside it,
+        // which reports a net cost of 150 (the slice alone) for an attack that
+        // actually costs 3,150.
+        address sybil = makeAddr("selfFilingCohort");
+        _fund(sybil);
+        uint256 attackerBefore = wood.balanceOf(sybil) + wood.balanceOf(guardianA);
+
+        vm.prank(sybil);
+        uint256 self =
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+
+        uint256 bondSelf = game.challengeOf(self).bondWood;
+        assertEq(bondSelf, 3_000e18, "fixture: 3,000 WOOD per bond, as the doc comment above works through");
+
+        (, uint256 target,,,) = game.counterBondPoolOf(self);
+        assertEq(target, bondSelf, "one pool, one bond's worth");
+        vm.prank(guardianA);
+        game.dispute(self, type(uint256).max);
+
+        // The honest challenge was adopted by that pool for free — the free ride
+        // the attacker is paying for.
+        assertEq(
+            uint8(game.challengeOf(honest).status),
+            uint8(IChallengeGame.Status.Disputed),
+            "the honest filing rides the attacker's pool"
+        );
+
+        // The attacker's OWN filing is ruled first — the ordering that used to
+        // hand it the pool back as the winning challenger.
+        uint256 burnBefore = wood.balanceOf(game.BURN_ADDRESS());
+        vm.prank(court);
+        game.rule(self, IChallengeGame.Verdict.Guilty);
+
+        uint256 slice = (bondSelf * 500) / 10_000; // settleBurnBps, live default
+        assertEq(slice, 150e18, "fixture: a 150 WOOD settle slice");
+        assertEq(
+            wood.balanceOf(game.BURN_ADDRESS()) - burnBefore, target + slice, "3,000 of pool plus 150 of slice burned"
+        );
+
+        // Collect everything the attacker could possibly still be owed.
+        assertEq(game.claimableContribution(self, guardianA), 0, "nothing claimable out of a burned pool");
+        assertEq(game.claimableContribution(honest, guardianA), 0);
+
+        uint256 attackerAfter = wood.balanceOf(sybil) + wood.balanceOf(guardianA);
+        assertEq(attackerBefore - attackerAfter, target + slice, "net cost is the whole pool plus the slice: 3,150");
+        assertEq(attackerBefore - attackerAfter, 3_150e18, "and in absolute terms, against 150 under the old rule");
+        assertEq(
+            wood.balanceOf(sybil),
+            10_000_000e18 - bondSelf + (bondSelf - slice),
+            "the self-filer recovered only its own bond net of the slice -- never the pool"
+        );
+        assertEq(swood.callCount(), 1, "and it was convicted while paying for the privilege");
+    }
+
+    /// @notice THE REFUND PATH IS INTACT, AND SINGLE-SHOT. Two concurrent
+    ///         challenges on one pool both unwind `Inconclusive`: nothing is
+    ///         burned out of the pool, the funder gets its stake back EXACTLY
+    ///         ONCE, and the release waits for the LAST live challenge — holding
+    ///         it back is what keeps a `Guilty` ruling on a still-live sibling
+    ///         with something to burn.
+    function test_rule_inconclusiveReturnsTheSharedPoolExactlyOnce() public {
+        (uint256[] memory ids, uint256 target) = _fileNAndFundOnePool(2);
+        uint256 funderBefore = wood.balanceOf(guardianA);
+
+        vm.prank(court);
+        game.rule(ids[0], IChallengeGame.Verdict.Inconclusive);
+        assertEq(
+            game.claimableContribution(ids[0], guardianA), 0, "not while a sibling challenge is still live on the pool"
+        );
+        (uint256 stillHeld,,,, bool burned) = game.counterBondPoolOf(ids[1]);
+        assertEq(stillHeld, target, "the pool is still held, still backing the live sibling");
+        assertFalse(burned);
+
+        vm.prank(court);
+        game.rule(ids[1], IChallengeGame.Verdict.Inconclusive);
+
+        (uint256 afterRelease,,,, bool burnedAfter) = game.counterBondPoolOf(ids[1]);
+        assertEq(afterRelease, 0, "released out of live accounting");
+        assertFalse(burnedAfter, "released, not burned -- no conviction happened");
+        assertEq(game.unclaimedWood(), target, "and booked for a pull-claim, to the wei");
+
+        // Claimed once, through either challenge, and never twice.
+        assertEq(game.claimableContribution(ids[0], guardianA), target, "the whole stake, once");
+        assertEq(game.claimableContribution(ids[1], guardianA), target, "the same one entitlement, not a second");
+        vm.prank(guardianA);
+        game.claimContribution(ids[0]);
+        assertEq(wood.balanceOf(guardianA) - funderBefore, target, "stake back, no winnings and no loss");
+
+        vm.prank(guardianA);
+        vm.expectRevert(IChallengeGame.NothingToClaim.selector);
+        game.claimContribution(ids[1]);
+        assertEq(game.claimableContribution(ids[0], guardianA), 0, "and it is retired on both");
+
+        assertEq(swood.callCount(), 0, "an unwind convicts nobody");
+        assertEq(game.bondedWood(), 0, "nothing left accounted");
+        assertEq(game.unclaimedWood(), 0, "and nothing stranded in the claim book");
+        assertEq(wood.balanceOf(address(game)), 0);
+    }
+
+    /// @notice A SINGLE HONEST FILING BEHAVES EXACTLY AS IT DID. Nobody funds a
+    ///         counter-bond, the silence IS the verdict, and the challenger
+    ///         recovers its bond net of `settleBurnBps` — the branch
+    ///         `honestFilingBreaksEven` prices, deliberately untouched by this
+    ///         fix. The only pool machinery that runs is a burn of zero.
+    function test_resolve_singleHonestFilingIsUnchangedByTheSharedPool() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        uint256 bond = game.challengeOf(id).bondWood;
+        assertEq(bond, _standardBondWood(), "the bond is sized as before");
+        (uint256 poolWood, uint256 target, uint256 raised, uint256 completedAt,) = game.counterBondPoolOf(id);
+        assertEq(poolWood, 0, "nobody funded a defence");
+        assertEq(raised, 0);
+        assertEq(target, bond, "and the pool a defender WOULD have to raise is still one bond");
+        assertEq(completedAt, 0);
+
+        uint256 challengerBefore = wood.balanceOf(challenger);
+        uint256 burnBefore = wood.balanceOf(game.BURN_ADDRESS());
+
+        vm.warp(_filedAt(id) + game.autoSlashDelay());
+        game.resolve(id);
+
+        uint256 slice = (bond * game.settleBurnBps()) / 10_000;
+        assertEq(
+            wood.balanceOf(challenger) - challengerBefore, bond - slice, "bond back net of the settle slice, as before"
+        );
+        assertEq(
+            wood.balanceOf(game.BURN_ADDRESS()) - burnBefore,
+            slice,
+            "and ONLY the slice burned -- an unfunded pool has nothing to destroy"
+        );
+        assertEq(swood.callCount(), 1, "the silence verdict still slashes");
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled));
+        assertEq(game.bondedWood(), 0, "nothing left accounted");
+        assertEq(game.unclaimedWood(), 0);
+        assertEq(wood.balanceOf(address(game)), 0, "nothing stranded");
+        _assertLiveBondsBacked();
     }
 }

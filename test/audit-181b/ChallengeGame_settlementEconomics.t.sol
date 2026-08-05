@@ -181,8 +181,21 @@ contract MockCourtSE {
 ///         OWN counter-bond pool and is then ruled `Guilty` used to recover
 ///         `bond + pool` untouched — its whole round-trip capital, net cost
 ///         zero, despite `forfeitBurnBps`'s own natspec pricing exactly this
-///         trade on the FAIL path. `test_selfFundedGuiltyRuling_burnsASlice_notTheWholeRoundTrip`
+///         trade on the FAIL path. `test_selfFundedGuiltyRuling_burnsTheWholePoolPlusASlice`
 ///         proves the escalated branch now burns too.
+///
+///         SUPERSEDED IN SIZING BY pashov 2026-08 FINDING #10, and the test
+///         above is updated accordingly. 18b's remedy — burn a
+///         `settleBurnBps` SLICE of the forfeited pool — left the rest of the
+///         pool returning to the ruled challenger, which finding #10 showed is
+///         a ~5% refundable deposit rather than a cost, and reachable by the
+///         GUILTY COHORT itself once the pool is keyed per proposal: it
+///         self-files from a fresh address, funds the proposal's only pool
+///         through that filing, adopts the honest challenge for free, and
+///         collects the pool back on the ruling that convicts it. The pool is
+///         now burned in full on every conviction. 18b's PROPERTY (the round
+///         trip must not be free) is preserved and strengthened; only its
+///         price changed, from the slice to the slice plus the whole pool.
 ///
 /// @dev    Finding 19 (free first round): the very first `Inconclusive`
 ///         unwind against a fresh proposal used to pin a 0 bps burn rate,
@@ -279,10 +292,14 @@ contract ChallengeGame_settlementEconomicsTest is Test {
     ///         exactly `2 * bondWood` against a `2 * bondWood` outlay (bond +
     ///         its own pool contribution) — a net WOOD change of exactly ZERO
     ///         for a conviction it triggered entirely with its own capital.
-    ///         The `assertLt(received, 2 * bondWood, ...)` below is the
-    ///         load-bearing assertion: it is false (`received == 2 *
-    ///         bondWood`) against the old code and true against the fix.
-    function test_selfFundedGuiltyRuling_burnsASlice_notTheWholeRoundTrip() public {
+    ///         `assertEq(received, expectedReceipt)` below is the load-bearing
+    ///         assertion. It is the only one that discriminates against BOTH
+    ///         predecessors: pre-18b returned `2 * bondWood` (free round trip)
+    ///         and pre-#10 returned `2 * bondWood - expectedBurn` (a ~5%
+    ///         refundable deposit). The `assertLt` that used to carry that role
+    ///         now passes against the pre-#10 code as well, so it documents the
+    ///         18b property rather than proving the current one.
+    function test_selfFundedGuiltyRuling_burnsTheWholePoolPlusASlice() public {
         address challenger = address(0xC4A11E7);
         uint256 bondWood = _expectedBondWood();
 
@@ -320,7 +337,19 @@ contract ChallengeGame_settlementEconomicsTest is Test {
         uint256 settleBurnBpsAtFiling = game.challengeOf(id).settleBurnBpsAtFiling;
         uint256 expectedBurn = (bondWood * settleBurnBpsAtFiling) / 10_000;
         assertGt(expectedBurn, 0, "fixture must exercise a non-zero burn rate");
-        uint256 expectedReceipt = 2 * bondWood - expectedBurn;
+
+        // SUPERSEDED SIZING, SAME PROPERTY (pashov 2026-08 finding #10). This
+        // used to expect `2 * bondWood - expectedBurn`: both legs back, less a
+        // slice. Finding #10 named that for what it was — a ~5% REFUNDABLE
+        // DEPOSIT — because with one pool per proposal the round trip is
+        // available to a GUILTY cohort, not just to a self-dealing challenger:
+        // self-file from a fresh address, fund the proposal's only pool through
+        // that filing, and take it back as the challenger on the ruling that
+        // convicts you. Finding 18b's property ("the round trip must not be
+        // free") is kept and strengthened: the pool is now BURNED outright, so
+        // only the bond leg returns and the round trip costs the WHOLE pool plus
+        // the slice.
+        uint256 expectedReceipt = bondWood - expectedBurn;
 
         vm.prank(address(court));
         game.rule(id, IChallengeGame.Verdict.Guilty);
@@ -330,9 +359,19 @@ contract ChallengeGame_settlementEconomicsTest is Test {
         // Challenger's balance was exactly 0 immediately before this call, so
         // its balance now IS what the round trip returned.
         uint256 received = wood.balanceOf(challenger);
-        assertEq(received, expectedReceipt, "the round trip must cost exactly the settle-burn slice, not zero");
+        // THE LOAD-BEARING ASSERTION. Pins the exact receipt, so it discriminates
+        // against BOTH the pre-18b code (`2 * bondWood`, a free round trip) and
+        // the pre-#10 code (`2 * bondWood - expectedBurn`, a refundable deposit).
+        assertEq(received, expectedReceipt, "only the bond leg returns, net of the settle-burn slice");
+        // Kept as the named 18b property, but note it is now IMPLIED by the
+        // equality above rather than doing the discriminating itself — it passes
+        // against the pre-#10 code too.
         assertLt(received, 2 * bondWood, "THE ROUND TRIP MUST NOT BE FREE (issue #181 finding 18b)");
-        assertEq(wood.balanceOf(game.BURN_ADDRESS()), expectedBurn, "the slice must actually be destroyed");
+        assertEq(
+            wood.balanceOf(game.BURN_ADDRESS()),
+            expectedBurn + bondWood,
+            "the slice AND the whole self-funded pool must actually be destroyed"
+        );
     }
 
     // ── Finding 19 ──
@@ -352,7 +391,7 @@ contract ChallengeGame_settlementEconomicsTest is Test {
         uint256 bondWood = _expectedBondWood();
 
         // The court must be wired BEFORE filing for the same reason as
-        // `test_selfFundedGuiltyRuling_burnsASlice_notTheWholeRoundTrip`
+        // `test_selfFundedGuiltyRuling_burnsTheWholePoolPlusASlice`
         // above: `courtAtFiling` pins whatever `court` reads at `file()`
         // time, and the later `game.rule(id, Inconclusive)` call below is
         // refused (`NotCourt`) on a challenge that pinned `address(0)`,

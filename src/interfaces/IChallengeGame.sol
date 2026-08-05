@@ -14,6 +14,20 @@ pragma solidity 0.8.28;
 ///         judge-enforcing the rest would run two security models in one
 ///         mechanism. Adjudication is SILENCE: not contesting IS the verdict.
 interface IChallengeGame {
+    /// @notice Lifecycle of a proposal's counter-bond pool.
+    /// @dev    `Burned` and `Released` are deliberately two values rather than
+    ///         one `resolved` bit: only `Released` makes a funder's stake
+    ///         claimable, and collapsing them would let a BURNED pool be claimed
+    ///         back - the exact clawback the burn exists to remove.
+    ///
+    ///         Declared here rather than on the implementation so `poolOutcomeOf`
+    ///         can return it from this interface; `ChallengeGame` inherits it.
+    enum PoolOutcome {
+        Open,
+        Burned,
+        Released
+    }
+
     /// @notice The predicate a challenge cites.
     /// @dev    Classification only, carried in `ChallengeFiled` so
     ///         watchtowers, indexers and judges can filter and route. It
@@ -68,9 +82,19 @@ interface IChallengeGame {
     ///        auditing the bond arithmetic.
     /// @param counterBondWood The counter-bond POOL raised so far, summed over
     ///        every contributor. There is deliberately no single `disputer` field:
-    ///        the defence is bought collectively. `Filed` implies this is strictly
-    ///        below `bondWood`; `Disputed` implies it equals `bondWood`, because
-    ///        the status flips in the call that completes the pool.
+    ///        the defence is bought collectively.
+    ///
+    ///        SHARED ACROSS EVERY CHALLENGE ON THE PROPOSAL (pashov 2026-08
+    ///        finding #10): the pool is keyed per review key, not per challenge,
+    ///        so two concurrent challenges report the SAME figure here and one
+    ///        funding answers both. `challengeOf` synthesises it from the pool
+    ///        while the challenge is live, and the value is pinned into storage
+    ///        when the challenge terminates. Summing it across challenges
+    ///        therefore double-counts - ask `counterBondPoolOf` instead.
+    ///
+    ///        `Disputed` still implies a COMPLETE pool, but completeness is
+    ///        `>= target` for the pool, and the target is the largest live bond
+    ///        on the proposal rather than necessarily this challenge's own.
     /// @param adapterTarget The adapter the challenger accuses, demoted on a
     ///        passed challenge. Zero means the filing accuses no adapter.
     /// @param adapterSelector The accused adapter's selector.
@@ -195,9 +219,10 @@ interface IChallengeGame {
     ///         caller is rejected by `WrongStatus` first.
     error NothingToContribute();
     /// @notice `claimContribution` found nothing owed — the caller never
-    ///         contributed, has already claimed, or the challenge ended on the
-    ///         guilty-ruling path where the whole pool forfeits to the
-    ///         challenger and the funders are owed nothing.
+    ///         contributed, has already claimed, or the proposal was CONVICTED,
+    ///         which burns the pool rather than returning it. A pool shared with
+    ///         a still-live sibling challenge also reads as nothing owed until
+    ///         that sibling terminates and the pool is released.
     error NothingToClaim();
     /// @notice `claimContribution` on a challenge that is not yet terminal.
     ///         Entitlements are only knowable once the outcome is fixed.
@@ -280,7 +305,29 @@ interface IChallengeGame {
     ///      instant the escalation is actually bought. It carries no `disputer`:
     ///      the defence is collective, and who paid what is in the
     ///      `CounterBondContributed` log that precedes this one.
+    /// @dev `challengeId` IS THE CHALLENGE THE COMPLETING CONTRIBUTION WAS PAID
+    ///      THROUGH, not the only one it disputes. The pool is per proposal, so
+    ///      every live challenge on that review key whose own silence window
+    ///      still contains this instant becomes `Disputed` in the same call, and
+    ///      any filed afterwards is adopted by it. An indexer must re-read
+    ///      `challengeOf(...).status` for the siblings rather than assume one
+    ///      event means one challenge.
     event ChallengeDisputed(uint256 indexed challengeId, uint256 counterBondWood);
+    /// @notice A conviction destroyed the proposal's counter-bond pool. Emitted
+    ///         once per pool, by whichever challenge convicted first.
+    /// @dev    The pool is NOT paid to the challenger: doing so made the
+    ///         counter-bond a refundable deposit for a guilty cohort able to
+    ///         file from a second address. `challengeId` is the settling
+    ///         challenge, `amountWood` the whole pool, complete or partial.
+    event CounterBondPoolBurned(uint256 indexed challengeId, uint256 amountWood);
+    /// @notice The proposal's counter-bond pool was returned to its funders —
+    ///         booked into `unclaimedWood` for `claimContribution`, not pushed.
+    /// @dev    Emitted by the LAST live challenge on the proposal to terminate
+    ///         without a conviction, so it can lag a `NotGuilty` or
+    ///         `Inconclusive` outcome on any one challenge. Releasing earlier
+    ///         would hand the pool back while a sibling was still `Disputed` on
+    ///         it, leaving a later `Guilty` ruling nothing to burn.
+    event CounterBondPoolReleased(uint256 indexed challengeId, uint256 amountWood);
     /// @notice The pool-completing `dispute` call tried `TokenCourt.refer` on the
     ///         challenger's behalf and the court reverted — a best-effort
     ///         auto-referral. The dispute itself still landed, and `refer` stays
@@ -299,10 +346,12 @@ interface IChallengeGame {
     ///      (`inconclusiveBurnBps`) — a filing is never free on either path where
     ///      the challenger did nothing wrong, because an unanswered or unresolved
     ///      filing still froze a cohort's coverage for the price of gas. On a
-    ///      settle this is a slice of the CHALLENGER'S BOND on the silence branch,
-    ///      and the identically-sized slice of the forfeited COUNTER-BOND POOL on
-    ///      the escalated branch. Distinct from `ChallengeFailed.burnedWood`, the
-    ///      FAIL-path burn charged to a challenger who was actually wrong.
+    ///      settle this is a slice of the CHALLENGER'S BOND on both branches — it
+    ///      used to be taken off the forfeited COUNTER-BOND POOL on the escalated
+    ///      one, for an identical amount, before that pool stopped being a
+    ///      challenger payout at all (see `CounterBondPoolBurned`). Distinct from
+    ///      `ChallengeFailed.burnedWood`, the FAIL-path burn charged to a
+    ///      challenger who was actually wrong.
     event ChallengerBondBurned(uint256 indexed challengeId, uint256 burnedWood);
     /// @dev A settle that convicted nothing because an earlier challenge on the
     ///      same proposal already did. The approvers' liability is one liability;
@@ -464,32 +513,69 @@ interface IChallengeGame {
 
     // ── Views ──
     function challengeOf(uint256 challengeId) external view returns (Challenge memory);
-    /// @notice Everyone that has put WOOD into a challenge's counter-bond
-    ///         pool, in first-contribution order and without duplicates.
-    ///         This is the payout set on the failure path — a failed
-    ///         challenge's forfeited bond splits pro-rata across THIS
-    ///         list, not across the accused set.
+    /// @notice Everyone that has put WOOD into the counter-bond pool THIS
+    ///         CHALLENGE BELONGS TO, in first-contribution order and without
+    ///         duplicates. This is the payout set on the failure path — a failed
+    ///         challenge's forfeited bond splits pro-rata across THIS list, not
+    ///         across the accused set.
+    /// @dev    The pool is per PROPOSAL, so every concurrent challenge on one
+    ///         review key returns the same list.
     function counterBondContributors(uint256 challengeId) external view returns (address[] memory);
-    /// @notice What one address has contributed to a challenge's
-    ///         counter-bond pool. Retained after resolution, so the split
-    ///         a terminal challenge paid out stays auditable on-chain.
+    /// @notice What one address has contributed to the pool this challenge
+    ///         belongs to. Retained after resolution AND after a claim — it is
+    ///         the pro-rata weight every later payout out of the same pool is
+    ///         split by, so it is a record, not a balance.
     function counterBondContributionOf(uint256 challengeId, address contributor) external view returns (uint256);
 
-    /// @notice Collect what a terminal challenge owes you for funding its
-    ///         counter-bond: your stake back, plus your pro-rata slice of the
-    ///         forfeited challenger bond when the challenge FAILED.
+    /// @notice The counter-bond pool this challenge belongs to. The pool is
+    ///         shared per PROPOSAL, so this is the figure to aggregate over —
+    ///         summing `Challenge.counterBondWood` across concurrent challenges
+    ///         double-counts one pool.
+    /// @param poolWood    WOOD the pool still holds — zero once it resolved.
+    /// @param targetWood  What the pool must raise to dispute. The largest live
+    ///                    challenger bond on the proposal, frozen at completion.
+    /// @param raisedWood  Total ever contributed; the pro-rata denominator.
+    /// @param completedAt When the pool first reached its target, or zero. A
+    ///                    challenge is `Disputed` when this is non-zero AND
+    ///                    earlier than its own auto-slash deadline.
+    /// @param burned      True when a conviction destroyed the pool. False both
+    ///                    while open and after a release to its funders.
+    function counterBondPoolOf(uint256 challengeId)
+        external
+        view
+        returns (uint256 poolWood, uint256 targetWood, uint256 raisedWood, uint256 completedAt, bool burned);
+
+    /// @notice The pool's full lifecycle outcome for the pool `challengeId`
+    ///         belongs to.
+    /// @dev    `counterBondPoolOf`'s `burned` flag cannot distinguish `Open` from
+    ///         `Released` — both report false — and those two differ in exactly
+    ///         the way an invariant cares about: `Open` still HOLDS the WOOD,
+    ///         `Released` has moved it to `unclaimedWood`. Any property about
+    ///         what a pool holds needs this, not that flag.
+    function poolOutcomeOf(uint256 challengeId) external view returns (PoolOutcome);
+
+    /// @notice Collect what a terminal challenge owes you for funding the
+    ///         counter-bond pool it belongs to: your stake back once that POOL
+    ///         has been released, plus your pro-rata slice of THIS challenge's
+    ///         forfeited challenger bond when it FAILED.
     /// @dev    PULL, NOT PUSH: resolution stores the total to split and each
     ///         claimant computes its own share on the way out, so the payout is
     ///         O(1) regardless of contributor-list length and one reverting
     ///         recipient can never brick a resolution. Shares floor-divide
     ///         independently, so up to `contributors - 1` wei is never claimable —
     ///         bounded at wei scale and still covered by `unclaimedWood`.
+    /// @dev    The two legs are tracked separately and each is single-shot. A
+    ///         pool shared by several challenges can owe one funder a stake
+    ///         (once) and a forfeit share from every challenge on it that
+    ///         failed (once each), so claiming through one challenge never
+    ///         retires an entitlement earned on another.
     function claimContribution(uint256 challengeId) external returns (uint256 amount);
 
     /// @notice What `claimContribution` would pay `contributor` right now
-    ///         — the stake plus, on the failed path, its slice of the
-    ///         forfeit. Zero once claimed, and zero on the guilty-ruling
-    ///         path.
+    ///         — the released stake plus, on the failed path, its slice of the
+    ///         forfeit. Zero once claimed, zero while the challenge is live, and
+    ///         zero on any conviction path, where the pool is BURNED rather than
+    ///         returned.
     function claimableContribution(uint256 challengeId, address contributor) external view returns (uint256);
 
     /// @notice WOOD owed to counter-bond funders of terminal challenges and not

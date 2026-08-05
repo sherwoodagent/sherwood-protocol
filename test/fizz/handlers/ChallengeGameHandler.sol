@@ -55,7 +55,11 @@ abstract contract ChallengeGameHandler is Properties {
         uint256 bal = wood.balanceOf(actor);
         if (bal == 0) return;
         IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
-        uint256 remaining = c.bondWood > c.counterBondWood ? c.bondWood - c.counterBondWood : 0;
+        // The pool is keyed per PROPOSAL now (pashov 2026-08 finding #10), so
+        // the remaining headroom comes from the pool's own target/raised rather
+        // than from this challenge's stale per-challenge field.
+        (, uint256 target, uint256 raised,,) = game.counterBondPoolOf(challengeId);
+        uint256 remaining = target > raised ? target - raised : 0;
         if (remaining == 0) return;
         amountWood = clampBetween(amountWood, 1, remaining < bal ? remaining : bal);
 
@@ -71,7 +75,11 @@ abstract contract ChallengeGameHandler is Properties {
         challengeId = clampBetween(challengeId, 1, count);
 
         IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
-        uint256 remaining = c.bondWood > c.counterBondWood ? c.bondWood - c.counterBondWood : 0;
+        // The pool is keyed per PROPOSAL now (pashov 2026-08 finding #10), so
+        // the remaining headroom comes from the pool's own target/raised rather
+        // than from this challenge's stale per-challenge field.
+        (, uint256 target, uint256 raised,,) = game.counterBondPoolOf(challengeId);
+        uint256 remaining = target > raised ? target - raised : 0;
         if (remaining == 0 || wood.balanceOf(actor) < remaining) return;
 
         challengeGame_dispute(challengeId, remaining);
@@ -172,7 +180,11 @@ abstract contract ChallengeGameHandler is Properties {
         // `counterBondWood == bondWood`; a short pool leaves the challenge in
         // Filed and `refer` reverts, so partial funding is not enough.
         IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
-        uint256 remaining = c.bondWood > c.counterBondWood ? c.bondWood - c.counterBondWood : 0;
+        // The pool is keyed per PROPOSAL now (pashov 2026-08 finding #10), so
+        // the remaining headroom comes from the pool's own target/raised rather
+        // than from this challenge's stale per-challenge field.
+        (, uint256 target, uint256 raised,,) = game.counterBondPoolOf(challengeId);
+        uint256 remaining = target > raised ? target - raised : 0;
         for (uint256 i; i < actors.length && remaining != 0; i++) {
             address d = _nonGuardian(i);
             if (d == challenger) continue;

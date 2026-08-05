@@ -690,6 +690,35 @@ contract TierRegistry is Ownable2Step {
             b.releasableAt = releasableAt;
             emit SubmitterBondReleaseStarted(target, selector, b.submitter, releasableAt);
         }
+        // PASHOV 2026-08 FINDING #15 LIVES ON THIS LINE, and it is knowingly
+        // left open rather than patched here.
+        //
+        // `_adapterAllowed` answers TWO questions with ONE bit: "may this
+        // address receive vault-fund movements?" and "may the vault CALL this
+        // address in a governor batch?" (`SyndicateVault._guardBatchCalls`
+        // PART 2a). Clearing it on demotion is right for the first and
+        // catastrophic for the second when the target is a strategy CLONE that
+        // currently holds the vault's capital: `settleProposal`, `unstick` AND
+        // `finalizeEmergencySettle` all revert `DisallowedBatchCallee`, the
+        // proposal pins in `Executed`, `redemptionsLocked()` stays true, and
+        // every LP exit is shut until a DIFFERENT owner (the registry
+        // multisig) re-grants the standing this conviction just removed.
+        // `test/ChallengeEndToEnd.t.sol` already works around exactly this.
+        //
+        // Not narrowed here because both candidate fixes are worse from this
+        // seat. Keeping the bit but skipping the clear would let a convicted
+        // adapter keep receiving funds, which is the entire point of demotion.
+        // Exempting the in-flight position vault-side reverses openspec
+        // `target-based-batch-gating` Decision 3 ("No lifecycle state is
+        // grandfathered in code") and was already dropped once for scoping the
+        // exemption to "named in a batch" rather than "holds this proposal's
+        // capital".
+        //
+        // The real fix is to split the two questions into two bits, which is
+        // the same axis rework already owned elsewhere (see the `#211` review
+        // of `isCounterpartyAllowed`, whose stated justification — "the swap
+        // adapter is the one address that receives forceApprove" — is false).
+        // Landing a competing version here would collide with it.
         if (_adapterAllowed[target]) {
             delete _adapterAllowed[target];
             emit AdapterAllowedSet(target, false);

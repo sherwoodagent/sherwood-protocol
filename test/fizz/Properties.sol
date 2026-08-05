@@ -113,20 +113,64 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         return sum == swood.totalGuardianStake();
     }
 
-    /// @notice GL-14 — while a challenge is live (`Filed`/`Disputed`), Σ
-    ///         contributor amounts equals `challengeOf(id).counterBondWood`.
+    /// @notice GL-14 — the counter-bond pool is keyed per PROPOSAL, not per
+    ///         challenge (pashov 2026-08 finding #10), so this no longer asserts
+    ///         anything per-challenge. For every live (`Filed`/`Disputed`)
+    ///         challenge it now says three things about THE POOL THAT CHALLENGE
+    ///         BELONGS TO:
+    ///
+    ///           1. Σ `counterBondContributionOf` over the pool's contributor
+    ///              list equals the pool's `raisedWood` — the contributor ledger
+    ///              and the pool total never diverge.
+    ///           2. The pool never HOLDS more than it raised
+    ///              (`poolWood <= raisedWood`).
+    ///
+    ///              NOT `poolWood == raisedWood`, and NOT `!burned`. A terminal
+    ///              pool coexisting with a live challenge is a NORMAL state
+    ///              here, in two ways: `_burnPool` fires on the first conviction
+    ///              regardless of `_liveCount`, and `_settle`'s incomplete-pool
+    ///              branch calls `_releasePool`, which is deliberately ungated
+    ///              for the same reason. Siblings stay `Filed` and keep reading
+    ///              `Disputed` through `_poolBacked` in both cases.
+    ///
+    ///              `counterBondPoolOf` reports `poolWood == 0` for ANY
+    ///              non-`Open` outcome while its `burned` flag is true only for
+    ///              `Burned` — so an equality fires on burned AND released
+    ///              pools, and adding a `!burned` guard alone would still fire
+    ///              on released ones. `test_settle_burnsTheSharedPoolExactlyOnce`
+    ///              and `_assertLiveBondsBacked`'s own note both pin the
+    ///              coexistence the strict form contradicts.
+    ///           3. The pool never exceeds its target — `dispute` clamps the
+    ///              overshoot rather than refunding it.
+    ///
+    ///         The pre-fix version compared a per-challenge contributor sum
+    ///         against `challengeOf(id).counterBondWood`. That comparison went
+    ///         vacuous rather than false once the pool moved per-key: BOTH sides
+    ///         now read the shared pool, so it could no longer catch a
+    ///         divergence between a challenge and its own funding. Concurrent
+    ///         challenges on one review key deliberately report the SAME pool
+    ///         here, which is the whole point of the fix.
     function property_GL14_counterBondPoolMatchesContributions() public view returns (bool) {
         uint256 n = game.challengeCount();
         for (uint256 id = 1; id <= n; id++) {
             IChallengeGame.Challenge memory c = game.challengeOf(id);
-            if (c.status == IChallengeGame.Status.Filed || c.status == IChallengeGame.Status.Disputed) {
-                address[] memory contributors = game.counterBondContributors(id);
-                uint256 sum;
-                for (uint256 j; j < contributors.length; j++) {
-                    sum += game.counterBondContributionOf(id, contributors[j]);
-                }
-                if (sum != c.counterBondWood) return false;
+            if (c.status != IChallengeGame.Status.Filed && c.status != IChallengeGame.Status.Disputed) continue;
+
+            (uint256 poolWood, uint256 targetWood, uint256 raisedWood,,) = game.counterBondPoolOf(id);
+            address[] memory contributors = game.counterBondContributors(id);
+            uint256 sum;
+            for (uint256 j; j < contributors.length; j++) {
+                sum += game.counterBondContributionOf(id, contributors[j]);
             }
+            if (sum != raisedWood) return false;
+            // STRICT, but only where it can be: an OPEN pool must still hold
+            // exactly what it raised. A terminal pool coexisting with a live
+            // challenge is normal on both paths (`_burnPool` on first
+            // conviction, `_releasePool` on the incomplete-pool branch), so the
+            // equality is scoped to `Open` rather than weakened to `<=` — which
+            // would assert almost nothing.
+            if (game.poolOutcomeOf(id) == IChallengeGame.PoolOutcome.Open && poolWood != raisedWood) return false;
+            if (raisedWood > targetWood) return false;
         }
         return true;
     }

@@ -387,19 +387,27 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         if (voteOf[caseId][msg.sender] != ITokenCourt.Ruling.None) revert AlreadyVoted();
         if (isAccused[caseId][msg.sender]) revert AccusedCannotVote();
         // The challenger may not vote on its own filing: a `Guilty` verdict
-        // pays it the accused's bond plus the escalated pool, and the floor's
-        // `total - accusedWeight` shape makes a unilateral conviction easier
-        // the more approvers the challenge names. Pinned in `refer`.
+        // returns its bond net of `settleBurnBps` AND pays it the prosecutor fee
+        // out of the forfeited proposer bond, and the floor's
+        // `total - accusedWeight` shape makes a unilateral conviction easier the
+        // more approvers the challenge names. Pinned in `refer`.
+        //
+        // THE POOL IS NO LONGER PART OF THAT PAYOUT. Since finding #10 a
+        // completed pool is BURNED on conviction and an incomplete one is
+        // returned to its funders — nothing routes it to the challenger. The bar
+        // stands on the prosecutor fee and the bond return, which are payout
+        // enough.
         if (msg.sender == c.challenger) revert ChallengerCannotVote();
         // AND NEITHER MAY THE PROPOSER, whose whole bond the verdict destroys or
         // returns. Pinned in `refer` from the bond record; zero means no bond
         // was locked, hence no payout and no bar — and zero can never match a
         // caller, since `address(0)` cannot originate a call.
         if (msg.sender == c.proposer) revert ProposerCannotVote();
-        // AND NEITHER MAY THE SIDE A `NotGuilty` VERDICT PAYS. The two bars
-        // above cover both beneficiaries of a `Guilty` ruling (the accused
-        // avoid the slash, the challenger takes the forfeited pool) but left
-        // the beneficiary of the OPPOSITE ruling unbarred. `dispute` is open
+        // AND NEITHER MAY THE SIDE A `NotGuilty` VERDICT PAYS. The bars above
+        // cover the beneficiaries of a `Guilty` ruling (the accused avoid the
+        // slash, the challenger keeps its bond and takes the prosecutor fee, the
+        // proposer's bond is destroyed) but left the beneficiary of the OPPOSITE
+        // ruling unbarred. `dispute` is open
         // to anyone by design, and `_fail`'s payout is pro-rata to
         // CONTRIBUTION with no accused-membership filter — so a guardian who
         // never approved the proposal (hence `isAccused` false) can fund the
