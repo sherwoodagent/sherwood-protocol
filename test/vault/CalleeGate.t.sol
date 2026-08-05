@@ -295,4 +295,43 @@ contract CalleeGateTest is Test {
         _expectCalleeDisallowed(address(demotedAdapter));
         _exec(_one(address(demotedAdapter), abi.encodeWithSelector(sel, attacker)));
     }
+
+    /// @notice A COUNTERPARTY grant does not open this gate.
+    /// @dev    This is the boundary the counterparty axis actually draws, pinned
+    ///         as a check rather than left as a comment — the PR #217 review
+    ///         found the axis documented with a claim ("nothing that reads this
+    ///         may spend vault funds") that was simply false, since
+    ///         `ConcentratedLiquidityStrategy` approves every address it binds
+    ///         through it.
+    ///
+    ///         What the weak grant withholds is reachability from
+    ///         proposer-authored batch calldata, which is exactly what this gate
+    ///         controls. A registry that has vouched for an address as a
+    ///         strategy counterparty and NOT as an adapter must still refuse it
+    ///         here, or the two axes collapse into one and listing a Uniswap
+    ///         position manager for a CL strategy would silently make it a legal
+    ///         batch callee.
+    function test_counterpartyGrantDoesNotOpenTheCalleeGate() public {
+        ERC20Mock cp = new ERC20Mock("Counterparty", "CP", 18);
+        tierRegistry.setCounterpartyAllowed(address(cp), true);
+
+        assertTrue(tierRegistry.isCounterpartyAllowed(address(cp)), "precondition: counterparty standing granted");
+        assertFalse(tierRegistry.isAdapterAllowed(address(cp)), "precondition: and no adapter standing");
+
+        _expectCalleeDisallowed(address(cp));
+        _exec(_one(address(cp), abi.encodeCall(cp.balanceOf, (attacker))));
+    }
+
+    /// @notice The converse, so the implication direction stays pinned at the
+    ///         boundary that consumes it: adapter standing is the stronger claim
+    ///         and does open the gate for the very same address.
+    function test_adapterGrantOpensTheCalleeGateForTheSameAddress() public {
+        ERC20Mock cp = new ERC20Mock("Counterparty", "CP", 18);
+        tierRegistry.setCounterpartyAllowed(address(cp), true);
+        _expectCalleeDisallowed(address(cp));
+        _exec(_one(address(cp), abi.encodeCall(cp.balanceOf, (attacker))));
+
+        tierRegistry.setAdapterAllowed(address(cp), true);
+        _exec(_one(address(cp), abi.encodeCall(cp.balanceOf, (attacker))));
+    }
 }
