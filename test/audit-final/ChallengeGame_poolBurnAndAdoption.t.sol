@@ -166,21 +166,22 @@ contract ChallengeGamePoolBurnAndAdoptionTest is ChallengeGameTest {
     }
 
     /// @notice STAGGERED WINDOWS: a pool completed too late for the EARLIEST
-    ///         live challenge still burns, and the sibling it actually backed
-    ///         loses it.
+    ///         live challenge must NOT be burned by that challenge's conviction
+    ///         — it is the sibling's defence, and the sibling is still live.
     ///
-    ///         Windows are per-challenge and staggered; the pool is per-proposal
-    ///         and shared. A completion landing inside a later filing's window
-    ///         but after an earlier one's has closed backs the later challenge
-    ///         only — so the earlier one silence-convicts, `_settle` sees
-    ///         `completedAt != 0`, and the burn destroys a defence that was real
-    ///         for the sibling.
+    ///         Windows are per-challenge and staggered while the pool is
+    ///         per-proposal and shared, so a completion landing inside a later
+    ///         filing's window but after an earlier one's has closed backs the
+    ///         later challenge and not the earlier one. The earlier one then
+    ///         silence-convicts.
     ///
-    ///         Pinned as the CURRENT behaviour, with the operational rule stated
-    ///         at `_poolBacked`: the accused must complete before the earliest
-    ///         live challenge's deadline, not their own. Closing it properly
-    ///         means pricing the burn per-challenge rather than per-pool.
-    function test_settle_poolCompletedTooLateForTheEarliestChallengeStillBurns() public {
+    ///         Keying the burn on `completedAt != 0` destroyed the pool here —
+    ///         a defence that was real for the sibling, which was left
+    ///         `Disputed` against nothing. Keying it on `_poolBacked(c, pool)`
+    ///         asks the right question: this conviction is not a verdict on the
+    ///         pool, so the pool survives and the sibling's own verdict decides
+    ///         its fate.
+    function test_settle_poolCompletedTooLateForTheEarliestChallengeSurvives() public {
         uint256 idEarly = _fileStandard(PROPOSAL);
         IChallengeGame.Challenge memory early = game.challengeOf(idEarly);
 
@@ -210,18 +211,56 @@ contract ChallengeGamePoolBurnAndAdoptionTest is ChallengeGameTest {
             "the early one is NOT - the payment landed after its deadline"
         );
 
-        // The early challenge silence-convicts, and takes the pool with it.
+        // The early challenge silence-convicts — and must NOT take the pool
+        // with it. The pool never backed this challenge, and the sibling it
+        // does back is still live.
         game.resolve(idEarly);
+
         assertEq(
             uint8(game.poolOutcomeOf(idEarly)),
-            uint8(IChallengeGame.PoolOutcome.Burned),
-            "a completed-but-too-late pool still burns"
+            uint8(IChallengeGame.PoolOutcome.Open),
+            "the pool backed the SIBLING, not this challenge - it must survive the conviction"
         );
         assertEq(
-            game.claimableContribution(idLate, guardianA),
-            0,
-            "and the sibling it DID back is left with nothing to claim"
+            uint8(game.challengeOf(idLate).status),
+            uint8(IChallengeGame.Status.Disputed),
+            "and the sibling keeps the defence it paid for"
         );
+
+        // The sibling's own verdict decides the pool. Ruled Guilty, it burns —
+        // for the challenge it actually defended.
+        vm.prank(court);
+        game.rule(idLate, IChallengeGame.Verdict.Guilty);
+        assertEq(
+            uint8(game.poolOutcomeOf(idLate)),
+            uint8(IChallengeGame.PoolOutcome.Burned),
+            "the pool burns on the verdict of the challenge it DID back"
+        );
+    }
+
+    /// @notice The other half of the same rule: when the un-backed conviction is
+    ///         the LAST live challenge, the pool goes back to its funders rather
+    ///         than waiting forever. `_releasePoolIfLast` is safe to gate on
+    ///         `_liveCount` precisely because `_releaseFreeze` has already
+    ///         decremented this challenge before the pool branch runs — so a
+    ///         lone challenge does not wait on itself.
+    function test_settle_unbackedPoolIsReleasedWhenNoSiblingRemains() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        (, uint256 target,,,) = game.counterBondPoolOf(id);
+        _fund(guardianA);
+        vm.prank(guardianA);
+        game.dispute(id, target / 2); // never completes, so never backs anything
+
+        IChallengeGame.Challenge memory c = game.challengeOf(id);
+        vm.warp(c.filedAt + c.autoSlashDelayAtFiling + 1);
+        game.resolve(id);
+
+        assertEq(
+            uint8(game.poolOutcomeOf(id)),
+            uint8(IChallengeGame.PoolOutcome.Released),
+            "last live challenge gone: the pool is returned, not stranded Open"
+        );
+        assertEq(game.claimableContribution(id, guardianA), target / 2, "and its funder can collect");
     }
 
     /// @notice The sibling that never got referred is the one that pays at the

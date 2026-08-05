@@ -978,43 +978,26 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      A challenge filed AFTER completion passes trivially
     ///      (`completedAt <= filedAt`), which is the intended free adoption.
     ///
-    ///      THE OPERATIONAL RULE THIS CREATES, because nothing else states it:
-    ///      the accused must complete the pool before the EARLIEST live
-    ///      challenge's window shuts, not before the window of whichever
-    ///      challenge they happen to pay through. Windows are per-challenge and
-    ///      staggered, the pool is per-proposal and shared, so a completion that
-    ///      lands inside a later filing's window but after an earlier one's has
-    ///      already closed backs the later challenge and NOT the earlier one.
+    ///      WINDOWS ARE PER-CHALLENGE, THE POOL IS PER-PROPOSAL, AND THEY DO NOT
+    ///      LINE UP. A completion landing inside a later filing's window but
+    ///      after an earlier one's has already closed backs the later challenge
+    ///      and NOT the earlier one — so the accused can pay in full, in good
+    ///      faith, and still leave the earliest live challenge undefended.
     ///
-    ///      The earlier challenge then silence-convicts, and `_settle`'s pool
-    ///      branch sees `completedAt != 0` and BURNS a pool that did buy a real
-    ///      defence — for the sibling, which is left `Disputed` against an empty
-    ///      pool and rides to `_fail`. `dispute` accepts the payment without
-    ///      signalling any of this.
+    ///      THIS PREDICATE IS THEREFORE THE BURN'S DISCRIMINATOR, not just the
+    ///      dispute gate. `_settle` asks it again to decide the pool's fate,
+    ///      because "was the pool full" and "did the pool defend the challenge
+    ///      that just lost" are different questions and only the second one is
+    ///      the right one. Keying the burn on `completedAt != 0` destroyed a
+    ///      pool that was a real defence for a sibling whenever the windows
+    ///      staggered like that; keying it here cannot, because a challenge the
+    ///      pool does not back is exactly a challenge whose conviction is no
+    ///      verdict on the pool.
     ///
-    ///      OPEN, KNOWINGLY, AND NOT BECAUSE A GUARD WOULD BE UNSAFE. The
-    ///      obvious guard — refuse the contribution in `dispute` whenever some
-    ///      LIVE challenge's window has already closed — does not enable the
-    ///      denial it looks like it might. The instant that window closes,
-    ///      `resolve` is permissionless and the silence verdict is automatic, so
-    ///      the challenger's move is to CONVICT, not to sit still; and once it
-    ///      does, `_convicted[rk]` makes every other challenge on the key moot.
-    ///      The refusal window is therefore a window in which paying was already
-    ///      pointless. All the guard would really remove is the accused's gamble
-    ///      that nobody collects a verdict already sitting there for the taking
-    ///      — a weak gamble, but not literally nothing, which is the only force
-    ///      the denial argument has.
-    ///
-    ///      What actually keeps this open is the burn: closing the hole means
-    ///      pricing the burn PER-CHALLENGE rather than per-pool, so a pool that
-    ///      backed a sibling is not destroyed by a conviction it never
-    ///      defended. That is a redesign, not a guard, and the guard alone would
-    ///      leave the burn wrong in every other staggered case.
-    ///
-    ///      Stated plainly rather than argued away: the behaviour is pinned by
-    ///      `test_settle_poolCompletedTooLateForTheEarliestChallengeStillBurns`,
-    ///      and a reviewer should read this as a known open issue with a named
-    ///      fix, not as a closed question.
+    ///      The two `_settle` entries already separate the cases for free:
+    ///      `rule(Guilty)` requires this to be TRUE, `resolve`'s silence branch
+    ///      requires it to be FALSE. See the pool branch at the end of `_settle`
+    ///      and `test_settle_poolCompletedTooLateForTheEarliestChallengeSurvives`.
     function _poolBacked(Challenge storage c, CounterBondPool storage p) private view returns (bool) {
         uint256 completedAt = p.completedAt;
         return completedAt != 0 && completedAt < c.filedAt + c.autoSlashDelayAtFiling;
@@ -1463,45 +1446,52 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             emit ChallengerBondBurned(challengeId, burned);
         }
         wood.safeTransfer(c.challenger, bond - burned);
-        // BURN A COMPLETED POOL; RETURN AN INCOMPLETE ONE.
+        // BURN THE POOL ONLY IF IT BACKED *THIS* CHALLENGE.
         //
-        // A completed pool bought the accused a real defence — the challenge
-        // became `Disputed`, the verdict path opened, and losing it forfeits
-        // what they staked on it. Burning that is the point.
+        // The question is not "was the pool full" but "did the pool defend the
+        // challenge that just lost", and that is exactly what routes into this
+        // function — no new bookkeeping is needed to answer it:
         //
-        // An INCOMPLETE pool bought them nothing. `_poolBacked` requires
-        // `completedAt != 0`, so a pool that never completed has never made any
-        // challenge `Disputed`, has never opened a verdict path, and cannot have
-        // been the reason this conviction landed — this is the SILENCE branch,
-        // which is reached precisely because no defence materialised. Destroying
-        // it takes money from the accused for a service they never received, and
-        // it is exactly the money the pre-#10 code refunded.
+        //   - `rule(Guilty)` requires `_poolBacked(c, pool)` (it reverts
+        //     `WrongStatus` otherwise). The pool bought THIS challenge its
+        //     dispute, the dispute was adjudicated, and it lost. Burning is the
+        //     point, and it is what keeps finding #10's round trip dead: a
+        //     challenger who funds its own pool and is ruled `Guilty` still
+        //     loses it.
         //
-        // That asymmetry is also grindable while it exists: `file` raises
-        // `pool.target` while the pool is incomplete, so an attacker filing a
-        // second challenge — or merely a WOOD price decline, since `bondWood`
-        // scales with `coverageUsd * bps / priceX8` — moves the bar away from a
-        // part-funded defence and converts the shortfall into a burn.
+        //   - `resolve`'s silence branch is reached only when
+        //     `!_poolBacked(c, pool)`. By construction the pool did NOT back
+        //     this challenge, so this conviction is not a verdict on it and
+        //     destroying it charges the accused for a case their money had no
+        //     part in.
         //
-        // RELEASING RATHER THAN BURNING DOES NOT REOPEN THE POOL. `dispute`
-        // reverts on `p.outcome != PoolOutcome.Open` (see its `WrongStatus`
-        // guard), so `Released` closes it to further contribution exactly as
-        // `Burned` does. The natspec's argument for burning — that a spendable
-        // pool lets contributions continue after conviction — argues for
-        // CLOSING the pool, which both outcomes do.
+        // KEYING ON `completedAt` INSTEAD WAS WRONG IN EXACTLY ONE CASE, and it
+        // is a reachable one. Windows are per-challenge and staggered while the
+        // pool is per-proposal, so a pool completing after the EARLIEST live
+        // challenge's window shuts but inside a later one's is full, backs the
+        // later challenge, and backs the earlier one not at all. `completedAt !=
+        // 0` then burned a defence that was real — for the sibling, which was
+        // left `Disputed` against an empty pool. `_poolBacked` is the predicate
+        // that distinguishes them; `completedAt` only approximates it.
         //
-        // AND THE `_liveCount` GATE IS IRRELEVANT HERE, which is why this calls
-        // `_releasePool` rather than `_releasePoolIfLast`. That gate exists so a
-        // completed pool is not handed back while a sibling is still `Disputed`
-        // on it and could yet be ruled `Guilty` with nothing left to burn. A
-        // sibling can only be `Disputed` through `_poolBacked`, which an
-        // incomplete pool fails by definition — so there is no such sibling to
-        // protect, and holding the money hostage to `_liveCount` would strand it
-        // behind challenges that can never reach a verdict on it.
-        if (_pools[poolKey].completedAt == 0) {
-            _releasePool(key, poolKey, challengeId);
-        } else {
+        // AND THE NON-BURN SIDE IS GATED, on purpose. `_releasePoolIfLast`
+        // returns the pool only once no live challenge remains, so a sibling the
+        // pool DOES back keeps its defence and decides the pool's fate with its
+        // own verdict. Releasing outright here would strip that sibling mid-
+        // fight and hand the accused money still at stake. The gate is safe to
+        // rely on because `_releaseFreeze` above has already decremented
+        // `_liveCount` for THIS challenge, so a lone challenge releases
+        // immediately rather than waiting on itself.
+        //
+        // Contributions can continue while the pool stays `Open`, and that is
+        // coherent rather than the seam the burn model feared: further funding
+        // can only complete the pool for a LIVE sibling, and that sibling's own
+        // verdict then burns or releases it. No conviction is ever paid for
+        // twice.
+        if (_poolBacked(c, _pools[poolKey])) {
             _burnPool(key, poolKey, challengeId);
+        } else {
+            _releasePoolIfLast(key, poolKey, challengeId);
         }
         emit ChallengeSettled(challengeId, slashedWood);
     }
@@ -1550,12 +1540,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         _releasePool(rk, poolKey, challengeId);
     }
 
-    /// @dev The release itself, with no liveness gate. Split out for the one
-    ///      caller that must not consult `_liveCount`: `_settle`'s incomplete-pool
-    ///      branch, where the gate protects nothing (an incomplete pool fails
-    ///      `_poolBacked`, so no sibling can be `Disputed` on it) and would
-    ///      instead strand the funders' money behind challenges that can never
-    ///      reach a verdict against it. See the comment at that call site.
+    /// @dev The release itself, with no liveness gate. `_releasePoolIfLast` is
+    ///      its only caller — the gate lives there so every release path in this
+    ///      contract goes through it, and none can hand the pool back while a
+    ///      sibling is still `Disputed` on it.
+    ///
+    ///      Kept separate rather than inlined so the gate and the transfer stay
+    ///      one decision each: an earlier revision called this directly from
+    ///      `_settle` on the reasoning that an un-backed pool has no sibling to
+    ///      protect, which is false in the staggered-window case (see the
+    ///      comment at `_settle`'s pool branch).
     ///
     ///      Idempotent by the outcome check, exactly as `_burnPool` is.
     function _releasePool(bytes32 rk, bytes32 poolKey, uint256 challengeId) private {
