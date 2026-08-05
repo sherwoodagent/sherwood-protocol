@@ -17,6 +17,16 @@ import {Properties} from "../Properties.sol";
 ///      through a full propose→vote lifecycle and would almost never
 ///      interleave them adversarially.
 abstract contract ExposureLedgerHandler is Properties {
+    // ―――――――――――――――――― Challenge economics (GL-51) ―――――――――――――――――
+    // The fourth input to `ChallengeGame.honestFilingNetPayoffBps`. It lives
+    // here rather than on the game, which is exactly why no single setter can
+    // enforce the break-even condition — the invariant spans two contracts
+    // with two independent owners.
+
+    function exposureLedger_setProposerBondBps(uint256 bps) public {
+        ledger.setProposerBondBps(clampBetween(bps, 0, 10_000));
+    }
+
     // ――――――――――――――――――――――――― Clamped ――――――――――――――――――――――――――
 
     function exposureLedger_retireApproval_clamped(uint256 proposalId, uint256 guardianSeed) public {

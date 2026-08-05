@@ -2,105 +2,11 @@
 
 ## Purpose
 
-Defines how the protocol establishes value: strategy NAV priced vault-side by the `PriceRouter` (trust inversion — strategies report positions, never value), the vault's two-lane NAV composition, WOOD and vault-asset USD pricing in the `ExposureLedger` with explicit staleness and fallback rules, and the wall-clock epoch schedule that buckets guardian exposure. Per-epoch NAV *checkpointing* (design §3.4a, Plan F) is intentionally absent from v1: a protocol-wide ceiling on strategy duration bounds each commitment to a single covered window instead.
+Defines how the protocol establishes value: WOOD and vault-asset USD pricing in the `ExposureLedger` with explicit staleness and fallback rules, and the wall-clock epoch schedule that buckets guardian exposure. Per-epoch NAV *checkpointing* (design §3.4a, Plan F) is intentionally absent from v1: a protocol-wide ceiling on strategy duration bounds each commitment to a single covered window instead.
+
+Strategy NAV is deliberately NOT in scope. The vault-side `PriceRouter` that once priced a live strategy was retired with Lane A (issue #54), so vault NAV is float-only and defined by the `syndicate-vault` capability, not here. What survives in this capability is guardian-bond and coverage pricing — `ExposureLedger` and `WoodTwapOracle` — which never referenced the router. V2 reintroduces strategy pricing together with the lane it serves.
 
 ## Requirements
-
-### Requirement: Strategy valuation is router-priced and fail-closed
-
-`PriceRouter.valueStrategy(strategy)` SHALL value a strategy exclusively from its self-reported *positions* (venue + kind + locator via `IStrategy.positions()`), never from any self-reported value, and SHALL return `(value, instantOK)` where `instantOK == true` only when every one of the following holds:
-
-- `strategy` is non-zero,
-- `positions()` returns without reverting and reports at least one position,
-- every position's `kind` is Lane-A-enabled by governance,
-- every position prices with `ok == true` through its adapter,
-- the summed haircut-adjusted value is non-zero.
-
-On any failure the router SHALL return `(0, false)`, signalling the consumer to fall back to the async (Lane B) settlement path.
-
-#### Scenario: Reverting positions read fails closed
-
-- **WHEN** `positions()` reverts (or the strategy address is zero, or the positions array is empty)
-- **THEN** `valueStrategy` returns `(0, false)`
-
-#### Scenario: A single unpriceable or disabled position poisons the aggregate
-
-- **WHEN** any reported position has a kind with `laneAEnabled == false`, an unregistered adapter, or prices with `ok == false`
-- **THEN** `valueStrategy` returns `(0, false)` for the whole strategy
-
-#### Scenario: All-zero value is not instant-eligible
-
-- **WHEN** every position prices OK but the total value is 0 (e.g. value held only in an unreported venue)
-- **THEN** `valueStrategy` returns `(0, false)` rather than letting deposits mint against a float-only NAV
-
-#### Scenario: Fully priceable strategy
-
-- **WHEN** every position's kind is Lane-A-enabled and prices OK with a non-zero total
-- **THEN** `valueStrategy` returns the haircut-adjusted sum and `instantOK == true`
-
-### Requirement: Single-position pricing applies haircut and instant cap
-
-`PriceRouter.valuePosition(p, holder)` SHALL price one position through the adapter registered for `p.kind`, reading the real quantity at the venue for `holder`. The router SHALL:
-
-- return `(0, false)` when no adapter is registered for the kind,
-- wrap the adapter call in try/catch and return `(0, false)` on revert or `ok == false`,
-- apply the kind's realizability haircut: `value = raw * (10_000 - haircutBps[kind]) / 10_000`,
-- return `(0, false)` when a non-zero `instantCap[kind]` is exceeded by the haircut value (cap 0 means unlimited).
-
-The output is NOT normalized: each adapter answers in its own numeraire at that token's decimals. "The adapter's numeraire equals the vault's `asset()` at its decimals" is an unenforced precondition every adapter MUST uphold.
-
-#### Scenario: Unknown kind
-
-- **WHEN** `valuePosition` is called for a kind with no registered adapter
-- **THEN** it returns `(0, false)`
-
-#### Scenario: Over-cap position routes to Lane B
-
-- **WHEN** the haircut-adjusted value exceeds a non-zero `instantCap` for the kind
-- **THEN** `valuePosition` returns `(0, false)`
-
-#### Scenario: Haircut preserved through pricing
-
-- **WHEN** an adapter returns `(raw, true)` and the kind's haircut is `h` bps within cap
-- **THEN** the returned value is `raw * (10_000 - h) / 10_000` with `instantOK == true`
-
-### Requirement: Router pricing parameters are owner-gated with a one-way haircut
-
-All `PriceRouter` configuration SHALL be restricted to the owner:
-
-- `registerAdapter(kind, adapter)` SHALL revert `ZeroAddress` for a zero adapter and emit `AdapterRegistered`.
-- `setHaircutBps(kind, bps)` SHALL revert `HaircutTooHigh` above 10_000 and `HaircutCannotDecrease` when lowering — the haircut is monotone-increasing; lowering requires a contract upgrade.
-- `setInstantCap(kind, cap)` SHALL set the per-kind instant ceiling (0 = unlimited) and emit `InstantCapSet`.
-- `setLaneAEnabled(kind, enabled)` SHALL gate the instant lane per kind; the default is `false`, so a position kind is instant-eligible only after governance explicitly enables it.
-
-#### Scenario: Haircut cannot be lowered
-
-- **WHEN** the owner attempts to set a kind's haircut below its current value
-- **THEN** the call reverts `HaircutCannotDecrease`
-
-#### Scenario: Lane A is opt-in per kind
-
-- **WHEN** a new adapter is registered for a kind but `setLaneAEnabled` has not been called
-- **THEN** `valueStrategy` returns `(0, false)` for any strategy holding that kind
-
-### Requirement: Vault NAV is idle float plus router-priced live NAV
-
-`SyndicateVault.totalAssets()` SHALL equal the vault's idle asset balance plus a live-NAV term that is non-zero only when the full Lane A derivation holds: an active proposal binds the vault, the proposal carries a non-zero strategy (a proposer passing `strategy = 0` opts out of live NAV), the factory has a price router wired, and `valueStrategy` answers `instantOK == true`. Every failure in that chain — including a reverting router call, caught by try/catch — SHALL degrade to float-only NAV with mid-proposal LP flow routed through the async queue, never to a revert of `totalAssets()`.
-
-#### Scenario: Router outage degrades to float-only NAV
-
-- **WHEN** the vault is proposal-locked and `valueStrategy` reverts or returns `instantOK == false`
-- **THEN** `totalAssets()` returns only the idle float, and instant deposits/exits are closed in favour of the Lane B queue
-
-#### Scenario: Live-NAV opt-out
-
-- **WHEN** the active proposal was created with `strategy = address(0)`
-- **THEN** the live-NAV term is 0 for the proposal's whole life
-
-#### Scenario: Lane A adds priced positions to NAV
-
-- **WHEN** the vault is proposal-locked and the router prices the active strategy with `instantOK == true`
-- **THEN** `totalAssets()` returns float plus the router's value, and instant entry/exit at live NAV is available
 
 ### Requirement: WOOD is priced feed-first with a maintained governance fallback
 

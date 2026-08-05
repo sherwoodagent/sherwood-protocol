@@ -48,13 +48,13 @@ On the fork the deployer (`0x5A00afAecE9CF61A768E2AE2713084C8d354DF94`) SHALL be
 
 ### Requirement: Deploy ceremony order and skip rules
 The fork ceremony SHALL run five scripts in order, each broadcast with the flags above:
-1. `script/robinhood-mainnet/Deploy.s.sol:DeployRobinhoodMainnet` with `WOOD_TOKEN=<live WOOD>`, `SKIP_MULTISIG_HANDOFF=true`, `ROBINHOOD_FORK_CHAIN_ID=9994663` — core + zero-adapter PriceRouter; no ENS/ERC-8004 (both registrar addresses are `address(0)` on Robinhood).
+1. `script/robinhood-mainnet/Deploy.s.sol:DeployRobinhoodMainnet` with `WOOD_TOKEN=<live WOOD>`, `SKIP_MULTISIG_HANDOFF=true`, `ROBINHOOD_FORK_CHAIN_ID=9994663` — core only; no ENS/ERC-8004 (both registrar addresses are `address(0)` on Robinhood).
 2. `script/robinhood-mainnet/DeployPortfolioStrategy.s.sol` — UniswapSwapAdapter (v3+v4) + PortfolioStrategy template.
 3. `script/robinhood-mainnet/DeployMorphoStrategy.s.sol` — MorphoSupplyStrategy template. Separate from step 2 because that script reads four Uniswap addresses to build its adapter and this template needs none of them.
 4. `script/robinhood-mainnet/DeployConcentratedLiquidityStrategy.s.sol` — ConcentratedLiquidityStrategy template. It reads `UNISWAP_V3_POSITION_MANAGER`, `UNISWAP_V3_FACTORY` and `MORPHO_BLUE` from the address book and asserts the position manager's identity, not merely its code presence; the first and third keys SHALL be seeded before this step runs.
 5. `script/DeployStrategyFactory.s.sol` with `SKIP_MULTISIG_HANDOFF=true` — keyless-clone StrategyFactory + template approvals.
 
-`DeployWood` SHALL be skipped — WOOD is already live on the fork. CREATE3 makes the core addresses order-independent. With handoff skipped, the deployer retains ownership of beacon / factory / registry / sWOOD / ProtocolConfig / PriceRouter (needed for fork admin); on the real mainnet ceremony `SKIP_MULTISIG_HANDOFF` SHALL NOT be used and `OWNER_MULTISIG` MUST be a contract (Safe), not an EOA.
+`DeployWood` SHALL be skipped — WOOD is already live on the fork. CREATE3 makes the core addresses order-independent. With handoff skipped, the deployer retains ownership of beacon / factory / registry / sWOOD / ProtocolConfig (needed for fork admin); on the real mainnet ceremony `SKIP_MULTISIG_HANDOFF` SHALL NOT be used and `OWNER_MULTISIG` MUST be a contract (Safe), not an EOA.
 
 The ceremony SHALL persist `TIER_REGISTRY` into `chains/{chainId}.json`. `DeployPlanD` and `WireTokenCourt` both read that key as an env address, so omitting it leaves the later phases with nothing to read and forces the operator to recover the address from broadcast logs.
 
@@ -72,7 +72,7 @@ Both are seeded to the DEPLOYER as a placeholder, never as the destination. The 
 
 #### Scenario: Post-deploy validation reads
 - **WHEN** the five scripts complete
-- **THEN** the operator verifies `factory.beacon/priceRouter/protocolConfig`, `swood.wood == WOOD`, `swood.registry == registry`, `registry.reviewPeriod == 86400`, `registry.blockQuorumBps == 3000`, `strategyFactory.approvedTemplate(PORTFOLIO) == true`, and `governorImpl.MIN_VOTING_PERIOD() == 86400`
+- **THEN** the operator verifies `factory.beacon/protocolConfig`, `swood.wood == WOOD`, `swood.registry == registry`, `registry.reviewPeriod == 86400`, `registry.blockQuorumBps == 3000`, `strategyFactory.approvedTemplate(PORTFOLIO) == true`, and `governorImpl.MIN_VOTING_PERIOD() == 86400`
 
 #### Scenario: Mainnet ceremony with EOA multisig refused
 - **WHEN** `OWNER_MULTISIG` is an EOA and handoff is not skipped
@@ -261,15 +261,11 @@ Manual follow-ups: an sWOOD upgrade touching `slashVerdict`'s ABI and any Challe
 - **THEN** `WireTokenCourt` reverts PRE-FLIGHT 5 — the court must not be granted ruling authority over a game whose verdicts cannot execute
 
 ### Requirement: Chain-specific factory identity configuration
-On Robinhood Chain (no ENS/Durin registrar, no ERC-8004 identity registry) the factory SHALL be deployed with `address(0)` for both `ensRegistrar` and `agentRegistry` (identity + subname registration disabled), and validation SHALL assert both read back as zero. The PriceRouter SHALL deploy with zero adapters — PortfolioStrategy is Lane-B-only, and the router fails closed to Lane B until governance registers an adapter post-audit.
+On Robinhood Chain (no ENS/Durin registrar, no ERC-8004 identity registry) the factory SHALL be deployed with `address(0)` for both `ensRegistrar` and `agentRegistry` (identity + subname registration disabled), and validation SHALL assert both read back as zero.
 
 #### Scenario: Identity disabled on Robinhood
 - **WHEN** post-deploy validation runs on 4663 or its fork
 - **THEN** `factory.ensRegistrar() == address(0)` and `factory.agentRegistry() == address(0)`
-
-#### Scenario: Zero-adapter router fails closed
-- **WHEN** a price is requested before any adapter is registered
-- **THEN** the router falls through to Lane B rather than serving an adapter price
 
 ### Requirement: Accepted oracle risks are stated in the deploy runbook
 Two oracle exposures are accepted for v1, not open defects, and SHALL be documented in the operator's line of sight rather than only in source natspec: (1) Chainlink aggregators clamp at `minAnswer`/`maxAnswer` — a clamped price is anti-conservative, understating `coverageUsd` (asset side) and over-valuing guardian bonds via `woodPriceX8` (WOOD side), with `woodHaircutBps` a fixed discount rather than a clamp bound; and (2) Robinhood Chain 4663 publishes no sequencer-uptime feed, so the standard staleness-plus-grace-period gate (`src/libraries/ChainlinkReader.sol`'s `SequencerDown`/`GracePeriodNotOver`) cannot be built — `ExposureLedger` reads aggregators directly, and `ASSET_FEED_MAX_DELAY` SHALL be sized tightly enough that a plausible outage pushes reads past staleness while still covering the full vote + review + execute lifecycle.

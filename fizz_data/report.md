@@ -102,13 +102,20 @@ to be mine, confirmed by deterministic Foundry repros (`test_triage_GL09`,
 Surfaced by the discovery agents and verified by direct source reading. None is
 a confirmed bug; each is a documentation or design question:
 
-1. **Spec describes a retired subsystem.** `openspec/specs/epoch-nav/spec.md`
-   and parts of `syndicate-vault/spec.md` describe a `PriceRouter` / "Lane A
-   live-NAV" mechanism. `SyndicateFactory.sol:127` marks the slot
-   `__deprecated_priceRouter`, and `SyndicateVault.totalAssets()` is
-   `balanceOf(asset) − reservedQueueAssets()` with no router term. Consequence:
-   a live strategy's PnL is invisible to share price until settlement. Several
-   SHALL-clauses in that spec cannot be checked against this codebase at all.
+1. **Spec described a retired subsystem — RESOLVED.** `openspec/specs/`
+   described a `PriceRouter` / "Lane A live-NAV" mechanism that no longer
+   exists: `SyndicateFactory.sol:127` marks the slot `__deprecated_priceRouter`,
+   and `totalAssets()` is idle balance minus `reservedQueueAssets()` and the
+   escrowed fee liability, with no router term.
+
+   The cause was narrower than "the spec is stale". A complete change proposal,
+   `openspec/changes/retire-lane-a`, had already been written *with its five
+   spec deltas*, and the entire code deletion had shipped — but the change was
+   never marked applied, so section 8.1 (the spec sync) never ran and
+   `openspec/specs/` kept describing the deleted lane. Applied on branch
+   `fix/spec-drift-and-cap-gaps`: the deltas landed, `instant-exit-fees` was
+   deleted whole (its one general requirement relocated to `syndicate-vault`),
+   and the change was archived.
 2. **Agent-fee NatSpec drift, two figures on one interface.** Both are on
    `ISyndicateVault.sol`, and both disagree with the constants they name:
    - line 168 says the fee "Defaults to 5% (500)", but
@@ -119,18 +126,51 @@ a confirmed bug; each is a documentation or design question:
 
    The same 5%/20% drift was corrected in `SyndicateVault.sol` itself by the
    comment-trim work already on `main`; the interface copy was missed, so the
-   stale number now survives only on the file integrators actually read.
-   `guardian-coverage/spec.md` and `syndicate-governor/spec.md` still say
-   `1500` as well. Code is authoritative in all four places.
-3. **Covered-TVL cap is per-proposal, not protocol-wide.**
-   `requireWithinCoveredTvlCap` checks one proposal against `coveredTvlCapUsd`
-   with no running accumulator, so N vaults could each sit just under it. G-40
-   describes it as a ceiling on *simultaneously* covered TVL. Not reachable in
-   this harness (single vault), so untested here.
+   stale number survived on the file integrators actually read.
+
+   **RESOLVED on `fix/spec-drift-and-cap-gaps`.** The drift turned out to span
+   five sites, not the two originally reported — all traceable to the archived
+   `2026-07-24-fee-mechanism` change (which raised the ceiling 1500 → 3000 and
+   set the default to 2000) never being propagated into the specs:
+   `ISyndicateVault.sol` lines 168 and 172, `syndicate-vault/spec.md`,
+   `guardian-coverage/spec.md`, and `syndicate-governor/spec.md` in two places
+   (the setter bound `≤ 1_500`, actually `MAX_PERFORMANCE_FEE_CAP` = 3000; and
+   the factory default `1_500`, actually `DEFAULT_MAX_PERFORMANCE_FEE_BPS` =
+   2000). Code was authoritative in all five.
+3. **~~Covered-TVL cap is per-proposal, not protocol-wide.~~ RETRACTED — this
+   observation was wrong.** It claimed `requireWithinCoveredTvlCap` leaves
+   aggregate exposure unbounded because N vaults could each sit just under
+   `coveredTvlCapUsd`, and cited G-40. Both halves were wrong:
+
+   - **G-40 is about something else.** It pins `TokenCourt`'s participation
+     floor against sWOOD's age-weight floor (`x-ray/invariants.md`,
+     `TokenCourt.sol:258`). Nothing in it concerns covered TVL. The citation was
+     fabricated by cross-reference, not read.
+   - **Aggregate exposure is bounded, just not by this cap.** `recordApproval`
+     computes `capUsd = kNumerator * _slashableBondUsd(guardian, …)` against
+     `open = openExposureUsd(guardian)`, and `_buckets[guardian][epoch]` is
+     keyed by GUARDIAN, not by vault — so a guardian's exposure already sums
+     across every vault they cover, and booking stops at `open >= capUsd`. The
+     binding constraint is the guardian's own bond budget.
+
+   `coveredTvlCapUsd` is a per-proposal ceiling, and
+   `guardian-coverage/spec.md` specifies it as exactly that. Code and spec
+   agree; there was no gap.
 4. **Challenge economics can be configured into a losing game.**
    `honestFilingBreaksEven` / `honestFilingNetPayoffBps` *report* the break-even
-   condition; no setter enforces it across the three parameters that determine
-   it. Captured as GL-51, not yet implemented.
+   condition; no setter enforces it. Captured as GL-51.
+
+   Worth stating explicitly, because "add a setter guard" is the obvious wrong
+   fix: enforcement per-setter would be incorrect on three counts. The inputs
+   span two contracts (`proposerBondBps` lives on `ExposureLedger`, the other
+   three on `ChallengeGame`), so no single setter owns the invariant. Enforcing
+   it would also brick reconfiguration — moving between two valid configurations
+   can require an intermediate that violates it. And the figure is a *lower
+   bound* that prices only the silence branch; the escalated branch pays
+   `bond + pool − burned`, which the NatSpec says is deliberately not modelled,
+   so a negative reading is not by itself a losing game. It is a monitoring
+   surface by design, which is why GL-51 is tagged EXPLORATORY rather than
+   SHOULD-HOLD.
 
 ---
 

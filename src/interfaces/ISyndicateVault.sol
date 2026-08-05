@@ -165,11 +165,14 @@ interface ISyndicateVault {
     function redemptionsLocked() external view returns (bool);
     function managementFeeBps() external view returns (uint256);
     /// @notice Vault-owner-set agent performance fee (basis points). Defaults
-    ///         to 5% (500) at vault creation. Snapshotted onto a proposal at
-    ///         propose time and clamped to `maxPerformanceFeeBps` at settlement.
+    ///         to `FeeConstants.DEFAULT_AGENT_FEE_BPS` (2000 = 20%) while unset.
+    ///         Snapshotted onto a proposal at propose time and clamped to
+    ///         `maxPerformanceFeeBps` at settlement.
     function agentFeeBps() external view returns (uint256);
     /// @notice Set the agent performance fee (owner only). Capped at
-    ///         `MAX_AGENT_FEE_BPS` (15%). Reverts with `AgentFeeTooHigh` above.
+    ///         `MAX_AGENT_FEE_BPS`, which aliases
+    ///         `FeeConstants.MAX_PERFORMANCE_FEE_BPS` (3000 = 30%). Reverts with
+    ///         `AgentFeeTooHigh` above.
     function setAgentFeeBps(uint256 bps) external;
     /// @notice Idle-liquidity floor in basis points of the pre-batch float.
     ///         `executeGovernorBatch` reverts if a batch would leave less than

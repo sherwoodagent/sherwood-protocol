@@ -1,24 +1,37 @@
 # Syndicate Vault Specification
 
 ## Purpose
-Define the observable behavior of the SyndicateVault: an ERC-4626, ERC20Votes-checkpointed, UUPS-upgradeable vault that custodies a syndicate's assets, prices shares against vault-side live NAV (Lane A), routes mid-proposal LP flow through a per-vault async request queue (Lane B), enforces an instant-withdrawal liquidity buffer and queue-reserve seniority against governor strategy batches, and confines all privileged surfaces to owner, factory, governor, and queue roles.
+Define the observable behavior of the SyndicateVault: an ERC-4626, ERC20Votes-checkpointed, UUPS-upgradeable vault that custodies a syndicate's assets, prices shares against float-only NAV, routes all mid-proposal LP flow through a per-vault async request queue (Lane B, the only mid-proposal path), enforces an instant-withdrawal liquidity buffer and queue-reserve seniority against governor strategy batches, and confines all privileged surfaces to owner, factory, governor, and queue roles. Instant entry and exit exist only outside a proposal; Lane A (mid-proposal instant flow at router-priced live NAV) was retired from v1 with issue #54.
 ## Requirements
 ### Requirement: ERC-4626 share accounting and NAV
-The vault SHALL be an ERC-4626 vault over a single underlying asset fixed at initialization. `totalAssets()` SHALL equal the vault's idle asset balance plus a live-NAV term that is nonzero only when Lane A is available; the vault SHALL never trust a strategy's self-reported value — live NAV is the active strategy's positions priced vault-side by the protocol PriceRouter. The ERC-4626 virtual-shares decimals offset SHALL equal the asset's `decimals()`, cached once at initialization.
+
+The vault SHALL be an ERC-4626 vault over a single underlying asset fixed at
+initialization. `totalAssets()` SHALL equal the vault's idle balance of the
+underlying asset minus the queue's reserved (stamped-but-unclaimed) redemption
+assets, floored at zero. The vault SHALL NOT consult any strategy or external
+pricing source for NAV: strategy value is recognized only when a settlement returns
+assets to the vault's idle balance. The ERC-4626 virtual-shares decimals offset
+SHALL equal the asset's `decimals()`, cached once at initialization.
 
 #### Scenario: NAV outside any proposal
+
 - **WHEN** no proposal is active
-- **THEN** `totalAssets()` equals the vault's idle balance of the underlying asset (live-NAV term is 0)
+- **THEN** `totalAssets()` equals the vault's idle balance of the underlying asset
+  minus `reservedQueueAssets()`
 
-#### Scenario: NAV during a proposal with Lane A available
-- **WHEN** a proposal is active, the factory's PriceRouter is set, and `valueStrategy(activeStrategy)` returns `(value, ok=true)`
-- **THEN** `totalAssets()` equals idle float plus that router-priced value
+#### Scenario: NAV during a proposal is float-only
 
-#### Scenario: NAV fails closed without pricing
-- **WHEN** a proposal is active but the PriceRouter is unset, the router call reverts, or it returns `ok=false`
-- **THEN** the live-NAV term is 0 and the vault reports float-only NAV (Lane A closed)
+- **WHEN** a proposal is active with capital deployed into a strategy
+- **THEN** `totalAssets()` reflects only the idle balance (net of the queue reserve);
+  no live valuation of the deployed position is added
+
+#### Scenario: Reserve exceeding float floors at zero
+
+- **WHEN** the queue reserve exceeds the vault's idle balance
+- **THEN** `totalAssets()` returns 0 rather than reverting
 
 #### Scenario: Inflation-attack mitigation
+
 - **WHEN** the vault is initialized over a 6-decimal asset such as USDC
 - **THEN** the virtual-shares offset is 6, yielding 12-decimal shares
 
@@ -37,39 +50,36 @@ The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`
 - **WHEN** shares arrive at a holder that has already delegated to another address
 - **THEN** the existing delegation choice is unchanged
 
-### Requirement: Lane eligibility rule
-The vault SHALL derive instant-lane (Lane A) eligibility from a single rule: Lane A is open only when a proposal is active AND the PriceRouter successfully prices every position of the active strategy (`valueStrategy` returns ok). Any missing precondition — no active proposal-bound strategy, unset router, router revert, or `ok=false` — SHALL fail closed to Lane A unavailable with a zero live-NAV term. An active strategy address with no deployed code SHALL be treated as non-pullable for liquidity purposes.
-
-#### Scenario: Router failure closes Lane A
-- **WHEN** the PriceRouter reverts while a proposal is active
-- **THEN** Lane A is unavailable, `totalAssets()` is float-only, and instant exits are closed (`maxWithdraw`/`maxRedeem` return 0)
-
-#### Scenario: Codeless strategy cannot brick views
-- **WHEN** the active strategy address has no code
-- **THEN** `maxWithdraw`/`maxRedeem` still return (with strategy liquidity counted as 0) rather than reverting
-
 ### Requirement: Instant deposit flow
-`deposit`/`mint` SHALL succeed only when the vault is not paused, and either no proposal is open (governor `openProposalCount() == 0`) or Lane A is available; otherwise they SHALL revert `DepositsLocked` and depositors use the async queue. The whitelist check SHALL run against the `receiver` (the share holder), not the caller, so pay-on-behalf funding is permitted. A Lane A (mid-proposal) deposit SHALL record the active proposal id as the receiver's Lane A lock and SHALL add the deposited assets to the interim net-flow accumulator.
+
+`deposit`/`mint` SHALL succeed only when the vault is not paused and no proposal is
+open (governor `openProposalCount() == 0`); while any proposal is open they SHALL
+revert `DepositsLocked` and depositors use the async queue (`requestDeposit`). The
+whitelist check SHALL run against the `receiver` (the share holder), not the caller,
+so pay-on-behalf funding is permitted.
 
 #### Scenario: Deposit outside any open proposal
-- **WHEN** no proposal is open and the receiver is eligible (deposits open, or receiver whitelisted)
+
+- **WHEN** no proposal is open and the receiver is eligible (deposits open, or
+  receiver whitelisted)
 - **THEN** the deposit mints shares at the current NAV
 
-#### Scenario: Mid-proposal deposit without Lane A
-- **WHEN** a proposal is open and Lane A is unavailable
-- **THEN** `deposit`/`mint` revert `DepositsLocked`
+#### Scenario: Mid-proposal deposit is locked
 
-#### Scenario: Mid-proposal Lane A deposit locks the receiver
-- **WHEN** a deposit executes while Lane A is available during an active proposal
-- **THEN** the receiver's shares are Lane-A-locked to that proposal id and `interimNetFlow` increases by the deposited assets
+- **WHEN** any proposal is open (Pending through Executed)
+- **THEN** `deposit`/`mint` revert `DepositsLocked` and the depositor's path is
+  `requestDeposit`
 
 #### Scenario: Non-whitelisted receiver in closed mode
+
 - **WHEN** `openDeposits` is false and the receiver is not an approved depositor
 - **THEN** the deposit reverts `NotApprovedDepositor`
 
 #### Scenario: maxDeposit reflects pause only
+
 - **WHEN** the vault is paused
-- **THEN** `maxDeposit`/`maxMint` return 0; otherwise they return `type(uint256).max` (proposal and whitelist gating is not reflected in these views)
+- **THEN** `maxDeposit`/`maxMint` return 0; otherwise they return
+  `type(uint256).max` (proposal and whitelist gating is not reflected in these views)
 
 ### Requirement: Depositor access control
 The vault owner SHALL control deposit access via an open/closed mode flag (`setOpenDeposits`) and an approved-depositor whitelist (`approveDepositor`, `approveDepositors`, `removeDepositor`), all owner-only. Approving the zero address SHALL revert `InvalidDepositor`; re-approving via the single-address path SHALL revert `DepositorAlreadyApproved`; removing an unapproved depositor SHALL revert `DepositorNotApproved`. Whitelist membership SHALL be readable via `isApprovedDepositor` and paginated via `approvedDepositorsPaginated`, with page size hard-clamped to `MAX_PAGE_LIMIT` (100).
@@ -83,57 +93,79 @@ The vault owner SHALL control deposit access via an open/closed mode flag (`setO
 - **THEN** at most 100 rows are returned
 
 ### Requirement: Instant withdrawal flow and capacity
-While no proposal is active, instant `withdraw`/`redeem` SHALL be available up to the holder's balance, capped by instant capacity = available float (idle balance minus the queue's reserved assets) plus the active strategy's on-demand liquidity. While a proposal is active, instant exit SHALL be open only when Lane A is available and the holder is not Lane-A-locked; otherwise `maxWithdraw`/`maxRedeem` SHALL return 0 and exits route through the async queue. When a requested exit exceeds idle float (net of the queue reserve), the vault SHALL pull exactly the shortfall from the active strategy in the same transaction via `IStrategy.withdrawTo`, verifying delivery by balance difference and reverting `UnwindShortfall` on under-delivery; with no pullable strategy the exit SHALL revert `QueueReserveBreached`. An instant exit during an active proposal SHALL subtract the withdrawn assets from `interimNetFlow`.
 
-#### Scenario: Exit served fully from float
-- **WHEN** a holder withdraws no more than the available float
+While no proposal is active, instant `withdraw`/`redeem` SHALL be available up to the
+holder's balance, capped by instant capacity = available float (idle balance minus
+the queue's reserved assets). While a proposal is active, `maxWithdraw`/`maxRedeem`
+SHALL return 0 for every holder except the bound withdrawal queue, and exits route
+through the async queue — mid-proposal exits route to the queue, full stop. A
+requested exit whose assets plus the queue reserve exceed the idle balance SHALL
+revert `QueueReserveBreached`; the vault SHALL NOT pull capital from a strategy to
+serve an exit.
+
+#### Scenario: Exit served from float
+
+- **WHEN** no proposal is active and a holder withdraws no more than the available
+  float
 - **THEN** assets transfer out with no strategy interaction
 
-#### Scenario: Exit spanning float and strategy liquidity
-- **WHEN** Lane A is available and a withdrawal exceeds available float but not float plus `availableLiquidity()`
-- **THEN** the shortfall is pulled from the strategy in the same transaction and the exit completes at live NAV
+#### Scenario: Exit beyond available float reverts
 
-#### Scenario: Under-delivering strategy reverts the exit
-- **WHEN** the strategy's `withdrawTo` returns fewer assets than the requested shortfall
-- **THEN** the withdrawal reverts `UnwindShortfall`
+- **WHEN** a withdrawal's assets plus the queue reserve exceed the vault's idle
+  balance
+- **THEN** the withdrawal reverts `QueueReserveBreached`
 
-#### Scenario: Locked without pricing means queue-only
-- **WHEN** a proposal is active and Lane A is unavailable
-- **THEN** `maxWithdraw` and `maxRedeem` return 0 for every holder except the bound withdrawal queue
+#### Scenario: Active proposal means queue-only
+
+- **WHEN** a proposal is active
+- **THEN** `maxWithdraw` and `maxRedeem` return 0 for every holder except the bound
+  withdrawal queue
 
 #### Scenario: Queue bypasses caps it owns
+
 - **WHEN** the bound withdrawal queue is the caller/owner of a withdrawal
-- **THEN** the reserve cap and lane gates do not apply (the reserved float belongs to the queue)
+- **THEN** the reserve cap and the active-proposal gate do not apply (the reserved
+  float belongs to the queue)
 
 #### Scenario: maxRedeem excludes queued shares
+
 - **WHEN** shares are escrowed in the queue (`pendingQueueShares`)
-- **THEN** `maxRedeem` treats them as unavailable supply, and redeemable shares are further capped by shares convertible from instant capacity when the holder's balance exceeds it
+- **THEN** `maxRedeem` treats them as unavailable supply, and redeemable shares are
+  further capped by shares convertible from instant capacity when the holder's
+  balance exceeds it
 
 #### Scenario: Views return zero when paused
+
 - **WHEN** the vault is paused
 - **THEN** `maxWithdraw` and `maxRedeem` return 0
 
-### Requirement: Lane A per-holder lock (anti intra-proposal MEV)
-Shares acquired via a Lane A deposit during an active proposal SHALL be locked to that proposal id for the receiving holder: while that proposal remains active, the holder SHALL NOT transfer shares (`SharesLocked` on transfer), SHALL NOT instant-exit (`maxWithdraw`/`maxRedeem` return 0 for the holder), and SHALL NOT queue an exit (`requestRedeem` reverts `SharesLocked`). The lock SHALL lift implicitly when the active proposal id changes or clears. Mints and burns are unaffected by the transfer restriction.
+#### Scenario: Missing governor fails closed in exit views
 
-#### Scenario: Locked holder cannot hop wallets
-- **WHEN** a Lane-A-locked holder attempts an ERC-20 share transfer during the locking proposal
-- **THEN** the transfer reverts `SharesLocked`
-
-#### Scenario: Lock lifts at settlement
-- **WHEN** the locking proposal settles and is no longer active
-- **THEN** the holder may transfer, instant-exit, and request redemptions again with no explicit clearing transaction
+- **WHEN** the factory resolves a zero governor for the vault
+- **THEN** `maxWithdraw`/`maxRedeem` revert `GovernorNotSet` (via
+  `redemptionsLocked()`) rather than reporting instant capacity
 
 ### Requirement: Async redemption requests (Lane B)
-`requestRedeem(shares, owner)` SHALL be callable only while `redemptionsLocked()` is true, the vault is not paused, and a withdrawal queue is bound; zero shares SHALL revert `InsufficientShares`, an unset queue `WithdrawalQueueNotSet`, and an unlocked vault `RedemptionsNotLocked`. A caller other than the share owner SHALL spend ERC-20 allowance. The shares SHALL be transferred (not burned) into queue custody, tagged with the active proposal id, and a request id strictly greater than 0 SHALL be returned with `RedeemRequested` emitted. Lane-A-locked owners SHALL be rejected with `SharesLocked`.
+
+`requestRedeem(shares, owner)` SHALL be callable only while `redemptionsLocked()` is
+true, the vault is not paused, and a withdrawal queue is bound; zero shares SHALL
+revert `InsufficientShares`, an unset queue `WithdrawalQueueNotSet`, and an unlocked
+vault `RedemptionsNotLocked`. A caller other than the share owner SHALL spend ERC-20
+allowance. The shares SHALL be transferred (not burned) into queue custody, tagged
+with the active proposal id, and a request id strictly greater than 0 SHALL be
+returned with `RedeemRequested` emitted.
 
 #### Scenario: Queued exit escrows shares
+
 - **WHEN** a holder requests a redemption mid-proposal
-- **THEN** their shares move into queue custody (retaining checkpointed voting weight at the queue), and burning is deferred to claim time
+- **THEN** their shares move into queue custody (retaining checkpointed voting weight
+  at the queue), and burning is deferred to claim time
 
 #### Scenario: Request outside the lock window
+
 - **WHEN** no proposal is active
-- **THEN** `requestRedeem` reverts `RedemptionsNotLocked` (instant exit is the correct path)
+- **THEN** `requestRedeem` reverts `RedemptionsNotLocked` (instant exit is the
+  correct path)
 
 ### Requirement: Async deposit requests (Lane B)
 `requestDeposit(assets, receiver)` SHALL be callable only while `redemptionsLocked()` is true, the vault is not paused, and a queue is bound; zero assets SHALL revert `ZeroAssets`, and the receiver SHALL pass the same whitelist rule as instant deposits. Assets SHALL be escrowed in the queue's own balance — never counted in `totalAssets()` and never sweepable into a strategy — tagged with the active proposal id, and a request id strictly greater than 0 SHALL be returned with `DepositRequested` emitted.
@@ -143,15 +175,26 @@ Shares acquired via a Lane A deposit during an active proposal SHALL be locked t
 - **THEN** `totalAssets()` is unchanged until the request is claimed and assets are pushed into the vault
 
 ### Requirement: Settlement price stamping
-When the governor notifies settlement via `onProposalSettled(pid)` (governor-only), the vault SHALL first reset `interimNetFlow` to 0 (even when no queue is bound), then stamp one frozen settle price into the queue: `num = totalAssets() + 1`, `den = totalSupply() + 10^decimalsOffset`, reproducing ERC-4626 conversion rounding exactly. The queue SHALL accept at most one stamp per proposal id (`AlreadySettled` on re-stamp) and SHALL, at stamp time, reserve `mulDiv(queuedRedeemShares(pid), num, den)` assets for that proposal's queued redemptions, adding it to the aggregate `reservedAssets`.
+
+When the governor notifies settlement via `onProposalSettled(pid)` (governor-only),
+the vault SHALL stamp one frozen settle price into the queue: `num = totalAssets() +
+1`, `den = totalSupply() + 10^decimalsOffset`, reproducing ERC-4626 conversion
+rounding exactly; on a queueless vault the call SHALL be a no-op. The queue SHALL
+accept at most one stamp per proposal id (`AlreadySettled` on re-stamp) and SHALL, at
+stamp time, reserve `mulDiv(queuedRedeemShares(pid), num, den)` assets for that
+proposal's queued redemptions, adding it to the aggregate `reservedAssets`.
 
 #### Scenario: One frozen price per proposal
+
 - **WHEN** a proposal settles with queued requests tagged to it
-- **THEN** every request tagged to that proposal claims against a single stamped `num/den`, and a second stamp for the same pid reverts
+- **THEN** every request tagged to that proposal claims against a single stamped
+  `num/den`, and a second stamp for the same pid reverts
 
 #### Scenario: Reserve created at stamp
+
 - **WHEN** a proposal with queued redeem shares is stamped
-- **THEN** `reservedAssets` increases by the aggregate asset value of those shares at the stamped price
+- **THEN** `reservedAssets` increases by the aggregate asset value of those shares at
+  the stamped price
 
 ### Requirement: Claiming settled requests
 `claim(requestId)` SHALL be permissionless, SHALL require the request's proposal to be stamped (`NotSettled` otherwise) and the vault to be unlocked (`VaultLocked` while a proposal is active), and SHALL reject already-claimed (`AlreadyClaimed`) or cancelled (`AlreadyCancelled`) requests. A redeem claim SHALL pay `mulDiv(shares, num, den)` at the request's own proposal's stamped price via the vault's queue-only `settleRedeem` (burn escrowed shares, transfer assets to the request owner). A deposit claim SHALL mint `mulDiv(assets, den, num)` shares priced at the LATEST stamped settlement (not the request's own pid), pushing the escrowed assets into the vault immediately before the queue-only `settleDeposit` mint — pricing at the request's own pid would grant depositors a free look-back option across later settlements.
@@ -259,15 +302,8 @@ The self-transfer fast-path (destination decodes to the vault itself) SHALL appl
 - **WHEN** a governor batch contains `asset().transferFrom(vault, vault, amount)` (a self-approve/self-transfer of the vault's own underlying asset)
 - **THEN** the destination guard's fast-path exempts it exactly as before, since `asset()` is the token the outer net-outflow meter independently verifies
 
-### Requirement: Interim net-flow accounting
-The vault SHALL accumulate a signed `interimNetFlow` — Lane A mid-proposal deposits add assets, mid-proposal instant exits subtract assets — readable by the governor at settlement so mid-proposal LP flows neither corrupt strategy PnL nor incur performance fees on depositor principal. Queue settlements SHALL NOT be counted (they post-date the PnL read). The accumulator SHALL reset to 0 in `onProposalSettled` before any queue interaction, including on queueless vaults.
-
-#### Scenario: Principal excluded from PnL
-- **WHEN** an LP deposits via Lane A mid-proposal and the proposal later settles
-- **THEN** the deposited principal is reflected in `interimNetFlow` and excluded from settlement PnL / performance-fee computation
-
 ### Requirement: Fee parameters
-The vault SHALL expose an initialization-time `managementFeeBps` and an owner-settable agent performance fee `agentFeeBps`. The agent fee SHALL default to 5% (500 bps) until explicitly set, SHALL distinguish an explicit 0% from unset, SHALL be capped at `MAX_AGENT_FEE_BPS` (15%, the protocol performance-fee ceiling; `AgentFeeTooHigh` above), and SHALL emit `AgentFeeUpdated` on change. The fee is snapshotted onto a proposal at propose time and clamped to the governor's configured maximum at settlement. `transferPerformanceFee(asset, to, amount)` SHALL be governor-only, restricted to the vault's own underlying asset (`InvalidAsset` otherwise), to a nonzero recipient, and to at most the vault's balance (`AmountExceedsBalance`).
+The vault SHALL expose an initialization-time `managementFeeBps` and an owner-settable agent performance fee `agentFeeBps`. The agent fee SHALL default to `FeeConstants.DEFAULT_AGENT_FEE_BPS` (2000 bps, 20%) until explicitly set, SHALL distinguish an explicit 0% from unset, SHALL be capped at `MAX_AGENT_FEE_BPS` (3000 bps, 30% — an alias of the protocol performance-fee ceiling `FeeConstants.MAX_PERFORMANCE_FEE_BPS`; `AgentFeeTooHigh` above), and SHALL emit `AgentFeeUpdated` on change. The fee is snapshotted onto a proposal at propose time and clamped to the governor's configured maximum at settlement. `transferPerformanceFee(asset, to, amount)` SHALL be governor-only, restricted to the vault's own underlying asset (`InvalidAsset` otherwise), to a nonzero recipient, and to at most the vault's balance (`AmountExceedsBalance`).
 
 #### Scenario: Default agent fee
 - **WHEN** the owner has never called `setAgentFeeBps`
@@ -397,3 +433,13 @@ The permitted source is exactly the vault itself, NOT the TierRegistry adapter a
 - **WHEN** a governor batch contains `DSToken.pull(victim, amount)` or `DSToken.move(victim, attacker, amount)` where `victim` is not the vault
 - **THEN** the batch reverts `DisallowedTransferFromSource(dstoken, victim)`
 
+
+### Requirement: Deposits are not charged a fee
+
+The vault SHALL charge nothing on entry. (Relocated verbatim from the retired
+`instant-exit-fees` capability — it was never Lane-A-specific.)
+
+#### Scenario: A deposit incurs no fee
+
+- **WHEN** a depositor deposits into the vault
+- **THEN** the shares issued reflect the full deposited amount, less no fee

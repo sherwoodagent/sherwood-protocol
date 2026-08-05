@@ -140,9 +140,15 @@ Checked after every call sequence.
 - [ ] **GL-50** `EXPLORATORY` — an `Executed` proposal can always reach `Settled` through
   permissionless calls alone, without vault-owner cooperation. If false, a hostile
   proposer can wedge a vault permanently via G-1.
-- [ ] **GL-51** `EXPLORATORY` — under every reachable parameter configuration,
+- [x] **GL-51** `EXPLORATORY` — under every reachable parameter configuration,
   `game.honestFilingNetPayoffBps()` stays non-negative. The contract *reports* the
-  break-even condition but does not enforce it (x-ray E-4).
+  break-even condition but does not enforce it (x-ray E-4). Implemented together
+  with the four setter handlers that make it non-vacuous (`challengerBondBps`,
+  `settleBurnBps`, `prosecutorFeeBps` on ChallengeGame; `proposerBondBps` on
+  ExposureLedger). Expected to FAIL: the figure prices only the silence branch,
+  and no single setter can enforce the condition because its inputs span two
+  independently-owned contracts. A counterexample names a parameter tuple
+  governance must not ship — it is not a protocol bug.
 
 ---
 
