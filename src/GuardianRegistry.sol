@@ -452,6 +452,19 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      it evaluates only the at-open block-quorum comparison.
     function _isBlocked(Review storage r) private view returns (bool) {
         uint256 denom = uint256(r.totalStakeAtOpen);
+        // A ZERO DENOMINATOR IS VACUOUSLY BLOCKED, so guard it explicitly:
+        // `0 * 10_000 >= q * 0` is `0 >= 0` = TRUE, which resolves a review
+        // Blocked with no guardian participation at all and slashes every
+        // approver. `_resolveEmergency` already guards its own comparison with
+        // `if (denomE > 0)`, and `cancelReview`'s natspec names this exact
+        // vacuous-`0 >= 0` hazard — the standard review path was relying on
+        // `cohortTooSmall` to keep it away from the predicate instead, which is
+        // a coupling rather than a guard. Defence in depth, not a live bug:
+        // `cohortTooSmall` reads the live total, so a zero electorate flags and
+        // short-circuits before reaching here. It stops being defence in depth
+        // the moment anyone changes that basis, which has now been attempted
+        // once (see `_lookbackMinTotalVotes`).
+        if (denom == 0) return false;
         return uint256(r.blockStakeWeight) * 10_000 >= uint256(r.blockQuorumBpsAtOpen) * denom;
     }
 
@@ -511,6 +524,63 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      stake counts again), so a deflation the attacker intends to reverse
     ///      is not free. That is a `StakedWood` change with its own blast radius
     ///      and is deliberately NOT bundled here.
+    ///
+    ///      PASHOV 2026-08 FINDING #1, EXAMINED AND NOT ACTED ON. The finding is
+    ///      correct and its worked example reproduces — see
+    ///      `test/pashov-audit/GuardianRegistry_blockQuorumDenominator.t.sol`,
+    ///      which pins every claim below as an executable fixture. `minTotal` is
+    ///      up to `FLOOR_LOOKBACK` stale while `_growthGatedVoteWeight` clamps
+    ///      only a voter whose OWN raw stake grew, so a guardian who holds still
+    ///      votes full weight against a 30-day-old electorate: 40k of a 60k
+    ///      cohort at t0 blocks alone at t0 + 30d against a live 600k
+    ///      electorate, and the same stale denominator drives `_severityBps` to
+    ///      within a few bps of `maxSlashBps`, wiping the honest approvers.
+    ///
+    ///      IT HAS NO FIX LOCAL TO THIS FUNCTION, and the reason is structural
+    ///      rather than a matter of finding a better formula. The denominator
+    ///      faces two OPPOSITE attacks:
+    ///        - OVER-WEIGHTING (the finding) wants the denominator LARGER. It
+    ///          exploits a denominator that ignores real, honest young stake.
+    ///        - DILUTION (why `minTotal` is here at all) wants it SMALLER.
+    ///          `stakeAsGuardian` has no cap and no allowlist, so anyone can
+    ///          park never-voting, no-slash-risk stake and raise the absolute
+    ///          weight an honest cohort must clear to block.
+    ///      Both turn on stake younger than `FLOOR_LOOKBACK`, and in the
+    ///      aggregate `getPastTotalVotes` trace — the ONLY input available here
+    ///      — honest young stake and attacker-planted young stake are THE SAME
+    ///      OBJECT: an attacker reproduces any growth curve by paying the
+    ///      matching holding time. So every rule expressible from these reads
+    ///      counts young stake at some weight k in [0, 1] and trades one
+    ///      exposure for the other, with no dominant setting:
+    ///        k = 0      `minTotal`, today: dilution closed, over-weighting open.
+    ///        k = 1      the live total: over-weighting closed, dilution open.
+    ///        0 < k < 1  `max(minTotal, k * total)`: both bounded, neither
+    ///                   closed — and the smallest k that defeats the finding's
+    ///                   own worked example already surrenders the veto to a
+    ///                   diluter who simply parks more.
+    ///      "Scale each voter's numerator by `minTotal / total` and keep
+    ///      comparing against `minTotal`" is NOT a third option: it reduces to
+    ///      `weight * 10_000 >= q * total`, which is k = 1 exactly.
+    ///
+    ///      WHAT A REAL FIX NEEDS: a denominator summing per-voter
+    ///      `min(stake(ts1), stake(ts1 - FLOOR_LOOKBACK))` over the WHOLE
+    ///      electorate — the aggregate counterpart of `_growthGatedVoteWeight`.
+    ///      That figure is not derivable from the aggregate checkpoints sWOOD
+    ///      publishes and cannot be iterated on-chain; it needs new `StakedWood`
+    ///      accounting, e.g. a checkpointed total of stake continuously present
+    ///      for at least `FLOOR_LOOKBACK`. Same conclusion, by the same route,
+    ///      that `TokenCourt._participationFloor` reached on the same
+    ///      construction — read its note too before touching this one, and note
+    ///      that BOTH of the candidate fixes tried there measured worse than the
+    ///      defect.
+    ///
+    ///      THE RESIDUAL, stated so it reads as a decision and not an oversight:
+    ///      a guardian who held at least `blockQuorumBps` of the electorate as
+    ///      it stood `FLOOR_LOOKBACK` ago keeps a unilateral veto — and a
+    ///      near-ceiling severity — for that long after the electorate grows
+    ///      past them. In a fast-growing cohort that is a standing discount
+    ///      rather than a transient one, and it is the price currently paid for
+    ///      dilution resistance.
     function _lookbackMinTotalVotes(IStakedWood sw, uint256 ts1)
         private
         view
