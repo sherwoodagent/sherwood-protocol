@@ -230,7 +230,15 @@ contract ConcentratedLiquidityStrategyRerangeTest is CLFixture {
         pool.setTicks(target, target);
     }
 
-    /// @notice PASHOV 2026-08 FINDING #17, PINNED AS AN OPEN EXPOSURE.
+    /// @notice PASHOV 2026-08 FINDING #17, RESIDUAL HALF, pinned as an open
+    ///         exposure. The STRUCTURAL half is now closed at bind time — see
+    ///         `test_init_rerangeBandNarrowerThanApprovedRangeReverts`: a
+    ///         rerange band narrower than the approved range is refused, so the
+    ///         same notional can no longer be concentrated into one spacing.
+    ///
+    ///         What remains, and what this test drives, is venue DEPTH FALLING
+    ///         between execute and rerange: an unchanged band breaches the cap
+    ///         on its own, and no bind-time rule can see that coming.
     /// @dev    This test asserts the BUG, deliberately. `_execute` ends with
     ///         `_requireWithinPoolShare` on the actually-minted liquidity;
     ///         `rerange` re-mints through the same `_mintPosition` and does

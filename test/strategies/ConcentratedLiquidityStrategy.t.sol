@@ -512,6 +512,39 @@ contract ConcentratedLiquidityStrategyInitTest is CLFixture {
         _expectInitRevert(ConcentratedLiquidityStrategy.InvalidBound.selector, p);
     }
 
+    /// @notice PASHOV 2026-08 FINDING #17, structural half — a rerange band
+    ///         narrower than the approved one is refused at BIND time.
+    /// @dev    `_execute` enforces `MAX_POOL_SHARE_BPS` on the liquidity it
+    ///         actually mints; `rerange` re-mints through the same
+    ///         `_mintPosition` and cannot re-check it without a permanent brick
+    ///         (see the block in `rerange`). So the cap is preserved here
+    ///         instead.
+    ///
+    ///         The finding's own worked case: a wide initial range plus
+    ///         `halfWidthTicks == tickSpacing` cleared every init and execute
+    ///         check and then concentrated the same notional into ONE spacing,
+    ///         far above the cap, on a permissionless call. For fixed token
+    ///         amounts liquidity scales inversely with band width, so requiring
+    ///         the rerange band to be at least as wide as the initial one
+    ///         bounds the re-mint by a figure that already cleared the cap.
+    function test_init_rerangeBandNarrowerThanApprovedRangeReverts() public {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        // The exact shape from the finding: initial range is +/-1000, the
+        // rerange policy would re-mint into a single tick spacing.
+        p.rerange.halfWidthTicks = TICK_SPACING;
+        _expectInitRevert(ConcentratedLiquidityStrategy.InvalidRerangePolicy.selector, p);
+    }
+
+    /// @dev The boundary is inclusive: a band exactly as wide as the approved
+    ///      range mints at most what the initial mint did, so it is admissible.
+    function test_init_rerangeBandEqualToApprovedRangeSucceeds() public {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.rerange.halfWidthTicks = (TICK_UPPER - TICK_LOWER) / 2;
+        ConcentratedLiquidityStrategy s = _newStrategy(p);
+        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Pending));
+        assertEq(s.rerangePolicy().halfWidthTicks, (TICK_UPPER - TICK_LOWER) / 2, "the band was accepted as given");
+    }
+
     function test_init_deviationBoundAboveCeilingReverts() public {
         ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
         p.maxTwapDeviationBps = strategy.MAX_TWAP_DEVIATION_BPS() + 1;

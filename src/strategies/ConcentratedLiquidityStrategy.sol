@@ -551,7 +551,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         _requireValidRange(p.tickLower, p.tickUpper, spacing);
 
         _requireValidBounds(p);
-        _requireValidRerangePolicy(p.rerange, spacing);
+        _requireValidRerangePolicy(p.rerange, spacing, p.tickLower, p.tickUpper);
 
         pool = pool_;
         positionManager = INonfungiblePositionManager(p.positionManager);
@@ -857,9 +857,34 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         if (p.swapFractionBps > BPS_DENOMINATOR) revert InvalidBound();
     }
 
-    function _requireValidRerangePolicy(RerangePolicy memory r, int24 spacing) private pure {
+    function _requireValidRerangePolicy(RerangePolicy memory r, int24 spacing, int24 lower, int24 upper) private pure {
         // A half-width below one tick spacing cannot snap to a non-empty range.
         if (r.halfWidthTicks < spacing) revert InvalidRerangePolicy();
+        // THE RERANGE BAND MAY NOT BE NARROWER THAN THE APPROVED ONE (pashov
+        // 2026-08 finding #17, structural half).
+        //
+        // `_execute` enforces `MAX_POOL_SHARE_BPS` on the liquidity it actually
+        // mints; `rerange` re-mints through the same `_mintPosition` and cannot
+        // re-check it without introducing a permanent brick (see the block in
+        // `rerange`). So the cap is preserved HERE instead, at bind time, where
+        // refusing costs a re-proposal rather than stranding a live position.
+        //
+        // For fixed token amounts, liquidity scales inversely with band width:
+        // `L ≈ amount / (sqrt(Pu) - sqrt(Pl))`. A rerange band at least as wide
+        // as the initial one therefore mints at most the liquidity the initial
+        // mint did, and that figure already cleared the cap at `_execute`. This
+        // closes the structural case the finding turns on — a wide initial
+        // range plus `halfWidthTicks == tickSpacing`, which passed every check
+        // and then concentrated the same notional into a single spacing.
+        //
+        // What it does NOT close, stated so the gap is not mistaken for
+        // covered: venue depth FALLING between execute and rerange breaches the
+        // cap with an unchanged band, and no bind-time rule can see that. That
+        // residual needs the runtime check, which needs the zero-liquidity
+        // brick solved first.
+        if (uint256(int256(r.halfWidthTicks)) * 2 < uint256(int256(upper - lower))) {
+            revert InvalidRerangePolicy();
+        }
         if (r.halfWidthTicks > MAX_HALF_WIDTH_TICKS) revert InvalidRerangePolicy();
         if (r.triggerBps == 0 || r.triggerBps > BPS_DENOMINATOR) revert InvalidRerangePolicy();
         if (r.maxReranges > MAX_RERANGE_LIMIT) revert InvalidRerangePolicy();
