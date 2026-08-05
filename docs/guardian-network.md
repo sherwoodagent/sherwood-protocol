@@ -199,6 +199,31 @@ the verdict. No panel, no appeal.
   not guardians. Finalize executes with per-call caps disabled — the escape hatch
   for a settlement leg stuck on a cap.
 
+### Migrating a vault created under the zero-bond sentinel
+
+`minOwnerStake` may legally be `0` — the deliberate open-onboarding sentinel for
+vault creation. Before the `MIN_OWNER_BOND_FLOOR`, that made the emergency gate
+evaluate `0 < 0` and pass with **no bond posted**, while `slashOwnerBond`
+returned early on `amount == 0`. The deterrent on the one path that runs
+owner-supplied calldata with per-call metering disabled was a complete no-op.
+
+Flooring `requiredOwnerBond` fixes that, and it is a **behaviour change for
+vaults already created under the sentinel**: `bindOwnerStake` only sets
+`p.bound = true` when `p.amount != 0`, so those vaults hold an unbound,
+zero-amount slot and `emergencySettleWithCalls` now reverts
+`OwnerBondInsufficient` for them until a real bond is posted.
+
+The way back is a three-step, `onlyFactory`-gated ceremony, and it works
+because `transferOwnerStakeSlot`'s `PriorStakeNotCleared` guard passes at zero:
+
+1. `prepareOwnerStake(amount)` with `amount >= requiredOwnerBond(vault)`
+2. `approvedBindVault` to bind the funded slot
+3. `rotateOwner` to the same address, re-binding it
+
+Until that runs, the affected vault keeps `unstick` — which carries no bond gate
+— so a settlement replay of already-reviewed calldata is unaffected. Only the
+new-calldata escape hatch is gated.
+
 ## How guardians get paid
 
 The guardian network earns 10% of every management fee and 15% of every performance

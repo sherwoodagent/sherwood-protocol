@@ -258,6 +258,31 @@ contract PortfolioStrategy is BaseStrategy {
     ///         Exhaustion is not a brick: `settle()` never consults this meter,
     ///         so the exit path stays open, and 18% still wants the
     ///         `strategyDuration` and adapter allowlist doing their share.
+    ///
+    ///         CALL BUDGET AFTER PER-LEG BILLING (pashov 2026-08 finding #20).
+    ///         `rebalanceDelta` used to bill one leg per call however many legs
+    ///         traded; it now bills each leg that ran, which is what
+    ///         `rebalance()` always did. The constant was NOT re-sized, so the
+    ///         lifetime call count for a two-sided delta rebalance halves:
+    ///
+    ///           maxSlippageBps  50 -> 20 calls    (was 40)
+    ///                          200 ->  5 calls    (was 10)
+    ///                        1_000 ->  1 call     (was 2)
+    ///
+    ///         AT THE `MAX_SLIPPAGE_CEILING_BPS` CEILING THAT IS EXACTLY ONE
+    ///         two-sided delta rebalance per clone, and every later call
+    ///         reverts `DecayBudgetExhausted`. Deliberate, not an oversight: a
+    ///         proposal that reserved the right to lose 10% per leg has spent
+    ///         the entire 18% lifetime allowance the moment it uses it twice,
+    ///         and the budget is a cap on REACHABLE LOSS rather than on
+    ///         activity. Raising the constant to restore the old call count
+    ///         would raise that reachable loss by the same factor, which is the
+    ///         thing the cap exists to bound.
+    ///
+    ///         A proposal that wants many rebalances asks for a tighter
+    ///         `maxSlippageBps`, which is also the direction that makes each
+    ///         one cheaper. Unlike the withdrawn finding #14 change, nothing
+    ///         here reverts on the FIRST call at any legal parameterisation.
     uint256 public constant MAX_CUMULATIVE_DECAY_BPS = 2_000;
 
     // ── Storage (per-clone) ──

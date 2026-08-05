@@ -179,10 +179,14 @@ contract MorphoSupplyStrategy is BaseStrategy {
         //
         // Refusing at bind time costs a re-proposal. Refusing at execute would
         // cost the deployed capital.
-        if (_resolveTierRegistry() == address(0)) revert TierRegistryUnresolved();
+        // Resolved ONCE and reused: `_requireAllowedMorpho` would otherwise
+        // re-walk `vault() -> governor() -> tierRegistry()` immediately after
+        // this line, four staticcalls where two do.
+        address registry = _resolveTierRegistry();
+        if (registry == address(0)) revert TierRegistryUnresolved();
         // Bind the proposer's Morpho singleton to the governance allowlist
         // before ANY call is made into it and before anything is written.
-        _requireAllowedMorpho(morpho_);
+        if (!_isAdapterAllowed(registry, morpho_)) revert MorphoNotAllowed(morpho_, registry);
         if (supplyAmount_ == 0) revert InvalidAmount();
 
         address vaultAsset = IERC4626(vault()).asset();
@@ -352,11 +356,25 @@ contract MorphoSupplyStrategy is BaseStrategy {
 
     /// @dev Staticcall-safe `isAdapterAllowed`. Unreadable → `false` (see the
     ///      fail-closed rationale on `_requireAllowedMorpho`).
+    ///
+    ///      READS THE WORD, DOES NOT `abi.decode` IT. `abi.decode(ret, (bool))`
+    ///      REVERTS on any returned word outside `{0, 1}`, and that revert
+    ///      lands in THIS frame with nothing to catch it — so a registry
+    ///      answering `2` would brick `_initialize` instead of resolving to
+    ///      "not vouched for", contradicting the line above and defeating the
+    ///      point of writing this as a raw staticcall at all. Any non-zero word
+    ///      is truthy, which is also what a well-behaved registry returns.
+    ///      Mirrors `ConcentratedLiquidityStrategy._readAllowed`, and the
+    ///      sibling `_readAddress` below already had the corrected shape.
     function _isAdapterAllowed(address registry, address adapter) private view returns (bool) {
         if (registry.code.length == 0) return false;
         (bool ok, bytes memory ret) = registry.staticcall(abi.encodeCall(ITierBindingPath.isAdapterAllowed, (adapter)));
         if (!ok || ret.length != 32) return false;
-        return abi.decode(ret, (bool));
+        uint256 word;
+        assembly ("memory-safe") {
+            word := mload(add(ret, 0x20))
+        }
+        return word != 0;
     }
 
     /// @dev Staticcall-safe address read: codeless target, revert, short
