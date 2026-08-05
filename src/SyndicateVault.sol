@@ -898,7 +898,32 @@ contract SyndicateVault is
         if (asset_ != asset()) revert InvalidAsset();
         if (to == address(0)) revert ZeroAddress();
         uint256 spendable = IERC20(asset_).balanceOf(address(this));
-        uint256 reserve = reservedQueueAssets();
+        // BOTH LIABILITIES, not just the queue's (pashov 2026-08 finding #23).
+        // `totalAssets()` already treats the vault as owing
+        // `reservedQueueAssets() + _escrowedFeeLiability()`; this guard counted
+        // only the first, so a later settlement's fee could spend float already
+        // booked as an earlier recipient's escrow — after which THEIR
+        // `claimUnclaimedFees` reverts `AmountExceedsBalance` with no recovery
+        // path, since `_payFee`'s escrow-on-failure is one-shot per settlement.
+        //
+        // THE CLAIM PATH EXEMPTS ITSELF, STRUCTURALLY — there is no special
+        // case here and there must not be one. `claimUnclaimedFees` decrements
+        // `_escrowedFees[vault][token]` BEFORE calling this
+        // (`SyndicateGovernor.claimUnclaimedFees`), so by the time this runs the
+        // liability no longer includes the amount being claimed and the
+        // subtraction below leaves exactly enough. Reordering that decrement to
+        // after the transfer would brick every escrowed claim.
+        //
+        // The LP paths (`_availableFloat`, `_withdraw`) deliberately do NOT
+        // subtract escrow: `totalAssets()` nets it already, so an LP's share
+        // entitlement is reduced by it rather than reserved against it, and
+        // double-counting there would refuse withdrawals no liability requires.
+        //
+        // `_escrowedFeeLiability()` degrades to 0 on an unreadable governor.
+        // Stated as a decision: that is the LIVENESS direction on a path whose
+        // own failure mode is a lost fee, and it reproduces exactly the
+        // pre-existing behaviour rather than inventing a stricter one.
+        uint256 reserve = reservedQueueAssets() + _escrowedFeeLiability();
         spendable = spendable > reserve ? spendable - reserve : 0;
         if (amount > spendable) revert AmountExceedsBalance();
         IERC20(asset_).safeTransfer(to, amount);

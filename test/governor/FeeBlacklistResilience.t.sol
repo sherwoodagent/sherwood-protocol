@@ -252,6 +252,51 @@ contract FeeBlacklistResilienceTest is Test {
         assertEq(governor.unclaimedFees(address(vault), protocolRecipient, address(usdc)), 0, "escrow cleared");
     }
 
+    /// @notice PASHOV 2026-08 FINDING #23 — an escrowed fee is float the vault
+    ///         OWES, and the spend guard must reserve it.
+    /// @dev    `totalAssets()` treats the vault as owing
+    ///         `reservedQueueAssets() + _escrowedFeeLiability()`, but
+    ///         `transferPerformanceFee` counted only the queue reserve. A later
+    ///         payout could therefore spend float already booked as an earlier
+    ///         recipient's escrow, and that recipient's `claimUnclaimedFees`
+    ///         then reverted `AmountExceedsBalance` with no recovery path.
+    ///
+    ///         Driven directly against the guard rather than through a second
+    ///         settlement, because what is being pinned is the ARITHMETIC: with
+    ///         an escrow outstanding, the spendable figure must exclude it.
+    function test_finding23_escrowedFeeIsReservedAgainstLaterPayouts() public {
+        uint256 proposalId = _executeThroughSettle(1500, 7 days, _emptyCoProposers());
+
+        usdc.mint(address(vault), 10_000e6);
+        usdc.setBlacklisted(protocolRecipient, true);
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+
+        uint256 escrowed = governor.unclaimedFees(address(vault), protocolRecipient, address(usdc));
+        assertGt(escrowed, 0, "fixture escrowed nothing, the guard could not bind");
+        assertEq(governor.outstandingEscrow(address(vault), address(usdc)), escrowed, "liability is visible");
+
+        // Leave the vault holding EXACTLY the escrow and nothing more, so every
+        // spendable wei is owed to the blacklisted recipient.
+        deal(address(usdc), address(vault), escrowed);
+
+        // Any payout at all must now be refused: spendable is zero.
+        vm.prank(address(governor));
+        vm.expectRevert(ISyndicateVault.AmountExceedsBalance.selector);
+        vault.transferPerformanceFee(address(usdc), address(0xFEE), 1);
+
+        // ...while the escrowed recipient's own claim still goes through. It
+        // exempts itself structurally: `claimUnclaimedFees` decrements
+        // `_escrowedFees` BEFORE calling the vault, so the liability no longer
+        // includes what is being claimed. If that ordering is ever reversed,
+        // this assertion is what fails.
+        usdc.setBlacklisted(protocolRecipient, false);
+        vm.prank(protocolRecipient);
+        governor.claimUnclaimedFees(address(vault), address(usdc));
+        assertEq(usdc.balanceOf(protocolRecipient), escrowed, "the escrowed claim is not blocked by its own reserve");
+    }
+
     /// @notice Co-proposer share gets escrowed when the co-proposer is
     ///         blacklisted. Lead proposer still receives their share; settle
     ///         still completes.
