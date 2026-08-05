@@ -54,8 +54,11 @@ abstract contract ChallengeGameHandler is Properties {
         // reverts in the transfer rather than in the game.
         uint256 bal = wood.balanceOf(actor);
         if (bal == 0) return;
-        IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
-        uint256 remaining = c.bondWood > c.counterBondWood ? c.bondWood - c.counterBondWood : 0;
+        // The shortfall is the POOL's, not the challenge's: one pool per
+        // proposal serves every concurrent challenge on it, and its target is
+        // the largest live bond rather than this challenge's own.
+        (, uint256 target, uint256 raised,,) = game.counterBondPoolOf(challengeId);
+        uint256 remaining = target > raised ? target - raised : 0;
         if (remaining == 0) return;
         amountWood = clampBetween(amountWood, 1, remaining < bal ? remaining : bal);
 
@@ -70,8 +73,8 @@ abstract contract ChallengeGameHandler is Properties {
         if (count == 0) return;
         challengeId = clampBetween(challengeId, 1, count);
 
-        IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
-        uint256 remaining = c.bondWood > c.counterBondWood ? c.bondWood - c.counterBondWood : 0;
+        (, uint256 target, uint256 raised,,) = game.counterBondPoolOf(challengeId);
+        uint256 remaining = target > raised ? target - raised : 0;
         if (remaining == 0 || wood.balanceOf(actor) < remaining) return;
 
         challengeGame_dispute(challengeId, remaining);

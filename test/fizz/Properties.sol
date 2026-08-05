@@ -113,20 +113,44 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         return sum == swood.totalGuardianStake();
     }
 
-    /// @notice GL-14 — while a challenge is live (`Filed`/`Disputed`), Σ
-    ///         contributor amounts equals `challengeOf(id).counterBondWood`.
+    /// @notice GL-14 — the counter-bond pool is keyed per PROPOSAL, not per
+    ///         challenge (pashov 2026-08 finding #10), so this no longer asserts
+    ///         anything per-challenge. For every live (`Filed`/`Disputed`)
+    ///         challenge it now says three things about THE POOL THAT CHALLENGE
+    ///         BELONGS TO:
+    ///
+    ///           1. Σ `counterBondContributionOf` over the pool's contributor
+    ///              list equals the pool's `raisedWood` — the contributor ledger
+    ///              and the pool total never diverge.
+    ///           2. The pool still HOLDS what it raised (`poolWood ==
+    ///              raisedWood`) and has not been burned. Only a terminal
+    ///              outcome empties a pool, and a live challenge on the key
+    ///              means none has landed on it.
+    ///           3. The pool never exceeds its target — `dispute` clamps the
+    ///              overshoot rather than refunding it.
+    ///
+    ///         The pre-fix version compared a per-challenge contributor sum
+    ///         against `challengeOf(id).counterBondWood`. That comparison went
+    ///         vacuous rather than false once the pool moved per-key: BOTH sides
+    ///         now read the shared pool, so it could no longer catch a
+    ///         divergence between a challenge and its own funding. Concurrent
+    ///         challenges on one review key deliberately report the SAME pool
+    ///         here, which is the whole point of the fix.
     function property_GL14_counterBondPoolMatchesContributions() public view returns (bool) {
         uint256 n = game.challengeCount();
         for (uint256 id = 1; id <= n; id++) {
             IChallengeGame.Challenge memory c = game.challengeOf(id);
-            if (c.status == IChallengeGame.Status.Filed || c.status == IChallengeGame.Status.Disputed) {
-                address[] memory contributors = game.counterBondContributors(id);
-                uint256 sum;
-                for (uint256 j; j < contributors.length; j++) {
-                    sum += game.counterBondContributionOf(id, contributors[j]);
-                }
-                if (sum != c.counterBondWood) return false;
+            if (c.status != IChallengeGame.Status.Filed && c.status != IChallengeGame.Status.Disputed) continue;
+
+            (uint256 poolWood, uint256 targetWood, uint256 raisedWood,, bool burned) = game.counterBondPoolOf(id);
+            address[] memory contributors = game.counterBondContributors(id);
+            uint256 sum;
+            for (uint256 j; j < contributors.length; j++) {
+                sum += game.counterBondContributionOf(id, contributors[j]);
             }
+            if (sum != raisedWood) return false;
+            if (poolWood != raisedWood || burned) return false;
+            if (raisedWood > targetWood) return false;
         }
         return true;
     }
