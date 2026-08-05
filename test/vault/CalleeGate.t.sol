@@ -262,13 +262,23 @@ contract CalleeGateTest is Test {
         _exec(_one(address(swappedAdapter), abi.encodeWithSelector(bytes4(0x12345678), attacker)));
     }
 
-    /// @notice Demotion severs callability too, not only fund-destination
-    ///         consent: `_demote`'s allowlist clear (deliberately over-broad
-    ///         per its own natspec) means an owner `demote` of a CERTIFIED
-    ///         (target, selector) pair also revokes that target's standing as
-    ///         a batch callee at all, even for calls unrelated to the
-    ///         demoted selector.
-    function test_demotionSeveresCallee() public {
+    /// @notice pashov 2026-08 finding #15 INVERTED THIS TEST. Demotion used to
+    ///         sever callability as well as fund-destination consent, because
+    ///         `_demote` cleared `_adapterAllowed` and `isAdapterAllowed` is the
+    ///         single predicate behind both PART 2a and PART 2b. That is exactly
+    ///         what bricked an already-executed proposal's settlement batch —
+    ///         the batch was fixed at propose time and names the convicted
+    ///         target, so `settleProposal`/`unstick`/`finalizeEmergencySettle`
+    ///         all reverted `DisallowedBatchCallee` and every LP exit shut.
+    ///
+    ///         A demotion now LEAVES an explicit address-level allow alone, so
+    ///         the target stays callable and the live position can be unwound;
+    ///         the conviction is enforced against NEW proposals in
+    ///         `SyndicateGovernor` instead. Severing callability is once again
+    ///         the owner's explicit `setAdapterAllowed(target, false)`, which
+    ///         this test now drives as its second half — so the callee gate
+    ///         itself is still proven to bite.
+    function test_demotionLeavesCalleeIntact_ownerDisallowSevers() public {
         ERC20Mock demotedAdapter = new ERC20Mock("Demoted", "DMT", 18);
         bytes4 sel = bytes4(0x12345678);
         tierRegistry.setAdapterAllowed(address(demotedAdapter), true);
@@ -290,7 +300,18 @@ contract CalleeGateTest is Test {
         _exec(_one(address(demotedAdapter), abi.encodeCall(demotedAdapter.balanceOf, (attacker))));
 
         tierRegistry.demote(address(demotedAdapter), sel);
-        assertFalse(tierRegistry.isAdapterAllowed(address(demotedAdapter)), "demotion clears the allowlist flag too");
+        assertTrue(
+            tierRegistry.isAdapterAllowed(address(demotedAdapter)), "demotion leaves the explicit allowlist flag alone"
+        );
+        assertTrue(tierRegistry.isClassAllowDenied(address(demotedAdapter)), "but records the conviction");
+
+        // STILL CALLABLE — the whole point: an in-flight position's
+        // pre-committed unwind still runs after its target is convicted.
+        _exec(_one(address(demotedAdapter), abi.encodeCall(demotedAdapter.balanceOf, (attacker))));
+
+        // And the gate still bites, on the owner's explicit withdrawal.
+        tierRegistry.setAdapterAllowed(address(demotedAdapter), false);
+        assertFalse(tierRegistry.isAdapterAllowed(address(demotedAdapter)), "owner disallow closes it");
 
         _expectCalleeDisallowed(address(demotedAdapter));
         _exec(_one(address(demotedAdapter), abi.encodeWithSelector(sel, attacker)));
