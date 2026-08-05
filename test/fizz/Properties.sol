@@ -529,7 +529,7 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         uint256 n = governor.proposalCount();
         for (uint256 pid = 1; pid <= n; pid++) {
             bytes32 key = keccak256(abi.encode(address(governor), pid));
-            (bool opened, bool resolved,,) = registry.getReviewState(address(governor), pid);
+            (bool opened, bool resolved,) = registry.getReviewState(address(governor), pid);
             if (opened) ghosts.everOpened[key] = true;
             else if (ghosts.everOpened[key]) return false;
             if (resolved) ghosts.everResolved[key] = true;
