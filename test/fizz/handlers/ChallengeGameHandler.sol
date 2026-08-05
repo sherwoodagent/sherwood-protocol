@@ -109,6 +109,146 @@ abstract contract ChallengeGameHandler is Properties {
         else _challengeGame_setSettleBurnBps(clampBetween(arg0, 0, 10_000));
     }
 
+    // ―――――――――――――――――――― Lifecycle composite ――――――――――――――――――――
+
+    /// @notice Drives a filed challenge all the way to a conviction:
+    ///         file -> dispute to pool completion -> refer -> vote -> finalize
+    ///         -> rule.
+    ///
+    /// @dev THE POINT: every terminal path in `ChallengeGame`, `TokenCourt`,
+    ///      `ProposerBondEscrow` and the slash half of `ExposureLedger` sits
+    ///      behind this one chain, and random sequencing essentially never
+    ///      assembles it — the calls are order-dependent, separated by two time
+    ///      windows, and each has a different eligible caller. This is the same
+    ///      shape of gap `syndicateGovernor_lifecycle_toExecuted` closed for
+    ///      propose->execute, and the same fix.
+    ///
+    ///      Roles are kept disjoint on purpose, because the court bars three
+    ///      groups from voting and a naive assignment silently produces an
+    ///      Inconclusive verdict instead of a conviction:
+    ///        - approvers are `isAccused` (`AccusedCannotVote`),
+    ///        - the challenger is barred (`ChallengerCannotVote`),
+    ///        - counter-bond contributors are barred
+    ///          (`CounterBondContributorCannotVote`).
+    ///      So the challenger and the disputer are drawn from the NON-guardian
+    ///      actors, leaving the staked guardians as the voter pool. Voting is
+    ///      attempted from every guardian under try/catch rather than computing
+    ///      the accused set: whoever approved reverts and is skipped, which
+    ///      keeps this correct no matter which guardian the governor composite
+    ///      happened to use.
+    ///
+    ///      Court weight is sWOOD (`getPastVotes` at the case snapshot AND
+    ///      `getVotes` now), not WOOD — guardians qualify only because they are
+    ///      staked at setup, before any `executedAt`.
+    ///
+    ///      Everything is try/catch: a step that cannot fire leaves the
+    ///      challenge parked in a legitimate intermediate state (Filed,
+    ///      Disputed, or an Inconclusive/NotGuilty verdict), all of which are
+    ///      themselves worth exploring. The handler never reverts the sequence.
+    function challengeGame_lifecycle_toConviction(uint256 proposalSeed, uint256 predicateSeed) public {
+        uint256 pid = _challengeableProposal(proposalSeed);
+        if (pid == 0) return;
+
+        // Challenger: a non-guardian actor, so the guardian pool stays eligible
+        // to vote. `_nonGuardian` wraps within the non-guardian range.
+        address challenger = _nonGuardian(proposalSeed);
+        uint256 idBefore = game.challengeCount();
+        vm.prank(challenger);
+        try game.file(
+            address(governor),
+            pid,
+            IChallengeGame.Predicate(predicateSeed % 5),
+            address(0),
+            bytes4(0),
+            "fizz-conviction"
+        ) {}
+        catch {
+            return;
+        }
+        uint256 challengeId = game.challengeCount();
+        if (challengeId == idBefore) return;
+
+        // Fund the counter-bond to exactly its target. `Disputed` requires
+        // `counterBondWood == bondWood`; a short pool leaves the challenge in
+        // Filed and `refer` reverts, so partial funding is not enough.
+        IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
+        uint256 remaining = c.bondWood > c.counterBondWood ? c.bondWood - c.counterBondWood : 0;
+        for (uint256 i; i < actors.length && remaining != 0; i++) {
+            address d = _nonGuardian(i);
+            if (d == challenger) continue;
+            uint256 bal = wood.balanceOf(d);
+            if (bal == 0) continue;
+            uint256 amt = bal < remaining ? bal : remaining;
+            vm.prank(d);
+            try game.dispute(challengeId, amt) {
+                remaining -= amt;
+            } catch {}
+        }
+        if (remaining != 0) return; // pool never completed: stays Filed
+
+        // `dispute` AUTO-REFERS the moment the counter-bond pool completes
+        // (`ChallengeGame.sol:913`), so by here the case usually already
+        // exists and an explicit `refer` would revert. Read the mapping first
+        // and only refer when the auto-referral did not fire — treating refer
+        // as mandatory aborts the composite on its own success.
+        uint256 caseId = court.caseOfChallenge(address(game), challengeId);
+        if (caseId == 0) {
+            try court.refer(challengeId) returns (uint256 cid) {
+                caseId = cid;
+            } catch {
+                return;
+            }
+        }
+        if (caseId == 0) return;
+
+        // Guilty needs turnout >= the participation floor AND
+        // guiltyVotes > notGuiltyVotes (a tie fails safe to NotGuilty).
+        uint256 voted;
+        for (uint256 i; i < GUARDIAN_COUNT; i++) {
+            vm.prank(actors[i]);
+            try court.vote(caseId, true) {
+                voted++;
+            } catch {}
+        }
+        if (voted == 0) return; // every guardian barred: turnout 0 -> Inconclusive
+
+        skipTime(court.voteWindow() + 1);
+        // `finalize` calls back into `ChallengeGame.rule`, which is what
+        // actually settles the slash and forfeits the proposer bond.
+        try court.finalize(caseId) {} catch {}
+    }
+
+    /// @dev First proposal that `file` would currently accept: executed, still
+    ///      inside its challenge window, and carrying booked coverage — the
+    ///      `NothingToFreeze` guard rejects a proposal no guardian approved.
+    ///      Returns 0 when none qualifies.
+    function _challengeableProposal(uint256 seed) internal view returns (uint256) {
+        uint256 count = governor.proposalCount();
+        if (count == 0) return 0;
+        uint256 start = seed % count;
+        for (uint256 n; n < count; n++) {
+            uint256 pid = ((start + n) % count) + 1;
+            ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(pid);
+            if (p.executedAt == 0) continue;
+            if (block.timestamp > p.executedAt + p.strategyDuration + ledger.challengeWindow()) continue;
+            (, uint256[] memory committed) = ledger.approversOf(address(governor), pid);
+            uint256 total;
+            for (uint256 i; i < committed.length; i++) {
+                total += committed[i];
+            }
+            if (total == 0) continue;
+            return pid;
+        }
+        return 0;
+    }
+
+    /// @dev An actor outside the guardian range, so using it as challenger or
+    ///      counter-bond contributor does not burn a court voter.
+    function _nonGuardian(uint256 seed) internal view returns (address) {
+        uint256 span = actors.length - GUARDIAN_COUNT;
+        return actors[GUARDIAN_COUNT + (seed % span)];
+    }
+
     // ―――――――――――――――――――――――― Unclamped ―――――――――――――――――――――――――
 
     function challengeGame_claimContribution(uint256 challengeId) public asActor {

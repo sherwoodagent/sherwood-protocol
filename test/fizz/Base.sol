@@ -153,6 +153,12 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
     ///      challenger from voting, so with fewer than three staked guardians
     ///      a conviction could never clear the participation floor (I-20).
     uint256 internal constant GUARDIAN_COUNT = 3;
+    /// @dev Guardians that approve a proposal, leaving `GUARDIAN_COUNT -
+    ///      APPROVER_COUNT` staked but unaccused. The reserve exists because
+    ///      TokenCourt bars approvers (`isAccused`) from voting: with every
+    ///      guardian approving there is no eligible electorate, turnout is zero
+    ///      and a disputed challenge can never reach a verdict.
+    uint256 internal constant APPROVER_COUNT = GUARDIAN_COUNT - 1;
 
     modifier asActor() virtual {
         vm.startPrank(actor);

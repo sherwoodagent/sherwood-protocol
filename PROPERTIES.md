@@ -30,7 +30,7 @@ Checked after every call sequence.
 - [ ] **GL-02** `SHOULD-HOLD` — `wood.balanceOf(GuardianRegistry) == slashAppealReserve`.
   The registry custodies no other WOOD; `fundSlashAppealReserve` / `refundSlash`
   are the only two writers, each paired 1:1 with a real transfer.
-- [ ] **GL-03** `SHOULD-HOLD` — `wood.balanceOf(ProposerBondEscrow) >= Σ locked bond amounts`.
+- [x] **GL-03** `SHOULD-HOLD` — `wood.balanceOf(ProposerBondEscrow) >= Σ locked bond amounts`.
   The escrow keeps no aggregate of its own, so this needs a ghost (x-ray I-24 shape).
 - [ ] **GL-04** `SHOULD-HOLD` — `wood.balanceOf(TierRegistry) >= totalBondedWood`
   (valid while WOOD is the only configured bond token, which the harness enforces).
@@ -42,14 +42,14 @@ Checked after every call sequence.
   No public getter for `_pidReserved`; requires a ghost mirroring both write sites.
 - [x] **GL-09** `SHOULD-HOLD` — Σ actor vault-share balances + queue-escrowed shares == `vault.totalSupply()`.
   Standard no-phantom-mint check, specialised to the one non-wallet share holder.
-- [ ] **GL-10** `SHOULD-HOLD` — Σ actor asset balances + `asset.balanceOf(vault)` == total minted asset supply.
+- [x] **GL-10** `SHOULD-HOLD` — Σ actor asset balances + `asset.balanceOf(vault)` == total minted asset supply.
   `asset` never leaves the {actors, vault} set in the fuzzed surface.
 - [x] **GL-11** `SHOULD-HOLD` — `StakedWood.totalGuardianStake` == Σ `stakedAmount` over
   guardians with `unstakeRequestedAt == 0`. The conditional decrement in `_slashOne`
   (active-only) is the subtle edge (x-ray I-4).
-- [ ] **GL-12** `SHOULD-HOLD` — per guardian, `ledger.openExposureUsd(g)` == Σ of that
+- [x] **GL-12** `SHOULD-HOLD` — per guardian, `ledger.openExposureUsd(g)` == Σ of that
   guardian's per-proposal recorded exposure via `approversOf` (x-ray I-5, first clause).
-- [ ] **GL-13** `SHOULD-HOLD` — per guardian, pledged-basis total == Σ per-proposal
+- [x] **GL-13** `SHOULD-HOLD` — per guardian, pledged-basis total == Σ per-proposal
   `pledgedOf` entries. `_livePledgedUsd` has no accessor; needs a ghost (x-ray I-5, second clause).
 - [x] **GL-14** `SHOULD-HOLD` — while a challenge is live, Σ contributor amounts ==
   `challengeOf(id).counterBondWood` (x-ray I-6).
@@ -68,9 +68,9 @@ Checked after every call sequence.
   reporting `isCoverageFrozen` true.
 - [ ] **GL-19** `SHOULD-HOLD` — a guardian never appears in both the approver and
   blocker set of the same review. Explicitly marked LOAD-BEARING in source.
-- [ ] **GL-20** `SHOULD-HOLD` — approver-array length == count of guardians whose
+- [x] **GL-20** `SHOULD-HOLD` — approver-array length == count of guardians whose
   recorded vote is Approve (and the blocker mirror).
-- [ ] **GL-21** `SHOULD-HOLD` — at most one live challenge per (review key, challenger) (x-ray G-44).
+- [x] **GL-21** `SHOULD-HOLD` — at most one live challenge per (review key, challenger) (x-ray G-44).
 - [ ] **GL-22** `SHOULD-HOLD` — `registry.paused()` is false iff `pausedAt == 0`.
   A drifted `pausedAt` corrupts the next cycle's deadman delay.
 
@@ -131,7 +131,7 @@ Checked after every call sequence.
 - [ ] **GL-48** `SHOULD-HOLD` — a historical checkpoint read is stable: once `ts` is past,
   `getPastVotes(g, ts)` returns the same value regardless of later top-ups.
   The spec names "deflation-only drift" as a prior bug class this design fixed.
-- [ ] **GL-49** `EXPLORATORY` — per guardian, Σ booked coverage shares across keys
+- [x] **GL-49** `EXPLORATORY` — per guardian, Σ booked coverage shares across keys
   <= their slashable stake. This is x-ray X-8, flagged On-chain=**No** — the
   mathematical core of E-1 that nothing currently asserts.
 

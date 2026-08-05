@@ -27,14 +27,56 @@ abstract contract SyndicateGovernorHandler is Properties {
 
     /// @dev `propose` rejects an empty execute batch (`EmptyExecuteCalls`), so
     ///      every proposal carries one fund-neutral call to the certified,
-    ///      allowlisted `FizzAdapter`. Caps are all-zero: `poke()` moves no
-    ///      assets, so a zero cap is legal and keeps `execSum <= maxCapital`
-    ///      trivially satisfied (G-10).
-    function _benignBatch() internal view returns (BatchExecutorLib.Call[] memory calls, uint256[] memory caps) {
+    ///      allowlisted `FizzAdapter`.
+    /// @dev `cap` is the per-call capital DECLARATION, and it is what prices the
+    ///      proposal's coverage: `requiredCoverage` is derived from the caps and
+    ///      the target's `extractableBoundBps`, NOT from `envelope.maxCapital`.
+    ///
+    ///      A zero cap therefore prices the proposal to zero coverage, and the
+    ///      governor treats that as "can extract nothing, needs no covering
+    ///      signer" (`SyndicateGovernor.sol:1494`) — so no guardian approval
+    ///      ever books, `ExposureLedger` records nothing, and
+    ///      `ChallengeGame.file` reverts `NothingToFreeze` because there is no
+    ///      coverage to freeze. That is a legitimate protocol path, but it was
+    ///      the ONLY path this harness proposed, which is why the whole
+    ///      adjudication chain sat unreachable behind it.
+    ///
+    ///      `FizzAdapter.poke` is fund-neutral, so a non-zero cap is a
+    ///      declaration the call never uses; the per-call meter enforces the
+    ///      declaration is not exceeded, and under-spending it is fine.
+    function _benignBatch(uint256 cap)
+        internal
+        view
+        returns (BatchExecutorLib.Call[] memory calls, uint256[] memory caps)
+    {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] =
             BatchExecutorLib.Call({target: address(adapter), data: abi.encodeCall(FizzAdapter.poke, ()), value: 0});
         caps = new uint256[](1);
+        caps[0] = cap;
+    }
+
+    /// @dev Largest asset-denominated capital the guardian cohort can back,
+    ///      derived from live bonds rather than hardcoded: sum each guardian's
+    ///      slashable bond (scaled by `kNumerator`, the ledger's leverage on
+    ///      bond-to-coverage), then convert that USD figure back into asset
+    ///      units through the ledger's own `coverageUsd` so the asset's decimals
+    ///      and feed price are respected. Conservative: `requiredCoverage` is at
+    ///      most the declared capital, so staying under this keeps the cohort
+    ///      able to cover it.
+    function _coverableCapital() internal view returns (uint256) {
+        uint256 capacityUsd;
+        for (uint256 i; i < APPROVER_COUNT; i++) {
+            capacityUsd += ledger.slashableBondUsd(actors[i]);
+        }
+        capacityUsd *= ledger.kNumerator();
+        if (capacityUsd == 0) return 0;
+
+        // USD18 produced by one whole asset unit, used as the inverse rate.
+        uint256 unit = 10 ** ASSET_DECIMALS;
+        uint256 usdPerUnit = ledger.coverageUsd(address(asset), unit);
+        if (usdPerUnit == 0) return 0;
+        return (capacityUsd * unit) / usdPerUnit;
     }
 
     /// @dev Only registered agents may propose. Coverage cycle 1 showed the
@@ -62,7 +104,8 @@ abstract contract SyndicateGovernorHandler is Properties {
             maxCapital: clampBetween(capitalSeed, 1, ceiling), maxDrawdownBps: 10_000
         });
 
-        (BatchExecutorLib.Call[] memory ecalls, uint256[] memory ecaps) = _benignBatch();
+        // Cap = the full envelope, so the proposal prices to real coverage.
+        (BatchExecutorLib.Call[] memory ecalls, uint256[] memory ecaps) = _benignBatch(env.maxCapital);
         syndicateGovernor_propose(
             address(vault),
             address(0),
@@ -93,7 +136,7 @@ abstract contract SyndicateGovernorHandler is Properties {
             agent: actors[GUARDIAN_COUNT + (agentSeed % 2)], splitBps: clampBetween(splitBps, 1, 9_000)
         });
 
-        (BatchExecutorLib.Call[] memory ecalls, uint256[] memory ecaps) = _benignBatch();
+        (BatchExecutorLib.Call[] memory ecalls, uint256[] memory ecaps) = _benignBatch(ceiling);
         syndicateGovernor_propose(
             address(vault),
             address(0),
@@ -131,19 +174,36 @@ abstract contract SyndicateGovernorHandler is Properties {
         uint256 ceiling = vault.totalAssets();
         if (ceiling == 0) return;
 
+        // Cap the envelope at what the guardian cohort's bonds can actually
+        // cover. Sizing purely off vault TVL prices `requiredCoverage` above
+        // the whole cohort's slashable stake, and execute dies on
+        // `InsufficientApproveCoverage` — an executed proposal is the gate for
+        // everything downstream, so it is worth staying under it.
+        uint256 coverable = _coverableCapital();
+        if (coverable == 0) return;
+        if (coverable < ceiling) ceiling = coverable;
+
         ISyndicateGovernor.GovernorParams memory p = governor.getGovernorParams();
         uint256 duration = clampBetween(strategyDuration, p.minStrategyDuration, p.maxStrategyDuration);
 
         actor = _toAgent(capitalSeed);
-        (BatchExecutorLib.Call[] memory ecalls, uint256[] memory ecaps) = _benignBatch();
+        // Hoisted so the declared cap and the envelope cannot drift apart:
+        // `sum(caps) <= maxCapital` is a propose-time guard.
+        // Floored at half the ceiling, NOT at 1. `clampBetween` wraps by
+        // modulo, so a seed that happens to be an exact multiple of the range
+        // lands on the low bound — a capital of 1 prices `requiredCoverage` to
+        // effectively zero, no guardian books anything, and this composite
+        // silently degrades into the zero-coverage path it exists to avoid.
+        // Small-capital proposals stay reachable through the plain propose
+        // handlers; this one is specifically the material-coverage path.
+        uint256 capital = clampBetween(capitalSeed, (ceiling / 2) + 1, ceiling);
+        (BatchExecutorLib.Call[] memory ecalls, uint256[] memory ecaps) = _benignBatch(capital);
         syndicateGovernor_propose(
             address(vault),
             address(0),
             "fizz-lifecycle",
             duration,
-            ISyndicateGovernor.RiskEnvelope({
-                maxCapital: clampBetween(capitalSeed, 1, ceiling), maxDrawdownBps: 10_000
-            }),
+            ISyndicateGovernor.RiskEnvelope({maxCapital: capital, maxDrawdownBps: 10_000}),
             ecalls,
             ecaps,
             ecalls,
@@ -157,18 +217,34 @@ abstract contract SyndicateGovernorHandler is Properties {
         // any ballot is cast.
         skipTime(1);
 
-        // A guardian approval books USD coverage against real stake — the
-        // input every ExposureLedger and slashing invariant depends on.
-        // Called directly rather than through GuardianRegistryHandler: the two
+        // ORDER IS LOAD-BEARING: guardian review opens only AFTER `voteEnd`,
+        // so an approve vote cast here — before `openReview` — reverts
+        // `ReviewNotOpen`. This originally voted first, the revert was
+        // swallowed by the try/catch, and the result was that NO proposal this
+        // harness ever executed carried booked coverage. `requiredCoverage`
+        // stayed unbacked, `approversOf` came back empty, and
+        // `ChallengeGame.file` reverted `NothingToFreeze` on every attempt —
+        // which is why ExposureLedger, ChallengeGame, TokenCourt and
+        // ProposerBondEscrow all flatlined around 30%.
+        skipTime(p.votingPeriod + 1);
+        try registry.openReview(address(governor), pid) {} catch {}
+
+        // Approve with every guardian EXCEPT the reserved court voter. A single
+        // bond rarely covers `requiredCoverage` (`requireApproveQuorum` reverts
+        // `InsufficientApproveCoverage` when the cohort raises nothing), but
+        // approving with ALL of them makes every guardian `isAccused` and
+        // therefore barred from the TokenCourt vote — which leaves a filed
+        // challenge stranded in `Disputed`, unable to reach a verdict. The
+        // cohort has to be split: approvers back the proposal, the reserve
+        // adjudicates it.
+        // Called directly rather than through GuardianRegistryHandler — the two
         // handlers are sibling branches off `Properties`, so neither sees the
         // other's functions.
-        vm.prank(toGuardian(guardianSeed));
-        try registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve) {} catch {}
+        for (uint256 i; i < APPROVER_COUNT; i++) {
+            vm.prank(actors[i]);
+            try registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve) {} catch {}
+        }
 
-        skipTime(p.votingPeriod + 1);
-
-        // Guardian review: open, let the window elapse, resolve.
-        try registry.openReview(address(governor), pid) {} catch {}
         skipTime(registry.reviewPeriod() + 1);
         try registry.resolveReview(address(governor), pid) {} catch {}
 
