@@ -22,7 +22,7 @@ means `stakedAmount > 0` and no pending unstake request.
 |---|---|---|---|---|
 | `minGuardianStake` | 10 000 WOOD | 1 WOOD | — | `StakedWood.sol:818` |
 | `coolDownPeriod` (unstake delay) | 7 d | 1 d | 30 d, and ≥ `registry.reviewPeriod` | `StakedWood.sol:833` |
-| `minOwnerStake` (vault-owner bond) | 10 000 WOOD | 0 (open onboarding) or ≥ 1 000 | — | `StakedWood.sol:848` |
+| `minOwnerStake` (vault-owner bond at creation) | 10 000 WOOD | 0 (open onboarding) or ≥ 1 000 | — | `StakedWood.sol:848` |
 | `minSlashBps` | 10% | 0 | ≤ `maxSlashBps` | `StakedWood.sol:858` |
 | `maxSlashBps` | 100% | ≥ `minSlashBps` | 100% | `StakedWood.sol:867` |
 | `ageFloorBps` (new-stake vote weight) | 25% | > 0 | 100% | `StakedWood.sol:874` |
@@ -193,7 +193,8 @@ the verdict. No panel, no appeal.
 - `unstick` — vault owner replays the already-voted settlement calls after
   `strategyDuration`. No review: the calldata was already reviewed.
 - `emergencySettleWithCalls` — vault owner submits **new** calls; requires the
-  owner's sWOOD bond (`requiredOwnerBond`, currently flat `minOwnerStake`) and opens
+  owner's sWOOD bond (`requiredOwnerBond` = `max(minOwnerStake, 1 000 WOOD)`,
+  and the posted bond must be strictly positive) and opens
   a fresh guardian review (block-only voting). A block slashes the **owner's bond**,
   not guardians. Finalize executes with per-call caps disabled — the escape hatch
   for a settlement leg stuck on a cap.

@@ -35,11 +35,26 @@ import {MorphoSupplyStrategy} from "../../src/strategies/MorphoSupplyStrategy.so
  *      (`0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010` on 4663, verified live),
  *      which the CLONE validates at init via `MarketNotCreated`.
  *
+ * @dev OPERATOR ACTION REQUIRED, and it is NOT part of this script. Since the
+ *      pashov 2026-08 finding-12 fix, `MorphoSupplyStrategy._initialize` binds
+ *      its proposer-supplied Morpho singleton to the governance-owned
+ *      `TierRegistry` (`vault() -> governor() -> tierRegistry() ->
+ *      isAdapterAllowed`) and reverts `MorphoNotAllowed` otherwise. The
+ *      registry owner MUST therefore call
+ *      `setAdapterAllowed(0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010, true)`
+ *      before any Morpho proposal can clone this template. It is deliberately
+ *      not done here: this phase runs before `DeployStrategyFactory` and the
+ *      registry is owned by the parameter multisig, not the deployer key.
+ *      (The binding SKIPS when the walk resolves no registry at all, so a
+ *      registry-less deployment is unaffected — but 4663 has one.)
+ *
  *   Ceremony position (openspec/specs/deployment-docs/spec.md):
  *     core (3 phases) -> DeployPortfolioStrategy -> THIS -> DeployStrategyFactory
  *
  *   Prerequisites:
  *     - Core stack already deployed via Deploy.s.sol.
+ *     - Post-ceremony: registry owner allowlists the Morpho Blue singleton
+ *       (see the OPERATOR ACTION note above).
  *
  *   Usage:
  *     forge script script/robinhood-mainnet/DeployMorphoStrategy.s.sol:DeployMorphoStrategy \
