@@ -921,26 +921,29 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
     }
 
-    /// @notice INVERTED by the zero-cap refusal added in #220. A proposal that
-    ///         carries execute calls and prices at ZERO coverage is now refused
-    ///         at propose (`UnpricedCapability`), where it used to execute
-    ///         "optimistically".
-    /// @dev    Zero coverage is not inert -- it is the value at which three
-    ///         controls switch off together: the approve quorum never runs and
-    ///         `effectiveMaxCapital` stays at the full declared `maxCapital`,
-    ///         `proposerBondWood(asset, 0)` locks no bond, and
-    ///         `ExposureLedger.recordApproval` returns early leaving
-    ///         `_approversOf` empty, so `ChallengeGame.file` reverts
-    ///         `NothingToFreeze` and the proposal is unchallengeable for life.
+    /// @notice Review finding M-1, preserved: `requiredCoverage == 0` still
+    ///         passes optimistically at threshold 0, with zero approvers. Not an
+    ///         exception to the rule above but the same rule evaluated at zero —
+    ///         a proposal that can extract nothing has nothing to underwrite,
+    ///         and demanding a covering signer for it is pure throughput loss.
     ///
-    ///         The fixture reaches zero the honest way: 1 unit at a 1 bp bound
-    ///         floors to 0 under integer division. That is exactly the shape
-    ///         the guard exists to catch, so the test now pins the refusal.
-    function test_propose_zeroRequiredCoverageWithExecuteCallsIsRefused() public {
-        _wireTierRegistryCertifiedAt(0, 1); // 1 bp -- the smallest certifiable bound
-        // 1 unit x 1 bp / 10_000 == 0 after integer division, on both calls.
-        vm.expectRevert(ISyndicateGovernor.UnpricedCapability.selector);
-        _proposeSolo(governor, address(vault), agent, 1);
+    /// @dev    Reached by ROUNDING, not by a zero bound: `TierRegistry.certify`
+    ///         rejects `extractableBoundBps == 0` (`BoundRequired`), so the only
+    ///         way to a zero coverage figure is a `maxCapital` small enough that
+    ///         `maxCapital × boundBps / 10_000` floors to 0. That makes this the
+    ///         genuine reachable case rather than a synthetic one.
+    function test_execute_zeroRequiredCoverage_passesOptimistically() public {
+        _wireTierRegistryCertifiedAt(0, 1); // 1 bp — the smallest certifiable bound
+        // 1 unit × 1 bp / 10_000 == 0 after integer division, on both calls.
+        uint256 pid = _proposeSolo(governor, address(vault), agent, 1);
+        assertEq(governor.getProposalTier(pid), 0);
+        assertEq(governor.getRequiredCoverage(pid), 0);
+
+        _toApproved(pid);
+        governor.executeProposal(pid); // no approvers, still executes
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+        // issue #27: zero `requiredCoverage` skips the gate, so nothing scales.
+        assertEq(governor.getEffectiveMaxCapital(pid), 1, "ungated path stores the declared maxCapital");
     }
 
     /// @notice An unwired governor keeps Plan A behaviour — no quorum at all.
@@ -1200,30 +1203,54 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(wood.balanceOf(agent), balBefore + 200e18, "opens one second past the term-inclusive deadline");
     }
 
-    /// @notice SUPERSEDED. This exercised the bond gate under a game window
-    ///         LONGER than the ledger's -- the state where a gate reading only
-    ///         `challengeableUntil` would release while the game still admitted
-    ///         a filing.
+    /// @notice DESIGN D2 — why the gate is a `max` and not `challengeableUntil`
+    ///         alone. The two windows can diverge with no `Inconclusive`
+    ///         anywhere in the picture: `ChallengeGame`'s own setters floor its
+    ///         window under the ledger's, but `ExposureLedger.setChallengeWindow`
+    ///         floors only against the registry's review period and has no
+    ///         game-side check, so the ledger owner can drop the ledger's window
+    ///         below the game's afterwards.
     ///
-    ///         That state is no longer constructible. Both setters now enforce
-    ///         the coupling: `setCoverageFreezer` rejects a freezer whose
-    ///         `challengeWindow()` exceeds the ledger's, and
-    ///         `setChallengeWindow` rejects a shrink below the wired game's.
-    ///         So the divergence is closed at the source rather than tolerated
-    ///         by the gate, and the gate's handling of it becomes defence in
-    ///         depth rather than a reachable path.
-    ///
-    ///         The test now pins the refusal, which is the property that
-    ///         actually holds. `test_setChallengeWindow_cannotShrinkBelowThe`
-    ///         `WiredGameWindow` in `test/audit-2/ExposureLedger_pledgeAndPins`
-    ///         covers the other direction.
-    function test_setCoverageFreezer_refusesAGameWindowAboveTheLedgers() public {
-        _executeThenSettle();
+    ///         Here `challengeableUntil` is ZERO throughout — a gate reading
+    ///         only that value would have released on the ledger's deadline
+    ///         while the game still admitted a filing for another week. The
+    ///         divergence is set up from the game's side (a stub with a longer
+    ///         window) because it is the identical condition and does not
+    ///         require an `ExposureLedger` setter whose floor this fixture's
+    ///         EOA registry cannot answer.
+    function test_reclaimBond_gameWindowAboveTheLedgers_waitsForTheGame() public {
+        uint256 pid = _executeThenSettle();
         uint256 gameWindow = ledger.challengeWindow() + 7 days;
         MockFilingDeadline stubGame = new MockFilingDeadline(gameWindow);
         vm.prank(ledgerOwner);
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
         ledger.setCoverageFreezer(address(stubGame));
+
+        uint256 executedAt = governor.getProposal(pid).executedAt;
+        // Every deadline here is anchored at `executedAt + strategyDuration`,
+        // not `executedAt` — risk ends when the strategy's term is over AND
+        // the window on top of it has run out (second-audit finding A).
+        uint256 anchor = executedAt + governor.getProposal(pid).strategyDuration;
+        assertEq(
+            stubGame.challengeableUntil(keccak256(abi.encode(address(governor), pid))),
+            0,
+            "no Inconclusive here -- the divergence IS the two windows"
+        );
+
+        // Both original gates are open at the ledger's deadline...
+        vm.warp(anchor + ledger.challengeWindow());
+        assertFalse(ledger.isCoverageFrozen(address(governor), pid), "and nothing is frozen");
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        governor.reclaimProposerBond(pid);
+
+        // ...and the hold runs to the GAME's deadline, strictly.
+        vm.warp(anchor + gameWindow);
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        governor.reclaimProposerBond(pid);
+
+        uint256 balBefore = wood.balanceOf(agent);
+        vm.warp(anchor + gameWindow + 1);
+        governor.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), balBefore + 200e18);
     }
 
     /// @notice The other arm of the same `max`: a `challengeableUntil` raised

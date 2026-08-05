@@ -452,19 +452,15 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
     ///         Fails against the pre-fix code (no such check exists, so the
     ///         shrink below succeeds), passes against the fix.
     function test_setChallengeWindow_cannotShrinkBelowTheWiredGameWindow() public {
-        // ORDER MATTERS NOW. `setCoverageFreezer` gained the same coupling
-        // check (`challengeWindow < gameWindow` reverts `InvalidParameter`), so
-        // wiring a 20-day game while the ledger still sits at its default
-        // reverts before this test reaches its subject. Raise the ledger's
-        // window FIRST, then wire the game -- which is also the order an
-        // operator would have to use.
-        vm.prank(owner);
-        ledger.setChallengeWindow(25 days);
-        assertEq(ledger.challengeWindow(), 25 days);
-
         MockChallengeGameWindow game = new MockChallengeGameWindow(20 days);
         vm.prank(owner);
         ledger.setCoverageFreezer(address(game));
+
+        // Bump the ledger's window above the game's first, isolating the
+        // SHRINK direction finding D is about.
+        vm.prank(owner);
+        ledger.setChallengeWindow(25 days);
+        assertEq(ledger.challengeWindow(), 25 days);
 
         // Shrinking below the game's own 20d window must revert.
         vm.prank(owner);
