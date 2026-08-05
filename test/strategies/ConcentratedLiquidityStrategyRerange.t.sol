@@ -43,6 +43,52 @@ contract ConcentratedLiquidityStrategyTunablesTest is CLFixture {
         strategy.updateParams(abi.encode(tooHigh, uint256(0)));
     }
 
+    /// @dev The ceiling check alone does NOT make this "only risk-reducing".
+    ///      `updateParams` is `onlyProposer` in `Executed`, and `settleProposal`
+    ///      is proposer-callable an hour after execute — so a proposal voters
+    ///      reviewed at a tight settlement band could be widened to the ceiling
+    ///      by its own proposer and then settled through, into a sandwich they
+    ///      control, with nobody reviewing the change. Raising must be refused
+    ///      at every value, not merely above the ceiling.
+    function test_updateParams_cannotWidenSlippageAfterApproval() public {
+        _execute();
+        uint256 approved = strategy.settleSlippageBps();
+        assertEq(approved, 500, "fixture no longer approves 500 bps");
+
+        vm.prank(proposer);
+        vm.expectRevert(ConcentratedLiquidityStrategy.ImmutableParam.selector);
+        strategy.updateParams(abi.encode(approved + 1, uint256(0)));
+
+        // All the way to the ceiling — the value the bare ceiling check admits,
+        // and the one the sandwich actually wants.
+        uint256 ceiling = strategy.MAX_SLIPPAGE_BPS();
+        vm.prank(proposer);
+        vm.expectRevert(ConcentratedLiquidityStrategy.ImmutableParam.selector);
+        strategy.updateParams(abi.encode(ceiling, uint256(0)));
+
+        assertEq(strategy.settleSlippageBps(), approved, "settlement band widened after approval");
+    }
+
+    /// @dev And the rule is a RATCHET, not a comparison against the initial
+    ///      value: once tightened, the old band is no longer reachable either.
+    function test_updateParams_slippageRatchetsDownOnly() public {
+        _execute();
+
+        vm.prank(proposer);
+        strategy.updateParams(abi.encode(uint256(100), uint256(0)));
+        assertEq(strategy.settleSlippageBps(), 100, "tightening was refused");
+
+        vm.prank(proposer);
+        vm.expectRevert(ConcentratedLiquidityStrategy.ImmutableParam.selector);
+        strategy.updateParams(abi.encode(uint256(101), uint256(0)));
+
+        // Equal is not a widening, so it stays admissible.
+        vm.prank(proposer);
+        strategy.updateParams(abi.encode(uint256(100), uint256(7 days)));
+        assertEq(strategy.settleSlippageBps(), 100);
+        assertEq(strategy.settleDeadline(), 7 days, "deadline is not gated by the slippage ratchet");
+    }
+
     /// @dev The range, the pool, and every rerange-policy field are unreachable
     ///      from `updateParams` BY CONSTRUCTION — the decoder accepts exactly two
     ///      uint256s, so there is no encoding that names them. This pins that
@@ -182,6 +228,60 @@ contract ConcentratedLiquidityStrategyRerangeTest is CLFixture {
         int24 half = (upper - lower) / 2;
         int24 target = mid + (half * 85) / 100;
         pool.setTicks(target, target);
+    }
+
+    /// @dev `_execute` ends on `_requireWithinPoolShare` against the liquidity it
+    ///      actually minted; a rerange that skipped it would be the way around
+    ///      the cap, because it re-mints the same notional through the same
+    ///      `_mintPosition`. Two routes reach the breach — a half-width narrow
+    ///      enough that the same capital becomes a much larger share of one
+    ///      spacing, and (modelled here, because the mock's liquidity is not a
+    ///      function of the range) depth that simply fell away between execute
+    ///      and rerange with the half-width unchanged.
+    function test_rerange_exceedingPoolShareCapReverts() public {
+        _execute();
+        uint256 tidBefore = strategy.tokenId();
+        (,,,,,,, uint128 live,,,,) = posm.positions(tidBefore);
+        assertGt(live, 0, "fixture minted nothing, the cap could not bind");
+
+        _warpPastInterval();
+        _moveToTrigger();
+
+        // The venue can now carry only a tenth of what this position alone is.
+        pool.setLiquidity(live);
+
+        vm.prank(keeper);
+        vm.expectRevert(ConcentratedLiquidityStrategy.PositionExceedsPoolShareCap.selector);
+        strategy.rerange();
+
+        // Refusing costs nothing that is not recoverable: the position is still
+        // there, in its last approved range, and still settleable.
+        assertEq(strategy.rerangeCount(), 0, "rerange landed despite breaching the cap");
+        assertEq(strategy.tokenId(), tidBefore, "position replaced by a rerange that should have reverted");
+        _accrueFees(1_000e6);
+        _settle();
+        assertEq(
+            uint256(strategy.state()), uint256(BaseStrategy.State.Settled), "position stuck after a refused rerange"
+        );
+    }
+
+    /// @dev The companion to the test above: the check is a CAP, not a blanket
+    ///      refusal. The same rerange lands the moment the venue is deep enough
+    ///      to carry the position at the approved share.
+    function test_rerange_atThePoolShareCapSucceeds() public {
+        _execute();
+        (,,,,,,, uint128 live,,,,) = posm.positions(strategy.tokenId());
+
+        _warpPastInterval();
+        _moveToTrigger();
+
+        // Ten times the position is exactly the 10% cap. A shade above it, so
+        // the mock's sqrt rounding cannot decide the assertion.
+        pool.setLiquidity(uint128(uint256(live) * 10 + 1_000));
+
+        vm.prank(keeper);
+        strategy.rerange();
+        assertEq(strategy.rerangeCount(), 1, "rerange refused at a share the cap admits");
     }
 
     // ── 6.6 Determinism ──
@@ -402,5 +502,65 @@ contract ConcentratedLiquidityStrategyRerangeTest is CLFixture {
         _resetTriggerRelativeToRange();
         vm.expectRevert(ConcentratedLiquidityStrategy.RerangeCapReached.selector);
         strategy.rerange();
+    }
+}
+
+/// @notice The single-sided LP configuration — `swapFractionBps == 0`, which
+///         `_requireValidBounds` accepts as `<= BPS_DENOMINATOR` and which is
+///         precisely how a proposal for a range sitting entirely on one side of
+///         spot is expressed.
+/// @dev    `_rebalanceToTarget` skips the quote when nothing of `otherToken` is
+///         held, so `otherValue` stays 0 — and the SELL branch is still reached
+///         in that state, because `targetOtherValue > otherValue` is `0 > 0`.
+///         The proportional conversion then divides by `otherValue` BEFORE the
+///         `toSwap == 0` guard, so the whole call panics 0x12. That is an
+///         undecodable revert of `execute()` with the proposer's bond already
+///         locked, and of permissionless `rerange()` on any position holding
+///         only the vault asset.
+contract ConcentratedLiquidityStrategySingleSidedTest is CLFixture {
+    /// @dev Replaces the fixture's clone with one configured to buy none of the
+    ///      volatile leg, re-binding the active proposal and the vault approval
+    ///      so `execute()` reaches the code under test rather than the guards.
+    function _useSingleSidedStrategy() internal {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.swapFractionBps = 0;
+        p.rerange.swapFractionBps = 0;
+        strategy = _newStrategy(p);
+        status.set(1, 1, address(strategy));
+        vm.prank(address(vaultStub));
+        usdg.approve(address(strategy), type(uint256).max);
+    }
+
+    function test_execute_singleSidedConfigDoesNotPanic() public {
+        _useSingleSidedStrategy();
+
+        _execute();
+
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed), "execute did not complete");
+        assertGt(strategy.tokenId(), 0, "no position minted");
+        // And it genuinely stayed single-sided rather than being rescued by a
+        // swap: nothing of the volatile leg was bought.
+        assertEq(nvda.balanceOf(address(strategy)), 0, "single-sided config bought the volatile leg");
+    }
+
+    /// @dev The same divisor, reached from the permissionless entry point. Fee
+    ///      income in the VAULT ASSET is what hands the re-mint a non-zero asset
+    ///      balance against a zero `otherToken` balance — the exact state the
+    ///      sell branch divides by zero in.
+    function test_rerange_singleSidedConfigDoesNotPanic() public {
+        _useSingleSidedStrategy();
+        _execute();
+
+        usdg.mint(address(posm), 1_000e6);
+        posm.accrueFees(strategy.tokenId(), uint128(1_000e6), 0);
+        assertEq(nvda.balanceOf(address(strategy)), 0, "fixture did not produce a one-legged position");
+
+        vm.warp(vm.getBlockTimestamp() + 2 hours);
+        pool.setTicks(850, 850);
+
+        vm.prank(keeper);
+        strategy.rerange();
+
+        assertEq(strategy.rerangeCount(), 1, "rerange did not complete");
     }
 }
