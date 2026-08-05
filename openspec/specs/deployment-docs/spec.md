@@ -138,6 +138,27 @@ To make guardian blocking real (not the cold-start bypass), total staked guardia
 - The env key is `WOOD_PRICE_CAP_X8`, RENAMED from `WOOD_PRICE_HAIRCUT_X8` because the number's meaning inverted: it is a ceiling on manipulation, never served as a price, and SHALL be seeded **ABOVE** market — 1.25–2× is the intended band, reviewed monthly. The old "≤ 30-day low" instruction is now exactly backwards: a cap below market binds permanently, pins every bond at the cap and makes the market source inert.
 - `WOOD_TWAP_ORACLE` SHALL name a `WoodTwapOracle` that ALREADY HAS A COMPLETED AVERAGING WINDOW. The oracle needs at least `twapWindow` of keeper activity before `consult()` answers, so the ceremony ordering is: deploy the oracle → run the keeper → run Plan B. Pre-flight 8 enforces this rather than merely documenting it.
 
+#### Scenario: Unset price cap refused post-broadcast
+- **WHEN** `DeployPlanB` completes its broadcast with `woodUsdPriceX8` still zero
+- **THEN** the run FAILS naming the cap, because a zero cap reverts every price read and nothing can be proposed, executed or challenged
+
+#### Scenario: Cap set but nothing priced under it
+- **GIVEN** `WOOD_PRICE_CAP_X8` is non-zero but no TWAP oracle is wired (and chain 4663 has no Chainlink WOOD/USD feed)
+- **WHEN** the post-broadcast pre-flights run
+- **THEN** the run FAILS on the composed price — proving the cap-only assert would have passed a dead deployment
+
+#### Scenario: Oracle wired but not yet primed
+- **GIVEN** the TWAP oracle is wired but has no completed averaging window
+- **THEN** pre-flight 8 FAILS, directing the operator to run the keeper for at least `twapWindow` before re-running
+
+#### Scenario: Wrong slash ceiling refused pre-deploy
+- **WHEN** `DeployPlanB` runs against an sWOOD with `maxSlashBps < 10_000`
+- **THEN** the script reverts its PRE-FLIGHT before deploying the ledger
+
+#### Scenario: Unwired unstake gate refused post-wiring
+- **WHEN** the broadcast completes but sWOOD's `exposureLedger` pointer is still zero
+- **THEN** the script reverts, directing the operator to call `setExposureLedger(ledger)` by governance and re-run
+
 ### Requirement: The WOOD TWAP oracle has its own deploy step
 
 `script/DeployWoodTwapOracle.s.sol:DeployWoodTwapOracle` SHALL deploy the `WoodTwapOracle`, record the first observation, and persist `WOOD_TWAP_ORACLE` to `chains/{chainId}.json`. It runs AFTER the three core phases and BEFORE `DeployPlanB`.
@@ -163,27 +184,6 @@ Pre-flights, all PRE-broadcast:
 #### Scenario: Fork cannot prime the oracle
 - **GIVEN** a Tenderly vnet, where the pool stops trading at the fork point and `idle` grows without bound
 - **THEN** no amount of keeper activity primes the oracle there, and the vnet SHALL either generate swaps against the pair or wire a Chainlink-shaped WOOD feed via `ledger.setWoodFeed` instead — on mainnet the pair trades continuously (measured 2026-08-04: 10s idle), so the guard is near-free in production
-
-#### Scenario: Unset price cap refused post-broadcast
-- **WHEN** `DeployPlanB` completes its broadcast with `woodUsdPriceX8` still zero
-- **THEN** the run FAILS naming the cap, because a zero cap reverts every price read and nothing can be proposed, executed or challenged
-
-#### Scenario: Cap set but nothing priced under it
-- **GIVEN** `WOOD_PRICE_CAP_X8` is non-zero but no TWAP oracle is wired (and chain 4663 has no Chainlink WOOD/USD feed)
-- **WHEN** the post-broadcast pre-flights run
-- **THEN** the run FAILS on the composed price — proving the cap-only assert would have passed a dead deployment
-
-#### Scenario: Oracle wired but not yet primed
-- **GIVEN** the TWAP oracle is wired but has no completed averaging window
-- **THEN** pre-flight 8 FAILS, directing the operator to run the keeper for at least `twapWindow` before re-running
-
-#### Scenario: Wrong slash ceiling refused pre-deploy
-- **WHEN** `DeployPlanB` runs against an sWOOD with `maxSlashBps < 10_000`
-- **THEN** the script reverts its PRE-FLIGHT before deploying the ledger
-
-#### Scenario: Unwired unstake gate refused post-wiring
-- **WHEN** the broadcast completes but sWOOD's `exposureLedger` pointer is still zero
-- **THEN** the script reverts, directing the operator to call `setExposureLedger(ledger)` by governance and re-run
 
 ### Requirement: DeployPlanB seats the strategy-duration ceiling
 `DeployPlanB` SHALL seat `ProtocolConfig.maxStrategyDuration` inside the broadcast: to the documented default when `MAX_STRATEGY_DURATION` is unset in the environment, or to the operator-supplied value when set. A zero override SHALL be rejected before broadcast — an explicit "no ceiling" MUST NOT be expressible through this script. The post-broadcast assert SHALL confirm `maxStrategyDuration` is non-zero.
