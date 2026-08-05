@@ -605,6 +605,65 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
                 proposal.effectiveMaxCapital
             );
 
+        // THE SETTLE PRICE MAY NOT BE STAMPED AGAINST AN UNREALIZED UNWIND.
+        // `_finishSettlement` calls `vault.onProposalSettled`, which freezes
+        // `num = totalAssets() + 1` as the price EVERY queued deposit and redeem
+        // for this proposal is later paid at — and settlement is
+        // deliverable-maximum at the strategy layer, not all-or-revert
+        // (`MorphoSupplyStrategy` and `ConcentratedLiquidityStrategy` both emit
+        // `SettlementIncomplete` and continue). `MorphoSupplyStrategy` further
+        // caps delivery at Morpho's own idle balance, which is exactly what a
+        // fee-free `flashLoan` removes for one callback frame.
+        //
+        // So without this gate an unprivileged caller settles from inside a
+        // flash-loan callback, the strategy delivers ~0, and the stamp becomes
+        // `num == 1`: queued depositors mint against a near-zero price (traced:
+        // 1e29 shares against a 1e18 supply) and queued redeemers burn for zero
+        // assets, with `cancel` already closed by `AlreadySettled`.
+        //
+        // `maxDrawdownBps` is the envelope voters and guardians actually
+        // approved, and until now it was validated at propose and never read
+        // again. Enforcing it here is what makes it load-bearing.
+        //
+        // MEASURED AS AN ABSOLUTE DROP AGAINST THE CAPITAL THE ENVELOPE COVERS,
+        // not as a percentage of the whole fund. `maxDrawdownBps` is declared —
+        // and validated at propose, and documented on `InvalidDrawdown` — as a
+        // share of COMMITTED capital, so the allowance is
+        // `effectiveMaxCapital * bps` (the coverage-scaled figure `execute` and
+        // the settlement batch above are both bounded by), never
+        // `vaultBalance * bps`. Scaling off the vault balance would let a
+        // proposal committing 10% of the fund lose ten times its own declared
+        // envelope before this trips.
+        //
+        // Both sides are the vault's RAW asset balance, `_capitalSnapshots`'
+        // own unit (the same measure `_finishSettlement` computes `pnl` in), so
+        // the comparison reduces to `balanceBefore - balanceNow <= allowance`.
+        // Any balance component that is constant across the window — the queue
+        // reserve, an untouched fee escrow — therefore cancels exactly instead
+        // of scaling the bar. The one component that is NOT constant is the fee
+        // escrow, and `claimUnclaimedFees` is gated on the active proposal for
+        // precisely that reason; see the note there.
+        //
+        // SCOPED TO THIS PATH ON PURPOSE. `unstick` and `finalizeEmergencySettle`
+        // route through `_finishSettlementHook` and stay ungated: they are the
+        // owner-multisig escape hatch for a genuine loss that exceeds the
+        // envelope, and gating them would wedge exactly the position that most
+        // needs to exit. A proposal that trips this gate is not stuck — it is
+        // redirected to the path where a human looks at it.
+        {
+            uint256 basis = _capitalSnapshots[proposalId];
+            uint256 allowance = (proposal.effectiveMaxCapital * proposal.maxDrawdownBps) / 10_000;
+            // `allowance >= basis` covers the declared-total-loss envelope
+            // (`maxDrawdownBps == 10_000` on a proposal committing the whole
+            // float): the floor is zero, so any realized balance settles. That
+            // is the envelope working as declared, not a hole.
+            if (basis > allowance) {
+                uint256 floor = basis - allowance;
+                uint256 realized = IERC20(IERC4626(proposal.vault).asset()).balanceOf(proposal.vault);
+                if (realized < floor) revert SettlementBelowDrawdownFloor(realized, floor);
+            }
+        }
+
         _finishSettlement(proposalId, proposal);
     }
 
@@ -2031,7 +2090,29 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      reentrant call with the same key sees a zeroed slot and short-circuits.
     ///      Being the one unguarded entrypoint among guarded siblings is the
     ///      asymmetry that turns into a bug later.
+    /// @dev CLOSED WHILE `vault` HAS AN ACTIVE PROPOSAL. This was the ONLY path
+    ///      that could move `vault`'s asset out between `executeProposal` and
+    ///      `settleProposal` without being the strategy: every other outflow is
+    ///      either governor-driven (`executeGovernorBatch`, the settlement fee
+    ///      transfers) or gated on `redemptionsLocked()` (instant redeem, queue
+    ///      `claim`/`settleRedeem`, the `rescue*` helpers). An escrowed fee
+    ///      leaving mid-strategy is indistinguishable from a strategy loss to
+    ///      both asset-balance-differencing consumers: it understates
+    ///      `_finishSettlement`'s `pnl`, and — since the drawdown floor —
+    ///      it can revert an otherwise-profitable `settleProposal` outright,
+    ///      which leaves `_activeProposal` set and therefore keeps redemptions,
+    ///      queue claims and every future proposal locked until the owner
+    ///      multisig runs `unstick`.
+    ///
+    ///      Costs the recipient nothing but a wait. The escrow only exists
+    ///      because a transfer already failed once, it accrues no deadline, and
+    ///      `_activeProposal` clears on every settlement path including the
+    ///      emergency ones. Deliberately keyed on the CLAIMED vault, not on
+    ///      `_activeProposal != 0`, so a proposal on one vault cannot freeze
+    ///      escrow claims on another.
     function claimUnclaimedFees(address vault, address token) external nonReentrant {
+        uint256 active = _activeProposal;
+        if (active != 0 && _proposals[active].vault == vault) revert VaultProposalActive();
         bytes32 k = _unclaimedKey(vault, msg.sender, token);
         uint256 amt = _unclaimedFees[k];
         if (amt == 0) return;

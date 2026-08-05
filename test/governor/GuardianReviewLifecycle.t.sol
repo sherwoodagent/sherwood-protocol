@@ -386,6 +386,88 @@ contract GuardianReviewLifecycleTest is Test {
         );
     }
 
+    /// @notice Pashov 2026-08 finding #2 — the OTHER half of the pause tradeoff.
+    /// @dev    `test_reviewItem7_pauseSpanningReviewWindow_expiresProposal_neverClearsIt`
+    ///         above pins a pause that outlives `executeBy`, where terminal
+    ///         Expired is the correct and intended outcome. This pins the case
+    ///         it does not reach: a SHORT pause, with the whole execution window
+    ///         still ahead of the proposal.
+    ///
+    ///         Pre-fix, `_afterVote` mapped the registry's honest "deferred, not
+    ///         yet decided" `Unresolved` onto terminal `Expired` unconditionally,
+    ///         so ANY pause — an ordinary incident pause of a single minute —
+    ///         permanently killed every in-flight proposal the moment WALL time
+    ///         crossed `reviewEnd`, while the registry's own `_effNow` had not.
+    ///         The window is exactly `pauseShiftTotal` wide and the write is
+    ///         latched by the permissionless `resolveProposalState`, so no
+    ///         malice and no privileged actor is required on the harmful step.
+    ///
+    ///         Asserted here: inside that window the proposal stays
+    ///         GuardianReview rather than Expired, and once the deferred window
+    ///         genuinely closes it resolves and executes normally.
+    function test_pashovFinding2_shortPauseDefersReview_doesNotExpireProposal() public {
+        uint256 pid = _propose();
+        _voteFor(pid);
+
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        registry.openReview(address(governor), pid);
+        vm.prank(g1);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+
+        // An ordinary, SHORT incident pause partway through the review window.
+        uint256 pauseSpan = 1 hours;
+        vm.prank(owner);
+        registry.pause();
+        vm.warp(vm.getBlockTimestamp() + pauseSpan);
+        vm.prank(owner);
+        registry.unpause();
+        assertEq(registry.pauseShiftTotal(), pauseSpan, "the shift is the pause span, nothing more");
+
+        // Wall clock crosses the governor's reviewEnd while the registry's
+        // effective clock has not: the registry honestly reports Unresolved.
+        // Anchored to the value the CONTRACT stored, not to a local read of
+        // `block.timestamp` — the optimizer CSEs those across `vm.warp`.
+        uint256 reviewEnd = governor.getProposal(pid).reviewEnd;
+        vm.warp(reviewEnd + 1);
+        assertEq(
+            uint256(registry.outcomeOf(address(governor), pid)),
+            uint256(IGuardianRegistry.ReviewOutcome.Unresolved),
+            "a deferred review is undetermined, not absent"
+        );
+
+        // THE FIX. Pre-fix this read Expired, terminally, with ~23h of execution
+        // window left. The proposal is still alive and still in review.
+        assertEq(
+            uint256(governor.getProposalState(pid)),
+            uint256(ISyndicateGovernor.ProposalState.GuardianReview),
+            "a short pause must defer the review, never expire the proposal"
+        );
+
+        // And the permissionless latch must not be able to write it terminal
+        // either — this is the call an attacker front-runs the proposer with.
+        governor.resolveProposalState(pid);
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.GuardianReview),
+            "resolveProposalState must not latch a deferred review as Expired"
+        );
+
+        // Once the deferred window actually closes, the review resolves and the
+        // proposal executes normally — the deferral cost it nothing.
+        vm.warp(reviewEnd + pauseSpan + 1);
+        assertEq(
+            uint256(governor.getProposalState(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Approved),
+            "the deferred window closes and the review clears"
+        );
+        governor.executeProposal(pid);
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Executed),
+            "a proposal that survived a short pause still executes"
+        );
+    }
+
     /// @notice Block quorum hit → proposal rejected and approvers slashed.
     function test_lifecycle_blockQuorum_rejects_slashesApprovers() public {
         uint256 pid = _propose();
