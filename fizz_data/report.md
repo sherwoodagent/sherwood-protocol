@@ -245,3 +245,93 @@ forge test --match-contract FoundryTester -vvv
 After any harness change, clear `fizz_data/crytic-export` and
 `fizz_data/corpus_medusa` before re-running, or the campaign will silently
 replay stale artifacts.
+
+---
+
+## Deep campaign, 2026-08-05 (post challenge-lifecycle composite)
+
+**140 properties passed, 3 failed.** All three failures are informative rather
+than regressions — two are EXPLORATORY properties doing their job, one was a
+defect in a property added the same day.
+
+### Coverage: the adjudication chain unblocked
+
+| Contract | Before | Now | Lines |
+|---|------:|----:|------:|
+| ChallengeGame | 26% | **64.2%** | 201/313 |
+| TokenCourt | 29% | **83.3%** | 100/120 |
+| ExposureLedger | 33% | **83.3%** | 309/371 |
+| ProposerBondEscrow | 34% | **88.6%** | 31/35 |
+
+The cause was NOT only the missing composite. Two silent harness bugs meant no
+proposal had ever booked guardian coverage: `_benignBatch` declared all-zero
+per-call caps (caps price coverage, so `requiredCoverage` was always 0), and
+the lifecycle composite cast its guardian approve vote before `openReview`, so
+it reverted `ReviewNotOpen` into a try/catch. `ChallengeGame.file` therefore
+reverted `NothingToFreeze` on every attempt in every prior campaign. The
+composite alone would have hit the same wall.
+
+**Caveat on the other rows.** This run was stopped at ~3 minutes / 8k calls
+because a concurrent process drove the machine into swap; the baseline runs
+were 600s. Contracts not on the critical path show lower numbers than the
+baseline for that reason alone (`TierRegistry` 64% -> 37%,
+`VaultWithdrawalQueue` 91% -> 76%) — that is less fuzzing time, not a
+regression. The four target contracts improved *despite* the shorter run.
+
+### GL-49 violated — x-ray X-8 does not hold as a standing invariant
+
+Two calls from clean state: `syndicateGovernor_lifecycle_toExecuted` then
+`challengeGame_lifecycle_toConviction`. `recordApproval` enforces
+`open < kNumerator * slashableBondUsd` at BOOKING time, but the right side is a
+live read — a conviction slashes the approvers, their bond falls, and the
+coverage booked against it does not move.
+
+Not automatically a bug (the exposure covers an already-adjudicated proposal),
+but E-1 rests on this figure, and it is reachable in two calls with no
+adversarial parameter tuning. Whether post-slash exposure should unwind, or the
+claim be restated as a booking-time precondition, is worth an explicit decision.
+
+### GL-51 violated — one setter call switches the challenge game off
+
+Shrunk to a single call from deploy defaults: `setChallengerBondBps(3238)` gives
+`honestFilingNetPayoffBps() == -1_419_000`. With shipped defaults
+(`proposerBondBps` 100, `prosecutorFeeBps` 2000, `settleBurnBps` 500) the
+break-even challenger bond is **400 bps**. The default 150 is safe, but the
+setter accepts up to 10 000 — 25x past the point where filing an honest
+challenge stops paying, with no warning and no timelock on that surface.
+
+### GL-10 violated — the property was wrong, now fixed
+
+`donateERC20 -> lifecycle_toExecuted -> lifecycle_toSettled`. The property
+enumerated actors plus vault/queue/adapter/governor and asserted no handler
+could route assets elsewhere. Settlement pays fees: the management fee goes to
+the vault owner and the protocol/guardian legs to whatever `ProtocolConfig`
+names, none of which were counted. Holder set corrected; kept as `==` so a
+future new sink still surfaces.
+
+### Echidna
+
+**Result: 113 tests passing, 0 failing** (incl. `AssertionFailed(..)`) — no
+panic, assertion failure or unexpected revert reachable across the handler set.
+
+`echidna.yaml` runs `testMode: assertion`, which hunts panics and assertion
+failures across the handlers. It does NOT evaluate the `property_*` bool
+returns — that needs `testMode: property`, which reverts state after each
+property call and would break the self-updating ghosts GL-23/25/32/33/35/37
+depend on. Echidna is therefore complementary in bug CLASS here, not a second
+opinion on the same properties.
+
+Two config blockers had to be cleared before it would start, both worth knowing
+if this is re-run:
+
+1. **Unlinked libraries.** Echidna refuses to start if ANY contract in the
+   compilation unit carries unlinked library bytecode, and
+   `--foundry-compile-all` pulls in `script/Deploy.s.sol`. Fixed with
+   `--compile-libraries`.
+2. **The linked address must actually hold the library.** `SyndicateVaultAdminLib`
+   has external functions, so `SyndicateVault` reaches it by DELEGATECALL
+   (`registerAgent` / `removeAgent`). Linking it to an empty address is not
+   cosmetic — those calls revert with no data, and the symptom is `setup()`
+   dying on its very last line at `vault.registerAgent`, which reads like a
+   harness bug rather than a config one. `deployContracts` now places the
+   library at the linked address before the harness constructor runs.

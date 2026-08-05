@@ -133,12 +133,15 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
 
     // ── Counts and state consistency (GL-15, GL-16, GL-17, GL-18) ──
     //
-    // GL-19 and GL-20 are NOT implemented: they need to inspect the
-    // blocker/approver *set membership* and per-guardian vote (registry's
-    // internal `_blockers` / `_votes`), and `GuardianRegistry` exposes no
-    // getter for either — only `getApproverWeights` (approvers only) and
-    // `getReviewState`/`outcomeOf` (aggregate flags). Implementing them
-    // would require inventing a getter, which is out of scope here.
+    // GL-19 is still NOT implemented: it needs BLOCKER set membership, and
+    // `GuardianRegistry` exposes no getter for `_blockers` — only
+    // `getApproverWeights` (approvers only) and `getReviewState`/`outcomeOf`
+    // (aggregate flags). Asserting it would mean adding a getter to production
+    // code to suit a test, which is the wrong trade.
+    //
+    // GL-20 IS implemented, further down, but against the ledger rather than
+    // the registry: `approversOf`/`pledgedOf` expose exactly the membership and
+    // pledge pair the property is about, so no new getter is needed.
 
     /// @notice GL-15 — `getActiveProposal() != 0` iff exactly one proposal is
     ///         `Executed`, and it is that one.
@@ -432,6 +435,312 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
             if (swood.getPastVotes(actors[i], block.timestamp) > swood.getPastStake(actors[i], block.timestamp)) {
                 return false;
             }
+        }
+        return true;
+    }
+
+    // ―――――――――――― One-shot latches (ghost-backed) ――――――――――――
+    // Each of these guards a fact the protocol commits to ONCE. State alone
+    // cannot prove a latch was never re-opened — only a remembered previous
+    // observation can — so these read and update a ghost, and are therefore
+    // deliberately NOT `view`, matching the existing GL-23/26/30/31 pattern.
+
+    /// @notice GL-25 `SHOULD-HOLD` — `proposal.executedAt` is a one-shot latch.
+    /// @dev It is the pre-drain snapshot basis every slash is measured against,
+    ///      and `ChallengeGame.file` pins it onto the challenge precisely so a
+    ///      governor cannot move it afterwards. If it could be rewritten while a
+    ///      challenge is live, the accusation would be re-anchored to a
+    ///      different moment than the one it was filed about.
+    function property_GL25_executedAtIsOneShot() public returns (bool) {
+        uint256 n = governor.proposalCount();
+        for (uint256 pid = 1; pid <= n; pid++) {
+            uint256 cur = governor.getProposal(pid).executedAt;
+            uint256 prev = ghosts.lastExecutedAt[pid];
+            if (prev != 0 && cur != prev) return false;
+            if (cur != 0) ghosts.lastExecutedAt[pid] = cur;
+        }
+        return true;
+    }
+
+    /// @notice GL-32 `SHOULD-HOLD` — `caseOfChallenge` is set once per
+    ///         challenge.
+    /// @dev A second referral would hand one challenge two adjudications, and
+    ///      the two verdicts could disagree — `rule` would then be callable
+    ///      twice against the same bond. Relevant because referral has TWO
+    ///      entry points: the auto-referral inside `dispute` and the explicit
+    ///      `TokenCourt.refer`.
+    function property_GL32_caseOfChallengeSetOnce() public returns (bool) {
+        uint256 n = game.challengeCount();
+        for (uint256 id = 1; id <= n; id++) {
+            uint256 cur = court.caseOfChallenge(address(game), id);
+            uint256 prev = ghosts.lastCaseOfChallenge[id];
+            if (prev != 0 && cur != prev) return false;
+            if (cur != 0) ghosts.lastCaseOfChallenge[id] = cur;
+        }
+        return true;
+    }
+
+    /// @notice GL-33 `SHOULD-HOLD` — `isAccused` is never cleared mid-case.
+    /// @dev The bar exists so an approver cannot vote on their own conviction.
+    ///      Clearing it before `finalize` would let the accused cohort acquit
+    ///      itself, which is the single most valuable state to reach for an
+    ///      attacker in the whole court.
+    function property_GL33_accusedFlagNeverCleared() public returns (bool) {
+        uint256 n = court.caseCount();
+        for (uint256 id = 1; id <= n; id++) {
+            for (uint256 a; a < actors.length; a++) {
+                bool cur = court.isAccused(id, actors[a]);
+                if (cur) {
+                    ghosts.everAccused[id][actors[a]] = true;
+                } else if (ghosts.everAccused[id][actors[a]]) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// @notice GL-35 `SHOULD-HOLD` — x-ray G-19: a proposal's settle price is
+    ///         stamped at most once.
+    /// @dev The queue reserves assets at the stamped price, so re-stamping
+    ///      would re-price redemptions that already have a claim against the
+    ///      old one — the mid-flight NAV re-pricing surface the single stamp
+    ///      exists to close.
+    function property_GL35_settlePriceStampIsOneShot() public returns (bool) {
+        uint256 n = governor.proposalCount();
+        for (uint256 pid = 1; pid <= n; pid++) {
+            bool cur = queue.getSettlePrice(pid).stamped;
+            if (cur) {
+                ghosts.everStamped[pid] = true;
+            } else if (ghosts.everStamped[pid]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// @notice GL-37 `SHOULD-HOLD` — `Review.opened` and `Review.resolved` are
+    ///         each one-shot.
+    /// @dev Re-opening a resolved review would re-run the slash path over a
+    ///      cohort already judged, and re-opening an opened one would reset the
+    ///      window guardians are voting inside. Both flags gate
+    ///      `slashGuardians`, so neither may fall back to false.
+    function property_GL37_reviewFlagsAreOneShot() public returns (bool) {
+        uint256 n = governor.proposalCount();
+        for (uint256 pid = 1; pid <= n; pid++) {
+            bytes32 key = keccak256(abi.encode(address(governor), pid));
+            (bool opened, bool resolved,,) = registry.getReviewState(address(governor), pid);
+            if (opened) ghosts.everOpened[key] = true;
+            else if (ghosts.everOpened[key]) return false;
+            if (resolved) ghosts.everResolved[key] = true;
+            else if (ghosts.everResolved[key]) return false;
+        }
+        return true;
+    }
+
+    /// @notice GL-03 `SHOULD-HOLD` — the escrow's WOOD balance always covers
+    ///         every bond it still owes.
+    /// @dev Solvency in the same shape as GL-01: a bond that is still locked is
+    ///      a claim on this balance, so a shortfall means two proposals were
+    ///      promised the same WOOD. `bondOf` reads zero after EITHER exit
+    ///      (release or forfeit), so this sums only live obligations — which is
+    ///      exactly the set the balance has to cover.
+    function property_GL03_escrowCoversLockedBonds() public view returns (bool) {
+        uint256 owed;
+        uint256 n = governor.proposalCount();
+        for (uint256 pid = 1; pid <= n; pid++) {
+            (, uint256 amount) = bondEscrow.bondOf(address(governor), pid);
+            owed += amount;
+        }
+        return wood.balanceOf(address(bondEscrow)) >= owed;
+    }
+
+    /// @notice GL-10 `SHOULD-HOLD` — vault asset accounting never creates or
+    ///         destroys the underlying: every minted asset sits in exactly one
+    ///         known holder.
+    ///
+    /// @dev The asset is a mock whose only mint path is `deal` at setup, so
+    ///      `totalSupply()` is a closed universe and equality is the right
+    ///      shape — but only if the holder set is genuinely complete.
+    ///
+    ///      IT WAS NOT, on the first campaign. This originally counted actors
+    ///      plus vault/queue/adapter/governor, with a docstring asserting that
+    ///      "no handler can route assets to an address outside this list". The
+    ///      fuzzer refuted that in three calls
+    ///      (`donateERC20 -> lifecycle_toExecuted -> lifecycle_toSettled`):
+    ///      SETTLEMENT PAYS FEES. The management fee goes to the vault owner —
+    ///      which in this harness is the test contract itself — and the
+    ///      protocol/guardian legs go to whatever `ProtocolConfig` names. None
+    ///      of those was counted, so a settled proposal always "lost" assets.
+    ///
+    ///      The recipients are read LIVE rather than hardcoded, because the
+    ///      secondary dispatcher can re-point them mid-campaign. Zero addresses
+    ///      are skipped: an unseated recipient does not strand its leg, the
+    ///      governor hands that slice to the proposer as remainder, and the
+    ///      proposer is already an actor.
+    ///
+    ///      Kept as `==`, not relaxed to `<=`. A future failure means either
+    ///      conservation genuinely broke or a NEW asset sink was introduced —
+    ///      and the counterexample sequence distinguishes them immediately, as
+    ///      it did here. That is worth more than a bound that can never fire.
+    function property_GL10_assetSupplyConserved() public view returns (bool) {
+        uint256 sum = asset.balanceOf(address(vault)) + asset.balanceOf(address(queue))
+            + asset.balanceOf(address(adapter)) + asset.balanceOf(address(governor)) + asset.balanceOf(address(this)); // vault owner: management-fee sink
+        for (uint256 i; i < actors.length; i++) {
+            sum += asset.balanceOf(actors[i]);
+        }
+        address p = protocolConfig.protocolFeeRecipient();
+        address g = protocolConfig.guardiansFeeRecipient();
+        if (p != address(0) && p != address(this)) sum += asset.balanceOf(p);
+        if (g != address(0) && g != address(this) && g != p) sum += asset.balanceOf(g);
+        return sum == asset.totalSupply();
+    }
+
+    /// @notice GL-20 `SHOULD-HOLD` — the approver array holds exactly the
+    ///         guardians carrying a live pledge, with no duplicates.
+    /// @dev `_approversOf` is append-only while `_reservedUsd` is cleared on
+    ///      release, so the two can drift: a guardian appearing twice would
+    ///      double-count toward `requireApproveQuorum`, and one appearing with a
+    ///      zeroed pledge would inflate the cohort's apparent size. Both are
+    ///      quorum-inflation bugs, which is why membership and pledge are
+    ///      checked together rather than counting length alone.
+    function property_GL20_approverArrayMatchesPledges() public view returns (bool) {
+        uint256 n = governor.proposalCount();
+        for (uint256 pid = 1; pid <= n; pid++) {
+            (address[] memory approvers,) = ledger.approversOf(address(governor), pid);
+            (, uint256[] memory pledged) = ledger.pledgedOf(address(governor), pid);
+            for (uint256 i; i < approvers.length; i++) {
+                if (pledged[i] == 0) return false;
+                for (uint256 j = i + 1; j < approvers.length; j++) {
+                    if (approvers[i] == approvers[j]) return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// @notice GL-21 `SHOULD-HOLD` — x-ray G-44: at most one LIVE challenge per
+    ///         (proposal, challenger).
+    /// @dev `file` enforces this through `_liveByChallenger`, and the guard is
+    ///      what stops a challenger re-filing to re-freeze coverage that a
+    ///      previous filing already released — a griefing loop that would pin a
+    ///      guardian's stake indefinitely at the cost of one bond. Live means
+    ///      Filed or Disputed; the terminal statuses are allowed to repeat
+    ///      because the window legitimately re-arms after an Inconclusive.
+    function property_GL21_oneLiveChallengePerProposalChallenger() public view returns (bool) {
+        uint256 n = game.challengeCount();
+        for (uint256 a = 1; a <= n; a++) {
+            IChallengeGame.Challenge memory x = game.challengeOf(a);
+            if (!_isLive(x.status)) continue;
+            for (uint256 b = a + 1; b <= n; b++) {
+                IChallengeGame.Challenge memory y = game.challengeOf(b);
+                if (!_isLive(y.status)) continue;
+                if (x.challenger == y.challenger && x.governor == y.governor && x.proposalId == y.proposalId) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    function _isLive(IChallengeGame.Status s) private pure returns (bool) {
+        return s == IChallengeGame.Status.Filed || s == IChallengeGame.Status.Disputed;
+    }
+
+    // ―――――― ExposureLedger shared-stake accumulators (x-ray I-5 / X-8) ――――――
+    // The mathematical core of the protocol's central economic claim: one
+    // guardian bond backs many proposals at once, and the ledger's job is to
+    // stop the same stake being promised twice. Nothing on-chain asserts it.
+
+    /// @notice GL-12 `SHOULD-HOLD` — a guardian's live bucketed exposure never
+    ///         exceeds the sum of what the ledger recorded for them across
+    ///         every proposal.
+    ///
+    /// @dev `<=`, NOT `==`, and the asymmetry is the whole subtlety.
+    ///      `openExposureUsd` sums `_buckets[guardian][epoch]` over a WALL-CLOCK
+    ///      window — buckets age out once their challenge window elapses — while
+    ///      `approversOf` returns `_recorded[key][guardian]` for every key ever
+    ///      written. Expiry, `retireApproval` and `settleCoverage`'s re-book can
+    ///      each drop the live side below the historical sum, so equality is
+    ///      false for a reason that is correct behaviour.
+    ///
+    ///      `<=` still carries the real content: it fails if a booking is
+    ///      double-counted into the buckets, or if a bucket is credited without
+    ///      a matching record — the two ways this accumulator could overstate a
+    ///      guardian's free budget and let them over-promise their bond.
+    ///
+    ///      Deliberately not written as `==` first and relaxed later: GL-09 and
+    ///      GL-16 both shipped as equalities, both fired, and both turned out to
+    ///      be defects in the property rather than the protocol. The direction
+    ///      that can actually be violated is the one worth asserting.
+    function property_GL12_openExposureWithinRecordedSum() public view returns (bool) {
+        uint256 n = governor.proposalCount();
+        for (uint256 g; g < GUARDIAN_COUNT; g++) {
+            address guardian = actors[g];
+            uint256 recorded;
+            for (uint256 pid = 1; pid <= n; pid++) {
+                (address[] memory approvers, uint256[] memory committed) = ledger.approversOf(address(governor), pid);
+                for (uint256 i; i < approvers.length; i++) {
+                    if (approvers[i] == guardian) recorded += committed[i];
+                }
+            }
+            if (ledger.openExposureUsd(guardian) > recorded) return false;
+        }
+        return true;
+    }
+
+    /// @notice GL-13 `SHOULD-HOLD` — per (proposal, guardian), the pledged
+    ///         reservation is never below the recorded exposure booked against
+    ///         it.
+    ///
+    /// @dev I-5's second clause. `recordApproval` writes both sides equal
+    ///      (`_reservedUsd` and `_recorded.usd` both take `share`), and only
+    ///      `settleCoverage`'s re-book moves them apart — downward on the
+    ///      recorded side, rebooking approvals to actual need. The pledge is the
+    ///      standing promise and nothing but a release clears it, so recorded
+    ///      exposure exceeding its own pledge would mean the ledger is carrying
+    ///      liability the guardian never reserved.
+    ///
+    ///      PROPERTIES.md specifies this against `_livePledgedUsd`, which has no
+    ///      accessor and would need a ghost mirroring every mutation site. This
+    ///      is the same clause expressed through the two accessors that DO
+    ///      exist, so it is assertable today; the ghost-based aggregate remains
+    ///      open.
+    function property_GL13_pledgeCoversRecorded() public view returns (bool) {
+        uint256 n = governor.proposalCount();
+        for (uint256 pid = 1; pid <= n; pid++) {
+            (address[] memory approvers, uint256[] memory committed) = ledger.approversOf(address(governor), pid);
+            (, uint256[] memory pledged) = ledger.pledgedOf(address(governor), pid);
+            if (pledged.length != approvers.length) return false;
+            for (uint256 i; i < approvers.length; i++) {
+                if (pledged[i] < committed[i]) return false;
+            }
+        }
+        return true;
+    }
+
+    /// @notice GL-49 `EXPLORATORY` — x-ray X-8: a guardian's aggregate booked
+    ///         coverage never exceeds the stake that backs it,
+    ///         `kNumerator * slashableBondUsd`.
+    ///
+    /// @dev THE central economic claim, and x-ray flags it On-chain=**No** —
+    ///      nothing asserts it anywhere. `recordApproval` maintains it going in:
+    ///      it books `share = min(free, need)` only while `open < capUsd`, so
+    ///      the sum cannot exceed the cap AT BOOKING TIME.
+    ///
+    ///      EXPLORATORY because the bound is enforced only at that instant and
+    ///      the right-hand side moves afterwards. `slashableBondUsd` is a live
+    ///      read: a WOOD price fall, a haircut change, or a slash on another
+    ///      case all shrink the cap under commitments already booked against it.
+    ///      A violation is therefore not automatically a bug — it is the
+    ///      quantitative answer to "how far can a guardian's book drift past
+    ///      their collateral without any single call being wrong", which is
+    ///      exactly what the fuzzer should be asked and what E-1 rests on.
+    function property_GL49_bookedCoverageWithinSlashableStake() public view returns (bool) {
+        uint256 k = ledger.kNumerator();
+        for (uint256 g; g < GUARDIAN_COUNT; g++) {
+            address guardian = actors[g];
+            if (ledger.openExposureUsd(guardian) > k * ledger.slashableBondUsd(guardian)) return false;
         }
         return true;
     }

@@ -30,7 +30,7 @@ Checked after every call sequence.
 - [ ] **GL-02** `SHOULD-HOLD` — `wood.balanceOf(GuardianRegistry) == slashAppealReserve`.
   The registry custodies no other WOOD; `fundSlashAppealReserve` / `refundSlash`
   are the only two writers, each paired 1:1 with a real transfer.
-- [ ] **GL-03** `SHOULD-HOLD` — `wood.balanceOf(ProposerBondEscrow) >= Σ locked bond amounts`.
+- [x] **GL-03** `SHOULD-HOLD` — `wood.balanceOf(ProposerBondEscrow) >= Σ locked bond amounts`.
   The escrow keeps no aggregate of its own, so this needs a ghost (x-ray I-24 shape).
 - [ ] **GL-04** `SHOULD-HOLD` — `wood.balanceOf(TierRegistry) >= totalBondedWood`
   (valid while WOOD is the only configured bond token, which the harness enforces).
@@ -42,14 +42,14 @@ Checked after every call sequence.
   No public getter for `_pidReserved`; requires a ghost mirroring both write sites.
 - [x] **GL-09** `SHOULD-HOLD` — Σ actor vault-share balances + queue-escrowed shares == `vault.totalSupply()`.
   Standard no-phantom-mint check, specialised to the one non-wallet share holder.
-- [ ] **GL-10** `SHOULD-HOLD` — Σ actor asset balances + `asset.balanceOf(vault)` == total minted asset supply.
+- [x] **GL-10** `SHOULD-HOLD` — Σ actor asset balances + `asset.balanceOf(vault)` == total minted asset supply.
   `asset` never leaves the {actors, vault} set in the fuzzed surface.
 - [x] **GL-11** `SHOULD-HOLD` — `StakedWood.totalGuardianStake` == Σ `stakedAmount` over
   guardians with `unstakeRequestedAt == 0`. The conditional decrement in `_slashOne`
   (active-only) is the subtle edge (x-ray I-4).
-- [ ] **GL-12** `SHOULD-HOLD` — per guardian, `ledger.openExposureUsd(g)` == Σ of that
+- [x] **GL-12** `SHOULD-HOLD` — per guardian, `ledger.openExposureUsd(g)` == Σ of that
   guardian's per-proposal recorded exposure via `approversOf` (x-ray I-5, first clause).
-- [ ] **GL-13** `SHOULD-HOLD` — per guardian, pledged-basis total == Σ per-proposal
+- [x] **GL-13** `SHOULD-HOLD` — per guardian, pledged-basis total == Σ per-proposal
   `pledgedOf` entries. `_livePledgedUsd` has no accessor; needs a ghost (x-ray I-5, second clause).
 - [x] **GL-14** `SHOULD-HOLD` — while a challenge is live, Σ contributor amounts ==
   `challengeOf(id).counterBondWood` (x-ray I-6).
@@ -68,9 +68,9 @@ Checked after every call sequence.
   reporting `isCoverageFrozen` true.
 - [ ] **GL-19** `SHOULD-HOLD` — a guardian never appears in both the approver and
   blocker set of the same review. Explicitly marked LOAD-BEARING in source.
-- [ ] **GL-20** `SHOULD-HOLD` — approver-array length == count of guardians whose
+- [x] **GL-20** `SHOULD-HOLD` — approver-array length == count of guardians whose
   recorded vote is Approve (and the blocker mirror).
-- [ ] **GL-21** `SHOULD-HOLD` — at most one live challenge per (review key, challenger) (x-ray G-44).
+- [x] **GL-21** `SHOULD-HOLD` — at most one live challenge per (review key, challenger) (x-ray G-44).
 - [ ] **GL-22** `SHOULD-HOLD` — `registry.paused()` is false iff `pausedAt == 0`.
   A drifted `pausedAt` corrupts the next cycle's deadman delay.
 
@@ -82,7 +82,7 @@ Checked after every call sequence.
   `Draft→{Pending,Cancelled,Expired}`, `Pending→{GuardianReview,Approved,Rejected,Expired,Cancelled}`,
   `GuardianReview→{Approved,Rejected,Expired,Cancelled}`, `Approved→{Executed,Expired,Cancelled}`,
   `Executed→{Settled}`.
-- [ ] **GL-25** `SHOULD-HOLD` — `proposal.executedAt` is a one-shot latch, never reset or overwritten.
+- [x] **GL-25** `SHOULD-HOLD` — `proposal.executedAt` is a one-shot latch, never reset or overwritten.
   `ChallengeGame.file` and `TokenCourt.refer` both derive snapshots from it.
 - [x] **GL-26** `SHOULD-HOLD` — a challenge reaches exactly one terminal status and never
   changes after (x-ray I-25).
@@ -95,14 +95,14 @@ Checked after every call sequence.
 - [x] **GL-30** `SHOULD-HOLD` — a court case's phase goes `Voting→Resolved` once, never back.
 - [x] **GL-31** `SHOULD-HOLD` — `voteOf[caseId][voter]` is one-shot: NatSpec says
   "NO VOTE CHANGES" (x-ray I-26).
-- [ ] **GL-32** `SHOULD-HOLD` — `caseOfChallenge[game][challengeId]` is set once.
-- [ ] **GL-33** `SHOULD-HOLD` — `isAccused[caseId][addr]` is never cleared mid-case.
+- [x] **GL-32** `SHOULD-HOLD` — `caseOfChallenge[game][challengeId]` is set once.
+- [x] **GL-33** `SHOULD-HOLD` — `isAccused[caseId][addr]` is never cleared mid-case.
 - [x] **GL-34** `SHOULD-HOLD` — a queue request's `claimed` and `cancelled` are mutually
   exclusive and each one-shot.
-- [ ] **GL-35** `SHOULD-HOLD` — `_settlePrice[pid].stamped` is one-shot (x-ray G-19).
+- [x] **GL-35** `SHOULD-HOLD` — `_settlePrice[pid].stamped` is one-shot (x-ray G-19).
 - [x] **GL-36** `SHOULD-HOLD` — a bond record goes `0 → proposer → 0` via exactly one of
   release XOR forfeit (x-ray I-24).
-- [ ] **GL-37** `SHOULD-HOLD` — `Review.opened` and `Review.resolved` are each one-shot.
+- [x] **GL-37** `SHOULD-HOLD` — `Review.opened` and `Review.resolved` are each one-shot.
 - [ ] **GL-38** `SHOULD-HOLD` — a TierRegistry bond's `releasableAt` is one-shot per bond
   instance; a fresh bond is a new struct, not a reset.
 
@@ -131,9 +131,30 @@ Checked after every call sequence.
 - [ ] **GL-48** `SHOULD-HOLD` — a historical checkpoint read is stable: once `ts` is past,
   `getPastVotes(g, ts)` returns the same value regardless of later top-ups.
   The spec names "deflation-only drift" as a prior bug class this design fixed.
-- [ ] **GL-49** `EXPLORATORY` — per guardian, Σ booked coverage shares across keys
+- [x] **GL-49** `EXPLORATORY` — per guardian, Σ booked coverage shares across keys
   <= their slashable stake. This is x-ray X-8, flagged On-chain=**No** — the
   mathematical core of E-1 that nothing currently asserts.
+
+  **VIOLATED — counterexample found (deep campaign, 2026-08-05).** Shrunk to
+  exactly two calls:
+  `syndicateGovernor_lifecycle_toExecuted` then
+  `challengeGame_lifecycle_toConviction`.
+
+  The mechanism is the one the EXPLORATORY tag anticipated: `recordApproval`
+  enforces `open < kNumerator * slashableBondUsd` **at booking time**, but the
+  right-hand side is a LIVE read. A conviction slashes the approving guardians,
+  their slashable bond falls, and the coverage already booked against it does
+  not move — so the cohort ends the sequence carrying more booked coverage than
+  the stake now backing it.
+
+  Not automatically a bug: the exposure covers a proposal whose challenge has
+  already been adjudicated, so the two figures arguably describe different
+  moments. What it does establish is that X-8 does **not** hold as a standing
+  invariant — only as a booking-time precondition — and that the gap is
+  reachable in two calls from a clean state, with no adversarial parameter
+  tuning. Since E-1 rests on this, whether post-slash exposure should be
+  unwound (or the claim restated) is worth a decision rather than an
+  assumption.
 
 ### Liveness and economics
 
@@ -149,6 +170,21 @@ Checked after every call sequence.
   and no single setter can enforce the condition because its inputs span two
   independently-owned contracts. A counterexample names a parameter tuple
   governance must not ship — it is not a protocol bug.
+
+  **VIOLATED, as designed — counterexample found (deep campaign, 2026-08-05).**
+  Shrunk to a SINGLE owner call from deploy defaults:
+  `setChallengerBondBps(3238)` → `honestFilingNetPayoffBps() == -1_419_000`.
+
+  With the shipped defaults (`proposerBondBps` 100, `prosecutorFeeBps` 2000,
+  `settleBurnBps` 500) the break-even challenger bond is
+  `100 * 2000 / 500 = 400` bps. The default is 150 — safe, with 2.7× margin —
+  but `setChallengerBondBps` accepts anything up to 10 000, i.e. **25× past the
+  point where filing an honest challenge stops paying**, and nothing on-chain
+  or in the setter warns. One owner transaction, no timelock on this surface,
+  silently switches the challenge game off: filing still works, it just never
+  makes sense to do it, and the protocol's only enforcement mechanism is
+  economic. Recommend a documented operating band for these four parameters, or
+  a monitored alert on `honestFilingBreaksEven()`.
 
 ---
 
