@@ -28,6 +28,21 @@ contract MockUniswapV3Pool {
     int24 public twapTick;
     uint16 public observationCardinality = 2;
 
+    /// @notice The pool's spot price as `sqrt(token1/token0) * 2^96`.
+    /// @dev    Returned as `slot0()`'s first field, which this mock used to hard
+    ///         -code to 0. `ConcentratedLiquidityStrategy._poolAnchoredMinOut`
+    ///         reads it to build a swap floor that does not depend on the venue
+    ///         `swapExtraData` routes through, and treats 0 as "unreadable" and
+    ///         degrades — so leaving it at 0 made that floor silently inert in
+    ///         every test rather than failing loudly. Tests that exercise the
+    ///         floor MUST seat a real value via `setSqrtPriceX96`.
+    ///
+    ///         Kept independent of `spotTick` on purpose: this mock never had
+    ///         tick<->price math and deriving one from the other would mean
+    ///         vendoring `TickMath` into the test tree to check a contract that
+    ///         deliberately avoids it.
+    uint160 public sqrtPriceX96;
+
     /// @notice Force `observe` to revert, standing in for a window older than the
     ///         ring's oldest observation (upstream reverts `OLD`).
     bool public observeReverts;
@@ -68,8 +83,12 @@ contract MockUniswapV3Pool {
         factory = f;
     }
 
+    function setSqrtPriceX96(uint160 v) external {
+        sqrtPriceX96 = v;
+    }
+
     function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
-        return (0, spotTick, 0, observationCardinality, 0, 0, true);
+        return (sqrtPriceX96, spotTick, 0, observationCardinality, 0, 0, true);
     }
 
     function increaseObservationCardinalityNext(uint16 next) external {
