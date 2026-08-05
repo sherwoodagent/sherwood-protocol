@@ -182,6 +182,20 @@ contract MorphoSupplyStrategy_singletonBindingTest is Test {
         s.initialize(address(vaultStub), proposer, abi.encode(morpho_, params, SUPPLY));
     }
 
+    /// @dev Assert that INITIALIZE reverts with `err`. The clone and the
+    ///      `abi.encode` are hoisted deliberately: `vm.expectRevert` is a
+    ///      one-shot that binds to the very NEXT call, and `Clones.clone` is a
+    ///      CREATE — arming the cheatcode before it makes the cheatcode
+    ///      intercept the deployment, and every negative init test then fails
+    ///      with `FailedDeployment()` no matter what the contract does.
+    function _expectInitRevert(bytes4 err, address morpho_, MarketParams memory params) internal {
+        MorphoSupplyStrategy s = MorphoSupplyStrategy(Clones.clone(address(template)));
+        bytes memory data = abi.encode(morpho_, params, SUPPLY);
+        address v = address(vaultStub);
+        vm.expectRevert(err);
+        s.initialize(v, proposer, data);
+    }
+
     // ── The attack ──
 
     /// @notice THE FINDING. A hostile singleton satisfies both pre-existing
@@ -266,23 +280,36 @@ contract MorphoSupplyStrategy_singletonBindingTest is Test {
         s.initialize(address(vaultStub), proposer, initData);
     }
 
-    /// @notice An UNRESOLVED walk skips the check entirely — the same
-    ///         fail-open-only-here posture as `PortfolioStrategy`, and the same
-    ///         condition under which `SyndicateVault._guardBatchCalls` disables
-    ///         itself. No hop is proposer input, so the proposer cannot steer
-    ///         into it.
-    function test_init_skipsWhenGovernorHasNoRegistryGetter() public {
+    /// @notice An UNRESOLVED walk fails CLOSED at init.
+    /// @dev    This suite originally asserted the opposite — that an unresolved
+    ///         walk SKIPS the check, "the same fail-open-only-here posture as
+    ///         `PortfolioStrategy`". That reading was wrong, and adversarial
+    ///         review caught it: `PortfolioStrategy._initialize` carries a
+    ///         SEPARATE `if (_resolveTierRegistry() == address(0)) revert`
+    ///         above its per-adapter call, under a note that says in terms "Do
+    ///         not make these symmetric." The skip belongs to the per-call
+    ///         re-certification, where blocking would strand deployed capital.
+    ///         It does not belong at bind time.
+    ///
+    ///         The gap that made this load-bearing rather than stylistic:
+    ///         `SyndicateFactory` documents a zero factory `tierRegistry` as
+    ///         "Optional — address(0) means governors created by this factory
+    ///         keep the safe tier-2 default", so EVERY governor created before
+    ///         `setTierRegistry`/`pushWiring` resolves to nothing. Fail-open
+    ///         left finding #12 unmitigated for that entire population, with no
+    ///         allowlist step needed by the attacker.
+    function test_init_failsClosedWhenGovernorHasNoRegistryGetter() public {
         GovernorNoRegistryGetter blind = new GovernorNoRegistryGetter();
         vaultStub.setGovernor(address(blind));
 
-        MorphoSupplyStrategy s = _init(address(realMorpho), mp);
-        assertEq(address(s.morpho()), address(realMorpho), "unresolved walk -> check skipped");
+        _expectInitRevert(MorphoSupplyStrategy.TierRegistryUnresolved.selector, address(realMorpho), mp);
     }
 
-    function test_init_skipsWhenRegistryUnset() public {
+    /// @notice The governor population the factory explicitly permits: wired,
+    ///         but with `tierRegistry() == 0`. Must also refuse at bind time.
+    function test_init_failsClosedWhenRegistryUnset() public {
         governor.setTierRegistry(address(0));
-        MorphoSupplyStrategy s = _init(address(realMorpho), mp);
-        assertEq(address(s.morpho()), address(realMorpho), "registry unset -> check skipped");
+        _expectInitRevert(MorphoSupplyStrategy.TierRegistryUnresolved.selector, address(realMorpho), mp);
     }
 
     // ── Execute-time re-certification ──

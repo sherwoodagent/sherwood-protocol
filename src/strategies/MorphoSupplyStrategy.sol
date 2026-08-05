@@ -66,6 +66,11 @@ contract MorphoSupplyStrategy is BaseStrategy {
     ///         governor gates batch approvals against. See
     ///         `_requireAllowedMorpho`.
     error MorphoNotAllowed(address morpho, address registry);
+    /// @notice The `vault() -> governor() -> tierRegistry()` walk yielded no
+    ///         registry at `_initialize`, so the proposer-supplied Morpho
+    ///         singleton cannot be vouched for. Init fails CLOSED on this;
+    ///         the per-call re-certification deliberately does not.
+    error TierRegistryUnresolved();
     /// @notice This strategy exposes nothing to tune between execute and
     ///         settle; `updateParams` always reverts.
     error NoTunableParams();
@@ -155,6 +160,26 @@ contract MorphoSupplyStrategy is BaseStrategy {
             abi.decode(data, (address, MarketParams, uint256));
 
         if (morpho_ == address(0)) revert ZeroAddress();
+        // INIT IS FAIL-CLOSED ON THE REGISTRY, AND ONLY INIT — matching
+        // `PortfolioStrategy._initialize` and `ConcentratedLiquidityStrategy`,
+        // whose note reads "Do not make these symmetric."
+        //
+        // `_requireAllowedMorpho` returns EARLY when the walk yields no
+        // registry, which is right for the per-call re-certification at
+        // `_execute` (blocking there would strand deployed capital) and wrong
+        // here. `SyndicateFactory` documents a zero factory `tierRegistry` as
+        // "Optional — address(0) means governors created by this factory keep
+        // the safe tier-2 default", so every governor created before
+        // `setTierRegistry`/`pushWiring` resolves to nothing — and for that
+        // whole population the binding below would be a no-op, leaving the
+        // finding unmitigated with no allowlist step required: a proposer inits
+        // with a hostile singleton naming the real asset as `loanToken`,
+        // `MarketNotCreated` is self-attested away by that same contract, and
+        // `_execute` pulls the float and approves it away.
+        //
+        // Refusing at bind time costs a re-proposal. Refusing at execute would
+        // cost the deployed capital.
+        if (_resolveTierRegistry() == address(0)) revert TierRegistryUnresolved();
         // Bind the proposer's Morpho singleton to the governance allowlist
         // before ANY call is made into it and before anything is written.
         _requireAllowedMorpho(morpho_);

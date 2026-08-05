@@ -6,6 +6,7 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockMorpho, MockIrm} from "../mocks/MockMorpho.sol";
 import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
+import {MockPermissiveTierRegistry} from "../mocks/MockPermissiveTierRegistry.sol";
 import {MorphoSupplyStrategy} from "../../src/strategies/MorphoSupplyStrategy.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 import {Id, MarketParams, Market} from "../../src/vendor/morpho/IMorpho.sol";
@@ -71,6 +72,10 @@ abstract contract MorphoSupplyFixture is Test {
         marketId = mockMorpho.createMarket(mp);
 
         status = new MockProposalStatus();
+        // `_initialize` fails CLOSED when `vault() -> governor() -> tierRegistry()`
+        // yields nothing, so the governor stand-in must seat a registry.
+        // Permissive by default; the binding tests deny specific addresses.
+        status.setTierRegistry(address(new MockPermissiveTierRegistry()));
         vaultStub = new VaultStub(address(usdg), address(status));
         usdg.mint(address(vaultStub), SUPPLY);
 
