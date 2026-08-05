@@ -366,6 +366,17 @@ interface ISyndicateGovernor {
     ///         `totalAssets() * tier2CallCapBps / 10_000` at propose (issue
     ///         #43). `index` disambiguates; arrays are scanned exec-then-settle.
     error Tier2CallCapExceedsCeiling(uint256 index);
+    /// @notice A NEW proposal named a target the TierRegistry has convicted —
+    ///         `isClassAllowDenied(target)`, set by `TierRegistry._demote` on a
+    ///         passed challenge / owner demotion / codehash `poke`, or by an
+    ///         explicit `setAdapterAllowed(target, false)`. Propose-time only:
+    ///         the registry no longer revokes an already-executed proposal's
+    ///         batch-callee standing (pashov 2026-08 finding #15), so the
+    ///         conviction bites on proposals that do not exist yet instead of
+    ///         trapping capital already deployed through the address. Recovery is
+    ///         the registry owner's `setAdapterAllowed(target, true)`, which
+    ///         clears the flag.
+    error ConvictedBatchTarget(address target);
     /// @notice `setTier2CallCapBps` called with 0 or a value above 10_000.
     error InvalidTier2CallCapBps();
 

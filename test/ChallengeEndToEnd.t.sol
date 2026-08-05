@@ -952,19 +952,17 @@ contract ChallengeEndToEndTest is Test {
         );
         assertEq(wood.balanceOf(agent), agentBalAfterBond, "the proposer got nothing back");
 
-        // The conviction above demoted `adapter`'s certification, which (by
-        // design — `TierRegistry._demote`'s natspec, "DELIBERATELY
-        // OVER-BROAD") ALSO cleared its batch-callee allowlist entry
-        // entirely. The pre-committed settlement batch (`_settleCalls()`,
-        // set at propose time) still names `adapter`, so self-settle would
-        // now hit the SAME `DisallowedBatchCallee` a fresh, never-certified
-        // target would — this is issue #166's gate doing exactly its job on
-        // a demoted target. The natspec's own documented recovery is one
-        // owner `setAdapterAllowed` call; this test is not about that
-        // recovery ceremony (it is about proposer-bond forfeiture / reclaim
-        // mechanics), so perform it here to reach self-settle, same as a
-        // real owner would before an already-convicted proposal is unstuck.
-        tierRegistry.setAdapterAllowed(address(adapter), true);
+        // NO `tierRegistry.setAdapterAllowed(address(adapter), true)` here any
+        // more. This test used to need one: the conviction above demoted
+        // `adapter`'s certification and, at the time, ALSO erased its
+        // batch-callee allowlist entry, so the pre-committed settlement batch
+        // (`_settleCalls()`, fixed at propose time) could no longer run and
+        // self-settle reverted `DisallowedBatchCallee`. pashov 2026-08 finding
+        // #15 removed that erasure — a conviction is enforced against NEW
+        // proposals instead — so self-settle below now reaches `Settled` on its
+        // own merits, with no third-party ceremony in the middle of a test about
+        // proposer-bond forfeiture. `test_conviction_doesNotBrickSettlement_
+        // addressAllowlistedTarget` is the dedicated regression.
 
         // Reclaim's forfeiture-acknowledge path only applies from a TERMINAL
         // state (design D3, same terminal gate every other reclaim path
@@ -1224,5 +1222,140 @@ contract ChallengeEndToEndTest is Test {
 
         gov.reclaimProposerBond(pid);
         assertEq(wood.balanceOf(agent), agentBalBefore + PROPOSER_BOND, "and the bond goes home the moment it can");
+    }
+
+    // ── 5. pashov 2026-08 finding #15: a conviction must not trap the capital ──
+
+    /// @dev Drives a proposal to `Executed`, then convicts `(adapter, poke)` on
+    ///      silence. `adapter` is the fixture's in-flight target: it is named by
+    ///      BOTH the execute batch and the pre-committed settlement batch, and it
+    ///      carries an explicit `setAdapterAllowed` entry (setUp), exactly like a
+    ///      strategy clone the registry owner allowlisted for the proposal.
+    function _executeThenConvictTheAdapter() internal returns (uint256 pid) {
+        pid = _proposeApproveExecute();
+
+        vm.prank(challenger);
+        uint256 cid = game.file(
+            address(gov),
+            pid,
+            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            address(adapter),
+            adapter.poke.selector,
+            "ipfs://evidence/finding-15"
+        );
+        vm.warp(game.challengeOf(cid).filedAt + game.autoSlashDelay());
+        game.resolve(cid);
+        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "convicted");
+
+        // The conviction really did demote: the certification is gone and the
+        // conviction is on record.
+        (uint8 tierAfter,) = tierRegistry.tierOf(address(adapter), adapter.poke.selector);
+        assertEq(tierAfter, 2, "certification revoked by the verdict");
+        assertTrue(tierRegistry.isClassAllowDenied(address(adapter)), "and the conviction is recorded");
+    }
+
+    /// @notice THE regression. Before the fix, `TierRegistry._demote` also ran
+    ///         `delete _adapterAllowed[target]`, which is the SAME predicate
+    ///         `SyndicateVault._guardBatchCalls` PART 2a uses to decide whether
+    ///         the vault may CALL a target at all. The settlement batch was fixed
+    ///         at propose time and names the convicted address, so every exit —
+    ///         `settleProposal`, `unstick`, `finalizeEmergencySettle` — reverted
+    ///         `DisallowedBatchCallee`, the proposal pinned in `Executed`, and
+    ///         `redemptionsLocked()` stayed true, shutting every LP out until the
+    ///         TierRegistry multisig (a DIFFERENT party from the vault owner)
+    ///         re-granted the standing the conviction had just removed.
+    ///
+    ///         Now the conviction leaves callee standing alone and bites at
+    ///         propose time instead (see `test_conviction_refusesTheNextProposal`
+    ///         below), so the already-committed unwind still runs and the capital
+    ///         comes home.
+    function test_conviction_doesNotBrickSettlement_addressAllowlistedTarget() public {
+        uint256 pid = _executeThenConvictTheAdapter();
+
+        // The exact predicate the vault's callee gate reads — still true. This
+        // is the `isAdapterAllowed` statement ordering the fix leans on: the
+        // explicit-allow branch returns BEFORE the `_classAllowDenied` check.
+        assertTrue(tierRegistry.isAdapterAllowed(address(adapter)), "batch-callee standing survives the conviction");
+
+        // While Executed, every LP exit is shut — this is the lock the brick
+        // used to make permanent.
+        assertTrue(vault.redemptionsLocked(), "redemptions locked while the proposal is live");
+        assertEq(vault.maxWithdraw(lp1), 0, "and maxWithdraw reports it");
+
+        // NO `tierRegistry.setAdapterAllowed(...)` rescue here — that call is
+        // exactly the workaround this fix removes.
+        uint256 pokesBefore = adapter.pokes();
+        vm.prank(agent);
+        gov.settleProposal(pid);
+        assertEq(_state(pid), uint256(ISyndicateGovernor.ProposalState.Settled), "settled with no owner rescue");
+        assertEq(adapter.pokes(), pokesBefore + 1, "the pre-committed settlement batch really ran");
+
+        // And the LPs are out.
+        assertFalse(vault.redemptionsLocked(), "the lock lifted");
+        assertGt(vault.maxWithdraw(lp1), 0, "lp1 can exit");
+        uint256 lp1AssetsBefore = usdg.balanceOf(lp1);
+        // Hoisted: a call in ARGUMENT position would consume the one-shot prank
+        // and `redeem` would run as the test contract, which holds no allowance.
+        uint256 lp1Shares = vault.balanceOf(lp1);
+        vm.prank(lp1);
+        vault.redeem(lp1Shares, lp1, lp1);
+        assertGt(usdg.balanceOf(lp1), lp1AssetsBefore, "and really did");
+    }
+
+    /// @notice The same regression on the EMERGENCY path. `unstick` replays the
+    ///         identical stored settlement calls through the identical vault
+    ///         guard, so it bricked on a conviction for the identical reason —
+    ///         and it is the path that mattered most, because it is the vault
+    ///         owner's rescue for a proposal the proposer has abandoned. Under
+    ///         the old behaviour the "rescue" itself needed a rescue from a third
+    ///         party.
+    function test_conviction_doesNotBrickTheEmergencyUnstick() public {
+        uint256 pid = _executeThenConvictTheAdapter();
+
+        // `unstick` is vault-owner-gated and waits the full declared duration
+        // (the proposer's self-settle shortcut does not apply here).
+        vm.warp(gov.getProposal(pid).executedAt + gov.getProposal(pid).strategyDuration);
+
+        uint256 pokesBefore = adapter.pokes();
+        vm.prank(owner);
+        gov.unstick(pid);
+        assertEq(_state(pid), uint256(ISyndicateGovernor.ProposalState.Settled), "unstuck with no owner rescue");
+        assertEq(adapter.pokes(), pokesBefore + 1, "the voted settlement batch really replayed");
+        assertFalse(vault.redemptionsLocked(), "and the LP lock lifted");
+    }
+
+    /// @notice The other half of the fix: the conviction did not evaporate, it
+    ///         MOVED to propose time. A brand-new proposal naming the convicted
+    ///         address is refused outright — not merely repriced to tier 2, which
+    ///         is what the registry alone would have done.
+    function test_conviction_refusesTheNextProposal() public {
+        uint256 pid = _executeThenConvictTheAdapter();
+        vm.prank(agent);
+        gov.settleProposal(pid);
+
+        // Past the governor cooldown so the refusal below is the tier registry's
+        // and not the proposer rate limit's.
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.ConvictedBatchTarget.selector, address(adapter)));
+        _propose();
+    }
+
+    /// @notice And the refusal is recoverable by the documented ceremony: the
+    ///         registry owner's explicit `setAdapterAllowed(target, true)` clears
+    ///         the conviction record, after which the target may be proposed
+    ///         again. Pins that the propose-time gate reads the SAME flag the
+    ///         owner clears, so there is no second, unreachable denial.
+    function test_conviction_ownerReAttestationReopensProposing() public {
+        uint256 pid = _executeThenConvictTheAdapter();
+        vm.prank(agent);
+        gov.settleProposal(pid);
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+
+        tierRegistry.setAdapterAllowed(address(adapter), true);
+        assertFalse(tierRegistry.isClassAllowDenied(address(adapter)), "conviction cleared by the re-attestation");
+
+        uint256 pid2 = _propose();
+        assertEq(_state(pid2), uint256(ISyndicateGovernor.ProposalState.Pending), "proposable again");
     }
 }

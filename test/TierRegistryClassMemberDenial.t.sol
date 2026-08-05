@@ -150,6 +150,36 @@ contract TierRegistryClassMemberDenialTest is Test {
         _assertFullyRevoked(clone, "re-read");
     }
 
+    /// @notice THE RESIDUAL LEFT OPEN BY pashov 2026-08 finding #15, pinned so
+    ///         it is never mistaken for a closed case. That fix stopped
+    ///         `_demote` from erasing an EXPLICIT `_adapterAllowed` entry, so an
+    ///         address-allowlisted target keeps the batch-callee standing the
+    ///         vault needs to run an already-committed settlement batch. A clone
+    ///         standing ONLY on its class has no such entry: `isAdapterAllowed`
+    ///         falls through to the `_classAllowDenied` check, which `_demote`
+    ///         still sets, and the clone loses callee standing exactly as
+    ///         before. If that clone is the in-flight strategy holding the
+    ///         vault's capital, `settleProposal`/`unstick`/
+    ///         `finalizeEmergencySettle` still revert `DisallowedBatchCallee`
+    ///         and LP exits are still shut until an owner ceremony.
+    ///
+    ///         Closing it means separating the conviction RECORD from the
+    ///         class-denial FLAG (they are one mapping today, and the governor's
+    ///         propose-time refusal reads it). That was deliberately not taken
+    ///         in the finding-#15 change. Change this test's expectations only
+    ///         alongside that separation.
+    function test_conviction_classOnlyMemberStillLosesCalleeStanding() public {
+        _certifyAndAllowClass(address(template));
+        address clone = _cloneViaFactory();
+        assertTrue(registry.isAdapterAllowed(clone), "class fallback grants callee standing");
+
+        vm.prank(court);
+        registry.demoteByChallenge(clone, SEL);
+
+        assertFalse(registry.isAdapterAllowed(clone), "RESIDUAL: class-only standing is still revoked on conviction");
+        assertTrue(registry.isClassAllowDenied(clone));
+    }
+
     /// @notice Blast radius is one clone. The point of a per-member denial is
     ///         that the alternative — `demoteClass` — revokes every clone of the
     ///         template, guilty and innocent together.
@@ -339,6 +369,11 @@ contract TierRegistryClassMemberDenialTest is Test {
         (uint8 tier, uint16 bound) = registry.tierOf(plain, SEL);
         assertEq(tier, TIER_ARBITRARY, "tier-2 default as always");
         assertEq(bound, FULL_NOTIONAL_BPS, "full notional as always");
-        assertFalse(registry.isAdapterAllowed(plain), "allowlist cleared as always");
+        // pashov 2026-08 finding #15: the demotion no longer erases an EXPLICIT
+        // address-level allow — that erasure is what bricked the settlement of
+        // an already-executed proposal naming this target. The conviction is
+        // recorded in `_classAllowDenied` and enforced at propose time instead.
+        assertTrue(registry.isAdapterAllowed(plain), "explicit allow survives the demotion");
+        assertTrue(registry.isClassAllowDenied(plain), "the conviction is recorded");
     }
 }
