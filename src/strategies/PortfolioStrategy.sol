@@ -823,13 +823,21 @@ contract PortfolioStrategy is BaseStrategy {
 
         // Sell overweight positions.
         uint256 swapsExecuted;
+        bool soldAny;
+        bool boughtAny;
         for (uint256 i; i < len; ++i) {
-            if (_sellOverweight(i, totalValue, snap.currentValues[i], snap.prices[i])) ++swapsExecuted;
+            if (_sellOverweight(i, totalValue, snap.currentValues[i], snap.prices[i])) {
+                ++swapsExecuted;
+                soldAny = true;
+            }
         }
 
         // Buy underweight positions with available asset.
         for (uint256 i; i < len; ++i) {
-            if (_buyUnderweight(i, totalValue, snap.currentValues[i], snap.prices[i])) ++swapsExecuted;
+            if (_buyUnderweight(i, totalValue, snap.currentValues[i], snap.prices[i])) {
+                ++swapsExecuted;
+                boughtAny = true;
+            }
         }
 
         // Update stored token amounts and snapshot post-balances.
@@ -840,9 +848,29 @@ contract PortfolioStrategy is BaseStrategy {
             newBalances[i] = bal;
         }
 
-        // See the note at the top of this function: one leg's worth, and only
-        // when something actually traded.
-        if (swapsExecuted != 0) _chargeDecayBudget(maxSlippageBps);
+        // ONE CHARGE PER LEG THAT ACTUALLY RAN, not one per call (pashov
+        // 2026-08 finding #20).
+        //
+        // This used to bill a flat `maxSlippageBps` however many legs traded,
+        // on the premise stated at the top of this function that a delta
+        // rebalance trades only the over/under-weight remainder rather than the
+        // full basket. NOTHING ENFORCES THAT PARTIALITY: `_updateParams`
+        // accepts any weight vector summing to `BPS_DENOMINATOR`, so `[0,
+        // 10_000]` on a 50/50 basket makes `_sellOverweight` sell the entire
+        // slot and `_buyUnderweight` spend the entire proceeds — the same two
+        // legs `rebalance()` bills at `2 * maxSlippageBps`.
+        //
+        // Billed at half rate, the reachable lifetime loss becomes
+        // `1 - (1-s)^(2B/s)` instead of `1 - (1-s)^(B/s)`: about 33% against
+        // the ~18% `MAX_CUMULATIVE_DECAY_BPS` documents, and alternating
+        // `[0,10_000]` / `[10_000,0]` rotates the whole basket every call.
+        //
+        // Deliberately counts LEGS, not swaps: a basket with eight overweight
+        // slots still crosses the spread twice, once in each direction, which
+        // is what `rebalance()` charges and what the budget's arithmetic
+        // assumes.
+        uint256 legs = (soldAny ? maxSlippageBps : 0) + (boughtAny ? maxSlippageBps : 0);
+        if (legs != 0) _chargeDecayBudget(legs);
 
         _rebalancing = false;
         emit RebalancedDelta(
