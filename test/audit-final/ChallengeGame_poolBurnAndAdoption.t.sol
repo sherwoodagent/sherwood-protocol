@@ -56,10 +56,13 @@ contract ChallengeGamePoolBurnAndAdoptionTest is ChallengeGameTest {
             game.claimableContribution(id, guardianA), partFunded, "the funder's stake is claimable, not destroyed"
         );
 
-        // Only the challenger's own bond slice burns on this branch — the pool
-        // contributes nothing to the burn.
+        // EXACTLY the challenger's own bond slice, and nothing of the pool. An
+        // upper bound like `< partFunded + target` would pass even if most of
+        // the pool burned, which is the failure this test exists to catch.
+        uint256 settleBurn = (c.bondWood * c.settleBurnBpsAtFiling) / 10_000;
+        assertGt(settleBurn, 0, "fixture uses a zero burn rate, the assertion would be vacuous");
         uint256 burnDelta = wood.balanceOf(game.BURN_ADDRESS()) - burnedBefore;
-        assertLt(burnDelta, partFunded + target, "pool WOOD reached the burn address");
+        assertEq(burnDelta, settleBurn, "only the challenger's bond slice burns; no pool WOOD reaches the dead address");
     }
 
     /// @notice A COMPLETED pool is still burned in full — it bought a real
@@ -68,12 +71,36 @@ contract ChallengeGamePoolBurnAndAdoptionTest is ChallengeGameTest {
     ///         the finding-#10 deterrent entirely.
     function test_settle_completedPoolIsStillBurned() public {
         uint256 id = _fileStandard(PROPOSAL);
+        (, uint256 target,,,) = game.counterBondPoolOf(id);
         _fund(guardianA);
         vm.prank(guardianA);
         game.dispute(id, type(uint256).max);
 
         (,,, uint256 completedAt,) = game.counterBondPoolOf(id);
         assertGt(completedAt, 0, "fixture left the pool incomplete, wrong branch");
+
+        // AND ACTUALLY CONVICT. Asserting only that the fixture completed the
+        // pool would pass against a mutant that released on BOTH branches —
+        // i.e. against the exact over-correction this test exists to catch.
+        //
+        // Through the COURT, not through silence: completing the pool makes the
+        // challenge `Disputed`, and `resolve` on a Disputed challenge waits for
+        // `disputeTimeout` and then routes to `_fail`, never to `_settle`. A
+        // `Guilty` ruling is the only way a COMPLETED pool reaches the burn.
+        assertEq(
+            uint8(game.challengeOf(id).status),
+            uint8(IChallengeGame.Status.Disputed),
+            "a completed pool must have bought the dispute"
+        );
+        uint256 burnedBefore = wood.balanceOf(game.BURN_ADDRESS());
+        vm.prank(court);
+        game.rule(id, IChallengeGame.Verdict.Guilty);
+
+        assertEq(
+            uint8(game.poolOutcomeOf(id)), uint8(IChallengeGame.PoolOutcome.Burned), "a completed pool must still burn"
+        );
+        assertGe(wood.balanceOf(game.BURN_ADDRESS()) - burnedBefore, target, "pool WOOD did not reach the burn address");
+        assertEq(game.claimableContribution(id, guardianA), 0, "and a burned pool owes its funder nothing");
     }
 
     /// @notice The release closes the pool, so contribution cannot continue
@@ -136,6 +163,65 @@ contract ChallengeGamePoolBurnAndAdoptionTest is ChallengeGameTest {
         // payment routed through. `_fileNAndFundOnePool` disputes `ids[0]`.
         assertEq(MockRecordingCourt(court).lastReferred(), ids[0], "only the paying challenge is auto-referred");
         assertTrue(ids[1] != ids[0] && ids[2] != ids[0], "fixture sanity: the siblings are distinct");
+    }
+
+    /// @notice STAGGERED WINDOWS: a pool completed too late for the EARLIEST
+    ///         live challenge still burns, and the sibling it actually backed
+    ///         loses it.
+    ///
+    ///         Windows are per-challenge and staggered; the pool is per-proposal
+    ///         and shared. A completion landing inside a later filing's window
+    ///         but after an earlier one's has closed backs the later challenge
+    ///         only — so the earlier one silence-convicts, `_settle` sees
+    ///         `completedAt != 0`, and the burn destroys a defence that was real
+    ///         for the sibling.
+    ///
+    ///         Pinned as the CURRENT behaviour, with the operational rule stated
+    ///         at `_poolBacked`: the accused must complete before the earliest
+    ///         live challenge's deadline, not their own. Closing it properly
+    ///         means pricing the burn per-challenge rather than per-pool.
+    function test_settle_poolCompletedTooLateForTheEarliestChallengeStillBurns() public {
+        uint256 idEarly = _fileStandard(PROPOSAL);
+        IChallengeGame.Challenge memory early = game.challengeOf(idEarly);
+
+        // A second filing well after the first, so its window outlives the
+        // first's by the gap between them.
+        vm.warp(early.filedAt + (early.autoSlashDelayAtFiling / 2));
+        address filerLate = makeAddr("lateFiler");
+        _fund(filerLate);
+        vm.prank(filerLate);
+        uint256 idLate =
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, ADAPTER, SELECTOR, EVIDENCE);
+
+        // Pay AFTER the early challenge's deadline, inside the late one's.
+        vm.warp(early.filedAt + early.autoSlashDelayAtFiling + 1);
+        _fund(guardianA);
+        vm.prank(guardianA);
+        game.dispute(idLate, type(uint256).max);
+
+        assertEq(
+            uint8(game.challengeOf(idLate).status),
+            uint8(IChallengeGame.Status.Disputed),
+            "the late filing IS backed - it paid inside its own window"
+        );
+        assertEq(
+            uint8(game.challengeOf(idEarly).status),
+            uint8(IChallengeGame.Status.Filed),
+            "the early one is NOT - the payment landed after its deadline"
+        );
+
+        // The early challenge silence-convicts, and takes the pool with it.
+        game.resolve(idEarly);
+        assertEq(
+            uint8(game.poolOutcomeOf(idEarly)),
+            uint8(IChallengeGame.PoolOutcome.Burned),
+            "a completed-but-too-late pool still burns"
+        );
+        assertEq(
+            game.claimableContribution(idLate, guardianA),
+            0,
+            "and the sibling it DID back is left with nothing to claim"
+        );
     }
 
     /// @notice The sibling that never got referred is the one that pays at the

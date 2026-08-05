@@ -14,6 +14,20 @@ pragma solidity 0.8.28;
 ///         judge-enforcing the rest would run two security models in one
 ///         mechanism. Adjudication is SILENCE: not contesting IS the verdict.
 interface IChallengeGame {
+    /// @notice Lifecycle of a proposal's counter-bond pool.
+    /// @dev    `Burned` and `Released` are deliberately two values rather than
+    ///         one `resolved` bit: only `Released` makes a funder's stake
+    ///         claimable, and collapsing them would let a BURNED pool be claimed
+    ///         back - the exact clawback the burn exists to remove.
+    ///
+    ///         Declared here rather than on the implementation so `poolOutcomeOf`
+    ///         can return it from this interface; `ChallengeGame` inherits it.
+    enum PoolOutcome {
+        Open,
+        Burned,
+        Released
+    }
+
     /// @notice The predicate a challenge cites.
     /// @dev    Classification only, carried in `ChallengeFiled` so
     ///         watchtowers, indexers and judges can filter and route. It
@@ -530,6 +544,15 @@ interface IChallengeGame {
         external
         view
         returns (uint256 poolWood, uint256 targetWood, uint256 raisedWood, uint256 completedAt, bool burned);
+
+    /// @notice The pool's full lifecycle outcome for the pool `challengeId`
+    ///         belongs to.
+    /// @dev    `counterBondPoolOf`'s `burned` flag cannot distinguish `Open` from
+    ///         `Released` — both report false — and those two differ in exactly
+    ///         the way an invariant cares about: `Open` still HOLDS the WOOD,
+    ///         `Released` has moved it to `unclaimedWood`. Any property about
+    ///         what a pool holds needs this, not that flag.
+    function poolOutcomeOf(uint256 challengeId) external view returns (PoolOutcome);
 
     /// @notice Collect what a terminal challenge owes you for funding the
     ///         counter-bond pool it belongs to: your stake back once that POOL

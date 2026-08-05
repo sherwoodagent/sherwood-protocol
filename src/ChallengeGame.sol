@@ -429,15 +429,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @notice How a counter-bond pool ended. `Open` is the only live state;
     ///         both terminal outcomes CLOSE the pool to further contributions,
     ///         which is what makes a resolution single-shot.
-    /// @dev    `Burned` and `Released` are deliberately two values rather than
-    ///         one `resolved` bit: only `Released` makes a funder's stake
-    ///         claimable, and collapsing them would let a BURNED pool be claimed
-    ///         back - the exact clawback the burn exists to remove.
-    enum PoolOutcome {
-        Open,
-        Burned,
-        Released
-    }
+    // `PoolOutcome` lives on `IChallengeGame` so views returning it can be
+    // declared there; inherited here, so every `PoolOutcome.X` below is
+    // unchanged.
 
     /// @notice ONE COUNTER-BOND POOL PER PROPOSAL PER ROUND, not one per
     ///         challenge (pashov 2026-08 finding #10).
@@ -983,6 +977,27 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///
     ///      A challenge filed AFTER completion passes trivially
     ///      (`completedAt <= filedAt`), which is the intended free adoption.
+    ///
+    ///      THE OPERATIONAL RULE THIS CREATES, because nothing else states it:
+    ///      the accused must complete the pool before the EARLIEST live
+    ///      challenge's window shuts, not before the window of whichever
+    ///      challenge they happen to pay through. Windows are per-challenge and
+    ///      staggered, the pool is per-proposal and shared, so a completion that
+    ///      lands inside a later filing's window but after an earlier one's has
+    ///      already closed backs the later challenge and NOT the earlier one.
+    ///
+    ///      The earlier challenge then silence-convicts, and `_settle`'s pool
+    ///      branch sees `completedAt != 0` and BURNS a pool that did buy a real
+    ///      defence — for the sibling, which is left `Disputed` against an empty
+    ///      pool and rides to `_fail`. `dispute` accepts the payment without
+    ///      signalling any of this.
+    ///
+    ///      Kept as a stated rule rather than a refusal in `dispute` because the
+    ///      alternative — rejecting a contribution whenever some live sibling's
+    ///      window has already closed — hands any challenger a cheap way to
+    ///      block the defence entirely by filing early and waiting. Closing it
+    ///      properly means pricing the burn per-challenge rather than
+    ///      per-pool, which is a design change, not a guard.
     function _poolBacked(Challenge storage c, CounterBondPool storage p) private view returns (bool) {
         uint256 completedAt = p.completedAt;
         return completedAt != 0 && completedAt < c.filedAt + c.autoSlashDelayAtFiling;
@@ -1126,6 +1141,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // `InsufficientClock` gate, i.e. well before `disputeTimeout` - a
             // challenger that files while others are live should watch for
             // adoption rather than assume referral.
+            //
+            // AND THERE IS NO EVENT ON THE ADOPTED CHALLENGE TO WATCH FOR.
+            // `ChallengeDisputed` carries the PAYING `challengeId`, so a sibling
+            // adopted by derivation emits nothing of its own - the only on-chain
+            // signal is `challengeOf(sibling).status` flipping to `Disputed`,
+            // which has to be polled. An adopted challenger that watches only
+            // its own logs sees nothing at all.
             if (courtAddr != address(0) && court != address(0)) {
                 try ITokenCourt(courtAddr).refer(challengeId) {}
                 catch {
@@ -1462,7 +1484,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (_pools[poolKey].completedAt == 0) {
             _releasePool(key, poolKey, challengeId);
         } else {
-            _burnPool(poolKey, challengeId, key);
+            _burnPool(key, poolKey, challengeId);
         }
         emit ChallengeSettled(challengeId, slashedWood);
     }
@@ -1476,7 +1498,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      path that reaches here, so `file` refuses this proposal forever -
     ///      but it keeps the one-pool-per-round rule true without depending on
     ///      that second contract's gate.
-    function _burnPool(bytes32 poolKey, uint256 challengeId, bytes32 rk) private {
+    ///
+    ///      PARAMETER ORDER MATCHES `_releasePool`/`_releasePoolIfLast`
+    ///      DELIBERATELY. The two are called adjacently in `_settle`'s if/else,
+    ///      both take two `bytes32`, and both compile either way - so a future
+    ///      swap would key the round bump on the wrong mapping with nothing to
+    ///      catch it. Keeping one order across all three makes the mistake
+    ///      visible at the call site.
+    function _burnPool(bytes32 rk, bytes32 poolKey, uint256 challengeId) private {
         CounterBondPool storage p = _pools[poolKey];
         if (p.outcome != PoolOutcome.Open) return;
         p.outcome = PoolOutcome.Burned;
@@ -1836,6 +1865,24 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             p.completedAt,
             p.outcome == PoolOutcome.Burned
         );
+    }
+
+    /// @inheritdoc IChallengeGame
+    /// @dev THE FULL OUTCOME, because `counterBondPoolOf`'s `bool burned` cannot
+    ///      express it. That flag is `outcome == Burned`, which collapses `Open`
+    ///      and `Released` into the same `false` — and those two differ in the
+    ///      one way an invariant cares about: an `Open` pool HOLDS what it
+    ///      raised, a `Released` one has handed it to `unclaimedWood`.
+    ///
+    ///      Without this, a property asserting "a live challenge's pool still
+    ///      holds what it raised" has to be weakened to `<=` to avoid firing on
+    ///      terminal-pool-with-live-sibling, which is a normal state on both the
+    ///      burn and the release paths — and a `<=` there asserts almost
+    ///      nothing. Exposed as a separate view rather than widening
+    ///      `counterBondPoolOf`'s tuple, which would break every existing
+    ///      destructuring of it for no gain.
+    function poolOutcomeOf(uint256 challengeId) external view returns (PoolOutcome) {
+        return _pools[_poolOf[challengeId]].outcome;
     }
 
     /// @inheritdoc IChallengeGame

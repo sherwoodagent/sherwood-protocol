@@ -163,7 +163,13 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
                 sum += game.counterBondContributionOf(id, contributors[j]);
             }
             if (sum != raisedWood) return false;
-            if (poolWood > raisedWood) return false;
+            // STRICT, but only where it can be: an OPEN pool must still hold
+            // exactly what it raised. A terminal pool coexisting with a live
+            // challenge is normal on both paths (`_burnPool` on first
+            // conviction, `_releasePool` on the incomplete-pool branch), so the
+            // equality is scoped to `Open` rather than weakened to `<=` — which
+            // would assert almost nothing.
+            if (game.poolOutcomeOf(id) == IChallengeGame.PoolOutcome.Open && poolWood != raisedWood) return false;
             if (raisedWood > targetWood) return false;
         }
         return true;
