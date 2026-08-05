@@ -456,11 +456,22 @@ contract PerCallCapitalDeclarationsTest is Test {
         governor.executeProposal(pid);
     }
 
-    /// @notice design.md D2 / spec "All-zero caps price zero coverage": with a
-    ///         wired registry, an all-zero-cap batch prices to ZERO coverage
-    ///         regardless of tier, and the per-call meter still blocks any
-    ///         actual outflow at execute time.
-    function test_allZeroCaps_pricesZeroCoverage_meterStillBlocksOutflow() public {
+    /// @notice SUPERSEDED by the zero-cap refusal added in #220. design.md D2
+    ///         said an all-zero-cap batch prices to zero coverage and relied on
+    ///         the per-call meter to block the outflow at execute. That defence
+    ///         is real but incomplete: the meter reads
+    ///         `balanceBefore - balanceAfter` of the vault asset, so a call
+    ///         whose capability is an AUTHORIZATION rather than a transfer --
+    ///         `approve` to an allowlisted adapter -- truthfully declares
+    ///         `cap = 0` and truthfully meters 0 while licensing an unbounded
+    ///         pull in a later transaction, outside every meter.
+    ///
+    ///         So the batch is now refused at PROPOSE rather than metered at
+    ///         execute. This test keeps the same fixture and asserts the
+    ///         refusal; the meter's own behaviour is still covered by
+    ///         `test_zeroCap_blocksAnyOutflowOnThatCall` above, which reaches
+    ///         the meter through a proposal that prices above zero.
+    function test_allZeroCaps_areRefusedAtProposeRatherThanMeteredAtExecute() public {
         _wireTierRegistry();
         _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
         // The vault's selector guard (Part 2, registry-dependent) requires
@@ -475,25 +486,24 @@ contract PerCallCapitalDeclarationsTest is Test {
         });
         uint256[] memory execCaps = new uint256[](1); // zero
 
+        // Hoisted: `GovEnvelope.permissive` makes an external `totalAssets()`
+        // staticcall, and a call in ARGUMENT position is evaluated first -- it
+        // would consume the one-shot `vm.expectRevert` before `propose` runs.
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(agent);
-        uint256 pid = governor.propose(
+        vm.expectRevert(ISyndicateGovernor.UnpricedCapability.selector);
+        governor.propose(
             address(vault),
             address(0),
             "ipfs://all-zero",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            env,
             execCalls,
             execCaps,
             _benignSettle(),
             new uint256[](1),
             new ISyndicateGovernor.CoProposer[](0)
         );
-
-        assertEq(governor.getRequiredCoverage(pid), 0, "all-zero caps price zero coverage regardless of tier");
-
-        _advancePastVoting();
-        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1, 0));
-        governor.executeProposal(pid);
     }
 
     // ── 8.3: regression guards re-evaluated against per-call caps ──────────
@@ -582,72 +592,47 @@ contract PerCallCapitalDeclarationsTest is Test {
         governor.executeProposal(pid);
     }
 
-    /// @notice design.md D2's deliberate residual: a zero-cap call's adapter
-    ///         demoting inside an ALREADY-tier-2 batch changes nothing —
-    ///         coverage is unaffected (0 * anything = 0) and the tier was
-    ///         already at the max, so execution proceeds normally.
-    function test_regression_zeroCapCallDemotion_insideAlreadyTier2Batch_executesFine() public {
+    /// @notice SUPERSEDED by the zero-cap refusal added in #220. This pinned
+    ///         that demoting a zero-cap call inside an ALREADY-tier-2 batch
+    ///         changes nothing and the batch executes cleanly. The premise --
+    ///         "the batch's own calls move nothing, so it executes" -- is
+    ///         exactly what the refusal now rejects: an all-zero-cap batch is
+    ///         refused at propose, because a zero cap is honest about TRANSFERS
+    ///         while blind to AUTHORIZATIONS, and zero coverage silently
+    ///         disables the approve quorum, the proposer bond and challenge
+    ///         eligibility together.
+    ///
+    ///         The demotion behaviour it was guarding is still covered: see the
+    ///         other regression tests in this section, which demote inside
+    ///         batches that price above zero and therefore still reach execute.
+    function test_regression_zeroCapCallDemotion_isRefusedAtProposeNow() public {
         _wireTierRegistry();
-        // The vault's selector guard (Part 2) requires an `approve` spender to
-        // be allowlisted -- orthogonal to this test's subject (tier/coverage
-        // regression under caps), so allowlist the spender explicitly.
-        tierRegistry.setAdapterAllowed(address(this), true);
-        // Two calls: one uncertified (forces tier 2 already), one certified
-        // tier-0 but capped at ZERO.
+        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
+
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
-        // `approve` (never requires a balance precondition, unlike `transfer`)
-        // stays uncertified -- this is the call that forces tier 2.
         execCalls[0] = BatchExecutorLib.Call({
             target: address(mockAdapter), data: abi.encodeCall(mockAdapter.approve, (address(this), 1)), value: 0
         });
         execCalls[1] = BatchExecutorLib.Call({
             target: address(mockAdapter), data: abi.encodeCall(mockAdapter.mint, (address(this), 1)), value: 0
         });
-        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
-        uint256[] memory execCaps = new uint256[](2);
-        execCaps[0] = 0; // uncertified call -- moves nothing declared
-        execCaps[1] = 0; // certified tier-0 call, ALSO capped at zero
+        uint256[] memory execCaps = new uint256[](2); // both zero
 
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(agent);
-        uint256 pid = governor.propose(
+        vm.expectRevert(ISyndicateGovernor.UnpricedCapability.selector);
+        governor.propose(
             address(vault),
             address(0),
             "ipfs://zero-cap-demotion",
             7 days,
-            GovEnvelope.permissive(address(vault)),
+            env,
             execCalls,
             execCaps,
             _benignSettle(),
             new uint256[](1),
             new ISyndicateGovernor.CoProposer[](0)
         );
-        assertEq(governor.getProposalTier(pid), 2, "uncertified call already pins tier 2");
-        assertEq(governor.getRequiredCoverage(pid), 0, "both caps zero");
-
-        _advancePastVoting();
-        // Demote the certified call too -- tier stays 2 (already the max),
-        // coverage stays 0 (cap is 0 either way). Neither regression guard
-        // fires; the batch's own calls move nothing, so it executes cleanly.
-        // Etched with a harmless-fallback contract (not executorLib's code,
-        // which has no fallback at all) so the batch's approve/mint calls
-        // still succeed post-demotion -- this test's subject is the
-        // tier/coverage arithmetic, not whether the demoted contract remains
-        // independently callable.
-        vm.etch(address(mockAdapter), address(new HarmlessFallback()).code);
-        // issue #166: the etch above changes `mockAdapter`'s codehash, which
-        // the pre-existing codehash-drift self-heal (issue #137) correctly
-        // reads as revoking `isAdapterAllowed` -- that check is now ALSO the
-        // batch callee gate (Part 2a), not just the fund-destination check
-        // Part 2b already was, so an un-re-attested etch would refuse the
-        // whole batch with `DisallowedBatchCallee` before execution even
-        // reaches the tier/coverage arithmetic this test is about (see the
-        // comment above: "not whether the demoted contract remains
-        // independently callable"). Re-snapshot the new (harmless) code,
-        // mirroring the owner re-attestation ceremony `setAdapterAllowed`'s
-        // natspec documents for a verified legitimate bytecode change.
-        tierRegistry.setAdapterAllowed(address(mockAdapter), true);
-        governor.executeProposal(pid);
-        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Executed));
     }
 
     // ── 8.4: unwired-registry default ───────────────────────────────────────
