@@ -4409,9 +4409,8 @@ contract ChallengeGameTest is Test {
             address filer = makeAddr(string.concat("concurrentFiler", vm.toString(i)));
             _fund(filer);
             vm.prank(filer);
-            ids[i] = game.file(
-                address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, ADAPTER, SELECTOR, EVIDENCE
-            );
+            ids[i] =
+                game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.DrawdownBreach, ADAPTER, SELECTOR, EVIDENCE);
         }
 
         (, target,,,) = game.counterBondPoolOf(ids[0]);
@@ -4603,7 +4602,7 @@ contract ChallengeGameTest is Test {
         assertEq(
             wood.balanceOf(sybil),
             10_000_000e18 - bondSelf + (bondSelf - slice),
-            "the self-filer recovered only its own bond net of the slice — never the pool"
+            "the self-filer recovered only its own bond net of the slice -- never the pool"
         );
         assertEq(swood.callCount(), 1, "and it was convicted while paying for the privilege");
     }
@@ -4632,7 +4631,7 @@ contract ChallengeGameTest is Test {
 
         (uint256 afterRelease,,,, bool burnedAfter) = game.counterBondPoolOf(ids[1]);
         assertEq(afterRelease, 0, "released out of live accounting");
-        assertFalse(burnedAfter, "released, not burned — no conviction happened");
+        assertFalse(burnedAfter, "released, not burned -- no conviction happened");
         assertEq(game.unclaimedWood(), target, "and booked for a pull-claim, to the wei");
 
         // Claimed once, through either challenge, and never twice.
@@ -4681,7 +4680,7 @@ contract ChallengeGameTest is Test {
         assertEq(
             wood.balanceOf(game.BURN_ADDRESS()) - burnBefore,
             slice,
-            "and ONLY the slice burned — an unfunded pool has nothing to destroy"
+            "and ONLY the slice burned -- an unfunded pool has nothing to destroy"
         );
         assertEq(swood.callCount(), 1, "the silence verdict still slashes");
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled));
