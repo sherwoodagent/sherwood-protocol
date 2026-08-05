@@ -451,15 +451,47 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      Mirrors `TokenCourt._participationFloor`'s construction, minus the
     ///      accused-weight subtraction, so `minTotal` is a plain min of two raw
     ///      `getPastTotalVotes` reads.
+    ///        - `floorTotal` — the LARGER of the two reads, and the correct
+    ///          basis for `cohortTooSmall` (pashov 2026-08 finding #2).
+    ///
+    ///      WHY THE FLOOR MOVED OFF THE LIVE READ. The live read was chosen over
+    ///      the lookback-min for the reason above, and that reasoning is still
+    ///      right — but it did not go far enough: `total` is
+    ///      `getPastTotalVotes(ts1)`, and `StakedWood.requestUnstakeGuardian`
+    ///      decrements `totalGuardianStake` and pushes the reduced checkpoint
+    ///      IMMEDIATELY, with `cancelUnstakeGuardian` restoring it in full at no
+    ///      cost, no cooldown and no transfer. So the very primitive named above
+    ///      as "a free, on-demand off-switch" also moves the LIVE figure — a
+    ///      guardian large enough to cross `MIN_COHORT_STAKE_AT_OPEN` could
+    ///      request-unstake in block N, be first to `openReview`/`openEmergency`
+    ///      in N+1, and cancel in N+2, having stamped `cohortTooSmall` for a
+    ///      proposal of their choosing. That flag makes `resolveReview` return
+    ///      not-blocked REGARDLESS of votes and skips `slashOwnerBond` on the
+    ///      emergency path, so it disables the guardian veto and the owner-bond
+    ///      slash together.
+    ///
+    ///      Taking the MAX over the window closes it, and is safe in the
+    ///      direction that matters: for a does-a-jury-exist question, INFLATING
+    ///      the electorate is not an attack — it makes `cohortTooSmall` false,
+    ///      which ENABLES the veto and the slash, against the inflater's own
+    ///      interest. Only deflation is an attack, and deflation now has to hold
+    ///      for the whole `FLOOR_LOOKBACK` window rather than for one block.
+    ///
+    ///      The residual is a genuine mass exit: for `FLOOR_LOOKBACK` afterwards
+    ///      the floor still reads the pre-exit figure, so a small surviving
+    ///      cohort keeps its veto. That is the conservative direction — the
+    ///      veto's action is REFUSAL, and `_isBlocked` still measures it against
+    ///      `minTotal`, which tracks the shrunken electorate.
     function _lookbackMinTotalVotes(IStakedWood sw, uint256 ts1)
         private
         view
-        returns (uint256 total, uint256 minTotal)
+        returns (uint256 total, uint256 minTotal, uint256 floorTotal)
     {
         total = sw.getPastTotalVotes(ts1);
         uint256 lookbackTs = ts1 > FLOOR_LOOKBACK ? ts1 - FLOOR_LOOKBACK : 0;
         uint256 earlier = sw.getPastTotalVotes(lookbackTs);
         minTotal = (earlier != 0 && earlier < total) ? earlier : total;
+        floorTotal = earlier > total ? earlier : total;
     }
 
     /// @dev GROWTH-GATED MIN on a voter's OWN weight at review open, mirroring
@@ -820,7 +852,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // the lookback-min — see `_lookbackMinTotalVotes`.
         IStakedWood sw = swood;
         uint256 ts1 = block.timestamp - 1;
-        (uint256 liveTotal, uint256 gs) = _lookbackMinTotalVotes(sw, ts1);
+        (, uint256 gs, uint256 floorTotal) = _lookbackMinTotalVotes(sw, ts1);
 
         er.governor = msg.sender; // stored before any external calls
         er.callsHash = callsHash;
@@ -833,7 +865,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         er.resolved = false;
         er.blocked = false;
         er.openedAt = uint64(ts1);
-        er.cohortTooSmall = liveTotal < MIN_COHORT_STAKE_AT_OPEN;
+        er.cohortTooSmall = floorTotal < MIN_COHORT_STAKE_AT_OPEN;
         // Snapshot block-quorum threshold at open so the owner can't shift
         // it mid-review.
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -979,7 +1011,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // for does-a-cohort-exist made it a free off-switch for the guardian veto
         // during ordinary early growth.
         uint256 ts1 = block.timestamp - 1;
-        (uint256 liveTotal, uint256 minTotal) = _lookbackMinTotalVotes(sw, ts1);
+        (, uint256 minTotal, uint256 floorTotal) = _lookbackMinTotalVotes(sw, ts1);
         uint128 totalAtOpen = uint128(minTotal);
         uint256 combinedAtOpen = uint256(totalAtOpen);
         r.opened = true;
@@ -1004,7 +1036,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // forge-lint: disable-next-line(unsafe-typecast)
         r.maxSlashBpsAtOpen = uint16(swood.maxSlashBps() + 1);
         r.openedAt = uint64(ts1);
-        if (liveTotal < MIN_COHORT_STAKE_AT_OPEN) {
+        if (floorTotal < MIN_COHORT_STAKE_AT_OPEN) {
             r.cohortTooSmall = true;
             emit CohortTooSmallToReview(proposalId, combinedAtOpen);
         } else {

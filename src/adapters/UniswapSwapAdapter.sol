@@ -250,6 +250,20 @@ contract UniswapSwapAdapter is ISwapAdapter {
             if (pathStart != tokenIn) {
                 path = _reversePath(path);
             }
+            // BIND BOTH ENDPOINTS (pashov 2026-08 finding #4). Only the head was
+            // checked, and `tokenOut` was never referenced on this branch at
+            // all: `_chainedSingleHops` derives every hop from the path bytes
+            // and sends the terminal token to `msg.sender`, so the route decided
+            // what the caller received. `amountOutMin` is computed by the caller
+            // in `tokenOut` units — an oracle-anchored figure in
+            // `PortfolioStrategy._buyFloor`/`_sellFloor` — and was then enforced
+            // by the router against a DIFFERENT token's units, which any
+            // freely-mintable token clears trivially.
+            //
+            // Modes 0, 2 and 3 all bind `tokenOut` already (`exactInputSingle`'s
+            // struct field, `hops[0].currency`, and `_orientHops`' explicit
+            // endpoint check respectively); mode 1 was the sole exception.
+            _requireEndpoints(path, tokenIn, tokenOut);
             amountOut = _chainedSingleHops(path, amountIn, amountOutMin, perHopSlippageBps);
         } else {
             revert UnsupportedMode();
@@ -479,6 +493,25 @@ contract UniswapSwapAdapter is ISwapAdapter {
         }
     }
 
+    /// @dev Require a packed V3 path to run exactly from `tokenIn` to
+    ///      `tokenOut`. Call AFTER any `_reversePath` orientation fix.
+    ///
+    ///      The tail check is the load-bearing half: without it a route may end
+    ///      anywhere, and since `_chainedSingleHops` pays the terminal token to
+    ///      `msg.sender` while `amountOutMin` is denominated by the caller in
+    ///      `tokenOut`, the floor gets enforced against units it does not
+    ///      describe. The head check is re-asserted here rather than trusted
+    ///      from the caller's `if`, so this function is a complete statement of
+    ///      the invariant on its own.
+    ///
+    ///      Path layout is `addr(20) [+ fee(3) + addr(20)]*`, so the terminal
+    ///      address begins at `length - 20`.
+    function _requireEndpoints(bytes memory path, address tokenIn, address tokenOut) internal pure {
+        if (path.length < 20) revert InvalidPath();
+        if (_extractFirstAddress(path) != tokenIn) revert InvalidPath();
+        if (_extractAddressAt(path, path.length - 20) != tokenOut) revert InvalidPath();
+    }
+
     /// @dev Reverse a packed Uniswap V3 path (addr + fee + addr + fee + ...).
     ///      Each segment is 20 bytes (address) + 3 bytes (fee). Last element is 20 bytes.
     function _reversePath(bytes memory path) internal pure returns (bytes memory reversed) {
@@ -532,6 +565,13 @@ contract UniswapSwapAdapter is ISwapAdapter {
             // Match `swap()`'s path orientation: ensure tokenIn is the head
             // of the path before passing to the quoter.
             if (_extractFirstAddress(path) != tokenIn) path = _reversePath(path);
+            // Same endpoint binding as `swap()`, and for a sharper reason:
+            // `quoteExactInput` prices the PATH's terminal token, so an
+            // unbound tail returns a quote denominated in something other than
+            // `tokenOut`. Callers build slippage floors out of this number
+            // (`PortfolioStrategy._quoteMinOut`), so a mis-denominated quote
+            // silently mis-scales the floor rather than failing.
+            _requireEndpoints(path, tokenIn, tokenOut);
             (amountOut,,,) = quoter.quoteExactInput(path, amountIn);
         } else if (mode == 2) {
             if (address(v4Quoter) == address(0)) revert V4Unavailable();
