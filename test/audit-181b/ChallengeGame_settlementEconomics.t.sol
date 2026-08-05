@@ -184,6 +184,19 @@ contract MockCourtSE {
 ///         trade on the FAIL path. `test_selfFundedGuiltyRuling_burnsASlice_notTheWholeRoundTrip`
 ///         proves the escalated branch now burns too.
 ///
+///         SUPERSEDED IN SIZING BY pashov 2026-08 FINDING #10, and the test
+///         above is updated accordingly. 18b's remedy — burn a
+///         `settleBurnBps` SLICE of the forfeited pool — left the rest of the
+///         pool returning to the ruled challenger, which finding #10 showed is
+///         a ~5% refundable deposit rather than a cost, and reachable by the
+///         GUILTY COHORT itself once the pool is keyed per proposal: it
+///         self-files from a fresh address, funds the proposal's only pool
+///         through that filing, adopts the honest challenge for free, and
+///         collects the pool back on the ruling that convicts it. The pool is
+///         now burned in full on every conviction. 18b's PROPERTY (the round
+///         trip must not be free) is preserved and strengthened; only its
+///         price changed, from the slice to the slice plus the whole pool.
+///
 /// @dev    Finding 19 (free first round): the very first `Inconclusive`
 ///         unwind against a fresh proposal used to pin a 0 bps burn rate,
 ///         making a self-funded stall-to-quorum-miss a genuinely free way to
@@ -320,12 +333,18 @@ contract ChallengeGame_settlementEconomicsTest is Test {
         uint256 settleBurnBpsAtFiling = game.challengeOf(id).settleBurnBpsAtFiling;
         uint256 expectedBurn = (bondWood * settleBurnBpsAtFiling) / 10_000;
         assertGt(expectedBurn, 0, "fixture must exercise a non-zero burn rate");
-        // BURN MODEL (pashov 2026-08 finding #10). The pool is burned on
-        // conviction rather than forfeited to the challenger, so a self-funded
-        // round trip recovers only its own BOND net of the slice -- it does not
-        // get the pool back at all. That makes issue #181 finding 18b STRICTLY
-        // STRONGER than when this test was written: the round trip used to cost
-        // the slice alone, and now costs the whole pool plus the slice.
+
+        // SUPERSEDED SIZING, SAME PROPERTY (pashov 2026-08 finding #10). This
+        // used to expect `2 * bondWood - expectedBurn`: both legs back, less a
+        // slice. Finding #10 named that for what it was — a ~5% REFUNDABLE
+        // DEPOSIT — because with one pool per proposal the round trip is
+        // available to a GUILTY cohort, not just to a self-dealing challenger:
+        // self-file from a fresh address, fund the proposal's only pool through
+        // that filing, and take it back as the challenger on the ruling that
+        // convicts you. Finding 18b's property ("the round trip must not be
+        // free") is kept and strengthened: the pool is now BURNED outright, so
+        // only the bond leg returns and the round trip costs the WHOLE pool plus
+        // the slice.
         uint256 expectedReceipt = bondWood - expectedBurn;
 
         vm.prank(address(court));
@@ -336,10 +355,18 @@ contract ChallengeGame_settlementEconomicsTest is Test {
         // Challenger's balance was exactly 0 immediately before this call, so
         // its balance now IS what the round trip returned.
         uint256 received = wood.balanceOf(challenger);
-        assertEq(received, expectedReceipt, "the round trip must cost exactly the settle-burn slice, not zero");
+        assertEq(received, expectedReceipt, "only the bond leg returns, net of the settle-burn slice");
         assertLt(received, 2 * bondWood, "THE ROUND TRIP MUST NOT BE FREE (issue #181 finding 18b)");
-        assertLt(received, bondWood, "and under the burn model it does not even recover its own bond");
-        assertEq(wood.balanceOf(game.BURN_ADDRESS()), expectedBurn, "the slice must actually be destroyed");
+        assertEq(
+            received + expectedBurn + bondWood,
+            2 * bondWood,
+            "and it costs the whole pool plus the slice, not the slice alone (finding #10)"
+        );
+        assertEq(
+            wood.balanceOf(game.BURN_ADDRESS()),
+            expectedBurn + bondWood,
+            "the slice AND the whole self-funded pool must actually be destroyed"
+        );
     }
 
     // ── Finding 19 ──
