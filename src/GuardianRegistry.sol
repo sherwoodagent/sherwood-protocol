@@ -407,7 +407,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // would make `SyndicateGovernor.propose` revert for the duration of any
         // registry pause, since propose is what pushes this window. Stamping the
         // in-progress span costs nothing and changes no liveness.
-        r.clockShiftAtRegister = paused ? pauseShiftTotal + uint64(block.timestamp - uint256(pausedAt)) : pauseShiftTotal;
+        r.clockShiftAtRegister =
+            paused ? pauseShiftTotal + uint64(block.timestamp - uint256(pausedAt)) : pauseShiftTotal;
         emit ReviewRegistered(msg.sender, proposalId, uint64(voteEnd), uint64(reviewEnd));
     }
 
@@ -472,47 +473,53 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      Mirrors `TokenCourt._participationFloor`'s construction, minus the
     ///      accused-weight subtraction, so `minTotal` is a plain min of two raw
     ///      `getPastTotalVotes` reads.
-    ///        - `floorTotal` — the LARGER of the two reads, and the correct
-    ///          basis for `cohortTooSmall` (pashov 2026-08 finding #2).
     ///
-    ///      WHY THE FLOOR MOVED OFF THE LIVE READ. The live read was chosen over
-    ///      the lookback-min for the reason above, and that reasoning is still
-    ///      right — but it did not go far enough: `total` is
-    ///      `getPastTotalVotes(ts1)`, and `StakedWood.requestUnstakeGuardian`
-    ///      decrements `totalGuardianStake` and pushes the reduced checkpoint
-    ///      IMMEDIATELY, with `cancelUnstakeGuardian` restoring it in full at no
-    ///      cost, no cooldown and no transfer. So the very primitive named above
-    ///      as "a free, on-demand off-switch" also moves the LIVE figure — a
-    ///      guardian large enough to cross `MIN_COHORT_STAKE_AT_OPEN` could
-    ///      request-unstake in block N, be first to `openReview`/`openEmergency`
-    ///      in N+1, and cancel in N+2, having stamped `cohortTooSmall` for a
-    ///      proposal of their choosing. That flag makes `resolveReview` return
-    ///      not-blocked REGARDLESS of votes and skips `slashOwnerBond` on the
-    ///      emergency path, so it disables the guardian veto and the owner-bond
-    ///      slash together.
+    ///      REJECTED FIX, RECORDED SO IT IS NOT RE-ATTEMPTED (pashov 2026-08
+    ///      finding #2). The audit is RIGHT that the live read is cheaply
+    ///      movable: `StakedWood.requestUnstakeGuardian` decrements
+    ///      `totalGuardianStake` and pushes the reduced checkpoint IMMEDIATELY,
+    ///      and `cancelUnstakeGuardian` restores it in full with no cost, no
+    ///      cooldown and no transfer — so a holder large enough to cross
+    ///      `MIN_COHORT_STAKE_AT_OPEN` can request-unstake in block N, be first
+    ///      to `openReview`/`openEmergency` in N+1, and cancel in N+2, having
+    ///      stamped `cohortTooSmall` on a proposal of their choosing. That flag
+    ///      disables the guardian veto AND skips `slashOwnerBond` together.
     ///
-    ///      Taking the MAX over the window closes it, and is safe in the
-    ///      direction that matters: for a does-a-jury-exist question, INFLATING
-    ///      the electorate is not an attack — it makes `cohortTooSmall` false,
-    ///      which ENABLES the veto and the slash, against the inflater's own
-    ///      interest. Only deflation is an attack, and deflation now has to hold
-    ///      for the whole `FLOOR_LOOKBACK` window rather than for one block.
+    ///      The obvious fix — decide the floor from `max(total, earlier)` so a
+    ///      one-block deflation cannot reach it — was implemented, tested, and
+    ///      REVERTED, because it is strictly worse:
     ///
-    ///      The residual is a genuine mass exit: for `FLOOR_LOOKBACK` afterwards
-    ///      the floor still reads the pre-exit figure, so a small surviving
-    ///      cohort keeps its veto. That is the conservative direction — the
-    ///      veto's action is REFUSAL, and `_isBlocked` still measures it against
-    ///      `minTotal`, which tracks the shrunken electorate.
+    ///        after a GENUINE drain, `max` reads the pre-drain figure and
+    ///        clears `cohortTooSmall`, so the veto stays ACTIVE — while
+    ///        `_isBlocked`'s denominator is `minTotal`, which tracks the
+    ///        SHRUNKEN electorate. A 15k holder against a 40k denominator makes
+    ///        37% against a 30% quorum: it blocks proposals and slashes every
+    ///        approver at high severity, on a trivial stake, for the whole
+    ///        `FLOOR_LOOKBACK` window.
+    ///
+    ///      That converts a fail-SAFE state (veto disabled on a cohort too thin
+    ///      to judge) into a cheap veto-and-slash. Four existing tests pin the
+    ///      current behaviour and correctly caught it —
+    ///      `test_lifecycle_cohortTooSmall_autoApproves_noSlashing` is the
+    ///      attack shape verbatim, and on-chain a genuine drain and the attack
+    ///      are indistinguishable AT THE INSTANT `openReview` reads them.
+    ///
+    ///      The distinguishing fact is PERSISTENCE, and the honest place to
+    ///      charge for it is the primitive, not the basis: make the
+    ///      request/cancel round trip cost something (a cooldown on
+    ///      `cancelUnstakeGuardian`, or a minimum dwell before a re-cancelled
+    ///      stake counts again), so a deflation the attacker intends to reverse
+    ///      is not free. That is a `StakedWood` change with its own blast radius
+    ///      and is deliberately NOT bundled here.
     function _lookbackMinTotalVotes(IStakedWood sw, uint256 ts1)
         private
         view
-        returns (uint256 total, uint256 minTotal, uint256 floorTotal)
+        returns (uint256 total, uint256 minTotal)
     {
         total = sw.getPastTotalVotes(ts1);
         uint256 lookbackTs = ts1 > FLOOR_LOOKBACK ? ts1 - FLOOR_LOOKBACK : 0;
         uint256 earlier = sw.getPastTotalVotes(lookbackTs);
         minTotal = (earlier != 0 && earlier < total) ? earlier : total;
-        floorTotal = earlier > total ? earlier : total;
     }
 
     /// @dev GROWTH-GATED MIN on a voter's OWN weight at review open, mirroring
@@ -873,7 +880,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // the lookback-min — see `_lookbackMinTotalVotes`.
         IStakedWood sw = swood;
         uint256 ts1 = block.timestamp - 1;
-        (, uint256 gs, uint256 floorTotal) = _lookbackMinTotalVotes(sw, ts1);
+        (uint256 liveTotal, uint256 gs) = _lookbackMinTotalVotes(sw, ts1);
 
         er.governor = msg.sender; // stored before any external calls
         er.callsHash = callsHash;
@@ -886,7 +893,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         er.resolved = false;
         er.blocked = false;
         er.openedAt = uint64(ts1);
-        er.cohortTooSmall = floorTotal < MIN_COHORT_STAKE_AT_OPEN;
+        er.cohortTooSmall = liveTotal < MIN_COHORT_STAKE_AT_OPEN;
         // Snapshot block-quorum threshold at open so the owner can't shift
         // it mid-review.
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -1055,7 +1062,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // for does-a-cohort-exist made it a free off-switch for the guardian veto
         // during ordinary early growth.
         uint256 ts1 = block.timestamp - 1;
-        (, uint256 minTotal, uint256 floorTotal) = _lookbackMinTotalVotes(sw, ts1);
+        (uint256 liveTotal, uint256 minTotal) = _lookbackMinTotalVotes(sw, ts1);
         uint128 totalAtOpen = uint128(minTotal);
         uint256 combinedAtOpen = uint256(totalAtOpen);
         r.opened = true;
@@ -1080,7 +1087,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // forge-lint: disable-next-line(unsafe-typecast)
         r.maxSlashBpsAtOpen = uint16(swood.maxSlashBps() + 1);
         r.openedAt = uint64(ts1);
-        if (floorTotal < MIN_COHORT_STAKE_AT_OPEN) {
+        if (liveTotal < MIN_COHORT_STAKE_AT_OPEN) {
             r.cohortTooSmall = true;
             emit CohortTooSmallToReview(proposalId, combinedAtOpen);
         } else {
