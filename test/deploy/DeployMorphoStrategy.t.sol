@@ -145,8 +145,9 @@ contract DeployMorphoStrategyTest is Test {
     function test_templateKeys_holdExactlyTheLiveTemplates() public {
         string[] memory keys = new DeployStrategyFactoryHarness().exposed_templateKeys();
 
-        assertEq(keys.length, 2, "exactly the live templates");
+        assertEq(keys.length, 3, "exactly the live templates");
         assertEq(keys[0], "PORTFOLIO_TEMPLATE", "portfolio");
         assertEq(keys[1], "MORPHO_SUPPLY_TEMPLATE", "morpho");
+        assertEq(keys[2], "CONCENTRATED_LIQUIDITY_TEMPLATE", "concentrated liquidity");
     }
 }

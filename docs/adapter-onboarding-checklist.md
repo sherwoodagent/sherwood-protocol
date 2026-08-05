@@ -307,6 +307,39 @@ Write down, at onboarding time, the (target, selector) pairs and the adapter
 address that a de-onboarding will have to reverse (§4). The bond-release
 timelock makes this slow — plan it before you need it, not during an incident.
 
+### [ ] 2.7 Strategy clones: allowlist per proposal, and mind the mid-period selector
+
+Strategy clones are not adapters in the usual sense, but Gate B still binds
+them: `SyndicateVault._guardBatchCalls` rejects any batch target that is not an
+allowlisted adapter (`asset()` is the sole exemption), so **each clone needs its
+own owner `setAdapterAllowed(clone, true)` before its batch can execute**. A
+clone is a fresh address per proposal, so this is a per-proposal step, not a
+one-off template step. The template being approved on `StrategyFactory` gates
+*cloning*; it does not make the clone reachable from a batch.
+
+`ConcentratedLiquidityStrategy` adds a wrinkle worth stating explicitly, because
+it is the first template where the allowlist window is not just "execute and
+settle":
+
+- Its `rerange()` is **permissionless and batch-reachable**, and it is expected
+  to be called repeatedly during the strategy period rather than at the two
+  lifecycle endpoints. The clone must therefore **stay allowlisted for the whole
+  strategy period**, not only across `execute()` and `settle()`.
+- De-allowlisting a clone mid-period does NOT freeze the position: `rerange()`
+  moves no vault funds — it burns and re-mints the clone's own Uniswap position
+  — so a keeper calling it **directly** is unaffected by the batch guard. What
+  de-allowlisting stops is the governor batch route. Do not treat it as a kill
+  switch for reranging.
+- The clone is uncertified and therefore reads as **tier 2** (`TIER_ARBITRARY`,
+  full notional), like every other strategy clone. That is admissible, but it
+  means guardian coverage is priced at full notional, so these proposals consume
+  maximum coverage capacity per dollar deployed. Plan capacity, not permission.
+
+Certifying clones at tier 0/1 is not the answer: certification is owner-only,
+bonded, and keys on address, so it would mean one certification per clone per
+proposal. Clones of one template share a codehash, but tiering does not key on
+codehash, so there is nothing to amortize.
+
 ---
 
 ## 3. Verification reads

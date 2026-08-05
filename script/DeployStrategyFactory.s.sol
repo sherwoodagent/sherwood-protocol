@@ -71,9 +71,10 @@ contract DeployStrategyFactory is ScriptBase {
     ///      legacy Base books, and only for a NEW StrategyFactory — already
     ///      deployed factories keep whatever they approved at their own deploy.
     function _templateKeys() internal pure returns (string[] memory keys) {
-        keys = new string[](2);
+        keys = new string[](3);
         keys[0] = "PORTFOLIO_TEMPLATE";
         keys[1] = "MORPHO_SUPPLY_TEMPLATE";
+        keys[2] = "CONCENTRATED_LIQUIDITY_TEMPLATE";
     }
 
     function _tryParseAddress(string memory json, string memory key) internal view returns (address) {
