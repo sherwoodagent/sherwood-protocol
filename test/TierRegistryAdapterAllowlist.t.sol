@@ -84,43 +84,27 @@ contract TierRegistryAdapterAllowlistTest is Test {
         reg.proposeCertification(target, bytes4(0x88888888), 1, 500, address(0), target.codehash);
     }
 
-    // ── Issue #77, as revised by pashov 2026-08 finding #15 ──
-    //
-    // Demotion USED TO `delete _adapterAllowed[target]`. It no longer does: that
-    // erasure also revoked the target's BATCH-CALLEE standing, and the
-    // settlement batch of an already-executed proposal names the target, so a
-    // conviction bricked `settleProposal`/`unstick`/`finalizeEmergencySettle`
-    // and froze every LP exit. What demotion still does on this axis is set the
-    // per-address `_classAllowDenied` flag — the conviction RECORD, which the
-    // governor refuses new proposals against, and which also blocks the class
-    // fallback. The tests below pin the new split.
+    // ── Issue #77: demotion auto-clears the adapter allowlist ──
 
-    /// @notice Owner `demote` LEAVES an explicit address-level allow intact,
-    ///         and emits no `AdapterAllowedSet` — but records the conviction.
-    function test_demote_leavesExplicitAdapterAllowlistIntact() public {
+    /// @notice Owner `demote` clears the target's allowlist entry atomically,
+    ///         reusing the existing `AdapterAllowedSet` event.
+    function test_demote_clearsAdapterAllowlist() public {
         _certifyNow(target, bytes4(0x12345678), 1, 500, address(0));
         vm.prank(owner);
         reg.setAdapterAllowed(target, true);
         assertTrue(reg.isAdapterAllowed(target));
 
-        bytes32 allowedSetSig = keccak256("AdapterAllowedSet(address,bool)");
-        vm.recordLogs();
+        vm.expectEmit(true, false, false, true);
+        emit TierRegistry.AdapterAllowedSet(target, false);
         vm.prank(owner);
         reg.demote(target, bytes4(0x12345678));
-        Vm.Log[] memory logs = vm.getRecordedLogs();
-        for (uint256 i = 0; i < logs.length; i++) {
-            assertTrue(logs[i].topics[0] != allowedSetSig, "demotion no longer touches the allowlist");
-        }
 
-        assertTrue(reg.isAdapterAllowed(target), "callee standing survives so the live position can be settled");
-        assertTrue(reg.isClassAllowDenied(target), "but the conviction IS on record");
-        (uint8 tierAfter,) = reg.tierOf(target, bytes4(0x12345678));
-        assertEq(tierAfter, 2, "and the certification is gone");
+        assertFalse(reg.isAdapterAllowed(target));
     }
 
-    /// @notice `demoteByChallenge` behaves identically to owner `demote` — both
-    ///         converge on `_demote`.
-    function test_demoteByChallenge_leavesExplicitAdapterAllowlistIntact() public {
+    /// @notice `demoteByChallenge` clears the allowlist identically to owner
+    ///         `demote` — both converge on `_demote`.
+    function test_demoteByChallenge_clearsAdapterAllowlist() public {
         address demoter = makeAddr("demoter");
         _certifyNow(target, bytes4(0x12345678), 1, 500, address(0));
         vm.startPrank(owner);
@@ -129,33 +113,42 @@ contract TierRegistryAdapterAllowlistTest is Test {
         vm.stopPrank();
         assertTrue(reg.isAdapterAllowed(target));
 
+        // hoist: any argument-position call would consume the one-shot prank
+        vm.expectEmit(true, false, false, true);
+        emit TierRegistry.AdapterAllowedSet(target, false);
         vm.prank(demoter);
         reg.demoteByChallenge(target, bytes4(0x12345678));
 
-        assertTrue(reg.isAdapterAllowed(target), "a conviction does not strip batch-callee standing");
-        assertTrue(reg.isClassAllowDenied(target));
+        assertFalse(reg.isAdapterAllowed(target));
     }
 
-    /// @notice Permissionless `poke` (on codehash drift) is the third
-    ///         `_demote`-converging path and behaves the same. `isAdapterAllowed`
-    ///         still reports `false` here — but from the LAZY codehash self-heal
-    ///         (issue #137), not from any erasure `poke` performed.
-    function test_poke_leavesAdapterAllowlistStorageIntact() public {
+    /// @notice Permissionless `poke` (on codehash drift) clears the allowlist
+    ///         too — the third of the three `_demote`-converging paths.
+    function test_poke_clearsAdapterAllowlist() public {
         _certifyNow(target, bytes4(0x12345678), 1, 500, address(0));
         vm.prank(owner);
         reg.setAdapterAllowed(target, true);
         vm.etch(target, hex"6001600101");
-        assertFalse(reg.isAdapterAllowed(target), "codehash drift alone closes the funds path");
+        // issue #137: isAdapterAllowed self-heals lazily on read, exactly like
+        // tierOf, so it already reports false here even though `poke` has not
+        // run yet and `_adapterAllowed[target]` storage is still `true`. This
+        // assertion used to be `assertTrue` and was pinning the stale-`true`
+        // window that let a metamorphic redeploy keep standing funds-path
+        // rights until someone happened to poke.
+        assertFalse(reg.isAdapterAllowed(target));
 
+        vm.expectEmit(true, false, false, true);
+        emit TierRegistry.AdapterAllowedSet(target, false);
         vm.prank(makeAddr("rando"));
         reg.poke(target, bytes4(0x12345678));
 
-        assertFalse(reg.isAdapterAllowed(target), "still shut, still by the codehash mismatch");
-        assertTrue(reg.isClassAllowDenied(target), "and the drift is on record as a demotion");
+        assertFalse(reg.isAdapterAllowed(target));
     }
 
-    /// @notice No demotion path emits `AdapterAllowedSet` any more — neither for
-    ///         an allowlisted target (above) nor for one that never was.
+    /// @notice Demoting a target that was never allowlisted must NOT emit a
+    ///         phantom `AdapterAllowedSet` — the guarded emission keeps the
+    ///         channel truthful and existing `vm.expectEmit` assertions in
+    ///         this file (which never allowlist before demoting) unaffected.
     function test_demote_neverAllowlisted_noAllowedSetEvent() public {
         _certifyNow(target, bytes4(0x12345678), 1, 500, address(0));
         assertFalse(reg.isAdapterAllowed(target));
@@ -171,14 +164,13 @@ contract TierRegistryAdapterAllowlistTest is Test {
         }
     }
 
-    /// @notice DELIBERATE over-breadth (design.md Decision 3), on the axis that
-    ///         still carries it: certification is keyed (target, selector) while
-    ///         the CONVICTION RECORD is keyed by bare address, so demoting ONE
-    ///         selector marks the WHOLE adapter convicted even though its other
-    ///         selectors remain certified. That is what bars the adapter from
-    ///         future proposals and from the class fallback. Do not "fix" it
-    ///         back to per-selector.
-    function test_demoteOneSelector_convictsWholeAdapter_intended() public {
+    /// @notice DELIBERATE over-breadth (design.md Decision 3): certification
+    ///         is keyed (target, selector), the allowlist by bare address, so
+    ///         demoting ONE selector de-allowlists the WHOLE adapter even
+    ///         though its other selectors remain certified. This pins the
+    ///         over-broad clear as specified behavior, not a bug — do not
+    ///         "fix" it back to per-selector.
+    function test_demoteOneSelector_clearsWholeAdapter_intended() public {
         _certifyNow(target, bytes4(0x12345678), 1, 500, address(0));
         _certifyNow(target, bytes4(0x87654321), 0, 200, address(0));
         vm.prank(owner);
@@ -187,40 +179,41 @@ contract TierRegistryAdapterAllowlistTest is Test {
         vm.prank(owner);
         reg.demote(target, bytes4(0x12345678));
 
-        assertTrue(reg.isClassAllowDenied(target), "whole adapter convicted by one selector's demotion");
+        assertFalse(reg.isAdapterAllowed(target), "whole adapter de-allowlisted by one selector's demotion");
         (uint8 survivingTier, uint16 survivingBound) = reg.tierOf(target, bytes4(0x87654321));
         assertEq(survivingTier, 0, "other selector remains certified");
         assertEq(survivingBound, 200);
     }
 
-    /// @notice Re-certifying a demoted (target, selector) must NOT clear the
-    ///         conviction record — `certify` never writes either allowlist axis;
-    ///         the coupling is one-way and fail-closed. Only the owner's explicit
-    ///         `setAdapterAllowed(target, true)` clears it.
-    function test_recertify_doesNotClearTheConvictionRecord() public {
+    /// @notice Re-certifying a demoted (target, selector) must NOT restore
+    ///         the allowlist — `certify` never sets or restores
+    ///         `_adapterAllowed`; the coupling is one-way and fail-closed.
+    function test_recertify_doesNotRestoreAllowlist() public {
         _certifyNow(target, bytes4(0x12345678), 1, 500, address(0));
         vm.prank(owner);
-        reg.demote(target, bytes4(0x12345678));
-        assertTrue(reg.isClassAllowDenied(target));
+        reg.setAdapterAllowed(target, true);
+        vm.prank(owner);
+        reg.demote(target, bytes4(0x12345678)); // auto-clears the allowlist
+        assertFalse(reg.isAdapterAllowed(target));
 
         _certifyNow(target, bytes4(0x12345678), 1, 500, address(0));
 
-        assertTrue(reg.isClassAllowDenied(target), "re-certification must not clear the conviction");
+        assertFalse(reg.isAdapterAllowed(target), "re-certification must not re-grant the allowlist");
     }
 
-    /// @notice The recovery path: after a conviction, the owner's explicit
-    ///         re-grant clears the record and reopens both the class fallback
-    ///         and, at the governor, new proposals naming the target.
-    function test_ownerReallowClearsTheConvictionRecord() public {
+    /// @notice The recovery path: after a demotion-triggered clear, the owner
+    ///         can always explicitly re-allowlist the adapter.
+    function test_ownerReallowsAfterClear() public {
         _certifyNow(target, bytes4(0x12345678), 1, 500, address(0));
         vm.prank(owner);
+        reg.setAdapterAllowed(target, true);
+        vm.prank(owner);
         reg.demote(target, bytes4(0x12345678));
-        assertTrue(reg.isClassAllowDenied(target));
+        assertFalse(reg.isAdapterAllowed(target));
 
         vm.prank(owner);
         reg.setAdapterAllowed(target, true);
 
-        assertFalse(reg.isClassAllowDenied(target));
         assertTrue(reg.isAdapterAllowed(target));
     }
 
@@ -406,20 +399,7 @@ contract TierRegistryAdapterAllowlistTest is Test {
         vm.prank(demoter);
         reg.demoteByChallenge(target, sel);
 
-        // pashov 2026-08 finding #15: the adapter entry SURVIVES (it is what
-        // keeps an already-committed settlement batch runnable), and because
-        // `isCounterpartyAllowed` is IMPLIED BY adapter standing, the weaker
-        // axis reads `true` right along with it. The counterparty clear is
-        // therefore inert while an explicit adapter grant stands — it only
-        // becomes visible once that grant is withdrawn, which is what the second
-        // half of this test proves.
-        assertTrue(reg.isAdapterAllowed(target), "adapter standing survives the conviction");
-        assertTrue(reg.isCounterpartyAllowed(target), "and the weak axis rides on it");
-
-        vm.prank(owner);
-        reg.setAdapterAllowed(target, false);
-
-        assertFalse(reg.isAdapterAllowed(target), "owner withdrew the strong grant");
-        assertFalse(reg.isCounterpartyAllowed(target), "and `_demote` really had cleared the weak one");
+        assertFalse(reg.isAdapterAllowed(target), "adapter standing cleared");
+        assertFalse(reg.isCounterpartyAllowed(target), "counterparty standing cleared");
     }
 }

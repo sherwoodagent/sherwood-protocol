@@ -1325,7 +1325,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // block) purely for the same stack-budget reason — an extra call
         // frame in propose() tips it over. Same-tx revert either way.
         _checkMaxCapitalCeiling(p.maxCapital);
-        // atPropose=true: this IS the propose-time sweep the per-call
+        // checkCeiling=true: this IS the propose-time sweep the per-call
         // tier-2 ceiling runs inside (design.md D1/D2). Caps are loaded from
         // storage (stored by `propose` via `_storeCaps` before this call
         // runs) rather than taken as stack arguments, for the same
@@ -1434,9 +1434,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      With no registry wired every proposal is tier 2 / full notional, so
     ///      the pre-registry safe default is not made cheaper by per-call caps.
     ///      `memory` params (not calldata) so this can be reused on
-    ///      storage-loaded calls at execute time. `atPropose` gates the
-    ///      propose-only refusals — the per-call tier-2 ceiling and the
-    ///      convicted-target denylist — true at propose, false at execute, where
+    ///      storage-loaded calls at execute time. `checkCeiling` gates the
+    ///      per-call tier-2 ceiling — true at propose, false at execute, where
     ///      post-propose tier drift is the regression guards' job.
     function _resolveTierAndCoverage(
         BatchExecutorLib.Call[] memory execCalls,
@@ -1444,32 +1443,30 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         BatchExecutorLib.Call[] memory settleCalls,
         uint256[] memory settleCaps,
         uint256 maxCapital,
-        bool atPropose
+        bool checkCeiling
     ) private view returns (uint8 tier, uint256 coverage) {
         address registry = _tierRegistry;
         if (registry == address(0)) return (2, maxCapital);
-        uint256 tier2Ceiling = atPropose
+        uint256 tier2Ceiling = checkCeiling
             ? (IERC4626(GovernorParameters.vault).totalAssets() * tier2CallCapBps()) / BPS_DENOMINATOR
             : type(uint256).max;
-        (uint8 execTier, uint256 execCoverage) = _scanCalls(registry, execCalls, execCaps, atPropose, tier2Ceiling);
-        (, uint256 settleCoverage) = _scanCalls(registry, settleCalls, settleCaps, atPropose, tier2Ceiling);
+        (uint8 execTier, uint256 execCoverage) = _scanCalls(registry, execCalls, execCaps, checkCeiling, tier2Ceiling);
+        (, uint256 settleCoverage) = _scanCalls(registry, settleCalls, settleCaps, checkCeiling, tier2Ceiling);
         tier = execTier;
         coverage = execCoverage + settleCoverage;
     }
 
     /// @dev Max tier and `sum(cap_i * boundBps_i) / 10_000` across `calls`,
-    ///      resolved through the TierRegistry. When `atPropose` is set, also
-    ///      enforces the per-call tier-2 ceiling AND the convicted-target
-    ///      denylist in the SAME sweep (one registry scan, not three): any call
-    ///      resolving to tier 2, uncertified included, must declare
-    ///      `caps[i] <= tier2Ceiling`, and no call may name a target the registry
-    ///      reports as convicted. The reported `i` is this array's own index;
-    ///      exec and settle are scanned as two separate calls.
+    ///      resolved through the TierRegistry. When `checkCeiling` is set, also
+    ///      enforces the per-call tier-2 ceiling in the SAME sweep (one registry
+    ///      scan, not two): any call resolving to tier 2, uncertified included,
+    ///      must declare `caps[i] <= tier2Ceiling`. The reported `i` is this
+    ///      array's own index; exec and settle are scanned as two separate calls.
     function _scanCalls(
         address registry,
         BatchExecutorLib.Call[] memory calls,
         uint256[] memory caps,
-        bool atPropose,
+        bool checkCeiling,
         uint256 tier2Ceiling
     ) private view returns (uint8 tier, uint256 coverage) {
         for (uint256 i = 0; i < calls.length; i++) {
@@ -1487,56 +1484,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             (uint8 t, uint16 boundBps) = ITierRegistry(registry).tierOf(calls[i].target, sel);
             if (t > tier) tier = t;
             uint256 cap_i = caps[i];
-            if (atPropose) {
-                if (t == 2 && cap_i > tier2Ceiling) revert Tier2CallCapExceedsCeiling(i);
-                _revertIfConvictedTarget(registry, calls[i].target);
-            }
+            if (checkCeiling && t == 2 && cap_i > tier2Ceiling) revert Tier2CallCapExceedsCeiling(i);
             coverage += (cap_i * boundBps) / 10_000;
-        }
-    }
-
-    /// @dev PROPOSE-TIME ONLY. Refuses a proposal that names a target the
-    ///      TierRegistry has convicted — i.e. one a passed challenge (or an owner
-    ///      demotion, or a codehash `poke`) ran `_demote` against, recorded as
-    ///      `isClassAllowDenied(target) == true`.
-    ///
-    ///      WHY THIS EXISTS AND WHY IT LIVES HERE (pashov 2026-08 finding #15).
-    ///      `TierRegistry._demote` used to `delete _adapterAllowed[target]`, and
-    ///      that one erasure answered two unrelated questions: "may vault funds
-    ///      move to this address" and "may the vault CALL this address at all".
-    ///      The second is fatal against the address a live position sits behind:
-    ///      the settlement batch was fixed at propose time and names it, so
-    ///      `settleProposal`, `unstick` and `finalizeEmergencySettle` all revert
-    ///      `DisallowedBatchCallee`, the proposal pins in `Executed`, and every
-    ///      LP exit is shut until the registry owner — a different party from the
-    ///      vault owner — re-grants what the conviction removed. The registry
-    ///      stopped erasing it; a conviction now bites HERE instead, on proposals
-    ///      that do not exist yet, where refusing strands nothing.
-    ///
-    ///      A DENYLIST, NOT AN ALLOWLIST — which is why this does not contradict
-    ///      `openspec/changes/target-based-batch-gating` design.md's "propose-time
-    ///      is NOT extended". That decision refuses to check `isAdapterAllowed`
-    ///      (the ALLOW half) at propose, because it is mutable and flips with zero
-    ///      state writes on codehash drift, so a propose-time pass would
-    ///      manufacture false completeness about a settle-time question. This
-    ///      check asserts nothing about a target being acceptable; it only refuses
-    ///      one already adjudicated unacceptable, exactly as
-    ///      `_rejectPrivilegedTargets` does, and a stale `false` here costs
-    ///      nothing because the vault re-checks the real predicate at call time.
-    ///
-    ///      DEGRADES OPEN, like `_revertIfPrivilegedTarget`. Raw staticcall with
-    ///      an explicit length check: a registry predating the getter (or any
-    ///      non-conforming stand-in) answers nothing, and is treated as "no
-    ///      conviction on record" — the pre-fix behaviour, where propose had no
-    ///      conviction refusal at all. Failing CLOSED here would brick `propose`
-    ///      outright for every such registry, a total liveness loss traded for a
-    ///      gate that is defense-in-depth: the registry is owner-set and already
-    ///      trusted for `tierOf`, so one that cannot answer this has no
-    ///      conviction to hide.
-    function _revertIfConvictedTarget(address registry, address target) private view {
-        (bool ok, bytes memory ret) = registry.staticcall(abi.encodeCall(ITierRegistry.isClassAllowDenied, (target)));
-        if (ok && ret.length == 32 && abi.decode(ret, (bool))) {
-            revert ConvictedBatchTarget(target);
         }
     }
 

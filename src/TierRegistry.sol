@@ -607,15 +607,14 @@ contract TierRegistry is Ownable2Step {
     ///         challenge against it passed. Reuses the same `_demote` path as
     ///         owner demotion, so the bond release timelock starts identically.
     /// @dev    REQUIRES AN EXISTING CERTIFICATION, mirroring `poke`. Without it,
-    ///         `_demote`'s per-address denial flags are reachable for a pair that
+    ///         `_demote`'s adapter-allowlist clear is reachable for a pair that
     ///         was never certified: `ChallengeGame.file` only checks that the
     ///         named pair appears somewhere in the executed proposal's calldata,
     ///         so a challenger could name a routine, uncertified selector on an
     ///         otherwise-legitimate allowlisted adapter, let the challenge settle
-    ///         on silence, and strip that adapter's class-derived fund-movement
-    ///         standing — and, since finding #15, bar it from every FUTURE
-    ///         proposal at propose time — for ~1% of the proposal's coverage,
-    ///         without the adapter ever being adjudicated.
+    ///         on silence, and strip that adapter's ENTIRE fund-movement standing
+    ///         for ~1% of the proposal's coverage — without the adapter ever being
+    ///         adjudicated.
     ///
     ///         ACCEPTS A CLASS-ONLY MEMBER (see `_isCertifiedFor`). Restricting
     ///         this to address entries made the whole class axis unreachable
@@ -639,71 +638,19 @@ contract TierRegistry is Ownable2Step {
         _demote(target, selector);
     }
 
-    /// @dev Convergence point for all three demotion paths.
+    /// @dev Convergence point for all three demotion paths. ALSO clears the
+    ///      target's adapter allowlist entry, emitting only if the entry was set.
+    ///      The adversary: an adapter just convicted in a challenge, or whose
+    ///      bytecode was just swapped under it, otherwise retains the standing
+    ///      right to receive value-moving ERC20 calls inside a governor batch —
+    ///      tier 2 raises the coverage price but is a price, not a prohibition.
     ///
-    ///      DOES NOT CLEAR `_adapterAllowed[target]` (pashov 2026-08 finding
-    ///      #15). It used to, and that single erasure answered two unrelated
-    ///      questions at once, because `isAdapterAllowed` is the sole predicate
-    ///      behind both of `SyndicateVault._guardBatchCalls`' registry checks:
-    ///        (a) PART 2b — may vault funds be approved to, or transferred to,
-    ///            this address?
-    ///        (b) PART 2a — may the vault CALL this address as a batch callee
-    ///            at all?
-    ///      Revoking (a) on conviction is right. Revoking (b) is catastrophic
-    ///      when the convicted address is the in-flight target the vault's
-    ///      capital is currently sitting behind: the settlement batch was
-    ///      pre-committed at PROPOSE time and names that address, so
-    ///      `settleProposal`, `unstick` AND `finalizeEmergencySettle` all revert
-    ///      `DisallowedBatchCallee`. The proposal pins in `Executed`,
-    ///      `_activeProposal != 0` keeps `redemptionsLocked()` true,
-    ///      `maxWithdraw`/`maxRedeem` report 0 and `VaultWithdrawalQueue.claim`
-    ///      reverts `VaultLocked` — every LP exit shut until THIS contract's
-    ///      owner (a different party from the vault owner) re-grants the exact
-    ///      standing the conviction had just removed.
-    ///
-    ///      THE ENFORCEMENT POINT MOVED, IT DID NOT DISAPPEAR. A conviction now
-    ///      means "this address may not be named by NEW proposals", not "capital
-    ///      already deployed through it is trapped": `SyndicateGovernor`'s
-    ///      propose-time sweep refuses any proposal whose execute OR settlement
-    ///      calls name a target with `isClassAllowDenied(target) == true` —
-    ///      which `_demote` sets below, and which is therefore the persistent
-    ///      conviction record. Nothing is grandfathered at call time; the
-    ///      already-executed batch keeps working because the rule it is checked
-    ///      against never flipped, not because it was exempted from one.
-    ///
-    ///      SUBTLE, AND THE REASON THIS WORKS AT ALL: `isAdapterAllowed`
-    ///      early-returns `true` from its explicit-allow branch BEFORE it reaches
-    ///      `if (_classAllowDenied[adapter]) return false;`. So leaving
-    ///      `_adapterAllowed[target]` set genuinely does preserve callee standing
-    ///      even though `_classAllowDenied[target]` is set in the same call. DO
-    ///      NOT "tidy" that ordering by hoisting the deny check to the top of
-    ///      `isAdapterAllowed` — it silently reintroduces the brick above.
-    ///      `test_conviction_doesNotBrickSettlement_addressAllowlistedTarget`
-    ///      in `test/ChallengeEndToEnd.t.sol` fails if you do.
-    ///
-    ///      RESIDUAL, STATED SO IT IS NOT MISTAKEN FOR A CLOSED CASE: a target
-    ///      whose callee standing comes ONLY from the class fallback (no address
-    ///      entry) is still bricked, because `_classAllowDenied` is checked
-    ///      ahead of the class and this function still sets it. Separating the
-    ///      conviction record from the class-denial flag is the fix for that and
-    ///      is deliberately NOT taken here — it is the same two-bit axis split
-    ///      already owned by the `#211` review of `isCounterpartyAllowed`, and
-    ///      landing a competing version here would collide with it.
-    ///      `test_conviction_classOnlyMemberStillLosesCalleeStanding` in
-    ///      `test/TierRegistryClassMemberDenial.t.sol` pins the residual so it
-    ///      cannot be lost.
-    ///
-    ///      SECOND RESIDUAL, ON THE OTHER AXIS: because `isAdapterAllowed` is
-    ///      also the RECIPIENT predicate (PART 2b) and the governor's
-    ///      propose-time refusal is TARGET-keyed, a convicted address holding an
-    ///      explicit allow can still be named as an approve spender / transfer
-    ///      recipient — by a new proposal whose TARGET is `asset()`, or by
-    ///      owner-supplied `emergencySettleWithCalls` calldata, which is never
-    ///      propose-gated. Bounded by tier-2 full-notional coverage pricing, the
-    ///      per-call caps, `effectiveMaxCapital`, and guardian review on the
-    ///      emergency path; shut immediately by the owner's
-    ///      `setAdapterAllowed(target, false)`. This is the price the chosen
-    ///      shape pays, and the same two-bit split closes it.
+    ///      DELIBERATELY OVER-BROAD: certification is keyed `(target, selector)`
+    ///      while the allowlist is keyed by bare address, so demoting ONE selector
+    ///      de-allowlists the WHOLE adapter. This is the chosen conservative
+    ///      direction of error — recovery is one owner `setAdapterAllowed` call —
+    ///      and it is pinned by test. Do NOT change it to a per-selector
+    ///      allowlist.
     ///
     ///      ALSO clears a same-key PENDING certification: otherwise a renewal
     ///      proposed while a certification is still live would survive that
@@ -743,30 +690,46 @@ contract TierRegistry is Ownable2Step {
             b.releasableAt = releasableAt;
             emit SubmitterBondReleaseStarted(target, selector, b.submitter, releasableAt);
         }
-        // THE COUNTERPARTY AXIS IS STILL CLEARED, and deliberately so — it is
-        // not the axis finding #15 was about. `isCounterpartyAllowed` licenses a
-        // strategy TEMPLATE to BIND an address (a lending market, a position
-        // manager, a collateral token) and is read exclusively on the BINDING
-        // path: `ConcentratedLiquidityStrategy._initialize`'s check (0), and
-        // nowhere in `_settle`/`sweep`. It is not a `_guardBatchCalls`
-        // predicate, so no already-executed proposal's exit route runs through
-        // it and clearing it strands no deployed capital — the same reasoning
-        // the strategies already apply to themselves (see
-        // `MorphoSupplyStrategy._requireAllowedMorpho`: "`_settle`/`sweep`
-        // deliberately do NOT [re-certify]: they are the exit path, and gating
-        // them would hand a demotion the power to freeze deployed capital").
-        // What it does buy is that a convicted address cannot be bound by the
-        // NEXT strategy deployment, which is the same posture the propose-time
-        // refusal takes on the callee axis.
+        // PASHOV 2026-08 FINDING #15 LIVES ON THIS LINE, and it is knowingly
+        // left open rather than patched here.
         //
-        // OBSERVABLY INERT WHILE AN EXPLICIT ADAPTER GRANT STANDS, because
-        // `isCounterpartyAllowed` is IMPLIED BY `isAdapterAllowed` — and that
-        // grant now survives demotion. It becomes visible the moment the owner
-        // withdraws the strong grant with `setAdapterAllowed(target, false)`.
-        // Kept anyway rather than deleted: the write is what makes the weak axis
-        // actually revoked in storage, so the owner's later withdrawal does not
-        // silently leave a stale binding grant behind.
-        // `test_demotionClearsCounterpartyStandingToo` pins both halves.
+        // `_adapterAllowed` answers TWO questions with ONE bit: "may this
+        // address receive vault-fund movements?" and "may the vault CALL this
+        // address in a governor batch?" (`SyndicateVault._guardBatchCalls`
+        // PART 2a). Clearing it on demotion is right for the first and
+        // catastrophic for the second when the target is a strategy CLONE that
+        // currently holds the vault's capital: `settleProposal`, `unstick` AND
+        // `finalizeEmergencySettle` all revert `DisallowedBatchCallee`, the
+        // proposal pins in `Executed`, `redemptionsLocked()` stays true, and
+        // every LP exit is shut until a DIFFERENT owner (the registry
+        // multisig) re-grants the standing this conviction just removed.
+        // `test/ChallengeEndToEnd.t.sol` already works around exactly this.
+        //
+        // Not narrowed here because both candidate fixes are worse from this
+        // seat. Keeping the bit but skipping the clear would let a convicted
+        // adapter keep receiving funds, which is the entire point of demotion.
+        // Exempting the in-flight position vault-side reverses openspec
+        // `target-based-batch-gating` Decision 3 ("No lifecycle state is
+        // grandfathered in code") and was already dropped once for scoping the
+        // exemption to "named in a batch" rather than "holds this proposal's
+        // capital".
+        //
+        // The real fix is to split the two questions into two bits, which is
+        // the same axis rework already owned elsewhere (see the `#211` review
+        // of `isCounterpartyAllowed`, whose stated justification — "the swap
+        // adapter is the one address that receives forceApprove" — is false).
+        // Landing a competing version here would collide with it.
+        if (_adapterAllowed[target]) {
+            delete _adapterAllowed[target];
+            emit AdapterAllowedSet(target, false);
+        }
+        // Both axes, so "demoted" means the address holds NO standing rather
+        // than "no standing on whichever axis was written first". The
+        // counterparty axis carries its own codehash check and would invalidate
+        // independently on a bytecode swap, but demotion also fires for reasons
+        // that check cannot see, and a stale binding grant surviving one is the
+        // kind of asymmetry this contract's demotion is deliberately over-broad
+        // to avoid.
         if (_counterpartyAllowed[target]) {
             delete _counterpartyAllowed[target];
             emit CounterpartyAllowedSet(target, false);
@@ -821,14 +784,10 @@ contract TierRegistry is Ownable2Step {
     ///         (ERC-721/1155/777, LP-position NFTs) MUST NOT be allowlisted here
     ///         as batch callees; batches should reach such positions through
     ///         allowlisted adapters instead.
-    /// @dev    THE ONLY PATH THAT WRITES THIS MAPPING AT ALL, in either
-    ///         direction. `certify` never touches it, and — since pashov 2026-08
-    ///         finding #15 — neither does `_demote`: a conviction that erased an
-    ///         address-level allow would take away the batch-callee standing the
-    ///         vault needs to run the ALREADY-COMMITTED settlement batch, pinning
-    ///         the proposal in `Executed` and shutting every LP exit until this
-    ///         contract's owner re-granted it. A conviction is now enforced at
-    ///         PROPOSE time instead (see `_demote`).
+    /// @dev    The only path that SETS this to true. `_demote` is the only path
+    ///         that clears it, over-broadly by design. `certify` never touches
+    ///         this mapping — re-allowlisting after a demotion-triggered clear is
+    ///         always this explicit owner call.
     ///
     ///         On the grant path, (re)writes `_adapterAllowedCodehash[adapter]` to
     ///         the adapter's CURRENT effective codehash, so every grant re-attests
@@ -869,26 +828,10 @@ contract TierRegistry is Ownable2Step {
     ///         allowlist flag is set AND the adapter's live effective codehash
     ///         still matches the grant-time snapshot — no state write in the hot
     ///         path, nothing to grief, and no dependence on any demotion path ever
-    ///         running. Persistence of a `false` result comes from an explicit
-    ///         owner `setAdapterAllowed(adapter, false)`, or — for an adapter
-    ///         standing only on its CLASS — from the `_classAllowDenied` flag
-    ///         `poke`/`demote`/`demoteByChallenge` set.
-    ///
-    ///         STATEMENT ORDER IS LOAD-BEARING, DO NOT "TIDY" IT. The
-    ///         explicit-allow branch returns `true` BEFORE the
-    ///         `_classAllowDenied` check below it, so an address the owner
-    ///         allowlisted directly keeps callee standing even after a
-    ///         conviction sets that flag. That is not an oversight — it is the
-    ///         whole mechanism behind pashov 2026-08 finding #15's fix (see
-    ///         `_demote`): the settlement batch of an ALREADY-EXECUTED proposal
-    ///         names the convicted address, and hoisting the deny check to the
-    ///         top of this function makes `settleProposal`, `unstick` and
-    ///         `finalizeEmergencySettle` all revert `DisallowedBatchCallee`,
-    ///         pinning the proposal in `Executed` and freezing every LP exit.
-    ///         `test_conviction_doesNotBrickSettlement_addressAllowlistedTarget`
-    ///         in `test/ChallengeEndToEnd.t.sol` is the regression that fails if
-    ///         the two statements are swapped. A conviction is enforced against
-    ///         NEW proposals at propose time instead.
+    ///         running. Persistence of a `false` result still comes from
+    ///         `poke`/`demote`/`demoteByChallenge` where a certification exists, or
+    ///         an explicit owner `setAdapterAllowed(adapter, false)` — the only
+    ///         path for an allowlisted-but-uncertified adapter.
     ///
     ///         The adversary: an allowlisted adapter whose bytecode is swapped at
     ///         the same address, or a codeless allowlisted address at which code
@@ -1037,8 +980,7 @@ contract TierRegistry is Ownable2Step {
     // ── PER-MEMBER DENIAL (the class fallback's off switch) ──
     //
     // Revocation in this contract is expressed as ERASURE: `_demote` deletes
-    // `_configs[k]` (and `setAdapterAllowed(x, false)` clears
-    // `_adapterAllowed[x]`), and the absence of a record
+    // `_configs[k]` and `_adapterAllowed[target]`, and the absence of a record
     // used to BE the tier-2 default. The class fallback gave absence a second,
     // permissive meaning, which silently converted every revocation against a
     // class member into a no-op — the conviction still deleted a record, but
@@ -1067,15 +1009,7 @@ contract TierRegistry is Ownable2Step {
     /// @dev target => this ADDRESS may not read its allowlist standing off a
     ///      class. Per-address, matching `_adapterAllowed`, so it inherits
     ///      `_demote`'s deliberate over-broadness: demoting one selector strips
-    ///      the whole adapter's class-derived fund-movement standing.
-    ///
-    ///      DOUBLE DUTY since pashov 2026-08 finding #15: this is also THE
-    ///      persistent conviction record, read through `isClassAllowDenied` by
-    ///      `SyndicateGovernor`'s propose-time sweep to refuse any NEW proposal
-    ///      naming the address. It does not bar the address from an
-    ///      already-committed settlement batch — an explicit `_adapterAllowed`
-    ///      entry short-circuits `isAdapterAllowed` ahead of this flag, and
-    ///      `_demote` no longer clears that entry.
+    ///      the whole adapter's fund-movement standing.
     ///
     ///      Cleared by `setAdapterAllowed(target, true)` and set by
     ///      `setAdapterAllowed(target, false)`, so the owner's explicit

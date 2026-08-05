@@ -14,13 +14,4 @@ interface ITierRegistry {
     ///         NOT "never receives funds" — a bound counterparty is approved by
     ///         the template that bound it.
     function isCounterpartyAllowed(address counterparty) external view returns (bool);
-    /// @notice THE CONVICTION RECORD: `true` once `TierRegistry._demote` has run
-    ///         against this address (passed challenge, owner demotion, or a
-    ///         codehash `poke`), or the owner explicitly disallowed it.
-    /// @dev    Declared here for `abi.encodeCall` type-safety only —
-    ///         `SyndicateGovernor` reaches it through a length-checked raw
-    ///         staticcall that degrades open, NEVER a typed call, so a registry
-    ///         without this getter does not revert `propose`. See
-    ///         `SyndicateGovernor._revertIfConvictedTarget`.
-    function isClassAllowDenied(address target) external view returns (bool);
 }
