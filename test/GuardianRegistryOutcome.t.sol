@@ -76,8 +76,12 @@ contract GuardianRegistryOutcomeTest is RegistryTestHarness {
         assertEq(_outcome(PID), uint8(IGuardianRegistry.ReviewOutcome.Cleared));
     }
 
-    function test_outcomeOf_cohortTooSmallIsCleared() public {
-        // Drop 2 guardians → combined at-open stake 30_000e18 < 50_000e18 floor.
+    /// @dev Inverted with the removal of the cold-start waiver: a thin cohort
+    ///      voting unanimously to block is BLOCKED. The waiver used to clear it
+    ///      regardless, which is what made the veto worth switching off — see
+    ///      `_isBlocked` and `GuardianRegistry.openReview`.
+    function test_outcomeOf_thinCohortUnanimousBlockIsBlocked() public {
+        // Drop 2 guardians → combined at-open stake 30_000e18.
         vm.prank(_guardian(3));
         swood.requestUnstakeGuardian();
         vm.prank(_guardian(4));
@@ -86,14 +90,14 @@ contract GuardianRegistryOutcomeTest is RegistryTestHarness {
         vm.warp(vm.getBlockTimestamp() + 1);
 
         _open();
-        // Even a unanimous block from the 3 survivors can't flip a too-small
-        // cohort.
+        // A unanimous block from the 3 survivors is 100% of the electorate that
+        // exists, so it decides.
         for (uint256 i = 0; i < 3; i++) {
             _vote(i, IGuardianRegistry.GuardianVoteType.Block);
         }
 
         vm.warp(reviewEnd);
-        assertEq(_outcome(PID), uint8(IGuardianRegistry.ReviewOutcome.Cleared));
+        assertEq(_outcome(PID), uint8(IGuardianRegistry.ReviewOutcome.Blocked));
     }
 
     // ── Blocked / Cleared at quorum ──

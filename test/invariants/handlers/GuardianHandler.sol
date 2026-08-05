@@ -263,8 +263,8 @@ contract GuardianHandler is Test {
 
         // Snapshot approvers BEFORE the registry zeroes their stake on a
         // blocked resolve (INV-2 needs to see the slashed set).
-        (bool opened, bool alreadyResolved,, bool cohortTooSmall) = registry.getReviewState(address(governor), pid);
-        if (opened && !alreadyResolved && !cohortTooSmall) {
+        (bool opened, bool alreadyResolved,) = registry.getReviewState(address(governor), pid);
+        if (opened && !alreadyResolved) {
             address[] memory snapshot = _snapshotApprovers(pid);
             _approversSnapshot[pid] = snapshot;
         }

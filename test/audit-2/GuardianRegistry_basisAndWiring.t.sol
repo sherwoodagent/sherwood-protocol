@@ -153,84 +153,22 @@ contract GuardianRegistry_basisAndWiringTest is RegistryTestHarness {
     }
 
     // ══════════════════════════ FINDING B ══════════════════════════
-
-    /// @notice `cohortTooSmall` must be decided off the LIVE electorate, not
-    ///         the 30-day lookback-min. Setup: `guardian1` stakes only
-    ///         10_000e18 (below `MIN_COHORT_STAKE_AT_OPEN` = 50_000e18) and
-    ///         matures untouched for 31 days -- this is what the lookback
-    ///         read (`ts1 - FLOOR_LOOKBACK`) sees. THEN, at `ts1`, four more
-    ///         guardians stake 20_000e18 each, pushing the LIVE total to
-    ///         90_000e18 -- well above the floor.
-    ///
-    ///         Against the (broken) lookback-min basis, `cohortTooSmall`
-    ///         would read `10_000e18 < 50_000e18 -> true`, disabling the
-    ///         guardian veto outright: `resolveReview` would return `false`
-    ///         regardless of any block vote cast. Against the fix,
-    ///         `cohortTooSmall` reads the live 90_000e18 total (`false`), and
-    ///         `guardian1`'s own vote -- which by itself equals the ENTIRE
-    ///         lookback-min denominator used for the block-quorum test --
-    ///         clears the quorum and the review resolves Blocked.
-    function test_openReview_cohortTooSmallUsesLiveElectorateNotLookbackMin() public {
-        _stakeGuardian(guardian1, 10_000e18, 1);
-        vm.warp(vm.getBlockTimestamp() + 31 days);
-
-        _stakeGuardian(guardian2, 20_000e18, 2);
-        _stakeGuardian(guardian3, 20_000e18, 3);
-        _stakeGuardian(guardian4, 20_000e18, 4);
-        _stakeGuardian(guardian5, 20_000e18, 5);
-
-        uint256 voteEnd = vm.getBlockTimestamp();
-        _registerReview(4, voteEnd, voteEnd + REVIEW_PERIOD);
-        vm.warp(vm.getBlockTimestamp() + 1);
-
-        registry.openReview(address(governor), 4);
-
-        (,, bool blockedYet, bool cohortTooSmall) = registry.getReviewState(address(governor), 4);
-        assertFalse(blockedYet, "not yet resolved");
-        assertFalse(
-            cohortTooSmall,
-            "live electorate (90_000e18) clears MIN_COHORT_STAKE_AT_OPEN even though the 30-day-old checkpoint (10_000e18) does not"
-        );
-
-        // guardian1's own vote equals the WHOLE lookback-min denominator
-        // (10_000e18), so it alone clears any legal block-quorum bps.
-        vm.prank(guardian1);
-        registry.voteOnProposal(address(governor), 4, IGuardianRegistry.GuardianVoteType.Block);
-
-        vm.warp(voteEnd + REVIEW_PERIOD);
-        bool blocked = registry.resolveReview(address(governor), 4);
-        assertTrue(blocked, "the veto pipeline must actually run -- cohortTooSmall must not have short-circuited it");
-    }
-
-    /// @notice Mirror of the above for `openEmergency` / `_resolveEmergency`
-    ///         -- the emergency owner-bond slash path shares the identical
-    ///         `cohortTooSmall` off-switch hazard (Failure Mode 1).
-    function test_openEmergency_cohortTooSmallUsesLiveElectorateNotLookbackMin() public {
-        _stakeGuardian(guardian1, 10_000e18, 1);
-        vm.warp(vm.getBlockTimestamp() + 31 days);
-
-        _stakeGuardian(guardian2, 20_000e18, 2);
-        _stakeGuardian(guardian3, 20_000e18, 3);
-        _stakeGuardian(guardian4, 20_000e18, 4);
-        _stakeGuardian(guardian5, 20_000e18, 5);
-        vm.warp(vm.getBlockTimestamp() + 1);
-
-        BatchExecutorLib.Call[] memory emptyCalls = new BatchExecutorLib.Call[](0);
-        bytes32 emptyHash = keccak256(abi.encode(emptyCalls));
-        vm.prank(address(governor));
-        registry.openEmergency(5, emptyHash, emptyCalls);
-
-        vm.prank(guardian1);
-        registry.voteBlockEmergencySettle(address(governor), 5);
-
-        // `resolveEmergencyReview` is the permissionless keeper path; its
-        // commit is entirely internal (`_resolveEmergency`), so the only
-        // window into `cohortTooSmall` is the resolved outcome itself.
-        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
-        vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.EmergencyReviewResolved(5, true, 0);
-        registry.resolveEmergencyReview(address(governor), 5);
-    }
+    //
+    // REMOVED. Both tests here pinned a design that no longer exists: they
+    // asserted that `cohortTooSmall` must read the LIVE electorate rather than
+    // the 30-day lookback-min, and that a guardian whose own stake equalled the
+    // entire lookback-min denominator should therefore block alone.
+    //
+    // `cohortTooSmall` is gone entirely — the cold-start waiver it carried made
+    // the guardian veto and the emergency owner-bond slash switchable off by
+    // anyone able to dip the staked total for one block via
+    // `requestUnstakeGuardian` + `cancelUnstakeGuardian`, at no cost.
+    //
+    // The lookback-min denominator is gone too. "A guardian whose vote equals
+    // the whole lookback-min denominator blocks alone" was not a property worth
+    // pinning; it WAS pashov 2026-08 finding #1, and both sides of the quorum
+    // comparison are now read at the same propose-time instant. See
+    // `test/pashov-audit/GuardianRegistry_blockQuorumDenominator.t.sol`.
 
     // ══════════════════════════ FINDING C ══════════════════════════
 

@@ -961,9 +961,9 @@ contract CoverageEndToEndTest is Test {
 
     // ── 3. Cold start: a thin cohort BLOCKS execution, it does not force it ──
 
-    /// @notice Spec §3.3a cold-start. The guardian cohort collapses below the
-    ///         registry's `MIN_COHORT_STAKE_AT_OPEN` before the review opens, so
-    ///         the review auto-resolves NOT-blocked with ZERO approvers. The
+    /// @notice Spec §3.3a cold-start. The guardian cohort collapses to a single
+    ///         member before the review opens and nobody votes, so the review
+    ///         auto-resolves NOT-blocked with ZERO approvers. The
     ///         optimistic path would happily execute that; the §3.3a quorum
     ///         refuses (`InsufficientApproveCoverage`) because there is no
     ///         identified, stake-backed signer to hold liable (R1). The proposal
@@ -987,19 +987,12 @@ contract CoverageEndToEndTest is Test {
 
         _openReview(govA, pid);
         assertEq(swood.getPastTotalVotes(vm.getBlockTimestamp() - 1), FILLER_STAKE, "only g4 left");
-        assertLt(
-            swood.getPastTotalVotes(vm.getBlockTimestamp() - 1),
-            registry.MIN_COHORT_STAKE_AT_OPEN(),
-            "cohort under the floor at open"
-        );
-        (,,, bool cohortTooSmall) = registry.getReviewState(address(govA), pid);
-        assertTrue(cohortTooSmall, "review flagged cold-start");
 
         // Review closes with nobody having voted; it auto-resolves not-blocked.
         _pastReview(govA, pid);
         govA.resolveProposalState(pid);
         assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Approved), "not blocked => Approved");
-        (bool opened, bool resolved, bool blocked,) = registry.getReviewState(address(govA), pid);
+        (bool opened, bool resolved, bool blocked) = registry.getReviewState(address(govA), pid);
         assertTrue(opened, "review was opened");
         assertTrue(resolved, "review resolved");
         assertFalse(blocked, "and not blocked");

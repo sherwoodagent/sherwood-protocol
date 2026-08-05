@@ -81,7 +81,7 @@ contract PashovClockAndBasisTest is RegistryTestHarness {
         vm.prank(address(governor));
         registry.cancelReview(PROPOSAL_ID);
 
-        (, bool resolved,,) = registry.getReviewState(address(governor), PROPOSAL_ID);
+        (, bool resolved,) = registry.getReviewState(address(governor), PROPOSAL_ID);
         assertTrue(resolved, "cancel must close the review inside the deferred span");
     }
 
@@ -211,7 +211,7 @@ contract PashovClockAndBasisTest is RegistryTestHarness {
         vm.prank(address(governor));
         registry.cancelReview(PROPOSAL_ID);
 
-        (, bool resolved,,) = registry.getReviewState(address(governor), PROPOSAL_ID);
+        (, bool resolved,) = registry.getReviewState(address(governor), PROPOSAL_ID);
         assertTrue(resolved, "cancel must work mid-pause on a mid-pause registration");
     }
 

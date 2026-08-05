@@ -129,7 +129,7 @@ contract GuardianRegistryCompositeKeyTest is Test {
         registry.voteOnProposal(address(governorA), PID, IGuardianRegistry.GuardianVoteType.Approve);
 
         // A: opened, approver recorded with weight.
-        (bool openedA,,,) = registry.getReviewState(address(governorA), PID);
+        (bool openedA,,) = registry.getReviewState(address(governorA), PID);
         assertTrue(openedA, "A review open");
         (address[] memory approversA, uint128[] memory weightsA, uint128 denomA) =
             registry.getApproverWeights(address(governorA), PID);
@@ -139,7 +139,7 @@ contract GuardianRegistryCompositeKeyTest is Test {
         assertEq(uint256(denomA), STAKE, "A approve denom");
 
         // B: opened but ZERO bleed from A's vote.
-        (bool openedB,,,) = registry.getReviewState(address(governorB), PID);
+        (bool openedB,,) = registry.getReviewState(address(governorB), PID);
         assertTrue(openedB, "B review open");
         (address[] memory approversB,, uint128 denomB) = registry.getApproverWeights(address(governorB), PID);
         assertEq(approversB.length, 0, "B approvers untouched by A's vote");

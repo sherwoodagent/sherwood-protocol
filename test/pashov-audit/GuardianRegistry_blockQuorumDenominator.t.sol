@@ -123,16 +123,21 @@ contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
         vm.warp(vm.getBlockTimestamp() + 30 days);
         _stakeGuardian(honestNew, 540_000e18, 3);
         // Live electorate: 600_000e18. The attacker is now 6.67% of it.
+        //
+        // ONE SECOND, AND IT IS LOAD-BEARING. The quorum basis is stamped at
+        // `registerReview` time MINUS ONE, so a cohort that staked in the very
+        // same block as the proposal is invisible to it — that `- 1` is the
+        // flash-stake defence. Without this warp the fixture would still see
+        // the 60_000e18 pre-growth total and would prove nothing about the fix.
+        // Real timelines have weeks here, not one second.
+        vm.warp(vm.getBlockTimestamp() + 1);
 
         uint256 reviewEnd = _registerAndOpen(1);
         uint256 openedAt = vm.getBlockTimestamp() - 1;
 
         (uint256 totalNow, uint256 minTotal) = _totalsAt(openedAt);
         assertEq(totalNow, 600_000e18, "live electorate at ts1");
-        assertEq(minTotal, 60_000e18, "denominator is the 30-day-old electorate");
-
-        (,,, bool cohortTooSmall) = registry.getReviewState(address(governor), 1);
-        assertFalse(cohortTooSmall, "the veto pipeline must actually run for this fixture to mean anything");
+        assertEq(minTotal, 60_000e18, "the 30-day-old electorate, no longer the denominator");
 
         // The honest approver is an OLD guardian, so it is not itself clamped —
         // this is a real approver taking real slash risk, not a strawman.
@@ -143,21 +148,28 @@ contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
         registry.voteOnProposal(address(governor), 1, IGuardianRegistry.GuardianVoteType.Block);
 
         vm.warp(reviewEnd);
-        assertTrue(
+        // THE FIX. Both sides of the comparison are now read at the same
+        // propose-time instant, so the attacker is measured as what it is —
+        // 40_000e18 of a 600_000e18 electorate, 667 bps against a 3_000 bps
+        // quorum. Pre-fix this returned TRUE: the numerator was current while
+        // the denominator was the 60_000e18 electorate of 30 days earlier.
+        assertFalse(
             registry.resolveReview(address(governor), 1),
-            "finding #1: 6.67% of the live electorate blocks alone against a 30% quorum"
+            "a 6.67% holder must not block alone once both sides share an instant"
         );
 
-        // ...and the same stale denominator sets the penalty. bBps =
-        // 40_000e18 * 10_000 / 60_000e18 = 6666 under integer division — ONE
+        // The second half of the finding closes with the first. The stale
+        // denominator also drove `_severityBps`: pre-fix, bBps was
+        // 40_000e18 * 10_000 / 60_000e18 = 6666 under integer division — one
         // bps under `SUPERMAJORITY_BPS` (6667), so the audit's "reads 6,667"
-        // is off by one. It does not matter: the quadratic ramp at t = 3666/3667
-        // still lands within a handful of bps of `maxSlashBps`, so the honest
-        // approver is wiped either way.
-        assertLt(
-            swood.guardianStake(honestOld),
-            20_000e18 / 100,
-            "the honest approver keeps under 1% of its stake -- severity is effectively maxSlashBps"
+        // was off by one, but the quadratic ramp at t = 3666/3667 landed within
+        // a handful of bps of `maxSlashBps` and wiped the honest approver
+        // anyway.
+        //
+        // Now there is no block, so there is no slash at all: the approver who
+        // took real risk on an honest approval keeps every token.
+        assertEq(
+            swood.guardianStake(honestOld), 20_000e18, "no block means no slash -- the honest approver is untouched"
         );
 
         // THE COUNTERFACTUAL that makes this a finding rather than a design

@@ -45,14 +45,10 @@ contract MockRegistryMinimal is IGuardianRegistry {
         return false;
     }
 
-    function getReviewState(address, uint256)
-        external
-        pure
-        returns (bool opened, bool resolved, bool blocked, bool cohortTooSmall)
-    {
+    function getReviewState(address, uint256) external pure returns (bool opened, bool resolved, bool blocked) {
         // `resolved = true` so _resolveAfterVote skips straight to Approved
         // when reviewPeriod == 0. `blocked = false` so the vote outcome sticks.
-        return (true, true, false, false);
+        return (true, true, false);
     }
 
     /// @dev V2: `_finishSettlement` calls `isEmergencyOpen` to decide whether

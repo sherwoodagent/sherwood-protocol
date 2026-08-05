@@ -101,13 +101,19 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
         assertEq(swood.totalGuardianStake(), 50_000e18);
     }
 
-    function test_openReview_flagsCohortTooSmall() public {
-        _stakeN(3); // 30_000e18 < 50_000e18 threshold
+    /// @dev The cold-start waiver is GONE. A thin cohort opens a normal review
+    ///      and decides it. The waiver used to auto-clear any review opened
+    ///      under a stake floor, which made the guardian veto switchable off by
+    ///      anyone able to dip the staked total for a single block via
+    ///      `requestUnstakeGuardian` + `cancelUnstakeGuardian` — free, and
+    ///      reversible in the next block.
+    function test_openReview_thinCohortOpensNormally() public {
+        _stakeN(3); // 30_000e18 — would have been "too small" before
         uint256 ve = vm.getBlockTimestamp();
         _registerReview(PROPOSAL_ID, ve, ve + REVIEW_PERIOD);
 
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.CohortTooSmallToReview(PROPOSAL_ID, 30_000e18);
+        emit IGuardianRegistry.ReviewOpened(PROPOSAL_ID, 30_000e18);
         registry.openReview(address(governor), PROPOSAL_ID);
     }
 
@@ -148,7 +154,7 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
         vm.prank(address(governor));
         registry.cancelReview(PROPOSAL_ID);
 
-        (bool opened, bool resolved,,) = registry.getReviewState(address(governor), PROPOSAL_ID);
+        (bool opened, bool resolved,) = registry.getReviewState(address(governor), PROPOSAL_ID);
         assertFalse(opened, "cancel must not open the review");
         assertTrue(resolved, "never-opened cancel resolves the review");
 
@@ -156,7 +162,7 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
         vm.recordLogs();
         registry.openReview(address(governor), PROPOSAL_ID);
         assertEq(vm.getRecordedLogs().length, 0, "re-open must emit nothing");
-        (opened,,,) = registry.getReviewState(address(governor), PROPOSAL_ID);
+        (opened,,) = registry.getReviewState(address(governor), PROPOSAL_ID);
         assertFalse(opened, "a resolved review must never re-open");
 
         // Leg 2: no guardian can vote on it.
@@ -651,7 +657,11 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
         assertEq(swood.totalGuardianStake(), totalStakeBefore - slashTotal);
     }
 
-    function test_resolveReview_cohortTooSmall_returnsFalseEvenWithBlockVotes() public {
+    /// @dev Inverted with the removal of the cold-start waiver: a thin cohort
+    ///      voting unanimously to block now BLOCKS. Previously the flag
+    ///      short-circuited this to not-blocked no matter how the cohort voted,
+    ///      which is exactly what made the veto worth switching off.
+    function test_resolveReview_thinCohortBlocksOnUnanimousBlockVotes() public {
         // Drop 2 guardians via sWOOD unstake → cohort down to 30_000e18.
         vm.prank(_guardian(3));
         swood.requestUnstakeGuardian();
@@ -667,18 +677,17 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
         vm.warp(vm.getBlockTimestamp() + 1);
 
         registry.openReview(address(governor), PROPOSAL_ID);
-        // Remaining 3 active guardians all vote Block — would be 100% block
-        // weight, but cohort flag short-circuits to false.
+        // Remaining 3 active guardians all vote Block — 100% of the electorate
+        // that exists, so the veto fires.
         for (uint256 i = 0; i < 3; i++) {
             vm.prank(_guardian(i));
             registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
         }
 
         vm.warp(reviewEnd);
-        vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.ReviewResolved(PROPOSAL_ID, false, 0);
         bool blocked = registry.resolveReview(address(governor), PROPOSAL_ID);
-        assertFalse(blocked);
+        assertTrue(blocked, "a thin cohort still decides its own review");
+        // Nobody approved, so there is nothing to slash and nothing to burn.
         assertEq(wood.balanceOf(BURN_ADDRESS), 0);
     }
 
@@ -967,9 +976,12 @@ contract GuardianRegistryEmergencyTest is RegistryTestHarness {
         assertEq(wood.balanceOf(BURN_ADDRESS), 10_000e18);
     }
 
-    function test_finalizeEmergency_cohortTooSmall_returnsFalse() public {
-        // Drain all guardian stake to 0 to exercise the cold-start fallback
-        // (`totalStakeAtOpen == 0` branch).
+    /// @dev ZERO guardians is the one case that must still fail OPEN — there is
+    ///      nobody to have reviewed. Now carried by the explicit
+    ///      `denom > 0` guard rather than by the removed cold-start waiver, so
+    ///      the outcome is unchanged and the reason is different.
+    function test_finalizeEmergency_zeroElectorateReturnsFalse() public {
+        // Drain all guardian stake to 0 (`totalStakeAtOpen == 0` branch).
         for (uint256 i = 0; i < 5; i++) {
             vm.prank(_guardian(i));
             swood.requestUnstakeGuardian();
