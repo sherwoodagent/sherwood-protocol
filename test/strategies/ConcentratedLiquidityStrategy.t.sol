@@ -828,29 +828,49 @@ contract ConcentratedLiquidityStrategyPoolAnchoredFloorTest is CLFixture {
         );
     }
 
-    /// @dev THE FIX. `_settle`/`sweep` assert nothing about spot — unlike
-    ///      `_execute`/`rerange`, which revert `SpotOutsideTwapBound` first — so
-    ///      an unverified spot used as a FLOOR is a lever rather than a guard:
-    ///      push the pool until `otherToken` reads expensive and `minOut` is
-    ///      unfillable, and the exit swap is skipped for as long as the attacker
-    ///      keeps paying for the round-trip. Downstream that starves the vault
-    ///      balance the governor's drawdown floor measures, escalating a skipped
-    ///      swap into a proposal only the owner multisig can clear.
+    /// @dev THE FIX, and the correction to its first attempt. `_settle`/`sweep`
+    ///      assert nothing about spot — unlike `_execute`/`rerange`, which
+    ///      revert `SpotOutsideTwapBound` first — so the anchor's safety is not
+    ///      inherited here and a pushed pool has to be handled explicitly.
     ///
-    ///      Post-fix the anchor is applied only while spot is TWAP-verified, so
-    ///      a pool pushed outside the bound simply stops contributing a floor
-    ///      and the honest venue still fills.
-    function test_settle_manipulatedSpotCannotBlockTheExit() public {
+    ///      SKIPPING THE ANCHOR IS THE WRONG HANDLING, which is what this pins.
+    ///      With the anchor off, `minOut` falls back to the routed venue quoting
+    ///      itself, so the same actor who pushed the pool also moves the venue
+    ///      and the original finding clears — measured at a full conversion of
+    ///      the position through a venue paying half the pool price. Skipping
+    ///      the SWAP instead costs delay rather than principal.
+    function test_settle_pushedPoolMustNotHandTheSkimBack() public {
         _execute();
+        pool.setTicks(23_000, 0);
+        adapter.setRate(address(nvda), address(usdg), (100 * 1e18 / 1e12) / 2);
+        _settle();
+        assertGt(
+            nvda.balanceOf(address(strategy)),
+            0,
+            "an unverified pool must skip the swap, not swap on the venue's own quote"
+        );
+    }
 
-        // A ~10x push: the sqrt price drops by ~3.16x (so `nvda` reads ~10x
-        // dearer, inflating the anchor ~100x) and the tick moves with it, far
-        // outside the 100 bps bound. Both fields move together, as they would
-        // on a real pool.
+    /// @dev And the delay is only that. The residue a pushed pool leaves is
+    ///      recoverable by the permissionless `sweep()` at any later honest
+    ///      moment, with no owner involvement — which is what makes trading the
+    ///      skim for a skipped swap the right way round. Holding spot outside
+    ///      the bound costs the attacker every block while the TWAP walks toward
+    ///      spot, so the deviation they are paying for closes underneath them.
+    function test_settle_pushedPoolResidueIsRecoveredBySweep() public {
+        _execute();
         pool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96 / 3);
         pool.setTicks(23_000, 0);
 
         _settle();
-        assertEq(nvda.balanceOf(address(strategy)), 0, "a pushed pool must not be able to veto the exit swap");
+        assertGt(nvda.balanceOf(address(strategy)), 0, "precondition: the pushed pool left a residue");
+
+        // The pool returns to itself; anyone may retry.
+        pool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96);
+        pool.setTicks(0, 0);
+        vm.prank(keeper);
+        strategy.sweep();
+
+        assertEq(nvda.balanceOf(address(strategy)), 0, "sweep must recover the residue once the pool is honest");
     }
 }

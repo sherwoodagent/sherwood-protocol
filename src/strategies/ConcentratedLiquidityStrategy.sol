@@ -1345,29 +1345,37 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // this floor was purely the routed venue quoting itself. Raise it to the
         // configured pool's own price when that is higher.
         //
-        // GATED ON `_spotNearTwap()`, WHICH IS THE WHOLE DIFFERENCE FROM THE
-        // MINTING SITES. There the anchor is safe unconditionally because
-        // `_execute`/`rerange` have already asserted spot against the TWAP and
-        // reverted otherwise. Here nothing has, and an unverified spot as a
-        // FLOOR is a lever, not a guard: pushing the pool so `otherToken` reads
-        // expensive makes `minOut` unfillable, the swap is skipped, and the
-        // residue never converts. That is a settlement denial anyone can buy for
-        // one pool round-trip — and downstream it starves the vault balance the
-        // governor's own drawdown floor measures, which escalates a skipped swap
-        // into a proposal only the owner multisig can clear. Applying the anchor
-        // ONLY while spot is TWAP-verified keeps the anti-skim floor for every
-        // honest pool state and removes the lever for the manipulated one.
+        // AN UNVERIFIED POOL MEANS NO SWAP, NOT A CHEAPER SWAP. This is the one
+        // place the anchor's safety is not inherited from its caller:
+        // `_execute`/`rerange` assert spot against the TWAP and revert
+        // otherwise, so for them a pushed pool never reaches the floor at all.
+        // `_settle`/`sweep` assert nothing, which leaves exactly two options for
+        // a pool whose spot is outside `maxTwapDeviationBps` — and only one of
+        // them is safe:
         //
-        // NON-REVERTING either way, unlike the `_rebalanceToTarget` sites.
-        // Everything on this path degrades rather than blocks — `settle()` is
-        // the vault's exit and the deliverable-maximum design exists so a bad
-        // venue cannot veto it. A higher floor that the honest market cannot
-        // fill leaves the residue for `sweep()` to retry, which is the existing
-        // behaviour for an unfillable quote.
-        if (_spotNearTwap()) {
-            uint256 anchored = _poolAnchoredMinOut(otherToken, bal, slippageBps);
-            if (anchored > minOut) minOut = anchored;
-        }
+        //   SKIP THE ANCHOR and swap on the quote floor alone. Rejected. It
+        //   hands the attacker who pushed the pool the ORIGINAL finding back:
+        //   with the anchor off, `minOut` is the routed venue quoting itself,
+        //   so the same actor moves both and the skim clears. Measured, not
+        //   argued: a venue paying half the pool price converted the entire
+        //   position with the pool pushed 23,000 ticks off its TWAP.
+        //
+        //   SKIP THE SWAP. Taken. It is what this function already does for
+        //   every other unusable floor — "the swap is NEVER attempted without a
+        //   floor; it is skipped instead" — and the residue is recoverable by
+        //   the permissionless `sweep()`, so the cost of a pushed pool is delay,
+        //   not loss.
+        //
+        // The denial that buys is bounded and self-defeating: holding spot
+        // outside the bound costs the attacker capital every block, while the
+        // TWAP walks toward spot over `twapWindow`, so the deviation they are
+        // paying to maintain closes underneath them. `sweep()` and
+        // `settleProposal` are both retryable by anyone at any later honest
+        // moment. Trading a bounded, unprofitable delay for a profitable,
+        // unbounded skim is the wrong direction on the vault's exit.
+        if (!_spotNearTwap()) return;
+        uint256 anchored = _poolAnchoredMinOut(otherToken, bal, slippageBps);
+        if (anchored > minOut) minOut = anchored;
 
         IERC20(otherToken).forceApprove(address(swapAdapter), bal);
         // The swap itself is also allowed to fail: a quote that stood a moment
