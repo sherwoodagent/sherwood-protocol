@@ -311,9 +311,27 @@ future new sink still surfaces.
 
 ### Echidna
 
+**Result: 113 tests passing, 0 failing** (incl. `AssertionFailed(..)`) — no
+panic, assertion failure or unexpected revert reachable across the handler set.
+
 `echidna.yaml` runs `testMode: assertion`, which hunts panics and assertion
 failures across the handlers. It does NOT evaluate the `property_*` bool
 returns — that needs `testMode: property`, which reverts state after each
 property call and would break the self-updating ghosts GL-23/25/32/33/35/37
 depend on. Echidna is therefore complementary in bug CLASS here, not a second
 opinion on the same properties.
+
+Two config blockers had to be cleared before it would start, both worth knowing
+if this is re-run:
+
+1. **Unlinked libraries.** Echidna refuses to start if ANY contract in the
+   compilation unit carries unlinked library bytecode, and
+   `--foundry-compile-all` pulls in `script/Deploy.s.sol`. Fixed with
+   `--compile-libraries`.
+2. **The linked address must actually hold the library.** `SyndicateVaultAdminLib`
+   has external functions, so `SyndicateVault` reaches it by DELEGATECALL
+   (`registerAgent` / `removeAgent`). Linking it to an empty address is not
+   cosmetic — those calls revert with no data, and the symptom is `setup()`
+   dying on its very last line at `vault.registerAgent`, which reads like a
+   harness bug rather than a config one. `deployContracts` now places the
+   library at the linked address before the harness constructor runs.
