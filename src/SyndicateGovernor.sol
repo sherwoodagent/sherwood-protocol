@@ -2124,8 +2124,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // stricter one invented for it, so this cannot regress an integration
             // that works today.
             uint256 escrowAmount = amount;
-            (bool okCap, bytes memory capRet) =
-                vault.staticcall(abi.encodeCall(ISyndicateVault.spendableFee, (asset)));
+            (bool okCap, bytes memory capRet) = vault.staticcall(abi.encodeCall(ISyndicateVault.spendableFee, (asset)));
             if (okCap && capRet.length == 32) {
                 uint256 spendable = abi.decode(capRet, (uint256));
                 if (spendable < escrowAmount) escrowAmount = spendable;
