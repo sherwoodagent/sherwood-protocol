@@ -158,6 +158,32 @@ contract TierRegistry is Ownable2Step {
     ///      per-(target, selector) pricing axis with its own snapshot.
     mapping(address adapter => bytes32) private _adapterAllowedCodehash;
 
+    /// @dev THE OTHER AXIS: addresses a STRATEGY TEMPLATE may bind as a
+    ///      counterparty, without any of the batch-callee, approve-spender or
+    ///      transfer-recipient standing `_adapterAllowed` confers.
+    ///
+    ///      Exists because those are genuinely different questions and the
+    ///      answer to one is not the answer to the other. `_adapterAllowed`'s
+    ///      own contract says exotic-asset contracts — "ERC-721/1155/777,
+    ///      LP-position NFTs" — MUST NOT be listed on it, yet a concentrated-
+    ///      liquidity template has to bind a Uniswap position manager, which is
+    ///      exactly an LP-position NFT. Forcing that binding through the
+    ///      adapter axis would make operating the template require an entry the
+    ///      adapter axis forbids, and would widen the vault's batch guard for
+    ///      the position manager and for Morpho as a side effect of a decision
+    ///      about a strategy.
+    ///
+    ///      Strictly weaker than `_adapterAllowed`, and implied by it: see
+    ///      `isCounterpartyAllowed`. Nothing that reads this may spend vault
+    ///      funds on the strength of it.
+    mapping(address counterparty => bool) private _counterpartyAllowed;
+
+    /// @dev Grant-time codehash snapshot for the counterparty axis, mirroring
+    ///      `_adapterAllowedCodehash` and for the same adversary: a grant made
+    ///      against a codeless address, or bytecode swapped at a listed one.
+    ///      Meaningful only while `_counterpartyAllowed[x]` is true.
+    mapping(address counterparty => bytes32) private _counterpartyAllowedCodehash;
+
     IERC20 public wood;
     /// @dev LAUNCH GATE: a non-zero value is inert as a warranty — and imposes a
     ///      real, currently-unrecoverable cost on adapter submitters — until ALL
@@ -284,6 +310,10 @@ contract TierRegistry is Ownable2Step {
     event CertifyDelaySet(uint256 delay);
     event TierDemoted(address indexed target, bytes4 indexed selector);
     event AdapterAllowedSet(address indexed adapter, bool allowed);
+    /// @notice The counterparty axis moved for `counterparty`. Distinct from
+    ///         `AdapterAllowedSet` so an indexer can tell "may be bound by a
+    ///         strategy" from "may receive vault funds through a batch".
+    event CounterpartyAllowedSet(address indexed counterparty, bool allowed);
     event SubmitterBondLocked(
         address indexed target, bytes4 indexed selector, address indexed submitter, uint256 amount
     );
@@ -655,6 +685,17 @@ contract TierRegistry is Ownable2Step {
             delete _adapterAllowed[target];
             emit AdapterAllowedSet(target, false);
         }
+        // Both axes, so "demoted" means the address holds NO standing rather
+        // than "no standing on whichever axis was written first". The
+        // counterparty axis carries its own codehash check and would invalidate
+        // independently on a bytecode swap, but demotion also fires for reasons
+        // that check cannot see, and a stale binding grant surviving one is the
+        // kind of asymmetry this contract's demotion is deliberately over-broad
+        // to avoid.
+        if (_counterpartyAllowed[target]) {
+            delete _counterpartyAllowed[target];
+            emit CounterpartyAllowedSet(target, false);
+        }
         emit TierDemoted(target, selector);
     }
 
@@ -770,13 +811,62 @@ contract TierRegistry is Ownable2Step {
     ///         the same per-address denial ahead of it, so an adapter demoted
     ///         for cause or explicitly disallowed by the owner cannot re-acquire
     ///         standing from its class on the next read.
-    function isAdapterAllowed(address adapter) external view returns (bool) {
+    function isAdapterAllowed(address adapter) public view returns (bool) {
         if (_adapterAllowed[adapter] && _effectiveCodehash(adapter) == _adapterAllowedCodehash[adapter]) {
             return true;
         }
         if (_classAllowDenied[adapter]) return false;
         bytes32 cch = _classOf(adapter);
         return cch != bytes32(0) && _classAllowed[cch];
+    }
+
+    /// @notice Allow or disallow `counterparty` as an address a STRATEGY
+    ///         TEMPLATE may bind — a lending market, a position manager, a
+    ///         collateral token. Confers NONE of `setAdapterAllowed`'s standing:
+    ///         nothing listed here becomes a batch callee, an approve spender or
+    ///         a transfer recipient by virtue of this call.
+    /// @dev    The point of the separation is that `setAdapterAllowed`'s own
+    ///         contract forbids listing exotic-asset contracts ("ERC-721/1155/
+    ///         777, LP-position NFTs"), while a concentrated-liquidity template
+    ///         must bind a Uniswap position manager, which is one. Without this
+    ///         axis an owner has to choose between not running the template and
+    ///         making an entry the other axis tells them not to make.
+    ///
+    ///         Snapshots the codehash on the grant path exactly as
+    ///         `setAdapterAllowed` does, with the same consequence: grant AFTER
+    ///         the counterparty's final code is deployed, and re-grant as the
+    ///         recovery ceremony after a verified legitimate bytecode change.
+    ///
+    ///         NO CLASS FALLBACK, deliberately. The class axis exists so one
+    ///         certification can cover every clone of a template; counterparties
+    ///         are long-lived singletons an owner names individually, so a
+    ///         fallback would add reach without removing any ceremony.
+    function setCounterpartyAllowed(address counterparty, bool allowed) external onlyOwner {
+        _counterpartyAllowed[counterparty] = allowed;
+        if (allowed) _counterpartyAllowedCodehash[counterparty] = _effectiveCodehash(counterparty);
+        emit CounterpartyAllowedSet(counterparty, allowed);
+    }
+
+    /// @notice True when `counterparty` may be bound by a strategy template.
+    /// @dev    IMPLIED BY ADAPTER STANDING. `isAdapterAllowed` is the strictly
+    ///         stronger grant — it already licenses moving vault funds to the
+    ///         address — so anything carrying it trivially clears the weaker
+    ///         bar, and an owner who has listed a swap adapter never needs a
+    ///         second entry for it. The implication runs one way only: a
+    ///         counterparty entry grants nothing on the adapter axis, which is
+    ///         the whole reason the axis exists.
+    ///
+    ///         Same SCOPE CAVEAT as `tierOf` and `isAdapterAllowed`: the
+    ///         codehash check catches same-address bytecode mutation, not proxy
+    ///         implementation swaps.
+    function isCounterpartyAllowed(address counterparty) external view returns (bool) {
+        if (
+            _counterpartyAllowed[counterparty]
+                && _effectiveCodehash(counterparty) == _counterpartyAllowedCodehash[counterparty]
+        ) {
+            return true;
+        }
+        return isAdapterAllowed(counterparty);
     }
 
     // ── CODEHASH-CLASS CERTIFICATION ──

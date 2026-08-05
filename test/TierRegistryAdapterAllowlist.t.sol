@@ -313,4 +313,93 @@ contract TierRegistryAdapterAllowlistTest is Test {
         reg.setAdapterAllowed(adapter, true); // re-grant snapshots the NEW code
         assertTrue(reg.isAdapterAllowed(adapter), "next grant overwrites the stale snapshot with current code");
     }
+
+    // ── The counterparty axis ──
+    //
+    // A second, STRICTLY WEAKER grant: "a strategy template may bind this
+    // address" and nothing else. It exists because the two questions are
+    // genuinely different and this contract already answers only one of them —
+    // `setAdapterAllowed`'s own contract forbids listing exotic-asset contracts
+    // ("ERC-721/1155/777, LP-position NFTs") on the adapter axis, while a
+    // concentrated-liquidity template must bind a Uniswap position manager,
+    // which is exactly one. Without this axis an owner has to choose between
+    // running the template and honouring that rule.
+
+    /// @dev The load-bearing direction: a counterparty grant confers NO adapter
+    ///      standing. If this ever inverts, listing a position manager for a
+    ///      strategy silently makes it a legal batch callee, approve spender and
+    ///      transfer recipient — which is the whole thing the split prevents.
+    function test_counterpartyGrantConfersNoAdapterStanding() public {
+        address cp = address(new TierRegistry(owner));
+        vm.prank(owner);
+        reg.setCounterpartyAllowed(cp, true);
+
+        assertTrue(reg.isCounterpartyAllowed(cp), "counterparty standing granted");
+        assertFalse(reg.isAdapterAllowed(cp), "a binding grant must not license moving vault funds");
+    }
+
+    /// @dev The other direction DOES hold: adapter standing is the stronger
+    ///      claim, so it satisfies the weaker bar without a second entry. This
+    ///      is what keeps a registry configured before the axis existed working.
+    function test_adapterStandingImpliesCounterpartyStanding() public {
+        address a = address(new TierRegistry(owner));
+        vm.prank(owner);
+        reg.setAdapterAllowed(a, true);
+
+        assertTrue(reg.isAdapterAllowed(a));
+        assertTrue(reg.isCounterpartyAllowed(a), "the strong grant must satisfy the weak bar");
+    }
+
+    /// @dev Same codehash discipline as the adapter axis: a grant is against the
+    ///      code the owner was looking at. Bytecode swapped at the address
+    ///      invalidates it without anyone having to notice.
+    function test_counterpartyStandingDiesOnBytecodeSwap() public {
+        address cp = address(new TierRegistry(owner));
+        vm.prank(owner);
+        reg.setCounterpartyAllowed(cp, true);
+        assertTrue(reg.isCounterpartyAllowed(cp));
+
+        vm.etch(cp, hex"6001600101");
+        assertFalse(reg.isCounterpartyAllowed(cp), "a swapped codehash must invalidate the grant");
+    }
+
+    /// @dev A grant against a codeless address snapshots no-code, so the binding
+    ///      closes the instant code appears — the counterfactual-address
+    ///      adversary the adapter axis already documents.
+    function test_counterpartyGrantAgainstCodelessAddressClosesWhenCodeAppears() public {
+        address cp = makeAddr("counterfactual");
+        vm.prank(owner);
+        reg.setCounterpartyAllowed(cp, true);
+        assertTrue(reg.isCounterpartyAllowed(cp), "granted against no code");
+
+        vm.etch(cp, hex"6001600101");
+        assertFalse(reg.isCounterpartyAllowed(cp), "code appearing at the address must close the grant");
+    }
+
+    function test_setCounterpartyAllowed_onlyOwner() public {
+        vm.expectRevert();
+        reg.setCounterpartyAllowed(makeAddr("rogue"), true);
+    }
+
+    /// @dev Demotion is over-broad by design and must clear BOTH axes, so
+    ///      "demoted" means the address holds no standing at all rather than
+    ///      none on whichever axis happened to be written first.
+    function test_demotionClearsCounterpartyStandingToo() public {
+        bytes4 sel = bytes4(0x12345678);
+        _certifyNow(target, sel, 1, 500, address(0));
+        vm.startPrank(owner);
+        reg.setAdapterAllowed(target, true);
+        reg.setCounterpartyAllowed(target, true);
+        vm.stopPrank();
+        assertTrue(reg.isCounterpartyAllowed(target), "precondition: standing on both axes");
+
+        address demoter = makeAddr("demoter");
+        vm.prank(owner);
+        reg.setAuthorizedDemoter(demoter);
+        vm.prank(demoter);
+        reg.demoteByChallenge(target, sel);
+
+        assertFalse(reg.isAdapterAllowed(target), "adapter standing cleared");
+        assertFalse(reg.isCounterpartyAllowed(target), "counterparty standing cleared");
+    }
 }

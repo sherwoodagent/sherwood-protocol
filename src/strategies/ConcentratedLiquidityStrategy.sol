@@ -26,6 +26,7 @@ interface ITierBindingPath {
     function governor() external view returns (address);
     function tierRegistry() external view returns (address);
     function isAdapterAllowed(address adapter) external view returns (bool);
+    function isCounterpartyAllowed(address counterparty) external view returns (bool);
 }
 
 /**
@@ -440,20 +441,23 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         //     execute costs the deployed capital. No hop is proposer input, so
         //     the proposer cannot steer the walk into the skip.
         //
-        //     OPERATIONAL CONSEQUENCE, STATED BECAUSE IT IS NOT FREE.
-        //     `isAdapterAllowed` is not a counterparty allowlist — it is the
-        //     same predicate `SyndicateVault._guardBatchCalls` uses to decide
+        //     TWO AXES, BECAUSE THEY ARE TWO QUESTIONS. `isAdapterAllowed` is
+        //     the predicate `SyndicateVault._guardBatchCalls` uses to decide
         //     which addresses a governor batch may call directly, approve as a
-        //     spender, and transfer to. Binding through it therefore REQUIRES
-        //     an owner to admit Morpho and the position manager to that
-        //     allowlist, which widens the batch guard for them by the same
-        //     stroke. Accepted rather than papered over: the registry is the
-        //     only governance surface a strategy clone can reach from chain
-        //     state alone (`PortfolioStrategy` binds its swap adapter and price
-        //     sources the identical way), and a batch call to those two is
-        //     still bounded by the vault's per-call caps and net-outflow meter.
-        //     A dedicated predicate would be the cleaner shape if `TierRegistry`
-        //     ever grows one.
+        //     spender, and transfer to — and `setAdapterAllowed`'s own contract
+        //     says exotic-asset contracts, naming LP-position NFTs, MUST NOT be
+        //     listed on it. A Uniswap position manager is exactly one, so
+        //     binding everything through that axis would have made running this
+        //     template require the entry the axis forbids, and would have
+        //     widened the batch guard for Morpho and the position manager as a
+        //     side effect of a decision about a strategy.
+        //
+        //     So the swap adapter — the one address here that receives
+        //     `forceApprove` of this strategy's balances — binds on the strong
+        //     axis, and the rest bind on `isCounterpartyAllowed`, which says
+        //     "a strategy may name this" and nothing more. Adapter standing
+        //     implies it, so a registry configured before that axis existed
+        //     keeps working unchanged.
         //
         //     THE VAULT ASSET IS EXEMPT, mirroring `_guardBatchCalls`' own
         //     `target != asset_` carve-out. `collateralToken == vaultAsset` is
@@ -468,11 +472,14 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         {
             address registry = _resolveTierRegistry();
             if (registry == address(0)) revert TierRegistryUnresolved();
+            // The swap adapter is the one address here that receives approvals
+            // of this strategy's balances, so it binds on the STRONG axis. The
+            // rest bind on the weak one, which adapter standing implies.
             _requireAllowedAdapter(registry, p.swapAdapter);
-            _requireAllowedAdapter(registry, p.positionManager);
-            _requireAllowedAdapter(registry, p.morpho);
+            _requireAllowedCounterparty(registry, p.positionManager);
+            _requireAllowedCounterparty(registry, p.morpho);
             if (p.marketParams.collateralToken != vaultAsset) {
-                _requireAllowedAdapter(registry, p.marketParams.collateralToken);
+                _requireAllowedCounterparty(registry, p.marketParams.collateralToken);
             }
         }
 
@@ -710,15 +717,38 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     // ── Governance-allowlist binding (see check (0) in `_initialize`) ──
 
-    /// @dev Reverts unless `counterparty` is allowlisted in `registry`. An
-    ///      unreadable `isAdapterAllowed` fails CLOSED: a registry that cannot
-    ///      vouch for an address has not vouched for it. Mirrors
+    /// @dev Reverts unless `adapter` carries ADAPTER standing in `registry` —
+    ///      the strong grant, which licenses moving vault funds to the address.
+    ///      For the swap adapter only: it is the one counterparty here that
+    ///      receives `forceApprove` of this strategy's balances, so the weaker
+    ///      binding grant would not be enough. Mirrors
     ///      `PortfolioStrategy._requireAllowedAdapter`, but takes the registry
-    ///      as an argument since `_initialize` binds four counterparties and
+    ///      as an argument since `_initialize` binds several counterparties and
     ///      re-walking `vault() -> governor() -> tierRegistry()` per address
-    ///      would be three redundant staticcall pairs.
-    function _requireAllowedAdapter(address registry, address counterparty) private view {
-        if (!_isAdapterAllowed(registry, counterparty)) revert CounterpartyNotAllowed(counterparty, registry);
+    ///      would be redundant staticcall pairs.
+    function _requireAllowedAdapter(address registry, address adapter) private view {
+        if (!_readAllowed(registry, abi.encodeCall(ITierBindingPath.isAdapterAllowed, (adapter)))) {
+            revert CounterpartyNotAllowed(adapter, registry);
+        }
+    }
+
+    /// @dev Reverts unless `counterparty` carries COUNTERPARTY standing — the
+    ///      weak grant, which says "a strategy may bind this" and nothing about
+    ///      batch callees, approve spenders or transfer recipients.
+    ///
+    ///      This is the predicate the lending market, the position manager and
+    ///      the collateral token bind through. Binding them on the adapter axis
+    ///      instead would force an owner to make an entry that axis explicitly
+    ///      forbids — `setAdapterAllowed` says exotic-asset contracts, naming
+    ///      LP-position NFTs, MUST NOT be listed there, and a Uniswap position
+    ///      manager is one — and would widen the vault's batch guard for Morpho
+    ///      and the position manager as a side effect of a strategy decision.
+    ///      `isCounterpartyAllowed` is implied by adapter standing, so a
+    ///      registry already configured the old way keeps working unchanged.
+    function _requireAllowedCounterparty(address registry, address counterparty) private view {
+        if (!_readAllowed(registry, abi.encodeCall(ITierBindingPath.isCounterpartyAllowed, (counterparty)))) {
+            revert CounterpartyNotAllowed(counterparty, registry);
+        }
     }
 
     /// @dev The `vault() -> governor() -> tierRegistry()` walk. `address(0)`
@@ -731,7 +761,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         registry = _readAddress(governor_, abi.encodeCall(ITierBindingPath.tierRegistry, ()));
     }
 
-    /// @dev Staticcall-safe `isAdapterAllowed`. Unreadable → `false`.
+    /// @dev Staticcall-safe boolean read, shared by both allowlist axes.
+    ///      Unreadable → `false`, so a registry that cannot answer has not
+    ///      vouched.
+    ///
     ///      The word is read directly rather than via `abi.decode(ret, (bool))`:
     ///      decoding a bool REVERTS on any word that is not 0 or 1, and that
     ///      revert would land in this frame with nothing to catch it — turning
@@ -739,9 +772,13 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      bricks `_initialize` undecodably", which is the exact failure this
     ///      whole helper is written in raw-staticcall form to avoid. Non-zero is
     ///      true, matching how the EVM itself reads a boolean return.
-    function _isAdapterAllowed(address registry, address adapter) private view returns (bool) {
+    ///
+    ///      Takes encoded calldata rather than a selector-plus-address so the
+    ///      two axes cannot diverge in their failure handling: there is exactly
+    ///      one place that decides what an unanswerable registry means.
+    function _readAllowed(address registry, bytes memory data) private view returns (bool) {
         if (registry.code.length == 0) return false;
-        (bool ok, bytes memory ret) = registry.staticcall(abi.encodeCall(ITierBindingPath.isAdapterAllowed, (adapter)));
+        (bool ok, bytes memory ret) = registry.staticcall(data);
         if (!ok || ret.length != 32) return false;
         uint256 word;
         assembly ("memory-safe") {
@@ -904,34 +941,42 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         (int24 twap, bool ok) = _tryTwapTick();
         if (!ok) return false;
         (, int24 spot,,,,,) = pool.slot0();
-        int24 diff = spot > twap ? spot - twap : twap - spot;
-        // `diff` is non-negative by construction above, so the cast cannot wrap.
-        // forge-lint: disable-next-line(unsafe-typecast)
-        return uint256(uint24(diff)) <= maxTwapDeviationBps;
+        return _withinTwapBound(spot, twap);
     }
 
     /// @dev Reverts unless spot sits within `maxTwapDeviationBps` of the TWAP.
+    ///      Shares `_withinTwapBound` with `_spotNearTwap` — see there for the
+    ///      tick-space reasoning and the first-order bps↔tick mapping.
+    function _requireSpotNearTwap() private view returns (int24 twap) {
+        twap = _twapTick();
+        (, int24 spot,,,,,) = pool.slot0();
+        if (!_withinTwapBound(spot, twap)) revert SpotOutsideTwapBound();
+    }
+
+    /// @dev THE comparison, in one place. `_requireSpotNearTwap` asserts it and
+    ///      `_spotNearTwap` asks it; holding the arithmetic in two copies would
+    ///      let the assertion and the question drift apart, and they must answer
+    ///      identically — the settle path's decision to swap at all is only
+    ///      sound while it means exactly what the minting paths enforce.
+    ///
     ///      Compared in TICK space, not price space: a tick is a log of price,
     ///      so a bound on tick distance is a bound on the RATIO of the two
     ///      prices, which is what "deviation" means here. Doing it in price
     ///      space would need the exp this contract deliberately does not carry.
-    function _requireSpotNearTwap() private view returns (int24 twap) {
-        twap = _twapTick();
-        (, int24 spot,,,,,) = pool.slot0();
+    ///
+    ///      One tick is a factor of 1.0001, i.e. ~1 bps, so a bound expressed in
+    ///      bps maps onto ticks one-for-one. The mapping is a FIRST-ORDER
+    ///      approximation and drifts as the bound grows: at the
+    ///      `MAX_TWAP_DEVIATION_BPS` ceiling of 1_000, `1.0001^1000 = 1.1052`,
+    ///      so the check actually admits ~10.5% rather than exactly 10%. It errs
+    ///      PERMISSIVE, never strict, which is why the ceiling is the real
+    ///      control and this conversion is not asked to be exact (design
+    ///      Decision 2).
+    function _withinTwapBound(int24 spot, int24 twap) private view returns (bool) {
         int24 diff = spot > twap ? spot - twap : twap - spot;
-        // One tick is a factor of 1.0001, i.e. ~1 bps, so a bound expressed in
-        // bps maps onto ticks one-for-one. The mapping is a FIRST-ORDER
-        // approximation and drifts as the bound grows: at the
-        // `MAX_TWAP_DEVIATION_BPS` ceiling of 1_000, `1.0001^1000 = 1.1052`, so
-        // the check actually admits ~10.5% rather than exactly 10%. It errs
-        // PERMISSIVE, never strict, which is why the ceiling is the real
-        // control and this conversion is not asked to be exact. Computing the
-        // exact bound needs the exp this contract deliberately does not carry
-        // (design Decision 2).
-        //
         // `diff` is non-negative by construction above, so the cast cannot wrap.
         // forge-lint: disable-next-line(unsafe-typecast)
-        if (uint256(uint24(diff)) > maxTwapDeviationBps) revert SpotOutsideTwapBound();
+        return uint256(uint24(diff)) <= maxTwapDeviationBps;
     }
 
     // ── Execute ──

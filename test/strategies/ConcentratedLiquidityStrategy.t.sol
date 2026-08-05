@@ -589,6 +589,36 @@ contract ConcentratedLiquidityStrategyInitTest is CLFixture {
         _expectInitRevert(ConcentratedLiquidityStrategy.TierRegistryUnresolved.selector, _defaultParams());
     }
 
+    /// @dev THE POINT OF THE TWO AXES. The position manager and Morpho bind on
+    ///      `isCounterpartyAllowed`, not `isAdapterAllowed` — so an owner can
+    ///      run this template WITHOUT admitting either to the allowlist that
+    ///      governs batch callees, approve spenders and transfer recipients.
+    ///
+    ///      That is not a preference. `TierRegistry.setAdapterAllowed`'s own
+    ///      contract says exotic-asset contracts, naming LP-position NFTs, MUST
+    ///      NOT be listed on that axis, and a Uniswap position manager is one.
+    ///      Binding it there would have made operating the template require the
+    ///      exact entry the registry tells the owner not to make.
+    ///
+    ///      Denies both on the ADAPTER axis only, so the test fails if either
+    ///      one is ever moved back onto the strong grant.
+    function test_init_counterpartiesDoNotNeedAdapterStanding() public {
+        tierRegistry.setDeniedAsAdapter(address(posm), true);
+        tierRegistry.setDeniedAsAdapter(address(morpho), true);
+        tierRegistry.setDeniedAsAdapter(mp.collateralToken, true);
+
+        ConcentratedLiquidityStrategy s = _newStrategy(_defaultParams());
+        assertEq(address(s.positionManager()), address(posm));
+    }
+
+    /// @dev The converse, so the split does not quietly weaken the swap adapter.
+    ///      It is the one address here that receives `forceApprove` of the
+    ///      strategy's balances, so the WEAK grant must not be enough for it.
+    function test_init_swapAdapterStillNeedsAdapterStanding() public {
+        tierRegistry.setDeniedAsAdapter(address(adapter), true);
+        _expectInitRevertWithArgs(address(adapter));
+    }
+
     /// @dev The vault asset is EXEMPT from the binding, mirroring
     ///      `SyndicateVault._guardBatchCalls`' own `target != asset_` carve-out.
     ///      `collateralToken == vaultAsset` is an explicitly supported market
