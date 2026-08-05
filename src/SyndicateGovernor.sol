@@ -1339,31 +1339,25 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             true
         );
         p.envelopeTier = tier_;
-        // A BATCH THAT MOVES CALLS MUST PRICE ABOVE ZERO. `_resolveTierAndCoverage`
-        // sums `cap_i * boundBps_i / 10_000`, so a proposal declaring every cap
-        // at 0 prices at 0 for ANY bound — and zero is not inert, it is the
-        // value at which three independent controls switch themselves off at
-        // once: `_deriveAndStoreEffectiveCapital`'s `gated` goes false so the
-        // approve quorum never runs and `effectiveMaxCapital` stays at the full
-        // `maxCapital`; `proposerBondWood(asset, 0)` returns 0 before it even
-        // reads a price, so no bond is locked; and `ExposureLedger.recordApproval`
-        // returns early on `needUsd == 0`, leaving `_approversOf` empty so
-        // `ChallengeGame.file` reverts `NothingToFreeze` and the proposal is
-        // unchallengeable for life.
+        // ZERO COVERAGE IS SPECIFIED, NOT A HOLE — see design.md D2, pinned by
+        // `PerCallCapitalDeclarations.test_allZeroCaps_pricesZeroCoverage_meterStillBlocksOutflow`
+        // and `GovernorCoverageGates.test_execute_zeroRequiredCoverage_passesOptimistically`.
+        // An all-zero-cap batch prices to zero coverage regardless of tier, and
+        // the protection is the PER-CALL METER at execute time, not a coverage
+        // floor: `cap_i == 0` makes `BatchExecutorLib` revert `CallCapExceeded`
+        // on any outflow at all, which is strictly stronger than any coverage
+        // requirement. A floor here would refuse the declaration that buys the
+        // tightest possible spend limit.
         //
-        // Zero-cap is NOT the same as harmless. `BatchExecutorLib` meters
-        // `balanceBefore - balanceAfter` of the vault asset only, so a call whose
-        // capability is an AUTHORIZATION rather than a transfer — `approve` to an
-        // allowlisted adapter is a recognized selector that passes the vault's
-        // recipient check — truthfully declares `cap = 0` and truthfully meters 0,
-        // while licensing an unbounded pull in a later transaction outside every
-        // meter. The declaration is honest; the metric is what cannot see it.
-        //
-        // Refusing at propose rather than patching the three consumers keeps the
-        // invariant in one place: a proposal carrying execute calls always has a
-        // priced envelope behind it. A genuinely no-op batch has no execute calls
-        // and is unaffected.
-        if (execCalls.length != 0 && coverage_ == 0) revert UnpricedCapability();
+        // A guard was briefly added here on the reading that zero coverage also
+        // switches off the approve quorum, the proposer bond and the challenge
+        // freeze. It does — but the residual that argument is really about is
+        // that `BatchExecutorLib` meters only vault-asset BALANCE, so a call
+        // whose capability is an AUTHORIZATION rather than a transfer moves zero
+        // and meters zero honestly. That is a metering-SCOPE question about what
+        // the meter can see, and it belongs where the meter is defined; pricing
+        // is the wrong lever for it and refusing at propose broke three
+        // specified behaviours.
         p.requiredCoverage = coverage_;
         // Skipped when unwired — the pre-ledger safe default matches the
         // tierRegistry pattern.

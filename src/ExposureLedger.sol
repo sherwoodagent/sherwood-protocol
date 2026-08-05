@@ -809,42 +809,27 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      path, and every accused approver would be permanently barred from
     ///      `claimUnstakeGuardian`. Zero is still legal as the unwire switch; the
     ///      only reachable order is to drain live challenges first.
-    /// @dev AND IT RE-ASSERTS THE WINDOW INVARIANT ON THE INCOMING GAME.
-    ///      `game.challengeWindow <= ledger.challengeWindow` is guarded in three
-    ///      places — the `ChallengeGame` constructor, `ChallengeGame.setExposureLedger`,
-    ///      and `setChallengeWindow`'s LOWER BOUND #2 — and this setter was the
-    ///      fourth corner, left open. Worse, bound #2 is CONDITIONAL on a freezer
-    ///      being wired, so the three calls
-    ///      `setCoverageFreezer(0)` -> `setChallengeWindow(small)` ->
-    ///      `setCoverageFreezer(game)` walk straight through every existing check
-    ///      and seat a ledger window BELOW the game's. `DeployPlanD` wires the
-    ///      freezer LAST by design ("nothing can be frozen before the verdict path
-    ///      is complete"), so the unwired state is ordinary operation, not an
-    ///      exotic one, and the script's equality assertion is a `require` in the
-    ///      script — it does not re-fire on any later rotation.
+    /// @dev NO WINDOW CHECK HERE, DELIBERATELY. `game.challengeWindow >
+    ///      ledger.challengeWindow` is a state the design ACCOMMODATES rather
+    ///      than forbids — see design.md D2 and
+    ///      `GovernorCoverageGates.test_reclaimBond_gameWindowAboveTheLedgers_waitsForTheGame`,
+    ///      whose note says it outright: "`ExposureLedger.setChallengeWindow`
+    ///      floors only against the registry's review period and has no
+    ///      game-side check, so the ledger owner can drop the ledger's window
+    ///      below the game's afterwards."
     ///
-    ///      What the inversion costs, in `setChallengeWindow`'s own words: "a
-    ///      sweep can empty `_approversOf` while the proposal is still legally
-    ///      filable — permanently unchallengeable the moment it happens." The
-    ///      permissionless `retireApproval` opens at
-    ///      `epochGenesis + (epoch+1)*epochLength + W_ledger` while
-    ///      `ChallengeGame.file` closes at
-    ///      `executedAt + strategyDuration + W_game`, so the gap is the full
-    ///      `W_game - W_ledger`. The recovery direction does not close it either:
-    ///      `ChallengeGame.setChallengeWindow` only refuses a window ABOVE the
-    ///      ledger's, so the game may lower itself to match but is never forced
-    ///      to, and nothing detects the inversion once seated.
+    ///      The divergence is handled DOWNSTREAM instead:
+    ///      `reclaimProposerBond`'s gate is a `max` of both deadlines precisely
+    ///      so a longer game window still holds the bond. That is why the gate
+    ///      is a `max` and not `challengeableUntil` alone.
     ///
-    ///      Same tolerant shape as bound #2 — an unanswerable pointer must not
-    ///      brick the rotation, since that would reintroduce the stranded-freeze
-    ///      hazard this setter's guard above exists to prevent.
+    ///      A guard was briefly added here refusing to wire a freezer whose
+    ///      window exceeds this one. It broke that test's fixture and removed a
+    ///      configuration the protocol is built to tolerate. If the sweep-versus-
+    ///      filing gap is to be closed, it belongs at `retireApproval`'s gate —
+    ///      the thing that actually opens too early — not at the wiring step.
     function setCoverageFreezer(address freezer) external onlyOwner {
         if (_frozenKeyCount != 0) revert CoverageFrozen();
-        if (freezer != address(0) && freezer.code.length != 0) {
-            try IChallengeGameWindowMinimal(freezer).challengeWindow() returns (uint256 gameWindow) {
-                if (challengeWindow < gameWindow) revert InvalidParameter();
-            } catch {}
-        }
         emit CoverageFreezerSet(coverageFreezer, freezer);
         coverageFreezer = freezer;
     }

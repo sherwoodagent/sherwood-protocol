@@ -229,16 +229,6 @@ interface ISyndicateGovernor {
     ///         that the tier-only check waves through while the aggregate
     ///         cap would still trust the stale, lower snapshot.
     error CoverageRegressed();
-    /// @notice `propose` carried execute calls whose summed
-    ///         `cap_i * extractableBoundBps_i` came to ZERO. Coverage is the
-    ///         input to the approve quorum, the proposer bond and the challenge
-    ///         game's freeze — all three of which switch OFF at zero — so a
-    ///         batch that moves calls must price above zero or it obtains
-    ///         capability with none of the three controls attached. Declaring
-    ///         `cap = 0` on a call whose effect is an authorization rather than
-    ///         a transfer is honest and still meters zero; the metric, not the
-    ///         declaration, is what fails to see it.
-    error UnpricedCapability();
     /// @notice Fail-safe sibling to `TierRegressed`/`CoverageRegressed`: revert at
     ///         execute if `proposal.maxCapital` now exceeds the LIVE
     ///         `totalAssets() * maxCapitalBps / 10_000` ceiling. The propose-time

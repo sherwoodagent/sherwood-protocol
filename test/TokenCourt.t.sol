@@ -116,6 +116,15 @@ contract MockGameForCourt {
         return _challenges[id];
     }
 
+    /// @dev `TokenCourt.refer` now pins the PROPOSER — the party whose whole
+    ///      bond a verdict destroys or returns — by reading `bondOf` off this
+    ///      pinned escrow. Left at zero by `setChallenge`, which is the real
+    ///      contract's own "no bond was locked" sentinel, so every existing
+    ///      fixture keeps its pre-fix behaviour (no proposer, hence no bar).
+    function setProposerBondEscrow(uint256 id, address escrow) external {
+        _challenges[id].proposerBondEscrow = escrow;
+    }
+
     /// @dev `TokenCourt.vote` bars counter-bond contributors — the side a
     ///      `NotGuilty` verdict pays — so this mock must answer the same
     ///      question the real game does. Zero for everyone unless a test sets
