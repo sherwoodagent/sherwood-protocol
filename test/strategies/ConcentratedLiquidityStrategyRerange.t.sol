@@ -230,15 +230,26 @@ contract ConcentratedLiquidityStrategyRerangeTest is CLFixture {
         pool.setTicks(target, target);
     }
 
-    /// @dev `_execute` ends on `_requireWithinPoolShare` against the liquidity it
-    ///      actually minted; a rerange that skipped it would be the way around
-    ///      the cap, because it re-mints the same notional through the same
-    ///      `_mintPosition`. Two routes reach the breach — a half-width narrow
-    ///      enough that the same capital becomes a much larger share of one
-    ///      spacing, and (modelled here, because the mock's liquidity is not a
-    ///      function of the range) depth that simply fell away between execute
-    ///      and rerange with the half-width unchanged.
-    function test_rerange_exceedingPoolShareCapReverts() public {
+    /// @notice PASHOV 2026-08 FINDING #17, PINNED AS AN OPEN EXPOSURE.
+    /// @dev    This test asserts the BUG, deliberately. `_execute` ends with
+    ///         `_requireWithinPoolShare` on the actually-minted liquidity;
+    ///         `rerange` re-mints through the same `_mintPosition` and does
+    ///         not, so the approved cap binds only on the first mint.
+    ///
+    ///         The enforcement was written and WITHDRAWN — see the block in
+    ///         `rerange()`. Reverting there has two permanent failure paths (a
+    ///         structurally over-cap `halfWidthTicks` policy bricks every
+    ///         future rerange; and `pool.liquidity()` reading zero after
+    ///         `_closePosition` bricks it on a live pool where the strategy is
+    ///         the only in-range LP — a branch these mocks cannot reach, since
+    ///         `MockPositionManager.decreaseLiquidity` never touches the mock
+    ///         pool's settable `liquidity`). Trading an over-cap position for a
+    ///         permanently frozen one is not a fix.
+    ///
+    ///         Kept executable so the exposure is visible rather than
+    ///         forgotten: when the bind-time fix lands, this test should FLIP
+    ///         to expecting `PositionExceedsPoolShareCap`.
+    function test_rerange_overPoolShareCapStillLands_openFinding17() public {
         _execute();
         uint256 tidBefore = strategy.tokenId();
         (,,,,,,, uint128 live,,,,) = posm.positions(tidBefore);
@@ -247,27 +258,17 @@ contract ConcentratedLiquidityStrategyRerangeTest is CLFixture {
         _warpPastInterval();
         _moveToTrigger();
 
-        // The venue can now carry only a tenth of what this position alone is.
+        // The venue can now carry only a tenth of what this position alone is,
+        // i.e. far past `MAX_POOL_SHARE_BPS`.
         pool.setLiquidity(live);
 
         vm.prank(keeper);
-        vm.expectRevert(ConcentratedLiquidityStrategy.PositionExceedsPoolShareCap.selector);
         strategy.rerange();
 
-        // Refusing costs nothing that is not recoverable: the position is still
-        // there, in its last approved range, and still settleable.
-        assertEq(strategy.rerangeCount(), 0, "rerange landed despite breaching the cap");
-        assertEq(strategy.tokenId(), tidBefore, "position replaced by a rerange that should have reverted");
-        _accrueFees(1_000e6);
-        _settle();
-        assertEq(
-            uint256(strategy.state()), uint256(BaseStrategy.State.Settled), "position stuck after a refused rerange"
-        );
+        assertEq(strategy.rerangeCount(), 1, "rerange is currently unguarded by the pool-share cap");
+        assertTrue(strategy.tokenId() != tidBefore, "the position was re-minted over the cap");
     }
 
-    /// @dev The companion to the test above: the check is a CAP, not a blanket
-    ///      refusal. The same rerange lands the moment the venue is deep enough
-    ///      to carry the position at the approved share.
     function test_rerange_atThePoolShareCapSucceeds() public {
         _execute();
         (,,,,,,, uint128 live,,,,) = posm.positions(strategy.tokenId());
