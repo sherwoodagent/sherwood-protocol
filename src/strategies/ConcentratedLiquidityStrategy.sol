@@ -847,7 +847,13 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         if (p.twapWindow < MIN_TWAP_WINDOW) revert InvalidBound();
         if (p.maxTwapDeviationBps == 0 || p.maxTwapDeviationBps > MAX_TWAP_DEVIATION_BPS) revert InvalidBound();
         if (p.mintSlippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
-        if (p.settleSlippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
+        // ZERO IS NOT A LEGAL INIT VALUE, because `_updateParams` reads zero as
+        // "keep current" and is otherwise a one-way ratchet. A clone
+        // initialized at 0 could therefore never be corrected: every later
+        // `slippageBps > 0` trips `ImmutableParam` against a stored 0, and the
+        // sentinel path leaves it at 0. The keep-sentinel closes the
+        // pass-0-to-change-only-the-deadline trap; this closes the init one.
+        if (p.settleSlippageBps == 0 || p.settleSlippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
         if (p.swapFractionBps > BPS_DENOMINATOR) revert InvalidBound();
     }
 

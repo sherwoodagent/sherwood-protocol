@@ -78,10 +78,28 @@ interface IStakedWood {
     ///         exactly `vault` first.
     function transferOwnerStakeSlot(address vault, address newOwner) external;
 
-    /// @notice The owner bond a vault must hold. TVL scaling is not implemented
-    ///         in V1; the bond is unconditionally `minOwnerStake`. The `vault`
-    ///         parameter is retained for forward-compatibility.
+    /// @notice The owner bond a vault must hold to reach the emergency
+    ///         settlement path: `max(minOwnerStake, MIN_OWNER_BOND_FLOOR)`.
+    /// @dev    TVL scaling is still not implemented, so the `vault` parameter
+    ///         is retained for forward-compatibility and ignored today. The
+    ///         floor is NOT ignored: `minOwnerStake` may legally be zero (the
+    ///         open-onboarding sentinel), and a zero required bond made
+    ///         `emergencySettleWithCalls`' gate pass at `0 >= 0` with nothing
+    ///         posted and `slashOwnerBond` a no-op on an empty slot.
+    ///
+    ///         This is NOT the vault-creation floor — that is `minOwnerStake`
+    ///         itself, which `IGuardianRegistry.minOwnerStake()` exposes. The
+    ///         two answer different questions and diverge under the sentinel.
     function requiredOwnerBond(address vault) external view returns (uint256);
+
+    /// @notice The vault-CREATION owner-stake floor, verbatim — zero under the
+    ///         open-onboarding sentinel.
+    /// @dev    Distinct from `requiredOwnerBond`, which floors the same slot at
+    ///         `MIN_OWNER_BOND_FLOOR` for the emergency gate. Asking this one
+    ///         "what does creating a vault require?" and that one "what does
+    ///         reaching emergency settlement require?" is the intended split;
+    ///         `IGuardianRegistry.minOwnerStake()` forwards to THIS.
+    function minOwnerStake() external view returns (uint256);
 
     // ── Snapshot-compatible vote-read surface (timestamp-keyed) ──
     //

@@ -1146,8 +1146,8 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      visibility.
     ///
     ///      WHY THE FLOOR IS UNCONDITIONAL, i.e. why this does NOT honour the
-    ///      `minOwnerStake == 0` open-onboarding sentinel. This view has exactly
-    ///      one consumer: `GovernorEmergency.emergencySettleWithCalls`'s gate
+    ///      `minOwnerStake == 0` open-onboarding sentinel. The consumer that
+    ///      matters is `GovernorEmergency.emergencySettleWithCalls`'s gate
     ///      `ownerStake(vault) < requiredOwnerBond(vault)`. Returning
     ///      `minOwnerStake` verbatim made that gate evaluate `0 < 0` — false —
     ///      for every vault created under the sentinel, so the gate passed with

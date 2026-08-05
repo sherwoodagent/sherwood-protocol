@@ -176,6 +176,45 @@ contract PashovClockAndBasisTest is RegistryTestHarness {
         );
     }
 
+    /// @dev THE PANIC THE FIRST VERSION OF THE #21 FIX INTRODUCED, found by an
+    ///      independent reviewer and pinned here.
+    ///
+    ///      Stamping the in-progress pause span into `clockShiftAtRegister`
+    ///      broke an invariant that had held globally: `pauseShiftTotal` is
+    ///      advanced only by `unpause`, so between a mid-pause `registerReview`
+    ///      and the end of that pause, `clockShiftAtRegister > pauseShiftTotal`
+    ///      and `_effNow`'s checked subtraction panicked `0x11`.
+    ///
+    ///      Both readers reachable mid-pause are exercised: `outcomeOf` (the
+    ///      view `ProposalLifecycle._afterVote` calls, so every state commit on
+    ///      the proposal reverted) and `cancelReview` (no `whenNotPaused`, and
+    ///      `SyndicateGovernor.cancelProposal` calls it unwrapped).
+    ///
+    ///      The original #21 tests could not catch this: both unpause before
+    ///      reading anything.
+    function test_finding21_readsDuringTheSamePauseDoNotUnderflow() public {
+        _stakeFullCohort();
+
+        vm.prank(regOwner);
+        registry.pause();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+
+        // Registered mid-pause: the write that used to break the invariant.
+        uint256 voteEnd = vm.getBlockTimestamp() + 1 hours;
+        uint256 reviewEnd = voteEnd + REVIEW_PERIOD;
+        _registerReview(PROPOSAL_ID, voteEnd, reviewEnd);
+
+        // STILL PAUSED. Pre-fix both of these panicked 0x11.
+        vm.warp(voteEnd + 1);
+        registry.outcomeOf(address(governor), PROPOSAL_ID);
+
+        vm.prank(address(governor));
+        registry.cancelReview(PROPOSAL_ID);
+
+        (, bool resolved,,) = registry.getReviewState(address(governor), PROPOSAL_ID);
+        assertTrue(resolved, "cancel must work mid-pause on a mid-pause registration");
+    }
+
     /// @dev The genuine case the deferral exists for is untouched: a pause that
     ///      starts AFTER registration still defers this review's clock in full.
     function test_finding21_pauseAfterRegistrationStillDefersInFull() public {

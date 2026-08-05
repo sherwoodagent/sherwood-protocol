@@ -435,8 +435,29 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      timestamp because sWOOD checkpoint lookups are keyed on it, nor for
     ///      the `DEADMAN_UNPAUSE_DELAY` check, whose entire purpose is to
     ///      measure real elapsed pause time.
+    ///      COUNTS THE PAUSE IN PROGRESS, not only completed ones.
+    ///      `pauseShiftTotal` is advanced solely by `unpause`, so reading it
+    ///      bare treats an ongoing outage as zero downtime and lets the
+    ///      effective clock keep ticking through a pause that is, by
+    ///      construction, time nobody could act in.
+    ///
+    ///      It is also a SAFETY requirement, not just a correctness one, since
+    ///      `registerReview` began stamping the in-progress span into
+    ///      `clockShiftAtRegister` (finding #21): that write makes
+    ///      `clockShiftAtStart > pauseShiftTotal` for the remainder of the
+    ///      pause, and the checked subtraction below then panics `0x11`. Two
+    ///      readers reach it mid-pause — `outcomeOf`, a view that
+    ///      `ProposalLifecycle._afterVote` calls, and `cancelReview`, which
+    ///      carries no `whenNotPaused` and which `SyndicateGovernor
+    ///      .cancelProposal` calls UNWRAPPED. `_closeReviewIfRegistered`'s bare
+    ///      `try` would swallow the panic, leaving a live slashable review on a
+    ///      terminal proposal: exactly the harm finding #6 exists to close.
+    ///
+    ///      Adding the live span restores `clockShiftAtStart <= total` as an
+    ///      invariant, because both sides now include it.
     function _effNow(uint64 clockShiftAtStart) private view returns (uint256) {
-        return block.timestamp - (uint256(pauseShiftTotal) - uint256(clockShiftAtStart));
+        uint256 total = uint256(pauseShiftTotal) + (paused ? block.timestamp - uint256(pausedAt) : 0);
+        return block.timestamp - (total - uint256(clockShiftAtStart));
     }
 
     /// @dev Composite key isolating per-(governor, proposalId) review state.
@@ -656,11 +677,19 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     }
 
     /// @inheritdoc IGuardianRegistry
-    /// @dev Passes `address(0)` to obtain the unscaled floor: a zero vault has
-    ///      zero TVL, so the TVL-scaled `requiredOwnerBond` collapses to the
-    ///      bare floor (`max(floor, TVL * ownerStakeTvlBps / 10_000)` -> floor).
+    /// @dev Reads the CREATION FLOOR directly, not `requiredOwnerBond`.
+    ///
+    ///      This used to pass `address(0)` to `requiredOwnerBond` on the
+    ///      reasoning that a zero vault has zero TVL so the scaled figure
+    ///      collapses to the bare floor. That stopped being true when
+    ///      `requiredOwnerBond` gained a `MIN_OWNER_BOND_FLOOR` (finding #22):
+    ///      under the open-onboarding sentinel (`minOwnerStake == 0`) it now
+    ///      returns the floor, so this view — the ABI-facing question "what
+    ///      bond does creating a vault require?" — would answer with a nonzero
+    ///      figure while `canCreateVault` still requires none. A function named
+    ///      `minOwnerStake` must return `minOwnerStake`.
     function minOwnerStake() external view returns (uint256) {
-        return swood.requiredOwnerBond(address(0));
+        return swood.minOwnerStake();
     }
 
     /// @inheritdoc IGuardianRegistry
