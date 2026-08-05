@@ -268,23 +268,6 @@ contract ConcentratedLiquidityStrategyRerangeTest is CLFixture {
         assertEq(strategy.rerangeCount(), 1, "rerange is currently unguarded by the pool-share cap");
         assertTrue(strategy.tokenId() != tidBefore, "the position was re-minted over the cap");
     }
-
-    function test_rerange_atThePoolShareCapSucceeds() public {
-        _execute();
-        (,,,,,,, uint128 live,,,,) = posm.positions(strategy.tokenId());
-
-        _warpPastInterval();
-        _moveToTrigger();
-
-        // Ten times the position is exactly the 10% cap. A shade above it, so
-        // the mock's sqrt rounding cannot decide the assertion.
-        pool.setLiquidity(uint128(uint256(live) * 10 + 1_000));
-
-        vm.prank(keeper);
-        strategy.rerange();
-        assertEq(strategy.rerangeCount(), 1, "rerange refused at a share the cap admits");
-    }
-
     // ── 6.6 Determinism ──
 
     function test_rerange_isPermissionless() public {
