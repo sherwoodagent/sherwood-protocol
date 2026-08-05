@@ -321,7 +321,20 @@ interface ISyndicateGovernor {
     ///         The owner-multisig `unstick` / `finalizeEmergencySettle` paths
     ///         are deliberately NOT gated on it: they are the escape hatch for
     ///         a genuine loss that must still be able to settle.
+    /// @param  realized The vault's asset balance when settlement was attempted.
+    /// @param  floor    The pre-execute balance less
+    ///                  `effectiveMaxCapital * maxDrawdownBps / 10_000` — the
+    ///                  absolute drop the declared envelope permits on the
+    ///                  capital it actually covers, NOT a percentage of the
+    ///                  whole fund.
     error SettlementBelowDrawdownFloor(uint256 realized, uint256 floor);
+    /// @notice Revert if `claimUnclaimedFees` is called for a vault whose
+    ///         proposal is currently Executed. An escrowed fee leaving the
+    ///         vault mid-strategy is indistinguishable from a strategy loss to
+    ///         every asset-balance-differencing consumer — `_finishSettlement`'s
+    ///         `pnl` and the `SettlementBelowDrawdownFloor` gate — so the claim
+    ///         waits for the settlement that clears `_activeProposal`.
+    error VaultProposalActive();
     /// @notice Revert if `executeCalls.length` or `settlementCalls.length`
     ///         exceeds MAX_CALLS_PER_PROPOSAL. Bounds calldata-unbounded
     ///         arrays that otherwise let a proposer grief gas when the batch

@@ -189,11 +189,19 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             // "no window", i.e. the pre-existing terminal-Expired behaviour:
             // fail-closed, and the vault binding is released rather than held
             // to `executeBy` on the strength of a reply we could not read.
+            //
+            // DECODED AS `uint256`, NOT `uint64`, even though `reviewWindow`
+            // declares `uint64`. `abi.decode` REVERTS on a word whose high bits
+            // exceed the narrow type, and that revert lands in THIS frame with
+            // no `try` around it — it would brick `_commitState` and every
+            // `getProposalState` read rather than degrading. Decoding wide
+            // cannot revert on any 64-byte payload, and the only question asked
+            // of the word is `!= 0`, which is scale-independent.
             bool windowRegistered;
             (bool probeOk, bytes memory ret) =
                 address(reg).staticcall(abi.encodeCall(IGuardianRegistry.reviewWindow, (address(this), p.id)));
             if (probeOk && ret.length >= 64) {
-                (, uint64 registeredReviewEnd) = abi.decode(ret, (uint64, uint64));
+                (, uint256 registeredReviewEnd) = abi.decode(ret, (uint256, uint256));
                 windowRegistered = registeredReviewEnd != 0;
             }
             // (a) no record: terminal immediately, so `_commitState` releases the

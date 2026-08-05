@@ -1034,6 +1034,23 @@ contract PortfolioStrategy is BaseStrategy {
     ///      `ok == false` covers both a reverting adapter (non-quoting adapters
     ///      are a supported pairing) and a zero quote, and leaves the caller's
     ///      oracle-derived floor standing unchanged.
+    ///
+    ///      WHAT THIS DOES NOT SOFTEN, stated because the distinction is the
+    ///      whole liveness argument: an UNAVAILABLE quote is non-fatal, an
+    ///      OVERSTATED one is not. An adapter whose `quote` promises more than
+    ///      its own `swap` delivers by more than `maxSlippageBps` now reverts
+    ///      the swap it floors — and in Data Streams mode that reaches
+    ///      `settle()`, where the stale-anchor branch was previously
+    ///      pool-state-independent and always cleared. `_sellOverweight` has
+    ///      carried the identical exposure since the quote floor was introduced,
+    ///      but only on `rebalanceDelta`, where blocking one call strands
+    ///      nothing. Accepted here on the same terms the oracle floor is:
+    ///      quote and swap are taken in ONE transaction against ONE pool state
+    ///      through the SAME `extraData` route, so a conforming adapter's quote
+    ///      already includes its fee and price impact and the gap is zero. A
+    ///      non-conforming adapter degrades this to the emergency-settle path
+    ///      rather than to a silent skim, which is the correct direction for
+    ///      the only floor Data Streams mode has here.
     function _tryQuoteMinOut(address tokenIn, address tokenOut, uint256 amountIn, bytes memory extraData)
         private
         returns (uint256 floor, bool ok)
