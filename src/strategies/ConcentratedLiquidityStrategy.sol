@@ -454,12 +454,39 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         //     widened the batch guard for Morpho and the position manager as a
         //     side effect of a decision about a strategy.
         //
-        //     So the swap adapter — the one address here that receives
-        //     `forceApprove` of this strategy's balances — binds on the strong
-        //     axis, and the rest bind on `isCounterpartyAllowed`, which says
-        //     "a strategy may name this" and nothing more. Adapter standing
-        //     implies it, so a registry configured before that axis existed
-        //     keeps working unchanged.
+        //     CORRECTION (PR #217 review). An earlier version of this note said
+        //     the swap adapter is "the one address here that receives
+        //     `forceApprove` of this strategy's balances". THAT IS FALSE and
+        //     nothing should be reasoned from it: `_postCollateral` approves the
+        //     collateral token and then Morpho, `_mintPosition` approves the
+        //     position manager on both legs, and `_repayAndWithdraw` approves
+        //     Morpho again. ALL FOUR bound addresses receive approvals of clone
+        //     balances. The split is not "who touches funds".
+        //
+        //     THE ACTUAL LINE IS WHOSE CALLDATA. Every `isAdapterAllowed` read
+        //     in `SyndicateVault` sits inside `_guardBatchCalls`, iterating the
+        //     governor batch's own `calls[]` — it answers "may a PROPOSER-
+        //     AUTHORED batch name this address as a callee, an approve spender
+        //     or a transfer recipient". Nothing in the vault gates what a
+        //     strategy clone does with capital already delegated to it; that is
+        //     governed by the template's own code, which is itself certified
+        //     and allowlisted before any batch can reach it.
+        //
+        //     So `isCounterpartyAllowed` grants "a certified template may bind
+        //     and approve this address from inside its own reviewed code path",
+        //     and withholds "arbitrary batch calldata may name it". Those are
+        //     different capabilities over different calldata, which is what
+        //     makes the weaker grant meaningful — not any claim that a
+        //     counterparty never sees funds.
+        //
+        //     The swap adapter stays on the strong axis anyway, for a reason
+        //     that survives the correction: `PortfolioStrategy` binds its own
+        //     adapter through `isAdapterAllowed`, and a swap adapter is exactly
+        //     the kind of address a batch legitimately names. Keeping the two
+        //     templates asking the same question of the same role is worth more
+        //     than the one entry it costs. Adapter standing implies counterparty
+        //     standing, so a registry configured before this axis existed keeps
+        //     working unchanged.
         //
         //     THE VAULT ASSET IS EXEMPT, mirroring `_guardBatchCalls`' own
         //     `target != asset_` carve-out. `collateralToken == vaultAsset` is
@@ -474,9 +501,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         {
             address registry = _resolveTierRegistry();
             if (registry == address(0)) revert TierRegistryUnresolved();
-            // The swap adapter is the one address here that receives approvals
-            // of this strategy's balances, so it binds on the STRONG axis. The
-            // rest bind on the weak one, which adapter standing implies.
+            // Strong axis for the swap adapter, matching `PortfolioStrategy`'s
+            // binding of the same role; weak axis for the rest, which adapter
+            // standing implies. All four receive approvals — see the note above
+            // for why that is not what separates them.
             _requireAllowedAdapter(registry, p.swapAdapter);
             _requireAllowedCounterparty(registry, p.positionManager);
             _requireAllowedCounterparty(registry, p.morpho);
@@ -720,11 +748,16 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     // ── Governance-allowlist binding (see check (0) in `_initialize`) ──
 
     /// @dev Reverts unless `adapter` carries ADAPTER standing in `registry` —
-    ///      the strong grant, which licenses moving vault funds to the address.
-    ///      For the swap adapter only: it is the one counterparty here that
-    ///      receives `forceApprove` of this strategy's balances, so the weaker
-    ///      binding grant would not be enough. Mirrors
-    ///      `PortfolioStrategy._requireAllowedAdapter`, but takes the registry
+    ///      the strong grant, which additionally licenses appearing in
+    ///      proposer-authored governor-batch calldata.
+    ///
+    ///      For the swap adapter only, and NOT because it is the only address
+    ///      here that receives approvals — every bound address does; see the
+    ///      correction in check (0). It is because `PortfolioStrategy` binds the
+    ///      same role through the same predicate, and keeping two templates
+    ///      asking one question of one role is worth the extra registry entry.
+    ///
+    ///      Mirrors `PortfolioStrategy._requireAllowedAdapter`, but takes the registry
     ///      as an argument since `_initialize` binds several counterparties and
     ///      re-walking `vault() -> governor() -> tierRegistry()` per address
     ///      would be redundant staticcall pairs.
@@ -735,8 +768,19 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     }
 
     /// @dev Reverts unless `counterparty` carries COUNTERPARTY standing — the
-    ///      weak grant, which says "a strategy may bind this" and nothing about
-    ///      batch callees, approve spenders or transfer recipients.
+    ///      weak grant: a CERTIFIED TEMPLATE may bind and approve this address
+    ///      from inside its own reviewed code path, and proposer-authored batch
+    ///      calldata may NOT name it as a callee, approve spender or transfer
+    ///      recipient.
+    ///
+    ///      READ THAT BOUNDARY PRECISELY, because the obvious reading is wrong.
+    ///      It is not "this address never receives funds" — `_postCollateral`,
+    ///      `_mintPosition` and `_repayAndWithdraw` all `forceApprove` addresses
+    ///      bound through here. It is that the approving code is fixed at
+    ///      certification time rather than written by the proposer per proposal.
+    ///      Every `isAdapterAllowed` read in `SyndicateVault` sits inside
+    ///      `_guardBatchCalls` iterating `calls[]`; none of them gates what a
+    ///      clone does with capital already delegated to it.
     ///
     ///      This is the predicate the lending market, the position manager and
     ///      the collateral token bind through. Binding them on the adapter axis

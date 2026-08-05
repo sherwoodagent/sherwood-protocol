@@ -174,8 +174,17 @@ contract TierRegistry is Ownable2Step {
     ///      about a strategy.
     ///
     ///      Strictly weaker than `_adapterAllowed`, and implied by it: see
-    ///      `isCounterpartyAllowed`. Nothing that reads this may spend vault
-    ///      funds on the strength of it.
+    ///      `isCounterpartyAllowed`.
+    ///
+    ///      WHAT IT WITHHOLDS IS BATCH REACHABILITY, NOT FUND CONTACT. An
+    ///      earlier version of this note said "nothing that reads this may spend
+    ///      vault funds on the strength of it", which is false and was corrected
+    ///      in the PR #217 review: `ConcentratedLiquidityStrategy` approves
+    ///      every address it binds here. The real boundary is whose calldata
+    ///      does the approving — a certified template's own reviewed code, not a
+    ///      proposer-authored governor batch. Every `isAdapterAllowed` read in
+    ///      `SyndicateVault` sits inside `_guardBatchCalls` iterating `calls[]`,
+    ///      so that is precisely the capability this axis does not confer.
     mapping(address counterparty => bool) private _counterpartyAllowed;
 
     /// @dev Grant-time codehash snapshot for the counterparty axis, mirroring
@@ -825,6 +834,14 @@ contract TierRegistry is Ownable2Step {
     ///         collateral token. Confers NONE of `setAdapterAllowed`'s standing:
     ///         nothing listed here becomes a batch callee, an approve spender or
     ///         a transfer recipient by virtue of this call.
+    /// @dev    A LISTED COUNTERPARTY WILL RECEIVE TOKEN APPROVALS. That is not
+    ///         a contradiction of the line above and it is worth stating
+    ///         plainly, because the natural reading of "weaker grant" is
+    ///         "cannot touch funds" and that reading is wrong: a template binds
+    ///         a lending market precisely in order to approve and supply to it.
+    ///         What the grant withholds is appearing in a governor batch, whose
+    ///         calldata a proposer writes freely. Grant this the same way you
+    ///         would grant the strong one — against code you have read.
     /// @dev    The point of the separation is that `setAdapterAllowed`'s own
     ///         contract forbids listing exotic-asset contracts ("ERC-721/1155/
     ///         777, LP-position NFTs"), while a concentrated-liquidity template
