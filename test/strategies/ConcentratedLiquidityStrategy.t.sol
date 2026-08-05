@@ -9,6 +9,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockERC4626Wrapper} from "../mocks/MockERC4626Wrapper.sol";
 import {MockMorpho, MockIrm} from "../mocks/MockMorpho.sol";
 import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
+import {MockPermissiveTierRegistry} from "../mocks/MockPermissiveTierRegistry.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 import {MockUniswapV3Pool} from "../mocks/MockUniswapV3Pool.sol";
 import {MockPositionManager} from "../mocks/MockPositionManager.sol";
@@ -61,6 +62,13 @@ abstract contract CLFixture is Test {
     int24 constant TICK_UPPER = 1000;
     uint24 constant POOL_FEE = 500;
 
+    /// @dev The pool price matching this fixture's adapter rate, as
+    ///      `sqrt(token1_raw / token0_raw) * 2^96`. token0 is USDG (6dp),
+    ///      token1 is NVDA (18dp), and 1 USDG buys 0.01 NVDA, so in RAW units
+    ///      1e6 USDG buys 1e16 NVDA and the raw ratio is 1e10.
+    ///      `sqrt(1e10) = 1e5`, so the value is `1e5 * 2^96`.
+    uint160 constant FAIR_SQRT_PRICE_X96 = uint160(1e5) * uint160(2 ** 96);
+
     uint32 constant TWAP_WINDOW = 1800;
     uint256 constant MAX_DEVIATION_BPS = 100;
 
@@ -73,6 +81,7 @@ abstract contract CLFixture is Test {
     MockPositionManager posm;
     MockSwapAdapter adapter;
     MockProposalStatus status;
+    MockPermissiveTierRegistry tierRegistry;
     VaultStub vaultStub;
 
     MarketParams mp;
@@ -118,7 +127,22 @@ abstract contract CLFixture is Test {
         nvda.mint(address(adapter), 1_000_000e18);
         usdg.mint(address(adapter), 1_000_000e6);
 
+        // Seat a real pool price. `_poolAnchoredMinOut` treats 0 as unreadable
+        // and degrades to the quote floor alone, so leaving the mock's default
+        // would make the anchored floor inert in every test here rather than
+        // fail loudly. FAIR_SQRT_PRICE_X96 encodes exactly the adapter's rate,
+        // so the two floors agree and the honest path is unaffected; the
+        // manipulation tests move the ADAPTER away from it.
+        pool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96);
+
         status = new MockProposalStatus();
+        // `_initialize` binds every proposer-supplied counterparty to the
+        // registry reached through `vault() -> governor() -> tierRegistry()`,
+        // and fails CLOSED when that walk yields nothing — so the fixture must
+        // seat one. Permissive by default; the binding tests deny specific
+        // addresses to drive the refusal.
+        tierRegistry = new MockPermissiveTierRegistry();
+        status.setTierRegistry(address(tierRegistry));
         vaultStub = new VaultStub(address(usdg), address(status));
         usdg.mint(address(vaultStub), COLLATERAL * 10);
 
@@ -278,6 +302,29 @@ contract ConcentratedLiquidityStrategyLifecycleTest is CLFixture {
 
     function test_name() public view {
         assertEq(strategy.name(), "Concentrated Liquidity LP");
+    }
+}
+
+/// @notice A `TierRegistry` stand-in whose `isAdapterAllowed` returns a raw
+///         word rather than a canonical boolean.
+/// @dev    Exists to drive the one input `abi.decode(ret, (bool))` cannot
+///         survive. Solidity's bool decoder reverts on any word outside {0, 1},
+///         and there is no `try` around the binding probe — so a registry that
+///         answers `2` would brick `_initialize` instead of failing closed.
+///         Written in assembly because the type system cannot express it.
+contract DirtyWordTierRegistry {
+    uint256 private _word;
+
+    function setWord(uint256 w) external {
+        _word = w;
+    }
+
+    fallback() external {
+        uint256 w = _word;
+        assembly ("memory-safe") {
+            mstore(0x00, w)
+            return(0x00, 0x20)
+        }
     }
 }
 
@@ -470,6 +517,175 @@ contract ConcentratedLiquidityStrategyInitTest is CLFixture {
         p.maxTwapDeviationBps = strategy.MAX_TWAP_DEVIATION_BPS() + 1;
         _expectInitRevert(ConcentratedLiquidityStrategy.InvalidBound.selector, p);
     }
+
+    // ── Pashov 2026-08 finding #3 — governance binding of counterparties ──
+    //
+    // Every init-time check in this template resolves THROUGH an address the
+    // proposer chose: `pool.factory() == p.uniswapFactory` compares an
+    // attacker's pool's answer against an attacker's own parameter,
+    // `market(id).lastUpdate` asks an attacker's Morpho whether an attacker's
+    // market exists, `_isWrapperOf` asks an attacker's token what it wraps.
+    // Self-consistent by construction, every one of them.
+    //
+    // The vault's batch guard does not cover it either: `_guardBatchCalls`
+    // PART 2a checks the CLONE is an allowlisted callee, while the approvals
+    // that move money are issued INSIDE this contract — `forceApprove` to the
+    // collateral token in `_postCollateral` and to the swap adapter in
+    // `_rebalanceToTarget` — one hop past anything the batch names.
+    //
+    // `PortfolioStrategy` binds its adapter and price sources for exactly this
+    // reason. These pin that this template now does the same, for all four.
+
+    /// @dev Each counterparty individually, so a fix that binds three of four
+    ///      cannot pass.
+    function test_init_deniedSwapAdapterReverts() public {
+        tierRegistry.setDenied(address(adapter), true);
+        _expectInitRevertWithArgs(address(adapter));
+    }
+
+    function test_init_deniedPositionManagerReverts() public {
+        tierRegistry.setDenied(address(posm), true);
+        _expectInitRevertWithArgs(address(posm));
+    }
+
+    function test_init_deniedMorphoReverts() public {
+        tierRegistry.setDenied(address(morpho), true);
+        _expectInitRevertWithArgs(address(morpho));
+    }
+
+    function test_init_deniedCollateralTokenReverts() public {
+        tierRegistry.setDenied(mp.collateralToken, true);
+        _expectInitRevertWithArgs(mp.collateralToken);
+    }
+
+    /// @dev The binding must run BEFORE the counterparty-derived checks, or a
+    ///      hostile `morpho` gets to answer `market()` first and the refusal
+    ///      surfaces as whatever THAT contract chose to revert with. Denying a
+    ///      counterparty while also handing over params that would fail a later
+    ///      check pins the ordering: the binding error is what comes out.
+    function test_init_bindingRunsBeforeCounterpartyDerivedChecks() public {
+        tierRegistry.setDenied(address(morpho), true);
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        // Would trip `BorrowExceedsLiquidity` if the binding did not fire first.
+        p.borrowAmount = MARKET_SUPPLY * 100;
+
+        ConcentratedLiquidityStrategy s = ConcentratedLiquidityStrategy(Clones.clone(address(template)));
+        bytes memory data = abi.encode(p);
+        address v = address(vaultStub);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ConcentratedLiquidityStrategy.CounterpartyNotAllowed.selector, address(morpho), address(tierRegistry)
+            )
+        );
+        s.initialize(v, proposer, data);
+    }
+
+    /// @dev No registry resolvable → fail CLOSED, matching
+    ///      `PortfolioStrategy._initialize`. Binding time is the cheap place to
+    ///      refuse: it costs a re-proposal, where discovering it at execute
+    ///      costs the deployed capital.
+    function test_init_unresolvableTierRegistryReverts() public {
+        status.setTierRegistry(address(0));
+        _expectInitRevert(ConcentratedLiquidityStrategy.TierRegistryUnresolved.selector, _defaultParams());
+    }
+
+    /// @dev THE POINT OF THE TWO AXES. The position manager and Morpho bind on
+    ///      `isCounterpartyAllowed`, not `isAdapterAllowed` — so an owner can
+    ///      run this template WITHOUT admitting either to the allowlist that
+    ///      governs batch callees, approve spenders and transfer recipients.
+    ///
+    ///      That is not a preference. `TierRegistry.setAdapterAllowed`'s own
+    ///      contract says exotic-asset contracts, naming LP-position NFTs, MUST
+    ///      NOT be listed on that axis, and a Uniswap position manager is one.
+    ///      Binding it there would have made operating the template require the
+    ///      exact entry the registry tells the owner not to make.
+    ///
+    ///      Denies both on the ADAPTER axis only, so the test fails if either
+    ///      one is ever moved back onto the strong grant.
+    function test_init_counterpartiesDoNotNeedAdapterStanding() public {
+        tierRegistry.setDeniedAsAdapter(address(posm), true);
+        tierRegistry.setDeniedAsAdapter(address(morpho), true);
+        tierRegistry.setDeniedAsAdapter(mp.collateralToken, true);
+
+        ConcentratedLiquidityStrategy s = _newStrategy(_defaultParams());
+        assertEq(address(s.positionManager()), address(posm));
+    }
+
+    /// @dev The converse, so the split does not quietly weaken the swap adapter.
+    ///      It is the one address here that receives `forceApprove` of the
+    ///      strategy's balances, so the WEAK grant must not be enough for it.
+    function test_init_swapAdapterStillNeedsAdapterStanding() public {
+        tierRegistry.setDeniedAsAdapter(address(adapter), true);
+        _expectInitRevertWithArgs(address(adapter));
+    }
+
+    /// @dev The vault asset is EXEMPT from the binding, mirroring
+    ///      `SyndicateVault._guardBatchCalls`' own `target != asset_` carve-out.
+    ///      `collateralToken == vaultAsset` is an explicitly supported market
+    ///      (see `test_init_vaultAssetAsCollateralSucceeds`), and the vault's
+    ///      guard treats its own asset as needing no allowlist entry — so
+    ///      demanding one here would refuse a legitimate market on a registry
+    ///      configured exactly right.
+    ///
+    ///      DENIES `usdg` EXPLICITLY, which is the whole point: the permissive
+    ///      mock answers yes to everything it was not told about, so a test
+    ///      that merely used the asset as collateral would pass either way and
+    ///      prove nothing. Same inert-fixture failure this PR fixed for
+    ///      `slot0()`.
+    function test_init_vaultAssetAsCollateralIsExemptFromTheBinding() public {
+        MarketParams memory direct = mp;
+        direct.collateralToken = address(usdg);
+        morpho.createMarket(direct);
+        _fundMarket(direct);
+
+        tierRegistry.setDenied(address(usdg), true);
+
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.marketParams = direct;
+        ConcentratedLiquidityStrategy s = _newStrategy(p);
+        assertEq(s.marketParams().collateralToken, address(usdg));
+    }
+
+    /// @dev A registry answering with a word that is neither 0 nor 1 must fail
+    ///      CLOSED, not undecodably. `abi.decode(ret, (bool))` REVERTS on such a
+    ///      word, in this frame, with nothing to catch it — which would turn the
+    ///      documented "unreadable means not vouched for" into a bricked
+    ///      `_initialize`, the exact failure the raw-staticcall form exists to
+    ///      avoid. Non-zero reads as true, matching the EVM's own convention.
+    function test_init_registryReturningNonBooleanWordDoesNotBrickInit() public {
+        DirtyWordTierRegistry dirty = new DirtyWordTierRegistry();
+        status.setTierRegistry(address(dirty));
+
+        // 2 is "true" by the EVM's convention, so the binding passes rather than
+        // reverting on the decode.
+        dirty.setWord(2);
+        ConcentratedLiquidityStrategy s = _newStrategy(_defaultParams());
+        assertEq(s.marketParams().collateralToken, mp.collateralToken);
+
+        // 0 is still a refusal, and it surfaces as the typed error.
+        dirty.setWord(0);
+        ConcentratedLiquidityStrategy s2 = ConcentratedLiquidityStrategy(Clones.clone(address(template)));
+        bytes memory data = abi.encode(_defaultParams());
+        address v = address(vaultStub);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ConcentratedLiquidityStrategy.CounterpartyNotAllowed.selector, address(adapter), address(dirty)
+            )
+        );
+        s2.initialize(v, proposer, data);
+    }
+
+    function _expectInitRevertWithArgs(address counterparty) internal {
+        ConcentratedLiquidityStrategy s = ConcentratedLiquidityStrategy(Clones.clone(address(template)));
+        bytes memory data = abi.encode(_defaultParams());
+        address v = address(vaultStub);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ConcentratedLiquidityStrategy.CounterpartyNotAllowed.selector, counterparty, address(tierRegistry)
+            )
+        );
+        s.initialize(v, proposer, data);
+    }
 }
 
 contract ConcentratedLiquidityStrategyTwapTest is CLFixture {
@@ -520,5 +736,171 @@ contract ConcentratedLiquidityStrategyTwapTest is CLFixture {
         vm.prank(address(vaultStub));
         vm.expectRevert(ConcentratedLiquidityStrategy.TwapUnavailable.selector);
         strategy.execute();
+    }
+}
+
+/// @notice Pashov 2026-08 finding #4 — swap floors must not be derived from the
+///         venue being swapped against.
+/// @dev    Every swap floor in this template came from
+///         `swapAdapter.quote(..., swapExtraData)` taken in the SAME transaction,
+///         through the SAME route, as the swap it bounded. `PortfolioStrategy`
+///         states the property outright for its own `_quoteMinOut` ("NOT
+///         SANDWICH PROTECTION ... a searcher who moves the pool before the call
+///         gets a quote at the moved price and a floor derived from it, and the
+///         swap clears") and answers it with oracle-anchored floors. This
+///         template had no oracle and no equivalent.
+///
+///         `_requireSpotNearTwap` did not cover it: it reads `pool.slot0()` —
+///         the LP venue — while `swapExtraData` is stored verbatim at
+///         `_initialize` and may route a different fee tier, a V4 pool, or a
+///         multi-hop path. So the guarded venue and the swapped venue were not
+///         the same venue.
+///
+///         These drive exactly that split: the POOL keeps quoting the fair
+///         price while the ROUTED ADAPTER is moved against the strategy.
+contract ConcentratedLiquidityStrategyPoolAnchoredFloorTest is CLFixture {
+    /// @dev Sanity that the anchored floor is not simply blocking everything:
+    ///      with the adapter and the pool agreeing, the honest path is
+    ///      unaffected. Without this a floor stuck at "reject" would look like
+    ///      a working fix.
+    function test_execute_fairVenueStillSucceeds() public {
+        _execute();
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed));
+    }
+
+    /// @dev THE fix. The routed venue pays half what the configured pool says.
+    ///      Pre-fix `minOut` came from that same halved venue and the swap
+    ///      cleared; post-fix the pool-anchored floor rejects it.
+    function test_execute_routedVenueMovedAgainstPool_isRejected() public {
+        adapter.setRate(address(usdg), address(nvda), (1e18 * 1e12 / 100) / 2);
+        vm.prank(address(vaultStub));
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
+        strategy.execute();
+    }
+
+    /// @dev SELF-PROVING COUNTERPART to the test above, and the reason it is not
+    ///      vacuous. Same halved routed venue, but with the pool price
+    ///      unreadable the floor degrades to the quote alone — the pre-fix
+    ///      construction — and the identical skim CLEARS.
+    ///
+    ///      Two things are pinned at once: the manipulation test is actually
+    ///      exercising the new floor rather than some unrelated guard, and the
+    ///      degradation path is a real, deliberate residual (an unreadable pool
+    ///      price buys back the old exposure) rather than an accident.
+    function test_execute_quoteFloorAloneAdmitsTheSkim_provingTheAnchorIsLoadBearing() public {
+        pool.setSqrtPriceX96(0);
+        adapter.setRate(address(usdg), address(nvda), (1e18 * 1e12 / 100) / 2);
+        _execute();
+        assertEq(
+            uint256(strategy.state()),
+            uint256(BaseStrategy.State.Executed),
+            "without the pool anchor the halved venue clears -- this is the pre-fix behaviour"
+        );
+    }
+
+    /// @dev The pool read degrades rather than bricks: an unreadable price
+    ///      (`sqrtPriceX96 == 0`) must fall back to the quote floor alone, which
+    ///      is the pre-existing behaviour, not a new revert. Pins that the
+    ///      degradation path is deliberate — and, read against the test above,
+    ///      pins that a zero price is what made this floor inert.
+    function test_execute_unreadablePoolPriceDegradesToQuoteFloor() public {
+        pool.setSqrtPriceX96(0);
+        _execute();
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed));
+    }
+
+    /// @dev The anchor is the pool's MID price, while `_quoteMinOut`'s operand
+    ///      is an adapter quote that already has the venue's fee taken out of
+    ///      it. Applying the same `slippageBps` to both would quietly redefine
+    ///      that budget as "fee first, slippage with whatever is left", so a
+    ///      fee tier wider than the configured slippage would revert every
+    ///      `_rebalanceToTarget` — at execute, after the vote.
+    ///
+    ///      Discriminating by construction: a 1% pool against a 50 bps slippage
+    ///      budget, with the venue filling at exactly mid-less-fee. Without the
+    ///      haircut the anchor sits at `mid * 0.995`, above the honest `mid *
+    ///      0.99` fill, and this reverts.
+    function test_execute_poolFeeIsNettedOutOfTheAnchor() public {
+        MockUniswapV3Pool widePool = new MockUniswapV3Pool(address(usdg), address(nvda), 10_000, TICK_SPACING, factory);
+        widePool.setLiquidity(POOL_LIQUIDITY);
+        widePool.setTicks(0, 0);
+        widePool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96);
+
+        // The honest fill for a 1% venue: mid less the fee, nothing else.
+        adapter.setRate(address(usdg), address(nvda), (1e18 * 1e12 / 100) * 99 / 100);
+
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.pool = address(widePool);
+        p.mintSlippageBps = 50;
+        ConcentratedLiquidityStrategy s = _newStrategy(p);
+        status.set(1, 1, address(s));
+        vm.prank(address(vaultStub));
+        usdg.approve(address(s), type(uint256).max);
+
+        vm.prank(address(vaultStub));
+        s.execute();
+        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Executed), "the fee haircut must not be double-counted");
+    }
+
+    // ── The exit leg: the anchor must not become a settlement veto ──
+
+    /// @dev THE REGRESSION THE GATE MUST NOT BREAK. Pool honest, routed venue
+    ///      short: the anchor holds and the skim is refused, leaving the residue
+    ///      for `sweep()`. If gating the anchor on `_spotNearTwap()` had
+    ///      disabled it on this path, this converts and the finding is back.
+    function test_settle_shortRoutedVenueIsRefusedWhileSpotIsTwapVerified() public {
+        _execute();
+        // Half of what the pool says the token is worth.
+        adapter.setRate(address(nvda), address(usdg), (100 * 1e18 / 1e12) / 2);
+        _settle();
+        assertGt(
+            nvda.balanceOf(address(strategy)), 0, "the halved venue must not clear while the pool price is verified"
+        );
+    }
+
+    /// @dev THE FIX, and the correction to its first attempt. `_settle`/`sweep`
+    ///      assert nothing about spot — unlike `_execute`/`rerange`, which
+    ///      revert `SpotOutsideTwapBound` first — so the anchor's safety is not
+    ///      inherited here and a pushed pool has to be handled explicitly.
+    ///
+    ///      SKIPPING THE ANCHOR IS THE WRONG HANDLING, which is what this pins.
+    ///      With the anchor off, `minOut` falls back to the routed venue quoting
+    ///      itself, so the same actor who pushed the pool also moves the venue
+    ///      and the original finding clears — measured at a full conversion of
+    ///      the position through a venue paying half the pool price. Skipping
+    ///      the SWAP instead costs delay rather than principal.
+    function test_settle_pushedPoolMustNotHandTheSkimBack() public {
+        _execute();
+        pool.setTicks(23_000, 0);
+        adapter.setRate(address(nvda), address(usdg), (100 * 1e18 / 1e12) / 2);
+        _settle();
+        assertGt(
+            nvda.balanceOf(address(strategy)),
+            0,
+            "an unverified pool must skip the swap, not swap on the venue's own quote"
+        );
+    }
+
+    /// @dev And the delay is only that. The residue a pushed pool leaves is
+    ///      recoverable by the permissionless `sweep()` at any later honest
+    ///      moment, with no owner involvement — which is what makes trading the
+    ///      skim for a skipped swap the right way round. Holding spot outside
+    ///      the bound costs the attacker every block while the TWAP walks toward
+    ///      spot, so the deviation they are paying for closes underneath them.
+    function test_settle_pushedPoolResidueIsRecoveredBySweep() public {
+        _execute();
+        pool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96 / 3);
+        pool.setTicks(23_000, 0);
+
+        _settle();
+        assertGt(nvda.balanceOf(address(strategy)), 0, "precondition: the pushed pool left a residue");
+
+        // The pool returns to itself; anyone may retry.
+        pool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96);
+        pool.setTicks(0, 0);
+        vm.prank(keeper);
+        strategy.sweep();
+
+        assertEq(nvda.balanceOf(address(strategy)), 0, "sweep must recover the residue once the pool is honest");
     }
 }
