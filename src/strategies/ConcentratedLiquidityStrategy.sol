@@ -68,6 +68,13 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
+    /// @notice Uniswap V3 fee scale: `fee()` is in hundredths of a bip, so
+    ///         1e6 is 100% and the 500 / 3_000 / 10_000 tiers are 0.05% / 0.3%
+    ///         / 1%. Distinct from `BPS_DENOMINATOR` on purpose — conflating
+    ///         the two would misprice `_poolAnchoredMinOut`'s fee haircut by
+    ///         two orders of magnitude.
+    uint256 public constant FEE_DENOMINATOR = 1e6;
+
     /// @notice Uniswap V3's tick domain. Mirrored here rather than imported so
     ///         `_derivedRange` can clamp without pulling in `TickMath`.
     int24 public constant MIN_TICK = -887_272;
@@ -432,13 +439,41 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         //     to refuse: it costs a re-proposal, where discovering it at
         //     execute costs the deployed capital. No hop is proposer input, so
         //     the proposer cannot steer the walk into the skip.
+        //
+        //     OPERATIONAL CONSEQUENCE, STATED BECAUSE IT IS NOT FREE.
+        //     `isAdapterAllowed` is not a counterparty allowlist — it is the
+        //     same predicate `SyndicateVault._guardBatchCalls` uses to decide
+        //     which addresses a governor batch may call directly, approve as a
+        //     spender, and transfer to. Binding through it therefore REQUIRES
+        //     an owner to admit Morpho and the position manager to that
+        //     allowlist, which widens the batch guard for them by the same
+        //     stroke. Accepted rather than papered over: the registry is the
+        //     only governance surface a strategy clone can reach from chain
+        //     state alone (`PortfolioStrategy` binds its swap adapter and price
+        //     sources the identical way), and a batch call to those two is
+        //     still bounded by the vault's per-call caps and net-outflow meter.
+        //     A dedicated predicate would be the cleaner shape if `TierRegistry`
+        //     ever grows one.
+        //
+        //     THE VAULT ASSET IS EXEMPT, mirroring `_guardBatchCalls`' own
+        //     `target != asset_` carve-out. `collateralToken == vaultAsset` is
+        //     an explicitly supported configuration (see check (2) and
+        //     `_collateralValue`), and the vault's own guard treats its asset as
+        //     needing no allowlist entry — so requiring one here would refuse a
+        //     legitimate market on a registry that is configured exactly right.
+        //     The exemption is safe on its own terms: the address is read from
+        //     the vault, not from `p`, so a proposer cannot name it into the
+        //     skip. `swapAdapter`, `positionManager` and `morpho` get no such
+        //     exemption; they are never the asset.
         {
             address registry = _resolveTierRegistry();
             if (registry == address(0)) revert TierRegistryUnresolved();
             _requireAllowedAdapter(registry, p.swapAdapter);
             _requireAllowedAdapter(registry, p.positionManager);
             _requireAllowedAdapter(registry, p.morpho);
-            _requireAllowedAdapter(registry, p.marketParams.collateralToken);
+            if (p.marketParams.collateralToken != vaultAsset) {
+                _requireAllowedAdapter(registry, p.marketParams.collateralToken);
+            }
         }
 
         // (1) The pool exists and one of its two tokens is the vault asset.
@@ -574,10 +609,30 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      WHY sqrtPriceX96 AND NOT THE TWAP TICK. Converting a tick to a
     ///      price needs `TickMath.getSqrtRatioAtTick`, which this contract
     ///      deliberately does not vendor (see `_derivedRange`). `slot0()`
-    ///      already returns `sqrtPriceX96` directly, and every caller of this
-    ///      helper runs behind `_requireSpotNearTwap()`, which bounds that spot
-    ///      to the TWAP within `maxTwapDeviationBps`. So the anchor is a
-    ///      TWAP-verified pool price reached without new price math.
+    ///      already returns `sqrtPriceX96` directly. So the anchor is a pool
+    ///      price reached without new price math.
+    ///
+    ///      SPOT, AND THEREFORE ONLY AS SAFE AS ITS CALLER'S TWAP CHECK. The
+    ///      minting sites (`_execute`, `rerange`) have already asserted spot
+    ///      against the TWAP via `_requireSpotNearTwap()` and reverted
+    ///      otherwise, so for them this is a TWAP-verified price. `_settle` and
+    ///      `sweep` assert nothing, so `_trySwapToAsset` gates the call on
+    ///      `_spotNearTwap()` itself — see the note there on why an unverified
+    ///      spot used as a floor is a denial lever rather than a guard. Do NOT
+    ///      add a call site without deciding which of the two it is.
+    ///
+    ///      NETTED OF THE POOL FEE. The value derived here is the pool's MID
+    ///      price; `_quoteMinOut`'s operand is an adapter quote, which already
+    ///      has the venue's fee and price impact taken out of it. Applying the
+    ///      same `slippageBps` to both would silently redefine what that budget
+    ///      has to cover — on the mid it would have to absorb the fee before it
+    ///      absorbs any slippage at all, so a 0.3% tier would eat 30 bps of it
+    ///      and a 1% tier 100, and every configuration sized against the old
+    ///      quote-only floor would start reverting at `_rebalanceToTarget`
+    ///      (which, unlike settle, does NOT degrade). Subtracting `pool.fee()`
+    ///      first keeps `slippageBps` meaning the same thing it did before.
+    ///      The routed venue may charge differently, so this is the configured
+    ///      pool's fee as a proxy, not a claim about the route.
     ///
     ///      `price(token1 per token0) = sqrtPriceX96^2 / 2^192`, split into two
     ///      `mulDiv`s by 2^96 so the intermediate never overflows.
@@ -603,6 +658,11 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         } else {
             expected = Math.mulDiv(Math.mulDiv(amountIn, 1 << 96, sp), 1 << 96, sp);
         }
+        if (expected == 0) return 0;
+        // Fee first, slippage second — see the NatSpec. `pool.fee()` is in
+        // hundredths of a bip (1e6 = 100%), and Uniswap V3 caps it far below
+        // that, so the subtraction cannot underflow.
+        expected = (expected * (FEE_DENOMINATOR - uint256(pool.fee()))) / FEE_DENOMINATOR;
         if (expected == 0) return 0;
         return (expected * (BPS_DENOMINATOR - slippageBps)) / BPS_DENOMINATOR;
     }
@@ -672,11 +732,22 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     }
 
     /// @dev Staticcall-safe `isAdapterAllowed`. Unreadable → `false`.
+    ///      The word is read directly rather than via `abi.decode(ret, (bool))`:
+    ///      decoding a bool REVERTS on any word that is not 0 or 1, and that
+    ///      revert would land in this frame with nothing to catch it — turning
+    ///      the documented "unreadable means not vouched for" into "unreadable
+    ///      bricks `_initialize` undecodably", which is the exact failure this
+    ///      whole helper is written in raw-staticcall form to avoid. Non-zero is
+    ///      true, matching how the EVM itself reads a boolean return.
     function _isAdapterAllowed(address registry, address adapter) private view returns (bool) {
         if (registry.code.length == 0) return false;
         (bool ok, bytes memory ret) = registry.staticcall(abi.encodeCall(ITierBindingPath.isAdapterAllowed, (adapter)));
         if (!ok || ret.length != 32) return false;
-        return abi.decode(ret, (bool));
+        uint256 word;
+        assembly ("memory-safe") {
+            word := mload(add(ret, 0x20))
+        }
+        return word != 0;
     }
 
     /// @dev Staticcall-safe address read: codeless target, revert, short
@@ -777,19 +848,37 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         reverts (upstream `OLD`) is distinguishable from one that returns
     ///         malformed data, and neither reaches `abi.decode` unchecked.
     function _twapTick() private view returns (int24) {
+        (int24 tick, bool ok) = _tryTwapTick();
+        if (!ok) revert TwapUnavailable();
+        return tick;
+    }
+
+    /// @dev The read itself, reporting availability instead of reverting.
+    ///      Exists for `_spotNearTwap`, which asks the same question on a path
+    ///      that must not revert (see there). `_twapTick` is the fail-closed
+    ///      wrapper and remains the only form the minting paths use — the
+    ///      difference is which caller is allowed to survive an unavailable
+    ///      TWAP, never how the TWAP itself is computed.
+    ///
+    ///      The `ret.length` floor bounds `abi.decode` to payloads that can at
+    ///      least carry two dynamic-array heads; beyond that the decode assumes
+    ///      well-formed ABI, which `pool` earns by being factory-verified at
+    ///      `_initialize`. What this path defends against is a manipulated
+    ///      PRICE, not a hostile pool ABI.
+    function _tryTwapTick() private view returns (int24, bool) {
         // Cardinality 1 means the ring holds only the current observation:
         // there is no history to average, so `observe` would answer with spot.
         (,,, uint16 cardinality,,,) = pool.slot0();
-        if (cardinality < 2) revert TwapUnavailable();
+        if (cardinality < 2) return (0, false);
 
         uint32[] memory secondsAgos = new uint32[](2);
         secondsAgos[0] = twapWindow;
         secondsAgos[1] = 0;
 
         (bool ok, bytes memory ret) = address(pool).staticcall(abi.encodeCall(IUniswapV3Pool.observe, (secondsAgos)));
-        if (!ok) revert TwapUnavailable();
+        if (!ok || ret.length < 128) return (0, false);
         (int56[] memory tickCumulatives,) = abi.decode(ret, (int56[], uint160[]));
-        if (tickCumulatives.length != 2) revert TwapUnavailable();
+        if (tickCumulatives.length != 2) return (0, false);
 
         int56 delta = tickCumulatives[1] - tickCumulatives[0];
         // The quotient is a mean of two ticks, so it is bounded by the tick
@@ -799,7 +888,26 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // Upstream `OracleLibrary` floors toward negative infinity; mirror it so
         // a re-centered range derived here matches an off-chain simulation.
         if (delta < 0 && (delta % int56(uint56(twapWindow)) != 0)) avg--;
-        return avg;
+        return (avg, true);
+    }
+
+    /// @dev `_requireSpotNearTwap` as a QUESTION rather than an assertion: true
+    ///      only when the TWAP is readable AND spot sits inside
+    ///      `maxTwapDeviationBps` of it. Same tick-space comparison, same
+    ///      first-order bps↔tick mapping, same permissive-erring direction.
+    ///
+    ///      Exists because `_trySwapToAsset` needs to know whether the pool
+    ///      price is trustworthy WITHOUT that question being able to revert the
+    ///      vault's exit. An unreadable TWAP answers false, so the pool anchor
+    ///      is simply not applied — never a settlement veto.
+    function _spotNearTwap() private view returns (bool) {
+        (int24 twap, bool ok) = _tryTwapTick();
+        if (!ok) return false;
+        (, int24 spot,,,,,) = pool.slot0();
+        int24 diff = spot > twap ? spot - twap : twap - spot;
+        // `diff` is non-negative by construction above, so the cast cannot wrap.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint256(uint24(diff)) <= maxTwapDeviationBps;
     }
 
     /// @dev Reverts unless spot sits within `maxTwapDeviationBps` of the TWAP.
@@ -1237,14 +1345,29 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // this floor was purely the routed venue quoting itself. Raise it to the
         // configured pool's own price when that is higher.
         //
-        // NON-REVERTING, unlike the `_rebalanceToTarget` sites. Everything on
-        // this path degrades rather than blocks — `settle()` is the vault's exit
-        // and the deliverable-maximum design exists so a bad venue cannot veto
-        // it. A higher floor here means the swap may simply not fill, leaving
-        // the residue for `sweep()` to retry, which is the existing behaviour
-        // for an unfillable quote.
-        uint256 anchored = _poolAnchoredMinOut(otherToken, bal, slippageBps);
-        if (anchored > minOut) minOut = anchored;
+        // GATED ON `_spotNearTwap()`, WHICH IS THE WHOLE DIFFERENCE FROM THE
+        // MINTING SITES. There the anchor is safe unconditionally because
+        // `_execute`/`rerange` have already asserted spot against the TWAP and
+        // reverted otherwise. Here nothing has, and an unverified spot as a
+        // FLOOR is a lever, not a guard: pushing the pool so `otherToken` reads
+        // expensive makes `minOut` unfillable, the swap is skipped, and the
+        // residue never converts. That is a settlement denial anyone can buy for
+        // one pool round-trip — and downstream it starves the vault balance the
+        // governor's own drawdown floor measures, which escalates a skipped swap
+        // into a proposal only the owner multisig can clear. Applying the anchor
+        // ONLY while spot is TWAP-verified keeps the anti-skim floor for every
+        // honest pool state and removes the lever for the manipulated one.
+        //
+        // NON-REVERTING either way, unlike the `_rebalanceToTarget` sites.
+        // Everything on this path degrades rather than blocks — `settle()` is
+        // the vault's exit and the deliverable-maximum design exists so a bad
+        // venue cannot veto it. A higher floor that the honest market cannot
+        // fill leaves the residue for `sweep()` to retry, which is the existing
+        // behaviour for an unfillable quote.
+        if (_spotNearTwap()) {
+            uint256 anchored = _poolAnchoredMinOut(otherToken, bal, slippageBps);
+            if (anchored > minOut) minOut = anchored;
+        }
 
         IERC20(otherToken).forceApprove(address(swapAdapter), bal);
         // The swap itself is also allowed to fail: a quote that stood a moment

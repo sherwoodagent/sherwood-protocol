@@ -305,6 +305,29 @@ contract ConcentratedLiquidityStrategyLifecycleTest is CLFixture {
     }
 }
 
+/// @notice A `TierRegistry` stand-in whose `isAdapterAllowed` returns a raw
+///         word rather than a canonical boolean.
+/// @dev    Exists to drive the one input `abi.decode(ret, (bool))` cannot
+///         survive. Solidity's bool decoder reverts on any word outside {0, 1},
+///         and there is no `try` around the binding probe — so a registry that
+///         answers `2` would brick `_initialize` instead of failing closed.
+///         Written in assembly because the type system cannot express it.
+contract DirtyWordTierRegistry {
+    uint256 private _word;
+
+    function setWord(uint256 w) external {
+        _word = w;
+    }
+
+    fallback() external {
+        uint256 w = _word;
+        assembly ("memory-safe") {
+            mstore(0x00, w)
+            return(0x00, 0x20)
+        }
+    }
+}
+
 contract ConcentratedLiquidityStrategyInitTest is CLFixture {
     // ── 6.2 Init validation, one test per check ──
 
@@ -566,6 +589,62 @@ contract ConcentratedLiquidityStrategyInitTest is CLFixture {
         _expectInitRevert(ConcentratedLiquidityStrategy.TierRegistryUnresolved.selector, _defaultParams());
     }
 
+    /// @dev The vault asset is EXEMPT from the binding, mirroring
+    ///      `SyndicateVault._guardBatchCalls`' own `target != asset_` carve-out.
+    ///      `collateralToken == vaultAsset` is an explicitly supported market
+    ///      (see `test_init_vaultAssetAsCollateralSucceeds`), and the vault's
+    ///      guard treats its own asset as needing no allowlist entry — so
+    ///      demanding one here would refuse a legitimate market on a registry
+    ///      configured exactly right.
+    ///
+    ///      DENIES `usdg` EXPLICITLY, which is the whole point: the permissive
+    ///      mock answers yes to everything it was not told about, so a test
+    ///      that merely used the asset as collateral would pass either way and
+    ///      prove nothing. Same inert-fixture failure this PR fixed for
+    ///      `slot0()`.
+    function test_init_vaultAssetAsCollateralIsExemptFromTheBinding() public {
+        MarketParams memory direct = mp;
+        direct.collateralToken = address(usdg);
+        morpho.createMarket(direct);
+        _fundMarket(direct);
+
+        tierRegistry.setDenied(address(usdg), true);
+
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.marketParams = direct;
+        ConcentratedLiquidityStrategy s = _newStrategy(p);
+        assertEq(s.marketParams().collateralToken, address(usdg));
+    }
+
+    /// @dev A registry answering with a word that is neither 0 nor 1 must fail
+    ///      CLOSED, not undecodably. `abi.decode(ret, (bool))` REVERTS on such a
+    ///      word, in this frame, with nothing to catch it — which would turn the
+    ///      documented "unreadable means not vouched for" into a bricked
+    ///      `_initialize`, the exact failure the raw-staticcall form exists to
+    ///      avoid. Non-zero reads as true, matching the EVM's own convention.
+    function test_init_registryReturningNonBooleanWordDoesNotBrickInit() public {
+        DirtyWordTierRegistry dirty = new DirtyWordTierRegistry();
+        status.setTierRegistry(address(dirty));
+
+        // 2 is "true" by the EVM's convention, so the binding passes rather than
+        // reverting on the decode.
+        dirty.setWord(2);
+        ConcentratedLiquidityStrategy s = _newStrategy(_defaultParams());
+        assertEq(s.marketParams().collateralToken, mp.collateralToken);
+
+        // 0 is still a refusal, and it surfaces as the typed error.
+        dirty.setWord(0);
+        ConcentratedLiquidityStrategy s2 = ConcentratedLiquidityStrategy(Clones.clone(address(template)));
+        bytes memory data = abi.encode(_defaultParams());
+        address v = address(vaultStub);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ConcentratedLiquidityStrategy.CounterpartyNotAllowed.selector, address(adapter), address(dirty)
+            )
+        );
+        s2.initialize(v, proposer, data);
+    }
+
     function _expectInitRevertWithArgs(address counterparty) internal {
         ConcentratedLiquidityStrategy s = ConcentratedLiquidityStrategy(Clones.clone(address(template)));
         bytes memory data = abi.encode(_defaultParams());
@@ -698,5 +777,80 @@ contract ConcentratedLiquidityStrategyPoolAnchoredFloorTest is CLFixture {
         pool.setSqrtPriceX96(0);
         _execute();
         assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed));
+    }
+
+    /// @dev The anchor is the pool's MID price, while `_quoteMinOut`'s operand
+    ///      is an adapter quote that already has the venue's fee taken out of
+    ///      it. Applying the same `slippageBps` to both would quietly redefine
+    ///      that budget as "fee first, slippage with whatever is left", so a
+    ///      fee tier wider than the configured slippage would revert every
+    ///      `_rebalanceToTarget` — at execute, after the vote.
+    ///
+    ///      Discriminating by construction: a 1% pool against a 50 bps slippage
+    ///      budget, with the venue filling at exactly mid-less-fee. Without the
+    ///      haircut the anchor sits at `mid * 0.995`, above the honest `mid *
+    ///      0.99` fill, and this reverts.
+    function test_execute_poolFeeIsNettedOutOfTheAnchor() public {
+        MockUniswapV3Pool widePool = new MockUniswapV3Pool(address(usdg), address(nvda), 10_000, TICK_SPACING, factory);
+        widePool.setLiquidity(POOL_LIQUIDITY);
+        widePool.setTicks(0, 0);
+        widePool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96);
+
+        // The honest fill for a 1% venue: mid less the fee, nothing else.
+        adapter.setRate(address(usdg), address(nvda), (1e18 * 1e12 / 100) * 99 / 100);
+
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.pool = address(widePool);
+        p.mintSlippageBps = 50;
+        ConcentratedLiquidityStrategy s = _newStrategy(p);
+        status.set(1, 1, address(s));
+        vm.prank(address(vaultStub));
+        usdg.approve(address(s), type(uint256).max);
+
+        vm.prank(address(vaultStub));
+        s.execute();
+        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Executed), "the fee haircut must not be double-counted");
+    }
+
+    // ── The exit leg: the anchor must not become a settlement veto ──
+
+    /// @dev THE REGRESSION THE GATE MUST NOT BREAK. Pool honest, routed venue
+    ///      short: the anchor holds and the skim is refused, leaving the residue
+    ///      for `sweep()`. If gating the anchor on `_spotNearTwap()` had
+    ///      disabled it on this path, this converts and the finding is back.
+    function test_settle_shortRoutedVenueIsRefusedWhileSpotIsTwapVerified() public {
+        _execute();
+        // Half of what the pool says the token is worth.
+        adapter.setRate(address(nvda), address(usdg), (100 * 1e18 / 1e12) / 2);
+        _settle();
+        assertGt(
+            nvda.balanceOf(address(strategy)), 0, "the halved venue must not clear while the pool price is verified"
+        );
+    }
+
+    /// @dev THE FIX. `_settle`/`sweep` assert nothing about spot — unlike
+    ///      `_execute`/`rerange`, which revert `SpotOutsideTwapBound` first — so
+    ///      an unverified spot used as a FLOOR is a lever rather than a guard:
+    ///      push the pool until `otherToken` reads expensive and `minOut` is
+    ///      unfillable, and the exit swap is skipped for as long as the attacker
+    ///      keeps paying for the round-trip. Downstream that starves the vault
+    ///      balance the governor's drawdown floor measures, escalating a skipped
+    ///      swap into a proposal only the owner multisig can clear.
+    ///
+    ///      Post-fix the anchor is applied only while spot is TWAP-verified, so
+    ///      a pool pushed outside the bound simply stops contributing a floor
+    ///      and the honest venue still fills.
+    function test_settle_manipulatedSpotCannotBlockTheExit() public {
+        _execute();
+
+        // A ~10x push: the sqrt price drops by ~3.16x (so `nvda` reads ~10x
+        // dearer, inflating the anchor ~100x) and the tick moves with it, far
+        // outside the 100 bps bound. Both fields move together, as they would
+        // on a real pool.
+        pool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96 / 3);
+        pool.setTicks(23_000, 0);
+
+        _settle();
+        assertEq(nvda.balanceOf(address(strategy)), 0, "a pushed pool must not be able to veto the exit swap");
     }
 }
