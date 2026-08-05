@@ -100,6 +100,12 @@ interface ITokenCourt {
         uint256 finalizedAt;
         address challenger; // pinned Challenge.challenger, written once in refer (finding #7)
         uint256 accusedWeightAtLookback; // raw getPastStake sum at snapshotTs - FLOOR_LOOKBACK, same accused set as accusedWeight (finding #6)
+        /// @dev The proposer whose bond this verdict destroys or returns, read
+        ///      once in `refer` from the challenge's pinned `proposerBondEscrow`
+        ///      and barred by `vote`. Zero when the proposal locked no bond —
+        ///      then there is no verdict-contingent payout to this party and
+        ///      nothing to bar. Appended last for storage-layout stability.
+        address proposer;
     }
 
     /// @notice A wiring setter was handed the zero address.
@@ -172,6 +178,24 @@ interface ITokenCourt {
     ///         non-accused funder could otherwise fund the whole pool and vote
     ///         its own acquittal, collecting the challenger's forfeited bond.
     error CounterBondContributorCannotVote();
+    /// @notice `vote` called by the proposer of the challenged proposal. The
+    ///         three bars above cover the guardians who approved, the
+    ///         challenger, and the counter-bond funders — but the proposer is
+    ///         the single LARGEST verdict-contingent payee: `ChallengeGame._settle`
+    ///         confiscates its whole `proposerBondWood` on `Guilty`
+    ///         (`ProposerBondEscrow.forfeitBond` — "NO PARTIAL FORFEIT"), and
+    ///         every other verdict returns it intact via `reclaimProposerBond`.
+    ///         Nothing stops the proposer also staking as a guardian
+    ///         (`StakedWood.stakeAsGuardian` has no allowlist), and `isAccused`
+    ///         cannot reach it: that set is `pledgedOf(governor, proposalId)`,
+    ///         i.e. approving guardians, a role disjoint from the vault agent
+    ///         who proposed. Left unbarred it votes its own acquittal — and it
+    ///         only has to MATCH the guilty tally, since `finalize` acquits on a
+    ///         tie, while its ballot simultaneously lifts `turnout` over
+    ///         `_participationFloor`, converting a re-armable `Inconclusive`
+    ///         into a terminal `NotGuilty` that forecloses re-challenge and
+    ///         forfeits the honest challenger's bond.
+    error ProposerCannotVote();
     /// @notice `renounceOwnership` was called. The court refuses it outright, for
     ///         everyone including the owner: it is non-upgradeable, so an
     ///         ownerless court can never again be re-wired or re-tuned — losing

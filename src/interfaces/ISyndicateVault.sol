@@ -161,6 +161,12 @@ interface ISyndicateVault {
     function setExecutorImpl(address newImpl) external;
     function owner() external view returns (address);
     function transferPerformanceFee(address asset, address to, uint256 amount) external;
+    /// @notice The ceiling `transferPerformanceFee` tests `amount` against —
+    ///         asset balance less the queue reserve and the existing fee escrow.
+    ///         Read by `SyndicateGovernor._payFee` so a failed transfer is
+    ///         escrowed only up to what the vault can actually back; see the
+    ///         implementation note for why an unbacked escrow is unrecoverable.
+    function spendableFee(address asset) external view returns (uint256);
     function governor() external view returns (address);
     function redemptionsLocked() external view returns (bool);
     function managementFeeBps() external view returns (uint256);

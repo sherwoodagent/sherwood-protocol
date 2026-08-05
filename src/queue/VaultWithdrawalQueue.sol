@@ -148,6 +148,17 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     function stampSettlement(uint256 pid, uint256 num, uint256 den) external onlyVault {
         SettlePrice storage sp = _settlePrice[pid];
         if (sp.stamped) revert AlreadySettled();
+        // MONOTONIC BY ASSERTION, NOT BY ASSUMPTION. Both surviving exits key
+        // off `_lastStampedPid` as a high-water mark and are exact complements
+        // of each other — `claim` needs `_lastStampedPid >= r.pid`, `cancel`
+        // needs its negation — so a LOWER pid stamped after a higher one would
+        // make an already-claimable deposit unclaimable AND reopen its cancel
+        // exit, which is precisely the costless straddle pashov #10 closed. That
+        // ordering follows today from the governor's single-open-proposal
+        // invariant, i.e. from another contract; nothing here enforced it, and a
+        // cross-contract invariant that two local branches silently depend on is
+        // the kind that survives until it doesn't.
+        if (pid < _lastStampedPid) revert StampOutOfOrder();
         sp.num = num;
         sp.den = den;
         sp.stamped = true;

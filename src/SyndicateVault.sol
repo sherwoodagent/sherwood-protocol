@@ -930,6 +930,31 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
+    /// @dev The SAME quantity `transferPerformanceFee` tests `amount` against,
+    ///      exposed as a view so the governor can size an escrow it is about to
+    ///      book instead of discovering the ceiling by reverting.
+    ///
+    ///      WHY THIS EXISTS. `SyndicateGovernor._payFee` escrows the full
+    ///      requested amount on ANY revert, and one legitimate revert reason is
+    ///      `AmountExceedsBalance` — the vault saying "I do not have this." A
+    ///      liability booked for that reason is unbacked by construction: it
+    ///      flows into `_escrowedFeeLiability()`, which `totalAssets()` subtracts,
+    ///      so an escrow exceeding the float pins `totalAssets()` to 0 (zeroing
+    ///      every LP's conversion and stamping the settle price at `num == 1`),
+    ///      and `claimUnclaimedFees` — which re-requests the SAME full amount —
+    ///      then fails the same comparison forever, with `rescueERC20` unable to
+    ///      touch the vault asset. A fee cannot exceed the assets it is charged
+    ///      against; letting the governor read the ceiling is what keeps the
+    ///      distinction between "recipient cannot receive" and "vault cannot pay"
+    ///      visible at book time, when it is still actionable.
+    function spendableFee(address asset_) external view returns (uint256) {
+        if (asset_ != asset()) return 0;
+        uint256 bal = IERC20(asset_).balanceOf(address(this));
+        uint256 reserve = reservedQueueAssets() + _escrowedFeeLiability();
+        return bal > reserve ? bal - reserve : 0;
+    }
+
+    /// @inheritdoc ISyndicateVault
     function governor() external view returns (address) {
         return _getGovernor();
     }

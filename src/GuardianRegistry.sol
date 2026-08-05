@@ -883,6 +883,27 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         bytes32 eKey = _reviewKey(msg.sender, proposalId);
         EmergencyReview storage er = _emergencyReviews[eKey];
         if (er.reviewEnd > 0 && _effNow(er.clockShiftAtOpen) < er.reviewEnd) revert EmergencyAlreadyOpen();
+        // COMMIT THE PRIOR ROUND BEFORE OVERWRITING IT. The guard above asks
+        // only "is a window still running?", never "was the last one settled?" —
+        // and those are different facts, because the ONLY path that commits a
+        // Blocked verdict (`resolveEmergencyReview` -> `_resolveEmergency`, and
+        // its `slashOwnerBond`) is itself gated on `_effNow >= er.reviewEnd`.
+        // Both predicates therefore flip at the SAME instant, leaving the entire
+        // deterrent as a same-block race whose timestamp the owner knows in
+        // advance: re-calling `emergencySettleWithCalls` at exactly `reviewEnd`
+        // resets `blockStakeWeight` to 0, clears `resolved`, and bumps `round`
+        // (voiding every block vote, since `_emergencyBlockVotes` is round-keyed)
+        // — so the owner never pays the bond and can retry the uncapped
+        // owner-calldata path indefinitely, forcing guardians to re-win the race
+        // and re-cast every vote each round.
+        //
+        // The other route out of a review, `cancelEmergency`, already imposes a
+        // full `reviewPeriod` cooldown for exactly this reason. Resolving in
+        // place is the narrower fix: it settles the verdict the elapsed window
+        // already earned, then lets the re-open proceed on a clean record.
+        // Cheap in the common case — a first open leaves `callsHash` zero, and a
+        // round already resolved short-circuits.
+        if (er.callsHash != bytes32(0) && !er.resolved) _resolveEmergency(eKey, proposalId, er);
         // Denominator read at `t-1`, the same checkpoint anchor the numerator
         // uses (`voteBlockEmergencySettle` reads its weight at `er.openedAt`),
         // so a flash (de)stake in this block cannot move one side without the
