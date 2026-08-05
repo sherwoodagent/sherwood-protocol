@@ -212,6 +212,36 @@ contract PortfolioStrategy is BaseStrategy {
     ///         zero and the anchor never stops binding — an attacker who waits
     ///         out the whole ramp still cannot take more than 30%, against the
     ///         unbounded take the pre-fix quote-anchored floor allowed.
+    ///
+    ///         THE RESIDUAL, stated so it reads as a decision (pashov 2026-08
+    ///         finding #25). `settleProposal` is proposer-callable one hour
+    ///         after execute, so a proposer who simply lets the anchor age can
+    ///         self-settle the basket up to 30% below its last observed oracle
+    ///         price with `minOut` still satisfied. That is real and it is
+    ///         accepted, because every way of removing it is worse:
+    ///
+    ///           - Tightening this ceiling re-creates the exact wedge the ramp
+    ///             was introduced to remove. A genuine move beyond the new
+    ///             ceiling while the feed is stale makes the adapter revert on
+    ///             `minOut`, which reverts `_settle`, which reverts BOTH
+    ///             `settleProposal` and `unstick` — pinning the proposal in
+    ///             `Executed` with redemptions locked, recoverable only through
+    ///             the owner-multisig emergency path. The file's own
+    ///             `MAX_PUSH_PRICE_AGE` note documents 77h equity-feed gaps as
+    ///             routine, so that is not a tail case.
+    ///           - Making the band depend on WHO is settling would put a
+    ///             caller-dependent floor on the exit path, which nothing else
+    ///             here does, and the proposer is exactly the party who must be
+    ///             able to settle when a keeper will not.
+    ///
+    ///         What bounds it instead: the anchor still binds (30% is not
+    ///         unbounded), the ramp is linear in age so a manipulated pool in
+    ///         the settle transaction is judged against a NEAR-FRESH anchor,
+    ///         and `strategyDuration` plus guardian review of the route sit
+    ///         upstream. Since finding #14, the widened band also applies ONLY
+    ///         to the exit — `rebalance()` caps at `maxSlippageBps` — so this
+    ///         is the price of keeping the one mandatory path alive, and
+    ///         nothing else pays it.
     uint256 public constant MAX_STALE_SLIPPAGE_BPS = 3_000;
     /// @notice Span of anchor staleness over which the band ramps from
     ///         `STALE_PRICE_SLIPPAGE_BPS` to `MAX_STALE_SLIPPAGE_BPS`. Sized
