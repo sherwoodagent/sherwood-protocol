@@ -1,6 +1,8 @@
 # continuous-integration (delta)
 
-## ADDED Requirement: Fork tests run on demand, never on PR cadence
+## ADDED Requirements
+
+### Requirement: Fork tests run on demand, never on PR cadence
 
 The CI pipeline SHALL provide an opt-in job that runs the fork/integration
 test set excluded from the PR-cadence test job.
@@ -30,7 +32,11 @@ test set excluded from the PR-cadence test job.
 - **THEN** the job fails with an explicit message naming the missing secret —
   it does not silently pass or skip.
 
-## ADDED Requirement: Coverage is measured and published as an artifact
+### Requirement: Coverage is measured and published as an artifact
+
+The CI pipeline SHALL measure coverage on every pull request and publish the
+lcov report as a workflow artifact. The job MAY be advisory rather than
+blocking, but its status SHALL remain visible in the checks list.
 
 #### Scenario: coverage on PR
 

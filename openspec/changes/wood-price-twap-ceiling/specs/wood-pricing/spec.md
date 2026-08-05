@@ -1,39 +1,16 @@
 # wood-pricing (delta)
 
-> ## ⚠️ THE UNAVAILABILITY SCENARIOS BELOW ARE SUPERSEDED
->
-> Read `../../design-revision-2026-08-01.md` first. Revision 2 deleted
-> `woodFallbackPriceX8`, so three things here no longer describe the code:
->
-> - **"An unavailable TWAP degrades to today's behaviour"** — it does not.
->   `woodUsdPriceX8` is a CAP and is never served as a price, so an unavailable
->   TWAP with no Chainlink WOOD feed reverts `NoWoodPrice`. "No oracle wired" is
->   not a working configuration on chain 4663.
-> - **"stale snapshot falls back to the maintained price"** — there is no
->   maintained price left to fall back to.
-> - **"oracle reverts, is codeless, or returns malformed data"** — it still
->   degrades to unavailable rather than propagating, which is the load-bearing
->   half; but "still returns a price from the governance number" is wrong.
->
-> What SURVIVES, and is the whole point: **the market may only LOWER the WOOD
-> price, never raise it** (the first requirement below), the emergency ceiling
-> caps every source, the oracle is permissionless and non-discretionary, and the
-> pair is validated before it is trusted.
->
-> The replacement semantics, in one block:
->
-> ```
-> sourceX8 = feed fresh ? min(feedX8, woodUsdPriceX8)
->          : twap fresh ? min(twapX8, woodUsdPriceX8)
->          :              revert NoWoodPrice          // incl. a zero cap
-> price    = haircut(sourceX8), floored at 1 when sourceX8 != 0
-> ```
->
-> `recordApproval` CATCHES `NoWoodPrice` and books nothing; every other consumer
-> lets it revert. See the revision's halting-semantics table. `woodPriceDetail()`
-> returns `(price, fromFeed, capBinding)` rather than `(price, usingFallback)`.
+> Reflects revision 2 (see `../../design-revision-2026-08-01.md`), which
+> deleted `woodFallbackPriceX8` and made `woodUsdPriceX8` a cap that is never
+> served as a price. The unavailability requirements below were re-derived
+> against that model rather than annotated on top of it.
 
-## ADDED Requirement: The TWAP may only lower the WOOD price, never raise it
+## ADDED Requirements
+
+### Requirement: The TWAP may only lower the WOOD price, never raise it
+
+The TWAP SHALL only ever lower the WOOD price relative to the governance
+number, and SHALL NEVER raise it.
 
 This is the load-bearing invariant. It is stated as a requirement rather than a
 comment because the whole safety argument rests on it: the TWAP source is a
@@ -53,43 +30,59 @@ valuation basis for all guardian collateral.
 - **THEN** `woodPriceX8()` returns `_haircut(twapUsd)` — the ceiling binds, and
   a governance number that has drifted above market stops overvaluing bonds.
 
-## ADDED Requirement: An unavailable TWAP degrades to today's behaviour
+### Requirement: An unavailable price halts new risk without halting the protocol
 
-The change must be incapable of failing *worse* than the current design.
+With no fresh market source, `woodPriceX8()` SHALL revert `NoWoodPrice` rather
+than serve a price. `woodUsdPriceX8` is a CAP and SHALL NEVER be served as a
+price, so there is no branch on which a hand-maintained number becomes the
+valuation:
+
+```
+sourceX8 = feed fresh ? min(feedX8, woodUsdPriceX8)
+         : twap fresh ? min(twapX8, woodUsdPriceX8)
+         :              revert NoWoodPrice          // incl. a zero cap
+price    = haircut(sourceX8), floored at 1 when sourceX8 != 0
+```
+
+`recordApproval` SHALL CATCH `NoWoodPrice` and book nothing; every other
+consumer SHALL let it revert. The adversary for that carve-out is a stale
+price turning a full review into a block-only one: a revert inside
+`recordApproval` disenfranchises approvers while block votes still land, which
+is the failure reviews M3/N1/N4 each removed.
+
+Serving `0` instead of reverting is rejected: it silently values every bond at
+nothing, and `effectiveTotal == 0` on the slash path marks a challenge
+convicted while recovering nothing and permanently blocking a re-file
+(2026-08-01 audit). A loud failure beats a silent one.
 
 #### Scenario: no oracle wired
 
 - **GIVEN** the oracle address is `address(0)`
-- **THEN** `woodPriceX8()` behaves exactly as it does today.
-
-#### Scenario: stale snapshot falls back to the maintained price
-
-- **GIVEN** the oracle's last `update()` is older than `maxTwapAge`
-- **AND** `woodFallbackPriceX8 != 0`
-- **THEN** `woodPriceX8()` returns
-  `_haircut(min(woodFallbackPriceX8, woodUsdPriceX8))` — the maintained
-  conservative price, still capped by the emergency ceiling.
-- **AND** it does **not** fall back to `woodUsdPriceX8` as a *price*: that
-  number is deliberately set high under the emergency-only doctrine, so using
-  it as the price would fail in the dangerous direction at exactly the moment
-  market data stopped arriving.
+- **AND** no fresh Chainlink WOOD feed is configured, as on chain 4663
+- **THEN** `woodPriceX8()` reverts `NoWoodPrice` — this is not a working
+  production configuration, not a degraded one
 
 #### Scenario: no price from any source
 
-- **GIVEN** the TWAP is unavailable or stale
-- **AND** `woodFallbackPriceX8 == 0`
-- **THEN** `woodPriceX8()` **reverts** `NoWoodPrice`.
-- **AND** a deploy pre-flight asserts `woodFallbackPriceX8 != 0` and
-  `woodUsdPriceX8 != 0`, so this state is unreachable in production and the
-  revert is a configuration guard rather than a live failure mode.
+- **GIVEN** neither the feed nor the TWAP is fresh, or the cap is zero
+- **THEN** `woodPriceX8()` **reverts** `NoWoodPrice`
+- **AND** a deploy pre-flight asserts `woodUsdPriceX8 != 0` and that the
+  composed price resolves non-zero, so the state is a configuration guard
+  rather than a live failure mode
 
-Serving `0` here is rejected as the alternative: it silently values every bond
-at nothing, and `effectiveTotal == 0` on the slash path marks a challenge
-convicted while recovering nothing and permanently blocking a re-file
-(2026-08-01 audit). A loud failure on an unreachable state beats a silent one
-on a reachable path.
+#### Scenario: approvers are not disenfranchised by a stale price
 
-## ADDED Requirement: The emergency ceiling caps every source
+- **GIVEN** no source is fresh, so the WOOD read reverts `NoWoodPrice`
+- **THEN** `recordApproval` catches it and books nothing, while
+  `requireApproveQuorum`, `propose` and `ChallengeGame.file` let it revert
+- **AND** the net effect is that proposals can neither be created nor executed,
+  votes still function, and live challenges resolve normally
+
+### Requirement: The emergency ceiling caps every source
+
+Lowering `woodUsdPriceX8` SHALL cap the price served on every branch, whatever
+source is live at the time. The brake MUST NOT have a hole on the branch that
+is serving precisely when it is pulled.
 
 #### Scenario: brake pulled while the TWAP is live
 
@@ -106,9 +99,11 @@ on a reachable path.
 #### Scenario: oracle reverts, is codeless, or returns malformed data
 
 - **GIVEN** the wired oracle has no code, reverts, or returns short data
-- **THEN** `woodPriceX8()` still returns a price from the governance number,
-  mirroring `_woodPrice`'s existing `code.length` + `try/catch` treatment of a
-  bad Chainlink feed.
+- **THEN** the read degrades to "TWAP unavailable" rather than propagating the
+  failure, mirroring `_woodPrice`'s existing `code.length` + `try/catch`
+  treatment of a bad Chainlink feed
+- **AND** with no fresh feed either, `woodPriceX8()` then reverts
+  `NoWoodPrice` — it does NOT fall back to serving the governance number
 
 #### Scenario: ETH/USD feed unusable
 
@@ -116,7 +111,12 @@ on a reachable path.
 - **THEN** the TWAP cannot be converted to USD, so `consult()` reports
   unavailable and the ceiling is skipped.
 
-## ADDED Requirement: The oracle is permissionless and non-discretionary
+### Requirement: The oracle is permissionless and non-discretionary
+
+`update()` SHALL be callable by any address, with no owner check, allowlist, or
+privileged keeper. The TWAP window SHALL be bounded on both sides, so it can
+neither be shrunk to a cheaply-manipulated interval nor stretched until it
+stops tracking reality.
 
 #### Scenario: anyone snapshots
 
@@ -131,7 +131,12 @@ on a reachable path.
   maximum are rejected, so the window can neither be shrunk to a
   cheaply-manipulated interval nor stretched until it stops tracking reality.
 
-## ADDED Requirement: The pair is validated before it is trusted
+### Requirement: The pair is validated before it is trusted
+
+The wiring path SHALL confirm the configured pair's token ordering and a
+non-zero cumulative accumulator, so an empty or wrong-token pool cannot be
+wired by address alone. Unwiring by setting the oracle to `address(0)` SHALL
+remain accepted as a deliberate escape hatch.
 
 #### Scenario: wiring an oracle
 
@@ -146,15 +151,21 @@ on a reachable path.
 - **THEN** it is accepted, returning the protocol to the governance-only price —
   the same deliberate escape hatch `setWoodFeed` provides.
 
-## MODIFIED Requirement: `woodPriceDetail` reports which source bound the price
+## MODIFIED Requirements
 
-`usingFallback` alone is uninformative once the fallback is permanent (there is
-no Chainlink WOOD feed on 4663, so it is always `true`).
+### Requirement: `woodPriceDetail` reports which source bound the price
+
+`woodPriceDetail()` SHALL return `(price, fromFeed, capBinding)` rather than
+`(price, usingFallback)` — naming which market source answered, and whether
+`woodUsdPriceX8` is currently binding that answer.
+
+`usingFallback` alone is uninformative once there is no Chainlink WOOD feed on
+4663, so it is always `true` and never distinguishes anything.
 
 #### Scenario: operator inspects pricing
 
 - **WHEN** `woodPriceDetail()` is called
-- **THEN** it distinguishes at least: feed-priced, governance-priced, and
-  governance-priced-but-capped-by-TWAP — so an operator can tell whether the
-  ceiling is currently binding, which is the signal that the manual number has
-  drifted.
+- **THEN** it reports whether the feed or the TWAP answered, and whether the
+  cap is binding — so an operator can tell that the manual number has drifted
+  below market, which is the state in which the cap silently becomes the
+  valuation basis.
