@@ -122,10 +122,24 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     ///           1. Σ `counterBondContributionOf` over the pool's contributor
     ///              list equals the pool's `raisedWood` — the contributor ledger
     ///              and the pool total never diverge.
-    ///           2. The pool still HOLDS what it raised (`poolWood ==
-    ///              raisedWood`) and has not been burned. Only a terminal
-    ///              outcome empties a pool, and a live challenge on the key
-    ///              means none has landed on it.
+    ///           2. The pool never HOLDS more than it raised
+    ///              (`poolWood <= raisedWood`).
+    ///
+    ///              NOT `poolWood == raisedWood`, and NOT `!burned`. A terminal
+    ///              pool coexisting with a live challenge is a NORMAL state
+    ///              here, in two ways: `_burnPool` fires on the first conviction
+    ///              regardless of `_liveCount`, and `_settle`'s incomplete-pool
+    ///              branch calls `_releasePool`, which is deliberately ungated
+    ///              for the same reason. Siblings stay `Filed` and keep reading
+    ///              `Disputed` through `_poolBacked` in both cases.
+    ///
+    ///              `counterBondPoolOf` reports `poolWood == 0` for ANY
+    ///              non-`Open` outcome while its `burned` flag is true only for
+    ///              `Burned` — so an equality fires on burned AND released
+    ///              pools, and adding a `!burned` guard alone would still fire
+    ///              on released ones. `test_settle_burnsTheSharedPoolExactlyOnce`
+    ///              and `_assertLiveBondsBacked`'s own note both pin the
+    ///              coexistence the strict form contradicts.
     ///           3. The pool never exceeds its target — `dispute` clamps the
     ///              overshoot rather than refunding it.
     ///
@@ -142,14 +156,14 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
             IChallengeGame.Challenge memory c = game.challengeOf(id);
             if (c.status != IChallengeGame.Status.Filed && c.status != IChallengeGame.Status.Disputed) continue;
 
-            (uint256 poolWood, uint256 targetWood, uint256 raisedWood,, bool burned) = game.counterBondPoolOf(id);
+            (uint256 poolWood, uint256 targetWood, uint256 raisedWood,,) = game.counterBondPoolOf(id);
             address[] memory contributors = game.counterBondContributors(id);
             uint256 sum;
             for (uint256 j; j < contributors.length; j++) {
                 sum += game.counterBondContributionOf(id, contributors[j]);
             }
             if (sum != raisedWood) return false;
-            if (poolWood != raisedWood || burned) return false;
+            if (poolWood > raisedWood) return false;
             if (raisedWood > targetWood) return false;
         }
         return true;

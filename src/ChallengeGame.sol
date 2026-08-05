@@ -1099,6 +1099,33 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             //
             // No court pinned means no referral is possible either way — the
             // timeout remains the only path out of `Disputed`.
+            // ONLY THIS CHALLENGE IS REFERRED, AND ADOPTED SIBLINGS MUST REFER
+            // THEMSELVES. One payment completes the single pool on the key, and
+            // `challengeOf` then derives `Disputed` for EVERY live challenge the
+            // pool backs (see `_poolBacked`) - but auto-referral fires only for
+            // the challenge the payment routed through. Every other adopted
+            // sibling is `Disputed` with no case attached.
+            //
+            // Left this way deliberately: enumerating siblings here is an
+            // unbounded loop over `_liveCount`, which `_liveByChallenger` lets
+            // any number of addresses grow, so an attacker could make `dispute`
+            // arbitrarily expensive or unexecutable for everyone.
+            //
+            // THE HAZARD THAT LEAVES, STATED PLAINLY, because it lands on the
+            // honest party. An accused who self-files from a fresh address and
+            // pays the pool through their OWN filing opens the case on that one.
+            // An honest challenger H, adopted for free and never referred, sits
+            // `Disputed` until `disputeTimeout` and then resolves through
+            // `_fail` - forfeiting its bond pro-rata to the pool's funders, who
+            // are the accused, with the proposal never adjudicated.
+            //
+            // H's remedy is to REFER ITSELF: `ITokenCourt.refer` is
+            // permissionless and `challengeOf` already reports H as `Disputed`,
+            // so `court.refer(H)` opens H's case with no cooperation from
+            // anyone. It must happen with enough slack left for `refer`'s own
+            // `InsufficientClock` gate, i.e. well before `disputeTimeout` - a
+            // challenger that files while others are live should watch for
+            // adoption rather than assume referral.
             if (courtAddr != address(0) && court != address(0)) {
                 try ITokenCourt(courtAddr).refer(challengeId) {}
                 catch {
@@ -1216,19 +1243,32 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///        free-ride where a duplicate filer adopts an honest challenger's
     ///        pool and races it for the payout.
     ///
-    ///      - The silence branch used to REFUND a part-funded pool to its
-    ///        contributors, on the reasoning that it bought no dispute. That
-    ///        reasoning is still true and the refund is still given up, because
-    ///        the seam it opens is worse than the harshness it avoids: a settle
-    ///        that leaves the pool spendable lets contributions continue against
-    ///        a proposal that has ALREADY been convicted, so a silence
-    ///        conviction on challenge A could be followed by the pool completing
-    ///        and a sibling B being ruled `Guilty` on it - paying out a pool
-    ///        that a conviction had already accounted for. Closing the pool on
-    ///        EVERY conviction, and burning whatever is in it, is what makes
-    ///        that impossible by construction rather than by a flag on one
-    ///        branch. The challenger's economics are untouched on this branch,
-    ///        which is what `honestFilingBreaksEven` prices.
+    ///      - The silence branch REFUNDS a part-funded pool to its contributors,
+    ///        on the reasoning that it bought no dispute. The seam that reasoning
+    ///        has to answer is real: a settle that leaves the pool SPENDABLE lets
+    ///        contributions continue against a proposal that has ALREADY been
+    ///        convicted, so a silence conviction on challenge A could be followed
+    ///        by the pool completing and a sibling B being ruled `Guilty` on it -
+    ///        paying out a pool a conviction had already accounted for.
+    ///
+    ///        But that argues for CLOSING the pool, not for destroying it.
+    ///        `dispute` reverts on `p.outcome != PoolOutcome.Open`, so
+    ///        `Released` shuts the contribution window exactly as `Burned` does
+    ///        and the sibling-completion path is impossible either way. Burning
+    ///        additionally took money from the accused for a defence they never
+    ///        received - an incomplete pool fails `_poolBacked`, so it never made
+    ///        any challenge `Disputed` and cannot be why this conviction landed.
+    ///
+    ///        It was also grindable: `file` raises `pool.target` while the pool
+    ///        is incomplete, so a second filing - or merely a WOOD price decline,
+    ///        since `bondWood` scales with `coverageUsd * bps / priceX8` - moves
+    ///        the bar away from a part-funded defence and converts the shortfall
+    ///        into a burn the accused pay for.
+    ///
+    ///        A COMPLETED pool is genuinely different and is still burned in
+    ///        full: it bought a real defence, opened the verdict path, and losing
+    ///        it is the point. The challenger's economics are untouched on either
+    ///        branch, which is what `honestFilingBreaksEven` prices.
     function _settle(uint256 challengeId, Challenge storage c, bytes32 poolKey) private {
         IStakedWood swood = stakedWood;
         // Fail closed: without the slasher wired there is no verdict to execute.
@@ -1374,8 +1414,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
         // A correct filing is cheap, not free. The burn is a slice of the
         // CHALLENGER'S OWN BOND on both entries now - the pool is no longer a
-        // payout that could be burned down instead, it is destroyed in full
-        // below. A `msg.sender != challenger` check would be theatre anyway (two
+        // payout that could be burned down instead, it is closed below (burned
+        // when it completed, returned to its funders when it did not). A
+        // `msg.sender != challenger` check would be theatre anyway (two
         // addresses defeat it), so the cost is charged by rate, not by identity.
         uint256 burned = (bond * c.settleBurnBpsAtFiling) / BPS_DENOMINATOR;
         if (burned != 0) {
@@ -1383,9 +1424,46 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             emit ChallengerBondBurned(challengeId, burned);
         }
         wood.safeTransfer(c.challenger, bond - burned);
-        // EVERY conviction, complete pool or partial, first or diverted. See
-        // this function's natspec for the two decisions this reverses and why.
-        _burnPool(poolKey, challengeId, key);
+        // BURN A COMPLETED POOL; RETURN AN INCOMPLETE ONE.
+        //
+        // A completed pool bought the accused a real defence — the challenge
+        // became `Disputed`, the verdict path opened, and losing it forfeits
+        // what they staked on it. Burning that is the point.
+        //
+        // An INCOMPLETE pool bought them nothing. `_poolBacked` requires
+        // `completedAt != 0`, so a pool that never completed has never made any
+        // challenge `Disputed`, has never opened a verdict path, and cannot have
+        // been the reason this conviction landed — this is the SILENCE branch,
+        // which is reached precisely because no defence materialised. Destroying
+        // it takes money from the accused for a service they never received, and
+        // it is exactly the money the pre-#10 code refunded.
+        //
+        // That asymmetry is also grindable while it exists: `file` raises
+        // `pool.target` while the pool is incomplete, so an attacker filing a
+        // second challenge — or merely a WOOD price decline, since `bondWood`
+        // scales with `coverageUsd * bps / priceX8` — moves the bar away from a
+        // part-funded defence and converts the shortfall into a burn.
+        //
+        // RELEASING RATHER THAN BURNING DOES NOT REOPEN THE POOL. `dispute`
+        // reverts on `p.outcome != PoolOutcome.Open` (see its `WrongStatus`
+        // guard), so `Released` closes it to further contribution exactly as
+        // `Burned` does. The natspec's argument for burning — that a spendable
+        // pool lets contributions continue after conviction — argues for
+        // CLOSING the pool, which both outcomes do.
+        //
+        // AND THE `_liveCount` GATE IS IRRELEVANT HERE, which is why this calls
+        // `_releasePool` rather than `_releasePoolIfLast`. That gate exists so a
+        // completed pool is not handed back while a sibling is still `Disputed`
+        // on it and could yet be ruled `Guilty` with nothing left to burn. A
+        // sibling can only be `Disputed` through `_poolBacked`, which an
+        // incomplete pool fails by definition — so there is no such sibling to
+        // protect, and holding the money hostage to `_liveCount` would strand it
+        // behind challenges that can never reach a verdict on it.
+        if (_pools[poolKey].completedAt == 0) {
+            _releasePool(key, poolKey, challengeId);
+        } else {
+            _burnPool(poolKey, challengeId, key);
+        }
         emit ChallengeSettled(challengeId, slashedWood);
     }
 
@@ -1422,9 +1500,21 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      collects with `claimContribution`, so one reverting recipient cannot
     ///      brick a resolution.
     function _releasePoolIfLast(bytes32 rk, bytes32 poolKey, uint256 challengeId) private {
+        if (_liveCount[rk] != 0) return;
+        _releasePool(rk, poolKey, challengeId);
+    }
+
+    /// @dev The release itself, with no liveness gate. Split out for the one
+    ///      caller that must not consult `_liveCount`: `_settle`'s incomplete-pool
+    ///      branch, where the gate protects nothing (an incomplete pool fails
+    ///      `_poolBacked`, so no sibling can be `Disputed` on it) and would
+    ///      instead strand the funders' money behind challenges that can never
+    ///      reach a verdict against it. See the comment at that call site.
+    ///
+    ///      Idempotent by the outcome check, exactly as `_burnPool` is.
+    function _releasePool(bytes32 rk, bytes32 poolKey, uint256 challengeId) private {
         CounterBondPool storage p = _pools[poolKey];
         if (p.outcome != PoolOutcome.Open) return;
-        if (_liveCount[rk] != 0) return;
         p.outcome = PoolOutcome.Released;
         _poolRound[rk]++;
         uint256 amount = p.weight;

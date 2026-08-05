@@ -3337,23 +3337,31 @@ contract ChallengeGameTest is Test {
         _assertLiveBondsBacked();
     }
 
-    /// @notice THE PARTIAL POOL IS BURNED ON A SILENCE CONVICTION, which
-    ///         REVERSES what this test used to pin (the part-funded pool going
-    ///         back to its contributors). The reasoning for the refund was that
-    ///         the pool never bought a dispute — still true, and still given up,
-    ///         because with ONE POOL PER PROPOSAL (pashov 2026-08 finding #10) a
-    ///         settle that leaves the pool spendable leaves it open to
-    ///         contributions AFTER the proposal has already been convicted: the
-    ///         pool could then complete, a sibling challenge become `Disputed`
-    ///         on it, and a `Guilty` ruling pay out a pool the first conviction
-    ///         had already accounted for. Closing and burning on EVERY
-    ///         conviction is what makes that unreachable by construction rather
-    ///         than by a flag on one branch.
+    /// @notice THE PARTIAL POOL IS RETURNED TO ITS FUNDERS ON A SILENCE
+    ///         CONVICTION, not burned.
     ///
-    ///         What this test still pins is that the pool is NOT the
-    ///         challenger's: it is destroyed, not handed over, and the
+    ///         This briefly pinned the opposite. The argument for burning was
+    ///         that with ONE POOL PER PROPOSAL (pashov 2026-08 finding #10) a
+    ///         settle leaving the pool SPENDABLE lets contributions continue
+    ///         after the proposal is already convicted — the pool could then
+    ///         complete, a sibling become `Disputed` on it, and a `Guilty`
+    ///         ruling pay out a pool the first conviction already accounted for.
+    ///
+    ///         That argument is sound but it argues for CLOSING the pool, which
+    ///         `Released` does exactly as `Burned` does: `dispute` reverts on any
+    ///         outcome other than `Open`, so the sibling-completion path is shut
+    ///         either way (pinned by
+    ///         `test_settle_releasedPoolRefusesFurtherContribution`). Burning
+    ///         additionally took money from the accused for a defence they never
+    ///         received — an incomplete pool fails `_poolBacked`, so it never
+    ///         made any challenge `Disputed` and cannot be why the conviction
+    ///         landed — and was grindable, since `file` raises `pool.target`
+    ///         while the pool is incomplete.
+    ///
+    ///         What this test pins either way is that the pool is NOT the
+    ///         CHALLENGER'S: it goes back to the people who put it in, and the
     ///         challenger's own payout is unchanged.
-    function test_resolve_undisputedBurnsAPartialPool() public {
+    function test_resolve_undisputedReturnsAPartialPool() public {
         uint256 id = _fileStandard(PROPOSAL);
         uint256 bond = game.challengeOf(id).bondWood;
         uint256 aBefore = wood.balanceOf(guardianA);
@@ -3381,15 +3389,16 @@ contract ChallengeGameTest is Test {
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "silence was the verdict");
         assertEq(swood.callCount(), 1, "the contributors are slashed as well as losing the pool");
 
-        // Exact balances: neither contributor gets anything back, and the pool
-        // is not claimable at all.
-        assertEq(wood.balanceOf(guardianA), aBefore - aPut, "guardianA's contribution was destroyed");
-        assertEq(wood.balanceOf(guardianB), bBefore - bPut, "guardianB's contribution was destroyed");
-        assertEq(game.claimableContribution(id, guardianA), 0, "a burned pool is not claimable");
+        // Exact balances: both contributors are made whole, because the pool
+        // they part-funded never bought a dispute. `_claimAll` above already
+        // pulled it, so the balances are back where they started.
+        assertEq(wood.balanceOf(guardianA), aBefore, "guardianA's contribution is returned, not destroyed");
+        assertEq(wood.balanceOf(guardianB), bBefore, "guardianB's contribution is returned, not destroyed");
+        assertEq(game.claimableContribution(id, guardianA), 0, "and nothing is left owing after the claim");
         assertEq(game.claimableContribution(id, guardianB), 0);
         (uint256 poolWood,,,, bool burned) = game.counterBondPoolOf(id);
-        assertEq(poolWood, 0, "the pool holds nothing after the burn");
-        assertTrue(burned, "and it is marked burned, not released");
+        assertEq(poolWood, 0, "the pool holds nothing once released");
+        assertFalse(burned, "released, NOT burned -- an incomplete pool bought no defence");
 
         // Less F4's settle burn. This is the UNADJUDICATED path, which is
         // exactly the scope that burn has: a filing nobody answered used to buy
@@ -3403,12 +3412,12 @@ contract ChallengeGameTest is Test {
         );
         assertEq(
             wood.balanceOf(game.BURN_ADDRESS()),
-            settleBurn + aPut + bPut,
-            "the dead address got the settle slice AND the whole part-funded pool"
+            settleBurn,
+            "only the settle slice burns -- the part-funded pool went back to its funders"
         );
 
         assertEq(game.bondedWood(), 0, "nothing left accounted");
-        assertEq(game.unclaimedWood(), 0, "and nothing booked for a claim that can never come");
+        assertEq(game.unclaimedWood(), 0, "and nothing left booked, since _claimAll already pulled the release");
         assertEq(wood.balanceOf(address(game)), 0, "and nothing left stranded");
         _assertLiveBondsBacked();
     }
@@ -4172,16 +4181,26 @@ contract ChallengeGameTest is Test {
         uint256 burned = (bond * filed.settleBurnBpsAtFiling) / 10_000;
         assertEq(wood.balanceOf(challenger) - challengerBefore, bond - burned, "challenger refunded");
 
-        // The part-funded pool is burned, not returned: a diverted settle is
-        // still a conviction on the books (`_convicted[key]` is set), and every
-        // conviction closes and destroys the pool.
-        assertEq(game.claimableContribution(id, guardianB), 0, "a burned pool owes nothing");
+        // The part-funded pool is RETURNED, not burned. A diverted settle is
+        // still a conviction on the books (`_convicted[key]` is set) and still
+        // CLOSES the pool — but closing is `Released` here, because the pool
+        // never completed and so never bought the accused a dispute. Burning it
+        // would charge them for a defence they did not get; see `_settle`'s
+        // branch on `completedAt`.
+        assertEq(
+            game.claimableContribution(id, guardianB),
+            partialPool,
+            "an incomplete pool is returned to its funder, not destroyed"
+        );
+        // Pull-payment, as everywhere else: the release moves the WOOD to
+        // `unclaimedWood` and the funder collects, so one reverting recipient
+        // cannot brick the resolution.
         vm.prank(guardianB);
-        vm.expectRevert(IChallengeGame.NothingToClaim.selector);
         game.claimContribution(id);
-        assertEq(guardianBefore - wood.balanceOf(guardianB), 0, "no push either");
+        assertEq(wood.balanceOf(guardianB) - guardianBefore, partialPool, "the funder collects exactly what it put in");
+        assertEq(game.claimableContribution(id, guardianB), 0, "and only once");
         (,,,, bool poolBurned) = game.counterBondPoolOf(id);
-        assertTrue(poolBurned, "burned, not released");
+        assertFalse(poolBurned, "released, not burned");
 
         // And the freeze is genuinely gone.
         assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "unfrozen");

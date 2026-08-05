@@ -181,7 +181,7 @@ contract MockCourtSE {
 ///         OWN counter-bond pool and is then ruled `Guilty` used to recover
 ///         `bond + pool` untouched — its whole round-trip capital, net cost
 ///         zero, despite `forfeitBurnBps`'s own natspec pricing exactly this
-///         trade on the FAIL path. `test_selfFundedGuiltyRuling_burnsASlice_notTheWholeRoundTrip`
+///         trade on the FAIL path. `test_selfFundedGuiltyRuling_burnsTheWholePoolPlusASlice`
 ///         proves the escalated branch now burns too.
 ///
 ///         SUPERSEDED IN SIZING BY pashov 2026-08 FINDING #10, and the test
@@ -292,10 +292,14 @@ contract ChallengeGame_settlementEconomicsTest is Test {
     ///         exactly `2 * bondWood` against a `2 * bondWood` outlay (bond +
     ///         its own pool contribution) — a net WOOD change of exactly ZERO
     ///         for a conviction it triggered entirely with its own capital.
-    ///         The `assertLt(received, 2 * bondWood, ...)` below is the
-    ///         load-bearing assertion: it is false (`received == 2 *
-    ///         bondWood`) against the old code and true against the fix.
-    function test_selfFundedGuiltyRuling_burnsASlice_notTheWholeRoundTrip() public {
+    ///         `assertEq(received, expectedReceipt)` below is the load-bearing
+    ///         assertion. It is the only one that discriminates against BOTH
+    ///         predecessors: pre-18b returned `2 * bondWood` (free round trip)
+    ///         and pre-#10 returned `2 * bondWood - expectedBurn` (a ~5%
+    ///         refundable deposit). The `assertLt` that used to carry that role
+    ///         now passes against the pre-#10 code as well, so it documents the
+    ///         18b property rather than proving the current one.
+    function test_selfFundedGuiltyRuling_burnsTheWholePoolPlusASlice() public {
         address challenger = address(0xC4A11E7);
         uint256 bondWood = _expectedBondWood();
 
@@ -355,13 +359,14 @@ contract ChallengeGame_settlementEconomicsTest is Test {
         // Challenger's balance was exactly 0 immediately before this call, so
         // its balance now IS what the round trip returned.
         uint256 received = wood.balanceOf(challenger);
+        // THE LOAD-BEARING ASSERTION. Pins the exact receipt, so it discriminates
+        // against BOTH the pre-18b code (`2 * bondWood`, a free round trip) and
+        // the pre-#10 code (`2 * bondWood - expectedBurn`, a refundable deposit).
         assertEq(received, expectedReceipt, "only the bond leg returns, net of the settle-burn slice");
+        // Kept as the named 18b property, but note it is now IMPLIED by the
+        // equality above rather than doing the discriminating itself — it passes
+        // against the pre-#10 code too.
         assertLt(received, 2 * bondWood, "THE ROUND TRIP MUST NOT BE FREE (issue #181 finding 18b)");
-        assertEq(
-            received + expectedBurn + bondWood,
-            2 * bondWood,
-            "and it costs the whole pool plus the slice, not the slice alone (finding #10)"
-        );
         assertEq(
             wood.balanceOf(game.BURN_ADDRESS()),
             expectedBurn + bondWood,
@@ -386,7 +391,7 @@ contract ChallengeGame_settlementEconomicsTest is Test {
         uint256 bondWood = _expectedBondWood();
 
         // The court must be wired BEFORE filing for the same reason as
-        // `test_selfFundedGuiltyRuling_burnsASlice_notTheWholeRoundTrip`
+        // `test_selfFundedGuiltyRuling_burnsTheWholePoolPlusASlice`
         // above: `courtAtFiling` pins whatever `court` reads at `file()`
         // time, and the later `game.rule(id, Inconclusive)` call below is
         // refused (`NotCourt`) on a challenge that pinned `address(0)`,
