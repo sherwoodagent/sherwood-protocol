@@ -231,9 +231,29 @@ abstract contract ChallengeGameHandler is Properties {
     }
 
     /// @dev First proposal that `file` would currently accept: executed, still
-    ///      inside its challenge window, and carrying booked coverage — the
-    ///      `NothingToFreeze` guard rejects a proposal no guardian approved.
+    ///      inside its challenge window, and carrying coverage — the
+    ///      `NothingToFreeze` guard rejects a proposal no guardian backed.
     ///      Returns 0 when none qualifies.
+    ///
+    ///      READS `pledgedOf`, NOT `approversOf`, because this predicts a
+    ///      specific on-chain gate and must use the same accumulator that gate
+    ///      does. Finding #24 (PR #217) migrated `ChallengeGame.file` from the
+    ///      booking (`_recorded`, via `approversOf`) to the pledge
+    ///      (`_reservedUsd`, via `pledgedOf`) — the last of five sites to move,
+    ///      after `slashBpsFor`, `freezeCoverage`, `pinCoverageUntil` and
+    ///      `TokenCourt._recordAccused`. That landed AFTER this helper did, so
+    ///      the two silently diverged.
+    ///
+    ///      The divergence is one-directional and quiet, which is why it is
+    ///      worth a comment rather than just a fix. GL-13 pins
+    ///      `pledged >= recorded`, so a booking-based check can only ever be
+    ///      too STRICT: it skips proposals `file` would accept, never picks one
+    ///      `file` would reject. The failure mode is therefore lost
+    ///      reachability, not a reverting handler — the composite quietly stops
+    ///      finding targets and adjudication coverage decays, with nothing
+    ///      failing to point at it. `settleCoverage` is permissionless,
+    ///      re-runnable and not freeze-gated, and rebooking recorded down to
+    ///      zero while the pledge stands is exactly the state that triggers it.
     function _challengeableProposal(uint256 seed) internal view returns (uint256) {
         uint256 count = governor.proposalCount();
         if (count == 0) return 0;
@@ -243,10 +263,10 @@ abstract contract ChallengeGameHandler is Properties {
             ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(pid);
             if (p.executedAt == 0) continue;
             if (block.timestamp > p.executedAt + p.strategyDuration + ledger.challengeWindow()) continue;
-            (, uint256[] memory committed) = ledger.approversOf(address(governor), pid);
+            (, uint256[] memory pledged) = ledger.pledgedOf(address(governor), pid);
             uint256 total;
-            for (uint256 i; i < committed.length; i++) {
-                total += committed[i];
+            for (uint256 i; i < pledged.length; i++) {
+                total += pledged[i];
             }
             if (total == 0) continue;
             return pid;
