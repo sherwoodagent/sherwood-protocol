@@ -235,6 +235,30 @@ contract QuotesFairFillsShortAdapter is ISwapAdapter {
 ///      in the propose→execute window (reachable permissionlessly via
 ///      `TierRegistry.poke` / `demoteByChallenge`) must block execution.
 contract PortfolioStrategy_quoteFloorScopeAndProbeTest is Test {
+    /// @dev Seed each allocation's Data Streams anchor so `_execute` will deploy.
+    ///      Permissionless, so no prank.
+    ///
+    ///      Before the anchor requirement existed these fixtures executed with
+    ///      `_lastGoodPrice[i] == 0`, so every buy floor fell through to
+    ///      `_quoteMinOut` -- a quote from the very pool the swap was about to
+    ///      hit. That is audit finding #6, and one test in this file recorded the
+    ///      fallback in a comment as expected behaviour.
+    ///
+    ///      Anchored at the fair 1:1 rate every fixture here uses: the
+    ///      adversarial adapters in this file deviate on the FILL, which is what
+    ///      those tests are about, so a fair anchor is exactly what exposes the
+    ///      deviation rather than masking it. No-op in push mode, where
+    ///      `submitPriceReports` correctly refuses.
+    function _seedAnchors(PortfolioStrategy s_) internal {
+        if (s_.chainlinkVerifier() == address(0)) return;
+        uint256 n = s_.allocationCount();
+        bytes[] memory reports = new bytes[](n);
+        for (uint256 i; i < n; ++i) {
+            reports[i] = abi.encode(s_.feedIdOf(i), int192(int256(1e18)));
+        }
+        s_.submitPriceReports(reports);
+    }
+
     PortfolioStrategy public template;
 
     ERC20Mock public weth;
@@ -421,6 +445,7 @@ contract PortfolioStrategy_quoteFloorScopeAndProbeTest is Test {
         strategy.initialize(
             address(vault), proposer, _initData(address(adapter), address(verifier), tokens, weights, feedIds)
         );
+        _seedAnchors(strategy);
         vm.prank(address(vault));
         strategy.execute();
 
@@ -479,6 +504,7 @@ contract PortfolioStrategy_quoteFloorScopeAndProbeTest is Test {
         strategy.initialize(
             address(vault), proposer, _initData(address(adapter), address(verifier), tokens, weights, feedIds)
         );
+        _seedAnchors(strategy);
         vm.prank(address(vault));
         strategy.execute();
 
@@ -704,6 +730,30 @@ contract PortfolioStrategy_quoteFloorScopeAndProbeTest is Test {
 ///         ~18% `MAX_CUMULATIVE_DECAY_BPS` documents, and alternating
 ///         `[0,10_000]` / `[10_000,0]` rotates the basket every call.
 contract PortfolioStrategy_deltaLegBillingTest is Test {
+    /// @dev Seed each allocation's Data Streams anchor so `_execute` will deploy.
+    ///      Permissionless, so no prank.
+    ///
+    ///      Before the anchor requirement existed these fixtures executed with
+    ///      `_lastGoodPrice[i] == 0`, so every buy floor fell through to
+    ///      `_quoteMinOut` -- a quote from the very pool the swap was about to
+    ///      hit. That is audit finding #6, and one test in this file recorded the
+    ///      fallback in a comment as expected behaviour.
+    ///
+    ///      Anchored at the fair 1:1 rate every fixture here uses: the
+    ///      adversarial adapters in this file deviate on the FILL, which is what
+    ///      those tests are about, so a fair anchor is exactly what exposes the
+    ///      deviation rather than masking it. No-op in push mode, where
+    ///      `submitPriceReports` correctly refuses.
+    function _seedAnchors(PortfolioStrategy s_) internal {
+        if (s_.chainlinkVerifier() == address(0)) return;
+        uint256 n = s_.allocationCount();
+        bytes[] memory reports = new bytes[](n);
+        for (uint256 i; i < n; ++i) {
+            reports[i] = abi.encode(s_.feedIdOf(i), int192(int256(1e18)));
+        }
+        s_.submitPriceReports(reports);
+    }
+
     PortfolioStrategy public template;
     ERC20Mock public weth;
     ERC20Mock public tsla;
@@ -777,6 +827,7 @@ contract PortfolioStrategy_deltaLegBillingTest is Test {
                 feedIds
             )
         );
+        _seedAnchors(strategy);
         vm.prank(address(vault));
         strategy.execute();
 
@@ -823,6 +874,30 @@ contract PortfolioStrategy_deltaLegBillingTest is Test {
 ///         alternative — billing the wide band — made the FIRST `rebalance()`
 ///         revert `DecayBudgetExhausted` at any anchor age above ~303s.
 contract PortfolioStrategy_meteredBandCapTest is Test {
+    /// @dev Seed each allocation's Data Streams anchor so `_execute` will deploy.
+    ///      Permissionless, so no prank.
+    ///
+    ///      Before the anchor requirement existed these fixtures executed with
+    ///      `_lastGoodPrice[i] == 0`, so every buy floor fell through to
+    ///      `_quoteMinOut` -- a quote from the very pool the swap was about to
+    ///      hit. That is audit finding #6, and one test in this file recorded the
+    ///      fallback in a comment as expected behaviour.
+    ///
+    ///      Anchored at the fair 1:1 rate every fixture here uses: the
+    ///      adversarial adapters in this file deviate on the FILL, which is what
+    ///      those tests are about, so a fair anchor is exactly what exposes the
+    ///      deviation rather than masking it. No-op in push mode, where
+    ///      `submitPriceReports` correctly refuses.
+    function _seedAnchors(PortfolioStrategy s_) internal {
+        if (s_.chainlinkVerifier() == address(0)) return;
+        uint256 n = s_.allocationCount();
+        bytes[] memory reports = new bytes[](n);
+        for (uint256 i; i < n; ++i) {
+            reports[i] = abi.encode(s_.feedIdOf(i), int192(int256(1e18)));
+        }
+        s_.submitPriceReports(reports);
+    }
+
     PortfolioStrategy public template;
     ERC20Mock public weth;
     ERC20Mock public tsla;
@@ -907,6 +982,7 @@ contract PortfolioStrategy_meteredBandCapTest is Test {
                 feedIds
             )
         );
+        _seedAnchors(strategy);
         vm.prank(address(vault));
         strategy.execute();
 

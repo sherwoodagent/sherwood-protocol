@@ -219,6 +219,49 @@ contract PortfolioStrategyTest is Test {
         return abi.encode(keccak256(abi.encode("portfolio.feed", slotIndex)), price);
     }
 
+    /// @dev Seed every allocation's price anchor so `_execute` will deploy in
+    ///      Data Streams mode. Permissionless by design — no prank needed.
+    ///
+    ///      REQUIRED BEFORE EVERY DS-MODE `execute()`, and the fact that it is
+    ///      required is the finding: before the anchor requirement existed these
+    ///      tests all executed with `_lastGoodPrice[i] == 0`, so every buy floor
+    ///      fell through to `_quoteMinOut` — a quote taken from the same pool the
+    ///      swap was about to hit. They passed because the mock adapter quotes
+    ///      honestly; against a real venue an attacker moves it first.
+    ///
+    ///      Prices match this fixture's mock adapter rate so the floors bind at
+    ///      the same value the swap returns.
+    function _seedAnchors() internal {
+        bytes[] memory reports = new bytes[](3);
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
+        reports[2] = _signedReport(2, int192(int256(0.005e18)));
+        strategy.submitPriceReports(reports);
+    }
+
+    /// @dev As `_seedAnchors`, for a locally-built clone with its own basket.
+    ///
+    ///      Reads each slot's price from the MOCK ADAPTER's own configured rate
+    ///      rather than taking one as a parameter, so a fixture whose tokens
+    ///      trade at different rates (tsla 0.01, amzn 0.02, nflx 0.005) gets a
+    ///      floor per slot that binds exactly where the swap lands. A uniform
+    ///      price here fails `SlippageExceeded` on any mixed-rate basket.
+    ///
+    ///      NO-OP IN PUSH MODE, because `submitPriceReports` correctly refuses
+    ///      there: a push-mode clone reads its own aggregator and consumes no
+    ///      report. That keeps this helper safe to call from any fixture without
+    ///      the caller having to know which mode the clone was built in.
+    function _seedAnchorsFor(PortfolioStrategy s) internal {
+        if (s.chainlinkVerifier() == address(0)) return;
+        PortfolioStrategy.TokenAllocation[] memory allocs = s.getAllocations();
+        bytes[] memory reports = new bytes[](allocs.length);
+        for (uint256 i; i < allocs.length; ++i) {
+            uint256 rate = adapter.rates(keccak256(abi.encodePacked(allocs[i].token, address(weth))));
+            reports[i] = _signedReport(i, int192(int256(rate)));
+        }
+        s.submitPriceReports(reports);
+    }
+
     // ==================== INITIALIZATION ====================
 
     function test_initialize() public view {
@@ -432,6 +475,7 @@ contract PortfolioStrategyTest is Test {
         vm.prank(vault);
         weth.approve(address(strategy), TOTAL_AMOUNT);
 
+        _seedAnchors();
         vm.prank(vault);
         strategy.execute();
 
@@ -455,6 +499,7 @@ contract PortfolioStrategyTest is Test {
     }
 
     function test_execute_onlyVault() public {
+        _seedAnchors();
         vm.prank(proposer);
         vm.expectRevert(BaseStrategy.NotVault.selector);
         strategy.execute();
@@ -463,9 +508,11 @@ contract PortfolioStrategyTest is Test {
     function test_execute_twice_reverts() public {
         vm.prank(vault);
         weth.approve(address(strategy), TOTAL_AMOUNT);
+        _seedAnchors();
         vm.prank(vault);
         strategy.execute();
 
+        _seedAnchors();
         vm.prank(vault);
         vm.expectRevert(BaseStrategy.AlreadyExecuted.selector);
         strategy.execute();
@@ -477,6 +524,7 @@ contract PortfolioStrategyTest is Test {
         // Execute first
         vm.prank(vault);
         weth.approve(address(strategy), TOTAL_AMOUNT);
+        _seedAnchors();
         vm.prank(vault);
         strategy.execute();
 
@@ -503,6 +551,7 @@ contract PortfolioStrategyTest is Test {
     function test_settle_withProfit() public {
         vm.prank(vault);
         weth.approve(address(strategy), TOTAL_AMOUNT);
+        _seedAnchors();
         vm.prank(vault);
         strategy.execute();
 
@@ -529,6 +578,7 @@ contract PortfolioStrategyTest is Test {
     function test_settle_onlyVault() public {
         vm.prank(vault);
         weth.approve(address(strategy), TOTAL_AMOUNT);
+        _seedAnchors();
         vm.prank(vault);
         strategy.execute();
 
@@ -794,6 +844,7 @@ contract PortfolioStrategyTest is Test {
         // 1. Execute
         vm.prank(vault);
         weth.approve(address(strategy), TOTAL_AMOUNT);
+        _seedAnchors();
         vm.prank(vault);
         strategy.execute();
 
@@ -892,6 +943,7 @@ contract PortfolioStrategyTest is Test {
         // Execute: 5 WETH → 500 TSLA
         vm.prank(vault);
         weth.approve(address(s), 5e18);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -962,6 +1014,7 @@ contract PortfolioStrategyTest is Test {
         weth.mint(vault, 20e18); // extra WETH for this test
         vm.prank(vault);
         weth.approve(address(s), 20e18);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1021,6 +1074,7 @@ contract PortfolioStrategyTest is Test {
         // Execute: NFLX should get 0 allocation
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1187,6 +1241,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s2), TOTAL_AMOUNT);
+        _seedAnchorsFor(s2);
         vm.prank(vault);
         s2.execute();
 
@@ -1258,6 +1313,7 @@ contract PortfolioStrategyTest is Test {
         weth.mint(vault, 20e18);
         vm.prank(vault);
         weth.approve(address(s), 20e18);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1280,6 +1336,7 @@ contract PortfolioStrategyTest is Test {
         weth.mint(vault, 20e18);
         vm.prank(vault);
         weth.approve(address(s2), 20e18);
+        _seedAnchorsFor(s2);
         vm.prank(vault);
         s2.execute();
 
@@ -1304,6 +1361,7 @@ contract PortfolioStrategyTest is Test {
     function _executeStrategy() internal {
         vm.prank(vault);
         weth.approve(address(strategy), TOTAL_AMOUNT);
+        _seedAnchors();
         vm.prank(vault);
         strategy.execute();
     }
@@ -1359,6 +1417,7 @@ contract PortfolioStrategyTest is Test {
         //   TSLA: 1e6 (= 0.01 × 1e8)   AMZN: 2e6 (= 0.02 × 1e8)   NFLX: 5e5 (= 0.005 × 1e8)
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1527,6 +1586,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1558,6 +1618,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1579,6 +1640,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1598,6 +1660,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1654,6 +1717,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1675,6 +1739,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1694,6 +1759,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1744,6 +1810,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 

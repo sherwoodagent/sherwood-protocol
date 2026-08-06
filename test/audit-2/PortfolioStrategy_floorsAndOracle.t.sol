@@ -3,10 +3,35 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
-import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
+import {PortfolioStrategy, ChainlinkReport} from "../../src/strategies/PortfolioStrategy.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
+
+/// @notice Minimal Data Streams verifier, echoing the report it is handed.
+/// @dev    Added because the anchor requirement at `_execute` (audit finding #6)
+///         means a DS-mode fixture must be able to actually VERIFY a report to
+///         reach execute at all. `makeAddr("verifier")` is a bare EOA and
+///         reverts on `verify`, which was fine only while DS-mode execute
+///         silently ran with no anchor — the very thing the requirement removes.
+contract MockDsVerifier {
+    function verify(bytes calldata signedReport) external payable returns (bytes memory) {
+        (bytes32 feedId, int192 price) = abi.decode(signedReport, (bytes32, int192));
+        return abi.encode(
+            ChainlinkReport({
+                feedId: feedId,
+                validFromTimestamp: uint32(block.timestamp),
+                observationsTimestamp: uint32(block.timestamp),
+                nativeFee: 0,
+                linkFee: 0,
+                expiresAt: uint32(block.timestamp + 300),
+                price: price,
+                bid: price,
+                ask: price
+            })
+        );
+    }
+}
 
 /// @notice Minimal vault stand-in exposing `governor()` — the one hop
 ///         `_requireAllowedAdapter`/`_requireAllowedPriceSource(s)` and
@@ -257,6 +282,7 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
 
         r.strategy.initialize(address(r.vault), proposer, _pushModeInitData(address(r.adapter), address(r.feed)));
 
+        _seedAnchor(r.strategy);
         vm.prank(address(r.vault));
         r.strategy.execute();
     }
@@ -275,6 +301,23 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
     ///      `cumulativeDecayBps` charges the worst case (`2 * maxSlippageBps`
     ///      per full rebalance) and refuses once `MAX_CUMULATIVE_DECAY_BPS` is
     ///      spent. Pre-fix this loop never terminated.
+
+    /// @dev Seed the Data Streams price anchor so `_execute` will deploy.
+    ///      Permissionless, so no prank. Before the anchor requirement existed
+    ///      these fixtures executed with `_lastGoodPrice[0] == 0` and the buy
+    ///      floor fell through to `_quoteMinOut` — a quote from the very pool the
+    ///      swap was about to hit, which is audit finding #6. One test's comment
+    ///      recorded that fallback as expected behaviour; it was the bug.
+    ///
+    ///      `1e18` is this fixture's fair rate, matching the oracle price the
+    ///      suite uses throughout, so the floor binds where the swap lands.
+    function _seedAnchor(PortfolioStrategy s_) internal {
+        if (s_.chainlinkVerifier() == address(0)) return;
+        bytes[] memory reports = new bytes[](1);
+        reports[0] = abi.encode(bytes32(uint256(0xBEEF)), int192(int256(1e18)));
+        s_.submitPriceReports(reports);
+    }
+
     function test_finding9_rebalanceDecayBudgetIsFinite() public {
         Rig memory r = _rig();
 
@@ -539,6 +582,7 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         // execute() is triggered (permissionless in production).
         adapter.setRate(address(weth), address(tsla), 0.01e18);
 
+        _seedAnchor(strategy);
         vm.prank(address(vault));
         vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
         strategy.execute();
@@ -608,7 +652,7 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
     ///      `rebalanceDelta` the same way a revoked push feed does above.
     function test_rebalanceDelta_revertsWhenVerifierRevoked_dataStreamsMode() public {
         MockSwapAdapter adapter = _deployFundedAdapter();
-        address verifier = makeAddr("verifier");
+        address verifier = address(new MockDsVerifier());
         MockTierRegistry registry = new MockTierRegistry();
         registry.setAllowed(address(adapter), true);
         registry.setAllowed(verifier, true);
@@ -621,8 +665,15 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         weth.approve(address(strategy), type(uint256).max);
         strategy.initialize(address(vault), proposer, _dataStreamsInitData(address(adapter), verifier));
 
+        // The buy leg is now ORACLE-anchored, not pool-quoted. This line used to
+        // read "Data Streams buy leg falls back to _quoteMinOut; fair rate fills
+        // fine" — which was audit finding #6 recorded as expected behaviour: with
+        // no anchor the floor came from a quote against the very pool the swap
+        // was about to hit, and it only "filled fine" because this fixture's
+        // adapter quotes honestly.
+        _seedAnchor(strategy);
         vm.prank(address(vault));
-        strategy.execute(); // Data Streams buy leg falls back to _quoteMinOut; fair rate fills fine
+        strategy.execute();
 
         registry.setAllowed(verifier, false); // governance revokes the verifier post-execute
 
