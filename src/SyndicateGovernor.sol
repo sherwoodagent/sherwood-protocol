@@ -34,6 +34,22 @@ import {IVotes} from "@openzeppelin/contracts/governance/utils/IVotes.sol";
  *   - Protocol fee taken from profit before agent/management fees
  */
 contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializable {
+    /// @notice Ceiling applied to `maxDrawdownBps` when deriving the SETTLE-PRICE
+    ///         floor (pashov finding #2). Not a bound on the strategy's declared
+    ///         loss — that stays whatever voters approved, up to 10_000.
+    /// @dev    Why a cap rather than rejecting `maxDrawdownBps == 10_000` at
+    ///         propose: rejecting it would make the P&L envelope answer for the
+    ///         stamp's safety, which is the exact conflation this finding is
+    ///         about, and it would invalidate `GovEnvelope.permissive` — the
+    ///         fixture nearly every suite builds on. Capping keeps the two
+    ///         questions separate: declare any loss you like, but the price a
+    ///         permissionless caller may FREEZE is bounded regardless.
+    ///
+    ///         9_000 leaves a 100%-drawdown proposal a floor at 10% of the
+    ///         execute-time price. Far below any honest settlement, far above
+    ///         the ~0 a flash-loaned settle produces.
+    uint256 public constant MAX_STAMP_DRAWDOWN_BPS = 9_000;
+
     // ── Storage (existing -- DO NOT reorder) ──
     // `vault`, `protocolConfig`, `factory`, `_params` live in `GovernorParameters`.
 
@@ -175,10 +191,30 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      which shrinks 28 -> 27; every pre-existing variable keeps its slot.
     mapping(address vault => mapping(address token => uint256)) private _escrowedFees;
 
+    /// @notice Proposal ID -> the vault's price per share at EXECUTE, captured
+    ///         before the batch deploys any capital (pashov finding #2).
+    /// @dev THE ANCHOR THE SETTLE-PRICE FLOOR IS MEASURED AGAINST, and the
+    ///      reason it cannot be faked. Taken while the vault still physically
+    ///      holds the capital, so it is a real ratio (~par) rather than the
+    ///      near-zero figure the vault reports for the whole Executed window,
+    ///      during which `totalAssets()` counts only idle float.
+    ///
+    ///      A PRIOR-BLOCK READ WOULD NOT SUBSTITUTE. Robinhood Chain blocks are
+    ///      ~100ms, so "last block" is no economic barrier at all, and one block
+    ///      before settlement the capital is still deployed — that reading is
+    ///      also ~0. What makes this anchor unreachable is the DISTANCE (a whole
+    ///      strategy term) and the INSTANT (pre-deployment), not its age.
+    ///
+    ///      Appended before `__gap`, which shrinks 27 -> 26; every pre-existing
+    ///      variable keeps its slot. Regenerate the golden with
+    ///      `./script/check-layout-goldens.sh --update-golden`.
+    mapping(uint256 => uint256) private _ppsSnapshots;
+
     /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31)
-    ///      for the three mappings above, then 1 more for `_escrowedFees` —
-    ///      append-only. See `script/syndicate-governor-layout.golden.json`.
-    uint256[27] private __gap;
+    ///      for the three mappings above, then 1 more for `_escrowedFees`, then
+    ///      1 more for `_ppsSnapshots` — append-only. See
+    ///      `script/syndicate-governor-layout.golden.json`.
+    uint256[26] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -489,6 +525,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         address asset = IERC4626(vault).asset();
         uint256 balanceBefore = IERC20(asset).balanceOf(vault);
         _capitalSnapshots[proposalId] = balanceBefore;
+        // Anchor for the settle-price floor (pashov finding #2). MUST be read
+        // HERE, before the execute batch deploys capital: `totalAssets()` counts
+        // only the vault's idle balance, so a reading taken after deployment
+        // would be ~0 and the floor derived from it would be vacuous — the exact
+        // failure being fixed. Typed call: `pricePerShare()` is on
+        // `ISyndicateVault` and every governor path already calls this vault.
+        _ppsSnapshots[proposalId] = ISyndicateVault(vault).pricePerShare();
 
         // Update state BEFORE external call (CEI pattern)
         _activeProposal = proposalId;
@@ -664,7 +707,78 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             }
         }
 
+        // SECOND, INDEPENDENT GATE — the settle PRICE (pashov finding #2).
+        //
+        // The capital floor above is identically true when a proposal declares
+        // `maxDrawdownBps == 10_000`: `allowance` then equals `basis`, so
+        // `basis > allowance` is false and the whole branch is SKIPPED. That is
+        // defensible for the strategy's own P&L — voters may accept a total
+        // loss — but the waiver reaches a party the envelope never spoke for.
+        // `_finishSettlement` -> `onProposalSettled` freezes
+        // `num = totalAssets() + 1` as the price EVERY queued deposit and redeem
+        // is paid at, and a permissionless caller picks the block.
+        //
+        // Proven on a live Robinhood fork: settle from inside a `flashLoan` that
+        // empties Morpho's idle balance so `_deliverableNow` returns 0, and the
+        // stamp lands at `num == 1` — a queued 1 USDG deposit minted 99.99% of a
+        // 20,000 USDG vault's supply.
+        //
+        // So the stamp gets its OWN bound, and the declared drawdown is CAPPED
+        // on the way in. A proposal may still declare a total loss; the price it
+        // may freeze is bounded regardless. A settlement under this floor is not
+        // stuck — it is redirected to `finalizeEmergencySettle`, where an owner
+        // bond and guardian review stand behind it.
+        _requireSettlePriceAboveFloorHook(proposalId, proposal, false);
+
         _finishSettlement(proposalId, proposal);
+    }
+
+    /// @dev Shared by `settleProposal` and `unstick` (pashov findings #2, #12).
+    ///      `unstick` replays the SAME stored batch under the SAME caps, so
+    ///      leaving it ungated closed the front door and left the side door
+    ///      open — the attack there needs no 100% declaration at all.
+    ///
+    ///      DELIBERATELY LOOSER THAN THE CAPITAL FLOOR. Capping the declared
+    ///      drawdown at `MAX_STAMP_DRAWDOWN_BPS` leaves a 100% proposal a floor
+    ///      of 10% of the execute-time price, so ordinary and even severe losses
+    ///      still settle and `unstick` remains the escape hatch it was added to
+    ///      be. Only a near-zero stamp — the shape a flash-loaned settle
+    ///      manufactures, and the shape that mints unbounded shares to a queued
+    ///      depositor — is refused.
+    ///
+    ///      `finalizeEmergencySettle` stays exempt: it already carries a
+    ///      slashable owner bond and a guardian review, and it is the path a
+    ///      genuine loss past the envelope is supposed to be redirected TO.
+    function _requireSettlePriceAboveFloorHook(uint256 proposalId, StrategyProposal storage proposal, bool rescuePath)
+        internal
+        view
+        override
+    {
+        uint256 ppsAtExecute = _ppsSnapshots[proposalId];
+        // Zero means a proposal executed before this upgrade landed: there is no
+        // anchor to measure against, and inventing one would gate in-flight
+        // proposals on a figure never recorded. Those keep the pre-fix
+        // behaviour rather than becoming unsettleable.
+        if (ppsAtExecute == 0) return;
+
+        // TWO BARS, because the two callers mean different things.
+        //
+        // `settleProposal` (rescuePath == false) is the ordinary, permissionless
+        // exit, so it is held to the DECLARED envelope — capped, so a 100%
+        // declaration cannot waive it to nothing.
+        //
+        // `unstick` (rescuePath == true) exists precisely to settle a proposal
+        // the declared envelope refused. Holding it to that same envelope would
+        // delete its purpose, so it gets only the absolute backstop: refuse a
+        // near-zero stamp, allow everything above it. A genuine loss past the
+        // backstop is not stuck either — it routes to `finalizeEmergencySettle`,
+        // which carries an owner bond and a guardian review.
+        uint256 declared = rescuePath ? MAX_STAMP_DRAWDOWN_BPS : proposal.maxDrawdownBps;
+        if (declared > MAX_STAMP_DRAWDOWN_BPS) declared = MAX_STAMP_DRAWDOWN_BPS;
+        uint256 ppsFloor = (ppsAtExecute * (BPS_DENOMINATOR - declared)) / BPS_DENOMINATOR;
+
+        uint256 ppsNow = ISyndicateVault(proposal.vault).pricePerShare();
+        if (ppsNow < ppsFloor) revert SettlePriceBelowFloor(ppsNow, ppsFloor);
     }
 
     /// @inheritdoc ISyndicateGovernor

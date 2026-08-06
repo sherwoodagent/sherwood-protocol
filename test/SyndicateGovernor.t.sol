@@ -683,16 +683,94 @@ contract SyndicateGovernorTest is Test {
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
     }
 
-    /// @notice The gate must not bind a proposal whose voters accepted a total
-    ///         loss (`maxDrawdownBps == 10_000`) — that is the envelope working
-    ///         as declared, not a bug. Also pins that the ubiquitous
-    ///         `GovEnvelope.permissive` fixture is unaffected by the fix.
-    function test_pashovFinding1_fullDrawdownEnvelope_settlesAtAnyBalance() public {
+    /// @notice The CAPITAL gate must not bind a proposal whose voters accepted a
+    ///         total loss (`maxDrawdownBps == 10_000`) — that is the envelope
+    ///         working as declared, and it stays true.
+    ///
+    /// @dev    REWRITTEN FOR pashov FINDING #2, and the change of expectation is
+    ///         the point. This previously settled at a balance of ZERO and
+    ///         asserted that as correct, on the reasoning that a declared total
+    ///         loss should not be second-guessed. That reasoning holds for the
+    ///         STRATEGY's P&L and does not hold for the SETTLE PRICE: the same
+    ///         waiver let `onProposalSettled` freeze `num == 1` as the price
+    ///         every queued deposit and redeem is paid at, which a fork PoC
+    ///         turned into 1 USDG -> 20,001 USDG. Queued LPs never voted on that
+    ///         envelope.
+    ///
+    ///         So the two gates are now separate and this pins BOTH halves: the
+    ///         capital floor still does not bind (a 90%-loss settlement that
+    ///         would have tripped a declared-20% envelope goes through), while
+    ///         the price floor refuses the near-zero stamp the old version
+    ///         accepted. `GovEnvelope.permissive` is still unaffected — it
+    ///         settles at or near par, far above the 10% backstop.
+    function test_pashovFinding1_fullDrawdownEnvelope_capitalFloorStillDoesNotBind() public {
         uint256 pid = _createAndExecuteProposalWithDrawdown(10_000);
-        deal(address(usdc), address(vault), 0);
+
+        // A 90% loss: far past any declared envelope the capital floor would
+        // enforce, and still settleable because the voters accepted total loss.
+        deal(address(usdc), address(vault), 10_000e6);
         vm.prank(agent);
         governor.settleProposal(pid);
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
+    // ── pashov finding #2 — the settle PRICE needs its own floor ──
+
+    /// @notice THE FINDING. `maxDrawdownBps == 10_000` makes the capital floor
+    ///         above identically true (`basis > basis` is false, so the branch
+    ///         is skipped entirely), and that waiver reaches a party the
+    ///         envelope never spoke for: `onProposalSettled` freezes
+    ///         `num = totalAssets() + 1` as the price EVERY queued deposit and
+    ///         redeem is paid at.
+    ///
+    ///         Proven on a live Robinhood fork before this test existed
+    ///         (`test/pocs/Finding2_VacuousDrawdownStampAtOne.t.sol`): deploy
+    ///         100% of a 20,000 USDG vault into Morpho, queue a 1 USDG deposit,
+    ///         then settle from inside a `flashLoan` that empties Morpho's idle
+    ///         balance so the strategy delivers ZERO. The stamp lands at
+    ///         `num == 1`, the 1 USDG mints 99.99% of the supply, and `sweep()`
+    ///         plus `redeem()` returns 20,001 USDG to the attacker.
+    ///
+    ///         The strategy's P&L envelope is NOT what is wrong — voters may
+    ///         legitimately accept a total loss. What is wrong is that one
+    ///         number was also acting as the only bound on the stamp. The fix
+    ///         gives the stamp a SEPARATE floor, anchored to the price per
+    ///         share recorded at execute (before capital left, while the vault
+    ///         was whole) and capped independently of the declared drawdown.
+    function test_pashovFinding2_settleCannotStampANearZeroPrice() public {
+        uint256 pid = _createAndExecuteProposalWithDrawdown(10_000);
+        // The unwind delivers nothing — the state a flash loan manufactures.
+        deal(address(usdc), address(vault), 0);
+        vm.prank(agent);
+        vm.expectRevert();
+        governor.settleProposal(pid);
+
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Executed),
+            "a refused settle must not advance the proposal"
+        );
+    }
+
+    /// @notice pashov finding #12 — the same hole through the other door.
+    ///         `unstick` replays the identical stored batch under the identical
+    ///         caps and skipped the floor entirely, so the attack above needs no
+    ///         100% declaration at all: the owner queues a deposit, waits out
+    ///         the term, and calls `unstick` inside the flash loan.
+    /// @dev    Deliberately looser than the capital floor, so the escape hatch
+    ///         `test_pashovFinding1_unstickRecoversAProposalTheFloorRefused`
+    ///         depends on stays open for ORDINARY losses — only a near-zero
+    ///         stamp is refused.
+    function test_pashovFinding12_unstickCannotStampANearZeroPrice() public {
+        uint256 pid = _createAndExecuteProposalWithDrawdown(10_000);
+        // `unstick` gates on the FULL `strategyDuration`, not the proposer's
+        // 1-hour self-settle window the fixture leaves us in. Without this the
+        // test passes on `StrategyDurationNotElapsed` and proves nothing.
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        deal(address(usdc), address(vault), 0);
+        vm.prank(owner);
+        vm.expectRevert();
+        governor.unstick(pid);
     }
 
     /// @notice The floor is a share of the CAPITAL THE ENVELOPE COVERS, never a

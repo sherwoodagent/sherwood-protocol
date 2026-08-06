@@ -53,6 +53,16 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         internal
         virtual
         returns (int256 pnl, uint256 totalFee);
+    /// @dev Settle-price floor (pashov findings #2, #12). Declared here because
+    ///      `unstick` stamps through `_finishSettlementHook` exactly as
+    ///      `settleProposal` does, while the anchor it measures against lives in
+    ///      the concrete governor's storage. Gating only `settleProposal` closed
+    ///      the front door and left this one open — the attack through `unstick`
+    ///      needs no 100% drawdown declaration at all.
+    function _requireSettlePriceAboveFloorHook(uint256 pid, StrategyProposal storage p, bool rescuePath)
+        internal
+        view
+        virtual;
 
     // ── Reentrancy modifier (shares status var with SyndicateGovernor) ──
 
@@ -98,6 +108,19 @@ abstract contract GovernorEmergency is ProposalLifecycle {
             .executeGovernorBatch(
                 _getSettlementCalls(proposalId), _getEffectiveSettlementCallCaps(proposalId), p.effectiveMaxCapital
             );
+        // Same settle-price floor `settleProposal` enforces (pashov #12). An
+        // honest rescue replays an already-voted batch and is net-INFLOW, so it
+        // clears the floor trivially; only a near-zero stamp — the shape a
+        // flash-loaned settle manufactures — is refused, and that case belongs
+        // on the bonded, guardian-reviewed `finalizeEmergencySettle` path.
+        // `rescuePath = true`: the floor here is the ABSOLUTE backstop, not the
+        // declared envelope. `unstick` exists precisely to settle a proposal the
+        // declared-envelope floor REFUSED, so deriving its bar from that same
+        // envelope would delete its reason to exist — pinned by
+        // `test_pashovFinding1_unstickRecoversAProposalTheFloorRefused`. An
+        // ordinary or even severe loss still unsticks; only a near-zero stamp is
+        // refused, and that one belongs on `finalizeEmergencySettle`.
+        _requireSettlePriceAboveFloorHook(proposalId, p, true);
         _finishSettlementHook(proposalId, p);
     }
 
