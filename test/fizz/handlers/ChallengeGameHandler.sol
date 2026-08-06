@@ -154,12 +154,17 @@ abstract contract ChallengeGameHandler is Properties {
     ///      Disputed, or an Inconclusive/NotGuilty verdict), all of which are
     ///      themselves worth exploring. The handler never reverts the sequence.
     function challengeGame_lifecycle_toConviction(uint256 proposalSeed, uint256 predicateSeed) public {
-        uint256 pid = _challengeableProposal(proposalSeed);
-        if (pid == 0) return;
-
         // Challenger: a non-guardian actor, so the guardian pool stays eligible
         // to vote. `_nonGuardian` wraps within the non-guardian range.
+        //
+        // DERIVED BEFORE the predictor and PASSED IN, not re-derived inside it.
+        // `file`'s `AlreadyChallenged` gate is per (key, msg.sender), so the
+        // predictor cannot answer it without knowing who is about to file, and
+        // duplicating this derivation there is exactly the drift this helper's
+        // own natspec is about.
         address challenger = _nonGuardian(proposalSeed);
+        uint256 pid = _challengeableProposal(proposalSeed, challenger);
+        if (pid == 0) return;
         uint256 idBefore = game.challengeCount();
         vm.prank(challenger);
         try game.file(
@@ -254,7 +259,39 @@ abstract contract ChallengeGameHandler is Properties {
     ///      failing to point at it. `settleCoverage` is permissionless,
     ///      re-runnable and not freeze-gated, and rebooking recorded down to
     ///      zero while the pledge stands is exactly the state that triggers it.
-    function _challengeableProposal(uint256 seed) internal view returns (uint256) {
+    ///
+    ///      ALSO MODELS THE TWO GATES THE COMPOSITE ITSELF MANUFACTURES, which
+    ///      are the same drift in the OPPOSITE and worse direction. A predictor
+    ///      that is too strict `continue`s and keeps scanning; one that is too
+    ///      LOOSE returns early on a proposal `file` will reject, and the
+    ///      composite no-ops for that seed:
+    ///
+    ///        - `AlreadyConvicted`. Nothing clears the pledge on conviction —
+    ///          `_reservedUsd` is deleted only by `_unwindApproval`, reached
+    ///          from `releaseApproval`/`retireApproval` — so a convicted
+    ///          proposal keeps passing the three checks above forever, and
+    ///          `challengeGame_lifecycle_toConviction` mints one every time it
+    ///          succeeds. Its hit rate would decay against its own output.
+    ///
+    ///        - `AlreadyChallenged`. One live challenge per challenger, and the
+    ///          composite files from a `_nonGuardian` derived off the same seed.
+    ///
+    ///      `_convicted` HAS NO ACCESSOR, so the conviction gate is asked of
+    ///      sWOOD instead. That is faithful rather than approximate: `file`'s
+    ///      second gate is `_verdictAlreadyCollected`, itself
+    ///      `_convicted[key] || any verdictSlashed(key, accused)`, and every
+    ///      path that sets `_convicted` under this key also slashes under it —
+    ///      `_settle`'s diverted branch only runs when a slash is already
+    ///      recorded. Asked over the SAME accused set `file` builds (pledge
+    ///      non-zero), against the SAME `keccak256(abi.encode(governor, pid))`
+    ///      that `_settle` hands to `slashVerdict`.
+    ///
+    ///      Still not modelled, deliberately: `filingsPaused`, `WoodPriceUnset`
+    ///      and `BondTooSmall`. All three are global rather than per-proposal,
+    ///      so skipping a pid cannot route around them and a predictor that
+    ///      consulted them would only ever return 0 — the composite's own
+    ///      try/catch is the right handler for those.
+    function _challengeableProposal(uint256 seed, address challenger) internal view returns (uint256) {
         uint256 count = governor.proposalCount();
         if (count == 0) return 0;
         uint256 start = seed % count;
@@ -263,12 +300,23 @@ abstract contract ChallengeGameHandler is Properties {
             ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(pid);
             if (p.executedAt == 0) continue;
             if (block.timestamp > p.executedAt + p.strategyDuration + ledger.challengeWindow()) continue;
-            (, uint256[] memory pledged) = ledger.pledgedOf(address(governor), pid);
+            // `AlreadyChallenged` — one live challenge per CHALLENGER, which is
+            // why this needs the address rather than deriving one.
+            if (game.liveChallengeOfBy(address(governor), pid, challenger) != 0) continue;
+
+            (address[] memory approvers, uint256[] memory pledged) = ledger.pledgedOf(address(governor), pid);
             uint256 total;
+            bool collected;
+            bytes32 key = keccak256(abi.encode(address(governor), pid));
             for (uint256 i; i < pledged.length; i++) {
+                // Zero-pledge entries are outside `file`'s accused set, so they
+                // neither price the bond nor answer the conviction question.
+                if (pledged[i] == 0) continue;
                 total += pledged[i];
+                if (swood.verdictSlashed(key, approvers[i])) collected = true;
             }
-            if (total == 0) continue;
+            // `NothingToFreeze` and both `AlreadyConvicted` gates, in that order.
+            if (total == 0 || collected) continue;
             return pid;
         }
         return 0;

@@ -201,6 +201,96 @@ contract FoundryTester is Test, Handlers {
         );
     }
 
+    /// @notice The predictor stops returning a proposal once `file` would
+    ///         refuse it, and the conviction composite is what creates that
+    ///         state.
+    ///
+    /// @dev `_challengeableProposal` predicts `file`'s gates. Modelling only
+    ///      the coverage one left it too LOOSE against `AlreadyConvicted`:
+    ///      nothing clears the pledge on conviction, so a convicted proposal
+    ///      keeps passing executed/window/coverage forever, and the predictor
+    ///      would keep returning it while `file` rejected it — the composite
+    ///      quietly no-opping for every seed that lands there first.
+    ///
+    ///      That decay is self-inflicted, which is what makes it worth a test
+    ///      rather than a comment: the composite mints one poisoned proposal
+    ///      per success, so its own hit rate falls as it works.
+    ///
+    ///      Asserts BOTH sides of the transition — found before, skipped after
+    ///      — with the pledge proven still standing in between, so the test
+    ///      cannot pass because the fixture stopped qualifying for some other
+    ///      reason. The `file` probe pins that the predictor's new answer is
+    ///      the same one the contract gives.
+    function test_challengeableProposal_skipsAConvictedProposal() public {
+        syndicateGovernor_lifecycle_toExecuted(7 days, 50_000e6, 0);
+        uint256 pid = governor.proposalCount();
+        require(governor.getProposal(pid).executedAt != 0, "setup: proposal not executed");
+
+        address challenger = _nonGuardian(0);
+        assertEq(_challengeableProposal(0, challenger), pid, "setup: the predictor must find it BEFORE the conviction");
+
+        challengeGame_lifecycle_toConviction(0, 0);
+        uint256 challengeId = game.challengeCount();
+        require(
+            game.challengeOf(challengeId).status == IChallengeGame.Status.Settled,
+            "setup: the composite did not reach a conviction"
+        );
+
+        // The pledge SURVIVES the conviction, so every check the predictor made
+        // before still passes. Without this the test could go green because the
+        // fixture stopped qualifying rather than because the gate is modelled.
+        (, uint256[] memory pledged) = ledger.pledgedOf(address(governor), pid);
+        uint256 stillPledged;
+        for (uint256 i; i < pledged.length; i++) {
+            stillPledged += pledged[i];
+        }
+        assertGt(stillPledged, 0, "conviction cleared the pledge; this fixture no longer covers the gap");
+
+        assertEq(_challengeableProposal(0, challenger), 0, "predictor still offers a proposal file() would reject");
+
+        // And that is the contract's own answer, not just the predictor's.
+        vm.prank(challenger);
+        vm.expectRevert(IChallengeGame.AlreadyConvicted.selector);
+        game.file(address(governor), pid, IChallengeGame.Predicate(0), address(0), bytes4(0), "probe");
+    }
+
+    /// @notice The other gate the composite manufactures: one live challenge
+    ///         per CHALLENGER, so the predictor's answer depends on who is
+    ///         about to file.
+    ///
+    /// @dev Separate from the conviction test because that one cannot reach
+    ///      this clause — `file` checks `_convicted` first, so a convicted
+    ///      proposal would exercise the earlier gate and leave this one
+    ///      unproven. This files WITHOUT convicting, so `AlreadyChallenged` is
+    ///      the only reason the pid becomes unavailable.
+    ///
+    ///      Asserts the gate is per challenger and not per proposal: the filer
+    ///      is blocked, a second challenger is still offered the same pid. A
+    ///      predictor that skipped the proposal outright would pass the first
+    ///      assertion and fail the second — which is the point of having both.
+    function test_challengeableProposal_skipsAProposalThisChallengerAlreadyFiled() public {
+        syndicateGovernor_lifecycle_toExecuted(7 days, 50_000e6, 0);
+        uint256 pid = governor.proposalCount();
+        require(governor.getProposal(pid).executedAt != 0, "setup: proposal not executed");
+
+        address filer = _nonGuardian(0);
+        address other = _nonGuardian(1);
+        require(filer != other, "setup: the two challengers must differ");
+        assertEq(_challengeableProposal(0, filer), pid, "setup: found before anyone filed");
+
+        vm.prank(filer);
+        game.file(address(governor), pid, IChallengeGame.Predicate(0), address(0), bytes4(0), "fizz-already");
+        require(game.challengeCount() != 0, "setup: nothing was filed");
+
+        assertEq(_challengeableProposal(0, filer), 0, "predictor still offers a proposal this challenger cannot file");
+        assertEq(_challengeableProposal(0, other), pid, "the gate is per CHALLENGER; another one may still file");
+
+        // Again, the contract's own answer rather than only the predictor's.
+        vm.prank(filer);
+        vm.expectRevert(IChallengeGame.AlreadyChallenged.selector);
+        game.file(address(governor), pid, IChallengeGame.Predicate(0), address(0), bytes4(0), "probe");
+    }
+
     // ── Violation Repros (auto-generated by Step 11) ──────────────────
     // Each test_repro_* function below replays a shrunk fuzzer call
     // sequence that violated a property. Run all with:
