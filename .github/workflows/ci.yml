@@ -132,6 +132,32 @@ jobs:
       - name: forge fmt --check
         run: forge fmt --check src test script
 
+  openspec:
+    name: OpenSpec validate
+    runs-on: ubuntu-latest
+    # A malformed delta does NOT fail loudly on its own: OpenSpec parses
+    # positionally, so `## ADDED Requirement: <name>` — which collapses the
+    # section header into the requirement header — makes a change parse as
+    # having no deltas at all. Two changes sat in that state from 2026-08-01
+    # until 2026-08-05 (PR #210), describing nothing while looking complete.
+    #
+    # Deliberately NOT filtered on `paths: openspec/**`: a spec goes stale
+    # because the CODE moved under it, which is exactly how wood-pricing came
+    # to document a `woodFallbackPriceX8` that no longer existed.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Pinned for the same reason FOUNDRY_VERSION is: a validator's rules are
+      # as version-sensitive as a formatter's, and an unpinned bump would turn
+      # unrelated PRs red. Note the SCOPE — the unscoped `openspec` on npm is a
+      # placeholder at 0.0.0, not this tool.
+      - name: openspec validate --all --strict
+        run: npx --yes @fission-ai/openspec@1.7.0 validate --all --strict
+
   storage-layout:
     name: Storage-layout gates
     runs-on: ubuntu-latest
