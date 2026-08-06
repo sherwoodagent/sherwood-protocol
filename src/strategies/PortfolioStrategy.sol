@@ -114,6 +114,17 @@ contract PortfolioStrategy is BaseStrategy {
     ///         the slot's declared `_feedIds[i]`.
     error InvalidFeedId();
     error WrongFeedId(uint256 index, bytes32 expected, bytes32 actual);
+    /// @notice `submitPriceReports` called in push-feed mode, where the contract
+    ///         reads its own aggregator and no report is consumed. Refused
+    ///         explicitly rather than left to `_verifyPrice`'s `InvalidFeedId`,
+    ///         so the caller learns the mode is wrong rather than the report.
+    error PushModeNeedsNoReports();
+    /// @notice Data Streams mode reached `_execute` with allocation `index`
+    ///         carrying no price anchor, or one older than
+    ///         `PRICE_ANCHOR_MAX_AGE_AT_EXECUTE`. Call `submitPriceReports`
+    ///         (permissionless) and execute again — nothing is stranded, the
+    ///         proposal stays Approved and no capital has left the vault.
+    error PriceAnchorMissingOrStale(uint256 index);
     /// @notice Push-mode per-slot max-age (upper 96 bits of `_feedIds[i]`) is
     ///         outside `[MIN_PUSH_PRICE_AGE, MAX_PUSH_PRICE_AGE_CAP]`.
     error InvalidPriceAge();
@@ -248,6 +259,25 @@ contract PortfolioStrategy is BaseStrategy {
     ///         past the longest documented equity-feed gap so an ordinary
     ///         holiday weekend lands mid-ramp rather than at the ceiling.
     uint256 public constant STALE_WIDEN_PERIOD = 7 days;
+    /// @notice How fresh every allocation's price anchor must be for `_execute`
+    ///         to deploy capital in Data Streams mode. See the check there.
+    ///
+    /// @dev    SIZED FOR TWO TRANSACTIONS, NOT ONE BLOCK. A Data Streams report
+    ///         expires, so it cannot be carried in propose-time calldata and
+    ///         still be valid at execute — the anchor has to be refreshed close
+    ///         to execution, by a `submitPriceReports` call separate from
+    ///         `executeProposal`. Both are permissionless, so the normal flow is
+    ///         one caller sending two transactions; demanding they land in the
+    ///         same block would fail honest executions for no security gain,
+    ///         since the report itself already carries Chainlink's own expiry.
+    ///
+    ///         An hour is short enough that the entry floor is anchored to a
+    ///         genuinely current price and long enough to survive a congested
+    ///         block or a retried transaction. Deliberately NOT reusing
+    ///         `STALE_WIDEN_PERIOD`: that governs how the band widens AFTER
+    ///         capital is deployed and an exit must stay possible, a different
+    ///         question from whether capital should be deployed at all.
+    uint256 public constant PRICE_ANCHOR_MAX_AGE_AT_EXECUTE = 1 hours;
     /// @notice Ceiling on `cumulativeDecayBps` across a clone's whole life
     ///         (pashov review finding #9).
     ///
@@ -387,6 +417,12 @@ contract PortfolioStrategy is BaseStrategy {
     bytes32[] internal _feedIds;
 
     // ── Events ──
+    /// @notice Every allocation's price anchor was re-stamped from signed Data
+    ///         Streams reports by `caller`. Emitted so a keeper can see whether
+    ///         an anchor is already fresh before paying to refresh it, and so
+    ///         the widening band in `_staleSlippageBps` has an on-chain trail of
+    ///         who last closed it.
+    event PriceAnchorsRefreshed(address indexed caller, uint256 at);
     event WeightsUpdated(address[] tokens, uint256[] oldWeights, uint256[] newWeights);
     event Rebalanced(
         address[] tokens,
@@ -621,6 +657,46 @@ contract PortfolioStrategy is BaseStrategy {
     function _execute() internal override {
         _requireAllowedAdapter(address(swapAdapter));
         _requireAllowedPriceSources();
+        // AN ORACLE ANCHOR IS REQUIRED BEFORE CAPITAL MOVES, in Data Streams
+        // mode only (audit finding #6).
+        //
+        // `_buyFloor`'s oracle read sits inside `if (chainlinkVerifier ==
+        // address(0))`, so in DS mode it is skipped and the floor falls back to
+        // `_lastGoodPrice[i]`. That slot is written only by `_verifyPrice`, and
+        // the sole pre-execute writer is `submitPriceReports` — nothing in
+        // `execute()`'s own path can seed it. So without this check the anchor
+        // is provably ZERO here for every slot on the first execute, and every
+        // buy floor degrades to `_quoteMinOut`: a quote taken in the same
+        // transaction, from the same venue the swap is about to hit, against a
+        // pool an attacker can move first. The floors' own natspec traces the
+        // loss at ~99% of the allocation, and `executeProposal` is permissionless
+        // so the attacker picks the block.
+        //
+        // FAIL CLOSED, because the alternative is spending the vault's capital
+        // through a floor that bounds nothing. This is the one path where
+        // refusing strands nothing: no funds have left the vault yet, the
+        // proposal simply stays Approved until someone supplies reports, and
+        // `settle`/`sweep` are untouched — the exits never depend on this.
+        //
+        // A GENEROUS BOUND ON PURPOSE. Reports expire, so one cannot be baked
+        // into propose-time calldata and still be alive at execute; the anchor
+        // has to be refreshed near execution by a separate call. Both
+        // `submitPriceReports` and `executeProposal` are permissionless, so the
+        // ordinary sequence is two transactions from the same caller — and the
+        // bound has to leave room for them to be blocks apart rather than
+        // atomic. `PRICE_ANCHOR_MAX_AGE_AT_EXECUTE` is sized for that, and is
+        // far tighter than `STALE_WIDEN_PERIOD`, which governs the post-execute
+        // ramp rather than the entry gate.
+        if (chainlinkVerifier != address(0)) {
+            uint256 n = _allocations.length;
+            for (uint256 i; i < n; ++i) {
+                if (_allocations[i].targetWeightBps == 0) continue;
+                uint256 at = _lastGoodAt[i];
+                if (at == 0 || block.timestamp - at > PRICE_ANCHOR_MAX_AGE_AT_EXECUTE) {
+                    revert PriceAnchorMissingOrStale(i);
+                }
+            }
+        }
 
         _pullFromVault(asset, totalAmount);
 
@@ -825,6 +901,68 @@ contract PortfolioStrategy is BaseStrategy {
         uint256[] oldBalances;
         uint256[] prices;
         uint256[] currentValues;
+    }
+
+    /// @notice Refresh every allocation's price anchor from signed Data Streams
+    ///         reports. Permissionless.
+    /// @param signedReports Signed reports, one per allocation, in the same order.
+    ///
+    /// @dev    WHY THIS EXISTS, AND WHY IT IS OPEN TO ANYONE. In push mode the
+    ///         contract fetches its own price: `_sellFloor`/`_buyFloor` read the
+    ///         aggregator on every swap and re-stamp the anchor, so the anchor
+    ///         ages only during a genuine oracle outage. In Data Streams mode it
+    ///         CANNOT fetch — a price only exists on-chain once somebody hands
+    ///         over a DON-signed report — and the whole live-read block sits
+    ///         behind `chainlinkVerifier == address(0)`, so in DS mode both
+    ///         re-stamps are skipped.
+    ///
+    ///         That left `_verifyPrice` as the only writer of `_lastGoodPrice`
+    ///         and `_lastGoodAt`, reachable solely from `rebalanceDelta`, which
+    ///         is `onlyProposer` — and `execute()`/`settle()`/`rebalance()` carry
+    ///         no report at all. Two consequences, both proposer-controlled with
+    ///         no oracle failure anywhere:
+    ///
+    ///           - the anchor is ZERO at `_execute`, so `_buyFloor` falls through
+    ///             to `_quoteMinOut`, a floor quoted from the very pool the swap
+    ///             is about to hit (audit finding #6);
+    ///           - after execute the anchor ages purely because the proposer
+    ///             declines to call `rebalanceDelta`, and `_staleSlippageBps`
+    ///             ramps the accepted loss from `maxSlippageBps` toward
+    ///             `MAX_STALE_SLIPPAGE_BPS` (30%) over `STALE_WIDEN_PERIOD`
+    ///             (audit finding #25). Settling into a wide band becomes a
+    ///             choice rather than a symptom.
+    ///
+    ///         PERMISSIONLESS IS THE FIX, and it is safe by CONSTRUCTION rather
+    ///         than by trust. `_verifyPrice` requires a DON signature through the
+    ///         governance-bound verifier, requires `report.feedId` to equal THIS
+    ///         slot's `_feedIds[i]` (so a valid report cannot be replayed into
+    ///         another slot), rejects an expired report, and rejects a
+    ///         non-positive price. A caller therefore cannot inject a false, a
+    ///         stale, or another asset's price — the only thing an adversarial
+    ///         caller can do here is tell the truth on time, which is precisely
+    ///         what the anchor is for. Whoever dislikes a widening band — an LP,
+    ///         a guardian, the keeper about to settle — can close it themselves.
+    ///
+    ///         Re-certifies the verifier on the same fail-closed terms as
+    ///         `rebalanceDelta`: the reports are DON-signed, but the contract
+    ///         CHECKING those signatures is proposer-supplied, governance-bound
+    ///         state.
+    ///
+    ///         No state gate: refreshing an anchor moves no funds, and it is
+    ///         useful before `execute` (to satisfy the freshness requirement
+    ///         there) and before `settle` (to tighten the band on the way out).
+    ///         In push mode this is a no-op by construction — `_verifyPrice`
+    ///         reverts `InvalidFeedId` on a non-empty report — so the function
+    ///         is DS-mode only without needing to say so.
+    function submitPriceReports(bytes[] calldata signedReports) external {
+        if (chainlinkVerifier == address(0)) revert PushModeNeedsNoReports();
+        uint256 len = _allocations.length;
+        if (signedReports.length != len) revert LengthMismatch();
+        _requireAllowedPriceSources();
+        for (uint256 i; i < len; ++i) {
+            _verifyPrice(i, signedReports[i]);
+        }
+        emit PriceAnchorsRefreshed(msg.sender, block.timestamp);
     }
 
     /// @notice Delta-based rebalance using Chainlink Data Streams prices. Only
@@ -1600,6 +1738,35 @@ contract PortfolioStrategy is BaseStrategy {
     /// @notice Number of tokens in the basket
     function allocationCount() external view returns (uint256) {
         return _allocations.length;
+    }
+
+    /// @notice The price-source identifier bound to allocation `index`.
+    /// @dev    In Data Streams mode this is the expected `feedId`, the exact
+    ///         value `_verifyPrice` matches a report against. In push mode it is
+    ///         the packed `(maxAge, aggregator)` word.
+    ///
+    ///         EXPOSED BECAUSE `submitPriceReports` IS PERMISSIONLESS. Anyone may
+    ///         refresh the anchor, so anyone must be able to discover WHICH feed
+    ///         to fetch a report for — otherwise the open function is only
+    ///         usable by whoever kept the init calldata, which would hand the
+    ///         proposer back the control the permissionless refresh exists to
+    ///         remove.
+    /// @param  index Allocation index; reverts on out of range.
+    function feedIdOf(uint256 index) external view returns (bytes32) {
+        if (index >= _allocations.length) revert LengthMismatch();
+        return _feedIds[index];
+    }
+
+    /// @notice When allocation `index`'s price anchor was last stamped, and the
+    ///         price it was stamped at. Zero `recordedAt` means never.
+    /// @dev    The pair `_staleSlippageBps` derives the widening band from, and
+    ///         what `_execute` checks against `PRICE_ANCHOR_MAX_AGE_AT_EXECUTE`.
+    ///         Exposed for the same reason as `feedIdOf`: a keeper deciding
+    ///         whether a refresh is needed before executing or settling should
+    ///         not have to infer it from events.
+    function priceAnchorOf(uint256 index) external view returns (uint256 price, uint256 recordedAt) {
+        if (index >= _allocations.length) revert LengthMismatch();
+        return (_lastGoodPrice[index], _lastGoodAt[index]);
     }
 
     /// @notice Get swap extra data for all tokens
