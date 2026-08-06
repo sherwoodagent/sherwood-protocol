@@ -115,31 +115,47 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
 
     /// @notice GL-14 — the counter-bond pool is keyed per PROPOSAL, not per
     ///         challenge (pashov 2026-08 finding #10), so this no longer asserts
-    ///         anything per-challenge. For every live (`Filed`/`Disputed`)
-    ///         challenge it now says three things about THE POOL THAT CHALLENGE
-    ///         BELONGS TO:
+    ///         anything per-challenge. Walking every live (`Filed`/`Disputed`)
+    ///         challenge, it says three things — two about THE POOL THAT
+    ///         CHALLENGE BELONGS TO, and one about the whole ledger those pools
+    ///         and bonds add up to:
     ///
     ///           1. Σ `counterBondContributionOf` over the pool's contributor
     ///              list equals the pool's `raisedWood` — the contributor ledger
     ///              and the pool total never diverge.
-    ///           2. The pool never HOLDS more than it raised
-    ///              (`poolWood <= raisedWood`).
+    ///           2. `bondedWood` equals Σ live challenge bonds + Σ DISTINCT
+    ///              open pool weights — the contract's own held-WOOD counter
+    ///              against the positions that counter is supposed to be
+    ///              summarising.
     ///
-    ///              NOT `poolWood == raisedWood`, and NOT `!burned`. A terminal
-    ///              pool coexisting with a live challenge is a NORMAL state
-    ///              here, in two ways: `_burnPool` fires on the first conviction
-    ///              regardless of `_liveCount`, and `_settle`'s incomplete-pool
-    ///              branch calls `_releasePool`, which is deliberately ungated
-    ///              for the same reason. Siblings stay `Filed` and keep reading
-    ///              `Disputed` through `_poolBacked` in both cases.
+    ///              NOT a comparison between `poolWood` and `raisedWood`, which
+    ///              is what this clause used to be and what it cannot be:
+    ///              `counterBondPoolOf` derives BOTH from `p.weight`, returning
+    ///              `outcome == Open ? raisedWood : 0` alongside `raisedWood`
+    ///              itself, so `poolWood == raisedWood` holds by construction
+    ///              wherever the outcome is `Open` and the check is
+    ///              unsatisfiable. A derived field and its own source can never
+    ///              disagree; an invariant has to cross an independent boundary.
     ///
-    ///              `counterBondPoolOf` reports `poolWood == 0` for ANY
-    ///              non-`Open` outcome while its `burned` flag is true only for
-    ///              `Burned` — so an equality fires on burned AND released
-    ///              pools, and adding a `!burned` guard alone would still fire
-    ///              on released ones. `test_settle_burnsTheSharedPoolExactlyOnce`
-    ///              and `_assertLiveBondsBacked`'s own note both pin the
-    ///              coexistence the strict form contradicts.
+    ///              `bondedWood` is that boundary. Every mutation of it is a
+    ///              position this loop can see: `file` adds a bond, `dispute`
+    ///              adds a contribution, `_settle`/`_fail`/`_refundAll` each
+    ///              remove one bond, and `_burnPool`/`_releasePool` each remove
+    ///              one pool. So the equality catches a decrement keyed on the
+    ///              wrong pool, a double decrement, and a pool left `Open` after
+    ///              its last live challenge terminated — none of which the old
+    ///              form could see. Unit-side sibling: `_assertLiveBondsBacked`
+    ///              in `ChallengeGame.t.sol`, which asserts the same shape.
+    ///
+    ///              `poolWood` is already zero for any non-`Open` outcome, so a
+    ///              burned or released pool drops out of the sum without a
+    ///              second read — a terminal pool coexisting with a live
+    ///              challenge stays the normal state it is.
+    ///
+    ///              Custody (`balanceOf >= bondedWood + unclaimedWood`) is a
+    ///              different statement and is pinned separately by GL-01. This
+    ///              one is about whether the counter is right, not whether the
+    ///              tokens are there.
     ///           3. The pool never exceeds its target — `dispute` clamps the
     ///              overshoot rather than refunding it.
     ///
@@ -152,6 +168,9 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     ///         here, which is the whole point of the fix.
     function property_GL14_counterBondPoolMatchesContributions() public view returns (bool) {
         uint256 n = game.challengeCount();
+        uint256 accounted;
+        bytes32[] memory seen = new bytes32[](n);
+        uint256 seenN;
         for (uint256 id = 1; id <= n; id++) {
             IChallengeGame.Challenge memory c = game.challengeOf(id);
             if (c.status != IChallengeGame.Status.Filed && c.status != IChallengeGame.Status.Disputed) continue;
@@ -163,16 +182,24 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
                 sum += game.counterBondContributionOf(id, contributors[j]);
             }
             if (sum != raisedWood) return false;
-            // STRICT, but only where it can be: an OPEN pool must still hold
-            // exactly what it raised. A terminal pool coexisting with a live
-            // challenge is normal on both paths (`_burnPool` on first
-            // conviction, `_releasePool` on the incomplete-pool branch), so the
-            // equality is scoped to `Open` rather than weakened to `<=` — which
-            // would assert almost nothing.
-            if (game.poolOutcomeOf(id) == IChallengeGame.PoolOutcome.Open && poolWood != raisedWood) return false;
             if (raisedWood > targetWood) return false;
+
+            // THE LEDGER SIDE. Every live challenge's own bond counts once;
+            // each PROPOSAL's pool counts once however many challenges share
+            // it, which is why the key is deduplicated rather than the id.
+            // `poolWood` is already zero for any closed pool, so a burned or
+            // released one contributes nothing and needs no second read.
+            accounted += c.bondWood;
+            bytes32 key = keccak256(abi.encode(c.governor, c.proposalId));
+            bool counted;
+            for (uint256 j; j < seenN; j++) {
+                if (seen[j] == key) counted = true;
+            }
+            if (counted) continue;
+            seen[seenN++] = key;
+            accounted += poolWood;
         }
-        return true;
+        return accounted == game.bondedWood();
     }
 
     // ── Counts and state consistency (GL-15, GL-16, GL-17, GL-18) ──
