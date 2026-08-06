@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {IStrategy} from "../interfaces/IStrategy.sol";
 import {IProposalStatus} from "../interfaces/IProposalStatus.sol";
+import {IStrategyDelivery} from "../interfaces/IStrategyDelivery.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -42,7 +43,7 @@ interface IAgentSet {
  *   Proposer can update tunable params (slippage, amounts) between execute
  *   and settle — no new proposal needed.
  */
-abstract contract BaseStrategy is IStrategy {
+abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
     using SafeERC20 for IERC20;
 
     // ── Errors ──
@@ -224,6 +225,20 @@ abstract contract BaseStrategy is IStrategy {
     /// @notice Current lifecycle state
     function state() external view returns (State) {
         return _state;
+    }
+
+    /// @inheritdoc IStrategyDelivery
+    /// @dev FALSE BY DEFAULT, and that is the safe default rather than a lazy
+    ///      one: this base has no idea what a given template can strand, and a
+    ///      template that answers true when it holds nothing would shut the
+    ///      vault's deposits until someone calls a sweep that moves nothing.
+    ///      Templates whose settlement is deliverable-maximum override it —
+    ///      `MorphoSupplyStrategy` (market utilization caps the withdrawal) and
+    ///      `ConcentratedLiquidityStrategy` (debt, collateral wrapper, LP legs).
+    ///      A template that always settles all-or-nothing correctly inherits
+    ///      this.
+    function hasUndeliveredValue() public view virtual returns (bool) {
+        return false;
     }
 
     // ── Internal helpers ──

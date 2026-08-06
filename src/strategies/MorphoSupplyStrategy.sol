@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
+import {IStrategyDelivery} from "../interfaces/IStrategyDelivery.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -273,6 +274,28 @@ contract MorphoSupplyStrategy is BaseStrategy {
     ///         deliverable maximum on each call, so a market that frees up
     ///         gradually can be swept repeatedly.
     /// @return assets The vault-asset amount pushed to the vault this call.
+    /// @inheritdoc IStrategyDelivery
+    /// @dev True while a settled proposal still has a supply position or idle
+    ///      asset on this clone — exactly what `sweep()` would move. The vault
+    ///      reads this to keep deposits shut over that window, because
+    ///      `totalAssets()` prices anything held here at zero and a depositor
+    ///      would otherwise mint against a NAV missing the residue.
+    ///
+    ///      MEASURED ON THE POSITION, NOT ON `_deliverableNow()`. Deliverability
+    ///      is a property of the MARKET's idle balance at this instant, and it
+    ///      is exactly the quantity an attacker manipulates with a flash loan.
+    ///      A residue that cannot be withdrawn right now is still value the
+    ///      vault does not count, so it must still hold deposits.
+    ///
+    ///      Only meaningful once Settled: before that the vault is already
+    ///      gated by `openProposalCount() != 0`, and answering true early would
+    ///      be redundant rather than wrong.
+    function hasUndeliveredValue() public view override returns (bool) {
+        if (_state != State.Settled) return false;
+        if (morpho.position(marketId, address(this)).supplyShares != 0) return true;
+        return IERC20(asset).balanceOf(address(this)) != 0;
+    }
+
     function sweep() external returns (uint256 assets) {
         if (_state != State.Settled) revert NotSettled();
         (uint256 shares, uint256 own, uint256 deliverable) = _deliverableNow();
