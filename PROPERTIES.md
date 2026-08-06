@@ -156,6 +156,47 @@ Checked after every call sequence.
   unwound (or the claim restated) is worth a decision rather than an
   assumption.
 
+  **RESOLVED 2026-08-06 — real, bounded, and benign. Both restatements I
+  proposed were wrong.** Measured directly (`test_x8_basisTable`), per guardian,
+  across a conviction:
+
+  | basis | before | after conviction |
+  |---|---:|---:|
+  | booking (`openExposureUsd`) | 1000e18 | 1000e18 |
+  | recorded | 1000e18 | 1000e18 |
+  | pledged | 1000e18 | 1000e18 |
+  | k x bond, LIVE | 1000e18 | **0** |
+  | k x bond, ANCHORED (`slashableStakeAt`) | 1000e18 | **0** |
+
+  Restating on the PLEDGE basis does not help — all three exposure accumulators
+  are unmoved by the slash. Restating on the ANCHORED bond does not help either
+  — it drops to zero alongside the live one, because a full slash leaves no
+  stake for a historical read to return. The earlier recommendation to prefer
+  the pledge basis (made twice) is withdrawn.
+
+  What actually happens: nothing decrements `_buckets`, `_recorded` or
+  `_reservedUsd` on the slash path, so a convicted guardian carries stranded
+  exposure against zero bond. It **self-heals** — `openExposureUsd` sums buckets
+  over a wall-clock window, and after `challengeWindow` plus the epoch boundary
+  it reads 0 again, with `hasFrozenCoverage` already false (the conviction
+  released the freeze).
+
+  Inside that window the guardian cannot `claimUnstakeGuardian` (G-28 gates on
+  open exposure) and cannot book new approvals (`capUsd == 0`). Both are correct
+  for an account with no stake, so the practical impact of the FULL-slash case
+  is nil.
+
+  **Recommendation: restate X-8 as a booking-time precondition — which is what
+  `recordApproval` enforces — and document the post-slash window as a bounded,
+  self-healing artifact. Do NOT add exposure release on slash: it is complexity
+  for no benefit.** GL-49 stays EXPLORATORY and is expected to fire; the
+  counterexample is evidence for the restatement, not a defect.
+
+  **Untested here:** the PARTIAL-slash case. A guardian slashed by less than
+  100% retains stake while carrying full pre-slash exposure until expiry, which
+  temporarily blocks both unstaking and approving. Defensible, but it is a real
+  liveness effect and this harness only exercised the 100% path.
+
 ### Liveness and economics
 
 - [ ] **GL-50** `EXPLORATORY` — an `Executed` proposal can always reach `Settled` through
@@ -185,6 +226,33 @@ Checked after every call sequence.
   makes sense to do it, and the protocol's only enforcement mechanism is
   economic. Recommend a documented operating band for these four parameters, or
   a monitored alert on `honestFilingBreaksEven()`.
+
+  **RESOLVED 2026-08-06 — full operating band characterised.** The invariant is
+  `challengerBondBps * settleBurnBps <= proposerBondBps * prosecutorFeeBps`.
+  Holding the other three at shipped defaults:
+
+  | parameter | default | break-even | setter max | can cross? |
+  |---|---:|---:|---:|---|
+  | `challengerBondBps` | 150 | <= 400 | 10 000 | yes — 25x past |
+  | `settleBurnBps` | 500 | <= 1 333 | 5 000 | yes — 3.75x past |
+  | `prosecutorFeeBps` | 2 000 | >= 750 | 2 000 | yes, by lowering |
+  | `proposerBondBps` | 100 | >= 37 | 10 000 | yes, by lowering |
+
+  Every parameter ships at a uniform **2.67x margin**, and THREE of the four
+  setters can individually cross break-even without touching the others.
+
+  The structural point is easy to miss: **`prosecutorFeeBps` already ships AT
+  its ceiling** (2 000 = `MAX_PROSECUTOR_FEE_BPS`). The reward side therefore has
+  no headroom — if the cost side is raised, there is nothing to raise in
+  compensation, and the only remedies are lowering the cost side again or
+  raising `proposerBondBps`.
+
+  **Recommendation:** (1) document the band above; (2) consume the existing
+  `honestFilingBreaksEven()` — it reports exactly this condition and nothing
+  currently reads it; (3) record in the deploy runbook that `prosecutorFeeBps`
+  is at its ceiling. Still NOT a setter guard, for the reasons above: the inputs
+  span two independently-owned contracts and a per-setter check would brick
+  reconfiguration.
 
 ---
 
