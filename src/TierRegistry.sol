@@ -166,6 +166,38 @@ contract TierRegistry is Ownable2Step {
     ///      bit, and exempting in-flight positions vault-side).
     mapping(address adapter => bool) private _calleeAllowed;
 
+    /// @dev EXPLICIT owner revocation of the callee axis, and the reason it
+    ///      needs its own slot. `_classAllowDenied` cannot serve: `_demote`
+    ///      writes it too, so honouring it in `isCallableTarget` would re-close
+    ///      the axis for exactly the demoted class-certified clones this split
+    ///      exists to rescue. But ignoring it outright left
+    ///      `setAdapterAllowed(a, false)` with NO effect on the callee axis for
+    ///      a class member — such a clone has no address entry, so
+    ///      `_calleeAllowed` is already false and clearing it bites nothing,
+    ///      and the class fallback then re-allowed it forever. Since anyone can
+    ///      permissionlessly deploy an ERC-1167 clone of a certified template
+    ///      to become a class member, that was a strict widening.
+    ///
+    ///      Set ONLY by `setAdapterAllowed(a, false)`; cleared by
+    ///      `setAdapterAllowed(a, true)`; `_demote` never touches it. That is
+    ///      the whole distinction: a conviction says "you may not be PAID
+    ///      again", an owner delisting says "the vault has no further business
+    ///      with you at all".
+    mapping(address adapter => bool) private _calleeRevoked;
+
+    /// @dev The CLASS half of the callee axis, mirroring `_calleeAllowed` on the
+    ///      address half. Set by `setClassAllowed(t, true)`, cleared only by
+    ///      `setClassAllowed(t, false)`; `_demoteClass` never touches it.
+    ///
+    ///      Without this the split did nothing for the case it most needed to
+    ///      cover. A per-proposal strategy clone has NO address entry — class
+    ///      standing is the only standing it ever had — so a class conviction
+    ///      cleared `_classAllowed`, `isCallableTarget`'s fallback read false,
+    ///      and the vault again could not reach the clone holding its capital.
+    ///      The address-entry version of the test passed regardless, which is
+    ///      why this went unnoticed until a class-clone test was written.
+    mapping(bytes32 classCodehash => bool) private _classCalleeAllowed;
+
     /// @dev Grant-time codehash snapshot for the allowlist axis. The adversary: an
     ///      allowlisted adapter whose bytecode is swapped at the same address, or
     ///      a codeless allowlisted address at which code later appears, otherwise
@@ -832,6 +864,9 @@ contract TierRegistry is Ownable2Step {
     ///         for the address path.
     function setAdapterAllowed(address adapter, bool allowed) external onlyOwner {
         _adapterAllowed[adapter] = allowed;
+        // Explicit revocation closes the callee axis for CLASS members too, who
+        // have no address entry for the line below to clear.
+        _calleeRevoked[adapter] = !allowed;
         // BOTH axes move together on an EXPLICIT owner decision. Only `_demote`
         // splits them (see `_calleeAllowed`): an owner delisting an address
         // means "the vault has no further business with you at all", while a
@@ -910,11 +945,16 @@ contract TierRegistry is Ownable2Step {
     ///         swapped under an allowlisted address. A clone's runtime is
     ///         immutable, so this never strands the case the fix targets.
     function isCallableTarget(address target) public view returns (bool) {
+        // Explicit owner delisting closes this axis outright, including via the
+        // class path below. `_demote` never sets this flag, so a CONVICTED
+        // clone stays reachable for the settlement batch that reclaims the
+        // vault's capital — which is the entire point of the split.
+        if (_calleeRevoked[target]) return false;
         if (_calleeAllowed[target] && _effectiveCodehash(target) == _adapterAllowedCodehash[target]) {
             return true;
         }
         bytes32 cch = _classOf(target);
-        return cch != bytes32(0) && _classAllowed[cch];
+        return cch != bytes32(0) && _classCalleeAllowed[cch];
     }
 
     /// @notice Allow or disallow `counterparty` as an address a STRATEGY
@@ -1308,6 +1348,10 @@ contract TierRegistry is Ownable2Step {
         bytes32 cch = cloneCodehashOf(template);
         if (allowed && _classAnchors[cch].template == address(0)) revert ClassNotCertified();
         _classAllowed[cch] = allowed;
+        // Callee axis moves with the owner's EXPLICIT decision, and only with
+        // it — `_demoteClass` deliberately leaves `_classCalleeAllowed` set so a
+        // convicted class stays reclaimable while becoming unfundable.
+        _classCalleeAllowed[cch] = allowed;
         emit ClassAllowedSet(template, cch, allowed);
     }
 

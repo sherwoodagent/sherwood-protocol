@@ -11,6 +11,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 
 /// @notice Stand-in for a strategy clone that currently custodies vault
 ///         capital. `settle()` is the call the vault MUST still be able to make
@@ -171,5 +172,58 @@ contract RegistryDemoteKeepsCalleeStandingTest is Test {
 
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchCallee.selector, address(strategy)));
         _runBatch(_one(address(strategy), abi.encodeWithSignature("settle()")));
+    }
+
+    /// @notice THE CLASS-PATH VERSION OF THE TEST ABOVE, and the one that
+    ///         actually bites. The address-entry version passes even with a
+    ///         broken predicate, because a `new`-deployed stub has an address
+    ///         entry for `setAdapterAllowed(a,false)` to clear — it never
+    ///         reaches the class fallback at all.
+    ///
+    /// @dev    A CLASS-CERTIFIED CLONE HAS NO ADDRESS ENTRY. `_calleeAllowed`
+    ///         is already false for it, so clearing that flag bites nothing,
+    ///         and the class fallback re-allows it on the very next read. The
+    ///         first cut of `isCallableTarget` dropped `_classAllowDenied`
+    ///         wholesale to keep DEMOTED clones reachable — which also deleted
+    ///         the only per-member denial lever an owner has over a class
+    ///         member, permanently, and anyone may permissionlessly deploy an
+    ///         ERC-1167 clone of a certified template to become one. Hence the
+    ///         dedicated `_calleeRevoked` flag, which `_demote` never writes.
+    function test_explicitOwnerRevocationClosesCalleeStandingForAClassMember() public {
+        // A real class member: an ERC-1167 clone of a certified template, with
+        // no address entry of its own.
+        address clone = Clones.clone(address(strategy));
+        tierRegistry.proposeClassCertification(
+            address(strategy), EXECUTE_SELECTOR, 1, 500, address(0), address(strategy).codehash
+        );
+        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay() + 1);
+        tierRegistry.certifyClass(address(strategy), EXECUTE_SELECTOR);
+        tierRegistry.setClassAllowed(address(strategy), true);
+
+        assertTrue(tierRegistry.isCallableTarget(clone), "precondition: reachable via the class path");
+
+        // The owner delists this specific member. It has no address entry, so
+        // this must bite through the class fallback or it bites nothing.
+        tierRegistry.setAdapterAllowed(clone, false);
+
+        assertFalse(tierRegistry.isCallableTarget(clone), "explicit revocation must close the class path too");
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchCallee.selector, clone));
+        _runBatch(_one(clone, abi.encodeWithSignature("settle()")));
+    }
+
+    /// @notice The other half: a DEMOTED class member must STAY callable, or
+    ///         the new flag has simply re-created the bug it was added to fix.
+    function test_demotedClassMemberRemainsCallable() public {
+        address clone = Clones.clone(address(strategy));
+        tierRegistry.proposeClassCertification(
+            address(strategy), EXECUTE_SELECTOR, 1, 500, address(0), address(strategy).codehash
+        );
+        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay() + 1);
+        tierRegistry.certifyClass(address(strategy), EXECUTE_SELECTOR);
+        tierRegistry.setClassAllowed(address(strategy), true);
+
+        tierRegistry.demoteClassByChallenge(address(strategy), EXECUTE_SELECTOR);
+
+        assertTrue(tierRegistry.isCallableTarget(clone), "a conviction must not strand the capital it holds");
     }
 }
