@@ -531,7 +531,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // would be ~0 and the floor derived from it would be vacuous — the exact
         // failure being fixed. Typed call: `pricePerShare()` is on
         // `ISyndicateVault` and every governor path already calls this vault.
-        _ppsSnapshots[proposalId] = ISyndicateVault(vault).pricePerShare();
+        // STORED OFFSET BY ONE so `0` unambiguously means "no anchor recorded"
+        // and can never mean "recorded as zero". `pricePerShare()` floors to 0
+        // whenever `totalAssets()` reads 0 against a large supply — a state
+        // `SyndicateVault` itself documents as reachable ("an escrow exceeding
+        // the float pins `totalAssets()` to 0") — and without the offset that
+        // would silently and totally disable this gate for the proposal.
+        _ppsSnapshots[proposalId] = ISyndicateVault(vault).pricePerShare() + 1;
 
         // Update state BEFORE external call (CEI pattern)
         _activeProposal = proposalId;
@@ -754,12 +760,14 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         view
         override
     {
-        uint256 ppsAtExecute = _ppsSnapshots[proposalId];
         // Zero means a proposal executed before this upgrade landed: there is no
         // anchor to measure against, and inventing one would gate in-flight
         // proposals on a figure never recorded. Those keep the pre-fix
-        // behaviour rather than becoming unsettleable.
-        if (ppsAtExecute == 0) return;
+        // behaviour rather than becoming unsettleable. The +1 offset at the
+        // write site is what keeps this branch meaning ONLY that.
+        uint256 anchor = _ppsSnapshots[proposalId];
+        if (anchor == 0) return;
+        uint256 ppsAtExecute = anchor - 1;
 
         // TWO BARS, because the two callers mean different things.
         //

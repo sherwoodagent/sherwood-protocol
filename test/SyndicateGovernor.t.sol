@@ -706,9 +706,12 @@ contract SyndicateGovernorTest is Test {
     function test_pashovFinding1_fullDrawdownEnvelope_capitalFloorStillDoesNotBind() public {
         uint256 pid = _createAndExecuteProposalWithDrawdown(10_000);
 
-        // A 90% loss: far past any declared envelope the capital floor would
+        // An 80% loss: far past any declared envelope the capital floor would
         // enforce, and still settleable because the voters accepted total loss.
-        deal(address(usdc), address(vault), 10_000e6);
+        // Deliberately NOT 10_000e6 — that is exactly the price floor, so the
+        // test would pass by ~9 wei of pps and flip red on any rounding change,
+        // while reading as if it exercised only the capital gate.
+        deal(address(usdc), address(vault), 20_000e6);
         vm.prank(agent);
         governor.settleProposal(pid);
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
@@ -723,8 +726,9 @@ contract SyndicateGovernorTest is Test {
     ///         `num = totalAssets() + 1` as the price EVERY queued deposit and
     ///         redeem is paid at.
     ///
-    ///         Proven on a live Robinhood fork before this test existed
-    ///         (`test/pocs/Finding2_VacuousDrawdownStampAtOne.t.sol`): deploy
+    ///         Proven on a live Robinhood fork before this test existed, with a
+    ///         PoC kept OUT of the repo (it needs an RPC and would red the
+    ///         non-fork CI job): deploy
     ///         100% of a 20,000 USDG vault into Morpho, queue a 1 USDG deposit,
     ///         then settle from inside a `flashLoan` that empties Morpho's idle
     ///         balance so the strategy delivers ZERO. The stamp lands at
@@ -742,13 +746,48 @@ contract SyndicateGovernorTest is Test {
         // The unwind delivers nothing — the state a flash loan manufactures.
         deal(address(usdc), address(vault), 0);
         vm.prank(agent);
-        vm.expectRevert();
+        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
         governor.settleProposal(pid);
 
         assertEq(
             uint256(governor.getProposal(pid).state),
             uint256(ISyndicateGovernor.ProposalState.Executed),
             "a refused settle must not advance the proposal"
+        );
+    }
+
+    /// @notice The legacy-anchor concession must (a) still let a proposal that
+    ///         executed BEFORE this upgrade settle, and (b) never be reachable
+    ///         by a new proposal. The `+1` offset at the write site is what
+    ///         separates those two, so pin it directly: force the raw slot to 0
+    ///         (the pre-upgrade state) and confirm the gate stands down.
+    function test_pashovFinding2_legacyProposalWithNoAnchorStillSettles() public {
+        uint256 pid = _createAndExecuteProposalWithDrawdown(10_000);
+
+        // Reproduce a pre-upgrade proposal: anchor slot never written.
+        bytes32 slot = keccak256(abi.encode(pid, uint256(65)));
+        vm.store(address(governor), slot, bytes32(0));
+
+        deal(address(usdc), address(vault), 0);
+        vm.prank(agent);
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
+    /// @notice The price floor's BOUNDARY, mirroring the capital floor's own
+    ///         at-the-floor / one-below pair. Without this the only price-floor
+    ///         evidence is a near-zero stamp, which says nothing about where the
+    ///         line actually sits.
+    function test_pashovFinding2_priceFloorBoundary() public {
+        uint256 pid = _createAndExecuteProposalWithDrawdown(10_000);
+        // 10% of the 100_000e6 basis is exactly MAX_STAMP_DRAWDOWN_BPS' floor.
+        deal(address(usdc), address(vault), 10_000e6);
+        vm.prank(agent);
+        governor.settleProposal(pid);
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Settled),
+            "at the floor it settles"
         );
     }
 
@@ -769,7 +808,7 @@ contract SyndicateGovernorTest is Test {
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
         deal(address(usdc), address(vault), 0);
         vm.prank(owner);
-        vm.expectRevert();
+        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
         governor.unstick(pid);
     }
 
