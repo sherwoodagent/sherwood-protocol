@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
+import {IStrategyDelivery} from "../interfaces/IStrategyDelivery.sol";
 import {ISwapAdapter} from "../interfaces/ISwapAdapter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
@@ -1748,6 +1749,31 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         set `_settle` can create, or the "recoverable later" claim above
     ///         is false for whichever step was left out — so the position
     ///         unwind is retried here too, not just the repay and the withdraw.
+    /// @inheritdoc IStrategyDelivery
+    /// @dev True while a settled proposal still has value on this clone that a
+    ///      `sweep()` or `releaseUnconvertible()` would move. The vault reads it
+    ///      to keep deposits shut over that window, since `totalAssets()` prices
+    ///      anything held here at zero.
+    ///
+    ///      Covers every leg this template can strand, which is more than the
+    ///      Morpho case: an open LP position, the ERC-4626 collateral wrapper,
+    ///      the `otherToken` side, and plain idle `asset`. `_settle` reports the
+    ///      first two through `SettlementIncomplete`; the last two are what
+    ///      `sweep`/`releaseUnconvertible` exist to return.
+    ///
+    ///      Reads BALANCES, not deliverability. Whether a wrapper will redeem or
+    ///      a pool will quote right now is the manipulable part; value the vault
+    ///      is not counting is the part that matters here.
+    function hasUndeliveredValue() public view override returns (bool) {
+        if (_state != State.Settled) return false;
+        if (tokenId != 0) return true;
+        if (IERC20(asset).balanceOf(address(this)) != 0) return true;
+        if (IERC20(otherToken).balanceOf(address(this)) != 0) return true;
+        address coll = _marketParams.collateralToken;
+        if (coll != asset && IERC20(coll).balanceOf(address(this)) != 0) return true;
+        return false;
+    }
+
     function sweep() external nonReentrant returns (uint256 assets) {
         if (_state != State.Settled) revert NotSettled();
 
