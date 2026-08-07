@@ -38,6 +38,12 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     using EnumerableSet for EnumerableSet.UintSet;
 
     // ── Errors ──
+    /// @notice `createSyndicate` was called while the factory has no
+    ///         `tierRegistry` wired (pashov finding #1). A governor created in
+    ///         that state is permanently registry-less, and
+    ///         `SyndicateVault._guardBatchCalls` degrades OPEN without one —
+    ///         wire the registry with `setTierRegistry` first.
+    error TierRegistryNotWired();
     error InvalidExecutorImpl();
     error InvalidVaultImpl();
     error InvalidENSRegistrar();
@@ -361,11 +367,27 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         IGuardianRegistry(guardianRegistry).addGovernor(govProxy, vault);
         // Push the adapter-selector tier registry into the fresh governor.
         // `setTierRegistry` is onlyFactory, so this is the sole wiring point.
-        // When `tierRegistry` is unset the governor keeps its safe tier-2
-        // default — skip the call rather than write address(0).
-        if (tierRegistry != address(0)) {
-            ISyndicateGovernor(govProxy).setTierRegistry(tierRegistry);
-        }
+        //
+        // REFUSES RATHER THAN SKIPS (pashov finding #1). This used to read
+        // `if (tierRegistry != address(0))` and quietly leave the governor
+        // registry-less, on the premise that it "keeps its safe tier-2 default".
+        // That is a PRICING default; what a missing registry actually removes is
+        // a CAPABILITY gate. `SyndicateVault._guardBatchCalls` resolves no
+        // registry and RETURNS, dropping the callee allowlist, the
+        // spender/recipient gate and the `UnrecognizedAssetSelector` branch on
+        // the way out — after which one batch instruction,
+        // `asset.approve(attacker, max)`, moves ZERO balance, so the net-outflow
+        // meter, the per-call cap and `requiredCoverage` all read zero, and the
+        // vault is drained in a LATER transaction no meter watches.
+        //
+        // A vault created in that window stayed registry-less permanently, so
+        // the window was not transient — it was inherited. Refusing here makes
+        // the state unreachable by ordinary deploy ordering; the paired
+        // `setTierRegistry` zero-check on the governor closes the other route.
+        // `Deploy.s.sol` already wires the registry in the same function that
+        // creates it, so no supported deployment loses anything.
+        if (tierRegistry == address(0)) revert TierRegistryNotWired();
+        ISyndicateGovernor(govProxy).setTierRegistry(tierRegistry);
         // Same idiom for the exposure-ledger and bond-escrow wiring slots:
         // `setExposureLedger` / `setBondEscrow` are onlyFactory, so this is the
         // sole wiring point at creation. Unset ⇒ skip the call, leaving the

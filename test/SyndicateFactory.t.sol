@@ -69,6 +69,16 @@ contract SyndicateFactoryTest is Test {
                 }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
+        // pashov finding #1: `createSyndicate` now REFUSES without a wired
+        // TierRegistry (a registry-less governor makes the vault's batch guard
+        // degrade open), so every factory fixture must wire one.
+        // HOISTED: a call in argument position consumes a pending one-shot
+        // `vm.prank`, so `factory.owner()` inline would eat it and the setter
+        // would run unpranked (OwnableUnauthorizedAccount).
+        address _factoryOwner = factory.owner();
+        TierRegistry _fixtureTierRegistry = new TierRegistry(_factoryOwner);
+        vm.prank(_factoryOwner);
+        factory.setTierRegistry(address(_fixtureTierRegistry));
 
         // Mint ERC-8004 identity NFTs for creators
         creator1AgentId = agentRegistry.mint(creator1);
@@ -244,6 +254,15 @@ contract SyndicateFactoryTest is Test {
         usdc.approve(vaultAddr, 50_000e6);
         vault.deposit(50_000e6, lp);
         vm.stopPrank();
+
+        // The fixture now wires a real TierRegistry (pashov finding #1), so the
+        // vault's spender gate is LIVE rather than skipped — allowlist the
+        // approve target the way a real deployment would.
+        address _owner = factory.owner();
+        TierRegistry _reg = TierRegistry(factory.tierRegistry());
+        address _protocolSpender = makeAddr("protocol");
+        vm.prank(_owner);
+        _reg.setAdapterAllowed(_protocolSpender, true);
 
         // Governor executes batch (strategy-style approve — onlyGovernor after V-C3)
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
@@ -848,16 +867,68 @@ contract SyndicateFactoryTest is Test {
     ///         other factory tests run with `tierRegistry == address(0)` (governor
     ///         keeps the tier-2 default), so this is the only end-to-end proof of
     ///         the non-zero push.
+    /// @notice pashov finding #1 (route 1) — a vault must not be CREATABLE
+    ///         without a TierRegistry.
+    /// @dev    `createSyndicate` SKIPPED the wiring when the factory's own
+    ///         pointer was unset, rather than refusing, so every vault created
+    ///         in that window was permanently registry-less. In that state
+    ///         `SyndicateVault._guardBatchCalls` resolves no registry and
+    ///         RETURNS, skipping the callee allowlist, the spender/recipient
+    ///         gate and the `UnrecognizedAssetSelector` branch — after which one
+    ///         instruction, `asset.approve(attacker, max)`, moves zero balance
+    ///         (so every meter reads zero) and licenses an unbounded pull in a
+    ///         LATER transaction.
+    ///
+    ///         Closing the STATE rather than the symptom: the vault's runtime
+    ///         guard is deliberately untouched here. See
+    ///         `test_setTierRegistry_rejectsZero` for the other route.
+    function test_createSyndicate_refusesWhileFactoryHasNoRegistry() public {
+        // setUp wires one, so reproduce the unwired state explicitly. The
+        // FACTORY-side setter still accepts zero on purpose: zeroing it blocks
+        // NEW syndicates (fail-closed) rather than opening anything, unlike the
+        // governor-side setter which is now zero-rejecting.
+        vm.prank(owner);
+        factory.setTierRegistry(address(0));
+        assertEq(factory.tierRegistry(), address(0), "precondition: factory has no registry");
+
+        vm.prank(creator1);
+        vm.expectRevert(SyndicateFactory.TierRegistryNotWired.selector);
+        factory.createSyndicate(creator1AgentId, _configWithSubdomain("no-registry"));
+    }
+
+    /// @notice pashov finding #1 (route 2) — a wired registry must not be
+    ///         REMOVABLE. `setTierRegistry(address(0))` was explicitly legal and
+    ///         its natspec called it "the safe default"; it re-opens the batch
+    ///         gate for every subsequent proposal on that governor.
+    function test_setTierRegistry_rejectsZero() public {
+        TierRegistry reg = new TierRegistry(owner);
+        vm.prank(owner);
+        factory.setTierRegistry(address(reg));
+
+        vm.prank(creator1);
+        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _configWithSubdomain("wired"));
+        address gov = factory.governorOf(vaultAddr);
+        assertEq(SyndicateGovernor(gov).tierRegistry(), address(reg), "precondition: governor is wired");
+
+        vm.prank(address(factory));
+        vm.expectRevert();
+        SyndicateGovernor(gov).setTierRegistry(address(0));
+    }
+
     function test_createSyndicate_pushesTierRegistryToGovernor() public {
         TierRegistry tierRegistry = new TierRegistry(owner);
 
-        // Baseline: with no registry wired, a governor comes up tier-registry-less.
+        // Baseline REWRITTEN for pashov finding #1: a governor can no longer
+        // come up tier-registry-less, because `createSyndicate` refuses while
+        // the factory has none. What this test still proves is the PUSH — that
+        // whatever the factory holds reaches the fresh governor — so the
+        // baseline is now "the setUp registry", not "address(0)".
         vm.prank(creator1);
         (, address vaultDefault) = factory.createSyndicate(creator1AgentId, _configWithSubdomain("tier-default"));
         assertEq(
             SyndicateGovernor(factory.governorOf(vaultDefault)).tierRegistry(),
-            address(0),
-            "unset factory registry => governor keeps tier-2 default"
+            factory.tierRegistry(),
+            "governor picks up whatever the factory holds"
         );
 
         // Owner wires the registry; only governors created AFTER pick it up.
