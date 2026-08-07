@@ -13,6 +13,7 @@ import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {ScriptBase} from "../ScriptBase.sol";
 
 /**
@@ -141,7 +142,18 @@ contract DeployTestnet is ScriptBase {
         require(address(factory) == predictedFactoryProxy, "factory addr mismatch");
         console.log("SyndicateFactory:", address(factory));
 
-        // 6. Wire governor → factory. Setters apply immediately.
+        // 6. Tier registry — REQUIRED before any syndicate can be created.
+        //    `createSyndicate` now reverts `TierRegistryNotWired()` rather than
+        //    silently leaving a governor registry-less (pashov finding #1): a
+        //    vault created without one makes `_guardBatchCalls` degrade OPEN,
+        //    and that state was inherited permanently. Mirrors the production
+        //    `script/Deploy.s.sol`, which wires it in the same function that
+        //    creates it. Deployer-owned at birth so the launch adapter set can
+        //    be announced before any multisig handoff.
+        TierRegistry tierRegistry = new TierRegistry(deployer);
+        factory.setTierRegistry(address(tierRegistry));
+        console.log("TierRegistry:", address(tierRegistry));
+
         //    Guardian fee recipient pinned at init — no separate wiring.
         // factory set at governor initialize time (per-vault design)
 

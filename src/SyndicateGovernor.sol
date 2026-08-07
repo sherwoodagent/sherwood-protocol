@@ -2230,6 +2230,18 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      — the factory's own `setTierRegistry` only reaches governors created
     ///      after it.
     function setTierRegistry(address newRegistry) external onlyFactory {
+        // ZERO IS NO LONGER LEGAL (pashov finding #1). The natspec above used to
+        // call un-wiring "the pre-registry safe default"; it is not. The vault's
+        // batch guard resolves the registry through this slot and, finding none,
+        // RETURNS — dropping the callee allowlist, the spender/recipient gate
+        // and the `UnrecognizedAssetSelector` branch. An `approve` then moves
+        // zero balance past every meter and licenses an unbounded pull later.
+        //
+        // Re-pointing to a DIFFERENT registry stays legal; only removal is
+        // refused. Paired with `SyndicateFactory.createSyndicate`'s refusal to
+        // create a governor without one, this makes the registry-less state
+        // unreachable rather than merely unlikely.
+        if (newRegistry == address(0)) revert TierRegistryNotWired();
         emit TierRegistrySet(_tierRegistry, newRegistry);
         _tierRegistry = newRegistry;
     }

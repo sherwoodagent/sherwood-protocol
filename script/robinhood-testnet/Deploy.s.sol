@@ -13,6 +13,7 @@ import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {ScriptBase} from "../ScriptBase.sol";
 
 /**
@@ -126,7 +127,18 @@ contract DeployRobinhoodTestnet is ScriptBase {
         require(address(factory) == predictedFactoryProxy, "factory addr mismatch");
         console.log("SyndicateFactory:", address(factory));
 
-        // 6. Per-vault governors are deployed by the factory at createSyndicate
+        // 6. Tier registry — REQUIRED before any syndicate can be created.
+        //    `createSyndicate` now reverts `TierRegistryNotWired()` rather than
+        //    silently leaving a governor registry-less (pashov finding #1): a
+        //    vault created without one makes `_guardBatchCalls` degrade OPEN,
+        //    and that state was inherited permanently. Mirrors the production
+        //    `script/Deploy.s.sol`, which wires it in the same function that
+        //    creates it.
+        TierRegistry tierRegistry = new TierRegistry(deployer);
+        factory.setTierRegistry(address(tierRegistry));
+        console.log("TierRegistry:", address(tierRegistry));
+
+        //    Per-vault governors are deployed by the factory at createSyndicate
         //    and authorized on the registry via addGovernor — no singleton wiring.
 
         vm.stopBroadcast();

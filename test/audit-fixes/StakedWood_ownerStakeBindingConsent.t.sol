@@ -16,6 +16,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockL2Registrar} from "../mocks/MockL2Registrar.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 
 /// @title StakedWood_ownerStakeBindingConsent — issue #98 regression
 /// @notice `SyndicateFactory.rotateOwner(vault, newOwner)` authorizes only
@@ -136,6 +137,16 @@ contract StakedWood_ownerStakeBindingConsent is Test {
                 }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
+        // pashov finding #1: `createSyndicate` now REFUSES without a wired
+        // TierRegistry (a registry-less governor makes the vault's batch guard
+        // degrade open), so every factory fixture must wire one.
+        // HOISTED: a call in argument position consumes a pending one-shot
+        // `vm.prank`, so `factory.owner()` inline would eat it and the setter
+        // would run unpranked (OwnableUnauthorizedAccount).
+        address _factoryOwner = factory.owner();
+        TierRegistry _fixtureTierRegistry = new TierRegistry(_factoryOwner);
+        vm.prank(_factoryOwner);
+        factory.setTierRegistry(address(_fixtureTierRegistry));
         require(address(factory) == predictedFactoryProxy, "factory address prediction mismatch");
 
         wood.mint(mallory, 200_000e18);

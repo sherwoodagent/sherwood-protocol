@@ -24,6 +24,13 @@ contract DenyAllTierRegistry {
     function isAdapterAllowed(address) external pure returns (bool) {
         return false;
     }
+
+    /// @dev Callee axis (pashov finding #14). Mirrors the adapter axis: these
+    ///      tests hit Part 1's unconditional target denylist before PART 2a is
+    ///      reached, so denying both keeps every assertion meaning what it did.
+    function isCallableTarget(address) external pure returns (bool) {
+        return false;
+    }
 }
 
 /// @dev issue #166 companion fixture: `DenyAllTierRegistry` above is
@@ -43,6 +50,13 @@ contract AllowlistableTierRegistry {
 
     function setAdapterAllowed(address adapter, bool allowed) external {
         isAdapterAllowed[adapter] = allowed;
+    }
+
+    /// @dev Callee axis (pashov finding #14) — mirrors the adapter axis here,
+    ///      since this fixture exists only to let ONE ordinary adapter stay
+    ///      reachable, not to exercise the demotion asymmetry.
+    function isCallableTarget(address target) external view returns (bool) {
+        return isAdapterAllowed[target];
     }
 }
 

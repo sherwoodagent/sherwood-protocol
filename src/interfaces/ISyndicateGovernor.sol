@@ -311,6 +311,11 @@ interface ISyndicateGovernor {
     /// @notice Revert if `envelope.maxDrawdownBps > 10_000` at propose — a
     ///         drawdown declaration cannot exceed 100% of committed capital.
     error InvalidDrawdown();
+    /// @notice `setTierRegistry(address(0))` (pashov finding #1). Un-wiring the
+    ///         registry re-opens `SyndicateVault._guardBatchCalls`, which
+    ///         resolves the registry through this slot and degrades OPEN when it
+    ///         finds none. Re-pointing to a different registry stays legal.
+    error TierRegistryNotWired();
     /// @notice Revert if the realized vault balance at `settleProposal` sits
     ///         below the proposal's declared drawdown floor. `settleProposal`
     ///         freezes the Lane B settle price for every queued deposit and

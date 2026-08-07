@@ -18,3 +18,8 @@ fizz_data/crytic-export/
 fizz_data/last-run.json
 crytic-export/
 slither_results.json
+
+# Fork-only exploit PoCs kept locally: they vm.skip() without an RPC, and
+# ci.yml's --no-match-path excludes test/integration/** but not this path,
+# so committing them turns the RPC-less job red with [FAIL: skipped].
+test/pocs/

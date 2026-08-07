@@ -89,6 +89,16 @@ contract FactoryCoverageWiringTest is Test {
                 }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
+        // pashov finding #1: `createSyndicate` now REFUSES without a wired
+        // TierRegistry (a registry-less governor makes the vault's batch guard
+        // degrade open), so every factory fixture must wire one.
+        // HOISTED: a call in argument position consumes a pending one-shot
+        // `vm.prank`, so `factory.owner()` inline would eat it and the setter
+        // would run unpranked (OwnableUnauthorizedAccount).
+        address _factoryOwner = factory.owner();
+        TierRegistry _fixtureTierRegistry = new TierRegistry(_factoryOwner);
+        vm.prank(_factoryOwner);
+        factory.setTierRegistry(address(_fixtureTierRegistry));
 
         creator1AgentId = agentRegistry.mint(creator1);
         creator2AgentId = agentRegistry.mint(creator2);
@@ -165,7 +175,12 @@ contract FactoryCoverageWiringTest is Test {
     ///         rescued by `pushWiring` for all three slots at once.
     function test_pushWiring_rewiresExistingGovernor() public {
         (address gov,) = _createSyndicate(); // created BEFORE wiring existed
-        assertEq(SyndicateGovernor(gov).tierRegistry(), address(0), "precondition: unwired");
+        // pashov finding #1: the TIER REGISTRY can no longer be unwired at
+        // creation — `createSyndicate` refuses without one — so the governor
+        // comes up holding the fixture's registry. The ledger and escrow slots
+        // are unaffected and still model the LOW-1 case; what this test proves
+        // is that `pushWiring` RE-POINTS all three, which is unchanged.
+        assertTrue(SyndicateGovernor(gov).tierRegistry() != address(0), "precondition: registry always wired");
         assertEq(SyndicateGovernor(gov).exposureLedger(), address(0), "precondition: unwired");
         assertEq(SyndicateGovernor(gov).bondEscrow(), address(0), "precondition: unwired");
 

@@ -39,6 +39,17 @@ contract MockPermissiveTierRegistry {
         return !denied[adapter] && !deniedAsAdapter[adapter];
     }
 
+    /// @notice The CALLEE axis (`_guardBatchCalls` PART 2a), split out of
+    ///         `isAdapterAllowed` per pashov finding #14.
+    /// @dev    Tracks the strong grant here rather than adding a third denial
+    ///         switch: no strategy fixture is exercising the demotion asymmetry
+    ///         (that lives in `Registry_demoteKeepsCalleeStanding.t.sol` against
+    ///         the REAL registry), so mirroring keeps every existing refusal
+    ///         test meaning exactly what it meant before the split.
+    function isCallableTarget(address target) external view returns (bool) {
+        return !denied[target] && !deniedAsAdapter[target];
+    }
+
     function isCounterpartyAllowed(address counterparty) external view returns (bool) {
         return !denied[counterparty];
     }
