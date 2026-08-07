@@ -328,6 +328,14 @@ interface ISyndicateGovernor {
     ///                  capital it actually covers, NOT a percentage of the
     ///                  whole fund.
     error SettlementBelowDrawdownFloor(uint256 realized, uint256 floor);
+    /// @notice The settle PRICE fell below the floor anchored at execute
+    ///         (pashov finding #2). Distinct from `SettlementBelowDrawdownFloor`,
+    ///         which bounds the strategy's absolute capital loss: this one
+    ///         bounds what may be FROZEN as the price every queued deposit and
+    ///         redeem is paid at. Two different questions, two separate gates —
+    ///         the first is waivable to nothing by a 100% drawdown declaration,
+    ///         and this one is not.
+    error SettlePriceBelowFloor(uint256 ppsNow, uint256 ppsFloor);
     /// @notice Revert if `claimUnclaimedFees` is called for a vault whose
     ///         proposal is currently Executed. An escrowed fee leaving the
     ///         vault mid-strategy is indistinguishable from a strategy loss to
