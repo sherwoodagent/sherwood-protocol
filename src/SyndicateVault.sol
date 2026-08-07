@@ -1530,8 +1530,7 @@ contract SyndicateVault is
         // length-checked staticcall: a governor that cannot answer leaves the
         // pin at zero, which `_depositsLocked` reads as nothing outstanding —
         // the pre-existing behaviour, not a stricter one.
-        (bool okS, bytes memory retS) =
-            msg.sender.staticcall(abi.encodeCall(IProposalStatus.strategyOf, (proposalId)));
+        (bool okS, bytes memory retS) = msg.sender.staticcall(abi.encodeCall(IProposalStatus.strategyOf, (proposalId)));
         _lastSettledStrategy = (okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0);
 
         address q = _withdrawalQueue;
