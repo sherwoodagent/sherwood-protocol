@@ -384,8 +384,11 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         // the window was not transient — it was inherited. Refusing here makes
         // the state unreachable by ordinary deploy ordering; the paired
         // `setTierRegistry` zero-check on the governor closes the other route.
-        // `Deploy.s.sol` already wires the registry in the same function that
-        // creates it, so no supported deployment loses anything.
+        // Every in-repo deploy script now wires the registry before creating a
+        // syndicate — `script/Deploy.s.sol` always did (same function that
+        // creates it); `script/testnet/` and `script/robinhood-testnet/` were
+        // brought in line with this change, since they deploy their own factory
+        // and would otherwise revert here on the first `createSyndicate`.
         if (tierRegistry == address(0)) revert TierRegistryNotWired();
         ISyndicateGovernor(govProxy).setTierRegistry(tierRegistry);
         // Same idiom for the exposure-ledger and bond-escrow wiring slots:
