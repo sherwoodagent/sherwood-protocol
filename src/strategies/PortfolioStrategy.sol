@@ -1702,6 +1702,33 @@ contract PortfolioStrategy is BaseStrategy {
         if (block.timestamp > report.expiresAt) revert StalePrice();
         if (report.price <= 0) revert InvalidAmount();
 
+        // THE ANCHOR IS DATED BY OBSERVATION, NOT BY SUBMISSION, and it may only
+        // ever move FORWARD. Both halves are load-bearing now that
+        // `submitPriceReports` is permissionless.
+        //
+        // Dating by `block.timestamp` measured how recently someone pressed
+        // submit, not how old the price is — so `PRICE_ANCHOR_MAX_AGE_AT_EXECUTE`
+        // really meant "Chainlink's expiry window plus an hour", a bound this
+        // contract neither reads nor controls. Requiring the anchor to advance
+        // is what removes report SELECTION as an attacker capability: within the
+        // set of still-unexpired reports, a caller could otherwise pick the one
+        // whose price suits them — the highest to depress a buy floor and
+        // sandwich the fill, the lowest to push the floor out of reach and grief
+        // `execute` until `executeBy` lapses. Every such report is genuinely
+        // DON-signed; the attack is choosing among true statements, so the fix
+        // has to constrain WHICH truth is admissible rather than check
+        // signatures harder.
+        //
+        // Monotonicity also makes the permissionless entrypoint safe by
+        // construction: the most an adversarial caller can do is advance the
+        // anchor to a fresher observation, which is the honest action.
+        if (report.observationsTimestamp > block.timestamp) revert StalePrice();
+        // STRICTLY BACKWARDS is the attack; equal is not. Re-presenting the
+        // report already anchored is legitimate and idempotent — `rebalanceDelta`
+        // routinely carries the same report `submitPriceReports` just recorded —
+        // so only a report OLDER than the anchor is refused.
+        if (report.observationsTimestamp < _lastGoodAt[i]) revert StalePrice();
+
         // Chainlink prices are int192 with the report's declared decimals (8 for
         // tokenized stocks, 18 for crypto pairs). The raw oracle units are
         // preserved here; decimal-correct scaling happens in `rebalanceDelta`
@@ -1725,7 +1752,13 @@ contract PortfolioStrategy is BaseStrategy {
         // In lockstep, always — `_staleSlippageBps` derives the band from this
         // age, so an anchor recorded without its timestamp would be judged as
         // maximally stale and get the widest band on its very first use.
-        _lastGoodAt[i] = block.timestamp;
+        //
+        // OBSERVATION TIME, not `block.timestamp`: this is what makes both
+        // `PRICE_ANCHOR_MAX_AGE_AT_EXECUTE` and `_staleSlippageBps` measure the
+        // age of the PRICE rather than the age of the transaction that carried
+        // it. Widening the band for a price that is genuinely old is the point
+        // of that ramp; dating it by submission defeated it.
+        _lastGoodAt[i] = report.observationsTimestamp;
     }
 
     // ── View functions ──

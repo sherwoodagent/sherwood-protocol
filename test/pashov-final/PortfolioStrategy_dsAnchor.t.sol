@@ -77,6 +77,66 @@ contract PashovFinalDsAnchorTest is PortfolioStrategyTest {
 
     // ── #25: refreshing is not the proposer's private lever ──
 
+    /// @notice REPORT SELECTION IS THE ATTACK, and monotonicity is what removes
+    ///         it. `submitPriceReports` is permissionless and every report it
+    ///         accepts is genuinely DON-signed — so the adversary does not forge
+    ///         anything, they CHOOSE among true statements. Within the set of
+    ///         still-unexpired reports they would pick the price that suits
+    ///         them: the highest to depress a buy floor and sandwich the fill,
+    ///         the lowest to push the floor out of reach and grief `execute`
+    ///         until `executeBy` lapses.
+    ///
+    ///         Dating the anchor by `block.timestamp` made every unexpired
+    ///         report look equally fresh, so the freshness gate could not tell
+    ///         them apart. Dating by `observationsTimestamp` and refusing a
+    ///         BACKWARDS move means the only thing a caller can do is advance
+    ///         the anchor to a fresher observation — the honest action.
+    function test_anchor_refusesAnOlderObservationThanAlreadyAnchored() public {
+        // Foundry starts at timestamp 1; a negative observation skew below would
+        // underflow rather than model an older report.
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        bytes[] memory fresh = new bytes[](3);
+        fresh[0] = _signedReport(0, int192(int256(0.01e18)));
+        fresh[1] = _signedReport(1, int192(int256(0.02e18)));
+        fresh[2] = _signedReport(2, int192(int256(0.005e18)));
+        strategy.submitPriceReports(fresh);
+
+        (, uint256 anchoredAt) = strategy.priceAnchorOf(0);
+        assertEq(anchoredAt, block.timestamp, "anchored at the observation time");
+
+        // Same signature validity, same expiry window — only OLDER, and
+        // carrying whatever price the attacker prefers.
+        verifier.setObsSkew(-60);
+        bytes[] memory stale = new bytes[](3);
+        stale[0] = _signedReport(0, int192(int256(0.05e18)));
+        stale[1] = _signedReport(1, int192(int256(0.02e18)));
+        stale[2] = _signedReport(2, int192(int256(0.005e18)));
+
+        vm.expectRevert(PortfolioStrategy.StalePrice.selector);
+        strategy.submitPriceReports(stale);
+
+        (uint256 price, uint256 at) = strategy.priceAnchorOf(0);
+        assertEq(price, 0.01e18, "the anchor must not have moved");
+        assertEq(at, anchoredAt, "nor its date");
+    }
+
+    /// @notice The anchor is dated by OBSERVATION, so a report that sat unsent
+    ///         is judged on the age of its price rather than on how recently it
+    ///         was relayed — which is what `PRICE_ANCHOR_MAX_AGE_AT_EXECUTE` and
+    ///         `_staleSlippageBps` both need in order to mean anything.
+    function test_anchor_isDatedByObservationNotSubmission() public {
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        verifier.setObsSkew(-30);
+        bytes[] memory reports = new bytes[](3);
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
+        reports[2] = _signedReport(2, int192(int256(0.005e18)));
+        strategy.submitPriceReports(reports);
+
+        (, uint256 at) = strategy.priceAnchorOf(0);
+        assertEq(at, block.timestamp - 30, "dated by the observation, not the transaction");
+    }
+
     /// @notice THE PIN FOR #25. `submitPriceReports` is permissionless, so a
     ///         proposer cannot widen the band by simply declining to refresh —
     ///         any LP, guardian or keeper closes it instead.
