@@ -94,6 +94,26 @@ The list SHALL name `PORTFOLIO_TEMPLATE`, `MORPHO_SUPPLY_TEMPLATE` and `CONCENTR
 - **WHEN** a deprecated key is re-added to `_templateKeys()`
 - **THEN** the exact-set assertion in `test/deploy/DeployMorphoStrategy.t.sol` FAILS, because a key with no backing contract overstates what the protocol can propose
 
+### Requirement: The Uniswap V3 factory is counterparty-allowlisted before the CL template ships
+
+`ConcentratedLiquidityStrategy._initialize` binds its proposer-supplied `uniswapFactory` through `vault() -> governor() -> tierRegistry() -> isCounterpartyAllowed` and reverts `CounterpartyNotAllowed` otherwise. That binding is load-bearing rather than defensive: the pool's provenance is settled by asking that factory `getPool(token0, token1, fee)`, so a factory the proposer chose is no authority at all (pashov 2026-08 finding #4).
+
+An unlisted factory therefore does not degrade the template, it makes it INERT — the ceremony completes, `DeployStrategyFactory` allowlists the template, agents write proposals, and every one reverts at clone-init. The registry owner SHALL call `TierRegistry.setCounterpartyAllowed(UNISWAP_V3_FACTORY, true)` before `DeployConcentratedLiquidityStrategy` runs.
+
+This SHALL be enforced as a deploy-time assertion, not as prose in a runbook. `TierRegistry` is `Ownable2Step` and belongs to the parameter multisig, so the deployer key cannot make the grant itself — but the grant depends on no artifact this phase produces, so requiring it is a scheduling constraint rather than a circular one. The assertion SHALL skip only when the address book carries no `TIER_REGISTRY` key (a fork or partial deployment where the core phase never ran), and SHALL fail when the named registry cannot answer the selector — a registry that cannot be asked has not vouched.
+
+#### Scenario: Ceremony run before the grant
+- **WHEN** `DeployConcentratedLiquidityStrategy` runs and `isCounterpartyAllowed(UNISWAP_V3_FACTORY)` is false
+- **THEN** the script reverts naming the exact call the registry owner must make, before the template is deployed or written to the address book
+
+#### Scenario: Registry named but unanswerable
+- **WHEN** the address book's `TIER_REGISTRY` holds no code, or answers `isCounterpartyAllowed` with anything other than a 32-byte word
+- **THEN** the script reverts rather than treating the silence as a grant
+
+#### Scenario: Core phase never ran
+- **WHEN** the address book carries no `TIER_REGISTRY` key at all
+- **THEN** the script proceeds and prints the required `setCounterpartyAllowed` call as a RUNBOOK line, because the grant cannot be verified from there
+
 ### Requirement: Core wiring order inside deployCore
 The canonical `DeploySherwood.deployCore` SHALL wire in this order: executor lib and vault impl; ProtocolConfig (plain Ownable, fee params seeded when non-zero); governor impl wrapped in a `GovernorBeacon` (per-vault governors are `BeaconProxy`s minted at `createSyndicate` — no singleton governor proxy is deployed); **sWOOD proxy before the registry proxy** (the registry's `initialize` takes the sWOOD address; the registry↔sWOOD cycle resolves via the set-once `StakedWood.setRegistry` call after the registry exists); factory proxy (address predicted by CREATE3 and asserted); then `TierRegistry` deployed owner-as-deployer and wired via the factory-only `setTierRegistry` BEFORE the multisig handoff. The `SYNDICATE_GOVERNOR` address-book slot SHALL be persisted as zero — governors are per-vault, resolved via `factory.governorOf(vault)`.
 
