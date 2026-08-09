@@ -1774,6 +1774,44 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         return false;
     }
 
+    /// @inheritdoc IStrategyDelivery
+    /// @dev DELIBERATELY PARTIAL, AND BIASED LOW. Reports only what this
+    ///      template can value in vault-asset units WITHOUT consulting a price
+    ///      an attacker could move inside the settlement transaction: the idle
+    ///      vault-asset balance, plus the Morpho collateral net of debt when the
+    ///      collateral token IS the vault asset (the fee-free 1:1 wrapper case
+    ///      this template is built for).
+    ///
+    ///      NOT counted: a live LP position (`tokenId != 0`), the volatile leg,
+    ///      and a collateral token that is not the vault asset. Valuing those
+    ///      needs a pool or oracle read, and a stamp that trusts one is exactly
+    ///      the unrealized, strategy-influenced NAV the frozen-price design
+    ///      exists to avoid — the same lever findings #2/#3 pull.
+    ///
+    ///      Under-reporting is the SAFE direction: the stamp stays at or below
+    ///      true value, so a queued depositor can never mint against value that
+    ///      was counted but never arrives. `hasUndeliveredValue()` still returns
+    ///      true for every residue shape, so the deposit lock keeps its wider
+    ///      coverage; only the PRICE correction is narrowed.
+    function undeliveredValue() public view override returns (uint256) {
+        if (_state != State.Settled) return 0;
+        uint256 v = IERC20(asset).balanceOf(address(this));
+        if (_marketParams.collateralToken != asset) return v;
+
+        uint128 collateral = morpho.position(marketId, address(this)).collateral;
+        if (collateral == 0) return v;
+        uint128 borrowShares = morpho.position(marketId, address(this)).borrowShares;
+        uint256 owed;
+        if (borrowShares != 0) {
+            Market memory m = morpho.market(marketId);
+            owed = _sharesToAssetsUp(borrowShares, m.totalBorrowAssets, m.totalBorrowShares);
+        }
+        // Net equity only, and never negative: an underwater position
+        // contributes nothing rather than subtracting from the stamp.
+        if (uint256(collateral) > owed) v += uint256(collateral) - owed;
+        return v;
+    }
+
     function sweep() external nonReentrant returns (uint256 assets) {
         if (_state != State.Settled) revert NotSettled();
 

@@ -115,10 +115,16 @@
       "type": "t_uint256"
     },
     {
-      "label": "__gap",
+      "label": "_lastSettledStrategy",
       "slot": "17",
       "offset": 0,
-      "type": "t_array(t_uint256)31_storage"
+      "type": "t_address"
+    },
+    {
+      "label": "__gap",
+      "slot": "18",
+      "offset": 0,
+      "type": "t_array(t_uint256)30_storage"
     }
   ],
   "types": {

@@ -37,4 +37,23 @@ interface IStrategyDelivery {
     ///         closed would let one non-conforming clone shut deposits for the
     ///         vault's whole remaining life with no permissionless way out.
     function hasUndeliveredValue() external view returns (bool);
+
+    /// @notice The vault-asset value this strategy still holds and has not
+    ///         delivered — the AMOUNT behind `hasUndeliveredValue`'s bool.
+    ///
+    /// @dev    READ ONLY AT SETTLEMENT, and that scoping is the whole safety
+    ///         argument. `VaultWithdrawalQueue`'s header commits the vault to
+    ///         stamping ONE frozen REALIZED price per proposal precisely "so the
+    ///         vault never mints or burns against an unrealized,
+    ///         strategy-influenced NAV". Counting strategy-held value in the
+    ///         LIVE `totalAssets()` would reintroduce exactly that, and hand a
+    ///         proposer the pricing lever back. By settlement the position is
+    ///         already unwound, so what remains is realized-but-undelivered
+    ///         value — a receivable, not a mark to market.
+    ///
+    ///         MUST NOT REVERT and must not depend on a price an attacker can
+    ///         move within the settlement transaction. Callers read it through a
+    ///         length-checked staticcall that treats any failure as 0, which
+    ///         degrades to the pre-fix stamp rather than to a wrong one.
+    function undeliveredValue() external view returns (uint256);
 }

@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {VaultInstantLiquidityTest} from "../SyndicateVault.InstantLiquidity.t.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
+import {IVaultWithdrawalQueue} from "../../src/interfaces/IVaultWithdrawalQueue.sol";
 
 /// @dev A settled strategy that answers the delivery probe. `holding` is what a
 ///      `sweep()` would still return.
@@ -15,6 +16,16 @@ contract StubDeliveryStrategy {
 
     function hasUndeliveredValue() external view returns (bool) {
         return holding;
+    }
+
+    uint256 public residue;
+
+    function setResidue(uint256 v) external {
+        residue = v;
+    }
+
+    function undeliveredValue() external view returns (uint256) {
+        return residue;
     }
 }
 
@@ -72,6 +83,41 @@ contract PashovFinalDepositLockTest is VaultInstantLiquidityTest {
         vm.prank(alice);
         vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
         vault.deposit(1_000e6, alice);
+    }
+
+    /// @notice THE OTHER HALF, and the one the deposit lock cannot reach.
+    ///         Locking `deposit()` does nothing for the QUEUED path: a queued
+    ///         depositor is paid at the price FROZEN by `onProposalSettled`,
+    ///         and `claim` -> `settleDeposit` never consults the lock. Freezing
+    ///         a price computed from float alone is what made the theft
+    ///         unfixable after the fact — a third party sweeping first does not
+    ///         repair the stamp.
+    ///
+    ///         So the stamp itself now counts undelivered value. This pins the
+    ///         numerator directly, because that is the quantity the attacker
+    ///         mints against.
+    function test_finding3_stampCountsUndeliveredValue() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(4_000e6);
+
+        uint256 float_ = vault.totalAssets();
+        _settleWith(address(deliveryStrat));
+
+        IVaultWithdrawalQueue.SettlePrice memory sp = queue.getSettlePrice(PID);
+        assertEq(sp.num, float_ + 4_000e6 + 1, "stamp must include the residue the vault still owns");
+    }
+
+    /// @notice The degrade path, and it must degrade to the OLD number rather
+    ///         than a higher one: over-counting would mint against value that
+    ///         never arrives, which is worse than the bug being fixed.
+    function test_finding3_unanswerableResidueStampsFloatOnly() public {
+        StubDeliveryShortReturn bad = new StubDeliveryShortReturn();
+        uint256 float_ = vault.totalAssets();
+        _settleWith(address(bad));
+
+        IVaultWithdrawalQueue.SettlePrice memory sp = queue.getSettlePrice(PID);
+        assertEq(sp.num, float_ + 1, "an unanswerable strategy must not inflate the stamp");
     }
 
     /// @notice NOBODY IS WEDGED — the property that makes locking safe here.

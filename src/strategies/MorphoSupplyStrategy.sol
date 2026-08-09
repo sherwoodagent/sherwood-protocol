@@ -296,6 +296,19 @@ contract MorphoSupplyStrategy is BaseStrategy {
         return IERC20(asset).balanceOf(address(this)) != 0;
     }
 
+    /// @inheritdoc IStrategyDelivery
+    /// @dev Loan token IS the vault asset for this template (`_initialize`
+    ///      pins `marketParams.loanToken == asset`), so the supply position is
+    ///      already denominated in vault-asset units — no oracle, and nothing
+    ///      an attacker can move inside the settlement transaction. `own` is
+    ///      the redeemable value of the remaining shares; the idle balance is
+    ///      whatever a partial withdrawal already pulled but has not pushed.
+    function undeliveredValue() public view override returns (uint256) {
+        if (_state != State.Settled) return 0;
+        (, uint256 own,) = _deliverableNow();
+        return own + IERC20(asset).balanceOf(address(this));
+    }
+
     function sweep() external returns (uint256 assets) {
         if (_state != State.Settled) revert NotSettled();
         (uint256 shares, uint256 own, uint256 deliverable) = _deliverableNow();

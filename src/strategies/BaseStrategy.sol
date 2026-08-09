@@ -241,6 +241,16 @@ abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
         return false;
     }
 
+    /// @notice The vault-asset value this strategy still holds undelivered.
+    /// @dev    Default 0, matching `hasUndeliveredValue`'s default of false: a
+    ///         template that settles all-or-nothing has no residue to report.
+    ///         Overriding one without the other is a bug — the bool gates the
+    ///         deposit lock, this figure corrects the settle price, and they
+    ///         must describe the same value.
+    function undeliveredValue() public view virtual returns (uint256) {
+        return 0;
+    }
+
     // ── Internal helpers ──
 
     /// @notice Pull tokens from the vault into this strategy

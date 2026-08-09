@@ -1535,9 +1535,39 @@ contract SyndicateVault is
 
         address q = _withdrawalQueue;
         if (q == address(0)) return;
-        uint256 num = totalAssets() + 1;
+        // THE STAMP COUNTS UNDELIVERED VALUE; `totalAssets()` DELIBERATELY DOES
+        // NOT. `totalAssets()` is the LIVE figure every conversion reads, and
+        // teaching it to count strategy-held value would price the vault against
+        // an unrealized, strategy-influenced NAV — the exact lever the frozen
+        // settle price exists to remove (see `VaultWithdrawalQueue`'s header).
+        //
+        // At THIS point the position is already unwound, so what the strategy
+        // still holds is realized-but-undelivered value: a receivable, not a
+        // mark to market. Excluding it stamped a price below what the vault
+        // actually owned, and a queued depositor claiming at that frozen number
+        // minted against the shortfall — then swept it in. Freezing the price is
+        // what made it unfixable after the fact: a third party sweeping first
+        // did not repair the stamp, and the attacker carried no directional
+        // risk, since no residue simply meant a fair-price deposit.
+        //
+        // Degrades to 0 on any failure, i.e. to the pre-fix stamp, never to a
+        // higher one — an over-count is the only direction that could mint
+        // against value that never arrives.
+        uint256 num = totalAssets() + _undeliveredValueOf(_lastSettledStrategy) + 1;
         uint256 den = _pricingSupply() + 10 ** _decimalsOffset();
         IVaultWithdrawalQueue(q).stampSettlement(proposalId, num, den);
+    }
+
+    /// @dev Vault-asset value a settled strategy still holds. Length-checked
+    ///      raw staticcall for the same reason the sibling bool probe is one:
+    ///      the address is proposer-chosen, so a typed call would let it revert
+    ///      settlement. Any failure — no code, revert, short return — reads as
+    ///      0, which reproduces the pre-fix stamp exactly.
+    function _undeliveredValueOf(address s) private view returns (uint256) {
+        if (s == address(0) || s.code.length == 0) return 0;
+        (bool ok, bytes memory ret) = s.staticcall(abi.encodeCall(IStrategyDelivery.undeliveredValue, ()));
+        if (!ok || ret.length != 32) return 0;
+        return abi.decode(ret, (uint256));
     }
 
     // ==================== MANAGEMENT-FEE ACCRUAL ====================
