@@ -277,14 +277,25 @@ abstract contract ChallengeGameHandler is Properties {
     ///          composite files from a `_nonGuardian` derived off the same seed.
     ///
     ///      `_convicted` HAS NO ACCESSOR, so the conviction gate is asked of
-    ///      sWOOD instead. That is faithful rather than approximate: `file`'s
-    ///      second gate is `_verdictAlreadyCollected`, itself
-    ///      `_convicted[key] || any verdictSlashed(key, accused)`, and every
-    ///      path that sets `_convicted` under this key also slashes under it —
-    ///      `_settle`'s diverted branch only runs when a slash is already
-    ///      recorded. Asked over the SAME accused set `file` builds (pledge
-    ///      non-zero), against the SAME `keccak256(abi.encode(governor, pid))`
-    ///      that `_settle` hands to `slashVerdict`.
+    ///      sWOOD instead — the closest available proxy, not an exact mirror.
+    ///      `file`'s second gate is `_verdictAlreadyCollected`, itself
+    ///      `_convicted[key] || any verdictSlashed(key, accused)`, asked here
+    ///      over the SAME accused set `file` builds (pledge non-zero) and
+    ///      against the SAME `keccak256(abi.encode(governor, pid))` that
+    ///      `_settle` hands to `slashVerdict`.
+    ///
+    ///      KNOWN RESIDUAL, stated rather than asserted away: the two are NOT
+    ///      equivalent in one direction. `_settle` writes `_convicted[key]`
+    ///      BEFORE calling `slashVerdict`, and `StakedWood.slashVerdict`
+    ///      deliberately declines to mark an approver whose slash lands zero
+    ///      ("MARK ONLY A SLASH THAT LANDED" — an approver already emptied by a
+    ///      concurrent conviction, or exited). So a conviction against a cohort
+    ///      with no live stake — reachable here via `StakedWoodHandler`'s
+    ///      unstake/slash paths — sets the local flag while marking nothing in
+    ///      sWOOD, and `file` reverts `AlreadyConvicted` on a flag this
+    ///      predictor cannot see. Rare, and it fails in the same no-op
+    ///      direction as any other too-loose miss; recorded so the next reader
+    ///      does not have to re-derive it.
     ///
     ///      Still not modelled, deliberately: `filingsPaused`, `WoodPriceUnset`
     ///      and `BondTooSmall`. All three are global rather than per-proposal,
@@ -299,7 +310,26 @@ abstract contract ChallengeGameHandler is Properties {
             uint256 pid = ((start + n) % count) + 1;
             ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(pid);
             if (p.executedAt == 0) continue;
-            if (block.timestamp > p.executedAt + p.strategyDuration + ledger.challengeWindow()) continue;
+            // THE GAME'S WINDOW, NOT THE LEDGER'S. `file` computes its deadline
+            // off `ChallengeGame.challengeWindow` (14 days by default), which is
+            // only constrained to be `<=` the ledger's. `ExposureLedgerHandler`
+            // can raise the LEDGER's to 30 days while nothing moves the game's,
+            // so reading the ledger here put the predictor's deadline up to 16
+            // days beyond `file`'s: it would hand back a pid `file` rejects with
+            // `WindowClosed`, the composite's try/catch would swallow it, and
+            // the handler would no-op for that seed — exactly the too-loose
+            // failure this predictor exists to avoid, and per-proposal, so it is
+            // not covered by the global-gate exemption below.
+            //
+            // `file` then takes `max(deadline, challengeableUntil[key])`, so the
+            // re-armed floor has to be honoured too or the predictor is too
+            // STRICT after an Inconclusive round and skips genuinely filable
+            // pids.
+            bytes32 rk = keccak256(abi.encode(address(governor), pid));
+            uint256 deadline = p.executedAt + p.strategyDuration + game.challengeWindow();
+            uint256 extended = game.challengeableUntil(rk);
+            if (extended > deadline) deadline = extended;
+            if (block.timestamp > deadline) continue;
             // `AlreadyChallenged` — one live challenge per CHALLENGER, which is
             // why this needs the address rather than deriving one.
             if (game.liveChallengeOfBy(address(governor), pid, challenger) != 0) continue;
@@ -307,13 +337,13 @@ abstract contract ChallengeGameHandler is Properties {
             (address[] memory approvers, uint256[] memory pledged) = ledger.pledgedOf(address(governor), pid);
             uint256 total;
             bool collected;
-            bytes32 key = keccak256(abi.encode(address(governor), pid));
+
             for (uint256 i; i < pledged.length; i++) {
                 // Zero-pledge entries are outside `file`'s accused set, so they
                 // neither price the bond nor answer the conviction question.
                 if (pledged[i] == 0) continue;
                 total += pledged[i];
-                if (swood.verdictSlashed(key, approvers[i])) collected = true;
+                if (swood.verdictSlashed(rk, approvers[i])) collected = true;
             }
             // `NothingToFreeze` and both `AlreadyConvicted` gates, in that order.
             if (total == 0 || collected) continue;
