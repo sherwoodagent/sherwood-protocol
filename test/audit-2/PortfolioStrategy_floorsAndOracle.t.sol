@@ -287,6 +287,28 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         r.strategy.execute();
     }
 
+    /// @dev Seed the Data Streams price anchor so `_execute` will deploy.
+    ///      Permissionless, so no prank. Before the anchor requirement existed
+    ///      these fixtures executed with `_lastGoodPrice[0] == 0` and the buy
+    ///      floor fell through to `_quoteMinOut` — a quote from the very pool the
+    ///      swap was about to hit, which is audit finding #6. One test's comment
+    ///      recorded that fallback as expected behaviour; it was the bug.
+    ///
+    ///      `1e18` is this fixture's fair rate, matching the oracle price the
+    ///      suite uses throughout, so the floor binds where the swap lands, and
+    ///      the feed id is read off the clone rather than restated here.
+    ///
+    ///      NO-OP IN PUSH MODE, where `submitPriceReports` correctly refuses: a
+    ///      push-mode clone reads its own aggregator and consumes no report.
+    ///      Deliberately called from push-mode fixtures too, so a fixture can be
+    ///      flipped between modes without its call sites having to follow.
+    function _seedAnchor(PortfolioStrategy s_) internal {
+        if (s_.chainlinkVerifier() == address(0)) return;
+        bytes[] memory reports = new bytes[](1);
+        reports[0] = abi.encode(s_.feedIdOf(0), int192(int256(1e18)));
+        s_.submitPriceReports(reports);
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // pashov review finding #9 — bounded rebalancing, live proposer standing
     // ════════════════════════════════════════════════════════════════════
@@ -301,23 +323,6 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
     ///      `cumulativeDecayBps` charges the worst case (`2 * maxSlippageBps`
     ///      per full rebalance) and refuses once `MAX_CUMULATIVE_DECAY_BPS` is
     ///      spent. Pre-fix this loop never terminated.
-
-    /// @dev Seed the Data Streams price anchor so `_execute` will deploy.
-    ///      Permissionless, so no prank. Before the anchor requirement existed
-    ///      these fixtures executed with `_lastGoodPrice[0] == 0` and the buy
-    ///      floor fell through to `_quoteMinOut` — a quote from the very pool the
-    ///      swap was about to hit, which is audit finding #6. One test's comment
-    ///      recorded that fallback as expected behaviour; it was the bug.
-    ///
-    ///      `1e18` is this fixture's fair rate, matching the oracle price the
-    ///      suite uses throughout, so the floor binds where the swap lands.
-    function _seedAnchor(PortfolioStrategy s_) internal {
-        if (s_.chainlinkVerifier() == address(0)) return;
-        bytes[] memory reports = new bytes[](1);
-        reports[0] = abi.encode(bytes32(uint256(0xBEEF)), int192(int256(1e18)));
-        s_.submitPriceReports(reports);
-    }
-
     function test_finding9_rebalanceDecayBudgetIsFinite() public {
         Rig memory r = _rig();
 

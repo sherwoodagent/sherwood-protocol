@@ -119,6 +119,13 @@ contract PortfolioStrategy is BaseStrategy {
     ///         explicitly rather than left to `_verifyPrice`'s `InvalidFeedId`,
     ///         so the caller learns the mode is wrong rather than the report.
     error PushModeNeedsNoReports();
+    /// @notice A per-allocation view was asked for a slot the basket does not
+    ///         have. Distinct from `LengthMismatch`, which is about an ARRAY
+    ///         whose size disagrees with the basket's: nothing about a single
+    ///         out-of-range index is a length, and the discovery views
+    ///         (`feedIdOf`, `priceAnchorOf`) are the ones a third-party keeper
+    ///         probes blind, so the revert they get should name what they did.
+    error IndexOutOfRange(uint256 index);
     /// @notice Data Streams mode reached `_execute` with allocation `index`
     ///         carrying no price anchor, or one older than
     ///         `PRICE_ANCHOR_MAX_AGE_AT_EXECUTE`. Call `submitPriceReports`
@@ -277,6 +284,29 @@ contract PortfolioStrategy is BaseStrategy {
     ///         `STALE_WIDEN_PERIOD`: that governs how the band widens AFTER
     ///         capital is deployed and an exit must stay possible, a different
     ///         question from whether capital should be deployed at all.
+    ///
+    ///         MEASURED AGAINST THE PRICE, NOT THE RELAY. `_lastGoodAt` is dated
+    ///         by the report's `observationsTimestamp`, so this bounds how old the
+    ///         PRICE may be — which is the whole point, and also the thing that
+    ///         makes the number depend on the FEED's cadence rather than on block
+    ///         times. Two consequences worth stating before a basket ships:
+    ///
+    ///           - a feed that stops observing for longer than an hour cannot be
+    ///             executed against until it resumes, and an approved proposal
+    ///             whose `executeBy` falls entirely inside such a gap will expire
+    ///             unexecuted. For a tokenized-equity feed that pauses outside
+    ///             market hours, that means execution windows track market hours.
+    ///             Refusing is the correct answer — an hours-old equity print is
+    ///             not a floor — but it is an operational constraint, not a
+    ///             detail: size `executeBy` against the feed's real cadence.
+    ///           - it is also the ceiling on report SELECTION at the moment
+    ///             capital moves; see `_verifyPrice` for why that pairing, rather
+    ///             than the anchor's monotonicity alone, is what closes it.
+    ///
+    ///         One global constant, where push mode packs a per-slot max age into
+    ///         `_feedIds[i]`. Fine while a basket's feeds share a cadence; a
+    ///         basket mixing a 24/7 crypto feed with a market-hours equity feed
+    ///         wants the per-slot treatment here too.
     uint256 public constant PRICE_ANCHOR_MAX_AGE_AT_EXECUTE = 1 hours;
     /// @notice Ceiling on `cumulativeDecayBps` across a clone's whole life
     ///         (pashov review finding #9).
@@ -374,11 +404,24 @@ contract PortfolioStrategy is BaseStrategy {
     ///      only case still degrading to the quote-anchored floor.
     mapping(uint256 allocationIndex => uint256 priceInFeedScale) private _lastGoodPrice;
 
-    /// @dev `block.timestamp` at which `_lastGoodPrice[i]` was recorded, written
-    ///      in lockstep with it at every site (PR #195 re-review). The stale
-    ///      band is a function of this age — see `MAX_STALE_SLIPPAGE_BPS` — so
-    ///      an anchor and its age must never diverge. Zero exactly when
-    ///      `_lastGoodPrice[i]` is zero, i.e. the slot has never been priced.
+    /// @dev When `_lastGoodPrice[i]` was OBSERVED, written in lockstep with it at
+    ///      every site (PR #195 re-review). The stale band is a function of this
+    ///      age — see `MAX_STALE_SLIPPAGE_BPS` — so an anchor and its age must
+    ///      never diverge. Zero exactly when `_lastGoodPrice[i]` is zero, i.e.
+    ///      the slot has never been priced.
+    ///
+    ///      THE CLOCK DIFFERS BY MODE, deliberately, because "observed" does:
+    ///      in push mode the floors read the aggregator live, so the observation
+    ///      IS the call and `block.timestamp` is exact; in Data Streams mode the
+    ///      price is observed off-chain and relayed later, so it is dated by the
+    ///      report's `observationsTimestamp` (clamped to now) rather than by the
+    ///      transaction that carried it. Both therefore mean the same thing to
+    ///      every reader — the age of the PRICE — which is what
+    ///      `_staleSlippageBps` and `PRICE_ANCHOR_MAX_AGE_AT_EXECUTE` need.
+    ///
+    ///      MONOTONIC IN DATA STREAMS MODE: `_verifyPrice` skips the write for an
+    ///      observation older than what is already recorded, so the anchor never
+    ///      rewinds and the band never re-tightens onto an older price.
     mapping(uint256 allocationIndex => uint256 recordedAt) private _lastGoodAt;
 
     /// @notice Running sum, in bps, of oracle-valued NAV given up across every
@@ -417,11 +460,16 @@ contract PortfolioStrategy is BaseStrategy {
     bytes32[] internal _feedIds;
 
     // ── Events ──
-    /// @notice Every allocation's price anchor was re-stamped from signed Data
-    ///         Streams reports by `caller`. Emitted so a keeper can see whether
-    ///         an anchor is already fresh before paying to refresh it, and so
-    ///         the widening band in `_staleSlippageBps` has an on-chain trail of
-    ///         who last closed it.
+    /// @notice `caller` submitted a full set of signed Data Streams reports.
+    ///         Emitted so a keeper can see whether an anchor is already fresh
+    ///         before paying to refresh it, and so the widening band in
+    ///         `_staleSlippageBps` has an on-chain trail of who last closed it.
+    ///
+    ///         PER SLOT THE EFFECT IS FORWARD-ONLY: a report older than the
+    ///         anchor already recorded is accepted and ignored rather than
+    ///         reverted (see `_verifyPrice`), so this event marks a valid
+    ///         submission, not proof that every anchor moved. Read
+    ///         `priceAnchorOf` for the resulting state.
     event PriceAnchorsRefreshed(address indexed caller, uint256 at);
     event WeightsUpdated(address[] tokens, uint256[] oldWeights, uint256[] newWeights);
     event Rebalanced(
@@ -937,11 +985,14 @@ contract PortfolioStrategy is BaseStrategy {
     ///         governance-bound verifier, requires `report.feedId` to equal THIS
     ///         slot's `_feedIds[i]` (so a valid report cannot be replayed into
     ///         another slot), rejects an expired report, and rejects a
-    ///         non-positive price. A caller therefore cannot inject a false, a
-    ///         stale, or another asset's price — the only thing an adversarial
-    ///         caller can do here is tell the truth on time, which is precisely
-    ///         what the anchor is for. Whoever dislikes a widening band — an LP,
-    ///         a guardian, the keeper about to settle — can close it themselves.
+    ///         non-positive price. On top of that `_verifyPrice` dates the anchor
+    ///         by the report's OBSERVATION time and only ever moves it forward, so
+    ///         a caller cannot inject a false price, another asset's price, or an
+    ///         older one than is already recorded — the only thing an adversarial
+    ///         caller can do here is advance the anchor to a fresher truth, which
+    ///         is precisely what the anchor is for. Whoever dislikes a widening
+    ///         band — an LP, a guardian, the keeper about to settle — can close it
+    ///         themselves.
     ///
     ///         Re-certifies the verifier on the same fail-closed terms as
     ///         `rebalanceDelta`: the reports are DON-signed, but the contract
@@ -1709,25 +1760,38 @@ contract PortfolioStrategy is BaseStrategy {
         // Dating by `block.timestamp` measured how recently someone pressed
         // submit, not how old the price is — so `PRICE_ANCHOR_MAX_AGE_AT_EXECUTE`
         // really meant "Chainlink's expiry window plus an hour", a bound this
-        // contract neither reads nor controls. Requiring the anchor to advance
-        // is what removes report SELECTION as an attacker capability: within the
-        // set of still-unexpired reports, a caller could otherwise pick the one
-        // whose price suits them — the highest to depress a buy floor and
-        // sandwich the fill, the lowest to push the floor out of reach and grief
-        // `execute` until `executeBy` lapses. Every such report is genuinely
-        // DON-signed; the attack is choosing among true statements, so the fix
-        // has to constrain WHICH truth is admissible rather than check
-        // signatures harder.
+        // contract neither reads nor controls. What the two rules constrain is
+        // report SELECTION: within the set of still-unexpired reports a caller
+        // would otherwise pick the one whose price suits them — the highest to
+        // depress a buy floor and sandwich the fill, the lowest to push the floor
+        // out of reach and grief `execute` until `executeBy` lapses. Every such
+        // report is genuinely DON-signed, so the attack is choosing among true
+        // statements, and the answer has to constrain WHICH truth is admissible
+        // rather than check signatures harder.
         //
-        // Monotonicity also makes the permissionless entrypoint safe by
-        // construction: the most an adversarial caller can do is advance the
-        // anchor to a fresher observation, which is the honest action.
-        if (report.observationsTimestamp > block.timestamp) revert StalePrice();
-        // STRICTLY BACKWARDS is the attack; equal is not. Re-presenting the
-        // report already anchored is legitimate and idempotent — `rebalanceDelta`
-        // routinely carries the same report `submitPriceReports` just recorded —
-        // so only a report OLDER than the anchor is refused.
-        if (report.observationsTimestamp < _lastGoodAt[i]) revert StalePrice();
+        // THE RESIDUAL, stated plainly: monotonicity is RELATIVE, so on its own
+        // it bounds selection only to "newer than whatever is anchored", which at
+        // a never-anchored slot is no bound at all. What actually closes the
+        // deploy-time case is the pairing — observation dating plus `_execute`'s
+        // `PRICE_ANCHOR_MAX_AGE_AT_EXECUTE` gate, which together confine the
+        // admissible set at the moment capital moves to reports observed within
+        // that hour. Everywhere else the ceiling is the report's own `expiresAt`,
+        // checked above, and the direction of the remaining freedom is harmless:
+        // a caller can only make the anchor NEWER, and a newer anchor tightens
+        // `_staleSlippageBps`' band rather than widening it.
+        //
+        // CLAMPED, NOT REJECTED, when the observation runs AHEAD of
+        // `block.timestamp` — the same convention, for the same reason, as
+        // `_pushFeedPrice`'s guarded subtraction: a feed clock ahead of a lagging
+        // L2 clock carries the freshest price there is, so it dates to `now`
+        // rather than being refused. Rejecting it would fail on a seconds-wide
+        // DON/sequencer skew, and this is the ONLY path that can satisfy
+        // `_execute`'s anchor requirement — a skew would brick Data Streams mode
+        // entirely rather than degrade it. Clamping opens nothing: the DON signs
+        // the real observation time, so a caller cannot manufacture a future date,
+        // and clamping only ever moves a timestamp DOWN.
+        uint256 observedAt = report.observationsTimestamp;
+        if (observedAt > block.timestamp) observedAt = block.timestamp;
 
         // Chainlink prices are int192 with the report's declared decimals (8 for
         // tokenized stocks, 18 for crypto pairs). The raw oracle units are
@@ -1748,17 +1812,33 @@ contract PortfolioStrategy is BaseStrategy {
         // the slot's declared decimals — the same units and the same
         // trustworthiness as the push-mode read, so it is a valid anchor for
         // the calls that arrive without a report of their own.
-        _lastGoodPrice[i] = price;
-        // In lockstep, always — `_staleSlippageBps` derives the band from this
-        // age, so an anchor recorded without its timestamp would be judged as
-        // maximally stale and get the widest band on its very first use.
         //
-        // OBSERVATION TIME, not `block.timestamp`: this is what makes both
+        // WRITTEN IN LOCKSTEP WITH ITS TIMESTAMP, ALWAYS — `_staleSlippageBps`
+        // derives the band from that age, so an anchor recorded without its
+        // timestamp would be judged maximally stale and get the widest band on
+        // its very first use. Dated by OBSERVATION TIME rather than
+        // `block.timestamp`, which is what makes both
         // `PRICE_ANCHOR_MAX_AGE_AT_EXECUTE` and `_staleSlippageBps` measure the
         // age of the PRICE rather than the age of the transaction that carried
         // it. Widening the band for a price that is genuinely old is the point
         // of that ramp; dating it by submission defeated it.
-        _lastGoodAt[i] = report.observationsTimestamp;
+        //
+        // FORWARD ONLY, AND SILENTLY SO. Refusing an older observation outright
+        // made the anchor's position a precondition ANYONE could move against a
+        // pending transaction: `submitPriceReports` is permissionless and Data
+        // Streams publishes continuously, so a griefer watching the mempool could
+        // advance the anchor in front of an in-flight `rebalanceDelta` and revert
+        // it — every block, for the cost of one call, with no gain to themselves.
+        // Skipping the write keeps the property that actually matters (the anchor
+        // NEVER rewinds, so the band never re-tightens onto an older price, and a
+        // cherry-picked older report cannot become the floor) while removing the
+        // revert an adversary was using as the weapon. The report still prices
+        // THIS call, bounded as ever by its own `expiresAt`; only the persisted
+        // anchor is protected.
+        if (observedAt >= _lastGoodAt[i]) {
+            _lastGoodPrice[i] = price;
+            _lastGoodAt[i] = observedAt;
+        }
     }
 
     // ── View functions ──
@@ -1784,9 +1864,9 @@ contract PortfolioStrategy is BaseStrategy {
     ///         usable by whoever kept the init calldata, which would hand the
     ///         proposer back the control the permissionless refresh exists to
     ///         remove.
-    /// @param  index Allocation index; reverts on out of range.
+    /// @param  index Allocation index; reverts `IndexOutOfRange` past the basket.
     function feedIdOf(uint256 index) external view returns (bytes32) {
-        if (index >= _allocations.length) revert LengthMismatch();
+        if (index >= _allocations.length) revert IndexOutOfRange(index);
         return _feedIds[index];
     }
 
@@ -1797,8 +1877,9 @@ contract PortfolioStrategy is BaseStrategy {
     ///         Exposed for the same reason as `feedIdOf`: a keeper deciding
     ///         whether a refresh is needed before executing or settling should
     ///         not have to infer it from events.
+    /// @param  index Allocation index; reverts `IndexOutOfRange` past the basket.
     function priceAnchorOf(uint256 index) external view returns (uint256 price, uint256 recordedAt) {
-        if (index >= _allocations.length) revert LengthMismatch();
+        if (index >= _allocations.length) revert IndexOutOfRange(index);
         return (_lastGoodPrice[index], _lastGoodAt[index]);
     }
 

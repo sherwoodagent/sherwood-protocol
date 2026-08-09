@@ -77,21 +77,29 @@ contract PashovFinalDsAnchorTest is PortfolioStrategyTest {
 
     // ── #25: refreshing is not the proposer's private lever ──
 
-    /// @notice REPORT SELECTION IS THE ATTACK, and monotonicity is what removes
-    ///         it. `submitPriceReports` is permissionless and every report it
-    ///         accepts is genuinely DON-signed — so the adversary does not forge
-    ///         anything, they CHOOSE among true statements. Within the set of
-    ///         still-unexpired reports they would pick the price that suits
+    /// @notice REPORT SELECTION IS THE ATTACK, and forward-only anchoring is what
+    ///         removes it. `submitPriceReports` is permissionless and every report
+    ///         it accepts is genuinely DON-signed — so the adversary does not
+    ///         forge anything, they CHOOSE among true statements. Within the set
+    ///         of still-unexpired reports they would pick the price that suits
     ///         them: the highest to depress a buy floor and sandwich the fill,
     ///         the lowest to push the floor out of reach and grief `execute`
     ///         until `executeBy` lapses.
     ///
-    ///         Dating the anchor by `block.timestamp` made every unexpired
-    ///         report look equally fresh, so the freshness gate could not tell
-    ///         them apart. Dating by `observationsTimestamp` and refusing a
-    ///         BACKWARDS move means the only thing a caller can do is advance
-    ///         the anchor to a fresher observation — the honest action.
-    function test_anchor_refusesAnOlderObservationThanAlreadyAnchored() public {
+    ///         Dating the anchor by `block.timestamp` made every unexpired report
+    ///         look equally fresh, so the freshness gate could not tell them
+    ///         apart. Dating by `observationsTimestamp` and never moving the
+    ///         anchor backwards means the only thing a caller can do is advance it
+    ///         to a fresher observation — the honest action.
+    ///
+    ///         IGNORED, NOT REVERTED. The older report is a valid submission that
+    ///         simply loses; refusing it outright would let anyone revert a
+    ///         pending `rebalanceDelta` by anchoring in front of it, which
+    ///         `test_anchor_aStrangersRefreshCannotRevertTheProposersRebalance`
+    ///         pins. What has to hold is that the attacker's price never becomes
+    ///         the floor, and that is asserted on the stored anchor rather than on
+    ///         the call's success.
+    function test_anchor_ignoresAnOlderObservationThanAlreadyAnchored() public {
         // Foundry starts at timestamp 1; a negative observation skew below would
         // underflow rather than model an older report.
         vm.warp(vm.getBlockTimestamp() + 1 days);
@@ -112,12 +120,83 @@ contract PashovFinalDsAnchorTest is PortfolioStrategyTest {
         stale[1] = _signedReport(1, int192(int256(0.02e18)));
         stale[2] = _signedReport(2, int192(int256(0.005e18)));
 
-        vm.expectRevert(PortfolioStrategy.StalePrice.selector);
         strategy.submitPriceReports(stale);
 
         (uint256 price, uint256 at) = strategy.priceAnchorOf(0);
-        assertEq(price, 0.01e18, "the anchor must not have moved");
-        assertEq(at, anchoredAt, "nor its date");
+        assertEq(price, 0.01e18, "the cherry-picked older price must not become the anchor");
+        assertEq(at, anchoredAt, "nor may its date rewind");
+    }
+
+    /// @notice A FUTURE-DATED OBSERVATION IS CLAMPED, NOT REFUSED. The DON's
+    ///         clock and an L2's `block.timestamp` are different clocks, and the
+    ///         mock models exactly that skew. Refusing on `observationsTimestamp >
+    ///         block.timestamp` would mean a seconds-wide lag makes every
+    ///         submission revert — and since `_execute` will not deploy without a
+    ///         fresh anchor, and only this path can supply one, that is a brick of
+    ///         Data Streams mode rather than a degradation.
+    ///
+    ///         Same convention as `_pushFeedPrice`'s guarded subtraction, which
+    ///         documents the identical case for a push feed: a feed clock ahead of
+    ///         a lagging chain clock carries the freshest price there is.
+    function test_anchor_futureDatedObservationIsClampedNotRefused() public {
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        verifier.setObsSkew(30); // DON observed 30s "ahead" of this chain's clock
+
+        bytes[] memory reports = new bytes[](3);
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
+        reports[2] = _signedReport(2, int192(int256(0.005e18)));
+        strategy.submitPriceReports(reports);
+
+        (uint256 price, uint256 at) = strategy.priceAnchorOf(0);
+        assertEq(price, 0.01e18, "a skewed report still anchors");
+        assertEq(at, block.timestamp, "clamped to now, an anchor is never dated in the future");
+
+        // And the clamped anchor is usable: no future date means no underflow and
+        // no accidental immunity from `PRICE_ANCHOR_MAX_AGE_AT_EXECUTE`.
+        vm.prank(vault);
+        weth.approve(address(strategy), TOTAL_AMOUNT);
+        vm.prank(vault);
+        strategy.execute();
+        assertEq(uint8(strategy.state()), uint8(BaseStrategy.State.Executed), "skew-clamped anchor executes");
+    }
+
+    /// @notice THE ANCHOR'S POSITION MUST NOT BE A WEAPON. `submitPriceReports` is
+    ///         permissionless and Data Streams publishes continuously, so if a
+    ///         backwards observation REVERTED, anyone watching the mempool could
+    ///         advance the anchor in front of a pending `rebalanceDelta` and kill
+    ///         it — every block, for the cost of one call, with nothing gained
+    ///         except the proposer's gas. Skipping the write instead keeps the
+    ///         anchor monotonic without handing out that lever.
+    function test_anchor_aStrangersRefreshCannotRevertTheProposersRebalance() public {
+        _executeStrategy();
+
+        // A stranger lands a FRESHER observation than the report the proposer is
+        // about to submit.
+        vm.warp(vm.getBlockTimestamp() + 60);
+        bytes[] memory fresher = new bytes[](3);
+        fresher[0] = _signedReport(0, int192(int256(0.01e18)));
+        fresher[1] = _signedReport(1, int192(int256(0.02e18)));
+        fresher[2] = _signedReport(2, int192(int256(0.005e18)));
+        vm.prank(makeAddr("frontRunner"));
+        strategy.submitPriceReports(fresher);
+
+        (, uint256 anchoredAt) = strategy.priceAnchorOf(0);
+        assertEq(anchoredAt, block.timestamp, "the front-runner moved the anchor forward");
+
+        // The proposer's own report — signed before that, still unexpired, now
+        // older than the anchor.
+        verifier.setObsSkew(-60);
+        bytes[] memory proposerReports = new bytes[](3);
+        proposerReports[0] = _signedReport(0, int192(int256(0.01e18)));
+        proposerReports[1] = _signedReport(1, int192(int256(0.02e18)));
+        proposerReports[2] = _signedReport(2, int192(int256(0.005e18)));
+
+        vm.prank(proposer);
+        strategy.rebalanceDelta(proposerReports);
+
+        (, uint256 after_) = strategy.priceAnchorOf(0);
+        assertEq(after_, anchoredAt, "and the older report still did not rewind the anchor");
     }
 
     /// @notice The anchor is dated by OBSERVATION, so a report that sat unsent
@@ -143,8 +222,9 @@ contract PashovFinalDsAnchorTest is PortfolioStrategyTest {
     ///
     ///         Safe because `_verifyPrice` demands a DON signature through the
     ///         governance-bound verifier, a feed id matching THIS slot, an
-    ///         unexpired report and a positive price. The most an adversarial
-    ///         caller can do here is tell the truth on time.
+    ///         unexpired report and a positive price, and then only ever moves the
+    ///         anchor forward. The most an adversarial caller can do here is
+    ///         advance it to a fresher truth.
     function test_finding25_anyoneCanRefreshTheAnchor() public {
         address stranger = makeAddr("passingKeeper");
 
@@ -166,13 +246,22 @@ contract PashovFinalDsAnchorTest is PortfolioStrategyTest {
 
     /// @notice A report for the WRONG SLOT cannot be replayed into another's
     ///         anchor — the feed-id match is what makes the open door safe.
+    /// @dev    Pinned to the exact selector AND its arguments. This is the single
+    ///         test standing behind "a valid report cannot be replayed into
+    ///         another slot", so a bare `vm.expectRevert()` would let it keep
+    ///         passing on an unrelated revert — a changed length check, an
+    ///         arithmetic panic, a mock that stopped echoing the feed id.
     function test_finding25_reportCannotBeReplayedAcrossSlots() public {
         bytes[] memory reports = new bytes[](3);
         reports[0] = _signedReport(1, int192(int256(0.02e18))); // slot 1's feed in slot 0
         reports[1] = _signedReport(1, int192(int256(0.02e18)));
         reports[2] = _signedReport(2, int192(int256(0.005e18)));
 
-        vm.expectRevert();
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PortfolioStrategy.WrongFeedId.selector, uint256(0), strategy.feedIdOf(0), strategy.feedIdOf(1)
+            )
+        );
         strategy.submitPriceReports(reports);
     }
 

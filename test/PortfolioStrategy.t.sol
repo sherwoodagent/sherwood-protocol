@@ -251,13 +251,19 @@ contract PortfolioStrategyTest is Test {
     ///      there: a push-mode clone reads its own aggregator and consumes no
     ///      report. That keeps this helper safe to call from any fixture without
     ///      the caller having to know which mode the clone was built in.
+    ///
+    ///      FEED IDS COME FROM THE CLONE, via `feedIdOf`, rather than from
+    ///      `_signedReport`'s index-derived guess. This file builds fixtures both
+    ///      ways — `_feedIds` keys on the slot index, `_feedIdsForTokens` on the
+    ///      token address — so a helper that assumed the former would hand a
+    ///      token-keyed fixture a `WrongFeedId` from its own SETUP.
     function _seedAnchorsFor(PortfolioStrategy s) internal {
         if (s.chainlinkVerifier() == address(0)) return;
         PortfolioStrategy.TokenAllocation[] memory allocs = s.getAllocations();
         bytes[] memory reports = new bytes[](allocs.length);
         for (uint256 i; i < allocs.length; ++i) {
             uint256 rate = adapter.rates(keccak256(abi.encodePacked(allocs[i].token, address(weth))));
-            reports[i] = _signedReport(i, int192(int256(rate)));
+            reports[i] = abi.encode(s.feedIdOf(i), int192(int256(rate)));
         }
         s.submitPriceReports(reports);
     }

@@ -210,6 +210,36 @@ contract QuotesFairFillsShortAdapter is ISwapAdapter {
     }
 }
 
+/// @notice Shared anchor seeding for the three fixtures in this file.
+/// @dev    Every Data Streams fixture here has to anchor before `_execute` will
+///         deploy, and all three wanted the identical helper — so it lives once,
+///         here, rather than as three copies drifting apart.
+abstract contract DsAnchorSeeding is Test {
+    /// @dev Seed each allocation's Data Streams anchor so `_execute` will deploy.
+    ///      Permissionless, so no prank.
+    ///
+    ///      Before the anchor requirement existed these fixtures executed with
+    ///      `_lastGoodPrice[i] == 0`, so every buy floor fell through to
+    ///      `_quoteMinOut` -- a quote from the very pool the swap was about to
+    ///      hit. That is audit finding #6, and one test in this file recorded the
+    ///      fallback in a comment as expected behaviour.
+    ///
+    ///      Anchored at the fair 1:1 rate every fixture here uses: the
+    ///      adversarial adapters in this file deviate on the FILL, which is what
+    ///      those tests are about, so a fair anchor is exactly what exposes the
+    ///      deviation rather than masking it. No-op in push mode, where
+    ///      `submitPriceReports` correctly refuses.
+    function _seedAnchors(PortfolioStrategy s_) internal {
+        if (s_.chainlinkVerifier() == address(0)) return;
+        uint256 n = s_.allocationCount();
+        bytes[] memory reports = new bytes[](n);
+        for (uint256 i; i < n; ++i) {
+            reports[i] = abi.encode(s_.feedIdOf(i), int192(int256(1e18)));
+        }
+        s_.submitPriceReports(reports);
+    }
+}
+
 /// @title PortfolioStrategy_quoteFloorScopeAndProbe
 /// @notice Design-pin suite for the audit-gap fixes (PR #196) plus the two
 ///         review corrections layered on top of them:
@@ -234,31 +264,7 @@ contract QuotesFairFillsShortAdapter is ISwapAdapter {
 ///   4. `_execute` re-certifies the adapter and price sources — a demotion
 ///      in the propose→execute window (reachable permissionlessly via
 ///      `TierRegistry.poke` / `demoteByChallenge`) must block execution.
-contract PortfolioStrategy_quoteFloorScopeAndProbeTest is Test {
-    /// @dev Seed each allocation's Data Streams anchor so `_execute` will deploy.
-    ///      Permissionless, so no prank.
-    ///
-    ///      Before the anchor requirement existed these fixtures executed with
-    ///      `_lastGoodPrice[i] == 0`, so every buy floor fell through to
-    ///      `_quoteMinOut` -- a quote from the very pool the swap was about to
-    ///      hit. That is audit finding #6, and one test in this file recorded the
-    ///      fallback in a comment as expected behaviour.
-    ///
-    ///      Anchored at the fair 1:1 rate every fixture here uses: the
-    ///      adversarial adapters in this file deviate on the FILL, which is what
-    ///      those tests are about, so a fair anchor is exactly what exposes the
-    ///      deviation rather than masking it. No-op in push mode, where
-    ///      `submitPriceReports` correctly refuses.
-    function _seedAnchors(PortfolioStrategy s_) internal {
-        if (s_.chainlinkVerifier() == address(0)) return;
-        uint256 n = s_.allocationCount();
-        bytes[] memory reports = new bytes[](n);
-        for (uint256 i; i < n; ++i) {
-            reports[i] = abi.encode(s_.feedIdOf(i), int192(int256(1e18)));
-        }
-        s_.submitPriceReports(reports);
-    }
-
+contract PortfolioStrategy_quoteFloorScopeAndProbeTest is DsAnchorSeeding {
     PortfolioStrategy public template;
 
     ERC20Mock public weth;
@@ -729,31 +735,7 @@ contract PortfolioStrategy_quoteFloorScopeAndProbeTest is Test {
 ///         `1 - (1-s)^(2B/s)` rather than `1 - (1-s)^(B/s)`: ~33% against the
 ///         ~18% `MAX_CUMULATIVE_DECAY_BPS` documents, and alternating
 ///         `[0,10_000]` / `[10_000,0]` rotates the basket every call.
-contract PortfolioStrategy_deltaLegBillingTest is Test {
-    /// @dev Seed each allocation's Data Streams anchor so `_execute` will deploy.
-    ///      Permissionless, so no prank.
-    ///
-    ///      Before the anchor requirement existed these fixtures executed with
-    ///      `_lastGoodPrice[i] == 0`, so every buy floor fell through to
-    ///      `_quoteMinOut` -- a quote from the very pool the swap was about to
-    ///      hit. That is audit finding #6, and one test in this file recorded the
-    ///      fallback in a comment as expected behaviour.
-    ///
-    ///      Anchored at the fair 1:1 rate every fixture here uses: the
-    ///      adversarial adapters in this file deviate on the FILL, which is what
-    ///      those tests are about, so a fair anchor is exactly what exposes the
-    ///      deviation rather than masking it. No-op in push mode, where
-    ///      `submitPriceReports` correctly refuses.
-    function _seedAnchors(PortfolioStrategy s_) internal {
-        if (s_.chainlinkVerifier() == address(0)) return;
-        uint256 n = s_.allocationCount();
-        bytes[] memory reports = new bytes[](n);
-        for (uint256 i; i < n; ++i) {
-            reports[i] = abi.encode(s_.feedIdOf(i), int192(int256(1e18)));
-        }
-        s_.submitPriceReports(reports);
-    }
-
+contract PortfolioStrategy_deltaLegBillingTest is DsAnchorSeeding {
     PortfolioStrategy public template;
     ERC20Mock public weth;
     ERC20Mock public tsla;
@@ -873,31 +855,7 @@ contract PortfolioStrategy_deltaLegBillingTest is Test {
 ///         `maxSlippageBps` and refuses a trade it cannot bill for. The
 ///         alternative — billing the wide band — made the FIRST `rebalance()`
 ///         revert `DecayBudgetExhausted` at any anchor age above ~303s.
-contract PortfolioStrategy_meteredBandCapTest is Test {
-    /// @dev Seed each allocation's Data Streams anchor so `_execute` will deploy.
-    ///      Permissionless, so no prank.
-    ///
-    ///      Before the anchor requirement existed these fixtures executed with
-    ///      `_lastGoodPrice[i] == 0`, so every buy floor fell through to
-    ///      `_quoteMinOut` -- a quote from the very pool the swap was about to
-    ///      hit. That is audit finding #6, and one test in this file recorded the
-    ///      fallback in a comment as expected behaviour.
-    ///
-    ///      Anchored at the fair 1:1 rate every fixture here uses: the
-    ///      adversarial adapters in this file deviate on the FILL, which is what
-    ///      those tests are about, so a fair anchor is exactly what exposes the
-    ///      deviation rather than masking it. No-op in push mode, where
-    ///      `submitPriceReports` correctly refuses.
-    function _seedAnchors(PortfolioStrategy s_) internal {
-        if (s_.chainlinkVerifier() == address(0)) return;
-        uint256 n = s_.allocationCount();
-        bytes[] memory reports = new bytes[](n);
-        for (uint256 i; i < n; ++i) {
-            reports[i] = abi.encode(s_.feedIdOf(i), int192(int256(1e18)));
-        }
-        s_.submitPriceReports(reports);
-    }
-
+contract PortfolioStrategy_meteredBandCapTest is DsAnchorSeeding {
     PortfolioStrategy public template;
     ERC20Mock public weth;
     ERC20Mock public tsla;
