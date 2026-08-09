@@ -245,12 +245,16 @@ contract SyndicateVault is
     ///         `onProposalSettled` so `_depositsLocked` can ask whether it still
     ///         holds undelivered value.
     ///
-    ///         NEEDED BECAUSE THE ORDINARY POINTER IS ALREADY GONE by then:
-    ///         `_activeStrategy()` resolves through `getActiveProposal()`, which
-    ///         `_finishSettlement` zeroes before this vault is called, so after
-    ///         settlement there is no live path back to the strategy that just
-    ///         settled. Zero when unresolvable, which reads as "nothing
-    ///         outstanding" — see `_depositsLocked`.
+    ///         NEEDED BECAUSE THE ORDINARY POINTER IS GONE BY THE TIME IT WOULD
+    ///         BE READ: `_activeStrategy()` resolves through
+    ///         `getActiveProposal()`, which `_finishSettlement` zeroes
+    ///         IMMEDIATELY AFTER calling this vault — the ordering is CEI and
+    ///         load-bearing, see the note on `_activeProposal = 0` there. So the
+    ///         pointer is still live during `onProposalSettled` and gone by the
+    ///         time `_depositsLocked` runs, leaving no path back to the strategy
+    ///         that just settled. Pinning here is what survives that gap. Zero
+    ///         when unresolvable, which reads as "nothing outstanding" — see
+    ///         `_depositsLocked`.
     address private _lastSettledStrategy;
 
     /// @dev Reserved storage for future upgrades. Shrinks whenever a new state

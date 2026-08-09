@@ -1750,6 +1750,26 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         set `_settle` can create, or the "recoverable later" claim above
     ///         is false for whichever step was left out — so the position
     ///         unwind is retried here too, not just the repay and the withdraw.
+    function sweep() external nonReentrant returns (uint256 assets) {
+        if (_state != State.Settled) revert NotSettled();
+
+        _tryUnwindPosition();
+        _trySwapToAsset(settleSlippageBps);
+
+        (uint256 debtRemaining, uint256 collateralRemaining) = _repayAndWithdraw();
+        if (debtRemaining != 0 || collateralRemaining != 0) {
+            // Loud on the same terms `_settle` is: a sweep that recovers only
+            // part of the residue must not read as a completed recovery.
+            emit SettlementIncomplete(debtRemaining, collateralRemaining);
+        }
+
+        assets = IERC20(asset).balanceOf(address(this));
+        if (assets != 0) {
+            _pushAllToVault(asset);
+            emit ResidualSwept(assets);
+        }
+    }
+
     /// @inheritdoc IStrategyDelivery
     /// @dev True while a settled proposal still has value on this clone that a
     ///      `sweep()` or `releaseUnconvertible()` would move. The vault reads it
@@ -1849,26 +1869,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // contributes nothing rather than subtracting from the stamp.
         if (uint256(pos.collateral) > owed) v += uint256(pos.collateral) - owed;
         return v;
-    }
-
-    function sweep() external nonReentrant returns (uint256 assets) {
-        if (_state != State.Settled) revert NotSettled();
-
-        _tryUnwindPosition();
-        _trySwapToAsset(settleSlippageBps);
-
-        (uint256 debtRemaining, uint256 collateralRemaining) = _repayAndWithdraw();
-        if (debtRemaining != 0 || collateralRemaining != 0) {
-            // Loud on the same terms `_settle` is: a sweep that recovers only
-            // part of the residue must not read as a completed recovery.
-            emit SettlementIncomplete(debtRemaining, collateralRemaining);
-        }
-
-        assets = IERC20(asset).balanceOf(address(this));
-        if (assets != 0) {
-            _pushAllToVault(asset);
-            emit ResidualSwept(assets);
-        }
     }
 
     /// @notice Hand an `otherToken` residue this clone cannot convert to the
