@@ -4,7 +4,6 @@ pragma solidity 0.8.28;
 import {VaultInstantLiquidityTest} from "../SyndicateVault.InstantLiquidity.t.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
 import {IVaultWithdrawalQueue} from "../../src/interfaces/IVaultWithdrawalQueue.sol";
-import {IStrategyDelivery} from "../../src/interfaces/IStrategyDelivery.sol";
 
 /// @dev A settled strategy that answers the delivery probe. `holding` is what a
 ///      `sweep()` would still return.
@@ -108,27 +107,6 @@ contract PashovFinalDepositLockTest is VaultInstantLiquidityTest {
 
         IVaultWithdrawalQueue.SettlePrice memory sp = queue.getSettlePrice(PID);
         assertEq(sp.num, float_ + 1, "stamp must stay payable; residue correction needs a non-reserving mechanism");
-    }
-
-    /// @notice `undeliveredValue()` has NO vault-side caller today — the stamp
-    ///         correction that would have consumed it was reverted (issue #233).
-    ///         It is kept as the hook the replacement mechanism will use, and
-    ///         this keeps its degrade path covered: a function that a future
-    ///         change will make load-bearing is exactly the one that must not
-    ///         ship untested.
-    function test_finding3_undeliveredValueDegradesOnAnUnanswerableStrategy() public {
-        StubDeliveryShortReturn bad = new StubDeliveryShortReturn();
-        assertEq(
-            IStrategyDelivery(address(bad)).undeliveredValue.selector,
-            IStrategyDelivery.undeliveredValue.selector,
-            "selector pinned so a signature change breaks here, not silently at the call site"
-        );
-
-        // The real strategies answer 0 outside `Settled`, which is the same
-        // degrade the vault probe treats as "nothing counted".
-        deliveryStrat = new StubDeliveryStrategy();
-        deliveryStrat.setResidue(4_000e6);
-        assertEq(deliveryStrat.undeliveredValue(), 4_000e6, "stub reports its residue");
     }
 
     /// @notice NOBODY IS WEDGED — the property that makes locking safe here.

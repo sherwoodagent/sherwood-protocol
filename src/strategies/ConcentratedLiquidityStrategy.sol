@@ -1793,9 +1793,11 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // answered false without this and reopened deposits.
         Position memory pos = morpho.position(marketId, address(this));
         // Dust-floored for the same reason: `supplyCollateral` also takes
-        // `onBehalf` and needs no authorization. Debt alone does not strand
-        // value — it is the COLLATERAL behind it that cannot leave — so the
-        // floor is applied to that.
+        // `onBehalf` and needs no authorization. The floor is on COLLATERAL and
+        // the `borrowShares` clause is gone deliberately: debt with zero
+        // collateral is not a reachable steady state, because Morpho's bad-debt
+        // realization zeroes both sides together. So the collateral floor
+        // subsumes it rather than merely ignoring it.
         if (pos.collateral > RESIDUE_DUST) return true;
         address coll = _marketParams.collateralToken;
         if (coll != asset && IERC20(coll).balanceOf(address(this)) > RESIDUE_DUST) return true;
@@ -1828,7 +1830,11 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         // ONE read of the struct, not two.
         Position memory pos = morpho.position(marketId, address(this));
-        if (pos.collateral == 0) return v;
+        // SAME FLOOR AS THE BOOL. Without it a 1-wei donated collateral gives
+        // `hasUndeliveredValue() == false` while this returns non-zero — the
+        // bool/amount divergence that was finding #1. Free to close now; it
+        // would not be obvious once #233 wires a consumer.
+        if (pos.collateral <= RESIDUE_DUST) return v;
         uint256 owed;
         if (pos.borrowShares != 0) {
             // ACCRUED totals, not raw. A raw `morpho.market` read excludes

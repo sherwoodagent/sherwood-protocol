@@ -1607,6 +1607,18 @@ contract SyndicateVault is
     ///      `onProposalSettled` the probe sits inside the settle path and can
     ///      OOG settlement itself. The degrade-to-false/0 semantics already
     ///      handle a truncated result correctly.
+    ///
+    ///      ACCEPTED TRADE, stated rather than implied: the Morpho probe now
+    ///      routes through `_deliverableNow` -> `expectedMarketBalances` ->
+    ///      `borrowRateView`, and the IRM is part of the proposer-supplied
+    ///      `MarketParams`. A proposer can therefore pick an IRM whose view
+    ///      burns more than this cap, degrade the probe to `false`, and
+    ///      SUPPRESS the deposit lock. That is a suppression of a mitigation,
+    ///      not a DoS — the recoverable direction, and the same direction the
+    ///      probe already degrades in when a strategy cannot answer at all.
+    ///      Raising the cap trades it back against the OOG risk above; if the
+    ///      lock ever becomes load-bearing rather than defence-in-depth, this
+    ///      needs a measured worst-case bound instead of a round number.
     uint256 private constant _PROBE_GAS = 150_000;
 
     // ==================== MANAGEMENT-FEE ACCRUAL ====================

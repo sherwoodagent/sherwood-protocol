@@ -49,6 +49,12 @@ interface IStrategyDelivery {
     ///         is retained as the hook the replacement mechanism will use;
     ///         treat it as reserved, not as live behaviour.
     ///
+    ///         UNREAD AND THEREFORE UNCOVERED. With no caller, the vault-side
+    ///         degrade path is unreachable from a test, and a test asserting
+    ///         otherwise would be theatre — one was written and removed for
+    ///         exactly that reason. Whoever wires the consumer in #233 owns
+    ///         covering it then.
+    ///
     ///         READ ONLY AT SETTLEMENT once a caller exists, and that scoping is
     ///         the whole safety argument. `VaultWithdrawalQueue`'s header commits the vault to
     ///         stamping ONE frozen REALIZED price per proposal precisely "so the
