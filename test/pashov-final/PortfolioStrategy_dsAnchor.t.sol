@@ -4,6 +4,8 @@ pragma solidity 0.8.28;
 import {PortfolioStrategyTest} from "../PortfolioStrategy.t.sol";
 import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
+import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 
 /// @title PortfolioStrategy — the Data Streams price anchor
 /// @notice Audit findings #6 and #25. Both come from one structural fact: in
@@ -322,6 +324,78 @@ contract PashovFinalDsAnchorTest is PortfolioStrategyTest {
             )
         );
         strategy.submitPriceReports(reports);
+    }
+
+    /// @notice WHY THE BATCH MUST STAY ALL-OR-NOTHING, pinned on the exit path.
+    ///
+    ///         `submitPriceReports` demands a report for EVERY slot, zero-weight
+    ///         ones included, and that reads like a robustness weakness: one
+    ///         momentarily unobtainable feed blocks the whole basket's refresh,
+    ///         and a per-index variant would fix it. It would also open a hole.
+    ///
+    ///         `_execute` skips a zero-weight slot and no trade ever fills it,
+    ///         but `_settle` sells ANY slot carrying a balance — and a donation
+    ///         puts one there. `_sellFloor` degrades to the pool-quoted floor
+    ///         exactly when that slot was never anchored. So an unanchored
+    ///         zero-weight slot is sold against a quote from the pool it is
+    ///         selling into: finding #6's shape, on the way OUT, where refusing
+    ///         is not an option.
+    ///
+    ///         The pin: donate to the zero-weight slot, crash that pool, and
+    ///         settle. The oracle anchor must reject the fill. Loosen the
+    ///         coupling and this test goes green for the wrong reason — the floor
+    ///         becomes the crashed quote, which the crashed fill clears exactly.
+    function test_anchor_zeroWeightSlotIsAnchoredSoSettleCannotBeQuoteFloored() public {
+        PortfolioStrategy s = PortfolioStrategy(Clones.clone(address(template)));
+
+        address[] memory tokens = new address[](3);
+        tokens[0] = address(tsla);
+        tokens[1] = address(amzn);
+        tokens[2] = address(nflx); // zero-weight: never traded, still sellable
+
+        uint256[] memory weights = new uint256[](3);
+        weights[0] = 6000;
+        weights[1] = 4000;
+        weights[2] = 0;
+
+        s.initialize(
+            vault,
+            proposer,
+            abi.encode(
+                address(weth),
+                address(adapter),
+                address(verifier),
+                tokens,
+                weights,
+                TOTAL_AMOUNT,
+                MAX_SLIPPAGE,
+                new bytes[](3),
+                _pd(3),
+                _feedIdsFor(3)
+            )
+        );
+
+        vm.prank(vault);
+        weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
+
+        // The invariant itself: the slot `_execute` will skip is anchored anyway.
+        (uint256 price, uint256 at) = s.priceAnchorOf(2);
+        assertEq(price, 0.005e18, "the zero-weight slot must be anchored too");
+        assertGt(at, 0, "and dated");
+
+        vm.prank(vault);
+        s.execute();
+        assertEq(s.getAllocations()[2].tokenAmount, 0, "zero-weight slot bought nothing");
+
+        // A donation lands in the slot no trade ever filled, and its pool is
+        // pushed 100x against the vault before the exit.
+        nflx.mint(address(s), 1_000e18);
+        MockSwapAdapter(address(adapter)).setRate(address(nflx), address(weth), 0.00005e18);
+
+        vm.prank(vault);
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
+        s.settle();
     }
 
     /// @notice Wrong array length is refused rather than partially applied, so a

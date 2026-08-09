@@ -1046,6 +1046,33 @@ contract PortfolioStrategy is BaseStrategy {
     ///         In push mode this is a no-op by construction — `_verifyPrice`
     ///         reverts `InvalidFeedId` on a non-empty report — so the function
     ///         is DS-mode only without needing to say so.
+    ///
+    ///         ALL-OR-NOTHING ACROSS EVERY SLOT, INCLUDING ZERO-WEIGHT ONES, AND
+    ///         THAT IS THE POINT rather than an oversight. It reads as one: a
+    ///         per-index variant (or accepting empty bytes as "skip this slot")
+    ///         would make the refresh robust to a single momentarily
+    ///         unobtainable feed, where today one bad feed blocks the whole
+    ///         basket's refresh and therefore its `execute`. That liveness cost
+    ///         is real and is accepted, because the coupling buys an invariant
+    ///         the exit path depends on:
+    ///
+    ///           EVERY SLOT IS ANCHORED BY THE TIME `settle()` RUNS.
+    ///
+    ///         `_settle` sells any slot carrying a balance, `targetWeightBps == 0`
+    ///         included — a slot the `_execute` gate deliberately skips and no
+    ///         trade ever fills, but which a donation or a weight rebalanced to
+    ///         zero can leave holding tokens. `_sellFloor` degrades to the
+    ///         pool-quoted floor exactly when `_lastGoodPrice[i] == 0`. So an
+    ///         unanchored zero-weight slot would be sold at settle against a quote
+    ///         taken from the pool it is selling into: audit finding #6's shape,
+    ///         reintroduced on the way OUT, where refusing is not an option and
+    ///         the sandwich window is widest.
+    ///
+    ///         Anchoring every slot unconditionally is what makes that
+    ///         unreachable, since `_execute` cannot run until this has been called
+    ///         and this cannot succeed on a subset. Anyone loosening the coupling
+    ///         has to close that hole another way first — anchoring zero-weight
+    ///         slots on the settle path, or refusing to sell an unanchored slot.
     function submitPriceReports(bytes[] calldata signedReports) external {
         if (chainlinkVerifier == address(0)) revert PushModeNeedsNoReports();
         uint256 len = _allocations.length;
