@@ -1778,7 +1778,9 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         //
         // Closing the emergency-path gap needs `sweep()` reachable for a
         // terminal-but-`Executed` clone first — either by relaxing its gate or
-        // by a permissionless `forceSettle()`. Until then this stays narrow.
+        // by a permissionless `forceSettle()`. Tracked with the NAV work in
+        // issue #233 / `docs/nav-residue-design.md`. Until then this stays
+        // narrow.
         if (_state != State.Settled) return false;
         if (tokenId != 0) return true;
         if (IERC20(asset).balanceOf(address(this)) > RESIDUE_DUST) return true;
@@ -1790,7 +1792,11 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // burned, loose balances pushed, collateral stuck behind residual debt —
         // answered false without this and reopened deposits.
         Position memory pos = morpho.position(marketId, address(this));
-        if (pos.collateral != 0 || pos.borrowShares != 0) return true;
+        // Dust-floored for the same reason: `supplyCollateral` also takes
+        // `onBehalf` and needs no authorization. Debt alone does not strand
+        // value — it is the COLLATERAL behind it that cannot leave — so the
+        // floor is applied to that.
+        if (pos.collateral > RESIDUE_DUST) return true;
         address coll = _marketParams.collateralToken;
         if (coll != asset && IERC20(coll).balanceOf(address(this)) > RESIDUE_DUST) return true;
         return false;

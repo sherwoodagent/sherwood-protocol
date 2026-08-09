@@ -1570,11 +1570,18 @@ contract SyndicateVault is
         // under-priced but ALWAYS PAYABLE, and payable is the property the
         // queue's solvency rests on.
         //
-        // The queued-deposit mispricing is therefore still open, and closing it
-        // needs a mechanism that does not couple price to reserve: skip the
-        // stamp while `hasUndeliveredValue()` holds and add a permissionless
-        // `restamp(pid)` any sweeper can call once the residue has landed.
-        // Recorded here rather than left implied.
+        // The queued-deposit mispricing is therefore still open. The design for
+        // closing it lives in `docs/nav-residue-design.md` and issue #233 — do
+        // not re-derive it here.
+        //
+        // NOTE the skip-stamp-plus-`restamp(pid)` shape is NOT the plan: it does
+        // not survive the queue. `claim` requires `_lastStampedPid >= r.pid`, so
+        // skipping strands every queued request for that pid including
+        // redeemers; `stampSettlement` reverts `StampOutOfOrder` once a later
+        // proposal settles, which would strand them permanently; and
+        // restamping a stamped pid needs `_reservedAssets` and
+        // `_stampedUnclaimedShares` unwound first. Strictly worse than the
+        // mispricing.
         uint256 num = totalAssets() + 1;
         uint256 den = _pricingSupply() + 10 ** _decimalsOffset();
         IVaultWithdrawalQueue(q).stampSettlement(proposalId, num, den);

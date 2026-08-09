@@ -49,6 +49,23 @@ Non-negotiables:
    be able to block settlement — that is the capital-hostage failure the
    deliverable-maximum design exists to avoid.
 
+## The restamp route, and why it is NOT the plan
+
+An earlier in-source note suggested: skip the stamp while `hasUndeliveredValue()`
+holds, then add a permissionless `restamp(pid)`. Recorded here as REJECTED so it
+is not rediscovered — it does not survive `VaultWithdrawalQueue`:
+
+- `claim` requires `_lastStampedPid >= r.pid`. Skipping the stamp strands EVERY
+  queued request for that pid — redeemers included — until a restamp lands.
+- `stampSettlement` reverts `StampOutOfOrder` when `pid < _lastStampedPid`. If any
+  later proposal settles first, `restamp(pid)` reverts PERMANENTLY and those
+  requests are stranded for good. Strictly worse than the mispricing it fixes.
+- `sp.stamped` reverts `AlreadySettled`, so restamping a stamped pid additionally
+  needs `_reservedAssets` and `_stampedUnclaimedShares` unwound and re-added.
+
+The narrowing below has none of these properties, which is why it is the
+recommendation.
+
 ## Sketch
 
 - `IStrategyDelivery.undeliveredValue()` already exists (PR #227) and is the right

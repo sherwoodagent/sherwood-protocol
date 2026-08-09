@@ -41,8 +41,16 @@ interface IStrategyDelivery {
     /// @notice The vault-asset value this strategy still holds and has not
     ///         delivered — the AMOUNT behind `hasUndeliveredValue`'s bool.
     ///
-    /// @dev    READ ONLY AT SETTLEMENT, and that scoping is the whole safety
-    ///         argument. `VaultWithdrawalQueue`'s header commits the vault to
+    /// @dev    CURRENTLY UNREAD BY THE VAULT, and deliberately so. The stamp
+    ///         correction that would have consumed it was attempted twice and
+    ///         reverted — raising the settle price reserves float the vault does
+    ///         not hold, and no cap on the price bounds that (see the note at
+    ///         `SyndicateVault.onProposalSettled` and issue #233). This member
+    ///         is retained as the hook the replacement mechanism will use;
+    ///         treat it as reserved, not as live behaviour.
+    ///
+    ///         READ ONLY AT SETTLEMENT once a caller exists, and that scoping is
+    ///         the whole safety argument. `VaultWithdrawalQueue`'s header commits the vault to
     ///         stamping ONE frozen REALIZED price per proposal precisely "so the
     ///         vault never mints or burns against an unrealized,
     ///         strategy-influenced NAV". Counting strategy-held value in the

@@ -303,9 +303,17 @@ contract MorphoSupplyStrategy is BaseStrategy {
         //
         // Closing the emergency-path gap needs `sweep()` reachable for a
         // terminal-but-`Executed` clone first — either by relaxing its gate or
-        // by a permissionless `forceSettle()`. Until then this stays narrow.
+        // by a permissionless `forceSettle()`. Tracked with the NAV work in
+        // issue #233 / `docs/nav-residue-design.md`. Until then this stays
+        // narrow.
         if (_state != State.Settled) return false;
-        if (morpho.position(marketId, address(this)).supplyShares != 0) return true;
+        // VALUED, NOT COUNTED. `supply` takes `onBehalf` and requires no
+        // authorization — Morpho gates the withdraw/borrow side, not the credit
+        // side — so anyone can mint 1 wei of shares to a settled clone. Keying
+        // on `supplyShares != 0` let that bypass the dust floor and shut vault
+        // deposits indefinitely, which is the grief `RESIDUE_DUST` exists for.
+        (, uint256 own,) = _deliverableNow();
+        if (own > RESIDUE_DUST) return true;
         return IERC20(asset).balanceOf(address(this)) > RESIDUE_DUST;
     }
 
