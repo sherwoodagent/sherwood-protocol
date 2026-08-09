@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
+import {IStrategyDelivery} from "../interfaces/IStrategyDelivery.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -273,6 +274,62 @@ contract MorphoSupplyStrategy is BaseStrategy {
     ///         deliverable maximum on each call, so a market that frees up
     ///         gradually can be swept repeatedly.
     /// @return assets The vault-asset amount pushed to the vault this call.
+    /// @inheritdoc IStrategyDelivery
+    /// @dev True while a settled proposal still has a supply position or idle
+    ///      asset on this clone — exactly what `sweep()` would move. The vault
+    ///      reads this to keep deposits shut over that window, because
+    ///      `totalAssets()` prices anything held here at zero and a depositor
+    ///      would otherwise mint against a NAV missing the residue.
+    ///
+    ///      MEASURED ON THE POSITION, NOT ON `_deliverableNow()`. Deliverability
+    ///      is a property of the MARKET's idle balance at this instant, and it
+    ///      is exactly the quantity an attacker manipulates with a flash loan.
+    ///      A residue that cannot be withdrawn right now is still value the
+    ///      vault does not count, so it must still hold deposits.
+    ///
+    ///      Only meaningful once Settled: before that the vault is already
+    ///      gated by `openProposalCount() != 0`, and answering true early would
+    ///      be redundant rather than wrong.
+    function hasUndeliveredValue() public view override returns (bool) {
+        // `Settled` ONLY, and that is a deliberate reversal. Answering for
+        // `Executed` too was tried, to cover a clone left holding everything by
+        // `finalizeEmergencySettle`. It WEDGES the vault: `sweep()` is itself
+        // `Settled`-gated, so such a clone reports residue forever, cannot be
+        // swept, and deposits shut permanently with no permissionless way out —
+        // and a proposer can reach it cheaply by omitting `settle()` from a
+        // `maxDrawdownBps == 10_000` batch. A permanent DoS is worse than the
+        // fail-open it was closing, and it would have falsified
+        // `_depositsLocked`'s "NOBODY IS WEDGED" doctrine.
+        //
+        // Closing the emergency-path gap needs `sweep()` reachable for a
+        // terminal-but-`Executed` clone first — either by relaxing its gate or
+        // by a permissionless `forceSettle()`. Tracked with the NAV work in
+        // issue #233 / `docs/nav-residue-design.md`. Until then this stays
+        // narrow.
+        if (_state != State.Settled) return false;
+        // VALUED, NOT COUNTED. `supply` takes `onBehalf` and requires no
+        // authorization — Morpho gates the withdraw/borrow side, not the credit
+        // side — so anyone can mint 1 wei of shares to a settled clone. Keying
+        // on `supplyShares != 0` let that bypass the dust floor and shut vault
+        // deposits indefinitely, which is the grief `RESIDUE_DUST` exists for.
+        (, uint256 own,) = _deliverableNow();
+        if (own > RESIDUE_DUST) return true;
+        return IERC20(asset).balanceOf(address(this)) > RESIDUE_DUST;
+    }
+
+    /// @inheritdoc IStrategyDelivery
+    /// @dev Loan token IS the vault asset for this template (`_initialize`
+    ///      pins `marketParams.loanToken == asset`), so the supply position is
+    ///      already denominated in vault-asset units — no oracle, and nothing
+    ///      an attacker can move inside the settlement transaction. `own` is
+    ///      the redeemable value of the remaining shares; the idle balance is
+    ///      whatever a partial withdrawal already pulled but has not pushed.
+    function undeliveredValue() public view override returns (uint256) {
+        if (_state != State.Settled) return 0;
+        (, uint256 own,) = _deliverableNow();
+        return own + IERC20(asset).balanceOf(address(this));
+    }
+
     function sweep() external returns (uint256 assets) {
         if (_state != State.Settled) revert NotSettled();
         (uint256 shares, uint256 own, uint256 deliverable) = _deliverableNow();

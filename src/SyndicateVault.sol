@@ -5,6 +5,7 @@ import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
 import {IProposalStatus} from "./interfaces/IProposalStatus.sol";
+import {IStrategyDelivery} from "./interfaces/IStrategyDelivery.sol";
 import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IVaultWithdrawalQueue} from "./interfaces/IVaultWithdrawalQueue.sol";
@@ -240,12 +241,25 @@ contract SyndicateVault is
     ///         falls and recovers is not charged twice on the same dollars.
     uint256 private _highWaterPricePerShare;
 
+    /// @notice The strategy of the most recently settled proposal, pinned at
+    ///         `onProposalSettled` so `_depositsLocked` can ask whether it still
+    ///         holds undelivered value.
+    ///
+    ///         NEEDED BECAUSE THE ORDINARY POINTER IS ALREADY GONE by then:
+    ///         `_activeStrategy()` resolves through `getActiveProposal()`, which
+    ///         `_finishSettlement` zeroes before this vault is called, so after
+    ///         settlement there is no live path back to the strategy that just
+    ///         settled. Zero when unresolvable, which reads as "nothing
+    ///         outstanding" — see `_depositsLocked`.
+    address private _lastSettledStrategy;
+
     /// @dev Reserved storage for future upgrades. Shrinks whenever a new state
     ///      variable is added above. Grown from 28 → 31 slots: this deletion
     ///      frees `_laneALockPid` (1), `_interimNetFlow` (1), and
     ///      `_crystallizedMgmt`+`_crystallizedPerf` (1, shared) — legal only
     ///      because no vault proxy is live (see design.md "Deployment reality").
-    uint256[31] private __gap;
+    ///      Back to 30: `_lastSettledStrategy` takes one.
+    uint256[30] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -1113,8 +1127,53 @@ contract SyndicateVault is
     ///      window where a depositor mid-vote would be silently pulled into a
     ///      strategy by `executeProposal`. Off-chain readers can call
     ///      `governor.openProposalCount(vault)` directly.
+    /// @dev AND WHILE THE LAST SETTLEMENT STILL HAS VALUE IN FLIGHT.
+    ///      `openProposalCount() != 0` covers the window where capital is
+    ///      deployed, on the reasoning that `totalAssets()` reads only
+    ///      `balanceOf(this)` and so under-reports while a strategy holds funds.
+    ///      That reasoning does not stop at settlement: strategy settlement is
+    ///      DELIVERABLE-MAXIMUM, not all-or-revert (`MorphoSupplyStrategy` caps
+    ///      at the market's idle balance and emits `SettlementIncomplete`), so a
+    ///      settled proposal can leave a residue on the clone while
+    ///      `_finishSettlement` has already cleared the open count.
+    ///
+    ///      In that gap `totalAssets()` under-reports by the residue and
+    ///      deposits are open, so a depositor mints against a price missing
+    ///      value that is still coming back. The permissionless `sweep()` then
+    ///      returns it into the enlarged share pool, and the difference —
+    ///      `A * R / (float + A)` for a deposit `A` against residue `R` — comes
+    ///      out of the LPs who were already in. No privileged action, repeatable
+    ///      per proposal, and an attacker can induce the residue rather than
+    ///      wait for it: `_deliverableNow` caps at Morpho's idle balance, which
+    ///      a fee-free `flashLoan` removes for one callback frame.
+    ///
+    ///      NOBODY IS WEDGED BY THIS. `sweep()` is permissionless and untaxed,
+    ///      so the very depositor this refuses can call it and then deposit at
+    ///      the correct price. That is the property that makes locking safe
+    ///      here, where blocking SETTLEMENT itself would not be — an illiquid
+    ///      market must never trap the vault, which is why the deliverable-
+    ///      maximum design exists and why this guard is on deposits only.
+    ///
+    ///      DEGRADES OPEN, STATED. A strategy that cannot answer leaves deposits
+    ///      unlocked — the pre-existing behaviour — rather than locked. Failing
+    ///      closed here would let one non-conforming clone brick deposits for
+    ///      the vault's whole remaining life, with no permissionless way out,
+    ///      which is a worse and less reversible failure than the mispricing it
+    ///      would be guarding against. Same doctrine as `_escrowedFeeLiability`.
+    ///
+    ///      This closes the MINT side only. Queued redeemers stamped in the same
+    ///      `onProposalSettled` call are still priced at the float-only figure
+    ///      and remain underpaid by the residue; that half needs `totalAssets()`
+    ///      itself to count strategy-held value and is deliberately not done
+    ///      here.
     function _depositsLocked() private view returns (bool) {
-        return IProposalStatus(_getGovernor()).openProposalCount() != 0;
+        if (IProposalStatus(_getGovernor()).openProposalCount() != 0) return true;
+        address s = _lastSettledStrategy;
+        if (s == address(0)) return false;
+        (bool ok, bytes memory ret) =
+            s.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.hasUndeliveredValue, ()));
+        if (!ok || ret.length != 32) return false;
+        return abi.decode(ret, (uint256)) != 0;
     }
 
     /// @dev Float available for instant exits = vault asset balance minus the
@@ -1465,12 +1524,102 @@ contract SyndicateVault is
     ///      `stampSettlement` increments the queue's counter only AFTER receiving
     ///      `num`/`den`, so the read here excludes only PRIOR stamps.
     function onProposalSettled(uint256 proposalId) external onlyGovernor {
+        // Pin the settling strategy BEFORE anything can return early — this is
+        // the last moment the governor still names it, and `_depositsLocked`
+        // needs it to ask whether a residue is still in flight. Read from the
+        // caller (the governor), which is `onlyGovernor`-authenticated, via a
+        // length-checked staticcall: a governor that cannot answer leaves the
+        // pin at zero, which `_depositsLocked` reads as nothing outstanding —
+        // the pre-existing behaviour, not a stricter one.
+        (bool okS, bytes memory retS) = msg.sender.staticcall(abi.encodeCall(IProposalStatus.strategyOf, (proposalId)));
+        _lastSettledStrategy = (okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0);
+
         address q = _withdrawalQueue;
         if (q == address(0)) return;
+        // THE STAMP COUNTS UNDELIVERED VALUE; `totalAssets()` DELIBERATELY DOES
+        // NOT. `totalAssets()` is the LIVE figure every conversion reads, and
+        // teaching it to count strategy-held value would price the vault against
+        // an unrealized, strategy-influenced NAV — the exact lever the frozen
+        // settle price exists to remove (see `VaultWithdrawalQueue`'s header).
+        //
+        // At THIS point the position is already unwound, so what the strategy
+        // still holds is realized-but-undelivered value: a receivable, not a
+        // mark to market. Excluding it stamped a price below what the vault
+        // actually owned, and a queued depositor claiming at that frozen number
+        // minted against the shortfall — then swept it in. Freezing the price is
+        // what made it unfixable after the fact: a third party sweeping first
+        // did not repair the stamp, and the attacker carried no directional
+        // risk, since no residue simply meant a fair-price deposit.
+        //
+        // Degrades to 0 on any failure, i.e. to the pre-fix stamp, never to a
+        // higher one — an over-count is the only direction that could mint
+        // against value that never arrives.
+        // STAMPED FROM FLOAT ALONE, DELIBERATELY — the residue correction was
+        // attempted here and REVERTED, because it cannot be made safe at this
+        // site. `stampSettlement` derives the queue reserve as
+        // `mulDiv(redeemShares, num, den)`, and `_availableFloat` is
+        // `balanceOf - reserve`. Raising `num` therefore reserves assets the
+        // vault does not hold: instant `maxWithdraw`/`maxRedeem` floor to zero
+        // for EVERY LP, and a queued `claim` reverts outright if the residue
+        // never frees.
+        //
+        // Capping `num` does NOT fix that. The reserve scales with
+        // `redeemShares / den`, a ratio this call does not control, so no bound
+        // on `num` alone keeps the reserve payable — a 90%-queued vault still
+        // over-reserves by ~1.8x at the cap. The float-only stamp is
+        // under-priced but ALWAYS PAYABLE, and payable is the property the
+        // queue's solvency rests on.
+        //
+        // The queued-deposit mispricing is therefore still open. The design for
+        // closing it lives in `docs/nav-residue-design.md` and issue #233 — do
+        // not re-derive it here.
+        //
+        // NOTE the skip-stamp-plus-`restamp(pid)` shape is NOT the plan: it does
+        // not survive the queue. `claim` requires `_lastStampedPid >= r.pid`, so
+        // skipping strands every queued request for that pid including
+        // redeemers; `stampSettlement` reverts `StampOutOfOrder` once a later
+        // proposal settles, which would strand them permanently; and
+        // restamping a stamped pid needs `_reservedAssets` and
+        // `_stampedUnclaimedShares` unwound first. Strictly worse than the
+        // mispricing.
         uint256 num = totalAssets() + 1;
         uint256 den = _pricingSupply() + 10 ** _decimalsOffset();
         IVaultWithdrawalQueue(q).stampSettlement(proposalId, num, den);
     }
+
+    /// @dev Vault-asset value a settled strategy still holds. Length-checked
+    ///      raw staticcall for the same reason the sibling bool probe is one:
+    ///      the address is proposer-chosen, so a typed call would let it revert
+    ///      settlement. Any failure — no code, revert, short return — reads as
+    ///      0, which reproduces the pre-fix stamp exactly.
+    function _undeliveredValueOf(address s) private view returns (uint256) {
+        if (s == address(0) || s.code.length == 0) return 0;
+        (bool ok, bytes memory ret) =
+            s.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.undeliveredValue, ()));
+        if (!ok || ret.length != 32) return 0;
+        return abi.decode(ret, (uint256));
+    }
+
+    /// @dev Gas ceiling for both strategy probes. The address is
+    ///      proposer-chosen, so an uncapped staticcall lets a gas-burning
+    ///      callee eat 63/64 of the forwarded gas: on `_deposit` that is a
+    ///      permanent deposit DoS with no permissionless clear, and on
+    ///      `onProposalSettled` the probe sits inside the settle path and can
+    ///      OOG settlement itself. The degrade-to-false/0 semantics already
+    ///      handle a truncated result correctly.
+    ///
+    ///      ACCEPTED TRADE, stated rather than implied: the Morpho probe now
+    ///      routes through `_deliverableNow` -> `expectedMarketBalances` ->
+    ///      `borrowRateView`, and the IRM is part of the proposer-supplied
+    ///      `MarketParams`. A proposer can therefore pick an IRM whose view
+    ///      burns more than this cap, degrade the probe to `false`, and
+    ///      SUPPRESS the deposit lock. That is a suppression of a mitigation,
+    ///      not a DoS — the recoverable direction, and the same direction the
+    ///      probe already degrades in when a strategy cannot answer at all.
+    ///      Raising the cap trades it back against the OOG risk above; if the
+    ///      lock ever becomes load-bearing rather than defence-in-depth, this
+    ///      needs a measured worst-case bound instead of a round number.
+    uint256 private constant _PROBE_GAS = 150_000;
 
     // ==================== MANAGEMENT-FEE ACCRUAL ====================
 

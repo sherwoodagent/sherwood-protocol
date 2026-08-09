@@ -3,14 +3,15 @@ pragma solidity 0.8.28;
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
+import {IStrategyDelivery} from "../interfaces/IStrategyDelivery.sol";
 import {ISwapAdapter} from "../interfaces/ISwapAdapter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
-import {IMorpho, Id, MarketParams, Market} from "../vendor/morpho/IMorpho.sol";
-import {MarketParamsLib} from "../vendor/morpho/MorphoLibs.sol";
+import {IMorpho, Id, MarketParams, Market, Position} from "../vendor/morpho/IMorpho.sol";
+import {MarketParamsLib, MorphoBalancesLib} from "../vendor/morpho/MorphoLibs.sol";
 import {IUniswapV3Pool} from "../vendor/uniswap/IUniswapV3Pool.sol";
 import {INonfungiblePositionManager} from "../vendor/uniswap/INonfungiblePositionManager.sol";
 
@@ -64,6 +65,7 @@ interface ITierBindingPath {
 contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
     using MarketParamsLib for MarketParams;
+    using MorphoBalancesLib for IMorpho;
 
     // ── Constants ──
 
@@ -1748,6 +1750,107 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         set `_settle` can create, or the "recoverable later" claim above
     ///         is false for whichever step was left out — so the position
     ///         unwind is retried here too, not just the repay and the withdraw.
+    /// @inheritdoc IStrategyDelivery
+    /// @dev True while a settled proposal still has value on this clone that a
+    ///      `sweep()` or `releaseUnconvertible()` would move. The vault reads it
+    ///      to keep deposits shut over that window, since `totalAssets()` prices
+    ///      anything held here at zero.
+    ///
+    ///      Covers every leg this template can strand, which is more than the
+    ///      Morpho case: an open LP position, the ERC-4626 collateral wrapper,
+    ///      the `otherToken` side, and plain idle `asset`. `_settle` reports the
+    ///      first two through `SettlementIncomplete`; the last two are what
+    ///      `sweep`/`releaseUnconvertible` exist to return.
+    ///
+    ///      Reads BALANCES, not deliverability. Whether a wrapper will redeem or
+    ///      a pool will quote right now is the manipulable part; value the vault
+    ///      is not counting is the part that matters here.
+    function hasUndeliveredValue() public view override returns (bool) {
+        // `Settled` ONLY, and that is a deliberate reversal. Answering for
+        // `Executed` too was tried, to cover a clone left holding everything by
+        // `finalizeEmergencySettle`. It WEDGES the vault: `sweep()` is itself
+        // `Settled`-gated, so such a clone reports residue forever, cannot be
+        // swept, and deposits shut permanently with no permissionless way out —
+        // and a proposer can reach it cheaply by omitting `settle()` from a
+        // `maxDrawdownBps == 10_000` batch. A permanent DoS is worse than the
+        // fail-open it was closing, and it would have falsified
+        // `_depositsLocked`'s "NOBODY IS WEDGED" doctrine.
+        //
+        // Closing the emergency-path gap needs `sweep()` reachable for a
+        // terminal-but-`Executed` clone first — either by relaxing its gate or
+        // by a permissionless `forceSettle()`. Tracked with the NAV work in
+        // issue #233 / `docs/nav-residue-design.md`. Until then this stays
+        // narrow.
+        if (_state != State.Settled) return false;
+        if (tokenId != 0) return true;
+        if (IERC20(asset).balanceOf(address(this)) > RESIDUE_DUST) return true;
+        if (IERC20(otherToken).balanceOf(address(this)) > RESIDUE_DUST) return true;
+        // THE MORPHO POSITION, which is the residue this template most often
+        // strands: `_repayAndWithdraw` defines `collateralRemaining` as exactly
+        // this, `_tryWithdrawCollateral` degrades rather than reverting, and
+        // collateral cannot leave while debt remains. The canonical strand — LP
+        // burned, loose balances pushed, collateral stuck behind residual debt —
+        // answered false without this and reopened deposits.
+        Position memory pos = morpho.position(marketId, address(this));
+        // Dust-floored for the same reason: `supplyCollateral` also takes
+        // `onBehalf` and needs no authorization. The floor is on COLLATERAL and
+        // the `borrowShares` clause is gone deliberately: debt with zero
+        // collateral is not a reachable steady state, because Morpho's bad-debt
+        // realization zeroes both sides together. So the collateral floor
+        // subsumes it rather than merely ignoring it.
+        if (pos.collateral > RESIDUE_DUST) return true;
+        address coll = _marketParams.collateralToken;
+        if (coll != asset && IERC20(coll).balanceOf(address(this)) > RESIDUE_DUST) return true;
+        return false;
+    }
+
+    /// @inheritdoc IStrategyDelivery
+    /// @dev DELIBERATELY PARTIAL, AND BIASED LOW. Reports only what this
+    ///      template can value in vault-asset units WITHOUT consulting a price
+    ///      an attacker could move inside the settlement transaction: the idle
+    ///      vault-asset balance, plus the Morpho collateral net of debt when the
+    ///      collateral token IS the vault asset (the fee-free 1:1 wrapper case
+    ///      this template is built for).
+    ///
+    ///      NOT counted: a live LP position (`tokenId != 0`), the volatile leg,
+    ///      and a collateral token that is not the vault asset. Valuing those
+    ///      needs a pool or oracle read, and a stamp that trusts one is exactly
+    ///      the unrealized, strategy-influenced NAV the frozen-price design
+    ///      exists to avoid — the same lever findings #2/#3 pull.
+    ///
+    ///      Under-reporting is the SAFE direction: the stamp stays at or below
+    ///      true value, so a queued depositor can never mint against value that
+    ///      was counted but never arrives. `hasUndeliveredValue()` still returns
+    ///      true for every residue shape, so the deposit lock keeps its wider
+    ///      coverage; only the PRICE correction is narrowed.
+    function undeliveredValue() public view override returns (uint256) {
+        if (_state != State.Settled) return 0;
+        uint256 v = IERC20(asset).balanceOf(address(this));
+        if (_marketParams.collateralToken != asset) return v;
+
+        // ONE read of the struct, not two.
+        Position memory pos = morpho.position(marketId, address(this));
+        // SAME FLOOR AS THE BOOL. Without it a 1-wei donated collateral gives
+        // `hasUndeliveredValue() == false` while this returns non-zero — the
+        // bool/amount divergence that was finding #1. Free to close now; it
+        // would not be obvious once #233 wires a consumer.
+        if (pos.collateral <= RESIDUE_DUST) return v;
+        uint256 owed;
+        if (pos.borrowShares != 0) {
+            // ACCRUED totals, not raw. A raw `morpho.market` read excludes
+            // interest since `lastUpdate`, which understates `owed` and pushes
+            // `collateral - owed` HIGH — the one direction this stamp must
+            // never err in. The same-tx accrual in `_repayAndWithdraw` is a
+            // guarded call allowed to fail, so it is not a guarantee.
+            (,, uint256 totalBorrowAssets, uint256 totalBorrowShares) = morpho.expectedMarketBalances(_marketParams);
+            owed = _sharesToAssetsUp(pos.borrowShares, totalBorrowAssets, totalBorrowShares);
+        }
+        // Net equity only, and never negative: an underwater position
+        // contributes nothing rather than subtracting from the stamp.
+        if (uint256(pos.collateral) > owed) v += uint256(pos.collateral) - owed;
+        return v;
+    }
+
     function sweep() external nonReentrant returns (uint256 assets) {
         if (_state != State.Settled) revert NotSettled();
 
