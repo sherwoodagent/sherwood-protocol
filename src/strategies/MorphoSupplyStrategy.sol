@@ -274,18 +274,38 @@ contract MorphoSupplyStrategy is BaseStrategy {
     ///         deliverable maximum on each call, so a market that frees up
     ///         gradually can be swept repeatedly.
     /// @return assets The vault-asset amount pushed to the vault this call.
+    function sweep() external returns (uint256 assets) {
+        if (_state != State.Settled) revert NotSettled();
+        (uint256 shares, uint256 own, uint256 deliverable) = _deliverableNow();
+        if (shares != 0 && deliverable != 0) {
+            if (deliverable >= own) {
+                morpho.withdraw(_marketParams, 0, shares, address(this), address(this));
+            } else {
+                morpho.withdraw(_marketParams, deliverable, 0, address(this), address(this));
+            }
+        }
+        assets = IERC20(asset).balanceOf(address(this));
+        if (assets != 0) {
+            _pushAllToVault(asset);
+            emit ResidualSwept(assets);
+        }
+    }
+
     /// @inheritdoc IStrategyDelivery
     /// @dev True while a settled proposal still has a supply position or idle
-    ///      asset on this clone — exactly what `sweep()` would move. The vault
-    ///      reads this to keep deposits shut over that window, because
+    ///      asset on this clone — exactly what `sweep()` above would move. The
+    ///      vault reads this to keep deposits shut over that window, because
     ///      `totalAssets()` prices anything held here at zero and a depositor
     ///      would otherwise mint against a NAV missing the residue.
     ///
-    ///      MEASURED ON THE POSITION, NOT ON `_deliverableNow()`. Deliverability
-    ///      is a property of the MARKET's idle balance at this instant, and it
-    ///      is exactly the quantity an attacker manipulates with a flash loan.
-    ///      A residue that cannot be withdrawn right now is still value the
-    ///      vault does not count, so it must still hold deposits.
+    ///      MEASURED ON WHAT THE POSITION IS WORTH, NEVER ON WHAT THE MARKET
+    ///      CAN PAY OUT RIGHT NOW. Both come from `_deliverableNow()`, and the
+    ///      distinction is which element is read: `own` is this clone's claim,
+    ///      a function of its own shares and the supply index. `deliverable` is
+    ///      that claim clamped to the market's idle balance, which is exactly
+    ///      the quantity a flash loan moves — so it is never consulted here. A
+    ///      residue that cannot be withdrawn this instant is still value the
+    ///      vault does not count, and must still hold deposits.
     ///
     ///      Only meaningful once Settled: before that the vault is already
     ///      gated by `openProposalCount() != 0`, and answering true early would
@@ -330,29 +350,13 @@ contract MorphoSupplyStrategy is BaseStrategy {
         return own + IERC20(asset).balanceOf(address(this));
     }
 
-    function sweep() external returns (uint256 assets) {
-        if (_state != State.Settled) revert NotSettled();
-        (uint256 shares, uint256 own, uint256 deliverable) = _deliverableNow();
-        if (shares != 0 && deliverable != 0) {
-            if (deliverable >= own) {
-                morpho.withdraw(_marketParams, 0, shares, address(this), address(this));
-            } else {
-                morpho.withdraw(_marketParams, deliverable, 0, address(this), address(this));
-            }
-        }
-        assets = IERC20(asset).balanceOf(address(this));
-        if (assets != 0) {
-            _pushAllToVault(asset);
-            emit ResidualSwept(assets);
-        }
-    }
-
     /// @dev (own supply shares, their redeemable value, the amount the market
-    ///      can actually pay out right now). Shared core for `_settle` and
-    ///      `sweep` — deliberately WITHOUT a `_state` gate: both run in
-    ///      `State.Settled` (see `BaseStrategy.settle`, which flips state
-    ///      BEFORE calling `_settle`), so a state gate here would zero them
-    ///      out entirely.
+    ///      can actually pay out right now). Shared core for `_settle`, `sweep`
+    ///      and the two delivery probes — deliberately WITHOUT a `_state` gate:
+    ///      `_settle` and `sweep` both run in `State.Settled` (see
+    ///      `BaseStrategy.settle`, which flips state BEFORE calling `_settle`),
+    ///      so a state gate here would zero them out entirely. The probes carry
+    ///      their own gate instead.
     function _deliverableNow() private view returns (uint256 shares, uint256 own, uint256 deliverable) {
         MarketParams memory mp = _marketParams;
         (uint256 totalSupplyAssets, uint256 totalSupplyShares, uint256 totalBorrowAssets,) =
