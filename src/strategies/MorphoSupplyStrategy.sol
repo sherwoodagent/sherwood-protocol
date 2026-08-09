@@ -291,9 +291,20 @@ contract MorphoSupplyStrategy is BaseStrategy {
     ///      gated by `openProposalCount() != 0`, and answering true early would
     ///      be redundant rather than wrong.
     function hasUndeliveredValue() public view override returns (bool) {
-        // `Executed` too — see the CL override for why `Settled` alone fails
-        // open on the `finalizeEmergencySettle` path.
-        if (_state != State.Settled && _state != State.Executed) return false;
+        // `Settled` ONLY, and that is a deliberate reversal. Answering for
+        // `Executed` too was tried, to cover a clone left holding everything by
+        // `finalizeEmergencySettle`. It WEDGES the vault: `sweep()` is itself
+        // `Settled`-gated, so such a clone reports residue forever, cannot be
+        // swept, and deposits shut permanently with no permissionless way out —
+        // and a proposer can reach it cheaply by omitting `settle()` from a
+        // `maxDrawdownBps == 10_000` batch. A permanent DoS is worse than the
+        // fail-open it was closing, and it would have falsified
+        // `_depositsLocked`'s "NOBODY IS WEDGED" doctrine.
+        //
+        // Closing the emergency-path gap needs `sweep()` reachable for a
+        // terminal-but-`Executed` clone first — either by relaxing its gate or
+        // by a permissionless `forceSettle()`. Until then this stays narrow.
+        if (_state != State.Settled) return false;
         if (morpho.position(marketId, address(this)).supplyShares != 0) return true;
         return IERC20(asset).balanceOf(address(this)) > RESIDUE_DUST;
     }
@@ -306,7 +317,7 @@ contract MorphoSupplyStrategy is BaseStrategy {
     ///      the redeemable value of the remaining shares; the idle balance is
     ///      whatever a partial withdrawal already pulled but has not pushed.
     function undeliveredValue() public view override returns (uint256) {
-        if (_state != State.Settled && _state != State.Executed) return 0;
+        if (_state != State.Settled) return 0;
         (, uint256 own,) = _deliverableNow();
         return own + IERC20(asset).balanceOf(address(this));
     }

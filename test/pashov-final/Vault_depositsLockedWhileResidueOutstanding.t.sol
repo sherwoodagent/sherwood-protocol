@@ -85,61 +85,28 @@ contract PashovFinalDepositLockTest is VaultInstantLiquidityTest {
         vault.deposit(1_000e6, alice);
     }
 
-    /// @notice THE OTHER HALF, and the one the deposit lock cannot reach.
-    ///         Locking `deposit()` does nothing for the QUEUED path: a queued
-    ///         depositor is paid at the price FROZEN by `onProposalSettled`,
-    ///         and `claim` -> `settleDeposit` never consults the lock. Freezing
-    ///         a price computed from float alone is what made the theft
-    ///         unfixable after the fact — a third party sweeping first does not
-    ///         repair the stamp.
+    /// @notice THE STAMP STAYS FLOAT-ONLY, and this pins that deliberately.
+    ///         Adding the residue to `num` was tried and reverted: the queue
+    ///         reserve is `mulDiv(redeemShares, num, den)`, so raising `num`
+    ///         reserves assets the vault does not hold and floors instant exits
+    ///         for every LP. Capping `num` does not help — the reserve scales
+    ///         with a ratio this call does not control.
     ///
-    ///         So the stamp itself now counts undelivered value. This pins the
-    ///         numerator directly, because that is the quantity the attacker
-    ///         mints against.
-    function test_finding3_stampCountsUndeliveredValue() public {
+    ///         So the queued-deposit mispricing remains OPEN, and this test
+    ///         exists so nobody re-adds the residue here without also solving
+    ///         the reserve coupling (skip-stamp plus a permissionless
+    ///         `restamp`, most likely).
+    function test_finding3_stampRemainsFloatOnly() public {
         deliveryStrat = new StubDeliveryStrategy();
         deliveryStrat.setHolding(true);
         deliveryStrat.setResidue(4_000e6);
-        // The vault must actually be able to cover the residue, or the float
-        // bound below caps it away — see the sibling test.
         deal(vault.asset(), address(vault), 10_000e6);
 
         uint256 float_ = vault.totalAssets();
         _settleWith(address(deliveryStrat));
 
         IVaultWithdrawalQueue.SettlePrice memory sp = queue.getSettlePrice(PID);
-        assertEq(sp.num, float_ + 4_000e6 + 1, "stamp must include the residue the vault still owns");
-    }
-
-    /// @notice THE FLOAT BOUND. `stampSettlement` derives the queue reserve from
-    ///         `num`, and `_availableFloat` is `balanceOf - reserve` — so
-    ///         counting residue the vault does not hold would reserve assets it
-    ///         cannot pay, flooring `maxWithdraw`/`maxRedeem` to zero for EVERY
-    ///         LP and reverting queued claims outright. The float-only stamp was
-    ///         under-priced but always payable; that property must survive the
-    ///         correction, so the residue is capped at what the vault holds.
-    function test_finding3_residueIsBoundedByFloatTheVaultHolds() public {
-        deliveryStrat = new StubDeliveryStrategy();
-        deliveryStrat.setHolding(true);
-        deliveryStrat.setResidue(type(uint128).max);
-        deal(vault.asset(), address(vault), 1_000e6);
-
-        _settleWith(address(deliveryStrat));
-
-        IVaultWithdrawalQueue.SettlePrice memory sp = queue.getSettlePrice(PID);
-        assertEq(sp.num, 1_000e6 + 1_000e6 + 1, "residue may not exceed the float backing it");
-    }
-
-    /// @notice The degrade path, and it must degrade to the OLD number rather
-    ///         than a higher one: over-counting would mint against value that
-    ///         never arrives, which is worse than the bug being fixed.
-    function test_finding3_unanswerableResidueStampsFloatOnly() public {
-        StubDeliveryShortReturn bad = new StubDeliveryShortReturn();
-        uint256 float_ = vault.totalAssets();
-        _settleWith(address(bad));
-
-        IVaultWithdrawalQueue.SettlePrice memory sp = queue.getSettlePrice(PID);
-        assertEq(sp.num, float_ + 1, "an unanswerable strategy must not inflate the stamp");
+        assertEq(sp.num, float_ + 1, "stamp must stay payable; residue correction needs a non-reserving mechanism");
     }
 
     /// @notice NOBODY IS WEDGED — the property that makes locking safe here.

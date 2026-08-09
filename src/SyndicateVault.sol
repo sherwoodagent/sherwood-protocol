@@ -1554,21 +1554,28 @@ contract SyndicateVault is
         // Degrades to 0 on any failure, i.e. to the pre-fix stamp, never to a
         // higher one — an over-count is the only direction that could mint
         // against value that never arrives.
-        // BOUNDED BY FLOAT THE VAULT ACTUALLY HOLDS. `stampSettlement` derives
-        // the queue reserve from `num`, and `_availableFloat` is
-        // `balanceOf - reserve`, so counting residue that is still on the clone
-        // reserves assets the vault cannot pay: instant `maxWithdraw`/
-        // `maxRedeem` floor to zero for EVERY LP, and a queued `claim` reverts
-        // outright if the residue never frees. The float-only stamp was
-        // under-priced but always payable, and that property must survive.
+        // STAMPED FROM FLOAT ALONE, DELIBERATELY — the residue correction was
+        // attempted here and REVERTED, because it cannot be made safe at this
+        // site. `stampSettlement` derives the queue reserve as
+        // `mulDiv(redeemShares, num, den)`, and `_availableFloat` is
+        // `balanceOf - reserve`. Raising `num` therefore reserves assets the
+        // vault does not hold: instant `maxWithdraw`/`maxRedeem` floor to zero
+        // for EVERY LP, and a queued `claim` reverts outright if the residue
+        // never frees.
         //
-        // Capping keeps the correction wherever the vault can honour it and
-        // degrades to the old under-price where it cannot — under-pricing being
-        // the direction that cannot mint against value that never arrives.
-        uint256 held = IERC20(asset()).balanceOf(address(this));
-        uint256 residue = _undeliveredValueOf(_lastSettledStrategy);
-        if (residue > held) residue = held;
-        uint256 num = totalAssets() + residue + 1;
+        // Capping `num` does NOT fix that. The reserve scales with
+        // `redeemShares / den`, a ratio this call does not control, so no bound
+        // on `num` alone keeps the reserve payable — a 90%-queued vault still
+        // over-reserves by ~1.8x at the cap. The float-only stamp is
+        // under-priced but ALWAYS PAYABLE, and payable is the property the
+        // queue's solvency rests on.
+        //
+        // The queued-deposit mispricing is therefore still open, and closing it
+        // needs a mechanism that does not couple price to reserve: skip the
+        // stamp while `hasUndeliveredValue()` holds and add a permissionless
+        // `restamp(pid)` any sweeper can call once the residue has landed.
+        // Recorded here rather than left implied.
+        uint256 num = totalAssets() + 1;
         uint256 den = _pricingSupply() + 10 ** _decimalsOffset();
         IVaultWithdrawalQueue(q).stampSettlement(proposalId, num, den);
     }

@@ -1766,15 +1766,20 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      a pool will quote right now is the manipulable part; value the vault
     ///      is not counting is the part that matters here.
     function hasUndeliveredValue() public view override returns (bool) {
-        // ALSO ANSWERS FOR `Executed`, not only `Settled`. `settle()` landing is
-        // not guaranteed: `finalizeEmergencySettle` runs owner-supplied calls —
-        // the escape hatch for a strategy whose `settle()` reverts — so the
-        // clone can stay `Executed` holding everything while the open count is
-        // cleared. Gating on `Settled` answered "nothing outstanding" in exactly
-        // the stuck case this exists for. A `true` during the ordinary Executed
-        // window is redundant rather than wrong, since `openProposalCount()`
-        // already locks deposits there.
-        if (_state != State.Settled && _state != State.Executed) return false;
+        // `Settled` ONLY, and that is a deliberate reversal. Answering for
+        // `Executed` too was tried, to cover a clone left holding everything by
+        // `finalizeEmergencySettle`. It WEDGES the vault: `sweep()` is itself
+        // `Settled`-gated, so such a clone reports residue forever, cannot be
+        // swept, and deposits shut permanently with no permissionless way out —
+        // and a proposer can reach it cheaply by omitting `settle()` from a
+        // `maxDrawdownBps == 10_000` batch. A permanent DoS is worse than the
+        // fail-open it was closing, and it would have falsified
+        // `_depositsLocked`'s "NOBODY IS WEDGED" doctrine.
+        //
+        // Closing the emergency-path gap needs `sweep()` reachable for a
+        // terminal-but-`Executed` clone first — either by relaxing its gate or
+        // by a permissionless `forceSettle()`. Until then this stays narrow.
+        if (_state != State.Settled) return false;
         if (tokenId != 0) return true;
         if (IERC20(asset).balanceOf(address(this)) > RESIDUE_DUST) return true;
         if (IERC20(otherToken).balanceOf(address(this)) > RESIDUE_DUST) return true;
@@ -1811,7 +1816,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      true for every residue shape, so the deposit lock keeps its wider
     ///      coverage; only the PRICE correction is narrowed.
     function undeliveredValue() public view override returns (uint256) {
-        if (_state != State.Settled && _state != State.Executed) return 0;
+        if (_state != State.Settled) return 0;
         uint256 v = IERC20(asset).balanceOf(address(this));
         if (_marketParams.collateralToken != asset) return v;
 
