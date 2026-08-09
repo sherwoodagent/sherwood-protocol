@@ -470,7 +470,13 @@ contract PortfolioStrategy is BaseStrategy {
     ///         reverted (see `_verifyPrice`), so this event marks a valid
     ///         submission, not proof that every anchor moved. Read
     ///         `priceAnchorOf` for the resulting state.
-    event PriceAnchorsRefreshed(address indexed caller, uint256 at);
+    /// @param  caller      Who submitted.
+    /// @param  submittedAt When the submission landed. NOT the anchor's date:
+    ///                     anchors are stamped with the report's OBSERVATION
+    ///                     time, which precedes this by the relay lag. Named for
+    ///                     the difference so a keeper does not read one for the
+    ///                     other.
+    event PriceAnchorsRefreshed(address indexed caller, uint256 submittedAt);
     event WeightsUpdated(address[] tokens, uint256[] oldWeights, uint256[] newWeights);
     event Rebalanced(
         address[] tokens,
@@ -1792,6 +1798,17 @@ contract PortfolioStrategy is BaseStrategy {
         // and clamping only ever moves a timestamp DOWN.
         uint256 observedAt = report.observationsTimestamp;
         if (observedAt > block.timestamp) observedAt = block.timestamp;
+        // A ZERO OBSERVATION IS NOT A DATE. `_lastGoodAt[i]` is documented as
+        // zero EXACTLY when `_lastGoodPrice[i]` is zero, and `_staleSlippageBps`
+        // reads that invariant directly ("this is only reached when the latter is
+        // non-zero, so the former is non-zero too"). While the anchor was stamped
+        // `block.timestamp` the invariant held by construction; dating it from a
+        // field of an external report means a zero can now reach it, pairing a
+        // real price with a zero date — an anchor `_execute` reads as missing but
+        // the floors read as maximally stale. No honest report carries this, which
+        // is the point: it costs one comparison to keep an invariant the readers
+        // are entitled to assume rather than to re-derive.
+        if (observedAt == 0) revert StalePrice();
 
         // Chainlink prices are int192 with the report's declared decimals (8 for
         // tokenized stocks, 18 for crypto pairs). The raw oracle units are
@@ -1835,6 +1852,14 @@ contract PortfolioStrategy is BaseStrategy {
         // revert an adversary was using as the weapon. The report still prices
         // THIS call, bounded as ever by its own `expiresAt`; only the persisted
         // anchor is protected.
+        //
+        // `>=`, NOT `>`, AND THAT IS NOT AN OFF-BY-ONE. STRICTLY BACKWARDS is the
+        // attack; equal is not. Re-presenting the report already anchored is
+        // legitimate and idempotent — `rebalanceDelta` routinely carries the very
+        // report `submitPriceReports` just recorded, in the same block — so an
+        // equal observation must still take. Tightening this to `>` would not
+        // revert anything, it would silently stop the anchor tracking a re-sent
+        // report; `test_anchor_equalObservationStillTakes` is the pin.
         if (observedAt >= _lastGoodAt[i]) {
             _lastGoodPrice[i] = price;
             _lastGoodAt[i] = observedAt;

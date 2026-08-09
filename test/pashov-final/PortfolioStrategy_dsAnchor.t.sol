@@ -127,6 +127,65 @@ contract PashovFinalDsAnchorTest is PortfolioStrategyTest {
         assertEq(at, anchoredAt, "nor may its date rewind");
     }
 
+    /// @notice `>=` IS DELIBERATE, AND THIS IS ITS ONLY PIN. Strictly backwards
+    ///         is the attack; equal is not. `rebalanceDelta` routinely carries the
+    ///         very report `submitPriceReports` just recorded, in the same block,
+    ///         so an equal observation has to keep taking.
+    ///
+    ///         Worth a test of its own precisely because the guard no longer
+    ///         reverts: tightening `>=` to `>` would fail nothing loudly, it would
+    ///         silently stop the anchor tracking a re-sent report. So the
+    ///         assertion has to be that the PRICE moved, which means the second
+    ///         report has to carry a different one at the same timestamp.
+    function test_anchor_equalObservationStillTakes() public {
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        bytes[] memory first = new bytes[](3);
+        first[0] = _signedReport(0, int192(int256(0.01e18)));
+        first[1] = _signedReport(1, int192(int256(0.02e18)));
+        first[2] = _signedReport(2, int192(int256(0.005e18)));
+        strategy.submitPriceReports(first);
+
+        (uint256 price, uint256 at) = strategy.priceAnchorOf(0);
+        assertEq(price, 0.01e18);
+        assertEq(at, block.timestamp);
+
+        // Same block, same observation time, different price.
+        bytes[] memory second = new bytes[](3);
+        second[0] = _signedReport(0, int192(int256(0.011e18)));
+        second[1] = _signedReport(1, int192(int256(0.02e18)));
+        second[2] = _signedReport(2, int192(int256(0.005e18)));
+        strategy.submitPriceReports(second);
+
+        (uint256 priceAfter, uint256 atAfter) = strategy.priceAnchorOf(0);
+        assertEq(priceAfter, 0.011e18, "an equal observation must still update the anchor");
+        assertEq(atAfter, at, "and leave its date where it was");
+    }
+
+    /// @notice A ZERO OBSERVATION IS NOT A DATE. `_lastGoodAt[i]` is documented as
+    ///         zero exactly when `_lastGoodPrice[i]` is zero, and
+    ///         `_staleSlippageBps` reads that invariant rather than re-deriving
+    ///         it. Stamping `block.timestamp` kept it true by construction; dating
+    ///         from a field of an external report does not, so the zero is refused
+    ///         rather than allowed to pair a real price with a missing date —
+    ///         which `_execute` would read as "no anchor" while the floors read it
+    ///         as maximally stale and hand out the 30% band.
+    function test_anchor_zeroObservationIsRefused() public {
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        verifier.setObsSkew(-int256(vm.getBlockTimestamp())); // observation lands on 0
+
+        bytes[] memory reports = new bytes[](3);
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
+        reports[2] = _signedReport(2, int192(int256(0.005e18)));
+
+        vm.expectRevert(PortfolioStrategy.StalePrice.selector);
+        strategy.submitPriceReports(reports);
+
+        (uint256 price, uint256 at) = strategy.priceAnchorOf(0);
+        assertEq(price, 0, "no price may be recorded against a zero date");
+        assertEq(at, 0, "and the slot stays unanchored");
+    }
+
     /// @notice A FUTURE-DATED OBSERVATION IS CLAMPED, NOT REFUSED. The DON's
     ///         clock and an L2's `block.timestamp` are different clocks, and the
     ///         mock models exactly that skew. Refusing on `observationsTimestamp >
