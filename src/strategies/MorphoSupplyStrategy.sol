@@ -291,9 +291,11 @@ contract MorphoSupplyStrategy is BaseStrategy {
     ///      gated by `openProposalCount() != 0`, and answering true early would
     ///      be redundant rather than wrong.
     function hasUndeliveredValue() public view override returns (bool) {
-        if (_state != State.Settled) return false;
+        // `Executed` too — see the CL override for why `Settled` alone fails
+        // open on the `finalizeEmergencySettle` path.
+        if (_state != State.Settled && _state != State.Executed) return false;
         if (morpho.position(marketId, address(this)).supplyShares != 0) return true;
-        return IERC20(asset).balanceOf(address(this)) != 0;
+        return IERC20(asset).balanceOf(address(this)) > RESIDUE_DUST;
     }
 
     /// @inheritdoc IStrategyDelivery
@@ -304,7 +306,7 @@ contract MorphoSupplyStrategy is BaseStrategy {
     ///      the redeemable value of the remaining shares; the idle balance is
     ///      whatever a partial withdrawal already pulled but has not pushed.
     function undeliveredValue() public view override returns (uint256) {
-        if (_state != State.Settled) return 0;
+        if (_state != State.Settled && _state != State.Executed) return 0;
         (, uint256 own,) = _deliverableNow();
         return own + IERC20(asset).balanceOf(address(this));
     }

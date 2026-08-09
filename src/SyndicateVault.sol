@@ -1170,7 +1170,8 @@ contract SyndicateVault is
         if (IProposalStatus(_getGovernor()).openProposalCount() != 0) return true;
         address s = _lastSettledStrategy;
         if (s == address(0)) return false;
-        (bool ok, bytes memory ret) = s.staticcall(abi.encodeCall(IStrategyDelivery.hasUndeliveredValue, ()));
+        (bool ok, bytes memory ret) =
+            s.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.hasUndeliveredValue, ()));
         if (!ok || ret.length != 32) return false;
         return abi.decode(ret, (uint256)) != 0;
     }
@@ -1553,7 +1554,21 @@ contract SyndicateVault is
         // Degrades to 0 on any failure, i.e. to the pre-fix stamp, never to a
         // higher one — an over-count is the only direction that could mint
         // against value that never arrives.
-        uint256 num = totalAssets() + _undeliveredValueOf(_lastSettledStrategy) + 1;
+        // BOUNDED BY FLOAT THE VAULT ACTUALLY HOLDS. `stampSettlement` derives
+        // the queue reserve from `num`, and `_availableFloat` is
+        // `balanceOf - reserve`, so counting residue that is still on the clone
+        // reserves assets the vault cannot pay: instant `maxWithdraw`/
+        // `maxRedeem` floor to zero for EVERY LP, and a queued `claim` reverts
+        // outright if the residue never frees. The float-only stamp was
+        // under-priced but always payable, and that property must survive.
+        //
+        // Capping keeps the correction wherever the vault can honour it and
+        // degrades to the old under-price where it cannot — under-pricing being
+        // the direction that cannot mint against value that never arrives.
+        uint256 held = IERC20(asset()).balanceOf(address(this));
+        uint256 residue = _undeliveredValueOf(_lastSettledStrategy);
+        if (residue > held) residue = held;
+        uint256 num = totalAssets() + residue + 1;
         uint256 den = _pricingSupply() + 10 ** _decimalsOffset();
         IVaultWithdrawalQueue(q).stampSettlement(proposalId, num, den);
     }
@@ -1565,10 +1580,20 @@ contract SyndicateVault is
     ///      0, which reproduces the pre-fix stamp exactly.
     function _undeliveredValueOf(address s) private view returns (uint256) {
         if (s == address(0) || s.code.length == 0) return 0;
-        (bool ok, bytes memory ret) = s.staticcall(abi.encodeCall(IStrategyDelivery.undeliveredValue, ()));
+        (bool ok, bytes memory ret) =
+            s.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.undeliveredValue, ()));
         if (!ok || ret.length != 32) return 0;
         return abi.decode(ret, (uint256));
     }
+
+    /// @dev Gas ceiling for both strategy probes. The address is
+    ///      proposer-chosen, so an uncapped staticcall lets a gas-burning
+    ///      callee eat 63/64 of the forwarded gas: on `_deposit` that is a
+    ///      permanent deposit DoS with no permissionless clear, and on
+    ///      `onProposalSettled` the probe sits inside the settle path and can
+    ///      OOG settlement itself. The degrade-to-false/0 semantics already
+    ///      handle a truncated result correctly.
+    uint256 private constant _PROBE_GAS = 150_000;
 
     // ==================== MANAGEMENT-FEE ACCRUAL ====================
 

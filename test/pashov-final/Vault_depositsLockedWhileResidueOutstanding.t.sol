@@ -100,12 +100,34 @@ contract PashovFinalDepositLockTest is VaultInstantLiquidityTest {
         deliveryStrat = new StubDeliveryStrategy();
         deliveryStrat.setHolding(true);
         deliveryStrat.setResidue(4_000e6);
+        // The vault must actually be able to cover the residue, or the float
+        // bound below caps it away — see the sibling test.
+        deal(vault.asset(), address(vault), 10_000e6);
 
         uint256 float_ = vault.totalAssets();
         _settleWith(address(deliveryStrat));
 
         IVaultWithdrawalQueue.SettlePrice memory sp = queue.getSettlePrice(PID);
         assertEq(sp.num, float_ + 4_000e6 + 1, "stamp must include the residue the vault still owns");
+    }
+
+    /// @notice THE FLOAT BOUND. `stampSettlement` derives the queue reserve from
+    ///         `num`, and `_availableFloat` is `balanceOf - reserve` — so
+    ///         counting residue the vault does not hold would reserve assets it
+    ///         cannot pay, flooring `maxWithdraw`/`maxRedeem` to zero for EVERY
+    ///         LP and reverting queued claims outright. The float-only stamp was
+    ///         under-priced but always payable; that property must survive the
+    ///         correction, so the residue is capped at what the vault holds.
+    function test_finding3_residueIsBoundedByFloatTheVaultHolds() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(type(uint128).max);
+        deal(vault.asset(), address(vault), 1_000e6);
+
+        _settleWith(address(deliveryStrat));
+
+        IVaultWithdrawalQueue.SettlePrice memory sp = queue.getSettlePrice(PID);
+        assertEq(sp.num, 1_000e6 + 1_000e6 + 1, "residue may not exceed the float backing it");
     }
 
     /// @notice The degrade path, and it must degrade to the OLD number rather

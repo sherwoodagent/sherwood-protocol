@@ -10,8 +10,8 @@ import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
-import {IMorpho, Id, MarketParams, Market} from "../vendor/morpho/IMorpho.sol";
-import {MarketParamsLib} from "../vendor/morpho/MorphoLibs.sol";
+import {IMorpho, Id, MarketParams, Market, Position} from "../vendor/morpho/IMorpho.sol";
+import {MarketParamsLib, MorphoBalancesLib} from "../vendor/morpho/MorphoLibs.sol";
 import {IUniswapV3Pool} from "../vendor/uniswap/IUniswapV3Pool.sol";
 import {INonfungiblePositionManager} from "../vendor/uniswap/INonfungiblePositionManager.sol";
 
@@ -65,6 +65,7 @@ interface ITierBindingPath {
 contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
     using MarketParamsLib for MarketParams;
+    using MorphoBalancesLib for IMorpho;
 
     // ── Constants ──
 
@@ -1765,12 +1766,28 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      a pool will quote right now is the manipulable part; value the vault
     ///      is not counting is the part that matters here.
     function hasUndeliveredValue() public view override returns (bool) {
-        if (_state != State.Settled) return false;
+        // ALSO ANSWERS FOR `Executed`, not only `Settled`. `settle()` landing is
+        // not guaranteed: `finalizeEmergencySettle` runs owner-supplied calls —
+        // the escape hatch for a strategy whose `settle()` reverts — so the
+        // clone can stay `Executed` holding everything while the open count is
+        // cleared. Gating on `Settled` answered "nothing outstanding" in exactly
+        // the stuck case this exists for. A `true` during the ordinary Executed
+        // window is redundant rather than wrong, since `openProposalCount()`
+        // already locks deposits there.
+        if (_state != State.Settled && _state != State.Executed) return false;
         if (tokenId != 0) return true;
-        if (IERC20(asset).balanceOf(address(this)) != 0) return true;
-        if (IERC20(otherToken).balanceOf(address(this)) != 0) return true;
+        if (IERC20(asset).balanceOf(address(this)) > RESIDUE_DUST) return true;
+        if (IERC20(otherToken).balanceOf(address(this)) > RESIDUE_DUST) return true;
+        // THE MORPHO POSITION, which is the residue this template most often
+        // strands: `_repayAndWithdraw` defines `collateralRemaining` as exactly
+        // this, `_tryWithdrawCollateral` degrades rather than reverting, and
+        // collateral cannot leave while debt remains. The canonical strand — LP
+        // burned, loose balances pushed, collateral stuck behind residual debt —
+        // answered false without this and reopened deposits.
+        Position memory pos = morpho.position(marketId, address(this));
+        if (pos.collateral != 0 || pos.borrowShares != 0) return true;
         address coll = _marketParams.collateralToken;
-        if (coll != asset && IERC20(coll).balanceOf(address(this)) != 0) return true;
+        if (coll != asset && IERC20(coll).balanceOf(address(this)) > RESIDUE_DUST) return true;
         return false;
     }
 
@@ -1794,21 +1811,26 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      true for every residue shape, so the deposit lock keeps its wider
     ///      coverage; only the PRICE correction is narrowed.
     function undeliveredValue() public view override returns (uint256) {
-        if (_state != State.Settled) return 0;
+        if (_state != State.Settled && _state != State.Executed) return 0;
         uint256 v = IERC20(asset).balanceOf(address(this));
         if (_marketParams.collateralToken != asset) return v;
 
-        uint128 collateral = morpho.position(marketId, address(this)).collateral;
-        if (collateral == 0) return v;
-        uint128 borrowShares = morpho.position(marketId, address(this)).borrowShares;
+        // ONE read of the struct, not two.
+        Position memory pos = morpho.position(marketId, address(this));
+        if (pos.collateral == 0) return v;
         uint256 owed;
-        if (borrowShares != 0) {
-            Market memory m = morpho.market(marketId);
-            owed = _sharesToAssetsUp(borrowShares, m.totalBorrowAssets, m.totalBorrowShares);
+        if (pos.borrowShares != 0) {
+            // ACCRUED totals, not raw. A raw `morpho.market` read excludes
+            // interest since `lastUpdate`, which understates `owed` and pushes
+            // `collateral - owed` HIGH — the one direction this stamp must
+            // never err in. The same-tx accrual in `_repayAndWithdraw` is a
+            // guarded call allowed to fail, so it is not a guarantee.
+            (,, uint256 totalBorrowAssets, uint256 totalBorrowShares) = morpho.expectedMarketBalances(_marketParams);
+            owed = _sharesToAssetsUp(pos.borrowShares, totalBorrowAssets, totalBorrowShares);
         }
         // Net equity only, and never negative: an underwater position
         // contributes nothing rather than subtracting from the stamp.
-        if (uint256(collateral) > owed) v += uint256(collateral) - owed;
+        if (uint256(pos.collateral) > owed) v += uint256(pos.collateral) - owed;
         return v;
     }
 

@@ -251,6 +251,18 @@ abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
         return 0;
     }
 
+    /// @dev Dust floor for the residue probes. Anyone may transfer 1 wei to a
+    ///      long-settled clone, and `hasUndeliveredValue()` keying on `!= 0`
+    ///      turned that into an indefinite deposit DoS: `sweep()` clears it,
+    ///      the griefer re-donates for 1 wei plus gas, forever. A residue below
+    ///      this is not worth shutting deposits over — it cannot move a share
+    ///      price meaningfully, which is the only thing the lock protects.
+    ///
+    ///      Denominated in the strategy's own units on purpose: the templates
+    ///      that override this hold the VAULT ASSET, so the threshold reads in
+    ///      the same units as the value being judged.
+    uint256 internal constant RESIDUE_DUST = 1e3;
+
     // ── Internal helpers ──
 
     /// @notice Pull tokens from the vault into this strategy
