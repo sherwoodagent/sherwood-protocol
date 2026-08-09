@@ -761,6 +761,41 @@ contract PortfolioStrategy is BaseStrategy {
             if (allocation == 0) continue;
 
             IERC20(asset).forceApprove(address(swapAdapter), allocation);
+            // UNCAPPED BAND, AND NOT BY OVERSIGHT. See `_sellFloor`'s `bandCap`
+            // note for the split; `_execute` is the third case it did not have to
+            // name until the anchor gate above made this branch reachable.
+            //
+            // By the exit/discretionary test alone this call looks like it
+            // belongs with `rebalance()`, since refusing here strands nothing —
+            // that is the very argument the anchor gate above is built on. It
+            // sits with the uncapped callers for a different reason: DEPLOYING IS
+            // ONE-SHOT AND ON A DEADLINE. What the band absorbs here is not an
+            // oracle failure but the ANCHOR'S OWN AGE, which
+            // `PRICE_ANCHOR_MAX_AGE_AT_EXECUTE` allows to reach an hour. Flooring
+            // an hour-old price at `maxSlippageBps` would refuse every honest
+            // execution where the market moved more than that in the interval —
+            // routine for an equity — and a refusal that repeats until `executeBy`
+            // lapses does not cost one trade, it kills the proposal. A rebalance
+            // refused is retried; an execute refused often enough is gone.
+            //
+            // THE RESIDUAL, accepted knowingly: a Data Streams entry therefore
+            // tolerates up to `STALE_PRICE_SLIPPAGE_BPS` against the oracle even
+            // on a perfectly fresh anchor, where a push-mode entry enforces the
+            // `maxSlippageBps` the proposal declared. Two things bound it — the
+            // quote floor raises `minOut` whenever the venue is honest, so this
+            // band binds only against a pool pushed DOWN, making it the loss
+            // CEILING UNDER ATTACK rather than an everyday tolerance; and that
+            // ceiling is what this PR moved, from the ~99% of a pool-quoted floor
+            // to a bounded fraction of the allocation.
+            //
+            // THE NUMBER WORTH REVISITING is not this argument but
+            // `STALE_PRICE_SLIPPAGE_BPS`, which is pinned to
+            // `MAX_SLIPPAGE_CEILING_BPS` — so an anchor observed SECONDS ago is
+            // handed the widest tolerance the system permits, a value chosen back
+            // when this branch meant "the oracle has failed". An age-proportional
+            // cap (`maxSlippageBps` plus an allowance scaled by the anchor's real
+            // age) is the better shape, and wants the drift figure sized against
+            // live feed behaviour rather than guessed here.
             uint256 minOut = _buyFloor(i, allocation, type(uint256).max);
             uint256 amountOut = swapAdapter.swap(asset, alloc.token, allocation, minOut, _swapExtraData[i]);
             if (amountOut == 0) revert SwapFailed();
@@ -1364,7 +1399,7 @@ contract PortfolioStrategy is BaseStrategy {
     ///        band it did not enforce, by a ratio reaching 60x. That is the
     ///        finding.
     ///
-    ///        Resolved at the SPLIT rather than at the meter, because the two
+    ///        Resolved at the SPLIT rather than at the meter, because the
     ///        callers want opposite things. `settle()` is the only
     ///        non-emergency exit and passes `type(uint256).max`: it must take
     ///        the widened band, since failing closed there strands capital and
@@ -1372,6 +1407,16 @@ contract PortfolioStrategy is BaseStrategy {
     ///        `rebalance()` is discretionary and passes `maxSlippageBps`:
     ///        blocking one rebalance strands nothing, so it refuses a trade it
     ///        cannot bill for rather than taking a 30% band on a 0.5% budget.
+    ///
+    ///        `_execute()` is a THIRD case, and only became one when the Data
+    ///        Streams anchor gate made this branch reachable at entry — before
+    ///        that the anchor was zero there and the floor fell through to the
+    ///        quote. It passes `type(uint256).max` too, but NOT on the exit
+    ///        argument: refusing at execute strands nothing. It is uncapped
+    ///        because deploying is one-shot and on a deadline, so a band tight
+    ///        enough to reject an hour-old anchor's drift can burn `executeBy`
+    ///        and kill the proposal outright. The full reasoning, and the
+    ///        residual it accepts, sit at that call site.
     ///
     ///        With the cap in place the metered path's enforced band IS
     ///        `maxSlippageBps`, so the existing charge is correct and
