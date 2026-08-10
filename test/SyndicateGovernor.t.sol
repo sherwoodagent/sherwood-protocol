@@ -807,9 +807,18 @@ contract SyndicateGovernorTest is Test {
         // test passes on `StrategyDurationNotElapsed` and proves nothing.
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
         deal(address(usdc), address(vault), 0);
-        vm.prank(owner);
+        vm.prank(vault.owner());
         vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
         governor.unstick(pid);
+
+        // Same assertion as the `settleProposal` twin: a refused rescue must
+        // leave the proposal where it was, so no queued claim was ever priced
+        // against the near-zero stamp.
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Executed),
+            "a refused unstick must not advance the proposal"
+        );
     }
 
     /// @notice The floor is a share of the CAPITAL THE ENVELOPE COVERS, never a

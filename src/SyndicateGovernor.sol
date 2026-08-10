@@ -46,8 +46,37 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         permissionless caller may FREEZE is bounded regardless.
     ///
     ///         9_000 leaves a 100%-drawdown proposal a floor at 10% of the
-    ///         execute-time price. Far below any honest settlement, far above
-    ///         the ~0 a flash-loaned settle produces.
+    ///         execute-time price — far above the ~0 a flash-loaned settle
+    ///         produces. It is NOT "far below any honest settlement": on a
+    ///         proposal whose voters declared `maxDrawdownBps == 10_000`, an
+    ///         honest loss past 90% is exactly the case this bar refuses. That
+    ///         is a deliberate liveness trade, not an oversight — see the
+    ///         residual-risk note below and
+    ///         `test_subFloorSettlementIsClearedByFinalizeEmergencySettle`.
+    ///
+    ///         WHAT THIS BOUNDS, STATED PLAINLY. The floor does not close the
+    ///         dilution attack; it prices it. An attacker who delivers 10% of
+    ///         the capital instead of 0% settles just above the bar and mints
+    ///         at ~10x the fair share count, then `sweep()` returns the
+    ///         withheld remainder. For a queued deposit `D` against vault
+    ///         assets `TA` that is `10D / (TA + 10D)` of the vault: ~60% at
+    ///         `D = 0.2·TA`, ~82% at `D = TA`. What changes is the price of the
+    ///         attack — the pre-fix version cost ~0 (a flash loan, repaid in
+    ///         frame), this one requires REAL capital proportional to the vault
+    ///         and locks it for the whole strategy term. "Bounded at 10x
+    ///         dilution for an attacker willing to fund it", not "closed".
+    ///
+    ///         WHY NOT 5_000 (2x dilution for the same shape)? Because the bar
+    ///         is symmetric: every bps of tightening moves an equal band of
+    ///         HONEST settlements off `settleProposal` AND off `unstick` (which
+    ///         derives its backstop from this same constant) and onto
+    ///         `finalizeEmergencySettle` — owner bond, guardian review, a full
+    ///         `reviewPeriod`, and a frozen vault for the duration. At 5_000
+    ///         that band is every loss past 50%, which is a routine outcome for
+    ///         a permissive envelope; at 9_000 it is a loss past 90%, which is
+    ///         near-total. Revisit if the emergency path ever becomes cheap
+    ///         enough that routing honest severe losses through it is not a
+    ///         liveness regression.
     uint256 public constant MAX_STAMP_DRAWDOWN_BPS = 9_000;
 
     // ── Storage (existing -- DO NOT reorder) ──
@@ -701,7 +730,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // redirected to the path where a human looks at it.
         {
             uint256 basis = _capitalSnapshots[proposalId];
-            uint256 allowance = (proposal.effectiveMaxCapital * proposal.maxDrawdownBps) / 10_000;
+            uint256 allowance = (proposal.effectiveMaxCapital * proposal.maxDrawdownBps) / BPS_DENOMINATOR;
             // `allowance >= basis` covers the declared-total-loss envelope
             // (`maxDrawdownBps == 10_000` on a proposal committing the whole
             // float): the floor is zero, so any realized balance settles. That
@@ -752,9 +781,32 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      manufactures, and the shape that mints unbounded shares to a queued
     ///      depositor — is refused.
     ///
-    ///      `finalizeEmergencySettle` stays exempt: it already carries a
-    ///      slashable owner bond and a guardian review, and it is the path a
-    ///      genuine loss past the envelope is supposed to be redirected TO.
+    ///      `finalizeEmergencySettle` stays exempt, and the accurate statement
+    ///      of what that costs is: AN ATTACKING VAULT OWNER MUST NOW WAIT OUT A
+    ///      GUARDIAN REVIEW, not "the stamp is bounded on every path". The bond
+    ///      is slashed only if guardians actively BLOCK (`finalizeEmergency` ->
+    ///      `GuardianRegistry._resolveEmergency`), and guardians review the
+    ///      submitted CALLDATA, not the block the owner later finalizes in — so
+    ///      an owner may post a bond, submit the honest replay calls, let the
+    ///      review lapse unblocked, and finalize from inside a flash-loan frame
+    ///      with no slash. The exemption is still the right call: gating it
+    ///      would leave a genuinely illiquid position with NO exit at all, and
+    ///      the vault stays frozen meanwhile. What the exemption buys the
+    ///      protocol is time and visibility, not arithmetic.
+    ///
+    ///      MEASURES A SLIGHTLY DIFFERENT NUMBER THAN THE ONE STAMPED. This
+    ///      runs before `_finishSettlement`, which charges the management fee
+    ///      and then the performance fee — both of which leave the vault (or
+    ///      land in `_escrowedFees`, which `totalAssets()` also subtracts)
+    ///      BEFORE `onProposalSettled` freezes `num = totalAssets() + 1`. So
+    ///      the stamped price is strictly at or below the price approved here,
+    ///      by the size of the fees. The gap is bounded and cannot be inflated
+    ///      into a near-zero stamp: the management base is ~0 for the deployed
+    ///      window and the performance leg is zero on a loss, which is the only
+    ///      case where this floor binds at all. Checked pre-fee deliberately —
+    ///      moving it after `_chargePerformanceFee` would make a fee charge
+    ///      able to REVERT an otherwise-valid settlement, converting a fee
+    ///      rounding edge into a stuck vault.
     function _requireSettlePriceAboveFloorHook(uint256 proposalId, StrategyProposal storage proposal, bool rescuePath)
         internal
         view
@@ -1198,6 +1250,21 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @inheritdoc ISyndicateGovernor
     function getCapitalSnapshot(uint256 proposalId) external view returns (uint256) {
         return _capitalSnapshots[proposalId];
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    /// @dev Two returns rather than the zero-value convention `getCapitalSnapshot`
+    ///      uses, because zero is MEANINGFUL here: `pricePerShare()` floors to 0
+    ///      on a live vault, so a single-value getter would reproduce off-chain
+    ///      exactly the sentinel ambiguity the `+1` storage offset exists to
+    ///      remove. `recorded == false` means no anchor (pre-upgrade proposal,
+    ///      not yet executed, or already cleared at settlement) and therefore
+    ///      "this gate will stand down"; only `recorded == true` makes
+    ///      `ppsAtExecute` a number a monitor may derive the floor from.
+    function getPpsSnapshot(uint256 proposalId) external view returns (uint256 ppsAtExecute, bool recorded) {
+        uint256 anchor = _ppsSnapshots[proposalId];
+        if (anchor == 0) return (0, false);
+        return (anchor - 1, true);
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -1910,6 +1977,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _activeProposal = 0;
         _transition(proposal, ProposalState.Settled);
         delete _capitalSnapshots[proposalId];
+        // Symmetric with the capital snapshot above: both are read only on the
+        // way INTO settlement (the two floors), never after it, and `Settled`
+        // is terminal — no path re-enters `_finishSettlement` for this id — so
+        // clearing recovers the refund without weakening either gate.
+        delete _ppsSnapshots[proposalId];
         _decOpen();
 
         emit ProposalSettled(proposalId, vault, pnl, totalFee, block.timestamp - proposal.executedAt);

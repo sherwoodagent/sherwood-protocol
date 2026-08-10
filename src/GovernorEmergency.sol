@@ -111,15 +111,24 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         // Same settle-price floor `settleProposal` enforces (pashov #12). An
         // honest rescue replays an already-voted batch and is net-INFLOW, so it
         // clears the floor trivially; only a near-zero stamp — the shape a
-        // flash-loaned settle manufactures — is refused, and that case belongs
-        // on the bonded, guardian-reviewed `finalizeEmergencySettle` path.
+        // flash-loaned settle manufactures — is refused, and that case is
+        // redirected to `finalizeEmergencySettle`.
         // `rescuePath = true`: the floor here is the ABSOLUTE backstop, not the
         // declared envelope. `unstick` exists precisely to settle a proposal the
         // declared-envelope floor REFUSED, so deriving its bar from that same
         // envelope would delete its reason to exist — pinned by
         // `test_pashovFinding1_unstickRecoversAProposalTheFloorRefused`. An
         // ordinary or even severe loss still unsticks; only a near-zero stamp is
-        // refused, and that one belongs on `finalizeEmergencySettle`.
+        // refused.
+        //
+        // WHAT THAT REDIRECTION IS WORTH, STATED HONESTLY: it costs an
+        // attacking owner a posted bond and a full guardian REVIEW WINDOW, not
+        // the ability to stamp a near-zero price. `finalizeEmergencySettle` is
+        // itself ungated on this floor (see the note there), and the same owner
+        // gate `_requireVaultOwner` guards both, so the barrier this adds on the
+        // `unstick` door is delay and visibility rather than arithmetic. It is
+        // still the load-bearing difference: `unstick` is instant and unbonded,
+        // the emergency path is neither.
         _requireSettlePriceAboveFloorHook(proposalId, p, true);
         _finishSettlementHook(proposalId, p);
     }
@@ -204,6 +213,25 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         // on the very declaration that stranded the proposal. The BATCH-level
         // ceiling is tightened regardless, since that is not what the escape hatch
         // was designed to relax.
+        // DELIBERATELY NOT GATED ON THE SETTLE-PRICE FLOOR (pashov #2/#12),
+        // unlike `settleProposal` and `unstick`. This is the terminus every
+        // sub-floor settlement is redirected TO: a position that genuinely lost
+        // more than 90% of the execute-time price has to be able to close, and
+        // gating here would leave it with no exit at all while `_activeProposal`
+        // keeps the whole vault frozen — redemptions, deposits, queue claims and
+        // any further proposal. Pinned by
+        // `test_subFloorSettlementIsClearedByFinalizeEmergencySettle`.
+        //
+        // WHAT STANDS BEHIND IT INSTEAD, accurately: a posted owner bond, an
+        // opened emergency, a full `reviewPeriod` elapsed, and no guardian
+        // block. Note the limits of that — the bond is slashed only when
+        // guardians actively block (`GuardianRegistry._resolveEmergency`), and
+        // guardians review the submitted CALLDATA, not the block this call
+        // eventually lands in. An owner may therefore submit honest replay
+        // calls, let the review lapse, and finalize from inside a flash-loan
+        // frame, stamping the same near-zero price with no slash. So the claim
+        // this path supports is "an attacking owner must wait out a guardian
+        // review", NOT "the stamp is bounded on every path".
         ISyndicateVault(p.vault).executeGovernorBatch(calls, new uint256[](0), p.effectiveMaxCapital);
         (int256 pnl,) = _finishSettlementHook(proposalId, p);
         emit EmergencySettleFinalized(proposalId, pnl);
