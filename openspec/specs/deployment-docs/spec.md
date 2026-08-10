@@ -114,6 +114,22 @@ This SHALL be enforced as a deploy-time assertion, not as prose in a runbook. `T
 - **WHEN** the address book carries no `TIER_REGISTRY` key at all
 - **THEN** the script proceeds and prints the required `setCounterpartyAllowed` call as a RUNBOOK line, because the grant cannot be verified from there
 
+### Requirement: Each CL pool's volatile leg is counterparty-allowlisted before its proposal
+
+Pool provenance establishes where a pool came from; it says nothing about what the pool TRADES. A proposer can deploy a worthless ERC-20, create a genuine `(vaultAsset, junk)` pool through the real factory, initialise it at a price of their choosing, and pass every provenance check on the merits — after which `_rebalanceToTarget` buys that token with vault asset, priced by the only venue that quotes the pair.
+
+`ConcentratedLiquidityStrategy._initialize` therefore binds the pool's non-asset token (`otherToken`) through `isCounterpartyAllowed` alongside `swapAdapter`, `positionManager`, `morpho`, `collateralToken` and `uniswapFactory`, and re-checks it at `execute()` and `rerange()`.
+
+This is a PER-PROPOSAL obligation, not a ceremony step: the volatile leg is chosen per clone, so no deploy script can assert it. The registry owner SHALL call `setCounterpartyAllowed(<volatile leg>, true)` for each token a CL proposal is expected to trade, before that proposal is executed. Exits are deliberately NOT gated on it — `settle`, `sweep` and `releaseUnconvertible` stay open under the existing capital-hostage rule, so a demotion cannot strand the funds it is meant to protect.
+
+#### Scenario: Proposal naming an unvouched volatile leg
+- **WHEN** a CL proposal names a pool whose non-asset token is not counterparty-allowlisted
+- **THEN** clone-init reverts `CounterpartyNotAllowed(otherToken, registry)`, failing the proposal rather than the batch
+
+#### Scenario: Volatile leg demoted after init
+- **WHEN** the leg is demoted between clone-init and `execute()`, or before a permissionless `rerange()`
+- **THEN** both entry paths revert, while `settle()` still completes
+
 ### Requirement: Core wiring order inside deployCore
 The canonical `DeploySherwood.deployCore` SHALL wire in this order: executor lib and vault impl; ProtocolConfig (plain Ownable, fee params seeded when non-zero); governor impl wrapped in a `GovernorBeacon` (per-vault governors are `BeaconProxy`s minted at `createSyndicate` — no singleton governor proxy is deployed); **sWOOD proxy before the registry proxy** (the registry's `initialize` takes the sWOOD address; the registry↔sWOOD cycle resolves via the set-once `StakedWood.setRegistry` call after the registry exists); factory proxy (address predicted by CREATE3 and asserted); then `TierRegistry` deployed owner-as-deployer and wired via the factory-only `setTierRegistry` BEFORE the multisig handoff. The `SYNDICATE_GOVERNOR` address-book slot SHALL be persisted as zero — governors are per-vault, resolved via `factory.governorOf(vault)`.
 

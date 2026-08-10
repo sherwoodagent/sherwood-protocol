@@ -6,6 +6,7 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {CLFixture} from "../strategies/ConcentratedLiquidityStrategy.t.sol";
 import {MockUniswapV3Factory} from "../mocks/MockUniswapV3Factory.sol";
 import {ConcentratedLiquidityStrategy} from "../../src/strategies/ConcentratedLiquidityStrategy.sol";
+import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 
 /// @notice A contract that answers every `IUniswapV3Pool` selector with values
 ///         its deployer picked, including `factory()`.
@@ -144,5 +145,101 @@ contract PashovFinalCLPoolProvenanceTest is CLFixture {
     function test_init_factoryRegisteredPoolStillInitializes() public {
         ConcentratedLiquidityStrategy s = _newStrategy(_defaultParams());
         assertEq(address(s.pool()), address(pool), "the factory-vouched pool binds");
+    }
+}
+
+/// @title ConcentratedLiquidityStrategy — the volatile leg is a counterparty
+///
+/// @notice The sibling gap to the provenance defect above, and the reason
+///         fixing provenance alone was not enough. Establishing that a pool
+///         really came from the Uniswap factory says nothing about what the
+///         pool TRADES. A proposer could still deploy a worthless ERC-20,
+///         create a genuine `(vaultAsset, junk)` pool through the real factory,
+///         initialise it at a price of their choosing, and hand it over: every
+///         provenance check passes, because every one of them is true.
+///
+///         The vault then buys that token. `_rebalanceToTarget` swaps vault
+///         asset into `otherToken` before minting, and both slippage floors are
+///         derived from the same attacker-priced venue — the pool anchor from
+///         its own `slot0`, the adapter quote from the only venue that quotes
+///         the pair — so the two floors agree with each other and with nothing
+///         real.
+///
+/// @dev    `otherToken` belongs on the counterparty axis by this file's own
+///         stated rule for it: "every address this contract approves or calls
+///         with vault funds". `_mintPosition` force-approves it to the position
+///         manager, `_rebalanceToTarget` and `_convertOtherToAsset` approve it
+///         to the swap adapter, and `rerange()`'s own natspec already calls it
+///         "any ERC-20 for which a real pool exists, so a transfer hook is a
+///         live possibility". It was the one such address not bound.
+contract PashovFinalCLVolatileLegTest is CLFixture {
+    /// @notice THE GAP. Nothing about this configuration is forged — the pool is
+    ///         factory-registered and quotes the vault asset. It is refused
+    ///         because governance has not vouched for what sits on the other
+    ///         side of it.
+    function test_init_unvouchedVolatileLegIsRejected() public {
+        tierRegistry.setDenied(address(nvda), true);
+
+        ConcentratedLiquidityStrategy s = ConcentratedLiquidityStrategy(Clones.clone(address(template)));
+        bytes memory data = abi.encode(_defaultParams());
+        address v = address(vaultStub);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ConcentratedLiquidityStrategy.CounterpartyNotAllowed.selector, address(nvda), address(tierRegistry)
+            )
+        );
+        s.initialize(v, proposer, data);
+    }
+
+    /// @notice Bound at init is not enough on its own — the axis is
+    ///         permissionless to revoke (`TierRegistry.poke`,
+    ///         `demoteByChallenge`), and `execute()` is where the vault's
+    ///         capital actually crosses into the token.
+    function test_execute_refusesAfterTheVolatileLegIsDemoted() public {
+        tierRegistry.setDenied(address(nvda), true);
+
+        vm.prank(address(vaultStub));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ConcentratedLiquidityStrategy.CounterpartyNotAllowed.selector, address(nvda), address(tierRegistry)
+            )
+        );
+        strategy.execute();
+    }
+
+    /// @notice Same treatment as every other counterparty on the permissionless
+    ///         entrypoint: `rerange()` re-approves `otherToken` on every call,
+    ///         so a demoted leg must not keep receiving them.
+    function test_rerange_refusesAfterTheVolatileLegIsDemoted() public {
+        _execute();
+        pool.setTicks(850, 850);
+        vm.warp(vm.getBlockTimestamp() + 2 hours);
+        tierRegistry.setDenied(address(nvda), true);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ConcentratedLiquidityStrategy.CounterpartyNotAllowed.selector, address(nvda), address(tierRegistry)
+            )
+        );
+        strategy.rerange();
+    }
+
+    /// @notice The EXIT stays open, matching the capital-hostage rule the other
+    ///         counterparties already follow. Blocking settlement because the
+    ///         volatile leg was demoted would strand the very funds the
+    ///         demotion is meant to protect.
+    function test_settle_stillWorksAfterTheVolatileLegIsDemoted() public {
+        _execute();
+        tierRegistry.setDenied(address(nvda), true);
+
+        _settle();
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled), "settlement is not gated on the leg");
+    }
+
+    /// @notice The vouched configuration is unaffected — the guard is not
+    ///         passing by refusing everything.
+    function test_init_vouchedVolatileLegStillInitializes() public {
+        ConcentratedLiquidityStrategy s = _newStrategy(_defaultParams());
+        assertEq(s.otherToken(), address(nvda), "the vouched volatile leg binds");
     }
 }

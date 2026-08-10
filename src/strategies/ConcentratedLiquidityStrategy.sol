@@ -181,9 +181,11 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     error PoolNotFromFactory();
     /// @notice A proposer-supplied counterparty is not allowlisted in the
     ///         `TierRegistry` the vault's own governor gates batch approvals
-    ///         against. Covers `swapAdapter`, `positionManager`, `morpho` and
-    ///         `marketParams.collateralToken` — every address this contract
-    ///         approves or calls with vault funds.
+    ///         against. Covers `swapAdapter`, `positionManager`, `morpho`,
+    ///         `marketParams.collateralToken`, `uniswapFactory` and the pool's
+    ///         volatile leg (`otherToken`) — every address this contract
+    ///         approves or calls with vault funds, plus the factory whose word
+    ///         the pool's provenance rests on.
     error CounterpartyNotAllowed(address counterparty, address registry);
     /// @notice The `vault() -> governor() -> tierRegistry()` walk yielded no
     ///         registry, so no counterparty can be vouched for. Fails closed at
@@ -512,9 +514,13 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         //     the vault, not from `p`, so a proposer cannot name it into the
         //     skip. `swapAdapter`, `positionManager` and `morpho` get no such
         //     exemption; they are never the asset.
+        //     NOT ALL OF THEM ARE BOUND HERE. `otherToken` is a counterparty by
+        //     the same rule as the rest, but its address is not known until the
+        //     pool has been proven and read, so it is bound at the end of check
+        //     (1). `registry` is hoisted out of this block for that.
+        address registry = _resolveTierRegistry();
+        if (registry == address(0)) revert TierRegistryUnresolved();
         {
-            address registry = _resolveTierRegistry();
-            if (registry == address(0)) revert TierRegistryUnresolved();
             // Strong axis for the swap adapter, matching `PortfolioStrategy`'s
             // binding of the same role; weak axis for the rest, which adapter
             // standing implies. All four receive approvals — see the note above
@@ -557,13 +563,12 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         //     pool over a worthless second token reports the real factory too,
         //     so it clears both formulations identically. The two differ only
         //     on the impostor, which self-reporting admits and this rejects.
-        //     What that note was reaching for is a real and still-OPEN gap,
-        //     recorded here because nothing else records it: `otherToken` is
-        //     not allowlisted, so a proposer may still name a genuine,
-        //     factory-created pool of the vault asset against a token it
-        //     controls. Provenance is not the control for that, and this check
-        //     must not be read as closing it. What bounds it today is only that
-        //     the token is visible to review — it is the pool's own `token1`.
+        //     What that note was reaching for is a real gap, and provenance is
+        //     genuinely not the control for it: a proposer may create a real
+        //     pool of the vault asset against a token it controls, and every
+        //     provenance check passes because every one of them is true. That
+        //     is closed SEPARATELY, by binding `otherToken` below — do not read
+        //     THIS check as covering it.
         //
         //     `p.pool` is non-zero (checked above) and the read is length-
         //     checked, so a factory that cannot answer — no code, revert, short
@@ -587,6 +592,32 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         } else {
             revert PoolAssetMismatch();
         }
+
+        //     THE VOLATILE LEG IS A COUNTERPARTY (pashov 2026-08, the gap named
+        //     in the provenance note above). Provenance proves where the pool
+        //     came from; it says nothing about what the pool TRADES. Without
+        //     this, a proposer deploys a worthless ERC-20, creates a genuine
+        //     `(vaultAsset, junk)` pool through the real factory, initialises
+        //     it at a price of their choosing, and every check above passes on
+        //     the merits. `_rebalanceToTarget` then buys that token with vault
+        //     asset, and BOTH slippage floors are derived from that same
+        //     attacker-priced venue — the anchor from the pool's own `slot0`,
+        //     the quote from the only venue that quotes the pair — so they
+        //     agree with each other and with nothing real.
+        //
+        //     It belongs on this axis by the rule the axis already states:
+        //     every address this contract approves or calls with vault funds.
+        //     `_mintPosition` force-approves it to the position manager,
+        //     `_rebalanceToTarget` and `_convertOtherToAsset` approve it to the
+        //     swap adapter, and `rerange()`'s own natspec already calls it "any
+        //     ERC-20 for which a real pool exists, so a transfer hook is a live
+        //     possibility". It was the one such address left unbound.
+        //
+        //     NO VAULT-ASSET EXEMPTION IS NEEDED, unlike `collateralToken`:
+        //     `otherToken` is by construction the token that is NOT the vault
+        //     asset — the branch above assigns it from whichever side failed to
+        //     match — so the carve-out could never apply.
+        _requireAllowedCounterparty(registry, otherToken);
 
         // (2) The market exists and lends the vault asset.
         if (p.marketParams.loanToken != vaultAsset) revert LoanAssetMismatch();
@@ -896,6 +927,11 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         _requireAllowedAdapter(registry, address(swapAdapter));
         _requireAllowedCounterparty(registry, address(positionManager));
         _requireAllowedCounterparty(registry, address(morpho));
+        // The volatile leg re-checks on the same terms as the rest: `rerange()`
+        // is permissionless and re-issues `forceApprove(otherToken, …)` to both
+        // the adapter and the position manager on every call, so a leg demoted
+        // after init would otherwise keep receiving them.
+        _requireAllowedCounterparty(registry, otherToken);
         address coll = _marketParams.collateralToken;
         if (coll != asset) _requireAllowedCounterparty(registry, coll);
     }
