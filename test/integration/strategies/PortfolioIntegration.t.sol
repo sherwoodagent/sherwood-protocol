@@ -141,6 +141,27 @@ contract PortfolioIntegrationTest is RobinhoodIntegrationTest {
         calls[0] = BatchExecutorLib.Call({target: strategy, data: abi.encodeWithSignature("settle()"), value: 0});
     }
 
+    /// @dev BLOCKED ON A REAL DON REPORT, and deliberately left that way rather
+    ///      than quietly rotting behind `stackCanExecute`.
+    ///
+    ///      `_buildBasketInitData` passes a non-zero `chainlinkVerifier`, so this
+    ///      basket is in Data Streams mode, and `_execute` now refuses to deploy
+    ///      unless every weighted allocation carries a price anchor younger than
+    ///      `PRICE_ANCHOR_MAX_AGE_AT_EXECUTE` (audit finding #6). The only way to
+    ///      seed one is `submitPriceReports` with a DON-signed report, which this
+    ///      fixture cannot produce: its `feedIds` are placeholders
+    ///      (`bytes32(uint256(i + 1))`), not real Data Streams feed ids, and no
+    ///      script in this repo fetches reports. So the moment `stackCanExecute`
+    ///      flips true, the lifecycle test will revert `PriceAnchorMissingOrStale`
+    ///      rather than pass.
+    ///
+    ///      To make it runnable, either (a) point `feedIds` at real Data Streams
+    ///      feeds for TSLA/AMZN/AMD, fetch a report per slot off-chain, and call
+    ///      `submitPriceReports` between init and execute, or (b) rebuild this
+    ///      fixture in push mode against deployed aggregators, which also makes
+    ///      the anchor self-seeding. The same gap is operational, not just a test
+    ///      one: any keeper executing a DS-mode basket needs that off-chain fetch
+    ///      step, and nothing in this repo provides it yet.
     function _deploy3TokenBasket() internal returns (address strategy, uint256 proposalId) {
         address[] memory tokens = new address[](3);
         tokens[0] = TSLA;
