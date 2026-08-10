@@ -671,11 +671,27 @@ contract SyndicateVault is
     ///      singleton — this fails CLOSED, so it is a possible over-restriction,
     ///      not a fund-safety gap.
     ///
-    ///      UNSET REGISTRY: with no tier registry wired (or a governor predating
-    ///      the getter), PART 2 cannot run and is skipped by design — the default
-    ///      is tier-2 / full-notional pricing anyway, and hard-reverting would
-    ///      brick registry-less vaults. PART 1 IS NOT AFFECTED: it needs no
-    ///      registry and sits above both early returns. Pinned by
+    ///      UNSET REGISTRY — PREVENTED UPSTREAM, NOT SAFE HERE (pashov finding
+    ///      #1). With no tier registry wired (or a governor predating the
+    ///      getter), PART 2 cannot run and this function RETURNS, dropping the
+    ///      callee allowlist, the spender/recipient gate and the
+    ///      `UnrecognizedAssetSelector` branch on the way out. That is NOT a
+    ///      pricing-only degradation, and it is not "by design": one batch
+    ///      instruction, `asset.approve(attacker, max)`, moves zero balance — so
+    ///      the net-outflow meter, the per-call cap and `requiredCoverage` all
+    ///      read zero — and licenses an unbounded pull in a LATER transaction.
+    ///
+    ///      The branch is retained ONLY because hard-reverting would brick any
+    ///      governor that is already registry-less, stranding LP capital behind
+    ///      `settleProposal` / `unstick` / every exit. The state itself is now
+    ///      unreachable going forward: `SyndicateFactory.createSyndicate` reverts
+    ///      `TierRegistryNotWired` while the factory has no registry, and
+    ///      `SyndicateGovernor.setTierRegistry` rejects zero and codeless
+    ///      addresses, so no NEW governor can reach this branch. Pre-fix
+    ///      governors are rescued with `SyndicateFactory.pushWiring(governor)`.
+    ///
+    ///      PART 1 IS NOT AFFECTED: it needs no registry and sits above both
+    ///      early returns. Pinned by
     ///      `test_targetGate_bitesEvenWithNoTierRegistryWired` and
     ///      `test_targetGate_bitesEvenWhenGovernorHasNoTierGetter`, one per
     ///      degrade-open branch, so relocating Part 1 below either return fails a

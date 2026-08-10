@@ -39,10 +39,11 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
 
     // ── Errors ──
     /// @notice `createSyndicate` was called while the factory has no
-    ///         `tierRegistry` wired (pashov finding #1). A governor created in
-    ///         that state is permanently registry-less, and
-    ///         `SyndicateVault._guardBatchCalls` degrades OPEN without one —
-    ///         wire the registry with `setTierRegistry` first.
+    ///         `tierRegistry` wired, or `setTierRegistry` was handed a codeless
+    ///         address (pashov finding #1). A governor created in that state is
+    ///         permanently registry-less, and `SyndicateVault._guardBatchCalls`
+    ///         degrades OPEN without one — wire a real registry with
+    ///         `setTierRegistry` first.
     error TierRegistryNotWired();
     error InvalidExecutorImpl();
     error InvalidVaultImpl();
@@ -305,6 +306,13 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         if (bytes(config.symbol).length == 0) revert InvalidSyndicateConfig();
         if (bytes(config.subdomain).length == 0) revert InvalidSyndicateConfig();
         if (bytes(config.metadataURI).length == 0) revert InvalidSyndicateConfig();
+        // Same "before any side effects" rule applied to the factory's own
+        // wiring: a syndicate created while `tierRegistry` is unset is born
+        // permanently registry-less (pashov finding #1 — full rationale at the
+        // push site below). This reads factory storage only, so it belongs up
+        // here with the other pre-flight rejects rather than after the vault
+        // proxy, queue, governor and `addGovernor` have already executed.
+        if (tierRegistry == address(0)) revert TierRegistryNotWired();
 
         // Gate on prepared owner stake before any side effects. Owner bonds
         // live on sWOOD; the registry exposes its sWOOD handle so the factory
@@ -381,15 +389,19 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         // vault is drained in a LATER transaction no meter watches.
         //
         // A vault created in that window stayed registry-less permanently, so
-        // the window was not transient — it was inherited. Refusing here makes
-        // the state unreachable by ordinary deploy ordering; the paired
-        // `setTierRegistry` zero-check on the governor closes the other route.
-        // Every in-repo deploy script now wires the registry before creating a
-        // syndicate — `script/Deploy.s.sol` always did (same function that
-        // creates it); `script/testnet/` and `script/robinhood-testnet/` were
-        // brought in line with this change, since they deploy their own factory
-        // and would otherwise revert here on the first `createSyndicate`.
-        if (tierRegistry == address(0)) revert TierRegistryNotWired();
+        // the window was not transient — it was inherited. Refusing makes the
+        // state unreachable by ordinary deploy ordering; the paired
+        // `setTierRegistry` code/zero check on the governor keeps it that way
+        // against a future factory upgrade. Every in-repo deploy script now
+        // wires the registry before creating a syndicate —
+        // `script/Deploy.s.sol` always did (same function that creates it);
+        // `script/testnet/` and `script/robinhood-testnet/` were brought in
+        // line with this change, since they deploy their own factory and would
+        // otherwise revert on the first `createSyndicate`.
+        //
+        // The reject itself sits at the TOP of this function with the other
+        // pre-flight config checks, not here, so it cannot burn the gas of a
+        // vault proxy + queue + governor deployment before failing.
         ISyndicateGovernor(govProxy).setTierRegistry(tierRegistry);
         // Same idiom for the exposure-ledger and bond-escrow wiring slots:
         // `setExposureLedger` / `setBondEscrow` are onlyFactory, so this is the
@@ -639,13 +651,27 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     }
 
     /// @notice Set the adapter-selector tier registry pushed into governors at
-    ///         `createSyndicate`. `address(0)` is tolerated — it disables tier
-    ///         pricing for governors created afterward (they keep the safe
-    ///         tier-2 full-notional default). Only affects governors created
-    ///         AFTER this call; existing per-vault governors are rewired via
+    ///         `createSyndicate`. Only affects governors created AFTER this
+    ///         call; existing per-vault governors are rewired via
     ///         `pushWiring(governor)`. The governor's own `setTierRegistry` is
     ///         `onlyFactory`, so it is NOT callable directly.
+    /// @dev `address(0)` remains legal HERE and only here, and it no longer
+    ///      means "governors created afterward keep the safe tier-2 default" —
+    ///      since pashov finding #1 there are no governors created afterward at
+    ///      all: `createSyndicate` reverts `TierRegistryNotWired` while this is
+    ///      unset. Zeroing is therefore a fail-CLOSED kill switch on new
+    ///      syndicates, not a pricing knob, and it cannot un-wire any governor
+    ///      that already exists. The governor-side setter rejects zero outright.
+    ///
+    ///      Codeless addresses are refused on both setters. An EOA here would
+    ///      satisfy every zero-check and still brick every vault it reached:
+    ///      `SyndicateVault._guardBatchCalls` makes a TYPED `isCallableTarget`
+    ///      call, which reverts against a codeless address, so
+    ///      `executeGovernorBatch` — and with it `settleProposal`, `unstick`,
+    ///      `finalizeEmergencySettle` and every LP exit — would revert forever.
+    ///      Same reasoning as `SyndicateVault.setExecutorImpl`'s code check.
     function setTierRegistry(address newRegistry) external onlyOwner {
+        if (newRegistry != address(0) && newRegistry.code.length == 0) revert TierRegistryNotWired();
         address old = tierRegistry;
         tierRegistry = newRegistry;
         emit TierRegistrySet(old, newRegistry);

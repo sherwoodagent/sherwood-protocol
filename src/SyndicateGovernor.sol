@@ -2206,42 +2206,46 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     }
 
     /// @inheritdoc ISyndicateGovernor
-    /// @dev address(0) is legal: it un-wires the registry and every subsequent
-    ///      proposal resolves to tier 2 / full notional — the safe default, so
-    ///      no zero-check (unlike `setProtocolConfig`, where zero would brick
-    ///      fee snapshots).
+    /// @dev ZERO IS NOT LEGAL, AND NEITHER IS A CODELESS ADDRESS (pashov
+    ///      finding #1). This slot used to accept zero on the premise that
+    ///      un-wiring "resolves everything at tier 2 / full notional — the safe
+    ///      default". That is a PRICING default; what a missing registry
+    ///      actually removes is a CAPABILITY gate. `SyndicateVault
+    ///      ._guardBatchCalls` resolves the registry through this slot and,
+    ///      finding none, RETURNS — dropping the callee allowlist, the
+    ///      spender/recipient gate and the `UnrecognizedAssetSelector` branch.
+    ///      One batch instruction, `asset.approve(attacker, max)`, then moves
+    ///      zero balance past every meter and licenses an unbounded pull in a
+    ///      LATER transaction. Re-pointing to a DIFFERENT registry stays legal;
+    ///      only removal is refused.
     ///
-    ///      "SAFE DEFAULT" IS NO LONGER THE WHOLE STORY FOR STRATEGY CLONES.
-    ///      Un-wiring stays safe in the sense that matters — no privilege is
-    ///      granted, everything prices at full notional — but it is no longer
-    ///      merely a degradation. `PortfolioStrategy._initialize` is fail-closed
-    ///      on registry resolution (change: `codehash-class-certification`), and
-    ///      it resolves through `vault() → governor() → tierRegistry()`. With
-    ///      this set to zero that walk dead-ends, so EVERY new clone bound to
-    ///      this vault reverts `TierRegistryUnresolved` at init. Existing clones
-    ///      are unaffected: they resolved at their own init, and rebalance /
-    ///      settle deliberately keep degrading open so an un-wiring can never
-    ///      strand capital inside a live strategy.
+    ///      A codeless address is refused for the same reason it is on
+    ///      `SyndicateVault.setExecutorImpl`: it passes every zero-check and
+    ///      then fails the typed `isCallableTarget` call in the batch guard,
+    ///      which reverts in the VAULT's frame — bricking `executeGovernorBatch`
+    ///      and with it `settleProposal`, `unstick`, `finalizeEmergencySettle`
+    ///      and every LP exit. Fails closed, but permanently.
     ///
-    ///      Operational shape of zeroing this: live positions keep working and
-    ///      can still be wound down, but no new portfolio strategy can be
-    ///      deployed on this vault until the registry is re-wired. For an
-    ///      EXISTING governor that means `SyndicateFactory.pushWiring(governor)`
-    ///      — the factory's own `setTierRegistry` only reaches governors created
-    ///      after it.
+    ///      Paired with `SyndicateFactory.createSyndicate`'s refusal to create a
+    ///      governor without a registry, this makes the registry-less state
+    ///      unreachable rather than merely unlikely. The factory's own
+    ///      `setTierRegistry` still accepts zero — there it is a kill switch on
+    ///      NEW syndicates and cannot reach an existing governor.
+    ///
+    ///      CONSEQUENCE FOR STRATEGY CLONES (now unreachable, retained as
+    ///      rationale). `PortfolioStrategy._initialize` is fail-closed on
+    ///      registry resolution (change: `codehash-class-certification`) and
+    ///      resolves through `vault() → governor() → tierRegistry()`. Had this
+    ///      been zeroed, that walk would dead-end and every new clone bound to
+    ///      this vault would revert `TierRegistryUnresolved` at init, while
+    ///      existing clones kept running (they resolved at their own init, and
+    ///      rebalance / settle deliberately degrade open so an un-wiring can
+    ///      never strand capital inside a live strategy). Recovering a
+    ///      pre-fix governor that IS registry-less is
+    ///      `SyndicateFactory.pushWiring(governor)` — the factory's own
+    ///      `setTierRegistry` only reaches governors created after it.
     function setTierRegistry(address newRegistry) external onlyFactory {
-        // ZERO IS NO LONGER LEGAL (pashov finding #1). The natspec above used to
-        // call un-wiring "the pre-registry safe default"; it is not. The vault's
-        // batch guard resolves the registry through this slot and, finding none,
-        // RETURNS — dropping the callee allowlist, the spender/recipient gate
-        // and the `UnrecognizedAssetSelector` branch. An `approve` then moves
-        // zero balance past every meter and licenses an unbounded pull later.
-        //
-        // Re-pointing to a DIFFERENT registry stays legal; only removal is
-        // refused. Paired with `SyndicateFactory.createSyndicate`'s refusal to
-        // create a governor without one, this makes the registry-less state
-        // unreachable rather than merely unlikely.
-        if (newRegistry == address(0)) revert TierRegistryNotWired();
+        if (newRegistry.code.length == 0) revert TierRegistryNotWired();
         emit TierRegistrySet(_tierRegistry, newRegistry);
         _tierRegistry = newRegistry;
     }

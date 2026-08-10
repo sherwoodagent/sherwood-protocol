@@ -687,12 +687,36 @@ into governors created *after* the call; an existing governor is rewired with
 was unset cannot run portfolio strategies until that vault's governor is
 rewired — even if every other vault is fine.
 
-The same applies to deliberately zeroing a governor's registry. It stays safe in
-the sense that matters (no privilege granted, everything prices at tier 2 /
-full notional), but it now also blocks new clone deploys on that vault. Live
-positions are unaffected and can still be wound down: existing clones resolved
-at their own init, and rebalance/settle deliberately still degrade open —
-blocking those would strand vault capital. Only init refuses.
+A governor's registry can no longer be zeroed (pashov finding #1):
+`SyndicateGovernor.setTierRegistry` rejects `address(0)` and codeless
+addresses, and `SyndicateFactory.createSyndicate` reverts `TierRegistryNotWired`
+while the factory itself has none. Zero on the **factory** setter is still
+legal, but it is a kill switch on new syndicates only — it cannot reach a
+governor that already exists. Re-pointing to a different real registry stays
+legal on both.
+
+### MANDATORY PRE-MAINNET: rewire every pre-fix governor
+
+Any governor created **before** finding #1 was fixed may be permanently
+registry-less, because `createSyndicate` used to skip the wiring push instead of
+refusing. In that state `SyndicateVault._guardBatchCalls` resolves no registry
+and returns early, dropping the callee allowlist, the spender/recipient gate and
+the `UnrecognizedAssetSelector` branch — `asset.approve(attacker, max)` then
+passes every meter (it moves zero balance) and licenses an unbounded pull in a
+later transaction. The fix is forward-only; it does not heal these.
+
+Before mainnet, for every governor the factory has ever deployed:
+
+1. Enumerate them. There is no on-chain enumeration — read `GovernorDeployed`
+   logs from the factory (`vault`, `governor`) from its deployment block.
+2. `cast call <governor> "tierRegistry()(address)"` on each. Anything returning
+   `0x0` is affected. As of writing that means checking the ~9 syndicates on
+   Robinhood testnet (46630); mainnet has none yet.
+3. `SyndicateFactory.pushWiring(governor)` (factory-owner only) for each hit.
+   It pushes the factory's current registry / ledger / escrow and never writes
+   zero, so it is safe to run on unaffected governors too.
+4. Re-read `tierRegistry()` and confirm non-zero before treating the vault as
+   guarded.
 
 ### Token↔price-source pairing
 

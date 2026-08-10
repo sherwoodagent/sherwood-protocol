@@ -861,14 +861,8 @@ contract SyndicateFactoryTest is Test {
         // asserted implicitly by the mocked registry accepting the call in setUp.
     }
 
-    /// @notice Task 7 wiring: when the factory owner sets a non-zero
-    ///         tierRegistry, `createSyndicate` must push it into the fresh
-    ///         per-vault governor (the onlyFactory `setTierRegistry` path). All
-    ///         other factory tests run with `tierRegistry == address(0)` (governor
-    ///         keeps the tier-2 default), so this is the only end-to-end proof of
-    ///         the non-zero push.
-    /// @notice pashov finding #1 (route 1) — a vault must not be CREATABLE
-    ///         without a TierRegistry.
+    /// @notice pashov finding #1 (THE live route) — a vault must not be
+    ///         CREATABLE without a TierRegistry.
     /// @dev    `createSyndicate` SKIPPED the wiring when the factory's own
     ///         pointer was unset, rather than refusing, so every vault created
     ///         in that window was permanently registry-less. In that state
@@ -880,8 +874,15 @@ contract SyndicateFactoryTest is Test {
     ///         LATER transaction.
     ///
     ///         Closing the STATE rather than the symptom: the vault's runtime
-    ///         guard is deliberately untouched here. See
-    ///         `test_setTierRegistry_rejectsZero` for the other route.
+    ///         guard is deliberately untouched here.
+    ///
+    ///         SCOPE: this was the only LIVE route to `_tierRegistry == 0`.
+    ///         `SyndicateGovernor.setTierRegistry` is `onlyFactory` and both
+    ///         factory call sites already refused to pass zero — the line this
+    ///         change replaced, and `pushWiring`, which still skips unset slots
+    ///         (`SyndicateFactory.sol`). The governor-side check pinned by
+    ///         `test_setTierRegistry_rejectsZero` is defence-in-depth against a
+    ///         future factory upgrade, not a second open door.
     function test_createSyndicate_refusesWhileFactoryHasNoRegistry() public {
         // setUp wires one, so reproduce the unwired state explicitly. The
         // FACTORY-side setter still accepts zero on purpose: zeroing it blocks
@@ -896,10 +897,21 @@ contract SyndicateFactoryTest is Test {
         factory.createSyndicate(creator1AgentId, _configWithSubdomain("no-registry"));
     }
 
-    /// @notice pashov finding #1 (route 2) — a wired registry must not be
-    ///         REMOVABLE. `setTierRegistry(address(0))` was explicitly legal and
-    ///         its natspec called it "the safe default"; it re-opens the batch
-    ///         gate for every subsequent proposal on that governor.
+    /// @notice pashov finding #1, defence-in-depth — a wired registry must not
+    ///         be REMOVABLE. `setTierRegistry(address(0))` was explicitly legal
+    ///         and its natspec called it "the safe default"; it would re-open
+    ///         the batch gate for every subsequent proposal on that governor.
+    /// @dev    No factory call site can reach this today (see the SCOPE note on
+    ///         `test_createSyndicate_refusesWhileFactoryHasNoRegistry`), so this
+    ///         pins the guard against a future factory upgrade that stops
+    ///         filtering zero.
+    ///
+    ///         The two `TierRegistryNotWired` declarations — `SyndicateFactory`'s
+    ///         and `ISyndicateGovernor`'s — share a selector by construction, so
+    ///         the assertion cannot prove WHICH contract reverted. Naming the
+    ///         governor's is deliberate documentation of intent; the caller
+    ///         identity (`address(factory)`) is what rules out
+    ///         `OwnableUnauthorizedAccount` / `NotFactory` passing vacuously.
     function test_setTierRegistry_rejectsZero() public {
         TierRegistry reg = new TierRegistry(owner);
         vm.prank(owner);
@@ -911,10 +923,39 @@ contract SyndicateFactoryTest is Test {
         assertEq(SyndicateGovernor(gov).tierRegistry(), address(reg), "precondition: governor is wired");
 
         vm.prank(address(factory));
-        vm.expectRevert();
+        vm.expectRevert(ISyndicateGovernor.TierRegistryNotWired.selector);
         SyndicateGovernor(gov).setTierRegistry(address(0));
+
+        // Codeless addresses are refused on the same branch: an EOA passes every
+        // zero-check and then bricks the vault's typed `isCallableTarget` call.
+        vm.prank(address(factory));
+        vm.expectRevert(ISyndicateGovernor.TierRegistryNotWired.selector);
+        SyndicateGovernor(gov).setTierRegistry(makeAddr("eoaRegistry"));
+
+        assertEq(SyndicateGovernor(gov).tierRegistry(), address(reg), "registry unchanged after both refusals");
     }
 
+    /// @notice The factory-side setter rejects a codeless registry but still
+    ///         accepts `address(0)`.
+    /// @dev    Asymmetric on purpose. Zero here is a fail-CLOSED kill switch —
+    ///         it blocks NEW syndicates and cannot un-wire an existing governor
+    ///         — whereas an EOA would be pushed into every governor created
+    ///         afterwards and brick each one's `executeGovernorBatch` (and with
+    ///         it `settleProposal`, `unstick` and every LP exit) permanently.
+    function test_setTierRegistry_factoryRejectsCodelessButAllowsZero() public {
+        vm.prank(owner);
+        vm.expectRevert(SyndicateFactory.TierRegistryNotWired.selector);
+        factory.setTierRegistry(makeAddr("eoaRegistry"));
+
+        vm.prank(owner);
+        factory.setTierRegistry(address(0));
+        assertEq(factory.tierRegistry(), address(0), "zero is a legal kill switch on the factory side");
+    }
+
+    /// @notice Task 7 wiring: when the factory owner sets a non-zero
+    ///         tierRegistry, `createSyndicate` must push it into the fresh
+    ///         per-vault governor (the onlyFactory `setTierRegistry` path).
+    ///         This is the only end-to-end proof of the push itself.
     function test_createSyndicate_pushesTierRegistryToGovernor() public {
         TierRegistry tierRegistry = new TierRegistry(owner);
 
