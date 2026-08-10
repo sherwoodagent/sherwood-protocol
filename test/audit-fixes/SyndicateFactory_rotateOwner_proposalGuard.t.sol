@@ -71,10 +71,8 @@ contract SyndicateFactory_rotateOwner_proposalGuard is Test {
         // `baseNonce`: swoodImpl(+0), swoodProxy(+1), govImpl(+2), beacon(+3),
         // factoryImpl(+4), regImpl(+5), regProxy(+6), factoryProxy(+7).
         ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
-        // pashov finding #1: the tier registry is a MANDATORY `InitParams`
-        // field. Deployed ABOVE `baseNonce` — like `_hoistedPC` — so it costs a
-        // nonce the prediction plan never counted, leaving every offset below
-        // unchanged.
+        // Mandatory `InitParams` field (pashov finding #1). Deployed above
+        // `baseNonce` like `_hoistedPC`, so no offset below shifts.
         TierRegistry _hoistedTierRegistry = new TierRegistry(owner);
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 6);

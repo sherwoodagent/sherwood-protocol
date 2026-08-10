@@ -311,13 +311,10 @@ interface ISyndicateGovernor {
     /// @notice Revert if `envelope.maxDrawdownBps > 10_000` at propose — a
     ///         drawdown declaration cannot exceed 100% of committed capital.
     error InvalidDrawdown();
-    /// @notice `setTierRegistry` was handed `address(0)` or a codeless address
-    ///         (pashov finding #1). Un-wiring the registry re-opens
-    ///         `SyndicateVault._guardBatchCalls`, which resolves the registry
-    ///         through this slot and degrades OPEN when it finds none; a
-    ///         codeless address instead bricks the guard's typed
-    ///         `isCallableTarget` call and with it every batch the vault runs.
-    ///         Re-pointing to a different real registry stays legal.
+    /// @notice `setTierRegistry` was handed zero or a codeless address (pashov
+    ///         finding #1). Un-wiring re-opens `SyndicateVault._guardBatchCalls`
+    ///         (it degrades OPEN with no registry); a codeless address bricks
+    ///         the guard's typed call. Re-pointing to a real registry is legal.
     error TierRegistryNotWired();
     /// @notice Revert if the realized vault balance at `settleProposal` sits
     ///         below the proposal's declared drawdown floor. `settleProposal`

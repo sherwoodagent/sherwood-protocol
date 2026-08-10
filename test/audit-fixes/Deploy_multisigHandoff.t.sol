@@ -258,9 +258,8 @@ contract DeployMultisigHandoffTest is Test {
                     protocolConfig: address(new ProtocolConfig(deployer)),
                     managementFeeBps: 50,
                     guardianRegistry: registry,
-                    // Mandatory since pashov finding #1. The factory proxy is
-                    // CREATE3-derived from a salt, so this extra nonce-consuming
-                    // deployment does not move `predictedFactoryProxy`.
+                    // Mandatory since pashov finding #1. Factory proxy is
+                    // CREATE3, so the extra nonce moves no prediction.
                     tierRegistry: address(new TierRegistry(deployer))
                 }))
         );

@@ -60,16 +60,10 @@ contract DeployRobinhoodTestnet is ScriptBase {
         // ProtocolConfig at +0, govImpl +1, govProxy +2, swoodImpl +3, swoodProxy +4,
         // registryImpl +5, registryProxy +6, tierRegistry +7, factoryImpl +8,
         // factoryProxy +9.
-        //
-        // `tierRegistry` was inserted at +7 by pashov finding #1: it is now a
-        // mandatory `SyndicateFactory.InitParams` field, so it must exist
-        // before the factory proxy rather than being wired after it. Only the
-        // factory prediction shifts (+8 -> +9); sWOOD and the registry are
-        // deployed ahead of it and keep their offsets. The
-        // `require(address(factory) == predictedFactoryProxy)` below is what
-        // catches this arithmetic if it is ever wrong — it aborts the deploy
-        // rather than mis-wiring sWOOD and the guardian registry, both of which
-        // take the predicted factory address at init.
+        // `tierRegistry` inserted at +7 (pashov finding #1: mandatory
+        // `InitParams` field, so it must precede the factory), shifting only the
+        // factory prediction +8 -> +9. The `require` below catches a wrong
+        // offset before it mis-wires sWOOD / the guardian registry.
         address predictedSwoodProxy = vm.computeCreateAddress(deployer, baseNonce + 4);
         address predictedRegistryProxy = vm.computeCreateAddress(deployer, baseNonce + 6);
         address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 9);
@@ -118,12 +112,8 @@ contract DeployRobinhoodTestnet is ScriptBase {
         // Wire the set-once registry reference on sWOOD.
         StakedWood(swoodProxy).setRegistry(registryProxy);
 
-        // 5. Tier registry — a MANDATORY `SyndicateFactory.InitParams` field
-        //    since pashov finding #1, so it is deployed BEFORE the factory
-        //    rather than wired after it. A vault created without one makes
-        //    `_guardBatchCalls` degrade OPEN, and that state was inherited
-        //    permanently by the governor. Mirrors the production
-        //    `script/Deploy.s.sol`.
+        // 5. Tier registry — mandatory `InitParams` field (pashov finding #1),
+        //    so it precedes the factory. Mirrors `script/Deploy.s.sol`.
         TierRegistry tierRegistry = new TierRegistry(deployer);
         console.log("TierRegistry:", address(tierRegistry));
 

@@ -699,11 +699,10 @@ legal on both.
 
 Any governor created **before** finding #1 was fixed may be permanently
 registry-less, because `createSyndicate` used to skip the wiring push instead of
-refusing. In that state `SyndicateVault._guardBatchCalls` resolves no registry
-and returns early, dropping the callee allowlist, the spender/recipient gate and
-the `UnrecognizedAssetSelector` branch — `asset.approve(attacker, max)` then
-passes every meter (it moves zero balance) and licenses an unbounded pull in a
-later transaction. The fix is forward-only; it does not heal these.
+refusing. In that state `SyndicateVault._guardBatchCalls` returns early and
+drops the callee allowlist and the spender gate, so `asset.approve(attacker,
+max)` passes every meter (it moves zero balance) and licenses an unbounded pull
+later. The fix is forward-only; it does not heal these.
 
 Before mainnet, for every governor the factory has ever deployed:
 

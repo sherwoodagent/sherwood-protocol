@@ -672,23 +672,20 @@ contract SyndicateVault is
     ///      not a fund-safety gap.
     ///
     ///      UNSET REGISTRY — PREVENTED UPSTREAM, NOT SAFE HERE (pashov finding
-    ///      #1). With no tier registry wired (or a governor predating the
-    ///      getter), PART 2 cannot run and this function RETURNS, dropping the
-    ///      callee allowlist, the spender/recipient gate and the
-    ///      `UnrecognizedAssetSelector` branch on the way out. That is NOT a
-    ///      pricing-only degradation, and it is not "by design": one batch
-    ///      instruction, `asset.approve(attacker, max)`, moves zero balance — so
-    ///      the net-outflow meter, the per-call cap and `requiredCoverage` all
-    ///      read zero — and licenses an unbounded pull in a LATER transaction.
+    ///      #1). With no registry wired (or a governor predating the getter),
+    ///      PART 2 cannot run and this function RETURNS, dropping the callee
+    ///      allowlist, the spender/recipient gate and the
+    ///      `UnrecognizedAssetSelector` branch. That is not a pricing-only
+    ///      degradation and not "by design": `asset.approve(attacker, max)`
+    ///      moves zero balance, so every meter reads zero, and licenses an
+    ///      unbounded pull in a LATER transaction.
     ///
-    ///      The branch is retained ONLY because hard-reverting would brick any
-    ///      governor that is already registry-less, stranding LP capital behind
-    ///      `settleProposal` / `unstick` / every exit. The state itself is now
-    ///      unreachable going forward: `SyndicateFactory.createSyndicate` reverts
-    ///      `TierRegistryNotWired` while the factory has no registry, and
-    ///      `SyndicateGovernor.setTierRegistry` rejects zero and codeless
-    ///      addresses, so no NEW governor can reach this branch. Pre-fix
-    ///      governors are rescued with `SyndicateFactory.pushWiring(governor)`.
+    ///      The branch is retained ONLY because hard-reverting would brick an
+    ///      already registry-less governor, stranding LP capital behind
+    ///      `settleProposal` / `unstick` / every exit. No NEW governor can reach
+    ///      it: the registry is mandatory in `SyndicateFactory.InitParams` and
+    ///      `SyndicateGovernor.setTierRegistry` refuses zero and codeless.
+    ///      Pre-fix governors are rescued with `SyndicateFactory.pushWiring`.
     ///
     ///      PART 1 IS NOT AFFECTED: it needs no registry and sits above both
     ///      early returns. Pinned by

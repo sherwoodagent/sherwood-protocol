@@ -72,8 +72,7 @@ contract SetGuardianRegistryTest is Test {
                     protocolConfig: address(governor),
                     managementFeeBps: 0,
                     guardianRegistry: address(initialRegistry),
-                    // Mandatory since pashov finding #1 — a factory cannot be
-                    // initialized without a real tier registry.
+                    // Mandatory since pashov finding #1.
                     tierRegistry: address(new TierRegistry(owner))
                 }))
         );

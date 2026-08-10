@@ -127,10 +127,8 @@ contract GovernorLayoutPinsTest is Test {
     ///         `test_layout_lifecycleBasePrefixPinned` instead.
     function test_layout_appendedFieldsPinned() public {
         assertEq(_slot(58), bytes32(0), "slot 58 starts unset");
-        // `setTierRegistry` refuses codeless addresses since pashov finding #1
-        // (an EOA registry bricks the vault's typed `isCallableTarget` call), so
-        // the sentinel needs code. The byte is arbitrary — nothing calls it; the
-        // pin is on the stored VALUE, which is unchanged.
+        // `setTierRegistry` refuses codeless addresses (pashov finding #1), so
+        // the sentinel needs code. Arbitrary byte — the pin is on the VALUE.
         vm.etch(TIER_REGISTRY_SENTINEL, hex"00");
         governor.setTierRegistry(TIER_REGISTRY_SENTINEL); // this test is the factory
         assertEq(_slot(58), bytes32(uint256(uint160(TIER_REGISTRY_SENTINEL))), "slot 58: _tierRegistry");

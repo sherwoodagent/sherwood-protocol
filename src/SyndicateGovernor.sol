@@ -2206,44 +2206,29 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     }
 
     /// @inheritdoc ISyndicateGovernor
-    /// @dev ZERO IS NOT LEGAL, AND NEITHER IS A CODELESS ADDRESS (pashov
-    ///      finding #1). This slot used to accept zero on the premise that
-    ///      un-wiring "resolves everything at tier 2 / full notional — the safe
-    ///      default". That is a PRICING default; what a missing registry
-    ///      actually removes is a CAPABILITY gate. `SyndicateVault
-    ///      ._guardBatchCalls` resolves the registry through this slot and,
+    /// @dev ZERO AND CODELESS BOTH REFUSED (pashov finding #1). This slot used
+    ///      to accept zero on the premise that un-wiring "resolves everything at
+    ///      tier 2 / full notional — the safe default". That is a PRICING
+    ///      default; what a missing registry removes is a CAPABILITY gate:
+    ///      `SyndicateVault._guardBatchCalls` resolves through this slot and,
     ///      finding none, RETURNS — dropping the callee allowlist, the
-    ///      spender/recipient gate and the `UnrecognizedAssetSelector` branch.
-    ///      One batch instruction, `asset.approve(attacker, max)`, then moves
-    ///      zero balance past every meter and licenses an unbounded pull in a
-    ///      LATER transaction. Re-pointing to a DIFFERENT registry stays legal;
-    ///      only removal is refused.
+    ///      spender/recipient gate and the `UnrecognizedAssetSelector` branch,
+    ///      after which `asset.approve(attacker, max)` moves zero balance past
+    ///      every meter and licenses an unbounded pull later. A codeless address
+    ///      instead reverts the guard's typed call and bricks the vault. Only
+    ///      removal is refused — re-pointing to a different registry is legal.
     ///
-    ///      A codeless address is refused for the same reason it is on
-    ///      `SyndicateVault.setExecutorImpl`: it passes every zero-check and
-    ///      then fails the typed `isCallableTarget` call in the batch guard,
-    ///      which reverts in the VAULT's frame — bricking `executeGovernorBatch`
-    ///      and with it `settleProposal`, `unstick`, `finalizeEmergencySettle`
-    ///      and every LP exit. Fails closed, but permanently.
+    ///      The factory's own `setTierRegistry` still accepts zero: there it is
+    ///      a kill switch on NEW syndicates and cannot reach an existing
+    ///      governor. A pre-fix governor that IS registry-less is recovered with
+    ///      `SyndicateFactory.pushWiring(governor)`.
     ///
-    ///      Paired with `SyndicateFactory.createSyndicate`'s refusal to create a
-    ///      governor without a registry, this makes the registry-less state
-    ///      unreachable rather than merely unlikely. The factory's own
-    ///      `setTierRegistry` still accepts zero — there it is a kill switch on
-    ///      NEW syndicates and cannot reach an existing governor.
-    ///
-    ///      CONSEQUENCE FOR STRATEGY CLONES (now unreachable, retained as
-    ///      rationale). `PortfolioStrategy._initialize` is fail-closed on
-    ///      registry resolution (change: `codehash-class-certification`) and
-    ///      resolves through `vault() → governor() → tierRegistry()`. Had this
-    ///      been zeroed, that walk would dead-end and every new clone bound to
-    ///      this vault would revert `TierRegistryUnresolved` at init, while
-    ///      existing clones kept running (they resolved at their own init, and
-    ///      rebalance / settle deliberately degrade open so an un-wiring can
-    ///      never strand capital inside a live strategy). Recovering a
-    ///      pre-fix governor that IS registry-less is
-    ///      `SyndicateFactory.pushWiring(governor)` — the factory's own
-    ///      `setTierRegistry` only reaches governors created after it.
+    ///      Now-unreachable consequence, kept as rationale: zeroing this would
+    ///      dead-end `PortfolioStrategy._initialize`'s
+    ///      `vault() → governor() → tierRegistry()` walk, reverting
+    ///      `TierRegistryUnresolved` for every new clone while existing clones
+    ///      kept running — rebalance/settle degrade open by design so an
+    ///      un-wiring can never strand capital in a live strategy.
     function setTierRegistry(address newRegistry) external onlyFactory {
         if (newRegistry.code.length == 0) revert TierRegistryNotWired();
         emit TierRegistrySet(_tierRegistry, newRegistry);

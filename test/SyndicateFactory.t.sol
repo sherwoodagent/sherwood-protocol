@@ -55,9 +55,7 @@ contract SyndicateFactoryTest is Test {
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         GovernorBeacon beacon = new GovernorBeacon(address(govImpl), owner);
 
-        // pashov finding #1: the tier registry is a MANDATORY `InitParams`
-        // field, so a factory cannot exist without one. Deployed before the
-        // factory rather than wired after it.
+        // Mandatory `InitParams` field (pashov finding #1).
         tierRegistryFixture = new TierRegistry(owner);
 
         // Deploy factory as UUPS proxy
@@ -874,21 +872,14 @@ contract SyndicateFactoryTest is Test {
     ///         (so every meter reads zero) and licenses an unbounded pull in a
     ///         LATER transaction.
     ///
-    ///         Closing the STATE rather than the symptom: the vault's runtime
-    ///         guard is deliberately untouched here.
-    ///
-    ///         SCOPE: this was the only LIVE route to `_tierRegistry == 0`.
-    ///         `SyndicateGovernor.setTierRegistry` is `onlyFactory` and both
-    ///         factory call sites already refused to pass zero — the line this
-    ///         change replaced, and `pushWiring`, which still skips unset slots
-    ///         (`SyndicateFactory.sol`). The governor-side check pinned by
-    ///         `test_setTierRegistry_rejectsZero` is defence-in-depth against a
-    ///         future factory upgrade, not a second open door.
+    ///         Closes the STATE, not the symptom — the vault's runtime guard is
+    ///         deliberately untouched. This was the only LIVE route to
+    ///         `_tierRegistry == 0`: `setTierRegistry` is `onlyFactory` and both
+    ///         factory call sites already filtered zero, so the governor-side
+    ///         check is defence-in-depth, not a second open door.
     function test_createSyndicate_refusesWhileFactoryHasNoRegistry() public {
-        // setUp wires one, so reproduce the unwired state explicitly. The
-        // FACTORY-side setter still accepts zero on purpose: zeroing it blocks
-        // NEW syndicates (fail-closed) rather than opening anything, unlike the
-        // governor-side setter which is now zero-rejecting.
+        // setUp wires one, so reproduce the unwired state explicitly. Zero is
+        // legal on the FACTORY setter on purpose — it blocks new syndicates.
         vm.prank(owner);
         factory.setTierRegistry(address(0));
         assertEq(factory.tierRegistry(), address(0), "precondition: factory has no registry");
@@ -902,17 +893,11 @@ contract SyndicateFactoryTest is Test {
     ///         be REMOVABLE. `setTierRegistry(address(0))` was explicitly legal
     ///         and its natspec called it "the safe default"; it would re-open
     ///         the batch gate for every subsequent proposal on that governor.
-    /// @dev    No factory call site can reach this today (see the SCOPE note on
-    ///         `test_createSyndicate_refusesWhileFactoryHasNoRegistry`), so this
-    ///         pins the guard against a future factory upgrade that stops
-    ///         filtering zero.
-    ///
-    ///         The two `TierRegistryNotWired` declarations — `SyndicateFactory`'s
-    ///         and `ISyndicateGovernor`'s — share a selector by construction, so
-    ///         the assertion cannot prove WHICH contract reverted. Naming the
-    ///         governor's is deliberate documentation of intent; the caller
-    ///         identity (`address(factory)`) is what rules out
-    ///         `OwnableUnauthorizedAccount` / `NotFactory` passing vacuously.
+    /// @dev    Unreachable from the factory today; pins the guard against a
+    ///         future upgrade that stops filtering zero. The factory's and the
+    ///         governor's `TierRegistryNotWired` share a selector, so this
+    ///         cannot prove WHICH reverted — the pranked caller
+    ///         (`address(factory)`) is what rules out an auth revert.
     function test_setTierRegistry_rejectsZero() public {
         TierRegistry reg = new TierRegistry(owner);
         vm.prank(owner);
@@ -927,8 +912,8 @@ contract SyndicateFactoryTest is Test {
         vm.expectRevert(ISyndicateGovernor.TierRegistryNotWired.selector);
         SyndicateGovernor(gov).setTierRegistry(address(0));
 
-        // Codeless addresses are refused on the same branch: an EOA passes every
-        // zero-check and then bricks the vault's typed `isCallableTarget` call.
+        // Same branch refuses codeless: an EOA passes every zero-check, then
+        // bricks the vault's typed `isCallableTarget` call.
         vm.prank(address(factory));
         vm.expectRevert(ISyndicateGovernor.TierRegistryNotWired.selector);
         SyndicateGovernor(gov).setTierRegistry(makeAddr("eoaRegistry"));
@@ -937,24 +922,18 @@ contract SyndicateFactoryTest is Test {
     }
 
     /// @notice pashov finding #1, structural — a factory cannot be initialized
-    ///         without a real tier registry, so the "live but unwired" state
-    ///         has no window at all rather than being merely fail-closed.
-    /// @dev    Before this, `tierRegistry` was absent from `InitParams` and
-    ///         every deployment had a gap between `initialize` and
-    ///         `setTierRegistry` in which `createSyndicate` reverted. The
-    ///         invariant held by script discipline plus a runtime check; it now
-    ///         holds by construction. Both rejected shapes are covered: zero
-    ///         and codeless (an EOA would be stamped into every governor this
-    ///         factory creates and brick each one's `executeGovernorBatch`).
+    ///         without a real tier registry, so the live-but-unwired state has
+    ///         no window rather than being merely fail-closed.
+    /// @dev    `tierRegistry` used to be absent from `InitParams`, leaving a gap
+    ///         between `initialize` and `setTierRegistry`. Covers both rejected
+    ///         shapes: zero and codeless.
     function test_factoryInitialize_requiresRealTierRegistry() public {
         SyndicateFactory freshImpl = new SyndicateFactory();
         TierRegistry reg = new TierRegistry(owner);
 
-        // HOISTED: `_factoryInitDataWithTierRegistry` reads `factory.beacon()`
-        // and `factory.protocolConfig()`. Left in argument position those
-        // external calls are evaluated FIRST and consume the pending one-shot
-        // `vm.expectRevert`, so the create runs unarmed and the test fails with
-        // "next call did not revert as expected".
+        // HOISTED: the helper reads `factory.beacon()` / `.protocolConfig()`.
+        // In argument position those are evaluated first and eat the one-shot
+        // `vm.expectRevert`, leaving the create unarmed.
         bytes memory initZero = _factoryInitDataWithTierRegistry(address(0));
         bytes memory initEoa = _factoryInitDataWithTierRegistry(makeAddr("eoaRegistry"));
         bytes memory initReal = _factoryInitDataWithTierRegistry(address(reg));
@@ -992,11 +971,9 @@ contract SyndicateFactoryTest is Test {
 
     /// @notice The factory-side setter rejects a codeless registry but still
     ///         accepts `address(0)`.
-    /// @dev    Asymmetric on purpose. Zero here is a fail-CLOSED kill switch —
-    ///         it blocks NEW syndicates and cannot un-wire an existing governor
-    ///         — whereas an EOA would be pushed into every governor created
-    ///         afterwards and brick each one's `executeGovernorBatch` (and with
-    ///         it `settleProposal`, `unstick` and every LP exit) permanently.
+    /// @dev    Asymmetric on purpose: zero is a fail-CLOSED kill switch on new
+    ///         syndicates and cannot un-wire an existing governor, whereas an
+    ///         EOA would be pushed into every later governor and brick it.
     function test_setTierRegistry_factoryRejectsCodelessButAllowsZero() public {
         vm.prank(owner);
         vm.expectRevert(SyndicateFactory.TierRegistryNotWired.selector);

@@ -73,11 +73,8 @@ contract FactoryCoverageWiringTest is Test {
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         GovernorBeacon beacon = new GovernorBeacon(address(govImpl), owner);
 
-        // pashov finding #1: the tier registry is a MANDATORY `InitParams`
-        // field, so a factory cannot exist without one. Deployed before the
-        // factory rather than wired after it. NOTE: this is NOT `tierReg` (set
-        // further down) — `pushWiring` is proved by re-pointing to a DIFFERENT
-        // registry, so the two must not be the same contract.
+        // Mandatory `InitParams` field (pashov finding #1). Deliberately NOT
+        // `tierReg` — `pushWiring` is proved by re-pointing to a different one.
         TierRegistry initialTierRegistry = new TierRegistry(owner);
 
         SyndicateFactory factoryImpl = new SyndicateFactory();

@@ -254,8 +254,7 @@ contract DeployPlanBPreflightTest is Test {
                     protocolConfig: address(protocolConfig),
                     managementFeeBps: 50,
                     guardianRegistry: address(registry),
-                    // Mandatory since pashov finding #1 — a factory cannot be
-                    // initialized without a real tier registry.
+                    // Mandatory since pashov finding #1.
                     tierRegistry: address(new TierRegistry(DEFAULT_SENDER))
                 }))
         );

@@ -201,8 +201,7 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                 protocolConfig: address(governor),
                 managementFeeBps: 200,
                 guardianRegistry: address(registry),
-                // Mandatory since pashov finding #1 — a factory cannot be
-                // initialized without a real tier registry.
+                // Mandatory since pashov finding #1.
                 tierRegistry: address(new TierRegistry(factoryOwner))
             });
             factory = SyndicateFactory(

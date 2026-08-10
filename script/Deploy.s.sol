@@ -279,13 +279,9 @@ contract DeploySherwood is ScriptBase {
         // the factory-only `setTierRegistry`. A plain Ownable2Step contract —
         // no proxy needed (certifications are re-issuable, not upgrade-state).
         //
-        // DEPLOYED BEFORE THE FACTORY (pashov finding #1). The registry is a
-        // mandatory `InitParams` field, so the factory cannot exist without
-        // one — there is no window in which it is live but unwired. Ordering
-        // is free: `TierRegistry`'s constructor takes only an owner, and the
-        // factory proxy address is CREATE3-derived from a salt, so inserting a
-        // nonce-consuming deployment ahead of it does not move
-        // `predictedFactoryProxy`.
+        // Deployed BEFORE the factory: mandatory `InitParams` field since pashov
+        // finding #1. Free of ordering cost — the factory proxy is CREATE3, so
+        // an extra nonce ahead of it does not move `predictedFactoryProxy`.
         //
         // Granting is two-step (issue #45): `proposeCertification` is
         // owner-only and now takes the reviewed codehash as

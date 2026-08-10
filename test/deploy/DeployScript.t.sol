@@ -121,9 +121,8 @@ contract DeployScriptTest is Test {
                     protocolConfig: address(protocolConfig),
                     managementFeeBps: 50,
                     guardianRegistry: registryProxy,
-                    // Mandatory since pashov finding #1. Every address this test
-                    // asserts on is CREATE3-derived from a salt, so the extra
-                    // nonce this deployment consumes moves none of them.
+                    // Mandatory since pashov finding #1. Every asserted address
+                    // is CREATE3-derived, so the extra nonce moves none.
                     tierRegistry: address(new TierRegistry(deployer))
                 }))
         );
