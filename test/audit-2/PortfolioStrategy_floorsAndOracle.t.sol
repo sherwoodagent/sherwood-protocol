@@ -70,6 +70,17 @@ contract MockTierRegistry {
         return allowed[a];
     }
 
+    /// @dev The CALLEE axis (`_guardBatchCalls` PART 2a), split out of
+    ///      `isAdapterAllowed` per pashov finding #14. Mirrors the adapter axis:
+    ///      the demotion asymmetry is exercised against the real registry in
+    ///      `test/pashov-final/Registry_demoteKeepsCalleeStanding.t.sol`, so
+    ///      mirroring keeps every floors/oracle case here unchanged. Present at
+    ///      all because the vault's PART 2a call is TYPED — a stand-in missing
+    ///      this selector reverts in the CALLER's frame with empty returndata.
+    function isCallableTarget(address a) external view returns (bool) {
+        return allowed[a];
+    }
+
     /// @dev Token↔price-source attestation, permissive by default so the
     ///      floors/oracle cases keep testing what they were written for.
     mapping(address => mapping(bytes32 => bool)) public deniedPair;

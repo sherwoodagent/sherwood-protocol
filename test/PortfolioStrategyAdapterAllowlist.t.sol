@@ -81,6 +81,23 @@ contract MockTierRegistry {
         return allowed[adapter];
     }
 
+    /// @dev The CALLEE axis (`_guardBatchCalls` PART 2a), split out of
+    ///      `isAdapterAllowed` per pashov finding #14. MIRRORS the adapter axis
+    ///      rather than adding a second switch: nothing in this file exercises
+    ///      the demotion asymmetry (that lives in
+    ///      `test/pashov-final/Registry_demoteKeepsCalleeStanding.t.sol`,
+    ///      against the real registry), so mirroring keeps every case here
+    ///      meaning exactly what it meant before the split.
+    ///
+    ///      Present at all because the vault's PART 2a call is TYPED: a stand-in
+    ///      missing this selector reverts in the CALLER's frame with empty
+    ///      returndata, which is indistinguishable from a bug in the vault. The
+    ///      hostile fixtures below deliberately stay bare, for the same reason
+    ///      they lack `isPriceSourceForToken`.
+    function isCallableTarget(address target) external view returns (bool) {
+        return allowed[target];
+    }
+
     /// @dev Token↔price-source attestation, permissive by default so the
     ///      adapter-allowlist cases keep testing the adapter axis in
     ///      isolation. The hostile fixtures below deliberately do NOT gain
