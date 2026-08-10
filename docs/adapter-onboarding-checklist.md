@@ -367,8 +367,13 @@ cast call $REG "pendingOwner()(address)" --rpc-url $RPC
 SEL=$(cast sig "deposit(uint256,address)")
 cast call $REG "tierOf(address,bytes4)(uint8,uint16)" $ADAPTER $SEL --rpc-url $RPC
 
-# 3. Gate B. Expect true only for adapters that passed §2.1.
+# 3. Gate B, FUNDS axis. Expect true only for adapters that passed §2.1.
 cast call $REG "isAdapterAllowed(address)(bool)" $ADAPTER --rpc-url $RPC
+
+# 3b. Gate B, CALLEE axis. Read BOTH — since finding #14 they diverge, and a
+#     demoted adapter answers false above while still answering true here.
+#     Confirming a de-onboarding means confirming this one is false too.
+cast call $REG "isCallableTarget(address)(bool)" $ADAPTER --rpc-url $RPC
 
 # 4. Proxy check (§2.3). All three EIP-1967 slots must read as zero.
 #    implementation / beacon / admin:
@@ -402,8 +407,8 @@ current-codehash pair behind it; anything else is the §4 gap.
 ## 4. De-onboarding: allowlist off **before** decertification
 
 ```
-1. setAdapterAllowed(adapter, false)      # funds can no longer reach it
-2. demote(target, selector)               # per certified pair
+1. setAdapterAllowed(adapter, false)      # closes BOTH axes: funds AND callee
+2. demote(target, selector)               # per certified pair; funds axis only
 3. (bondReleaseDelay later) claimSubmitterBond(target, selector)
 ```
 
@@ -412,11 +417,18 @@ current-codehash pair behind it; anything else is the §4 gap.
 which deletes the `TierConfig`, starts the submitter-bond release timer
 (`bondReleaseDelay`, default 14 days, [`:78`](../src/TierRegistry.sol#L78),
 bounded to [1 day, 365 days] by [`:59-60`](../src/TierRegistry.sol#L59)), and
-**also clears the adapter's allowlist entry on-chain** (see below). Step 1
-above therefore now duplicates what step 2 does for a single adapter in the
-common case; it stays the documented order as belt-and-suspenders, and
-because it remains the only lever for the two gaps the watcher still has to
-cover.
+**also clears the adapter's funds-axis allowlist entry on-chain** (see below).
+
+**STEP 1 IS NOT REDUNDANT, and since pashov finding #14 it is the load-bearing
+call.** An earlier version of this section said step 1 merely duplicated step 2
+for a single adapter and stayed only as belt-and-suspenders. That is no longer
+true. `_demote` now clears the FUNDS axis and deliberately leaves the CALLEE
+axis (`_calleeAllowed`,
+[`:167`](../src/TierRegistry.sol#L167)) standing, so `setAdapterAllowed(adapter,
+false)` is the **only** call that closes the callee axis — it is what sets
+`_calleeRevoked` ([`:186`](../src/TierRegistry.sol#L186)). Skip step 1 and the
+address remains a legal batch callee indefinitely, priced at tier 2 but
+reachable, no matter how many times you demote it.
 
 Decertifying first opens a window in which the adapter is **allowlisted but
 uncertified**: governance has withdrawn its statement about what the target
@@ -424,7 +436,34 @@ does, while the guard still lets vault funds be approved to it. Turning the
 allowlist off first closes the funds path immediately; the certification can
 then be withdrawn at whatever pace the bond mechanics require.
 
-### `_demote` clears the allowlist too — over-broad by design, one-way
+### `_demote` clears the FUNDS axis only — the callee axis survives by design
+
+Since pashov finding #14, "the allowlist" is two axes and demotion moves only
+one of them. Read this before the subsection below, which describes the funds
+axis:
+
+| axis | read via | cleared by `_demote`? |
+|---|---|---|
+| funds — may RECEIVE vault money | `isAdapterAllowed` | **yes** |
+| callee — may BE CALLED in a batch | `isCallableTarget` ([`:947`](../src/TierRegistry.sol#L947)) | **no, on purpose** |
+
+The asymmetry is the fix, not an oversight. Demotion is reachable
+permissionlessly — `ChallengeGame.file` only needs the `(target, selector)` pair
+to appear in the executed proposal's calldata, and every execute batch names
+`(clone, execute())` — so clearing the callee axis on demotion let anyone
+revoke the vault's ability to CALL the strategy clone **holding its capital**.
+`settleProposal`, `unstick` and `finalizeEmergencySettle` all reverted
+`DisallowedBatchCallee`, the proposal pinned in `Executed`,
+`redemptionsLocked()` stayed true, and every LP exit shut until the registry
+multisig re-granted standing. Revoking the right to be PAID must not revoke the
+vault's ability to RECLAIM.
+
+Operationally: **a convicted adapter is reachable but not fundable.** To close
+the callee axis as well, an explicit owner `setAdapterAllowed(adapter, false)`
+is required (step 1 of §4) — and see §4b Rollback for the ordering constraint,
+because closing it too early re-creates the freeze described above.
+
+### `_demote` clears the funds-axis allowlist too — over-broad by design, one-way
 
 Every persisted demotion routes through `_demote`
 ([`:296-310`](../src/TierRegistry.sol#L296)), which deletes `_configs[k]`
@@ -569,8 +608,14 @@ Step 3 is what **replaces `setAdapterAllowed(clone, true)` per proposal**.
 ```
 cast call $REGISTRY "classOf(address)(bytes32)"        $CLONE     # non-zero => live member
 cast call $REGISTRY "tierOf(address,bytes4)(uint8,uint16)" $CLONE $SEL
-cast call $REGISTRY "isAdapterAllowed(address)(bool)"  $CLONE
+cast call $REGISTRY "isAdapterAllowed(address)(bool)"  $CLONE     # funds axis
+cast call $REGISTRY "isCallableTarget(address)(bool)"  $CLONE     # callee axis
 ```
+
+Read both axes. After a class conviction the expected answers **differ** —
+`isAdapterAllowed` false, `isCallableTarget` still true — and that is correct
+until step 4 of Rollback below has run. Both false is the finished
+de-onboarding; both true is a live class.
 
 A clone reading `(2, 10000)` while the class is certified means the membership
 check failed — either it is not a clone of that template, or the template's own
@@ -579,9 +624,50 @@ code changed since certification.
 ### Rollback
 
 `demoteClass(template, selector)` returns every clone to the tier-2 default and
-clears the class allowlist. That is the state clones are in today, so rollback
-is never worse than the status quo — and existing per-clone address grants keep
-working throughout, because the address path always wins over the class.
+clears the class **funds** axis (`_classAllowed`). It does **not** clear the
+class **callee** axis (`_classCalleeAllowed`,
+[`:199`](../src/TierRegistry.sol#L199)) — `_demoteClass`
+([`:1407`](../src/TierRegistry.sol#L1407)) leaves that standing deliberately, for
+the same reason `_demote` does on the address path: a class conviction must not
+strand the capital a live clone is holding. Existing per-clone address grants
+keep working throughout, because the address path always wins over the class.
+
+**Closing the class callee axis is a SEQUENCED step, not an immediate one.**
+`setClassAllowed(template, false)` ([`:1347`](../src/TierRegistry.sol#L1347)) is
+the only call that closes it. Running it straight after the conviction
+re-creates exactly the freeze finding #14 fixed — the live clone becomes
+unreachable and every LP exit shuts. Correct order:
+
+```
+1. demoteClass(template, selector)        # funds axis closed, tier -> 2
+                                          # callee axis intentionally still open
+2. <settle the open proposal>             # uses the still-open callee axis to
+                                          # reclaim capital from the live clone
+3. <confirm nothing outstanding>          # vault.redemptionsLocked() == false
+                                          # governor openProposalCount == 0
+                                          # no proposal for this template in Executed
+4. setClassAllowed(template, false)       # NOW close the callee axis
+```
+
+Step 4 is the one the contract no longer does for you, and the one that gets
+skipped. Two mechanics make it safe whenever you reach it: the
+`ClassNotCertified` guard is scoped to the `allowed == true` branch, so
+revocation works on a demoted, uncertified or drifted class; and
+`cloneCodehashOf` is `pure`, deriving the fingerprint from the template ADDRESS,
+so it resolves even after the template's bytecode drifted.
+
+If step 4 is skipped, every clone of that template stays a legal batch callee
+indefinitely — **including clones deployed after the conviction**, since class
+membership is computed live from bytecode and anyone may permissionlessly deploy
+an ERC-1167 clone of the template to become a member. They cannot receive vault
+funds (the funds axis is closed), and reaching them still requires a passed
+proposal, so this is a boundary-widening rather than a funds path. It is
+nonetheless unbounded and permanent until step 4 runs.
+
+`_demoteClass` emits `ClassDemoted(template, selector, cch)`. A watchtower that
+alerts when a `ClassDemoted` is not followed by
+`ClassAllowedSet(template, cch, false)` once `openProposalCount` reaches zero
+turns step 4 from "remember" into "get paged".
 
 Re-certifying does **not** restore allowlist standing. That is deliberate and
 matters more here than on the address path: the blast radius is every clone of
