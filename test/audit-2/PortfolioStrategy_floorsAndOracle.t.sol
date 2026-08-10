@@ -15,7 +15,14 @@ import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 ///         reverts on `verify`, which was fine only while DS-mode execute
 ///         silently ran with no anchor — the very thing the requirement removes.
 contract MockDsVerifier {
-    function verify(bytes calldata signedReport) external payable returns (bytes memory) {
+    /// @dev Two arguments, matching the deployed `VerifierProxy 2.0.0`. The
+    ///      single-argument 1.x shape this mock used to expose is not on the
+    ///      real proxy at all -- calling it there reverts with empty returndata,
+    ///      so a one-argument mock would have gone on passing against a
+    ///      contract that could never work on chain. `parameterPayload` names
+    ///      the fee token when a `FeeManager` is wired; none is, so it is
+    ///      ignored here exactly as the live proxy ignores it.
+    function verify(bytes calldata signedReport, bytes calldata) external payable returns (bytes memory) {
         (bytes32 feedId, int192 price) = abi.decode(signedReport, (bytes32, int192));
         return abi.encode(
             ChainlinkReport({

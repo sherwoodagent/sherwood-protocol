@@ -8,9 +8,33 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/// @notice Chainlink Data Streams verifier proxy interface
+/// @notice Chainlink Data Streams verifier proxy interface.
+/// @dev    TWO ARGUMENTS, MATCHING `VerifierProxy 2.0.0`. This was declared with
+///         the single-argument `verify(bytes)` of the 1.x proxy, a shape the
+///         deployed contract does not have — probed read-only against the
+///         verifier in `chains/46630.json`
+///         (`0x72790f9eB82db492a7DDb6d2af22A270Dcc3Db64`), which answers
+///         `typeAndVersion() == "VerifierProxy 2.0.0"`. A call to the one-argument
+///         selector reverts with EMPTY returndata there, byte-identical to
+///         calling a function that does not exist, while the two-argument
+///         selector reverts with a typed `VerifierNotFound(bytes32)` — the
+///         function running and rejecting a dummy feed. So the old declaration
+///         did not merely mis-describe the proxy, it could never reach it, and
+///         the failure carried nothing to decode.
+///
+///         `parameterPayload` selects the fee token when the proxy routes
+///         through a `FeeManager`. This one does not: `s_feeManager()` reads
+///         `address(0)`, so verification is free and the argument is passed
+///         empty, which is why `submitPriceReports` needs neither `payable` nor a
+///         refund path. WIRING A `FeeManager` IS A BREAKING CHANGE for this
+///         contract: the empty payload would start reverting, and the call would
+///         need a fee-token payload plus forwarded value. Fail loudly there
+///         rather than quietly overpay from a permissionless entrypoint.
 interface IVerifierProxy {
-    function verify(bytes calldata signedReport) external payable returns (bytes memory verifierResponse);
+    function verify(bytes calldata payload, bytes calldata parameterPayload)
+        external
+        payable
+        returns (bytes memory verifierResponse);
 }
 
 /// @notice Minimal Chainlink push-feed (AggregatorV3) interface. Used in
@@ -1823,7 +1847,9 @@ contract PortfolioStrategy is BaseStrategy {
             return _pushFeedPrice(i);
         }
 
-        bytes memory verifierResponse = IVerifierProxy(chainlinkVerifier).verify(signedReport);
+        // Empty `parameterPayload`: this proxy has no `FeeManager`, so there is no
+        // fee token to nominate and nothing to pay. See `IVerifierProxy`.
+        bytes memory verifierResponse = IVerifierProxy(chainlinkVerifier).verify(signedReport, "");
         ChainlinkReport memory report = abi.decode(verifierResponse, (ChainlinkReport));
 
         bytes32 expected = _feedIds[i];
