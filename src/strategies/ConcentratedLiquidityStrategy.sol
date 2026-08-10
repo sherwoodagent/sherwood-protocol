@@ -30,6 +30,20 @@ interface ITierBindingPath {
     function isCounterpartyAllowed(address counterparty) external view returns (bool);
 }
 
+/// @notice Morpho Blue's oracle surface: the collateral price quoted in
+///         loan-token units, scaled by `ORACLE_PRICE_SCALE`.
+/// @dev    Declared locally for the same reason as `ITierBindingPath`, and read
+///         the same way — a length-checked raw staticcall. The oracle address
+///         is a member of the proposer-supplied `MarketParams`, so a typed call
+///         would let whoever controls it revert this frame undecodably and veto
+///         settlement. Exists to generate a selector, not to type the response.
+interface IMorphoOracle {
+    function price() external view returns (uint256);
+}
+
+/// @dev Morpho Blue's fixed oracle price scale (`1e36`).
+uint256 constant ORACLE_PRICE_SCALE = 1e36;
+
 /**
  * @title ConcentratedLiquidityStrategy
  * @notice Deploys vault capital as a market-making position: concentrated
@@ -1642,8 +1656,30 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         }
 
         uint128 collateral = morpho.position(marketId, address(this)).collateral;
-        if (morpho.position(marketId, address(this)).borrowShares == 0 && collateral != 0) {
-            _tryWithdrawCollateral(collateral);
+        uint128 outstanding = morpho.position(marketId, address(this)).borrowShares;
+        if (collateral != 0) {
+            if (outstanding == 0) {
+                _tryWithdrawCollateral(collateral);
+            } else {
+                // PASHOV FINDING #8. Gating the withdrawal on `outstanding == 0`
+                // is strictly stronger than the rule Morpho enforces
+                // (`LTV <= LLTV`), so a position that came back a few units
+                // short of its accrued interest kept its ENTIRE collateral
+                // locked behind trivial residual debt — traced in
+                // `CLStrategy_partialCollateralRecovery.t.sol`: ~412 of debt
+                // stranding 100,000 of collateral, a ~243x disproportion, from
+                // an ordinary interest-outran-fees outcome with no attacker.
+                //
+                // It is also unrecoverable once it happens: the partial repay
+                // above leaves this clone's asset balance at zero, so `sweep()`
+                // never re-enters the repay branch and the withdrawal stays
+                // gated forever. Only a third party volunteering to repay
+                // someone else's dust would unblock it.
+                //
+                // So take the health-preserving maximum instead of nothing.
+                uint256 freeable = _withdrawableWhileHealthy(collateral);
+                if (freeable != 0) _tryWithdrawCollateral(uint128(freeable));
+            }
         }
 
         // Retried UNCONDITIONALLY, not only under the branch above. A previous
@@ -1683,6 +1719,75 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         IERC20(asset).forceApprove(address(morpho), approveAmount);
         (ok,) = address(morpho).call(callData);
         IERC20(asset).forceApprove(address(morpho), 0);
+    }
+
+    /// @dev The collateral this position can release while still satisfying
+    ///      Morpho's own health rule against the debt that is STILL OUTSTANDING
+    ///      (pashov finding #8). Morpho requires
+    ///        collateral * price / ORACLE_PRICE_SCALE * lltv / WAD  >=  borrowed
+    ///      so the collateral that must STAY is the smallest value satisfying it,
+    ///      rounded UP at every step, and everything above that is freeable.
+    ///
+    ///      KEEPS `MIN_LLTV_BUFFER_BPS` OF HEADROOM rather than unwinding to the
+    ///      liquidation threshold exactly. Landing on the bar would leave the
+    ///      residual position one interest-accrual block away from liquidation,
+    ///      which trades the bug for a worse one; the same buffer the entry-side
+    ///      LTV gate enforces is the natural bar to reuse.
+    ///
+    ///      THE ORACLE READ IS RAW AND GUARDED, matching this file's standing
+    ///      treatment of proposer-supplied `MarketParams` members (`accrueInterest`
+    ///      above, `_tryRedeemWrapper`, `_feedPriceX8` in `ExposureLedger`): the
+    ///      oracle address is part of the proposer's market declaration, so a
+    ///      typed call would hand whoever controls it a settlement veto — a
+    ///      revert in this frame with no returndata to catch. DECISION ON
+    ///      FAILURE: return 0, i.e. degrade to the pre-fix behaviour of leaving
+    ///      the collateral for `sweep()`. This is a liveness path, so it fails
+    ///      to the OLD outcome, never to a withdrawal sized off an unread price.
+    ///
+    ///      NOT GATED ON THE `accrued` FLAG, unlike the shares-mode repay in the
+    ///      caller — and that asymmetry is deliberate, not an oversight. Both
+    ///      read the same `totalBorrowAssets`, which is STALE when
+    ///      `accrueInterest` failed, and a stale read understates `owed` and so
+    ///      oversizes the result here. It cannot land, though: Morpho re-accrues
+    ///      INSIDE `withdrawCollateral` before its health check, so the same
+    ///      reverting IRM that left these totals stale also reverts the
+    ///      withdrawal, `_tryWithdrawCollateral` swallows it, and the outcome is
+    ///      the pre-fix one. Shares-mode repay needs the gate because a stale
+    ///      `owed` there makes Morpho pull MORE than expected; there is no
+    ///      matching hazard on this side.
+    ///
+    ///      A COROLLARY WORTH PINNING: `MIN_LLTV_BUFFER_BPS` above therefore
+    ///      does exactly the one job its own paragraph claims. It is NOT also
+    ///      absorbing un-accrued interest, because no withdrawal ever lands with
+    ///      un-accrued interest outstanding. Do not shrink it on the theory that
+    ///      it is carrying slack for this case.
+    function _withdrawableWhileHealthy(uint128 collateral) private view returns (uint256) {
+        MarketParams memory mp = _marketParams;
+        uint128 borrowShares = morpho.position(marketId, address(this)).borrowShares;
+        if (borrowShares == 0 || mp.lltv == 0) return 0;
+
+        address oracle = mp.oracle;
+        if (oracle.code.length == 0) return 0;
+        (bool ok, bytes memory ret) = oracle.staticcall(abi.encodeWithSelector(IMorphoOracle.price.selector));
+        if (!ok || ret.length < 32) return 0;
+        uint256 price = abi.decode(ret, (uint256));
+        if (price == 0) return 0;
+
+        Market memory m = morpho.market(marketId);
+        uint256 owed = _sharesToAssetsUp(borrowShares, m.totalBorrowAssets, m.totalBorrowShares);
+
+        // Effective LTV ceiling, held `MIN_LLTV_BUFFER_BPS` under the market's.
+        uint256 bufferWad = (MIN_LLTV_BUFFER_BPS * 1e18) / BPS_DENOMINATOR;
+        if (mp.lltv <= bufferWad) return 0;
+        uint256 effLltv = mp.lltv - bufferWad;
+
+        // required = ceil(ceil(owed * ORACLE_PRICE_SCALE / price) * WAD / effLltv)
+        // Split so the intermediate never needs 1e36 * 1e18 at once.
+        uint256 required = Math.mulDiv(owed, ORACLE_PRICE_SCALE, price, Math.Rounding.Ceil);
+        required = Math.mulDiv(required, 1e18, effLltv, Math.Rounding.Ceil);
+
+        if (required >= collateral) return 0;
+        return collateral - required;
     }
 
     /// @dev Degrades rather than reverting. A collateral withdrawal can fail for

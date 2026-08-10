@@ -262,13 +262,29 @@ contract CalleeGateTest is Test {
         _exec(_one(address(swappedAdapter), abi.encodeWithSelector(bytes4(0x12345678), attacker)));
     }
 
-    /// @notice Demotion severs callability too, not only fund-destination
-    ///         consent: `_demote`'s allowlist clear (deliberately over-broad
-    ///         per its own natspec) means an owner `demote` of a CERTIFIED
-    ///         (target, selector) pair also revokes that target's standing as
-    ///         a batch callee at all, even for calls unrelated to the
-    ///         demoted selector.
-    function test_demotionSeveresCallee() public {
+    /// @notice Demotion severs the FUNDS path but NOT callability (pashov
+    ///         finding #14). This assertion is deliberately the REVERSE of what
+    ///         it pinned before, and the reversal is the fix.
+    ///
+    /// @dev    The previous version asserted that demoting a certified
+    ///         (target, selector) pair also revoked that target's standing as a
+    ///         batch callee. `_demote`'s own natspec conceded that behaviour was
+    ///         a known-open finding on the very line that produced it: one bit
+    ///         answered both "may receive vault funds?" and "may the vault call
+    ///         you?", so convicting the strategy clone that currently HOLDS the
+    ///         vault's capital made `settleProposal`, `unstick` and
+    ///         `finalizeEmergencySettle` all revert `DisallowedBatchCallee`,
+    ///         pinning the proposal in `Executed` and freezing every LP exit.
+    ///
+    ///         The "deliberately over-broad" language that justified the old
+    ///         assertion is about SELECTOR SCOPE — demoting one selector
+    ///         de-allowlists the whole address — and that is unchanged here.
+    ///         What changed is the AXIS: revoking the right to be paid must not
+    ///         revoke the vault's ability to reclaim. An owner who does want to
+    ///         sever callability entirely still has `setAdapterAllowed(x, false)`,
+    ///         pinned by `test_explicitOwnerRevocationClosesCalleeStandingToo`
+    ///         in `test/pashov-final/Registry_demoteKeepsCalleeStanding.t.sol`.
+    function test_demotionSeveresFundsPathButNotCallability() public {
         ERC20Mock demotedAdapter = new ERC20Mock("Demoted", "DMT", 18);
         bytes4 sel = bytes4(0x12345678);
         tierRegistry.setAdapterAllowed(address(demotedAdapter), true);
@@ -292,8 +308,23 @@ contract CalleeGateTest is Test {
         tierRegistry.demote(address(demotedAdapter), sel);
         assertFalse(tierRegistry.isAdapterAllowed(address(demotedAdapter)), "demotion clears the allowlist flag too");
 
-        _expectCalleeDisallowed(address(demotedAdapter));
-        _exec(_one(address(demotedAdapter), abi.encodeWithSelector(sel, attacker)));
+        // The FUNDS axis is closed: the demoted address may not receive value.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISyndicateVault.DisallowedTransferTarget.selector,
+                address(usdc),
+                usdc.transfer.selector,
+                address(demotedAdapter)
+            )
+        );
+        _exec(_one(address(usdc), abi.encodeCall(usdc.transfer, (address(demotedAdapter), 1e6))));
+
+        // The CALLEE axis stays open, so vault capital held by the demoted
+        // address can still be reclaimed. Uses a real selector for the same
+        // reason as the sanity call above: this one actually delegatecalls
+        // through, so a made-up selector would revert on the mock's missing
+        // fallback for a reason unrelated to this gate.
+        _exec(_one(address(demotedAdapter), abi.encodeCall(demotedAdapter.balanceOf, (attacker))));
     }
 
     /// @notice A COUNTERPARTY grant does not open this gate.

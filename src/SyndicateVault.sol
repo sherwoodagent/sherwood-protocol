@@ -774,8 +774,21 @@ contract SyndicateVault is
             // empty-calldata and native-`value` calls are gated too. asset() is
             // the sole exemption (design.md Decision 2); everything else must be
             // an allowlisted, codehash-current adapter.
+            //
+            // READS THE CALLEE AXIS (`isCallableTarget`), NOT `isAdapterAllowed`
+            // (pashov finding #14). The two used to be one registry bit, so a
+            // demotion — reachable permissionlessly, since `ChallengeGame.file`
+            // only needs the pair to appear in the executed proposal's calldata,
+            // and every execute batch names `(clone, execute.selector)` — revoked
+            // the vault's ability to CALL the very clone holding its capital.
+            // `settleProposal`, `unstick` and `finalizeEmergencySettle` all
+            // reverted here, the proposal pinned in `Executed`, and every LP exit
+            // shut. The recipient/spender checks in PART 2b still read
+            // `isAdapterAllowed`, so a demoted clone remains reclaimable but
+            // unfundable. No lifecycle state is grandfathered: this stays one
+            // unconditional rule, evaluated per call, exactly as before.
             address target = calls[i].target;
-            if (target != asset_ && !ITierRegistry(registry).isAdapterAllowed(target)) {
+            if (target != asset_ && !ITierRegistry(registry).isCallableTarget(target)) {
                 revert DisallowedBatchCallee(target);
             }
             bytes calldata data = calls[i].data;
