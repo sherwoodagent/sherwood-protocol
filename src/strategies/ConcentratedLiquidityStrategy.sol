@@ -1741,6 +1741,24 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      FAILURE: return 0, i.e. degrade to the pre-fix behaviour of leaving
     ///      the collateral for `sweep()`. This is a liveness path, so it fails
     ///      to the OLD outcome, never to a withdrawal sized off an unread price.
+    ///
+    ///      NOT GATED ON THE `accrued` FLAG, unlike the shares-mode repay in the
+    ///      caller — and that asymmetry is deliberate, not an oversight. Both
+    ///      read the same `totalBorrowAssets`, which is STALE when
+    ///      `accrueInterest` failed, and a stale read understates `owed` and so
+    ///      oversizes the result here. It cannot land, though: Morpho re-accrues
+    ///      INSIDE `withdrawCollateral` before its health check, so the same
+    ///      reverting IRM that left these totals stale also reverts the
+    ///      withdrawal, `_tryWithdrawCollateral` swallows it, and the outcome is
+    ///      the pre-fix one. Shares-mode repay needs the gate because a stale
+    ///      `owed` there makes Morpho pull MORE than expected; there is no
+    ///      matching hazard on this side.
+    ///
+    ///      A COROLLARY WORTH PINNING: `MIN_LLTV_BUFFER_BPS` above therefore
+    ///      does exactly the one job its own paragraph claims. It is NOT also
+    ///      absorbing un-accrued interest, because no withdrawal ever lands with
+    ///      un-accrued interest outstanding. Do not shrink it on the theory that
+    ///      it is carrying slack for this case.
     function _withdrawableWhileHealthy(uint128 collateral) private view returns (uint256) {
         MarketParams memory mp = _marketParams;
         uint128 borrowShares = morpho.position(marketId, address(this)).borrowShares;
