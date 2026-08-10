@@ -38,12 +38,12 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     using EnumerableSet for EnumerableSet.UintSet;
 
     // ── Errors ──
-    /// @notice `createSyndicate` was called while the factory has no
-    ///         `tierRegistry` wired, or `setTierRegistry` was handed a codeless
-    ///         address (pashov finding #1). A governor created in that state is
+    /// @notice A registry was missing where one is mandatory (pashov finding
+    ///         #1) — `initialize` without a `tierRegistry`, `setTierRegistry`
+    ///         handed a codeless address, or `createSyndicate` called after an
+    ///         owner zeroed the slot. A governor created without a registry is
     ///         permanently registry-less, and `SyndicateVault._guardBatchCalls`
-    ///         degrades OPEN without one — wire a real registry with
-    ///         `setTierRegistry` first.
+    ///         degrades OPEN without one.
     error TierRegistryNotWired();
     error InvalidExecutorImpl();
     error InvalidVaultImpl();
@@ -256,6 +256,15 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         address protocolConfig;
         uint256 managementFeeBps;
         address guardianRegistry;
+        /// @dev MANDATORY (pashov finding #1). Carried in `InitParams` rather
+        ///      than left to a follow-up `setTierRegistry` so the "factory is
+        ///      live but has no registry" state cannot exist at all. While it
+        ///      did exist, `createSyndicate` refused — fail-closed, but the
+        ///      invariant held by runtime check and deploy-script discipline
+        ///      instead of by construction. `TierRegistry`'s constructor takes
+        ///      only an owner, so it has no dependency on the factory and can
+        ///      always be deployed first.
+        address tierRegistry;
     }
 
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -270,6 +279,10 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         if (p.beacon == address(0)) revert InvalidBeacon();
         if (p.protocolConfig == address(0)) revert InvalidProtocolConfig();
         if (p.guardianRegistry == address(0)) revert InvalidGuardianRegistry();
+        // Zero AND codeless both refused, matching `setTierRegistry`'s own
+        // check: an EOA here would be stamped into every governor this factory
+        // creates and brick each one's `executeGovernorBatch` permanently.
+        if (p.tierRegistry.code.length == 0) revert TierRegistryNotWired();
 
         __Ownable_init(p.owner);
 
@@ -280,6 +293,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         beacon = p.beacon;
         protocolConfig = p.protocolConfig;
         guardianRegistry = p.guardianRegistry;
+        tierRegistry = p.tierRegistry;
         if (p.managementFeeBps > MAX_MANAGEMENT_FEE_BPS) revert ManagementFeeTooHigh();
         managementFeeBps = p.managementFeeBps;
     }
@@ -312,6 +326,11 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         // push site below). This reads factory storage only, so it belongs up
         // here with the other pre-flight rejects rather than after the vault
         // proxy, queue, governor and `addGovernor` have already executed.
+        //
+        // `initialize` now requires a registry, so this cannot fire on a
+        // freshly deployed factory. It still covers the one remaining way the
+        // slot reaches zero: an owner deliberately calling `setTierRegistry(0)`
+        // as a kill switch on new syndicates.
         if (tierRegistry == address(0)) revert TierRegistryNotWired();
 
         // Gate on prepared owner stake before any side effects. Owner bonds
@@ -650,11 +669,14 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         emit GuardianRegistrySet(old, newRegistry);
     }
 
-    /// @notice Set the adapter-selector tier registry pushed into governors at
-    ///         `createSyndicate`. Only affects governors created AFTER this
-    ///         call; existing per-vault governors are rewired via
-    ///         `pushWiring(governor)`. The governor's own `setTierRegistry` is
-    ///         `onlyFactory`, so it is NOT callable directly.
+    /// @notice RE-POINT the adapter-selector tier registry pushed into
+    ///         governors at `createSyndicate`. The initial value is mandatory
+    ///         and comes from `InitParams`, so this is not part of the deploy
+    ///         sequence — it exists to migrate to a new registry. Only affects
+    ///         governors created AFTER this call; existing per-vault governors
+    ///         are rewired via `pushWiring(governor)`. The governor's own
+    ///         `setTierRegistry` is `onlyFactory`, so it is NOT callable
+    ///         directly.
     /// @dev `address(0)` remains legal HERE and only here, and it no longer
     ///      means "governors created afterward keep the safe tier-2 default" —
     ///      since pashov finding #1 there are no governors created afterward at

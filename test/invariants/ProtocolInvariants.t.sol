@@ -6,6 +6,7 @@ import {StdInvariant} from "forge-std/StdInvariant.sol";
 
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
@@ -199,7 +200,10 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                 beacon: address(governor),
                 protocolConfig: address(governor),
                 managementFeeBps: 200,
-                guardianRegistry: address(registry)
+                guardianRegistry: address(registry),
+                // Mandatory since pashov finding #1 — a factory cannot be
+                // initialized without a real tier registry.
+                tierRegistry: address(new TierRegistry(factoryOwner))
             });
             factory = SyndicateFactory(
                 address(new ERC1967Proxy(address(facImpl), abi.encodeCall(SyndicateFactory.initialize, (fp))))

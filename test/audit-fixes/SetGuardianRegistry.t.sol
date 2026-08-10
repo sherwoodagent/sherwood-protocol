@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
@@ -70,7 +71,10 @@ contract SetGuardianRegistryTest is Test {
                     beacon: address(governor),
                     protocolConfig: address(governor),
                     managementFeeBps: 0,
-                    guardianRegistry: address(initialRegistry)
+                    guardianRegistry: address(initialRegistry),
+                    // Mandatory since pashov finding #1 — a factory cannot be
+                    // initialized without a real tier registry.
+                    tierRegistry: address(new TierRegistry(owner))
                 }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));

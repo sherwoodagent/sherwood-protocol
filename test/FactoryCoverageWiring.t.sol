@@ -73,6 +73,13 @@ contract FactoryCoverageWiringTest is Test {
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         GovernorBeacon beacon = new GovernorBeacon(address(govImpl), owner);
 
+        // pashov finding #1: the tier registry is a MANDATORY `InitParams`
+        // field, so a factory cannot exist without one. Deployed before the
+        // factory rather than wired after it. NOTE: this is NOT `tierReg` (set
+        // further down) — `pushWiring` is proved by re-pointing to a DIFFERENT
+        // registry, so the two must not be the same contract.
+        TierRegistry initialTierRegistry = new TierRegistry(owner);
+
         SyndicateFactory factoryImpl = new SyndicateFactory();
         bytes memory factoryInit = abi.encodeCall(
             SyndicateFactory.initialize,
@@ -85,20 +92,11 @@ contract FactoryCoverageWiringTest is Test {
                     beacon: address(beacon),
                     protocolConfig: address(protocolCfg),
                     managementFeeBps: 50,
-                    guardianRegistry: guardianRegistryAddr
+                    guardianRegistry: guardianRegistryAddr,
+                    tierRegistry: address(initialTierRegistry)
                 }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
-        // pashov finding #1: `createSyndicate` now REFUSES without a wired
-        // TierRegistry (a registry-less governor makes the vault's batch guard
-        // degrade open), so every factory fixture must wire one.
-        // HOISTED: a call in argument position consumes a pending one-shot
-        // `vm.prank`, so `factory.owner()` inline would eat it and the setter
-        // would run unpranked (OwnableUnauthorizedAccount).
-        address _factoryOwner = factory.owner();
-        TierRegistry _fixtureTierRegistry = new TierRegistry(_factoryOwner);
-        vm.prank(_factoryOwner);
-        factory.setTierRegistry(address(_fixtureTierRegistry));
 
         creator1AgentId = agentRegistry.mint(creator1);
         creator2AgentId = agentRegistry.mint(creator2);

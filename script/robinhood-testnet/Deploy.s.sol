@@ -58,10 +58,21 @@ contract DeployRobinhoodTestnet is ScriptBase {
         //    registry↔sWOOD circular dependency is resolved by `setRegistry`.
         uint256 baseNonce = vm.getNonce(deployer);
         // ProtocolConfig at +0, govImpl +1, govProxy +2, swoodImpl +3, swoodProxy +4,
-        // registryImpl +5, registryProxy +6, factoryImpl +7, factoryProxy +8.
+        // registryImpl +5, registryProxy +6, tierRegistry +7, factoryImpl +8,
+        // factoryProxy +9.
+        //
+        // `tierRegistry` was inserted at +7 by pashov finding #1: it is now a
+        // mandatory `SyndicateFactory.InitParams` field, so it must exist
+        // before the factory proxy rather than being wired after it. Only the
+        // factory prediction shifts (+8 -> +9); sWOOD and the registry are
+        // deployed ahead of it and keep their offsets. The
+        // `require(address(factory) == predictedFactoryProxy)` below is what
+        // catches this arithmetic if it is ever wrong — it aborts the deploy
+        // rather than mis-wiring sWOOD and the guardian registry, both of which
+        // take the predicted factory address at init.
         address predictedSwoodProxy = vm.computeCreateAddress(deployer, baseNonce + 4);
         address predictedRegistryProxy = vm.computeCreateAddress(deployer, baseNonce + 6);
-        address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 8);
+        address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 9);
 
         // 3a. Deploy ProtocolConfig (plain Ownable)
         ProtocolConfig protocolConfig = new ProtocolConfig(deployer);
@@ -107,7 +118,16 @@ contract DeployRobinhoodTestnet is ScriptBase {
         // Wire the set-once registry reference on sWOOD.
         StakedWood(swoodProxy).setRegistry(registryProxy);
 
-        // 5. Deploy SyndicateFactory (UUPS proxy, no ENS registrar, no agent registry)
+        // 5. Tier registry — a MANDATORY `SyndicateFactory.InitParams` field
+        //    since pashov finding #1, so it is deployed BEFORE the factory
+        //    rather than wired after it. A vault created without one makes
+        //    `_guardBatchCalls` degrade OPEN, and that state was inherited
+        //    permanently by the governor. Mirrors the production
+        //    `script/Deploy.s.sol`.
+        TierRegistry tierRegistry = new TierRegistry(deployer);
+        console.log("TierRegistry:", address(tierRegistry));
+
+        // 6. Deploy SyndicateFactory (UUPS proxy, no ENS registrar, no agent registry)
         SyndicateFactory factoryImpl = new SyndicateFactory();
         bytes memory factoryInitData = abi.encodeCall(
             SyndicateFactory.initialize,
@@ -120,23 +140,13 @@ contract DeployRobinhoodTestnet is ScriptBase {
                     beacon: beacon,
                     protocolConfig: address(protocolConfig),
                     managementFeeBps: 50,
-                    guardianRegistry: registryProxy
+                    guardianRegistry: registryProxy,
+                    tierRegistry: address(tierRegistry)
                 }))
         );
         SyndicateFactory factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInitData)));
         require(address(factory) == predictedFactoryProxy, "factory addr mismatch");
         console.log("SyndicateFactory:", address(factory));
-
-        // 6. Tier registry — REQUIRED before any syndicate can be created.
-        //    `createSyndicate` now reverts `TierRegistryNotWired()` rather than
-        //    silently leaving a governor registry-less (pashov finding #1): a
-        //    vault created without one makes `_guardBatchCalls` degrade OPEN,
-        //    and that state was inherited permanently. Mirrors the production
-        //    `script/Deploy.s.sol`, which wires it in the same function that
-        //    creates it.
-        TierRegistry tierRegistry = new TierRegistry(deployer);
-        factory.setTierRegistry(address(tierRegistry));
-        console.log("TierRegistry:", address(tierRegistry));
 
         //    Per-vault governors are deployed by the factory at createSyndicate
         //    and authorized on the registry via addGovernor — no singleton wiring.

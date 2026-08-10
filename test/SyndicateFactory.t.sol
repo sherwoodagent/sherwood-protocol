@@ -35,6 +35,9 @@ contract SyndicateFactoryTest is Test {
     // Post-split: the factory resolves sWOOD via `registry.swood()` then calls
     // `canCreateVault` / `bindOwnerStake` on sWOOD. Mock both indirections.
     address public swoodAddr = makeAddr("swood");
+    /// @dev Mandatory `InitParams.tierRegistry` (pashov finding #1). Held as a
+    ///      field so the re-init negative tests can reuse it.
+    TierRegistry public tierRegistryFixture;
 
     uint256 public creator1AgentId;
     uint256 public creator2AgentId;
@@ -52,6 +55,11 @@ contract SyndicateFactoryTest is Test {
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         GovernorBeacon beacon = new GovernorBeacon(address(govImpl), owner);
 
+        // pashov finding #1: the tier registry is a MANDATORY `InitParams`
+        // field, so a factory cannot exist without one. Deployed before the
+        // factory rather than wired after it.
+        tierRegistryFixture = new TierRegistry(owner);
+
         // Deploy factory as UUPS proxy
         SyndicateFactory factoryImpl = new SyndicateFactory();
         bytes memory factoryInit = abi.encodeCall(
@@ -65,20 +73,11 @@ contract SyndicateFactoryTest is Test {
                     beacon: address(beacon),
                     protocolConfig: address(protocolCfg),
                     managementFeeBps: 50,
-                    guardianRegistry: guardianRegistryAddr
+                    guardianRegistry: guardianRegistryAddr,
+                    tierRegistry: address(tierRegistryFixture)
                 }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
-        // pashov finding #1: `createSyndicate` now REFUSES without a wired
-        // TierRegistry (a registry-less governor makes the vault's batch guard
-        // degrade open), so every factory fixture must wire one.
-        // HOISTED: a call in argument position consumes a pending one-shot
-        // `vm.prank`, so `factory.owner()` inline would eat it and the setter
-        // would run unpranked (OwnableUnauthorizedAccount).
-        address _factoryOwner = factory.owner();
-        TierRegistry _fixtureTierRegistry = new TierRegistry(_factoryOwner);
-        vm.prank(_factoryOwner);
-        factory.setTierRegistry(address(_fixtureTierRegistry));
 
         // Mint ERC-8004 identity NFTs for creators
         creator1AgentId = agentRegistry.mint(creator1);
@@ -539,7 +538,8 @@ contract SyndicateFactoryTest is Test {
                 beacon: governorAddr,
                 protocolConfig: governorAddr,
                 managementFeeBps: 50,
-                guardianRegistry: guardianRegistryAddr
+                guardianRegistry: guardianRegistryAddr,
+                tierRegistry: address(tierRegistryFixture)
             })
         );
 
@@ -566,7 +566,8 @@ contract SyndicateFactoryTest is Test {
                 beacon: governorAddr,
                 protocolConfig: governorAddr,
                 managementFeeBps: 50,
-                guardianRegistry: guardianRegistryAddr
+                guardianRegistry: guardianRegistryAddr,
+                tierRegistry: address(tierRegistryFixture)
             })
         );
     }
@@ -933,6 +934,60 @@ contract SyndicateFactoryTest is Test {
         SyndicateGovernor(gov).setTierRegistry(makeAddr("eoaRegistry"));
 
         assertEq(SyndicateGovernor(gov).tierRegistry(), address(reg), "registry unchanged after both refusals");
+    }
+
+    /// @notice pashov finding #1, structural — a factory cannot be initialized
+    ///         without a real tier registry, so the "live but unwired" state
+    ///         has no window at all rather than being merely fail-closed.
+    /// @dev    Before this, `tierRegistry` was absent from `InitParams` and
+    ///         every deployment had a gap between `initialize` and
+    ///         `setTierRegistry` in which `createSyndicate` reverted. The
+    ///         invariant held by script discipline plus a runtime check; it now
+    ///         holds by construction. Both rejected shapes are covered: zero
+    ///         and codeless (an EOA would be stamped into every governor this
+    ///         factory creates and brick each one's `executeGovernorBatch`).
+    function test_factoryInitialize_requiresRealTierRegistry() public {
+        SyndicateFactory freshImpl = new SyndicateFactory();
+        TierRegistry reg = new TierRegistry(owner);
+
+        // HOISTED: `_factoryInitDataWithTierRegistry` reads `factory.beacon()`
+        // and `factory.protocolConfig()`. Left in argument position those
+        // external calls are evaluated FIRST and consume the pending one-shot
+        // `vm.expectRevert`, so the create runs unarmed and the test fails with
+        // "next call did not revert as expected".
+        bytes memory initZero = _factoryInitDataWithTierRegistry(address(0));
+        bytes memory initEoa = _factoryInitDataWithTierRegistry(makeAddr("eoaRegistry"));
+        bytes memory initReal = _factoryInitDataWithTierRegistry(address(reg));
+
+        vm.expectRevert(SyndicateFactory.TierRegistryNotWired.selector);
+        new ERC1967Proxy(address(freshImpl), initZero);
+
+        vm.expectRevert(SyndicateFactory.TierRegistryNotWired.selector);
+        new ERC1967Proxy(address(freshImpl), initEoa);
+
+        // The positive case: a real registry initializes and lands in storage.
+        SyndicateFactory fresh = SyndicateFactory(address(new ERC1967Proxy(address(freshImpl), initReal)));
+        assertEq(fresh.tierRegistry(), address(reg), "registry stored at init");
+    }
+
+    /// @dev Factory `InitParams` with every field but `tierRegistry` fixed, so
+    ///      the test above varies exactly one axis.
+    function _factoryInitDataWithTierRegistry(address reg) internal view returns (bytes memory) {
+        return abi.encodeCall(
+            SyndicateFactory.initialize,
+            (SyndicateFactory.InitParams({
+                    owner: owner,
+                    executorImpl: address(executorLib),
+                    vaultImpl: address(vaultImpl),
+                    ensRegistrar: address(ensRegistrar),
+                    agentRegistry: address(agentRegistry),
+                    beacon: factory.beacon(),
+                    protocolConfig: factory.protocolConfig(),
+                    managementFeeBps: 50,
+                    guardianRegistry: guardianRegistryAddr,
+                    tierRegistry: reg
+                }))
+        );
     }
 
     /// @notice The factory-side setter rejects a codeless registry but still

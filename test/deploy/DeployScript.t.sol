@@ -9,6 +9,7 @@ import {StakedWood} from "../../src/StakedWood.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
@@ -119,7 +120,11 @@ contract DeployScriptTest is Test {
                     beacon: beacon,
                     protocolConfig: address(protocolConfig),
                     managementFeeBps: 50,
-                    guardianRegistry: registryProxy
+                    guardianRegistry: registryProxy,
+                    // Mandatory since pashov finding #1. Every address this test
+                    // asserts on is CREATE3-derived from a salt, so the extra
+                    // nonce this deployment consumes moves none of them.
+                    tierRegistry: address(new TierRegistry(deployer))
                 }))
         );
         address factoryProxy = c3.deploy(

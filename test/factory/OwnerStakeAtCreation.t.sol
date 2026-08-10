@@ -63,6 +63,11 @@ contract OwnerStakeAtCreationTest is Test {
         // beacon (+3), factoryImpl (+4), regImpl (+5), regProxy (+6),
         // factoryProxy (+7).
         ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
+        // pashov finding #1: the tier registry is a MANDATORY `InitParams`
+        // field. Deployed ABOVE `baseNonce` — like `_hoistedPC` — so it costs a
+        // nonce the prediction plan never counted, leaving every offset below
+        // unchanged.
+        TierRegistry _hoistedTierRegistry = new TierRegistry(owner);
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 6);
         address predictedFactoryProxy = vm.computeCreateAddress(address(this), baseNonce + 7);
@@ -117,20 +122,11 @@ contract OwnerStakeAtCreationTest is Test {
                     beacon: address(beacon),
                     protocolConfig: address(_hoistedPC),
                     managementFeeBps: 50,
-                    guardianRegistry: address(registry)
+                    guardianRegistry: address(registry),
+                    tierRegistry: address(_hoistedTierRegistry)
                 }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
-        // pashov finding #1: `createSyndicate` now REFUSES without a wired
-        // TierRegistry (a registry-less governor makes the vault's batch guard
-        // degrade open), so every factory fixture must wire one.
-        // HOISTED: a call in argument position consumes a pending one-shot
-        // `vm.prank`, so `factory.owner()` inline would eat it and the setter
-        // would run unpranked (OwnableUnauthorizedAccount).
-        address _factoryOwner = factory.owner();
-        TierRegistry _fixtureTierRegistry = new TierRegistry(_factoryOwner);
-        vm.prank(_factoryOwner);
-        factory.setTierRegistry(address(_fixtureTierRegistry));
         require(address(factory) == predictedFactoryProxy, "factory address prediction mismatch");
 
         // Hand the governor's addVault gate to the factory.
