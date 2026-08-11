@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {IProposalStatus} from "../../src/interfaces/IProposalStatus.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Canonical test adapter for the vault↔governance seam: satisfies
 ///         `IProposalStatus` (the ONLY governance surface the vault reads) in a
@@ -14,10 +15,21 @@ contract MockProposalStatus is IProposalStatus {
     address public strategy;
 
     /// @dev Mirrors `SyndicateGovernor.tierRegistry()` — the vault resolves the
-    ///      TierRegistry through its governor for the value-moving-selector
-    ///      guard in `executeGovernorBatch`. address(0) (the default) means the
-    ///      guard is off, matching the unset-registry safe-default posture.
+    ///      TierRegistry through its governor for the callee and
+    ///      value-moving-selector guards in `executeGovernorBatch`.
+    ///
+    ///      DEFAULTS TO A WIRED, PERMISSIVE REGISTRY (pashov finding #1). It
+    ///      used to default to address(0), which turned the whole of PART 2 off
+    ///      — that is now a hard `TierRegistryUnresolved` revert, so an unset
+    ///      default would fail every batch in every suite using this adapter.
+    ///      Tests pinning the fail-closed behavior itself call
+    ///      `setTierRegistry(address(0))` explicitly, which still models a
+    ///      pre-fix governor.
     address public tierRegistry;
+
+    constructor() {
+        tierRegistry = address(deployTierRegistry(address(this)));
+    }
 
     function setTierRegistry(address registry) external {
         tierRegistry = registry;

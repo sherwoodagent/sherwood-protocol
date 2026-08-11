@@ -73,6 +73,10 @@ contract FactoryCoverageWiringTest is Test {
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         GovernorBeacon beacon = new GovernorBeacon(address(govImpl), owner);
 
+        // Mandatory `InitParams` field (pashov finding #1). Deliberately NOT
+        // `tierReg` — `pushWiring` is proved by re-pointing to a different one.
+        TierRegistry initialTierRegistry = new TierRegistry(owner);
+
         SyndicateFactory factoryImpl = new SyndicateFactory();
         bytes memory factoryInit = abi.encodeCall(
             SyndicateFactory.initialize,
@@ -85,7 +89,8 @@ contract FactoryCoverageWiringTest is Test {
                     beacon: address(beacon),
                     protocolConfig: address(protocolCfg),
                     managementFeeBps: 50,
-                    guardianRegistry: guardianRegistryAddr
+                    guardianRegistry: guardianRegistryAddr,
+                    tierRegistry: address(initialTierRegistry)
                 }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
@@ -165,7 +170,12 @@ contract FactoryCoverageWiringTest is Test {
     ///         rescued by `pushWiring` for all three slots at once.
     function test_pushWiring_rewiresExistingGovernor() public {
         (address gov,) = _createSyndicate(); // created BEFORE wiring existed
-        assertEq(SyndicateGovernor(gov).tierRegistry(), address(0), "precondition: unwired");
+        // pashov finding #1: the TIER REGISTRY can no longer be unwired at
+        // creation — `createSyndicate` refuses without one — so the governor
+        // comes up holding the fixture's registry. The ledger and escrow slots
+        // are unaffected and still model the LOW-1 case; what this test proves
+        // is that `pushWiring` RE-POINTS all three, which is unchanged.
+        assertTrue(SyndicateGovernor(gov).tierRegistry() != address(0), "precondition: registry always wired");
         assertEq(SyndicateGovernor(gov).exposureLedger(), address(0), "precondition: unwired");
         assertEq(SyndicateGovernor(gov).bondEscrow(), address(0), "precondition: unwired");
 

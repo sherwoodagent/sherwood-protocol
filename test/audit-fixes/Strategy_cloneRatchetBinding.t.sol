@@ -19,6 +19,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {MockStrategy} from "../mocks/MockStrategy.sol";
 import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice `StrategyFactory.syndicateFactory` stand-in: reports every vault as
 ///         registered so the factory's `_authClone` gate passes.
@@ -160,7 +161,8 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
                 address(vault),
                 address(guardianRegistry),
                 address(protocolConfig),
-                address(this), // factory
+                address(this),
+                address(deployTierRegistry(address(this))), // factory
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -471,6 +473,7 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
                 address(guardianRegistry),
                 address(protocolConfig),
                 address(this),
+                address(deployTierRegistry(address(this))),
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: votingPeriod,
                     executionWindow: 1 days,

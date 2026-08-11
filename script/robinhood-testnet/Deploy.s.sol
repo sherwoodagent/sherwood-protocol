@@ -13,6 +13,7 @@ import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {ScriptBase} from "../ScriptBase.sol";
 
 /**
@@ -57,10 +58,15 @@ contract DeployRobinhoodTestnet is ScriptBase {
         //    registry↔sWOOD circular dependency is resolved by `setRegistry`.
         uint256 baseNonce = vm.getNonce(deployer);
         // ProtocolConfig at +0, govImpl +1, govProxy +2, swoodImpl +3, swoodProxy +4,
-        // registryImpl +5, registryProxy +6, factoryImpl +7, factoryProxy +8.
+        // registryImpl +5, registryProxy +6, tierRegistry +7, factoryImpl +8,
+        // factoryProxy +9.
+        // `tierRegistry` inserted at +7 (pashov finding #1: mandatory
+        // `InitParams` field, so it must precede the factory), shifting only the
+        // factory prediction +8 -> +9. The `require` below catches a wrong
+        // offset before it mis-wires sWOOD / the guardian registry.
         address predictedSwoodProxy = vm.computeCreateAddress(deployer, baseNonce + 4);
         address predictedRegistryProxy = vm.computeCreateAddress(deployer, baseNonce + 6);
-        address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 8);
+        address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 9);
 
         // 3a. Deploy ProtocolConfig (plain Ownable)
         ProtocolConfig protocolConfig = new ProtocolConfig(deployer);
@@ -106,7 +112,12 @@ contract DeployRobinhoodTestnet is ScriptBase {
         // Wire the set-once registry reference on sWOOD.
         StakedWood(swoodProxy).setRegistry(registryProxy);
 
-        // 5. Deploy SyndicateFactory (UUPS proxy, no ENS registrar, no agent registry)
+        // 5. Tier registry — mandatory `InitParams` field (pashov finding #1),
+        //    so it precedes the factory. Mirrors `script/Deploy.s.sol`.
+        TierRegistry tierRegistry = new TierRegistry(deployer);
+        console.log("TierRegistry:", address(tierRegistry));
+
+        // 6. Deploy SyndicateFactory (UUPS proxy, no ENS registrar, no agent registry)
         SyndicateFactory factoryImpl = new SyndicateFactory();
         bytes memory factoryInitData = abi.encodeCall(
             SyndicateFactory.initialize,
@@ -119,14 +130,15 @@ contract DeployRobinhoodTestnet is ScriptBase {
                     beacon: beacon,
                     protocolConfig: address(protocolConfig),
                     managementFeeBps: 50,
-                    guardianRegistry: registryProxy
+                    guardianRegistry: registryProxy,
+                    tierRegistry: address(tierRegistry)
                 }))
         );
         SyndicateFactory factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInitData)));
         require(address(factory) == predictedFactoryProxy, "factory addr mismatch");
         console.log("SyndicateFactory:", address(factory));
 
-        // 6. Per-vault governors are deployed by the factory at createSyndicate
+        //    Per-vault governors are deployed by the factory at createSyndicate
         //    and authorized on the registry via addGovernor — no singleton wiring.
 
         vm.stopBroadcast();

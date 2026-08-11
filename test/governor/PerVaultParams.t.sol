@@ -16,6 +16,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 import {IProtocolConfig} from "../../src/interfaces/IProtocolConfig.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title PerVaultParams.t
 /// @notice Task 21 — per-vault governance parameters:
@@ -80,7 +81,14 @@ contract PerVaultParamsTest is Test {
         beacon = new GovernorBeacon(address(govImpl), owner);
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
-            (address(vault), address(guardianRegistry), address(protocolConfig), address(this), _validParams())
+            (
+                address(vault),
+                address(guardianRegistry),
+                address(protocolConfig),
+                address(this),
+                address(deployTierRegistry(address(this))),
+                _validParams()
+            )
         );
         governor = SyndicateGovernor(address(new BeaconProxy(address(beacon), govInit)));
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
@@ -257,7 +265,14 @@ contract PerVaultParamsTest is Test {
         gp.votingPeriod = 23 hours;
         bytes memory init = abi.encodeCall(
             SyndicateGovernor.initialize,
-            (address(vault), address(guardianRegistry), address(protocolConfig), address(this), gp)
+            (
+                address(vault),
+                address(guardianRegistry),
+                address(protocolConfig),
+                address(this),
+                address(deployTierRegistry(address(this))),
+                gp
+            )
         );
         vm.expectRevert(ISyndicateGovernor.InvalidVotingPeriod.selector);
         new BeaconProxy(address(beacon), init);
@@ -268,7 +283,14 @@ contract PerVaultParamsTest is Test {
         gp.vetoThresholdBps = 1999;
         bytes memory init = abi.encodeCall(
             SyndicateGovernor.initialize,
-            (address(vault), address(guardianRegistry), address(protocolConfig), address(this), gp)
+            (
+                address(vault),
+                address(guardianRegistry),
+                address(protocolConfig),
+                address(this),
+                address(deployTierRegistry(address(this))),
+                gp
+            )
         );
         vm.expectRevert(ISyndicateGovernor.InvalidVetoThresholdBps.selector);
         new BeaconProxy(address(beacon), init);

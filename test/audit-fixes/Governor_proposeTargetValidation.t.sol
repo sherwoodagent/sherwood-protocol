@@ -15,6 +15,7 @@ import {BlacklistingERC20Mock} from "../mocks/BlacklistingERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title Governor_proposeTargetValidation
 /// @notice Issue #118 — propose-time coverage that doesn't fit the lifecycle
@@ -89,7 +90,8 @@ contract GovernorProposeTargetValidationTest is Test {
                 address(vault),
                 address(guardianRegistry),
                 address(protocolConfig),
-                address(this), // factory
+                address(this),
+                address(deployTierRegistry(address(this))), // factory
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: 1 days,

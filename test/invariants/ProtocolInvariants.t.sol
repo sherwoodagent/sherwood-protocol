@@ -6,6 +6,7 @@ import {StdInvariant} from "forge-std/StdInvariant.sol";
 
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
@@ -20,6 +21,7 @@ import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {IProtocolConfig} from "../../src/interfaces/IProtocolConfig.sol";
 
 import {ProtocolHandler} from "./handlers/ProtocolHandler.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title ProtocolInvariantsTest
 /// @notice 7-invariant harness closing INV-2, INV-3, INV-9, INV-10, INV-30,
@@ -179,7 +181,14 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                         address(govImpl),
                         abi.encodeCall(
                             SyndicateGovernor.initialize,
-                            (placeholderVault, address(registry), address(protocolConfig), address(0xbeef), p)
+                            (
+                                placeholderVault,
+                                address(registry),
+                                address(protocolConfig),
+                                address(0xbeef),
+                                address(deployTierRegistry(address(this))),
+                                p
+                            )
                         )
                     )
                 )
@@ -199,7 +208,9 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                 beacon: address(governor),
                 protocolConfig: address(governor),
                 managementFeeBps: 200,
-                guardianRegistry: address(registry)
+                guardianRegistry: address(registry),
+                // Mandatory since pashov finding #1.
+                tierRegistry: address(new TierRegistry(factoryOwner))
             });
             factory = SyndicateFactory(
                 address(new ERC1967Proxy(address(facImpl), abi.encodeCall(SyndicateFactory.initialize, (fp))))

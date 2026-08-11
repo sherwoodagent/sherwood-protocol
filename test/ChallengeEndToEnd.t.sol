@@ -24,6 +24,7 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
 /// @dev Chainlink-shaped USD feed for the vault asset.
 contract ChallengeE2EFeed {
@@ -381,7 +382,8 @@ contract ChallengeEndToEndTest is Test {
                 address(vault),
                 address(registry),
                 address(protocolConfig),
-                address(this), // factory
+                address(this),
+                address(deployTierRegistry(address(this))), // factory
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,

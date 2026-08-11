@@ -272,17 +272,16 @@ contract DeploySherwood is ScriptBase {
         // Wire the set-once registry reference on sWOOD.
         StakedWood(d.swoodProxy).setRegistry(d.registryProxy);
 
-        address factoryImpl = c3.deploy(SALT_FACTORY_IMPL, abi.encodePacked(type(SyndicateFactory).creationCode));
-        d.factoryProxy = _deployFactoryProxy(c3, factoryImpl, d, cfg);
-        require(d.factoryProxy == predictedFactoryProxy, "factory addr mismatch");
-
         // Adapter-selector tier registry (spec §3.2). Owned by the deployer at
         // birth so `demote`/`poke` and the launch-set announcement can run
-        // before the multisig handoff; wired into the factory now (deployer
-        // still owns it) so every governor `createSyndicate` stamps out picks
-        // it up via the factory-only `setTierRegistry`. A plain Ownable2Step
-        // contract — no proxy needed (certifications are re-issuable, not
-        // upgrade-state).
+        // before the multisig handoff; passed into the factory's `InitParams`
+        // below so every governor `createSyndicate` stamps out picks it up via
+        // the factory-only `setTierRegistry`. A plain Ownable2Step contract —
+        // no proxy needed (certifications are re-issuable, not upgrade-state).
+        //
+        // Deployed BEFORE the factory: mandatory `InitParams` field since pashov
+        // finding #1. Free of ordering cost — the factory proxy is CREATE3, so
+        // an extra nonce ahead of it does not move `predictedFactoryProxy`.
         //
         // Granting is two-step (issue #45): `proposeCertification` is
         // owner-only and now takes the reviewed codehash as
@@ -303,7 +302,6 @@ contract DeploySherwood is ScriptBase {
         // ownership handoff overlap instead of serializing; demotion
         // (`demote`/`poke`) stays instant throughout.
         d.tierRegistry = address(new TierRegistry(d.deployer));
-        SyndicateFactory(d.factoryProxy).setTierRegistry(d.tierRegistry);
         // Issue #40: the submitter bond has no slash path yet, so it must
         // stay disabled until the launch gate documented on
         // `TierRegistry.submitterBondWood` is met. This script never calls
@@ -313,6 +311,10 @@ contract DeploySherwood is ScriptBase {
             TierRegistry(d.tierRegistry).submitterBondWood() == 0,
             "submitter bond must stay 0 at launch - see issue #40"
         );
+
+        address factoryImpl = c3.deploy(SALT_FACTORY_IMPL, abi.encodePacked(type(SyndicateFactory).creationCode));
+        d.factoryProxy = _deployFactoryProxy(c3, factoryImpl, d, cfg);
+        require(d.factoryProxy == predictedFactoryProxy, "factory addr mismatch");
     }
 
     /// @dev Deploys the StakedWood (sWOOD) proxy via CREATE3. The governor +
@@ -359,7 +361,8 @@ contract DeploySherwood is ScriptBase {
                     beacon: d.beacon,
                     protocolConfig: d.protocolConfig,
                     managementFeeBps: cfg.managementFeeBps,
-                    guardianRegistry: d.registryProxy
+                    guardianRegistry: d.registryProxy,
+                    tierRegistry: d.tierRegistry
                 }))
         );
         return c3.deploy(

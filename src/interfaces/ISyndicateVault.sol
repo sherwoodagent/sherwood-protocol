@@ -74,6 +74,13 @@ interface ISyndicateVault {
     ///         checks beneath it are defense-in-depth on allowlisted callees. Only
     ///         raised when the calling governor resolves a nonzero TierRegistry.
     error DisallowedBatchCallee(address target);
+    /// @notice The calling governor resolved no TierRegistry — no `tierRegistry()`
+    ///         getter, or one returning `address(0)`. The batch guard's callee
+    ///         allowlist and spender/recipient gate cannot be evaluated without
+    ///         it, so the batch is REFUSED rather than run unguarded (pashov
+    ///         finding #1). Unreachable for governors this factory deploys;
+    ///         `SyndicateFactory.pushWiring(governor)` rescues a pre-fix one.
+    error TierRegistryUnresolved();
     /// @notice A governor-batch call carries a guarded value-moving selector but
     ///         its calldata is too short to hold the spender/recipient argument.
     error MalformedCall();

@@ -311,6 +311,11 @@ interface ISyndicateGovernor {
     /// @notice Revert if `envelope.maxDrawdownBps > 10_000` at propose — a
     ///         drawdown declaration cannot exceed 100% of committed capital.
     error InvalidDrawdown();
+    /// @notice `setTierRegistry` was handed zero or a codeless address (pashov
+    ///         finding #1). Un-wiring re-opens `SyndicateVault._guardBatchCalls`
+    ///         (it degrades OPEN with no registry); a codeless address bricks
+    ///         the guard's typed call. Re-pointing to a real registry is legal.
+    error TierRegistryNotWired();
     /// @notice Revert if the realized vault balance at `settleProposal` sits
     ///         below the proposal's declared drawdown floor. `settleProposal`
     ///         freezes the Lane B settle price for every queued deposit and
@@ -706,11 +711,15 @@ interface ISyndicateGovernor {
     // ── Init ──
     /// @notice Initialize a freshly deployed per-vault governor proxy.
     ///         Called once by the factory inside the `BeaconProxy` constructor.
+    /// @param tierRegistry_ MANDATORY, must hold code (pashov finding #1). The
+    ///        registry is wired HERE, not in a follow-up `setTierRegistry`, so
+    ///        no governor ever exists with the batch guard's allowlist absent.
     function initialize(
         address vault_,
         address guardianRegistry_,
         address protocolConfig_,
         address factory_,
+        address tierRegistry_,
         GovernorParams calldata params_
     ) external;
 

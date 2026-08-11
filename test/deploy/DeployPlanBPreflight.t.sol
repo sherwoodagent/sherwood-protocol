@@ -8,6 +8,7 @@ import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
@@ -252,7 +253,9 @@ contract DeployPlanBPreflightTest is Test {
                     beacon: address(beacon),
                     protocolConfig: address(protocolConfig),
                     managementFeeBps: 50,
-                    guardianRegistry: address(registry)
+                    guardianRegistry: address(registry),
+                    // Mandatory since pashov finding #1.
+                    tierRegistry: address(new TierRegistry(DEFAULT_SENDER))
                 }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));

@@ -175,10 +175,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      goalposts for co-proposers who already approved.
     mapping(uint256 proposalId => uint256 packedTiming) private _draftTimingSnap;
 
-    /// @notice Tier registry. Optional: address(0) means every proposal
-    ///         resolves to tier 2 / full notional — the safe default. Wired
-    ///         post-init via `setTierRegistry` (factory-only, like
-    ///         `setProtocolConfig`).
+    /// @notice Tier registry. MANDATORY at `initialize` (pashov finding #1) —
+    ///         a governor cannot be born unwired. Re-pointed post-init via
+    ///         `setTierRegistry` (factory-only, like `setProtocolConfig`),
+    ///         which also refuses zero and codeless.
+    /// @dev Governors deployed BEFORE this became an init param can still read
+    ///      zero here; `SyndicateVault._guardBatchCalls` fails closed on that,
+    ///      and `SyndicateFactory.pushWiring` is the rescue.
     address internal _tierRegistry;
 
     /// @notice Exposure ledger. Optional: address(0) skips the covered-TVL
@@ -257,21 +260,32 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _disableInitializers();
     }
 
+    /// @param tierRegistry_ MANDATORY (pashov finding #1). Wiring the registry
+    ///        here rather than in a follow-up `setTierRegistry` is what makes
+    ///        the registry-less governor unreachable: `_guardBatchCalls` drops
+    ///        the whole callee/spender allowlist when it resolves none, so a
+    ///        governor that could exist unwired for even one block could hand a
+    ///        vault `asset.approve(attacker, max)` past every meter. Codeless
+    ///        subsumes zero — an EOA would pass a zero-check and then revert the
+    ///        guard's typed `isCallableTarget` call, bricking the vault instead.
     function initialize(
         address vault_,
         address guardianRegistry_,
         address protocolConfig_,
         address factory_,
+        address tierRegistry_,
         GovernorParams calldata params_
     ) external initializer {
         if (guardianRegistry_ == address(0) || protocolConfig_ == address(0) || factory_ == address(0)) {
             revert ZeroAddress();
         }
+        if (tierRegistry_.code.length == 0) revert TierRegistryNotWired();
         _validateParamBounds(params_);
         vault = vault_;
         _guardianRegistry = guardianRegistry_;
         protocolConfig = protocolConfig_;
         factory = factory_;
+        _tierRegistry = tierRegistry_;
         _params = params_;
         _reentrancyStatus = _NOT_ENTERED;
         // Bootstrap owner: if no vault is wired at deploy, the deployer acts as
@@ -2400,30 +2414,34 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     }
 
     /// @inheritdoc ISyndicateGovernor
-    /// @dev address(0) is legal: it un-wires the registry and every subsequent
-    ///      proposal resolves to tier 2 / full notional — the safe default, so
-    ///      no zero-check (unlike `setProtocolConfig`, where zero would brick
-    ///      fee snapshots).
+    /// @dev ZERO AND CODELESS BOTH REFUSED (pashov finding #1). This slot used
+    ///      to accept zero on the premise that un-wiring "resolves everything at
+    ///      tier 2 / full notional — the safe default". That is a PRICING
+    ///      default; what a missing registry removes is a CAPABILITY gate:
+    ///      `SyndicateVault._guardBatchCalls` resolves through this slot and,
+    ///      finding none, RETURNS — dropping the callee allowlist, the
+    ///      spender/recipient gate and the `UnrecognizedAssetSelector` branch,
+    ///      after which `asset.approve(attacker, max)` moves zero balance past
+    ///      every meter and licenses an unbounded pull later. A codeless address
+    ///      instead reverts the guard's typed call and bricks the vault. Only
+    ///      removal is refused — re-pointing to a different registry is legal.
     ///
-    ///      "SAFE DEFAULT" IS NO LONGER THE WHOLE STORY FOR STRATEGY CLONES.
-    ///      Un-wiring stays safe in the sense that matters — no privilege is
-    ///      granted, everything prices at full notional — but it is no longer
-    ///      merely a degradation. `PortfolioStrategy._initialize` is fail-closed
-    ///      on registry resolution (change: `codehash-class-certification`), and
-    ///      it resolves through `vault() → governor() → tierRegistry()`. With
-    ///      this set to zero that walk dead-ends, so EVERY new clone bound to
-    ///      this vault reverts `TierRegistryUnresolved` at init. Existing clones
-    ///      are unaffected: they resolved at their own init, and rebalance /
-    ///      settle deliberately keep degrading open so an un-wiring can never
-    ///      strand capital inside a live strategy.
+    ///      The factory's own `setTierRegistry` still accepts zero: there it is
+    ///      a kill switch on NEW syndicates and cannot reach an existing
+    ///      governor. A pre-fix governor that IS registry-less is recovered with
+    ///      `SyndicateFactory.pushWiring(governor)`.
     ///
-    ///      Operational shape of zeroing this: live positions keep working and
-    ///      can still be wound down, but no new portfolio strategy can be
-    ///      deployed on this vault until the registry is re-wired. For an
-    ///      EXISTING governor that means `SyndicateFactory.pushWiring(governor)`
-    ///      — the factory's own `setTierRegistry` only reaches governors created
-    ///      after it.
+    ///      This is a RE-POINT, not the wiring point: `initialize` now takes the
+    ///      registry, so every governor this factory deploys is born wired.
+    ///
+    ///      Now-unreachable consequence, kept as rationale: zeroing this would
+    ///      dead-end `PortfolioStrategy._initialize`'s
+    ///      `vault() → governor() → tierRegistry()` walk, reverting
+    ///      `TierRegistryUnresolved` for every new clone while existing clones
+    ///      kept running — rebalance/settle degrade open by design so an
+    ///      un-wiring can never strand capital in a live strategy.
     function setTierRegistry(address newRegistry) external onlyFactory {
+        if (newRegistry.code.length == 0) revert TierRegistryNotWired();
         emit TierRegistrySet(_tierRegistry, newRegistry);
         _tierRegistry = newRegistry;
     }
