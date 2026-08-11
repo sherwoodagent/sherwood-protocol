@@ -12,6 +12,7 @@ import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
 import {MockPermissiveTierRegistry} from "../mocks/MockPermissiveTierRegistry.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 import {MockUniswapV3Pool} from "../mocks/MockUniswapV3Pool.sol";
+import {MockUniswapV3Factory} from "../mocks/MockUniswapV3Factory.sol";
 import {MockPositionManager} from "../mocks/MockPositionManager.sol";
 
 import {ConcentratedLiquidityStrategy} from "../../src/strategies/ConcentratedLiquidityStrategy.sol";
@@ -90,7 +91,14 @@ abstract contract CLFixture is Test {
     ConcentratedLiquidityStrategy template;
     ConcentratedLiquidityStrategy strategy;
 
-    address factory = makeAddr("uniswapFactory");
+    /// @dev A DEPLOYED factory, not `makeAddr`. The strategy resolves a pool's
+    ///      provenance by asking the factory `getPool`, so a codeless stand-in
+    ///      answers nothing and every configuration in this file would read as
+    ///      un-vouched. Pools this fixture means to be genuine must be
+    ///      `register`ed on it.
+    MockUniswapV3Factory factoryMock;
+    address factory;
+
     address proposer = makeAddr("proposer");
     address keeper = makeAddr("keeper");
     address supplier = makeAddr("supplier");
@@ -114,9 +122,13 @@ abstract contract CLFixture is Test {
         marketId = morpho.createMarket(mp);
         _fundMarket(mp);
 
+        factoryMock = new MockUniswapV3Factory();
+        factory = address(factoryMock);
+
         pool = new MockUniswapV3Pool(address(usdg), address(nvda), POOL_FEE, TICK_SPACING, factory);
         pool.setLiquidity(POOL_LIQUIDITY);
         pool.setTicks(0, 0);
+        factoryMock.register(address(usdg), address(nvda), POOL_FEE, address(pool));
 
         posm = new MockPositionManager(factory);
         adapter = new MockSwapAdapter();
@@ -331,17 +343,28 @@ contract DirtyWordTierRegistry {
 contract ConcentratedLiquidityStrategyInitTest is CLFixture {
     // ── 6.2 Init validation, one test per check ──
 
+    /// @dev The rogue pool is never registered with the factory, so `getPool`
+    ///      for its own key names the genuine pool instead. `setFactory` puts it
+    ///      on the strongest footing the old self-attestation check could give
+    ///      it — claiming the real factory — which is precisely what that check
+    ///      accepted and this one does not.
     function test_init_poolNotFromFactoryReverts() public {
         MockUniswapV3Pool rogue = new MockUniswapV3Pool(address(usdg), address(nvda), POOL_FEE, TICK_SPACING, factory);
-        rogue.setFactory(makeAddr("attackerFactory"));
+        rogue.setFactory(factory);
         ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
         p.pool = address(rogue);
         _expectInitRevert(ConcentratedLiquidityStrategy.PoolNotFromFactory.selector, p);
     }
 
+    /// @dev Registered with the factory on purpose. Provenance is checked
+    ///      BEFORE the asset check, so an unregistered pool would revert
+    ///      `PoolNotFromFactory` and this test would pass without ever reaching
+    ///      the mismatch it is named for. The pool under test is genuine; it
+    ///      simply quotes the wrong pair.
     function test_init_poolDoesNotQuoteVaultAssetReverts() public {
         ERC20Mock other = new ERC20Mock("OTHER", "OTHER", 18);
         MockUniswapV3Pool bad = new MockUniswapV3Pool(address(other), address(nvda), POOL_FEE, TICK_SPACING, factory);
+        factoryMock.register(address(other), address(nvda), POOL_FEE, address(bad));
         ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
         p.pool = address(bad);
         _expectInitRevert(ConcentratedLiquidityStrategy.PoolAssetMismatch.selector, p);
@@ -554,11 +577,12 @@ contract ConcentratedLiquidityStrategyInitTest is CLFixture {
     // ── Pashov 2026-08 finding #3 — governance binding of counterparties ──
     //
     // Every init-time check in this template resolves THROUGH an address the
-    // proposer chose: `pool.factory() == p.uniswapFactory` compares an
-    // attacker's pool's answer against an attacker's own parameter,
-    // `market(id).lastUpdate` asks an attacker's Morpho whether an attacker's
-    // market exists, `_isWrapperOf` asks an attacker's token what it wraps.
-    // Self-consistent by construction, every one of them.
+    // proposer chose: `getPool` asks a factory which pool it created,
+    // `market(id).lastUpdate` asks a Morpho whether a market exists,
+    // `_isWrapperOf` asks a token what it wraps. Unless the address answering
+    // is bound first, every one of them is self-consistent by construction —
+    // which is what finding #4 turned out to be for the pool, and why
+    // `uniswapFactory` is on this list too.
     //
     // The vault's batch guard does not cover it either: `_guardBatchCalls`
     // PART 2a checks the CLONE is an allowlisted callee, while the approvals
@@ -855,6 +879,7 @@ contract ConcentratedLiquidityStrategyPoolAnchoredFloorTest is CLFixture {
     ///      0.99` fill, and this reverts.
     function test_execute_poolFeeIsNettedOutOfTheAnchor() public {
         MockUniswapV3Pool widePool = new MockUniswapV3Pool(address(usdg), address(nvda), 10_000, TICK_SPACING, factory);
+        factoryMock.register(address(usdg), address(nvda), 10_000, address(widePool));
         widePool.setLiquidity(POOL_LIQUIDITY);
         widePool.setTicks(0, 0);
         widePool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96);

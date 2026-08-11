@@ -13,6 +13,7 @@ import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/Reentrancy
 import {IMorpho, Id, MarketParams, Market, Position} from "../vendor/morpho/IMorpho.sol";
 import {MarketParamsLib, MorphoBalancesLib} from "../vendor/morpho/MorphoLibs.sol";
 import {IUniswapV3Pool} from "../vendor/uniswap/IUniswapV3Pool.sol";
+import {IUniswapV3Factory} from "../vendor/uniswap/IUniswapV3Factory.sol";
 import {INonfungiblePositionManager} from "../vendor/uniswap/INonfungiblePositionManager.sol";
 
 /// @notice The `vault() -> governor() -> tierRegistry() -> isAdapterAllowed(x)`
@@ -178,17 +179,31 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         proposer naming a pool whose position could not be unwound into
     ///         the asset the vault redeems in.
     error PoolAssetMismatch();
-    /// @notice The pool was not created by the configured factory. Adversary: a
-    ///         contract that answers every `IUniswapV3Pool` selector with
-    ///         attacker-chosen values — token0/token1 that pass the asset
-    ///         check, a `liquidity()` large enough to clear the pool-share cap,
-    ///         and an `observe` whose TWAP always equals its own spot.
+    /// @notice The allowlisted factory does not name `pool` as the canonical
+    ///         pool for `pool`'s own `(token0, token1, fee)` key — including
+    ///         when the factory cannot be read at all, which vouches for
+    ///         nothing. Adversary: a contract that answers every
+    ///         `IUniswapV3Pool` selector with attacker-chosen values —
+    ///         token0/token1 that pass the asset check, a `liquidity()` large
+    ///         enough to clear the pool-share cap, an `observe` whose TWAP
+    ///         always equals its own spot, and a `factory()` naming whichever
+    ///         address makes the check pass.
+    ///         Also raised when `pool` itself holds no code: the key the factory
+    ///         is asked about is read off the pool with typed calls, and an
+    ///         address that cannot be asked what pair it trades was never a pool
+    ///         the factory created.
+    /// @dev    Deliberately does NOT read `pool.factory()`. That answer comes
+    ///         from the party being checked; see check (1) in `_initialize` for
+    ///         why asking the factory is the only direction that establishes
+    ///         anything.
     error PoolNotFromFactory();
     /// @notice A proposer-supplied counterparty is not allowlisted in the
     ///         `TierRegistry` the vault's own governor gates batch approvals
-    ///         against. Covers `swapAdapter`, `positionManager`, `morpho` and
-    ///         `marketParams.collateralToken` — every address this contract
-    ///         approves or calls with vault funds.
+    ///         against. Covers `swapAdapter`, `positionManager`, `morpho`,
+    ///         `marketParams.collateralToken`, `uniswapFactory` and the pool's
+    ///         volatile leg (`otherToken`) — every address this contract
+    ///         approves or calls with vault funds, plus the factory whose word
+    ///         the pool's provenance rests on.
     error CounterpartyNotAllowed(address counterparty, address registry);
     /// @notice The `vault() -> governor() -> tierRegistry()` walk yielded no
     ///         registry, so no counterparty can be vouched for. Fails closed at
@@ -440,11 +455,14 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         // (0) GOVERNANCE BINDING — must run BEFORE any of the checks below,
         //     because every one of them resolves through an address the
-        //     proposer chose. `pool_.factory() != p.uniswapFactory` compares an
-        //     attacker's pool's answer against an attacker's own parameter;
-        //     `market(id).lastUpdate` asks an attacker's Morpho whether an
-        //     attacker's market exists; `_isWrapperOf` asks an attacker's token
-        //     what it wraps. Self-consistent by construction, all of them.
+        //     proposer chose. `getPool` asks a factory which pool it created;
+        //     `market(id).lastUpdate` asks a Morpho whether a market exists;
+        //     `_isWrapperOf` asks a token what it wraps. Bind the address first
+        //     and each of those is a question put to something the protocol
+        //     vouched for; bind nothing and each is self-consistent by
+        //     construction. Finding #4 was that exact failure — the pool's
+        //     provenance was settled by comparing two values the proposer
+        //     supplied — so `uniswapFactory` is bound here too.
         //
         //     The vault's batch guard cannot substitute. `_guardBatchCalls`
         //     PART 2a checks the CLONE is an allowlisted callee; the approvals
@@ -514,9 +532,13 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         //     the vault, not from `p`, so a proposer cannot name it into the
         //     skip. `swapAdapter`, `positionManager` and `morpho` get no such
         //     exemption; they are never the asset.
+        //     NOT ALL OF THEM ARE BOUND HERE. `otherToken` is a counterparty by
+        //     the same rule as the rest, but its address is not known until the
+        //     pool has been proven and read, so it is bound at the end of check
+        //     (1). `registry` is hoisted out of this block for that.
+        address registry = _resolveTierRegistry();
+        if (registry == address(0)) revert TierRegistryUnresolved();
         {
-            address registry = _resolveTierRegistry();
-            if (registry == address(0)) revert TierRegistryUnresolved();
             // Strong axis for the swap adapter, matching `PortfolioStrategy`'s
             // binding of the same role; weak axis for the rest, which adapter
             // standing implies. All four receive approvals — see the note above
@@ -524,22 +546,71 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             _requireAllowedAdapter(registry, p.swapAdapter);
             _requireAllowedCounterparty(registry, p.positionManager);
             _requireAllowedCounterparty(registry, p.morpho);
+            // The factory is the authority check (1) delegates the pool's
+            // provenance to, so it has to be an authority the PROTOCOL chose. A
+            // proposer-authored factory vouching for a proposer-authored pool is
+            // the same self-attestation one hop further out.
+            _requireAllowedCounterparty(registry, p.uniswapFactory);
             if (p.marketParams.collateralToken != vaultAsset) {
                 _requireAllowedCounterparty(registry, p.marketParams.collateralToken);
             }
         }
 
-        // (1) The pool exists and one of its two tokens is the vault asset.
-        //     The factory check comes first: without it every other read below
-        //     is attacker-chosen, because a contract can answer all of these
-        //     selectors. `getPool` is NOT used — a pool reporting its own
-        //     factory is the direction that cannot be forged by a third party
-        //     deploying a real pool for a fake token pair.
+        // (1) The pool is the one the FACTORY created for its own key, and one
+        //     of its two tokens is the vault asset. Provenance comes first:
+        //     without it every other read below is attacker-chosen, because a
+        //     contract can answer all of these selectors.
+        //
+        //     THE FACTORY IS ASKED, NOT THE POOL (pashov 2026-08 finding #4).
+        //     This check used to read `pool_.factory() != p.uniswapFactory`,
+        //     which established nothing — both operands came from the same
+        //     proposer, and `p.uniswapFactory` was otherwise unused, so an
+        //     impostor answering the whole `IUniswapV3Pool` surface simply
+        //     named itself a factory and passed. Binding `p.uniswapFactory` to
+        //     the registry, which (0) now does, is necessary but NOT sufficient
+        //     on its own: an impostor is equally free to report the genuine
+        //     factory's address, and the comparison still succeeds. The
+        //     direction is what was wrong. Only the factory can say which pool
+        //     is canonical for a key, and no contract can make the real factory
+        //     point at it.
+        //
+        //     An earlier note here argued against `getPool` on the grounds that
+        //     self-reporting "cannot be forged by a third party deploying a
+        //     real pool for a fake token pair". THAT REASONING DOES NOT HOLD
+        //     and nothing should be built on it: a genuinely factory-created
+        //     pool over a worthless second token reports the real factory too,
+        //     so it clears both formulations identically. The two differ only
+        //     on the impostor, which self-reporting admits and this rejects.
+        //     What that note was reaching for is a real gap, and provenance is
+        //     genuinely not the control for it: a proposer may create a real
+        //     pool of the vault asset against a token it controls, and every
+        //     provenance check passes because every one of them is true. That
+        //     is closed SEPARATELY, by binding `otherToken` below — do not read
+        //     THIS check as covering it.
+        //
+        //     `p.pool` is non-zero (checked above) and the read is length-
+        //     checked, so a factory that cannot answer — no code, revert, short
+        //     return — resolves to `address(0)`, fails the comparison, and
+        //     reverts with THIS contract's error rather than undecodably inside
+        //     a typed call.
+        //
+        //     BOTH SIDES GET THAT TREATMENT. The pool is read with TYPED calls
+        //     (`token0`/`token1`/`fee`) before the factory is asked, because
+        //     they only build the lookup key — but a typed call to an address
+        //     with no code reverts in THIS frame with empty returndata, which is
+        //     indistinguishable from a bug in the guard. So codelessness is
+        //     rejected here, up front, with the same error the provenance
+        //     comparison raises: an address that cannot be asked what pair it
+        //     trades was never a pool the factory created.
+        if (p.pool.code.length == 0) revert PoolNotFromFactory();
         IUniswapV3Pool pool_ = IUniswapV3Pool(p.pool);
-        if (pool_.factory() != p.uniswapFactory) revert PoolNotFromFactory();
 
         address t0 = pool_.token0();
         address t1 = pool_.token1();
+        {
+            bytes memory call_ = abi.encodeCall(IUniswapV3Factory.getPool, (t0, t1, pool_.fee()));
+            if (_readAddress(p.uniswapFactory, call_) != p.pool) revert PoolNotFromFactory();
+        }
         if (t0 == vaultAsset) {
             assetIsToken0 = true;
             otherToken = t1;
@@ -549,6 +620,32 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         } else {
             revert PoolAssetMismatch();
         }
+
+        //     THE VOLATILE LEG IS A COUNTERPARTY (pashov 2026-08, the gap named
+        //     in the provenance note above). Provenance proves where the pool
+        //     came from; it says nothing about what the pool TRADES. Without
+        //     this, a proposer deploys a worthless ERC-20, creates a genuine
+        //     `(vaultAsset, junk)` pool through the real factory, initialises
+        //     it at a price of their choosing, and every check above passes on
+        //     the merits. `_rebalanceToTarget` then buys that token with vault
+        //     asset, and BOTH slippage floors are derived from that same
+        //     attacker-priced venue — the anchor from the pool's own `slot0`,
+        //     the quote from the only venue that quotes the pair — so they
+        //     agree with each other and with nothing real.
+        //
+        //     It belongs on this axis by the rule the axis already states:
+        //     every address this contract approves or calls with vault funds.
+        //     `_mintPosition` force-approves it to the position manager,
+        //     `_rebalanceToTarget` and `_convertOtherToAsset` approve it to the
+        //     swap adapter, and `rerange()`'s own natspec already calls it "any
+        //     ERC-20 for which a real pool exists, so a transfer hook is a live
+        //     possibility". It was the one such address left unbound.
+        //
+        //     NO VAULT-ASSET EXEMPTION IS NEEDED, unlike `collateralToken`:
+        //     `otherToken` is by construction the token that is NOT the vault
+        //     asset — the branch above assigns it from whichever side failed to
+        //     match — so the carve-out could never apply.
+        _requireAllowedCounterparty(registry, otherToken);
 
         // (2) The market exists and lends the vault asset.
         if (p.marketParams.loanToken != vaultAsset) revert LoanAssetMismatch();
@@ -858,8 +955,22 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         _requireAllowedAdapter(registry, address(swapAdapter));
         _requireAllowedCounterparty(registry, address(positionManager));
         _requireAllowedCounterparty(registry, address(morpho));
+        // The volatile leg re-checks on the same terms as the rest: `rerange()`
+        // is permissionless and re-issues `forceApprove(otherToken, …)` to both
+        // the adapter and the position manager on every call, so a leg demoted
+        // after init would otherwise keep receiving them.
+        _requireAllowedCounterparty(registry, otherToken);
         address coll = _marketParams.collateralToken;
         if (coll != asset) _requireAllowedCounterparty(registry, coll);
+        // `uniswapFactory` is DELIBERATELY ABSENT, and the asymmetry with
+        // `otherToken` above is the reason to say so. Every address re-checked
+        // here keeps receiving vault funds or approvals for the clone's whole
+        // life. The factory receives neither: it is asked one question, once, at
+        // init — "did you create this pool?" — and the answer is a fact about
+        // the past that a later demotion cannot retract. Re-checking it would
+        // let a demotion freeze `execute()` and the permissionless `rerange()`
+        // over a pool whose provenance is still exactly as established, which is
+        // the capital-hostage failure the exit paths are ungated to avoid.
     }
 
     /// @dev Staticcall-safe boolean read, shared by both allowlist axes.

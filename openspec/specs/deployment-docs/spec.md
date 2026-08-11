@@ -94,6 +94,48 @@ The list SHALL name `PORTFOLIO_TEMPLATE`, `MORPHO_SUPPLY_TEMPLATE` and `CONCENTR
 - **WHEN** a deprecated key is re-added to `_templateKeys()`
 - **THEN** the exact-set assertion in `test/deploy/DeployMorphoStrategy.t.sol` FAILS, because a key with no backing contract overstates what the protocol can propose
 
+### Requirement: The Uniswap V3 factory is counterparty-allowlisted before the CL template ships
+
+`ConcentratedLiquidityStrategy._initialize` binds its proposer-supplied `uniswapFactory` through `vault() -> governor() -> tierRegistry() -> isCounterpartyAllowed` and reverts `CounterpartyNotAllowed` otherwise. That binding is load-bearing rather than defensive: the pool's provenance is settled by asking that factory `getPool(token0, token1, fee)`, so a factory the proposer chose is no authority at all (pashov 2026-08 finding #4).
+
+An unlisted factory therefore does not degrade the template, it makes it INERT — the ceremony completes, `DeployStrategyFactory` allowlists the template, agents write proposals, and every one reverts at clone-init. The registry owner SHALL call `TierRegistry.setCounterpartyAllowed(UNISWAP_V3_FACTORY, true)` before `DeployConcentratedLiquidityStrategy` runs.
+
+This SHALL be enforced as a deploy-time assertion, not as prose in a runbook. `TierRegistry` is `Ownable2Step` and belongs to the parameter multisig, so the deployer key cannot make the grant itself — but the grant depends on no artifact this phase produces, so requiring it is a scheduling constraint rather than a circular one. The assertion SHALL skip only when the core phase never ran, and SHALL fail when the named registry cannot answer the selector — a registry that cannot be asked has not vouched.
+
+"The core phase never ran" SHALL be read off `SYNDICATE_FACTORY`, not off `TIER_REGISTRY` itself. Keying the skip on the missing key would disarm the gate in the case most worth catching: both keys are written to `chains/{chainId}.json` by the same phase, so a book naming one and not the other is incomplete, and treating that silence as "nothing to verify" is the same error as treating an unanswerable registry as a grant.
+
+#### Scenario: Ceremony run before the grant
+- **WHEN** `DeployConcentratedLiquidityStrategy` runs and `isCounterpartyAllowed(UNISWAP_V3_FACTORY)` is false
+- **THEN** the script reverts naming the exact call the registry owner must make, before the template is deployed or written to the address book
+
+#### Scenario: Registry named but unanswerable
+- **WHEN** the address book's `TIER_REGISTRY` holds no code, or answers `isCounterpartyAllowed` with anything other than a 32-byte word
+- **THEN** the script reverts rather than treating the silence as a grant
+
+#### Scenario: Core phase never ran
+- **WHEN** the address book carries neither `TIER_REGISTRY` nor `SYNDICATE_FACTORY`
+- **THEN** the script proceeds and prints the required `setCounterpartyAllowed` call as a RUNBOOK line, because the grant cannot be verified from there
+
+#### Scenario: Incomplete address book
+- **WHEN** the address book names `SYNDICATE_FACTORY` but carries no `TIER_REGISTRY` key
+- **THEN** the script reverts, because the core phase writes both keys together and a book holding one without the other cannot be read as "nothing to verify"
+
+### Requirement: Each CL pool's volatile leg is counterparty-allowlisted before its proposal
+
+Pool provenance establishes where a pool came from; it says nothing about what the pool TRADES. A proposer can deploy a worthless ERC-20, create a genuine `(vaultAsset, junk)` pool through the real factory, initialise it at a price of their choosing, and pass every provenance check on the merits — after which `_rebalanceToTarget` buys that token with vault asset, priced by the only venue that quotes the pair.
+
+`ConcentratedLiquidityStrategy._initialize` therefore binds the pool's non-asset token (`otherToken`) through `isCounterpartyAllowed` alongside `swapAdapter`, `positionManager`, `morpho`, `collateralToken` and `uniswapFactory`, and re-checks it at `execute()` and `rerange()`.
+
+This is a PER-PROPOSAL obligation, not a ceremony step: the volatile leg is chosen per clone, so no deploy script can assert it. The registry owner SHALL call `setCounterpartyAllowed(<volatile leg>, true)` for each token a CL proposal is expected to trade, before that proposal is executed. Exits are deliberately NOT gated on it — `settle`, `sweep` and `releaseUnconvertible` stay open under the existing capital-hostage rule, so a demotion cannot strand the funds it is meant to protect.
+
+#### Scenario: Proposal naming an unvouched volatile leg
+- **WHEN** a CL proposal names a pool whose non-asset token is not counterparty-allowlisted
+- **THEN** clone-init reverts `CounterpartyNotAllowed(otherToken, registry)`, failing the proposal rather than the batch
+
+#### Scenario: Volatile leg demoted after init
+- **WHEN** the leg is demoted between clone-init and `execute()`, or before a permissionless `rerange()`
+- **THEN** both entry paths revert, while `settle()` still completes
+
 ### Requirement: Core wiring order inside deployCore
 The canonical `DeploySherwood.deployCore` SHALL wire in this order: executor lib and vault impl; ProtocolConfig (plain Ownable, fee params seeded when non-zero); governor impl wrapped in a `GovernorBeacon` (per-vault governors are `BeaconProxy`s minted at `createSyndicate` — no singleton governor proxy is deployed); **sWOOD proxy before the registry proxy** (the registry's `initialize` takes the sWOOD address; the registry↔sWOOD cycle resolves via the set-once `StakedWood.setRegistry` call after the registry exists); factory proxy (address predicted by CREATE3 and asserted); then `TierRegistry` deployed owner-as-deployer and wired via the factory-only `setTierRegistry` BEFORE the multisig handoff. The `SYNDICATE_GOVERNOR` address-book slot SHALL be persisted as zero — governors are per-vault, resolved via `factory.governorOf(vault)`.
 
