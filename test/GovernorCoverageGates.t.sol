@@ -19,6 +19,7 @@ import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
 /// @dev Minimal sWOOD read surface the ExposureLedger constructor consumes.
 ///      `coolDownPeriod` (45d) covers epochLength (28d) + challengeWindow (14d).
@@ -289,7 +290,8 @@ contract GovernorCoverageGatesTest is Test {
                 address(v),
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -341,7 +343,7 @@ contract GovernorCoverageGatesTest is Test {
             _execCalls(),
             GovEnvelope.defaultCaps((_envelope(cap)).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            GovEnvelope.defaultCaps((_envelope(cap)).maxCapital, (_settleCalls()).length),
+            GovEnvelope.defaultCaps((_envelope(0)).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -364,7 +366,7 @@ contract GovernorCoverageGatesTest is Test {
             _execCalls(),
             GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            GovEnvelope.defaultCaps((_envelope(0)).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -383,7 +385,7 @@ contract GovernorCoverageGatesTest is Test {
             _execCalls(),
             GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            GovEnvelope.defaultCaps((_envelope(0)).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         (address p, uint256 amt) = escrow.bondOf(address(governor), pid);
@@ -416,7 +418,7 @@ contract GovernorCoverageGatesTest is Test {
             _execCalls(),
             GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            GovEnvelope.defaultCaps((_envelope(0)).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -434,7 +436,7 @@ contract GovernorCoverageGatesTest is Test {
             _execCalls(),
             GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            GovEnvelope.defaultCaps((_envelope(0)).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         assertEq(unwiredGovernor.getProposal(pid).proposerBondWood, 0);
@@ -458,7 +460,7 @@ contract GovernorCoverageGatesTest is Test {
             _execCalls(),
             GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            GovEnvelope.defaultCaps((_envelope(0)).maxCapital, (_settleCalls()).length),
             _coProposers()
         );
 
@@ -512,7 +514,7 @@ contract GovernorCoverageGatesTest is Test {
             _execCalls(),
             GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            GovEnvelope.defaultCaps((_envelope(0)).maxCapital, (_settleCalls()).length),
             _coProposers()
         );
         assertEq(got, pid);
@@ -546,7 +548,7 @@ contract GovernorCoverageGatesTest is Test {
             _execCalls(),
             GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_execCalls()).length),
             _settleCalls(),
-            GovEnvelope.defaultCaps((_envelope(1_000e6)).maxCapital, (_settleCalls()).length),
+            GovEnvelope.defaultCaps((_envelope(0)).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
 
@@ -739,7 +741,11 @@ contract GovernorCoverageGatesTest is Test {
 
         address[] memory gs = new address[](1);
         gs[0] = g1;
-        _seatApprovers(pid, gs, 10_000e18); // $500 — 50% of the $1,000 required
+        // $1,000 — 50% of the $2,000 required. Unlike the other harness
+        // proposals here, this one's settle leg really does move 500e6 OUT, so
+        // it keeps a full `maxCapital` settle cap and is priced across BOTH
+        // legs: 1_000e6 exec + 1_000e6 settle at full notional.
+        _seatApprovers(pid, gs, 20_000e18);
         _toApproved(pid);
         governor.executeProposal(pid);
         assertEq(governor.getEffectiveMaxCapital(pid), 500e6, "executed at the coverage-scaled size");
@@ -787,8 +793,12 @@ contract GovernorCoverageGatesTest is Test {
         settleCalls[0] = BatchExecutorLib.Call({
             target: address(usdg), data: abi.encodeCall(usdg.approve, (address(targetToken), 0)), value: 0
         });
+        // The settle call is `approve(x, 0)` — it moves nothing out, so it
+        // declares a zero cap. `requiredCoverage` sums the exec and settle legs,
+        // so a full-`maxCapital` settle declaration would bill twice the
+        // notional this proposal can move and halve the coverage ratio the
+        // scaling below is measuring.
         uint256[] memory settleCaps = new uint256[](1);
-        settleCaps[0] = maxCapital;
 
         vm.prank(agent);
         uint256 pid = governor.propose(
@@ -898,8 +908,11 @@ contract GovernorCoverageGatesTest is Test {
         _wireTierRegistryCertifiedAt(0, 500); // closed-loop, 5% extractable
         uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
         assertEq(governor.getProposalTier(pid), 0);
-        // (500 exec + 500 settle) bps of 1_000e6 == $100 of extractable value.
-        assertEq(governor.getRequiredCoverage(pid), 100e6);
+        // 500 bps of the 1_000e6 exec leg == $50 of extractable value. The
+        // settle leg declares a zero cap (it moves nothing out), so it adds
+        // nothing — this used to read $100 because the harness declared a full
+        // `maxCapital` settle cap it could never spend.
+        assertEq(governor.getRequiredCoverage(pid), 50e6);
 
         _toApproved(pid);
         vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);

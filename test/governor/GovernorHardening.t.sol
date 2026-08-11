@@ -14,6 +14,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Regression suite for G-H2 / G-H3 / G-H4 / G-H6 hardening fixes
 ///         from the pre-mainnet protocol checklist (#236).
@@ -72,7 +73,8 @@ contract GovernorHardeningTest is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,

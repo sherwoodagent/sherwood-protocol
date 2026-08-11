@@ -11,6 +11,7 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title SetGuardianRegistry — owner-only registry repointing
 /// @notice Lets the protocol upgrade from a stub registry
@@ -37,7 +38,8 @@ contract SetGuardianRegistryTest is Test {
                 address(0), // vault_: bootstrap (factory auto-deploys per-vault governors)
                 address(initialRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: 24 hours,
                     executionWindow: 1 days,

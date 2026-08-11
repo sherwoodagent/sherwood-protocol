@@ -703,11 +703,15 @@ interface ISyndicateGovernor {
     // ── Init ──
     /// @notice Initialize a freshly deployed per-vault governor proxy.
     ///         Called once by the factory inside the `BeaconProxy` constructor.
+    /// @param tierRegistry_ MANDATORY, must hold code (pashov finding #1). The
+    ///        registry is wired HERE, not in a follow-up `setTierRegistry`, so
+    ///        no governor ever exists with the batch guard's allowlist absent.
     function initialize(
         address vault_,
         address guardianRegistry_,
         address protocolConfig_,
         address factory_,
+        address tierRegistry_,
         GovernorParams calldata params_
     ) external;
 

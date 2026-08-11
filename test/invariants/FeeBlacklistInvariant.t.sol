@@ -18,6 +18,7 @@ import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 
 import {FeeBlacklistHandler} from "./handlers/FeeBlacklistHandler.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title FeeBlacklistInvariantTest
 /// @notice INV-47 fuzz harness — `_distributeFees` MUST NOT revert because
@@ -111,7 +112,8 @@ contract FeeBlacklistInvariantTest is StdInvariant, Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 address(guardianRegistry),
                 address(protocolConfig),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,

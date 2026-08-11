@@ -130,10 +130,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      goalposts for co-proposers who already approved.
     mapping(uint256 proposalId => uint256 packedTiming) private _draftTimingSnap;
 
-    /// @notice Tier registry. Optional: address(0) means every proposal
-    ///         resolves to tier 2 / full notional — the safe default. Wired
-    ///         post-init via `setTierRegistry` (factory-only, like
-    ///         `setProtocolConfig`).
+    /// @notice Tier registry. MANDATORY at `initialize` (pashov finding #1) —
+    ///         a governor cannot be born unwired. Re-pointed post-init via
+    ///         `setTierRegistry` (factory-only, like `setProtocolConfig`),
+    ///         which also refuses zero and codeless.
+    /// @dev Governors deployed BEFORE this became an init param can still read
+    ///      zero here; `SyndicateVault._guardBatchCalls` fails closed on that,
+    ///      and `SyndicateFactory.pushWiring` is the rescue.
     address internal _tierRegistry;
 
     /// @notice Exposure ledger. Optional: address(0) skips the covered-TVL
@@ -192,21 +195,32 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _disableInitializers();
     }
 
+    /// @param tierRegistry_ MANDATORY (pashov finding #1). Wiring the registry
+    ///        here rather than in a follow-up `setTierRegistry` is what makes
+    ///        the registry-less governor unreachable: `_guardBatchCalls` drops
+    ///        the whole callee/spender allowlist when it resolves none, so a
+    ///        governor that could exist unwired for even one block could hand a
+    ///        vault `asset.approve(attacker, max)` past every meter. Codeless
+    ///        subsumes zero — an EOA would pass a zero-check and then revert the
+    ///        guard's typed `isCallableTarget` call, bricking the vault instead.
     function initialize(
         address vault_,
         address guardianRegistry_,
         address protocolConfig_,
         address factory_,
+        address tierRegistry_,
         GovernorParams calldata params_
     ) external initializer {
         if (guardianRegistry_ == address(0) || protocolConfig_ == address(0) || factory_ == address(0)) {
             revert ZeroAddress();
         }
+        if (tierRegistry_.code.length == 0) revert TierRegistryNotWired();
         _validateParamBounds(params_);
         vault = vault_;
         _guardianRegistry = guardianRegistry_;
         protocolConfig = protocolConfig_;
         factory = factory_;
+        _tierRegistry = tierRegistry_;
         _params = params_;
         _reentrancyStatus = _NOT_ENTERED;
         // Bootstrap owner: if no vault is wired at deploy, the deployer acts as
@@ -2222,6 +2236,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      a kill switch on NEW syndicates and cannot reach an existing
     ///      governor. A pre-fix governor that IS registry-less is recovered with
     ///      `SyndicateFactory.pushWiring(governor)`.
+    ///
+    ///      This is a RE-POINT, not the wiring point: `initialize` now takes the
+    ///      registry, so every governor this factory deploys is born wired.
     ///
     ///      Now-unreachable consequence, kept as rationale: zeroing this would
     ///      dead-end `PortfolioStrategy._initialize`'s

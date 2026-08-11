@@ -15,6 +15,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice A minimal DeFi adapter that pulls capital out of the calling vault.
 ///         `deploy` moves `amount` of `token` from the caller (the vault, in the
@@ -100,7 +101,8 @@ contract TierEndToEndTest is Test {
                 address(vault),
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract) — may call setTierRegistry
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract) — may call setTierRegistry
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,

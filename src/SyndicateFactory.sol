@@ -311,8 +311,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         if (bytes(config.subdomain).length == 0) revert InvalidSyndicateConfig();
         if (bytes(config.metadataURI).length == 0) revert InvalidSyndicateConfig();
         // Registry-less vaults are born unguarded (finding #1 — rationale at
-        // the push site below). `initialize` requires one, so this only fires
-        // after an owner zeroed the slot as a kill switch. Reads factory
+        // the governor init site below). `initialize` requires one, so this only
+        // fires after an owner zeroed the slot as a kill switch. Reads factory
         // storage only, so it belongs with the pre-flight rejects.
         if (tierRegistry == address(0)) revert TierRegistryNotWired();
 
@@ -368,34 +368,32 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         // from `_governorOf` below) — so recording the mapping here is what wires
         // the vault ↔ governor link (no separate vault setter needed).
         // `addGovernor` authorizes the new governor on the shared registry.
+        // The tier registry goes in the INIT CALL, not a follow-up
+        // `setTierRegistry` (pashov finding #1). This used to skip the push when
+        // the factory's own pointer was unset, on the premise that the governor
+        // "keeps its safe tier-2 default". That is a PRICING default; what a
+        // missing registry removes is a CAPABILITY gate.
+        // `SyndicateVault._guardBatchCalls` resolving no registry used to RETURN,
+        // dropping the callee allowlist, the spender/recipient gate and the
+        // `UnrecognizedAssetSelector` branch on the way out — after which one
+        // batch instruction, `asset.approve(attacker, max)`, moves ZERO balance,
+        // so the net-outflow meter, the per-call cap and `requiredCoverage` all
+        // read zero, and the vault is drained in a LATER transaction no meter
+        // watches. A vault created in that window stayed registry-less
+        // permanently, so the window was inherited, not transient.
+        //
+        // Three layers now, cheapest first: mandatory `InitParams.tierRegistry`
+        // on this factory, the pre-flight reject at the top of this function,
+        // and the governor's own `initialize` refusing a codeless registry —
+        // after which the guard itself fails closed rather than open.
         bytes memory govInitData = abi.encodeCall(
             ISyndicateGovernor.initialize,
-            (vault, guardianRegistry, protocolConfig, address(this), _defaultGovernorParams())
+            (vault, guardianRegistry, protocolConfig, address(this), tierRegistry, _defaultGovernorParams())
         );
         address govProxy = address(new BeaconProxy(beacon, govInitData));
         _governorOf[vault] = govProxy;
         IGuardianRegistry(guardianRegistry).addGovernor(govProxy, vault);
-        // Push the adapter-selector tier registry into the fresh governor.
-        // `setTierRegistry` is onlyFactory, so this is the sole wiring point.
-        //
-        // REFUSES RATHER THAN SKIPS (pashov finding #1). This used to read
-        // `if (tierRegistry != address(0))` and quietly leave the governor
-        // registry-less, on the premise that it "keeps its safe tier-2 default".
-        // That is a PRICING default; what a missing registry actually removes is
-        // a CAPABILITY gate. `SyndicateVault._guardBatchCalls` resolves no
-        // registry and RETURNS, dropping the callee allowlist, the
-        // spender/recipient gate and the `UnrecognizedAssetSelector` branch on
-        // the way out — after which one batch instruction,
-        // `asset.approve(attacker, max)`, moves ZERO balance, so the net-outflow
-        // meter, the per-call cap and `requiredCoverage` all read zero, and the
-        // vault is drained in a LATER transaction no meter watches.
-        //
-        // A vault created in that window stayed registry-less permanently, so
-        // the window was not transient — it was inherited. The registry is now
-        // a mandatory `InitParams` field and the reject sits at the top of this
-        // function, so the state is unreachable rather than merely refused.
-        ISyndicateGovernor(govProxy).setTierRegistry(tierRegistry);
-        // Same idiom for the exposure-ledger and bond-escrow wiring slots:
+        // The exposure-ledger and bond-escrow wiring slots keep the push idiom:
         // `setExposureLedger` / `setBondEscrow` are onlyFactory, so this is the
         // sole wiring point at creation. Unset ⇒ skip the call, leaving the
         // governor at its pre-ledger / no-bond default rather than writing zero.

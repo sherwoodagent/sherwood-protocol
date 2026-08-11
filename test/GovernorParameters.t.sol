@@ -10,6 +10,7 @@ import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Own
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {IProtocolConfig} from "../src/interfaces/IProtocolConfig.sol";
+import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
 /// @notice Unit tests targeting the abstract `GovernorParameters` surface
 ///         through a deployed `SyndicateGovernor` proxy. Covers happy path,
@@ -48,7 +49,8 @@ contract GovernorParametersTest is Test {
                 address(0), // vault_: bootstrap governor; factory acts as bootstrap owner
                 address(guardianRegistry),
                 address(protocolConfig),
-                owner, // factory == bootstrap owner: param setters are onlyVaultOwner → _bootstrapOwner
+                owner,
+                address(deployTierRegistry(address(this))), // factory == bootstrap owner: param setters are onlyVaultOwner → _bootstrapOwner
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,

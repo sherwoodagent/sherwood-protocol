@@ -205,29 +205,33 @@ contract CalleeGateTest is Test {
         _exec(_one(address(allowlistedToken), abi.encodeCall(allowlistedToken.approve, (attacker, 1e18))));
     }
 
-    // ── degrade-open: unset registry / no tierRegistry() getter ──
+    // ── fail-closed: unset registry / no tierRegistry() getter ──
 
-    /// @notice Mirrors `SelectorGuard.t.sol`'s
-    ///         `test_targetGate_bitesEvenWithNoTierRegistryWired` companions:
-    ///         with the registry unset, PART 2 (both 2a and 2b) is skipped
-    ///         entirely by design — a batch to an arbitrary, non-allowlisted
-    ///         target still executes. Part 1/1b are unaffected by this
-    ///         change and are not re-tested here (already pinned elsewhere).
-    function test_degradeOpen_registryUnset_calleeGateSkipped() public {
+    /// @notice INVERTED from `test_degradeOpen_registryUnset_calleeGateSkipped`
+    ///         (pashov finding #1). With the registry unset PART 2 cannot be
+    ///         evaluated, and the batch is now REFUSED rather than run with the
+    ///         callee gate, the spender/recipient gate and the
+    ///         `UnrecognizedAssetSelector` branch all silently dropped — the
+    ///         batch below names an arbitrary, non-allowlisted target and used
+    ///         to execute.
+    function test_failClosed_registryUnset_batchRefused() public {
         governor.setTierRegistry(address(0));
         address randomTarget = makeAddr("degradeOpenTarget1");
+        vm.expectRevert(ISyndicateVault.TierRegistryUnresolved.selector);
         _exec(_one(randomTarget, abi.encodeWithSelector(bytes4(0xdeadbeef), attacker)));
     }
 
-    /// @notice Companion degrade-open branch: a governor predating the
-    ///         `tierRegistry()` getter entirely resolves identically to an
-    ///         unset registry — the callee gate is skipped, not hard-reverted.
-    function test_degradeOpen_governorWithoutTierGetter_calleeGateSkipped() public {
+    /// @notice Companion branch: a governor predating the `tierRegistry()`
+    ///         getter resolves identically to an unset registry, and is refused
+    ///         identically. Reached through the staticcall's `!ok` arm rather
+    ///         than the zero-address arm, so this pins that the two agree.
+    function test_failClosed_governorWithoutTierGetter_batchRefused() public {
         MockGovernorNoTierGetterCG legacy = new MockGovernorNoTierGetterCG();
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(legacy)));
 
         address randomTarget = makeAddr("degradeOpenTarget2");
         vm.prank(address(legacy));
+        vm.expectRevert(ISyndicateVault.TierRegistryUnresolved.selector);
         vault.executeGovernorBatch(
             _one(randomTarget, abi.encodeWithSelector(bytes4(0xdeadbeef), attacker)),
             new uint256[](0),

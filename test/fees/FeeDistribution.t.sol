@@ -15,6 +15,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice End-to-end settlement under the two-number fee model
 ///         (`specs/management-fee/spec.md`, `specs/performance-fee/spec.md`):
@@ -87,7 +88,14 @@ contract FeeDistributionTest is Test {
         beacon = new GovernorBeacon(address(govImpl), owner);
         bytes memory govInit = abi.encodeCall(
             SyndicateGovernor.initialize,
-            (address(vault), address(guardianRegistry), address(protocolConfig), address(this), _validParams())
+            (
+                address(vault),
+                address(guardianRegistry),
+                address(protocolConfig),
+                address(this),
+                address(deployTierRegistry(address(this))),
+                _validParams()
+            )
         );
         governor = SyndicateGovernor(address(new BeaconProxy(address(beacon), govInit)));
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
