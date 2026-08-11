@@ -15,6 +15,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title Vault_batchQueueTargets_lifecycle
 /// @notice Issue #93 through the REAL governor lifecycle. The sibling unit file
@@ -100,7 +101,8 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
                 address(vault),
                 address(guardianRegistry),
                 address(protocolConfig),
-                address(this), // factory
+                address(this),
+                address(deployTierRegistry(address(this))), // factory
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: 1 days,

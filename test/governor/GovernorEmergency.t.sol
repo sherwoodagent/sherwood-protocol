@@ -18,6 +18,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title GovernorEmergency.t
 /// @notice Tests for the Task 24 guardian-review emergency settle lifecycle.
@@ -105,6 +106,10 @@ contract GovernorEmergencyTest is Test {
         //   swoodImpl (+0), swoodProxy (+1), govImpl (+2), govProxy (+3),
         //   regImpl (+4), regProxy (+5).
         ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
+        // Hoisted ABOVE the nonce snapshot: the governor's mandatory tier-registry
+        // argument (pashov finding #1) is a DEPLOYMENT, so leaving it inline in the
+        // `initialize` tuple would consume a nonce and slide every predicted address.
+        address fixtureTierRegistry = address(deployTierRegistry(address(this)));
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
@@ -135,7 +140,8 @@ contract GovernorEmergencyTest is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 predictedRegistryProxy,
                 address(_hoistedPC),
-                address(this), // factory (test contract)
+                address(this),
+                fixtureTierRegistry, // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -639,6 +645,62 @@ contract GovernorEmergencyTest is Test {
 
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
         assertFalse(vault.redemptionsLocked());
+    }
+
+    /// @notice The settle-price floor (pashov #2/#12) is defended as "not stuck,
+    ///         just redirected to `finalizeEmergencySettle`". That claim is worth
+    ///         exactly what it is tested at, and nothing else in the suite walks
+    ///         the redirection end to end — so walk it here.
+    ///
+    /// @dev    This is the band the floor NEWLY closes, and it is a band the
+    ///         protocol explicitly permits: `GovEnvelope.permissive` declares
+    ///         `maxDrawdownBps == 10_000`, i.e. voters accepted a total loss, so
+    ///         the CAPITAL floor does not bind and a genuine >90% loss is an
+    ///         allowed outcome. Both permissionless-ish exits now refuse it —
+    ///         `settleProposal` on the declared-envelope bar and `unstick` on the
+    ///         absolute backstop, which are the same 10% number here — which
+    ///         leaves `_activeProposal` set and the whole vault frozen. The only
+    ///         remaining exit is the bonded, guardian-reviewed one, and it must
+    ///         actually work.
+    function test_subFloorSettlementIsClearedByFinalizeEmergencySettle() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        // A near-total loss. Modelled on the vault balance directly: the floor
+        // reads the realized price, and how it got there (flash loan, genuine
+        // loss, a strategy that did not deliver) is not something the governor
+        // distinguishes.
+        deal(address(usdc), address(vault), 0);
+
+        vm.prank(random);
+        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
+        governor.settleProposal(pid);
+
+        vm.prank(owner);
+        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
+        governor.unstick(pid);
+
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Executed),
+            "both refusals leave the proposal, and therefore the vault, locked"
+        );
+        assertTrue(vault.redemptionsLocked(), "the vault really is frozen in the meantime");
+
+        // The documented exit: owner bond (posted in setUp), an opened
+        // emergency, a full review period, no guardian block.
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
+        vm.prank(owner);
+        governor.finalizeEmergencySettle(pid);
+
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Settled),
+            "the redirection target must actually clear a sub-floor settlement"
+        );
+        assertFalse(vault.redemptionsLocked(), "and must unfreeze the vault");
     }
 
     function test_finalizeEmergencySettle_blocked_reverts() public {

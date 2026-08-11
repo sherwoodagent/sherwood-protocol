@@ -20,6 +20,7 @@ import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {MockWoodTwapOracle} from "../mocks/MockWoodTwapOracle.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @dev Minimal sWOOD read surface `ExposureLedger` consumes — same shape as
 ///      `GovernorCoverageGatesTest`'s fixture mock (kept file-local, not
@@ -146,7 +147,8 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
                 address(vault),
                 address(guardianRegistryMock),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -243,12 +245,18 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
     function test_unstick_replaysAtCoverageScaledCap_cannotWidenBeyondSettleProposal() public {
         uint256 pid = _proposeWithDrainSettleLeg();
 
-        // 10,000e18 WOOD @ $0.05 == $500 == 50% of the $1,000 required.
-        _seatApprover(pid, g1, 10_000e18);
+        // This proposal's settle leg really DRAINS, so it declares a full
+        // `MAX_CAPITAL` cap on both legs and `requiredCoverage` sums to
+        // 2 x MAX_CAPITAL == $2,000. (It used to read $1,000: the harness
+        // governor was registry-less, and the flat tier-2 default prices the
+        // envelope once. The registry is mandatory at init since pashov
+        // finding #1, so per-call pricing is live.)
+        // 20,000e18 WOOD @ $0.05 == $1,000 == 50% of the $2,000 required.
+        _seatApprover(pid, g1, 20_000e18);
         _toApproved(pid);
 
         vm.expectEmit(true, false, false, true, address(governor));
-        emit ISyndicateGovernor.EffectiveMaxCapitalSet(pid, MAX_CAPITAL, MAX_CAPITAL / 2, 500e18, 1_000e18);
+        emit ISyndicateGovernor.EffectiveMaxCapitalSet(pid, MAX_CAPITAL, MAX_CAPITAL / 2, 1_000e18, 2_000e18);
         governor.executeProposal(pid);
         assertEq(governor.getEffectiveMaxCapital(pid), MAX_CAPITAL / 2, "executed at the coverage-scaled size");
 
@@ -291,8 +299,14 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
     function test_unstick_fullCoverage_stillDrainsToSink() public {
         uint256 pid = _proposeWithDrainSettleLeg();
 
-        // 20,000e18 WOOD @ $0.05 == $1,000 == 100% of the required coverage.
-        _seatApprover(pid, g1, 20_000e18);
+        // This proposal's settle leg really DRAINS, so it declares a full
+        // `MAX_CAPITAL` cap on both legs and `requiredCoverage` sums to
+        // 2 x MAX_CAPITAL == $2,000. (It used to read $1,000: the harness
+        // governor was registry-less, and the flat tier-2 default prices the
+        // envelope once. The registry is mandatory at init since pashov
+        // finding #1, so per-call pricing is live.)
+        // 40,000e18 WOOD @ $0.05 == $2,000 == 100% of the required coverage.
+        _seatApprover(pid, g1, 40_000e18);
         _toApproved(pid);
         governor.executeProposal(pid);
         assertEq(governor.getEffectiveMaxCapital(pid), MAX_CAPITAL, "full coverage -- no scaling");
@@ -387,6 +401,10 @@ contract GovernorEmergency_FinalizeCoverageCapsTest is Test {
         vault.registerAgent(agentNftId, agent);
 
         ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
+        // Hoisted ABOVE the nonce snapshot: the governor's mandatory tier-registry
+        // argument (pashov finding #1) is a DEPLOYMENT, so leaving it inline in the
+        // `initialize` tuple would consume a nonce and slide every predicted address.
+        address fixtureTierRegistry = address(deployTierRegistry(address(this)));
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
@@ -417,6 +435,7 @@ contract GovernorEmergency_FinalizeCoverageCapsTest is Test {
                 predictedRegistryProxy,
                 address(_hoistedPC),
                 address(this),
+                fixtureTierRegistry,
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,

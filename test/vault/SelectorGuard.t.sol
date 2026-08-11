@@ -281,30 +281,36 @@ contract SelectorGuardTest is Test {
         _exec(_one(address(usdc), abi.encodePacked(SEL_TRANSFER_FROM, uint256(uint160(attacker)))));
     }
 
-    // ── unset registry / legacy governor: guard off by design (Part 2 only) ──
+    // ── unset registry / legacy governor: guard fails CLOSED (Part 2 only) ──
 
-    /// @notice Registry unset (address(0)) on the governor → the batch runs
-    ///         UNguarded. Documented v1 posture: an unset registry already means
-    ///         tier-2/full-notional pricing; hard-reverting here would brick
-    ///         vaults deployed without a registry.
-    function test_unsetRegistryExecutesWithoutGate() public {
+    /// @notice THIS IS THE FINDING (pashov #1), now inverted. Registry unset on
+    ///         the governor used to run the batch UNguarded on the premise that
+    ///         "an unset registry already means tier-2/full-notional pricing" —
+    ///         but pricing is not a capability gate, and the exact call below,
+    ///         `usdc.approve(attacker, 1e6)`, moves zero balance, so the
+    ///         net-outflow meter, the per-call caps and `requiredCoverage` all
+    ///         read zero while the attacker walks away with a live allowance to
+    ///         pull in a later, unmetered transaction.
+    function test_unsetRegistry_batchRefused() public {
         governor.setTierRegistry(address(0));
+        vm.expectRevert(ISyndicateVault.TierRegistryUnresolved.selector);
         _exec(_one(address(usdc), abi.encodeCall(usdc.approve, (attacker, 1e6))));
-        assertEq(usdc.allowance(address(vault), attacker), 1e6);
+        assertEq(usdc.allowance(address(vault), attacker), 0, "no allowance was granted");
     }
 
     /// @notice A governor without the `tierRegistry()` getter (pre-registry
-    ///         deployment) resolves like an unset registry — guard off, batch
-    ///         executes.
-    function test_governorWithoutTierGetterExecutesWithoutGate() public {
+    ///         deployment) resolves like an unset registry — and is refused the
+    ///         same way, through the staticcall's `!ok` arm.
+    function test_governorWithoutTierGetter_batchRefused() public {
         MockGovernorNoTierGetter legacy = new MockGovernorNoTierGetter();
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(legacy)));
 
         vm.prank(address(legacy));
+        vm.expectRevert(ISyndicateVault.TierRegistryUnresolved.selector);
         vault.executeGovernorBatch(
             _one(address(usdc), abi.encodeCall(usdc.approve, (attacker, 1e6))), new uint256[](0), type(uint256).max
         );
-        assertEq(usdc.allowance(address(vault), attacker), 1e6);
+        assertEq(usdc.allowance(address(vault), attacker), 0, "no allowance was granted");
     }
 
     // ── transferFrom source guard (PART 1b) is unconditional — degrade-open coverage ──

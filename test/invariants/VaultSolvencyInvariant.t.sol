@@ -18,6 +18,7 @@ import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 
 import {VaultSolvencyHandler} from "./handlers/VaultSolvencyHandler.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title VaultSolvencyInvariantTest
 /// @notice INV-15 fuzz harness — vault solvency.
@@ -103,7 +104,8 @@ contract VaultSolvencyInvariantTest is StdInvariant, Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -299,7 +301,8 @@ contract VaultSolvencyColdStartInvariantTest is StdInvariant, Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,

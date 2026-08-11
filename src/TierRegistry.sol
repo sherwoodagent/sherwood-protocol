@@ -142,6 +142,62 @@ contract TierRegistry is Ownable2Step {
     ///         Batches reach such positions through allowlisted adapters instead.
     mapping(address adapter => bool) private _adapterAllowed;
 
+    /// @dev THE CALLEE AXIS, split out of `_adapterAllowed` (pashov finding #14).
+    ///      Answers ONLY "may the vault CALL this address in a governor batch?"
+    ///      (`SyndicateVault._guardBatchCalls` PART 2a). It confers NO right to
+    ///      receive value: PART 2b's spender/recipient gate reads
+    ///      `isAdapterAllowed`, never this.
+    ///
+    ///      WHY IT IS SEPARATE. One bit used to answer both questions, and
+    ///      `_demote` cleared it. That is right for "may receive funds" — the
+    ///      whole point of demotion — and catastrophic for "may be called" when
+    ///      the demoted target is the strategy clone HOLDING the vault's
+    ///      capital: `settleProposal`, `unstick` and `finalizeEmergencySettle`
+    ///      all revert `DisallowedBatchCallee`, the proposal pins in `Executed`,
+    ///      `redemptionsLocked()` stays true, and every LP exit shuts until the
+    ///      registry multisig re-grants standing. Revoking the right to be PAID
+    ///      must not revoke the vault's ability to RECLAIM.
+    ///
+    ///      SET on every `setAdapterAllowed(a, true)`; CLEARED only by an
+    ///      explicit `setAdapterAllowed(a, false)`. `_demote` deliberately
+    ///      leaves it alone — that asymmetry IS the fix, and it is pinned by
+    ///      `test/pashov-final/Registry_demoteKeepsCalleeStanding.t.sol`, whose
+    ///      three cases reject the two obvious wrong fixes (never clearing the
+    ///      bit, and exempting in-flight positions vault-side).
+    mapping(address adapter => bool) private _calleeAllowed;
+
+    /// @dev EXPLICIT owner revocation of the callee axis, and the reason it
+    ///      needs its own slot. `_classAllowDenied` cannot serve: `_demote`
+    ///      writes it too, so honouring it in `isCallableTarget` would re-close
+    ///      the axis for exactly the demoted class-certified clones this split
+    ///      exists to rescue. But ignoring it outright left
+    ///      `setAdapterAllowed(a, false)` with NO effect on the callee axis for
+    ///      a class member — such a clone has no address entry, so
+    ///      `_calleeAllowed` is already false and clearing it bites nothing,
+    ///      and the class fallback then re-allowed it forever. Since anyone can
+    ///      permissionlessly deploy an ERC-1167 clone of a certified template
+    ///      to become a class member, that was a strict widening.
+    ///
+    ///      Set ONLY by `setAdapterAllowed(a, false)`; cleared by
+    ///      `setAdapterAllowed(a, true)`; `_demote` never touches it. That is
+    ///      the whole distinction: a conviction says "you may not be PAID
+    ///      again", an owner delisting says "the vault has no further business
+    ///      with you at all".
+    mapping(address adapter => bool) private _calleeRevoked;
+
+    /// @dev The CLASS half of the callee axis, mirroring `_calleeAllowed` on the
+    ///      address half. Set by `setClassAllowed(t, true)`, cleared only by
+    ///      `setClassAllowed(t, false)`; `_demoteClass` never touches it.
+    ///
+    ///      Without this the split did nothing for the case it most needed to
+    ///      cover. A per-proposal strategy clone has NO address entry — class
+    ///      standing is the only standing it ever had — so a class conviction
+    ///      cleared `_classAllowed`, `isCallableTarget`'s fallback read false,
+    ///      and the vault again could not reach the clone holding its capital.
+    ///      The address-entry version of the test passed regardless, which is
+    ///      why this went unnoticed until a class-clone test was written.
+    mapping(bytes32 classCodehash => bool) private _classCalleeAllowed;
+
     /// @dev Grant-time codehash snapshot for the allowlist axis. The adversary: an
     ///      allowlisted adapter whose bytecode is swapped at the same address, or
     ///      a codeless allowlisted address at which code later appears, otherwise
@@ -690,35 +746,36 @@ contract TierRegistry is Ownable2Step {
             b.releasableAt = releasableAt;
             emit SubmitterBondReleaseStarted(target, selector, b.submitter, releasableAt);
         }
-        // PASHOV 2026-08 FINDING #15 LIVES ON THIS LINE, and it is knowingly
-        // left open rather than patched here.
+        // PASHOV FINDING #14 (formerly #15) IS FIXED ON THIS LINE by clearing
+        // ONLY the value-receiving axis and deliberately leaving
+        // `_calleeAllowed` standing.
         //
-        // `_adapterAllowed` answers TWO questions with ONE bit: "may this
-        // address receive vault-fund movements?" and "may the vault CALL this
-        // address in a governor batch?" (`SyndicateVault._guardBatchCalls`
+        // `_adapterAllowed` used to answer TWO questions with ONE bit: "may
+        // this address receive vault-fund movements?" and "may the vault CALL
+        // this address in a governor batch?" (`SyndicateVault._guardBatchCalls`
         // PART 2a). Clearing it on demotion is right for the first and
         // catastrophic for the second when the target is a strategy CLONE that
         // currently holds the vault's capital: `settleProposal`, `unstick` AND
-        // `finalizeEmergencySettle` all revert `DisallowedBatchCallee`, the
-        // proposal pins in `Executed`, `redemptionsLocked()` stays true, and
-        // every LP exit is shut until a DIFFERENT owner (the registry
-        // multisig) re-grants the standing this conviction just removed.
-        // `test/ChallengeEndToEnd.t.sol` already works around exactly this.
+        // `finalizeEmergencySettle` all reverted `DisallowedBatchCallee`, the
+        // proposal pinned in `Executed`, `redemptionsLocked()` stayed true, and
+        // every LP exit was shut until a DIFFERENT owner (the registry
+        // multisig) re-granted the standing this conviction just removed.
         //
-        // Not narrowed here because both candidate fixes are worse from this
-        // seat. Keeping the bit but skipping the clear would let a convicted
-        // adapter keep receiving funds, which is the entire point of demotion.
-        // Exempting the in-flight position vault-side reverses openspec
+        // The two candidate fixes previously rejected here are still rejected,
+        // and the pin suite encodes both refusals: NOT clearing the bit at all
+        // would let a convicted adapter keep receiving funds (the entire point
+        // of demotion — `test_demotedStrategyStillCannotReceiveVaultFunds`),
+        // and exempting the in-flight position VAULT-side would reverse openspec
         // `target-based-batch-gating` Decision 3 ("No lifecycle state is
-        // grandfathered in code") and was already dropped once for scoping the
-        // exemption to "named in a batch" rather than "holds this proposal's
-        // capital".
+        // grandfathered in code"). Splitting the axes in the REGISTRY is the
+        // third option both of those were standing in for: the vault keeps one
+        // unconditional rule per axis and grandfathers nothing.
         //
-        // The real fix is to split the two questions into two bits, which is
-        // the same axis rework already owned elsewhere (see the `#211` review
-        // of `isCounterpartyAllowed`, whose stated justification — "the swap
-        // adapter is the one address that receives forceApprove" — is false).
-        // Landing a competing version here would collide with it.
+        // `_calleeAllowed` is untouched here ON PURPOSE. A demoted clone stays
+        // reachable so its capital can be reclaimed, but cannot be re-funded:
+        // PART 2b still reads `isAdapterAllowed` for every spender/recipient,
+        // and a strategy's own `execute()` pull needs an approve that PART 2b
+        // now refuses. Callable is not fundable.
         if (_adapterAllowed[target]) {
             delete _adapterAllowed[target];
             emit AdapterAllowedSet(target, false);
@@ -807,6 +864,15 @@ contract TierRegistry is Ownable2Step {
     ///         for the address path.
     function setAdapterAllowed(address adapter, bool allowed) external onlyOwner {
         _adapterAllowed[adapter] = allowed;
+        // Explicit revocation closes the callee axis for CLASS members too, who
+        // have no address entry for the line below to clear.
+        _calleeRevoked[adapter] = !allowed;
+        // BOTH axes move together on an EXPLICIT owner decision. Only `_demote`
+        // splits them (see `_calleeAllowed`): an owner delisting an address
+        // means "the vault has no further business with you at all", while a
+        // conviction means "you may not be paid again" and must still leave the
+        // vault able to reclaim what you already hold.
+        _calleeAllowed[adapter] = allowed;
         if (allowed) {
             _adapterAllowedCodehash[adapter] = _effectiveCodehash(adapter);
             if (_classAllowDenied[adapter]) {
@@ -856,6 +922,39 @@ contract TierRegistry is Ownable2Step {
         if (_classAllowDenied[adapter]) return false;
         bytes32 cch = _classOf(adapter);
         return cch != bytes32(0) && _classAllowed[cch];
+    }
+
+    /// @notice May the vault CALL `target` inside a governor batch? This is the
+    ///         question `SyndicateVault._guardBatchCalls` PART 2a asks, and the
+    ///         ONLY one it asks — a `true` here confers no right to receive
+    ///         value, which PART 2b gates separately on `isAdapterAllowed`.
+    /// @dev    SURVIVES DEMOTION BY DESIGN (pashov finding #14). `_demote`
+    ///         clears `_adapterAllowed` but not `_calleeAllowed`, so a convicted
+    ///         strategy clone can still be reached by the settlement batch that
+    ///         reclaims the vault's capital, while being refused as a recipient
+    ///         of any further funds.
+    ///
+    ///         DELIBERATELY IGNORES `_classAllowDenied`, which `_demote` also
+    ///         sets: honouring it here would re-close the callee axis through
+    ///         the class fallback for exactly the class-certified clones this
+    ///         fix exists to rescue (a per-proposal clone has no address entry,
+    ///         so the class path is the only standing it ever had).
+    ///
+    ///         The codehash equality is retained on the address path for the
+    ///         same adversary `isAdapterAllowed` guards against — bytecode
+    ///         swapped under an allowlisted address. A clone's runtime is
+    ///         immutable, so this never strands the case the fix targets.
+    function isCallableTarget(address target) public view returns (bool) {
+        // Explicit owner delisting closes this axis outright, including via the
+        // class path below. `_demote` never sets this flag, so a CONVICTED
+        // clone stays reachable for the settlement batch that reclaims the
+        // vault's capital — which is the entire point of the split.
+        if (_calleeRevoked[target]) return false;
+        if (_calleeAllowed[target] && _effectiveCodehash(target) == _adapterAllowedCodehash[target]) {
+            return true;
+        }
+        bytes32 cch = _classOf(target);
+        return cch != bytes32(0) && _classCalleeAllowed[cch];
     }
 
     /// @notice Allow or disallow `counterparty` as an address a STRATEGY
@@ -1249,6 +1348,10 @@ contract TierRegistry is Ownable2Step {
         bytes32 cch = cloneCodehashOf(template);
         if (allowed && _classAnchors[cch].template == address(0)) revert ClassNotCertified();
         _classAllowed[cch] = allowed;
+        // Callee axis moves with the owner's EXPLICIT decision, and only with
+        // it — `_demoteClass` deliberately leaves `_classCalleeAllowed` set so a
+        // convicted class stays reclaimable while becoming unfundable.
+        _classCalleeAllowed[cch] = allowed;
         emit ClassAllowedSet(template, cch, allowed);
     }
 

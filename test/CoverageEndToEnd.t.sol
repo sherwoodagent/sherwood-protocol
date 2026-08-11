@@ -22,6 +22,7 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
 /// @dev Chainlink-shaped USD feed for the vault asset: fixed answer, `decimals`,
 ///      `updatedAt` stamped at construction.
@@ -82,7 +83,8 @@ contract NoopAdapter {
 ///
 /// @dev    Fixture scale (everything below derives from these):
 ///           - vault asset USDG, 6-dec, $1.00 feed → 1_000e6 maxCapital = $1,000
-///           - no TierRegistry wired ⇒ tier 2, coverage == maxCapital ⇒ $1,000
+///           - uncertified calls ⇒ tier 2 at full notional, and only the exec
+///             leg declares a cap ⇒ coverage == maxCapital ⇒ $1,000
 ///           - proposerBondBps 100 (1%) ⇒ $10 ⇒ 200 WOOD at the $0.05 haircut
 ///           - guardian bonds: 20_000 WOOD == $1,000, 30_000 WOOD == $1,500
 contract CoverageEndToEndTest is Test {
@@ -132,9 +134,11 @@ contract CoverageEndToEndTest is Test {
     uint256 constant FILLER_STAKE = 20_000e18; // $1,000
     uint256 constant DEPOSIT = 60_000e6;
 
-    /// @dev maxCapital of every tier-2 proposal here. With no TierRegistry
-    ///      wired, `_resolveTierAndCoverage` returns (2, maxCapital), so
-    ///      requiredCoverage == this and coverageUsd == $1,000.
+    /// @dev maxCapital of every tier-2 proposal here. Uncertified calls resolve
+    ///      to tier 2 at full notional and only the exec leg declares a cap, so
+    ///      requiredCoverage == this and coverageUsd == $1,000. (Before pashov
+    ///      finding #1 made the registry mandatory at init, the same figure came
+    ///      out of the registry-LESS flat default instead.)
     uint256 constant MAX_CAPITAL = 1_000e6;
     uint256 constant COVERAGE_USD = 1_000e18;
     uint256 constant BOND_WOOD = 200e18; // $1,000 × 1% ÷ $0.05
@@ -283,7 +287,8 @@ contract CoverageEndToEndTest is Test {
                 address(v),
                 address(registry),
                 address(protocolConfig),
-                address(this), // factory (test contract) — may call the onlyFactory setters
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract) — may call the onlyFactory setters
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -317,6 +322,13 @@ contract CoverageEndToEndTest is Test {
         });
     }
 
+    /// @dev The settle leg is `approve(targetToken, 0)` — it moves nothing out,
+    ///      so every proposal here declares a ZERO settle cap.
+    ///      `requiredCoverage` sums the exec and settle legs, so declaring a
+    ///      full `MAX_CAPITAL` on both would bill twice the notional these
+    ///      proposals can move. It went unnoticed while the harness governors
+    ///      ran registry-less, where the flat tier-2 default ignores declared
+    ///      caps; the registry is mandatory at init since pashov finding #1.
     function _settleCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
@@ -354,8 +366,7 @@ contract CoverageEndToEndTest is Test {
             ),
             settle,
             GovEnvelope.defaultCaps(
-                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
-                (settle).length
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: 0, maxDrawdownBps: 10_000})).maxCapital, (settle).length
             ),
             new ISyndicateGovernor.CoProposer[](0)
         );
@@ -1091,8 +1102,10 @@ contract CoverageEndToEndTest is Test {
 
         pid = _propose(govA, address(vaultA), agentA, _adapterCalls(), _adapterCalls());
         assertEq(govA.getProposal(pid).envelopeTier, 1, "certified tier 1");
-        // coverage = maxCapital × Σ(exec 100 bps + settle 100 bps) / 10_000.
-        uint256 coverage = (MAX_CAPITAL * 200) / 10_000;
+        // coverage = Σ(cap_i × bound_i) / 10_000. Only the exec leg declares a
+        // cap here — the settle leg's is zero (see `_settleCalls`) — so the
+        // certified 100 bps bites once, not twice.
+        uint256 coverage = (MAX_CAPITAL * 100) / 10_000;
         assertEq(govA.getProposal(pid).requiredCoverage, coverage, "bounded coverage, not full notional");
         // The propose-time bond still applies, scaled to the smaller coverage.
         assertEq(

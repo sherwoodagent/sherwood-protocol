@@ -14,6 +14,8 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {unwireTierRegistry} from "../helpers/TierRegistryUnwire.sol";
 
 /// @notice Task 5 — propose-time tier resolution (spec 2026-07-22 §3.2). The
 ///         proposal's tier is the MAX tier across its execute calls (resolved
@@ -72,7 +74,8 @@ contract TierResolutionTest is Test {
                 address(vault),
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -243,7 +246,17 @@ contract TierResolutionTest is Test {
 
     /// @notice Registry unset (address(0)) → everything defaults to tier 2 /
     ///         full notional, even for calls a registry would have certified.
+    /// @dev    Reaches the state with `vm.store` (see `unwireTierRegistry`): the
+    ///         registry is a mandatory `initialize` argument since pashov
+    ///         finding #1, so only a governor deployed BEFORE that fix is
+    ///         registry-less — which is exactly the population this branch
+    ///         exists for. Note the pricing here (`MAX_CAPITAL`, flat) differs
+    ///         from the wired uncertified case
+    ///         (`test_shortCalldataResolvesAsUncertifiedTier2`, `2 *
+    ///         MAX_CAPITAL`): the flat default prices the ENVELOPE once, the
+    ///         wired path prices each declared cap.
     function test_zeroTierRegistryAddressDefaultsAllToTier2() public {
+        unwireTierRegistry(address(governor));
         // Deliberately NOT wired; certification alone must not matter.
         _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
 

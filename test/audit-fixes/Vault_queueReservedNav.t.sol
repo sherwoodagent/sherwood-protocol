@@ -10,6 +10,7 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title Vault_queueReservedNav
 /// @notice Issue #92 — a redeem whose settle price has been STAMPED but not yet
@@ -78,6 +79,14 @@ contract VaultQueueReservedNavTest is Test {
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
+        // The batch guard resolves the TierRegistry through the governor and now
+        // REFUSES the batch when it resolves none (pashov finding #1), so a
+        // placeholder governor has to answer this too.
+        vm.mockCall(
+            MOCK_GOVERNOR,
+            abi.encodeWithSignature("tierRegistry()"),
+            abi.encode(address(deployTierRegistry(address(this))))
+        );
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), abi.encode(uint256(0)));
 
         usdc.mint(quitter, QUITTER_ASSETS);

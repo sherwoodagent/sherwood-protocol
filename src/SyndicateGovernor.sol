@@ -34,6 +34,51 @@ import {IVotes} from "@openzeppelin/contracts/governance/utils/IVotes.sol";
  *   - Protocol fee taken from profit before agent/management fees
  */
 contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializable {
+    /// @notice Ceiling applied to `maxDrawdownBps` when deriving the SETTLE-PRICE
+    ///         floor (pashov finding #2). Not a bound on the strategy's declared
+    ///         loss — that stays whatever voters approved, up to 10_000.
+    /// @dev    Why a cap rather than rejecting `maxDrawdownBps == 10_000` at
+    ///         propose: rejecting it would make the P&L envelope answer for the
+    ///         stamp's safety, which is the exact conflation this finding is
+    ///         about, and it would invalidate `GovEnvelope.permissive` — the
+    ///         fixture nearly every suite builds on. Capping keeps the two
+    ///         questions separate: declare any loss you like, but the price a
+    ///         permissionless caller may FREEZE is bounded regardless.
+    ///
+    ///         9_000 leaves a 100%-drawdown proposal a floor at 10% of the
+    ///         execute-time price — far above the ~0 a flash-loaned settle
+    ///         produces. It is NOT "far below any honest settlement": on a
+    ///         proposal whose voters declared `maxDrawdownBps == 10_000`, an
+    ///         honest loss past 90% is exactly the case this bar refuses. That
+    ///         is a deliberate liveness trade, not an oversight — see the
+    ///         residual-risk note below and
+    ///         `test_subFloorSettlementIsClearedByFinalizeEmergencySettle`.
+    ///
+    ///         WHAT THIS BOUNDS, STATED PLAINLY. The floor does not close the
+    ///         dilution attack; it prices it. An attacker who delivers 10% of
+    ///         the capital instead of 0% settles just above the bar and mints
+    ///         at ~10x the fair share count, then `sweep()` returns the
+    ///         withheld remainder. For a queued deposit `D` against vault
+    ///         assets `TA` that is `10D / (TA + 10D)` of the vault: ~60% at
+    ///         `D = 0.2·TA`, ~82% at `D = TA`. What changes is the price of the
+    ///         attack — the pre-fix version cost ~0 (a flash loan, repaid in
+    ///         frame), this one requires REAL capital proportional to the vault
+    ///         and locks it for the whole strategy term. "Bounded at 10x
+    ///         dilution for an attacker willing to fund it", not "closed".
+    ///
+    ///         WHY NOT 5_000 (2x dilution for the same shape)? Because the bar
+    ///         is symmetric: every bps of tightening moves an equal band of
+    ///         HONEST settlements off `settleProposal` AND off `unstick` (which
+    ///         derives its backstop from this same constant) and onto
+    ///         `finalizeEmergencySettle` — owner bond, guardian review, a full
+    ///         `reviewPeriod`, and a frozen vault for the duration. At 5_000
+    ///         that band is every loss past 50%, which is a routine outcome for
+    ///         a permissive envelope; at 9_000 it is a loss past 90%, which is
+    ///         near-total. Revisit if the emergency path ever becomes cheap
+    ///         enough that routing honest severe losses through it is not a
+    ///         liveness regression.
+    uint256 public constant MAX_STAMP_DRAWDOWN_BPS = 9_000;
+
     // ── Storage (existing -- DO NOT reorder) ──
     // `vault`, `protocolConfig`, `factory`, `_params` live in `GovernorParameters`.
 
@@ -130,10 +175,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      goalposts for co-proposers who already approved.
     mapping(uint256 proposalId => uint256 packedTiming) private _draftTimingSnap;
 
-    /// @notice Tier registry. Optional: address(0) means every proposal
-    ///         resolves to tier 2 / full notional — the safe default. Wired
-    ///         post-init via `setTierRegistry` (factory-only, like
-    ///         `setProtocolConfig`).
+    /// @notice Tier registry. MANDATORY at `initialize` (pashov finding #1) —
+    ///         a governor cannot be born unwired. Re-pointed post-init via
+    ///         `setTierRegistry` (factory-only, like `setProtocolConfig`),
+    ///         which also refuses zero and codeless.
+    /// @dev Governors deployed BEFORE this became an init param can still read
+    ///      zero here; `SyndicateVault._guardBatchCalls` fails closed on that,
+    ///      and `SyndicateFactory.pushWiring` is the rescue.
     address internal _tierRegistry;
 
     /// @notice Exposure ledger. Optional: address(0) skips the covered-TVL
@@ -175,10 +223,30 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      which shrinks 28 -> 27; every pre-existing variable keeps its slot.
     mapping(address vault => mapping(address token => uint256)) private _escrowedFees;
 
+    /// @notice Proposal ID -> the vault's price per share at EXECUTE, captured
+    ///         before the batch deploys any capital (pashov finding #2).
+    /// @dev THE ANCHOR THE SETTLE-PRICE FLOOR IS MEASURED AGAINST, and the
+    ///      reason it cannot be faked. Taken while the vault still physically
+    ///      holds the capital, so it is a real ratio (~par) rather than the
+    ///      near-zero figure the vault reports for the whole Executed window,
+    ///      during which `totalAssets()` counts only idle float.
+    ///
+    ///      A PRIOR-BLOCK READ WOULD NOT SUBSTITUTE. Robinhood Chain blocks are
+    ///      ~100ms, so "last block" is no economic barrier at all, and one block
+    ///      before settlement the capital is still deployed — that reading is
+    ///      also ~0. What makes this anchor unreachable is the DISTANCE (a whole
+    ///      strategy term) and the INSTANT (pre-deployment), not its age.
+    ///
+    ///      Appended before `__gap`, which shrinks 27 -> 26; every pre-existing
+    ///      variable keeps its slot. Regenerate the golden with
+    ///      `./script/check-layout-goldens.sh --update-golden`.
+    mapping(uint256 => uint256) private _ppsSnapshots;
+
     /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31)
-    ///      for the three mappings above, then 1 more for `_escrowedFees` —
-    ///      append-only. See `script/syndicate-governor-layout.golden.json`.
-    uint256[27] private __gap;
+    ///      for the three mappings above, then 1 more for `_escrowedFees`, then
+    ///      1 more for `_ppsSnapshots` — append-only. See
+    ///      `script/syndicate-governor-layout.golden.json`.
+    uint256[26] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -192,21 +260,32 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _disableInitializers();
     }
 
+    /// @param tierRegistry_ MANDATORY (pashov finding #1). Wiring the registry
+    ///        here rather than in a follow-up `setTierRegistry` is what makes
+    ///        the registry-less governor unreachable: `_guardBatchCalls` drops
+    ///        the whole callee/spender allowlist when it resolves none, so a
+    ///        governor that could exist unwired for even one block could hand a
+    ///        vault `asset.approve(attacker, max)` past every meter. Codeless
+    ///        subsumes zero — an EOA would pass a zero-check and then revert the
+    ///        guard's typed `isCallableTarget` call, bricking the vault instead.
     function initialize(
         address vault_,
         address guardianRegistry_,
         address protocolConfig_,
         address factory_,
+        address tierRegistry_,
         GovernorParams calldata params_
     ) external initializer {
         if (guardianRegistry_ == address(0) || protocolConfig_ == address(0) || factory_ == address(0)) {
             revert ZeroAddress();
         }
+        if (tierRegistry_.code.length == 0) revert TierRegistryNotWired();
         _validateParamBounds(params_);
         vault = vault_;
         _guardianRegistry = guardianRegistry_;
         protocolConfig = protocolConfig_;
         factory = factory_;
+        _tierRegistry = tierRegistry_;
         _params = params_;
         _reentrancyStatus = _NOT_ENTERED;
         // Bootstrap owner: if no vault is wired at deploy, the deployer acts as
@@ -489,6 +568,19 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         address asset = IERC4626(vault).asset();
         uint256 balanceBefore = IERC20(asset).balanceOf(vault);
         _capitalSnapshots[proposalId] = balanceBefore;
+        // Anchor for the settle-price floor (pashov finding #2). MUST be read
+        // HERE, before the execute batch deploys capital: `totalAssets()` counts
+        // only the vault's idle balance, so a reading taken after deployment
+        // would be ~0 and the floor derived from it would be vacuous — the exact
+        // failure being fixed. Typed call: `pricePerShare()` is on
+        // `ISyndicateVault` and every governor path already calls this vault.
+        // STORED OFFSET BY ONE so `0` unambiguously means "no anchor recorded"
+        // and can never mean "recorded as zero". `pricePerShare()` floors to 0
+        // whenever `totalAssets()` reads 0 against a large supply — a state
+        // `SyndicateVault` itself documents as reachable ("an escrow exceeding
+        // the float pins `totalAssets()` to 0") — and without the offset that
+        // would silently and totally disable this gate for the proposal.
+        _ppsSnapshots[proposalId] = ISyndicateVault(vault).pricePerShare() + 1;
 
         // Update state BEFORE external call (CEI pattern)
         _activeProposal = proposalId;
@@ -652,7 +744,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // redirected to the path where a human looks at it.
         {
             uint256 basis = _capitalSnapshots[proposalId];
-            uint256 allowance = (proposal.effectiveMaxCapital * proposal.maxDrawdownBps) / 10_000;
+            uint256 allowance = (proposal.effectiveMaxCapital * proposal.maxDrawdownBps) / BPS_DENOMINATOR;
             // `allowance >= basis` covers the declared-total-loss envelope
             // (`maxDrawdownBps == 10_000` on a proposal committing the whole
             // float): the floor is zero, so any realized balance settles. That
@@ -664,7 +756,103 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             }
         }
 
+        // SECOND, INDEPENDENT GATE — the settle PRICE (pashov finding #2).
+        //
+        // The capital floor above is identically true when a proposal declares
+        // `maxDrawdownBps == 10_000`: `allowance` then equals `basis`, so
+        // `basis > allowance` is false and the whole branch is SKIPPED. That is
+        // defensible for the strategy's own P&L — voters may accept a total
+        // loss — but the waiver reaches a party the envelope never spoke for.
+        // `_finishSettlement` -> `onProposalSettled` freezes
+        // `num = totalAssets() + 1` as the price EVERY queued deposit and redeem
+        // is paid at, and a permissionless caller picks the block.
+        //
+        // Proven on a live Robinhood fork: settle from inside a `flashLoan` that
+        // empties Morpho's idle balance so `_deliverableNow` returns 0, and the
+        // stamp lands at `num == 1` — a queued 1 USDG deposit minted 99.99% of a
+        // 20,000 USDG vault's supply.
+        //
+        // So the stamp gets its OWN bound, and the declared drawdown is CAPPED
+        // on the way in. A proposal may still declare a total loss; the price it
+        // may freeze is bounded regardless. A settlement under this floor is not
+        // stuck — it is redirected to `finalizeEmergencySettle`, where an owner
+        // bond and guardian review stand behind it.
+        _requireSettlePriceAboveFloorHook(proposalId, proposal, false);
+
         _finishSettlement(proposalId, proposal);
+    }
+
+    /// @dev Shared by `settleProposal` and `unstick` (pashov findings #2, #12).
+    ///      `unstick` replays the SAME stored batch under the SAME caps, so
+    ///      leaving it ungated closed the front door and left the side door
+    ///      open — the attack there needs no 100% declaration at all.
+    ///
+    ///      DELIBERATELY LOOSER THAN THE CAPITAL FLOOR. Capping the declared
+    ///      drawdown at `MAX_STAMP_DRAWDOWN_BPS` leaves a 100% proposal a floor
+    ///      of 10% of the execute-time price, so ordinary and even severe losses
+    ///      still settle and `unstick` remains the escape hatch it was added to
+    ///      be. Only a near-zero stamp — the shape a flash-loaned settle
+    ///      manufactures, and the shape that mints unbounded shares to a queued
+    ///      depositor — is refused.
+    ///
+    ///      `finalizeEmergencySettle` stays exempt, and the accurate statement
+    ///      of what that costs is: AN ATTACKING VAULT OWNER MUST NOW WAIT OUT A
+    ///      GUARDIAN REVIEW, not "the stamp is bounded on every path". The bond
+    ///      is slashed only if guardians actively BLOCK (`finalizeEmergency` ->
+    ///      `GuardianRegistry._resolveEmergency`), and guardians review the
+    ///      submitted CALLDATA, not the block the owner later finalizes in — so
+    ///      an owner may post a bond, submit the honest replay calls, let the
+    ///      review lapse unblocked, and finalize from inside a flash-loan frame
+    ///      with no slash. The exemption is still the right call: gating it
+    ///      would leave a genuinely illiquid position with NO exit at all, and
+    ///      the vault stays frozen meanwhile. What the exemption buys the
+    ///      protocol is time and visibility, not arithmetic.
+    ///
+    ///      MEASURES A SLIGHTLY DIFFERENT NUMBER THAN THE ONE STAMPED. This
+    ///      runs before `_finishSettlement`, which charges the management fee
+    ///      and then the performance fee — both of which leave the vault (or
+    ///      land in `_escrowedFees`, which `totalAssets()` also subtracts)
+    ///      BEFORE `onProposalSettled` freezes `num = totalAssets() + 1`. So
+    ///      the stamped price is strictly at or below the price approved here,
+    ///      by the size of the fees. The gap is bounded and cannot be inflated
+    ///      into a near-zero stamp: the management base is ~0 for the deployed
+    ///      window and the performance leg is zero on a loss, which is the only
+    ///      case where this floor binds at all. Checked pre-fee deliberately —
+    ///      moving it after `_chargePerformanceFee` would make a fee charge
+    ///      able to REVERT an otherwise-valid settlement, converting a fee
+    ///      rounding edge into a stuck vault.
+    function _requireSettlePriceAboveFloorHook(uint256 proposalId, StrategyProposal storage proposal, bool rescuePath)
+        internal
+        view
+        override
+    {
+        // Zero means a proposal executed before this upgrade landed: there is no
+        // anchor to measure against, and inventing one would gate in-flight
+        // proposals on a figure never recorded. Those keep the pre-fix
+        // behaviour rather than becoming unsettleable. The +1 offset at the
+        // write site is what keeps this branch meaning ONLY that.
+        uint256 anchor = _ppsSnapshots[proposalId];
+        if (anchor == 0) return;
+        uint256 ppsAtExecute = anchor - 1;
+
+        // TWO BARS, because the two callers mean different things.
+        //
+        // `settleProposal` (rescuePath == false) is the ordinary, permissionless
+        // exit, so it is held to the DECLARED envelope — capped, so a 100%
+        // declaration cannot waive it to nothing.
+        //
+        // `unstick` (rescuePath == true) exists precisely to settle a proposal
+        // the declared envelope refused. Holding it to that same envelope would
+        // delete its purpose, so it gets only the absolute backstop: refuse a
+        // near-zero stamp, allow everything above it. A genuine loss past the
+        // backstop is not stuck either — it routes to `finalizeEmergencySettle`,
+        // which carries an owner bond and a guardian review.
+        uint256 declared = rescuePath ? MAX_STAMP_DRAWDOWN_BPS : proposal.maxDrawdownBps;
+        if (declared > MAX_STAMP_DRAWDOWN_BPS) declared = MAX_STAMP_DRAWDOWN_BPS;
+        uint256 ppsFloor = (ppsAtExecute * (BPS_DENOMINATOR - declared)) / BPS_DENOMINATOR;
+
+        uint256 ppsNow = ISyndicateVault(proposal.vault).pricePerShare();
+        if (ppsNow < ppsFloor) revert SettlePriceBelowFloor(ppsNow, ppsFloor);
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -1076,6 +1264,21 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @inheritdoc ISyndicateGovernor
     function getCapitalSnapshot(uint256 proposalId) external view returns (uint256) {
         return _capitalSnapshots[proposalId];
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    /// @dev Two returns rather than the zero-value convention `getCapitalSnapshot`
+    ///      uses, because zero is MEANINGFUL here: `pricePerShare()` floors to 0
+    ///      on a live vault, so a single-value getter would reproduce off-chain
+    ///      exactly the sentinel ambiguity the `+1` storage offset exists to
+    ///      remove. `recorded == false` means no anchor (pre-upgrade proposal,
+    ///      not yet executed, or already cleared at settlement) and therefore
+    ///      "this gate will stand down"; only `recorded == true` makes
+    ///      `ppsAtExecute` a number a monitor may derive the floor from.
+    function getPpsSnapshot(uint256 proposalId) external view returns (uint256 ppsAtExecute, bool recorded) {
+        uint256 anchor = _ppsSnapshots[proposalId];
+        if (anchor == 0) return (0, false);
+        return (anchor - 1, true);
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -1788,6 +1991,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _activeProposal = 0;
         _transition(proposal, ProposalState.Settled);
         delete _capitalSnapshots[proposalId];
+        // Symmetric with the capital snapshot above: both are read only on the
+        // way INTO settlement (the two floors), never after it, and `Settled`
+        // is terminal — no path re-enters `_finishSettlement` for this id — so
+        // clearing recovers the refund without weakening either gate.
+        delete _ppsSnapshots[proposalId];
         _decOpen();
 
         emit ProposalSettled(proposalId, vault, pnl, totalFee, block.timestamp - proposal.executedAt);
@@ -2206,30 +2414,34 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     }
 
     /// @inheritdoc ISyndicateGovernor
-    /// @dev address(0) is legal: it un-wires the registry and every subsequent
-    ///      proposal resolves to tier 2 / full notional — the safe default, so
-    ///      no zero-check (unlike `setProtocolConfig`, where zero would brick
-    ///      fee snapshots).
+    /// @dev ZERO AND CODELESS BOTH REFUSED (pashov finding #1). This slot used
+    ///      to accept zero on the premise that un-wiring "resolves everything at
+    ///      tier 2 / full notional — the safe default". That is a PRICING
+    ///      default; what a missing registry removes is a CAPABILITY gate:
+    ///      `SyndicateVault._guardBatchCalls` resolves through this slot and,
+    ///      finding none, RETURNS — dropping the callee allowlist, the
+    ///      spender/recipient gate and the `UnrecognizedAssetSelector` branch,
+    ///      after which `asset.approve(attacker, max)` moves zero balance past
+    ///      every meter and licenses an unbounded pull later. A codeless address
+    ///      instead reverts the guard's typed call and bricks the vault. Only
+    ///      removal is refused — re-pointing to a different registry is legal.
     ///
-    ///      "SAFE DEFAULT" IS NO LONGER THE WHOLE STORY FOR STRATEGY CLONES.
-    ///      Un-wiring stays safe in the sense that matters — no privilege is
-    ///      granted, everything prices at full notional — but it is no longer
-    ///      merely a degradation. `PortfolioStrategy._initialize` is fail-closed
-    ///      on registry resolution (change: `codehash-class-certification`), and
-    ///      it resolves through `vault() → governor() → tierRegistry()`. With
-    ///      this set to zero that walk dead-ends, so EVERY new clone bound to
-    ///      this vault reverts `TierRegistryUnresolved` at init. Existing clones
-    ///      are unaffected: they resolved at their own init, and rebalance /
-    ///      settle deliberately keep degrading open so an un-wiring can never
-    ///      strand capital inside a live strategy.
+    ///      The factory's own `setTierRegistry` still accepts zero: there it is
+    ///      a kill switch on NEW syndicates and cannot reach an existing
+    ///      governor. A pre-fix governor that IS registry-less is recovered with
+    ///      `SyndicateFactory.pushWiring(governor)`.
     ///
-    ///      Operational shape of zeroing this: live positions keep working and
-    ///      can still be wound down, but no new portfolio strategy can be
-    ///      deployed on this vault until the registry is re-wired. For an
-    ///      EXISTING governor that means `SyndicateFactory.pushWiring(governor)`
-    ///      — the factory's own `setTierRegistry` only reaches governors created
-    ///      after it.
+    ///      This is a RE-POINT, not the wiring point: `initialize` now takes the
+    ///      registry, so every governor this factory deploys is born wired.
+    ///
+    ///      Now-unreachable consequence, kept as rationale: zeroing this would
+    ///      dead-end `PortfolioStrategy._initialize`'s
+    ///      `vault() → governor() → tierRegistry()` walk, reverting
+    ///      `TierRegistryUnresolved` for every new clone while existing clones
+    ///      kept running — rebalance/settle degrade open by design so an
+    ///      un-wiring can never strand capital in a live strategy.
     function setTierRegistry(address newRegistry) external onlyFactory {
+        if (newRegistry.code.length == 0) revert TierRegistryNotWired();
         emit TierRegistrySet(_tierRegistry, newRegistry);
         _tierRegistry = newRegistry;
     }

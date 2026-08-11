@@ -311,6 +311,11 @@ interface ISyndicateGovernor {
     /// @notice Revert if `envelope.maxDrawdownBps > 10_000` at propose — a
     ///         drawdown declaration cannot exceed 100% of committed capital.
     error InvalidDrawdown();
+    /// @notice `setTierRegistry` was handed zero or a codeless address (pashov
+    ///         finding #1). Un-wiring re-opens `SyndicateVault._guardBatchCalls`
+    ///         (it degrades OPEN with no registry); a codeless address bricks
+    ///         the guard's typed call. Re-pointing to a real registry is legal.
+    error TierRegistryNotWired();
     /// @notice Revert if the realized vault balance at `settleProposal` sits
     ///         below the proposal's declared drawdown floor. `settleProposal`
     ///         freezes the Lane B settle price for every queued deposit and
@@ -328,6 +333,14 @@ interface ISyndicateGovernor {
     ///                  capital it actually covers, NOT a percentage of the
     ///                  whole fund.
     error SettlementBelowDrawdownFloor(uint256 realized, uint256 floor);
+    /// @notice The settle PRICE fell below the floor anchored at execute
+    ///         (pashov finding #2). Distinct from `SettlementBelowDrawdownFloor`,
+    ///         which bounds the strategy's absolute capital loss: this one
+    ///         bounds what may be FROZEN as the price every queued deposit and
+    ///         redeem is paid at. Two different questions, two separate gates —
+    ///         the first is waivable to nothing by a 100% drawdown declaration,
+    ///         and this one is not.
+    error SettlePriceBelowFloor(uint256 ppsNow, uint256 ppsFloor);
     /// @notice Revert if `claimUnclaimedFees` is called for a vault whose
     ///         proposal is currently Executed. An escrowed fee leaving the
     ///         vault mid-strategy is indistinguishable from a strategy loss to
@@ -698,11 +711,15 @@ interface ISyndicateGovernor {
     // ── Init ──
     /// @notice Initialize a freshly deployed per-vault governor proxy.
     ///         Called once by the factory inside the `BeaconProxy` constructor.
+    /// @param tierRegistry_ MANDATORY, must hold code (pashov finding #1). The
+    ///        registry is wired HERE, not in a follow-up `setTierRegistry`, so
+    ///        no governor ever exists with the batch guard's allowlist absent.
     function initialize(
         address vault_,
         address guardianRegistry_,
         address protocolConfig_,
         address factory_,
+        address tierRegistry_,
         GovernorParams calldata params_
     ) external;
 
@@ -736,6 +753,22 @@ interface ISyndicateGovernor {
     function openProposalCount() external view returns (uint256);
     function getCooldownEnd() external view returns (uint256);
     function getCapitalSnapshot(uint256 proposalId) external view returns (uint256);
+
+    /// @notice Ceiling applied to `maxDrawdownBps` when deriving the settle-PRICE
+    ///         floor (pashov finding #2). Declared here so an interface-only
+    ///         consumer can read the cap that gates it without binding to the
+    ///         concrete governor.
+    function MAX_STAMP_DRAWDOWN_BPS() external view returns (uint256);
+
+    /// @notice The vault price per share recorded at execute, which the
+    ///         settle-price floor is measured against.
+    /// @dev    `recorded == false` means no anchor exists for this proposal —
+    ///         it predates the upgrade, has not executed, or has already
+    ///         settled — and the floor therefore stands down. The floor a
+    ///         pending settle will face is
+    ///         `ppsAtExecute * (10_000 - min(maxDrawdownBps, MAX_STAMP_DRAWDOWN_BPS)) / 10_000`,
+    ///         with `unstick` using the cap alone in place of the declared bps.
+    function getPpsSnapshot(uint256 proposalId) external view returns (uint256 ppsAtExecute, bool recorded);
     function getCoProposers(uint256 proposalId) external view returns (CoProposer[] memory);
     /// @notice Risk envelope declared by the proposer at propose time.
     ///         Immutable for the proposal's lifetime.

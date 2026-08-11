@@ -671,15 +671,32 @@ contract SyndicateVault is
     ///      singleton — this fails CLOSED, so it is a possible over-restriction,
     ///      not a fund-safety gap.
     ///
-    ///      UNSET REGISTRY: with no tier registry wired (or a governor predating
-    ///      the getter), PART 2 cannot run and is skipped by design — the default
-    ///      is tier-2 / full-notional pricing anyway, and hard-reverting would
-    ///      brick registry-less vaults. PART 1 IS NOT AFFECTED: it needs no
-    ///      registry and sits above both early returns. Pinned by
-    ///      `test_targetGate_bitesEvenWithNoTierRegistryWired` and
-    ///      `test_targetGate_bitesEvenWhenGovernorHasNoTierGetter`, one per
-    ///      degrade-open branch, so relocating Part 1 below either return fails a
-    ///      test rather than silently re-opening the hole.
+    ///      UNSET REGISTRY — FAILS CLOSED (pashov finding #1). With no registry
+    ///      wired (or a governor predating the getter), PART 2 cannot run. This
+    ///      used to RETURN, dropping the callee allowlist, the spender/recipient
+    ///      gate and the `UnrecognizedAssetSelector` branch — not a pricing-only
+    ///      degradation and not "by design": `asset.approve(attacker, max)` moves
+    ///      zero balance, so every meter reads zero, and licenses an unbounded
+    ///      pull in a LATER transaction. It now reverts
+    ///      `TierRegistryUnresolved`, matching `PortfolioStrategy`,
+    ///      `MorphoSupplyStrategy` and `ConcentratedLiquidityStrategy`, which
+    ///      already fail closed on the same walk.
+    ///
+    ///      LIVENESS COST, ACCEPTED: a governor that IS registry-less has its
+    ///      batches — `settleProposal` / `unstick` / every exit — reverting until
+    ///      the factory owner calls `pushWiring(governor)`. That state is
+    ///      unreachable for anything this factory deploys (mandatory
+    ///      `SyndicateFactory.InitParams.tierRegistry`, mandatory
+    ///      `SyndicateGovernor.initialize` arg, and `setTierRegistry` refusing
+    ///      zero and codeless), so only governors predating those checks can hit
+    ///      it, and for them a one-call rewire is preferable to running the
+    ///      allowlist-free window the finding describes.
+    ///
+    ///      PART 1 IS NOT AFFECTED: it needs no registry and sits above the
+    ///      resolve. Pinned by `test_targetGate_bitesEvenWithNoTierRegistryWired`
+    ///      and `test_targetGate_bitesEvenWhenGovernorHasNoTierGetter`, so
+    ///      relocating Part 1 below the resolve converts a privileged-callee
+    ///      rejection into the registry error and fails a test.
     function _guardBatchCalls(BatchExecutorLib.Call[] calldata calls) private view {
         // PRIVILEGED-CALLEE GATE, ahead of everything else.
         //
@@ -761,11 +778,14 @@ contract SyndicateVault is
         }
 
         // onlyGovernor holds, so msg.sender IS the governor. staticcall (not a
-        // typed call) so a governor without the getter degrades to "unset".
+        // typed call) so a governor without the getter resolves to "unset"
+        // HERE rather than reverting in this frame with empty returndata, which
+        // would be indistinguishable from a bug in the guard itself. Either way
+        // the outcome is the same refusal — only the error is legible.
         (bool ok, bytes memory ret) = msg.sender.staticcall(abi.encodeCall(ISyndicateGovernor.tierRegistry, ()));
-        if (!ok || ret.length != 32) return;
+        if (!ok || ret.length != 32) revert TierRegistryUnresolved();
         address registry = abi.decode(ret, (address));
-        if (registry == address(0)) return;
+        if (registry == address(0)) revert TierRegistryUnresolved();
 
         address asset_ = asset();
         for (uint256 i = 0; i < calls.length; i++) {
@@ -774,8 +794,21 @@ contract SyndicateVault is
             // empty-calldata and native-`value` calls are gated too. asset() is
             // the sole exemption (design.md Decision 2); everything else must be
             // an allowlisted, codehash-current adapter.
+            //
+            // READS THE CALLEE AXIS (`isCallableTarget`), NOT `isAdapterAllowed`
+            // (pashov finding #14). The two used to be one registry bit, so a
+            // demotion — reachable permissionlessly, since `ChallengeGame.file`
+            // only needs the pair to appear in the executed proposal's calldata,
+            // and every execute batch names `(clone, execute.selector)` — revoked
+            // the vault's ability to CALL the very clone holding its capital.
+            // `settleProposal`, `unstick` and `finalizeEmergencySettle` all
+            // reverted here, the proposal pinned in `Executed`, and every LP exit
+            // shut. The recipient/spender checks in PART 2b still read
+            // `isAdapterAllowed`, so a demoted clone remains reclaimable but
+            // unfundable. No lifecycle state is grandfathered: this stays one
+            // unconditional rule, evaluated per call, exactly as before.
             address target = calls[i].target;
-            if (target != asset_ && !ITierRegistry(registry).isAdapterAllowed(target)) {
+            if (target != asset_ && !ITierRegistry(registry).isCallableTarget(target)) {
                 revert DisallowedBatchCallee(target);
             }
             bytes calldata data = calls[i].data;

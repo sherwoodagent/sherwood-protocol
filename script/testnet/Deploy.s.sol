@@ -13,6 +13,7 @@ import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {ScriptBase} from "../ScriptBase.sol";
 
 /**
@@ -60,10 +61,15 @@ contract DeployTestnet is ScriptBase {
         //    resolved by the set-once `setRegistry` call.
         uint256 baseNonce = vm.getNonce(deployer);
         // ProtocolConfig at +0, govImpl +1, govProxy +2, swoodImpl +3, swoodProxy +4,
-        // registryImpl +5, registryProxy +6, factoryImpl +7, factoryProxy +8.
+        // registryImpl +5, registryProxy +6, tierRegistry +7, factoryImpl +8,
+        // factoryProxy +9.
+        // `tierRegistry` inserted at +7 (pashov finding #1: mandatory
+        // `InitParams` field, so it must precede the factory), shifting only the
+        // factory prediction +8 -> +9. The `require` below catches a wrong
+        // offset before it mis-wires sWOOD / the guardian registry.
         address predictedSwoodProxy = vm.computeCreateAddress(deployer, baseNonce + 4);
         address predictedRegistryProxy = vm.computeCreateAddress(deployer, baseNonce + 6);
-        address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 8);
+        address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 9);
 
         // Deploy ProtocolConfig (plain Ownable)
         ProtocolConfig protocolConfig = new ProtocolConfig(deployer);
@@ -121,7 +127,13 @@ contract DeployTestnet is ScriptBase {
         // Wire the set-once registry reference on sWOOD.
         StakedWood(swoodProxy).setRegistry(registryProxy);
 
-        // 5. Deploy SyndicateFactory (UUPS proxy). Must match predictedFactoryProxy.
+        // 5. Tier registry — mandatory `InitParams` field (pashov finding #1),
+        //    so it precedes the factory. Deployer-owned at birth so the launch
+        //    adapter set can be announced before multisig handoff.
+        TierRegistry tierRegistry = new TierRegistry(deployer);
+        console.log("TierRegistry:", address(tierRegistry));
+
+        // 6. Deploy SyndicateFactory (UUPS proxy). Must match predictedFactoryProxy.
         SyndicateFactory factoryImpl = new SyndicateFactory();
         bytes memory factoryInitData = abi.encodeCall(
             SyndicateFactory.initialize,
@@ -134,14 +146,14 @@ contract DeployTestnet is ScriptBase {
                     beacon: beacon,
                     protocolConfig: address(protocolConfig),
                     managementFeeBps: 50,
-                    guardianRegistry: registryProxy
+                    guardianRegistry: registryProxy,
+                    tierRegistry: address(tierRegistry)
                 }))
         );
         SyndicateFactory factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInitData)));
         require(address(factory) == predictedFactoryProxy, "factory addr mismatch");
         console.log("SyndicateFactory:", address(factory));
 
-        // 6. Wire governor → factory. Setters apply immediately.
         //    Guardian fee recipient pinned at init — no separate wiring.
         // factory set at governor initialize time (per-vault design)
 
