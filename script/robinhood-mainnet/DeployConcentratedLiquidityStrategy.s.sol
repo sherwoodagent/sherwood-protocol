@@ -92,18 +92,38 @@ contract DeployConcentratedLiquidityStrategy is ScriptBase {
     ///      artifact this script produces — so requiring it is a scheduling
     ///      constraint, not a circular one.
     ///
-    ///      SKIPS ONLY WHEN THE REGISTRY IS GENUINELY UNKNOWABLE — the address
-    ///      book has no `TIER_REGISTRY` key, i.e. a fork or partial deployment
-    ///      where the core phase never ran. That is the one case where this
-    ///      cannot be evaluated rather than the case where it is inconvenient.
-    ///      A registry that IS in the book but cannot answer the selector fails
-    ///      the run: a registry that cannot be asked has not vouched, matching
-    ///      how `_readAllowed` treats the same silence at runtime.
+    ///      SKIPS ONLY WHEN THE REGISTRY IS GENUINELY UNKNOWABLE — the core
+    ///      phase never ran, so there is no registry to ask. That is the one
+    ///      case where this cannot be evaluated rather than the case where it is
+    ///      inconvenient. A registry that IS in the book but cannot answer the
+    ///      selector fails the run: a registry that cannot be asked has not
+    ///      vouched, matching how `_readAllowed` treats the same silence at
+    ///      runtime.
+    ///
+    ///      "Core never ran" is read off `SYNDICATE_FACTORY`, not off
+    ///      `TIER_REGISTRY` itself. Keying the skip on the missing key would
+    ///      make the gate disarm itself in exactly the case worth catching: a
+    ///      book that HAS core but is missing the registry key is a broken or
+    ///      hand-edited book, and treating that silence as "nothing to verify"
+    ///      is the same mistake as treating an unanswerable registry as a grant.
+    ///      Both phases write to `chains/{chainId}.json`, so the two keys land
+    ///      together or not at all.
     function _assertFactoryIsVouchedFor(address uniswapFactory) internal view {
         string memory book = vm.readFile(_chainsPath());
-        address registry =
-            vm.keyExistsJson(book, ".TIER_REGISTRY") ? vm.parseJsonAddress(book, ".TIER_REGISTRY") : address(0);
+        bool hasRegistry = vm.keyExistsJson(book, ".TIER_REGISTRY");
+        _requireBookIsComplete(hasRegistry, vm.keyExistsJson(book, ".SYNDICATE_FACTORY"));
+        address registry = hasRegistry ? vm.parseJsonAddress(book, ".TIER_REGISTRY") : address(0);
         _requireFactoryVouchedBy(registry, uniswapFactory);
+    }
+
+    /// @dev Split from the address-book read above for the same reason
+    ///      `_requireFactoryVouchedBy` is: the DECISION is reachable from a test
+    ///      without staging a chains JSON on disk.
+    function _requireBookIsComplete(bool hasRegistry, bool hasFactory) internal pure {
+        require(
+            hasRegistry || !hasFactory,
+            "address book names SYNDICATE_FACTORY but no TIER_REGISTRY - the core phase writes both, so this book is incomplete and the factory allowlist cannot be verified"
+        );
     }
 
     /// @dev Split from the address-book read above so the DECISION is reachable

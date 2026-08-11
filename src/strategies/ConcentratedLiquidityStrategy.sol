@@ -188,6 +188,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         enough to clear the pool-share cap, an `observe` whose TWAP
     ///         always equals its own spot, and a `factory()` naming whichever
     ///         address makes the check pass.
+    ///         Also raised when `pool` itself holds no code: the key the factory
+    ///         is asked about is read off the pool with typed calls, and an
+    ///         address that cannot be asked what pair it trades was never a pool
+    ///         the factory created.
     /// @dev    Deliberately does NOT read `pool.factory()`. That answer comes
     ///         from the party being checked; see check (1) in `_initialize` for
     ///         why asking the factory is the only direction that establishes
@@ -589,6 +593,16 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         //     return — resolves to `address(0)`, fails the comparison, and
         //     reverts with THIS contract's error rather than undecodably inside
         //     a typed call.
+        //
+        //     BOTH SIDES GET THAT TREATMENT. The pool is read with TYPED calls
+        //     (`token0`/`token1`/`fee`) before the factory is asked, because
+        //     they only build the lookup key — but a typed call to an address
+        //     with no code reverts in THIS frame with empty returndata, which is
+        //     indistinguishable from a bug in the guard. So codelessness is
+        //     rejected here, up front, with the same error the provenance
+        //     comparison raises: an address that cannot be asked what pair it
+        //     trades was never a pool the factory created.
+        if (p.pool.code.length == 0) revert PoolNotFromFactory();
         IUniswapV3Pool pool_ = IUniswapV3Pool(p.pool);
 
         address t0 = pool_.token0();
@@ -948,6 +962,15 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         _requireAllowedCounterparty(registry, otherToken);
         address coll = _marketParams.collateralToken;
         if (coll != asset) _requireAllowedCounterparty(registry, coll);
+        // `uniswapFactory` is DELIBERATELY ABSENT, and the asymmetry with
+        // `otherToken` above is the reason to say so. Every address re-checked
+        // here keeps receiving vault funds or approvals for the clone's whole
+        // life. The factory receives neither: it is asked one question, once, at
+        // init — "did you create this pool?" — and the answer is a fact about
+        // the past that a later demotion cannot retract. Re-checking it would
+        // let a demotion freeze `execute()` and the permissionless `rerange()`
+        // over a pool whose provenance is still exactly as established, which is
+        // the capital-hostage failure the exit paths are ungated to avoid.
     }
 
     /// @dev Staticcall-safe boolean read, shared by both allowlist axes.

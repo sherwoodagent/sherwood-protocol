@@ -16,6 +16,10 @@ contract DeployCLHarness is DeployConcentratedLiquidityStrategy {
     function exposed_requireFactoryVouchedBy(address registry, address uniswapFactory) external view {
         _requireFactoryVouchedBy(registry, uniswapFactory);
     }
+
+    function exposed_requireBookIsComplete(bool hasRegistry, bool hasFactory) external pure {
+        _requireBookIsComplete(hasRegistry, hasFactory);
+    }
 }
 
 /// @notice A registry answering the selector with something that is not a
@@ -85,6 +89,34 @@ contract DeployConcentratedLiquidityStrategyTest is Test {
     ///         because it is inconvenient.
     function test_gate_skipsWhenTheBookNamesNoRegistry() public view {
         harness.exposed_requireFactoryVouchedBy(address(0), uniswapFactory);
+    }
+
+    /// @notice THE SKIP MUST NOT DISARM THE GATE. A book naming `SYNDICATE_FACTORY`
+    ///         has had the core phase run, and that phase writes `TIER_REGISTRY`
+    ///         in the same block of `_patchAddress` calls — so a book with one
+    ///         and not the other is broken or hand-edited. Reading that silence
+    ///         as "nothing to verify" is the same mistake as reading an
+    ///         unanswerable registry as a grant.
+    function test_book_failsWhenCoreRanButNamesNoRegistry() public {
+        vm.expectRevert(bytes(_incompleteBookMessage()));
+        harness.exposed_requireBookIsComplete(false, true);
+    }
+
+    /// @notice The tolerated case, unchanged: no core, so nothing to verify.
+    function test_book_allowsAPreCoreBook() public view {
+        harness.exposed_requireBookIsComplete(false, false);
+    }
+
+    /// @notice And a complete book passes regardless of what else is in it.
+    function test_book_allowsACompleteBook() public view {
+        harness.exposed_requireBookIsComplete(true, true);
+    }
+
+    function _incompleteBookMessage() private pure returns (string memory) {
+        return string.concat(
+            "address book names SYNDICATE_FACTORY but no TIER_REGISTRY - the core phase writes both, ",
+            "so this book is incomplete and the factory allowlist cannot be verified"
+        );
     }
 
     function _unlistedMessage() private pure returns (string memory) {

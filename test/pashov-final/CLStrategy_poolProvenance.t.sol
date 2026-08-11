@@ -139,6 +139,20 @@ contract PashovFinalCLPoolProvenanceTest is CLFixture {
         _expectInitRevert(ConcentratedLiquidityStrategy.PoolNotFromFactory.selector, p);
     }
 
+    /// @notice A codeless `pool` fails closed with THIS contract's error too.
+    /// @dev    The key the factory is asked about (`token0`/`token1`/`fee`) is
+    ///         read off the pool with TYPED calls, so without an explicit
+    ///         code check an EOA pool reverts in `_initialize`'s own frame with
+    ///         empty returndata — indistinguishable from a bug in the guard, and
+    ///         the exact failure mode the sibling test above pins for the
+    ///         factory side. Both sides now answer the same way.
+    function test_init_codelessPoolFailsClosedDecodably() public {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.pool = makeAddr("eoaPool");
+
+        _expectInitRevert(ConcentratedLiquidityStrategy.PoolNotFromFactory.selector, p);
+    }
+
     /// @notice The genuine configuration still initializes — the guard above
     ///         must not be passing for the trivial reason that it refuses
     ///         everything.

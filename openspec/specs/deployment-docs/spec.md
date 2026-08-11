@@ -100,7 +100,9 @@ The list SHALL name `PORTFOLIO_TEMPLATE`, `MORPHO_SUPPLY_TEMPLATE` and `CONCENTR
 
 An unlisted factory therefore does not degrade the template, it makes it INERT — the ceremony completes, `DeployStrategyFactory` allowlists the template, agents write proposals, and every one reverts at clone-init. The registry owner SHALL call `TierRegistry.setCounterpartyAllowed(UNISWAP_V3_FACTORY, true)` before `DeployConcentratedLiquidityStrategy` runs.
 
-This SHALL be enforced as a deploy-time assertion, not as prose in a runbook. `TierRegistry` is `Ownable2Step` and belongs to the parameter multisig, so the deployer key cannot make the grant itself — but the grant depends on no artifact this phase produces, so requiring it is a scheduling constraint rather than a circular one. The assertion SHALL skip only when the address book carries no `TIER_REGISTRY` key (a fork or partial deployment where the core phase never ran), and SHALL fail when the named registry cannot answer the selector — a registry that cannot be asked has not vouched.
+This SHALL be enforced as a deploy-time assertion, not as prose in a runbook. `TierRegistry` is `Ownable2Step` and belongs to the parameter multisig, so the deployer key cannot make the grant itself — but the grant depends on no artifact this phase produces, so requiring it is a scheduling constraint rather than a circular one. The assertion SHALL skip only when the core phase never ran, and SHALL fail when the named registry cannot answer the selector — a registry that cannot be asked has not vouched.
+
+"The core phase never ran" SHALL be read off `SYNDICATE_FACTORY`, not off `TIER_REGISTRY` itself. Keying the skip on the missing key would disarm the gate in the case most worth catching: both keys are written to `chains/{chainId}.json` by the same phase, so a book naming one and not the other is incomplete, and treating that silence as "nothing to verify" is the same error as treating an unanswerable registry as a grant.
 
 #### Scenario: Ceremony run before the grant
 - **WHEN** `DeployConcentratedLiquidityStrategy` runs and `isCounterpartyAllowed(UNISWAP_V3_FACTORY)` is false
@@ -111,8 +113,12 @@ This SHALL be enforced as a deploy-time assertion, not as prose in a runbook. `T
 - **THEN** the script reverts rather than treating the silence as a grant
 
 #### Scenario: Core phase never ran
-- **WHEN** the address book carries no `TIER_REGISTRY` key at all
+- **WHEN** the address book carries neither `TIER_REGISTRY` nor `SYNDICATE_FACTORY`
 - **THEN** the script proceeds and prints the required `setCounterpartyAllowed` call as a RUNBOOK line, because the grant cannot be verified from there
+
+#### Scenario: Incomplete address book
+- **WHEN** the address book names `SYNDICATE_FACTORY` but carries no `TIER_REGISTRY` key
+- **THEN** the script reverts, because the core phase writes both keys together and a book holding one without the other cannot be read as "nothing to verify"
 
 ### Requirement: Each CL pool's volatile leg is counterparty-allowlisted before its proposal
 
