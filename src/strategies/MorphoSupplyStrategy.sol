@@ -350,6 +350,16 @@ contract MorphoSupplyStrategy is BaseStrategy {
         return own + IERC20(asset).balanceOf(address(this));
     }
 
+    /// @inheritdoc IStrategyDelivery
+    /// @dev Always FALSE, and by construction rather than by policy: this
+    ///      template's only position is a Morpho supply whose loan token IS the
+    ///      vault asset, so `undeliveredValue()` expresses everything it holds
+    ///      in vault-asset units with no price conversion anywhere. There is no
+    ///      leg it cannot value.
+    function hasUnvaluedResidue() public pure override returns (bool) {
+        return false;
+    }
+
     /// @dev (own supply shares, their redeemable value, the amount the market
     ///      can actually pay out right now). Shared core for `_settle`, `sweep`
     ///      and the two delivery probes — deliberately WITHOUT a `_state` gate:

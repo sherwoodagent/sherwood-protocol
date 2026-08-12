@@ -251,6 +251,16 @@ abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
         return 0;
     }
 
+    /// @inheritdoc IStrategyDelivery
+    /// @dev Default FALSE, matching the zero default above: a template that
+    ///      holds nothing has nothing it cannot value. A template that DOES
+    ///      hold value its `undeliveredValue()` override cannot express must
+    ///      override this too, or the vault will price mints against a figure
+    ///      that silently omits it.
+    function hasUnvaluedResidue() public view virtual returns (bool) {
+        return false;
+    }
+
     /// @dev Dust floor for the residue probes. Anyone may transfer 1 wei to a
     ///      long-settled clone, and `hasUndeliveredValue()` keying on `!= 0`
     ///      turned that into an indefinite deposit DoS: `sweep()` clears it,

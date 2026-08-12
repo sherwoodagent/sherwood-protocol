@@ -47,6 +47,10 @@ interface ISyndicateVault {
     error QueueReserveBreached();
     error NotQueue();
     error ZeroAssets();
+    /// @notice A deposit would mint zero shares — refused rather than taking the
+    ///         assets for nothing. Reachable when the price denominator is large
+    ///         enough that `previewDeposit` floors to zero.
+    error ZeroShares();
     /// @notice `setAgentFeeBps` was called with `bps > MAX_AGENT_FEE_BPS`.
     error AgentFeeTooHigh();
     /// @notice `setMinBufferBps` was called with `bps > 5_000` (50%).
@@ -177,13 +181,10 @@ interface ISyndicateVault {
     function governor() external view returns (address);
     function redemptionsLocked() external view returns (bool);
     /// @notice True while a mint must not happen: an open proposal, or a settled
-    ///         strategy still holding undelivered value (the residue). The
-    ///         second arm is finding #3's gate — minting against a price that
-    ///         excludes the residue is the skim, so BOTH the instant path and
-    ///         the queue's deposit claim refuse on this one predicate.
-    /// @dev    Degrades CLOSED once a strategy is pinned; see the implementation
-    ///         for why the earlier degrade-open posture is unsafe now that the
-    ///         async path gates on it too.
+    ///         strategy holding residue no template can express in vault-asset
+    ///         units. A residue that CAN be valued does not lock — it is priced
+    ///         into `depositNav()` instead (finding #3). Both the instant path
+    ///         and the queue's deposit claim refuse on this one predicate.
     function depositsLocked() external view returns (bool);
     /// @notice Assets the vault is worth for pricing a MINT: idle float plus the
     ///         value settled strategies still owe. Redemptions deliberately keep
@@ -309,6 +310,11 @@ interface ISyndicateVault {
     ///         being priced in. `collected` is what this call actually
     ///         recovered, which may be zero if someone else swept first.
     event ResidueCleared(address indexed strategy, uint256 collected);
+    /// @notice A settled strategy started or stopped holding residue it cannot
+    ///         value in vault-asset units. Deposits are refused while any
+    ///         strategy is in this state — the one residue shape a price cannot
+    ///         express.
+    event ResidueUnvalued(address indexed strategy, bool unvalued);
     event RedeemRequested(uint256 indexed requestId, address indexed owner, uint256 shares);
     event DepositRequested(uint256 indexed requestId, address indexed receiver, uint256 assets);
 }

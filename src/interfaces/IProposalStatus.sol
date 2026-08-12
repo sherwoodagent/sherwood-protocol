@@ -21,6 +21,12 @@ pragma solidity 0.8.28;
 interface IProposalStatus {
     /// @notice Id of the proposal currently binding the vault (0 = none).
     function getActiveProposal() external view returns (uint256);
+    /// @notice The vault's asset balance immediately before the proposal's
+    ///         execute batch ran. Read by `SyndicateVault` as the upper bound on
+    ///         what that proposal's strategy can still owe back — a strategy
+    ///         cannot return more principal than the vault held when it was
+    ///         funded.
+    function getCapitalSnapshot(uint256 proposalId) external view returns (uint256);
 
     /// @notice Count of non-terminal proposals (Pending..Executed). Nonzero ⇒
     ///         instant deposits are gated (see vault `depositsLocked`).

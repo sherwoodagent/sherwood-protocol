@@ -9,9 +9,20 @@ import {IVaultWithdrawalQueue} from "../../src/interfaces/IVaultWithdrawalQueue.
 ///      `sweep()` would still return.
 contract StubDeliveryStrategy {
     bool public holding;
+    bool public unvalued;
 
     function setHolding(bool v) external {
         holding = v;
+    }
+
+    /// @dev Residue this template could not express in vault-asset units — an LP
+    ///      leg, a volatile token, a non-asset collateral.
+    function setUnvalued(bool v) external {
+        unvalued = v;
+    }
+
+    function hasUnvaluedResidue() external view returns (bool) {
+        return unvalued;
     }
 
     function hasUndeliveredValue() external view returns (bool) {
@@ -376,5 +387,122 @@ contract PashovFinalDepositResiduePricingTest is VaultInstantLiquidityTest {
         uint256 expected = vault.previewDeposit(1_000e6);
         assertEq(queue.claim(id), expected, "priced at the plain live price");
         assertEq(vault.balanceOf(alice), expected, "shares landed with the depositor");
+    }
+
+    // ── B1: residue a template cannot value still BLOCKS, it cannot be priced ──
+
+    /// @notice THE SKIM THAT SURVIVED PRICING. `ConcentratedLiquidityStrategy`
+    ///         reports `undeliveredValue()` deliberately partial and biased low:
+    ///         it excludes a live LP position, the volatile leg, and non-asset
+    ///         collateral, because valuing them means reading a price the
+    ///         proposal can move — the lever finding #3 was exploited through.
+    ///
+    ///         Under-reporting was harmless while a BOOLEAN lock covered every
+    ///         residue shape. Once the figure sets the price a mint pays,
+    ///         "biased low" IS the skim: a depositor mints against a price
+    ///         missing the LP leg, sweeps it in, and takes the difference.
+    ///         Pricing replaces the lock only where the value is knowable, so
+    ///         the lock survives exactly where it is not.
+    function test_finding3_unvaluableResidueStillBlocksDeposits() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setUnvalued(true);
+        _settleWith(address(deliveryStrat));
+
+        assertTrue(vault.depositsLocked(), "no honest price exists, so no mint");
+        vm.prank(alice);
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(1_000e6, alice);
+    }
+
+    /// @notice And it lifts once the unvaluable leg is gone. Every such shape is
+    ///         unwindable by the permissionless sweep — burning an LP position
+    ///         always returns its tokens — so unlike an illiquid Morpho supply
+    ///         this cannot wedge the vault.
+    function test_finding3_unvaluableResidueClearsOnSweep() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setUnvalued(true);
+        _settleWith(address(deliveryStrat));
+
+        deliveryStrat.setUnvalued(false);
+        vault.collectResidue(address(deliveryStrat));
+
+        assertFalse(vault.depositsLocked(), "unwound, so priceable again");
+        vm.prank(alice);
+        assertGt(vault.deposit(1_000e6, alice), 0, "deposits reopen");
+    }
+
+    /// @notice A VALUABLE residue does NOT block — that is the point of pricing.
+    ///         Only the unvaluable shape falls back to refusal.
+    function test_finding3_valuableResidueDoesNotBlock() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(1_000e6);
+        _settleWith(address(deliveryStrat));
+
+        assertFalse(vault.depositsLocked(), "priceable, so not blocked");
+        assertEq(vault.depositNav(), vault.totalAssets() + 1_000e6, "priced instead");
+    }
+
+    // ── B2: the self-reported figure is bounded ──
+
+    /// @notice AN UNBOUNDED SELF-REPORTED NUMBER IS A DEPOSIT BRICK. The figure
+    ///         comes from a proposer-chosen contract that `propose` does not
+    ///         validate. Near `type(uint256).max` it would overflow
+    ///         `depositNav()` and revert every mint path with no way to clear;
+    ///         merely large would floor `previewDeposit` to zero.
+    ///
+    ///         Capped at the capital the vault held when the batch that funded
+    ///         the strategy ran: it cannot owe back more than it was handed.
+    function test_finding3_absurdResidueReportIsCappedNotFatal() public {
+        governor.setCapitalSnapshot(2_000e6);
+
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(type(uint256).max);
+        _settleWith(address(deliveryStrat));
+
+        assertEq(vault.depositNav(), vault.totalAssets() + 2_000e6, "clamped to the capital bound");
+
+        vm.prank(alice);
+        assertGt(vault.deposit(1_000e6, alice), 0, "mint paths still work");
+    }
+
+    /// @notice The cap holds on REFRESH too, so a strategy cannot report small
+    ///         at settlement and enormous afterwards.
+    function test_finding3_capHoldsOnRefresh() public {
+        governor.setCapitalSnapshot(2_000e6);
+
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(100e6);
+        _settleWith(address(deliveryStrat));
+
+        deliveryStrat.setResidue(type(uint256).max);
+        vault.collectResidue(address(deliveryStrat));
+
+        assertEq(vault.depositNav(), vault.totalAssets() + 2_000e6, "still bounded");
+    }
+
+    /// @notice A deposit that would mint zero shares is refused rather than
+    ///         swallowing the assets. Independent of the residue work: the
+    ///         instant path simply never had the guard the queue path has.
+    function test_deposit_refusesWhenItWouldMintZeroShares() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(type(uint128).max);
+        _settleWith(address(deliveryStrat));
+
+        vm.prank(alice);
+        vm.expectRevert(ISyndicateVault.ZeroShares.selector);
+        vault.deposit(1, alice);
+    }
+
+    /// @notice Zero in, zero out stays the harmless ERC-4626 no-op — the guard
+    ///         is scoped to assets actually being taken.
+    function test_deposit_zeroAssetsIsStillANoOp() public {
+        vm.prank(alice);
+        assertEq(vault.deposit(0, alice), 0, "zero-asset deposit is not an error");
     }
 }

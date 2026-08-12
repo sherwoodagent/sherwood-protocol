@@ -244,8 +244,9 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             // against a frozen number, so there is nothing to wait for and no
             // stamp to require — what it needs is an instant at which minting is
             // honest, which is exactly what `depositsLocked()` answers: no open
-            // proposal AND no settled strategy still holding a residue. That
-            // predicate subsumes `redemptionsLocked()` (an active proposal
+            // proposal and no residue that cannot be
+            // valued (a valuable one is charged for by `previewDeposit` below,
+            // not blocked). That predicate subsumes `redemptionsLocked()` (an active proposal
             // implies a nonzero open count), so it is the only gate here.
             //
             // This also retires the `_lastStampedPid >= r.pid` requirement,
@@ -303,10 +304,10 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             // for one callback frame, forcing under-delivery on demand).
             //
             // Two changes close it together, and neither suffices alone. The
-            // gate above admits the claim only at an instant with no residue
-            // outstanding; this live read then prices whatever the vault holds
-            // AT THAT INSTANT — including a residue already swept in, which a
-            // frozen stamp would still be blind to.
+            // gate above admits the claim only at an instant the vault can
+            // price honestly; this live read then charges for what it is worth
+            // AT THAT INSTANT — float PLUS what settled strategies still owe,
+            // which a frozen stamp is blind to either way.
             //
             // The escrowed assets never entered the strategy (they sit in this
             // contract, off-vault, uncounted in `totalAssets`), so the honest
@@ -353,9 +354,10 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         // always mints at the price prevailing in that instant, so the option
         // is worth zero and the straddle has no payoff to straddle. Cancel is
         // then just "I changed my mind", which is what it was always for — and
-        // it must stay open, because the deposit gate can hold a claim shut
-        // while a residue is outstanding and a depositor must never be wedged
-        // between a closed claim and a closed cancel.
+        // it must stay open, because the deposit gate can still hold a claim
+        // shut (an open proposal, or a residue no template can value) and a
+        // depositor must never be wedged between a closed claim and a closed
+        // cancel.
         //
         // Redeem keeps `r.pid`: those shares left the supply at that settlement
         // and `_pidReserved` is denominated against that same frozen price, so
