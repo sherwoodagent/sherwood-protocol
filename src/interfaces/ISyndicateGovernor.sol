@@ -232,7 +232,7 @@ interface ISyndicateGovernor {
     /// @notice Fail-safe sibling to `TierRegressed`/`CoverageRegressed`: revert at
     ///         execute if `proposal.maxCapital` now exceeds the LIVE
     ///         `totalAssets() * maxCapitalBps / 10_000` ceiling. The propose-time
-    ///         check alone is not sufficient: `_depositsLocked()` rises at PROPOSE
+    ///         check alone is not sufficient: `depositsLocked()` rises at PROPOSE
     ///         but `redemptionsLocked()` only at EXECUTE, so between the two a
     ///         proposer can inflate `totalAssets()` with its own deposit to pass
     ///         the propose-time ratio, then redeem that same deposit during the

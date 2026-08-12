@@ -27,8 +27,23 @@ contract MockIrm is IIrm {
         reverting = reverting_;
     }
 
+    /// @dev Burn this much gas in the view. Models the finding-#3 suppression
+    ///      vector: `marketParams.irm` is proposer-chosen and unbound, so an IRM
+    ///      whose view exceeds the vault's `_PROBE_GAS` cap makes the residue
+    ///      probe fail while the uncapped `sweep()` path still works.
+    uint256 public gasToBurn;
+
+    function setGasToBurn(uint256 g) external {
+        gasToBurn = g;
+    }
+
     function borrowRateView(MarketParams memory, Market memory) external view returns (uint256) {
         require(!reverting, "MockIrm: reverting");
+        uint256 burn = gasToBurn;
+        if (burn != 0) {
+            uint256 target = gasleft() > burn ? gasleft() - burn : 0;
+            while (gasleft() > target) {}
+        }
         return rate;
     }
 }

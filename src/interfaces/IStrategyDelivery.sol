@@ -31,7 +31,7 @@ interface IStrategyDelivery {
     /// @notice True while this strategy still holds value belonging to the
     ///         vault that a `sweep()` (or equivalent release) would return.
     ///
-    ///         Read by `SyndicateVault._depositsLocked` through a length-checked
+    ///         Read by `SyndicateVault` through a length-checked
     ///         staticcall that degrades OPEN: a strategy which cannot answer
     ///         leaves deposits unlocked rather than bricking them, since failing
     ///         closed would let one non-conforming clone shut deposits for the
@@ -41,19 +41,28 @@ interface IStrategyDelivery {
     /// @notice The vault-asset value this strategy still holds and has not
     ///         delivered — the AMOUNT behind `hasUndeliveredValue`'s bool.
     ///
-    /// @dev    CURRENTLY UNREAD BY THE VAULT, and deliberately so. The stamp
-    ///         correction that would have consumed it was attempted twice and
-    ///         reverted — raising the settle price reserves float the vault does
-    ///         not hold, and no cap on the price bounds that (see the note at
-    ///         `SyndicateVault.onProposalSettled` and issue #233). This member
-    ///         is retained as the hook the replacement mechanism will use;
-    ///         treat it as reserved, not as live behaviour.
+    /// @dev    LIVE, AND LOAD-BEARING: this is the number every MINT is priced
+    ///         against. The vault adds it to `totalAssets()` in `depositNav()`,
+    ///         which `previewDeposit` / `previewMint` read, so a report that is
+    ///         too LOW is the finding-#3 skim (a depositor mints against a price
+    ///         missing value they can then sweep in) and one that is too HIGH
+    ///         only over-charges that depositor. Bias low is therefore NOT safe
+    ///         here in the way it was when a boolean lock guarded the mint —
+    ///         anything this cannot value must be declared through
+    ///         `hasUnvaluedResidue()` so the vault refuses to mint instead of
+    ///         charging a number it knows is incomplete.
     ///
-    ///         UNREAD AND THEREFORE UNCOVERED. With no caller, the vault-side
-    ///         degrade path is unreachable from a test, and a test asserting
-    ///         otherwise would be theatre — one was written and removed for
-    ///         exactly that reason. Whoever wires the consumer in #233 owns
-    ///         covering it then.
+    ///         The stamp correction that would once have consumed this was
+    ///         attempted twice and reverted — raising the settle price reserves
+    ///         float the vault does not hold. That is why the figure lives on
+    ///         the DEPOSIT side only: redemptions still read `totalAssets()`,
+    ///         so nothing is ever paid out against value that has not arrived.
+    ///
+    ///         BOUNDED BY THE CALLER. The vault clamps each strategy's
+    ///         contribution to the capital it was handed
+    ///         (`SyndicateVault._residueCap`), because this member is
+    ///         self-reported by a proposer-chosen contract and an unbounded
+    ///         figure would overflow or zero out every mint path.
     ///
     ///         READ ONLY AT SETTLEMENT once a caller exists, and that scoping is
     ///         the whole safety argument. `VaultWithdrawalQueue`'s header commits the vault to
@@ -70,4 +79,25 @@ interface IStrategyDelivery {
     ///         length-checked staticcall that treats any failure as 0, which
     ///         degrades to the pre-fix stamp rather than to a wrong one.
     function undeliveredValue() external view returns (uint256);
+
+    /// @notice Whether this strategy holds undelivered value it CANNOT express
+    ///         in vault-asset units — an open LP position, a volatile leg, a
+    ///         collateral token that is not the vault asset.
+    /// @dev    THE COMPANION `undeliveredValue()` NEEDS TO BE HONEST ABOUT ITS
+    ///         OWN BLIND SPOTS. That figure is deliberately partial and biased
+    ///         low, because valuing the excluded legs would mean consulting a
+    ///         price an attacker can move inside the settlement transaction —
+    ///         exactly what finding #3 exploited. Under-reporting was harmless
+    ///         while a boolean lock covered every residue shape; it is NOT
+    ///         harmless now that the figure sets the price a mint pays, because
+    ///         "biased low" is then precisely the skim.
+    ///
+    ///         So a template that cannot value something must SAY so here. The
+    ///         vault prices what is valued and refuses to mint at all while
+    ///         anything is unvalued — the one place a lock still beats a price,
+    ///         since there is no honest number to charge.
+    ///
+    ///         MUST NOT REVERT and must not depend on a movable price; an
+    ///         unreadable answer is treated as the last known one.
+    function hasUnvaluedResidue() external view returns (bool);
 }

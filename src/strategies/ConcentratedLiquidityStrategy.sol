@@ -2010,7 +2010,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // and a proposer can reach it cheaply by omitting `settle()` from a
         // `maxDrawdownBps == 10_000` batch. A permanent DoS is worse than the
         // fail-open it was closing, and it would have falsified
-        // `_depositsLocked`'s "NOBODY IS WEDGED" doctrine.
+        // `depositsLocked`'s "NOBODY IS WEDGED" doctrine.
         //
         // Closing the emergency-path gap needs `sweep()` reachable for a
         // terminal-but-`Executed` clone first — either by relaxing its gate or
@@ -2054,11 +2054,18 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      the unrealized, strategy-influenced NAV the frozen-price design
     ///      exists to avoid — the same lever findings #2/#3 pull.
     ///
-    ///      Under-reporting is the SAFE direction: the stamp stays at or below
-    ///      true value, so a queued depositor can never mint against value that
-    ///      was counted but never arrives. `hasUndeliveredValue()` still returns
-    ///      true for every residue shape, so the deposit lock keeps its wider
-    ///      coverage; only the PRICE correction is narrowed.
+    ///      UNDER-REPORTING IS NO LONGER SAFE ON ITS OWN, and that changed
+    ///      under this function rather than inside it. While the vault only
+    ///      needed a boolean, omitting a leg cost nothing: the lock covered
+    ///      every residue shape and the price stayed float-only. The vault now
+    ///      prices MINTS against this figure, so an omission is exactly the
+    ///      finding-#3 skim — a depositor mints against a price missing the LP
+    ///      leg, sweeps it in, and takes the difference from the incumbents.
+    ///
+    ///      What keeps the narrowing safe is `hasUnvaluedResidue()` below, which
+    ///      declares every shape this omits. The vault refuses to mint at all
+    ///      while any of them is outstanding, so the partial figure is only ever
+    ///      used when it is also COMPLETE.
     function undeliveredValue() public view override returns (uint256) {
         if (_state != State.Settled) return 0;
         uint256 v = IERC20(asset).balanceOf(address(this));
@@ -2085,6 +2092,42 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // contributes nothing rather than subtracting from the stamp.
         if (uint256(pos.collateral) > owed) v += uint256(pos.collateral) - owed;
         return v;
+    }
+
+    /// @inheritdoc IStrategyDelivery
+    /// @dev THE EXACT COMPLEMENT OF WHAT `undeliveredValue()` ABOVE CAN PRICE.
+    ///      That figure is deliberately partial: it reports the idle vault-asset
+    ///      balance, plus Morpho collateral net of debt ONLY when the collateral
+    ///      token IS the vault asset. Everything else needs a price this
+    ///      template refuses to consult, because the venue quoting it is one the
+    ///      proposal can trade — the lever finding #3 was exploited through.
+    ///
+    ///      So this reports the residue shapes that figure omits, and the vault
+    ///      refuses to mint at all while any of them is outstanding. Under a
+    ///      boolean lock the omission was harmless (the lock covered every
+    ///      shape); once the figure sets the price a mint pays, an omission IS
+    ///      the skim — a depositor mints against a price missing the LP leg,
+    ///      sweeps it in, and takes the difference from the incumbents.
+    ///
+    ///      Every shape here is unwindable by the permissionless `sweep()`:
+    ///      burning an LP position always returns its tokens, there is no
+    ///      illiquid market to wait on, and `releaseUnconvertible` hands off
+    ///      whatever cannot be swapped. So this cannot wedge the vault the way
+    ///      an unclearable Morpho supply could.
+    function hasUnvaluedResidue() public view override returns (bool) {
+        if (_state != State.Settled) return false;
+        // A live LP position — valuing it means reading the pool.
+        if (tokenId != 0) return true;
+        // The volatile leg, which is by construction not the vault asset.
+        if (IERC20(otherToken).balanceOf(address(this)) > RESIDUE_DUST) return true;
+        address coll = _marketParams.collateralToken;
+        if (coll != asset) {
+            // Loose collateral, and collateral still posted to Morpho — both in
+            // a token `undeliveredValue()` bails out on rather than converting.
+            if (IERC20(coll).balanceOf(address(this)) > RESIDUE_DUST) return true;
+            if (morpho.position(marketId, address(this)).collateral > RESIDUE_DUST) return true;
+        }
+        return false;
     }
 
     /// @notice Hand an `otherToken` residue this clone cannot convert to the

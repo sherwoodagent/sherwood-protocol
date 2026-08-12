@@ -47,6 +47,32 @@ contract MockProposalStatus is IProposalStatus {
         return activePid;
     }
 
+    /// @dev The vault reads this as the upper bound on what a settled strategy
+    ///      may still owe (`_residueCap`). Defaults high so fixtures that do not
+    ///      care about the cap are not silently clamped to zero; a test probing
+    ///      the bound sets it explicitly.
+    uint256 public capitalSnapshot = type(uint128).max;
+
+    function setCapitalSnapshot(uint256 v) external {
+        capitalSnapshot = v;
+    }
+
+    function getCapitalSnapshot(uint256) external view returns (uint256) {
+        return capitalSnapshot;
+    }
+
+    /// @dev The vault bounds a residue report by the TIGHTER of this and the
+    ///      capital snapshot. Defaults high for the same reason.
+    uint256 public effectiveMaxCapital = type(uint128).max;
+
+    function setEffectiveMaxCapital(uint256 v) external {
+        effectiveMaxCapital = v;
+    }
+
+    function getEffectiveMaxCapital(uint256) external view returns (uint256) {
+        return effectiveMaxCapital;
+    }
+
     function openProposalCount() external view returns (uint256) {
         return openCount;
     }

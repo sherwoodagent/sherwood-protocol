@@ -115,16 +115,40 @@
       "type": "t_uint256"
     },
     {
-      "label": "_lastSettledStrategy",
+      "label": "_residueAmount",
       "slot": "17",
       "offset": 0,
-      "type": "t_address"
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "_residueTotal",
+      "slot": "18",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_residueCap",
+      "slot": "19",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "_residueUnvalued",
+      "slot": "20",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_bool)"
+    },
+    {
+      "label": "_unvaluedCount",
+      "slot": "21",
+      "offset": 0,
+      "type": "t_uint256"
     },
     {
       "label": "__gap",
-      "slot": "18",
+      "slot": "22",
       "offset": 0,
-      "type": "t_array(t_uint256)30_storage"
+      "type": "t_array(t_uint256)26_storage"
     }
   ],
   "types": {

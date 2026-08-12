@@ -241,9 +241,45 @@ contract SyndicateVault is
     ///         falls and recovers is not charged twice on the same dollars.
     uint256 private _highWaterPricePerShare;
 
-    /// @notice The strategy of the most recently settled proposal, pinned at
-    ///         `onProposalSettled` so `_depositsLocked` can ask whether it still
-    ///         holds undelivered value.
+    /// @notice Last known undelivered value per settled strategy that still owes.
+    ///         Written at `onProposalSettled` and refreshed by the permissionless
+    ///         `collectResidue`; nonzero IS membership.
+    ///
+    ///         PRICED, NOT LOCKED. An earlier version of this gate refused
+    ///         deposits while any strategy still owed. That is a bet on an
+    ///         unanswerable question — will the value come back? — and it pays
+    ///         nothing in the branch where it is wrong: if the residue never
+    ///         arrives, the residue-free price was correct all along and the
+    ///         vault was frozen for nothing, potentially forever, since a market
+    ///         that never refills never clears. Charging the depositor as though
+    ///         it WILL arrive is safe in both branches instead: if it does they
+    ///         paid fairly, if it never does they overpaid and the incumbents
+    ///         are unharmed either way. The depositor carries the risk of value
+    ///         they can see on chain before choosing to enter, which is the
+    ///         right person to carry it.
+    ///
+    ///         DEPOSIT SIDE ONLY, and that asymmetry is the whole safety
+    ///         argument. On a mint, counting this makes the depositor receive
+    ///         FEWER shares — over-counting costs only them. On a redeem it
+    ///         would pay out assets the vault does not hold, which over-pays
+    ///         early exiters and strands the tail. Counting it on both sides is
+    ///         what made the "widen totalAssets()" direction unsafe; this counts
+    ///         it on the safe side only, so `totalAssets()`, the settle stamp,
+    ///         every redeem path, the fee bases and the governor's sizing reads
+    ///         are all untouched. ERC-4626 explicitly permits deposit and redeem
+    ///         to price differently — that is how a vault expresses an entry
+    ///         fee, and this is one: the depositor's share of value not yet home.
+    ///
+    ///         A SET, NOT A POINTER, AND THAT IS THE WHOLE POINT. This was one
+    ///         `_lastSettledStrategy` slot, overwritten at every settlement —
+    ///         which silently stopped watching the previous strategy even when
+    ///         it was still holding a residue. That reopened the finding-#3 skim
+    ///         one proposal later: settle N dirty (deposits locked, correctly),
+    ///         then settle N+1 clean, and the pin moves to N+1, `depositsLocked`
+    ///         reads "nothing outstanding", deposits open — while N's clone
+    ///         still holds `R` and `sweep()` is permissionless. Deposit cheap,
+    ///         sweep N, skim. The gate has to watch EVERY strategy that still
+    ///         owes, not the most recent one.
     ///
     ///         NEEDED BECAUSE THE ORDINARY POINTER IS GONE BY THE TIME IT WOULD
     ///         BE READ: `_activeStrategy()` resolves through
@@ -251,19 +287,83 @@ contract SyndicateVault is
     ///         IMMEDIATELY AFTER calling this vault — the ordering is CEI and
     ///         load-bearing, see the note on `_activeProposal = 0` there. So the
     ///         pointer is still live during `onProposalSettled` and gone by the
-    ///         time `_depositsLocked` runs, leaving no path back to the strategy
-    ///         that just settled. Pinning here is what survives that gap. Zero
-    ///         when unresolvable, which reads as "nothing outstanding" — see
-    ///         `_depositsLocked`.
-    address private _lastSettledStrategy;
+    ///         time `depositsLocked` runs. Recording membership here is what
+    ///         survives that gap.
+    mapping(address strategy => uint256) private _residueAmount;
+
+    /// @notice Sum of `_residueAmount` across every strategy that still owes —
+    ///         the figure DEPOSITS are priced against, on top of `totalAssets()`.
+    ///
+    ///         A RUNNING TOTAL, NOT AN ITERATION. It sits on every deposit
+    ///         preview, so summing a set there would be both a gas cost and an
+    ///         unbounded-growth hazard. Maintained by `_recordResidue` and
+    ///         `collectResidue`, which are the only two writers of
+    ///         `_residueAmount`.
+    uint256 private _residueTotal;
+
+    /// @notice Upper bound on what each strategy may contribute to
+    ///         `_residueTotal`, pinned at settlement from the proposal's capital
+    ///         snapshot — the vault's own asset balance immediately before the
+    ///         execute batch.
+    ///
+    ///         A SELF-REPORTED NUMBER THAT PRICES MINTS MUST BE BOUNDED. The
+    ///         figure comes from a proposer-chosen contract and `propose`
+    ///         validates nothing about it, so an uncapped report is a deposit
+    ///         brick with no exit: near `type(uint256).max` the addition in
+    ///         `depositNav()` overflows and every mint path reverts, and merely
+    ///         large floors `previewDeposit` to zero, which without the guard in
+    ///         `_deposit` would take a depositor's assets and mint nothing. The
+    ///         cap is the honest bound rather than an arbitrary one: a strategy
+    ///         cannot owe back more PRINCIPAL than the capital its proposal was
+    ///         permitted to move.
+    ///
+    ///         TRUE OF PRINCIPAL, NOT OF PRINCIPAL PLUS YIELD, and the gap is
+    ///         deliberate. A strategy that deployed its full ceiling and earned
+    ///         on it owes slightly more than that ceiling, and this clamp cuts
+    ///         the excess — so the recorded figure runs under, never over. That
+    ///         is the same direction as every other approximation on this path:
+    ///         an under-count costs the depositor a sliver, an over-count would
+    ///         let a hostile clone tax every entrant or brick the mint entirely.
+    mapping(address strategy => uint256) private _residueCap;
+
+    /// @notice Strategies reporting residue they CANNOT value in vault-asset
+    ///         terms — a live LP position, a volatile leg, a non-asset
+    ///         collateral. Set and refreshed alongside `_residueAmount`.
+    mapping(address strategy => bool) private _residueUnvalued;
+
+    /// @notice How many strategies are in `_residueUnvalued`. Deposits are
+    ///         REFUSED while this is nonzero, and that narrow lock is the one
+    ///         place pricing cannot substitute for blocking.
+    ///
+    ///         WHY A LOCK SURVIVES HERE AT ALL. `undeliveredValue()` is
+    ///         deliberately partial on `ConcentratedLiquidityStrategy`: it
+    ///         reports only what the template can value WITHOUT consulting a
+    ///         price an attacker could move, and excludes the LP position, the
+    ///         volatile leg, and a non-asset collateral. Under-reporting was the
+    ///         safe direction while a BOOLEAN lock covered every residue shape —
+    ///         but once the number sets the price, "biased low" IS the skim:
+    ///         a depositor mints against a price missing the LP leg, sweeps it
+    ///         in, and takes the difference. Pricing can only replace the lock
+    ///         where the value is knowable, so the lock is kept exactly where it
+    ///         is not, and nowhere else.
+    ///
+    ///         Bounded, unlike the lock this replaced: every unvaluable shape is
+    ///         unwindable by the permissionless `sweep()` (burning an LP
+    ///         position always returns its tokens — there is no illiquid market
+    ///         to wait on), and `releaseUnconvertible` hands off whatever cannot
+    ///         be swapped, after which the strategy holds nothing and the flag
+    ///         clears.
+    uint256 private _unvaluedCount;
 
     /// @dev Reserved storage for future upgrades. Shrinks whenever a new state
     ///      variable is added above. Grown from 28 → 31 slots: this deletion
     ///      frees `_laneALockPid` (1), `_interimNetFlow` (1), and
     ///      `_crystallizedMgmt`+`_crystallizedPerf` (1, shared) — legal only
     ///      because no vault proxy is live (see design.md "Deployment reality").
-    ///      Back to 30: `_lastSettledStrategy` takes one.
-    uint256[30] private __gap;
+    ///      Back to 26: `_residueAmount`, `_residueTotal`, `_residueCap`,
+    ///      `_residueUnvalued` and `_unvaluedCount` take one each, replacing the
+    ///      single `_lastSettledStrategy` slot.
+    uint256[26] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -1191,26 +1291,235 @@ contract SyndicateVault is
     ///      market must never trap the vault, which is why the deliverable-
     ///      maximum design exists and why this guard is on deposits only.
     ///
-    ///      DEGRADES OPEN, STATED. A strategy that cannot answer leaves deposits
-    ///      unlocked — the pre-existing behaviour — rather than locked. Failing
-    ///      closed here would let one non-conforming clone brick deposits for
-    ///      the vault's whole remaining life, with no permissionless way out,
-    ///      which is a worse and less reversible failure than the mispricing it
-    ///      would be guarding against. Same doctrine as `_escrowedFeeLiability`.
+    ///      DEGRADES OPEN, STATED. A strategy that cannot answer is never
+    ///      marked, so deposits stay unlocked. Failing closed was tried and is
+    ///      unsafe here for a specific structural reason rather than a
+    ///      preference: the mark would be unremovable, and any registered agent
+    ///      can reach it by naming an EOA as the proposal's strategy — see
+    ///      `_recordResidue` for the full trace. A permanent,
+    ///      unrecoverable deposit brick is worse than the suppression it would
+    ///      be guarding, which is the same trade `_PROBE_GAS` documents.
+    ///
+    ///      Bounded, not unbounded: only a strategy that DEFINITELY reported a
+    ///      residue is ever counted, `collectResidue` is the permissionless and
+    ///      untaxed exit, and the very depositor this refuses can call it and
+    ///      then deposit at the corrected price.
     ///
     ///      This closes the MINT side only. Queued redeemers stamped in the same
     ///      `onProposalSettled` call are still priced at the float-only figure
-    ///      and remain underpaid by the residue; that half needs `totalAssets()`
-    ///      itself to count strategy-held value and is deliberately not done
-    ///      here.
-    function _depositsLocked() private view returns (bool) {
+    ///      and remain underpaid by the residue — that is the FAIRNESS half of
+    ///      finding #3 (issue #233), deliberately not closed here; see
+    ///      `docs/nav-residue-design.md`. This PR closes the ATTACK half.
+    /// @notice Public because the withdrawal queue reads it: a queued deposit
+    ///         claim mints at the live price and must be refused on exactly the
+    ///         same predicate as an instant one, or the gate has a hole the
+    ///         width of the async path.
+    function depositsLocked() public view returns (bool) {
         if (IProposalStatus(_getGovernor()).openProposalCount() != 0) return true;
-        address s = _lastSettledStrategy;
-        if (s == address(0)) return false;
-        (bool ok, bytes memory ret) =
-            s.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.hasUndeliveredValue, ()));
-        if (!ok || ret.length != 32) return false;
-        return abi.decode(ret, (uint256)) != 0;
+        // The ONLY residue that still blocks rather than prices: value no
+        // template can express in vault-asset units without an oracle. See
+        // `_unvaluedCount`.
+        return _unvaluedCount != 0;
+    }
+
+    /// @notice Assets the vault is worth FOR PRICING A MINT: idle float plus the
+    ///         value settled strategies still owe it.
+    /// @dev    Deliberately not `totalAssets()`. See `_residueAmount` for why
+    ///         this figure is safe on the deposit side and unsafe on the redeem
+    ///         side; nothing but `previewDeposit` / `previewMint` reads it.
+    function depositNav() public view returns (uint256) {
+        return totalAssets() + _residueTotal;
+    }
+
+    /// @notice Sweep a settled strategy's residue back into the vault and, once
+    ///         it reports nothing outstanding, stop counting it against the
+    ///         deposit gate.
+    /// @dev    PERMISSIONLESS AND UNTAXED BY DESIGN — it is the exit from the
+    ///         lock, and the party most motivated to call it is the depositor
+    ///         being refused. That is what keeps the fail-closed gate from being
+    ///         a wedge: whoever wants in can clear the residue and then deposit,
+    ///         at the corrected price.
+    ///
+    ///         THE SWEEP IS A LOW-LEVEL CALL WITH THE RESULT IGNORED. The
+    ///         address is proposer-chosen (a clone of an allowlisted template,
+    ///         but still), so a typed call would let a reverting clone brick the
+    ///         only exit from the lock. A failed sweep simply recovers nothing
+    ///         and leaves the strategy counted, which is the honest outcome.
+    ///
+    ///         CLEARS ON A DEFINITE "NOTHING OUTSTANDING", OR ON CODELESSNESS.
+    ///         An unreadable probe on a live contract leaves the strategy
+    ///         counted — deposits stay shut, the safe direction, and the honest
+    ///         one since the vault genuinely cannot tell whether value is still
+    ///         out. That state is only ever entered from a definite readable
+    ///         "yes" (see `_recordResidue`), so it means a strategy
+    ///         that DID owe has stopped answering, not that an arbitrary address
+    ///         was marked. The codeless arm covers a strategy that has since
+    ///         self-destructed: it can hold nothing and answer nothing, so
+    ///         counting it forever would be a wedge with no upside.
+    ///
+    ///         A CONFORMING STRATEGY WHOSE MARKET NEVER REFILLS still holds the
+    ///         gate — `hasUndeliveredValue` stays true while `own` exceeds the
+    ///         dust floor even when `deliverable` is zero. That is a real,
+    ///         accepted liveness cost of the lock and the reason the round
+    ///         ledger's timeout/guardian backstop exists (issue #233); it is
+    ///         deliberately not improvised here.
+    function collectResidue(address strategy) external nonReentrant returns (uint256 collected) {
+        uint256 known = _residueAmount[strategy];
+        if (known == 0 && !_residueUnvalued[strategy]) return 0;
+
+        uint256 before = IERC20(asset()).balanceOf(address(this));
+        // solhint-disable-next-line avoid-low-level-calls
+        (bool swept,) = strategy.call{gas: _SWEEP_GAS}(abi.encodeWithSelector(_SEL_SWEEP));
+        swept; // result deliberately unused — see the note above
+        collected = IERC20(asset()).balanceOf(address(this)) - before;
+
+        // A CODELESS STRATEGY OWES NOTHING. It can hold nothing and answer
+        // nothing, so carrying its last known figure forever would over-price
+        // every future deposit against value that provably cannot exist.
+        if (strategy.code.length == 0) {
+            if (known != 0) {
+                _residueTotal -= known;
+                _residueAmount[strategy] = 0;
+            }
+            if (_residueUnvalued[strategy]) {
+                _residueUnvalued[strategy] = false;
+                _unvaluedCount -= 1;
+                emit ResidueUnvalued(strategy, false);
+            }
+            emit ResidueCleared(strategy, collected);
+            return collected;
+        }
+
+        _refreshUnvalued(strategy);
+        if (known == 0) return collected;
+
+        (bool ok, uint256 outstanding) = _readUndeliveredValue(strategy);
+        // UNREADABLE KEEPS THE LAST KNOWN FIGURE, deliberately. Delivery only
+        // ever shrinks what is owed, so a stale reading is stale-HIGH — the
+        // direction that over-prices a deposit rather than under-pricing it.
+        // Refusing to update is therefore the safe response to silence, and it
+        // is why a strategy that stops answering can never wedge this vault:
+        // there is no lock to hold, only a price that stays conservative.
+        if (!ok) return collected;
+
+        uint256 cap = _residueCap[strategy];
+        if (outstanding > cap) outstanding = cap; // the same bound the record honoured
+        if (outstanding != known) {
+            _residueTotal = _residueTotal - known + outstanding;
+            _residueAmount[strategy] = outstanding;
+        }
+        if (outstanding == 0) emit ResidueCleared(strategy, collected);
+    }
+
+    /// @dev Amount-returning sibling of the probes above. Returns `ok == false`
+    ///      when the strategy cannot be read at all, which callers MUST
+    ///      distinguish from a readable zero — the two mean opposite things
+    ///      (`unknown` vs `nothing owed`).
+    function _readUndeliveredValue(address strategy) private view returns (bool ok, uint256 value) {
+        bytes memory ret;
+        (ok, ret) = strategy.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.undeliveredValue, ()));
+        if (!ok || ret.length != 32) return (false, 0);
+        value = abi.decode(ret, (uint256));
+    }
+
+    /// @dev Record `strategy` as still owing, if it says so. Called at
+    ///      settlement, once, for the strategy that just settled.
+    ///      Idempotent on the count: a strategy already in the set is not
+    ///      double-counted, which matters because the same clone could in
+    ///      principle be named by two proposals.
+    ///
+    ///      MARKS ONLY ON A DEFINITE, READABLE "YES". An unreadable probe leaves
+    ///      the strategy unmarked — deposits stay OPEN — and that direction is
+    ///      forced, not preferred.
+    ///
+    ///      Marking fail-closed was tried and is UNSAFE, because the mark would
+    ///      be unremovable: `collectResidue` can only clear on a definite
+    ///      readable zero, so an address that can never answer is marked once
+    ///      and never cleared, and `depositsLocked()` returns true for the rest
+    ///      of the vault's life with no permissionless exit. That is reachable
+    ///      by any registered agent, not theoretical: `SyndicateGovernor.propose`
+    ///      stores `strategy` unvalidated and explicitly skips its own probe for
+    ///      codeless addresses (see the `strategy.code.length != 0` guard there
+    ///      and `test_propose_eoaStrategySucceedsAtPropose`), nothing ever calls
+    ///      the field, and a staticcall to a codeless address succeeds with
+    ///      empty returndata — so an EOA label settles normally and then bricks
+    ///      every deposit path, instant and queued, permanently.
+    ///
+    ///      A PERMANENT DoS IS WORSE THAN THE SUPPRESSION IT GUARDS, which is
+    ///      the same trade `_PROBE_GAS` already documents and the same doctrine
+    ///      `IStrategyDelivery.hasUndeliveredValue` and both templates state. A
+    ///      proposer who degrades the probe suppresses a MITIGATION — the
+    ///      recoverable direction — and the answer to that is a measured gas
+    ///      bound, not a lock nobody can lift. The codeless short-circuit below
+    ///      is the same treatment `address(0)` gets and the same rule
+    ///      `propose` applies: a guard that only makes sense for a CONTRACT must
+    ///      establish there is one first.
+    function _recordResidue(address strategy, uint256 cap) private {
+        if (strategy == address(0) || strategy.code.length == 0) return;
+
+        _refreshUnvalued(strategy);
+
+        (bool ok, uint256 outstanding) = _readUndeliveredValue(strategy);
+        if (!ok || outstanding == 0) return;
+        // BOUNDED BY THE CAPITAL THE VAULT HELD, see `_residueCap`. A zero cap
+        // (an unreadable governor) records nothing, matching every other probe
+        // here: unreadable means not recorded, never recorded-at-face-value.
+        if (cap == 0) return;
+        if (outstanding > cap) outstanding = cap;
+        _residueCap[strategy] = cap;
+
+        uint256 known = _residueAmount[strategy];
+        if (outstanding == known) return;
+        _residueTotal = _residueTotal - known + outstanding;
+        _residueAmount[strategy] = outstanding;
+        emit ResidueOutstanding(strategy, outstanding);
+    }
+
+    /// @dev The tighter of the two bounds the governor already keeps on how much
+    ///      a proposal could have moved out: the vault's whole float before the
+    ///      batch (`getCapitalSnapshot`) and the coverage-scaled ceiling the
+    ///      batch was actually held to (`getEffectiveMaxCapital`). The ceiling is
+    ///      the real bound — the snapshot admits a self-report of up to the
+    ///      entire vault — so a hostile clone cannot impose an entry tax larger
+    ///      than the capital its proposal was permitted to touch.
+    ///
+    ///      Either read failing yields zero, which records nothing: unreadable
+    ///      means not recorded here as everywhere else on this path.
+    function _residueBound(uint256 proposalId) private view returns (uint256) {
+        (bool okC, bytes memory retC) =
+            msg.sender.staticcall(abi.encodeCall(IProposalStatus.getCapitalSnapshot, (proposalId)));
+        if (!okC || retC.length != 32) return 0;
+        uint256 bound = abi.decode(retC, (uint256));
+
+        (bool okE, bytes memory retE) =
+            msg.sender.staticcall(abi.encodeCall(IProposalStatus.getEffectiveMaxCapital, (proposalId)));
+        if (!okE || retE.length != 32) return 0;
+        uint256 ceiling = abi.decode(retE, (uint256));
+
+        return ceiling < bound ? ceiling : bound;
+    }
+
+    /// @dev Re-read whether `strategy` holds residue it cannot value, and keep
+    ///      `_unvaluedCount` in step. Unreadable keeps the last known flag, for
+    ///      the same reason the amount does: silence must not be read as
+    ///      permission to mint.
+    function _refreshUnvalued(address strategy) private {
+        bool was = _residueUnvalued[strategy];
+        bool now_;
+        if (strategy.code.length != 0) {
+            (bool ok, bytes memory ret) =
+                strategy.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.hasUnvaluedResidue, ()));
+            if (!ok || ret.length != 32) return; // unreadable: keep the last known flag
+            now_ = abi.decode(ret, (uint256)) != 0;
+        }
+        if (now_ == was) return;
+        _residueUnvalued[strategy] = now_;
+        if (now_) {
+            _unvaluedCount += 1;
+        } else {
+            _unvaluedCount -= 1;
+        }
+        emit ResidueUnvalued(strategy, now_);
     }
 
     /// @dev Float available for instant exits = vault asset balance minus the
@@ -1328,6 +1637,29 @@ contract SyndicateVault is
         return Math.mulDiv(shares, totalAssets() + 1, _pricingSupply() + 10 ** _decimalsOffset(), rounding);
     }
 
+    /// @inheritdoc ERC4626Upgradeable
+    /// @dev PRICED OFF `depositNav()`, NOT `totalAssets()` — a mint pays for the
+    ///      value settled strategies still owe the vault as well as the float.
+    ///      Rounds DOWN, so the depositor never receives more than the figure
+    ///      implies. This is the finding-#3 gate in its final form: minting
+    ///      against a price that excludes a residue is the skim, and there is
+    ///      nothing left to skim once the price includes it.
+    ///
+    ///      `convertToShares` deliberately keeps reading `totalAssets()`: it is
+    ///      the symmetric, fee-free figure ERC-4626 defines, and the spread
+    ///      between it and this is exactly the entry fee described on
+    ///      `_residueAmount`.
+    function previewDeposit(uint256 assets) public view virtual override returns (uint256) {
+        return Math.mulDiv(assets, _pricingSupply() + 10 ** _decimalsOffset(), depositNav() + 1, Math.Rounding.Floor);
+    }
+
+    /// @inheritdoc ERC4626Upgradeable
+    /// @dev The `previewDeposit` inverse, rounding UP so the assets demanded for
+    ///      a given share count never undercharge.
+    function previewMint(uint256 shares) public view virtual override returns (uint256) {
+        return Math.mulDiv(shares, depositNav() + 1, _pricingSupply() + 10 ** _decimalsOffset(), Math.Rounding.Ceil);
+    }
+
     /// @dev Returns 0 when `paused()` so the EIP-4626 IMP-1 invariant holds
     ///      (`deposit(maxDeposit(x), x)` MUST NOT revert when the action is
     ///      disabled). Active-proposal / whitelist cases stay reported
@@ -1353,7 +1685,17 @@ contract SyndicateVault is
         whenNotPaused
         nonReentrant
     {
-        if (_depositsLocked()) revert DepositsLocked();
+        if (depositsLocked()) revert DepositsLocked();
+        // NEVER TAKE ASSETS FOR ZERO SHARES. `previewDeposit` floors, so a
+        // large enough denominator rounds a real deposit down to nothing and
+        // `super._deposit` would transfer the assets and mint none — a silent
+        // total loss for the depositor. The queue's claim path has always had
+        // this guard; the instant path did not.
+        //
+        // Scoped to `assets != 0` so a zero-asset deposit stays the harmless
+        // no-op ERC-4626 allows: nothing in, nothing out, nobody worse off. The
+        // loss this guards is assets-in-shares-out, not zero-in-zero-out.
+        if (shares == 0 && assets != 0) revert ZeroShares();
         _requireApprovedDepositor(receiver);
         super._deposit(caller, receiver, assets, shares);
         // The fund's first shares establish the high-water mark. Cannot be done
@@ -1562,14 +1904,24 @@ contract SyndicateVault is
     ///      `num`/`den`, so the read here excludes only PRIOR stamps.
     function onProposalSettled(uint256 proposalId) external onlyGovernor {
         // Pin the settling strategy BEFORE anything can return early — this is
-        // the last moment the governor still names it, and `_depositsLocked`
+        // the last moment the governor still names it, and `depositsLocked`
         // needs it to ask whether a residue is still in flight. Read from the
         // caller (the governor), which is `onlyGovernor`-authenticated, via a
         // length-checked staticcall: a governor that cannot answer leaves the
-        // pin at zero, which `_depositsLocked` reads as nothing outstanding —
+        // pin at zero, which `depositsLocked` reads as nothing outstanding —
         // the pre-existing behaviour, not a stricter one.
         (bool okS, bytes memory retS) = msg.sender.staticcall(abi.encodeCall(IProposalStatus.strategyOf, (proposalId)));
-        _lastSettledStrategy = (okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0);
+        // NOT SWEPT HERE, AND THAT IS MEASURED RATHER THAN ASSUMED. An earlier
+        // plan called for a best-effort `sweep()` of the settling strategy at
+        // this point, to clear the residue before the stamp. It recovers
+        // nothing: `MorphoSupplyStrategy.sweep()` computes `_deliverableNow()`
+        // exactly as `_settle()` just did, and `_settle` has already withdrawn
+        // that maximum in this same transaction — the market's idle balance is
+        // drained by that withdraw, so a second call in the same frame resolves
+        // `deliverable == 0`. The residue of the proposal being settled is
+        // recoverable only in a LATER transaction, once the market refills,
+        // which is what `collectResidue` is for.
+        _recordResidue((okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0), _residueBound(proposalId));
 
         address q = _withdrawalQueue;
         if (q == address(0)) return;
@@ -1624,19 +1976,6 @@ contract SyndicateVault is
         IVaultWithdrawalQueue(q).stampSettlement(proposalId, num, den);
     }
 
-    /// @dev Vault-asset value a settled strategy still holds. Length-checked
-    ///      raw staticcall for the same reason the sibling bool probe is one:
-    ///      the address is proposer-chosen, so a typed call would let it revert
-    ///      settlement. Any failure — no code, revert, short return — reads as
-    ///      0, which reproduces the pre-fix stamp exactly.
-    function _undeliveredValueOf(address s) private view returns (uint256) {
-        if (s == address(0) || s.code.length == 0) return 0;
-        (bool ok, bytes memory ret) =
-            s.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.undeliveredValue, ()));
-        if (!ok || ret.length != 32) return 0;
-        return abi.decode(ret, (uint256));
-    }
-
     /// @dev Gas ceiling for both strategy probes. The address is
     ///      proposer-chosen, so an uncapped staticcall lets a gas-burning
     ///      callee eat 63/64 of the forwarded gas: on `_deposit` that is a
@@ -1649,14 +1988,33 @@ contract SyndicateVault is
     ///      routes through `_deliverableNow` -> `expectedMarketBalances` ->
     ///      `borrowRateView`, and the IRM is part of the proposer-supplied
     ///      `MarketParams`. A proposer can therefore pick an IRM whose view
-    ///      burns more than this cap, degrade the probe to `false`, and
-    ///      SUPPRESS the deposit lock. That is a suppression of a mitigation,
-    ///      not a DoS — the recoverable direction, and the same direction the
-    ///      probe already degrades in when a strategy cannot answer at all.
-    ///      Raising the cap trades it back against the OOG risk above; if the
-    ///      lock ever becomes load-bearing rather than defence-in-depth, this
-    ///      needs a measured worst-case bound instead of a round number.
+    ///      burns more than this cap and suppress the probe entirely.
+    ///
+    ///      THAT IS NOW THE PRIMARY HOLE, NOT A DEGRADED MITIGATION. While a
+    ///      boolean lock guarded the mint, suppression cost an attacker a
+    ///      defence-in-depth layer and the price was still float-only-correct.
+    ///      Now the probe IS the price: a suppressed report means the residue is
+    ///      never recorded, deposits are priced residue-free, and finding #3 is
+    ///      back for that proposal. The round number below is therefore no
+    ///      longer adequate on its own — this needs a measured worst-case bound
+    ///      across the shipped templates, tracked with the rest of the residue
+    ///      work in issue #233.
     uint256 private constant _PROBE_GAS = 150_000;
+
+    /// @dev Gas ceiling for the `sweep()` call inside `collectResidue`. Unlike
+    ///      the probes above this is a STATE-CHANGING call into a
+    ///      proposer-chosen clone, so it needs room for a real withdraw + swap +
+    ///      transfer while still being bounded: `collectResidue` is
+    ///      permissionless, and an uncapped call would let a gas-burning clone
+    ///      eat 63/64 of whatever the caller forwards. The result is ignored, so
+    ///      a clone that exhausts this simply recovers nothing and stays counted.
+    uint256 private constant _SWEEP_GAS = 1_500_000;
+
+    /// @dev `bytes4(keccak256("sweep()"))`. Encoded by selector rather than
+    ///      through a typed interface on purpose: the call must stay low-level
+    ///      so a reverting or non-conforming clone cannot brick the only exit
+    ///      from the deposit lock.
+    bytes4 private constant _SEL_SWEEP = 0x35faa416;
 
     // ==================== MANAGEMENT-FEE ACCRUAL ====================
 

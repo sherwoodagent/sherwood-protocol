@@ -47,6 +47,10 @@ interface ISyndicateVault {
     error QueueReserveBreached();
     error NotQueue();
     error ZeroAssets();
+    /// @notice A deposit would mint zero shares — refused rather than taking the
+    ///         assets for nothing. Reachable when the price denominator is large
+    ///         enough that `previewDeposit` floors to zero.
+    error ZeroShares();
     /// @notice `setAgentFeeBps` was called with `bps > MAX_AGENT_FEE_BPS`.
     error AgentFeeTooHigh();
     /// @notice `setMinBufferBps` was called with `bps > 5_000` (50%).
@@ -176,6 +180,21 @@ interface ISyndicateVault {
     function spendableFee(address asset) external view returns (uint256);
     function governor() external view returns (address);
     function redemptionsLocked() external view returns (bool);
+    /// @notice True while a mint must not happen: an open proposal, or a settled
+    ///         strategy holding residue no template can express in vault-asset
+    ///         units. A residue that CAN be valued does not lock — it is priced
+    ///         into `depositNav()` instead (finding #3). Both the instant path
+    ///         and the queue's deposit claim refuse on this one predicate.
+    function depositsLocked() external view returns (bool);
+    /// @notice Assets the vault is worth for pricing a MINT: idle float plus the
+    ///         value settled strategies still owe. Redemptions deliberately keep
+    ///         reading `totalAssets()` — see the implementation for why counting
+    ///         a receivable is safe on one side and not the other.
+    function depositNav() external view returns (uint256);
+    /// @notice Permissionless: sweep a settled strategy's residue back into the
+    ///         vault and refresh the figure deposits are priced against.
+    /// @return collected Vault-asset actually recovered by this call.
+    function collectResidue(address strategy) external returns (uint256 collected);
     function managementFeeBps() external view returns (uint256);
     /// @notice Vault-owner-set agent performance fee (basis points). Defaults
     ///         to `FeeConstants.DEFAULT_AGENT_FEE_BPS` (2000 = 20%) while unset.
@@ -283,6 +302,19 @@ interface ISyndicateVault {
     ///         library is re-pointed and its expected codehash re-stamped.
     event ExecutorImplSet(address oldImpl, address newImpl);
     event WithdrawalQueueSet(address indexed queue);
+    /// @notice A settled strategy reported undelivered value; `outstanding` is
+    ///         the figure deposits are now priced against, on top of
+    ///         `totalAssets()`.
+    event ResidueOutstanding(address indexed strategy, uint256 outstanding);
+    /// @notice A settled strategy reported nothing outstanding and stopped
+    ///         being priced in. `collected` is what this call actually
+    ///         recovered, which may be zero if someone else swept first.
+    event ResidueCleared(address indexed strategy, uint256 collected);
+    /// @notice A settled strategy started or stopped holding residue it cannot
+    ///         value in vault-asset units. Deposits are refused while any
+    ///         strategy is in this state — the one residue shape a price cannot
+    ///         express.
+    event ResidueUnvalued(address indexed strategy, bool unvalued);
     event RedeemRequested(uint256 indexed requestId, address indexed owner, uint256 shares);
     event DepositRequested(uint256 indexed requestId, address indexed receiver, uint256 assets);
 }

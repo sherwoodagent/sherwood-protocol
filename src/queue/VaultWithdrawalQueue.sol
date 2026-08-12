@@ -11,6 +11,16 @@ import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/Reentrancy
 interface IRequestableVault {
     function asset() external view returns (address);
     function redemptionsLocked() external view returns (bool);
+    /// @notice True while a mint must not happen — an open proposal. The
+    ///         deposit claim below refuses on this, the same predicate the
+    ///         instant path uses. A residue no longer locks: it is PRICED via
+    ///         `previewDeposit` instead (finding #3).
+    function depositsLocked() external view returns (bool);
+    /// @notice Live assets-to-shares for a MINT, at the current price and
+    ///         INCLUDING value settled strategies still owe the vault. The
+    ///         deposit claim prices against this rather than a frozen stamp, so
+    ///         a residue is paid for whether or not it has come home yet.
+    function previewDeposit(uint256 assets) external view returns (uint256);
     /// @notice Queue-only: burn `shares` escrowed here and pay `assets` to `to`.
     function settleRedeem(uint256 shares, uint256 assets, address to) external;
     /// @notice Queue-only: mint `shares` to `to`. Assets were pushed to the
@@ -181,11 +191,19 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     // ── Claim / cancel ──
 
     /// @inheritdoc IVaultWithdrawalQueue
-    /// @dev Claimable once the RELEVANT settlement is stamped AND the vault is
-    ///      unlocked — deposit-claim assets must not land mid-proposal (they would
-    ///      mis-count as strategy profit) and redeem-claim float is only
-    ///      guaranteed available between proposals. Relevant means the request's
-    ///      own pid for a Redeem, but the LATEST stamped pid for a Deposit.
+    /// @dev THE TWO KINDS ARE GATED ON DIFFERENT QUESTIONS, deliberately.
+    ///
+    ///      A REDEEM asks "is my price fixed yet?" — it is paid from the frozen
+    ///      stamp of its own pid, whose reserve was denominated against that
+    ///      same price, and it needs the vault unlocked so the reserved float is
+    ///      actually available.
+    ///
+    ///      A DEPOSIT asks "is this an honest instant to mint?" — it carries no
+    ///      frozen price at all (it is converted live below), so no stamp is
+    ///      relevant to it. `depositsLocked()` is the whole gate: no open
+    ///      proposal, and no settled strategy still holding a residue. The
+    ///      second arm is finding #3 — see the pricing block in the deposit
+    ///      branch for why the gate and the live read are both required.
     function claim(uint256 requestId) external nonReentrant returns (uint256 outAmount) {
         Request storage r = _req(requestId);
         if (r.claimed) revert AlreadyClaimed();
@@ -214,17 +232,36 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         // not a gate. `_lastStampedPid >= r.pid` asks the real question, and
         // makes this the exact complement of `cancel`'s gate: before that
         // instant only cancel is open, after it only claim is.
-        uint256 pricePid = r.kind == RequestKind.Redeem ? r.pid : _lastStampedPid;
-        if (r.kind == RequestKind.Deposit && _lastStampedPid < r.pid) revert NotSettled();
-        SettlePrice memory sp = _settlePrice[pricePid];
-        if (!sp.stamped) revert NotSettled();
-        if (IRequestableVault(vault).redemptionsLocked()) revert VaultLocked();
+        bool isRedeem = r.kind == RequestKind.Redeem;
+        SettlePrice memory sp;
+        if (isRedeem) {
+            sp = _settlePrice[r.pid];
+            if (!sp.stamped) revert NotSettled();
+            if (IRequestableVault(vault).redemptionsLocked()) revert VaultLocked();
+        } else {
+            // DEPOSITS GATE ON THE VAULT'S OWN MINT PREDICATE, NOT ON A STAMP
+            // (finding #3, the attack half). A queued deposit no longer prices
+            // against a frozen number, so there is nothing to wait for and no
+            // stamp to require — what it needs is an instant at which minting is
+            // honest, which is exactly what `depositsLocked()` answers: no open
+            // proposal and no residue that cannot be
+            // valued (a valuable one is charged for by `previewDeposit` below,
+            // not blocked). That predicate subsumes `redemptionsLocked()` (an active proposal
+            // implies a nonzero open count), so it is the only gate here.
+            //
+            // This also retires the `_lastStampedPid >= r.pid` requirement,
+            // which was never about safety: a deposit tagged to a proposal that
+            // left Draft/Pending WITHOUT settling could never satisfy it and
+            // reverted forever. Such a request now claims at the next clean
+            // instant like any other.
+            if (IRequestableVault(vault).depositsLocked()) revert VaultLocked();
+        }
 
         r.claimed = true;
         r.closedAt = uint48(block.timestamp);
         uint256 amount = r.amount;
 
-        if (r.kind == RequestKind.Redeem) {
+        if (isRedeem) {
             // assets = shares * num / den (matches ERC-4626 convertToAssets at settle)
             outAmount = Math.mulDiv(amount, sp.num, sp.den);
             _pendingShares -= amount;
@@ -255,26 +292,39 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             _stampedUnclaimedShares = stamped > amount ? stamped - amount : 0;
             IRequestableVault(vault).settleRedeem(amount, outAmount, r.owner);
         } else {
-            // PRICED AT THE LATEST SETTLEMENT, not at the request's own pid.
+            // PRICED LIVE, NOT AT ANY STAMP (finding #3, the attack half).
             //
-            // A queued deposit has no claim deadline and `cancel` shuts once its
-            // proposal stamps, so waiting is strictly free. Pricing at the
-            // request's frozen pid therefore handed the depositor a perpetual
-            // look-back call on the vault's NAV: hold the request, watch the next
-            // proposal settle, and claim only when the OLD price mints more
-            // shares — repeatably, and across several requests by exercising only
-            // the favourable ones.
+            // A stamp is a frozen REALIZED figure taken at settlement, and
+            // `totalAssets()` counts only float — so a settlement that left a
+            // residue on the strategy stamps a price BELOW what the vault owns.
+            // Minting against that number is the skim: claim cheap, then call
+            // the permissionless `sweep()` and own a slice of the residue the
+            // incumbents paid for. An attacker can induce it rather than wait
+            // for it (a fee-free flash loan empties the market's idle balance
+            // for one callback frame, forcing under-delivery on demand).
             //
-            // The escrowed assets sat in this contract the whole time and never
-            // entered the strategy, so the honest price is the one prevailing when
-            // they actually join the pool. Claims are already confined to the gap
-            // between proposals, and in that gap the current share price IS the
-            // latest stamp. Redeem keeps its own pid deliberately: those shares
-            // left the supply at that settlement and the reserve is denominated
-            // against that same price.
-            outAmount = Math.mulDiv(amount, sp.den, sp.num);
+            // Two changes close it together, and neither suffices alone. The
+            // gate above admits the claim only at an instant the vault can
+            // price honestly; this live read then charges for what it is worth
+            // AT THAT INSTANT — float PLUS what settled strategies still owe,
+            // which a frozen stamp is blind to either way.
+            //
+            // The escrowed assets never entered the strategy (they sit in this
+            // contract, off-vault, uncounted in `totalAssets`), so the honest
+            // price is the one prevailing when they actually join the pool.
+            // Computed BEFORE the push so the deposit does not dilute its own
+            // price. Redeem keeps its stamp deliberately: those shares left the
+            // supply at that settlement and the reserve is denominated against
+            // that same price.
+            //
+            // Retires the perpetual look-back call the old frozen pricing
+            // created — with no frozen number there is nothing to look back at,
+            // which is why `cancel` can now stay open for deposits.
+            outAmount = IRequestableVault(vault).previewDeposit(amount);
+            if (outAmount == 0) revert ZeroShares();
             _pendingDepositAssets -= amount;
-            // Push escrowed assets into the vault, then mint at the frozen price.
+            // Push escrowed assets into the vault, then mint at the price read
+            // above (pre-push, so the mint is not diluted by its own assets).
             IERC20(IRequestableVault(vault).asset()).safeTransfer(vault, amount);
             IRequestableVault(vault).settleDeposit(outAmount, r.owner);
         }
@@ -282,44 +332,39 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     }
 
     /// @inheritdoc IVaultWithdrawalQueue
-    /// @dev Cancel is allowed ONLY before the request's proposal is stamped.
-    ///      Returns the escrowed shares (Redeem) or assets (Deposit) to the owner.
+    /// @dev A REDEEM cancels only before its proposal is stamped; a DEPOSIT
+    ///      cancels at any time. Returns the escrowed shares (Redeem) or assets
+    ///      (Deposit) to the owner.
     function cancel(uint256 requestId) external nonReentrant {
         Request storage r = _req(requestId);
         if (msg.sender != r.owner) revert NotQueueOwner();
         if (r.claimed) revert AlreadyClaimed();
         if (r.cancelled) revert AlreadyCancelled();
-        // GATE ON THE PID `claim` PRICES AGAINST, NOT THE REQUEST'S OWN
-        // (pashov review finding #10). `claim` was moved onto
-        // `_lastStampedPid` for Deposits precisely because a deposit's own
-        // `r.pid` may never be stamped — cancelled / vetoed / rejected /
-        // expired proposals all call `_decOpen()` and never
-        // `onProposalSettled` — but this gate was left on `r.pid`, which for
-        // exactly that class reads false FOREVER. Both exits therefore stayed
-        // open at once and the depositor held a costless permanent straddle
-        // worth `amount * max(1, ppsNow / ppsStamp)`, the upside leg funded by
-        // the incumbent shareholders. That is the same "perpetual look-back
-        // call on the vault's NAV" the `_lastStampedPid` change closed on the
-        // claim side, reopened through the un-migrated cancel side — and it
-        // falsifies `claim`'s own natspec, which asserts "`cancel` shuts once
-        // its proposal stamps, so waiting is strictly free". Keying both gates
-        // to one pid makes that sentence true again.
+        // DEPOSIT CANCEL IS UNCONDITIONALLY OPEN, and that is a CONSEQUENCE of
+        // the live pricing in `claim`, not a relaxation of pashov #10.
         //
-        // Redeem keeps `r.pid`: those shares left the supply at that
-        // settlement and `_pidReserved` is denominated against that same
-        // price, so its own stamp is the correct and only meaningful gate.
-        // THE EXACT COMPLEMENT OF `claim`'s GATE — see the block there. Gating
-        // a Deposit on `_settlePrice[_lastStampedPid].stamped` ALONE was the
-        // first attempt at this fix and it was worse than the defect: that
-        // expression is `true` by construction after the protocol's first
-        // settlement, so it did not close the straddle, it deleted the cancel
-        // exit outright, permanently, for every deposit (PR #195 review,
-        // blocker 1). `_lastStampedPid >= r.pid` asks the question that was
-        // actually meant — has a settlement landed SINCE this request — so
-        // cancel shuts exactly when claim opens and never before.
-        bool priceFixed = r.kind == RequestKind.Redeem
-            ? _settlePrice[r.pid].stamped
-            : (_lastStampedPid >= r.pid && _settlePrice[_lastStampedPid].stamped);
+        // #10 was a costless straddle: `claim` paid a deposit at a FROZEN
+        // price, so holding the request was a perpetual look-back call — claim
+        // when the stale number mints more, cancel when it does not, with the
+        // upside funded by the incumbents. The fix then was to shut cancel
+        // exactly when claim opened, keying both gates to `_lastStampedPid`.
+        //
+        // A deposit now converts LIVE at claim time (see the pricing block in
+        // `claim`). There is no stale number to exercise against: claiming
+        // always mints at the price prevailing in that instant, so the option
+        // is worth zero and the straddle has no payoff to straddle. Cancel is
+        // then just "I changed my mind", which is what it was always for — and
+        // it must stay open, because the deposit gate can still hold a claim
+        // shut (an open proposal, or a residue no template can value) and a
+        // depositor must never be wedged between a closed claim and a closed
+        // cancel.
+        //
+        // Redeem keeps `r.pid`: those shares left the supply at that settlement
+        // and `_pidReserved` is denominated against that same frozen price, so
+        // its own stamp is the correct and only meaningful gate — and unlike a
+        // deposit, a redeem IS paid from a stamp, so the look-back logic still
+        // applies to it.
+        bool priceFixed = r.kind == RequestKind.Redeem && _settlePrice[r.pid].stamped;
         if (priceFixed) revert AlreadySettled();
 
         r.cancelled = true;
