@@ -1208,22 +1208,19 @@ contract SyndicateVault is
     ///      market must never trap the vault, which is why the deliverable-
     ///      maximum design exists and why this guard is on deposits only.
     ///
-    ///      DEGRADES CLOSED ONCE A STRATEGY IS PINNED, STATED. A pinned clone
-    ///      that cannot answer locks deposits rather than leaving them open.
-    ///      This inverts the earlier posture, and the reason is that the probe
-    ///      is now the ONLY thing standing between a residue and a mint: the
-    ///      queued-deposit path gates on this same predicate (see the queue's
-    ///      `claim`), so a probe that degrades OPEN degrades the whole
-    ///      finding-#3 gate open, in exactly the window an attacker can force
-    ///      (a flash loan that empties the market's idle balance both induces
-    ///      the residue and, on a gas-burning IRM, can push the probe past
-    ///      `_PROBE_GAS`). A false lock costs a wait; a false open is the skim.
+    ///      DEGRADES OPEN, STATED. A strategy that cannot answer is never
+    ///      marked, so deposits stay unlocked. Failing closed was tried and is
+    ///      unsafe here for a specific structural reason rather than a
+    ///      preference: the mark would be unremovable, and any registered agent
+    ///      can reach it by naming an EOA as the proposal's strategy — see
+    ///      `_markResidueIfOutstanding` for the full trace. A permanent,
+    ///      unrecoverable deposit brick is worse than the suppression it would
+    ///      be guarding, which is the same trade `_PROBE_GAS` documents.
     ///
-    ///      Bounded, not unbounded: the pin only ever names a clone of a
-    ///      factory-allowlisted, TierRegistry-certified template, `address(0)`
-    ///      short-circuits before any call, and the next settlement re-pins.
-    ///      The permissionless, untaxed `sweep()` remains the exit — the very
-    ///      depositor this refuses can clear the residue and then deposit.
+    ///      Bounded, not unbounded: only a strategy that DEFINITELY reported a
+    ///      residue is ever counted, `collectResidue` is the permissionless and
+    ///      untaxed exit, and the very depositor this refuses can call it and
+    ///      then deposit at the corrected price.
     ///
     ///      This closes the MINT side only. Queued redeemers stamped in the same
     ///      `onProposalSettled` call are still priced at the float-only figure
@@ -1254,13 +1251,23 @@ contract SyndicateVault is
     ///         only exit from the lock. A failed sweep simply recovers nothing
     ///         and leaves the strategy counted, which is the honest outcome.
     ///
-    ///         CLEARS ONLY ON A DEFINITE "NOTHING OUTSTANDING". A probe that
-    ///         cannot be read leaves the strategy counted — the same
-    ///         fail-closed direction `depositsLocked` takes, and for the same
-    ///         reason: an unreadable answer must never be read as permission to
-    ///         mint. A clone that can never answer therefore holds the gate
-    ///         shut; the backstop for that case ships with the round ledger
-    ///         (issue #233) and is deliberately not improvised here.
+    ///         CLEARS ON A DEFINITE "NOTHING OUTSTANDING", OR ON CODELESSNESS.
+    ///         An unreadable probe on a live contract leaves the strategy
+    ///         counted — deposits stay shut, the safe direction, and the honest
+    ///         one since the vault genuinely cannot tell whether value is still
+    ///         out. That state is only ever entered from a definite readable
+    ///         "yes" (see `_markResidueIfOutstanding`), so it means a strategy
+    ///         that DID owe has stopped answering, not that an arbitrary address
+    ///         was marked. The codeless arm covers a strategy that has since
+    ///         self-destructed: it can hold nothing and answer nothing, so
+    ///         counting it forever would be a wedge with no upside.
+    ///
+    ///         A CONFORMING STRATEGY WHOSE MARKET NEVER REFILLS still holds the
+    ///         gate — `hasUndeliveredValue` stays true while `own` exceeds the
+    ///         dust floor even when `deliverable` is zero. That is a real,
+    ///         accepted liveness cost of the lock and the reason the round
+    ///         ledger's timeout/guardian backstop exists (issue #233); it is
+    ///         deliberately not improvised here.
     function collectResidue(address strategy) external nonReentrant returns (uint256 collected) {
         if (!_residueOutstanding[strategy]) return 0;
 
@@ -1270,9 +1277,15 @@ contract SyndicateVault is
         swept; // result deliberately unused — see the note above
         collected = IERC20(asset()).balanceOf(address(this)) - before;
 
-        (bool ok, bytes memory ret) =
-            strategy.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.hasUndeliveredValue, ()));
-        if (ok && ret.length == 32 && abi.decode(ret, (uint256)) == 0) {
+        bool clear;
+        if (strategy.code.length == 0) {
+            clear = true;
+        } else {
+            (bool ok, bytes memory ret) =
+                strategy.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.hasUndeliveredValue, ()));
+            clear = ok && ret.length == 32 && abi.decode(ret, (uint256)) == 0;
+        }
+        if (clear) {
             _residueOutstanding[strategy] = false;
             _residueCount -= 1;
             emit ResidueCleared(strategy, collected);
@@ -1284,15 +1297,39 @@ contract SyndicateVault is
     ///      Idempotent on the count: a strategy already in the set is not
     ///      double-counted, which matters because the same clone could in
     ///      principle be named by two proposals.
+    ///
+    ///      MARKS ONLY ON A DEFINITE, READABLE "YES". An unreadable probe leaves
+    ///      the strategy unmarked — deposits stay OPEN — and that direction is
+    ///      forced, not preferred.
+    ///
+    ///      Marking fail-closed was tried and is UNSAFE, because the mark would
+    ///      be unremovable: `collectResidue` can only clear on a definite
+    ///      readable zero, so an address that can never answer is marked once
+    ///      and never cleared, and `depositsLocked()` returns true for the rest
+    ///      of the vault's life with no permissionless exit. That is reachable
+    ///      by any registered agent, not theoretical: `SyndicateGovernor.propose`
+    ///      stores `strategy` unvalidated and explicitly skips its own probe for
+    ///      codeless addresses (see the `strategy.code.length != 0` guard there
+    ///      and `test_propose_eoaStrategySucceedsAtPropose`), nothing ever calls
+    ///      the field, and a staticcall to a codeless address succeeds with
+    ///      empty returndata — so an EOA label settles normally and then bricks
+    ///      every deposit path, instant and queued, permanently.
+    ///
+    ///      A PERMANENT DoS IS WORSE THAN THE SUPPRESSION IT GUARDS, which is
+    ///      the same trade `_PROBE_GAS` already documents and the same doctrine
+    ///      `IStrategyDelivery.hasUndeliveredValue` and both templates state. A
+    ///      proposer who degrades the probe suppresses a MITIGATION — the
+    ///      recoverable direction — and the answer to that is a measured gas
+    ///      bound, not a lock nobody can lift. The codeless short-circuit below
+    ///      is the same treatment `address(0)` gets and the same rule
+    ///      `propose` applies: a guard that only makes sense for a CONTRACT must
+    ///      establish there is one first.
     function _markResidueIfOutstanding(address strategy) private {
-        if (strategy == address(0) || _residueOutstanding[strategy]) return;
+        if (strategy == address(0) || strategy.code.length == 0) return;
+        if (_residueOutstanding[strategy]) return;
         (bool ok, bytes memory ret) =
             strategy.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.hasUndeliveredValue, ()));
-        // FAIL CLOSED, matching `collectResidue`: an unreadable probe counts the
-        // strategy rather than waving it through. `!ok` covers the codeless
-        // address too, so a strategy that cannot be asked is treated as owing
-        // until it can answer otherwise.
-        if (!ok || ret.length != 32 || abi.decode(ret, (uint256)) != 0) {
+        if (ok && ret.length == 32 && abi.decode(ret, (uint256)) != 0) {
             _residueOutstanding[strategy] = true;
             _residueCount += 1;
             emit ResidueOutstanding(strategy);

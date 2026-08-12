@@ -158,43 +158,79 @@ contract PashovFinalDepositLockTest is VaultInstantLiquidityTest {
         assertGt(shares, 0, "nothing outstanding, nothing to wait for");
     }
 
-    /// @notice DEGRADES CLOSED, AND THAT IS THE INVERSION OF AN EARLIER STATED
-    ///         DECISION. A pinned strategy that cannot answer now LOCKS
-    ///         deposits.
+    /// @notice DEGRADES OPEN, AND THAT IS FORCED RATHER THAN PREFERRED. A
+    ///         strategy that cannot answer is never marked, so deposits stay
+    ///         open.
     ///
-    ///         The earlier posture — degrade open, because one non-conforming
-    ///         clone shutting deposits is worse than the mispricing — was
-    ///         defensible while this probe was defence-in-depth on the instant
-    ///         path alone. It is not defensible now: the queued-deposit claim
-    ///         gates on this same predicate, so a probe that degrades OPEN
-    ///         degrades the entire finding-#3 gate open, in precisely the window
-    ///         an attacker can force (the flash loan that empties the market's
-    ///         idle balance to induce the residue can also, on a gas-burning
-    ///         IRM, push the probe past `_PROBE_GAS`). A false lock costs a
-    ///         wait; a false open is the skim.
+    ///         Failing closed was tried in this PR and reverted: the mark would
+    ///         be unremovable, because `collectResidue` can only clear on a
+    ///         definite readable zero. An address that can never answer would be
+    ///         marked once and never cleared, shutting every deposit path —
+    ///         instant and queued — for the rest of the vault's life, with no
+    ///         permissionless exit. See the EOA test below for why that is
+    ///         reachable by any registered agent rather than theoretical.
     ///
-    ///         Bounded, not unbounded: the pin only names a clone of a
-    ///         factory-allowlisted, TierRegistry-certified template, and the
-    ///         permissionless untaxed `sweep()` plus the next settlement's
-    ///         re-pin are the exits.
-    function test_finding3_unanswerableStrategyLocksDeposits() public {
-        _settleWith(makeAddr("strategyWithNoCode"));
-
-        vm.prank(alice);
-        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
-        vault.deposit(1_000e6, alice);
-    }
-
-    /// @notice Same inversion for a wrong-shaped answer — the explicit
-    ///         `ret.length` check is still what keeps this a DECISION rather
-    ///         than an undecodable revert inside a view the deposit path
-    ///         depends on; only the decision's direction changed.
-    function test_finding3_shortReturnStrategyLocksDeposits() public {
+    ///         A permanent DoS is worse than the suppression it guards, which is
+    ///         the trade `_PROBE_GAS` already documents and the doctrine both
+    ///         templates state.
+    function test_finding3_unanswerableStrategyLeavesDepositsOpen() public {
         _settleWith(address(new StubDeliveryShortReturn()));
 
         vm.prank(alice);
-        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
-        vault.deposit(1_000e6, alice);
+        uint256 shares = vault.deposit(1_000e6, alice);
+        assertGt(shares, 0, "a malformed answer must not brick deposits");
+        assertFalse(vault.depositsLocked(), "unreadable is never marked");
+    }
+
+    /// @notice THE BLOCKER THIS PR SHIPPED AND THEN FIXED. `SyndicateGovernor`
+    ///         stores `strategy` unvalidated and explicitly skips its own probe
+    ///         for codeless addresses (`strategy.code.length != 0` there,
+    ///         pinned by `test_propose_eoaStrategySucceedsAtPropose`). Nothing
+    ///         ever calls the field — it is a label — so a proposal naming an
+    ///         EOA executes and settles normally.
+    ///
+    ///         A staticcall to a codeless address succeeds with EMPTY
+    ///         returndata. Under a fail-closed mark that is "unreadable", so the
+    ///         EOA was marked and could never be cleared: one proposal from any
+    ///         registered agent permanently shut every deposit path on the
+    ///         vault. Codeless is now short-circuited before any call — the same
+    ///         treatment `address(0)` gets, and the same rule `propose` applies.
+    function test_finding3_eoaStrategyCannotBrickDeposits() public {
+        _settleWith(makeAddr("eoaStrategyLabel"));
+
+        assertFalse(vault.depositsLocked(), "an EOA label must never lock the vault");
+        vm.prank(alice);
+        assertGt(vault.deposit(1_000e6, alice), 0, "deposits unaffected by a codeless strategy");
+    }
+
+    /// @notice A strategy that DID owe and has since self-destructed is
+    ///         clearable: it can hold nothing and answer nothing, so counting it
+    ///         forever would be a wedge with no upside.
+    function test_finding3_codelessAfterMarkingIsClearable() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        _settleWith(address(deliveryStrat));
+        assertTrue(vault.depositsLocked(), "marked on a definite yes");
+
+        // The clone's code goes away underneath the mark.
+        vm.etch(address(deliveryStrat), "");
+        vault.collectResidue(address(deliveryStrat));
+        assertFalse(vault.depositsLocked(), "codeless clears rather than wedging");
+    }
+
+    /// @notice A LIVE contract that stops answering stays counted — deposits
+    ///         shut. That state is only ever entered from a definite readable
+    ///         "yes", so it means a strategy that DID owe went quiet, not that
+    ///         an arbitrary address was marked.
+    function test_finding3_liveStrategyThatStopsAnsweringStaysCounted() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        _settleWith(address(deliveryStrat));
+
+        // Same address, now a contract that cannot answer the probe.
+        vm.etch(address(deliveryStrat), address(new StubDeliveryShortReturn()).code);
+        vault.collectResidue(address(deliveryStrat));
+        assertTrue(vault.depositsLocked(), "a live strategy that went quiet stays counted");
     }
 
     /// @notice The original lock is untouched: an OPEN proposal still shuts
