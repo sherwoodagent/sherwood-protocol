@@ -185,6 +185,12 @@ interface ISyndicateVault {
     ///         for why the earlier degrade-open posture is unsafe now that the
     ///         async path gates on it too.
     function depositsLocked() external view returns (bool);
+    /// @notice Permissionless: sweep a settled strategy's residue back into the
+    ///         vault and stop counting it against the deposit gate once it
+    ///         reports nothing outstanding. The exit from the lock — the party
+    ///         most motivated to call it is the depositor being refused.
+    /// @return collected Vault-asset actually recovered by this call.
+    function collectResidue(address strategy) external returns (uint256 collected);
     function managementFeeBps() external view returns (uint256);
     /// @notice Vault-owner-set agent performance fee (basis points). Defaults
     ///         to `FeeConstants.DEFAULT_AGENT_FEE_BPS` (2000 = 20%) while unset.
@@ -292,6 +298,13 @@ interface ISyndicateVault {
     ///         library is re-pointed and its expected codehash re-stamped.
     event ExecutorImplSet(address oldImpl, address newImpl);
     event WithdrawalQueueSet(address indexed queue);
+    /// @notice A settled strategy reported undelivered value and is now counted
+    ///         against the deposit gate.
+    event ResidueOutstanding(address indexed strategy);
+    /// @notice A settled strategy reported nothing outstanding and stopped being
+    ///         counted. `collected` is what this call actually recovered, which
+    ///         may be zero if someone else swept first.
+    event ResidueCleared(address indexed strategy, uint256 collected);
     event RedeemRequested(uint256 indexed requestId, address indexed owner, uint256 shares);
     event DepositRequested(uint256 indexed requestId, address indexed receiver, uint256 assets);
 }

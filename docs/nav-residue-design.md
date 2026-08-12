@@ -249,13 +249,41 @@ and patch them in the SAME commit (repo guardrail, hit 4×).
   gate-complementarity — and cancel must stay open so a depositor is never wedged
   between a residue-gated claim and a closed cancel).
 
+**PR 2 — watch every strategy that still owes. SHIPPED.** Still harm (a): the
+gate PR 1 built was hung off a single overwritten pin, which reopened the skim
+one proposal later.
+
+- The single `_lastSettledStrategy` pin became a **set + O(1) counter**
+  (`_residueOutstanding` / `_residueCount`). The pin was overwritten at every
+  settlement, so a strategy still holding a residue silently stopped being
+  watched: settle N dirty (locked, correctly), settle N+1 clean, the pin moves,
+  `depositsLocked()` reads "nothing outstanding", deposits open — while N's clone
+  still holds `R` and `sweep()` is permissionless. Same skim, one proposal later.
+- `depositsLocked()` now reads the counter, so the hot path (every deposit and
+  every queued deposit claim) stays O(1) — no iteration, no unbounded-growth
+  hazard.
+- New permissionless **`collectResidue(strategy)`**: low-level `sweep()` with the
+  result ignored (a reverting clone must not brick the only exit from the lock),
+  then re-probe, and stop counting the strategy only on a definite "nothing
+  outstanding". Unreadable ⇒ still counted, same fail-closed direction as the
+  gate itself.
+- **NO SWEEP AT SETTLEMENT, and this is measured rather than assumed.** The
+  earlier plan called for a best-effort `sweep()` of the settling strategy inside
+  `onProposalSettled` to clear the residue before the stamp. It recovers exactly
+  nothing: `MorphoSupplyStrategy.sweep()` computes `_deliverableNow()` the same
+  way `_settle()` just did, and `_settle` already withdrew that maximum in the
+  same transaction — the market's idle balance is drained by that withdraw, so a
+  second call in the same frame resolves `deliverable == 0`. **A proposal's own
+  residue is recoverable only in a LATER transaction**, once the market refills.
+  That is what `collectResidue` is for, and it is why the "sweep-at-settle
+  carries the common case" claim in an earlier draft of this file was wrong.
+
 **Remaining — close the underpayment.** Harm (b), fairness only.
 
-2. **Mandatory best-effort sweep at settlement** (`try … catch`, never reverts
-   settlement). Carries the COMMON case: when the market can pay, the residue
-   lands in the settle tx, the stamp is computed off the full value, and the
-   queued redeemer is paid correctly with no ledger. This demotes everything
-   below to rare-tail insurance.
+2. ~~Mandatory best-effort sweep at settlement.~~ **Retired** — proven a no-op
+   for the settling strategy (see PR 2). The common case is carried instead by
+   whoever calls `collectResidue` once the market refills; there is no in-tx
+   shortcut.
 3. *(optional)* **Propose-time cap on deployment vs the target market's idle
    liquidity**, so the vault's own exit rarely creates a residue at all.
 4. **Queue round ledger + accumulator** (queue-only): round mappings + `ACC`,

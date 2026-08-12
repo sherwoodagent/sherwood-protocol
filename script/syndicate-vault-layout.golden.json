@@ -115,16 +115,22 @@
       "type": "t_uint256"
     },
     {
-      "label": "_lastSettledStrategy",
+      "label": "_residueOutstanding",
       "slot": "17",
       "offset": 0,
-      "type": "t_address"
+      "type": "t_mapping(t_address,t_bool)"
+    },
+    {
+      "label": "_residueCount",
+      "slot": "18",
+      "offset": 0,
+      "type": "t_uint256"
     },
     {
       "label": "__gap",
-      "slot": "18",
+      "slot": "19",
       "offset": 0,
-      "type": "t_array(t_uint256)30_storage"
+      "type": "t_array(t_uint256)29_storage"
     }
   ],
   "types": {

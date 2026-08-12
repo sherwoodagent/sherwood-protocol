@@ -65,11 +65,18 @@ contract PashovFinalDepositLockTest is VaultInstantLiquidityTest {
     StubDeliveryStrategy internal deliveryStrat;
 
     function _settleWith(address strategy) internal {
+        _settleWithPid(PID, strategy);
+    }
+
+    /// @dev Distinct pid per settlement — `stampSettlement` refuses a repeat
+    ///      (`AlreadySettled`) and a lower one (`StampOutOfOrder`), so the
+    ///      multi-settlement tests below must step the pid forward.
+    function _settleWithPid(uint256 pid, address strategy) internal {
         // Live proposal naming `strategy`, then settle it — the governor stamps
         // and clears the open count, which is exactly the transition under test.
-        governor.set(PID, 1, strategy);
+        governor.set(pid, 1, strategy);
         vm.prank(address(governor));
-        vault.onProposalSettled(PID);
+        vault.onProposalSettled(pid);
         governor.set(0, 0, address(0));
     }
 
@@ -123,12 +130,20 @@ contract PashovFinalDepositLockTest is VaultInstantLiquidityTest {
         vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
         vault.deposit(1_000e6, alice);
 
-        // Anyone calls sweep(); the residue returns and the probe goes quiet.
+        // The residue comes back and the strategy goes quiet — but the gate
+        // reads a COUNTER, not a live probe, so it takes an explicit
+        // `collectResidue` to stop counting this strategy. That call is
+        // permissionless and untaxed precisely so the refused depositor can
+        // make it themselves.
         deliveryStrat.setHolding(false);
+        assertTrue(vault.depositsLocked(), "still counted until collected");
+
+        vm.prank(alice);
+        vault.collectResidue(address(deliveryStrat));
 
         vm.prank(alice);
         uint256 shares = vault.deposit(1_000e6, alice);
-        assertGt(shares, 0, "deposits must reopen the moment the residue is back");
+        assertGt(shares, 0, "deposits reopen once the residue is collected");
     }
 
     /// @notice A COMPLETE settlement is unaffected. Without this the fix could be
@@ -203,6 +218,103 @@ contract PashovFinalDepositLockTest is VaultInstantLiquidityTest {
         assertGt(shares, 0, "fresh vault, nothing pinned, deposits open");
     }
 
+    // ── the MULTI-STRATEGY half of the same gate ──
+
+    /// @notice THE TWO-PROPOSAL SKIM. The gate used to hang off a single
+    ///         `_lastSettledStrategy` pin, overwritten at every settlement — so
+    ///         a strategy that was still holding a residue simply stopped being
+    ///         watched the moment the next proposal settled.
+    ///
+    ///         Settle N dirty (deposits locked, correctly). Settle N+1 clean.
+    ///         The pin moves to N+1, which reports nothing, and deposits reopen
+    ///         — while N's clone still holds `R` and `sweep()` is permissionless.
+    ///         Deposit cheap, sweep N, skim: the same finding-#3 theft, reached
+    ///         one proposal later and around the fix.
+    ///
+    ///         The gate now counts EVERY strategy that still owes.
+    function test_finding3_earlierStrategysResidueStillLocksAfterALaterCleanSettlement() public {
+        StubDeliveryStrategy dirty = new StubDeliveryStrategy();
+        dirty.setHolding(true);
+        _settleWithPid(PID, address(dirty));
+        assertTrue(vault.depositsLocked(), "N settled dirty");
+
+        // A later proposal settles CLEAN with a different strategy.
+        StubDeliveryStrategy clean = new StubDeliveryStrategy(); // holding == false
+        _settleWithPid(PID + 1, address(clean));
+
+        // Pre-fix the pin now named `clean`, which reports nothing, and this
+        // deposit succeeded while `dirty` was still holding the residue.
+        assertTrue(vault.depositsLocked(), "the earlier strategy still owes");
+        vm.prank(alice);
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(1_000e6, alice);
+
+        // Collecting the CLEAN one is not enough — it was never the problem.
+        vault.collectResidue(address(clean));
+        assertTrue(vault.depositsLocked(), "clearing the wrong strategy changes nothing");
+
+        // Collecting the one that actually owes is what opens the gate.
+        dirty.setHolding(false);
+        vault.collectResidue(address(dirty));
+        assertFalse(vault.depositsLocked(), "both accounted for");
+
+        vm.prank(alice);
+        assertGt(vault.deposit(1_000e6, alice), 0, "deposits reopen");
+    }
+
+    /// @notice Two dirty settlements outstanding at once: the count is a count,
+    ///         not a flag. Clearing one leaves the gate shut for the other.
+    function test_finding3_twoOutstandingStrategiesEachHoldTheGate() public {
+        StubDeliveryStrategy a = new StubDeliveryStrategy();
+        a.setHolding(true);
+        _settleWithPid(PID, address(a));
+
+        StubDeliveryStrategy b = new StubDeliveryStrategy();
+        b.setHolding(true);
+        _settleWithPid(PID + 1, address(b));
+
+        a.setHolding(false);
+        vault.collectResidue(address(a));
+        assertTrue(vault.depositsLocked(), "b still owes");
+
+        b.setHolding(false);
+        vault.collectResidue(address(b));
+        assertFalse(vault.depositsLocked(), "both cleared");
+    }
+
+    /// @notice `collectResidue` never clears a strategy that still owes, however
+    ///         many times it is called — the counter cannot be drained by
+    ///         repetition.
+    function test_finding3_collectResidueIsNoOpWhileTheStrategyStillOwes() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        _settleWith(address(deliveryStrat));
+
+        vault.collectResidue(address(deliveryStrat));
+        vault.collectResidue(address(deliveryStrat));
+        assertTrue(vault.depositsLocked(), "still owing, still counted");
+    }
+
+    /// @notice And it cannot be double-cleared: once a strategy has left the
+    ///         set, further calls are inert rather than decrementing the count
+    ///         again (which would open the gate while another strategy owes).
+    function test_finding3_collectResidueCannotDoubleClear() public {
+        StubDeliveryStrategy a = new StubDeliveryStrategy();
+        a.setHolding(true);
+        _settleWithPid(PID, address(a));
+
+        StubDeliveryStrategy b = new StubDeliveryStrategy();
+        b.setHolding(true);
+        _settleWithPid(PID + 1, address(b));
+
+        a.setHolding(false);
+        vault.collectResidue(address(a));
+        vault.collectResidue(address(a)); // second call must not decrement again
+        vault.collectResidue(address(a));
+
+        assertTrue(vault.depositsLocked(), "b still owes; a cannot be cleared twice");
+    }
+
     // ── the ASYNC half of the same gate ──
 
     /// @notice THE HOLE THIS PR CLOSES. The instant path was already shut while
@@ -249,8 +361,10 @@ contract PashovFinalDepositLockTest is VaultInstantLiquidityTest {
         vault.onProposalSettled(PID);
         governor.set(0, 0, address(0));
 
-        // The residue is delivered — the strategy no longer holds anything.
+        // The residue is delivered and collected — only then does the strategy
+        // stop counting against the gate.
         deliveryStrat.setHolding(false);
+        vault.collectResidue(address(deliveryStrat));
         assertFalse(vault.depositsLocked(), "residue cleared");
 
         uint256 expected = vault.convertToShares(1_000e6);

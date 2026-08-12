@@ -241,9 +241,20 @@ contract SyndicateVault is
     ///         falls and recovers is not charged twice on the same dollars.
     uint256 private _highWaterPricePerShare;
 
-    /// @notice The strategy of the most recently settled proposal, pinned at
-    ///         `onProposalSettled` so `depositsLocked` can ask whether it still
-    ///         holds undelivered value.
+    /// @notice Settled strategies that still hold undelivered value. Membership
+    ///         is set at `onProposalSettled` and cleared by the permissionless
+    ///         `collectResidue`.
+    ///
+    ///         A SET, NOT A POINTER, AND THAT IS THE WHOLE POINT. This was one
+    ///         `_lastSettledStrategy` slot, overwritten at every settlement —
+    ///         which silently stopped watching the previous strategy even when
+    ///         it was still holding a residue. That reopened the finding-#3 skim
+    ///         one proposal later: settle N dirty (deposits locked, correctly),
+    ///         then settle N+1 clean, and the pin moves to N+1, `depositsLocked`
+    ///         reads "nothing outstanding", deposits open — while N's clone
+    ///         still holds `R` and `sweep()` is permissionless. Deposit cheap,
+    ///         sweep N, skim. The gate has to watch EVERY strategy that still
+    ///         owes, not the most recent one.
     ///
     ///         NEEDED BECAUSE THE ORDINARY POINTER IS GONE BY THE TIME IT WOULD
     ///         BE READ: `_activeStrategy()` resolves through
@@ -251,19 +262,25 @@ contract SyndicateVault is
     ///         IMMEDIATELY AFTER calling this vault — the ordering is CEI and
     ///         load-bearing, see the note on `_activeProposal = 0` there. So the
     ///         pointer is still live during `onProposalSettled` and gone by the
-    ///         time `depositsLocked` runs, leaving no path back to the strategy
-    ///         that just settled. Pinning here is what survives that gap. Zero
-    ///         when unresolvable, which reads as "nothing outstanding" — see
-    ///         `depositsLocked`.
-    address private _lastSettledStrategy;
+    ///         time `depositsLocked` runs. Recording membership here is what
+    ///         survives that gap.
+    mapping(address strategy => bool) private _residueOutstanding;
+
+    /// @notice How many strategies are in `_residueOutstanding`. The deposit
+    ///         gate reads THIS, not the set, so the hot path stays O(1) — it
+    ///         sits on every deposit and on every queued deposit claim, and an
+    ///         iteration there would be both a gas cost and an unbounded-growth
+    ///         hazard.
+    uint256 private _residueCount;
 
     /// @dev Reserved storage for future upgrades. Shrinks whenever a new state
     ///      variable is added above. Grown from 28 → 31 slots: this deletion
     ///      frees `_laneALockPid` (1), `_interimNetFlow` (1), and
     ///      `_crystallizedMgmt`+`_crystallizedPerf` (1, shared) — legal only
     ///      because no vault proxy is live (see design.md "Deployment reality").
-    ///      Back to 30: `_lastSettledStrategy` takes one.
-    uint256[30] private __gap;
+    ///      Back to 29: `_residueOutstanding` and `_residueCount` take one each
+    ///      (replacing the single `_lastSettledStrategy` slot).
+    uint256[29] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -1219,12 +1236,67 @@ contract SyndicateVault is
     ///         width of the async path.
     function depositsLocked() public view returns (bool) {
         if (IProposalStatus(_getGovernor()).openProposalCount() != 0) return true;
-        address s = _lastSettledStrategy;
-        if (s == address(0)) return false;
+        return _residueCount != 0;
+    }
+
+    /// @notice Sweep a settled strategy's residue back into the vault and, once
+    ///         it reports nothing outstanding, stop counting it against the
+    ///         deposit gate.
+    /// @dev    PERMISSIONLESS AND UNTAXED BY DESIGN — it is the exit from the
+    ///         lock, and the party most motivated to call it is the depositor
+    ///         being refused. That is what keeps the fail-closed gate from being
+    ///         a wedge: whoever wants in can clear the residue and then deposit,
+    ///         at the corrected price.
+    ///
+    ///         THE SWEEP IS A LOW-LEVEL CALL WITH THE RESULT IGNORED. The
+    ///         address is proposer-chosen (a clone of an allowlisted template,
+    ///         but still), so a typed call would let a reverting clone brick the
+    ///         only exit from the lock. A failed sweep simply recovers nothing
+    ///         and leaves the strategy counted, which is the honest outcome.
+    ///
+    ///         CLEARS ONLY ON A DEFINITE "NOTHING OUTSTANDING". A probe that
+    ///         cannot be read leaves the strategy counted — the same
+    ///         fail-closed direction `depositsLocked` takes, and for the same
+    ///         reason: an unreadable answer must never be read as permission to
+    ///         mint. A clone that can never answer therefore holds the gate
+    ///         shut; the backstop for that case ships with the round ledger
+    ///         (issue #233) and is deliberately not improvised here.
+    function collectResidue(address strategy) external nonReentrant returns (uint256 collected) {
+        if (!_residueOutstanding[strategy]) return 0;
+
+        uint256 before = IERC20(asset()).balanceOf(address(this));
+        // solhint-disable-next-line avoid-low-level-calls
+        (bool swept,) = strategy.call{gas: _SWEEP_GAS}(abi.encodeWithSelector(_SEL_SWEEP));
+        swept; // result deliberately unused — see the note above
+        collected = IERC20(asset()).balanceOf(address(this)) - before;
+
         (bool ok, bytes memory ret) =
-            s.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.hasUndeliveredValue, ()));
-        if (!ok || ret.length != 32) return true;
-        return abi.decode(ret, (uint256)) != 0;
+            strategy.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.hasUndeliveredValue, ()));
+        if (ok && ret.length == 32 && abi.decode(ret, (uint256)) == 0) {
+            _residueOutstanding[strategy] = false;
+            _residueCount -= 1;
+            emit ResidueCleared(strategy, collected);
+        }
+    }
+
+    /// @dev Record `strategy` as still owing, if it says so. Called at
+    ///      settlement, once, for the strategy that just settled.
+    ///      Idempotent on the count: a strategy already in the set is not
+    ///      double-counted, which matters because the same clone could in
+    ///      principle be named by two proposals.
+    function _markResidueIfOutstanding(address strategy) private {
+        if (strategy == address(0) || _residueOutstanding[strategy]) return;
+        (bool ok, bytes memory ret) =
+            strategy.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.hasUndeliveredValue, ()));
+        // FAIL CLOSED, matching `collectResidue`: an unreadable probe counts the
+        // strategy rather than waving it through. `!ok` covers the codeless
+        // address too, so a strategy that cannot be asked is treated as owing
+        // until it can answer otherwise.
+        if (!ok || ret.length != 32 || abi.decode(ret, (uint256)) != 0) {
+            _residueOutstanding[strategy] = true;
+            _residueCount += 1;
+            emit ResidueOutstanding(strategy);
+        }
     }
 
     /// @dev Float available for instant exits = vault asset balance minus the
@@ -1583,7 +1655,17 @@ contract SyndicateVault is
         // pin at zero, which `depositsLocked` reads as nothing outstanding —
         // the pre-existing behaviour, not a stricter one.
         (bool okS, bytes memory retS) = msg.sender.staticcall(abi.encodeCall(IProposalStatus.strategyOf, (proposalId)));
-        _lastSettledStrategy = (okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0);
+        // NOT SWEPT HERE, AND THAT IS MEASURED RATHER THAN ASSUMED. An earlier
+        // plan called for a best-effort `sweep()` of the settling strategy at
+        // this point, to clear the residue before the stamp. It recovers
+        // nothing: `MorphoSupplyStrategy.sweep()` computes `_deliverableNow()`
+        // exactly as `_settle()` just did, and `_settle` has already withdrawn
+        // that maximum in this same transaction — the market's idle balance is
+        // drained by that withdraw, so a second call in the same frame resolves
+        // `deliverable == 0`. The residue of the proposal being settled is
+        // recoverable only in a LATER transaction, once the market refills,
+        // which is what `collectResidue` is for.
+        _markResidueIfOutstanding((okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0));
 
         address q = _withdrawalQueue;
         if (q == address(0)) return;
@@ -1671,6 +1753,21 @@ contract SyndicateVault is
     ///      lock ever becomes load-bearing rather than defence-in-depth, this
     ///      needs a measured worst-case bound instead of a round number.
     uint256 private constant _PROBE_GAS = 150_000;
+
+    /// @dev Gas ceiling for the `sweep()` call inside `collectResidue`. Unlike
+    ///      the probes above this is a STATE-CHANGING call into a
+    ///      proposer-chosen clone, so it needs room for a real withdraw + swap +
+    ///      transfer while still being bounded: `collectResidue` is
+    ///      permissionless, and an uncapped call would let a gas-burning clone
+    ///      eat 63/64 of whatever the caller forwards. The result is ignored, so
+    ///      a clone that exhausts this simply recovers nothing and stays counted.
+    uint256 private constant _SWEEP_GAS = 1_500_000;
+
+    /// @dev `bytes4(keccak256("sweep()"))`. Encoded by selector rather than
+    ///      through a typed interface on purpose: the call must stay low-level
+    ///      so a reverting or non-conforming clone cannot brick the only exit
+    ///      from the deposit lock.
+    bytes4 private constant _SEL_SWEEP = 0x35faa416;
 
     // ==================== MANAGEMENT-FEE ACCRUAL ====================
 
