@@ -1959,9 +1959,17 @@ contract SyndicateVault is
         // under-priced but ALWAYS PAYABLE, and payable is the property the
         // queue's solvency rests on.
         //
-        // The queued-deposit mispricing is therefore still open. The design for
-        // closing it lives in `docs/nav-residue-design.md` and issue #233 — do
-        // not re-derive it here.
+        // WHAT IS STILL OPEN HERE IS THE REDEEMER, NOT THE DEPOSITOR. The
+        // queued-DEPOSIT mispricing is closed, but not from this site: a mint no
+        // longer reads any stamp at all, it converts live against
+        // `depositNav()`, which counts what settled strategies still owe. A
+        // queued REDEEMER is still paid from this float-only stamp, so they
+        // leave their share of the residue behind and it accrues to the LPs who
+        // stayed. That is a fairness gap, not an attack — no adversary, no loss
+        // to the protocol, a transfer between LPs — and closing it means paying
+        // them a floor now plus a share of arrivals later, NOT correcting this
+        // number. See `docs/nav-residue-design.md` and issue #233; do not
+        // re-derive it here.
         //
         // NOTE the skip-stamp-plus-`restamp(pid)` shape is NOT the plan: it does
         // not survive the queue. `claim` requires `_lastStampedPid >= r.pid`, so
