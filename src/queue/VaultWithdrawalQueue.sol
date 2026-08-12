@@ -11,15 +11,16 @@ import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/Reentrancy
 interface IRequestableVault {
     function asset() external view returns (address);
     function redemptionsLocked() external view returns (bool);
-    /// @notice True while a mint must not happen — an open proposal, or a
-    ///         settled strategy still holding undelivered value. The deposit
-    ///         claim below refuses on this, on the same predicate the instant
-    ///         path uses (finding #3).
+    /// @notice True while a mint must not happen — an open proposal. The
+    ///         deposit claim below refuses on this, the same predicate the
+    ///         instant path uses. A residue no longer locks: it is PRICED via
+    ///         `previewDeposit` instead (finding #3).
     function depositsLocked() external view returns (bool);
-    /// @notice Live assets-to-shares at the current price. The deposit claim
-    ///         prices against this rather than a frozen stamp, so a residue that
-    ///         has since been swept in is already reflected.
-    function convertToShares(uint256 assets) external view returns (uint256);
+    /// @notice Live assets-to-shares for a MINT, at the current price and
+    ///         INCLUDING value settled strategies still owe the vault. The
+    ///         deposit claim prices against this rather than a frozen stamp, so
+    ///         a residue is paid for whether or not it has come home yet.
+    function previewDeposit(uint256 assets) external view returns (uint256);
     /// @notice Queue-only: burn `shares` escrowed here and pay `assets` to `to`.
     function settleRedeem(uint256 shares, uint256 assets, address to) external;
     /// @notice Queue-only: mint `shares` to `to`. Assets were pushed to the
@@ -318,7 +319,7 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             // Retires the perpetual look-back call the old frozen pricing
             // created — with no frozen number there is nothing to look back at,
             // which is why `cancel` can now stay open for deposits.
-            outAmount = IRequestableVault(vault).convertToShares(amount);
+            outAmount = IRequestableVault(vault).previewDeposit(amount);
             if (outAmount == 0) revert ZeroShares();
             _pendingDepositAssets -= amount;
             // Push escrowed assets into the vault, then mint at the price read

@@ -67,6 +67,13 @@ contract MockVault is ERC20("MV", "MV") {
         convertDen = den;
     }
 
+    /// @dev The queue's deposit claim prices through `previewDeposit`, which on
+    ///      the real vault includes value settled strategies still owe. Here it
+    ///      is just the settable rate.
+    function previewDeposit(uint256 assets) external view returns (uint256) {
+        return (assets * convertNum) / convertDen;
+    }
+
     function convertToShares(uint256 assets) external view returns (uint256) {
         return (assets * convertNum) / convertDen;
     }

@@ -241,9 +241,34 @@ contract SyndicateVault is
     ///         falls and recovers is not charged twice on the same dollars.
     uint256 private _highWaterPricePerShare;
 
-    /// @notice Settled strategies that still hold undelivered value. Membership
-    ///         is set at `onProposalSettled` and cleared by the permissionless
-    ///         `collectResidue`.
+    /// @notice Last known undelivered value per settled strategy that still owes.
+    ///         Written at `onProposalSettled` and refreshed by the permissionless
+    ///         `collectResidue`; nonzero IS membership.
+    ///
+    ///         PRICED, NOT LOCKED. An earlier version of this gate refused
+    ///         deposits while any strategy still owed. That is a bet on an
+    ///         unanswerable question — will the value come back? — and it pays
+    ///         nothing in the branch where it is wrong: if the residue never
+    ///         arrives, the residue-free price was correct all along and the
+    ///         vault was frozen for nothing, potentially forever, since a market
+    ///         that never refills never clears. Charging the depositor as though
+    ///         it WILL arrive is safe in both branches instead: if it does they
+    ///         paid fairly, if it never does they overpaid and the incumbents
+    ///         are unharmed either way. The depositor carries the risk of value
+    ///         they can see on chain before choosing to enter, which is the
+    ///         right person to carry it.
+    ///
+    ///         DEPOSIT SIDE ONLY, and that asymmetry is the whole safety
+    ///         argument. On a mint, counting this makes the depositor receive
+    ///         FEWER shares — over-counting costs only them. On a redeem it
+    ///         would pay out assets the vault does not hold, which over-pays
+    ///         early exiters and strands the tail. Counting it on both sides is
+    ///         what made the "widen totalAssets()" direction unsafe; this counts
+    ///         it on the safe side only, so `totalAssets()`, the settle stamp,
+    ///         every redeem path, the fee bases and the governor's sizing reads
+    ///         are all untouched. ERC-4626 explicitly permits deposit and redeem
+    ///         to price differently — that is how a vault expresses an entry
+    ///         fee, and this is one: the depositor's share of value not yet home.
     ///
     ///         A SET, NOT A POINTER, AND THAT IS THE WHOLE POINT. This was one
     ///         `_lastSettledStrategy` slot, overwritten at every settlement —
@@ -264,14 +289,17 @@ contract SyndicateVault is
     ///         pointer is still live during `onProposalSettled` and gone by the
     ///         time `depositsLocked` runs. Recording membership here is what
     ///         survives that gap.
-    mapping(address strategy => bool) private _residueOutstanding;
+    mapping(address strategy => uint256) private _residueAmount;
 
-    /// @notice How many strategies are in `_residueOutstanding`. The deposit
-    ///         gate reads THIS, not the set, so the hot path stays O(1) — it
-    ///         sits on every deposit and on every queued deposit claim, and an
-    ///         iteration there would be both a gas cost and an unbounded-growth
-    ///         hazard.
-    uint256 private _residueCount;
+    /// @notice Sum of `_residueAmount` across every strategy that still owes —
+    ///         the figure DEPOSITS are priced against, on top of `totalAssets()`.
+    ///
+    ///         A RUNNING TOTAL, NOT AN ITERATION. It sits on every deposit
+    ///         preview, so summing a set there would be both a gas cost and an
+    ///         unbounded-growth hazard. Maintained by `_recordResidue` and
+    ///         `collectResidue`, which are the only two writers of
+    ///         `_residueAmount`.
+    uint256 private _residueTotal;
 
     /// @dev Reserved storage for future upgrades. Shrinks whenever a new state
     ///      variable is added above. Grown from 28 → 31 slots: this deletion
@@ -1213,7 +1241,7 @@ contract SyndicateVault is
     ///      unsafe here for a specific structural reason rather than a
     ///      preference: the mark would be unremovable, and any registered agent
     ///      can reach it by naming an EOA as the proposal's strategy — see
-    ///      `_markResidueIfOutstanding` for the full trace. A permanent,
+    ///      `_recordResidue` for the full trace. A permanent,
     ///      unrecoverable deposit brick is worse than the suppression it would
     ///      be guarding, which is the same trade `_PROBE_GAS` documents.
     ///
@@ -1232,8 +1260,16 @@ contract SyndicateVault is
     ///         same predicate as an instant one, or the gate has a hole the
     ///         width of the async path.
     function depositsLocked() public view returns (bool) {
-        if (IProposalStatus(_getGovernor()).openProposalCount() != 0) return true;
-        return _residueCount != 0;
+        return IProposalStatus(_getGovernor()).openProposalCount() != 0;
+    }
+
+    /// @notice Assets the vault is worth FOR PRICING A MINT: idle float plus the
+    ///         value settled strategies still owe it.
+    /// @dev    Deliberately not `totalAssets()`. See `_residueAmount` for why
+    ///         this figure is safe on the deposit side and unsafe on the redeem
+    ///         side; nothing but `previewDeposit` / `previewMint` reads it.
+    function depositNav() public view returns (uint256) {
+        return totalAssets() + _residueTotal;
     }
 
     /// @notice Sweep a settled strategy's residue back into the vault and, once
@@ -1256,7 +1292,7 @@ contract SyndicateVault is
     ///         counted — deposits stay shut, the safe direction, and the honest
     ///         one since the vault genuinely cannot tell whether value is still
     ///         out. That state is only ever entered from a definite readable
-    ///         "yes" (see `_markResidueIfOutstanding`), so it means a strategy
+    ///         "yes" (see `_recordResidue`), so it means a strategy
     ///         that DID owe has stopped answering, not that an arbitrary address
     ///         was marked. The codeless arm covers a strategy that has since
     ///         self-destructed: it can hold nothing and answer nothing, so
@@ -1269,7 +1305,8 @@ contract SyndicateVault is
     ///         ledger's timeout/guardian backstop exists (issue #233); it is
     ///         deliberately not improvised here.
     function collectResidue(address strategy) external nonReentrant returns (uint256 collected) {
-        if (!_residueOutstanding[strategy]) return 0;
+        uint256 known = _residueAmount[strategy];
+        if (known == 0) return 0;
 
         uint256 before = IERC20(asset()).balanceOf(address(this));
         // solhint-disable-next-line avoid-low-level-calls
@@ -1277,19 +1314,41 @@ contract SyndicateVault is
         swept; // result deliberately unused — see the note above
         collected = IERC20(asset()).balanceOf(address(this)) - before;
 
-        bool clear;
+        // A CODELESS STRATEGY OWES NOTHING. It can hold nothing and answer
+        // nothing, so carrying its last known figure forever would over-price
+        // every future deposit against value that provably cannot exist.
         if (strategy.code.length == 0) {
-            clear = true;
-        } else {
-            (bool ok, bytes memory ret) =
-                strategy.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.hasUndeliveredValue, ()));
-            clear = ok && ret.length == 32 && abi.decode(ret, (uint256)) == 0;
-        }
-        if (clear) {
-            _residueOutstanding[strategy] = false;
-            _residueCount -= 1;
+            _residueTotal -= known;
+            _residueAmount[strategy] = 0;
             emit ResidueCleared(strategy, collected);
+            return collected;
         }
+
+        (bool ok, uint256 outstanding) = _readUndeliveredValue(strategy);
+        // UNREADABLE KEEPS THE LAST KNOWN FIGURE, deliberately. Delivery only
+        // ever shrinks what is owed, so a stale reading is stale-HIGH — the
+        // direction that over-prices a deposit rather than under-pricing it.
+        // Refusing to update is therefore the safe response to silence, and it
+        // is why a strategy that stops answering can never wedge this vault:
+        // there is no lock to hold, only a price that stays conservative.
+        if (!ok) return collected;
+
+        if (outstanding != known) {
+            _residueTotal = _residueTotal - known + outstanding;
+            _residueAmount[strategy] = outstanding;
+        }
+        if (outstanding == 0) emit ResidueCleared(strategy, collected);
+    }
+
+    /// @dev Amount-returning sibling of the probes above. Returns `ok == false`
+    ///      when the strategy cannot be read at all, which callers MUST
+    ///      distinguish from a readable zero — the two mean opposite things
+    ///      (`unknown` vs `nothing owed`).
+    function _readUndeliveredValue(address strategy) private view returns (bool ok, uint256 value) {
+        bytes memory ret;
+        (ok, ret) = strategy.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.undeliveredValue, ()));
+        if (!ok || ret.length != 32) return (false, 0);
+        value = abi.decode(ret, (uint256));
     }
 
     /// @dev Record `strategy` as still owing, if it says so. Called at
@@ -1324,16 +1383,16 @@ contract SyndicateVault is
     ///      is the same treatment `address(0)` gets and the same rule
     ///      `propose` applies: a guard that only makes sense for a CONTRACT must
     ///      establish there is one first.
-    function _markResidueIfOutstanding(address strategy) private {
+    function _recordResidue(address strategy) private {
         if (strategy == address(0) || strategy.code.length == 0) return;
-        if (_residueOutstanding[strategy]) return;
-        (bool ok, bytes memory ret) =
-            strategy.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.hasUndeliveredValue, ()));
-        if (ok && ret.length == 32 && abi.decode(ret, (uint256)) != 0) {
-            _residueOutstanding[strategy] = true;
-            _residueCount += 1;
-            emit ResidueOutstanding(strategy);
-        }
+        (bool ok, uint256 outstanding) = _readUndeliveredValue(strategy);
+        if (!ok || outstanding == 0) return;
+
+        uint256 known = _residueAmount[strategy];
+        if (outstanding == known) return;
+        _residueTotal = _residueTotal - known + outstanding;
+        _residueAmount[strategy] = outstanding;
+        emit ResidueOutstanding(strategy, outstanding);
     }
 
     /// @dev Float available for instant exits = vault asset balance minus the
@@ -1449,6 +1508,29 @@ contract SyndicateVault is
     /// @dev Mirror of `_convertToShares` above, same single change.
     function _convertToAssets(uint256 shares, Math.Rounding rounding) internal view override returns (uint256) {
         return Math.mulDiv(shares, totalAssets() + 1, _pricingSupply() + 10 ** _decimalsOffset(), rounding);
+    }
+
+    /// @inheritdoc ERC4626Upgradeable
+    /// @dev PRICED OFF `depositNav()`, NOT `totalAssets()` — a mint pays for the
+    ///      value settled strategies still owe the vault as well as the float.
+    ///      Rounds DOWN, so the depositor never receives more than the figure
+    ///      implies. This is the finding-#3 gate in its final form: minting
+    ///      against a price that excludes a residue is the skim, and there is
+    ///      nothing left to skim once the price includes it.
+    ///
+    ///      `convertToShares` deliberately keeps reading `totalAssets()`: it is
+    ///      the symmetric, fee-free figure ERC-4626 defines, and the spread
+    ///      between it and this is exactly the entry fee described on
+    ///      `_residueAmount`.
+    function previewDeposit(uint256 assets) public view virtual override returns (uint256) {
+        return Math.mulDiv(assets, _pricingSupply() + 10 ** _decimalsOffset(), depositNav() + 1, Math.Rounding.Floor);
+    }
+
+    /// @inheritdoc ERC4626Upgradeable
+    /// @dev The `previewDeposit` inverse, rounding UP so the assets demanded for
+    ///      a given share count never undercharge.
+    function previewMint(uint256 shares) public view virtual override returns (uint256) {
+        return Math.mulDiv(shares, depositNav() + 1, _pricingSupply() + 10 ** _decimalsOffset(), Math.Rounding.Ceil);
     }
 
     /// @dev Returns 0 when `paused()` so the EIP-4626 IMP-1 invariant holds
@@ -1702,7 +1784,7 @@ contract SyndicateVault is
         // `deliverable == 0`. The residue of the proposal being settled is
         // recoverable only in a LATER transaction, once the market refills,
         // which is what `collectResidue` is for.
-        _markResidueIfOutstanding((okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0));
+        _recordResidue((okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0));
 
         address q = _withdrawalQueue;
         if (q == address(0)) return;

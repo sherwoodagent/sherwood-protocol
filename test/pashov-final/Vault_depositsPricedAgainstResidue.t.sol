@@ -1,0 +1,380 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+import {VaultInstantLiquidityTest} from "../SyndicateVault.InstantLiquidity.t.sol";
+import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
+import {IVaultWithdrawalQueue} from "../../src/interfaces/IVaultWithdrawalQueue.sol";
+
+/// @dev A settled strategy that answers the delivery probe. `holding` is what a
+///      `sweep()` would still return.
+contract StubDeliveryStrategy {
+    bool public holding;
+
+    function setHolding(bool v) external {
+        holding = v;
+    }
+
+    function hasUndeliveredValue() external view returns (bool) {
+        return holding;
+    }
+
+    uint256 public residue;
+
+    function setResidue(uint256 v) external {
+        residue = v;
+    }
+
+    function undeliveredValue() external view returns (uint256) {
+        return residue;
+    }
+}
+
+/// @dev Answers with the WRONG SHAPE — succeeds but returns ZERO bytes, the way
+///      a void-returning or non-conforming implementation does. The probe must
+///      treat that as unanswerable rather than decoding whatever is on the wire.
+///
+///      Note a narrower-typed return does NOT reproduce this: a `uint128` return
+///      is still ABI-padded to a full 32-byte word, so it passes the length
+///      check and decodes as a normal non-zero answer. Reaching the length
+///      branch takes a genuinely short return, which is what the bare fallback
+///      below produces.
+contract StubDeliveryShortReturn {
+    fallback() external {
+        // returns 0 bytes of returndata with success
+    }
+}
+
+/// @title SyndicateVault — deposits are PRICED against value a settlement left behind
+/// @notice Finding #3. `totalAssets()` counts only `balanceOf(this)`, so value a
+///         strategy still holds prices at ZERO. During a live proposal that is
+///         covered by `openProposalCount() != 0` — but strategy settlement is
+///         DELIVERABLE-MAXIMUM, not all-or-revert: a market at high utilization
+///         delivers what it can, emits `SettlementIncomplete`, and leaves the
+///         rest for the permissionless `sweep()`. `_finishSettlement` clears the
+///         open count regardless.
+///
+///         In that gap the vault reopens deposits at a price missing the
+///         residue. A depositor mints cheap, calls `sweep()` themselves to drag
+///         the residue back into the now-larger pool, and redeems: for a deposit
+///         `A` against residue `R`, they take `A * R / (float + A)` straight out
+///         of the LPs who were already in. Unprivileged, repeatable per
+///         proposal, and inducible rather than merely opportunistic —
+///         `_deliverableNow` caps at Morpho's idle balance, which a fee-free
+///         `flashLoan` removes for one callback frame.
+contract PashovFinalDepositResiduePricingTest is VaultInstantLiquidityTest {
+    StubDeliveryStrategy internal deliveryStrat;
+
+    function _settleWith(address strategy) internal {
+        _settleWithPid(PID, strategy);
+    }
+
+    /// @dev Distinct pid per settlement — `stampSettlement` refuses a repeat
+    ///      (`AlreadySettled`) and a lower one (`StampOutOfOrder`), so the
+    ///      multi-settlement tests below must step the pid forward.
+    function _settleWithPid(uint256 pid, address strategy) internal {
+        // Live proposal naming `strategy`, then settle it — the governor stamps
+        // and clears the open count, which is exactly the transition under test.
+        governor.set(pid, 1, strategy);
+        vm.prank(address(governor));
+        vault.onProposalSettled(pid);
+        governor.set(0, 0, address(0));
+    }
+
+    /// @notice THE FIX, IN ITS FINAL FORM: a residue is PRICED, not locked.
+    ///         The deposit succeeds — but at a price that already charges for
+    ///         the value the strategy still owes, so there is nothing left to
+    ///         skim by sweeping it in afterwards.
+    ///
+    ///         Locking was the earlier shape and it was a bet on an
+    ///         unanswerable question. If the residue never arrives, the
+    ///         residue-free price was right all along and the vault was frozen
+    ///         for nothing — potentially forever, since a market that never
+    ///         refills never clears. Pricing is safe in BOTH branches.
+    function test_finding3_depositIsPricedAgainstTheResidue() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(1_000e6);
+        deal(vault.asset(), address(vault), 1_000e6);
+
+        uint256 floatOnly = vault.totalAssets();
+        _settleWith(address(deliveryStrat));
+
+        assertEq(vault.depositNav(), floatOnly + 1_000e6, "deposits price against float + residue");
+        assertEq(vault.totalAssets(), floatOnly, "totalAssets is untouched - redeems keep reading float");
+
+        // Same assets, fewer shares than the float-only price would have minted.
+        uint256 pricedIn = vault.previewDeposit(1_000e6);
+        uint256 floatOnlyShares = vault.convertToShares(1_000e6);
+        assertLt(pricedIn, floatOnlyShares, "charged for the residue");
+
+        vm.prank(alice);
+        assertEq(vault.deposit(1_000e6, alice), pricedIn, "mint matches the quoted, residue-inclusive price");
+    }
+
+    /// @notice AND THE SKIM IS GONE. The attacker's sequence — deposit at the
+    ///         residue-free price, then sweep the residue into the enlarged pool
+    ///         — cannot profit, because the deposit already paid for it. Their
+    ///         share of the vault after sweeping is worth no more than they put
+    ///         in.
+    function test_finding3_depositThenSweepIsNotProfitable() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(1_000e6);
+        deal(vault.asset(), address(vault), 1_000e6);
+        _settleWith(address(deliveryStrat));
+
+        vm.prank(alice);
+        uint256 shares = vault.deposit(1_000e6, alice);
+
+        // The residue comes home; the attacker sweeps it in themselves.
+        deal(vault.asset(), address(vault), vault.totalAssets() + 1_000e6);
+        deliveryStrat.setHolding(false);
+        deliveryStrat.setResidue(0);
+        vault.collectResidue(address(deliveryStrat));
+
+        // Their stake is worth no more than they paid — the skim is priced out.
+        assertLe(vault.convertToAssets(shares), 1_000e6 + 1, "no value extracted from the incumbents");
+    }
+
+    /// @notice A residue never locks anything, so a market that never refills
+    ///         cannot freeze the vault. This is the liveness property the lock
+    ///         could not offer at any timeout.
+    function test_finding3_permanentlyStuckResidueNeverBlocksDeposits() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(5_000e6);
+        _settleWith(address(deliveryStrat));
+
+        assertFalse(vault.depositsLocked(), "a residue must never lock the vault");
+        vm.prank(alice);
+        assertGt(vault.deposit(1_000e6, alice), 0, "deposits stay open against a dead market");
+    }
+
+    /// @notice THE STAMP STAYS FLOAT-ONLY. Redeems are priced on cash in hand,
+    ///         which is what keeps the residue off the side where over-counting
+    ///         would pay out assets the vault does not hold.
+    function test_finding3_stampRemainsFloatOnly() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(4_000e6);
+        deal(vault.asset(), address(vault), 10_000e6);
+
+        uint256 float_ = vault.totalAssets();
+        _settleWith(address(deliveryStrat));
+
+        IVaultWithdrawalQueue.SettlePrice memory sp = queue.getSettlePrice(PID);
+        assertEq(sp.num, float_ + 1, "the stamp is float-only; the residue lives on the deposit side alone");
+    }
+
+    /// @notice Collecting refreshes the figure. Once the value is home it is in
+    ///         `totalAssets()` and must stop being added on top, or it would be
+    ///         counted twice against every later deposit.
+    function test_finding3_collectingStopsDoubleCountingTheResidue() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(1_000e6);
+        _settleWith(address(deliveryStrat));
+        assertEq(vault.depositNav(), vault.totalAssets() + 1_000e6);
+
+        deliveryStrat.setHolding(false);
+        deliveryStrat.setResidue(0);
+        vault.collectResidue(address(deliveryStrat));
+
+        assertEq(vault.depositNav(), vault.totalAssets(), "no residue left to add");
+    }
+
+    /// @notice A partial delivery lowers the figure rather than clearing it.
+    function test_finding3_partialDeliveryLowersTheDepositPrice() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(1_000e6);
+        _settleWith(address(deliveryStrat));
+
+        deliveryStrat.setResidue(400e6);
+        vault.collectResidue(address(deliveryStrat));
+
+        assertEq(vault.depositNav(), vault.totalAssets() + 400e6, "figure tracks what is still owed");
+    }
+
+    /// @notice A COMPLETE settlement adds nothing — the ordinary case is
+    ///         untouched.
+    function test_finding3_completeSettlementPricesAtFloat() public {
+        deliveryStrat = new StubDeliveryStrategy(); // holding == false, residue == 0
+        _settleWith(address(deliveryStrat));
+
+        assertEq(vault.depositNav(), vault.totalAssets(), "nothing owed, nothing added");
+        vm.prank(alice);
+        assertGt(vault.deposit(1_000e6, alice), 0, "deposits open");
+    }
+
+    /// @notice UNREADABLE KEEPS THE LAST KNOWN FIGURE. Delivery only ever
+    ///         shrinks what is owed, so a stale reading is stale-HIGH — the
+    ///         direction that over-prices a deposit rather than under-pricing
+    ///         it. Silence therefore cannot wedge the vault OR open the skim.
+    function test_finding3_unreadableStrategyKeepsTheLastKnownFigure() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(1_000e6);
+        _settleWith(address(deliveryStrat));
+
+        // Same address, now a contract that cannot answer.
+        vm.etch(address(deliveryStrat), address(new StubDeliveryShortReturn()).code);
+        vault.collectResidue(address(deliveryStrat));
+
+        assertEq(vault.depositNav(), vault.totalAssets() + 1_000e6, "last known figure retained");
+        vm.prank(alice);
+        assertGt(vault.deposit(1_000e6, alice), 0, "still not a lock");
+    }
+
+    /// @notice A strategy that never reported anything is never priced in — the
+    ///         figure is only ever entered from a definite, readable answer.
+    function test_finding3_unreadableAtSettlementIsNeverPricedIn() public {
+        _settleWith(address(new StubDeliveryShortReturn()));
+
+        assertEq(vault.depositNav(), vault.totalAssets(), "unreadable is never recorded");
+    }
+
+    /// @notice THE BLOCKER AN EARLIER VERSION OF THIS PR SHIPPED.
+    ///         `SyndicateGovernor` stores `strategy` unvalidated and explicitly
+    ///         skips its own probe for codeless addresses (the
+    ///         `strategy.code.length != 0` guard there, pinned by
+    ///         `test_propose_eoaStrategySucceedsAtPropose`). Nothing ever calls
+    ///         the field — it is a label — so a proposal naming an EOA settles
+    ///         normally, and a staticcall to it succeeds with EMPTY returndata.
+    ///
+    ///         Under the old fail-closed lock that read as "unreadable", marked
+    ///         the EOA, and could never be cleared: one proposal from any
+    ///         registered agent permanently shut every deposit path. Codeless is
+    ///         short-circuited before any call, and there is no lock left to
+    ///         brick regardless.
+    function test_finding3_eoaStrategyIsNeverPricedIn() public {
+        _settleWith(makeAddr("eoaStrategyLabel"));
+
+        assertEq(vault.depositNav(), vault.totalAssets(), "an EOA label owes nothing");
+        assertFalse(vault.depositsLocked(), "and cannot lock the vault");
+        vm.prank(alice);
+        assertGt(vault.deposit(1_000e6, alice), 0, "deposits unaffected");
+    }
+
+    /// @notice A strategy that owed and has since self-destructed drops out: it
+    ///         can hold nothing, so carrying its figure would over-price every
+    ///         later deposit against value that provably cannot exist.
+    function test_finding3_codelessAfterRecordingIsCleared() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(1_000e6);
+        _settleWith(address(deliveryStrat));
+        assertEq(vault.depositNav(), vault.totalAssets() + 1_000e6);
+
+        vm.etch(address(deliveryStrat), "");
+        vault.collectResidue(address(deliveryStrat));
+
+        assertEq(vault.depositNav(), vault.totalAssets(), "codeless owes nothing");
+    }
+
+    // ── every strategy that owes, not just the newest ──
+
+    /// @notice THE TWO-PROPOSAL SKIM. The figure used to hang off a single
+    ///         `_lastSettledStrategy` pin, overwritten at every settlement — so
+    ///         a strategy still holding a residue stopped being accounted for
+    ///         the moment the next proposal settled, and a deposit priced as if
+    ///         it owed nothing.
+    function test_finding3_earlierStrategysResidueStillPricedAfterALaterSettlement() public {
+        StubDeliveryStrategy dirty = new StubDeliveryStrategy();
+        dirty.setHolding(true);
+        dirty.setResidue(1_000e6);
+        _settleWithPid(PID, address(dirty));
+
+        StubDeliveryStrategy clean = new StubDeliveryStrategy(); // owes nothing
+        _settleWithPid(PID + 1, address(clean));
+
+        // Pre-fix the pin named `clean`, which owes nothing, and the earlier
+        // strategy's 1,000 vanished from the price.
+        assertEq(vault.depositNav(), vault.totalAssets() + 1_000e6, "the earlier strategy still owes");
+    }
+
+    /// @notice Two outstanding at once: the figure is a SUM, not a flag.
+    function test_finding3_twoOutstandingStrategiesBothPriced() public {
+        StubDeliveryStrategy a = new StubDeliveryStrategy();
+        a.setHolding(true);
+        a.setResidue(600e6);
+        _settleWithPid(PID, address(a));
+
+        StubDeliveryStrategy b = new StubDeliveryStrategy();
+        b.setHolding(true);
+        b.setResidue(400e6);
+        _settleWithPid(PID + 1, address(b));
+
+        assertEq(vault.depositNav(), vault.totalAssets() + 1_000e6, "both counted");
+
+        a.setResidue(0);
+        a.setHolding(false);
+        vault.collectResidue(address(a));
+        assertEq(vault.depositNav(), vault.totalAssets() + 400e6, "only b remains");
+    }
+
+    /// @notice Collecting a strategy that is not owed anything is inert, so the
+    ///         running total cannot be drained by repetition.
+    function test_finding3_collectResidueIsInertForAnUnrecordedStrategy() public {
+        StubDeliveryStrategy a = new StubDeliveryStrategy();
+        a.setHolding(true);
+        a.setResidue(500e6);
+        _settleWithPid(PID, address(a));
+
+        uint256 navBefore = vault.depositNav();
+        vault.collectResidue(makeAddr("neverRecorded"));
+        vault.collectResidue(makeAddr("neverRecorded"));
+        assertEq(vault.depositNav(), navBefore, "unrecorded strategies cannot move the figure");
+    }
+
+    // ── the ASYNC half of the same gate ──
+
+    /// @notice THE ASYNC HALF. The instant path was gated while a residue was
+    ///         outstanding; the QUEUED path was not — it claimed against the
+    ///         frozen settle stamp, a float-only number blind to the residue by
+    ///         construction, so the skim survived the earlier fix by going
+    ///         around it.
+    ///
+    ///         Both paths now price through `previewDeposit`, so the queued
+    ///         claim is charged for the residue exactly like an instant deposit.
+    function test_finding3_queuedDepositClaimIsPricedAgainstTheResidue() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(1_000e6);
+
+        governor.set(PID, 1, address(deliveryStrat));
+        vm.prank(alice);
+        uint256 id = vault.requestDeposit(1_000e6, alice);
+
+        vm.prank(address(governor));
+        vault.onProposalSettled(PID);
+        governor.set(0, 0, address(0));
+
+        // The claim mints at the residue-inclusive price, not the stamp.
+        uint256 expected = vault.previewDeposit(1_000e6);
+        uint256 floatOnly = vault.convertToShares(1_000e6);
+        assertLt(expected, floatOnly, "charged for the residue");
+
+        uint256 minted = queue.claim(id);
+        assertEq(minted, expected, "queued claim priced like an instant deposit");
+    }
+
+    /// @notice A queued claim placed against a clean settlement is unaffected —
+    ///         no residue, no spread, the price is simply the live one.
+    function test_finding3_queuedDepositClaimUnaffectedByACleanSettlement() public {
+        deliveryStrat = new StubDeliveryStrategy(); // owes nothing
+
+        governor.set(PID, 1, address(deliveryStrat));
+        vm.prank(alice);
+        uint256 id = vault.requestDeposit(1_000e6, alice);
+
+        vm.prank(address(governor));
+        vault.onProposalSettled(PID);
+        governor.set(0, 0, address(0));
+
+        assertEq(vault.depositNav(), vault.totalAssets(), "nothing owed");
+        uint256 expected = vault.previewDeposit(1_000e6);
+        assertEq(queue.claim(id), expected, "priced at the plain live price");
+        assertEq(vault.balanceOf(alice), expected, "shares landed with the depositor");
+    }
+}
