@@ -314,8 +314,16 @@ contract SyndicateVault is
     ///         large floors `previewDeposit` to zero, which without the guard in
     ///         `_deposit` would take a depositor's assets and mint nothing. The
     ///         cap is the honest bound rather than an arbitrary one: a strategy
-    ///         cannot owe back more than the capital the vault held when the
-    ///         batch that funded it ran.
+    ///         cannot owe back more PRINCIPAL than the capital its proposal was
+    ///         permitted to move.
+    ///
+    ///         TRUE OF PRINCIPAL, NOT OF PRINCIPAL PLUS YIELD, and the gap is
+    ///         deliberate. A strategy that deployed its full ceiling and earned
+    ///         on it owes slightly more than that ceiling, and this clamp cuts
+    ///         the excess — so the recorded figure runs under, never over. That
+    ///         is the same direction as every other approximation on this path:
+    ///         an under-count costs the depositor a sliver, an over-count would
+    ///         let a hostile clone tax every entrant or brick the mint entirely.
     mapping(address strategy => uint256) private _residueCap;
 
     /// @notice Strategies reporting residue they CANNOT value in vault-asset
