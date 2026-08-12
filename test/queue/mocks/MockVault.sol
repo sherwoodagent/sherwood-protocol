@@ -11,10 +11,20 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///         mints / burns / pays exactly what it's told.
 contract MockVault is ERC20("MV", "MV") {
     bool public locked;
+    /// @dev Stands in for the real vault's `depositsLocked()` — an open proposal
+    ///      OR a settled strategy still holding a residue. The queue's deposit
+    ///      claim gates on this (finding #3), so the tests drive it directly
+    ///      rather than modelling a strategy.
+    bool public depositsLockedFlag;
     address public queue;
     IERC20 public immutable assetToken;
     address public lastRedeemTo;
     address public lastDepositTo;
+    /// @dev Live assets->shares rate, settable so a test can move the price
+    ///      between request and claim — which is exactly what a swept-in residue
+    ///      does to the real vault. Defaults to 1:1.
+    uint256 public convertNum = 1;
+    uint256 public convertDen = 1;
 
     constructor(address asset_) {
         assetToken = IERC20(asset_);
@@ -38,6 +48,27 @@ contract MockVault is ERC20("MV", "MV") {
 
     function redemptionsLocked() external view returns (bool) {
         return locked;
+    }
+
+    function setDepositsLocked(bool l) external {
+        depositsLockedFlag = l;
+    }
+
+    function depositsLocked() external view returns (bool) {
+        return depositsLockedFlag;
+    }
+
+    /// @dev Set the live price a deposit claim will convert at. `num/den` is
+    ///      shares-per-asset: a HIGHER den (more assets backing each share)
+    ///      means a deposit mints FEWER shares, which is what a residue arriving
+    ///      into the pool does.
+    function setConvertRate(uint256 num, uint256 den) external {
+        convertNum = num;
+        convertDen = den;
+    }
+
+    function convertToShares(uint256 assets) external view returns (uint256) {
+        return (assets * convertNum) / convertDen;
     }
 
     function settleRedeem(uint256 shares, uint256 assets, address to) external {

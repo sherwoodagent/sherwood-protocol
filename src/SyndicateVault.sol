@@ -242,7 +242,7 @@ contract SyndicateVault is
     uint256 private _highWaterPricePerShare;
 
     /// @notice The strategy of the most recently settled proposal, pinned at
-    ///         `onProposalSettled` so `_depositsLocked` can ask whether it still
+    ///         `onProposalSettled` so `depositsLocked` can ask whether it still
     ///         holds undelivered value.
     ///
     ///         NEEDED BECAUSE THE ORDINARY POINTER IS GONE BY THE TIME IT WOULD
@@ -251,10 +251,10 @@ contract SyndicateVault is
     ///         IMMEDIATELY AFTER calling this vault — the ordering is CEI and
     ///         load-bearing, see the note on `_activeProposal = 0` there. So the
     ///         pointer is still live during `onProposalSettled` and gone by the
-    ///         time `_depositsLocked` runs, leaving no path back to the strategy
+    ///         time `depositsLocked` runs, leaving no path back to the strategy
     ///         that just settled. Pinning here is what survives that gap. Zero
     ///         when unresolvable, which reads as "nothing outstanding" — see
-    ///         `_depositsLocked`.
+    ///         `depositsLocked`.
     address private _lastSettledStrategy;
 
     /// @dev Reserved storage for future upgrades. Shrinks whenever a new state
@@ -1191,25 +1191,39 @@ contract SyndicateVault is
     ///      market must never trap the vault, which is why the deliverable-
     ///      maximum design exists and why this guard is on deposits only.
     ///
-    ///      DEGRADES OPEN, STATED. A strategy that cannot answer leaves deposits
-    ///      unlocked — the pre-existing behaviour — rather than locked. Failing
-    ///      closed here would let one non-conforming clone brick deposits for
-    ///      the vault's whole remaining life, with no permissionless way out,
-    ///      which is a worse and less reversible failure than the mispricing it
-    ///      would be guarding against. Same doctrine as `_escrowedFeeLiability`.
+    ///      DEGRADES CLOSED ONCE A STRATEGY IS PINNED, STATED. A pinned clone
+    ///      that cannot answer locks deposits rather than leaving them open.
+    ///      This inverts the earlier posture, and the reason is that the probe
+    ///      is now the ONLY thing standing between a residue and a mint: the
+    ///      queued-deposit path gates on this same predicate (see the queue's
+    ///      `claim`), so a probe that degrades OPEN degrades the whole
+    ///      finding-#3 gate open, in exactly the window an attacker can force
+    ///      (a flash loan that empties the market's idle balance both induces
+    ///      the residue and, on a gas-burning IRM, can push the probe past
+    ///      `_PROBE_GAS`). A false lock costs a wait; a false open is the skim.
+    ///
+    ///      Bounded, not unbounded: the pin only ever names a clone of a
+    ///      factory-allowlisted, TierRegistry-certified template, `address(0)`
+    ///      short-circuits before any call, and the next settlement re-pins.
+    ///      The permissionless, untaxed `sweep()` remains the exit — the very
+    ///      depositor this refuses can clear the residue and then deposit.
     ///
     ///      This closes the MINT side only. Queued redeemers stamped in the same
     ///      `onProposalSettled` call are still priced at the float-only figure
-    ///      and remain underpaid by the residue; that half needs `totalAssets()`
-    ///      itself to count strategy-held value and is deliberately not done
-    ///      here.
-    function _depositsLocked() private view returns (bool) {
+    ///      and remain underpaid by the residue — that is the FAIRNESS half of
+    ///      finding #3 (issue #233), deliberately not closed here; see
+    ///      `docs/nav-residue-design.md`. This PR closes the ATTACK half.
+    /// @notice Public because the withdrawal queue reads it: a queued deposit
+    ///         claim mints at the live price and must be refused on exactly the
+    ///         same predicate as an instant one, or the gate has a hole the
+    ///         width of the async path.
+    function depositsLocked() public view returns (bool) {
         if (IProposalStatus(_getGovernor()).openProposalCount() != 0) return true;
         address s = _lastSettledStrategy;
         if (s == address(0)) return false;
         (bool ok, bytes memory ret) =
             s.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.hasUndeliveredValue, ()));
-        if (!ok || ret.length != 32) return false;
+        if (!ok || ret.length != 32) return true;
         return abi.decode(ret, (uint256)) != 0;
     }
 
@@ -1353,7 +1367,7 @@ contract SyndicateVault is
         whenNotPaused
         nonReentrant
     {
-        if (_depositsLocked()) revert DepositsLocked();
+        if (depositsLocked()) revert DepositsLocked();
         _requireApprovedDepositor(receiver);
         super._deposit(caller, receiver, assets, shares);
         // The fund's first shares establish the high-water mark. Cannot be done
@@ -1562,11 +1576,11 @@ contract SyndicateVault is
     ///      `num`/`den`, so the read here excludes only PRIOR stamps.
     function onProposalSettled(uint256 proposalId) external onlyGovernor {
         // Pin the settling strategy BEFORE anything can return early — this is
-        // the last moment the governor still names it, and `_depositsLocked`
+        // the last moment the governor still names it, and `depositsLocked`
         // needs it to ask whether a residue is still in flight. Read from the
         // caller (the governor), which is `onlyGovernor`-authenticated, via a
         // length-checked staticcall: a governor that cannot answer leaves the
-        // pin at zero, which `_depositsLocked` reads as nothing outstanding —
+        // pin at zero, which `depositsLocked` reads as nothing outstanding —
         // the pre-existing behaviour, not a stricter one.
         (bool okS, bytes memory retS) = msg.sender.staticcall(abi.encodeCall(IProposalStatus.strategyOf, (proposalId)));
         _lastSettledStrategy = (okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0);

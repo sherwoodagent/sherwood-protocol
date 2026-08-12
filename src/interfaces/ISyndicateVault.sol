@@ -176,6 +176,15 @@ interface ISyndicateVault {
     function spendableFee(address asset) external view returns (uint256);
     function governor() external view returns (address);
     function redemptionsLocked() external view returns (bool);
+    /// @notice True while a mint must not happen: an open proposal, or a settled
+    ///         strategy still holding undelivered value (the residue). The
+    ///         second arm is finding #3's gate — minting against a price that
+    ///         excludes the residue is the skim, so BOTH the instant path and
+    ///         the queue's deposit claim refuse on this one predicate.
+    /// @dev    Degrades CLOSED once a strategy is pinned; see the implementation
+    ///         for why the earlier degrade-open posture is unsafe now that the
+    ///         async path gates on it too.
+    function depositsLocked() external view returns (bool);
     function managementFeeBps() external view returns (uint256);
     /// @notice Vault-owner-set agent performance fee (basis points). Defaults
     ///         to `FeeConstants.DEFAULT_AGENT_FEE_BPS` (2000 = 20%) while unset.

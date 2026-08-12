@@ -23,7 +23,7 @@ interface IProposalStatus {
     function getActiveProposal() external view returns (uint256);
 
     /// @notice Count of non-terminal proposals (Pending..Executed). Nonzero ⇒
-    ///         instant deposits are gated (see vault `_depositsLocked`).
+    ///         instant deposits are gated (see vault `depositsLocked`).
     function openProposalCount() external view returns (uint256);
 
     /// @notice Strategy adapter of a proposal (address(0) = none / opted out of

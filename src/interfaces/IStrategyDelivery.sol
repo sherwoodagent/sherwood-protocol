@@ -31,7 +31,7 @@ interface IStrategyDelivery {
     /// @notice True while this strategy still holds value belonging to the
     ///         vault that a `sweep()` (or equivalent release) would return.
     ///
-    ///         Read by `SyndicateVault._depositsLocked` through a length-checked
+    ///         Read by `SyndicateVault.depositsLocked` through a length-checked
     ///         staticcall that degrades OPEN: a strategy which cannot answer
     ///         leaves deposits unlocked rather than bricking them, since failing
     ///         closed would let one non-conforming clone shut deposits for the

@@ -319,7 +319,7 @@ contract MorphoSupplyStrategy is BaseStrategy {
         // and a proposer can reach it cheaply by omitting `settle()` from a
         // `maxDrawdownBps == 10_000` batch. A permanent DoS is worse than the
         // fail-open it was closing, and it would have falsified
-        // `_depositsLocked`'s "NOBODY IS WEDGED" doctrine.
+        // `depositsLocked`'s "NOBODY IS WEDGED" doctrine.
         //
         // Closing the emergency-path gap needs `sweep()` reachable for a
         // terminal-but-`Executed` clone first — either by relaxing its gate or

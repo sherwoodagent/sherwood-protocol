@@ -143,32 +143,43 @@ contract PashovFinalDepositLockTest is VaultInstantLiquidityTest {
         assertGt(shares, 0, "nothing outstanding, nothing to wait for");
     }
 
-    /// @notice DEGRADES OPEN, AND THAT IS A STATED DECISION. A strategy that
-    ///         cannot answer leaves deposits unlocked — the pre-existing
-    ///         behaviour — rather than locked.
+    /// @notice DEGRADES CLOSED, AND THAT IS THE INVERSION OF AN EARLIER STATED
+    ///         DECISION. A pinned strategy that cannot answer now LOCKS
+    ///         deposits.
     ///
-    ///         Failing closed would let one non-conforming clone shut deposits
-    ///         for the vault's whole remaining life with no permissionless way
-    ///         out, which is a worse and far less reversible failure than the
-    ///         mispricing being guarded against. The guard is therefore
-    ///         best-effort by construction, not airtight.
-    function test_finding3_unanswerableStrategyLeavesDepositsOpen() public {
+    ///         The earlier posture — degrade open, because one non-conforming
+    ///         clone shutting deposits is worse than the mispricing — was
+    ///         defensible while this probe was defence-in-depth on the instant
+    ///         path alone. It is not defensible now: the queued-deposit claim
+    ///         gates on this same predicate, so a probe that degrades OPEN
+    ///         degrades the entire finding-#3 gate open, in precisely the window
+    ///         an attacker can force (the flash loan that empties the market's
+    ///         idle balance to induce the residue can also, on a gas-burning
+    ///         IRM, push the probe past `_PROBE_GAS`). A false lock costs a
+    ///         wait; a false open is the skim.
+    ///
+    ///         Bounded, not unbounded: the pin only names a clone of a
+    ///         factory-allowlisted, TierRegistry-certified template, and the
+    ///         permissionless untaxed `sweep()` plus the next settlement's
+    ///         re-pin are the exits.
+    function test_finding3_unanswerableStrategyLocksDeposits() public {
         _settleWith(makeAddr("strategyWithNoCode"));
 
         vm.prank(alice);
-        uint256 shares = vault.deposit(1_000e6, alice);
-        assertGt(shares, 0, "a codeless strategy must not brick deposits forever");
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(1_000e6, alice);
     }
 
-    /// @notice Same decision for a wrong-shaped answer — the explicit
-    ///         `ret.length` check is what keeps this a decision rather than an
-    ///         undecodable revert inside a view the deposit path depends on.
-    function test_finding3_shortReturnStrategyLeavesDepositsOpen() public {
+    /// @notice Same inversion for a wrong-shaped answer — the explicit
+    ///         `ret.length` check is still what keeps this a DECISION rather
+    ///         than an undecodable revert inside a view the deposit path
+    ///         depends on; only the decision's direction changed.
+    function test_finding3_shortReturnStrategyLocksDeposits() public {
         _settleWith(address(new StubDeliveryShortReturn()));
 
         vm.prank(alice);
-        uint256 shares = vault.deposit(1_000e6, alice);
-        assertGt(shares, 0, "a malformed answer must not be decoded");
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(1_000e6, alice);
     }
 
     /// @notice The original lock is untouched: an OPEN proposal still shuts
@@ -190,5 +201,61 @@ contract PashovFinalDepositLockTest is VaultInstantLiquidityTest {
         vm.prank(alice);
         uint256 shares = vault.deposit(1_000e6, alice);
         assertGt(shares, 0, "fresh vault, nothing pinned, deposits open");
+    }
+
+    // ── the ASYNC half of the same gate ──
+
+    /// @notice THE HOLE THIS PR CLOSES. The instant path was already shut while
+    ///         a residue was outstanding; the QUEUED path was not. A deposit
+    ///         requested during the proposal claimed afterwards against the
+    ///         frozen settle stamp — a number computed from float alone, blind
+    ///         to the residue by construction — so the skim survived the earlier
+    ///         fix entirely by going around it.
+    ///
+    ///         Now the claim gates on the same predicate as the instant path.
+    function test_finding3_queuedDepositClaimRefusedWhileResidueOutstanding() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+
+        // Queue a deposit while the proposal is live, then settle it dirty.
+        governor.set(PID, 1, address(deliveryStrat));
+        vm.prank(alice);
+        uint256 id = vault.requestDeposit(1_000e6, alice);
+
+        vm.prank(address(governor));
+        vault.onProposalSettled(PID);
+        governor.set(0, 0, address(0));
+
+        // The open count is clear, so the OLD gate would have let this mint at
+        // the residue-blind stamp. The residue probe holds it shut.
+        assertTrue(vault.depositsLocked(), "residue outstanding");
+        vm.expectRevert(IVaultWithdrawalQueue.VaultLocked.selector);
+        queue.claim(id);
+    }
+
+    /// @notice And it opens again once the residue is in — at the corrected
+    ///         price, which is the half that makes the gate meaningful rather
+    ///         than merely obstructive. `sweep()` is permissionless and untaxed,
+    ///         so the very depositor being refused can clear it themselves.
+    function test_finding3_queuedDepositClaimOpensOnceResidueIsCleared() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+
+        governor.set(PID, 1, address(deliveryStrat));
+        vm.prank(alice);
+        uint256 id = vault.requestDeposit(1_000e6, alice);
+
+        vm.prank(address(governor));
+        vault.onProposalSettled(PID);
+        governor.set(0, 0, address(0));
+
+        // The residue is delivered — the strategy no longer holds anything.
+        deliveryStrat.setHolding(false);
+        assertFalse(vault.depositsLocked(), "residue cleared");
+
+        uint256 expected = vault.convertToShares(1_000e6);
+        uint256 minted = queue.claim(id);
+        assertEq(minted, expected, "mints at the live, residue-inclusive price");
+        assertEq(vault.balanceOf(alice), minted, "shares landed with the depositor");
     }
 }

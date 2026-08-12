@@ -630,7 +630,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // `totalAssets()` at PROPOSE, and nothing stops the proposer inflating
         // that denominator with its own deposit right before proposing, then
         // withdrawing it during the vote. The two capital locks read different
-        // counters — `_depositsLocked()` rises at PROPOSE, `redemptionsLocked()`
+        // counters — `depositsLocked()` rises at PROPOSE, `redemptionsLocked()`
         // only at EXECUTE — so the proposer's own capital is free to leave in the
         // gap, shrinking the float the ceiling was computed against while
         // `maxCapital` stays pinned at its inflated value. Re-running the
@@ -1978,7 +1978,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
         // Release the locks LAST, after every external call above (CEI).
         // `_activeProposal` backs the vault's `redemptionsLocked()` and
-        // `_openProposalCount` backs `_depositsLocked()` — clearing either before
+        // `_openProposalCount` backs `depositsLocked()` — clearing either before
         // the fee transfers or the `onProposalSettled` stamp would open a window
         // where a callback-bearing fee recipient could deposit or redeem against a
         // NAV that is pre-fee and pre-stamp, shifting `totalSupply()` before the
