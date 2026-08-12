@@ -145,10 +145,16 @@
       "type": "t_uint256"
     },
     {
-      "label": "__gap",
+      "label": "_residuePid",
       "slot": "22",
       "offset": 0,
-      "type": "t_array(t_uint256)26_storage"
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "__gap",
+      "slot": "23",
+      "offset": 0,
+      "type": "t_array(t_uint256)25_storage"
     }
   ],
   "types": {

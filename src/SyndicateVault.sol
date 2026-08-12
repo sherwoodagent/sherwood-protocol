@@ -355,15 +355,23 @@ contract SyndicateVault is
     ///         clears.
     uint256 private _unvaluedCount;
 
+    /// @notice The proposal a settled strategy belongs to, so a late arrival can
+    ///         be routed to the redeem cohort that exited at its stamp.
+    /// @dev    Recorded at settlement, where the id is in hand.
+    ///         `collectResidue` is keyed by STRATEGY (the address it must sweep)
+    ///         while the cohort is keyed by PROPOSAL (the stamp it was priced
+    ///         at), and this is the only place both are known at once.
+    mapping(address strategy => uint256) private _residuePid;
+
     /// @dev Reserved storage for future upgrades. Shrinks whenever a new state
     ///      variable is added above. Grown from 28 → 31 slots: this deletion
     ///      frees `_laneALockPid` (1), `_interimNetFlow` (1), and
     ///      `_crystallizedMgmt`+`_crystallizedPerf` (1, shared) — legal only
     ///      because no vault proxy is live (see design.md "Deployment reality").
-    ///      Back to 26: `_residueAmount`, `_residueTotal`, `_residueCap`,
-    ///      `_residueUnvalued` and `_unvaluedCount` take one each, replacing the
-    ///      single `_lastSettledStrategy` slot.
-    uint256[26] private __gap;
+    ///      Back to 25: `_residueAmount`, `_residueTotal`, `_residueCap`,
+    ///      `_residueUnvalued`, `_unvaluedCount` and `_residuePid` take one each,
+    ///      replacing the single `_lastSettledStrategy` slot.
+    uint256[25] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -1372,6 +1380,7 @@ contract SyndicateVault is
         (bool swept,) = strategy.call{gas: _SWEEP_GAS}(abi.encodeWithSelector(_SEL_SWEEP));
         swept; // result deliberately unused — see the note above
         collected = IERC20(asset()).balanceOf(address(this)) - before;
+        _payCohortShare(strategy, collected);
 
         // A CODELESS STRATEGY OWES NOTHING. It can hold nothing and answer
         // nothing, so carrying its last known figure forever would over-price
@@ -1454,7 +1463,7 @@ contract SyndicateVault is
     ///      is the same treatment `address(0)` gets and the same rule
     ///      `propose` applies: a guard that only makes sense for a CONTRACT must
     ///      establish there is one first.
-    function _recordResidue(address strategy, uint256 cap) private {
+    function _recordResidue(address strategy, uint256 pid, uint256 cap) private {
         if (strategy == address(0) || strategy.code.length == 0) return;
 
         _refreshUnvalued(strategy);
@@ -1467,12 +1476,59 @@ contract SyndicateVault is
         if (cap == 0) return;
         if (outstanding > cap) outstanding = cap;
         _residueCap[strategy] = cap;
+        _residuePid[strategy] = pid;
 
         uint256 known = _residueAmount[strategy];
         if (outstanding == known) return;
         _residueTotal = _residueTotal - known + outstanding;
         _residueAmount[strategy] = outstanding;
         emit ResidueOutstanding(strategy, outstanding);
+    }
+
+    /// @dev Hand the exiting cohort their share of an arrival, and leave the
+    ///      rest where it landed.
+    ///
+    ///      THE FAIRNESS HALF OF FINDING #3. The settle stamp is computed from
+    ///      float alone, so a redeemer claiming against it is paid as though the
+    ///      residue were worth zero — and when it later comes home it lifts the
+    ///      price for whoever STAYED. The money is not lost; it goes to the
+    ///      wrong people. This pays it to the right ones.
+    ///
+    ///      SPLIT BY THE COHORT'S FRACTION AT THE STAMP, `shares / den`, both
+    ///      frozen by the queue when it stamped. If the exiting cohort held 30%
+    ///      of the vault at that instant, they are owed 30% of everything that
+    ///      arrives afterwards for that proposal. Rounds DOWN, so the cohort is
+    ///      never handed more than arrived and the dust stays with the stayers.
+    ///
+    ///      REAL ASSETS ONLY — `arrival` is a measured balance delta, never an
+    ///      estimate, so nothing here can pay out against value that has not
+    ///      turned up. That is what makes the junior leg unable to strand
+    ///      anyone: with no arrival there is simply nothing to split, and the
+    ///      redeemer keeps the floor they were already paid.
+    ///
+    ///      CUSTODIED BY THE QUEUE, not reserved here. Assets sent there leave
+    ///      `totalAssets()`, so they stop lifting the stayers' price the instant
+    ///      they are earmarked — which is correct, they are not the stayers' —
+    ///      and the junior leg never touches `reservedQueueAssets()`, the figure
+    ///      that gates instant exits and the next proposal's float.
+    function _payCohortShare(address strategy, uint256 arrival) private {
+        if (arrival == 0) return;
+        address q = _withdrawalQueue;
+        if (q == address(0)) return;
+
+        uint256 pid = _residuePid[strategy];
+        if (pid == 0) return;
+
+        (uint256 shares, uint256 den) = IVaultWithdrawalQueue(q).cohortOf(pid);
+        // No queued redeems at that settlement: nobody exited against the
+        // float-only stamp, so the whole arrival belongs to the stayers.
+        if (shares == 0 || den == 0) return;
+
+        uint256 cohortShare = Math.mulDiv(arrival, shares, den);
+        if (cohortShare == 0) return;
+
+        IERC20(asset()).safeTransfer(q, cohortShare);
+        IVaultWithdrawalQueue(q).creditCohort(pid, cohortShare);
     }
 
     /// @dev The tighter of the two bounds the governor already keeps on how much
@@ -1921,7 +1977,9 @@ contract SyndicateVault is
         // `deliverable == 0`. The residue of the proposal being settled is
         // recoverable only in a LATER transaction, once the market refills,
         // which is what `collectResidue` is for.
-        _recordResidue((okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0), _residueBound(proposalId));
+        _recordResidue(
+            (okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0), proposalId, _residueBound(proposalId)
+        );
 
         address q = _withdrawalQueue;
         if (q == address(0)) return;
