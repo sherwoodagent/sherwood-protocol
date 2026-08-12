@@ -1467,6 +1467,30 @@ contract SyndicateVault is
         emit ResidueOutstanding(strategy, outstanding);
     }
 
+    /// @dev The tighter of the two bounds the governor already keeps on how much
+    ///      a proposal could have moved out: the vault's whole float before the
+    ///      batch (`getCapitalSnapshot`) and the coverage-scaled ceiling the
+    ///      batch was actually held to (`getEffectiveMaxCapital`). The ceiling is
+    ///      the real bound — the snapshot admits a self-report of up to the
+    ///      entire vault — so a hostile clone cannot impose an entry tax larger
+    ///      than the capital its proposal was permitted to touch.
+    ///
+    ///      Either read failing yields zero, which records nothing: unreadable
+    ///      means not recorded here as everywhere else on this path.
+    function _residueBound(uint256 proposalId) private view returns (uint256) {
+        (bool okC, bytes memory retC) =
+            msg.sender.staticcall(abi.encodeCall(IProposalStatus.getCapitalSnapshot, (proposalId)));
+        if (!okC || retC.length != 32) return 0;
+        uint256 bound = abi.decode(retC, (uint256));
+
+        (bool okE, bytes memory retE) =
+            msg.sender.staticcall(abi.encodeCall(IProposalStatus.getEffectiveMaxCapital, (proposalId)));
+        if (!okE || retE.length != 32) return 0;
+        uint256 ceiling = abi.decode(retE, (uint256));
+
+        return ceiling < bound ? ceiling : bound;
+    }
+
     /// @dev Re-read whether `strategy` holds residue it cannot value, and keep
     ///      `_unvaluedCount` in step. Unreadable keeps the last known flag, for
     ///      the same reason the amount does: silence must not be read as
@@ -1889,12 +1913,7 @@ contract SyndicateVault is
         // `deliverable == 0`. The residue of the proposal being settled is
         // recoverable only in a LATER transaction, once the market refills,
         // which is what `collectResidue` is for.
-        (bool okC, bytes memory retC) =
-            msg.sender.staticcall(abi.encodeCall(IProposalStatus.getCapitalSnapshot, (proposalId)));
-        _recordResidue(
-            (okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0),
-            (okC && retC.length == 32) ? abi.decode(retC, (uint256)) : 0
-        );
+        _recordResidue((okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0), _residueBound(proposalId));
 
         address q = _withdrawalQueue;
         if (q == address(0)) return;

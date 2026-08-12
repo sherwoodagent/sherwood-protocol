@@ -7,7 +7,7 @@ import {IStrategyDelivery} from "../interfaces/IStrategyDelivery.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {IMorpho, Id, MarketParams} from "../vendor/morpho/IMorpho.sol";
+import {IMorpho, Id, MarketParams, Market} from "../vendor/morpho/IMorpho.sol";
 import {MarketParamsLib, MorphoBalancesLib, SharesMathLib} from "../vendor/morpho/MorphoLibs.sol";
 
 /// @notice The hops walked to resolve the governance-owned adapter allowlist from
@@ -332,8 +332,10 @@ contract MorphoSupplyStrategy is BaseStrategy {
         // side — so anyone can mint 1 wei of shares to a settled clone. Keying
         // on `supplyShares != 0` let that bypass the dust floor and shut vault
         // deposits indefinitely, which is the grief `RESIDUE_DUST` exists for.
-        (, uint256 own,) = _deliverableNow();
-        if (own > RESIDUE_DUST) return true;
+        // SAME RAW BASIS AS `undeliveredValue()` below, so the bool and the
+        // amount can never diverge — and so this probe is equally immune to a
+        // gas-griefing IRM. See `_ownRaw`.
+        if (_ownRaw() > RESIDUE_DUST) return true;
         return IERC20(asset).balanceOf(address(this)) > RESIDUE_DUST;
     }
 
@@ -346,8 +348,39 @@ contract MorphoSupplyStrategy is BaseStrategy {
     ///      whatever a partial withdrawal already pulled but has not pushed.
     function undeliveredValue() public view override returns (uint256) {
         if (_state != State.Settled) return 0;
-        (, uint256 own,) = _deliverableNow();
-        return own + IERC20(asset).balanceOf(address(this));
+        return _ownRaw() + IERC20(asset).balanceOf(address(this));
+    }
+
+    /// @dev This clone's supply position in loan-token units, valued over the
+    ///      market's RAW stored totals — deliberately NOT `_deliverableNow` /
+    ///      `expectedMarketBalances`.
+    ///
+    ///      THE ACCRUING READ ROUTES THROUGH A PROPOSER-CHOSEN CONTRACT.
+    ///      `expectedMarketBalances` calls `IIrm(marketParams.irm).borrowRateView`
+    ///      to project interest since `lastUpdate`, and `_initialize` binds
+    ///      neither `mp.irm` nor the registry against it. The vault reads the
+    ///      probes above under a gas cap (`SyndicateVault._PROBE_GAS`), so an IRM
+    ///      whose view burns past that cap makes the read fail — and a failed
+    ///      read means the residue is never recorded and deposits are priced as
+    ///      if there were none, which is finding #3 restored. `_settle` and
+    ///      `sweep()` call the accruing path with full gas and are unaffected,
+    ///      which is exactly what made the asymmetry reachable.
+    ///
+    ///      A raw `morpho.market(id)` read has no external call at all, so the
+    ///      suppression has nowhere to enter. The cost is that it excludes
+    ///      interest accrued since `lastUpdate`, i.e. it is stale-LOW by that
+    ///      amount — the same bounded staleness the vault already documents and
+    ///      accepts for a snapshot between refreshes, and a far smaller gap than
+    ///      an unbounded suppression of the whole figure.
+    ///
+    ///      `_deliverableNow` KEEPS the accruing read: `_settle` and `sweep`
+    ///      size real withdrawals with it and must not under-withdraw, and they
+    ///      are not gas-capped by a caller.
+    function _ownRaw() private view returns (uint256) {
+        uint256 shares = morpho.position(marketId, address(this)).supplyShares;
+        if (shares == 0) return 0;
+        Market memory m = morpho.market(marketId);
+        return shares.toAssetsDown(m.totalSupplyAssets, m.totalSupplyShares);
     }
 
     /// @inheritdoc IStrategyDelivery

@@ -27,6 +27,11 @@ interface IProposalStatus {
     ///         cannot return more principal than the vault held when it was
     ///         funded.
     function getCapitalSnapshot(uint256 proposalId) external view returns (uint256);
+    /// @notice The proposal's coverage-scaled capital ceiling — what its execute
+    ///         batch was actually allowed to move out. Read by `SyndicateVault`
+    ///         alongside `getCapitalSnapshot` to bound what the proposal's
+    ///         strategy can still owe: the tighter of the two.
+    function getEffectiveMaxCapital(uint256 proposalId) external view returns (uint256);
 
     /// @notice Count of non-terminal proposals (Pending..Executed). Nonzero ⇒
     ///         instant deposits are gated (see vault `depositsLocked`).

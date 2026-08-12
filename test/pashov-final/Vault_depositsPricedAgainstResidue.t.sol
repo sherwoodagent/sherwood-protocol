@@ -505,4 +505,36 @@ contract PashovFinalDepositResiduePricingTest is VaultInstantLiquidityTest {
         vm.prank(alice);
         assertEq(vault.deposit(0, alice), 0, "zero-asset deposit is not an error");
     }
+
+    /// @notice THE CAP IS THE TIGHTER OF THE TWO BOUNDS. The capital snapshot is
+    ///         the vault's ENTIRE float before the batch, so on its own it would
+    ///         admit a self-report of up to the whole vault — a permanent entry
+    ///         tax a proposer could impose, compounding across settlements. The
+    ///         coverage-scaled ceiling is what the batch was actually held to,
+    ///         and it is the honest bound.
+    function test_finding3_capUsesTheTighterOfSnapshotAndCeiling() public {
+        governor.setCapitalSnapshot(50_000e6); // the whole vault
+        governor.setEffectiveMaxCapital(2_000e6); // what the batch could move
+
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(type(uint256).max);
+        _settleWith(address(deliveryStrat));
+
+        assertEq(vault.depositNav(), vault.totalAssets() + 2_000e6, "bounded by the ceiling, not the float");
+    }
+
+    /// @notice And the other way round, so the min is a real min rather than a
+    ///         rename of the ceiling.
+    function test_finding3_capUsesTheSnapshotWhenItIsTheTighter() public {
+        governor.setCapitalSnapshot(800e6);
+        governor.setEffectiveMaxCapital(5_000e6);
+
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setResidue(type(uint256).max);
+        _settleWith(address(deliveryStrat));
+
+        assertEq(vault.depositNav(), vault.totalAssets() + 800e6, "bounded by the snapshot");
+    }
 }

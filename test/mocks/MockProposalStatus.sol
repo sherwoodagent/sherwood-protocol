@@ -61,6 +61,18 @@ contract MockProposalStatus is IProposalStatus {
         return capitalSnapshot;
     }
 
+    /// @dev The vault bounds a residue report by the TIGHTER of this and the
+    ///      capital snapshot. Defaults high for the same reason.
+    uint256 public effectiveMaxCapital = type(uint128).max;
+
+    function setEffectiveMaxCapital(uint256 v) external {
+        effectiveMaxCapital = v;
+    }
+
+    function getEffectiveMaxCapital(uint256) external view returns (uint256) {
+        return effectiveMaxCapital;
+    }
+
     function openProposalCount() external view returns (uint256) {
         return openCount;
     }

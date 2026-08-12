@@ -279,4 +279,67 @@ contract MorphoSupplySettlementTest is MorphoSupplyFixture {
         assertGt(usdg.balanceOf(address(vaultStub)) - vaultBefore, SUPPLY, "principal plus accrued interest");
         assertEq(mockMorpho.position(marketId, address(strategy)).supplyShares, 0, "nothing left behind");
     }
+
+    // ── the residue probes must not route through the proposer's IRM ──
+
+    /// @notice FINDING #3, SUPPRESSED THROUGH THE IRM. `_initialize` binds
+    ///         neither `mp.irm` nor the registry against it, and the vault reads
+    ///         the residue probes under a gas cap. An accruing read routes
+    ///         through `IIrm.borrowRateView`, so an IRM whose view burns past
+    ///         that cap makes the probe fail — and a failed probe means the
+    ///         residue is never recorded, deposits are priced as if there were
+    ///         none, and the skim is back.
+    ///
+    ///         `sweep()` calls the same market with FULL gas and still works,
+    ///         which is what made the asymmetry reachable: suppress the price,
+    ///         keep the recovery.
+    ///
+    ///         Both probes are computed from raw stored totals, so there is no
+    ///         external call for a hostile IRM to enter through.
+    function test_residueProbes_surviveAGasGriefingIrm() public {
+        _approveAndExecute();
+        _pinUtilization(10_000e6);
+        vm.prank(address(vaultStub));
+        strategy.settle();
+
+        // Interest must be pending, or there is nothing for the IRM to be asked
+        // about and the griefing branch is never reached.
+        vm.warp(vm.getBlockTimestamp() + 30 days);
+        irm.setGasToBurn(10_000_000);
+
+        // Read under the same 150k cap the vault applies. Pre-fix these OOG'd.
+        (bool okAmount, bytes memory amountRet) =
+            address(strategy).staticcall{gas: 150_000}(abi.encodeWithSignature("undeliveredValue()"));
+        assertTrue(okAmount, "amount probe must not depend on the proposer's IRM");
+        assertGt(abi.decode(amountRet, (uint256)), 0, "and must report the residue");
+
+        (bool okBool,) = address(strategy).staticcall{gas: 150_000}(abi.encodeWithSignature("hasUndeliveredValue()"));
+        assertTrue(okBool, "the bool probe must be equally immune");
+    }
+
+    /// @notice The raw basis is stale-LOW by the interest accrued since
+    ///         `lastUpdate`, never high — the bounded direction. It under-prices
+    ///         a deposit by at most that interest, where the suppression it
+    ///         replaces omitted the entire residue.
+    function test_undeliveredValue_isStaleLowNotHigh() public {
+        _approveAndExecute();
+        _pinUtilization(10_000e6);
+        vm.prank(address(vaultStub));
+        strategy.settle();
+
+        uint256 atSettle = strategy.undeliveredValue();
+        vm.warp(vm.getBlockTimestamp() + 30 days);
+
+        // Accrual is not projected, so the figure does not move until the market
+        // itself accrues — under-reporting by exactly the pending interest, and
+        // never over-reporting, which is the direction that would let a deposit
+        // be priced against value that never arrives.
+        assertEq(strategy.undeliveredValue(), atSettle, "raw totals, no projection");
+
+        // Once the market itself accrues, the figure catches up — the staleness
+        // is a lag, not a permanent under-count, and it only ever resolves
+        // upward.
+        mockMorpho.accrueInterest(mp);
+        assertGe(strategy.undeliveredValue(), atSettle, "resolves upward once accrued, never downward");
+    }
 }
