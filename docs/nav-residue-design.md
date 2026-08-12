@@ -284,8 +284,15 @@ one proposal later.
    for the settling strategy (see PR 2). The common case is carried instead by
    whoever calls `collectResidue` once the market refills; there is no in-tx
    shortcut.
-3. *(optional)* **Propose-time cap on deployment vs the target market's idle
-   liquidity**, so the vault's own exit rarely creates a residue at all.
+3. ~~Propose-time cap on deployment vs the target market's idle liquidity.~~
+   **REJECTED as overkill.** It would have made a residue rarer by stopping the
+   vault from being too large a share of a market — but it fixes nothing on its
+   own (a redeemer caught by one is underpaid by exactly the same amount), it is
+   checked at propose while the problem bites at settle, it is gameable by
+   flash-depositing into the market to inflate idle liquidity past the check,
+   and at Sherwood's real market sizes it would forbid the tokenized-equity
+   markets outright ($0–$1.6k lendable) while being invisible on the stable
+   wrappers ($1.2M–$20M). A product amputation bought with a heuristic.
 4. **Queue round ledger + accumulator** (queue-only): round mappings + `ACC`,
    `openRound`/`closeRound`/`creditArrival`/`openRoundCount`/`roundInfo`
    (onlyVault), and the `_roundCohortShares[pid] = redeemShares` freeze inside the
