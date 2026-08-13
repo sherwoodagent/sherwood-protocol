@@ -286,4 +286,110 @@ contract PashovFinalRedeemerResidueTest is VaultInstantLiquidityTest {
         vm.expectRevert(IVaultWithdrawalQueue.NotRedeemRequest.selector);
         queue.claimRemainder(depositId);
     }
+
+    // ── the two asset pools this contract now holds must not bleed ──
+
+    /// @notice The queue custodies escrowed DEPOSITS and redeem-cohort
+    ///         ARRIVALS in the same contract balance. They are tracked by
+    ///         separate counters and every flow touches exactly one of them, so
+    ///         neither pool can be paid out of the other's money.
+    ///
+    ///         Checked in the direction that would actually lose funds: a
+    ///         depositor cancelling must get their full escrow back even though
+    ///         cohort assets are sitting alongside it, and the cohort's claim
+    ///         must still be payable afterwards.
+    function test_depositEscrowAndCohortAssetsDoNotBleed() public {
+        uint256 id = _settleWithResidue(2_000e6);
+        queue.claim(id);
+        _fundStrategy(2_000e6);
+        vault.collectResidue(address(resStrat));
+
+        uint256 cohortHeld = queue.cohortAssets();
+        assertGt(cohortHeld, 0, "cohort money is sitting in the queue");
+
+        // A depositor escrows into the SAME contract while that money is held.
+        governor.set(PID + 1, 1, address(strat));
+        vm.prank(bob);
+        uint256 depositId = vault.requestDeposit(1_000e6, bob);
+        assertEq(queue.cohortAssets(), cohortHeld, "escrow did not disturb the cohort pool");
+
+        // Cancelling returns the full escrow, not a penny of the cohort's.
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob);
+        queue.cancel(depositId);
+        assertEq(usdc.balanceOf(bob) - bobBefore, 1_000e6, "depositor got their escrow back in full");
+        assertEq(queue.cohortAssets(), cohortHeld, "and the cohort pool is untouched");
+
+        // The cohort's claim is still payable.
+        governor.set(0, 0, address(0));
+        assertGt(queue.claimRemainder(id), 0, "cohort still paid");
+    }
+
+    /// @notice THE MASTER INVARIANT WITH A REAL COHORT: several redeemers
+    ///         against one settlement can never, between them, be paid more
+    ///         than arrived for that cohort. Rounding is DOWN, so the sum falls
+    ///         short by dust rather than over-running.
+    function test_multipleRedeemers_sumOfClaimsNeverExceedsArrived() public {
+        vm.prank(alice);
+        vault.deposit(10_000e6, alice);
+        vm.prank(bob);
+        vault.deposit(10_000e6, bob);
+
+        resStrat = new StubResidueStrategy(address(vault), address(usdc));
+        resStrat.setResidue(3_000e6);
+        governor.set(PID, 1, address(resStrat));
+
+        uint256 aliceShares = vault.balanceOf(alice) / 3;
+        vm.startPrank(alice);
+        vault.approve(address(vault), aliceShares);
+        uint256 aliceId = vault.requestRedeem(aliceShares, alice);
+        vm.stopPrank();
+
+        uint256 bobShares = vault.balanceOf(bob) / 2;
+        vm.startPrank(bob);
+        vault.approve(address(vault), bobShares);
+        uint256 bobId = vault.requestRedeem(bobShares, bob);
+        vm.stopPrank();
+
+        vm.prank(address(governor));
+        vault.onProposalSettled(PID);
+        governor.set(0, 0, address(0));
+
+        _fundStrategy(3_000e6);
+        vault.collectResidue(address(resStrat));
+
+        uint256 arrived = queue.cohortAssets();
+        uint256 paidAlice = queue.claimRemainder(aliceId);
+        uint256 paidBob = queue.claimRemainder(bobId);
+
+        assertGt(paidAlice, 0, "alice paid");
+        assertGt(paidBob, 0, "bob paid");
+        assertLe(paidAlice + paidBob, arrived, "never more than arrived");
+        // Bob exited a larger stake, so he is owed proportionally more.
+        assertGt(paidBob, paidAlice, "split is pro-rata by shares exited");
+    }
+
+    /// @notice A strategy that already owes for one proposal keeps that
+    ///         proposal's cohort as the payee. Re-pointing it would route the
+    ///         first cohort's arrivals to a later one — real money, misallocated
+    ///         between two sets of exited LPs.
+    /// @dev    Unreachable through the governor today (`BaseStrategy.execute`
+    ///         requires `State.Pending`, so a settled clone cannot settle
+    ///         twice), which is precisely why the guard is asserted locally
+    ///         rather than argued from another contract's state machine.
+    function test_residuePidIsNotRepointedWhileTheStrategyStillOwes() public {
+        uint256 id = _settleWithResidue(2_000e6);
+
+        // The same clone settles again under a later proposal.
+        governor.set(PID + 1, 1, address(resStrat));
+        vm.prank(address(governor));
+        vault.onProposalSettled(PID + 1);
+        governor.set(0, 0, address(0));
+
+        _fundStrategy(2_000e6);
+        vault.collectResidue(address(resStrat));
+
+        // The FIRST cohort is still the payee.
+        assertGt(queue.claimableRemainder(id), 0, "first cohort keeps its claim");
+    }
 }

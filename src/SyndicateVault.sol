@@ -1476,9 +1476,22 @@ contract SyndicateVault is
         if (cap == 0) return;
         if (outstanding > cap) outstanding = cap;
         _residueCap[strategy] = cap;
-        _residuePid[strategy] = pid;
 
         uint256 known = _residueAmount[strategy];
+        // FIRST COHORT KEEPS THE CLAIM. Re-pointing this at a later proposal
+        // while the strategy still owes for an earlier one would route the older
+        // cohort's arrivals to the newer cohort — real money, misallocated
+        // between two sets of exited LPs.
+        //
+        // That is unreachable today, but only because of an invariant in ANOTHER
+        // contract: `BaseStrategy.execute` requires `State.Pending`, so a settled
+        // clone cannot be executed again, cannot reach Settled again, and so
+        // never returns here. This repo has been bitten before by a local branch
+        // silently depending on a cross-contract invariant (see
+        // `VaultWithdrawalQueue`'s stamp-monotonicity note), so the guard is made
+        // local rather than argued. A second cohort simply goes unrecorded,
+        // which leaves it exactly where it is today: paid the float-only floor.
+        if (known == 0) _residuePid[strategy] = pid;
         if (outstanding == known) return;
         _residueTotal = _residueTotal - known + outstanding;
         _residueAmount[strategy] = outstanding;
