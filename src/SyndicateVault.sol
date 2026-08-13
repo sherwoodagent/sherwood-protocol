@@ -87,6 +87,14 @@ contract SyndicateVault is
     /// @notice Cap on the owner-set idle-liquidity floor (50%).
     uint256 private constant MAX_MIN_BUFFER_BPS = 5_000;
 
+    /// @notice How long an unvalued-residue mark may hold the deposit gate shut.
+    /// @dev    Long enough that a conforming strategy's `sweep()` /
+    ///         `releaseUnconvertible` window is never cut short by it — those
+    ///         are permissionless and callable the instant a proposal settles —
+    ///         and short enough that a hostile label cannot brick a vault's
+    ///         deposits for its lifetime. See `_unvaluedSince`.
+    uint256 private constant UNVALUED_MAX_LOCK = 7 days;
+
     // ── Value-moving ERC20 selectors guarded in governor batches ──
     // (see `_guardBatchCalls`)
     bytes4 private constant _SEL_APPROVE = 0x095ea7b3; // approve(address,uint256)
@@ -380,6 +388,44 @@ contract SyndicateVault is
     ///         anyone would find quickly.
     mapping(address strategy => uint256) private _residueNet;
 
+    /// @notice When `_unvaluedCount` last went from zero to nonzero, or 0 while
+    ///         it is zero. Read by `depositsLocked` to bound the lock in time.
+    ///
+    ///         WHY THE LOCK NEEDS AN EXPIRY. Every other probe result here fails
+    ///         OPEN precisely because a permanent lock is worse than the
+    ///         suppression it guards — `_recordResidue`'s own natspec spells
+    ///         that out for a CODELESS label. The unvalued flag was the one
+    ///         exception, and the codeless short-circuit does not cover the case
+    ///         that matters: a label WITH code that simply answers
+    ///         `hasUnvaluedResidue() -> 1` forever. `_refreshUnvalued` only ever
+    ///         clears on a truthful zero, `collectResidue` force-clears only for
+    ///         a codeless address, and the count is vault-wide so no later
+    ///         settlement displaces it the way `_lastSettledStrategy` did. That
+    ///         is a permanent, vault-wide deposit DoS with no permissionless
+    ///         exit and no owner override — reachable by any registered agent
+    ///         who can carry one proposal to Settled, since `propose` stores
+    ///         `strategy` unvalidated.
+    ///
+    ///         WHY EXPIRY IS THE RIGHT SHAPE, and cheap. A CONFORMING strategy
+    ///         clears this flag quickly: as `_unvaluedCount` documents, every
+    ///         unvaluable shape is unwindable by the permissionless `sweep()`
+    ///         and `releaseUnconvertible` hands off the rest. A flag still
+    ///         standing after `UNVALUED_MAX_LOCK` therefore means the label is
+    ///         not conforming — broken or hostile — which is exactly the case
+    ///         where holding the lock forever buys nothing. The trade is stated,
+    ///         not hidden: past the deadline a genuinely unvaluable residue
+    ///         stops blocking mints, so a depositor could enter against a NAV
+    ///         missing it. Bounded mispricing beats an unliftable lock, which is
+    ///         this contract's stated doctrine everywhere else, and it is the
+    ///         "timeout backstop" issue #233 already points at.
+    ///
+    ///         EARLIEST MARK WINS. One slot rather than per-strategy expiry: the
+    ///         count is almost always 0 or 1, and an attacker who can mark once
+    ///         can mark repeatedly, so per-strategy deadlines would let a
+    ///         sequence of labels hold the lock indefinitely anyway. Dating the
+    ///         lock from its first mark bounds the whole episode.
+    uint256 private _unvaluedSince;
+
     /// @dev Reserved storage for future upgrades. Shrinks whenever a new state
     ///      variable is added above. Grown from 28 → 31 slots: this deletion
     ///      frees `_laneALockPid` (1), `_interimNetFlow` (1), and
@@ -388,7 +434,8 @@ contract SyndicateVault is
     ///      Back to 24: `_residueAmount`, `_residueTotal`, `_residueCap`,
     ///      `_residueUnvalued`, `_unvaluedCount`, `_residuePid` and `_residueNet`
     ///      take one each, replacing the single `_lastSettledStrategy` slot.
-    uint256[24] private __gap;
+    ///      23: `_unvaluedSince` takes one more.
+    uint256[23] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -1344,7 +1391,10 @@ contract SyndicateVault is
         // The ONLY residue that still blocks rather than prices: value no
         // template can express in vault-asset units without an oracle. See
         // `_unvaluedCount`.
-        return _unvaluedCount != 0;
+        if (_unvaluedCount == 0) return false;
+        // ...and even that blocks only for a bounded window. See
+        // `_unvaluedSince` for why an unliftable lock is the worse failure.
+        return block.timestamp < _unvaluedSince + UNVALUED_MAX_LOCK;
     }
 
     /// @notice Assets the vault is worth FOR PRICING A MINT: idle float plus the
@@ -1406,7 +1456,7 @@ contract SyndicateVault is
             if (known != 0) _setResidue(strategy, 0);
             if (_residueUnvalued[strategy]) {
                 _residueUnvalued[strategy] = false;
-                _unvaluedCount -= 1;
+                _bumpUnvalued(false);
                 emit ResidueUnvalued(strategy, false);
             }
             emit ResidueCleared(strategy, collected);
@@ -1639,12 +1689,25 @@ contract SyndicateVault is
         }
         if (now_ == was) return;
         _residueUnvalued[strategy] = now_;
-        if (now_) {
+        _bumpUnvalued(now_);
+        emit ResidueUnvalued(strategy, now_);
+    }
+
+    /// @dev The ONLY place `_unvaluedCount` moves, so the deadline bounding the
+    ///      lock can never drift from the count it guards. Dated from the FIRST
+    ///      mark (0 -> 1) and cleared on the last (1 -> 0): the window
+    ///      `depositsLocked` honours is therefore the whole episode, not a fresh
+    ///      grace period per strategy. Per-strategy deadlines would let a
+    ///      sequence of hostile labels hold the gate shut indefinitely, which is
+    ///      the exact failure `_unvaluedSince` exists to rule out.
+    function _bumpUnvalued(bool marked) private {
+        if (marked) {
+            if (_unvaluedCount == 0) _unvaluedSince = block.timestamp;
             _unvaluedCount += 1;
         } else {
             _unvaluedCount -= 1;
+            if (_unvaluedCount == 0) _unvaluedSince = 0;
         }
-        emit ResidueUnvalued(strategy, now_);
     }
 
     /// @dev Float available for instant exits = vault asset balance minus the

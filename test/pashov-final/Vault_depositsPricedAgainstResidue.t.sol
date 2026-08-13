@@ -433,6 +433,82 @@ contract PashovFinalDepositResiduePricingTest is VaultInstantLiquidityTest {
         assertGt(vault.deposit(1_000e6, alice), 0, "deposits reopen");
     }
 
+    /// @notice THE LOCK EXPIRES, because a label that lies never lifts it.
+    ///
+    /// @dev    `_refreshUnvalued` takes `hasUnvaluedResidue()` at face value from
+    ///         the settled strategy label, and `SyndicateGovernor.propose` stores
+    ///         that label unvalidated — a contract satisfying `proposer()` and
+    ///         `vault()` is enough, and it need never be a batch target or hold a
+    ///         cent. A label that simply answers TRUE forever was unliftable
+    ///         before this fix:
+    ///           - `_refreshUnvalued` only clears on a truthful zero, which a
+    ///             hostile contract never returns;
+    ///           - `collectResidue` force-clears only for a CODELESS address, so
+    ///             against a live liar it re-reads the lie and leaves the mark;
+    ///           - `_unvaluedCount` is vault-wide, so unlike the
+    ///             `_lastSettledStrategy` slot it replaced, no later settlement
+    ///             displaces it;
+    ///           - and no owner, governor or guardian path writes it.
+    ///         Net: every deposit path, instant and queued, shut permanently by
+    ///         any registered agent who can carry one proposal to Settled.
+    ///
+    ///         That is the failure this contract refuses everywhere else — see
+    ///         `_recordResidue`'s own natspec making exactly this argument for a
+    ///         codeless label ("a permanent DoS is worse than the suppression it
+    ///         guards"). The codeless short-circuit just never covered the case
+    ///         that matters. `UNVALUED_MAX_LOCK` bounds the episode.
+    function test_lyingUnvaluedLabelCannotLockDepositsForever() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setUnvalued(true); // ...and never stops saying so
+        _settleWith(address(deliveryStrat));
+
+        assertTrue(vault.depositsLocked(), "the unvalued mark should hold the gate at first");
+
+        // The permissionless exit does NOT lift it: the liar still has code and
+        // still answers true, so both clearing arms decline.
+        vault.collectResidue(address(deliveryStrat));
+        assertTrue(vault.depositsLocked(), "collectResidue cleared a live liar's mark");
+
+        // Still shut just before the deadline — the window is real, not a no-op.
+        vm.warp(vm.getBlockTimestamp() + 7 days - 1);
+        assertTrue(vault.depositsLocked(), "the lock lapsed early");
+        vm.prank(alice);
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(1_000e6, alice);
+
+        // ...and open once it passes, with no privileged action by anyone.
+        vm.warp(vm.getBlockTimestamp() + 2);
+        assertFalse(vault.depositsLocked(), "the lock never lifted - permanent DoS");
+        vm.prank(alice);
+        assertGt(vault.deposit(1_000e6, alice), 0, "deposits never reopened");
+    }
+
+    /// @notice The deadline dates from the FIRST mark, so a second hostile label
+    ///         cannot restart the clock and hold the gate indefinitely.
+    /// @dev    Per-strategy expiry would leave the vector intact in a slower
+    ///         form: mark, wait, mark again, forever. `_bumpUnvalued` stamps only
+    ///         on the 0 -> 1 transition for exactly this reason.
+    function test_secondUnvaluedLabelDoesNotRestartTheClock() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setUnvalued(true);
+        _settleWith(address(deliveryStrat));
+
+        // Halfway through the window, a SECOND lying label settles.
+        vm.warp(vm.getBlockTimestamp() + 4 days);
+        StubDeliveryStrategy second = new StubDeliveryStrategy();
+        second.setHolding(true);
+        second.setUnvalued(true);
+        _settleWithPid(PID + 1, address(second));
+        assertTrue(vault.depositsLocked(), "two marks outstanding, still inside the window");
+
+        // The original deadline governs: 7 days from the FIRST mark, not from
+        // the second. A restart here would be an unbounded lock again.
+        vm.warp(vm.getBlockTimestamp() + 3 days + 1);
+        assertFalse(vault.depositsLocked(), "a later mark restarted the clock - the lock is unbounded again");
+    }
+
     /// @notice A VALUABLE residue does NOT block — that is the point of pricing.
     ///         Only the unvaluable shape falls back to refusal.
     function test_finding3_valuableResidueDoesNotBlock() public {
