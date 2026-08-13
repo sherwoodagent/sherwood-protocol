@@ -10,6 +10,7 @@ import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
 import {IProposerBondEscrow} from "./interfaces/IProposerBondEscrow.sol";
 import {IStrategy} from "./interfaces/IStrategy.sol";
+import {ICallSandbox} from "./interfaces/ICallSandbox.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
@@ -125,6 +126,15 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         passed to `propose`. Caps batch size so executeGovernorBatch
     ///         can't be weaponized for gas griefing.
     uint256 internal constant MAX_CALLS_PER_PROPOSAL = 64;
+    /// @notice Upper bounds on a `proposeWithSandbox` payload. MUST EQUAL
+    ///         `CallSandbox.MAX_CALLS` / `MAX_DECLARED_TOKENS` — mirrored here
+    ///         rather than read from the implementation because this runs on
+    ///         every propose and the sandbox address is two external hops away,
+    ///         and pinned equal by `test_sandboxBounds_matchImplementation`. A
+    ///         governor bound ABOVE the sandbox's would let a proposal pass
+    ///         review and then revert `InvalidCallSet` at execute, unfixably.
+    uint256 internal constant MAX_SANDBOX_CALLS = 32;
+    uint256 internal constant MAX_SANDBOX_TOKENS = 16;
 
     /// @notice Minimum elapsed time post-execute before the proposer can
     ///         self-settle (skipping `strategyDuration`). Prevents the single-
@@ -242,11 +252,35 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      `./script/check-layout-goldens.sh --update-golden`.
     mapping(uint256 => uint256) private _ppsSnapshots;
 
+    /// @notice Proposal ID -> the vault asset a `proposeWithSandbox` payload asks
+    ///         the sandbox to be funded with. Zero for every ordinary proposal.
+    /// @dev THE ONE FIELD BOTH PRICING AND DISPATCH READ. Written before
+    ///      `_snapshotTierAndGate` runs, because that is where required coverage
+    ///      is computed and the proposer bond is locked — a funding figure
+    ///      written after it would be priced at zero and the bond would
+    ///      under-charge, the same "read state a later call in this transaction
+    ///      establishes" ordering bug the residue netting hit.
+    mapping(uint256 => uint256) private _sandboxFunding;
+
+    /// @notice Proposal ID -> the arbitrary call set the sandbox runs.
+    /// @dev Also the EXISTENCE FLAG: a non-empty array is what "this proposal has
+    ///      a sandbox" means everywhere, which is why an empty payload is refused
+    ///      at propose rather than stored.
+    mapping(uint256 => ICallSandbox.Call[]) private _sandboxCalls;
+
+    /// @notice Proposal ID -> non-asset tokens the payload declares it may hold.
+    /// @dev Forwarded verbatim to `runSandbox`, where they become what the
+    ///      vault's residue probes can see. Undeclared leftovers are stranded in
+    ///      the sandbox by construction — never priced into a deposit, never
+    ///      collectable — which is the honest failure mode.
+    mapping(uint256 => address[]) private _sandboxTokens;
+
     /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31)
     ///      for the three mappings above, then 1 more for `_escrowedFees`, then
-    ///      1 more for `_ppsSnapshots` — append-only. See
+    ///      1 more for `_ppsSnapshots`, then 3 more for the sandbox payload
+    ///      (26 -> 23) — append-only. See
     ///      `script/syndicate-governor-layout.golden.json`.
-    uint256[26] private __gap;
+    uint256[23] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -351,6 +385,114 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         uint256[] calldata settlementCallCaps,
         CoProposer[] calldata coProposers
     ) external returns (uint256 proposalId) {
+        proposalId = _propose(
+            vault,
+            strategy,
+            metadataURI,
+            strategyDuration,
+            envelope,
+            executeCalls,
+            executeCallCaps,
+            settlementCalls,
+            settlementCallCaps,
+            coProposers
+        );
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function proposeWithSandbox(
+        SandboxPayload calldata sandbox,
+        address vault,
+        address strategy,
+        string calldata metadataURI,
+        uint256 strategyDuration,
+        RiskEnvelope calldata envelope,
+        BatchExecutorLib.Call[] calldata executeCalls,
+        uint256[] calldata executeCallCaps,
+        BatchExecutorLib.Call[] calldata settlementCalls,
+        uint256[] calldata settlementCallCaps,
+        CoProposer[] calldata coProposers
+    ) external returns (uint256 proposalId) {
+        // Payload validation only. Every OTHER gate — agent registration, the
+        // open-proposal lock, the envelope, the batch caps — belongs to the
+        // shared `_propose` body below and is not restated here, so the two
+        // entry points can never diverge on what a valid proposal is.
+        if (sandbox.calls.length == 0) revert EmptySandboxCalls();
+        // THE SANDBOX'S OWN BOUNDS, NOT `MAX_CALLS_PER_PROPOSAL`. `CallSandbox.init`
+        // refuses more than 32 calls or 16 declared tokens, and the batch bound is
+        // 64 — so validating against the batch figure here would accept a payload
+        // that reverts `InvalidCallSet` at execute, after the proposer's bond was
+        // locked and the review period spent, with no path to fix it.
+        if (sandbox.calls.length > MAX_SANDBOX_CALLS || sandbox.declaredTokens.length > MAX_SANDBOX_TOKENS) {
+            revert TooManyCalls();
+        }
+        if (sandbox.funding == 0) revert ZeroSandboxFunding();
+        // THE SANDBOX SPENDS THE DECLARED ENVELOPE, NOT A SECOND ONE. Bounding
+        // funding by `maxCapital` here is what lets `executeProposal` subtract
+        // the funded amount from the capital handed to the execute batch without
+        // ever underflowing, and it keeps the figure voters approved as the true
+        // ceiling on everything this proposal can move.
+        if (sandbox.funding > envelope.maxCapital) {
+            revert SandboxFundingExceedsMaxCapital(sandbox.funding, envelope.maxCapital);
+        }
+
+        // WRITTEN BEFORE THE PROPOSAL EXISTS, AGAINST THE ID IT IS ABOUT TO MINT.
+        // `_snapshotTierAndGate` — which runs deep inside `_propose`, prices
+        // required coverage and locks the proposer bond — reads the funding back
+        // out of storage by proposal id. Writing the payload afterwards would
+        // price it at zero: a state read that some later call in the same
+        // transaction establishes reads as unset, and a helper that degrades to
+        // zero makes that silent. Nothing can interleave between this write and
+        // the mint (`_propose` starts with view checks and a call to the vault's
+        // own `isAgent`), and if the ids ever diverge the whole transaction
+        // reverts rather than leaving a payload attached to the wrong proposal.
+        uint256 expectedId = _proposalCount + 1;
+        _storeSandbox(expectedId, sandbox);
+
+        proposalId = _propose(
+            vault,
+            strategy,
+            metadataURI,
+            strategyDuration,
+            envelope,
+            executeCalls,
+            executeCallCaps,
+            settlementCalls,
+            settlementCallCaps,
+            coProposers
+        );
+        if (proposalId != expectedId) revert SandboxProposalIdMismatch(expectedId, proposalId);
+        emit SandboxPayloadStored(proposalId, sandbox.funding, sandbox.calls.length, sandbox.declaredTokens.length);
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function sandboxPayload(uint256 proposalId) external view returns (SandboxPayload memory payload) {
+        ICallSandbox.Call[] storage stored = _sandboxCalls[proposalId];
+        uint256 n = stored.length;
+        ICallSandbox.Call[] memory calls = new ICallSandbox.Call[](n);
+        for (uint256 i = 0; i < n; i++) {
+            calls[i] = ICallSandbox.Call({target: stored[i].target, data: stored[i].data});
+        }
+        payload = SandboxPayload({
+            funding: _sandboxFunding[proposalId], calls: calls, declaredTokens: _sandboxTokens[proposalId]
+        });
+    }
+
+    /// @dev The shared `propose` body. Split out so `proposeWithSandbox` reaches
+    ///      exactly the same lifecycle — same gates, same order, same storage
+    ///      writes — instead of a parallel copy that could drift from it.
+    function _propose(
+        address vault,
+        address strategy,
+        string calldata metadataURI,
+        uint256 strategyDuration,
+        RiskEnvelope calldata envelope,
+        BatchExecutorLib.Call[] calldata executeCalls,
+        uint256[] calldata executeCallCaps,
+        BatchExecutorLib.Call[] calldata settlementCalls,
+        uint256[] calldata settlementCallCaps,
+        CoProposer[] calldata coProposers
+    ) private returns (uint256 proposalId) {
         if (vault != GovernorParameters.vault) revert VaultNotRegistered();
         if (!ISyndicateVault(vault).isAgent(msg.sender)) revert NotRegisteredAgent();
         // Blocks new proposals when the vault still has a non-terminal
@@ -665,7 +807,49 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // caps additionally bound each call's own gross outflow
         // (BatchExecutorLib-level) — two distinct accounting layers, both
         // mandatory on this path.
-        ISyndicateVault(vault).executeGovernorBatch(calls, scaledExecuteCaps, proposal.effectiveMaxCapital);
+        // Dispatch the sandbox BEFORE the execute batch, and hand the batch what
+        // is left of the envelope.
+        //
+        // ORDER IS LOAD-BEARING, NOT STYLISTIC. The vault prices its tier-2
+        // ceiling off `totalAssets()`, which during the Executed window counts
+        // only idle float — after the batch has deployed capital that reads near
+        // zero, so a sandbox dispatched afterwards would be measured against a
+        // ceiling of ~0 and revert for every non-trivial funding. Run here, the
+        // ceiling is measured against the same float the proposal was priced
+        // against.
+        //
+        // SUBTRACTING THE FUNDING IS WHAT STOPS THE ENVELOPE BEING SPENT TWICE.
+        // `effectiveMaxCapital` is the vault's net-outflow meter for the batch;
+        // without the subtraction a proposal could fund a sandbox to its full
+        // envelope and then deploy that same envelope again through the batch.
+        // The subtraction cannot underflow: `proposeWithSandbox` bounds funding
+        // by `maxCapital`, and the scaling below is monotone in it.
+        uint256 batchCapital = proposal.effectiveMaxCapital;
+        uint256 sandboxFunding = _sandboxFunding[proposalId];
+        if (sandboxFunding != 0) {
+            // Scaled by the SAME raised-over-required ratio the effective
+            // capital and the per-call caps already carry, expressed as
+            // `effective/max` rather than re-reading the quorum figures: the two
+            // are the same ratio by construction (`effective = max *
+            // raised / required`), and taking it this way keeps the quorum reads
+            // in one place. The extra floor can only round the funding DOWN,
+            // which under-funds rather than over-funds — the safe direction.
+            uint256 maxCapital = proposal.maxCapital;
+            uint256 scaledFunding =
+                batchCapital == maxCapital ? sandboxFunding : (sandboxFunding * batchCapital) / maxCapital;
+            // A payload whose coverage floored to nothing runs NOTHING. Minting
+            // an unfunded sandbox would still execute arbitrary calldata — from
+            // an address holding no capital, so nothing could be lost, but it
+            // would also consume the one-sandbox-per-proposal slot and emit a
+            // run that under-covered guardians never underwrote at that size.
+            if (scaledFunding != 0) {
+                batchCapital -= scaledFunding;
+                ISyndicateVault(vault)
+                    .runSandbox(proposalId, _loadSandboxCalls(proposalId), _sandboxTokens[proposalId], scaledFunding);
+            }
+        }
+
+        ISyndicateVault(vault).executeGovernorBatch(calls, scaledExecuteCaps, batchCapital);
 
         emit ProposalExecuted(proposalId, vault, balanceBefore);
     }
@@ -1541,6 +1725,24 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             p.maxCapital,
             true
         );
+        // A SANDBOX IS PRICED AT FULL NOTIONAL AND IS ALWAYS TIER 2. Read from
+        // storage, written by `proposeWithSandbox` before this call — see the
+        // ordering note at that write.
+        //
+        // The funding is the payload's structural maximum loss, and unlike a
+        // batch call there is no certified bound that could reduce it: the
+        // targets are uncertified by design, which is the whole point of the
+        // mechanism. So the charge is the entire funded amount, added to
+        // whatever the batches already cost. Forcing tier 2 is not cosmetic —
+        // `_deriveAndStoreEffectiveCapital` only demands the bond-encumbered
+        // approve quorum at or above `quorumTierThreshold`, so a payload that
+        // rode along at tier 0 would be arbitrary calldata reaching an
+        // arbitrary target with no identified underwriter on the hook.
+        uint256 sandboxFunding = _sandboxFunding[p.id];
+        if (sandboxFunding != 0) {
+            tier_ = 2;
+            coverage_ += sandboxFunding;
+        }
         p.envelopeTier = tier_;
         // ZERO COVERAGE IS SPECIFIED, NOT A HOLE — see design.md D2, pinned by
         // `PerCallCapitalDeclarations.test_allZeroCaps_pricesZeroCoverage_meterStillBlocksOutflow`
@@ -1694,6 +1896,32 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ) internal {
         for (uint256 i = 0; i < calls.length; i++) {
             target[proposalId].push(calls[i]);
+        }
+    }
+
+    /// @dev Persist a sandbox payload verbatim under `proposalId`. WRITE-ONCE BY
+    ///      CONSTRUCTION: the only caller is `proposeWithSandbox`, which runs it
+    ///      against an id that does not exist yet, so there is never a stored
+    ///      payload to append to or overwrite — no setter, no re-open path, and
+    ///      what guardians read during the review period is what executes.
+    function _storeSandbox(uint256 proposalId, SandboxPayload calldata sandbox) private {
+        _sandboxFunding[proposalId] = sandbox.funding;
+        ICallSandbox.Call[] storage dst = _sandboxCalls[proposalId];
+        for (uint256 i = 0; i < sandbox.calls.length; i++) {
+            dst.push(sandbox.calls[i]);
+        }
+        address[] storage tokens = _sandboxTokens[proposalId];
+        for (uint256 i = 0; i < sandbox.declaredTokens.length; i++) {
+            tokens.push(sandbox.declaredTokens[i]);
+        }
+    }
+
+    /// @dev Copy a stored sandbox call set to memory for dispatch.
+    function _loadSandboxCalls(uint256 proposalId) private view returns (ICallSandbox.Call[] memory result) {
+        ICallSandbox.Call[] storage stored = _sandboxCalls[proposalId];
+        result = new ICallSandbox.Call[](stored.length);
+        for (uint256 i = 0; i < stored.length; i++) {
+            result[i] = stored[i];
         }
     }
 

@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {BatchExecutorLib} from "../BatchExecutorLib.sol";
+import {ICallSandbox} from "./ICallSandbox.sol";
 
 interface ISyndicateVault {
     // ── Errors ──
@@ -175,6 +176,20 @@ interface ISyndicateVault {
         uint256[] calldata callCaps,
         uint256 maxNetOutflow
     ) external;
+    /// @notice Governor-only: mint the single-use sandbox for proposal `pid`,
+    ///         fund it with `funding` of `asset()`, and run `calls` from it.
+    /// @dev    The sandbox executes as ITSELF, not as this vault, so a payload
+    ///         target needs no allowlist entry and no certification — the loss
+    ///         bound is `funding`, structurally. Reverts if a sandbox was already
+    ///         minted for `pid`, or if `funding` exceeds the LIVE tier-2 ceiling
+    ///         read from the calling governor.
+    /// @return sandbox The address minted for `pid`.
+    function runSandbox(
+        uint256 pid,
+        ICallSandbox.Call[] calldata calls,
+        address[] calldata declaredTokens,
+        uint256 funding
+    ) external returns (address sandbox);
     /// @notice Factory-only: re-point the shared executor library and
     ///         re-stamp its expected codehash atomically. Reached through
     ///         `SyndicateFactory.pushExecutor`, which lifecycle-gates the

@@ -18,28 +18,30 @@
 
 ## 3. Governor wiring
 
-- [ ] 3.1 Add the sandbox payload (call set, funding amount, declared tokens) to `StrategyProposal`; store it in `propose`; add a public view returning it in full. No setter.
-- [ ] 3.2 Make a sandbox payload contribute its funding at full notional to required coverage and force the proposal's tier to 2.
-- [ ] 3.3 Dispatch the sandbox at execute through `vault.runSandbox`, scaling the funding by the same raised-over-required ratio applied to effective capital; skip entirely when the scaled amount floors to zero.
-- [ ] 3.4 Regenerate `script/syndicate-governor-layout.golden.json`.
+- [x] 3.1 Add the sandbox payload (call set, funding amount, declared tokens) to `StrategyProposal`; store it in `propose`; add a public view returning it in full. No setter. **Deviation:** stored in three pid-keyed mappings carved from `__gap`, NOT in `StrategyProposal` — the struct is append-only on a live BeaconProxy and dynamic arrays cannot be appended to it. New entry point `proposeWithSandbox` binds the payload to the id `propose` is about to mint (checked, not assumed) so pricing can read it; `propose`'s body moved verbatim into a shared `_propose`, so the two entry points cannot diverge.
+- [x] 3.2 Make a sandbox payload contribute its funding at full notional to required coverage and force the proposal's tier to 2. Done inside `_snapshotTierAndGate`, which is where coverage is priced and the proposer bond is locked.
+- [x] 3.3 Dispatch the sandbox at execute through `vault.runSandbox`, scaling the funding by the same raised-over-required ratio applied to effective capital; skip entirely when the scaled amount floors to zero. **Dispatched BEFORE the execute batch** — `totalAssets()` counts only idle float once capital is deployed, so a sandbox run afterwards would be priced against a ~0 ceiling. The batch then runs under `effectiveMaxCapital - scaledFunding`.
+- [x] 3.4 Regenerate `script/syndicate-governor-layout.golden.json`.
+- [x] 3.5 Bound the payload at propose by `CallSandbox`'s OWN limits (32 calls / 16 tokens), not `MAX_CALLS_PER_PROPOSAL` (64) — the wider bound would admit a payload that clears review and then reverts `InvalidCallSet` at execute with the bond locked.
 
 ## 4. Tests — the central claim
 
-- [ ] 4.1 Max-loss invariant: a hostile call set (approvals to third parties, transfers out, calls returning worthless tokens) loses at most the funded amount, measured as a vault-balance delta across execute, settle **and** a follow-up transaction that exercises every approval the sandbox granted.
-- [ ] 4.2 Identity: a target observes `msg.sender == sandbox`, and a contract gated on `msg.sender == vault` reverts when the sandbox calls it.
-- [ ] 4.3 No-allowance: `asset().allowance(vault, sandbox) == 0` before, during and after; a second `run()` reverts `AlreadyRun`.
-- [ ] 4.4 Funding ceiling: passes at the ceiling, reverts one wei above, and binds when the ceiling is tightened between propose and execute.
-- [ ] 4.5 Denylist: one denied target among valid calls reverts the whole execution with no call applied; cover all seven addresses.
+- [x] 4.1 Max-loss invariant: a hostile call set (approvals to third parties, transfers out, calls returning worthless tokens) loses at most the funded amount, measured as a vault-balance delta across execute, settle **and** a follow-up transaction that exercises every approval the sandbox granted. `test_maxLoss_hostilePayloadCostsAtMostTheFundedAmount`. Fixture runs at `managementFeeBps: 0` — a fee also leaves the vault at settle and would be miscounted as payload loss.
+- [x] 4.2 Identity: a target observes `msg.sender == sandbox`, and a contract gated on `msg.sender == vault` reverts when the sandbox calls it. `test_permissionless_*` (positive) and `test_identity_vaultGatedTargetRefusesTheSandbox` (negative).
+- [x] 4.3 No-allowance: `asset().allowance(vault, sandbox) == 0` before, during and after; a second `run()` reverts `AlreadyRun`. `test_maxLoss_*` and `test_run_isOneShot`.
+- [x] 4.4 Funding ceiling: passes at the ceiling, reverts one wei above. **Correction to the third clause:** the ceiling CANNOT be tightened between propose and execute — `setTier2CallCapBps` is `whenNoActiveProposal`, so the window is frozen. `test_ceiling_cannotBeMovedWhileAProposalIsOpen` pins that instead, which is what actually protects the window; the live read still binds a ceiling changed while no proposal was open.
+- [ ] 4.5 Denylist: one denied target among valid calls reverts the whole execution with no call applied; cover all seven addresses. **Partial:** vault and governor covered (`test_denylist_*`); queue, tier registry, exposure ledger, WOOD and sWOOD need a fixture that wires them.
 
 ## 5. Tests — the permissionless claim and boundaries
 
-- [ ] 5.1 **The headline**: an unlisted, uncertified target executes end-to-end from propose through settle with **no owner transaction anywhere in the test** — assert by using a fixture whose owner key is never used after deployment.
-- [ ] 5.2 Pin that `_guardBatchCalls` is unchanged: a non-allowlisted target named directly in a governor batch still reverts `DisallowedBatchCallee`.
-- [ ] 5.3 Proposer gate: a non-agent opening a sandbox proposal reverts `NotRegisteredAgent`; an agent succeeds.
-- [ ] 5.4 Coverage: a sandbox proposal with non-zero coverage cannot execute on silence; half-raised coverage funds half the declared amount; coverage flooring to zero runs no sandbox.
-- [ ] 5.5 Payload immutability and readability: no path alters a stored payload, and the full payload is readable during the review period.
+- [x] 5.1 **The headline**: an unlisted, uncertified target executes end-to-end with **no owner transaction in the test body** — `test_permissionless_unlistedTargetExecutesWithNoOwnerTransaction`. The registry ceremony in `_wireTierRegistry` allowlists the vault ASSET so the mandatory ordinary batch can run, and never touches the sandbox target.
+- [x] 5.2 Pin that `_guardBatchCalls` is unchanged: a non-allowlisted target named directly in a governor batch still reverts `DisallowedBatchCallee`. `test_batchGuard_unchangedForDirectlyNamedTargets`.
+- [x] 5.3 Proposer gate: a non-agent opening a sandbox proposal reverts `NotRegisteredAgent`; an agent succeeds.
+- [ ] 5.4 Coverage: a sandbox proposal with non-zero coverage cannot execute on silence; half-raised coverage funds half the declared amount; coverage flooring to zero runs no sandbox. **Needs an exposure-ledger fixture** — the sandbox suite deliberately runs un-gated so its reverts are attributable.
+- [x] 5.5 Payload immutability and readability: no path alters a stored payload, and the full payload is readable during the review period. `test_payload_readableInFullAndUnchangedAtExecute`, `test_payload_absentReadsEmpty`.
 - [ ] 5.6 Residue: a declared non-asset leftover reports unvalued residue and locks deposits; `collectResidue` clears it and reopens deposits; an undeclared leftover is stranded and never priced into a deposit.
-- [ ] 5.7 `runSandbox` authorization: reverts for a non-governor caller and while paused.
+- [ ] 5.7 `runSandbox` authorization: reverts for a non-governor caller (`test_runSandbox_refusesNonGovernorCallers`) and while paused — **paused case still owed**.
+- [x] 5.8 Envelope: the funded amount is subtracted from the capital the execute batch runs under, so the two cannot spend the same declaration (`test_envelope_fundingIsSubtractedFromTheBatchCapital`), and a payload prices at full notional on top of the batches (`test_pricing_fundingAddsToRequiredCoverageAtFullNotional`).
 
 ## 6. Deployment
 
