@@ -1957,16 +1957,25 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     }
 
     /// @notice Recover a residue left behind by an incomplete settlement.
-    /// @dev    Permissionless and post-settlement only: it moves value in
-    ///         exactly one direction — out of this strategy, into the vault it
-    ///         was always owed to — so there is nothing to gate. Idempotent and
-    ///         safe to call with nothing to move.
+    /// @dev    VAULT-ONLY, THOUGH THE VALUE ONLY EVER MOVES THE RIGHT WAY. This
+    ///         was permissionless on the reasoning that a one-directional push
+    ///         needs no gate. The push is fine; the ACCOUNTING is what breaks —
+    ///         `SyndicateVault.collectResidue` measures the arrival as a balance
+    ///         delta and pays the exited redeem cohort their frozen share of it,
+    ///         and a delta only measures everything if it is the only door.
+    ///         Called directly, the cohort is credited nothing and the arrival
+    ///         lifts the stayers' price instead, unrepairably. See the twin note
+    ///         on `MorphoSupplyStrategy.sweep`. The permissionless entry point
+    ///         is `collectResidue`, which calls this.
+    ///
+    ///         Post-settlement only. Idempotent and safe to call with nothing to
+    ///         move.
     ///         RETRIES EVERY STEP `_settle` CAN FAIL AT, in the same order. The
     ///         set of residues this can recover must not be narrower than the
     ///         set `_settle` can create, or the "recoverable later" claim above
     ///         is false for whichever step was left out — so the position
     ///         unwind is retried here too, not just the repay and the withdraw.
-    function sweep() external nonReentrant returns (uint256 assets) {
+    function sweep() external onlyVault nonReentrant returns (uint256 assets) {
         if (_state != State.Settled) revert NotSettled();
 
         _tryUnwindPosition();

@@ -1440,7 +1440,15 @@ contract SyndicateVault is
     ///         deliberately not improvised here.
     function collectResidue(address strategy) external nonReentrant returns (uint256 collected) {
         uint256 known = _residueAmount[strategy];
-        if (known == 0 && !_residueUnvalued[strategy]) return 0;
+        // SWEEP FIRST, ASK ABOUT THE BOOKS AFTER. This used to return early
+        // when nothing was recorded, which was safe only while `sweep()` was
+        // itself permissionless — a strategy holding assets the vault never
+        // recorded (an unreadable probe, a zero cap) could still be emptied by
+        // calling it directly. Now that `sweep()` is vault-only, that escape
+        // route runs through here, so an early return would strand those assets
+        // permanently. The call below is a no-op against an address with
+        // nothing to give, including an EOA.
+        bool tracked = known != 0 || _residueUnvalued[strategy];
 
         uint256 before = IERC20(asset()).balanceOf(address(this));
         // solhint-disable-next-line avoid-low-level-calls
@@ -1448,6 +1456,11 @@ contract SyndicateVault is
         swept; // result deliberately unused — see the note above
         collected = IERC20(asset()).balanceOf(address(this)) - before;
         _payCohortShare(strategy, collected);
+
+        // Nothing on the books to reconcile. Anything that DID arrive has
+        // already been split with the cohort above, which is the whole reason
+        // this runs before the bookkeeping rather than after it.
+        if (!tracked) return collected;
 
         // A CODELESS STRATEGY OWES NOTHING. It can hold nothing and answer
         // nothing, so carrying its last known figure forever would over-price

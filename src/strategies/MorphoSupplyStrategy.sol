@@ -267,14 +267,31 @@ contract MorphoSupplyStrategy is BaseStrategy {
     }
 
     /// @notice Return any supply position left behind by an incomplete settlement
-    ///         to the vault. Permissionless and post-settlement only: it moves
-    ///         value in exactly one direction — out of this strategy, into the
-    ///         vault it was always owed to — so there is nothing to gate.
-    /// @dev    Idempotent and safe to call when there is nothing to move. Takes the
-    ///         deliverable maximum on each call, so a market that frees up
+    ///         to the vault.
+    /// @dev    VAULT-ONLY, THOUGH THE VALUE ONLY EVER MOVES THE RIGHT WAY. This
+    ///         was permissionless on the reasoning that a one-directional push
+    ///         needs no gate. The push is fine; the ACCOUNTING is what breaks.
+    ///
+    ///         `SyndicateVault.collectResidue` measures what arrives as a
+    ///         balance delta across this call and hands the exited redeem cohort
+    ///         their frozen fraction of it (`_payCohortShare`). A delta is only
+    ///         a complete measurement if it is the ONLY way value arrives.
+    ///         Called directly, the assets land outside that window: the cohort
+    ///         is credited nothing, and the arrival silently lifts the price for
+    ///         whoever STAYED — the exact misallocation the junior leg was
+    ///         written to correct. Unrepairable too, since the delta is spent:
+    ///         a later `collectResidue` measures zero and pays zero.
+    ///
+    ///         Not an attack that needs an attacker. Any keeper calling the
+    ///         function on its own does it, which is why the fix is to remove
+    ///         the second door rather than document around it. The public entry
+    ///         point is `collectResidue`, still permissionless, which calls this.
+    ///
+    ///         Idempotent and safe to call when there is nothing to move. Takes
+    ///         the deliverable maximum on each call, so a market that frees up
     ///         gradually can be swept repeatedly.
     /// @return assets The vault-asset amount pushed to the vault this call.
-    function sweep() external returns (uint256 assets) {
+    function sweep() external onlyVault returns (uint256 assets) {
         if (_state != State.Settled) revert NotSettled();
         (uint256 shares, uint256 own, uint256 deliverable) = _deliverableNow();
         if (shares != 0 && deliverable != 0) {

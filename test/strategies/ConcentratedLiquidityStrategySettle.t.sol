@@ -192,7 +192,7 @@ contract ConcentratedLiquidityStrategyPartialSettleTest is SettleFixture {
         uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
         spUsdg.setRedeemPaused(false);
 
-        vm.prank(keeper); // anyone
+        vm.prank(address(vaultStub)); // vault-only since the cohort-accounting fix
         strategy.sweep();
 
         assertEq(spUsdg.balanceOf(address(strategy)), 0, "shares not recovered");
@@ -258,7 +258,7 @@ contract ConcentratedLiquidityStrategyPartialSettleTest is SettleFixture {
         // Fund the position manager so the collect can now pay out.
         usdg.mint(address(posm), 1_000_000e6);
 
-        vm.prank(keeper);
+        vm.prank(address(vaultStub));
         strategy.sweep();
 
         assertEq(strategy.tokenId(), 0, "unwind not retried");
@@ -293,7 +293,7 @@ contract ConcentratedLiquidityStrategyReleaseTest is SettleFixture {
         adapter.setRate(address(nvda), address(usdg), 0);
         _settle();
 
-        vm.prank(keeper);
+        vm.prank(address(vaultStub));
         strategy.sweep();
 
         assertGt(nvda.balanceOf(address(strategy)), 0, "sweep foreclosed the conversion");
@@ -345,10 +345,12 @@ contract ConcentratedLiquidityStrategySweepTest is SettleFixture {
     // ── 6.11 Sweep ──
 
     function test_sweep_beforeSettlementReverts() public {
+        vm.prank(address(vaultStub));
         vm.expectRevert(ConcentratedLiquidityStrategy.NotSettled.selector);
         strategy.sweep();
 
         _execute();
+        vm.prank(address(vaultStub));
         vm.expectRevert(ConcentratedLiquidityStrategy.NotSettled.selector);
         strategy.sweep();
     }
@@ -367,7 +369,7 @@ contract ConcentratedLiquidityStrategySweepTest is SettleFixture {
         uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
         morpho.setCollateralWithdrawCap(type(uint256).max); // conditions recover
 
-        vm.prank(keeper); // anyone
+        vm.prank(address(vaultStub)); // vault-only since the cohort-accounting fix
         strategy.sweep();
 
         assertEq(_collateral(), 0, "residue not recovered");
@@ -380,9 +382,9 @@ contract ConcentratedLiquidityStrategySweepTest is SettleFixture {
         _settle();
 
         // Nothing left to move; must not revert.
-        vm.prank(keeper);
+        vm.prank(address(vaultStub));
         uint256 first = strategy.sweep();
-        vm.prank(keeper);
+        vm.prank(address(vaultStub));
         uint256 second = strategy.sweep();
 
         assertEq(first, 0, "nothing should have been swept");
@@ -400,7 +402,7 @@ contract ConcentratedLiquidityStrategySweepTest is SettleFixture {
         adapter.setRate(address(nvda), address(usdg), 100 * 1e18 / 1e12);
         uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
 
-        vm.prank(keeper);
+        vm.prank(address(vaultStub));
         strategy.sweep();
 
         assertEq(nvda.balanceOf(address(strategy)), 0, "leg still unconverted");
