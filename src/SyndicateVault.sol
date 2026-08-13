@@ -6,6 +6,7 @@ import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
 import {IProposalStatus} from "./interfaces/IProposalStatus.sol";
 import {IStrategyDelivery} from "./interfaces/IStrategyDelivery.sol";
+import {ICallSandbox} from "./interfaces/ICallSandbox.sol";
 import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IVaultWithdrawalQueue} from "./interfaces/IVaultWithdrawalQueue.sol";
@@ -28,6 +29,7 @@ import {ERC721Holder} from "@openzeppelin/contracts/token/ERC721/utils/ERC721Hol
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
@@ -380,6 +382,26 @@ contract SyndicateVault is
     ///         anyone would find quickly.
     mapping(address strategy => uint256) private _residueNet;
 
+    /// @notice The `CallSandbox` implementation this vault clones per proposal.
+    ///         Factory-only and SET-ONCE, exactly like `_withdrawalQueue`.
+    /// @dev    The adversary is an owner who re-points the code the vault mints
+    ///         AFTER guardians have approved proposals on the strength of what
+    ///         that code does — the sandbox's confinement properties are what
+    ///         make an unreviewed target safe to call, so they must not be
+    ///         swappable behind a review. Unrepeatable rather than merely
+    ///         owner-gated; replacing it is a redeployment.
+    ///
+    ///         Zero is legal and means the sandbox path is simply absent, which
+    ///         is the posture of any deployment that does not wire one.
+    address private _sandboxImplementation;
+
+    /// @notice The sandbox minted for a proposal, if any. Recorded so the
+    ///         residue machinery can reach it after settlement.
+    /// @dev    One per proposal, enforced at mint: a second sandbox for the same
+    ///         id would overwrite the first while it still held capital, orphan
+    ///         it from `collectResidue`, and strand whatever it holds.
+    mapping(uint256 pid => address) private _proposalSandbox;
+
     /// @dev Reserved storage for future upgrades. Shrinks whenever a new state
     ///      variable is added above. Grown from 28 → 31 slots: this deletion
     ///      frees `_laneALockPid` (1), `_interimNetFlow` (1), and
@@ -388,7 +410,8 @@ contract SyndicateVault is
     ///      Back to 24: `_residueAmount`, `_residueTotal`, `_residueCap`,
     ///      `_residueUnvalued`, `_unvaluedCount`, `_residuePid` and `_residueNet`
     ///      take one each, replacing the single `_lastSettledStrategy` slot.
-    uint256[24] private __gap;
+    ///      Now 22: `_sandboxImplementation` and `_proposalSandbox` take one each.
+    uint256[22] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -579,6 +602,30 @@ contract SyndicateVault is
         return _withdrawalQueue;
     }
 
+    /// @notice Bind the `CallSandbox` implementation this vault clones. Factory-only,
+    ///         set-once, mirroring `setWithdrawalQueue` above.
+    /// @dev    NO RE-POINTING PATH, deliberately. See `_sandboxImplementation`
+    ///         for the adversary: swapping the minted code behind an already
+    ///         reviewed proposal would invalidate the confinement argument that
+    ///         lets a sandbox call targets nobody allowlisted.
+    function setSandboxImplementation(address impl) external {
+        if (msg.sender != _factory) revert NotFactory();
+        if (impl == address(0)) revert ZeroAddress();
+        if (_sandboxImplementation != address(0)) revert SandboxImplementationAlreadySet();
+        _sandboxImplementation = impl;
+        emit SandboxImplementationSet(impl);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function sandboxImplementation() external view returns (address) {
+        return _sandboxImplementation;
+    }
+
+    /// @inheritdoc ISyndicateVault
+    function sandboxOf(uint256 pid) external view returns (address) {
+        return _proposalSandbox[pid];
+    }
+
     // ==================== GOVERNOR ====================
 
     modifier onlyGovernor() {
@@ -681,6 +728,79 @@ contract SyndicateVault is
         // Idle-liquidity floor: a batch may deploy at most (1 − minBufferBps)
         // of the pre-batch float. Inflow (settle) batches pass trivially.
         if (balanceAfter < reserve + (balanceBefore * minBufferBps) / 10_000) revert BufferBreached();
+    }
+
+    /// @notice Governor-only: mint this proposal's sandbox, fund it with exactly
+    ///         `funding`, and dispatch its stored calls.
+    /// @dev    THE SECOND ASSET-MOVING PATH THAT DOES NOT PASS `_guardBatchCalls`,
+    ///         and it does not need to. The batch guard exists because a batch
+    ///         runs under `delegatecall`, so a sub-call reaches its target AS THIS
+    ///         VAULT — able to spend our allowances, move our position tokens, and
+    ///         satisfy any `msg.sender == vault` gate. A sandbox call carries the
+    ///         SANDBOX's identity and can spend only the balance handed to it
+    ///         here, so the callee's identity stops being load-bearing and the
+    ///         most a hostile call set costs is `funding` — precisely what
+    ///         full-notional tier-2 coverage already charged for.
+    ///
+    ///         AUTHORIZATION IS `onlyGovernor` AND NOTHING ELSE, the same posture
+    ///         `settleRedeem`/`settleDeposit` take toward the queue. The adversary
+    ///         is any second caller: this moves vault assets to a fresh contract
+    ///         without the callee gate, so it must be reachable only through a
+    ///         proposal that cleared the vote, the guardian review period and the
+    ///         coverage quorum.
+    ///
+    ///         PUSH, NEVER APPROVE-AND-PULL. An allowance would be a standing
+    ///         authorization whose size proposer calldata could choose, which is
+    ///         the "authorization meters zero" failure this whole mechanism
+    ///         exists to avoid, reproduced at the funding step. Nothing here ever
+    ///         grants the sandbox an allowance against this vault.
+    ///
+    ///         ONE SANDBOX PER PROPOSAL. A second mint for the same id would
+    ///         overwrite the recorded address while the first still held capital,
+    ///         orphaning it from `collectResidue`.
+    /// @return sandbox The address minted for `pid`.
+    function runSandbox(
+        uint256 pid,
+        ICallSandbox.Call[] calldata calls,
+        address[] calldata declaredTokens,
+        uint256 funding
+    ) external onlyGovernor nonReentrant whenNotPaused returns (address sandbox) {
+        address impl = _sandboxImplementation;
+        if (impl == address(0)) revert SandboxNotConfigured();
+        if (_proposalSandbox[pid] != address(0)) revert SandboxAlreadyMinted(pid);
+
+        // THE CEILING IS READ LIVE, not captured at propose. A ceiling tightened
+        // between propose and execute must bind, and this is the only read that
+        // can see it. Typed call on `msg.sender`, which `onlyGovernor` has
+        // already established IS the governor: fail closed, because a governor
+        // that cannot price its own tier-2 bound must not be funding arbitrary
+        // calldata. The failure is recoverable (the proposal expires with the
+        // capital never having left); what it prevents is not.
+        uint256 ceiling = (totalAssets() * ISyndicateGovernor(msg.sender).tier2CallCapBps()) / 10_000;
+        if (funding > ceiling) revert SandboxFundingExceedsCeiling(funding, ceiling);
+
+        uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
+
+        // Deterministic so the address is derivable off-chain before execution —
+        // guardians reviewing a payload can compute where it will run.
+        sandbox = Clones.cloneDeterministic(impl, bytes32(pid));
+        _proposalSandbox[pid] = sandbox;
+        ICallSandbox(sandbox).init(address(this), calls, declaredTokens);
+        if (funding != 0) IERC20(asset()).safeTransfer(sandbox, funding);
+        ICallSandbox(sandbox).run();
+
+        // SAME THREE CUSTODY CHECKS `executeGovernorBatch` applies, for the same
+        // reasons. `run()` can return assets (a call that swaps back into the
+        // vault asset and pushes), so the delta is measured rather than assumed
+        // to equal `funding`.
+        uint256 balanceAfter = IERC20(asset()).balanceOf(address(this));
+        uint256 netOutflow = balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;
+        if (netOutflow > funding) revert MaxNetOutflowExceeded(netOutflow, funding);
+        uint256 reserve = reservedQueueAssets();
+        if (balanceAfter < reserve) revert QueueReserveBreached();
+        if (balanceAfter < reserve + (balanceBefore * minBufferBps) / 10_000) revert BufferBreached();
+
+        emit SandboxRun(pid, sandbox, funding);
     }
 
     /// @inheritdoc ISyndicateVault
@@ -2055,6 +2175,7 @@ contract SyndicateVault is
             // stamped -- but the residue must still be recorded, or a mint
             // would be priced as though the strategy owed nothing.
             _recordResidue(strat, proposalId, bound);
+            _recordResidue(_proposalSandbox[proposalId], proposalId, bound);
             return;
         }
         // THE STAMP COUNTS UNDELIVERED VALUE; `totalAssets()` DELIBERATELY DOES
@@ -2126,6 +2247,16 @@ contract SyndicateVault is
         // `_pricingSupply()`, neither of which the residue record touches, so
         // moving the record later cannot move the price it stamped at.
         _recordResidue(strat, proposalId, bound);
+        // THE SANDBOX IS A SECOND HOLDER OF THIS PROPOSAL'S VALUE, and it must
+        // reach the same machinery or the vault would price mints against float
+        // alone while a sandbox still held assets — finding #3's shape
+        // reintroduced through a new path. Recording it here also keys it to
+        // THIS pid, so a late arrival is split with the cohort that exited at
+        // this settlement rather than accruing entirely to the stayers.
+        //
+        // Bounded by the same proposal envelope: the sandbox's funding was
+        // carved from it, so `bound` is a true ceiling on what it can owe.
+        _recordResidue(_proposalSandbox[proposalId], proposalId, bound);
     }
 
     /// @dev Gas ceiling for both strategy probes. The address is

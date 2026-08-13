@@ -37,6 +37,16 @@ interface ISyndicateVault {
     error AmountExceedsBalance();
     error WithdrawalQueueNotSet();
     error WithdrawalQueueAlreadySet();
+    /// @notice The sandbox implementation is bound set-once; it is already set.
+    error SandboxImplementationAlreadySet();
+    /// @notice No sandbox implementation is wired, so the sandbox path is absent.
+    error SandboxNotConfigured();
+    /// @notice A sandbox already exists for this proposal. One per proposal —
+    ///         a second would orphan the first from `collectResidue` while it
+    ///         still held capital.
+    error SandboxAlreadyMinted(uint256 pid);
+    /// @notice Sandbox funding exceeded the live tier-2 per-call capital ceiling.
+    error SandboxFundingExceedsCeiling(uint256 funding, uint256 ceiling);
     error InsufficientShares();
     error RedemptionsNotLocked();
     /// @notice `requestDeposit` was called with no non-terminal proposal open
@@ -302,6 +312,17 @@ interface ISyndicateVault {
     ///         library is re-pointed and its expected codehash re-stamped.
     event ExecutorImplSet(address oldImpl, address newImpl);
     event WithdrawalQueueSet(address indexed queue);
+    /// @notice The set-once `CallSandbox` implementation was bound.
+    event SandboxImplementationSet(address indexed implementation);
+    /// @notice A proposal's sandbox was minted, funded and run.
+    event SandboxRun(uint256 indexed pid, address indexed sandbox, uint256 funding);
+
+    /// @notice The `CallSandbox` implementation this vault clones per proposal.
+    ///         Zero means the sandbox path is not wired.
+    function sandboxImplementation() external view returns (address);
+
+    /// @notice The sandbox minted for `pid`, or zero if none.
+    function sandboxOf(uint256 pid) external view returns (address);
     /// @notice A settled strategy reported undelivered value; `outstanding` is
     ///         the figure deposits are now priced against, on top of
     ///         `totalAssets()`.
