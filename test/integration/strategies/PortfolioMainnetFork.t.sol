@@ -153,7 +153,12 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
     // At the pinned block the direct v4 TSLA pool trades ~8.5% above the
     // Chainlink TSLA/USD answer before impact (5% fee tier + drift), so the
     // oracle-anchored rebalanceDelta floor needs headroom above that.
-    uint256 constant MIXED_SLIPPAGE_BPS = 1200;
+    // CLAMPED TO THE TEMPLATE'S CEILING. This was 1200, which
+    // `PortfolioStrategy._initialize` rejects outright with `InvalidSlippage`
+    // (`MAX_SLIPPAGE_CEILING_BPS == 1_000`) — so both mixed-basket tests died
+    // at clone-init and the only mainnet-fork coverage of the v4 and mode-3
+    // native routes had been dead code. 1000 is the largest legal value.
+    uint256 constant MIXED_SLIPPAGE_BPS = 1000;
     // Smaller than TOTAL_AMOUNT: the direct USDG/TSLA 5% pool is thin, and the
     // execute-leg's own price impact at 2500 USDG pushes the pool far enough
     // above the Chainlink price that the oracle-floored rebalance buy can't

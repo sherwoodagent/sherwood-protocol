@@ -137,8 +137,16 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
 
     // ── Setup ──
 
+    /// @dev False when no RPC was configured: `setUp` returned early and the
+    ///      protocol was never deployed. Read by `_requireFork`.
+    bool forkReady;
+
     function setUp() public override {
         super.setUp();
+        // Everything below touches the deployed stack. With no RPC the base
+        // skipped and `vault`/`tierRegistry` are address(0), where a typed
+        // call reverts with empty returndata — an undecodable failure.
+        if (address(vault) == address(0)) return;
         // `MorphoSupplyStrategy._initialize` fails CLOSED unless the Morpho
         // singleton is allowlisted in the vault's own TierRegistry
         // (`MorphoNotAllowed`). The base harness only attests price feeds.
@@ -148,6 +156,16 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
         mp = IMorpho(MORPHO).idToMarketParams(Id.wrap(MARKET_ID));
         template = address(new MorphoSupplyStrategy());
         _normalizeMorphoClock();
+        forkReady = true;
+    }
+
+    /// @dev Body-level fork guard. The base's `vm.skip(true)` lives inside
+    ///      `setUp`, and that form is forge-version-dependent: local forge
+    ///      reports the suite as skipped, CI's reports `[FAIL: skipped]
+    ///      setUp()` and the job goes red. Calling `vm.skip` from the TEST BODY
+    ///      works on every version, so every test opens with this.
+    function _requireFork() internal {
+        if (!forkReady) vm.skip(true);
     }
 
     /// @notice Warp past `market.lastUpdate` when the fork clock is behind it.
@@ -235,6 +253,7 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
     ///      conversion, a lost interest term, or dust stranded on the clone all
     ///      break the equality rather than hiding inside a `>=`.
     function test_e2e_fullLifecycle_realVault_realInterest() public {
+        _requireFork();
         uint256 vaultBefore = _vaultRawUSDG();
         assertEq(vaultBefore, VAULT_FLOAT, "harness float");
 
@@ -312,6 +331,7 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
     ///      oracle price and would be a strictly less faithful reproduction of
     ///      the documented adversary.
     function test_e2e_residue_pricedLockedAndSweptExactlyOnce() public {
+        _requireFork();
         (address strategy, uint256 pid) = _deployAndExecute(RESIDUE_SUPPLY);
         vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
 
@@ -336,8 +356,31 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
         assertTrue(s.hasUndeliveredValue(), "residue declared");
         // The residue is priced at the position's own redeemable value — no
         // oracle, loan token IS the vault asset.
+        //
+        // IT UNDER-PRICES, BY DESIGN AND MEASURABLY. `_ownRaw` reads raw market
+        // storage with zero external calls — that is what took the proposer's
+        // IRM off the probe path (PR #243, finding B3) — so it necessarily
+        // misses interest accrued since Morpho's `lastUpdate`. Measured here
+        // against Morpho's own view accrual: 3,999,999,999 vs 4,000,142,747,
+        // short by 142,748 (~3.6 bps of the position).
+        //
+        // DIRECTION IS THE SAFETY PROPERTY. Under-pricing is the benign side
+        // for a REDEEMER — nobody can withdraw against value that has not
+        // landed. It is NOT benign on the mint side, and that is a live leak,
+        // not a theoretical one: a queued depositor mints against the
+        // under-stated NAV and keeps their pro-rata slice of the gap. See
+        // `test_e2e_residueSkim_isolatedAgainstTheNoAttackerCounterfactual`,
+        // where 20% x 142,748 = 28,550 comes out of the honest LPs exactly.
+        //
+        // So this asserts what is TRUE (never over-prices, and the shortfall
+        // stays inside a stated bound) rather than the "prices it exactly"
+        // this originally claimed. Tightening the bound is a real change: it
+        // would have to come from making the probe accrue.
         uint256 residue = s.undeliveredValue();
-        assertApproxEqAbs(residue, owed, 2, "undeliveredValue prices the leftover position");
+        assertLe(residue, owed, "undeliveredValue OVER-priced the residue - redeemers could drain unlanded value");
+        uint256 shortfall = owed - residue;
+        console2.log("undeliveredValue shortfall vs Morpho view accrual (USDG 1e6):", shortfall);
+        assertLe(shortfall, owed / 1000, "residue under-count exceeded 10 bps - the probe is drifting further behind");
 
         // NAV EXCLUDES THE RESIDUE — deliberately, on this commit. `totalAssets()`
         // is float minus liabilities and never counts strategy-held value; the
@@ -351,31 +394,78 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
         );
         assertLt(navBefore, VAULT_FLOAT, "NAV is short by the residue while it is outstanding");
 
-        // Deposits are locked while the residue is outstanding.
-        _dealUSDG(attacker, 1_000e6);
+        // INSTANT DEPOSITS ARE OPEN, AND PRICED — BUT NOT EXACTLY. Pre-#243
+        // this path was locked (`DepositsLocked`); #243 replaced the lock with
+        // `depositNav()`, which adds the residue back before minting. So the
+        // assertion that earns its keep is no longer "it reverts" — it is how
+        // much entering here still pays.
+        //
+        // It pays a little, and the arithmetic says why: `depositNav()` adds
+        // back the residue AS THE PROBE QUOTES IT, and the probe is short by
+        // the interest-since-`lastUpdate` term measured above. So a depositor
+        // mints against a NAV that is 142,748 too low and keeps their pro-rata
+        // slice of the gap when the residue lands. Measured: a 1,000 USDG
+        // deposit into a ~21,000 pool realizes +6,797, and
+        // 142,748 x 1,000/21,000 = 6,797.5.
+        //
+        // NOTE this CORRECTS the tempting reading that the instant path is
+        // safe and only the queued path leaks. BOTH entry paths leak, by the
+        // same under-count and in the same proportion — the queued path is not
+        // a different bug, just a different door. The ceiling on either is the
+        // whole under-count, which is what this asserts.
+        uint256 instantDeposit = 1_000e6;
+        _dealUSDG(attacker, instantDeposit);
         vm.startPrank(attacker);
-        IERC20(USDG).approve(address(vault), 1_000e6);
-        vm.expectRevert(bytes4(keccak256("DepositsLocked()")));
-        vault.deposit(1_000e6, attacker);
+        IERC20(USDG).approve(address(vault), instantDeposit);
+        vault.deposit(instantDeposit, attacker);
         vm.stopPrank();
+        assertGt(vault.balanceOf(attacker), 0, "instant deposit is open while residue is outstanding");
 
         // Sweep is permissionless and moves NAV by EXACTLY what it returns.
         vm.prank(makeAddr("sweeper"));
         uint256 swept = s.sweep();
-        assertApproxEqAbs(swept, residue, 2, "sweep returned the whole residue");
-        assertEq(vault.totalAssets(), navBefore + swept, "NAV moved by exactly the swept amount (no double count)");
+        // The sweep settles at the position's TRUE value, so it necessarily
+        // returns MORE than the call-free probe quoted — by the same
+        // interest-since-`lastUpdate` term measured above. The invariant is
+        // one-directional: never less than was priced (that would mean shares
+        // were minted against value that never arrived), and not so much more
+        // that the probe has drifted out of its stated bound.
+        assertGe(swept, residue, "sweep delivered LESS than undeliveredValue quoted - shares minted against nothing");
+        assertLe(swept - residue, owed / 1000, "sweep overshot the probe by more than 10 bps");
+        assertEq(
+            vault.totalAssets(),
+            navBefore + swept + instantDeposit,
+            "NAV moved by exactly the swept amount plus the instant deposit (no double count)"
+        );
+
+        // The depositor's profit is capped by the whole under-count: they can
+        // capture at most their pro-rata slice of the gap, and a slice is at
+        // most the gap. If this ever fails, `depositNav()` has stopped adding
+        // the residue back at all and the pre-#243 skim is open again.
+        uint256 instantRealized = vault.previewRedeem(vault.balanceOf(attacker));
+        console2.log(
+            "instant depositor profit from the residue under-count (USDG 1e6):", instantRealized - instantDeposit
+        );
+        assertLe(
+            instantRealized,
+            instantDeposit + shortfall,
+            "instant depositor captured MORE than the residue under-count - depositNav is not pricing the residue"
+        );
         assertEq(_supplyShares(strategy), 0, "position fully unwound by the sweep");
         address[] memory toks = new address[](1);
         toks[0] = USDG;
         _assertNoDust(strategy, toks);
         assertFalse(s.hasUndeliveredValue(), "residue cleared");
 
-        // ...and deposits reopen with no privileged action.
+        // ...and a second deposit still works with no privileged action, at a
+        // price that now reflects the landed residue.
+        uint256 sharesBefore = vault.balanceOf(attacker);
+        _dealUSDG(attacker, 1_000e6);
         vm.startPrank(attacker);
         IERC20(USDG).approve(address(vault), 1_000e6);
         vault.deposit(1_000e6, attacker);
         vm.stopPrank();
-        assertGt(vault.balanceOf(attacker), 0, "deposits reopen after the sweep");
+        assertGt(vault.balanceOf(attacker), sharesBefore, "deposits still open after the sweep");
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -400,6 +490,7 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
     ///      may not realize more than they contributed out of a settlement whose
     ///      only "profit" is value that was already the vault's.
     function test_e2e_attackerCannotSkimResidueViaQueuedDeposit() public {
+        _requireFork();
         uint256 attackDeposit = 5_000e6;
         (address strategy, uint256 pid) = _deployAndExecute(RESIDUE_SUPPLY);
 
@@ -438,6 +529,97 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
         assertLe(realized, attackDeposit + 1e3, "queued depositor skimmed the residue: realized more than contributed");
     }
 
+    /// @notice THE ISOLATION for the test above: does the attacker's gain come
+    ///         OUT OF the honest LPs, or out of yield that accrued after they
+    ///         were priced in?
+    /// @dev    `test_e2e_attackerCannotSkimResidueViaQueuedDeposit` shows the
+    ///         attacker realizing 28,549 units more than they contributed. That
+    ///         is a direction, not a verdict: a shareholder who is correctly
+    ///         priced in and then earns pro-rata yield on the residue also
+    ///         realizes more than they contributed, and so does one who skimmed.
+    ///
+    ///         The `lp1ClaimBefore` / `lp1ClaimAfter` read-out in that test
+    ///         CANNOT settle it — measured while the residue is outstanding,
+    ///         `previewRedeem` prices against a float-only NAV, so LP1's claim
+    ///         "rises" by the residue coming home whether or not anyone stole
+    ///         from them. Reading dilution off that pair is how a benign result
+    ///         gets reported as an attack.
+    ///
+    ///         The only measurement that separates them is the counterfactual:
+    ///         run the identical settlement with and without the attacker and
+    ///         compare what the HONEST LPs walk away with. Same fork state, same
+    ///         block, same interest — `snapshotState`/`revertToState` guarantees
+    ///         the two branches differ in exactly one thing.
+    ///
+    ///         A skim of size S shows up as honest LPs ending S poorer. Yield
+    ///         shows up as honest LPs ending no worse off at all.
+    ///
+    ///         MEASURED, and it is a skim:
+    ///           honest LPs alone          19,999,868,772
+    ///           honest LPs with attacker  19,999,840,222   (-28,550)
+    ///           attacker realized          5,000,028,549   (+28,549)
+    ///         Exact conservation to one unit of share-math rounding. PR #243
+    ///         shrank this leak ~34,600x (pre-#243 the same test measured +952
+    ///         USDG) but did not close it.
+    ///
+    ///         MECHANISM — this and the `undeliveredValue` under-count in
+    ///         `test_e2e_residue_pricedLockedAndSweptExactlyOnce` are ONE bug:
+    ///           `undeliveredValue()` under-counts the residue by 142,748
+    ///           (interest accrued since Morpho's `lastUpdate`, which the probe
+    ///           deliberately excludes to keep the read call-free);
+    ///           the attacker's post-mint pool share is 5,000/25,000 = 20%;
+    ///           20% x 142,748 = 28,550 = exactly what the honest LPs lost.
+    ///         A queued depositor mints against the under-stated NAV and
+    ///         captures their pro-rata slice of the gap when the residue lands.
+    ///
+    ///         The leak is BOUNDED by the size of the under-count (an attacker
+    ///         approaching 100% of the pool captures at most all of it, here
+    ///         3.6 bps of the residue) and grows with residue size and with the
+    ///         time the position sits unaccrued. It is small, but it is a
+    ///         directional transfer from sitting LPs to a timed depositor, not
+    ///         rounding.
+    function test_e2e_residueSkim_isolatedAgainstTheNoAttackerCounterfactual() public {
+        _requireFork();
+        uint256 attackDeposit = 5_000e6;
+
+        (address strategy, uint256 pid) = _deployAndExecute(RESIDUE_SUPPLY);
+        uint256 snap = vm.snapshotState();
+
+        // ── Branch A: no attacker. The honest baseline. ──
+        vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
+        _flashSettle(pid);
+        vm.prank(makeAddr("sweeperA"));
+        MorphoSupplyStrategy(strategy).sweep();
+        uint256 honestAlone = vault.previewRedeem(vault.balanceOf(lp1)) + vault.previewRedeem(vault.balanceOf(lp2));
+
+        // ── Branch B: identical, plus the queued attacker. ──
+        vm.revertToState(snap);
+        _dealUSDG(attacker, attackDeposit);
+        uint256 reqId = _requestDeposit(attacker, attackDeposit);
+        vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
+        _flashSettle(pid);
+        _claimQueued(attacker, reqId);
+        vm.prank(makeAddr("sweeperB"));
+        MorphoSupplyStrategy(strategy).sweep();
+        uint256 honestWithAttacker =
+            vault.previewRedeem(vault.balanceOf(lp1)) + vault.previewRedeem(vault.balanceOf(lp2));
+        uint256 attackerRealized = vault.previewRedeem(vault.balanceOf(attacker));
+
+        console2.log("honest LPs alone          (USDG 1e6):", honestAlone);
+        console2.log("honest LPs with attacker  (USDG 1e6):", honestWithAttacker);
+        console2.log("attacker contributed      (USDG 1e6):", attackDeposit);
+        console2.log("attacker realized         (USDG 1e6):", attackerRealized);
+
+        // The verdict. Tolerance is 2 units of USDG's smallest denomination —
+        // one per LP for share-math rounding, which always rounds toward the
+        // vault. Anything beyond that is value that changed hands.
+        assertGe(
+            honestWithAttacker + 2,
+            honestAlone,
+            "the queued depositor's gain came OUT OF the honest LPs - this is a skim, not yield"
+        );
+    }
+
     /// @notice CONTROL for the test above: the identical queued-deposit flow with
     ///         a COMPLETE settlement (no flash loan, no residue).
     /// @dev Without this, the failure above could be dismissed as "queued
@@ -446,6 +628,7 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
     ///      residue — not the queue, not the mid-flight float-only NAV — as the
     ///      thing being skimmed.
     function test_e2e_queuedDepositWithoutResidueIsFairlyPriced() public {
+        _requireFork();
         uint256 depositAmount = 5_000e6;
         (, uint256 pid) = _deployAndExecute(RESIDUE_SUPPLY);
 
@@ -481,6 +664,7 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
     ///      documented design, and silently changing it would change every
     ///      conversion in the vault.
     function test_e2e_navTracksLiveIrmAccrual_notAStaleSnapshot() public {
+        _requireFork();
         (address strategy, uint256 pid) = _deployAndExecute(SUPPLY_AMOUNT);
 
         uint256 floatMidFlight = _vaultRawUSDG();

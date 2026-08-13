@@ -28,6 +28,7 @@ contract ProbeGriefStrategy {
         RevertAlways,
         BurnGas,
         LieUndelivered,
+        LieUnvalued,
         Honest
     }
 
@@ -59,6 +60,16 @@ contract ProbeGriefStrategy {
 
     function undeliveredValue() external view returns (uint256) {
         return _answer();
+    }
+
+    /// @dev The gate PR #243 moved the deposit lock onto. `_refreshUnvalued`
+    ///      takes the bool at face value and only ever clears it on a truthful
+    ///      zero from a code-bearing address, so a contract that answers 1
+    ///      forever is never un-flagged. Separate from `_answer` on purpose:
+    ///      `LieUnvalued` lies HERE and tells the truth everywhere else, which
+    ///      is what makes the resulting lock survive `collectResidue`.
+    function hasUnvaluedResidue() external view returns (uint256) {
+        return mode == Mode.LieUnvalued ? 1 : 0;
     }
 
     function _answer() private view returns (uint256) {
@@ -95,6 +106,19 @@ contract ReentrantBatchAdapter {
     bool public settleReentered;
     bool public ran;
 
+    /// @dev THE REASON, not just the fact. A bare "it reverted" cannot tell the
+    ///      reentrancy latch apart from the unrelated gates that are also
+    ///      active during an executing proposal (`DepositsLocked`,
+    ///      `maxWithdraw == 0`, a zero share balance, a duration that has not
+    ///      elapsed) — so a suite asserting only `assertFalse(reentered)` stays
+    ///      green with every `nonReentrant` in the vault deleted. Recording the
+    ///      selector is what makes these probes falsifiable.
+    bytes4 public depositRevert;
+    bytes4 public withdrawRevert;
+    bytes4 public requestDepositRevert;
+    bytes4 public requestRedeemRevert;
+    bytes4 public settleRevert;
+
     uint256 public pid;
 
     constructor(address vault_, address governor_, address asset_) {
@@ -110,31 +134,35 @@ contract ReentrantBatchAdapter {
     /// @dev Called by the governor batch with `msg.sender == vault`.
     function poke() external {
         ran = true;
-        depositReentered =
+        (depositReentered, depositRevert) =
             _try(vaultAddr, abi.encodeWithSignature("deposit(uint256,address)", uint256(1e6), address(this)));
-        withdrawReentered = _try(
+        (withdrawReentered, withdrawRevert) = _try(
             vaultAddr,
             abi.encodeWithSignature("withdraw(uint256,address,address)", uint256(1), address(this), address(this))
         );
-        requestDepositReentered =
+        (requestDepositReentered, requestDepositRevert) =
             _try(vaultAddr, abi.encodeWithSignature("requestDeposit(uint256,address)", uint256(1e6), address(this)));
-        requestRedeemReentered =
+        (requestRedeemReentered, requestRedeemRevert) =
             _try(vaultAddr, abi.encodeWithSignature("requestRedeem(uint256,address)", uint256(1), address(this)));
-        settleReentered = _try(governorAddr, abi.encodeWithSignature("settleProposal(uint256)", pid));
+        (settleReentered, settleRevert) = _try(governorAddr, abi.encodeWithSignature("settleProposal(uint256)", pid));
     }
 
     /// @dev Control: the SAME deposit call, made outside any batch. Proves a
     ///      failure inside `poke()` was the reentrancy latch and not funding.
-    function depositOutsideBatch() external returns (bool) {
-        return _try(vaultAddr, abi.encodeWithSignature("deposit(uint256,address)", uint256(1e6), address(this)));
+    function depositOutsideBatch() external returns (bool ok) {
+        (ok,) = _try(vaultAddr, abi.encodeWithSignature("deposit(uint256,address)", uint256(1e6), address(this)));
     }
 
     function approveVault() external {
         IERC20(assetAddr).approve(vaultAddr, type(uint256).max);
     }
 
-    function _try(address target, bytes memory data) private returns (bool ok) {
-        (ok,) = target.call(data);
+    function _try(address target, bytes memory data) private returns (bool ok, bytes4 sel) {
+        bytes memory ret;
+        (ok, ret) = target.call(data);
+        if (!ok && ret.length >= 4) {
+            sel = bytes4(ret);
+        }
     }
 }
 
@@ -161,6 +189,16 @@ contract ReentrantBatchAdapter {
  */
 contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
     uint256 constant DURATION = 1 hours; // == governor minStrategyDuration
+
+    /// @dev Body-level fork guard. The base's `vm.skip(true)` lives inside
+    ///      `setUp`, and that form is forge-version-dependent: local forge
+    ///      reports the suite as skipped, CI's reports `[FAIL: skipped]
+    ///      setUp()` and the job goes red. Calling `vm.skip` from the TEST BODY
+    ///      works on every version. With no RPC the base never deployed, so a
+    ///      zero vault address is the signal.
+    function _requireFork() internal {
+        if (address(vault) == address(0)) vm.skip(true);
+    }
     uint256 constant FEE_BPS = 1000;
 
     address sink = makeAddr("sink");
@@ -286,6 +324,7 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
     ///         found it: capital untouched, instant exits reopened, execution
     ///         permanently refused, and no bond stranded.
     function test_defeated_capitalStaysAndLpsCanExit() public {
+        _requireFork();
         uint256 assetsBefore = _usdg(address(vault));
         uint256 ppsBefore = _pricePerShare();
 
@@ -336,6 +375,7 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
     ///         review must be equally dead: Rejected, unexecutable, capital
     ///         untouched, exits reopened.
     function test_guardianBlocked_passedVoteStillCannotExecute() public {
+        _requireFork();
         // The guardian's vote weight and the block-quorum denominator are both
         // read at the proposal's snapshot instant, so the stake must exist —
         // and be checkpointed — before `propose`.
@@ -382,6 +422,11 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
         (uint256 sharesOut, uint256 out) = _instantRedeemMax(lp1);
         assertGt(sharesOut, 0, "LP could not exit after a guardian block");
         assertLe(out, 10_000e6, "LP exited with more than deposited");
+        // FLOOR, not just a ceiling. A blocked proposal moved no capital and
+        // charged no fee (asserted above), so the exit is the deposit back to
+        // the wei. Without this, a vault that returned HALF the deposit would
+        // satisfy the line above and the test would call that a pass.
+        assertGe(out, 10_000e6 - 2, "LP exit shortfall beyond rounding dust after a guardian block");
         _assertShareClaimsSolvent(_holders());
     }
 
@@ -392,6 +437,7 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
     ///         and once the shortfall is repaired the proposal must settle
     ///         exactly once — a second settle is refused.
     function test_settleUnderDelivering_revertsAtFloor_thenSettlesExactlyOnce() public {
+        _requireFork();
         _allow(sink);
         uint256 vaultBefore = _usdg(address(vault));
         uint256 loss = vaultBefore / 2; // 50% out the door; declared max 10%
@@ -452,6 +498,12 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
         (, uint256 out1) = _instantRedeemMax(lp1);
         (, uint256 out2) = _instantRedeemMax(lp2);
         assertLe(out1 + out2, 20_000e6, "LPs withdrew more than the 20k deposited on a flat round trip");
+        // FLOOR. The shortfall the test set up was explicitly repaired before
+        // this exit, so a flat round trip must return essentially all of it.
+        // 0.1% is orders of magnitude above the only legitimate leak here (50
+        // bps ANNUALIZED management fee over a 1-hour strategy, ~6e-6 of NAV)
+        // and still catches a settlement that quietly kept a slice.
+        assertGe(out1 + out2, 20_000e6 - 20e6, "LPs lost more than fee-sized value on a flat round trip");
         console2.log("flat round trip, LP1+LP2 out:", out1 + out2);
     }
 
@@ -459,9 +511,21 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
 
     /// @notice Deposits must be shut for the whole window in which capital is
     ///         deployed-but-unpriced, and a queued deposit that lands inside it
-    ///         must mint at the realized settle price — never against the
-    ///         under-reported mid-flight NAV.
-    function test_depositGate_lockedWhileDeployed_queuedDepositPricesAtSettle() public {
+    ///         must not mint against the under-reported mid-flight NAV.
+    /// @dev    NOT "prices at settle" any more, and the difference is the point.
+    ///         PR #243 retired the frozen deposit stamp: `VaultWithdrawalQueue.
+    ///         claim` now gates a DEPOSIT on the vault's own mint predicate
+    ///         (`depositsLocked()` -> `VaultLocked`) and prices it live through
+    ///         `previewDeposit`, while `NotSettled` survives only on the REDEEM
+    ///         branch, which still prices against its own pid's stamp. The
+    ///         in-source rationale is explicit: "there is nothing to wait for
+    ///         and no stamp to require".
+    ///
+    ///         So the assertion below expects `VaultLocked`. The property under
+    ///         test is unchanged — a deposit may not land while capital is out
+    ///         and unpriced — only the error that enforces it moved.
+    function test_depositGate_lockedWhileDeployed_queuedDepositClaimsAtACleanInstant() public {
+        _requireFork();
         _allow(sink);
         _dealUSDG(victim, 5_000e6);
 
@@ -499,13 +563,15 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
         vault.deposit(1_000e6, victim);
         vm.stopPrank();
 
-        // The queued deposit cannot be claimed before the price is stamped.
+        // The queued deposit cannot be claimed while the vault is locked — the
+        // mint predicate refuses, because minting here would price against
+        // capital that is out of the vault and unvalued.
         // The queue handle is hoisted OUT of the `expectRevert` window on
         // purpose: `_claimQueued` resolves `vault.withdrawalQueue()` first, and
         // that call in argument position would consume the armed one-shot
         // cheatcode (the failure mode is "next call did not revert").
         IVaultWithdrawalQueue q = _queue();
-        vm.expectRevert(IVaultWithdrawalQueue.NotSettled.selector);
+        vm.expectRevert(IVaultWithdrawalQueue.VaultLocked.selector);
         q.claim(reqId);
 
         // --- Settle: the deployed capital comes back, THEN the price is frozen ---
@@ -549,6 +615,7 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
     ///         (= asset decimals, 6 for USDG) must keep the victim's loss at
     ///         dust.
     function test_donationInflation_freshSyndicateOnLiveUsdg() public {
+        _requireFork();
         address owner2 = makeAddr("owner2");
         wood.mint(owner2, MIN_OWNER_STAKE);
         vm.startPrank(owner2);
@@ -603,6 +670,17 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
         // pull out cannot exceed what they put in (1 wei + the donation).
         uint256 attackerClaim = fresh.previewRedeem(fresh.balanceOf(attacker));
         assertLe(attackerClaim, donation + 1, "attacker extracted more than the donation + stake");
+        // CONSERVATION, which is the assertion that actually bites. The line
+        // above is the right property but a loose one - the attacker's claim
+        // lands near half the donation, so a bound of `donation + 1` is ~2x the
+        // true value and cannot fail for anything the victim assertion has not
+        // already caught. This bounds BOTH sides at once: no combination of
+        // exits may return more than the three of them put in.
+        assertLe(
+            victimOut + attackerClaim,
+            victimDeposit + donation + 1,
+            "victim + attacker together recovered more than was ever contributed"
+        );
     }
 
     // ==================== 5. REENTRANCY / CALLBACK SURFACE ====================
@@ -612,6 +690,7 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
     ///         position-manager callback occupies. Every LP-facing and
     ///         lifecycle-facing entrypoint must refuse reentry from there.
     function test_reentrancy_everyEntrypointRefusedFromInsideTheBatch() public {
+        _requireFork();
         ReentrantBatchAdapter adapter = new ReentrantBatchAdapter(address(vault), address(governor), USDG);
         _allow(address(adapter));
         _dealUSDG(address(adapter), 10_000e6);
@@ -638,14 +717,57 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
         assertFalse(adapter.requestRedeemReentered(), "requestRedeem re-entered from inside the batch");
         assertFalse(adapter.settleReentered(), "settleProposal re-entered from inside execute");
 
+        // WHICH GATE REFUSED, not merely that something did. `assertFalse` on a
+        // bool cannot tell the reentrancy latch apart from the unrelated gates
+        // that are also live during an executing proposal (`DepositsLocked`,
+        // `maxWithdraw == 0`, a zero share balance, an unelapsed duration) — so
+        // without the selectors below, this whole test would stay green with
+        // every guard in the vault deleted.
+        //
+        // MEASURED: four of the five are refused by an actual reentrancy guard.
+        // Three trip OZ's latch on the vault (`_deposit` carries
+        // `nonReentrant`, and it is reached BEFORE the deposit-lock check, so
+        // the latch really is what fires); `settleProposal` trips the
+        // governor's own `Reentrancy()`.
+        bytes4 ozReentrancy = bytes4(keccak256("ReentrancyGuardReentrantCall()"));
+        bytes4 govReentrancy = bytes4(keccak256("Reentrancy()"));
+        assertEq(adapter.depositRevert(), ozReentrancy, "deposit was refused by something other than the latch");
+        assertEq(
+            adapter.requestDepositRevert(), ozReentrancy, "requestDeposit was refused by something other than the latch"
+        );
+        assertEq(
+            adapter.requestRedeemRevert(), ozReentrancy, "requestRedeem was refused by something other than the latch"
+        );
+        assertEq(
+            adapter.settleRevert(),
+            govReentrancy,
+            "settleProposal was refused by something other than the governor latch"
+        );
+
+        // `withdraw` is the ONE case not defended by a latch, and that is
+        // deliberate rather than an oversight — `SyndicateVault` states it:
+        // "The `withdraw`/`redeem` paths take no `nonReentrant` — not
+        // load-bearing", because withdraw transfers the asset OUT and any
+        // reentry into deposit/mint is still caught by `_deposit`'s latch.
+        // Asserted as what it actually is. Pinning the real selector means that
+        // if someone later adds a latch here, this line notices rather than
+        // silently passing either way.
+        assertEq(
+            adapter.withdrawRevert(),
+            bytes4(keccak256("ERC4626ExceededMaxWithdraw(address,uint256,uint256)")),
+            "withdraw refusal changed - re-check whether the latch story still holds"
+        );
+
         // Nothing minted, nothing moved.
         assertEq(vault.totalSupply(), supplyBefore, "supply changed via a reentrant mint");
         assertEq(_usdg(address(vault)), assetsBefore, "vault balance changed during the reentrancy batch");
         assertEq(vault.balanceOf(address(adapter)), 0, "adapter holds shares it should never have minted");
 
-        // CONTROL: the identical deposit call succeeds outside the batch, which
-        // proves the five failures above were the reentrancy latch and not a
-        // funding/approval artefact.
+        // CONTROL for FUNDING ONLY. This runs AFTER `settleProposal`, i.e. once
+        // the proposal is closed and deposits have reopened — so it proves the
+        // adapter was funded and approved, and nothing about the latch. Labelled
+        // for what it is: read as a reentrancy control it would be circular,
+        // since the gate it clears is the same one that refused the probe.
         vm.warp(vm.getBlockTimestamp() + DURATION + 1);
         governor.settleProposal(pid);
         assertTrue(adapter.depositOutsideBatch(), "control deposit failed - the reentry test proves nothing");
@@ -666,6 +788,7 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
     ///         must degrade OPEN — it may not brick deposits and it may not make
     ///         a deposit cost unbounded gas.
     function test_grief_revertingAndGasBurningProbe_degradeOpen() public {
+        _requireFork();
         ProbeGriefStrategy probe = new ProbeGriefStrategy(agent, address(vault), ProbeGriefStrategy.Mode.RevertAlways);
         _settleWithProbeLabel(probe);
 
@@ -692,59 +815,108 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
         assertLt(gasUsed, 900_000, "gas-burning probe made a deposit unboundedly expensive");
     }
 
-    /// @notice SUSPECTED GRIEFING VECTOR (PR #243 finding class B3, verified live).
-    ///
-    ///         `SyndicateVault._depositsLocked` trusts a nonzero answer from
-    ///         `_lastSettledStrategy.hasUndeliveredValue()`, and that address is
-    ///         whatever the PROPOSER named as the proposal's `strategy` label.
-    ///         `propose` only checks `proposer() == msg.sender` and
-    ///         `vault() == vault` — both trivially satisfiable by an attacker
-    ///         contract that is never a batch target and never holds a cent.
-    ///
-    ///         A label that simply LIES ("I still hold undelivered value")
-    ///         therefore closes instant deposits for the whole vault, with no
-    ///         `sweep()` to call (the escape route the source comment relies on
-    ///         belongs to real strategy templates, not to an arbitrary label) and
-    ///         no permissionless way to clear the pin — only another proposal
-    ///         reaching settlement overwrites `_lastSettledStrategy`, and that
-    ///         needs a registered agent plus a full vote+review cycle.
-    ///
-    ///         This test PASSES by asserting the vector exists. If the branch is
-    ///         hardened (e.g. probe only a strategy the batch actually called, or
-    ///         bound the lock in time), this test is the one that should flip.
-    function test_grief_lyingSettledStrategyLabel_shutsDepositsIndefinitely() public {
+    /// @notice The `hasUndeliveredValue` lie is CLOSED by PR #243 — recorded so
+    ///         the closure has a live regression pin.
+    /// @dev    Pre-#243, `_depositsLocked` trusted a nonzero answer from
+    ///         `_lastSettledStrategy.hasUndeliveredValue()`, so a proposer-named
+    ///         label that merely lied shut instant deposits for the whole vault.
+    ///         #243 replaced that read: residue is now PRICED (`depositNav()`)
+    ///         rather than used as a lock, and the deposit gate reads
+    ///         `_unvaluedCount` instead. A label lying on the old selector no
+    ///         longer moves the gate at all.
+    function test_grief_lyingUndeliveredValueNoLongerShutsDeposits() public {
+        _requireFork();
         ProbeGriefStrategy probe = new ProbeGriefStrategy(agent, address(vault), ProbeGriefStrategy.Mode.LieUndelivered);
         _settleWithProbeLabel(probe);
 
         _dealUSDG(victim, 1_000e6);
         vm.startPrank(victim);
         IERC20(USDG).approve(address(vault), type(uint256).max);
+        uint256 shares = vault.deposit(1_000e6, victim);
+        vm.stopPrank();
+        assertGt(shares, 0, "the retired hasUndeliveredValue lie still shuts deposits");
+    }
+
+    /// @notice CONFIRMED GRIEFING VECTOR, AND IT IS WORSE THAN THE ONE #243
+    ///         CLOSED: a label that lies on `hasUnvaluedResidue()` locks EVERY
+    ///         deposit path for the vault PERMANENTLY, with no lever to lift it.
+    ///
+    /// @dev    The vector moved rather than closed. `_refreshUnvalued` reads
+    ///         `hasUnvaluedResidue()` from the settled strategy label — still
+    ///         proposer-supplied, still only gated by `proposer() == msg.sender`
+    ///         and `vault() == vault` at `propose` — takes the bool at face
+    ///         value, and increments `_unvaluedCount`. `depositsLocked()` is
+    ///         then true for as long as that count is nonzero.
+    ///
+    ///         WHY IT IS PERMANENT, unlike its predecessor:
+    ///           - `_refreshUnvalued` only ever DECREMENTS on a truthful zero
+    ///             from a code-bearing address. A contract answering 1 forever
+    ///             is never un-flagged.
+    ///           - `collectResidue` is permissionless but force-clears the flag
+    ///             ONLY for a CODELESS strategy; against a lying contract it
+    ///             just calls `_refreshUnvalued` again and re-reads the lie.
+    ///           - `_unvaluedCount` is vault-wide, not per-proposal, so a later
+    ///             settlement does NOT overwrite it the way
+    ///             `_lastSettledStrategy` used to. The old vector cost one
+    ///             governance cycle to clear; this one has no clearing path.
+    ///           - The queue is no escape: `VaultWithdrawalQueue.claim` gates a
+    ///             deposit on `depositsLocked()`, so a request queued during
+    ///             some later proposal is mintable only at an instant this flag
+    ///             makes unreachable.
+    ///
+    ///         Note the residue AMOUNT is properly bounded by `_residueBound`,
+    ///         which is real defence. The unvalued FLAG is a bare bool with no
+    ///         cap and no expiry, and that asymmetry is the bug.
+    ///
+    ///         This test PASSES by asserting the vector exists. If the branch is
+    ///         hardened — bound the flag in time from `settledAt`, or only
+    ///         honour it from an address the executed batch actually called —
+    ///         this is the test that should flip.
+    function test_grief_lyingUnvaluedResidueLabel_shutsEveryDepositPathPermanently() public {
+        _requireFork();
+        ProbeGriefStrategy probe = new ProbeGriefStrategy(agent, address(vault), ProbeGriefStrategy.Mode.LieUnvalued);
+        _settleWithProbeLabel(probe);
+
+        assertTrue(vault.depositsLocked(), "the unvalued lie did not lock deposits");
+
+        _dealUSDG(victim, 5_000e6);
+        vm.startPrank(victim);
+        IERC20(USDG).approve(address(vault), type(uint256).max);
         vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
         vault.deposit(1_000e6, victim);
         vm.stopPrank();
 
-        // The lock is not a transient settlement artefact: it survives a month.
+        // Not a transient settlement artefact: it survives a month.
         vm.warp(vm.getBlockTimestamp() + 30 days);
         vm.startPrank(victim);
         vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
         vault.deposit(1_000e6, victim);
         vm.stopPrank();
 
-        // Bounding the blast radius, and the reason this is a griefing vector
-        // rather than a theft: existing LPs are NOT trapped, instant exits stay
-        // open, and no accounting is corrupted.
+        // The permissionless lever does not lift it: `collectResidue` re-reads
+        // the same lie and leaves the flag standing.
+        vault.collectResidue(address(probe));
+        assertTrue(vault.depositsLocked(), "collectResidue cleared a lying contract's flag");
+
+        // The queue is not an escape either, though NOT for this reason —
+        // `requestDeposit` needs an open proposal and there is none here, so it
+        // refuses with `NoOpenProposal`. The queue-side block is one step
+        // later: `VaultWithdrawalQueue.claim` gates a deposit on
+        // `depositsLocked()`, so a request made during some future proposal
+        // would be mintable only at an instant this flag makes unreachable.
+        // Asserted as what it actually is rather than folded into the lock —
+        // an over-stated blast radius is how a real finding gets dismissed.
+        vm.startPrank(victim);
+        vm.expectRevert(ISyndicateVault.NoOpenProposal.selector);
+        vault.requestDeposit(1_000e6, victim);
+        vm.stopPrank();
+
+        // Blast radius: existing LPs are not trapped and no accounting is
+        // corrupted — this is a denial of entry, not a theft.
         assertFalse(vault.redemptionsLocked(), "existing LPs trapped by the probe lie");
         (uint256 sharesOut, uint256 out) = _instantRedeemMax(lp1);
         assertGt(sharesOut, 0, "LP exit blocked by the probe lie");
         assertLe(out, 10_000e6, "LP took out more than deposited");
-
-        // And it is cleared only by a SETTLEMENT that re-pins the label — i.e.
-        // recovery costs a full governance cycle, it is not permissionless.
-        probe.setMode(ProbeGriefStrategy.Mode.Honest);
-        vm.startPrank(victim);
-        uint256 shares = vault.deposit(1_000e6, victim);
-        vm.stopPrank();
-        assertGt(shares, 0, "deposits did not reopen once the probe stopped lying");
     }
 
     // ==================== 7. ROUNDING DIRECTION ====================
@@ -754,6 +926,7 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
     ///         more than they put in when the round trip is flat, and price per
     ///         share must never fall on a pure entry/exit.
     function test_rounding_tinyFlowsAroundARoundTripNeverFavourTheExiter() public {
+        _requireFork();
         _allow(sink);
 
         uint256 n = 12;
@@ -775,6 +948,9 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
             uint256 outAssets = _instantRedeem(u, sh);
             totalOut += outAssets;
             assertLe(outAssets, unit, "tiny round trip paid out more than it took in");
+            // FLOOR: rounding must be dust, not confiscation. Without this a
+            // vault paying tiny redeemers ZERO satisfies the ceiling above.
+            assertGe(outAssets, unit - 2, "tiny round trip confiscated more than rounding dust");
             _assertPpsNotBelow(ppsFloor, "tiny deposit/redeem cycle");
             ppsFloor = _pricePerShare();
         }
@@ -803,16 +979,24 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
             uint256 outAssets = _instantRedeem(u, sh);
             totalOut += outAssets;
             assertLe(outAssets, unit, "tiny round trip paid out more than it took in (post-settle)");
+            assertGe(outAssets, unit - 2, "tiny round trip confiscated more than rounding dust (post-settle)");
         }
 
         console2.log("tiny flows in / out:", totalIn, totalOut);
         assertLe(totalOut, totalIn, "aggregate tiny flows extracted value from the vault");
+        // FLOOR on the aggregate too: n cycles of confiscated dust is a leak
+        // even when each single cycle looks negligible.
+        assertGe(totalOut, totalIn - 2 * n, "aggregate tiny flows lost more than 1 unit of dust per cycle");
 
         // Original LPs still whole (flat round trip; management fee is the only
         // legitimate leak and it accrues to the owner, not to an exiting LP).
         (, uint256 o1) = _instantRedeemMax(lp1);
         (, uint256 o2) = _instantRedeemMax(lp2);
         assertLe(o1 + o2, 20_000e6, "LPs extracted more than they deposited on a flat round trip");
+        // FLOOR: see the bound rationale above - 0.1% sits far above the
+        // annualized management fee over these windows and far below any real
+        // value destruction.
+        assertGe(o1 + o2, 20_000e6 - 20e6, "LPs lost more than fee-sized value across the tiny-flow round trip");
         console2.log("LP1+LP2 out after flat round trip:", o1 + o2);
     }
 }
