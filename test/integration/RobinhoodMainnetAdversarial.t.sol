@@ -837,9 +837,11 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
         assertGt(shares, 0, "the retired hasUndeliveredValue lie still shuts deposits");
     }
 
-    /// @notice CONFIRMED GRIEFING VECTOR, AND IT IS WORSE THAN THE ONE #243
-    ///         CLOSED: a label that lies on `hasUnvaluedResidue()` locks EVERY
-    ///         deposit path for the vault PERMANENTLY, with no lever to lift it.
+    /// @notice A label that lies on `hasUnvaluedResidue()` shuts the deposit
+    ///         gate — but only for `UNVALUED_MAX_LOCK`, not forever.
+    ///
+    ///         WAS a permanent, vault-wide deposit DoS with no lever, strictly
+    ///         worse than the vector #243 closed. The window is the fix.
     ///
     /// @dev    The vector moved rather than closed. `_refreshUnvalued` reads
     ///         `hasUnvaluedResidue()` from the settled strategy label — still
@@ -864,15 +866,19 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
     ///             some later proposal is mintable only at an instant this flag
     ///             makes unreachable.
     ///
-    ///         Note the residue AMOUNT is properly bounded by `_residueBound`,
-    ///         which is real defence. The unvalued FLAG is a bare bool with no
-    ///         cap and no expiry, and that asymmetry is the bug.
+    ///         Note the residue AMOUNT was already bounded by `_residueBound`.
+    ///         The unvalued FLAG was a bare bool with no cap and no expiry, and
+    ///         that asymmetry was the bug.
     ///
-    ///         This test PASSES by asserting the vector exists. If the branch is
-    ///         hardened — bound the flag in time from `settledAt`, or only
-    ///         honour it from an address the executed batch actually called —
-    ///         this is the test that should flip.
-    function test_grief_lyingUnvaluedResidueLabel_shutsEveryDepositPathPermanently() public {
+    ///         FIXED, and this test flipped accordingly: `UNVALUED_MAX_LOCK`
+    ///         bounds the episode, so the lie holds the gate for a stated window
+    ///         and then stops. Every clause above still describes live behaviour
+    ///         — nothing clears the flag, `collectResidue` still re-reads the
+    ///         lie — which is exactly why the deadline is what closes it. The
+    ///         unit-level twin is
+    ///         `Vault_depositsPricedAgainstResidue::test_lyingUnvaluedLabelCannotLockDepositsForever`;
+    ///         this one proves it against a real settlement on a live fork.
+    function test_grief_lyingUnvaluedResidueLabel_isBoundedInTime() public {
         _requireFork();
         ProbeGriefStrategy probe = new ProbeGriefStrategy(agent, address(vault), ProbeGriefStrategy.Mode.LieUnvalued);
         _settleWithProbeLabel(probe);
@@ -886,17 +892,28 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
         vault.deposit(1_000e6, victim);
         vm.stopPrank();
 
-        // Not a transient settlement artefact: it survives a month.
-        vm.warp(vm.getBlockTimestamp() + 30 days);
+        // The permissionless lever does NOT lift it -- `collectResidue`
+        // re-reads the same lie and leaves the flag standing. That is still
+        // true, and it is why the deadline below has to exist.
+        vault.collectResidue(address(probe));
+        assertTrue(vault.depositsLocked(), "collectResidue cleared a lying contract's flag");
+
+        // ...and the lock is real right up to the deadline.
+        vm.warp(vm.getBlockTimestamp() + 7 days - 1);
         vm.startPrank(victim);
         vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
         vault.deposit(1_000e6, victim);
         vm.stopPrank();
 
-        // The permissionless lever does not lift it: `collectResidue` re-reads
-        // the same lie and leaves the flag standing.
-        vault.collectResidue(address(probe));
-        assertTrue(vault.depositsLocked(), "collectResidue cleared a lying contract's flag");
+        // THEN IT LAPSES, which is the fix. Before `UNVALUED_MAX_LOCK` this
+        // survived 30 days and would have survived forever: no clearing arm can
+        // ever fire against a contract that keeps answering true, and
+        // `_unvaluedCount` is vault-wide so no later settlement displaces it.
+        vm.warp(vm.getBlockTimestamp() + 2);
+        assertFalse(vault.depositsLocked(), "the lie still holds the gate - the DoS is permanent again");
+        vm.startPrank(victim);
+        assertGt(vault.deposit(1_000e6, victim), 0, "deposits never reopened");
+        vm.stopPrank();
 
         // The queue is not an escape either, though NOT for this reason —
         // `requestDeposit` needs an open proposal and there is none here, so it

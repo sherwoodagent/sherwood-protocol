@@ -370,6 +370,15 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         return avg;
     }
 
+    /// @dev `collectResidue` behind a helper purely to keep the caller's stack
+    ///      shallow — this suite's lifecycle tests are already at the via-IR
+    ///      limit, and inlining the call there trips "stack too deep".
+    ///      Permissionless, and since `sweep()` became vault-only it is the only
+    ///      door to a residue recovery.
+    function _collectResidue(address strategy) internal returns (uint256) {
+        return vault.collectResidue(strategy);
+    }
+
     function _tickGap() internal view returns (uint256) {
         (, int24 spot,,,,,) = pool.slot0();
         int24 twap = _twapTick();
@@ -770,7 +779,9 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         // the permissionless recovery every chance.
         vm.warp(vm.getBlockTimestamp() + 2 * TWAP_WINDOW);
         assertLe(_tickGap(), 1_000, "TWAP did not converge - sweep would be refused for the right reason");
-        uint256 recovered = s.sweep();
+        // `sweep()` is vault-only now; `collectResidue` is the permissionless
+        // door and drives it, so this still tests "anyone can recover".
+        uint256 recovered = _collectResidue(address(s));
         console2.log("sweep recovered (USDG):", recovered);
         // Not exactly zero: wrapper yield since settlement nudges
         // `_withdrawableWhileHealthy` up by a few wei of USDG. The point is the
