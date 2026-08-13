@@ -478,10 +478,7 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         if (r.kind != RequestKind.Redeem) revert NotRedeemRequest();
         if (r.cancelled) revert AlreadyCancelled();
 
-        uint256 cohort = _pidCohortShares[r.pid];
-        if (cohort == 0) return 0;
-
-        uint256 entitled = Math.mulDiv(_pidArrived[r.pid], r.amount, cohort);
+        uint256 entitled = _entitlementOf(r);
         uint256 paid = _remainderPaid[requestId];
         if (entitled <= paid) return 0;
         owed = entitled - paid;
@@ -490,6 +487,21 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         _cohortAssets -= owed;
         IERC20(IRequestableVault(vault).asset()).safeTransfer(r.owner, owed);
         emit RemainderClaimed(requestId, r.owner, owed);
+    }
+
+    /// @dev A request's cumulative slice of everything that has arrived for its
+    ///      cohort. ONE formula, shared by the view and the mutator so they
+    ///      cannot drift — a view that quotes more than the payer will pay is
+    ///      the kind of divergence nobody notices until someone integrates
+    ///      against it.
+    ///
+    ///      Rounds DOWN, and the denominator is the cohort FROZEN at the stamp,
+    ///      so the entitlements of a pid's requests sum to at most what arrived
+    ///      for it.
+    function _entitlementOf(Request storage r) private view returns (uint256) {
+        uint256 cohort = _pidCohortShares[r.pid];
+        if (cohort == 0) return 0;
+        return Math.mulDiv(_pidArrived[r.pid], r.amount, cohort);
     }
 
     /// @inheritdoc IVaultWithdrawalQueue
@@ -501,9 +513,7 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     function claimableRemainder(uint256 requestId) external view returns (uint256) {
         Request storage r = _req(requestId);
         if (r.kind != RequestKind.Redeem || r.cancelled) return 0;
-        uint256 cohort = _pidCohortShares[r.pid];
-        if (cohort == 0) return 0;
-        uint256 entitled = Math.mulDiv(_pidArrived[r.pid], r.amount, cohort);
+        uint256 entitled = _entitlementOf(r);
         uint256 paid = _remainderPaid[requestId];
         return entitled > paid ? entitled - paid : 0;
     }

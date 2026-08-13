@@ -363,15 +363,32 @@ contract SyndicateVault is
     ///         at), and this is the only place both are known at once.
     mapping(address strategy => uint256) private _residuePid;
 
+    /// @notice What each strategy currently contributes to `_residueTotal` — its
+    ///         outstanding value LESS the exiting cohort's share of it.
+    ///
+    ///         `_residueTotal` prices MINTS, and after a cohort is owed part of
+    ///         a residue only the remainder will ever reach the pool a new
+    ///         depositor is buying into. Pricing the gross figure would charge
+    ///         them for value routed to somebody else — finding #3's shape
+    ///         flipped, an over-charged depositor instead of an under-paid
+    ///         redeemer.
+    ///
+    ///         Stored rather than recomputed so a clear subtracts EXACTLY what a
+    ///         record added. Re-deriving the cohort fraction at clear time would
+    ///         drift if the queue read ever degraded in between, and a drifting
+    ///         subtraction on the figure that prices every mint is not a bug
+    ///         anyone would find quickly.
+    mapping(address strategy => uint256) private _residueNet;
+
     /// @dev Reserved storage for future upgrades. Shrinks whenever a new state
     ///      variable is added above. Grown from 28 → 31 slots: this deletion
     ///      frees `_laneALockPid` (1), `_interimNetFlow` (1), and
     ///      `_crystallizedMgmt`+`_crystallizedPerf` (1, shared) — legal only
     ///      because no vault proxy is live (see design.md "Deployment reality").
-    ///      Back to 25: `_residueAmount`, `_residueTotal`, `_residueCap`,
-    ///      `_residueUnvalued`, `_unvaluedCount` and `_residuePid` take one each,
-    ///      replacing the single `_lastSettledStrategy` slot.
-    uint256[25] private __gap;
+    ///      Back to 24: `_residueAmount`, `_residueTotal`, `_residueCap`,
+    ///      `_residueUnvalued`, `_unvaluedCount`, `_residuePid` and `_residueNet`
+    ///      take one each, replacing the single `_lastSettledStrategy` slot.
+    uint256[24] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -1386,10 +1403,7 @@ contract SyndicateVault is
         // nothing, so carrying its last known figure forever would over-price
         // every future deposit against value that provably cannot exist.
         if (strategy.code.length == 0) {
-            if (known != 0) {
-                _residueTotal -= known;
-                _residueAmount[strategy] = 0;
-            }
+            if (known != 0) _setResidue(strategy, 0);
             if (_residueUnvalued[strategy]) {
                 _residueUnvalued[strategy] = false;
                 _unvaluedCount -= 1;
@@ -1413,10 +1427,7 @@ contract SyndicateVault is
 
         uint256 cap = _residueCap[strategy];
         if (outstanding > cap) outstanding = cap; // the same bound the record honoured
-        if (outstanding != known) {
-            _residueTotal = _residueTotal - known + outstanding;
-            _residueAmount[strategy] = outstanding;
-        }
+        if (outstanding != known) _setResidue(strategy, outstanding);
         if (outstanding == 0) emit ResidueCleared(strategy, collected);
     }
 
@@ -1493,9 +1504,55 @@ contract SyndicateVault is
         // which leaves it exactly where it is today: paid the float-only floor.
         if (known == 0) _residuePid[strategy] = pid;
         if (outstanding == known) return;
-        _residueTotal = _residueTotal - known + outstanding;
-        _residueAmount[strategy] = outstanding;
+        // ONLY THE STAYERS' PART PRICES A MINT — see `_residueNet`.
+        _setResidue(strategy, outstanding);
         emit ResidueOutstanding(strategy, outstanding);
+    }
+
+    /// @dev THE ONE PLACE `_residueTotal` MOVES. Every caller states the new
+    ///      gross figure; this derives the stayers' part of it and swaps the
+    ///      strategy's stored contribution for the new one, so a clear always
+    ///      removes exactly what a record added. Routing all three sites through
+    ///      here is what makes double-release and drift unrepresentable rather
+    ///      than merely tested-for.
+    function _setResidue(address strategy, uint256 outstanding) private {
+        uint256 net = _stayerShareOf(outstanding, _residuePid[strategy]);
+        _residueTotal = _residueTotal - _residueNet[strategy] + net;
+        _residueNet[strategy] = net;
+        _residueAmount[strategy] = outstanding;
+    }
+
+    /// @dev The exiting cohort's fraction of `pid`, frozen by the queue at its
+    ///      stamp. `(0, 0)` means "no cohort, or cannot be read", and every
+    ///      caller treats that as the whole amount belonging to the pool.
+    ///
+    ///      RAW STATICCALL, DEGRADING TO ZERO. The queue is not a proxy and can
+    ///      never gain a selector, so a vault paired with a queue deployed
+    ///      before this function existed would revert on a typed call — and this
+    ///      sits on `collectResidue`, which is the ONLY exit from the
+    ///      unvaluable-residue deposit lock. A typed call there turns an
+    ///      incoherent pairing into bricked deposits; degrading skips the junior
+    ///      leg instead, leaving redeemers exactly where they are today. Same
+    ///      doctrine as `_pricingSupply` and `ExposureLedger._feedPriceX8`: fail
+    ///      OPEN on a liveness path.
+    function _cohortFractionOf(uint256 pid) private view returns (uint256 shares, uint256 den) {
+        address q = _withdrawalQueue;
+        if (q == address(0) || pid == 0) return (0, 0);
+        (bool ok, bytes memory ret) = q.staticcall(abi.encodeCall(IVaultWithdrawalQueue.cohortOf, (pid)));
+        if (!ok || ret.length != 64) return (0, 0);
+        (shares, den) = abi.decode(ret, (uint256, uint256));
+        if (den == 0) return (0, 0);
+    }
+
+    /// @dev The part of `amount` that will actually reach the pool: everything
+    ///      the exiting cohort is not owed. Rounds the COHORT's slice down, the
+    ///      same direction `_payCohortShare` routes it, so the two can never
+    ///      disagree by more than the dust that stays with the stayers.
+    function _stayerShareOf(uint256 amount, uint256 pid) private view returns (uint256) {
+        if (amount == 0) return 0;
+        (uint256 shares, uint256 den) = _cohortFractionOf(pid);
+        if (shares == 0) return amount;
+        return amount - Math.mulDiv(amount, shares, den);
     }
 
     /// @dev Hand the exiting cohort their share of an arrival, and leave the
@@ -1530,18 +1587,17 @@ contract SyndicateVault is
         if (q == address(0)) return;
 
         uint256 pid = _residuePid[strategy];
-        if (pid == 0) return;
-
-        (uint256 shares, uint256 den) = IVaultWithdrawalQueue(q).cohortOf(pid);
-        // No queued redeems at that settlement: nobody exited against the
-        // float-only stamp, so the whole arrival belongs to the stayers.
-        if (shares == 0 || den == 0) return;
+        // No queued redeems at that settlement, or a queue that cannot answer:
+        // the whole arrival belongs to the stayers either way.
+        (uint256 shares, uint256 den) = _cohortFractionOf(pid);
+        if (shares == 0) return;
 
         uint256 cohortShare = Math.mulDiv(arrival, shares, den);
         if (cohortShare == 0) return;
 
         IERC20(asset()).safeTransfer(q, cohortShare);
         IVaultWithdrawalQueue(q).creditCohort(pid, cohortShare);
+        emit CohortShareRouted(strategy, pid, cohortShare);
     }
 
     /// @dev The tighter of the two bounds the governor already keeps on how much
@@ -1990,12 +2046,17 @@ contract SyndicateVault is
         // `deliverable == 0`. The residue of the proposal being settled is
         // recoverable only in a LATER transaction, once the market refills,
         // which is what `collectResidue` is for.
-        _recordResidue(
-            (okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0), proposalId, _residueBound(proposalId)
-        );
+        address strat = (okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0);
+        uint256 bound = _residueBound(proposalId);
 
         address q = _withdrawalQueue;
-        if (q == address(0)) return;
+        if (q == address(0)) {
+            // No queue, so no cohort can be owed anything and nothing is
+            // stamped -- but the residue must still be recorded, or a mint
+            // would be priced as though the strategy owed nothing.
+            _recordResidue(strat, proposalId, bound);
+            return;
+        }
         // THE STAMP COUNTS UNDELIVERED VALUE; `totalAssets()` DELIBERATELY DOES
         // NOT. `totalAssets()` is the LIVE figure every conversion reads, and
         // teaching it to count strategy-held value would price the vault against
@@ -2053,6 +2114,18 @@ contract SyndicateVault is
         uint256 num = totalAssets() + 1;
         uint256 den = _pricingSupply() + 10 ** _decimalsOffset();
         IVaultWithdrawalQueue(q).stampSettlement(proposalId, num, den);
+
+        // RECORDED AFTER THE STAMP, DELIBERATELY. `_recordResidue` nets out the
+        // exiting cohort's share of the residue so a mint is priced only for
+        // what will actually reach the pool -- and that fraction does not exist
+        // until the `stampSettlement` above freezes it. Recording first read a
+        // cohort of zero and quietly priced the gross figure, over-charging
+        // every depositor in the settle-to-arrival window.
+        //
+        // Safe in this order: the stamp reads `totalAssets()` and
+        // `_pricingSupply()`, neither of which the residue record touches, so
+        // moving the record later cannot move the price it stamped at.
+        _recordResidue(strat, proposalId, bound);
     }
 
     /// @dev Gas ceiling for both strategy probes. The address is

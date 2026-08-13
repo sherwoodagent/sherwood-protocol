@@ -151,10 +151,16 @@
       "type": "t_mapping(t_address,t_uint256)"
     },
     {
-      "label": "__gap",
+      "label": "_residueNet",
       "slot": "23",
       "offset": 0,
-      "type": "t_array(t_uint256)25_storage"
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "__gap",
+      "slot": "24",
+      "offset": 0,
+      "type": "t_array(t_uint256)24_storage"
     }
   ],
   "types": {

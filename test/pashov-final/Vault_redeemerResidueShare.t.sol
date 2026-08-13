@@ -33,13 +33,23 @@ contract StubResidueStrategy {
         return false;
     }
 
+    /// @dev When set, `sweep()` returns the strategy's WHOLE balance rather
+    ///      than capping at what it reported owing — a strategy that recovered
+    ///      more than its own probe could see (accrued yield, a market that
+    ///      refilled past the snapshot). Models `collected > known`.
+    bool public overDeliver;
+
+    function setOverDeliver(bool v) external {
+        overDeliver = v;
+    }
+
     /// @dev Pays whatever it has been funded with, up to what it owes — the
     ///      deliverable-maximum shape the real templates have.
     function sweep() external returns (uint256 sent) {
         uint256 bal = IERC20Like(assetAddr).balanceOf(address(this));
-        sent = bal < residue ? bal : residue;
+        sent = (overDeliver || bal < residue) ? bal : residue;
         if (sent != 0) {
-            residue -= sent;
+            residue = sent >= residue ? 0 : residue - sent;
             IERC20Like(assetAddr).transfer(vaultAddr, sent);
         }
     }
@@ -391,5 +401,181 @@ contract PashovFinalRedeemerResidueTest is VaultInstantLiquidityTest {
 
         // The FIRST cohort is still the payee.
         assertGt(queue.claimableRemainder(id), 0, "first cohort keeps its claim");
+    }
+
+    // ── the depositor priced in the settle-to-arrival window ──
+
+    /// @notice THE MIRROR OF THE BUG BEING FIXED. A valued residue does NOT lock
+    ///         deposits (that was the deliberate #243 design — only unvaluable
+    ///         residue blocks), so the whole settle-to-arrival window is open in
+    ///         normal operation. `depositNav()` therefore has to price what will
+    ///         actually reach the pool.
+    ///
+    ///         Once a cohort is owed part of a residue, only the REST ever
+    ///         arrives. Pricing the gross figure would charge a window depositor
+    ///         for value routed to somebody else — finding #3's shape flipped:
+    ///         an over-charged depositor instead of an under-paid redeemer.
+    function test_windowDepositorIsNotChargedForTheCohortsShare() public {
+        _settleWithResidue(2_000e6);
+
+        (uint256 shares, uint256 den) = queue.cohortOf(PID);
+        uint256 cohortSlice = (2_000e6 * shares) / den;
+        assertGt(cohortSlice, 0, "a cohort is owed part of this residue");
+
+        // The pool is priced on what will actually reach it, not the gross.
+        assertEq(
+            vault.depositNav(),
+            vault.totalAssets() + 2_000e6 - cohortSlice,
+            "the cohort's slice is excluded from the mint price"
+        );
+    }
+
+    /// @notice And end to end: what a window depositor pays matches what the
+    ///         pool is worth once the residue has actually landed and been
+    ///         split. Their entry price must not be an over-charge that the
+    ///         arrival then fails to justify.
+    function test_windowDepositorEntryPriceSurvivesTheArrival() public {
+        _settleWithResidue(2_000e6);
+
+        vm.prank(bob);
+        uint256 minted = vault.deposit(1_000e6, bob);
+        uint256 valueAtEntry = vault.convertToAssets(minted);
+
+        _fundStrategy(2_000e6);
+        vault.collectResidue(address(resStrat));
+
+        // After the split lands, their stake is worth at least what the entry
+        // price implied — the residue they were charged for did arrive for the
+        // pool, because they were only ever charged for the pool's part of it.
+        assertGe(vault.convertToAssets(minted) + 1, valueAtEntry, "no silent over-charge at entry");
+    }
+
+    /// @notice With no cohort the whole residue belongs to the pool, so the
+    ///         netting must not quietly under-price the mint either.
+    function test_noCohort_depositNavCountsTheWholeResidue() public {
+        vm.prank(alice);
+        vault.deposit(10_000e6, alice);
+
+        resStrat = new StubResidueStrategy(address(vault), address(usdc));
+        resStrat.setResidue(1_000e6);
+        governor.set(PID, 1, address(resStrat));
+        vm.prank(address(governor));
+        vault.onProposalSettled(PID);
+        governor.set(0, 0, address(0));
+
+        assertEq(vault.depositNav(), vault.totalAssets() + 1_000e6, "nobody exited, so the pool owns all of it");
+    }
+
+    // ── the queue's solvency, and arrivals across pids ──
+
+    /// @notice The queue's balance must always cover BOTH pools it custodies.
+    ///         Monotonically slack, because floor-rounding dust and any
+    ///         never-claimed slice stay here with no sweep path — stated rather
+    ///         than left implicit.
+    function test_queueBalanceCoversBothPools() public {
+        uint256 id = _settleWithResidue(2_000e6);
+        _fundStrategy(2_000e6);
+        vault.collectResidue(address(resStrat));
+
+        governor.set(PID + 1, 1, address(strat));
+        vm.prank(bob);
+        vault.requestDeposit(1_000e6, bob);
+        governor.set(0, 0, address(0));
+
+        assertGe(
+            usdc.balanceOf(address(queue)),
+            queue.cohortAssets() + queue.pendingDepositAssets(),
+            "queue covers both pools"
+        );
+
+        queue.claim(id);
+        queue.claimRemainder(id);
+        assertGe(
+            usdc.balanceOf(address(queue)),
+            queue.cohortAssets() + queue.pendingDepositAssets(),
+            "and still covers them after payouts"
+        );
+    }
+
+    /// @notice A sweep that OVER-DELIVERS: the strategy hands back more than it
+    ///         ever reported owing. The cohort takes its fraction of the whole
+    ///         arrival, which is the same rule as every other arrival — the
+    ///         excess is not treated as a windfall belonging solely to whoever
+    ///         stayed. What matters is that it cannot break the accounting:
+    ///         nothing is valued, so a bigger arrival is just a bigger split.
+    function test_overDeliveryIsSplitOnTheSameRuleAndStaysSolvent() public {
+        uint256 id = _settleWithResidue(1_000e6);
+        queue.claim(id);
+
+        resStrat.setOverDeliver(true);
+        _fundStrategy(1_500e6); // 500e6 more than it said it owed
+
+        uint256 floatBefore = usdc.balanceOf(address(vault));
+        uint256 collected = vault.collectResidue(address(resStrat));
+        assertEq(collected, 1_500e6, "the whole balance came home");
+
+        uint256 cohortSlice = queue.cohortAssets();
+        assertGt(cohortSlice, 0, "the cohort took its fraction of the excess too");
+        assertEq(
+            usdc.balanceOf(address(vault)) - floatBefore, collected - cohortSlice, "and the rest stayed with the pool"
+        );
+
+        assertGe(
+            usdc.balanceOf(address(queue)),
+            queue.cohortAssets() + queue.pendingDepositAssets(),
+            "solvent after an over-delivery"
+        );
+
+        // A claim never pays more than the queue is holding for that cohort.
+        assertLe(queue.claimableRemainder(id), queue.cohortAssets(), "entitlement bounded by what arrived");
+        queue.claimRemainder(id);
+        assertEq(queue.claimableRemainder(id), 0, "and the claim is idempotent");
+    }
+
+    /// @notice TWO COHORTS, TWO STRATEGIES, ARRIVALS INTERLEAVED. `_pidArrived`
+    ///         is per-pid for a reason: a later proposal's residue coming home
+    ///         must not enlarge an earlier cohort's entitlement, and vice versa.
+    ///         A single shared arrivals counter would silently pay each cohort a
+    ///         fraction of the other's money.
+    function test_arrivalsForDifferentPidsDoNotCrossCredit() public {
+        uint256 idA = _settleWithResidue(1_000e6);
+        StubResidueStrategy stratA = resStrat;
+
+        // A second round: Bob exits into the queue against PID + 1, which
+        // settles leaving its own residue on a different strategy.
+        StubResidueStrategy stratB = new StubResidueStrategy(address(vault), address(usdc));
+        stratB.setResidue(1_000e6);
+        governor.set(PID + 1, 1, address(stratB));
+
+        uint256 exiting = vault.balanceOf(bob) / 2;
+        vm.startPrank(bob);
+        vault.approve(address(vault), exiting);
+        uint256 idB = vault.requestRedeem(exiting, bob);
+        vm.stopPrank();
+
+        vm.prank(address(governor));
+        vault.onProposalSettled(PID + 1);
+        governor.set(0, 0, address(0));
+
+        // Only A's residue comes home.
+        usdc.mint(address(stratA), 1_000e6);
+        vault.collectResidue(address(stratA));
+
+        assertGt(queue.claimableRemainder(idA), 0, "A's cohort is owed its slice");
+        assertEq(queue.claimableRemainder(idB), 0, "B's cohort is owed nothing yet");
+
+        // Now B's. A's entitlement must not move.
+        uint256 owedABefore = queue.claimableRemainder(idA);
+        usdc.mint(address(stratB), 1_000e6);
+        vault.collectResidue(address(stratB));
+
+        assertEq(queue.claimableRemainder(idA), owedABefore, "A unchanged by B's arrival");
+        assertGt(queue.claimableRemainder(idB), 0, "and B is now owed its own slice");
+
+        assertGe(
+            usdc.balanceOf(address(queue)),
+            queue.cohortAssets() + queue.pendingDepositAssets(),
+            "solvent across both cohorts"
+        );
     }
 }
