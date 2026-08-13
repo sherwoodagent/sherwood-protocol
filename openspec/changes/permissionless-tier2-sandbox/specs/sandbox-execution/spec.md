@@ -92,6 +92,8 @@ A sandbox can end holding a token it has no means to value, because the calls th
 
 A contract cannot enumerate every token it holds, so the declared set is what makes the report checkable rather than a constant. An under-declared leftover SHALL be stranded in the sandbox and SHALL NOT be counted as vault value — the safe direction of error, and the proposer's own loss rather than the vault's.
 
+The lock SHALL have an exit that no one can withhold. Residue collection SHALL therefore also push each declared non-asset token to the vault, and a declared token that proves unmovable — a transfer attempt that fails — SHALL stop being counted. Without both, the lock is permanent: nothing else can move a token out of a sandbox whose one-shot run is already spent, so a proposer could shut minting forever by declaring a token its payload leaves behind, or one whose transfer always reverts. An abandoned token is stranded exactly as an undeclared one is, which is a loss already accepted; a deposit brick nobody can clear is not.
+
 #### Scenario: Asset balance returns in full
 - **WHEN** a sandbox settles holding a vault-asset balance
 - **THEN** the entire balance SHALL be transferred to the vault and its reported undelivered value SHALL become zero
@@ -103,6 +105,10 @@ A contract cannot enumerate every token it holds, so the declared set is what ma
 #### Scenario: An undeclared leftover is stranded, never counted
 - **WHEN** a sandbox holds a token the proposer did not declare
 - **THEN** the balance SHALL NOT be reported as vault value and SHALL NOT be included in any deposit price — it is stranded in the sandbox
+
+#### Scenario: The declared-leftover lock always has an exit
+- **WHEN** residue collection is called against a sandbox holding a declared non-asset token
+- **THEN** the token SHALL be pushed to the vault, or — if it proves unmovable — abandoned and no longer counted, and deposits SHALL reopen in either case
 
 #### Scenario: Recovery does not depend on the batch
 - **WHEN** the vault's permissionless residue collection is called against a sandbox

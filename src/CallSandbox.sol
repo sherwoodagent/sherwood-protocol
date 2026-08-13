@@ -60,6 +60,13 @@ contract CallSandbox is ICallSandbox {
     ///      consume the whole transaction.
     uint256 private constant _PROBE_GAS = 150_000;
 
+    /// @dev Per-token ceiling for the declared-token leg of `sweep`. Sized so
+    ///      all 16 declared tokens fit inside the vault's own 1,500,000-gas
+    ///      `_SWEEP_GAS` budget for the whole call, with room left for the asset
+    ///      transfer that runs first: a single hostile entry can waste its own
+    ///      leg and nothing else.
+    uint256 private constant _TOKEN_SWEEP_GAS = 80_000;
+
     address private _vault;
     address private _asset;
     bool private _initialized;
@@ -67,6 +74,21 @@ contract CallSandbox is ICallSandbox {
 
     Call[] private _calls;
     address[] private _declaredTokens;
+
+    /// @dev Declared tokens that have PROVEN unsweepable — `sweep` tried to
+    ///      transfer them to the vault and the call failed. Without this, a
+    ///      token whose `transfer` always reverts (a proposer can deploy one)
+    ///      keeps `hasUnvaluedResidue()` true forever while nothing on earth can
+    ///      move it, and `SyndicateVault.depositsLocked()` never reopens: a
+    ///      permanent, unrecoverable deposit brick, which the vault's own
+    ///      residue doctrine treats as worse than the suppression it guards.
+    ///
+    ///      Abandoning degrades that case to the UNDECLARED one, which the
+    ///      design already accepts: the token stays stranded here, is never
+    ///      counted as vault value, and no LP mints against it. Nothing that
+    ///      could be recovered is given up — the flag is only ever set after a
+    ///      real transfer attempt failed.
+    mapping(address token => bool) private _abandoned;
 
     modifier onlyVault() {
         if (msg.sender != _vault) revert NotVault();
@@ -211,10 +233,57 @@ contract CallSandbox is ICallSandbox {
     ///      `DisallowedBatchCallee` (pashov finding #15). A sandbox holds no
     ///      registry entry, so there is nothing to demote and nothing to wedge.
     function sweep() external returns (uint256 assets) {
+        address vault_ = _vault;
+        // THE ASSET FIRST, ALWAYS. It is the only leg that carries priced value,
+        // and the declared-token loop below runs on the same borrowed gas
+        // budget — recovering real capital must not depend on how the
+        // proposer's token list behaves.
         assets = IERC20(_asset).balanceOf(address(this));
         if (assets != 0) {
-            IERC20(_asset).safeTransfer(_vault, assets);
+            IERC20(_asset).safeTransfer(vault_, assets);
             emit SandboxSwept(assets);
+        }
+
+        // THEN THE DECLARED TOKENS, OR THE DEPOSIT LOCK IS PERMANENT. This is
+        // not tidiness: `hasUnvaluedResidue()` reports true while any declared
+        // non-asset token sits here, `SyndicateVault.depositsLocked()` shuts the
+        // mint side on exactly that flag, and `collectResidue` clears it only by
+        // re-reading the same probe. Without this leg the flag can never go
+        // false — nothing else can move a token out of a sandbox whose `run` is
+        // one-shot and already spent — so any registered agent could brick
+        // deposits forever by declaring a token its payload leaves behind. The
+        // vault's own `depositsLocked` natspec calls exactly that trade (a
+        // permanent, unrecoverable brick) worse than the suppression it guards.
+        //
+        // BEST-EFFORT, PER TOKEN, ON A BOUNDED BUDGET. The list is
+        // proposer-authored: a token that reverts, returns nothing, or burns gas
+        // must not take down the sweep and re-brick the exit it is the only
+        // escape from. A raw call with its own ceiling means the worst a hostile
+        // entry costs is its own leg. `MAX_DECLARED_TOKENS` bounds the loop.
+        //
+        // Tokens land in the VAULT, where `totalAssets()` does not count them —
+        // so this recovers custody without ever pricing an unvalued asset into a
+        // mint, which is the distinction the whole residue design rests on.
+        uint256 n = _declaredTokens.length;
+        for (uint256 i = 0; i < n; i++) {
+            address t = _declaredTokens[i];
+            if (t == address(0) || t == _asset || t.code.length == 0) continue;
+            (bool okBal, bytes memory balRet) =
+                t.staticcall{gas: _PROBE_GAS}(abi.encodeWithSelector(IERC20.balanceOf.selector, address(this)));
+            if (!okBal || balRet.length != 32) continue;
+            uint256 bal = abi.decode(balRet, (uint256));
+            if (bal == 0) continue;
+            // solhint-disable-next-line avoid-low-level-calls
+            (bool okXfer,) =
+                t.call{gas: _TOKEN_SWEEP_GAS}(abi.encodeWithSelector(IERC20.transfer.selector, vault_, bal));
+            if (okXfer) {
+                emit SandboxTokenSwept(t, bal);
+            } else {
+                // Proven unmovable — stop counting it, or the lock is permanent.
+                // See `_abandoned`.
+                _abandoned[t] = true;
+                emit SandboxTokenAbandoned(t, bal);
+            }
         }
     }
 
@@ -252,7 +321,7 @@ contract CallSandbox is ICallSandbox {
         uint256 n = _declaredTokens.length;
         for (uint256 i = 0; i < n; i++) {
             address t = _declaredTokens[i];
-            if (t == address(0) || t == asset_) continue;
+            if (t == address(0) || t == asset_ || _abandoned[t]) continue;
             (bool ok, bytes memory ret) =
                 t.staticcall{gas: _PROBE_GAS}(abi.encodeWithSelector(IERC20.balanceOf.selector, address(this)));
             if (ok && ret.length == 32 && abi.decode(ret, (uint256)) != 0) return true;

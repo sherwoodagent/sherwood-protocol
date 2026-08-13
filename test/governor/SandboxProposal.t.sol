@@ -49,6 +49,39 @@ contract VaultGated {
     }
 }
 
+/// @dev Hands the CALLER a non-asset token — how a payload realistically ends
+///      up holding something the sandbox cannot value. The sandbox's own address
+///      is not known when the payload is written, so the token must be pushed to
+///      `msg.sender` rather than to a named address.
+contract TokenFaucet {
+    function pour(address token, uint256 amount) external {
+        ERC20Mock(token).mint(msg.sender, amount);
+    }
+}
+
+/// @dev A token that answers `balanceOf` honestly and refuses every transfer —
+///      a proposer can deploy exactly this. Without abandonment it would pin
+///      `hasUnvaluedResidue()` true forever with nothing able to move it.
+contract UnmovableToken {
+    mapping(address => uint256) public balanceOf;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function transfer(address, uint256) external pure returns (bool) {
+        revert("nope");
+    }
+}
+
+/// @dev Faucet for the unmovable token — same reason as `TokenFaucet`: the
+///      sandbox's address is not known when the payload is authored.
+contract UnmovableFaucet {
+    function pour(address token, uint256 amount) external {
+        UnmovableToken(token).mint(msg.sender, amount);
+    }
+}
+
 /// @notice The central claims of `permissionless-tier2-sandbox`: an uncertified,
 ///         unlisted target reaches execution with no owner transaction, and the
 ///         most a hostile payload can cost is the amount it was funded with —
@@ -71,6 +104,8 @@ contract SandboxProposalTest is Test {
 
     IdentitySpy public spy;
     VaultGated public vaultGated;
+    TokenFaucet public faucet;
+    ERC20Mock public foreign;
 
     address public owner = makeAddr("owner");
     address public agent = makeAddr("agent");
@@ -154,6 +189,8 @@ contract SandboxProposalTest is Test {
 
         spy = new IdentitySpy();
         vaultGated = new VaultGated(address(vault));
+        faucet = new TokenFaucet();
+        foreign = new ERC20Mock("Foreign", "FGN", 18);
 
         usdc.mint(lp1, TVL);
         vm.startPrank(lp1);
@@ -513,6 +550,92 @@ contract SandboxProposalTest is Test {
         _advancePastVoting();
         governor.executeProposal(pid);
         assertEq(vault.sandboxOf(pid), address(0), "and no sandbox is ever minted");
+    }
+
+    // ── 5.6 residue ───────────────────────────────────────────────────────
+
+    /// @dev Run a payload that leaves `amount` of `foreign` in the sandbox, with
+    ///      the token declared or not, and settle. Returns the sandbox address.
+    function _runLeavingForeignToken(uint256 amount, bool declare) internal returns (uint256 pid, address sandbox) {
+        address[] memory tokens = new address[](declare ? 1 : 0);
+        if (declare) tokens[0] = address(foreign);
+
+        pid = _proposeSandbox(
+            _payload(
+                _oneCall(address(faucet), abi.encodeCall(TokenFaucet.pour, (address(foreign), amount))), FUNDING, tokens
+            ),
+            agent
+        );
+        _advancePastVoting();
+        governor.executeProposal(pid);
+        sandbox = vault.sandboxOf(pid);
+        assertEq(foreign.balanceOf(sandbox), amount, "the payload really did leave a foreign token behind");
+
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        governor.settleProposal(pid);
+    }
+
+    /// @notice A DECLARED non-asset leftover is what the vault can see, so it
+    ///         refuses to mint rather than price a NAV it knows is incomplete —
+    ///         and `collectResidue` is the permissionless exit that reopens
+    ///         deposits.
+    function test_residue_declaredLeftoverLocksDepositsUntilCollected() public {
+        (, address sandbox) = _runLeavingForeignToken(5e18, true);
+
+        assertTrue(vault.depositsLocked(), "an unvaluable leftover shuts the mint side");
+
+        vault.collectResidue(sandbox);
+
+        assertFalse(vault.depositsLocked(), "collecting it reopens deposits");
+        assertEq(foreign.balanceOf(sandbox), 0, "and the sandbox no longer holds it");
+    }
+
+    /// @notice An UNDECLARED leftover is stranded in the sandbox and never
+    ///         priced into a deposit. The safe direction of error: the proposer
+    ///         loses what it failed to declare, and no LP ever mints against it.
+    function test_residue_undeclaredLeftoverIsStrandedAndNeverPriced() public {
+        uint256 navBefore = vault.totalAssets();
+        (, address sandbox) = _runLeavingForeignToken(5e18, false);
+
+        assertFalse(vault.depositsLocked(), "the vault cannot see what was never declared");
+        assertEq(foreign.balanceOf(sandbox), 5e18, "the token stays stranded in the sandbox");
+        assertEq(foreign.balanceOf(address(vault)), 0, "and never reaches the vault");
+        assertLe(vault.totalAssets(), navBefore, "it is never counted as vault value");
+    }
+
+    /// @notice A DECLARED token that refuses every transfer must not become a
+    ///         permanent deposit brick. `sweep` proves it unmovable, abandons it,
+    ///         and the lock clears — the token stays stranded and unpriced,
+    ///         which is exactly how an undeclared leftover is already treated.
+    ///         Any registered agent could otherwise shut minting forever.
+    function test_residue_unmovableDeclaredTokenIsAbandonedRatherThanBrickingDeposits() public {
+        UnmovableToken bad = new UnmovableToken();
+        UnmovableFaucet badFaucet = new UnmovableFaucet();
+
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(bad);
+
+        uint256 pid = _proposeSandbox(
+            _payload(
+                _oneCall(address(badFaucet), abi.encodeCall(UnmovableFaucet.pour, (address(bad), 5e18))),
+                FUNDING,
+                tokens
+            ),
+            agent
+        );
+        _advancePastVoting();
+        governor.executeProposal(pid);
+        address sandbox = vault.sandboxOf(pid);
+
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        governor.settleProposal(pid);
+        assertTrue(vault.depositsLocked(), "it locks like any other declared leftover");
+
+        vault.collectResidue(sandbox);
+
+        assertFalse(vault.depositsLocked(), "and one permissionless call still reopens deposits");
+        assertEq(bad.balanceOf(sandbox), 5e18, "the token itself is stranded, as it must be");
+        assertEq(usdc.balanceOf(sandbox), 0, "while the real capital came home");
     }
 
     // ── 5.7 runSandbox authorization ──────────────────────────────────────
