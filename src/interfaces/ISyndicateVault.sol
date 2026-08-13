@@ -315,6 +315,13 @@ interface ISyndicateVault {
     ///         strategy is in this state — the one residue shape a price cannot
     ///         express.
     event ResidueUnvalued(address indexed strategy, bool unvalued);
+    /// @notice Part of an arrival was routed to the redeem cohort that exited at
+    ///         `pid`'s stamp, rather than staying in the vault.
+    /// @dev    `collectResidue` returns and `ResidueCleared` reports the GROSS
+    ///         amount recovered from the strategy; this is the part that left
+    ///         again. Vault float gained `collected - assets`, so an indexer
+    ///         must net the two rather than summing `ResidueCleared` alone.
+    event CohortShareRouted(address indexed strategy, uint256 indexed pid, uint256 assets);
     event RedeemRequested(uint256 indexed requestId, address indexed owner, uint256 shares);
     event DepositRequested(uint256 indexed requestId, address indexed receiver, uint256 assets);
 }
