@@ -78,6 +78,57 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     ///         would strand `floor(Σ)−Σfloor` wei of reserve forever.
     mapping(uint256 pid => uint256) private _pidReserved;
 
+    // ── The redeemer's share of value that had not come home yet ──
+    //
+    // A proposal can settle while its strategy still holds value the market
+    // could not release (`SettlementIncomplete`). The stamp above is computed
+    // from float alone, so a redeemer claiming against it leaves their share of
+    // that residue behind, and it accrues to the LPs who stayed. No attacker, no
+    // loss to the protocol — a transfer between LPs, and the fairness half of
+    // finding #3.
+    //
+    // PAID IN TWO PARTS, AND NOTHING IS EVER VALUED. The stamp above is the
+    // SENIOR floor: fully backed, always payable, unchanged. What follows is the
+    // JUNIOR leg — a claim on real assets as they actually arrive, never on an
+    // estimate of what might. If nothing arrives the redeemer keeps the floor,
+    // which is exactly today's outcome, so this can only ever pay more and never
+    // strand.
+    //
+    // CUSTODIED HERE RATHER THAN RESERVED IN THE VAULT. This contract already
+    // holds escrowed deposits, so paying a cohort from its own balance needs no
+    // new custody surface — and, more to the point, it keeps the junior leg out
+    // of `_reservedAssets`, which gates instant exits and blocks the next
+    // proposal from deploying float. Assets sitting here are simply not in the
+    // vault's balance, so they do not lift the stayers' price. Correct: they are
+    // not the stayers'.
+
+    /// @notice Redeem shares queued against `pid`, FROZEN at its stamp. The
+    ///         cohort's denominator for every later arrival.
+    /// @dev    Deliberately not `_pidRedeemShares`, which the floor claim
+    ///         decrements as redeemers are paid: dividing by a shrinking number
+    ///         would inflate each remaining redeemer's share and pay out more
+    ///         than arrived.
+    mapping(uint256 pid => uint256) private _pidCohortShares;
+
+    /// @notice The stamp's denominator, kept so the vault can compute the
+    ///         cohort's fraction of an arrival without re-deriving supply.
+    mapping(uint256 pid => uint256) private _pidCohortDen;
+
+    /// @notice Cumulative assets received here on behalf of `pid`'s cohort.
+    ///         Monotonic; each redeemer's entitlement is their pro-rata slice of
+    ///         it, less what they have already taken.
+    mapping(uint256 pid => uint256) private _pidArrived;
+
+    /// @notice Assets already paid out to a request from its cohort's arrivals.
+    ///         Stored rather than derived so repeat claims are idempotent as
+    ///         more arrives.
+    mapping(uint256 requestId => uint256) private _remainderPaid;
+
+    /// @notice Assets held here for cohorts and NOT payable to anyone else. The
+    ///         complement of `_pendingDepositAssets` for the redeem side; both
+    ///         exist so this contract's balance is never mistaken for spare.
+    uint256 private _cohortAssets;
+
     uint256 private _pendingShares; // escrowed redeem shares (not yet claimed/cancelled)
     uint256 private _pendingDepositAssets; // escrowed deposit assets
     uint256 private _reservedAssets; // frozen assets owed to stamped-unclaimed redeems
@@ -184,6 +235,13 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             // the assets, or the gap between the two is exactly the mispricing
             // window issue #92 describes.
             _stampedUnclaimedShares += redeemShares;
+            // FROZEN HERE, for the junior leg. `_pidRedeemShares` above is
+            // decremented as each redeemer takes their floor, so it cannot be
+            // the denominator a later arrival is split by — using it would
+            // inflate the remaining redeemers' shares and pay out more than
+            // arrived. This pair is written once and never revised.
+            _pidCohortShares[pid] = redeemShares;
+            _pidCohortDen[pid] = den;
         }
         emit SettlementStamped(pid, num, den);
     }
@@ -379,6 +437,90 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             IERC20(IRequestableVault(vault).asset()).safeTransfer(r.owner, amount);
         }
         emit RequestCancelled(requestId, r.owner);
+    }
+
+    // ── The junior leg: a cohort's share of value that arrived late ──
+
+    /// @inheritdoc IVaultWithdrawalQueue
+    /// @dev Called by the vault after it has ALREADY transferred `assets` here.
+    ///      Booking-only: this function moves no tokens, so a mismatch between
+    ///      the transfer and the credit can only under-book, never over-pay.
+    ///
+    ///      The vault decides the amount because it is the party that measures
+    ///      the arrival; this contract decides who it belongs to. Splitting the
+    ///      two is what keeps the cohort's denominator (frozen at the stamp)
+    ///      out of the vault entirely.
+    function creditCohort(uint256 pid, uint256 assets) external onlyVault {
+        if (assets == 0) return;
+        _pidArrived[pid] += assets;
+        _cohortAssets += assets;
+        emit CohortCredited(pid, assets);
+    }
+
+    /// @inheritdoc IVaultWithdrawalQueue
+    /// @dev PERMISSIONLESS AND REPEATABLE. A cohort's entitlement grows as more
+    ///      arrives, so this is a pull that can be called again after each
+    ///      arrival rather than a one-shot. Claiming nothing is a no-op rather
+    ///      than a revert, so a caller cannot be griefed into failure by someone
+    ///      else claiming first.
+    ///
+    ///      INDEPENDENT OF THE FLOOR CLAIM, in both directions. A redeemer may
+    ///      take this before or after `claim`, and taking it never touches
+    ///      `_pidReserved`, `_reservedAssets` or `_stampedUnclaimedShares` — the
+    ///      senior leg's accounting is untouched by the junior one, which is the
+    ///      whole reason this lives here rather than in the vault's reserve.
+    ///
+    ///      Rounds DOWN, so the sum of every entitlement is at most what
+    ///      arrived. The remainder is dust that stays here; it is never paid
+    ///      twice and never invented.
+    function claimRemainder(uint256 requestId) external nonReentrant returns (uint256 owed) {
+        Request storage r = _req(requestId);
+        if (r.kind != RequestKind.Redeem) revert NotRedeemRequest();
+        if (r.cancelled) revert AlreadyCancelled();
+
+        uint256 entitled = _entitlementOf(r);
+        uint256 paid = _remainderPaid[requestId];
+        if (entitled <= paid) return 0;
+        owed = entitled - paid;
+
+        _remainderPaid[requestId] = entitled;
+        _cohortAssets -= owed;
+        IERC20(IRequestableVault(vault).asset()).safeTransfer(r.owner, owed);
+        emit RemainderClaimed(requestId, r.owner, owed);
+    }
+
+    /// @dev A request's cumulative slice of everything that has arrived for its
+    ///      cohort. ONE formula, shared by the view and the mutator so they
+    ///      cannot drift — a view that quotes more than the payer will pay is
+    ///      the kind of divergence nobody notices until someone integrates
+    ///      against it.
+    ///
+    ///      Rounds DOWN, and the denominator is the cohort FROZEN at the stamp,
+    ///      so the entitlements of a pid's requests sum to at most what arrived
+    ///      for it.
+    function _entitlementOf(Request storage r) private view returns (uint256) {
+        uint256 cohort = _pidCohortShares[r.pid];
+        if (cohort == 0) return 0;
+        return Math.mulDiv(_pidArrived[r.pid], r.amount, cohort);
+    }
+
+    /// @inheritdoc IVaultWithdrawalQueue
+    function cohortOf(uint256 pid) external view returns (uint256 shares, uint256 den) {
+        return (_pidCohortShares[pid], _pidCohortDen[pid]);
+    }
+
+    /// @inheritdoc IVaultWithdrawalQueue
+    function claimableRemainder(uint256 requestId) external view returns (uint256) {
+        Request storage r = _req(requestId);
+        if (r.kind != RequestKind.Redeem || r.cancelled) return 0;
+        uint256 entitled = _entitlementOf(r);
+        uint256 paid = _remainderPaid[requestId];
+        return entitled > paid ? entitled - paid : 0;
+    }
+
+    /// @inheritdoc IVaultWithdrawalQueue
+    function cohortAssets() external view returns (uint256) {
+        return _cohortAssets;
     }
 
     // ── Views ──
