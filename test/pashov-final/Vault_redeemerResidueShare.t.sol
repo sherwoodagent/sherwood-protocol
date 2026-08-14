@@ -52,6 +52,20 @@ contract StubResidueStrategy {
     ///      and hide the very bypass this suite now pins.
     function sweep() external returns (uint256 sent) {
         if (msg.sender != vaultAddr) revert NotVault();
+        return _deliver();
+    }
+
+    /// @dev The last-resort hatch, modelled on `ConcentratedLiquidityStrategy`:
+    ///      it CONVERTS before it releases, so it too can push vault asset home
+    ///      — which is why it needs the same gate. A stub whose hatch stayed
+    ///      permissionless would hide the second door exactly as a permissionless
+    ///      `sweep()` stub hid the first.
+    function releaseUnconvertible() external returns (uint256 sent) {
+        if (msg.sender != vaultAddr) revert NotVault();
+        return _deliver();
+    }
+
+    function _deliver() private returns (uint256 sent) {
         uint256 bal = IERC20Like(assetAddr).balanceOf(address(this));
         sent = (overDeliver || bal < residue) ? bal : residue;
         if (sent != 0) {
@@ -178,6 +192,35 @@ contract PashovFinalRedeemerResidueTest is VaultInstantLiquidityTest {
 
         // ...and the only remaining route pays the cohort, as it always should.
         assertEq(vault.collectResidue(address(resStrat)), 2_000e6, "the residue came home");
+        assertGt(queue.claimableRemainder(id), 0, "the exited cohort was starved of its share");
+    }
+
+    /// @notice THE HATCH IS THE SAME DOOR, and it was left open by the first fix.
+    ///
+    /// @dev    `sweep()` was not the only way vault asset could leave a settled
+    ///         clone: `ConcentratedLiquidityStrategy.releaseUnconvertible()`
+    ///         attempts the conversion BEFORE releasing and pushes whatever it
+    ///         produced (`_trySwapToAsset` then `_pushAllToVault(asset)`), and it
+    ///         was permissionless. Gating `sweep()` alone therefore closed one
+    ///         door and left its twin standing — the cohort still credited
+    ///         nothing, the arrival still lifting the stayers' price, still
+    ///         unrepairable because the delta is spent.
+    ///
+    ///         Both are vault-only now, each with its own permissionless vault
+    ///         entry point. They stay SEPARATE rather than folded together
+    ///         because the hatch forecloses a conversion the routine sweep would
+    ///         retry.
+    function test_directReleaseUnconvertibleIsRefusedSoTheCohortCannotBeBypassed() public {
+        uint256 id = _settleWithResidue(2_000e6);
+        queue.claim(id);
+        _fundStrategy(2_000e6);
+
+        vm.expectRevert(StubResidueStrategy.NotVault.selector);
+        resStrat.releaseUnconvertible();
+
+        // The vault-side hatch is permissionless and measures what arrives.
+        vm.prank(makeAddr("passerby"));
+        assertEq(vault.releaseUnconvertible(address(resStrat)), 2_000e6, "the residue came home");
         assertGt(queue.claimableRemainder(id), 0, "the exited cohort was starved of its share");
     }
 

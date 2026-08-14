@@ -2154,16 +2154,29 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         The vault is the strictly better custodian for that: it carries
     ///         an owner-gated `rescueERC20`, and this clone carries nothing.
     ///
-    ///         Permissionless, like `sweep()`, and the conversion is attempted
-    ///         first every time — so the worst a caller can do is release during
-    ///         an outage that would have cleared. That trades a recoverable
-    ///         inconvenience (the owner sells it manually) against an
-    ///         unrecoverable loss, which is the right direction.
+    ///         VAULT-ONLY, LIKE `sweep()`, AND FOR THE SAME ACCOUNTING REASON.
+    ///         The conversion below is attempted before the release, so this
+    ///         function can push VAULT ASSET home — which makes it a second door
+    ///         onto the balance delta `SyndicateVault._payCohortShare` splits,
+    ///         and a delta only measures everything if it is the only door.
+    ///         Called directly, the exited redeem cohort is credited nothing and
+    ///         the arrival lifts the stayers' price instead, unrepairably: the
+    ///         delta is spent, so a later vault-side call measures zero. The
+    ///         permissionless entry point is `SyndicateVault
+    ///         .releaseUnconvertible(strategy)`, which calls this — so the
+    ///         capital-hostage property is unchanged, anyone may still trigger
+    ///         it at any time.
+    ///
+    ///         The conversion is attempted first every time — so the worst a
+    ///         caller can do is release during an outage that would have
+    ///         cleared. That trades a recoverable inconvenience (the owner sells
+    ///         it manually) against an unrecoverable loss, which is the right
+    ///         direction.
     ///
     ///         NOT counted as swept proceeds: the governor prices this proposal
     ///         from the vault's realized float in the VAULT ASSET, and this is
     ///         not that. It books as a loss here and is recovered off-path.
-    function releaseUnconvertible() external nonReentrant returns (uint256 released) {
+    function releaseUnconvertible() external onlyVault nonReentrant returns (uint256 released) {
         if (_state != State.Settled) revert NotSettled();
 
         // Retry the wrapper first: redemption may have reopened since settle,

@@ -280,7 +280,28 @@ contract ConcentratedLiquidityStrategyPartialSettleTest is SettleFixture {
 contract ConcentratedLiquidityStrategyReleaseTest is SettleFixture {
     function test_releaseUnconvertible_beforeSettlementReverts() public {
         _execute();
+        vm.prank(address(vaultStub));
         vm.expectRevert(ConcentratedLiquidityStrategy.NotSettled.selector);
+        strategy.releaseUnconvertible();
+    }
+
+    /// @notice VAULT-ONLY, for the same reason `sweep()` is. The hatch converts
+    ///         before it releases, so it can push VAULT ASSET home — a second
+    ///         door onto the balance delta `SyndicateVault._payCohortShare`
+    ///         splits, and a delta measures everything only if it is the only
+    ///         door. Called directly the exited cohort is credited nothing and
+    ///         the arrival lifts the stayers' price instead, unrepairably.
+    /// @dev    The permissionless property is unchanged where it is load-bearing:
+    ///         `SyndicateVault.releaseUnconvertible(strategy)` is open to anyone
+    ///         and drives this. Only the unmeasured door is gone.
+    function test_releaseUnconvertible_isVaultOnly() public {
+        _execute();
+        _accrueFees(0, 100e18);
+        adapter.setRate(address(nvda), address(usdg), 0);
+        _settle();
+
+        vm.prank(keeper);
+        vm.expectRevert(BaseStrategy.NotVault.selector);
         strategy.releaseUnconvertible();
     }
 
@@ -311,7 +332,7 @@ contract ConcentratedLiquidityStrategyReleaseTest is SettleFixture {
         adapter.setRate(address(nvda), address(usdg), 100 * 1e18 / 1e12); // outage clears
         uint256 vaultUsdgBefore = usdg.balanceOf(address(vaultStub));
 
-        vm.prank(keeper);
+        vm.prank(address(vaultStub));
         uint256 released = strategy.releaseUnconvertible();
 
         assertEq(released, 0, "released unconverted despite a working adapter");
@@ -332,7 +353,7 @@ contract ConcentratedLiquidityStrategyReleaseTest is SettleFixture {
         uint256 stranded = nvda.balanceOf(address(strategy));
         assertGt(stranded, 0, "precondition: residue stranded");
 
-        vm.prank(keeper); // anyone
+        vm.prank(address(vaultStub)); // vault-only since the cohort-accounting fix
         uint256 released = strategy.releaseUnconvertible();
 
         assertEq(released, stranded, "released amount mismatch");

@@ -163,10 +163,16 @@
       "type": "t_uint256"
     },
     {
-      "label": "__gap",
+      "label": "_unvaluedBurned",
       "slot": "25",
       "offset": 0,
-      "type": "t_array(t_uint256)23_storage"
+      "type": "t_mapping(t_address,t_bool)"
+    },
+    {
+      "label": "__gap",
+      "slot": "26",
+      "offset": 0,
+      "type": "t_array(t_uint256)22_storage"
     }
   ],
   "types": {

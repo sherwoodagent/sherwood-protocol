@@ -379,6 +379,19 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         return vault.collectResidue(strategy);
     }
 
+    /// @dev Same shape, same reason, for the last-resort hatch: `sweep()` and
+    ///      `releaseUnconvertible()` are both vault-only now, and both have a
+    ///      permissionless vault-side door that measures what arrives.
+    ///      Returns the WETH the hatch handed over — the vault's own return
+    ///      value counts VAULT ASSET, which is a different thing here — and
+    ///      pranks internally so the caller keeps one local, not four.
+    function _releaseUnconvertible(address strategy, address caller) internal returns (uint256 releasedWeth) {
+        uint256 wethBefore = IERC20(WETH).balanceOf(strategy);
+        vm.prank(caller);
+        vault.releaseUnconvertible(strategy);
+        return wethBefore - IERC20(WETH).balanceOf(strategy);
+    }
+
     function _tickGap() internal view returns (uint256) {
         (, int24 spot,,,,,) = pool.slot0();
         int24 twap = _twapTick();
@@ -729,8 +742,10 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         uint256 totalAssetsBefore = vault.totalAssets();
         uint256 supplyBefore = vault.totalSupply();
 
-        vm.prank(outsider); // permissionless by design
-        uint256 released = s.releaseUnconvertible();
+        // Permissionless by design, and still is — but through the vault, so
+        // any VAULT ASSET the hatch converts on its way is measured and split
+        // with the exited cohort. The clone-side function is vault-only.
+        uint256 released = _releaseUnconvertible(strategy, outsider);
 
         assertEq(released, wethResidue, "released amount does not match the residue");
         assertEq(IERC20(WETH).balanceOf(strategy), 0, "residue still on the clone");

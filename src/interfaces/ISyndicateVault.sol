@@ -24,6 +24,10 @@ interface ISyndicateVault {
     error NotGovernor();
     error RedemptionsLocked();
     error DepositsLocked();
+    /// @notice `pruneUnvaluedMark` called while the unvalued lock window is
+    ///         still running — deposits are genuinely shut, so there is nothing
+    ///         stale to drop yet.
+    error UnvaluedLockStillActive();
     error InvalidAgentAddress();
     error TransferFailed();
     error ZeroAddress();
@@ -195,6 +199,20 @@ interface ISyndicateVault {
     ///         vault and refresh the figure deposits are priced against.
     /// @return collected Vault-asset actually recovered by this call.
     function collectResidue(address strategy) external returns (uint256 collected);
+    /// @notice Permissionless: drop an unvalued mark whose lock window already
+    ///         lapsed, so the deposit gate can arm again for the next one.
+    /// @dev    Reverts `UnvaluedLockStillActive` inside the window; a no-op when
+    ///         nothing is marked. The strategy may never mark again — see the
+    ///         implementation for why the prune and the burn are inseparable.
+    function pruneUnvaluedMark(address strategy) external;
+    /// @notice Permissionless: drive a settled strategy's last-resort hatch,
+    ///         handing the vault what the clone can neither convert nor push.
+    /// @dev    Separate from `collectResidue` because the hatch forecloses a
+    ///         conversion the routine sweep would retry. Routed through the
+    ///         vault so any vault-asset it produces is measured and split with
+    ///         the exited redeem cohort — the same reason `sweep()` is.
+    /// @return collected Vault-asset actually recovered by this call.
+    function releaseUnconvertible(address strategy) external returns (uint256 collected);
     function managementFeeBps() external view returns (uint256);
     /// @notice Vault-owner-set agent performance fee (basis points). Defaults
     ///         to `FeeConstants.DEFAULT_AGENT_FEE_BPS` (2000 = 20%) while unset.

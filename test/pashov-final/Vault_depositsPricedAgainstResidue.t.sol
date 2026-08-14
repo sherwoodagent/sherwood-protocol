@@ -509,6 +509,104 @@ contract PashovFinalDepositResiduePricingTest is VaultInstantLiquidityTest {
         assertFalse(vault.depositsLocked(), "a later mark restarted the clock - the lock is unbounded again");
     }
 
+    /// @notice THE GATE ARMS AGAIN AFTER A PRUNE, which is the whole reason the
+    ///         prune exists.
+    ///
+    /// @dev    `UNVALUED_MAX_LOCK` bounds how long a mark SHUTS deposits, not
+    ///         how long it SURVIVES. A liar's mark is permanent, so
+    ///         `_unvaluedCount` never returns to zero, so the 0 -> 1 transition
+    ///         that stamps `_unvaluedSince` never happens again — and the
+    ///         deadline stays frozen at the attacker's timestamp forever. Every
+    ///         LATER mark, from an honest strategy, is then a 1 -> 2 that
+    ///         re-stamps nothing and is measured against a deadline months in
+    ///         the past. Deposits stay open against a NAV that structurally
+    ///         cannot include the unvaluable leg: the guard is off for the rest
+    ///         of the vault's life, bought once, for the price of one settled
+    ///         proposal.
+    ///
+    ///         This is the mutant that proves it: without the prune, the second
+    ///         (honest) mark below does not lock.
+    function test_pruningALapsedMarkRearmsTheGateForTheNextStrategy() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setUnvalued(true); // ...and never stops saying so
+        _settleWith(address(deliveryStrat));
+        assertTrue(vault.depositsLocked(), "precondition: the liar shuts the gate");
+
+        // The window lapses. Deposits reopen, and the stale mark is still there.
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        assertFalse(vault.depositsLocked(), "the lock did not lapse");
+
+        // Anyone may drop it now that it blocks nothing.
+        vm.prank(makeAddr("passerby"));
+        vault.pruneUnvaluedMark(address(deliveryStrat));
+
+        // THE POINT: a later, honest mark locks again. Before the prune this
+        // was a 1 -> 2 measured against a deadline already 7 days gone.
+        StubDeliveryStrategy honest = new StubDeliveryStrategy();
+        honest.setHolding(true);
+        honest.setUnvalued(true);
+        _settleWithPid(PID + 1, address(honest));
+        assertTrue(vault.depositsLocked(), "the gate never re-armed - it is off for good");
+    }
+
+    /// @notice Pruning INSIDE the window is refused: deposits are genuinely shut
+    ///         there, so there is nothing stale to drop.
+    /// @dev    A no-op would be worse than a revert — the caller could not tell
+    ///         "too early" from "nothing marked", and the two differ by whether
+    ///         the vault is currently accepting deposits.
+    function test_pruneIsRefusedWhileTheLockIsStillRunning() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setUnvalued(true);
+        _settleWith(address(deliveryStrat));
+
+        vm.expectRevert(ISyndicateVault.UnvaluedLockStillActive.selector);
+        vault.pruneUnvaluedMark(address(deliveryStrat));
+
+        vm.warp(vm.getBlockTimestamp() + 7 days - 1);
+        vm.expectRevert(ISyndicateVault.UnvaluedLockStillActive.selector);
+        vault.pruneUnvaluedMark(address(deliveryStrat));
+    }
+
+    /// @notice A PRUNED LABEL CANNOT MARK AGAIN, or the prune would hand anyone
+    ///         a renewable lock.
+    ///
+    /// @dev    `_refreshUnvalued` re-reads the label on every `collectResidue`,
+    ///         and the liar still answers TRUE. Without the burn, that read is a
+    ///         fresh 0 -> 1: `_unvaluedSince` re-stamps and the vault shuts for
+    ///         another full window — permissionlessly, for free, repeatable
+    ///         forever by anyone. That is strictly worse than the DoS the expiry
+    ///         was added to bound, so the burn and the prune ship together.
+    ///
+    ///         THE LABEL MUST CARRY A RECORDED RESIDUE AMOUNT for this to test
+    ///         anything. `collectResidue` short-circuits on `!tracked` BEFORE it
+    ///         reaches `_refreshUnvalued`, and after a prune the unvalued flag is
+    ///         false — so with a zero `undeliveredValue()` the re-read never
+    ///         happens and the test passes against a vault with no burn at all.
+    ///         Caught by mutation: the first version of this test survived
+    ///         deleting the guard it claims to pin.
+    function test_prunedLabelCannotReshutTheGate() public {
+        deliveryStrat = new StubDeliveryStrategy();
+        deliveryStrat.setHolding(true);
+        deliveryStrat.setUnvalued(true);
+        deliveryStrat.setResidue(1_000e6); // keeps it TRACKED past the prune
+        _settleWith(address(deliveryStrat));
+
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        vault.pruneUnvaluedMark(address(deliveryStrat));
+
+        // Reaching `_refreshUnvalued` at all is the point of the line above.
+        assertGt(vault.depositNav(), vault.totalAssets(), "precondition: the residue is on the books");
+
+        // The liar has not changed its story, and this re-reads it.
+        vault.collectResidue(address(deliveryStrat));
+        assertFalse(vault.depositsLocked(), "a pruned label re-shut the gate - the lock is renewable");
+
+        vm.prank(alice);
+        assertGt(vault.deposit(1_000e6, alice), 0, "deposits did not stay open");
+    }
+
     /// @notice A VALUABLE residue does NOT block — that is the point of pricing.
     ///         Only the unvaluable shape falls back to refusal.
     function test_finding3_valuableResidueDoesNotBlock() public {

@@ -426,6 +426,34 @@ contract SyndicateVault is
     ///         lock from its first mark bounds the whole episode.
     uint256 private _unvaluedSince;
 
+    /// @notice Strategies whose unvalued mark has already been pruned after
+    ///         lapsing, and which may therefore never set it again.
+    ///
+    ///         WITHOUT THIS, THE PRUNE IS A RENEWABLE LOCK. `_refreshUnvalued`
+    ///         re-reads the label on every `collectResidue` and every
+    ///         settlement, and a hostile label keeps answering TRUE forever. So
+    ///         a prune that only cleared the flag would hand ANYONE a lever:
+    ///         call `collectResidue(liar)`, the mark returns as a fresh 0 -> 1,
+    ///         `_unvaluedSince` re-stamps, and the vault is shut for another
+    ///         `UNVALUED_MAX_LOCK` — permissionlessly, for free, forever. That
+    ///         is strictly worse than the DoS the expiry was added to bound.
+    ///
+    ///         ONE STRATEGY GETS ONE EPISODE, which is the whole rule. A label
+    ///         that held the gate for its full window has spent its claim on
+    ///         the vault's trust; if it really still holds unvaluable value,
+    ///         that is now a priced-at-zero receivable like any other, not a
+    ///         reason to keep refusing deposits. A conforming strategy never
+    ///         reaches a prune at all, since `sweep()` and
+    ///         `releaseUnconvertible` clear it inside the window.
+    ///
+    ///         PER STRATEGY, NOT VAULT-WIDE, so an attacker burning its own
+    ///         label cannot disarm the gate for anyone else's: the next
+    ///         strategy to mark is a genuine 0 -> 1 with a fresh deadline. A
+    ///         clone cannot settle twice (`BaseStrategy.execute` requires
+    ///         `State.Pending`), so repeating the grief costs a fresh clone and
+    ///         a fresh proposal carried to Settled, every window, forever.
+    mapping(address strategy => bool) private _unvaluedBurned;
+
     /// @dev Reserved storage for future upgrades. Shrinks whenever a new state
     ///      variable is added above. Grown from 28 → 31 slots: this deletion
     ///      frees `_laneALockPid` (1), `_interimNetFlow` (1), and
@@ -435,7 +463,8 @@ contract SyndicateVault is
     ///      `_residueUnvalued`, `_unvaluedCount`, `_residuePid` and `_residueNet`
     ///      take one each, replacing the single `_lastSettledStrategy` slot.
     ///      23: `_unvaluedSince` takes one more.
-    uint256[23] private __gap;
+    ///      22: `_unvaluedBurned` takes one more.
+    uint256[22] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -1439,20 +1468,95 @@ contract SyndicateVault is
     ///         ledger's timeout/guardian backstop exists (issue #233); it is
     ///         deliberately not improvised here.
     function collectResidue(address strategy) external nonReentrant returns (uint256 collected) {
+        return _recoverResidueVia(strategy, _SEL_SWEEP);
+    }
+
+    /// @notice Drive a settled strategy's last-resort hatch: convert what it
+    ///         still can, hand the vault whatever it never will be able to, and
+    ///         split any vault-asset arrival with the exited redeem cohort.
+    /// @dev    THE TWIN OF `collectResidue`, AND FOR THE SAME REASON. The
+    ///         template's `releaseUnconvertible` attempts a conversion before it
+    ///         releases, so it can push VAULT ASSET home — which makes it a
+    ///         second door onto the balance delta `_payCohortShare` splits, and
+    ///         a delta is a complete measurement only while there is one door.
+    ///         Called directly it credited the cohort nothing and lifted the
+    ///         stayers' price instead, unrepairably, exactly as a direct
+    ///         `sweep()` did.
+    ///
+    ///         So the hatch is vault-only on the template and this is its
+    ///         permissionless entry point. The capital-hostage property that
+    ///         made it permissionless in the first place is preserved intact:
+    ///         anyone may still call it, at any time, with no privilege.
+    ///
+    ///         KEPT SEPARATE FROM `collectResidue` ON PURPOSE. The hatch
+    ///         FORECLOSES a conversion — it ships a token the clone can no
+    ///         longer sell — so folding it into the routine sweep path would
+    ///         release residues that a later retry would have converted. The
+    ///         template makes that argument for itself; this preserves it by
+    ///         keeping the two callable independently.
+    function releaseUnconvertible(address strategy) external nonReentrant returns (uint256 collected) {
+        return _recoverResidueVia(strategy, _SEL_RELEASE);
+    }
+
+    /// @notice Drop an unvalued mark whose lock window has already lapsed, so
+    ///         the deposit gate can arm again for the next one.
+    ///
+    /// @dev    WHAT THIS EXISTS FOR: `UNVALUED_MAX_LOCK` bounds how long a mark
+    ///         SHUTS deposits, but on its own it does not bound how long a mark
+    ///         SURVIVES. A hostile label never stops answering TRUE, so its mark
+    ///         is permanent, so `_unvaluedCount` never returns to zero, so the
+    ///         0 -> 1 transition that stamps `_unvaluedSince` can never happen
+    ///         again. The deadline stays frozen at the attacker's timestamp and
+    ///         `depositsLocked()` reads FALSE for the rest of the vault's life —
+    ///         including for every future HONEST mark, which is then priced
+    ///         against a NAV that structurally cannot include it. One label,
+    ///         once, and the guard is off permanently. That is the same
+    ///         permanence the expiry was added to remove, pointed the other way.
+    ///
+    ///         PERMISSIONLESS, AND HARMLESS BY CONSTRUCTION. It only ever
+    ///         removes a mark that is ALREADY past its deadline and therefore
+    ///         already blocking nothing — `depositsLocked` ignores it either
+    ///         way, so no depositor's access changes at the instant this runs.
+    ///         What changes is the FUTURE: with the count back at zero, the next
+    ///         mark is a real 0 -> 1 with a fresh window, and the gate works.
+    ///
+    ///         REFUSES INSIDE THE WINDOW rather than no-opping, so a caller
+    ///         cannot mistake "too early" for "nothing to do" — the two differ
+    ///         by whether deposits are currently shut.
+    ///
+    ///         The strategy is burned as it is pruned; see `_unvaluedBurned` for
+    ///         why the pair is inseparable.
+    function pruneUnvaluedMark(address strategy) external {
+        if (!_residueUnvalued[strategy]) return; // idempotent: nothing marked
+        if (block.timestamp < _unvaluedSince + UNVALUED_MAX_LOCK) revert UnvaluedLockStillActive();
+
+        _residueUnvalued[strategy] = false;
+        _unvaluedBurned[strategy] = true;
+        _bumpUnvalued(false);
+        emit ResidueUnvalued(strategy, false);
+    }
+
+    /// @dev The one measured door onto a settled strategy. `selector` picks the
+    ///      recovery the template should attempt; everything else — the delta,
+    ///      the cohort split, and the residue bookkeeping — is identical and
+    ///      must stay that way, since the invariant being protected is that
+    ///      NOTHING moves vault asset out of a strategy without being measured
+    ///      here.
+    function _recoverResidueVia(address strategy, bytes4 selector) private returns (uint256 collected) {
         uint256 known = _residueAmount[strategy];
-        // SWEEP FIRST, ASK ABOUT THE BOOKS AFTER. This used to return early
+        // RECOVER FIRST, ASK ABOUT THE BOOKS AFTER. This used to return early
         // when nothing was recorded, which was safe only while `sweep()` was
         // itself permissionless — a strategy holding assets the vault never
         // recorded (an unreadable probe, a zero cap) could still be emptied by
-        // calling it directly. Now that `sweep()` is vault-only, that escape
-        // route runs through here, so an early return would strand those assets
-        // permanently. The call below is a no-op against an address with
-        // nothing to give, including an EOA.
+        // calling it directly. Now that the templates' recovery entry points are
+        // vault-only, that escape route runs through here, so an early return
+        // would strand those assets permanently. The call below is a no-op
+        // against an address with nothing to give, including an EOA.
         bool tracked = known != 0 || _residueUnvalued[strategy];
 
         uint256 before = IERC20(asset()).balanceOf(address(this));
         // solhint-disable-next-line avoid-low-level-calls
-        (bool swept,) = strategy.call{gas: _SWEEP_GAS}(abi.encodeWithSelector(_SEL_SWEEP));
+        (bool swept,) = strategy.call{gas: _SWEEP_GAS}(abi.encodeWithSelector(selector));
         swept; // result deliberately unused — see the note above
         collected = IERC20(asset()).balanceOf(address(this)) - before;
         _payCohortShare(strategy, collected);
@@ -1701,6 +1805,13 @@ contract SyndicateVault is
             now_ = abi.decode(ret, (uint256)) != 0;
         }
         if (now_ == was) return;
+        // A BURNED LABEL CANNOT MARK AGAIN. Its one episode already ran to the
+        // deadline and was pruned; honouring a fresh TRUE here would let anyone
+        // re-shut the vault on demand by calling `collectResidue` on it. See
+        // `_unvaluedBurned`. Only the marking direction is refused — a burned
+        // strategy that somehow still carried a mark must always be able to
+        // clear it.
+        if (now_ && _unvaluedBurned[strategy]) return;
         _residueUnvalued[strategy] = now_;
         _bumpUnvalued(now_);
         emit ResidueUnvalued(strategy, now_);
@@ -2243,6 +2354,12 @@ contract SyndicateVault is
     ///      so a reverting or non-conforming clone cannot brick the only exit
     ///      from the deposit lock.
     bytes4 private constant _SEL_SWEEP = 0x35faa416;
+
+    /// @dev `bytes4(keccak256("releaseUnconvertible()"))`. Low-level for the
+    ///      same reason as `_SEL_SWEEP`, and additionally because not every
+    ///      template has the hatch at all — a typed call would revert against
+    ///      the ones that do not, rather than recovering nothing.
+    bytes4 private constant _SEL_RELEASE = 0x0ee7f80b;
 
     // ==================== MANAGEMENT-FEE ACCRUAL ====================
 
