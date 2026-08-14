@@ -52,8 +52,10 @@
 
 ## 7. Verification
 
-- [ ] 7.1 `forge test` green across the full non-fork suite; diff the test count against `origin/main` first to rule out an inherited failure.
-- [ ] 7.2 `forge fmt --check` clean; contract-size gate passing against the Robinhood 98,304-byte limit, with the vault's new size recorded.
-- [ ] 7.3 Storage-layout goldens regenerated and the layout gate passing.
-- [ ] 7.4 `openspec validate --all --strict` clean.
-- [ ] 7.5 Re-read design.md Risks against the finished code and confirm each mitigation is implemented, not just described — in particular that no code path lets a sandbox pull from the vault.
+- [x] 7.1 `forge test` green across the full non-fork suite: **2828 passed, 0 failed, 1 skipped (185 suites)**. `origin/main` is already an ancestor of this branch (`git merge-base --is-ancestor` passes), so there is no stale-branch delta and no inherited failure to rule out.
+- [x] 7.2 `forge fmt --check` clean. Size gate run with CI's own script and limit (98,304 B): **no offenders**. Recorded: SyndicateVault **32,318 B** (65,986 B headroom), SyndicateGovernor 43,692 B, SyndicateFactory 24,538 B, CallSandbox 4,859 B.
+- [x] 7.3 Goldens regenerated and the gate re-run WITHOUT `--update-golden`: `layout-goldens: OK` across SyndicateGovernor, SyndicateFactory, GuardianRegistry, StakedWood and SyndicateVault. All three carved slots are append-only (governor `__gap` 26 -> 23, factory 43 -> 42, vault 24 -> 22).
+- [x] 7.4 `openspec validate --all --strict`: 35 passed, 0 failed.
+- [x] 7.5 Re-read design.md Risks against the finished code. **Three claims did not match what shipped, and design.md was corrected rather than left describing mitigations that do not exist:** (a) the ceiling risk claimed a deploy-time seed plus a below-10,000 assertion — reversed by explicit decision and unimplementable as written anyway (per-governor parameter, no instance at deploy time); (b) the migration plan named a vault-implementation constructor immutable — the binding lives on the factory; (c) the rollback described clearing that immutable. Two risks discovered during implementation were added: the missing factory wiring and the unmovable declared token.
+
+  **The central claim — no code path lets a sandbox pull from the vault — was verified by enumerating every asset-out path in `SyndicateVault`, not by re-reading the design.** `transferPerformanceFee` is `onlyGovernor`; `settleRedeem` is queue-only (`msg.sender != _withdrawalQueue` reverts); `_payCohortShare` is internal and pays the queue; `rescueERC20` is `onlyOwner` and refuses the vault asset; `executeGovernorBatch` is governor-only behind `_guardBatchCalls`. None is reachable by a sandbox, which holds no standing anywhere. The funding leg is a PUSH (`safeTransfer`) with no allowance granted at any point (asserted live in `test_maxLoss_*`), and `runSandbox` measures the vault's balance across the whole run and reverts `MaxNetOutflowExceeded` if it fell by more than `funding` — so even a hypothetical pull is caught by the meter rather than only by the absence of a route.
