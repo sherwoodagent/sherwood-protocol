@@ -28,6 +28,15 @@ import {ICallSandbox} from "../src/interfaces/ICallSandbox.sol";
 contract MockSwood {
     mapping(address => uint256) public guardianStake;
     uint256 public coolDownPeriod = 45 days;
+    /// @dev Read by `CallSandbox`'s denylist chain (ledger -> sWOOD -> WOOD).
+    ///      The real `StakedWood` exposes the same getter; without it here the
+    ///      WOOD arm of the denylist would resolve to `address(0)` and pass
+    ///      vacuously, which is indistinguishable from it working.
+    address public wood;
+
+    function setWood(address w) external {
+        wood = w;
+    }
 
     function setStake(address g, uint256 own) external {
         guardianStake[g] = own;
@@ -194,6 +203,7 @@ contract GovernorCoverageGatesTest is Test {
 
         // ── Ledger: $0.05 WOOD, $1.00 USDG feed, generous cap, default bps 100.
         swood = new MockSwood();
+        swood.setWood(address(wood));
         ledger = new ExposureLedger(ledgerOwner, address(swood), 28 days);
         feed = new MockFeed(1e8, 8); // $1.00, 8-dec
         // Design revision 2: `woodUsdPriceX8` is a CAP, never a price. WOOD is
@@ -799,6 +809,70 @@ contract GovernorCoverageGatesTest is Test {
             uint256(ISyndicateGovernor.ProposalState.Executed),
             "the proposal still executes, carrying nothing"
         );
+    }
+
+    /// @dev A fully covered sandbox proposal naming `denied` among its calls.
+    ///      Coverage is seated so execution reaches `run()` — otherwise the
+    ///      quorum would revert first and the denylist assertion would pass for
+    ///      the wrong reason.
+    function _assertSandboxDenies(address denied) internal {
+        ICallSandbox.Call[] memory calls = new ICallSandbox.Call[](1);
+        calls[0] = ICallSandbox.Call({target: denied, data: abi.encodeWithSignature("owner()")});
+
+        vm.prank(agent);
+        uint256 pid = governor.proposeWithSandbox(
+            ISyndicateGovernor.SandboxPayload({funding: 1_000e6, calls: calls, declaredTokens: new address[](0)}),
+            address(vault),
+            address(0),
+            "uri",
+            7 days,
+            _envelope(1_000e6),
+            _execCalls(),
+            new uint256[](1),
+            _settleCalls(),
+            new uint256[](1),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+
+        address[] memory gs = new address[](1);
+        gs[0] = makeAddr("g1");
+        _seatApprovers(pid, gs, 20_000e18); // $1,000 — fully covers the payload
+        _toApproved(pid);
+
+        vm.expectRevert(abi.encodeWithSelector(ICallSandbox.DeniedTarget.selector, denied));
+        governor.executeProposal(pid);
+    }
+
+    /// @notice The four best-effort arms of the denylist, resolved through the
+    ///         governor -> ledger -> sWOOD -> WOOD chain. Each is reachable only
+    ///         because this fixture actually wires them; an unwired hop resolves
+    ///         to `address(0)`, never matches, and would make the assertion
+    ///         vacuous — which is why the vault/queue/governor arms live in the
+    ///         un-gated suite and these live here.
+    function test_sandbox_denylistCoversTheExposureLedger() public {
+        assertEq(governor.exposureLedger(), address(ledger), "fixture sanity: the ledger is wired");
+        _assertSandboxDenies(address(ledger));
+    }
+
+    function test_sandbox_denylistCoversSwood() public {
+        _assertSandboxDenies(address(swood));
+    }
+
+    function test_sandbox_denylistCoversWood() public {
+        assertEq(swood.wood(), address(wood), "fixture sanity: the WOOD hop resolves");
+        _assertSandboxDenies(address(wood));
+    }
+
+    function test_sandbox_denylistCoversTheTierRegistry() public {
+        // Permissive on purpose: the assertion here is about the DENYLIST
+        // resolving the registry address, not about anything the registry
+        // decides. A real one would only add allowlisting noise to a test that
+        // is not about allowlisting.
+        address registry = address(deployTierRegistry(address(this)));
+        governor.setTierRegistry(registry); // factory-only; test contract is factory
+
+        assertEq(governor.tierRegistry(), registry, "fixture sanity: the registry is wired");
+        _assertSandboxDenies(registry);
     }
 
     /// @notice Settlement reuses the STORED `effectiveMaxCapital` from execute

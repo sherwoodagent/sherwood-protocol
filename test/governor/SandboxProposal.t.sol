@@ -18,6 +18,7 @@ import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {VaultWithdrawalQueue} from "../../src/queue/VaultWithdrawalQueue.sol";
 
 /// @dev A target nobody allowlisted and nobody certified — the whole point.
 ///      Records who called it, so the identity claim is measured rather than
@@ -101,6 +102,7 @@ contract SandboxProposalTest is Test {
     MockRegistryMinimal public guardianRegistry;
     TierRegistry public tierRegistry;
     CallSandbox public sandboxImpl;
+    VaultWithdrawalQueue public queue;
 
     IdentitySpy public spy;
     VaultGated public vaultGated;
@@ -182,6 +184,11 @@ contract SandboxProposalTest is Test {
 
         // Factory-gated, one-shot: the test contract is this vault's factory.
         vault.setSandboxImplementation(address(sandboxImpl));
+        // A REAL queue, not a stub — the denylist resolves it live off the vault
+        // and an unbound queue would read as `address(0)`, which never matches
+        // and would make the queue arm of the denylist vacuously pass.
+        queue = new VaultWithdrawalQueue(address(vault));
+        vault.setWithdrawalQueue(address(queue));
 
         vm.startPrank(owner);
         vault.registerAgent(agentRegistry.mint(agent), agent);
@@ -388,6 +395,14 @@ contract SandboxProposalTest is Test {
 
     function test_denylist_governorTargetRevertsTheWholeRun() public {
         _assertDenied(address(governor));
+    }
+
+    /// @notice The queue is denied for the accounting reason, not a custody one:
+    ///         a sandbox holding vault capital could touch the queue's stamp and
+    ///         reserve counters, which other guards assume only the vault moves.
+    function test_denylist_queueTargetRevertsTheWholeRun() public {
+        assertTrue(vault.withdrawalQueue() != address(0), "fixture sanity: a real queue is bound");
+        _assertDenied(vault.withdrawalQueue());
     }
 
     function _assertDenied(address denied) internal {
@@ -639,6 +654,24 @@ contract SandboxProposalTest is Test {
     }
 
     // ── 5.7 runSandbox authorization ──────────────────────────────────────
+
+    /// @notice Pausing halts the sandbox alongside every other capital movement.
+    ///         A pause that stopped LP flow but still let arbitrary calldata
+    ///         reach an uncertified target with vault capital would be no pause
+    ///         at all.
+    function test_runSandbox_refusesWhilePaused() public {
+        uint256 pid = _proposeSandbox(
+            _payload(_oneCall(address(spy), abi.encodeCall(IdentitySpy.ping, ())), FUNDING, new address[](0)), agent
+        );
+        _advancePastVoting();
+
+        vm.prank(owner);
+        vault.pause();
+
+        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
+        governor.executeProposal(pid);
+        assertEq(vault.sandboxOf(pid), address(0), "nothing was minted and nothing was funded");
+    }
 
     function test_runSandbox_refusesNonGovernorCallers() public {
         vm.prank(stranger);
