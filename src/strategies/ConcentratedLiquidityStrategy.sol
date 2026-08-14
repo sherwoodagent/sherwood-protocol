@@ -2164,6 +2164,37 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         _trySwapToAsset(settleSlippageBps);
 
+        // REPAY BEFORE EXPORTING. `_repayAndWithdraw` funds the repayment from
+        // this clone's OWN asset balance, and the push below sends every wei of
+        // that balance to the vault. Exporting first therefore does not merely
+        // skip the repayment, it REMOVES the resource the repayment needs: a
+        // later `sweep()` reads `held == 0`, takes neither repay branch, and the
+        // collateral stays behind debt that can no longer be cleared.
+        //
+        // Adversary: a Morpho liquidator. This function is permissionless and
+        // asset arrives here in trickles (LP fees converting, a swap that
+        // finally quoted), so front-running each `sweep()` with a bare release
+        // costs gas and keeps the position permanently unable to repay — until
+        // it is liquidated and they take the incentive. `sweep()`'s own natspec
+        // states the invariant that breaks: "the set of residues this can
+        // recover must not be narrower than the set `_settle` can create."
+        // A release that strips `sweep()`'s working capital makes it narrower.
+        //
+        // Worse than the value leak: `hasUnvaluedResidue()` reports true while
+        // Morpho still holds collateral, and the vault refuses ALL deposits
+        // while any settled strategy reports that. Stranding the collateral is
+        // therefore a vault-wide deposit freeze, held open by anyone, for gas —
+        // against a lock whose safety argument is that every unvaluable shape is
+        // unwindable by the permissionless `sweep()`.
+        //
+        // Placed after the swap and before the push, matching `sweep()`. Nothing
+        // is foreclosed by running it here: `_repayAndWithdraw` ends with an
+        // unconditional `_tryRedeemWrapper()`, so collateral it pulls out of
+        // Morpho gets a redemption attempt in this same call and leaves as
+        // `asset` below. The raw pushes further down still fire only on a
+        // genuine redemption failure.
+        _repayAndWithdraw();
+
         // Deliver whatever the conversion DID produce before releasing the rest.
         // Skipping this would leave converted proceeds sitting on the clone —
         // the one outcome this path must never produce, since it exists to get
