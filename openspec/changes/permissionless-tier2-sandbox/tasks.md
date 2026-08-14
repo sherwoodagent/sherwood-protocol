@@ -45,10 +45,10 @@
 
 ## 6. Deployment
 
-- [ ] 6.1 Deploy `CallSandbox` and pass it to the vault implementation constructor in `script/robinhood-mainnet/`.
-- [ ] 6.2 Seed `tier2CallCapBps` to a real value **in the same script**, so it cannot be separated from wiring the sandbox; assert the deployed value is below `10_000`.
-- [ ] 6.3 Assert `quorumTierThreshold == 0` in the deploy script so the guardian quorum stays mandatory.
-- [ ] 6.4 Update `openspec/specs/deployment-docs/spec.md` with the ordering and the ceiling-before-wiring precondition; state explicitly that no registry ceremony exists.
+- [x] 6.1 Deploy `CallSandbox` and bind it in the deploy ceremony. **Deviation from the task's wording:** not a vault-implementation constructor arg — the vault is a shared implementation behind per-vault proxies, so the binding lives on the FACTORY (`sandboxImpl`, owner-settable, mirroring `exposureLedger`/`bondEscrow`) and is pushed into each vault at `createSyndicate`. This also uncovered that the factory never wired a sandbox at all, so the feature would have been dead on any real deployment: every vault would revert `SandboxNotConfigured`. `proposeWithSandbox` now refuses at PROPOSE against a vault with no implementation, since the vault's binding is set-once and such a proposal could otherwise burn a full review period and lock a bond against an execution that can never succeed.
+- [x] 6.2 **DECISION (Ana, 2026-08-14): no cap — `tier2CallCapBps` stays at its `10_000` default, so no tier-2-specific ceiling binds.** The task as written was also mis-specified: the parameter is per-GOVERNOR and governors are minted at `createSyndicate`, so the core deploy script has no instance to seed. What still bounds a payload is the proposal's declared envelope, the guardian coverage scaling, and the vault's buffer / queue-reserve checks. Recorded at the assertion site in `script/robinhood-mainnet/Deploy.s.sol` and in the deployment-docs spec; a deployment wanting a tighter bound sets it per vault via `setTier2CallCapBps`.
+- [x] 6.3 Assert `quorumTierThreshold == 0` in the deploy script so the guardian quorum stays mandatory. **Not assertable at this phase:** the core ceremony deploys no `ExposureLedger`, so there is no instance to read. Its default is already `0` (mandatory at every tier). Recorded in the deployment-docs spec as an obligation on whichever ceremony deploys the ledger.
+- [x] 6.4 Update `openspec/specs/deployment-docs/spec.md` with the ordering and the ceiling-before-wiring precondition; state explicitly that no registry ceremony exists. New requirement "The sandbox implementation is bound before the factory goes live", covering the one-way-door argument, the no-cap decision and its consequences, and the `quorumTierThreshold` obligation.
 
 ## 7. Verification
 

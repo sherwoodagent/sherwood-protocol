@@ -681,6 +681,21 @@ contract SandboxProposalTest is Test {
 
     // ── propose-time payload validation ───────────────────────────────────
 
+    /// @notice A vault with no sandbox implementation refuses at PROPOSE. The
+    ///         vault's binding is factory-only and set-once, so a vault created
+    ///         before its factory had one can never acquire it — letting the
+    ///         proposal through would burn the vote and the whole review period
+    ///         and lock the proposer's bond against an execution that can never
+    ///         succeed, with `SandboxNotConfigured` as the only outcome.
+    function test_propose_refusedWhenTheVaultHasNoSandboxImplementation() public {
+        vm.mockCall(address(vault), abi.encodeCall(ISyndicateVault.sandboxImplementation, ()), abi.encode(address(0)));
+
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.SandboxNotAvailable.selector, address(vault)));
+        _proposeSandbox(
+            _payload(_oneCall(address(spy), abi.encodeCall(IdentitySpy.ping, ())), FUNDING, new address[](0)), agent
+        );
+    }
+
     function test_propose_emptyCallSetRejected() public {
         vm.expectRevert(ISyndicateGovernor.EmptySandboxCalls.selector);
         _proposeSandbox(_payload(new ICallSandbox.Call[](0), FUNDING, new address[](0)), agent);

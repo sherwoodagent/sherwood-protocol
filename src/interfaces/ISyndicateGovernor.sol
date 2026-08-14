@@ -394,6 +394,13 @@ interface ISyndicateGovernor {
     ///         payload attached to the wrong proposal, or to none, would fund
     ///         arbitrary calldata against coverage nobody priced for it.
     error SandboxProposalIdMismatch(uint256 expected, uint256 actual);
+    /// @notice The vault has no `CallSandbox` implementation bound, so it can
+    ///         never run a payload. Refused at propose because the vault's
+    ///         binding is factory-only and set-once: a vault created before its
+    ///         factory had one can never acquire it, and letting the proposal
+    ///         through would burn a full review period and lock a bond against
+    ///         an execution that cannot succeed.
+    error SandboxNotAvailable(address vault);
     /// @notice Revert if `executeCallCaps.length != executeCalls.length` or
     ///         `settlementCallCaps.length != settlementCalls.length` at
     ///         propose (issue #43). Every call must declare exactly one cap.

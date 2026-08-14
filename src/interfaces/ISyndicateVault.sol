@@ -335,6 +335,11 @@ interface ISyndicateVault {
     /// @notice The `CallSandbox` implementation this vault clones per proposal.
     ///         Zero means the sandbox path is not wired.
     function sandboxImplementation() external view returns (address);
+    /// @notice Factory-only, set-once: bind the `CallSandbox` implementation
+    ///         this vault clones. No re-pointing path — swapping the minted code
+    ///         behind an already-reviewed proposal would invalidate the
+    ///         confinement argument that lets a sandbox call uncertified targets.
+    function setSandboxImplementation(address impl) external;
 
     /// @notice The sandbox minted for `pid`, or zero if none.
     function sandboxOf(uint256 pid) external view returns (address);

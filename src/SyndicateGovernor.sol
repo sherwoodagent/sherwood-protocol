@@ -427,6 +427,17 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             revert TooManyCalls();
         }
         if (sandbox.funding == 0) revert ZeroSandboxFunding();
+        // REFUSE HERE, NOT AT EXECUTE. A vault created before its factory had a
+        // sandbox implementation has none and can never be given one — the
+        // vault's setter is factory-only and set-once. Without this check such a
+        // proposal would pass the vote, spend the whole review period, lock the
+        // proposer's bond, and only then revert `SandboxNotConfigured` at
+        // execute, with no way to fix it and the bond reclaimable only after the
+        // proposal expires. Read live off the vault rather than mirrored here:
+        // the vault is the only authority on what it will actually clone.
+        if (ISyndicateVault(vault).sandboxImplementation() == address(0)) {
+            revert SandboxNotAvailable(vault);
+        }
         // THE SANDBOX SPENDS THE DECLARED ENVELOPE, NOT A SECOND ONE. Bounding
         // funding by `maxCapital` here is what lets `executeProposal` subtract
         // the funded amount from the capital handed to the execute batch without

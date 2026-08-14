@@ -74,6 +74,25 @@ Both are seeded to the DEPLOYER as a placeholder, never as the destination. The 
 - **WHEN** the five scripts complete
 - **THEN** the operator verifies `factory.beacon/protocolConfig`, `swood.wood == WOOD`, `swood.registry == registry`, `registry.reviewPeriod == 86400`, `registry.blockQuorumBps == 3000`, `strategyFactory.approvedTemplate(PORTFOLIO) == true`, and `governorImpl.MIN_VOTING_PERIOD() == 86400`
 
+### Requirement: The sandbox implementation is bound before the factory goes live
+The core ceremony SHALL deploy `CallSandbox` and bind it to the factory in the SAME broadcast that creates the factory, and validation SHALL assert `factory.sandboxImpl()` equals the deployed address.
+
+This is a one-way door, not a preference. Each vault receives its sandbox at `createSyndicate`, and the vault's own binding is factory-only and SET-ONCE — so a factory that goes live unbound creates vaults that can never run a payload and can never be repaired. Binding the factory afterwards fixes only vaults created after that point. `proposeWithSandbox` therefore refuses at PROPOSE against a vault with no implementation, rather than letting a proposal clear the vote and the review period and revert at execute with the proposer's bond locked.
+
+NO REGISTRY CEREMONY EXISTS FOR SANDBOX TARGETS, and none SHALL be added. A payload's targets are never allowlisted and never certified: the loss bound is the funded amount, structurally, so there is nothing for an owner to attest. The review that remains is the guardian coverage quorum, which underwrites the proposal against slashable stake and reads the payload during the review period.
+
+The funding ceiling `tier2CallCapBps` is NOT seeded by the ceremony. It is a per-governor parameter and governors are minted at `createSyndicate`, so no instance exists at deploy time; it is left at its `10_000` default, which means no tier-2-specific ceiling binds. What still bounds a payload is the proposal's declared envelope, the guardian coverage scaling, and the vault's buffer and queue-reserve checks. A deployment that wants a tighter bound SHALL set it per vault via `setTier2CallCapBps`, which is vault-owner-gated and frozen while any proposal is open.
+
+`quorumTierThreshold` governs whether the coverage quorum is mandatory and defaults to `0` (mandatory at every tier) on `ExposureLedger`. The core ceremony deploys no ledger, so there is nothing to assert at this phase; a ceremony that later deploys one SHALL assert the threshold is `0` before wiring it.
+
+#### Scenario: Factory live without a sandbox implementation
+- **WHEN** the core ceremony completes with `factory.sandboxImpl()` still zero
+- **THEN** validation FAILS, because every vault created afterwards would be permanently unable to run a payload
+
+#### Scenario: A vault predating the binding refuses at propose
+- **WHEN** `proposeWithSandbox` targets a vault whose `sandboxImplementation()` is zero
+- **THEN** it reverts at propose, not at execute, and no bond is locked
+
 #### Scenario: Mainnet ceremony with EOA multisig refused
 - **WHEN** `OWNER_MULTISIG` is an EOA and handoff is not skipped
 - **THEN** the deploy reverts "OWNER_MULTISIG must be a contract (Safe), not an EOA"

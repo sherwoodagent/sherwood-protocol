@@ -222,6 +222,19 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         _checkAddr("protocolConfig.guardiansFeeRecipient", protocolConfig.guardiansFeeRecipient(), deployer);
 
         _checkAddr("factory.beacon", factory.beacon(), d.beacon);
+        // WITHOUT THIS THE PERMISSIONLESS TIER-2 PATH IS DEAD ON ARRIVAL. Every
+        // vault binds its sandbox at `createSyndicate` and the binding is
+        // set-once, so a factory that goes live unbound produces vaults that can
+        // never run a payload and can never be repaired.
+        //
+        // The FUNDING CEILING is deliberately not asserted here. `tier2CallCapBps`
+        // is per-governor and governors are minted at `createSyndicate`, so there
+        // is no instance to seed at deploy time; and it is being left at its
+        // 10,000 default (no tier-2-specific ceiling) by explicit decision — see
+        // the change's tasks.md §6.2. What still bounds a payload is the
+        // proposal's own envelope, the guardian coverage scaling, and the vault's
+        // buffer and queue-reserve checks.
+        _checkAddr("factory.sandboxImpl", factory.sandboxImpl(), d.sandboxImpl);
         _checkAddr("factory.tierRegistry", address(factory.tierRegistry()), d.tierRegistry);
         _checkAddr("factory.ensRegistrar", address(factory.ensRegistrar()), address(0));
         _checkAddr("factory.agentRegistry", address(factory.agentRegistry()), address(0));
