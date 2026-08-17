@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {Vm} from "forge-std/Vm.sol";
 import {SettleFixture} from "../strategies/ConcentratedLiquidityStrategySettle.t.sol";
 
 /// @title ConcentratedLiquidityStrategy — the escape hatch that removed the
@@ -165,17 +166,89 @@ contract PashovFinalCLReleaseRepaysTest is SettleFixture {
     ///         revert on an already-cleared position — the hatch is
     ///         permissionless and callable at any time, so a revert would be a
     ///         griefing surface of its own.
+    ///
+    ///         Asserts the SECOND call's own return, not merely the end state:
+    ///         an end-state check after a `sweep()` holds even if the second
+    ///         release moved something it should not have, so it pins no-revert
+    ///         and nothing else.
     function test_releaseRemainsIdempotent() public {
         _settleShortWithAssetOnClone(20_000e6);
 
         vm.prank(liquidator);
         strategy.releaseUnconvertible();
         vm.prank(keeper);
-        strategy.releaseUnconvertible();
+        uint256 secondRelease = strategy.releaseUnconvertible();
+        assertEq(secondRelease, 0, "second release found something left to export");
+
         vm.prank(keeper);
         strategy.sweep();
 
         assertEq(_debtShares(), 0, "debt survived");
         assertEq(_collateral(), 0, "collateral survived");
+    }
+
+    // ── the partial outcome must stay visible ──
+
+    /// @notice A release that repays only PART of the debt must say so, on the
+    ///         same terms `sweep()` does. Without the event a partial recovery
+    ///         is indistinguishable off-chain from a complete one — and this is
+    ///         the path an attacker calls, so the partial outcome is precisely
+    ///         the one monitoring needs.
+    ///
+    ///         The trickle here is deliberately far below what is owed, so
+    ///         `_repayAndWithdraw` takes the deliverable-maximum branch and
+    ///         leaves both legs outstanding.
+    function test_partialReleaseEmitsSettlementIncomplete() public {
+        _settleShortWithAssetOnClone(1e6); // nowhere near the debt
+
+        vm.recordLogs();
+        vm.prank(liquidator);
+        strategy.releaseUnconvertible();
+
+        (bool seen, uint256 debtRemaining, uint256 collateralRemaining) = _lastSettlementIncomplete();
+        assertTrue(seen, "partial release reported as a complete recovery");
+        assertGt(debtRemaining, 0, "debt cleared -- this case is not the partial one");
+        assertGt(collateralRemaining, 0, "collateral freed -- this case is not the partial one");
+        // Non-vacuity: the event has to report the strand that actually exists,
+        // not a stale or zeroed pair.
+        assertGt(_debtShares(), 0, "precondition drifted: nothing was left outstanding");
+    }
+
+    /// @notice The mirror. A release that clears everything must NOT emit — an
+    ///         event that fires unconditionally carries no information.
+    function test_completeReleaseDoesNotEmitSettlementIncomplete() public {
+        _execute();
+        _accrueFees(1_000e6, 0);
+        _settle();
+        assertEq(_debtShares(), 0, "precondition: this case has no debt");
+        assertEq(_collateral(), 0, "precondition: this case has no collateral left");
+
+        nvda.mint(address(strategy), 100e18);
+        adapter.setRate(address(nvda), address(usdg), 0);
+
+        vm.recordLogs();
+        vm.prank(keeper);
+        strategy.releaseUnconvertible();
+
+        (bool seen,,) = _lastSettlementIncomplete();
+        assertFalse(seen, "clean release reported as incomplete");
+    }
+
+    /// @dev Scans recorded logs for `SettlementIncomplete` and decodes it.
+    ///      Local rather than shared: the fixture's own helper returns a bare
+    ///      boolean, and the values are what makes the assertion above
+    ///      non-vacuous.
+    function _lastSettlementIncomplete()
+        internal
+        returns (bool seen, uint256 debtRemaining, uint256 collateralRemaining)
+    {
+        bytes32 sig = keccak256("SettlementIncomplete(uint256,uint256)");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics.length != 0 && logs[i].topics[0] == sig) {
+                (debtRemaining, collateralRemaining) = abi.decode(logs[i].data, (uint256, uint256));
+                seen = true;
+            }
+        }
     }
 }
