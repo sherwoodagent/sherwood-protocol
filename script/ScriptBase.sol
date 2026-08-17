@@ -86,6 +86,25 @@ abstract contract ScriptBase is Script {
         return vm.parseJsonAddress(vm.readFile(_chainsPath()), string.concat(".", key));
     }
 
+    /// @notice Read an OPTIONAL address from chains/{chainId}.json.
+    /// @dev    `_readAddress` reverts on a missing file or key, which is right
+    ///         for a mandatory dependency and wrong for one that legitimately
+    ///         varies per chain — a phase that must run both before and after
+    ///         the core deploy cannot ask "is TIER_REGISTRY in the book yet?"
+    ///         without a tolerant read. Returns `address(0)` for a missing
+    ///         file, key, or value; callers treat zero as "not on this chain".
+    ///         (`Deploy.s.sol` predates this and keeps its own equivalent —
+    ///         a differently-named helper here avoids shadowing that one.)
+    function _optionalAddress(string memory key) internal view returns (address) {
+        string memory path = _chainsPath();
+        if (!_fileExists(path)) return address(0);
+        try vm.parseJsonAddress(vm.readFile(path), string.concat(".", key)) returns (address a) {
+            return a;
+        } catch {
+            return address(0);
+        }
+    }
+
     /// @notice Write tokenomics addresses to chains/{chainId}.json (appends to existing)
     function _writeTokenomicsAddresses(
         address woodToken,

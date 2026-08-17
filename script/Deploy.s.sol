@@ -168,6 +168,12 @@ contract DeploySherwood is ScriptBase {
         // deployer is still the owner.
         _seedRegistry(d.deployer, d.registryProxy, cfg);
 
+        // Same constraint as the registry seed above, for the TierRegistry:
+        // these are `onlyOwner` writes, so they MUST precede the handoff.
+        // Without them no strategy template can initialize (see the function's
+        // own natspec for the full dependency list).
+        _seedTierRegistry(d.deployer, d.tierRegistry);
+
         // Multisig handoff: prod hands all proxies to the multisig.
         address effectiveOwner = d.deployer;
         if (!skipHandoff) {
@@ -410,6 +416,123 @@ contract DeploySherwood is ScriptBase {
     ///      deployer holds WOOD. Skipped silently if either seed is 0 or the
     ///      balance is insufficient — testnet deploys without a WOOD balance
     ///      can top up post-deploy.
+    /// @dev The chain-constant half of the TierRegistry launch set, applied
+    ///      while the deployer still owns the registry.
+    ///
+    ///      WHY HERE. Every strategy template refuses to initialize against an
+    ///      unattested dependency: `PortfolioStrategy` checks each Chainlink
+    ///      aggregator (`_requireAllowedPriceSource`) AND its pairing to the
+    ///      slot's token (`_requirePairedPriceSource`), `MorphoSupplyStrategy`
+    ///      checks `isAdapterAllowed(morpho)`, `ConcentratedLiquidityStrategy`
+    ///      checks `isCounterpartyAllowed` on the position manager, Morpho and
+    ///      the Uniswap v3 factory. A fresh registry answers false to all of
+    ///      them, so a just-deployed protocol cannot run a single strategy
+    ///      until these land. Leaving them to a runbook means the first
+    ///      proposal on a new chain reverts, and the revert names a role
+    ///      (`PriceSourceNotAllowed`) rather than the missing step.
+    ///
+    ///      WHY ONLY THIS HALF. Seeded here is exactly what is already a
+    ///      constant of the chain — third-party addresses read from the
+    ///      address book, reviewable in the same diff as the deploy. Addresses
+    ///      this deploy MINTS (the swap adapter, strategy templates) do not
+    ///      exist yet: their scripts run later and seed themselves the same
+    ///      way, which the two-step `Ownable2Step` handoff below deliberately
+    ///      leaves room for — `transferOwnership` only sets `pendingOwner`, so
+    ///      the deployer stays owner until the multisig calls
+    ///      `acceptOwnership()`. THE RUNBOOK ORDER IS THEREFORE: core deploy →
+    ///      strategy deploys → multisig accepts. Accepting early is safe but
+    ///      costs a multisig transaction per dependency.
+    ///
+    ///      Per-clone `setAdapterAllowed` stays manual by construction — a
+    ///      clone's address is not known until an agent creates it.
+    ///
+    ///      Best-effort per key: a chain whose address book lacks an entry
+    ///      simply does not get that attestation. Silence is logged, never
+    ///      assumed.
+    function _seedTierRegistry(address deployer, address tierRegistry) internal {
+        console.log("\n=== Seeding TierRegistry launch set ===");
+        if (TierRegistry(tierRegistry).owner() != deployer) {
+            console.log("RUNBOOK: deployer no longer owns TierRegistry - seeding SKIPPED.");
+            console.log("RUNBOOK: the owner must apply the launch set manually before any proposal.");
+            return;
+        }
+
+        // Counterparties: addresses a certified template may BIND to (pools,
+        // position managers, lending singletons) as distinct from addresses
+        // that may RECEIVE vault funds. Morpho needs both axes — CL binds it
+        // as a counterparty, MorphoSupplyStrategy spends into it as an adapter.
+        _seedCounterparty(tierRegistry, "UNISWAP_V3_POSITION_MANAGER");
+        _seedCounterparty(tierRegistry, "UNISWAP_V3_FACTORY");
+        if (_seedCounterparty(tierRegistry, "MORPHO_BLUE")) {
+            _seedAdapter(tierRegistry, "MORPHO_BLUE");
+        }
+
+        // Push-feed price sources. `symbols` drives BOTH lookups: the feed key
+        // is CHAINLINK_<SYM>_USD_FEED and the token key is <SYM>, except ETH,
+        // whose token is wrapped. A symbol whose feed exists but whose token
+        // does not (BTC/LINK/USDC on Robinhood) is allowlisted without a
+        // pairing — harmless, because the pairing check is what actually gates
+        // a slot, and it stays unsatisfiable until someone attests it.
+        string[13] memory symbols =
+            ["ETH", "USDG", "USDC", "BTC", "LINK", "AAPL", "AMD", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "TSLA"];
+        for (uint256 i; i < symbols.length; ++i) {
+            _seedPriceSource(tierRegistry, symbols[i]);
+        }
+        // Index/commodity trackers whose token key matches the symbol.
+        string[3] memory funds = ["QQQ", "SPY", "SLV"];
+        for (uint256 i; i < funds.length; ++i) {
+            _seedPriceSource(tierRegistry, funds[i]);
+        }
+    }
+
+    function _seedCounterparty(address tierRegistry, string memory key) internal returns (bool) {
+        address target = _tryReadAddress(key);
+        if (target == address(0)) {
+            console.log("  counterparty skipped (not in address book):", key);
+            return false;
+        }
+        TierRegistry(tierRegistry).setCounterpartyAllowed(target, true);
+        console.log("  counterparty allowed:", key, target);
+        return true;
+    }
+
+    function _seedAdapter(address tierRegistry, string memory key) internal returns (bool) {
+        address target = _tryReadAddress(key);
+        if (target == address(0)) {
+            console.log("  adapter skipped (not in address book):", key);
+            return false;
+        }
+        TierRegistry(tierRegistry).setAdapterAllowed(target, true);
+        console.log("  adapter allowed:", key, target);
+        return true;
+    }
+
+    /// @dev Allowlists the aggregator and pairs it to the token it prices.
+    ///      `priceSource` MUST be the bare aggregator address widened to
+    ///      bytes32 with no packed max-age — that is the exact normalization
+    ///      `PortfolioStrategy._initialize` applies before calling
+    ///      `_requirePairedPriceSource`, so one attestation covers every
+    ///      staleness variant of the same feed. Encoding it any other way
+    ///      produces an attestation that is never consulted.
+    function _seedPriceSource(address tierRegistry, string memory symbol) internal {
+        address feed = _tryReadAddress(string.concat("CHAINLINK_", symbol, "_USD_FEED"));
+        if (feed == address(0)) {
+            console.log("  feed skipped (not in address book):", symbol);
+            return;
+        }
+        TierRegistry(tierRegistry).setAdapterAllowed(feed, true);
+
+        // ETH's feed prices the wrapped token — every other symbol's token key
+        // is the symbol itself.
+        address token = _tryReadAddress(keccak256(bytes(symbol)) == keccak256("ETH") ? "WETH" : symbol);
+        if (token == address(0)) {
+            console.log("  feed allowlisted, NO token pairing (token not on this chain):", symbol, feed);
+            return;
+        }
+        TierRegistry(tierRegistry).setPriceSourceForToken(token, bytes32(uint256(uint160(feed))), true);
+        console.log("  feed allowlisted + paired:", symbol, feed);
+    }
+
     function _seedRegistry(address deployer, address registryProxy, Config memory cfg) internal {
         IERC20 wood = IERC20(cfg.woodToken);
         uint256 bal = wood.balanceOf(deployer);
