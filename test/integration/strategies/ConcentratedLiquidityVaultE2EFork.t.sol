@@ -385,12 +385,53 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
     ///      Returns the WETH the hatch handed over — the vault's own return
     ///      value counts VAULT ASSET, which is a different thing here — and
     ///      pranks internally so the caller keeps one local, not four.
+    ///
+    ///      MEASURES THE CEILING WHILE IT IS HERE. Both recovery paths now run
+    ///      under `SyndicateVault._SWEEP_GAS` (1,500,000), where before they
+    ///      could be called directly with unbounded gas — so the cap binds the
+    ///      heavy path for the first time, and it has never been measured
+    ///      against live Morpho / Uniswap / ERC-4626 rather than mocks. It has
+    ///      to be measured HERE: the unit-level pin in
+    ///      `ConcentratedLiquidityStrategySettle.t.sol` bounds the template's
+    ///      own logic against stubbed vendors, which is a floor, not the bound.
+    ///
+    ///      AND AN OVERRUN IS SILENT WITHOUT THE SECOND ASSERT. The vault
+    ///      ignores the sub-call's result, so a hatch that exhausts the cap does
+    ///      not revert — it recovers nothing, stays counted, and holds the
+    ///      deposit gate. Gas-under-ceiling alone would therefore pass on
+    ///      exactly the failure being guarded, since a call that OOG'd at the
+    ///      cap also "fits". Pairing it with a recovery that actually landed is
+    ///      what makes the check non-vacuous.
+    ///
+    ///      THREE LOCALS, DELIBERATELY. This suite sits at the via-IR stack
+    ///      limit (see the note on `_collectResidue`); a fourth here fails the
+    ///      whole file to compile, which is why the assertion lives in its own
+    ///      frame below rather than inline.
     function _releaseUnconvertible(address strategy, address caller) internal returns (uint256 releasedWeth) {
         uint256 wethBefore = IERC20(WETH).balanceOf(strategy);
+        uint256 gasBefore = gasleft();
         vm.prank(caller);
         vault.releaseUnconvertible(strategy);
+        _assertFitsSweepCap(gasBefore);
         return wethBefore - IERC20(WETH).balanceOf(strategy);
     }
+
+    /// @dev Reads `gasleft()` one frame down, so the figure carries this call's
+    ///      own overhead. That biases it slightly HIGH, which is the safe
+    ///      direction for a ceiling check — it can report a near-miss that is
+    ///      really a pass, never a pass that is really an overrun.
+    function _assertFitsSweepCap(uint256 gasBefore) internal {
+        uint256 gasUsed = gasBefore - gasleft();
+        emit log_named_uint("releaseUnconvertible gas (fork, whole vault call)", gasUsed);
+        assertLt(gasUsed, SWEEP_GAS_CEILING, "the hatch no longer fits the vault's forwarding cap");
+    }
+
+    /// @dev Mirrors `SyndicateVault._SWEEP_GAS`, which is private and cannot be
+    ///      read from here. Quoted by name in that constant's own natspec as the
+    ///      thing that measures it, so lowering one without the other is caught
+    ///      by review rather than silently going stale in the permissive
+    ///      direction.
+    uint256 internal constant SWEEP_GAS_CEILING = 1_500_000;
 
     function _tickGap() internal view returns (uint256) {
         (, int24 spot,,,,,) = pool.slot0();

@@ -711,4 +711,84 @@ contract PashovFinalDepositResiduePricingTest is VaultInstantLiquidityTest {
 
         assertEq(vault.depositNav(), vault.totalAssets() + 800e6, "bounded by the snapshot");
     }
+
+    // ── the burn runs on the strategy's own clock ──
+
+    /// @notice A LATE HONEST MARK KEEPS ITS OWN FULL WINDOW. The prune's
+    ///         authorization is per-strategy even though the deposit gate's is
+    ///         not, and this is the difference between the two.
+    ///
+    /// @dev    `_unvaluedSince` dates from the episode's FIRST mark, so a
+    ///         strategy marking late inherits a deadline that is nearly spent —
+    ///         correct for `depositsLocked`, which is deliberately bounded per
+    ///         EPISODE so a sequence of hostile labels cannot hold the gate
+    ///         forever (`test_secondUnvaluedLabelDoesNotRestartTheClock` pins
+    ///         that, and it must keep passing).
+    ///
+    ///         Reading that same inherited deadline to authorize a PERMANENT
+    ///         per-strategy burn was the bug. The honest label below marks one
+    ///         second before the running deadline; two seconds later it was
+    ///         prunable, having had a three-second window. And since
+    ///         `_refreshUnvalued` refuses to re-mark a burned label, its real
+    ///         unvaluable residue then stopped gating deposits for the vault's
+    ///         life — finding #3's skim, permanent, with no attacker needed:
+    ///         two strategies settling inside one window is ordinary (see
+    ///         `test_finding3_twoOutstandingStrategiesBothPriced`).
+    function test_lateHonestMarkCannotBeBurnedOnTheEpisodeClock() public {
+        StubDeliveryStrategy liar = new StubDeliveryStrategy();
+        liar.setHolding(true);
+        liar.setUnvalued(true);
+        _settleWith(address(liar));
+
+        // An honest strategy marks one second before the liar's deadline.
+        vm.warp(vm.getBlockTimestamp() + 7 days - 1);
+        StubDeliveryStrategy honest = new StubDeliveryStrategy();
+        honest.setHolding(true);
+        honest.setUnvalued(true);
+        honest.setResidue(1_000e6); // keeps it TRACKED past a prune
+        _settleWithPid(PID + 1, address(honest));
+        assertTrue(vault.depositsLocked(), "precondition: the honest mark is live");
+
+        // Two seconds on, the EPISODE is over -- and that much is intended.
+        vm.warp(vm.getBlockTimestamp() + 2);
+        assertFalse(vault.depositsLocked(), "the episode clock stopped bounding the lock");
+
+        // ...but the honest label's own window has three seconds on it, so the
+        // burn is refused. This is the assertion the fix adds.
+        vm.prank(makeAddr("passerby"));
+        vm.expectRevert(ISyndicateVault.UnvaluedLockStillActive.selector);
+        vault.pruneUnvaluedMark(address(honest));
+
+        // The liar, whose own window really did lapse, is still prunable --
+        // otherwise the fix would have bought safety by disabling the prune.
+        vm.prank(makeAddr("passerby"));
+        vault.pruneUnvaluedMark(address(liar));
+    }
+
+    /// @notice NON-VACUITY CONTROL for the test above: once the honest label's
+    ///         OWN window lapses it is prunable like any other, and the gate
+    ///         re-arms. A fix that merely made late marks unprunable forever
+    ///         would pass the test above and fail this one.
+    function test_lateHonestMarkIsPrunableOnceItsOwnWindowLapses() public {
+        StubDeliveryStrategy liar = new StubDeliveryStrategy();
+        liar.setHolding(true);
+        liar.setUnvalued(true);
+        _settleWith(address(liar));
+
+        vm.warp(vm.getBlockTimestamp() + 7 days - 1);
+        StubDeliveryStrategy honest = new StubDeliveryStrategy();
+        honest.setHolding(true);
+        honest.setUnvalued(true);
+        honest.setResidue(1_000e6);
+        _settleWithPid(PID + 1, address(honest));
+
+        // Its own seven days, measured from its own mark.
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        vm.prank(makeAddr("passerby"));
+        vault.pruneUnvaluedMark(address(honest));
+
+        // And the burn still bites: a pruned label cannot re-shut the gate.
+        vault.collectResidue(address(honest));
+        assertFalse(vault.depositsLocked(), "a pruned label re-shut the gate");
+    }
 }

@@ -454,6 +454,40 @@ contract SyndicateVault is
     ///         a fresh proposal carried to Settled, every window, forever.
     mapping(address strategy => bool) private _unvaluedBurned;
 
+    /// @notice When each strategy's own unvalued mark was set, or 0 while it
+    ///         carries none. Read ONLY by `pruneUnvaluedMark`.
+    ///
+    ///         TWO CLOCKS, BECAUSE THERE ARE TWO QUESTIONS. `_unvaluedSince`
+    ///         answers "how long may the vault stay shut", and dating it from
+    ///         the episode's FIRST mark is what stops a sequence of hostile
+    ///         labels from holding the gate indefinitely. This one answers "has
+    ///         THIS label spent its episode", and it has to be per-strategy
+    ///         because the prune it authorizes is per-strategy and permanent.
+    ///
+    ///         READING THE GLOBAL CLOCK FOR A PER-STRATEGY BURN WAS THE BUG. A
+    ///         strategy that marks late inside somebody else's episode inherits
+    ///         that episode's deadline — correctly, for the deposit gate — and
+    ///         the prune then treated the inherited deadline as proof that THIS
+    ///         label had had its window. An honest strategy marking one second
+    ///         before the running deadline was burnable two seconds later,
+    ///         having had three seconds. Since `_refreshUnvalued` refuses to
+    ///         re-mark a burned label, its genuinely unvaluable residue then
+    ///         stops gating deposits for the vault's life — which is finding
+    ///         #3's skim made permanent, reachable with no attacker at all by
+    ///         two strategies settling inside one window.
+    ///
+    ///         So the deposit lock keeps the earliest-mark-wins rule and the
+    ///         burn does not. An attacker can still truncate how long the vault
+    ///         stays SHUT (that is the deliberate anti-restart trade), but can
+    ///         no longer use their own expiry to spend someone else's episode.
+    ///
+    ///         FALLS BACK TO `_unvaluedSince` when unset, so a mark that
+    ///         predates this field is governed by the episode clock rather than
+    ///         by zero — the difference between "prunable on the old rule" and
+    ///         "prunable immediately". Unreachable today (no vault proxy is
+    ///         live; see `__gap`), and cheap insurance if that ever changes.
+    mapping(address strategy => uint256) private _unvaluedMarkedAt;
+
     /// @dev Reserved storage for future upgrades. Shrinks whenever a new state
     ///      variable is added above. Grown from 28 → 31 slots: this deletion
     ///      frees `_laneALockPid` (1), `_interimNetFlow` (1), and
@@ -464,7 +498,8 @@ contract SyndicateVault is
     ///      take one each, replacing the single `_lastSettledStrategy` slot.
     ///      23: `_unvaluedSince` takes one more.
     ///      22: `_unvaluedBurned` takes one more.
-    uint256[22] private __gap;
+    ///      21: `_unvaluedMarkedAt` takes one more.
+    uint256[21] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -1526,14 +1561,28 @@ contract SyndicateVault is
     ///
     ///         The strategy is burned as it is pruned; see `_unvaluedBurned` for
     ///         why the pair is inseparable.
+    ///
+    ///         MEASURED ON THIS STRATEGY'S OWN CLOCK, not the episode's. The
+    ///         deposit gate runs on `_unvaluedSince` so that a later mark cannot
+    ///         restart the lock; reading that same figure here would let one
+    ///         label's expiry authorize a PERMANENT burn of another label that
+    ///         had barely marked. See `_unvaluedMarkedAt`.
     function pruneUnvaluedMark(address strategy) external {
         if (!_residueUnvalued[strategy]) return; // idempotent: nothing marked
-        if (block.timestamp < _unvaluedSince + UNVALUED_MAX_LOCK) revert UnvaluedLockStillActive();
+        if (block.timestamp < _markStartOf(strategy) + UNVALUED_MAX_LOCK) revert UnvaluedLockStillActive();
 
         _residueUnvalued[strategy] = false;
         _unvaluedBurned[strategy] = true;
-        _bumpUnvalued(false);
+        _bumpUnvalued(strategy, false);
         emit ResidueUnvalued(strategy, false);
+    }
+
+    /// @dev When `strategy`'s own mark was set. Falls back to the episode clock
+    ///      for a mark predating `_unvaluedMarkedAt`; see that field for why the
+    ///      fallback is the episode figure and not zero.
+    function _markStartOf(address strategy) private view returns (uint256) {
+        uint256 own = _unvaluedMarkedAt[strategy];
+        return own != 0 ? own : _unvaluedSince;
     }
 
     /// @dev The one measured door onto a settled strategy. `selector` picks the
@@ -1562,8 +1611,13 @@ contract SyndicateVault is
         _payCohortShare(strategy, collected);
 
         // Nothing on the books to reconcile. Anything that DID arrive has
-        // already been split with the cohort above, which is the whole reason
-        // this runs before the bookkeeping rather than after it.
+        // already been through `_payCohortShare` above, which is the whole
+        // reason that runs before the bookkeeping rather than after it — and
+        // it is a real split precisely when this strategy has a settlement
+        // behind it, i.e. `_residuePid` survives an amount that went to zero.
+        // For an address that never settled the pid is 0, `_cohortFractionOf`
+        // declines, and the arrival belongs to the stayers in full; there is
+        // no cohort to owe.
         if (!tracked) return collected;
 
         // A CODELESS STRATEGY OWES NOTHING. It can hold nothing and answer
@@ -1573,7 +1627,7 @@ contract SyndicateVault is
             if (known != 0) _setResidue(strategy, 0);
             if (_residueUnvalued[strategy]) {
                 _residueUnvalued[strategy] = false;
-                _bumpUnvalued(false);
+                _bumpUnvalued(strategy, false);
                 emit ResidueUnvalued(strategy, false);
             }
             emit ResidueCleared(strategy, collected);
@@ -1813,22 +1867,39 @@ contract SyndicateVault is
         // clear it.
         if (now_ && _unvaluedBurned[strategy]) return;
         _residueUnvalued[strategy] = now_;
-        _bumpUnvalued(now_);
+        _bumpUnvalued(strategy, now_);
         emit ResidueUnvalued(strategy, now_);
     }
 
-    /// @dev The ONLY place `_unvaluedCount` moves, so the deadline bounding the
-    ///      lock can never drift from the count it guards. Dated from the FIRST
-    ///      mark (0 -> 1) and cleared on the last (1 -> 0): the window
+    /// @dev The ONLY place `_unvaluedCount` and EITHER clock move, so neither
+    ///      deadline can drift from the marks it governs.
+    ///
+    ///      THE EPISODE CLOCK, `_unvaluedSince`, is dated from the FIRST mark
+    ///      (0 -> 1) and cleared on the last (1 -> 0): the window
     ///      `depositsLocked` honours is therefore the whole episode, not a fresh
-    ///      grace period per strategy. Per-strategy deadlines would let a
-    ///      sequence of hostile labels hold the gate shut indefinitely, which is
-    ///      the exact failure `_unvaluedSince` exists to rule out.
-    function _bumpUnvalued(bool marked) private {
+    ///      grace period per strategy. Per-strategy deposit deadlines would let
+    ///      a sequence of hostile labels hold the gate shut indefinitely, which
+    ///      is the exact failure `_unvaluedSince` exists to rule out.
+    ///
+    ///      THE PER-STRATEGY CLOCK, `_unvaluedMarkedAt`, is dated from THIS
+    ///      label's own mark and cleared when it drops, because the only thing
+    ///      that reads it — `pruneUnvaluedMark` — burns one strategy forever.
+    ///      Sharing the episode clock with the burn is what let one label's
+    ///      expiry spend another's window; see `_unvaluedMarkedAt`.
+    function _bumpUnvalued(address strategy, bool marked) private {
         if (marked) {
             if (_unvaluedCount == 0) _unvaluedSince = block.timestamp;
+            _unvaluedMarkedAt[strategy] = block.timestamp;
             _unvaluedCount += 1;
         } else {
+            // HYGIENE, NOT BEHAVIOUR, and stated as such because a test that
+            // claimed otherwise was vacuous. Nothing can observe this reset:
+            // `_markStartOf` is read only by `pruneUnvaluedMark`, which returns
+            // early unless a mark is standing, and every mark re-stamps in the
+            // arm above. It is kept so a stale timestamp cannot become load
+            // bearing for a future reader — if one ever does read it outside a
+            // live mark, that reader needs a test, since this line has none.
+            _unvaluedMarkedAt[strategy] = 0;
             _unvaluedCount -= 1;
             if (_unvaluedCount == 0) _unvaluedSince = 0;
         }
