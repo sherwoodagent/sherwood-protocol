@@ -423,8 +423,21 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // 64 — so validating against the batch figure here would accept a payload
         // that reverts `InvalidCallSet` at execute, after the proposer's bond was
         // locked and the review period spent, with no path to fix it.
-        if (sandbox.calls.length > MAX_SANDBOX_CALLS || sandbox.declaredTokens.length > MAX_SANDBOX_TOKENS) {
-            revert TooManyCalls();
+        if (sandbox.calls.length > MAX_SANDBOX_CALLS) revert TooManyCalls();
+        if (sandbox.declaredTokens.length > MAX_SANDBOX_TOKENS) revert TooManySandboxTokens();
+        // MIRRORS `CallSandbox.init`'S OWN REFUSAL, and must. Every rule `init`
+        // enforces has to be enforced HERE too, or the payload that breaks it
+        // clears the vote and the whole review period and then reverts at
+        // execute with the proposer's bond locked and no way to amend — the
+        // same reason the call-count bound is checked against the sandbox's
+        // figure rather than the batch's. Pinned by
+        // `test_propose_duplicateDeclaredTokenRejectedAtProposeNotExecute`.
+        for (uint256 i = 0; i < sandbox.declaredTokens.length; i++) {
+            for (uint256 j = 0; j < i; j++) {
+                if (sandbox.declaredTokens[i] == sandbox.declaredTokens[j]) {
+                    revert DuplicateSandboxToken(sandbox.declaredTokens[i]);
+                }
+            }
         }
         if (sandbox.funding == 0) revert ZeroSandboxFunding();
         // REFUSE HERE, NOT AT EXECUTE. A vault created before its factory had a

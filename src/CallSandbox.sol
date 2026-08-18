@@ -60,12 +60,43 @@ contract CallSandbox is ICallSandbox {
     ///      consume the whole transaction.
     uint256 private constant _PROBE_GAS = 150_000;
 
-    /// @dev Per-token ceiling for the declared-token leg of `sweep`. Sized so
-    ///      all 16 declared tokens fit inside the vault's own 1,500,000-gas
-    ///      `_SWEEP_GAS` budget for the whole call, with room left for the asset
-    ///      transfer that runs first: a single hostile entry can waste its own
-    ///      leg and nothing else.
+    /// @dev Per-token CEILINGS for the two declared-token loops. They are only
+    ///      the upper half of the bound — see `_fairShare`, which is what
+    ///      actually stops one entry starving the rest.
+    ///
+    ///      A FIXED CEILING ALONE IS NOT A BOUND ON A LOOP. The first version of
+    ///      this contract capped each token probe at `_PROBE_GAS` (150,000) —
+    ///      the same figure the VAULT allows for the whole
+    ///      `hasUnvaluedResidue()` call — so one declared token that burns its
+    ///      allowance consumed the caller's entire budget and every token behind
+    ///      it reverted the function out of gas. Two confirmed consequences:
+    ///      `SyndicateVault._refreshUnvalued` reads unreadable, KEEPS the last
+    ///      known flag, and a flag that latched true could never clear again
+    ///      (permanent deposit brick); and `collectResidue`'s 1,500,000-gas
+    ///      `sweep()` ran out before the asset leg, recovering nothing.
+    ///      Regression-pinned by `test_probe_*` / `test_sweep_*` in
+    ///      `test/governor/SandboxProposal.t.sol`.
+    uint256 private constant _TOKEN_PROBE_GAS = 30_000;
     uint256 private constant _TOKEN_SWEEP_GAS = 80_000;
+
+    /// @dev How long a declared token's transfer must have been failing before
+    ///      it may be abandoned. Measured from the FIRST OBSERVED FAILURE, not
+    ///      from the run: settlement is already `strategyDuration` past the run,
+    ///      so anchoring there would leave the guard elapsed before anyone could
+    ///      realistically sweep, which is the same as not having it.
+    ///
+    ///      What it buys: abandonment reopens deposits on a token the vault then
+    ///      stops counting, and `sweep()` is permissionless — so without a delay
+    ///      anyone could write off live value by calling during a TRANSIENT
+    ///      failure (a paused token, a temporary blacklist) and the write-off
+    ///      would outlive the condition. Requiring the failure to PERSIST is what
+    ///      distinguishes "unmovable" from "not moving right now".
+    ///
+    ///      The cost is stated: a genuinely unmovable token holds the deposit
+    ///      lock for this long instead of clearing on the first sweep. Bounded
+    ///      and self-clearing, against a permanent brick on the other side —
+    ///      the same trade `SyndicateVault.depositsLocked` already makes.
+    uint256 public constant ABANDON_DELAY = 2 days;
 
     address private _vault;
     address private _asset;
@@ -88,7 +119,30 @@ contract CallSandbox is ICallSandbox {
     ///      counted as vault value, and no LP mints against it. Nothing that
     ///      could be recovered is given up — the flag is only ever set after a
     ///      real transfer attempt failed.
+    ///
+    ///      TWO GUARDS AGAINST WRITING OFF LIVE VALUE, because this flag moves
+    ///      in the direction that REOPENS deposits: a token wrongly abandoned is
+    ///      one the vault stops counting while the sandbox still holds it, and
+    ///      the next depositor mints too cheaply against it.
+    ///
+    ///      1. NOT UNTIL THE FAILURE HAS PERSISTED for `ABANDON_DELAY`, tracked
+    ///         per token in `_failedSince`. `sweep()` is permissionless, so
+    ///         without this anyone could write a token off by calling during a
+    ///         TRANSIENT failure — a paused token, a temporary blacklist, a
+    ///         transfer momentarily over the per-token ceiling — and the
+    ///         write-off would outlive the condition that caused it. Two failed
+    ///         sweeps a week apart is evidence; one is a snapshot.
+    ///      2. CLEARED THE MOMENT A LATER TRANSFER SUCCEEDS. The flag records a
+    ///         belief about movability, not a verdict; if the token proves
+    ///         movable after all, the belief was wrong and nothing should still
+    ///         rest on it.
     mapping(address token => bool) private _abandoned;
+
+    /// @dev When a declared token's transfer was first seen to fail, or zero if
+    ///      it has never failed (or last succeeded). The clock `ABANDON_DELAY`
+    ///      runs on. Cleared on any success, so a token that recovers starts
+    ///      from scratch rather than carrying credit toward being written off.
+    mapping(address token => uint64) private _failedSince;
 
     modifier onlyVault() {
         if (msg.sender != _vault) revert NotVault();
@@ -120,7 +174,15 @@ contract CallSandbox is ICallSandbox {
             if (calls_[i].target == address(0)) revert InvalidCallSet();
             _calls.push(Call({target: calls_[i].target, data: calls_[i].data}));
         }
+        // DUPLICATES REFUSED. Both declared-token loops divide a borrowed gas
+        // budget between entries (see `_fairShare`), so a list padded with the
+        // same address 16 times shrinks every real entry's slice for nothing.
+        // `MAX_DECLARED_TOKENS` bounds the count; this makes the count mean
+        // distinct tokens. O(n^2) over at most 16 entries, once, at mint.
         for (uint256 i = 0; i < declaredTokens_.length; i++) {
+            for (uint256 j = 0; j < i; j++) {
+                if (declaredTokens_[i] == declaredTokens_[j]) revert DuplicateDeclaredToken(declaredTokens_[i]);
+            }
             _declaredTokens.push(declaredTokens_[i]);
         }
     }
@@ -162,6 +224,16 @@ contract CallSandbox is ICallSandbox {
     ///      back to mint shares while an open proposal has deposits locked, or
     ///      touch the queue's stamp and reserve counters, corrupting figures
     ///      other guards assume only the vault itself can move.
+    ///
+    ///      DEFENCE IN DEPTH, NOT THE LOAD-BEARING GUARD — do not build on it as
+    ///      though it were. It screens STORED TARGETS ONLY, and a payload reaches
+    ///      any of these addresses anyway by naming a proposer-deployed forwarder
+    ///      that calls on to them; screening one hop cannot be made complete.
+    ///      What actually holds is upstream and unaffected by indirection:
+    ///      `SyndicateVault.runSandbox` is `nonReentrant`, so no route back into
+    ///      the vault survives while a run is in flight, and every function on
+    ///      the contracts below is gated to its own privileged caller. This list
+    ///      catches the direct, obvious shape cheaply; it is not a boundary.
     ///
     ///      TWO CLASSES, AND THE DIFFERENCE IS DELIBERATE.
     ///
@@ -255,11 +327,15 @@ contract CallSandbox is ICallSandbox {
         // vault's own `depositsLocked` natspec calls exactly that trade (a
         // permanent, unrecoverable brick) worse than the suppression it guards.
         //
-        // BEST-EFFORT, PER TOKEN, ON A BOUNDED BUDGET. The list is
+        // BEST-EFFORT, PER TOKEN, ON A FAIRLY DIVIDED BUDGET. The list is
         // proposer-authored: a token that reverts, returns nothing, or burns gas
         // must not take down the sweep and re-brick the exit it is the only
-        // escape from. A raw call with its own ceiling means the worst a hostile
-        // entry costs is its own leg. `MAX_DECLARED_TOKENS` bounds the loop.
+        // escape from. `_fairShare` is what makes "its own leg" true — a FIXED
+        // ceiling alone does not, because 16 entries at the old 150,000-gas
+        // probe ceiling is 2.4M against the 1,500,000 `SyndicateVault.collectResidue`
+        // lends this call. Measured before the fix: 16 gas-burning declared
+        // tokens consumed the entire 1.5M and the ASSET TRANSFER ABOVE was
+        // reverted with it, recovering nothing.
         //
         // Tokens land in the VAULT, where `totalAssets()` does not count them —
         // so this recovers custody without ever pricing an unvalued asset into a
@@ -268,23 +344,66 @@ contract CallSandbox is ICallSandbox {
         for (uint256 i = 0; i < n; i++) {
             address t = _declaredTokens[i];
             if (t == address(0) || t == _asset || t.code.length == 0) continue;
-            (bool okBal, bytes memory balRet) =
-                t.staticcall{gas: _PROBE_GAS}(abi.encodeWithSelector(IERC20.balanceOf.selector, address(this)));
+            uint256 share = _fairShare(n - i);
+            (bool okBal, bytes memory balRet) = t.staticcall{gas: _min(share / 4, _TOKEN_PROBE_GAS)}(
+                abi.encodeWithSelector(IERC20.balanceOf.selector, address(this))
+            );
             if (!okBal || balRet.length != 32) continue;
             uint256 bal = abi.decode(balRet, (uint256));
             if (bal == 0) continue;
             // solhint-disable-next-line avoid-low-level-calls
-            (bool okXfer,) =
-                t.call{gas: _TOKEN_SWEEP_GAS}(abi.encodeWithSelector(IERC20.transfer.selector, vault_, bal));
+            (bool okXfer,) = t.call{gas: _min(share - share / 4, _TOKEN_SWEEP_GAS)}(
+                abi.encodeWithSelector(IERC20.transfer.selector, vault_, bal)
+            );
             if (okXfer) {
                 emit SandboxTokenSwept(t, bal);
-            } else {
-                // Proven unmovable — stop counting it, or the lock is permanent.
-                // See `_abandoned`.
+                // THE BELIEF WAS WRONG, SO DROP IT. A token that moves is
+                // movable; leaving either mark set would keep the vault blind to
+                // a balance it could arrive at again, and would let unrelated
+                // past failures accumulate toward a write-off.
+                _failedSince[t] = 0;
+                if (_abandoned[t]) {
+                    _abandoned[t] = false;
+                    emit SandboxTokenAbandonmentCleared(t);
+                }
+            } else if (_failedSince[t] == 0) {
+                // FIRST FAILURE STARTS THE CLOCK AND NOTHING ELSE. One failed
+                // transfer is a snapshot, not a verdict, and this call is
+                // permissionless — writing the token off here would let anyone
+                // pick the moment. See `_abandoned`.
+                _failedSince[t] = uint64(block.timestamp);
+            } else if (block.timestamp >= _failedSince[t] + ABANDON_DELAY) {
+                // Still failing a whole `ABANDON_DELAY` later: a transient cause
+                // has been ruled out, so stop counting it or the lock is
+                // permanent. Until then the token keeps counting and deposits
+                // stay shut — the recoverable direction.
                 _abandoned[t] = true;
                 emit SandboxTokenAbandoned(t, bal);
             }
         }
+    }
+
+    /// @dev This iteration's slice of the gas still in hand, with `remaining`
+    ///      tokens left to visit (this one included).
+    ///
+    ///      THE POINT IS THE DIVISION, NOT THE CEILING. A per-entry ceiling
+    ///      bounds one call; it does not bound a LOOP, because n entries at the
+    ///      ceiling exceed whatever the caller lent. Dividing what is actually
+    ///      left means a hostile entry can consume its own slice and no more —
+    ///      every token behind it still gets a turn, and the function always
+    ///      returns rather than reverting the caller out of gas.
+    ///
+    ///      The `+ 1` reserves a slice for the work after the loop (the return,
+    ///      and in `sweep` nothing else), so the LAST entry cannot take
+    ///      everything either. Scales both ways: given a generous budget the
+    ///      slices exceed the ceilings and the ceilings bind, which is the
+    ///      ordinary case.
+    function _fairShare(uint256 remaining) private view returns (uint256) {
+        return gasleft() / (remaining + 1);
+    }
+
+    function _min(uint256 a, uint256 b) private pure returns (uint256) {
+        return a < b ? a : b;
     }
 
     /// @inheritdoc IStrategyDelivery
@@ -316,14 +435,29 @@ contract CallSandbox is ICallSandbox {
     ///
     ///      A token that fails to answer `balanceOf` is treated as holding
     ///      nothing, so a hostile token cannot brick the mint path by reverting.
+    ///
+    ///      AND IT MUST NOT BE ABLE TO BRICK IT BY BURNING, EITHER — the subtler
+    ///      half, and the one this originally got wrong. The vault reads this
+    ///      through a 150,000-gas staticcall and `_refreshUnvalued` KEEPS THE
+    ///      LAST KNOWN FLAG when the read fails, so a payload that makes this
+    ///      function unreadable forever freezes whatever the flag last said. One
+    ///      declared token burning the old per-token ceiling (also 150,000, i.e.
+    ///      the caller's whole budget) did exactly that: probe once while a real
+    ///      residue token sits first in the list to latch the flag TRUE, drain
+    ///      that token so the loop walks past it into the burner, and every
+    ///      later read reverts out of gas — `depositsLocked()` true for the life
+    ///      of the vault, with no permissionless exit and no owner override.
+    ///      `_fairShare` removes the premise: no entry can take the budget the
+    ///      entries behind it need, so this always returns an answer.
     function hasUnvaluedResidue() external view returns (bool) {
         address asset_ = _asset;
         uint256 n = _declaredTokens.length;
         for (uint256 i = 0; i < n; i++) {
             address t = _declaredTokens[i];
             if (t == address(0) || t == asset_ || _abandoned[t]) continue;
-            (bool ok, bytes memory ret) =
-                t.staticcall{gas: _PROBE_GAS}(abi.encodeWithSelector(IERC20.balanceOf.selector, address(this)));
+            (bool ok, bytes memory ret) = t.staticcall{gas: _min(_fairShare(n - i), _TOKEN_PROBE_GAS)}(
+                abi.encodeWithSelector(IERC20.balanceOf.selector, address(this))
+            );
             if (ok && ret.length == 32 && abi.decode(ret, (uint256)) != 0) return true;
         }
         return false;

@@ -94,6 +94,12 @@ A contract cannot enumerate every token it holds, so the declared set is what ma
 
 The lock SHALL have an exit that no one can withhold. Residue collection SHALL therefore also push each declared non-asset token to the vault, and a declared token that proves unmovable — a transfer attempt that fails — SHALL stop being counted. Without both, the lock is permanent: nothing else can move a token out of a sandbox whose one-shot run is already spent, so a proposer could shut minting forever by declaring a token its payload leaves behind, or one whose transfer always reverts. An abandoned token is stranded exactly as an undeclared one is, which is a loss already accepted; a deposit brick nobody can clear is not.
 
+Abandonment SHALL require the transfer failure to persist. Collection is permissionless, so a single failed attempt is a moment someone else chose: a token that is merely paused or temporarily restricted would otherwise be written off by anyone who called at the right time, and the vault would then price mints as though value it still holds were gone. A token SHALL therefore only be abandoned once its transfer has been observed failing across a delay, and the mark SHALL be cleared if the token ever transfers successfully. The cost — a genuinely unmovable token holds the lock for that delay rather than clearing on the first attempt — is bounded and self-clearing, which is the trade the deposit gate already makes everywhere else.
+
+Both residue reads run on gas BORROWED from the vault, and the declared set is proposer-authored, so each entry SHALL be bounded by a share of the budget actually remaining rather than by a fixed per-entry ceiling alone. A fixed ceiling does not bound a loop: entries at the ceiling exceed what the caller lent, and an entry that consumes what the entries behind it need makes the whole read revert. That failure is silent in the direction that matters — the vault treats an unreadable residue probe as "keep the last known flag", so a payload could latch the deposit lock on and then make it unclearable, and a collection sweep could run out before returning the asset. Every declared-token loop SHALL therefore terminate and return an answer regardless of how any single entry behaves.
+
+The declared set SHALL contain no duplicates, and that SHALL be enforced when the proposal is created rather than only when the sandbox is minted: a rule enforced only at execution kills a proposal that has already cleared the vote and the review period, with the proposer's bond locked and no way to amend it.
+
 #### Scenario: Asset balance returns in full
 - **WHEN** a sandbox settles holding a vault-asset balance
 - **THEN** the entire balance SHALL be transferred to the vault and its reported undelivered value SHALL become zero
@@ -108,7 +114,23 @@ The lock SHALL have an exit that no one can withhold. Residue collection SHALL t
 
 #### Scenario: The declared-leftover lock always has an exit
 - **WHEN** residue collection is called against a sandbox holding a declared non-asset token
-- **THEN** the token SHALL be pushed to the vault, or — if it proves unmovable — abandoned and no longer counted, and deposits SHALL reopen in either case
+- **THEN** the token SHALL be pushed to the vault, or — if it proves unmovable across the abandonment delay — abandoned and no longer counted, and deposits SHALL reopen in either case
+
+#### Scenario: A transiently unmovable token is not written off
+- **WHEN** a declared token's transfer fails once and then succeeds before the abandonment delay elapses
+- **THEN** the token SHALL NOT be abandoned, and its balance SHALL be recovered to the vault rather than stranded
+
+#### Scenario: A gas-hostile declared token cannot freeze the residue report
+- **WHEN** a declared token consumes every drop of gas offered to it while other declared tokens remain to be read
+- **THEN** the residue report SHALL still return an answer, and the deposit lock SHALL remain clearable
+
+#### Scenario: A gas-hostile declared token cannot strand the funded capital
+- **WHEN** residue collection is called against a sandbox whose declared set is full of gas-consuming tokens
+- **THEN** the vault-asset balance SHALL still be returned to the vault in full
+
+#### Scenario: A duplicated declared token is refused at propose
+- **WHEN** a proposal declares the same token more than once
+- **THEN** it SHALL be rejected when the proposal is created, not when the sandbox is minted
 
 #### Scenario: Recovery does not depend on the batch
 - **WHEN** the vault's permissionless residue collection is called against a sandbox

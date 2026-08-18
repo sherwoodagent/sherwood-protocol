@@ -83,6 +83,60 @@ contract UnmovableFaucet {
     }
 }
 
+/// @dev A declared token whose `balanceOf` burns every drop of gas handed to it.
+///      A proposer can deploy exactly this, and it is the ADVERSARY the residue
+///      probes have to survive: the sandbox's loops run on gas BORROWED from the
+///      vault (150,000 for `hasUnvaluedResidue`, 1,500,000 for `collectResidue`'s
+///      sweep), so an entry that takes more than its share does not merely fail —
+///      it reverts the whole call, and `SyndicateVault._refreshUnvalued` reads an
+///      unreadable probe as "keep the last known flag".
+contract GasBurnerToken {
+    uint256 public sink;
+
+    function balanceOf(address) external view returns (uint256) {
+        uint256 acc;
+        while (true) {
+            acc = uint256(keccak256(abi.encode(acc, sink)));
+        }
+        return acc;
+    }
+
+    function transfer(address, uint256) external pure returns (bool) {
+        return true;
+    }
+}
+
+/// @dev A token that can be made to refuse transfers and then allowed again —
+///      a paused token, a temporary blacklist, an incident. Distinguishes a
+///      TRANSIENT failure from a permanent one, which is the whole question
+///      `ABANDON_DELAY` exists to answer.
+contract PausableToken {
+    mapping(address => uint256) public balanceOf;
+    bool public paused;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function setPaused(bool p) external {
+        paused = p;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(!paused, "paused");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+/// @dev Faucet for `PausableToken` — same reason as `TokenFaucet`.
+contract PausableFaucet {
+    function pour(address token, uint256 amount) external {
+        PausableToken(token).mint(msg.sender, amount);
+    }
+}
+
 /// @notice The central claims of `permissionless-tier2-sandbox`: an uncertified,
 ///         unlisted target reaches execution with no owner transaction, and the
 ///         most a hostile payload can cost is the amount it was funded with —
@@ -623,6 +677,13 @@ contract SandboxProposalTest is Test {
     ///         and the lock clears — the token stays stranded and unpriced,
     ///         which is exactly how an undeclared leftover is already treated.
     ///         Any registered agent could otherwise shut minting forever.
+    /// @dev    TWO SWEEPS, `ABANDON_DELAY` APART, and that is the point rather
+    ///         than a wrinkle. One failed transfer is a snapshot: `sweep()` is
+    ///         permissionless, so if a single failure wrote the token off anyone
+    ///         could pick a moment when a PERFECTLY GOOD token happens to be
+    ///         paused and make the vault stop counting value it still holds.
+    ///         Abandonment therefore requires the failure to persist, and the
+    ///         lock it clears is bounded by that delay instead of permanent.
     function test_residue_unmovableDeclaredTokenIsAbandonedRatherThanBrickingDeposits() public {
         UnmovableToken bad = new UnmovableToken();
         UnmovableFaucet badFaucet = new UnmovableFaucet();
@@ -647,10 +708,171 @@ contract SandboxProposalTest is Test {
         assertTrue(vault.depositsLocked(), "it locks like any other declared leftover");
 
         vault.collectResidue(sandbox);
+        assertTrue(vault.depositsLocked(), "the FIRST failure only starts the clock - one sweep is not evidence");
+        assertEq(usdc.balanceOf(sandbox), 0, "while the real capital came home on that very first call");
 
-        assertFalse(vault.depositsLocked(), "and one permissionless call still reopens deposits");
+        vm.warp(vm.getBlockTimestamp() + sandboxImpl.ABANDON_DELAY());
+        vault.collectResidue(sandbox);
+
+        assertFalse(vault.depositsLocked(), "still failing a delay later: abandoned, and deposits reopen");
         assertEq(bad.balanceOf(sandbox), 5e18, "the token itself is stranded, as it must be");
-        assertEq(usdc.balanceOf(sandbox), 0, "while the real capital came home");
+    }
+
+    /// @notice A token that was merely PAUSED is not written off. Abandonment
+    ///         reopens deposits on value the vault then stops counting, and
+    ///         `sweep()` is permissionless — so a griefer must not be able to
+    ///         pick a moment of transient failure and make that call for
+    ///         everyone. Once the token moves again it is swept for real.
+    function test_abandon_transientFailureIsNotWrittenOff() public {
+        PausableToken flaky = new PausableToken();
+        PausableFaucet flakyFaucet = new PausableFaucet();
+
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(flaky);
+
+        uint256 pid = _proposeSandbox(
+            _payload(
+                _oneCall(address(flakyFaucet), abi.encodeCall(PausableFaucet.pour, (address(flaky), 5e18))),
+                FUNDING,
+                tokens
+            ),
+            agent
+        );
+        _advancePastVoting();
+        governor.executeProposal(pid);
+        address sandbox = vault.sandboxOf(pid);
+
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        governor.settleProposal(pid);
+
+        flaky.setPaused(true);
+        vault.collectResidue(sandbox);
+        assertTrue(vault.depositsLocked(), "a paused token is still held, so it still counts");
+        assertEq(flaky.balanceOf(sandbox), 5e18, "and it is still there");
+
+        // The incident ends WITHIN the delay - exactly the case a single-failure
+        // write-off would have got wrong.
+        flaky.setPaused(false);
+        vault.collectResidue(sandbox);
+
+        assertFalse(vault.depositsLocked(), "it moved, so there is nothing left to count");
+        assertEq(flaky.balanceOf(sandbox), 0, "the value was RECOVERED, not written off");
+        assertEq(flaky.balanceOf(address(vault)), 5e18, "and it reached the vault");
+    }
+
+    // ── 5.6b gas-adversarial declared tokens ──────────────────────────────
+
+    /// @notice A declared token that BURNS GAS must not be able to freeze the
+    ///         residue flag. The vault reads `hasUnvaluedResidue()` through a
+    ///         150,000-gas staticcall and `_refreshUnvalued` KEEPS THE LAST KNOWN
+    ///         FLAG when that read fails — so a payload that latches the flag
+    ///         true and then makes the probe permanently unreadable would shut
+    ///         the mint side for the life of the vault, with no permissionless
+    ///         exit and no owner override.
+    /// @dev    The sequence is the exploit: `foreign` sits FIRST so the first
+    ///         probe returns true cheaply and the flag latches; sweeping it out
+    ///         then forces every later probe to walk past it into the burner.
+    ///         Against a fixed per-token gas ceiling equal to the caller's whole
+    ///         budget this reverts out of gas forever; against `_fairShare` the
+    ///         burner gets its slice and the loop still answers.
+    ///
+    ///         THE TRAILING TOKEN IS LOAD-BEARING, not padding. With the burner
+    ///         LAST this test passes against the broken code too: EIP-150 hands a
+    ///         sub-call only 63/64 of what is left, so a final burner still
+    ///         leaves its caller the 1/64 it needs to return. Only an entry that
+    ///         starves an entry BEHIND it makes the whole function unreadable,
+    ///         which is the condition `_fairShare` actually removes. Verified by
+    ///         mutation: restore the fixed `_PROBE_GAS` ceiling and this fails.
+    function test_probe_gasBurningDeclaredTokenCannotFreezeTheResidueFlag() public {
+        GasBurnerToken burner = new GasBurnerToken();
+
+        address[] memory tokens = new address[](3);
+        tokens[0] = address(foreign);
+        tokens[1] = address(burner);
+        tokens[2] = address(new ERC20Mock("Trailing", "TRAIL", 18));
+
+        uint256 pid = _proposeSandbox(
+            _payload(
+                _oneCall(address(faucet), abi.encodeCall(TokenFaucet.pour, (address(foreign), 5e18))), FUNDING, tokens
+            ),
+            agent
+        );
+        _advancePastVoting();
+        governor.executeProposal(pid);
+        address sandbox = vault.sandboxOf(pid);
+
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        governor.settleProposal(pid);
+        assertTrue(vault.depositsLocked(), "the flag latches true while the declared leftover is held");
+
+        vault.collectResidue(sandbox);
+
+        assertEq(foreign.balanceOf(sandbox), 0, "the leftover came home");
+        assertFalse(vault.depositsLocked(), "and the probe still ANSWERS with a burner behind it");
+    }
+
+    /// @notice The vault's `collectResidue` lends `sweep()` 1,500,000 gas. A full
+    ///         declared list of gas-burning tokens must not consume it before the
+    ///         ASSET leg — that leg is the only one carrying priced value, and
+    ///         losing it means the funded capital never comes home.
+    /// @dev    Measured against the pre-fix code: 16 burners consumed the entire
+    ///         1.5M, the whole sweep reverted, and the vault recovered ZERO.
+    function test_sweep_hostileTokenListStillReturnsTheFundedAsset() public {
+        address[] memory tokens = new address[](16);
+        for (uint256 i = 0; i < 16; i++) {
+            tokens[i] = address(new GasBurnerToken());
+        }
+
+        uint256 pid = _proposeSandbox(
+            _payload(_oneCall(address(spy), abi.encodeCall(IdentitySpy.ping, ())), FUNDING, tokens), agent
+        );
+        _advancePastVoting();
+        governor.executeProposal(pid);
+        address sandbox = vault.sandboxOf(pid);
+        assertEq(usdc.balanceOf(sandbox), FUNDING, "the payload spent nothing, so the funding is still out there");
+
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        governor.settleProposal(pid);
+
+        uint256 vaultBefore = usdc.balanceOf(address(vault));
+        vault.collectResidue(sandbox);
+
+        assertEq(usdc.balanceOf(sandbox), 0, "the funded capital came home");
+        assertEq(usdc.balanceOf(address(vault)) - vaultBefore, FUNDING, "in full, despite 16 hostile declared tokens");
+    }
+
+    /// @notice A FULL list of entirely well-behaved declared tokens must stay
+    ///         readable inside the vault's own probe budget. This is the budget
+    ///         regression gate: `MAX_DECLARED_TOKENS`, the per-token ceilings and
+    ///         `SyndicateVault._PROBE_GAS` are three numbers in two contracts, and
+    ///         nothing else fails loudly when they drift apart — an unreadable
+    ///         probe is silently read as "keep the last known flag".
+    function test_probe_maxDeclaredTokensStayReadableInsideTheVaultProbeBudget() public {
+        address[] memory tokens = new address[](16);
+        tokens[0] = address(foreign);
+        for (uint256 i = 1; i < 16; i++) {
+            tokens[i] = address(new ERC20Mock("Filler", "FILL", 18));
+        }
+
+        uint256 pid = _proposeSandbox(
+            _payload(
+                _oneCall(address(faucet), abi.encodeCall(TokenFaucet.pour, (address(foreign), 5e18))), FUNDING, tokens
+            ),
+            agent
+        );
+        _advancePastVoting();
+        governor.executeProposal(pid);
+        address sandbox = vault.sandboxOf(pid);
+
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        governor.settleProposal(pid);
+        vault.collectResidue(sandbox);
+
+        // Read it exactly as the vault does: same selector, same 150,000 budget.
+        (bool ok, bytes memory ret) = sandbox.staticcall{gas: 150_000}(abi.encodeWithSignature("hasUnvaluedResidue()"));
+        assertTrue(ok && ret.length == 32, "a full, benign declared list must answer inside the vault's budget");
+        assertFalse(abi.decode(ret, (bool)), "and answer that nothing is left");
+        assertFalse(vault.depositsLocked(), "so deposits reopen");
     }
 
     // ── 5.7 runSandbox authorization ──────────────────────────────────────
@@ -737,6 +959,33 @@ contract SandboxProposalTest is Test {
         }
         vm.expectRevert(ISyndicateGovernor.TooManyCalls.selector);
         _proposeSandbox(_payload(calls, FUNDING, new address[](0)), agent);
+    }
+
+    /// @notice The token bound has its OWN error, so a rejected payload says
+    ///         which of the two limits it broke.
+    function test_propose_oversizedTokenListUsesItsOwnError() public {
+        address[] memory tokens = new address[](17);
+        for (uint256 i = 0; i < tokens.length; i++) {
+            tokens[i] = address(new ERC20Mock("Filler", "FILL", 18));
+        }
+        vm.expectRevert(ISyndicateGovernor.TooManySandboxTokens.selector);
+        _proposeSandbox(_payload(_oneCall(address(spy), abi.encodeCall(IdentitySpy.ping, ())), FUNDING, tokens), agent);
+    }
+
+    /// @notice Duplicates are refused AT PROPOSE, not at execute. Both residue
+    ///         loops divide a borrowed gas budget between entries, so a padded
+    ///         list starves the real ones — but the reason this check lives in
+    ///         the governor as well as in `CallSandbox.init` is the lifecycle:
+    ///         a rule enforced only at execute kills a proposal that already
+    ///         cleared the vote and the review period, with the bond locked and
+    ///         no way to amend it.
+    function test_propose_duplicateDeclaredTokenRejectedAtProposeNotExecute() public {
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(foreign);
+        tokens[1] = address(foreign);
+
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.DuplicateSandboxToken.selector, address(foreign)));
+        _proposeSandbox(_payload(_oneCall(address(spy), abi.encodeCall(IdentitySpy.ping, ())), FUNDING, tokens), agent);
     }
 
     // ── 4.1 (envelope) ────────────────────────────────────────────────────

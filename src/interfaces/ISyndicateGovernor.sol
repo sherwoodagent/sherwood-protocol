@@ -380,6 +380,14 @@ interface ISyndicateGovernor {
     ///         an empty payload would force the proposal to tier 2 and charge
     ///         full-notional coverage for something that can never run.
     error EmptySandboxCalls();
+    /// @notice The declared-token list exceeded `CallSandbox.MAX_DECLARED_TOKENS`.
+    ///         Distinct from `TooManyCalls` so a rejected payload says which of
+    ///         the two bounds it broke.
+    error TooManySandboxTokens();
+    /// @notice The declared-token list named the same token twice. Refused here
+    ///         as well as in `CallSandbox.init` so the payload dies at propose
+    ///         rather than at execute with the bond already locked.
+    error DuplicateSandboxToken(address token);
     /// @notice Sandbox `funding` was zero. A sandbox holding nothing cannot move
     ///         vault capital, so there is nothing to price and nothing to
     ///         underwrite; use plain `propose` instead.

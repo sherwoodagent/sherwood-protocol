@@ -63,6 +63,10 @@ interface ICallSandbox is IStrategyDelivery {
     error AlreadyInitialized();
     /// @notice The call set was empty, or a call named the zero address.
     error InvalidCallSet();
+    /// @notice The declared-token list named the same token twice. Both residue
+    ///         loops divide a borrowed gas budget between entries, so padding the
+    ///         list starves the real ones.
+    error DuplicateDeclaredToken(address token);
 
     /// @notice Emitted once per successful run, naming what was dispatched.
     event SandboxRun(address indexed vault, uint256 callCount, uint256 funded);
@@ -74,10 +78,21 @@ interface ICallSandbox is IStrategyDelivery {
     ///         for a declared token is the signal that it is still stranded.
     event SandboxTokenSwept(address indexed token, uint256 amount);
     /// @notice A declared token failed to transfer and has been abandoned: it
-    ///         stops counting toward `hasUnvaluedResidue()` and is stranded here
-    ///         permanently. The alternative is a deposit lock nothing can clear,
-    ///         since no path can force an unmovable token out.
+    ///         stops counting toward `hasUnvaluedResidue()` and is stranded here.
+    ///         The alternative is a deposit lock nothing can clear, since no path
+    ///         can force an unmovable token out.
+    /// @dev    Only ever emitted once the transfer has been FAILING for
+    ///         `ABANDON_DELAY` — measured from the first observed failure, not
+    ///         from the run — so a TRANSIENT failure (paused token, temporary
+    ///         blacklist) cannot write off live value. `sweep()` is
+    ///         permissionless and would otherwise let anyone do so by calling at
+    ///         the wrong moment. Cleared by `SandboxTokenAbandonmentCleared` if
+    ///         the token ever transfers successfully afterwards.
     event SandboxTokenAbandoned(address indexed token, uint256 amount);
+    /// @notice A previously abandoned token transferred successfully after all,
+    ///         so it counts toward `hasUnvaluedResidue()` again. Abandonment
+    ///         records a belief about movability, not a verdict.
+    event SandboxTokenAbandonmentCleared(address indexed token);
 
     /// @notice Bind this clone to its vault and freeze its payload.
     /// @dev    Callable once. The payload is written here and has no setter: the
