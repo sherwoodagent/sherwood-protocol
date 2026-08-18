@@ -238,11 +238,38 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         upper = _align(spot + HALF_WIDTH, spacing);
     }
 
+    /// @dev The rerange policy, built in its OWN frame. See `_initParams`.
+    function _rerangePolicy() internal pure returns (ConcentratedLiquidityStrategy.RerangePolicy memory r) {
+        // `halfWidthTicks` must be >= the initial half-width, else
+        // `_requireValidRerangePolicy` rejects it (the pool-share cap is
+        // preserved at bind time rather than re-checked at rerange).
+        r.halfWidthTicks = RERANGE_HALF_WIDTH;
+        r.triggerBps = 1;
+        r.minInterval = 0;
+        r.maxReranges = 2;
+        r.slippageBps = 1_000;
+        r.swapFractionBps = 5_000;
+    }
+
     /// @dev Assembled field-by-field rather than as a struct literal: the
     ///      literal plus the live reads it needs overflows the IR stack in this
     ///      frame (`via_ir = true`, `optimizer_runs = 50`).
-    function _initData(uint256 twapDeviationBps) internal view returns (bytes memory) {
-        ConcentratedLiquidityStrategy.InitParams memory p;
+    ///
+    ///      SPLIT FROM `_initData`, AND THE SPLIT IS LOAD-BEARING. Assembling
+    ///      the struct and then `abi.encode`-ing it in one frame overflows the
+    ///      IR stack by a single slot — the encoder needs its own live memory
+    ///      pointers on top of every pointer the assembly above still holds
+    ///      (`Cannot swap ... too deep in the stack by 1 slots`, reported
+    ///      against whichever constant the frame happens to reference). Keeping
+    ///      the encode in a separate frame is what makes this file compile at
+    ///      all; the nested `rerange` gets the same treatment for the same
+    ///      reason. Sub-frames, not `--via-ir` tuning, because the profile is
+    ///      repo-wide and this is one test file's frame.
+    function _initParams(uint256 twapDeviationBps)
+        internal
+        view
+        returns (ConcentratedLiquidityStrategy.InitParams memory p)
+    {
         p.pool = address(pool);
         p.positionManager = POSITION_MANAGER;
         p.uniswapFactory = UNISWAP_V3_FACTORY;
@@ -259,19 +286,14 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         p.twapWindow = TWAP_WINDOW;
         p.maxTwapDeviationBps = twapDeviationBps;
         p.mintSlippageBps = 1_000;
-        // `halfWidthTicks` must be >= the initial half-width, else
-        // `_requireValidRerangePolicy` rejects it (the pool-share cap is
-        // preserved at bind time rather than re-checked at rerange).
-        p.rerange.halfWidthTicks = RERANGE_HALF_WIDTH;
-        p.rerange.triggerBps = 1;
-        p.rerange.minInterval = 0;
-        p.rerange.maxReranges = 2;
-        p.rerange.slippageBps = 1_000;
-        p.rerange.swapFractionBps = 5_000;
+        p.rerange = _rerangePolicy();
         p.settleSlippageBps = 1_000;
         p.settleDeadline = 0;
         p.swapExtraData = _routeData();
-        return abi.encode(p);
+    }
+
+    function _initData(uint256 twapDeviationBps) internal view returns (bytes memory) {
+        return abi.encode(_initParams(twapDeviationBps));
     }
 
     function _execCalls(address strategy) internal pure returns (BatchExecutorLib.Call[] memory calls) {
