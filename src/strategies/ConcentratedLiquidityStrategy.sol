@@ -2186,6 +2186,27 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         _trySwapToAsset(settleSlippageBps);
 
+        // REPAY BEFORE EXPORTING, in the position `sweep()` has it — after the
+        // swap, before the push. `_repayAndWithdraw` funds the repayment from
+        // this clone's OWN asset balance, and the push below sends every wei of
+        // that balance to the vault. Exporting first therefore does not merely
+        // skip the repayment, it REMOVES the resource the repayment needs: a
+        // later `sweep()` reads `held == 0`, takes neither repay branch, and the
+        // collateral stays behind debt that can no longer be cleared. This
+        // function is `onlyVault`, but the property that matters survives that:
+        // `SyndicateVault.releaseUnconvertible(strategy)` is ungated, so ANY
+        // party still drives this path — they drive it AS the vault. That makes
+        // the sequence front-runnable for gas by a party paid to do it; the
+        // adversary and the vault-wide cost are traced in
+        // `test/pashov-final/CLStrategy_releaseRepaysFirst.t.sol` (finding #10).
+        //
+        // Nothing is foreclosed by running it here: `_repayAndWithdraw` ends
+        // with an unconditional `_tryRedeemWrapper()`, so collateral it pulls
+        // out of Morpho gets a redemption attempt in this same call and leaves
+        // as `asset` below. The raw pushes further down still fire only on a
+        // genuine redemption failure.
+        (uint256 debtRemaining, uint256 collateralRemaining) = _repayAndWithdraw();
+
         // Deliver whatever the conversion DID produce before releasing the rest.
         // Skipping this would leave converted proceeds sitting on the clone —
         // the one outcome this path must never produce, since it exists to get
@@ -2215,7 +2236,35 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             if (collBal != 0) {
                 _pushAllToVault(coll);
                 emit UnconvertibleReleased(coll, collBal);
+                // HANDED OFF, NOT STRANDED — so it must not be reported as
+                // outstanding below. `_repayAndWithdraw` counts loose wrapper
+                // shares into `collateralRemaining` alongside what Morpho still
+                // holds, which is right for `sweep()` (the shares stay on the
+                // clone there) and wrong here, where this push just delivered
+                // them. `collBal` IS that loose component: it was measured after
+                // `_repayAndWithdraw` and nothing between the two touches `coll`
+                // (the `asset` push above is a different token inside this
+                // branch). Saturating anyway — an underflow here would revert
+                // the hatch of last resort over an accounting nicety.
+                collateralRemaining = collBal >= collateralRemaining ? 0 : collateralRemaining - collBal;
             }
+        }
+
+        // REPORTED AFTER THE HAND-OFF, unlike `sweep()`, and for the reason the
+        // two differ: `sweep()` only ever delivers `asset`, so what it measured
+        // is still stranded when it emits. This path also exports the collateral
+        // itself, so emitting on the pre-push figure would report value that
+        // reached the vault in this very call as missing — the monitoring signal
+        // would fire on the hatch WORKING. What is left after this line is the
+        // genuine strand: debt this clone could not clear, and collateral still
+        // posted to Morpho.
+        //
+        // Loud on the SAME terms `sweep()` is otherwise: a release that repays
+        // only part of the debt is indistinguishable off-chain from one that
+        // cleared everything, and this path is the one an attacker drives, so
+        // the partial outcome is the one monitoring most needs to see.
+        if (debtRemaining != 0 || collateralRemaining != 0) {
+            emit SettlementIncomplete(debtRemaining, collateralRemaining);
         }
 
         released = IERC20(otherToken).balanceOf(address(this));
