@@ -903,6 +903,26 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // already earned, then lets the re-open proceed on a clean record.
         // Cheap in the common case — a first open leaves `callsHash` zero, and a
         // round already resolved short-circuits.
+        //
+        // IN SERIES WITH THE CALLER'S BOND GATE (2026-08 sweep finding #11).
+        // That finding moved `emergencySettleWithCalls`'s owner-bond check to
+        // AFTER this call, and the two now form one mechanism against a
+        // re-open that would void a blocked verdict:
+        //
+        //   this resolve computes `blocked` -> `slashOwnerBond` empties the
+        //   slot -> the caller's gate reads zero and REVERTS the whole
+        //   transaction, re-open and slash together.
+        //
+        // Neither half works alone. Delete this line and the bond survives the
+        // re-open, the gate passes, and the owner voids the votes exactly as
+        // before — measured, not argued: removing it turns
+        // `test_emergencySettleWithCalls_cannotReopenOnABondTheSameCallBurns`
+        // and its sibling red. Those two tests pin THIS call as much as they
+        // pin the gate.
+        //
+        // Note what does NOT depend on it: `er.round++` below retires
+        // prior-round votes on its own, so vote hygiene across a re-open is the
+        // round bump's job, not this resolve's.
         if (er.callsHash != bytes32(0) && !er.resolved) _resolveEmergency(eKey, proposalId, er);
         // Denominator read at `t-1`, the same checkpoint anchor the numerator
         // uses (`voteBlockEmergencySettle` reads its weight at `er.openedAt`),

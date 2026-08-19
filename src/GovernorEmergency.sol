@@ -146,6 +146,11 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
 
         IGuardianRegistry reg = IGuardianRegistry(_guardianRegistry);
+
+        // OPENED FIRST, THEN BONDED — the order is the fix, see below.
+        bytes32 h = keccak256(abi.encode(calls));
+        reg.openEmergency(proposalId, h, calls);
+
         // STRICTLY POSITIVE, not merely "meets the requirement". `posted == 0`
         // is checked on its own rather than left to the comparison because the
         // comparison alone is satisfiable at zero: a registry (or sWOOD) whose
@@ -163,11 +168,32 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         // settlement batch above with no bond requirement at all, so the honest
         // stuck-proposal path is untouched. This gate covers only the path that
         // lets the owner write the calldata.
+        //
+        // MEASURED AFTER THE CALL THAT CAN BURN IT (2026-08 sweep finding #11).
+        // `openEmergency` does not only open: when a previous round is still
+        // unresolved it calls `_resolveEmergency` in place, and a blocked
+        // verdict there calls `slashOwnerBond`, which DELETES the stake. Read
+        // before that call, this gate passed on collateral the same transaction
+        // was about to destroy — and the round it admitted went live with
+        // nothing slashable behind it. A second block verdict then hits
+        // `slashOwnerBond`'s `amount == 0` early return, so the deterrent
+        // guarding owner-authored calldata (run by `finalizeEmergencySettle`
+        // with EMPTY per-call caps) was a no-op for that round.
+        //
+        // The owner races no one for it. `_resolveEmergency` and the
+        // permissionless `resolveEmergencyReview` are BOTH gated on
+        // `_effNow >= er.reviewEnd`, so both predicates flip at the same
+        // instant — a timestamp the owner knows in advance and can simply pick.
+        // `openEmergency`'s own natspec spells that out while closing the
+        // sibling race.
+        //
+        // Reverting here unwinds the open AND the slash, which is the right
+        // direction on both counts: no unbonded round is admitted, and the
+        // verdict the elapsed window earned stays on the record for the
+        // permissionless resolver to commit. Cost of moving it is one wasted
+        // `openEmergency` in the failing case, which reverts anyway.
         uint256 posted = reg.ownerStake(p.vault);
         if (posted == 0 || posted < reg.requiredOwnerBond(p.vault)) revert OwnerBondInsufficient();
-
-        bytes32 h = keccak256(abi.encode(calls));
-        reg.openEmergency(proposalId, h, calls);
         emit EmergencySettleProposed(proposalId, msg.sender, h, uint64(block.timestamp + reg.reviewPeriod()));
     }
 
@@ -192,6 +218,28 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         IGuardianRegistry reg = IGuardianRegistry(_guardianRegistry);
         (bool blocked, BatchExecutorLib.Call[] memory calls) = reg.finalizeEmergency(proposalId);
         if (blocked) revert EmergencySettleBlocked();
+
+        // RE-ASSERTED AT THE POINT OF USE, not only at the point of admission
+        // (2026-08 sweep finding #11, defence in depth). The bond is the only
+        // economic deterrent behind the calls executed below — owner-authored,
+        // EMPTY per-call caps — so the invariant that actually matters is
+        // "bonded WHEN THE CALLS RUN", and the open-time gate is a proxy for it.
+        // Finding #11 was that proxy failing: the gate passed on collateral the
+        // same transaction then burned. Checking here closes the class rather
+        // than the instance — any future path that opens a round without a live
+        // bond, or burns one mid-review, still cannot reach these calls.
+        //
+        // Mirrors `StakedWood.claimUnstakeOwner`, which re-checks
+        // `openProposalCount()` at claim time for the same reason and says so:
+        // a gate that fires once can be walked around by changing the state it
+        // measured.
+        //
+        // EXISTENCE ONLY, deliberately NOT `posted < requiredOwnerBond`. The
+        // requirement is governance-mutable, and re-imposing a live threshold
+        // here would let a `minOwnerStake` raise landed mid-review strand the
+        // finalize of an honest emergency that was correctly bonded when it
+        // opened. Zero is the property with no legitimate reading.
+        if (reg.ownerStake(p.vault) == 0) revert OwnerBondInsufficient();
 
         // Same EFFECTIVE capital cap as `settleProposal`/`unstick` — NOT
         // `p.maxCapital`: using the full propose-time declaration here reopens the
