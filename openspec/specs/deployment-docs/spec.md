@@ -58,9 +58,28 @@ The fork ceremony SHALL run five scripts in order, each broadcast with the flags
 
 The ceremony SHALL persist `TIER_REGISTRY` into `chains/{chainId}.json`. `DeployPlanD` and `WireTokenCourt` both read that key as an env address, so omitting it leaves the later phases with nothing to read and forces the operator to recover the address from broadcast logs.
 
+`DeployPlanB` SHALL likewise persist `EXPOSURE_LEDGER` and `PROPOSER_BOND_ESCROW`, `DeployPlanD` SHALL persist `CHALLENGE_GAME`, and `DeployTokenCourt` SHALL persist `TOKEN_COURT` — each is read as an env address by a later phase, and the reasoning is identical to `TIER_REGISTRY`'s. These writes SHALL happen in `run()`, never in the `deploy(AddressBook)` entry point the Plan B / Plan D pre-flight suites drive. They SHALL further go through `ScriptBase._patchAddressIfBook`, which no-ops when the chain has no address book: `DeployTokenCourt.run()` IS driven by its pre-flight suite under `vm.setEnv`, so an unguarded patch creates a junk `chains/31337.json` in the repo every time the tests run.
+
 #### Scenario: TierRegistry reaches the address book
 - **WHEN** the core ceremony completes
 - **THEN** `chains/{chainId}.json` carries `TIER_REGISTRY`, and it equals `factory.tierRegistry()`
+
+#### Scenario: Guardian-econ phases hand each other their addresses
+- **WHEN** Plan B, Plan D and the court phases complete
+- **THEN** `chains/{chainId}.json` carries `EXPOSURE_LEDGER`, `PROPOSER_BOND_ESCROW`, `CHALLENGE_GAME` and `TOKEN_COURT`, and the operator can run each phase straight out of the address book rather than off the previous phase's broadcast log
+
+### Requirement: The Robinhood ceremony seats every owner-gated write before handoff
+`DeployRobinhoodMainnet` reimplements `run()` rather than extending the canonical `DeploySherwood.run()`, so every write the canonical run makes between `deployCore` and the multisig handoff SHALL be restated in it. Those writes SHALL be collected in ONE internal method (`_seatOwnerWrites`) rather than scattered inline, so the set can be asserted as a set: each is an `onlyOwner` call on a contract the handoff then transfers, so each has exactly one window in which it is cheap and an eternity afterwards in which it is a multisig chore.
+
+The set is: `setProtocolFeeRecipient`, `setGuardiansFeeRecipient`, and **the TierRegistry launch set** (`_seedTierRegistry`). The launch set was MISSING for the entire life of the script. `deployCore` mints the TierRegistry empty and wires it into the factory; the attestations are separate `onlyOwner` writes. `isCounterpartyAllowed` GATES CLONE-INIT, so an empty registry makes every ConcentratedLiquidity clone revert `CounterpartyNotAllowed` and makes `DeployConcentratedLiquidityStrategy` refuse to run at all.
+
+#### Scenario: Launch set lands before the handoff
+- **WHEN** the Robinhood ceremony completes
+- **THEN** the TierRegistry attests `UNISWAP_V3_FACTORY`, `UNISWAP_V3_POSITION_MANAGER` and `MORPHO_BLUE` as counterparties, and `MORPHO_BLUE` on the adapter axis as well
+
+#### Scenario: Seeding moved below the handoff
+- **GIVEN** a refactor that moves the seed call after the Safe has accepted ownership
+- **THEN** the seeding SKIPS rather than reverting — it is best-effort by design — and the ceremony ships an empty registry while looking clean, which `test/deploy/DeployRobinhoodMainnetHandoff.t.sol` pins
 
 The ceremony SHALL seat BOTH `protocolFeeRecipient` AND `guardiansFeeRecipient` on `ProtocolConfig` inside the broadcast, and validation SHALL assert both. `ProtocolConfig`'s constructor seeds only the splits, and a zero recipient does NOT strand its leg — the governor zeroes that slice and hands it to the agent as remainder, in both `_chargeManagementFee` and `_chargePerformanceFee`. An unseated recipient is therefore a SILENT RE-ROUTING to the proposer, not a missing payment. The guardian leg is the load-bearing one: `MANAGEMENT_FEE_BPS = 200` is sized so 20% of management and 25% of performance fund the guardian pool, so leaving it unset charges depositors at a rate justified by a pool that receives nothing.
 
@@ -216,6 +235,8 @@ To make guardian blocking real (not the cold-start bypass), total staked guardia
 - PRE-FLIGHT 8 (POST-broadcast, design revision 2): `ledger.woodUsdPriceX8() != 0` AND the composed `ledger.woodPriceX8()` SHALL resolve to a non-zero price. These are two independent failures with different remedies. The first is the price CAP being unset, which under the cap-only model is a revert (`NoWoodPrice`) rather than "uncapped" — reading zero as "no ceiling" would make the likeliest misconfiguration the one state in which a ~$438k pool prices every guardian bond without bound. The second is a CAP configured with nothing priced beneath it, which a cap-only check misses entirely. `woodPriceX8()` SHALL be read by low-level probe rather than a typed call, because it now reverts instead of returning zero when unpriceable, and a bare revert would surface as an opaque script failure with no instruction attached.
 - The env key is `WOOD_PRICE_CAP_X8`, RENAMED from `WOOD_PRICE_HAIRCUT_X8` because the number's meaning inverted: it is a ceiling on manipulation, never served as a price, and SHALL be seeded **ABOVE** market — 1.25–2× is the intended band, reviewed monthly. The old "≤ 30-day low" instruction is now exactly backwards: a cap below market binds permanently, pins every bond at the cap and makes the market source inert.
 - `WOOD_TWAP_ORACLE` SHALL name a `WoodTwapOracle` that ALREADY HAS A COMPLETED AVERAGING WINDOW. The oracle needs at least `twapWindow` of keeper activity before `consult()` answers, so the ceremony ordering is: deploy the oracle → run the keeper → run Plan B. Pre-flight 8 enforces this rather than merely documenting it.
+- `WOOD_USD_FEED` and `WOOD_FEED_MAX_DELAY` are the SECOND way to satisfy pre-flight 8: an optional Chainlink-shaped WOOD/USD aggregator, wired inside the broadcast via `ledger.setWoodFeed`. Set, it becomes the PREFERRED market source and the TWAP oracle stays the fallback on all four degraded shapes; unset, the ledger is TWAP-only and the mainnet ceremony is unchanged. Chain 4663 publishes no such aggregator, so the mainnet ceremony leaves both keys unset. THE FORK SETS THEM AND MUST — a vnet cannot prime a TWAP oracle at all, so a feed is the only source that can produce a composed price there.
+- PRE-FLIGHT 12 (pre-broadcast): `WOOD_USD_FEED` and `WOOD_FEED_MAX_DELAY` SHALL be set together or not at all, and a named feed SHALL hold code. `setWoodFeed` already enforces the pairing, but from inside the broadcast after the ledger and escrow exist and four setters have run; checking pre-broadcast turns a half-applied run into a free refusal.
 
 #### Scenario: Unset price cap refused post-broadcast
 - **WHEN** `DeployPlanB` completes its broadcast with `woodUsdPriceX8` still zero
@@ -229,6 +250,19 @@ To make guardian blocking real (not the cold-start bypass), total staked guardia
 #### Scenario: Oracle wired but not yet primed
 - **GIVEN** the TWAP oracle is wired but has no completed averaging window
 - **THEN** pre-flight 8 FAILS, directing the operator to run the keeper for at least `twapWindow` before re-running
+
+#### Scenario: Half-edited feed environment refused pre-broadcast
+- **WHEN** `WOOD_USD_FEED` is set with `WOOD_FEED_MAX_DELAY` left at zero, or the delay is set with no feed
+- **THEN** pre-flight 12 refuses the run BEFORE the ledger and escrow are deployed, rather than letting `setWoodFeed` revert four setters into the broadcast
+
+#### Scenario: Feed is the preferred source when both are wired
+- **GIVEN** both `WOOD_TWAP_ORACLE` and `WOOD_USD_FEED` are set
+- **THEN** `woodPriceDetail()` reports `fromFeed == true` and the oracle remains wired as the fallback
+
+#### Scenario: Fork prices off the feed alone
+- **GIVEN** no TWAP oracle is wired, because a vnet cannot prime one
+- **WHEN** `WOOD_USD_FEED` names the fixture feed
+- **THEN** pre-flight 8 PASSES on the feed alone and `woodPriceDetail()` reports `fromFeed == true`
 
 #### Scenario: Wrong slash ceiling refused pre-deploy
 - **WHEN** `DeployPlanB` runs against an sWOOD with `maxSlashBps < 10_000`
@@ -264,6 +298,24 @@ Pre-flights, all PRE-broadcast:
 - **GIVEN** a Tenderly vnet, where the pool stops trading at the fork point and `idle` grows without bound
 - **THEN** no amount of keeper activity primes the oracle there, and the vnet SHALL either generate swaps against the pair or wire a Chainlink-shaped WOOD feed via `ledger.setWoodFeed` instead — on mainnet the pair trades continuously (measured 2026-08-04: 10s idle), so the guard is near-free in production
 
+### Requirement: The fork supplies its WOOD price through a fixture feed
+Because a vnet cannot prime `WoodTwapOracle`, the fork ceremony SHALL deploy `script/fork/DeployForkWoodUsdFeed.s.sol:DeployForkWoodUsdFeed` in the slot `DeployWoodTwapOracle` occupies on a real chain — after the core phases, before `DeployPlanB` — and pass its address to Plan B as `WOOD_USD_FEED`. The script persists `WOOD_USD_FEED` into `chains/{chainId}.json`.
+
+`ForkWoodUsdFeed` reports `updatedAt` as `block.timestamp` rather than a stored value, so it stays fresh across the `evm_increaseTime` warps a governance traversal needs. That makes staleness untestable through it, which is the correct trade for a fixture whose only job is to keep the price path alive across time travel — the real staleness gate is exercised against the Chainlink push feeds.
+
+`WOOD_USD_PRICE_X8` SHALL be DERIVED from the fork's own state — the WOOD/WETH pair reserves times the Chainlink ETH/USD answer — not invented, so bond valuations on the fork track mainnet. The cap `WOOD_PRICE_CAP_X8` SHALL then be seeded 1.25–2× above that derived price, exactly as on mainnet.
+
+The script SHALL refuse to run anywhere but the chain id named by `ROBINHOOD_FORK_CHAIN_ID`, and SHALL refuse outright when that key names 4663. A fixture feed on mainnet would price every guardian bond off an owner-writable number.
+
+#### Scenario: Fixture feed refused on mainnet
+- **WHEN** `DeployForkWoodUsdFeed` runs with `ROBINHOOD_FORK_CHAIN_ID=4663`, or against a chain whose id that key does not name
+- **THEN** the script reverts before broadcasting
+
+#### Scenario: Fork price survives a governance warp
+- **GIVEN** the fixture feed is wired as `WOOD_USD_FEED`
+- **WHEN** the operator advances 48h with `evm_increaseTime` to traverse the vote + review windows
+- **THEN** `woodPriceX8()` still resolves — the feed reports itself fresh at the new `block.timestamp`, so no post-warp refresh step is owed
+
 ### Requirement: DeployPlanB seats the strategy-duration ceiling
 `DeployPlanB` SHALL seat `ProtocolConfig.maxStrategyDuration` inside the broadcast: to the documented default when `MAX_STRATEGY_DURATION` is unset in the environment, or to the operator-supplied value when set. A zero override SHALL be rejected before broadcast — an explicit "no ceiling" MUST NOT be expressible through this script. The post-broadcast assert SHALL confirm `maxStrategyDuration` is non-zero.
 
@@ -284,7 +336,7 @@ Pre-flights, all PRE-broadcast:
 - **THEN** the run FAILS with a message naming the delegator-walkout hole
 
 #### Scenario: Preflight tests cover both invariants
-- **THEN** `test/deploy/DeployPlanBPreflight.t.sol` covers: default duration seating lands; zero override rejected; delegation-on fails the named assert; delegation-off passes
+- **THEN** `test/deploy/DeployPlanBPreflight.t.sol` covers: default duration seating lands; zero override rejected; delegation-on fails the named assert; delegation-off passes; and, for the WOOD feed, each half of the pre-flight-12 pairing refused, a code-less feed refused, the feed preferred when both sources are wired, the feed carrying the price alone on the fork shape, and both keys unset leaving the ledger TWAP-only
 
 ### Requirement: Plan D deployment pre-flights and wiring order
 `DeployPlanD` (ChallengeGame against an existing Plan B + Plan C deployment) SHALL run pre-flights before deploying anything, then wire the game's four roles in this order: `ledger.setCoverageFreezer(game)` → `tierRegistry.setAuthorizedDemoter(game)` → `swood.setAuthorizedSlasher(game)` → `game.setStakedWood(swood)` (the reciprocal pointer, owner-set rather than a constructor arg because the role is granted on sWOOD's side; the slasher grant and the reciprocal pointer can be wired in either order). Checks:

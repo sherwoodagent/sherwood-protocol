@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Script, console} from "forge-std/Script.sol";
+import {console} from "forge-std/Script.sol";
+import {ScriptBase} from "./ScriptBase.sol";
 import {TokenCourt} from "../src/TokenCourt.sol";
 import {ChallengeGame} from "../src/ChallengeGame.sol";
 import {IExposureLedger} from "../src/interfaces/IExposureLedger.sol";
@@ -54,7 +55,7 @@ interface IStakedWoodAgeFloor {
  *   Usage (simulate; never --broadcast blind):
  *     forge script script/DeployTokenCourt.s.sol:DeployTokenCourt --rpc-url <rpc> -vvvv
  */
-contract DeployTokenCourt is Script {
+contract DeployTokenCourt is ScriptBase {
     function run() external {
         address deployer = msg.sender;
 
@@ -85,6 +86,13 @@ contract DeployTokenCourt is Script {
         require(court.challengeGame() == challengeGame, "wiring: court.challengeGame");
         require(court.stakedWood() == stakedWood, "wiring: court.stakedWood");
         require(court.pendingOwner() == protocolOwner, "wiring: court.pendingOwner");
+
+        // PERSISTED FOR THE WIRING PHASE. `WireTokenCourt` reads COURT as an
+        // env address; this is the key that lets the operator run it straight
+        // out of the address book rather than off the broadcast log. Written
+        // after the post-conditions, so a court that failed them never reaches
+        // the book.
+        _patchAddressIfBook("TOKEN_COURT", address(court));
 
         console.log("TokenCourt:             %s", address(court));
         console.log("voteWindow (s):         %s", court.voteWindow());
@@ -209,7 +217,7 @@ contract DeployTokenCourt is Script {
  *   Usage (simulate; never --broadcast blind):
  *     forge script script/DeployTokenCourt.s.sol:WireTokenCourt --rpc-url <rpc> -vvvv
  */
-contract WireTokenCourt is Script {
+contract WireTokenCourt is ScriptBase {
     function run() external {
         address courtAddr = vm.envAddress("COURT");
         address gameAddr = vm.envAddress("CHALLENGE_GAME");

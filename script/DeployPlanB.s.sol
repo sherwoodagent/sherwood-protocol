@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Script, console} from "forge-std/Script.sol";
+import {console} from "forge-std/Script.sol";
+import {ScriptBase} from "./ScriptBase.sol";
 import {ExposureLedger} from "../src/ExposureLedger.sol";
 import {ProposerBondEscrow} from "../src/ProposerBondEscrow.sol";
 import {ISyndicateFactory} from "../src/interfaces/ISyndicateFactory.sol";
@@ -187,6 +188,19 @@ interface IProtocolConfigAdmin {
  *                                 COMPLETED averaging window when this runs —
  *                                 deploy it and run the keeper for at least
  *                                 `twapWindow` first (pre-flight 8).
+ *     WOOD_USD_FEED             — OPTIONAL Chainlink-shaped WOOD/USD aggregator.
+ *                                 The PREFERRED market source when set; the TWAP
+ *                                 oracle stays the fallback on all four degraded
+ *                                 shapes. Chain 4663 has no such feed, so the
+ *                                 mainnet ceremony leaves this unset. The FORK
+ *                                 sets it, and must: a vnet cannot prime a TWAP
+ *                                 oracle at all (the WOOD/WETH pair stops trading
+ *                                 at the fork point, so `update()` no-ops forever
+ *                                 across the growing idle span), which leaves a
+ *                                 feed as the only source that can satisfy
+ *                                 pre-flight 8 there.
+ *     WOOD_FEED_MAX_DELAY       — staleness bound for WOOD_USD_FEED, seconds.
+ *                                 Set together with it or not at all (pre-flight 12).
  *     COVERED_TVL_CAP_USD18     — per-vault covered-TVL ceiling, USD-18. Non-zero.
  *     PROTOCOL_CONFIG           — ProtocolConfig to seat the duration ceiling on
  *                                 (`Deploy.s.sol` already writes this key into
@@ -198,7 +212,7 @@ interface IProtocolConfigAdmin {
  *   Usage (simulate; never --broadcast blind):
  *     forge script script/DeployPlanB.s.sol:DeployPlanB --rpc-url <rpc> -vvvv
  */
-contract DeployPlanB is Script {
+contract DeployPlanB is ScriptBase {
     /// @notice Epoch length (spec §5: 28d initial). Immutable in the ledger.
     uint256 internal constant EPOCH_LENGTH = 28 days;
 
@@ -332,6 +346,25 @@ contract DeployPlanB is Script {
         ///      wired by hand before pre-flight 8's composed-price assert runs —
         ///      and chain 4663 has no such feed, so in practice this is required.
         address woodTwapOracle;
+        /// @dev A Chainlink-shaped WOOD/USD aggregator, or zero to wire none.
+        ///      The PREFERRED market source when set — `_woodPrice` reads it
+        ///      first and only falls back to the TWAP oracle on the four
+        ///      degraded shapes (unset, non-positive answer, stale, reverting).
+        ///      Still capped by `woodPriceCapX8` either way.
+        ///
+        ///      Wired here rather than left as a manual follow-up for the same
+        ///      reason the TWAP pointer is: pre-flight 8 demands a composed
+        ///      price, and the only two ways to supply one are this and the
+        ///      oracle. It is what makes the FORK ceremony runnable at all — a
+        ///      vnet cannot prime a TWAP oracle, because the WOOD/WETH pair
+        ///      stops trading at the fork point and `update()` then no-ops
+        ///      forever across the growing idle span.
+        address woodUsdFeed;
+        /// @dev Staleness bound for `woodUsdFeed`, seconds. Must be non-zero
+        ///      when the feed is set and zero when it is not — `setWoodFeed`
+        ///      enforces exactly that pairing so a mis-typed address cannot
+        ///      silently unwire the feed.
+        uint256 woodFeedMaxDelay;
         /// @dev FORK / VNET ONLY. Bypasses pre-flight 10's requirement that the
         ///      ledger owner be a contract. A Tenderly vnet has no Safe and its
         ///      deployer is an impersonated EOA, so the check makes the fork
@@ -339,52 +372,73 @@ contract DeployPlanB is Script {
         bool allowEoaLedgerOwner;
     }
 
+    /// @dev Assigned field-by-field into an already-allocated memory struct
+    ///      rather than built as one `AddressBook({...})` literal. The literal
+    ///      form holds all sixteen values live on the stack simultaneously and
+    ///      trips solc's "1 too deep" under the default (non-IR) pipeline.
     function run() external {
-        deploy(
-            AddressBook({
-                swood: vm.envAddress("STAKED_WOOD"),
-                factory: vm.envAddress("SYNDICATE_FACTORY"),
-                registry: vm.envAddress("GUARDIAN_REGISTRY"),
-                wood: vm.envAddress("WOOD_TOKEN"),
-                usdg: vm.envAddress("USDG"),
-                usdgFeed: vm.envAddress("CHAINLINK_USDG_USD_FEED"),
-                feedMaxDelay: vm.envUint("ASSET_FEED_MAX_DELAY"),
-                // RENAMED from WOOD_PRICE_HAIRCUT_X8, because the number's
-                // MEANING changed and a stale name would have carried the old
-                // instruction ("<= 30-day low") into the new semantics. It is a
-                // CAP now, not a price — seed it ABOVE market. See pre-flight 8.
-                woodPriceCapX8: vm.envUint("WOOD_PRICE_CAP_X8"),
-                // `envOr`, same convention as MAX_STRATEGY_DURATION: the
-                // ordinary run needs no new key and still seats a real
-                // allowance. An operator who wants a different one sets the
-                // key; one who wants NO allowance (10,000) is refused by the
-                // post-broadcast assert rather than allowed to express it here.
-                woodHaircutBps: vm.envOr("WOOD_HAIRCUT_BPS", DEFAULT_WOOD_HAIRCUT_BPS),
-                coveredTvlCapUsd: vm.envUint("COVERED_TVL_CAP_USD18"),
-                protocolConfig: vm.envAddress("PROTOCOL_CONFIG"),
-                // `envOr`, so the ordinary run needs no new key in the operator's
-                // environment and still seats a ceiling. An operator who WANTS a
-                // different one sets the key; one who wants NO ceiling cannot
-                // express that here at all (pre-flight 6).
-                maxStrategyDuration: vm.envOr("MAX_STRATEGY_DURATION", DEFAULT_MAX_STRATEGY_DURATION),
-                // `envOr` with a zero default: a chain that somehow HAS a
-                // Chainlink WOOD/USD feed does not need this, and pre-flight 8
-                // is what actually refuses a ledger with no live price source —
-                // so the requirement is expressed once, as a property of the
-                // deployed state, rather than twice as an env precondition too.
-                woodTwapOracle: vm.envOr("WOOD_TWAP_ORACLE", address(0)),
-                // `envOr` false: the mainnet ceremony needs no new key and keeps
-                // the refusal. Fork/vnet runs set it explicitly. Read HERE, in
-                // the env adapter, never inside `deploy()` — see `AddressBook`.
-                allowEoaLedgerOwner: vm.envOr("ALLOW_EOA_LEDGER_OWNER", false)
-            })
-        );
+        AddressBook memory book;
+        book.swood = vm.envAddress("STAKED_WOOD");
+        book.factory = vm.envAddress("SYNDICATE_FACTORY");
+        book.registry = vm.envAddress("GUARDIAN_REGISTRY");
+        book.wood = vm.envAddress("WOOD_TOKEN");
+        book.usdg = vm.envAddress("USDG");
+        book.usdgFeed = vm.envAddress("CHAINLINK_USDG_USD_FEED");
+        book.feedMaxDelay = vm.envUint("ASSET_FEED_MAX_DELAY");
+        // RENAMED from WOOD_PRICE_HAIRCUT_X8, because the number's MEANING
+        // changed and a stale name would have carried the old instruction
+        // ("<= 30-day low") into the new semantics. It is a CAP now, not a
+        // price — seed it ABOVE market. See pre-flight 8.
+        book.woodPriceCapX8 = vm.envUint("WOOD_PRICE_CAP_X8");
+        // `envOr`, same convention as MAX_STRATEGY_DURATION: the ordinary run
+        // needs no new key and still seats a real allowance. An operator who
+        // wants a different one sets the key; one who wants NO allowance
+        // (10,000) is refused by the post-broadcast assert rather than allowed
+        // to express it here.
+        book.woodHaircutBps = vm.envOr("WOOD_HAIRCUT_BPS", DEFAULT_WOOD_HAIRCUT_BPS);
+        book.coveredTvlCapUsd = vm.envUint("COVERED_TVL_CAP_USD18");
+        book.protocolConfig = vm.envAddress("PROTOCOL_CONFIG");
+        // `envOr`, so the ordinary run needs no new key in the operator's
+        // environment and still seats a ceiling. An operator who WANTS a
+        // different one sets the key; one who wants NO ceiling cannot express
+        // that here at all (pre-flight 6).
+        book.maxStrategyDuration = vm.envOr("MAX_STRATEGY_DURATION", DEFAULT_MAX_STRATEGY_DURATION);
+        // `envOr` with a zero default: a chain that somehow HAS a Chainlink
+        // WOOD/USD feed does not need this, and pre-flight 8 is what actually
+        // refuses a ledger with no live price source — so the requirement is
+        // expressed once, as a property of the deployed state, rather than
+        // twice as an env precondition too.
+        book.woodTwapOracle = vm.envOr("WOOD_TWAP_ORACLE", address(0));
+        // `envOr` with a zero default: chain 4663 has no Chainlink WOOD/USD
+        // aggregator, so the mainnet ceremony leaves both keys unset and prices
+        // off the TWAP oracle alone. The fork sets them, because it is the only
+        // source it can actually serve.
+        book.woodUsdFeed = vm.envOr("WOOD_USD_FEED", address(0));
+        book.woodFeedMaxDelay = vm.envOr("WOOD_FEED_MAX_DELAY", uint256(0));
+        // `envOr` false: the mainnet ceremony needs no new key and keeps the
+        // refusal. Fork/vnet runs set it explicitly. Read HERE, in the env
+        // adapter, never inside `deploy()` — see `AddressBook`.
+        book.allowEoaLedgerOwner = vm.envOr("ALLOW_EOA_LEDGER_OWNER", false);
+
+        (address ledgerAddr, address escrowAddr) = deploy(book);
+
+        // PERSISTED FOR THE PHASES THAT COME NEXT. `DeployPlanD` reads
+        // EXPOSURE_LEDGER as an env address and `WireTokenCourt` reads it
+        // again; without these keys the operator has to scrape both addresses
+        // out of the broadcast log and hand-set them, which is the same failure
+        // the TIER_REGISTRY key was added to prevent.
+        //
+        // Written from `run()` and never from `deploy()`: `deploy()` is what the
+        // pre-flight suite drives, and it runs on a chain id whose address book
+        // does not exist.
+        _patchAddressIfBook("EXPOSURE_LEDGER", ledgerAddr);
+        _patchAddressIfBook("PROPOSER_BOND_ESCROW", escrowAddr);
     }
 
     /// @notice Every pre-flight, deploy and wiring step. Public so the
     ///         pre-flight tests can drive the real thing without the process
     ///         environment — see `AddressBook`.
-    function deploy(AddressBook memory book) public {
+    function deploy(AddressBook memory book) public returns (address ledgerAddr, address escrowAddr) {
         address deployer = msg.sender;
 
         address swood = book.swood;
@@ -602,6 +656,23 @@ contract DeployPlanB is Script {
             "fix the constant, do not just re-run."
         );
 
+        // ── Pre-flight 12: the WOOD/USD feed and its staleness bound are set
+        //    together or not at all ──
+        // `setWoodFeed` already enforces this pairing, but it does so from
+        // INSIDE the broadcast, several state-changing calls in. Checking here
+        // turns a half-applied run into a refusal that costs nothing: a feed
+        // named with no delay, or a delay named with no feed, is an operator
+        // who edited one env key and forgot the other.
+        require(
+            (book.woodUsdFeed == address(0)) == (book.woodFeedMaxDelay == 0),
+            "PRE-FLIGHT: WOOD_USD_FEED and WOOD_FEED_MAX_DELAY must be set together -- one without "
+            "the other is a half-edited environment, and setWoodFeed would revert mid-broadcast."
+        );
+        require(
+            book.woodUsdFeed == address(0) || book.woodUsdFeed.code.length != 0,
+            "PRE-FLIGHT: WOOD_USD_FEED holds no code"
+        );
+
         console.log("sWOOD coolDownPeriod (s): %s", coolDown);
         console.log("deployer / ledger owner:  %s", deployer);
         console.log("existing syndicates on this factory: %s", liveGovernors);
@@ -620,6 +691,12 @@ contract DeployPlanB is Script {
         // decide who may forfeit a bond, so it must be deployed first (it is,
         // just above) and the pointer is immutable.
         ProposerBondEscrow escrow = new ProposerBondEscrow(wood, registry, address(ledger));
+        // Handed back to `run()` so the env adapter can persist them. Assigned
+        // HERE rather than after the broadcast because every later line can
+        // revert on a pre-flight, and a caller that got addresses back would
+        // then be holding two contracts that the run as a whole rejected.
+        ledgerAddr = address(ledger);
+        escrowAddr = address(escrow);
 
         ledger.setWoodUsdPrice(woodPriceCapX8);
         // THE ALLOWANCE, seated in the same broadcast as the cap because the
@@ -641,6 +718,12 @@ contract DeployPlanB is Script {
         // the broken state. Pre-flight 8 below proves it landed and works.
         if (book.woodTwapOracle != address(0)) {
             ledger.setWoodTwapOracle(book.woodTwapOracle);
+        }
+        // THE OTHER MARKET SOURCE, and the PREFERRED one when both are wired.
+        // Same broadcast, same reasoning: pre-flight 8 proves a composed price
+        // exists, and on a fork this is the only source that can produce one.
+        if (book.woodUsdFeed != address(0)) {
+            ledger.setWoodFeed(book.woodUsdFeed, book.woodFeedMaxDelay);
         }
         // maxDelay is LOAD-BEARING, not cosmetic: the §3.3a approve quorum
         // re-reads this feed at EXECUTE time, a full
@@ -925,6 +1008,7 @@ contract DeployPlanB is Script {
         console.log("ProposerBondEscrow: %s", address(escrow));
         console.log("ledger owner:       %s (must carry the Zodiac delay module)", ledger.owner());
         console.log("WoodTwapOracle:     %s", ledger.woodTwapOracle());
+        console.log("WOOD/USD feed:      %s (delay %s s)", book.woodUsdFeed, book.woodFeedMaxDelay);
         console.log("WOOD price cap (X8): %s", ledger.woodUsdPriceX8());
         console.log("WOOD haircut (bps):  %s", ledger.woodHaircutBps());
         console.log("asset feed maxDelay (s): %s", feedMaxDelay);

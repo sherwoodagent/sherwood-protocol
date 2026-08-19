@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Script, console} from "forge-std/Script.sol";
+import {console} from "forge-std/Script.sol";
+import {ScriptBase} from "./ScriptBase.sol";
 import {ChallengeGame} from "../src/ChallengeGame.sol";
 import {IExposureLedger} from "../src/interfaces/IExposureLedger.sol";
 import {IStakedWood} from "../src/interfaces/IStakedWood.sol";
@@ -77,7 +78,7 @@ interface ISwoodExposureLedger {
  *   Usage (simulate; never --broadcast blind):
  *     forge script script/DeployPlanD.s.sol:DeployPlanD --rpc-url <rpc> -vvvv
  */
-contract DeployPlanD is Script {
+contract DeployPlanD is ScriptBase {
     /// @notice The address book this deployment runs against, exactly as
     ///         `run()` reads it out of the environment.
     /// @dev    THE ENV READ AND THE DEPLOYMENT ARE SPLIT ON PURPOSE. `vm.setEnv`
@@ -96,7 +97,7 @@ contract DeployPlanD is Script {
     }
 
     function run() external {
-        deploy(
+        address gameAddr = deploy(
             AddressBook({
                 swood: vm.envAddress("STAKED_WOOD"),
                 wood: vm.envAddress("WOOD_TOKEN"),
@@ -104,12 +105,18 @@ contract DeployPlanD is Script {
                 tierRegistry: vm.envAddress("TIER_REGISTRY")
             })
         );
+
+        // PERSISTED FOR THE COURT PHASES. `DeployTokenCourt` and
+        // `WireTokenCourt` both read CHALLENGE_GAME as an env address; without
+        // this key the operator scrapes it out of the broadcast log by hand.
+        // Written from `run()`, never from `deploy()` — see `DeployPlanB`.
+        _patchAddressIfBook("CHALLENGE_GAME", gameAddr);
     }
 
     /// @notice Every pre-flight, deploy and wiring step. Public so the
     ///         pre-flight tests can drive the real thing without the process
     ///         environment — see `AddressBook`.
-    function deploy(AddressBook memory book) public {
+    function deploy(AddressBook memory book) public returns (address gameAddr) {
         address deployer = msg.sender;
 
         address swood = book.swood;
@@ -192,6 +199,7 @@ contract DeployPlanD is Script {
         // approver set from one and demotes through the other, and neither
         // pointer has a sane default.
         ChallengeGame game = new ChallengeGame(deployer, wood, ledger, tierRegistry);
+        gameAddr = address(game);
 
         // Drift guard: the game's challenge window is only meaningful while it
         // matches the ledger's coverage window. A filing outside that window

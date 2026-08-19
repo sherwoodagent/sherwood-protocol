@@ -115,8 +115,7 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         // agent instead, and the fee level is sized for a pool receiving
         // nothing. Seat both inside the broadcast, while the deployer still
         // owns the config.
-        ProtocolConfig(d.protocolConfig).setProtocolFeeRecipient(deployer);
-        ProtocolConfig(d.protocolConfig).setGuardiansFeeRecipient(deployer);
+        _seatOwnerWrites(d, deployer);
 
         // Multisig handoff (final action inside the broadcast).
         if (!skipHandoff) _handoffRobinhood(d, ownerMultisig);
@@ -150,6 +149,46 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         console.log(
             "\nNext: forge script script/robinhood-mainnet/DeployPortfolioStrategy.s.sol --rpc-url robinhood --broadcast"
         );
+    }
+
+    /// @notice Every write that REQUIRES the deployer to still be the owner,
+    ///         collected into one place so the set can be asserted as a set.
+    /// @dev    THIS GROUPING IS THE POINT. Each of these is an `onlyOwner` write
+    ///         on a contract `_handoffRobinhood` is about to transfer, so each
+    ///         has exactly one window in which it is cheap and an eternity
+    ///         afterwards in which it is a multisig chore. Scattered inline,
+    ///         they were three unrelated-looking statements and one of them went
+    ///         missing for the entire life of this script.
+    ///
+    ///         Fee recipients: `ProtocolConfig`'s constructor seeds only the
+    ///         SPLITS, and a zero recipient does NOT strand its leg — it folds
+    ///         into the agent's remainder in both `_chargeManagementFee` and
+    ///         `_chargePerformanceFee`. So an unseated recipient is not a
+    ///         missing payment, it is a SILENT RE-ROUTING to the proposer.
+    ///         BOTH legs, not just the protocol one: the guardian leg is why
+    ///         `MANAGEMENT_FEE_BPS` is 200, since 20% of management and 25% of
+    ///         performance fund the guardian pool. Left unseated, that whole
+    ///         budget pays the agent while depositors are charged at a rate
+    ///         sized for a pool receiving nothing. Both are seeded to the
+    ///         DEPLOYER as a PLACEHOLDER, never as the destination — the runbook
+    ///         directs the multisig to repoint them after `acceptOwnership()`.
+    ///
+    ///         TierRegistry launch set: `deployCore` mints the registry EMPTY
+    ///         and wires it into the factory; the attestations are separate
+    ///         `onlyOwner` writes. The canonical `DeploySherwood.run()` makes
+    ///         them, but this script overrides `run()` and calls `deployCore`
+    ///         directly — so until this existed, the Robinhood ceremony deployed
+    ///         an empty registry and handed it straight to the Safe. Not
+    ///         cosmetic: `isCounterpartyAllowed` GATES CLONE-INIT, so an empty
+    ///         registry makes every ConcentratedLiquidity clone revert
+    ///         `CounterpartyNotAllowed` and makes
+    ///         `DeployConcentratedLiquidityStrategy` refuse to run at all.
+    ///         Caught by the fork redeploy, where phase 4 stopped on exactly
+    ///         that.
+    function _seatOwnerWrites(Deployed memory d, address deployer) internal {
+        ProtocolConfig(d.protocolConfig).setProtocolFeeRecipient(deployer);
+        ProtocolConfig(d.protocolConfig).setGuardiansFeeRecipient(deployer);
+        _seedTierRegistry(deployer, d.tierRegistry);
     }
 
     /// @dev THE OWNERSHIP MODELS ARE NOT UNIFORM, and treating them as if they
