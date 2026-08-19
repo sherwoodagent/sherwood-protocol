@@ -219,6 +219,28 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         (bool blocked, BatchExecutorLib.Call[] memory calls) = reg.finalizeEmergency(proposalId);
         if (blocked) revert EmergencySettleBlocked();
 
+        // RE-ASSERTED AT THE POINT OF USE, not only at the point of admission
+        // (2026-08 sweep finding #11, defence in depth). The bond is the only
+        // economic deterrent behind the calls executed below — owner-authored,
+        // EMPTY per-call caps — so the invariant that actually matters is
+        // "bonded WHEN THE CALLS RUN", and the open-time gate is a proxy for it.
+        // Finding #11 was that proxy failing: the gate passed on collateral the
+        // same transaction then burned. Checking here closes the class rather
+        // than the instance — any future path that opens a round without a live
+        // bond, or burns one mid-review, still cannot reach these calls.
+        //
+        // Mirrors `StakedWood.claimUnstakeOwner`, which re-checks
+        // `openProposalCount()` at claim time for the same reason and says so:
+        // a gate that fires once can be walked around by changing the state it
+        // measured.
+        //
+        // EXISTENCE ONLY, deliberately NOT `posted < requiredOwnerBond`. The
+        // requirement is governance-mutable, and re-imposing a live threshold
+        // here would let a `minOwnerStake` raise landed mid-review strand the
+        // finalize of an honest emergency that was correctly bonded when it
+        // opened. Zero is the property with no legitimate reading.
+        if (reg.ownerStake(p.vault) == 0) revert OwnerBondInsufficient();
+
         // Same EFFECTIVE capital cap as `settleProposal`/`unstick` — NOT
         // `p.maxCapital`: using the full propose-time declaration here reopens the
         // same coverage widening `unstick` had, just gated behind guardian review

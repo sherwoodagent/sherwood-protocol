@@ -502,6 +502,108 @@ contract GovernorEmergencyTest is Test {
         assertEq(registry.ownerStake(address(vault)), 0, "the honest resolver could no longer slash");
     }
 
+    /// @dev THE CHECK AT THE POINT OF USE. The bond is the only economic
+    ///      deterrent behind `finalizeEmergencySettle`'s owner-authored calls,
+    ///      which run with EMPTY per-call caps — so the invariant that matters
+    ///      is "bonded when the calls RUN", and the open-time gate is only a
+    ///      proxy for it. Finding #11 was that proxy failing. This pins the
+    ///      backstop: a round that reaches finalize with the slot emptied
+    ///      cannot execute, whatever route emptied it.
+    ///
+    ///      The bond is zeroed directly here because no route to that state
+    ///      survives the fix — which is the point of a defence-in-depth check.
+    ///      `_zeroOwnerStake` is the same stdstore helper the zero-bond gate
+    ///      tests above use.
+    function test_finalizeEmergencySettle_revertsIfTheBondIsGoneByExecutionTime() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        // Review elapses with no block votes — the calls are approved.
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
+        _zeroOwnerStake(address(vault));
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.OwnerBondInsufficient.selector);
+        governor.finalizeEmergencySettle(pid);
+    }
+
+    /// @dev Non-vacuity for the check above: the SAME sequence with the bond
+    ///      left in place must finalize. Without this, the test above would
+    ///      also pass against a finalize that reverted unconditionally.
+    function test_finalizeEmergencySettle_stillRunsWithTheBondPosted() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
+
+        assertEq(registry.ownerStake(address(vault)), MIN_OWNER_STAKE, "precondition: the bond is not posted");
+
+        vm.prank(owner);
+        governor.finalizeEmergencySettle(pid);
+    }
+
+    /// @dev THE SUB-QUORUM ROUND — a state this file had no coverage for at
+    ///      all. Votes were cast, the bar was not met, and the re-open must
+    ///      therefore SUCCEED: nothing is slashed, so the bond the gate reads
+    ///      after `openEmergency` is still there. That is the boundary between
+    ///      this and the two finding #11 tests above, which differ only in
+    ///      whether quorum was reached.
+    ///
+    ///      WHAT IT DOES NOT PIN, stated because an earlier draft of this
+    ///      comment claimed otherwise and was wrong: the closing vote here does
+    ///      NOT measure `openEmergency`'s in-place `_resolveEmergency`. Votes
+    ///      are retired by the unconditional `er.round++`, so guardian C can
+    ///      vote again whether or not the resolve ran — verified by deleting
+    ///      the resolve and watching this test stay green while the two above
+    ///      went red. The in-place resolve is pinned by THOSE tests, being the
+    ///      call that empties the bond their gate then catches.
+    ///
+    ///      A third guardian is registered LOCALLY rather than in `setUp`
+    ///      because the fixture's two guardians hold 30k each: any single vote
+    ///      is 50% of the cohort and clears the 30% block quorum on its own, so
+    ///      a sub-quorum round is unconstructible with them. `guardianC` at the
+    ///      10k minimum votes alone for 10k/70k = 14%, under the bar.
+    function test_emergencySettleWithCalls_reopenAfterASubQuorumRoundRetiresItsVotes() public {
+        address guardianC = makeAddr("guardianC");
+        wood.mint(guardianC, 100_000e18);
+        vm.prank(guardianC);
+        wood.approve(address(swood), type(uint256).max);
+        vm.prank(guardianC);
+        swood.stakeAsGuardian(MIN_GUARDIAN_STAKE, 3);
+        // Mature to par, so the vote carries full weight rather than an
+        // age-discounted one that would clear the bar for the wrong reason.
+        skip(30 days);
+
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        vm.prank(guardianC);
+        registry.voteBlockEmergencySettle(address(governor), pid);
+
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
+
+        // The re-open must succeed: the prior round was under quorum, so the
+        // in-place resolve records "not blocked", no slash fires, and the bond
+        // the gate now reads afterwards is still there.
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+        assertEq(registry.ownerStake(address(vault)), MIN_OWNER_STAKE, "a sub-quorum round slashed the bond");
+
+        // Round 1's vote was retired by the round bump, so the same guardian
+        // votes again without `AlreadyVoted`. This pins the round-keying of
+        // `_emergencyBlockVotes`, not the in-place resolve — see the note above.
+        vm.prank(guardianC);
+        registry.voteBlockEmergencySettle(address(governor), pid);
+    }
+
     /// @dev NOT A BLANKET REFUSAL of re-opening. With the prior round resolved
     ///      as NOT blocked, no slash fires, the bond survives `openEmergency`,
     ///      and the owner may open again — which is the legitimate flow this
