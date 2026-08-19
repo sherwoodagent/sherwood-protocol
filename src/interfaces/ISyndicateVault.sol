@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {BatchExecutorLib} from "../BatchExecutorLib.sol";
+import {ICallSandbox} from "./ICallSandbox.sol";
 
 interface ISyndicateVault {
     // ── Errors ──
@@ -41,6 +42,16 @@ interface ISyndicateVault {
     error AmountExceedsBalance();
     error WithdrawalQueueNotSet();
     error WithdrawalQueueAlreadySet();
+    /// @notice The sandbox implementation is bound set-once; it is already set.
+    error SandboxImplementationAlreadySet();
+    /// @notice No sandbox implementation is wired, so the sandbox path is absent.
+    error SandboxNotConfigured();
+    /// @notice A sandbox already exists for this proposal. One per proposal —
+    ///         a second would orphan the first from `collectResidue` while it
+    ///         still held capital.
+    error SandboxAlreadyMinted(uint256 pid);
+    /// @notice Sandbox funding exceeded the live tier-2 per-call capital ceiling.
+    error SandboxFundingExceedsCeiling(uint256 funding, uint256 ceiling);
     error InsufficientShares();
     error RedemptionsNotLocked();
     /// @notice `requestDeposit` was called with no non-terminal proposal open
@@ -169,6 +180,20 @@ interface ISyndicateVault {
         uint256[] calldata callCaps,
         uint256 maxNetOutflow
     ) external;
+    /// @notice Governor-only: mint the single-use sandbox for proposal `pid`,
+    ///         fund it with `funding` of `asset()`, and run `calls` from it.
+    /// @dev    The sandbox executes as ITSELF, not as this vault, so a payload
+    ///         target needs no allowlist entry and no certification — the loss
+    ///         bound is `funding`, structurally. Reverts if a sandbox was already
+    ///         minted for `pid`, or if `funding` exceeds the LIVE tier-2 ceiling
+    ///         read from the calling governor.
+    /// @return sandbox The address minted for `pid`.
+    function runSandbox(
+        uint256 pid,
+        ICallSandbox.Call[] calldata calls,
+        address[] calldata declaredTokens,
+        uint256 funding
+    ) external returns (address sandbox);
     /// @notice Factory-only: re-point the shared executor library and
     ///         re-stamp its expected codehash atomically. Reached through
     ///         `SyndicateFactory.pushExecutor`, which lifecycle-gates the
@@ -320,6 +345,22 @@ interface ISyndicateVault {
     ///         library is re-pointed and its expected codehash re-stamped.
     event ExecutorImplSet(address oldImpl, address newImpl);
     event WithdrawalQueueSet(address indexed queue);
+    /// @notice The set-once `CallSandbox` implementation was bound.
+    event SandboxImplementationSet(address indexed implementation);
+    /// @notice A proposal's sandbox was minted, funded and run.
+    event SandboxRun(uint256 indexed pid, address indexed sandbox, uint256 funding);
+
+    /// @notice The `CallSandbox` implementation this vault clones per proposal.
+    ///         Zero means the sandbox path is not wired.
+    function sandboxImplementation() external view returns (address);
+    /// @notice Factory-only, set-once: bind the `CallSandbox` implementation
+    ///         this vault clones. No re-pointing path — swapping the minted code
+    ///         behind an already-reviewed proposal would invalidate the
+    ///         confinement argument that lets a sandbox call uncertified targets.
+    function setSandboxImplementation(address impl) external;
+
+    /// @notice The sandbox minted for `pid`, or zero if none.
+    function sandboxOf(uint256 pid) external view returns (address);
     /// @notice A settled strategy reported undelivered value; `outstanding` is
     ///         the figure deposits are now priced against, on top of
     ///         `totalAssets()`.
