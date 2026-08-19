@@ -4,7 +4,7 @@
       "label": "_reviews",
       "slot": "0",
       "offset": 0,
-      "type": "t_mapping(t_bytes32,t_struct(Review)_storage)"
+      "type": "t_mapping(t_bytes32,t_struct(GuardianRegistry.Review)_storage)"
     },
     {
       "label": "_votes",
@@ -46,7 +46,7 @@
       "label": "_emergencyReviews",
       "slot": "7",
       "offset": 0,
-      "type": "t_mapping(t_bytes32,t_struct(EmergencyReview)_storage)"
+      "type": "t_mapping(t_bytes32,t_struct(GuardianRegistry.EmergencyReview)_storage)"
     },
     {
       "label": "_emergencyBlockVotes",
@@ -58,7 +58,7 @@
       "label": "_emergencyCalls",
       "slot": "9",
       "offset": 0,
-      "type": "t_mapping(t_bytes32,t_array(t_struct(Call)_storage)dyn_storage)"
+      "type": "t_mapping(t_bytes32,t_array(t_struct(BatchExecutorLib.Call)_storage)dyn_storage)"
     },
     {
       "label": "epochGenesis",
@@ -106,7 +106,7 @@
       "label": "_authorizedGovernors",
       "slot": "16",
       "offset": 0,
-      "type": "t_struct(AddressSet)_storage"
+      "type": "t_struct(EnumerableSet.AddressSet)_storage"
     },
     {
       "label": "factory",
@@ -146,15 +146,7 @@
     }
   ],
   "types": {
-    "t_struct(AddressSet)_storage": [
-      {
-        "label": "_inner",
-        "slot": "0",
-        "offset": 0,
-        "type": "t_struct(Set)_storage"
-      }
-    ],
-    "t_struct(Call)_storage": [
+    "t_struct(BatchExecutorLib.Call)_storage": [
       {
         "label": "target",
         "slot": "0",
@@ -174,7 +166,29 @@
         "type": "t_uint256"
       }
     ],
-    "t_struct(EmergencyReview)_storage": [
+    "t_struct(EnumerableSet.AddressSet)_storage": [
+      {
+        "label": "_inner",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_struct(EnumerableSet.Set)_storage"
+      }
+    ],
+    "t_struct(EnumerableSet.Set)_storage": [
+      {
+        "label": "_values",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_array(t_bytes32)dyn_storage"
+      },
+      {
+        "label": "_positions",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_mapping(t_bytes32,t_uint256)"
+      }
+    ],
+    "t_struct(GuardianRegistry.EmergencyReview)_storage": [
       {
         "label": "callsHash",
         "slot": "0",
@@ -248,7 +262,7 @@
         "type": "t_uint64"
       }
     ],
-    "t_struct(Review)_storage": [
+    "t_struct(GuardianRegistry.Review)_storage": [
       {
         "label": "opened",
         "slot": "0",
@@ -332,20 +346,6 @@
         "slot": "3",
         "offset": 8,
         "type": "t_uint64"
-      }
-    ],
-    "t_struct(Set)_storage": [
-      {
-        "label": "_values",
-        "slot": "0",
-        "offset": 0,
-        "type": "t_array(t_bytes32)dyn_storage"
-      },
-      {
-        "label": "_positions",
-        "slot": "1",
-        "offset": 0,
-        "type": "t_mapping(t_bytes32,t_uint256)"
       }
     ]
   }

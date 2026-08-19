@@ -81,12 +81,17 @@ canonical_layout() {
   # proposal-lifecycle branch grew `Review` from 3 slots to 4; safe as an append, and
   # the gate could not have told the difference had it been a reorder.)
   #
-  # Ast ids and the declaring contract qualifier are stripped so only genuine layout
-  # drift diffs.
+  # Ast ids are stripped so only genuine layout drift diffs. Struct names KEEP their
+  # declaring-contract qualifier (`t_struct(BatchExecutorLib.Call)_storage`), because
+  # stripping it is not a canonicalisation — it is a COLLISION. See `qualify` below.
   inspect_layout "$1" | python3 -c '
 import json, re, sys
 
-def norm(s):
+def fail(msg):
+    sys.stderr.write("layout-goldens: FAIL — " + msg + "\n")
+    sys.exit(1)
+
+def strip_ast_ids(s):
     """Strip solc ast ids from type names while PRESERVING array lengths.
 
         t_struct(Review)1234_storage   -> t_struct(Review)_storage    (ast id: noise)
@@ -129,6 +134,45 @@ def norm(s):
 d = json.load(sys.stdin)
 types = d.get("types") or {}
 
+# Struct ast ids are NOT noise the way a contract`s or an enum`s are: they are the
+# only thing separating two structs that share a bare name. `SyndicateGovernor`
+# reaches two of them — `BatchExecutorLib.Call` (target, data, value) and
+# `ICallSandbox.Call` (target, data, deliberately no value) — and stripping the id
+# collapsed both onto the key `t_struct(Call)_storage`.
+#
+# That was not merely ambiguous, it was NONDETERMINISTIC and BLIND:
+#
+#   - the writer below iterates a Python SET of type strings, and CPython
+#     randomises string hashing per process, so which of the two survived was
+#     decided by PYTHONHASHSEED. Measured on this layout: 3 of 8 seeds emitted
+#     `value`, 5 did not. The golden baked one answer and CI computed the other,
+#     which is a gate that fails ~a third of the time on an unchanged tree.
+#   - whichever struct LOST was then pinned by nothing at all. A member reorder in
+#     it — the precise corruption this gate exists to catch — passed silently
+#     whenever the other one won the coin flip.
+#
+# So the qualifier is restored rather than stripped, from solc`s own `label`
+# ("struct BatchExecutorLib.Call"). It is stable across unrelated edits (unlike the
+# ast id), unique per declaration (unlike the bare name), and it makes the two
+# `Call` mappings in the `storage` half distinguishable as a side effect.
+def qualify(raw, info):
+    label = (info.get("label") or "").strip()
+    if not label.startswith("struct "):
+        fail("type %s carries members but its label %r is not a struct — refusing to "
+             "guess a qualified name for a type the gate must pin exactly" % (raw, label))
+    return "t_struct(" + label[len("struct "):] + ")_storage"
+
+# Longest-first so a raw key can never be rewritten by a prefix of itself.
+renames = sorted(
+    ((raw, qualify(raw, info)) for raw, info in types.items() if info.get("members")),
+    key=lambda kv: -len(kv[0]),
+)
+
+def norm(s):
+    for raw, qualified in renames:
+        s = s.replace(raw, qualified)
+    return strip_ast_ids(s)
+
 # Transitive closure over the type graph, starting from the top-level variables.
 # Structs contribute their members; mappings their key/value; arrays their base.
 seen, stack = set(), [v["type"] for v in d["storage"]]
@@ -144,15 +188,29 @@ while stack:
         if info.get(edge):
             stack.append(info[edge])
 
-structs = {}
-for t in seen:
+# Sorted, not set-ordered: the writer below must not depend on iteration order for
+# its RESULT, and the guard must not depend on it for WHICH collision it reports.
+structs, origin = {}, {}
+for t in sorted(seen):
     members = types[t].get("members")
     if not members:  # only structs carry an internal slot assignment
         continue
-    structs[norm(t)] = [
+    key = norm(t)
+    entry = [
         {"label": m["label"], "slot": m["slot"], "offset": m["offset"], "type": norm(m["type"])}
         for m in members
     ]
+    # Two distinct declarations landing on one key means the last writer wins and the
+    # other is pinned by nothing — silently, and (given the set above) at random. That
+    # is how the `Call` collision above went unnoticed, so it is now an ERROR rather
+    # than a coin flip. Qualified names make this unreachable; the guard exists so a
+    # future change to `norm` cannot quietly reintroduce the blindness.
+    if key in structs and structs[key] != entry:
+        fail("two distinct structs normalise to %s (%s and %s) with DIFFERENT layouts —\n"
+             "  one of them would be pinned by nothing at all. Disambiguate in norm()\n"
+             "  rather than regenerating the golden." % (key, origin[key], t))
+    structs[key] = entry
+    origin[key] = t
 
 out = {
     "storage": [
