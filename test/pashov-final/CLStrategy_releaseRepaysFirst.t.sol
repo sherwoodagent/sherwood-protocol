@@ -6,9 +6,19 @@ import {SettleFixture} from "../strategies/ConcentratedLiquidityStrategySettle.t
 
 /// @title ConcentratedLiquidityStrategy — the escape hatch that removed the
 ///        repayment's working capital (finding #10)
-/// @notice TWO permissionless post-settlement recovery paths, and they were not
-///         symmetric. `sweep()` repays Morpho before pushing to the vault;
+/// @notice TWO post-settlement recovery paths reachable by anyone, and they were
+///         not symmetric. `sweep()` repays Morpho before pushing to the vault;
 ///         `releaseUnconvertible()` pushed without repaying.
+///
+///         REACHABLE BY ANYONE, THROUGH THE VAULT. Both are `onlyVault` on the
+///         strategy since the cohort-accounting fix, and both are driven by an
+///         UNGATED vault entry point — `SyndicateVault.releaseUnconvertible(strategy)`
+///         and its sweep counterpart. So the attacker below needs no privilege:
+///         they call the vault, and the vault calls this. Every prank in this
+///         file is `address(vaultStub)` for that reason, and it stands in for
+///         the forwarding, not for an authorization the attacker holds —
+///         `ConcentratedLiquidityStrategySettle.t.sol::test_releaseUnconvertible_isVaultOnly`
+///         is what pins the gate itself.
 ///
 ///         That is not merely a missing step. `_repayAndWithdraw` funds the
 ///         repayment from this clone's OWN asset balance, and the push sends
@@ -28,10 +38,24 @@ import {SettleFixture} from "../strategies/ConcentratedLiquidityStrategySettle.t
 ///         holds collateral, and the vault refuses ALL deposits while any
 ///         settled strategy reports that — so this is a vault-wide deposit
 ///         freeze anyone can hold open, against a lock whose safety argument is
-///         that every unvaluable shape is unwindable by the permissionless
-///         `sweep()`.
+///         that every unvaluable shape is unwindable by a `sweep()` anyone can
+///         drive.
 contract PashovFinalCLReleaseRepaysTest is SettleFixture {
-    address internal liquidator = makeAddr("morphoLiquidator");
+    /// @dev The attacker's call, in the shape it actually arrives in: a Morpho
+    ///      liquidator calls the vault's ungated `releaseUnconvertible(strategy)`,
+    ///      and the vault forwards. Named for the adversary rather than the
+    ///      caller address so the sequences below read as the attack they are.
+    function _releaseAsLiquidator() internal returns (uint256 released) {
+        vm.prank(address(vaultStub));
+        released = strategy.releaseUnconvertible();
+    }
+
+    /// @dev The honest half of every sequence here, on the same footing: also
+    ///      vault-gated, also driven by an ungated vault entry point.
+    function _sweep() internal {
+        vm.prank(address(vaultStub));
+        strategy.sweep();
+    }
 
     /// @dev Settle with debt outstanding and collateral still posted, then put
     ///      asset on the clone — the trickle a `sweep()` would repay with.
@@ -60,11 +84,9 @@ contract PashovFinalCLReleaseRepaysTest is SettleFixture {
     function test_releaseThenSweepStillClearsTheDebtAndFreesTheCollateral() public {
         _settleShortWithAssetOnClone(20_000e6);
 
-        vm.prank(liquidator); // permissionless — anyone, and someone is paid to
-        strategy.releaseUnconvertible();
+        _releaseAsLiquidator();
 
-        vm.prank(keeper);
-        strategy.sweep();
+        _sweep();
 
         assertEq(_debtShares(), 0, "debt survived the release-then-sweep sequence");
         assertEq(_collateral(), 0, "collateral still stranded in Morpho");
@@ -81,10 +103,8 @@ contract PashovFinalCLReleaseRepaysTest is SettleFixture {
         // than the trickle even on a perfect recovery.
         uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
 
-        vm.prank(liquidator);
-        strategy.releaseUnconvertible();
-        vm.prank(keeper);
-        strategy.sweep();
+        _releaseAsLiquidator();
+        _sweep();
 
         assertGt(
             usdg.balanceOf(address(vaultStub)) - vaultBefore,
@@ -100,10 +120,8 @@ contract PashovFinalCLReleaseRepaysTest is SettleFixture {
         _settleShortWithAssetOnClone(20_000e6);
         assertTrue(strategy.hasUnvaluedResidue(), "precondition: the lock is on");
 
-        vm.prank(liquidator);
-        strategy.releaseUnconvertible();
-        vm.prank(keeper);
-        strategy.sweep();
+        _releaseAsLiquidator();
+        _sweep();
 
         assertFalse(strategy.hasUnvaluedResidue(), "deposit lock held open by a bare release");
     }
@@ -116,19 +134,16 @@ contract PashovFinalCLReleaseRepaysTest is SettleFixture {
         _settleShortWithAssetOnClone(5_000e6);
 
         for (uint256 i = 0; i < 4; i++) {
-            vm.prank(liquidator);
-            strategy.releaseUnconvertible();
+            _releaseAsLiquidator();
             usdg.mint(address(strategy), 5_000e6); // the next trickle
         }
         // AND THE LAST ONE. Leaving a trickle un-drained here would hand
         // `sweep()` the working capital the attack is defined by taking, and the
         // test would pass against the unfixed contract -- which it did, until
         // this call was added.
-        vm.prank(liquidator);
-        strategy.releaseUnconvertible();
+        _releaseAsLiquidator();
 
-        vm.prank(keeper);
-        strategy.sweep();
+        _sweep();
 
         assertEq(_debtShares(), 0, "four releases kept the debt alive");
         assertEq(_collateral(), 0, "four releases kept the collateral stranded");
@@ -155,16 +170,15 @@ contract PashovFinalCLReleaseRepaysTest is SettleFixture {
         adapter.setRate(address(nvda), address(usdg), 0);
         assertGt(nvda.balanceOf(address(strategy)), 0, "precondition: nothing stranded to release");
 
-        vm.prank(keeper);
-        uint256 released = strategy.releaseUnconvertible();
+        uint256 released = _releaseAsLiquidator();
 
         assertGt(released, 0, "the escape hatch stopped escaping");
         assertEq(nvda.balanceOf(address(strategy)), 0, "residue left on the clone");
     }
 
     /// @notice Still idempotent. The added repay must not make a second call
-    ///         revert on an already-cleared position — the hatch is
-    ///         permissionless and callable at any time, so a revert would be a
+    ///         revert on an already-cleared position — anyone can drive the
+    ///         hatch through the vault at any time, so a revert would be a
     ///         griefing surface of its own.
     ///
     ///         Asserts the SECOND call's own return, not merely the end state:
@@ -174,14 +188,11 @@ contract PashovFinalCLReleaseRepaysTest is SettleFixture {
     function test_releaseRemainsIdempotent() public {
         _settleShortWithAssetOnClone(20_000e6);
 
-        vm.prank(liquidator);
-        strategy.releaseUnconvertible();
-        vm.prank(keeper);
-        uint256 secondRelease = strategy.releaseUnconvertible();
+        _releaseAsLiquidator();
+        uint256 secondRelease = _releaseAsLiquidator();
         assertEq(secondRelease, 0, "second release found something left to export");
 
-        vm.prank(keeper);
-        strategy.sweep();
+        _sweep();
 
         assertEq(_debtShares(), 0, "debt survived");
         assertEq(_collateral(), 0, "collateral survived");
@@ -192,7 +203,7 @@ contract PashovFinalCLReleaseRepaysTest is SettleFixture {
     /// @notice A release that repays only PART of the debt must say so, on the
     ///         same terms `sweep()` does. Without the event a partial recovery
     ///         is indistinguishable off-chain from a complete one — and this is
-    ///         the path an attacker calls, so the partial outcome is precisely
+    ///         the path an attacker drives, so the partial outcome is precisely
     ///         the one monitoring needs.
     ///
     ///         The trickle here is deliberately far below what is owed, so
@@ -202,8 +213,7 @@ contract PashovFinalCLReleaseRepaysTest is SettleFixture {
         _settleShortWithAssetOnClone(1e6); // nowhere near the debt
 
         vm.recordLogs();
-        vm.prank(liquidator);
-        strategy.releaseUnconvertible();
+        _releaseAsLiquidator();
 
         (bool seen, uint256 debtRemaining, uint256 collateralRemaining) = _lastSettlementIncomplete();
         assertTrue(seen, "partial release reported as a complete recovery");
@@ -227,11 +237,72 @@ contract PashovFinalCLReleaseRepaysTest is SettleFixture {
         adapter.setRate(address(nvda), address(usdg), 0);
 
         vm.recordLogs();
-        vm.prank(keeper);
-        strategy.releaseUnconvertible();
+        _releaseAsLiquidator();
 
         (bool seen,,) = _lastSettlementIncomplete();
         assertFalse(seen, "clean release reported as incomplete");
+    }
+
+    /// @notice THE HAND-OFF IS NOT A STRAND. `_repayAndWithdraw` counts loose
+    ///         wrapper shares into `collateralRemaining` alongside what Morpho
+    ///         still holds — correct for `sweep()`, which leaves those shares on
+    ///         the clone, and wrong for this path, which EXPORTS them. Reporting
+    ///         the pre-push figure would fire the incomplete-settlement signal on
+    ///         the hatch doing exactly its job, and send an operator hunting for
+    ///         collateral that is sitting in the vault.
+    ///
+    ///         The shape is the wrapper that stops redeeming for good: the
+    ///         redeem is attempted and REFUSED, so the raw collateral push is
+    ///         the branch that runs — the one case where the two are not
+    ///         mutually exclusive.
+    function test_releaseThatHandsOffTheWrapperDoesNotReportItAsRemaining() public {
+        _execute();
+        _accrueFees(1_000e6, 0);
+        _settle();
+        assertEq(_debtShares(), 0, "precondition: this case has no debt");
+        assertEq(_collateral(), 0, "precondition: no collateral left in Morpho");
+
+        // Real shares, minted through the wrapper, so the balance the push moves
+        // is one the wrapper agrees exists.
+        usdg.mint(address(this), 50_000e6);
+        usdg.approve(address(spUsdg), 50_000e6);
+        spUsdg.deposit(50_000e6, address(strategy));
+        spUsdg.setRedeemPaused(true);
+        uint256 shares = spUsdg.balanceOf(address(strategy));
+        assertGt(shares, 0, "precondition: no wrapper shares to hand off");
+
+        vm.recordLogs();
+        _releaseAsLiquidator();
+
+        // NON-VACUITY FIRST: the push has to have fired, or "nothing reported"
+        // holds for a call that did nothing.
+        assertEq(spUsdg.balanceOf(address(strategy)), 0, "collateral push did not fire");
+        assertEq(spUsdg.balanceOf(address(vaultStub)), shares, "vault did not receive the wrapper shares");
+
+        (bool seen,, uint256 collateralRemaining) = _lastSettlementIncomplete();
+        assertFalse(seen, "delivered wrapper shares reported as an incomplete settlement");
+        assertEq(collateralRemaining, 0, "a figure was reported for collateral that reached the vault");
+    }
+
+    /// @notice The counterpart, so the subtraction above cannot be a blanket
+    ///         silencer: collateral this call could NOT hand off — still posted
+    ///         to Morpho behind debt — must still be reported. Same wrapper
+    ///         outage, but with the debt outstanding that keeps Morpho holding
+    ///         the collateral.
+    function test_releaseStillReportsCollateralItCouldNotHandOff() public {
+        _settleShortWithAssetOnClone(1e6); // nowhere near the debt
+        spUsdg.setRedeemPaused(true);
+        uint128 stillPosted = _collateral();
+        assertGt(stillPosted, 0, "precondition: Morpho holds nothing to report");
+
+        vm.recordLogs();
+        _releaseAsLiquidator();
+
+        (bool seen, uint256 debtRemaining, uint256 collateralRemaining) = _lastSettlementIncomplete();
+        assertTrue(seen, "a genuine strand went unreported");
+        assertGt(debtRemaining, 0, "debt cleared -- this case is not the partial one");
+        assertGe(collateralRemaining, _collateral(), "reported less than Morpho still holds");
+        assertGt(_collateral(), 0, "precondition drifted: nothing was left posted");
     }
 
     /// @dev Scans recorded logs for `SettlementIncomplete` and decodes it.
