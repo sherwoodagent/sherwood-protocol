@@ -956,7 +956,7 @@ contract ConcentratedLiquidityStrategyPoolAnchoredFloorTest is CLFixture {
         // The pool returns to itself; anyone may retry.
         pool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96);
         pool.setTicks(0, 0);
-        vm.prank(keeper);
+        vm.prank(address(vaultStub));
         strategy.sweep();
 
         assertEq(nvda.balanceOf(address(strategy)), 0, "sweep must recover the residue once the pool is honest");

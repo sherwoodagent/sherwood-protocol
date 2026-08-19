@@ -192,7 +192,7 @@ contract ConcentratedLiquidityStrategyPartialSettleTest is SettleFixture {
         uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
         spUsdg.setRedeemPaused(false);
 
-        vm.prank(keeper); // anyone
+        vm.prank(address(vaultStub)); // vault-only since the cohort-accounting fix
         strategy.sweep();
 
         assertEq(spUsdg.balanceOf(address(strategy)), 0, "shares not recovered");
@@ -258,7 +258,7 @@ contract ConcentratedLiquidityStrategyPartialSettleTest is SettleFixture {
         // Fund the position manager so the collect can now pay out.
         usdg.mint(address(posm), 1_000_000e6);
 
-        vm.prank(keeper);
+        vm.prank(address(vaultStub));
         strategy.sweep();
 
         assertEq(strategy.tokenId(), 0, "unwind not retried");
@@ -280,7 +280,28 @@ contract ConcentratedLiquidityStrategyPartialSettleTest is SettleFixture {
 contract ConcentratedLiquidityStrategyReleaseTest is SettleFixture {
     function test_releaseUnconvertible_beforeSettlementReverts() public {
         _execute();
+        vm.prank(address(vaultStub));
         vm.expectRevert(ConcentratedLiquidityStrategy.NotSettled.selector);
+        strategy.releaseUnconvertible();
+    }
+
+    /// @notice VAULT-ONLY, for the same reason `sweep()` is. The hatch converts
+    ///         before it releases, so it can push VAULT ASSET home — a second
+    ///         door onto the balance delta `SyndicateVault._payCohortShare`
+    ///         splits, and a delta measures everything only if it is the only
+    ///         door. Called directly the exited cohort is credited nothing and
+    ///         the arrival lifts the stayers' price instead, unrepairably.
+    /// @dev    The permissionless property is unchanged where it is load-bearing:
+    ///         `SyndicateVault.releaseUnconvertible(strategy)` is open to anyone
+    ///         and drives this. Only the unmeasured door is gone.
+    function test_releaseUnconvertible_isVaultOnly() public {
+        _execute();
+        _accrueFees(0, 100e18);
+        adapter.setRate(address(nvda), address(usdg), 0);
+        _settle();
+
+        vm.prank(keeper);
+        vm.expectRevert(BaseStrategy.NotVault.selector);
         strategy.releaseUnconvertible();
     }
 
@@ -293,7 +314,7 @@ contract ConcentratedLiquidityStrategyReleaseTest is SettleFixture {
         adapter.setRate(address(nvda), address(usdg), 0);
         _settle();
 
-        vm.prank(keeper);
+        vm.prank(address(vaultStub));
         strategy.sweep();
 
         assertGt(nvda.balanceOf(address(strategy)), 0, "sweep foreclosed the conversion");
@@ -311,7 +332,7 @@ contract ConcentratedLiquidityStrategyReleaseTest is SettleFixture {
         adapter.setRate(address(nvda), address(usdg), 100 * 1e18 / 1e12); // outage clears
         uint256 vaultUsdgBefore = usdg.balanceOf(address(vaultStub));
 
-        vm.prank(keeper);
+        vm.prank(address(vaultStub));
         uint256 released = strategy.releaseUnconvertible();
 
         assertEq(released, 0, "released unconverted despite a working adapter");
@@ -332,7 +353,7 @@ contract ConcentratedLiquidityStrategyReleaseTest is SettleFixture {
         uint256 stranded = nvda.balanceOf(address(strategy));
         assertGt(stranded, 0, "precondition: residue stranded");
 
-        vm.prank(keeper); // anyone
+        vm.prank(address(vaultStub)); // vault-only since the cohort-accounting fix
         uint256 released = strategy.releaseUnconvertible();
 
         assertEq(released, stranded, "released amount mismatch");
@@ -345,10 +366,12 @@ contract ConcentratedLiquidityStrategySweepTest is SettleFixture {
     // ── 6.11 Sweep ──
 
     function test_sweep_beforeSettlementReverts() public {
+        vm.prank(address(vaultStub));
         vm.expectRevert(ConcentratedLiquidityStrategy.NotSettled.selector);
         strategy.sweep();
 
         _execute();
+        vm.prank(address(vaultStub));
         vm.expectRevert(ConcentratedLiquidityStrategy.NotSettled.selector);
         strategy.sweep();
     }
@@ -367,7 +390,7 @@ contract ConcentratedLiquidityStrategySweepTest is SettleFixture {
         uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
         morpho.setCollateralWithdrawCap(type(uint256).max); // conditions recover
 
-        vm.prank(keeper); // anyone
+        vm.prank(address(vaultStub)); // vault-only since the cohort-accounting fix
         strategy.sweep();
 
         assertEq(_collateral(), 0, "residue not recovered");
@@ -380,9 +403,9 @@ contract ConcentratedLiquidityStrategySweepTest is SettleFixture {
         _settle();
 
         // Nothing left to move; must not revert.
-        vm.prank(keeper);
+        vm.prank(address(vaultStub));
         uint256 first = strategy.sweep();
-        vm.prank(keeper);
+        vm.prank(address(vaultStub));
         uint256 second = strategy.sweep();
 
         assertEq(first, 0, "nothing should have been swept");
@@ -400,10 +423,110 @@ contract ConcentratedLiquidityStrategySweepTest is SettleFixture {
         adapter.setRate(address(nvda), address(usdg), 100 * 1e18 / 1e12);
         uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
 
-        vm.prank(keeper);
+        vm.prank(address(vaultStub));
         strategy.sweep();
 
         assertEq(nvda.balanceOf(address(strategy)), 0, "leg still unconverted");
         assertGt(usdg.balanceOf(address(vaultStub)), vaultBefore, "converted residue not returned");
+    }
+}
+
+/// @notice The recovery paths must FIT the ceiling the vault calls them under.
+/// @dev    Both entry points are now vault-only, so every recovery runs through
+///         `SyndicateVault._recoverResidueVia`'s `call{gas: _SWEEP_GAS}` —
+///         1,500,000. Before that change a keeper could call the template
+///         directly with unbounded gas, so the ceiling never bound the heavy
+///         path. If a reachable shape exceeds it the residue is UNRECOVERABLE:
+///         the vault ignores the call's result, so an out-of-gas clone simply
+///         recovers nothing, stays counted, and holds the deposit gate until it
+///         is pruned and burned.
+///
+///         A FLOOR, NOT THE BOUND. Every vendor this path touches is a mock
+///         here — Morpho, the position manager, the swap adapter, the ERC-4626
+///         wrapper — so these numbers bound the TEMPLATE'S OWN logic and nothing
+///         else. A mock cannot falsify an assumption about what live Morpho
+///         charges; it only agrees. The measurement against real venues lives in
+///         `ConcentratedLiquidityVaultE2EFork.t.sol::_releaseUnconvertible`,
+///         which is where `_SWEEP_GAS`'s natspec request is actually answered.
+///         What this suite is good for is catching a REGRESSION: a new leg added
+///         to either path shows up here immediately and cheaply, without an RPC.
+contract ConcentratedLiquidityStrategyRecoveryGasTest is SettleFixture {
+    /// @dev Mirrors `SyndicateVault._SWEEP_GAS`, which is private and so cannot
+    ///      be read from here. If that constant is ever lowered this pin goes
+    ///      stale in the permissive direction, so it is quoted by name in the
+    ///      vault's own natspec as the thing that measures it.
+    uint256 internal constant SWEEP_GAS = 1_500_000;
+
+    /// @dev Every leg of `releaseUnconvertible` armed at once: a wrapper balance
+    ///      whose redemption is REFUSED (so the redeem is attempted AND the raw
+    ///      collateral push fires — the two are mutually exclusive on a working
+    ///      wrapper, and this is the branch that runs both), an `otherToken`
+    ///      residue with a live adapter (so the swap really executes rather than
+    ///      declining), and an idle `asset` balance. That is: redeem attempt +
+    ///      swap + three `_pushAllToVault` calls.
+    function _armHeaviestReleaseShape() internal {
+        _execute();
+        vm.warp(vm.getBlockTimestamp() + 30 days);
+        _settle();
+
+        // Real shares, minted through the wrapper rather than `deal`-ed in, so
+        // the balance the push moves is one the wrapper agrees exists.
+        usdg.mint(address(this), 50_000e6);
+        usdg.approve(address(spUsdg), 50_000e6);
+        spUsdg.deposit(50_000e6, address(strategy));
+        spUsdg.setRedeemPaused(true);
+        nvda.mint(address(strategy), 100e18);
+        usdg.mint(address(strategy), 20_000e6);
+    }
+
+    function test_releaseUnconvertible_fitsTheVaultsGasCeiling() public {
+        _armHeaviestReleaseShape();
+
+        uint256 before = gasleft();
+        vm.prank(address(vaultStub));
+        strategy.releaseUnconvertible();
+        uint256 used = before - gasleft();
+
+        // NON-VACUITY: the heavy legs must actually have run. A shape that
+        // pushed nothing would "fit" trivially.
+        assertEq(usdg.balanceOf(address(strategy)), 0, "asset push did not fire");
+        assertEq(nvda.balanceOf(address(strategy)), 0, "otherToken push did not fire");
+        assertEq(spUsdg.balanceOf(address(strategy)), 0, "collateral push did not fire");
+
+        emit log_named_uint("releaseUnconvertible gas", used);
+        assertLt(used, SWEEP_GAS, "the hatch cannot run under the vault's ceiling");
+    }
+
+    function test_sweep_fitsTheVaultsGasCeiling() public {
+        _armHeaviestReleaseShape();
+
+        uint256 before = gasleft();
+        vm.prank(address(vaultStub));
+        strategy.sweep();
+        uint256 used = before - gasleft();
+
+        assertEq(usdg.balanceOf(address(strategy)), 0, "asset push did not fire");
+        emit log_named_uint("sweep gas", used);
+        assertLt(used, SWEEP_GAS, "sweep cannot run under the vault's ceiling");
+    }
+
+    /// @notice HEADROOM, stated as a number rather than left implicit. The
+    ///         measurement above only says "fits today"; this says by how much,
+    ///         so a future leg added to either path fails here loudly instead of
+    ///         silently eating the margin.
+    function test_recoveryPathsKeepMeaningfulHeadroom() public {
+        _armHeaviestReleaseShape();
+
+        uint256 before = gasleft();
+        vm.prank(address(vaultStub));
+        strategy.releaseUnconvertible();
+        uint256 used = before - gasleft();
+
+        // An eighth of the ceiling, against mocked vendors. Deliberately far
+        // tighter than "fits": the real cost is a multiple of this, and PR #249
+        // adds `_repayAndWithdraw` to this same path (Morpho accrue + repay +
+        // withdraw + a second wrapper redeem). A pin at the ceiling itself would
+        // hold right up until the fork suite failed instead.
+        assertLt(used, SWEEP_GAS / 8, "template-side cost grew - re-measure on the fork before assuming it still fits");
     }
 }

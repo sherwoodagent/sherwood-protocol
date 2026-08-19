@@ -157,10 +157,28 @@
       "type": "t_mapping(t_address,t_uint256)"
     },
     {
-      "label": "__gap",
+      "label": "_unvaluedSince",
       "slot": "24",
       "offset": 0,
-      "type": "t_array(t_uint256)24_storage"
+      "type": "t_uint256"
+    },
+    {
+      "label": "_unvaluedBurned",
+      "slot": "25",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_bool)"
+    },
+    {
+      "label": "_unvaluedMarkedAt",
+      "slot": "26",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "__gap",
+      "slot": "27",
+      "offset": 0,
+      "type": "t_array(t_uint256)21_storage"
     }
   ],
   "types": {
