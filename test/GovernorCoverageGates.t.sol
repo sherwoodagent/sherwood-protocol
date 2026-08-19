@@ -20,12 +20,23 @@ import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
+import {CallSandbox} from "../src/CallSandbox.sol";
+import {ICallSandbox} from "../src/interfaces/ICallSandbox.sol";
 
 /// @dev Minimal sWOOD read surface the ExposureLedger constructor consumes.
 ///      `coolDownPeriod` (45d) covers epochLength (28d) + challengeWindow (14d).
 contract MockSwood {
     mapping(address => uint256) public guardianStake;
     uint256 public coolDownPeriod = 45 days;
+    /// @dev Read by `CallSandbox`'s denylist chain (ledger -> sWOOD -> WOOD).
+    ///      The real `StakedWood` exposes the same getter; without it here the
+    ///      WOOD arm of the denylist would resolve to `address(0)` and pass
+    ///      vacuously, which is indistinguishable from it working.
+    address public wood;
+
+    function setWood(address w) external {
+        wood = w;
+    }
 
     function setStake(address g, uint256 own) external {
         guardianStake[g] = own;
@@ -192,6 +203,7 @@ contract GovernorCoverageGatesTest is Test {
 
         // ── Ledger: $0.05 WOOD, $1.00 USDG feed, generous cap, default bps 100.
         swood = new MockSwood();
+        swood.setWood(address(wood));
         ledger = new ExposureLedger(ledgerOwner, address(swood), 28 days);
         feed = new MockFeed(1e8, 8); // $1.00, 8-dec
         // Design revision 2: `woodUsdPriceX8` is a CAP, never a price. WOOD is
@@ -282,6 +294,10 @@ contract GovernorCoverageGatesTest is Test {
                 }))
         );
         v = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
+        // Factory-gated and set-once; the test contract is the factory. Wired on
+        // every syndicate this fixture builds so the sandbox coverage tests
+        // below run against the same ledger-gated governor as everything else.
+        v.setSandboxImplementation(address(new CallSandbox()));
 
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(
@@ -701,6 +717,162 @@ contract GovernorCoverageGatesTest is Test {
 
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
         assertEq(governor.getEffectiveMaxCapital(pid), 0, "dust coverage floors to a zero net-outflow cap");
+    }
+
+    // ── permissionless-tier2-sandbox §5.4: coverage sizes the payload ──────
+
+    /// @dev A sandbox proposal whose BATCHES declare zero caps, so every unit of
+    ///      required coverage is the payload's own funding and the scaling can be
+    ///      read off the sandbox alone. The payload target is `targetToken`, a
+    ///      plain ERC-20 that no owner allowlisted and no registry certified —
+    ///      reachable only because the sandbox calls it as itself.
+    function _proposeSandbox(uint256 funding) internal returns (uint256) {
+        ICallSandbox.Call[] memory calls = new ICallSandbox.Call[](1);
+        calls[0] = ICallSandbox.Call({
+            target: address(targetToken), data: abi.encodeCall(targetToken.approve, (address(usdg), 1))
+        });
+
+        vm.prank(agent);
+        return governor.proposeWithSandbox(
+            ISyndicateGovernor.SandboxPayload({funding: funding, calls: calls, declaredTokens: new address[](0)}),
+            address(vault),
+            address(0),
+            "uri",
+            7 days,
+            _envelope(funding),
+            _execCalls(),
+            new uint256[](1),
+            _settleCalls(),
+            new uint256[](1),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+    }
+
+    /// @notice A funded payload prices coverage, and coverage is what silence
+    ///         cannot buy: with no approver there is no identified, stake-backed
+    ///         signer underwriting arbitrary calldata, so execution fails closed.
+    ///         This is the gate that replaced the registry owner's allowlist
+    ///         decision — if silence passed it, nothing would have replaced it.
+    function test_sandbox_noApprovers_cannotExecuteOnSilence() public {
+        uint256 pid = _proposeSandbox(1_000e6);
+        assertEq(governor.getRequiredCoverage(pid), 1_000e6, "the payload's own funding, at full notional");
+
+        _toApproved(pid);
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        governor.executeProposal(pid);
+        assertEq(vault.sandboxOf(pid), address(0), "and no sandbox was minted");
+    }
+
+    /// @notice Half the coverage funds half the payload. The sandbox is a
+    ///         structural loss bound, so scaling the funding IS scaling the risk
+    ///         — a half-underwritten proposal must not put the whole declared
+    ///         amount at stake.
+    function test_sandbox_halfRaisedCoverage_fundsHalfTheDeclaredAmount() public {
+        uint256 pid = _proposeSandbox(1_000e6);
+        address[] memory gs = new address[](1);
+        gs[0] = makeAddr("g1");
+        _seatApprovers(pid, gs, 10_000e18); // $500 against $1,000 required
+        _toApproved(pid);
+
+        uint256 vaultBefore = usdg.balanceOf(address(vault));
+        governor.executeProposal(pid);
+
+        address sandbox = vault.sandboxOf(pid);
+        assertTrue(sandbox != address(0), "a sandbox was minted");
+        assertEq(usdg.balanceOf(sandbox), 500e6, "funded at half the declared amount");
+        assertEq(vaultBefore - usdg.balanceOf(address(vault)), 500e6, "and the vault paid exactly that");
+        assertEq(governor.getEffectiveMaxCapital(pid), 500e6, "same raised-over-required ratio as the capital");
+    }
+
+    /// @notice Coverage that floors the funding to zero runs NOTHING. Minting an
+    ///         unfunded sandbox would still dispatch arbitrary calldata and would
+    ///         consume the one-sandbox-per-proposal slot, recorded as a run that
+    ///         the (dust-covered) guardians never underwrote at that size.
+    ///         Execution itself still proceeds — there is an identified signer,
+    ///         so the R1 floor is met — it simply carries no payload and no
+    ///         capital.
+    function test_sandbox_dustCoverage_runsNoSandboxAtAll() public {
+        uint256 pid = _proposeSandbox(1_000e6);
+        address[] memory gs = new address[](1);
+        gs[0] = makeAddr("g1");
+        _seatApprovers(pid, gs, 1e12); // $0.00000005 against $1,000 required
+        _toApproved(pid);
+
+        uint256 vaultBefore = usdg.balanceOf(address(vault));
+        governor.executeProposal(pid);
+
+        assertEq(governor.getEffectiveMaxCapital(pid), 0, "dust coverage floors the capital to zero");
+        assertEq(vault.sandboxOf(pid), address(0), "so no sandbox is minted");
+        assertEq(usdg.balanceOf(address(vault)), vaultBefore, "and not one unit left the vault");
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Executed),
+            "the proposal still executes, carrying nothing"
+        );
+    }
+
+    /// @dev A fully covered sandbox proposal naming `denied` among its calls.
+    ///      Coverage is seated so execution reaches `run()` — otherwise the
+    ///      quorum would revert first and the denylist assertion would pass for
+    ///      the wrong reason.
+    function _assertSandboxDenies(address denied) internal {
+        ICallSandbox.Call[] memory calls = new ICallSandbox.Call[](1);
+        calls[0] = ICallSandbox.Call({target: denied, data: abi.encodeWithSignature("owner()")});
+
+        vm.prank(agent);
+        uint256 pid = governor.proposeWithSandbox(
+            ISyndicateGovernor.SandboxPayload({funding: 1_000e6, calls: calls, declaredTokens: new address[](0)}),
+            address(vault),
+            address(0),
+            "uri",
+            7 days,
+            _envelope(1_000e6),
+            _execCalls(),
+            new uint256[](1),
+            _settleCalls(),
+            new uint256[](1),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+
+        address[] memory gs = new address[](1);
+        gs[0] = makeAddr("g1");
+        _seatApprovers(pid, gs, 20_000e18); // $1,000 — fully covers the payload
+        _toApproved(pid);
+
+        vm.expectRevert(abi.encodeWithSelector(ICallSandbox.DeniedTarget.selector, denied));
+        governor.executeProposal(pid);
+    }
+
+    /// @notice The four best-effort arms of the denylist, resolved through the
+    ///         governor -> ledger -> sWOOD -> WOOD chain. Each is reachable only
+    ///         because this fixture actually wires them; an unwired hop resolves
+    ///         to `address(0)`, never matches, and would make the assertion
+    ///         vacuous — which is why the vault/queue/governor arms live in the
+    ///         un-gated suite and these live here.
+    function test_sandbox_denylistCoversTheExposureLedger() public {
+        assertEq(governor.exposureLedger(), address(ledger), "fixture sanity: the ledger is wired");
+        _assertSandboxDenies(address(ledger));
+    }
+
+    function test_sandbox_denylistCoversSwood() public {
+        _assertSandboxDenies(address(swood));
+    }
+
+    function test_sandbox_denylistCoversWood() public {
+        assertEq(swood.wood(), address(wood), "fixture sanity: the WOOD hop resolves");
+        _assertSandboxDenies(address(wood));
+    }
+
+    function test_sandbox_denylistCoversTheTierRegistry() public {
+        // Permissive on purpose: the assertion here is about the DENYLIST
+        // resolving the registry address, not about anything the registry
+        // decides. A real one would only add allowlisting noise to a test that
+        // is not about allowlisting.
+        address registry = address(deployTierRegistry(address(this)));
+        governor.setTierRegistry(registry); // factory-only; test contract is factory
+
+        assertEq(governor.tierRegistry(), registry, "fixture sanity: the registry is wired");
+        _assertSandboxDenies(registry);
     }
 
     /// @notice Settlement reuses the STORED `effectiveMaxCapital` from execute

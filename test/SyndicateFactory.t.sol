@@ -12,6 +12,7 @@ import {GovernorBeacon} from "../src/GovernorBeacon.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 import {VaultWithdrawalQueue} from "../src/queue/VaultWithdrawalQueue.sol";
+import {CallSandbox} from "../src/CallSandbox.sol";
 import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 import {IStakedWood} from "../src/interfaces/IStakedWood.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
@@ -135,6 +136,49 @@ contract SyndicateFactoryTest is Test {
         // _executorImpl getter was dropped to free EIP-170 budget; verifying
         // the slot via vm.load is sufficient for this round-trip check.
         assertEq(address(uint160(uint256(vm.load(address(vault), bytes32(uint256(3)))))), address(executorLib));
+    }
+
+    /// @notice The sandbox implementation reaches the vault at creation. The
+    ///         vault's own setter is factory-only and set-once, so this is the
+    ///         ONLY moment a vault can ever get one — a factory that goes live
+    ///         unbound produces vaults permanently unable to run a payload.
+    function test_createSyndicate_bindsTheSandboxImplementation() public {
+        address impl = address(new CallSandbox());
+        vm.prank(owner);
+        factory.setSandboxImpl(impl);
+
+        vm.prank(creator1);
+        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _defaultConfig());
+
+        assertEq(SyndicateVault(payable(vaultAddr)).sandboxImplementation(), impl, "bound at creation");
+    }
+
+    /// @notice Unbound is a working factory, not a broken one — existing
+    ///         deployments keep creating vaults. Those vaults simply have no
+    ///         sandbox, and `proposeWithSandbox` refuses against them at propose.
+    function test_createSyndicate_withoutASandboxImplStillSucceeds() public {
+        assertEq(factory.sandboxImpl(), address(0), "fixture sanity: unbound");
+
+        vm.prank(creator1);
+        (, address vaultAddr) = factory.createSyndicate(creator1AgentId, _defaultConfig());
+
+        assertEq(SyndicateVault(payable(vaultAddr)).sandboxImplementation(), address(0), "no sandbox, no revert");
+    }
+
+    /// @notice A codeless implementation would be stamped into every future
+    ///         vault and then cloned into an address with no code — a sandbox
+    ///         that accepts the funding and does nothing.
+    function test_setSandboxImpl_refusesACodelessAddress() public {
+        vm.prank(owner);
+        vm.expectRevert(SyndicateFactory.InvalidSandboxImpl.selector);
+        factory.setSandboxImpl(address(0xBEEF));
+    }
+
+    function test_setSandboxImpl_onlyOwner() public {
+        address impl = address(new CallSandbox());
+        vm.prank(creator1);
+        vm.expectRevert();
+        factory.setSandboxImpl(impl);
     }
 
     /// @notice A freshly created vault's governor starts at the advertised 20%

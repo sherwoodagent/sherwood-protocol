@@ -43,6 +43,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         `SyndicateVault._guardBatchCalls` degrades OPEN.
     error TierRegistryNotWired();
     error InvalidExecutorImpl();
+    /// @notice `setSandboxImpl` was given a codeless address. See the setter.
+    error InvalidSandboxImpl();
     error InvalidVaultImpl();
     error InvalidENSRegistrar();
     error InvalidAgentRegistry();
@@ -197,13 +199,30 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         `pushWiring`.
     address public bondEscrow;
 
+    /// @notice The `CallSandbox` implementation each new vault clones for
+    ///         `proposeWithSandbox` payloads. Optional — `address(0)` means
+    ///         vaults created afterward have no sandbox and the permissionless
+    ///         tier-2 path is simply unavailable on them.
+    /// @dev BOUND AT CREATION AND NEVER AGAIN. The vault's own
+    ///      `setSandboxImplementation` is factory-only and set-once, so
+    ///      re-pointing this slot changes what FUTURE vaults clone and can never
+    ///      touch an existing one — which is the property the confinement
+    ///      argument needs: swapping the minted code behind an already-reviewed
+    ///      proposal would invalidate it.
+    ///
+    ///      Unwired is a REFUSAL, not a silent downgrade: `proposeWithSandbox`
+    ///      checks the vault's implementation at propose and rejects there,
+    ///      rather than letting a proposal clear the vote and the review period
+    ///      and then revert at execute with the proposer's bond already locked.
+    address public sandboxImpl;
+
     /// @dev Reserved for future storage. Shrinks as named slots are carved off the
     ///      FRONT of the gap, so every field behind it keeps its slot. One slot was
     ///      RESTORED when `compensationEscrow` was removed rather than deprecated
     ///      — legal only pre-mainnet, with the layout golden regenerated in the
     ///      same change; from the first mainnet deploy onward that slot would have
     ///      to stay.
-    uint256[43] private __gap;
+    uint256[42] private __gap;
 
     // ── Events ──
 
@@ -228,6 +247,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
+    event SandboxImplSet(address indexed oldImpl, address indexed newImpl);
     event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
     /// @notice Emitted when `pushWiring` re-pushes the factory's current
     ///         tierRegistry / exposureLedger / bondEscrow into an existing governor.
@@ -361,6 +381,14 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         VaultWithdrawalQueue queue = new VaultWithdrawalQueue(vault);
         ISyndicateVault(vault).setWithdrawalQueue(address(queue));
         emit WithdrawalQueueDeployed(vault, address(queue));
+
+        // Bind the sandbox implementation, same factory-only reason as the queue
+        // above. Skipped when unset so an existing factory keeps creating vaults
+        // — they simply have no sandbox, and `proposeWithSandbox` refuses at
+        // propose rather than letting a proposal reach execute and revert there.
+        if (sandboxImpl != address(0)) {
+            ISyndicateVault(vault).setSandboxImplementation(sandboxImpl);
+        }
 
         // Deploy the per-vault governor as a BeaconProxy. The governor's
         // `onlyVaultOwner` resolves the owner live from the vault, and the vault
@@ -670,6 +698,25 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         address old = exposureLedger;
         exposureLedger = newLedger;
         emit ExposureLedgerSet(old, newLedger);
+    }
+
+    /// @notice Set the `CallSandbox` implementation bound into vaults at
+    ///         `createSyndicate`. `address(0)` is tolerated — it disables the
+    ///         permissionless tier-2 path for vaults created afterward.
+    /// @dev NO `pushWiring` SIBLING, deliberately: the vault's setter is
+    ///      set-once, so an existing vault cannot be rewired here and must not
+    ///      appear to be. A vault created before this slot was set never gets a
+    ///      sandbox — the honest outcome, since re-pointing minted code under a
+    ///      live vault is exactly what the set-once rule exists to prevent.
+    ///
+    ///      Codeless is refused: an EOA stamped into a vault would pass every
+    ///      later check and then `Clones.cloneDeterministic` a codeless address,
+    ///      producing a sandbox that accepts the funding and does nothing.
+    function setSandboxImpl(address newImpl) external onlyOwner {
+        if (newImpl != address(0) && newImpl.code.length == 0) revert InvalidSandboxImpl();
+        address old = sandboxImpl;
+        sandboxImpl = newImpl;
+        emit SandboxImplSet(old, newImpl);
     }
 
     /// @notice Set the proposer-bond escrow pushed into governors at

@@ -211,10 +211,28 @@
       "type": "t_mapping(t_uint256,t_uint256)"
     },
     {
-      "label": "__gap",
+      "label": "_sandboxFunding",
       "slot": "66",
       "offset": 0,
-      "type": "t_array(t_uint256)26_storage"
+      "type": "t_mapping(t_uint256,t_uint256)"
+    },
+    {
+      "label": "_sandboxCalls",
+      "slot": "67",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_array(t_struct(Call)_storage)dyn_storage)"
+    },
+    {
+      "label": "_sandboxTokens",
+      "slot": "68",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_array(t_address)dyn_storage)"
+    },
+    {
+      "label": "__gap",
+      "slot": "69",
+      "offset": 0,
+      "type": "t_array(t_uint256)23_storage"
     }
   ],
   "types": {
@@ -230,12 +248,6 @@
         "slot": "1",
         "offset": 0,
         "type": "t_bytes_storage"
-      },
-      {
-        "label": "value",
-        "slot": "2",
-        "offset": 0,
-        "type": "t_uint256"
       }
     ],
     "t_struct(CoProposer)_storage": [
