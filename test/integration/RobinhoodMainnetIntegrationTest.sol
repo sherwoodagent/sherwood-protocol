@@ -319,9 +319,7 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
 
     function _cloneAndInit(address template, bytes memory initData) internal returns (address clone) {
         clone = Clones.clone(template);
-        (bool success,) =
-            clone.call(abi.encodeWithSignature("initialize(address,address,bytes)", address(vault), agent, initData));
-        require(success, "Strategy initialization failed");
+        _initializeClone(clone, initData);
         // PRE-EXISTING fix, not fallout of issue #147: `_guardBatchCalls`
         // (guard + registry wiring landed 9fafa00, post-dating this suite;
         // RPC gating hid it) requires the strategy CLONE itself to be
@@ -331,6 +329,36 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
         // check is enforced synchronously inside `initialize` above.
         vm.prank(deployer);
         TierRegistry(tierRegistry).setAdapterAllowed(clone, true);
+    }
+
+    /// @dev The `initialize` dispatch, in its OWN frame. Behaviour is identical
+    ///      to inlining it above; the split is purely to keep the encode out of
+    ///      `Clones.clone`'s frame.
+    ///
+    ///      WHY IT HAS TO BE SPLIT. Assembling
+    ///      `abi.encodeWithSignature("initialize(address,address,bytes)", ...)`
+    ///      keeps two cleaned address arguments, a memory pointer and the whole
+    ///      `bytes` argument's memory positions live at once — and inlined into
+    ///      `_cloneAndInit` those coexist with the clone's own temporaries,
+    ///      overflowing the IR stack by a single slot under this repo's
+    ///      `via_ir = true, optimizer_runs = 50` profile.
+    ///
+    ///      IT COMPILED ON BOTH SIDES AND FAILED ONLY ON THE MERGE. This
+    ///      function is unchanged; what moved is the derived suite around it.
+    ///      `ConcentratedLiquidityVaultE2EForkTest` had been tuned to exactly
+    ///      this limit twice INDEPENDENTLY — once on `post-audit` (the
+    ///      `_collectResidue` / `_assertFitsSweepCap` helpers, whose natspec
+    ///      says a fourth local fails the file to compile) and once on
+    ///      `feat/permissionless-tier2-sandbox` (the `_initParams` split) — and
+    ///      git merged both cleanly, with no conflict marker, into a derived
+    ///      contract one slot past what solc could schedule. Fixing it in the
+    ///      shared base rather than in that suite puts the headroom where the
+    ///      pressure actually is; the reported source location (a `constant` in
+    ///      the derived file) points at neither.
+    function _initializeClone(address clone, bytes memory initData) private {
+        (bool success,) =
+            clone.call(abi.encodeWithSignature("initialize(address,address,bytes)", address(vault), agent, initData));
+        require(success, "Strategy initialization failed");
     }
 
     /// @dev Propose → vote → open+resolve guardian review → execute, labelling

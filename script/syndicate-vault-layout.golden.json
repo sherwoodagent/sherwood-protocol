@@ -157,22 +157,40 @@
       "type": "t_mapping(t_address,t_uint256)"
     },
     {
-      "label": "_sandboxImplementation",
+      "label": "_unvaluedSince",
       "slot": "24",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_unvaluedBurned",
+      "slot": "25",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_bool)"
+    },
+    {
+      "label": "_unvaluedMarkedAt",
+      "slot": "26",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "_sandboxImplementation",
+      "slot": "27",
       "offset": 0,
       "type": "t_address"
     },
     {
       "label": "_proposalSandbox",
-      "slot": "25",
+      "slot": "28",
       "offset": 0,
       "type": "t_mapping(t_uint256,t_address)"
     },
     {
       "label": "__gap",
-      "slot": "26",
+      "slot": "29",
       "offset": 0,
-      "type": "t_array(t_uint256)22_storage"
+      "type": "t_array(t_uint256)19_storage"
     }
   ],
   "types": {
