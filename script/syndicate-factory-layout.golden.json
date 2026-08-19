@@ -58,7 +58,7 @@
       "label": "syndicates",
       "slot": "9",
       "offset": 0,
-      "type": "t_mapping(t_uint256,t_struct(Syndicate)_storage)"
+      "type": "t_mapping(t_uint256,t_struct(SyndicateFactory.Syndicate)_storage)"
     },
     {
       "label": "syndicateCount",
@@ -112,7 +112,7 @@
       "label": "_activeSyndicateIds",
       "slot": "17",
       "offset": 0,
-      "type": "t_struct(UintSet)_storage"
+      "type": "t_struct(EnumerableSet.UintSet)_storage"
     },
     {
       "label": "tierRegistry",
@@ -146,7 +146,7 @@
     }
   ],
   "types": {
-    "t_struct(Set)_storage": [
+    "t_struct(EnumerableSet.Set)_storage": [
       {
         "label": "_values",
         "slot": "0",
@@ -160,7 +160,15 @@
         "type": "t_mapping(t_bytes32,t_uint256)"
       }
     ],
-    "t_struct(Syndicate)_storage": [
+    "t_struct(EnumerableSet.UintSet)_storage": [
+      {
+        "label": "_inner",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_struct(EnumerableSet.Set)_storage"
+      }
+    ],
+    "t_struct(SyndicateFactory.Syndicate)_storage": [
       {
         "label": "id",
         "slot": "0",
@@ -202,14 +210,6 @@
         "slot": "6",
         "offset": 0,
         "type": "t_string_storage"
-      }
-    ],
-    "t_struct(UintSet)_storage": [
-      {
-        "label": "_inner",
-        "slot": "0",
-        "offset": 0,
-        "type": "t_struct(Set)_storage"
       }
     ]
   }

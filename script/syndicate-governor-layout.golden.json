@@ -10,7 +10,7 @@
       "label": "_proposals",
       "slot": "1",
       "offset": 0,
-      "type": "t_mapping(t_uint256,t_struct(StrategyProposal)_storage)"
+      "type": "t_mapping(t_uint256,t_struct(ISyndicateGovernor.StrategyProposal)_storage)"
     },
     {
       "label": "_openProposalCount",
@@ -58,7 +58,7 @@
       "label": "_params",
       "slot": "18",
       "offset": 0,
-      "type": "t_struct(GovernorParams)_storage"
+      "type": "t_struct(ISyndicateGovernor.GovernorParams)_storage"
     },
     {
       "label": "_bootstrapOwner",
@@ -118,7 +118,7 @@
       "label": "_coProposers",
       "slot": "50",
       "offset": 0,
-      "type": "t_mapping(t_uint256,t_array(t_struct(CoProposer)_storage)dyn_storage)"
+      "type": "t_mapping(t_uint256,t_array(t_struct(ISyndicateGovernor.CoProposer)_storage)dyn_storage)"
     },
     {
       "label": "coProposerApprovals",
@@ -136,13 +136,13 @@
       "label": "_executeCalls",
       "slot": "53",
       "offset": 0,
-      "type": "t_mapping(t_uint256,t_array(t_struct(Call)_storage)dyn_storage)"
+      "type": "t_mapping(t_uint256,t_array(t_struct(BatchExecutorLib.Call)_storage)dyn_storage)"
     },
     {
       "label": "_settlementCalls",
       "slot": "54",
       "offset": 0,
-      "type": "t_mapping(t_uint256,t_array(t_struct(Call)_storage)dyn_storage)"
+      "type": "t_mapping(t_uint256,t_array(t_struct(BatchExecutorLib.Call)_storage)dyn_storage)"
     },
     {
       "label": "_unclaimedFees",
@@ -220,7 +220,7 @@
       "label": "_sandboxCalls",
       "slot": "67",
       "offset": 0,
-      "type": "t_mapping(t_uint256,t_array(t_struct(Call)_storage)dyn_storage)"
+      "type": "t_mapping(t_uint256,t_array(t_struct(ICallSandbox.Call)_storage)dyn_storage)"
     },
     {
       "label": "_sandboxTokens",
@@ -236,7 +236,27 @@
     }
   ],
   "types": {
-    "t_struct(Call)_storage": [
+    "t_struct(BatchExecutorLib.Call)_storage": [
+      {
+        "label": "target",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_address"
+      },
+      {
+        "label": "data",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_bytes_storage"
+      },
+      {
+        "label": "value",
+        "slot": "2",
+        "offset": 0,
+        "type": "t_uint256"
+      }
+    ],
+    "t_struct(ICallSandbox.Call)_storage": [
       {
         "label": "target",
         "slot": "0",
@@ -250,7 +270,53 @@
         "type": "t_bytes_storage"
       }
     ],
-    "t_struct(CoProposer)_storage": [
+    "t_struct(IProtocolConfig.MgmtSplit)_storage": [
+      {
+        "label": "agentBps",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_uint16"
+      },
+      {
+        "label": "protocolBps",
+        "slot": "0",
+        "offset": 2,
+        "type": "t_uint16"
+      },
+      {
+        "label": "guardianBps",
+        "slot": "0",
+        "offset": 4,
+        "type": "t_uint16"
+      }
+    ],
+    "t_struct(IProtocolConfig.PerfSplit)_storage": [
+      {
+        "label": "agentBps",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_uint16"
+      },
+      {
+        "label": "protocolBps",
+        "slot": "0",
+        "offset": 2,
+        "type": "t_uint16"
+      },
+      {
+        "label": "guardianBps",
+        "slot": "0",
+        "offset": 4,
+        "type": "t_uint16"
+      },
+      {
+        "label": "ownerBps",
+        "slot": "0",
+        "offset": 6,
+        "type": "t_uint16"
+      }
+    ],
+    "t_struct(ISyndicateGovernor.CoProposer)_storage": [
       {
         "label": "agent",
         "slot": "0",
@@ -264,7 +330,7 @@
         "type": "t_uint256"
       }
     ],
-    "t_struct(GovernorParams)_storage": [
+    "t_struct(ISyndicateGovernor.GovernorParams)_storage": [
       {
         "label": "votingPeriod",
         "slot": "0",
@@ -320,53 +386,7 @@
         "type": "t_uint256"
       }
     ],
-    "t_struct(MgmtSplit)_storage": [
-      {
-        "label": "agentBps",
-        "slot": "0",
-        "offset": 0,
-        "type": "t_uint16"
-      },
-      {
-        "label": "protocolBps",
-        "slot": "0",
-        "offset": 2,
-        "type": "t_uint16"
-      },
-      {
-        "label": "guardianBps",
-        "slot": "0",
-        "offset": 4,
-        "type": "t_uint16"
-      }
-    ],
-    "t_struct(PerfSplit)_storage": [
-      {
-        "label": "agentBps",
-        "slot": "0",
-        "offset": 0,
-        "type": "t_uint16"
-      },
-      {
-        "label": "protocolBps",
-        "slot": "0",
-        "offset": 2,
-        "type": "t_uint16"
-      },
-      {
-        "label": "guardianBps",
-        "slot": "0",
-        "offset": 4,
-        "type": "t_uint16"
-      },
-      {
-        "label": "ownerBps",
-        "slot": "0",
-        "offset": 6,
-        "type": "t_uint16"
-      }
-    ],
-    "t_struct(StrategyProposal)_storage": [
+    "t_struct(ISyndicateGovernor.StrategyProposal)_storage": [
       {
         "label": "id",
         "slot": "0",
@@ -521,13 +541,13 @@
         "label": "snapshotMgmtSplit",
         "slot": "24",
         "offset": 0,
-        "type": "t_struct(MgmtSplit)_storage"
+        "type": "t_struct(IProtocolConfig.MgmtSplit)_storage"
       },
       {
         "label": "snapshotPerfSplit",
         "slot": "25",
         "offset": 0,
-        "type": "t_struct(PerfSplit)_storage"
+        "type": "t_struct(IProtocolConfig.PerfSplit)_storage"
       },
       {
         "label": "proposerBondLedger",
