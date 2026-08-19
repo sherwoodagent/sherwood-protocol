@@ -988,6 +988,33 @@ contract SandboxProposalTest is Test {
         _proposeSandbox(_payload(_oneCall(address(spy), abi.encodeCall(IdentitySpy.ping, ())), FUNDING, tokens), agent);
     }
 
+    /// @notice Same lifecycle argument as the duplicate-token check above, for
+    ///         the one other rule `CallSandbox.init` enforces: a zero target.
+    ///         Without this the payload reaches execute and reverts
+    ///         `InvalidCallSet` there, with the bond locked and the review
+    ///         period already spent.
+    function test_propose_zeroTargetRejectedAtProposeNotExecute() public {
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.ZeroSandboxTarget.selector, uint256(0)));
+        _proposeSandbox(_payload(_oneCall(address(0), ""), FUNDING, new address[](0)), agent);
+    }
+
+    /// @notice The whole call set is scanned, not just its head, and the error
+    ///         names WHICH call was zero.
+    ///
+    ///         Without the index assertion this test would also pass against a
+    ///         check that only ever looked at `calls[0]` — it would simply
+    ///         report the wrong index — so the index is what makes it pin the
+    ///         loop rather than the existence of a revert.
+    function test_propose_zeroTargetFoundAnywhereInTheCallSet() public {
+        ICallSandbox.Call[] memory calls = new ICallSandbox.Call[](3);
+        calls[0] = ICallSandbox.Call({target: address(spy), data: abi.encodeCall(IdentitySpy.ping, ())});
+        calls[1] = ICallSandbox.Call({target: address(spy), data: abi.encodeCall(IdentitySpy.ping, ())});
+        calls[2] = ICallSandbox.Call({target: address(0), data: ""});
+
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.ZeroSandboxTarget.selector, uint256(2)));
+        _proposeSandbox(_payload(calls, FUNDING, new address[](0)), agent);
+    }
+
     // ── 4.1 (envelope) ────────────────────────────────────────────────────
 
     /// @notice The funded amount is subtracted from the capital the execute

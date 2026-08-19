@@ -388,6 +388,23 @@ interface ISyndicateGovernor {
     ///         as well as in `CallSandbox.init` so the payload dies at propose
     ///         rather than at execute with the bond already locked.
     error DuplicateSandboxToken(address token);
+    /// @notice A sandbox call named `address(0)` as its target. Refused here for
+    ///         the same lifecycle reason as `DuplicateSandboxToken`: every rule
+    ///         `CallSandbox.init` enforces has to be enforced at propose too, or
+    ///         the payload that breaks it clears the vote, spends the whole
+    ///         review period, and only then reverts `InvalidCallSet` at execute
+    ///         with the proposer's bond locked and no way to amend it.
+    ///
+    ///         There is a second reason this one specifically must not reach the
+    ///         sandbox. `CallSandbox._denyIfNamed` uses `address(0)` as its
+    ///         "this probe did not resolve" sentinel and returns early on it, so
+    ///         a stored zero target would sit in the call set as an address the
+    ///         accounting denylist is structurally unable to screen. That
+    ///         sentinel is only safe because zero targets cannot exist, which is
+    ///         an invariant worth holding at both ends rather than one.
+    ///
+    ///         Carries the index so a rejected payload says which call broke it.
+    error ZeroSandboxTarget(uint256 index);
     /// @notice Sandbox `funding` was zero. A sandbox holding nothing cannot move
     ///         vault capital, so there is nothing to price and nothing to
     ///         underwrite; use plain `propose` instead.

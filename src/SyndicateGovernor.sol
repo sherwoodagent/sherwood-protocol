@@ -425,6 +425,19 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // locked and the review period spent, with no path to fix it.
         if (sandbox.calls.length > MAX_SANDBOX_CALLS) revert TooManyCalls();
         if (sandbox.declaredTokens.length > MAX_SANDBOX_TOKENS) revert TooManySandboxTokens();
+        // MIRRORS `CallSandbox.init`'S ZERO-TARGET REFUSAL, for the same reason
+        // the declared-token dedup below mirrors its duplicate check: a rule
+        // enforced only at execute kills a proposal that already cleared the
+        // vote and the review period, with the bond locked and no way to amend.
+        //
+        // AND THIS ONE ALSO PROPS UP A SENTINEL. `CallSandbox._denyIfNamed`
+        // treats `address(0)` as "the probe did not resolve" and returns
+        // early, so a zero target would be an entry the accounting denylist
+        // cannot screen. Its natspec argues that is safe BECAUSE `init` rejects
+        // zero targets — an invariant better held at both ends than at one.
+        for (uint256 i = 0; i < sandbox.calls.length; i++) {
+            if (sandbox.calls[i].target == address(0)) revert ZeroSandboxTarget(i);
+        }
         // MIRRORS `CallSandbox.init`'S OWN REFUSAL, and must. Every rule `init`
         // enforces has to be enforced HERE too, or the payload that breaks it
         // clears the vote and the whole review period and then reverts at
