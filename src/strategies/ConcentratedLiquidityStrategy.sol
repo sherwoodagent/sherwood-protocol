@@ -1057,12 +1057,17 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         if (p.twapWindow < MIN_TWAP_WINDOW) revert InvalidBound();
         if (p.maxTwapDeviationBps == 0 || p.maxTwapDeviationBps > MAX_TWAP_DEVIATION_BPS) revert InvalidBound();
         // ZERO IS THE STRICTEST SETTING, NOT THE LOOSEST (pashov 2026-08
-        // findings #16 and #9's first trigger). It reads as a safe default and
-        // is the one value that cannot work: `_mintPosition` derives
-        // `amountXMin` from the amounts OFFERED, so zero demands the pool
-        // consume every wei of both legs, which a two-sided mint never does.
-        // The mint reverts, `_execute` reverts with it, and the proposal
-        // expires at `executeBy` with the bond still locked. Same bar as
+        // finding #16). It reads as a safe default and is the one value that
+        // cannot work: this field is the floor for the `_rebalanceToTarget`
+        // swap that runs at the top of `_mintPosition`, and `_quoteMinOut`
+        // computes `expected * (BPS_DENOMINATOR - slippageBps)`. Zero puts the
+        // floor exactly ON the quote, which is read before the swap moves the
+        // pool, so no honest fill clears it. `_execute` reverts and the
+        // proposal expires at `executeBy` with the bond still locked.
+        //
+        // It ALSO used to brick the mint itself, via a per-leg floor derived
+        // from the offered amounts; finding #9 removed that floor, and this
+        // rejection is load-bearing independently of it. Same bar as
         // `settleSlippageBps` below, and for the same reason.
         if (p.mintSlippageBps == 0 || p.mintSlippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
         // ZERO IS NOT A LEGAL INIT VALUE, because `_updateParams` reads zero as
@@ -1295,8 +1300,16 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      THE SPLIT IS THE AGENT'S NUMBER, NOT A DERIVED ONE. Sizing the two
     ///      legs of a range exactly needs `sqrtRatioAtTick` for both bounds; the
     ///      design rejects carrying that math on-chain, and the agent has
-    ///      already computed the ratio precisely off-chain. What bounds a wrong
-    ///      split is the mint floor below, not a recomputation.
+    ///      already computed the ratio precisely off-chain.
+    ///
+    ///      A WRONG SPLIT NOW UNDER-DEPLOYS RATHER THAN REVERTING (pashov
+    ///      2026-08 finding #9). This note used to claim the mint floor bounded
+    ///      it; that floor measured the unconsumed remainder, not the price, and
+    ///      reverted on ordinary drift — see the block at the mint itself.
+    ///      Nothing recomputes the split on-chain, so what a bad ratio costs is
+    ///      a smaller position plus an idle remainder the settlement returns,
+    ///      not a stranded proposal. The size actually opened is emitted in
+    ///      `PositionOpened`.
     /// @dev Move the held balances to `targetOtherBps` of TOTAL value in the
     ///      other token, swapping only the difference in whichever direction it
     ///      is needed.
@@ -1384,7 +1397,37 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         (uint256 amount0Desired, uint256 amount1Desired) = assetIsToken0 ? (assetBal, otherBal) : (otherBal, assetBal);
 
-        uint256 floor = BPS_DENOMINATOR - slippageBps;
+        // NO PER-LEG FLOOR ON THE MINT (pashov 2026-08 finding #9).
+        //
+        // `amountXMin` bounded the wrong quantity. Uniswap's parameter exists to
+        // bound PRICE MOVEMENT between quote and execution; deriving it from
+        // `amountXDesired` — the clone's whole balance — bounded the UNCONSUMED
+        // REMAINDER instead, and a leftover is the routine outcome, as the
+        // comment below this call already says. Spot drifting inside the band
+        // between propose and execute leaves one leg barely touched, the floor
+        // on that leg becomes unreachable, and `_execute` reverts until the
+        // proposal expires at `executeBy` with the proposer bond locked. No
+        // attacker required; ordinary price movement is enough.
+        //
+        // WHAT GUARDS THE PRICE INSTEAD, one call up the stack: `_execute`
+        // asserts `_requireSpotNearTwap()` immediately before this, and
+        // `rerange` re-asserts it on its own path. That is the check that
+        // actually bounds a manipulated pool, and it does it on the pool's own
+        // price rather than on a leftover. A mint is also not a swap: the
+        // tokens move into a position THIS CONTRACT owns, so a skewed price
+        // costs composition, not principal.
+        //
+        // THE CONCESSION, STATED. This used to be what rejected a badly-chosen
+        // `swapFractionBps` (see the note on `_execute`'s helper below, now
+        // corrected). It no longer does: a wrong split under-deploys and leaves
+        // the remainder idle on the clone rather than reverting. That is the
+        // deliberate direction — the remainder is recoverable at settle, while a
+        // revert strands the entire proposal — and it is unavoidable, because a
+        // leftover from an honest drift and a leftover from a wrong split are
+        // the SAME observable. Any rule that rejects the second rejects the
+        // first, which is the defect. `PositionOpened` emits the liquidity
+        // actually minted, so an under-deployed proposal is visible off-chain
+        // without a new event.
         INonfungiblePositionManager.MintParams memory mp = INonfungiblePositionManager.MintParams({
             token0: assetIsToken0 ? asset : otherToken,
             token1: assetIsToken0 ? otherToken : asset,
@@ -1393,8 +1436,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             tickUpper: upper,
             amount0Desired: amount0Desired,
             amount1Desired: amount1Desired,
-            amount0Min: (amount0Desired * floor) / BPS_DENOMINATOR,
-            amount1Min: (amount1Desired * floor) / BPS_DENOMINATOR,
+            amount0Min: 0,
+            amount1Min: 0,
             recipient: address(this),
             deadline: block.timestamp
         });
