@@ -146,6 +146,11 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
 
         IGuardianRegistry reg = IGuardianRegistry(_guardianRegistry);
+
+        // OPENED FIRST, THEN BONDED — the order is the fix, see below.
+        bytes32 h = keccak256(abi.encode(calls));
+        reg.openEmergency(proposalId, h, calls);
+
         // STRICTLY POSITIVE, not merely "meets the requirement". `posted == 0`
         // is checked on its own rather than left to the comparison because the
         // comparison alone is satisfiable at zero: a registry (or sWOOD) whose
@@ -163,11 +168,32 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         // settlement batch above with no bond requirement at all, so the honest
         // stuck-proposal path is untouched. This gate covers only the path that
         // lets the owner write the calldata.
+        //
+        // MEASURED AFTER THE CALL THAT CAN BURN IT (2026-08 sweep finding #11).
+        // `openEmergency` does not only open: when a previous round is still
+        // unresolved it calls `_resolveEmergency` in place, and a blocked
+        // verdict there calls `slashOwnerBond`, which DELETES the stake. Read
+        // before that call, this gate passed on collateral the same transaction
+        // was about to destroy — and the round it admitted went live with
+        // nothing slashable behind it. A second block verdict then hits
+        // `slashOwnerBond`'s `amount == 0` early return, so the deterrent
+        // guarding owner-authored calldata (run by `finalizeEmergencySettle`
+        // with EMPTY per-call caps) was a no-op for that round.
+        //
+        // The owner races no one for it. `_resolveEmergency` and the
+        // permissionless `resolveEmergencyReview` are BOTH gated on
+        // `_effNow >= er.reviewEnd`, so both predicates flip at the same
+        // instant — a timestamp the owner knows in advance and can simply pick.
+        // `openEmergency`'s own natspec spells that out while closing the
+        // sibling race.
+        //
+        // Reverting here unwinds the open AND the slash, which is the right
+        // direction on both counts: no unbonded round is admitted, and the
+        // verdict the elapsed window earned stays on the record for the
+        // permissionless resolver to commit. Cost of moving it is one wasted
+        // `openEmergency` in the failing case, which reverts anyway.
         uint256 posted = reg.ownerStake(p.vault);
         if (posted == 0 || posted < reg.requiredOwnerBond(p.vault)) revert OwnerBondInsufficient();
-
-        bytes32 h = keccak256(abi.encode(calls));
-        reg.openEmergency(proposalId, h, calls);
         emit EmergencySettleProposed(proposalId, msg.sender, h, uint64(block.timestamp + reg.reviewPeriod()));
     }
 

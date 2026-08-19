@@ -430,6 +430,100 @@ contract GovernorEmergencyTest is Test {
         governor.emergencySettleWithCalls(pid, _customCalls());
     }
 
+    // ── 2026-08 sweep finding #11 — the gate read what the call burns ──
+    //
+    // `emergencySettleWithCalls` measured the owner bond BEFORE
+    // `reg.openEmergency`, and `openEmergency` does not only open: when a
+    // previous round is unresolved it calls `_resolveEmergency`, which on a
+    // blocked verdict calls `slashOwnerBond` — and that DELETES the stake.
+    // Nothing re-asserted the bond afterwards, so the gate passed on collateral
+    // the same transaction was about to destroy.
+    //
+    // The owner does not race anyone for this. `_resolveEmergency` is gated on
+    // `_effNow >= er.reviewEnd`, and so is the permissionless
+    // `resolveEmergencyReview` — both predicates flip at the SAME instant, and
+    // `openEmergency`'s own natspec says so. The owner simply picks that block.
+
+    /// @dev THE TRACE from the issue, end to end. Round 1 is blocked by
+    ///      guardian quorum; at exactly `reviewEnd` the owner re-opens rather
+    ///      than letting anyone resolve. Before the fix this SUCCEEDED: the
+    ///      gate read the live bond, `openEmergency` then burned it in place,
+    ///      and round 2 went live with zero slashable collateral — one free
+    ///      unbonded run at owner-authored calldata, which
+    ///      `finalizeEmergencySettle` executes with EMPTY per-call caps.
+    function test_emergencySettleWithCalls_cannotReopenOnABondTheSameCallBurns() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        vm.prank(guardianA);
+        registry.voteBlockEmergencySettle(address(governor), pid);
+        vm.prank(guardianB);
+        registry.voteBlockEmergencySettle(address(governor), pid);
+
+        // EXACTLY `reviewEnd` — the instant both predicates flip. Warping past
+        // it would work too; landing on it is the adversary's actual move and
+        // pins that the boundary itself is covered.
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.OwnerBondInsufficient.selector);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+    }
+
+    /// @dev THE STATE THE REVERT PROTECTS, asserted rather than inferred. A
+    ///      passing `expectRevert` above says only "this call failed"; it does
+    ///      not say the vault was left with an intact bond and no live round.
+    ///      Both matter — an unbonded OPEN round is the actual defect.
+    function test_emergencySettleWithCalls_reopenAttemptLeavesTheBondAndRoundIntact() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+        vm.prank(guardianA);
+        registry.voteBlockEmergencySettle(address(governor), pid);
+        vm.prank(guardianB);
+        registry.voteBlockEmergencySettle(address(governor), pid);
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.OwnerBondInsufficient.selector);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        // The whole transaction unwound, slash included — so the verdict round 1
+        // earned is still THERE to be committed by the permissionless resolver,
+        // rather than having been spent to admit an unbonded round 2.
+        assertEq(registry.ownerStake(address(vault)), MIN_OWNER_STAKE, "the bond was burned by the failed re-open");
+
+        registry.resolveEmergencyReview(address(governor), pid);
+        assertEq(registry.ownerStake(address(vault)), 0, "the honest resolver could no longer slash");
+    }
+
+    /// @dev NOT A BLANKET REFUSAL of re-opening. With the prior round resolved
+    ///      as NOT blocked, no slash fires, the bond survives `openEmergency`,
+    ///      and the owner may open again — which is the legitimate flow this
+    ///      fix must leave alone. Without this control the two tests above
+    ///      would also hold for a change that simply broke re-opening.
+    function test_emergencySettleWithCalls_reopenStillWorksWhenTheLastRoundWasNotBlocked() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        // No block votes this round, so the elapsed window resolves clean.
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        assertTrue(registry.isEmergencyOpen(address(governor), pid), "a clean round could no longer be re-opened");
+        assertEq(registry.ownerStake(address(vault)), MIN_OWNER_STAKE, "an unblocked round slashed the bond");
+    }
+
     /// @notice Positive control for both tests above: with a real bond posted
     ///         the escape hatch still opens. Guards against the gate degrading
     ///         into "always revert".
