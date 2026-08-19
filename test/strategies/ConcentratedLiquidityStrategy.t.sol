@@ -253,6 +253,64 @@ contract ConcentratedLiquidityStrategyLifecycleTest is CLFixture {
         assertEq(morpho.position(marketId, address(strategy)).collateral > 0, true, "collateral not posted");
     }
 
+    // ── Pashov 2026-08 finding #9 — the mint floor bounded the leftovers ──
+    //
+    // `_mintPosition` offers the clone's WHOLE balance of both tokens and used
+    // to set `amountXMin` to a fraction of that offer. Uniswap's `amountXMin`
+    // bounds price movement between quote and execution; a fraction of the
+    // OFFER bounds the unconsumed remainder instead, which the file's own
+    // comment calls routine: "A mint consumes only the side the range actually
+    // needs, so the offered balances are routinely larger than what is taken."
+    //
+    // WHY THE SUITE NEVER SAW IT. `MockPositionManager` consumes both legs in
+    // full by default (`consume0Bps = consume1Bps = 10_000`), and until these
+    // tests nothing in the repo called `setConsumption`. Every mint in 2800+
+    // tests therefore agreed with the assumption the floor encodes. A mock
+    // cannot falsify an assumption it shares.
+
+    /// @dev THE REPRODUCTION. The range needs 30% of the volatile leg at the
+    ///      execute-time price and leaves the rest — the ordinary outcome of
+    ///      spot drifting inside the band between propose and execute. The old
+    ///      floor demanded 95% of the offer, so the mint reverted, `_execute`
+    ///      reverted with it, and the proposal expired at `executeBy` with the
+    ///      proposer bond locked.
+    function test_execute_partialLegConsumptionStillMints() public {
+        posm.setConsumption(10_000, 3_000);
+
+        _execute();
+
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed), "execute reverted on a normal mint");
+        assertGt(strategy.tokenId(), 0, "no position minted");
+    }
+
+    /// @dev THE CONCESSION, PINNED. Dropping the floor means a mint that takes
+    ///      little of a leg no longer reverts — it under-deploys and the
+    ///      remainder stays on the clone. That is the intended trade (the
+    ///      residue is recoverable at settle, and a revert strands the whole
+    ///      proposal), but it must not be silent: the leftover is asserted here
+    ///      so a future change that starts burning or losing it fails loudly.
+    function test_execute_partialConsumptionLeavesTheRemainderRecoverable() public {
+        posm.setConsumption(10_000, 3_000);
+        _execute();
+
+        assertGt(nvda.balanceOf(address(strategy)), 0, "the unconsumed leg vanished rather than staying recoverable");
+    }
+
+    /// @dev NOT A BLANKET RELAXATION. `mintSlippageBps` still bounds the
+    ///      `_rebalanceToTarget` swap that runs first, through `_quoteMinOut` —
+    ///      so the parameter keeps its meaning and the zero-rejection shipped
+    ///      for finding #16 stays load-bearing. Only the mint's own per-leg
+    ///      floor, which measured the wrong quantity, is gone.
+    function test_execute_mintSlippageStillBoundsTheRebalanceSwap() public {
+        // A quote far below the pool's own price must still be refused by the
+        // swap floor, even though the mint no longer bands its legs.
+        adapter.setRate(address(usdg), address(nvda), 1);
+
+        vm.prank(address(vaultStub));
+        vm.expectRevert();
+        strategy.execute();
+    }
+
     /// @dev The clone-ratchet bypass (issue #150): a foreign proposal's batch
     ///      reaching this clone's `execute()` would flip the one-shot ratchet and
     ///      permanently brick the clone's own later proposal.
