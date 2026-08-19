@@ -529,6 +529,62 @@ contract ConcentratedLiquidityStrategyInitTest is CLFixture {
         _expectInitRevert(ConcentratedLiquidityStrategy.InvalidRerangePolicy.selector, p);
     }
 
+    // ── Pashov 2026-08 finding #16 — a zero slippage floor is a self-brick ──
+    //
+    // ZERO IS THE STRICTEST VALUE HERE, NOT THE LOOSEST, which is why it reads
+    // as a safe default and survives review. `_quoteMinOut` computes
+    // `expected * (BPS_DENOMINATOR - slippageBps) / BPS_DENOMINATOR`, so zero
+    // puts the floor exactly ON the quote — and the quote is taken BEFORE the
+    // swap moves the pool, so no honest fill ever clears it.
+    //
+    // The consequence is unrecoverable rather than merely annoying:
+    // `_updateParams` reaches only `settleSlippageBps` and `settleDeadline` and
+    // is a one-way ratchet, so neither of these two can be corrected after
+    // init. Every `rerange()` reverts for the clone's whole life — up to
+    // `ABSOLUTE_MAX_STRATEGY_DURATION` frozen in the initial band, earning no
+    // fees while the Morpho borrow accrues.
+    //
+    // This file ALREADY rejects `settleSlippageBps == 0` for the same reason,
+    // and `PortfolioStrategy` carries `MIN_SLIPPAGE_BPS = 50` with the note
+    // that it "turns a permanent self-brick into a rejected input". These two
+    // fields were the ones left out.
+
+    function test_init_rerangeSlippageZeroReverts() public {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.rerange.slippageBps = 0;
+        _expectInitRevert(ConcentratedLiquidityStrategy.InvalidRerangePolicy.selector, p);
+    }
+
+    /// @dev The mint side of the same shape, and ALSO finding #9's guaranteed
+    ///      trigger: `_mintPosition` derives `amountXMin` from the amounts
+    ///      OFFERED, so zero slippage demands the pool consume every wei of both
+    ///      legs — which a two-sided mint never does. Rejecting zero closes that
+    ///      trigger outright. Finding #9's other half (spot drifting outside the
+    ///      band, leaving one leg untouched at any non-zero setting) needs the
+    ///      floors derived from the range-implied amounts and is NOT fixed here.
+    function test_init_mintSlippageZeroReverts() public {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.mintSlippageBps = 0;
+        _expectInitRevert(ConcentratedLiquidityStrategy.InvalidBound.selector, p);
+    }
+
+    /// @dev NOT A BLANKET REJECTION. The bar is "non-zero", the same bar
+    ///      `settleSlippageBps` clears — one basis point is admissible. Without
+    ///      this the two tests above would also hold for a guard that refused
+    ///      every value, which would brick the template far harder than the
+    ///      finding does.
+    function test_init_oneBasisPointSlippageIsAccepted() public {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.mintSlippageBps = 1;
+        p.rerange.slippageBps = 1;
+
+        ConcentratedLiquidityStrategy s = _newStrategy(p);
+
+        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Pending));
+        assertEq(s.mintSlippageBps(), 1, "the mint floor was not stored as given");
+        assertEq(s.rerangePolicy().slippageBps, 1, "the rerange floor was not stored as given");
+    }
+
     function test_init_twapWindowTooShortReverts() public {
         ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
         p.twapWindow = strategy.MIN_TWAP_WINDOW() - 1;

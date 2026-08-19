@@ -1056,7 +1056,15 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     function _requireValidBounds(InitParams memory p) private pure {
         if (p.twapWindow < MIN_TWAP_WINDOW) revert InvalidBound();
         if (p.maxTwapDeviationBps == 0 || p.maxTwapDeviationBps > MAX_TWAP_DEVIATION_BPS) revert InvalidBound();
-        if (p.mintSlippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
+        // ZERO IS THE STRICTEST SETTING, NOT THE LOOSEST (pashov 2026-08
+        // findings #16 and #9's first trigger). It reads as a safe default and
+        // is the one value that cannot work: `_mintPosition` derives
+        // `amountXMin` from the amounts OFFERED, so zero demands the pool
+        // consume every wei of both legs, which a two-sided mint never does.
+        // The mint reverts, `_execute` reverts with it, and the proposal
+        // expires at `executeBy` with the bond still locked. Same bar as
+        // `settleSlippageBps` below, and for the same reason.
+        if (p.mintSlippageBps == 0 || p.mintSlippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
         // ZERO IS NOT A LEGAL INIT VALUE, because `_updateParams` reads zero as
         // "keep current" and is otherwise a one-way ratchet. A clone
         // initialized at 0 could therefore never be corrected: every later
@@ -1098,7 +1106,17 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         if (r.halfWidthTicks > MAX_HALF_WIDTH_TICKS) revert InvalidRerangePolicy();
         if (r.triggerBps == 0 || r.triggerBps > BPS_DENOMINATOR) revert InvalidRerangePolicy();
         if (r.maxReranges > MAX_RERANGE_LIMIT) revert InvalidRerangePolicy();
-        if (r.slippageBps > MAX_SLIPPAGE_BPS) revert InvalidRerangePolicy();
+        // ZERO IS A PERMANENT SELF-BRICK (pashov 2026-08 finding #16).
+        // `_quoteMinOut` computes `expected * (BPS_DENOMINATOR - slippageBps) /
+        // BPS_DENOMINATOR`, so zero puts the floor exactly ON the quote — and
+        // the quote is read BEFORE the swap moves the pool, so no honest fill
+        // clears it. Every `rerange()` then reverts for this clone's whole
+        // life: `_updateParams` reaches only `settleSlippageBps` and
+        // `settleDeadline` and is a one-way ratchet, so this field can never be
+        // corrected. The position sits frozen in its initial band for up to
+        // `ABSOLUTE_MAX_STRATEGY_DURATION`, earning no fees while the borrow
+        // accrues. Refusing the input costs a re-proposal instead.
+        if (r.slippageBps == 0 || r.slippageBps > MAX_SLIPPAGE_BPS) revert InvalidRerangePolicy();
         if (r.swapFractionBps > BPS_DENOMINATOR) revert InvalidRerangePolicy();
     }
 
