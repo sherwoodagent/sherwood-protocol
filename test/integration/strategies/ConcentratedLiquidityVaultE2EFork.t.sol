@@ -370,6 +370,69 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         return avg;
     }
 
+    /// @dev `collectResidue` behind a helper purely to keep the caller's stack
+    ///      shallow — this suite's lifecycle tests are already at the via-IR
+    ///      limit, and inlining the call there trips "stack too deep".
+    ///      Permissionless, and since `sweep()` became vault-only it is the only
+    ///      door to a residue recovery.
+    function _collectResidue(address strategy) internal returns (uint256) {
+        return vault.collectResidue(strategy);
+    }
+
+    /// @dev Same shape, same reason, for the last-resort hatch: `sweep()` and
+    ///      `releaseUnconvertible()` are both vault-only now, and both have a
+    ///      permissionless vault-side door that measures what arrives.
+    ///      Returns the WETH the hatch handed over — the vault's own return
+    ///      value counts VAULT ASSET, which is a different thing here — and
+    ///      pranks internally so the caller keeps one local, not four.
+    ///
+    ///      MEASURES THE CEILING WHILE IT IS HERE. Both recovery paths now run
+    ///      under `SyndicateVault._SWEEP_GAS` (1,500,000), where before they
+    ///      could be called directly with unbounded gas — so the cap binds the
+    ///      heavy path for the first time, and it has never been measured
+    ///      against live Morpho / Uniswap / ERC-4626 rather than mocks. It has
+    ///      to be measured HERE: the unit-level pin in
+    ///      `ConcentratedLiquidityStrategySettle.t.sol` bounds the template's
+    ///      own logic against stubbed vendors, which is a floor, not the bound.
+    ///
+    ///      AND AN OVERRUN IS SILENT WITHOUT THE SECOND ASSERT. The vault
+    ///      ignores the sub-call's result, so a hatch that exhausts the cap does
+    ///      not revert — it recovers nothing, stays counted, and holds the
+    ///      deposit gate. Gas-under-ceiling alone would therefore pass on
+    ///      exactly the failure being guarded, since a call that OOG'd at the
+    ///      cap also "fits". Pairing it with a recovery that actually landed is
+    ///      what makes the check non-vacuous.
+    ///
+    ///      THREE LOCALS, DELIBERATELY. This suite sits at the via-IR stack
+    ///      limit (see the note on `_collectResidue`); a fourth here fails the
+    ///      whole file to compile, which is why the assertion lives in its own
+    ///      frame below rather than inline.
+    function _releaseUnconvertible(address strategy, address caller) internal returns (uint256 releasedWeth) {
+        uint256 wethBefore = IERC20(WETH).balanceOf(strategy);
+        uint256 gasBefore = gasleft();
+        vm.prank(caller);
+        vault.releaseUnconvertible(strategy);
+        _assertFitsSweepCap(gasBefore);
+        return wethBefore - IERC20(WETH).balanceOf(strategy);
+    }
+
+    /// @dev Reads `gasleft()` one frame down, so the figure carries this call's
+    ///      own overhead. That biases it slightly HIGH, which is the safe
+    ///      direction for a ceiling check — it can report a near-miss that is
+    ///      really a pass, never a pass that is really an overrun.
+    function _assertFitsSweepCap(uint256 gasBefore) internal {
+        uint256 gasUsed = gasBefore - gasleft();
+        emit log_named_uint("releaseUnconvertible gas (fork, whole vault call)", gasUsed);
+        assertLt(gasUsed, SWEEP_GAS_CEILING, "the hatch no longer fits the vault's forwarding cap");
+    }
+
+    /// @dev Mirrors `SyndicateVault._SWEEP_GAS`, which is private and cannot be
+    ///      read from here. Quoted by name in that constant's own natspec as the
+    ///      thing that measures it, so lowering one without the other is caught
+    ///      by review rather than silently going stale in the permissive
+    ///      direction.
+    uint256 internal constant SWEEP_GAS_CEILING = 1_500_000;
+
     function _tickGap() internal view returns (uint256) {
         (, int24 spot,,,,,) = pool.slot0();
         int24 twap = _twapTick();
@@ -720,8 +783,10 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         uint256 totalAssetsBefore = vault.totalAssets();
         uint256 supplyBefore = vault.totalSupply();
 
-        vm.prank(outsider); // permissionless by design
-        uint256 released = s.releaseUnconvertible();
+        // Permissionless by design, and still is — but through the vault, so
+        // any VAULT ASSET the hatch converts on its way is measured and split
+        // with the exited cohort. The clone-side function is vault-only.
+        uint256 released = _releaseUnconvertible(strategy, outsider);
 
         assertEq(released, wethResidue, "released amount does not match the residue");
         assertEq(IERC20(WETH).balanceOf(strategy), 0, "residue still on the clone");
@@ -770,7 +835,9 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         // the permissionless recovery every chance.
         vm.warp(vm.getBlockTimestamp() + 2 * TWAP_WINDOW);
         assertLe(_tickGap(), 1_000, "TWAP did not converge - sweep would be refused for the right reason");
-        uint256 recovered = s.sweep();
+        // `sweep()` is vault-only now; `collectResidue` is the permissionless
+        // door and drives it, so this still tests "anyone can recover".
+        uint256 recovered = _collectResidue(address(s));
         console2.log("sweep recovered (USDG):", recovered);
         // Not exactly zero: wrapper yield since settlement nudges
         // `_withdrawableWhileHealthy` up by a few wei of USDG. The point is the

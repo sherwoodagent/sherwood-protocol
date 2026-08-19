@@ -251,7 +251,11 @@ contract MorphoSupplySettlementTest is MorphoSupplyFixture {
         vm.stopPrank();
 
         uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
-        uint256 swept = strategy.sweep(); // permissionless
+        // Vault-only since the cohort-accounting fix: `collectResidue` measures
+        // the arrival as a balance delta, so a direct call would land outside
+        // that measurement and starve the exited redeem cohort.
+        vm.prank(address(vaultStub));
+        uint256 swept = strategy.sweep();
         assertGt(swept, 0, "residue recovered");
         assertEq(usdg.balanceOf(address(vaultStub)) - vaultBefore, swept, "and lands in the vault");
         assertEq(mockMorpho.position(marketId, address(strategy)).supplyShares, 0, "position fully unwound");
@@ -261,6 +265,7 @@ contract MorphoSupplySettlementTest is MorphoSupplyFixture {
     ///         settlement the position is unwound by `settle`.
     function test_sweep_revertsBeforeSettlement() public {
         _approveAndExecute();
+        vm.prank(address(vaultStub));
         vm.expectRevert(MorphoSupplyStrategy.NotSettled.selector);
         strategy.sweep();
     }

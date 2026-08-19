@@ -421,9 +421,12 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
         vm.stopPrank();
         assertGt(vault.balanceOf(attacker), 0, "instant deposit is open while residue is outstanding");
 
-        // Sweep is permissionless and moves NAV by EXACTLY what it returns.
+        // Recovery is permissionless and moves NAV by EXACTLY what it returns.
+        // Driven through `collectResidue` because that is now the only door:
+        // `sweep()` is vault-only, so that the cohort split cannot be stepped
+        // over by pushing the residue home outside the measurement.
         vm.prank(makeAddr("sweeper"));
-        uint256 swept = s.sweep();
+        uint256 swept = vault.collectResidue(strategy);
         // The sweep settles at the position's TRUE value, so it necessarily
         // returns MORE than the call-free probe quoted — by the same
         // interest-since-`lastUpdate` term measured above. The invariant is
@@ -513,9 +516,9 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
         uint256 mintedShares = _claimQueued(attacker, reqId);
         assertEq(vault.balanceOf(attacker), mintedShares, "attacker holds the minted shares");
 
-        // The residue comes home into the enlarged pool.
+        // The residue comes home into the enlarged pool, via the only door.
         vm.prank(makeAddr("sweeper"));
-        uint256 swept = s.sweep();
+        uint256 swept = vault.collectResidue(strategy);
         assertGt(swept, 0, "residue swept back into the vault");
 
         // Realize: what are the attacker's shares actually worth now?
@@ -589,7 +592,7 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
         vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
         _flashSettle(pid);
         vm.prank(makeAddr("sweeperA"));
-        MorphoSupplyStrategy(strategy).sweep();
+        vault.collectResidue(strategy);
         uint256 honestAlone = vault.previewRedeem(vault.balanceOf(lp1)) + vault.previewRedeem(vault.balanceOf(lp2));
 
         // ── Branch B: identical, plus the queued attacker. ──
@@ -600,7 +603,7 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
         _flashSettle(pid);
         _claimQueued(attacker, reqId);
         vm.prank(makeAddr("sweeperB"));
-        MorphoSupplyStrategy(strategy).sweep();
+        vault.collectResidue(strategy);
         uint256 honestWithAttacker =
             vault.previewRedeem(vault.balanceOf(lp1)) + vault.previewRedeem(vault.balanceOf(lp2));
         uint256 attackerRealized = vault.previewRedeem(vault.balanceOf(attacker));
