@@ -2232,7 +2232,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // self-manage. Every proposal is charged the same way.
         {
             uint256 perfFee;
-            (agentFee, perfFee) = _chargePerformanceFee(proposalId, vault, asset, proposal.proposer, true);
+            (agentFee, perfFee) = _chargePerformanceFee(proposalId, vault, asset, proposal.proposer);
             totalFee += perfFee;
         }
 
@@ -2428,11 +2428,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      first would charge performance on assets already taken.
     /// @return agentFee The agent's slice, reported for the settle event.
     /// @return perfFee  The whole fee charged.
-    /// @param chargeNew Always `true`: both original reasons for a `false` call
-    ///        (the deleted `selfManagesFees` opt-out and the deleted
-    ///        `consumeCrystallizedPerf` path) are gone, so the parameter is
-    ///        provably vacuous. Retained pending a follow-up removal.
-    function _chargePerformanceFee(uint256 proposalId, address vault, address asset, address proposer, bool chargeNew)
+    function _chargePerformanceFee(uint256 proposalId, address vault, address asset, address proposer)
         internal
         returns (uint256 agentFee, uint256 perfFee)
     {
@@ -2441,7 +2437,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Profit measured against the fund's previous peak, not against this
         // proposal's own starting balance — a fund that fell and recovered has
         // already paid for this ground.
-        uint256 base = chargeNew ? ISyndicateVault(vault).aboveHighWaterMark() : 0;
+        uint256 base = ISyndicateVault(vault).aboveHighWaterMark();
 
         if (base > 0) {
             // Snapshotted at propose so it matches what voters approved, then
