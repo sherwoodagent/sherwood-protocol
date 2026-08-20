@@ -1169,8 +1169,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @inheritdoc IGuardianRegistry
     /// @dev Permissionless and idempotent — once resolved, returns the cached
     ///      `blocked` flag without re-slashing. Requires
-    ///      `block.timestamp >= reviewEnd`. Short-circuits to `false` when
-    ///      `!opened` or `cohortTooSmall`. CEI: sets `resolved`/`blocked` before
+    ///      `block.timestamp >= reviewEnd`. Short-circuits to `false` when the
+    ///      review was never opened — that is the ONLY short-circuit left; a
+    ///      thin cohort decides its own review, since the `cohortTooSmall`
+    ///      waiver was removed. Everything else goes to `_isBlocked`, which
+    ///      fails open on a zero electorate. CEI: sets `resolved`/`blocked` before
     ///      any token transfer, which is why no `nonReentrant` is needed — a
     ///      reentrant call hits the early return.
     function resolveReview(address governor, uint256 proposalId) external whenNotPaused returns (bool) {
@@ -1577,9 +1580,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @dev Pure mirror of `resolveReview`'s committed result. Branch order:
     ///      (1) resolved -> the cached `blocked` flag; (2) before `reviewEnd`, or
     ///      unregistered -> `Unresolved`; (3) window elapsed but not committed ->
-    ///      `Cleared` when the review was never opened or the cohort was too
-    ///      small, else `_isBlocked` decides. The short-circuits stay OUTSIDE
-    ///      `_isBlocked`, exactly as `resolveReview` applies them.
+    ///      `Cleared` when the review was never opened, else `_isBlocked`
+    ///      decides. The never-opened short-circuit stays OUTSIDE `_isBlocked`,
+    ///      exactly as `resolveReview` applies it.
     function outcomeOf(address governor, uint256 proposalId) external view returns (ReviewOutcome) {
         Review storage r = _reviews[_reviewKey(governor, proposalId)];
         if (r.resolved) {
