@@ -765,6 +765,40 @@ contract SandboxProposalTest is Test {
         assertEq(foreign.balanceOf(sandbox), 0, "and the sandbox no longer holds it");
     }
 
+    /// @notice THE COHORT-SPLIT DOOR STAYS SHUT. `_payCohortShare` splits a
+    ///         MEASURED BALANCE DELTA taken across the call inside
+    ///         `collectResidue`, and a delta is a complete measurement only
+    ///         while the vault is the one door vault asset arrives through. A
+    ///         sandbox is genuinely enrolled in that split — `onProposalSettled`
+    ///         records it against the settling pid — so a bare EOA driving
+    ///         `sweep()` directly used to land the whole balance in the vault
+    ///         OUTSIDE the measurement: the exited cohort credited nothing,
+    ///         unrepairably, and `depositNav()` double-counting until someone
+    ///         called `collectResidue`.
+    ///
+    ///         Both templates already carried `onlyVault` for this reason; the
+    ///         sandbox was a third residue holder merged with the door open.
+    function test_residue_directSweepIsRefusedSoTheCohortSplitStaysComplete() public {
+        (, address sandbox) = _runLeavingForeignToken(5e18, true);
+
+        // NON-VACUITY: there is really something to sweep, so a refusal here is
+        // the gate firing rather than an empty call trivially doing nothing.
+        assertGt(foreign.balanceOf(sandbox), 0, "the sandbox holds a leftover to sweep");
+
+        address keeper = makeAddr("keeper");
+        assertTrue(keeper != address(vault), "control: the caller is not the vault");
+        vm.prank(keeper);
+        vm.expectRevert(ICallSandbox.NotVault.selector);
+        ICallSandbox(sandbox).sweep();
+
+        // AND THE VAULT-ROUTED PATH STILL WORKS. The permissionless property is
+        // routed, not removed: `collectResidue` is itself callable by anyone.
+        vm.prank(keeper);
+        vault.collectResidue(sandbox);
+        assertEq(foreign.balanceOf(sandbox), 0, "the vault-routed exit still brings it home");
+        assertFalse(vault.depositsLocked(), "and it reopens deposits");
+    }
+
     /// @notice An UNDECLARED leftover is stranded in the sandbox and never
     ///         priced into a deposit. The safe direction of error: the proposer
     ///         loses what it failed to declare, and no LP ever mints against it.
