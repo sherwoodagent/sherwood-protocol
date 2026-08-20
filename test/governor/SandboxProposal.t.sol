@@ -11,6 +11,7 @@ import {ICallSandbox} from "../../src/interfaces/ICallSandbox.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
@@ -469,6 +470,111 @@ contract SandboxProposalTest is Test {
         vm.expectRevert(abi.encodeWithSelector(ICallSandbox.DeniedTarget.selector, denied));
         governor.executeProposal(pid);
         assertEq(spy.callCount(), 0, "no call in the set was applied");
+    }
+
+    /// @notice THE BEST-EFFORT BRANCH, MEASURED RATHER THAN ARGUED. When the
+    ///         governor cannot answer `tierRegistry()`, `CallSandbox._probeAddress`
+    ///         yields `address(0)`, `_denyIfNamed` treats that as "unresolved" and
+    ///         returns, and the tier registry is left UNDENIED — a stored target
+    ///         naming it walks straight through the denylist.
+    ///
+    ///         `CallSandbox`'s natspec calls that acceptable on one specific
+    ///         argument rather than a shrug: every function on the best-effort
+    ///         contracts is gated to its own privileged caller, so a sandbox that
+    ///         reaches them acts only as itself, holding no standing. This test
+    ///         pins both halves — the registry really is reached, and the identity
+    ///         it is reached with is the sandbox's own.
+    function test_denylist_unresolvedTierRegistryIsUndeniedAndArrivesWithNoStanding() public {
+        _wireTierRegistry();
+        address registry = governor.tierRegistry();
+        assertEq(registry, address(tierRegistry), "fixture sanity: the governor resolves a real registry");
+        // Read BEFORE the `expectCall` below is armed. `expectCall` counts every
+        // matching call for the rest of the test, so reading `owner()` after
+        // arming would let the non-vacuity control be satisfied by this
+        // assertion's own call instead of by the payload's.
+        address registryOwner = tierRegistry.owner();
+        assertEq(registryOwner, address(this), "fixture sanity: this test contract owns the registry");
+
+        ICallSandbox.Call[] memory calls = new ICallSandbox.Call[](2);
+        calls[0] = ICallSandbox.Call({target: address(spy), data: abi.encodeCall(IdentitySpy.ping, ())});
+        // An UNGATED view on the registry: the point here is reachability, so the
+        // call has to succeed. The privileged shape is the next test.
+        calls[1] = ICallSandbox.Call({target: registry, data: abi.encodeWithSignature("owner()")});
+
+        uint256 pid = _proposeSandbox(_payload(calls, FUNDING, new address[](0)), agent);
+        _advancePastVoting();
+
+        // ONLY THE FIRST READ GOES UNANSWERED, and the mock is armed only now.
+        // `SyndicateVault._guardBatchCalls` resolves the SAME getter later in this
+        // transaction and fails CLOSED on it (`TierRegistryUnresolved`), so muting
+        // it for the whole call would take the execute batch down before anything
+        // here could be observed. `mockCalls` answers each successive read from the
+        // list and then repeats the last entry, so entry 0 starves the sandbox's
+        // probe and entry 1 hands every later read the real address.
+        //
+        // THAT ALSO PINS THE ORDERING RATHER THAN ASSUMING IT: `executeProposal`
+        // dispatches the sandbox BEFORE the execute batch, so the probe is read 0.
+        // If it were not, the probe would take entry 1, resolve, and this test
+        // would fail with `DeniedTarget` — the assertion below cannot be satisfied
+        // by an accident of ordering.
+        bytes[] memory answers = new bytes[](2);
+        answers[0] = ""; // ret.length != 32, so `_probeAddress` returns address(0)
+        answers[1] = abi.encode(registry);
+        vm.mockCalls(address(governor), abi.encodeCall(ISyndicateGovernor.tierRegistry, ()), answers);
+
+        // NON-VACUITY. Without this the test would pass just as happily if the run
+        // had never dispatched a thing: `expectCall` fails the test unless the
+        // payload actually lands on the registry.
+        vm.expectCall(registry, abi.encodeWithSignature("owner()"), 1);
+        governor.executeProposal(pid);
+        assertEq(spy.callCount(), 1, "the run dispatched; naming the registry did not deny it");
+
+        // AND THE STANDING IT ARRIVES WITH IS NOTHING. The registry's own owner
+        // gate names the sandbox, which is the whole reason leaving it undenied is
+        // defensible: the denylist is defence in depth, this is the boundary.
+        address sandbox = vault.sandboxOf(pid);
+        assertTrue(sandbox != address(0), "a sandbox was minted for the proposal");
+        assertTrue(sandbox != registryOwner, "control: the sandbox is not the registry owner");
+        vm.prank(sandbox);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, sandbox));
+        tierRegistry.setAdapterAllowed(address(spy), true);
+    }
+
+    /// @notice The same unresolved probe, with the payload naming a PRIVILEGED
+    ///         function on the now-undenied registry. The run reaches it and the
+    ///         registry's own owner gate turns it away, so the failure surfaces as
+    ///         `CallFailed` — the sandbox wrapping the registry's revert — and
+    ///         never as `DeniedTarget`.
+    ///
+    ///         THE REVERT REASON IS THE WHOLE ASSERTION. A post-revert state read
+    ///         cannot pin which branch fired: `vm.expectRevert` rolls the registry
+    ///         back either way, so `isAdapterAllowed` reads false under a denial
+    ///         and under a gated refusal alike. Only the reason separates them.
+    function test_denylist_unresolvedTierRegistryPrivilegedCallDiesOnTheRegistryGate() public {
+        _wireTierRegistry();
+        address registry = governor.tierRegistry();
+
+        uint256 pid = _proposeSandbox(
+            _payload(
+                _oneCall(registry, abi.encodeCall(TierRegistry.setAdapterAllowed, (address(spy), true))),
+                FUNDING,
+                new address[](0)
+            ),
+            agent
+        );
+        _advancePastVoting();
+
+        // Same shape as the test above: read 0 (the sandbox's probe) goes
+        // unanswered, every later read resolves normally.
+        bytes[] memory answers = new bytes[](2);
+        answers[0] = "";
+        answers[1] = abi.encode(registry);
+        vm.mockCalls(address(governor), abi.encodeCall(ISyndicateGovernor.tierRegistry, ()), answers);
+
+        vm.expectRevert(abi.encodeWithSelector(ICallSandbox.CallFailed.selector, 0));
+        governor.executeProposal(pid);
+
+        assertFalse(tierRegistry.isAdapterAllowed(address(spy)), "the privileged call never took");
     }
 
     // ── 4.4 the funding ceiling ───────────────────────────────────────────
