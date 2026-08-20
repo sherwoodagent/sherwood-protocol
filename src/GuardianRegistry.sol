@@ -81,12 +81,23 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         bool opened;
         bool resolved;
         bool blocked;
-        /// @dev DEPRECATED and never written. The cold-start waiver it carried
-        ///      was removed: it made the guardian veto and the emergency
-        ///      owner-bond slash switchable off by anyone able to dip the
-        ///      staked total for one block via `requestUnstakeGuardian` +
-        ///      `cancelUnstakeGuardian`, which is free. The field stays so the
-        ///      storage layout of this upgradeable contract does not shift.
+        /// @dev LIVE — the block-quorum DENOMINATOR. Written once by
+        ///      `openReview` as `getPastTotalVotes(r.snapshotAt)`: the total
+        ///      staked weight at the PROPOSE instant, not at open, because
+        ///      `openReview` is permissionless and reading at open would let
+        ///      the caller pick when the electorate is measured. `_isBlocked`
+        ///      divides `blockStakeWeight` against it, and `_resolveEmergency`
+        ///      / `cancelEmergency` use the emergency review's own copy the
+        ///      same way. Zero means no electorate, and every one of those
+        ///      call sites must short-circuit before comparing — `0 >= 0` is
+        ///      vacuously true and would Block a review nobody voted in.
+        ///
+        ///      What WAS removed is the cold-start waiver that used to read
+        ///      this field against a floor: it made the guardian veto and the
+        ///      emergency owner-bond slash switchable off by anyone able to
+        ///      dip the staked total for one block via
+        ///      `requestUnstakeGuardian` + `cancelUnstakeGuardian`, which is
+        ///      free. The field itself outlived that waiver.
         uint128 totalStakeAtOpen;
         uint128 approveStakeWeight;
         uint128 blockStakeWeight;
