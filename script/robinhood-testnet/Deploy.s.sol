@@ -6,6 +6,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
+import {CallSandbox} from "../../src/CallSandbox.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
@@ -18,6 +19,17 @@ import {ScriptBase} from "../ScriptBase.sol";
 
 /**
  * @notice Deploy Sherwood protocol infrastructure to Robinhood L2 testnet.
+ *
+ *         STATUS: SUPERSEDED for new deployments by
+ *         `script/robinhood-testnet/DeployV2.s.sol:DeployRobinhoodTestnetV2`,
+ *         which deploys the same chain (46630) through the canonical
+ *         `DeploySherwood.deployCore` (CREATE3-salted, no hand-maintained nonce
+ *         offsets) plus the Synthra adapter / PortfolioStrategy phases. Its
+ *         header records that it supersedes the V1 keys in chains/46630.json.
+ *         It remains runnable for the bare-core case (SHE-132 fixed the nonce
+ *         ledger and the beacon validation that used to abort it), so it carries
+ *         the same sandbox binding V2 inherits — a header alone would not stop
+ *         `forge script` from bricking every vault it creates.
  *
  *         Robinhood L2 is Arbitrum Orbit — no ENS/Durin or ERC-8004 agent
  *         identity registry. The factory is deployed with address(0) for both,
@@ -48,6 +60,18 @@ contract DeployRobinhoodTestnet is ScriptBase {
         // 2. Deploy SyndicateVault implementation
         SyndicateVault vaultImpl = new SyndicateVault();
         console.log("Vault implementation:", address(vaultImpl));
+
+        // 2b. Deploy the CallSandbox implementation every vault clones for a
+        //     `proposeWithSandbox` payload. Deployed BEFORE the factory (and
+        //     before the `vm.getNonce` baseline below, so none of the linear
+        //     nonce offsets move) because the vault's binding is set-once and
+        //     is stamped at `createSyndicate`: a factory that goes live with an
+        //     unbound `sandboxImpl` produces vaults whose `runSandbox` reverts
+        //     `SandboxNotConfigured` forever, and `setSandboxImplementation` is
+        //     factory-only and one-shot, so those vaults can never be repaired.
+        //     Mirrors `script/Deploy.s.sol` (`SALT_SANDBOX_IMPL`).
+        CallSandbox sandboxImpl = new CallSandbox();
+        console.log("CallSandbox implementation:", address(sandboxImpl));
 
         // 3. Deploy SyndicateGovernor. Governor init requires the registry
         //    address; registry init requires the governor — resolved by
@@ -152,13 +176,26 @@ contract DeployRobinhoodTestnet is ScriptBase {
         require(address(factory) == predictedFactoryProxy, "factory addr mismatch");
         console.log("SyndicateFactory:", address(factory));
 
+        // 6b. Bind the sandbox implementation, in the same broadcast that
+        //     created the factory and before it can create a single vault. The
+        //     deployer is still the factory owner here (`InitParams.owner`), and
+        //     `setSandboxImpl` is `onlyOwner`. The `require` is not decoration:
+        //     `SyndicateFactory.createSyndicate` SKIPS the binding when
+        //     `sandboxImpl == address(0)` rather than reverting, so an unbound
+        //     factory fails silently at deploy time and only surfaces as a dead
+        //     tier-2 path per vault, unrepairably.
+        factory.setSandboxImpl(address(sandboxImpl));
+        require(
+            factory.sandboxImpl() == address(sandboxImpl), "sandbox impl must be bound before the factory goes live"
+        );
+
         //    Per-vault governors are deployed by the factory at createSyndicate
         //    and authorized on the registry via addGovernor — no singleton wiring.
 
         vm.stopBroadcast();
 
         // ── Validate on-chain state matches expected values ──
-        _validate(deployer, beacon, address(factory), address(executorLib), address(vaultImpl));
+        _validate(deployer, beacon, address(factory), address(executorLib), address(vaultImpl), address(sandboxImpl));
 
         // ── Persist addresses to chains/{chainId}.json ──
         _writeAddresses(
@@ -181,7 +218,8 @@ contract DeployRobinhoodTestnet is ScriptBase {
         address governorAddr,
         address factoryAddr,
         address executorLibAddr,
-        address vaultImplAddr
+        address vaultImplAddr,
+        address sandboxImplAddr
     ) internal view {
         console.log("\n=== Validating on-chain state ===");
 
@@ -223,6 +261,9 @@ contract DeployRobinhoodTestnet is ScriptBase {
         _checkAddr("factory.ensRegistrar", address(factory.ensRegistrar()), address(0));
         _checkAddr("factory.agentRegistry", address(factory.agentRegistry()), address(0));
         _checkUint("factory.managementFeeBps", factory.managementFeeBps(), 50);
+        // Without this the permissionless tier-2 path is dead on arrival for
+        // every vault this factory ever creates (see 6b above).
+        _checkAddr("factory.sandboxImpl", factory.sandboxImpl(), sandboxImplAddr);
 
         console.log("=== All checks passed ===");
     }
