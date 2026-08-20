@@ -49,24 +49,38 @@ contract DeployRobinhoodTestnet is ScriptBase {
         SyndicateVault vaultImpl = new SyndicateVault();
         console.log("Vault implementation:", address(vaultImpl));
 
-        // 3. Deploy SyndicateGovernor (UUPS proxy). Governor init requires the
-        //    registry address; registry init requires the governor — predict
-        //    proxy addresses via `vm.computeCreateAddress`: govImpl (+0),
-        //    govProxy (+1), swoodImpl (+2), swoodProxy (+3), registryImpl (+4),
-        //    registryProxy (+5), factoryImpl (+6), factoryProxy (+7). sWOOD is
-        //    the sole WOOD custodian, deployed before the registry; the
-        //    registry↔sWOOD circular dependency is resolved by `setRegistry`.
+        // 3. Deploy SyndicateGovernor. Governor init requires the registry
+        //    address; registry init requires the governor — resolved by
+        //    predicting proxy addresses from the deployer nonce, see the exact
+        //    ledger below. sWOOD is the sole WOOD custodian, deployed before
+        //    the registry; the registry↔sWOOD circular dependency is resolved
+        //    by the set-once `setRegistry` call.
         uint256 baseNonce = vm.getNonce(deployer);
-        // ProtocolConfig at +0, govImpl +1, govProxy +2, swoodImpl +3, swoodProxy +4,
-        // registryImpl +5, registryProxy +6, tierRegistry +7, factoryImpl +8,
-        // factoryProxy +9.
-        // `tierRegistry` inserted at +7 (pashov finding #1: mandatory
-        // `InitParams` field, so it must precede the factory), shifting only the
-        // factory prediction +8 -> +9. The `require` below catches a wrong
-        // offset before it mis-wires sWOOD / the guardian registry.
-        address predictedSwoodProxy = vm.computeCreateAddress(deployer, baseNonce + 4);
-        address predictedRegistryProxy = vm.computeCreateAddress(deployer, baseNonce + 6);
-        address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 9);
+        // EVERY BROADCAST TRANSACTION CONSUMES A NONCE, not just the CREATEs.
+        // An earlier version of this comment enumerated only `new` statements
+        // and the offsets were short by the two setter CALLs below, so all
+        // three `require`s failed and this script could not run at all.
+        //
+        //   +0  ProtocolConfig                  (CREATE)
+        //   +1  protocolConfig.setProtocolFeeRecipient   (CALL)
+        //   +2  SyndicateGovernor impl          (CREATE)
+        //   +3  GovernorBeacon over that impl   (CREATE) - a BEACON, not a
+        //       governor proxy; per-vault governor proxies are minted later by
+        //       the factory at `createSyndicate`.
+        //   +4  StakedWood impl                 (CREATE)
+        //   +5  StakedWood proxy                (CREATE)  <- predicted
+        //   +6  GuardianRegistry impl           (CREATE)
+        //   +7  GuardianRegistry proxy          (CREATE)  <- predicted
+        //   +8  swood.setRegistry               (CALL)
+        //   +9  TierRegistry                    (CREATE)
+        //   +10 SyndicateFactory impl           (CREATE)
+        //   +11 SyndicateFactory proxy          (CREATE)  <- predicted
+        //
+        // The `require`s below catch a wrong offset before it mis-wires sWOOD /
+        // the guardian registry.
+        address predictedSwoodProxy = vm.computeCreateAddress(deployer, baseNonce + 5);
+        address predictedRegistryProxy = vm.computeCreateAddress(deployer, baseNonce + 7);
+        address predictedFactoryProxy = vm.computeCreateAddress(deployer, baseNonce + 11);
 
         // 3a. Deploy ProtocolConfig (plain Ownable)
         ProtocolConfig protocolConfig = new ProtocolConfig(deployer);
@@ -171,24 +185,34 @@ contract DeployRobinhoodTestnet is ScriptBase {
     ) internal view {
         console.log("\n=== Validating on-chain state ===");
 
-        SyndicateGovernor governor = SyndicateGovernor(governorAddr);
         SyndicateFactory factory = SyndicateFactory(factoryAddr);
 
-        // ── Governor ──
-        ISyndicateGovernor.GovernorParams memory p = governor.getGovernorParams();
-
-        _checkAddr("gov.owner", Ownable(governorAddr).owner(), deployer);
-        _checkUint("gov.votingPeriod", p.votingPeriod, 1 hours);
-        _checkUint("gov.executionWindow", p.executionWindow, 1 days);
-        _checkUint("gov.vetoThresholdBps", p.vetoThresholdBps, 4000);
-        _checkUint("gov.maxPerformanceFeeBps", p.maxPerformanceFeeBps, 3000);
-        _checkUint("gov.cooldownPeriod", p.cooldownPeriod, 1 hours);
-        _checkUint("gov.collaborationWindow", p.collaborationWindow, 48 hours);
-        _checkUint("gov.maxCoProposers", p.maxCoProposers, 5);
-        _checkUint("gov.minStrategyDuration", p.minStrategyDuration, 1 hours);
-        // Note: Robinhood uses 7 days max (not 30 days like Base)
-        _checkUint("gov.maxStrategyDuration", p.maxStrategyDuration, 7 days);
-        // protocolFeeBps / protocolFeeRecipient moved to ProtocolConfig.
+        // ── Governor beacon ──
+        // NO GOVERNOR INSTANCE EXISTS AT DEPLOY TIME, and that is by design:
+        // every syndicate gets its OWN governor, minted by the factory as a
+        // BeaconProxy at `createSyndicate` and recorded in `_governorOf` in the
+        // same call, which is what makes "a syndicate always has a governor
+        // attached" structural rather than a convention.
+        //
+        // So the invariant this ceremony can actually assert is the one that
+        // makes that guarantee hold: the beacon resolves to a real governor
+        // implementation, because that implementation is the code every future
+        // per-vault governor proxy will run. A beacon pointing at nothing would
+        // mint syndicates whose governors are inert.
+        //
+        // `_params` is deliberately NOT read here. It is per-proxy STORAGE,
+        // written by each governor's own `initialize`, so on the uninitialized
+        // implementation it reads back all zeros - asserting it would either
+        // fail or, worse, pass against zeros. The constructor floors below are
+        // immutable, live in bytecode rather than storage, and therefore read
+        // correctly off the implementation (and through every proxy over it).
+        address governorImpl = GovernorBeacon(governorAddr).implementation();
+        require(governorImpl != address(0), "beacon implementation unset");
+        require(governorImpl.code.length != 0, "beacon implementation has no code");
+        console.log("beacon.implementation:", governorImpl);
+        _checkAddr("beacon.owner", Ownable(governorAddr).owner(), deployer);
+        _checkUint("govImpl.MIN_VOTING_PERIOD", SyndicateGovernor(governorImpl).MIN_VOTING_PERIOD(), 24 hours);
+        _checkUint("govImpl.MIN_COOLDOWN_PERIOD", SyndicateGovernor(governorImpl).MIN_COOLDOWN_PERIOD(), 1 hours);
 
         // ── Factory ──
         _checkAddr("factory.owner", Ownable(factoryAddr).owner(), deployer);
