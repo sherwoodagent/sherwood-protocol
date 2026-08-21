@@ -147,7 +147,7 @@ test/           Foundry tests (unit + fork/integration under test/integration/, 
 script/         Deploy + admin scripts (inherit script/ScriptBase.sol) and storage-layout goldens
 openspec/       Executable specs (openspec/specs/) and in-flight change proposals (openspec/changes/)
 chains/         Per-chain deployed addresses, {chainId}.json (auto-written by deploy scripts)
-docs/           Adapter onboarding checklist and design papers (docs/papers/)
+docs/           Operator docs (adapter onboarding checklist, pre-deployment parameter review) and design papers (docs/papers/)
 lib/            Vendored deps (forge-std, OpenZeppelin, OpenZeppelin-upgradeable, LayerZero-v2)
 ```
 
