@@ -86,7 +86,8 @@ contract CallSandbox is ICallSandbox {
     ///      realistically sweep, which is the same as not having it.
     ///
     ///      What it buys: abandonment reopens deposits on a token the vault then
-    ///      stops counting, and `sweep()` is permissionless — so without a delay
+    ///      stops counting, and `sweep()` stays reachable by anyone through the
+    ///      permissionless `SyndicateVault.collectResidue` — so without a delay
     ///      anyone could write off live value by calling during a TRANSIENT
     ///      failure (a paused token, a temporary blacklist) and the write-off
     ///      would outlive the condition. Requiring the failure to PERSIST is what
@@ -126,8 +127,9 @@ contract CallSandbox is ICallSandbox {
     ///      the next depositor mints too cheaply against it.
     ///
     ///      1. NOT UNTIL THE FAILURE HAS PERSISTED for `ABANDON_DELAY`, tracked
-    ///         per token in `_failedSince`. `sweep()` is permissionless, so
-    ///         without this anyone could write a token off by calling during a
+    ///         per token in `_failedSince`. `sweep()` is still reachable by
+    ///         anyone via `SyndicateVault.collectResidue`, so without this
+    ///         anyone could write a token off by calling during a
     ///         TRANSIENT failure — a paused token, a temporary blacklist, a
     ///         transfer momentarily over the per-token ceiling — and the
     ///         write-off would outlive the condition that caused it. Two failed
@@ -297,14 +299,33 @@ contract CallSandbox is ICallSandbox {
     }
 
     /// @inheritdoc ICallSandbox
-    /// @dev PERMISSIONLESS, and reached by a DIRECT call from the vault rather
-    ///      than through a governor batch. That is what lets capital come home
-    ///      with no registry standing and no owner action — including in the
-    ///      state that wedges an ordinary strategy, where a demotion has cleared
-    ///      the allowlist and every batch-routed settlement path reverts
-    ///      `DisallowedBatchCallee` (pashov finding #15). A sandbox holds no
-    ///      registry entry, so there is nothing to demote and nothing to wedge.
-    function sweep() external returns (uint256 assets) {
+    /// @dev VAULT-ONLY, and that gate is load-bearing rather than tidiness.
+    ///      `SyndicateVault._payCohortShare` splits a MEASURED BALANCE DELTA
+    ///      taken across the call inside `collectResidue`, and a delta is a
+    ///      complete measurement only while that is the one door vault asset can
+    ///      arrive through. A sandbox is genuinely enrolled in that machinery —
+    ///      `onProposalSettled` records it against the settling pid, the key the
+    ///      split runs on — so a bare EOA driving this function directly landed
+    ///      the whole balance in the vault OUTSIDE the measurement: the exited
+    ///      cohort was credited nothing (unrepairably, the delta is spent) and
+    ///      `depositNav()` double-counted until someone called
+    ///      `collectResidue`. No attacker required; any keeper calling a
+    ///      function advertised as permissionless did it.
+    ///
+    ///      Both `StrategyFactory` templates already carry this modifier for
+    ///      exactly this reason (`MorphoSupplyStrategy.sweep`,
+    ///      `ConcentratedLiquidityStrategy.sweep` / `releaseUnconvertible`); the
+    ///      sandbox was a third residue holder merged with the door open.
+    ///
+    ///      THE PERMISSIONLESS PROPERTY IS NOT LOST, only routed:
+    ///      `SyndicateVault.collectResidue` is itself permissionless and reaches
+    ///      this through the vault, so capital still comes home with no registry
+    ///      standing and no owner action — including in the state that wedges an
+    ///      ordinary strategy, where a demotion has cleared the allowlist and
+    ///      every batch-routed settlement path reverts `DisallowedBatchCallee`
+    ///      (pashov finding #15). A sandbox holds no registry entry, so there is
+    ///      nothing to demote and nothing to wedge.
+    function sweep() external onlyVault returns (uint256 assets) {
         address vault_ = _vault;
         // THE ASSET FIRST, ALWAYS. It is the only leg that carries priced value,
         // and the declared-token loop below runs on the same borrowed gas
@@ -369,8 +390,9 @@ contract CallSandbox is ICallSandbox {
             } else if (_failedSince[t] == 0) {
                 // FIRST FAILURE STARTS THE CLOCK AND NOTHING ELSE. One failed
                 // transfer is a snapshot, not a verdict, and this call is
-                // permissionless — writing the token off here would let anyone
-                // pick the moment. See `_abandoned`.
+                // reachable by anyone through `collectResidue` — writing the
+                // token off here would let them pick the moment. See
+                // `_abandoned`.
                 _failedSince[t] = uint64(block.timestamp);
             } else if (block.timestamp >= _failedSince[t] + ABANDON_DELAY) {
                 // Still failing a whole `ABANDON_DELAY` later: a transient cause

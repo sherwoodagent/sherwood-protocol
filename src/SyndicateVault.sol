@@ -2525,19 +2525,32 @@ contract SyndicateVault is
     ///      OOG settlement itself. The degrade-to-false/0 semantics already
     ///      handle a truncated result correctly.
     ///
-    ///      ACCEPTED TRADE, stated rather than implied: the Morpho probe now
-    ///      routes through `_deliverableNow` -> `expectedMarketBalances` ->
-    ///      `borrowRateView`, and the IRM is part of the proposer-supplied
-    ///      `MarketParams`. A proposer can therefore pick an IRM whose view
-    ///      burns more than this cap and suppress the probe entirely.
+    ///      ACCEPTED TRADE, stated rather than implied, and NAMING THE RIGHT
+    ///      TEMPLATE. `MorphoSupplyStrategy` was moved onto raw stored totals
+    ///      (`_ownRaw`) precisely to get off this hook, so it no longer routes
+    ///      through an IRM. The exposure lives in
+    ///      `ConcentratedLiquidityStrategy.undeliveredValue`, which still takes
+    ///      the ACCRUING read (`expectedMarketBalances` -> `borrowRateView`)
+    ///      with the IRM supplied in the proposer's `MarketParams`.
     ///
-    ///      THAT IS NOW THE PRIMARY HOLE, NOT A DEGRADED MITIGATION. While a
-    ///      boolean lock guarded the mint, suppression cost an attacker a
-    ///      defence-in-depth layer and the price was still float-only-correct.
-    ///      Now the probe IS the price: a suppressed report means the residue is
-    ///      never recorded, deposits are priced residue-free, and finding #3 is
-    ///      back for that proposal. The round number below is therefore no
-    ///      longer adequate on its own — this needs a measured worst-case bound
+    ///      WHY CL IS NOT SIMPLY MOVED TO RAW TOTALS TOO. It subtracts `owed`
+    ///      from collateral, and a raw `morpho.market` read excludes interest
+    ///      since `lastUpdate` — which UNDERSTATES `owed` and pushes
+    ///      `collateral - owed` HIGH. That is the one direction this stamp must
+    ///      never err in, so copying the Morpho fix here would trade a
+    ///      suppression risk for a systematic over-report. The templates differ
+    ///      because their arithmetic differs, not by oversight.
+    ///
+    ///      WHAT BOUNDS THE RISK INSTEAD: Morpho Blue's `createMarket` requires
+    ///      a governance-enabled IRM and `p.morpho` is counterparty-allowlisted,
+    ///      so an arbitrary gas-burner cannot be introduced. The realistic
+    ///      failure is the AdaptiveCurveIrm's own view cost drifting past this
+    ///      cap over time — silently, since a suppressed report means the
+    ///      residue is never recorded and deposits are priced residue-free
+    ///      (finding #3, for that proposal). Pinned by
+    ///      `test_residueProbes_surviveAGasGriefingIrm` on both templates.
+    ///
+    ///      The round number below still needs a measured worst-case bound
     ///      across the shipped templates, tracked with the rest of the residue
     ///      work in issue #233.
     uint256 private constant _PROBE_GAS = 150_000;

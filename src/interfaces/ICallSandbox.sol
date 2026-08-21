@@ -84,9 +84,9 @@ interface ICallSandbox is IStrategyDelivery {
     /// @dev    Only ever emitted once the transfer has been FAILING for
     ///         `ABANDON_DELAY` — measured from the first observed failure, not
     ///         from the run — so a TRANSIENT failure (paused token, temporary
-    ///         blacklist) cannot write off live value. `sweep()` is
-    ///         permissionless and would otherwise let anyone do so by calling at
-    ///         the wrong moment. Cleared by `SandboxTokenAbandonmentCleared` if
+    ///         blacklist) cannot write off live value. `sweep()` is reachable
+    ///         by anyone through the permissionless `collectResidue`, and would
+    ///         otherwise let them do so by calling at the wrong moment. Cleared by `SandboxTokenAbandonmentCleared` if
     ///         the token ever transfers successfully afterwards.
     event SandboxTokenAbandoned(address indexed token, uint256 amount);
     /// @notice A previously abandoned token transferred successfully after all,
@@ -105,10 +105,15 @@ interface ICallSandbox is IStrategyDelivery {
     function run() external;
 
     /// @notice Return the sandbox's vault-asset balance to the vault.
-    /// @dev    Permissionless and reached by a DIRECT call from the vault, never
-    ///         through a governor batch — which is what lets capital come home
-    ///         with no registry standing and no owner action, even after a
-    ///         demotion that would wedge a batch-reachable strategy.
+    /// @dev    VAULT-ONLY, and reached by a DIRECT call from the vault, never
+    ///         through a governor batch. The gate is what keeps this off the
+    ///         balance delta `SyndicateVault._payCohortShare` splits: a delta is
+    ///         a complete measurement only while the vault is the one door value
+    ///         arrives through, and a sandbox IS enrolled in that split.
+    ///         `SyndicateVault.collectResidue` supplies the permissionless entry
+    ///         point, so capital still comes home with no registry standing and
+    ///         no owner action, even after a demotion that would wedge a
+    ///         batch-reachable strategy.
     /// @return assets Amount returned by this call.
     function sweep() external returns (uint256 assets);
 
