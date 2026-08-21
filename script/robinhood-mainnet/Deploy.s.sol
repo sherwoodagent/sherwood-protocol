@@ -138,6 +138,10 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         // WireTokenCourt; without this key the later phases have nothing to
         // read and the operator has to recover it from broadcast logs.
         _patchAddress("TIER_REGISTRY", d.tierRegistry);
+        // CREATE3-salted, so not recoverable from a nonce; the factory's
+        // `sandboxImpl()` is the only on-chain copy and reading it presupposes
+        // already knowing the factory. Persist it for the CLI/SDK address books.
+        _patchAddress("CALL_SANDBOX_IMPL", d.sandboxImpl);
         _patchAddress("STAKED_WOOD", d.swoodProxy);
         _patchAddress("WOOD_TOKEN", woodToken);
 

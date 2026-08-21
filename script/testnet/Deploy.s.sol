@@ -206,6 +206,15 @@ contract DeployTestnet is ScriptBase {
         _patchAddress("GOVERNOR_BEACON", beacon);
         _patchAddress("PROTOCOL_CONFIG", address(protocolConfig));
         _patchAddress("GUARDIAN_REGISTRY", registryProxy);
+        // TIER_REGISTRY is read as an ENV ADDRESS by `DeployPlanD` and
+        // `WireTokenCourt`. Minted here and never persisted, those later phases
+        // had nothing to read and the operator had to recover it from the
+        // broadcast log by hand.
+        _patchAddress("TIER_REGISTRY", address(tierRegistry));
+        // The CallSandbox implementation every vault clones for a
+        // `proposeWithSandbox` payload — the factory's `sandboxImpl()` is the
+        // only other copy, and reading it presupposes knowing the factory.
+        _patchAddress("CALL_SANDBOX_IMPL", address(sandboxImpl));
         _patchAddress("STAKED_WOOD", swoodProxy);
 
         console.log("\nNext steps:");
