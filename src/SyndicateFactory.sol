@@ -38,7 +38,13 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     using EnumerableSet for EnumerableSet.UintSet;
 
     // ── Errors ──
+    /// @notice No real tier registry where one is mandatory (pashov finding #1):
+    ///         a governor without one is permanently registry-less, and
+    ///         `SyndicateVault._guardBatchCalls` degrades OPEN.
+    error TierRegistryNotWired();
     error InvalidExecutorImpl();
+    /// @notice `setSandboxImpl` was given a codeless address. See the setter.
+    error InvalidSandboxImpl();
     error InvalidVaultImpl();
     error InvalidENSRegistrar();
     error InvalidAgentRegistry();
@@ -193,13 +199,30 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         `pushWiring`.
     address public bondEscrow;
 
+    /// @notice The `CallSandbox` implementation each new vault clones for
+    ///         `proposeWithSandbox` payloads. Optional — `address(0)` means
+    ///         vaults created afterward have no sandbox and the permissionless
+    ///         tier-2 path is simply unavailable on them.
+    /// @dev BOUND AT CREATION AND NEVER AGAIN. The vault's own
+    ///      `setSandboxImplementation` is factory-only and set-once, so
+    ///      re-pointing this slot changes what FUTURE vaults clone and can never
+    ///      touch an existing one — which is the property the confinement
+    ///      argument needs: swapping the minted code behind an already-reviewed
+    ///      proposal would invalidate it.
+    ///
+    ///      Unwired is a REFUSAL, not a silent downgrade: `proposeWithSandbox`
+    ///      checks the vault's implementation at propose and rejects there,
+    ///      rather than letting a proposal clear the vote and the review period
+    ///      and then revert at execute with the proposer's bond already locked.
+    address public sandboxImpl;
+
     /// @dev Reserved for future storage. Shrinks as named slots are carved off the
     ///      FRONT of the gap, so every field behind it keeps its slot. One slot was
     ///      RESTORED when `compensationEscrow` was removed rather than deprecated
     ///      — legal only pre-mainnet, with the layout golden regenerated in the
     ///      same change; from the first mainnet deploy onward that slot would have
     ///      to stay.
-    uint256[43] private __gap;
+    uint256[42] private __gap;
 
     // ── Events ──
 
@@ -224,6 +247,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
+    event SandboxImplSet(address indexed oldImpl, address indexed newImpl);
     event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
     /// @notice Emitted when `pushWiring` re-pushes the factory's current
     ///         tierRegistry / exposureLedger / bondEscrow into an existing governor.
@@ -249,6 +273,9 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         address protocolConfig;
         uint256 managementFeeBps;
         address guardianRegistry;
+        /// @dev MANDATORY (pashov finding #1) — here rather than in a follow-up
+        ///      `setTierRegistry` so a live-but-unwired factory cannot exist.
+        address tierRegistry;
     }
 
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -263,6 +290,9 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         if (p.beacon == address(0)) revert InvalidBeacon();
         if (p.protocolConfig == address(0)) revert InvalidProtocolConfig();
         if (p.guardianRegistry == address(0)) revert InvalidGuardianRegistry();
+        // Codeless subsumes zero. An EOA would be stamped into every governor
+        // this factory creates and brick each one's `executeGovernorBatch`.
+        if (p.tierRegistry.code.length == 0) revert TierRegistryNotWired();
 
         __Ownable_init(p.owner);
 
@@ -273,6 +303,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         beacon = p.beacon;
         protocolConfig = p.protocolConfig;
         guardianRegistry = p.guardianRegistry;
+        tierRegistry = p.tierRegistry;
         if (p.managementFeeBps > MAX_MANAGEMENT_FEE_BPS) revert ManagementFeeTooHigh();
         managementFeeBps = p.managementFeeBps;
     }
@@ -299,6 +330,11 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         if (bytes(config.symbol).length == 0) revert InvalidSyndicateConfig();
         if (bytes(config.subdomain).length == 0) revert InvalidSyndicateConfig();
         if (bytes(config.metadataURI).length == 0) revert InvalidSyndicateConfig();
+        // Registry-less vaults are born unguarded (finding #1 — rationale at
+        // the governor init site below). `initialize` requires one, so this only
+        // fires after an owner zeroed the slot as a kill switch. Reads factory
+        // storage only, so it belongs with the pre-flight rejects.
+        if (tierRegistry == address(0)) revert TierRegistryNotWired();
 
         // Gate on prepared owner stake before any side effects. Owner bonds
         // live on sWOOD; the registry exposes its sWOOD handle so the factory
@@ -346,27 +382,46 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         ISyndicateVault(vault).setWithdrawalQueue(address(queue));
         emit WithdrawalQueueDeployed(vault, address(queue));
 
+        // Bind the sandbox implementation, same factory-only reason as the queue
+        // above. Skipped when unset so an existing factory keeps creating vaults
+        // — they simply have no sandbox, and `proposeWithSandbox` refuses at
+        // propose rather than letting a proposal reach execute and revert there.
+        if (sandboxImpl != address(0)) {
+            ISyndicateVault(vault).setSandboxImplementation(sandboxImpl);
+        }
+
         // Deploy the per-vault governor as a BeaconProxy. The governor's
         // `onlyVaultOwner` resolves the owner live from the vault, and the vault
         // resolves its governor back through `factory.governorOf(vault)` (read
         // from `_governorOf` below) — so recording the mapping here is what wires
         // the vault ↔ governor link (no separate vault setter needed).
         // `addGovernor` authorizes the new governor on the shared registry.
+        // The tier registry goes in the INIT CALL, not a follow-up
+        // `setTierRegistry` (pashov finding #1). This used to skip the push when
+        // the factory's own pointer was unset, on the premise that the governor
+        // "keeps its safe tier-2 default". That is a PRICING default; what a
+        // missing registry removes is a CAPABILITY gate.
+        // `SyndicateVault._guardBatchCalls` resolving no registry used to RETURN,
+        // dropping the callee allowlist, the spender/recipient gate and the
+        // `UnrecognizedAssetSelector` branch on the way out — after which one
+        // batch instruction, `asset.approve(attacker, max)`, moves ZERO balance,
+        // so the net-outflow meter, the per-call cap and `requiredCoverage` all
+        // read zero, and the vault is drained in a LATER transaction no meter
+        // watches. A vault created in that window stayed registry-less
+        // permanently, so the window was inherited, not transient.
+        //
+        // Three layers now, cheapest first: mandatory `InitParams.tierRegistry`
+        // on this factory, the pre-flight reject at the top of this function,
+        // and the governor's own `initialize` refusing a codeless registry —
+        // after which the guard itself fails closed rather than open.
         bytes memory govInitData = abi.encodeCall(
             ISyndicateGovernor.initialize,
-            (vault, guardianRegistry, protocolConfig, address(this), _defaultGovernorParams())
+            (vault, guardianRegistry, protocolConfig, address(this), tierRegistry, _defaultGovernorParams())
         );
         address govProxy = address(new BeaconProxy(beacon, govInitData));
         _governorOf[vault] = govProxy;
         IGuardianRegistry(guardianRegistry).addGovernor(govProxy, vault);
-        // Push the adapter-selector tier registry into the fresh governor.
-        // `setTierRegistry` is onlyFactory, so this is the sole wiring point.
-        // When `tierRegistry` is unset the governor keeps its safe tier-2
-        // default — skip the call rather than write address(0).
-        if (tierRegistry != address(0)) {
-            ISyndicateGovernor(govProxy).setTierRegistry(tierRegistry);
-        }
-        // Same idiom for the exposure-ledger and bond-escrow wiring slots:
+        // The exposure-ledger and bond-escrow wiring slots keep the push idiom:
         // `setExposureLedger` / `setBondEscrow` are onlyFactory, so this is the
         // sole wiring point at creation. Unset ⇒ skip the call, leaving the
         // governor at its pre-ledger / no-bond default rather than writing zero.
@@ -613,14 +668,20 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         emit GuardianRegistrySet(old, newRegistry);
     }
 
-    /// @notice Set the adapter-selector tier registry pushed into governors at
-    ///         `createSyndicate`. `address(0)` is tolerated — it disables tier
-    ///         pricing for governors created afterward (they keep the safe
-    ///         tier-2 full-notional default). Only affects governors created
-    ///         AFTER this call; existing per-vault governors are rewired via
-    ///         `pushWiring(governor)`. The governor's own `setTierRegistry` is
-    ///         `onlyFactory`, so it is NOT callable directly.
+    /// @notice RE-POINT the adapter-selector tier registry pushed into governors
+    ///         at `createSyndicate`. The initial value is mandatory and comes
+    ///         from `InitParams`, so this is a migration step, not a deploy one.
+    ///         Only affects governors created AFTER this call; existing ones are
+    ///         rewired via `pushWiring(governor)`.
+    /// @dev `address(0)` is legal HERE and nowhere else, and no longer means
+    ///      "later governors keep the safe tier-2 default" — since pashov
+    ///      finding #1 `createSyndicate` reverts while this is unset, so it is a
+    ///      fail-CLOSED kill switch on new syndicates that cannot un-wire an
+    ///      existing governor. Codeless is refused: an EOA passes every
+    ///      zero-check, then reverts the batch guard's typed `isCallableTarget`
+    ///      call and bricks every vault it reaches. Cf. `setExecutorImpl`.
     function setTierRegistry(address newRegistry) external onlyOwner {
+        if (newRegistry != address(0) && newRegistry.code.length == 0) revert TierRegistryNotWired();
         address old = tierRegistry;
         tierRegistry = newRegistry;
         emit TierRegistrySet(old, newRegistry);
@@ -637,6 +698,25 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         address old = exposureLedger;
         exposureLedger = newLedger;
         emit ExposureLedgerSet(old, newLedger);
+    }
+
+    /// @notice Set the `CallSandbox` implementation bound into vaults at
+    ///         `createSyndicate`. `address(0)` is tolerated — it disables the
+    ///         permissionless tier-2 path for vaults created afterward.
+    /// @dev NO `pushWiring` SIBLING, deliberately: the vault's setter is
+    ///      set-once, so an existing vault cannot be rewired here and must not
+    ///      appear to be. A vault created before this slot was set never gets a
+    ///      sandbox — the honest outcome, since re-pointing minted code under a
+    ///      live vault is exactly what the set-once rule exists to prevent.
+    ///
+    ///      Codeless is refused: an EOA stamped into a vault would pass every
+    ///      later check and then `Clones.cloneDeterministic` a codeless address,
+    ///      producing a sandbox that accepts the funding and does nothing.
+    function setSandboxImpl(address newImpl) external onlyOwner {
+        if (newImpl != address(0) && newImpl.code.length == 0) revert InvalidSandboxImpl();
+        address old = sandboxImpl;
+        sandboxImpl = newImpl;
+        emit SandboxImplSet(old, newImpl);
     }
 
     /// @notice Set the proposer-bond escrow pushed into governors at

@@ -116,6 +116,9 @@ contract PashovFinalCLTest is CLFixture {
         assertGt(stuck, 0, "fixture left no wrapper shares on the clone, the strand could not show");
 
         uint256 vaultBefore = IERC20(address(spUsdg)).balanceOf(address(vaultStub));
+        // Vault-only since the cohort-accounting fix; `SyndicateVault
+        // .releaseUnconvertible(strategy)` is the permissionless door.
+        vm.prank(address(vaultStub));
         strategy.releaseUnconvertible();
 
         assertEq(IERC20(address(spUsdg)).balanceOf(address(strategy)), 0, "the clone must not keep the principal");
@@ -133,6 +136,7 @@ contract PashovFinalCLTest is CLFixture {
         _execute();
         _settle();
 
+        vm.prank(address(vaultStub));
         strategy.releaseUnconvertible();
         assertEq(
             IERC20(address(spUsdg)).balanceOf(address(strategy)), 0, "no wrapper shares left on the clone either way"

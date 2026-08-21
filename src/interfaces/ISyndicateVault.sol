@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {BatchExecutorLib} from "../BatchExecutorLib.sol";
+import {ICallSandbox} from "./ICallSandbox.sol";
 
 interface ISyndicateVault {
     // ── Errors ──
@@ -24,6 +25,10 @@ interface ISyndicateVault {
     error NotGovernor();
     error RedemptionsLocked();
     error DepositsLocked();
+    /// @notice `pruneUnvaluedMark` called while the unvalued lock window is
+    ///         still running — deposits are genuinely shut, so there is nothing
+    ///         stale to drop yet.
+    error UnvaluedLockStillActive();
     error InvalidAgentAddress();
     error TransferFailed();
     error ZeroAddress();
@@ -37,6 +42,16 @@ interface ISyndicateVault {
     error AmountExceedsBalance();
     error WithdrawalQueueNotSet();
     error WithdrawalQueueAlreadySet();
+    /// @notice The sandbox implementation is bound set-once; it is already set.
+    error SandboxImplementationAlreadySet();
+    /// @notice No sandbox implementation is wired, so the sandbox path is absent.
+    error SandboxNotConfigured();
+    /// @notice A sandbox already exists for this proposal. One per proposal —
+    ///         a second would orphan the first from `collectResidue` while it
+    ///         still held capital.
+    error SandboxAlreadyMinted(uint256 pid);
+    /// @notice Sandbox funding exceeded the live tier-2 per-call capital ceiling.
+    error SandboxFundingExceedsCeiling(uint256 funding, uint256 ceiling);
     error InsufficientShares();
     error RedemptionsNotLocked();
     /// @notice `requestDeposit` was called with no non-terminal proposal open
@@ -47,6 +62,10 @@ interface ISyndicateVault {
     error QueueReserveBreached();
     error NotQueue();
     error ZeroAssets();
+    /// @notice A deposit would mint zero shares — refused rather than taking the
+    ///         assets for nothing. Reachable when the price denominator is large
+    ///         enough that `previewDeposit` floors to zero.
+    error ZeroShares();
     /// @notice `setAgentFeeBps` was called with `bps > MAX_AGENT_FEE_BPS`.
     error AgentFeeTooHigh();
     /// @notice `setMinBufferBps` was called with `bps > 5_000` (50%).
@@ -74,6 +93,13 @@ interface ISyndicateVault {
     ///         checks beneath it are defense-in-depth on allowlisted callees. Only
     ///         raised when the calling governor resolves a nonzero TierRegistry.
     error DisallowedBatchCallee(address target);
+    /// @notice The calling governor resolved no TierRegistry — no `tierRegistry()`
+    ///         getter, or one returning `address(0)`. The batch guard's callee
+    ///         allowlist and spender/recipient gate cannot be evaluated without
+    ///         it, so the batch is REFUSED rather than run unguarded (pashov
+    ///         finding #1). Unreachable for governors this factory deploys;
+    ///         `SyndicateFactory.pushWiring(governor)` rescues a pre-fix one.
+    error TierRegistryUnresolved();
     /// @notice A governor-batch call carries a guarded value-moving selector but
     ///         its calldata is too short to hold the spender/recipient argument.
     error MalformedCall();
@@ -154,6 +180,20 @@ interface ISyndicateVault {
         uint256[] calldata callCaps,
         uint256 maxNetOutflow
     ) external;
+    /// @notice Governor-only: mint the single-use sandbox for proposal `pid`,
+    ///         fund it with `funding` of `asset()`, and run `calls` from it.
+    /// @dev    The sandbox executes as ITSELF, not as this vault, so a payload
+    ///         target needs no allowlist entry and no certification — the loss
+    ///         bound is `funding`, structurally. Reverts if a sandbox was already
+    ///         minted for `pid`, or if `funding` exceeds the LIVE tier-2 ceiling
+    ///         read from the calling governor.
+    /// @return sandbox The address minted for `pid`.
+    function runSandbox(
+        uint256 pid,
+        ICallSandbox.Call[] calldata calls,
+        address[] calldata declaredTokens,
+        uint256 funding
+    ) external returns (address sandbox);
     /// @notice Factory-only: re-point the shared executor library and
     ///         re-stamp its expected codehash atomically. Reached through
     ///         `SyndicateFactory.pushExecutor`, which lifecycle-gates the
@@ -169,6 +209,35 @@ interface ISyndicateVault {
     function spendableFee(address asset) external view returns (uint256);
     function governor() external view returns (address);
     function redemptionsLocked() external view returns (bool);
+    /// @notice True while a mint must not happen: an open proposal, or a settled
+    ///         strategy holding residue no template can express in vault-asset
+    ///         units. A residue that CAN be valued does not lock — it is priced
+    ///         into `depositNav()` instead (finding #3). Both the instant path
+    ///         and the queue's deposit claim refuse on this one predicate.
+    function depositsLocked() external view returns (bool);
+    /// @notice Assets the vault is worth for pricing a MINT: idle float plus the
+    ///         value settled strategies still owe. Redemptions deliberately keep
+    ///         reading `totalAssets()` — see the implementation for why counting
+    ///         a receivable is safe on one side and not the other.
+    function depositNav() external view returns (uint256);
+    /// @notice Permissionless: sweep a settled strategy's residue back into the
+    ///         vault and refresh the figure deposits are priced against.
+    /// @return collected Vault-asset actually recovered by this call.
+    function collectResidue(address strategy) external returns (uint256 collected);
+    /// @notice Permissionless: drop an unvalued mark whose lock window already
+    ///         lapsed, so the deposit gate can arm again for the next one.
+    /// @dev    Reverts `UnvaluedLockStillActive` inside the window; a no-op when
+    ///         nothing is marked. The strategy may never mark again — see the
+    ///         implementation for why the prune and the burn are inseparable.
+    function pruneUnvaluedMark(address strategy) external;
+    /// @notice Permissionless: drive a settled strategy's last-resort hatch,
+    ///         handing the vault what the clone can neither convert nor push.
+    /// @dev    Separate from `collectResidue` because the hatch forecloses a
+    ///         conversion the routine sweep would retry. Routed through the
+    ///         vault so any vault-asset it produces is measured and split with
+    ///         the exited redeem cohort — the same reason `sweep()` is.
+    /// @return collected Vault-asset actually recovered by this call.
+    function releaseUnconvertible(address strategy) external returns (uint256 collected);
     function managementFeeBps() external view returns (uint256);
     /// @notice Vault-owner-set agent performance fee (basis points). Defaults
     ///         to `FeeConstants.DEFAULT_AGENT_FEE_BPS` (2000 = 20%) while unset.
@@ -276,6 +345,42 @@ interface ISyndicateVault {
     ///         library is re-pointed and its expected codehash re-stamped.
     event ExecutorImplSet(address oldImpl, address newImpl);
     event WithdrawalQueueSet(address indexed queue);
+    /// @notice The set-once `CallSandbox` implementation was bound.
+    event SandboxImplementationSet(address indexed implementation);
+    /// @notice A proposal's sandbox was minted, funded and run.
+    event SandboxRun(uint256 indexed pid, address indexed sandbox, uint256 funding);
+
+    /// @notice The `CallSandbox` implementation this vault clones per proposal.
+    ///         Zero means the sandbox path is not wired.
+    function sandboxImplementation() external view returns (address);
+    /// @notice Factory-only, set-once: bind the `CallSandbox` implementation
+    ///         this vault clones. No re-pointing path — swapping the minted code
+    ///         behind an already-reviewed proposal would invalidate the
+    ///         confinement argument that lets a sandbox call uncertified targets.
+    function setSandboxImplementation(address impl) external;
+
+    /// @notice The sandbox minted for `pid`, or zero if none.
+    function sandboxOf(uint256 pid) external view returns (address);
+    /// @notice A settled strategy reported undelivered value; `outstanding` is
+    ///         the figure deposits are now priced against, on top of
+    ///         `totalAssets()`.
+    event ResidueOutstanding(address indexed strategy, uint256 outstanding);
+    /// @notice A settled strategy reported nothing outstanding and stopped
+    ///         being priced in. `collected` is what this call actually
+    ///         recovered, which may be zero if someone else swept first.
+    event ResidueCleared(address indexed strategy, uint256 collected);
+    /// @notice A settled strategy started or stopped holding residue it cannot
+    ///         value in vault-asset units. Deposits are refused while any
+    ///         strategy is in this state — the one residue shape a price cannot
+    ///         express.
+    event ResidueUnvalued(address indexed strategy, bool unvalued);
+    /// @notice Part of an arrival was routed to the redeem cohort that exited at
+    ///         `pid`'s stamp, rather than staying in the vault.
+    /// @dev    `collectResidue` returns and `ResidueCleared` reports the GROSS
+    ///         amount recovered from the strategy; this is the part that left
+    ///         again. Vault float gained `collected - assets`, so an indexer
+    ///         must net the two rather than summing `ResidueCleared` alone.
+    event CohortShareRouted(address indexed strategy, uint256 indexed pid, uint256 assets);
     event RedeemRequested(uint256 indexed requestId, address indexed owner, uint256 shares);
     event DepositRequested(uint256 indexed requestId, address indexed receiver, uint256 assets);
 }

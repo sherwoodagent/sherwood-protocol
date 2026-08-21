@@ -6,6 +6,7 @@ import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Raw-slot pins for `SyndicateGovernor`'s proxy-upgraded storage layout
 ///         — the in-`forge test` layer of the golden-layout guard (the full
@@ -50,6 +51,9 @@ contract GovernorLayoutPinsTest is Test {
     address constant VAULT_SENTINEL = address(0xA1);
     address constant PROTOCOL_CONFIG_SENTINEL = address(0xA2);
     address constant TIER_REGISTRY_SENTINEL = address(0xB1);
+    /// @dev The registry passed to `initialize` — mandatory since pashov
+    ///      finding #1, so slot 58 is already populated when `setUp` returns.
+    address internal fixtureTierRegistry;
     address constant EXPOSURE_LEDGER_SENTINEL = address(0xB2);
     address constant BOND_ESCROW_SENTINEL = address(0xB3);
     address owner = makeAddr("owner");
@@ -58,6 +62,7 @@ contract GovernorLayoutPinsTest is Test {
     uint256 constant EXECUTION_WINDOW = 2 days;
 
     function setUp() public {
+        fixtureTierRegistry = address(deployTierRegistry(address(this)));
         guardianRegistry = new MockRegistryMinimal();
         SyndicateGovernor impl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory init = abi.encodeCall(
@@ -66,7 +71,8 @@ contract GovernorLayoutPinsTest is Test {
                 VAULT_SENTINEL,
                 address(guardianRegistry),
                 PROTOCOL_CONFIG_SENTINEL,
-                address(this), // factory (this test) — may call setTierRegistry
+                address(this),
+                fixtureTierRegistry, // factory (this test) — may call setTierRegistry
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -126,7 +132,14 @@ contract GovernorLayoutPinsTest is Test {
     ///         lifecycle base and is pinned by
     ///         `test_layout_lifecycleBasePrefixPinned` instead.
     function test_layout_appendedFieldsPinned() public {
-        assertEq(_slot(58), bytes32(0), "slot 58 starts unset");
+        // Starts WIRED, not unset: the registry is a mandatory `initialize`
+        // argument (pashov finding #1), so slot 58 already holds the fixture
+        // registry this suite passed in. That it is nonzero here is itself the
+        // pin that init writes this slot and no other.
+        assertEq(_slot(58), bytes32(uint256(uint160(fixtureTierRegistry))), "slot 58: _tierRegistry, set at init");
+        // `setTierRegistry` refuses codeless addresses (pashov finding #1), so
+        // the sentinel needs code. Arbitrary byte — the pin is on the VALUE.
+        vm.etch(TIER_REGISTRY_SENTINEL, hex"00");
         governor.setTierRegistry(TIER_REGISTRY_SENTINEL); // this test is the factory
         assertEq(_slot(58), bytes32(uint256(uint160(TIER_REGISTRY_SENTINEL))), "slot 58: _tierRegistry");
         assertEq(governor.tierRegistry(), TIER_REGISTRY_SENTINEL);
@@ -152,6 +165,6 @@ contract GovernorLayoutPinsTest is Test {
         assertEq(governor.bondEscrow(), BOND_ESCROW_SENTINEL);
 
         // The Plan B appends must not have disturbed the slot below them.
-        assertEq(_slot(58), bytes32(uint256(uint160(address(0)))), "slot 58 untouched by Plan B writes");
+        assertEq(_slot(58), bytes32(uint256(uint160(fixtureTierRegistry))), "slot 58 untouched by Plan B writes");
     }
 }

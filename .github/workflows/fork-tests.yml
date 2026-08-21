@@ -45,23 +45,6 @@ jobs:
         with:
           version: ${{ env.FOUNDRY_VERSION }}
 
-      # The fork suites read their RPC with `vm.envOr(..., "")` and `vm.skip(true)`
-      # when it is empty — so a missing secret silently turns a fork suite into a
-      # green no-op. Fail loudly instead, naming the secret.
-      - name: Preflight required secrets
-        run: |
-          missing=""
-          for var in ROBINHOOD_TESTNET_RPC_URL; do
-            if [ -z "${!var}" ]; then
-              missing="$missing $var"
-            fi
-          done
-          if [ -n "$missing" ]; then
-            echo "::error::Missing required repository secret(s):$missing — no public fallback exists for these endpoints. Set them under Settings > Secrets and variables > Actions, then re-run."
-            exit 1
-          fi
-          echo "OK: every endpoint without a public fallback has a secret set."
-
       - name: Build
         run: forge build
 
@@ -81,3 +64,34 @@ jobs:
             --match-path "{test/integration/**,test/WstETHMoonwellStrategy.t.sol}" \
             --fork-url "$BASE_RPC_URL" \
             -vv
+
+      # RUNS AFTER THE TESTS, AND THAT ORDER IS THE WHOLE POINT. The fork suites
+      # read their RPC with `vm.envOr(..., "")` and `vm.skip(true)` when it is
+      # empty, so a missing secret turns its suite into a green no-op that reads
+      # as coverage — hence the loud failure.
+      #
+      # It used to run FIRST, and that made one missing secret block every
+      # integration suite, including the ones whose endpoints have public
+      # fallbacks and need no secret at all. The job died at this gate on
+      # 2026-08-03, -08-10 and -08-17 without ever reaching `forge build`, so
+      # nothing under test/integration/ had actually executed in CI for at least
+      # three weeks — and the compile break in
+      # `ConcentratedLiquidityVaultE2EFork.t.sol` that this ordering hid was only
+      # found by hand. A gate that suppresses the signal it guards is worse than
+      # the silence it is trying to prevent.
+      #
+      # `always()` so a genuine test failure above still surfaces this too.
+      - name: Report endpoints with no secret and no fallback
+        if: always()
+        run: |
+          missing=""
+          for var in ROBINHOOD_TESTNET_RPC_URL; do
+            if [ -z "${!var}" ]; then
+              missing="$missing $var"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing — no public fallback exists for these endpoints, so the suites reading them SKIPPED rather than ran. Every other integration suite above did execute. Set them under Settings > Secrets and variables > Actions, then re-run."
+            exit 1
+          fi
+          echo "OK: every endpoint without a public fallback has a secret set."

@@ -28,7 +28,7 @@
       "label": "_guardians",
       "slot": "3",
       "offset": 0,
-      "type": "t_mapping(t_address,t_struct(Guardian)_storage)"
+      "type": "t_mapping(t_address,t_struct(StakedWood.Guardian)_storage)"
     },
     {
       "label": "totalGuardianStake",
@@ -52,25 +52,25 @@
       "label": "_stakeCheckpoints",
       "slot": "7",
       "offset": 0,
-      "type": "t_mapping(t_address,t_struct(Trace224)_storage)"
+      "type": "t_mapping(t_address,t_struct(Checkpoints.Trace224)_storage)"
     },
     {
       "label": "_totalStakeCheckpoint",
       "slot": "8",
       "offset": 0,
-      "type": "t_struct(Trace224)_storage"
+      "type": "t_struct(Checkpoints.Trace224)_storage"
     },
     {
       "label": "_ownerStakes",
       "slot": "9",
       "offset": 0,
-      "type": "t_mapping(t_address,t_struct(OwnerStake)_storage)"
+      "type": "t_mapping(t_address,t_struct(StakedWood.OwnerStake)_storage)"
     },
     {
       "label": "_prepared",
       "slot": "10",
       "offset": 0,
-      "type": "t_mapping(t_address,t_struct(PreparedOwnerStake)_storage)"
+      "type": "t_mapping(t_address,t_struct(StakedWood.PreparedOwnerStake)_storage)"
     },
     {
       "label": "minOwnerStake",
@@ -118,7 +118,7 @@
       "label": "_anchorCheckpoints",
       "slot": "20",
       "offset": 0,
-      "type": "t_mapping(t_address,t_struct(Trace224)_storage)"
+      "type": "t_mapping(t_address,t_struct(Checkpoints.Trace224)_storage)"
     },
     {
       "label": "approvedBindVault",
@@ -130,7 +130,7 @@
       "label": "_liabilityCheckpoints",
       "slot": "22",
       "offset": 0,
-      "type": "t_mapping(t_address,t_struct(Trace224)_storage)"
+      "type": "t_mapping(t_address,t_struct(Checkpoints.Trace224)_storage)"
     },
     {
       "label": "authorizedSlasher",
@@ -152,7 +152,7 @@
     }
   ],
   "types": {
-    "t_struct(Checkpoint224)_storage": [
+    "t_struct(Checkpoints.Checkpoint224)_storage": [
       {
         "label": "_key",
         "slot": "0",
@@ -166,7 +166,15 @@
         "type": "t_uint224"
       }
     ],
-    "t_struct(Guardian)_storage": [
+    "t_struct(Checkpoints.Trace224)_storage": [
+      {
+        "label": "_checkpoints",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_array(t_struct(Checkpoints.Checkpoint224)_storage)dyn_storage"
+      }
+    ],
+    "t_struct(StakedWood.Guardian)_storage": [
       {
         "label": "stakedAmount",
         "slot": "0",
@@ -198,7 +206,7 @@
         "type": "t_uint64"
       }
     ],
-    "t_struct(OwnerStake)_storage": [
+    "t_struct(StakedWood.OwnerStake)_storage": [
       {
         "label": "stakedAmount",
         "slot": "0",
@@ -224,7 +232,7 @@
         "type": "t_uint64"
       }
     ],
-    "t_struct(PreparedOwnerStake)_storage": [
+    "t_struct(StakedWood.PreparedOwnerStake)_storage": [
       {
         "label": "amount",
         "slot": "0",
@@ -242,14 +250,6 @@
         "slot": "0",
         "offset": 24,
         "type": "t_bool"
-      }
-    ],
-    "t_struct(Trace224)_storage": [
-      {
-        "label": "_checkpoints",
-        "slot": "0",
-        "offset": 0,
-        "type": "t_array(t_struct(Checkpoint224)_storage)dyn_storage"
       }
     ]
   }

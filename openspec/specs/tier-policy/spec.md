@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Adapter-selector tier certification for the guardian economic-security model. A tier is a property of a `(target, selector)` pair, set at listing by governance and consumed at propose/execute time: tier 0 (closed-loop) and tier 1 (oracle-bounded discretion) carry a certified extractable bound in bps of notional; tier 2 (arbitrary calldata, full notional) is the default for anything uncertified. `TierRegistry` also carries the adapter allowlist that bounds where vault funds may be approved or sent inside governor batches, and the submitter-bond machinery that makes a tier certification a bonded claim.
+Adapter-selector tier certification for the guardian economic-security model. A tier is a property of a `(target, selector)` pair, set at listing by governance and consumed at propose/execute time: tier 0 (closed-loop) and tier 1 (oracle-bounded discretion) carry a certified extractable bound in bps of notional; tier 2 (arbitrary calldata, full notional) is the default for anything uncertified. `TierRegistry` also carries the adapter allowlist that bounds where vault funds may be approved or sent inside governor batches — TWO axes since pashov finding #14, a funds axis (`isAdapterAllowed`) and a callee axis (`isCallableTarget`) that diverge on demotion — and the submitter-bond machinery that makes a tier certification a bonded claim.
 ## Requirements
 ### Requirement: Tier semantics and the tier-2 default
 The registry SHALL recognize exactly three tiers. Tier 0 (closed-loop) and tier 1 (oracle-bounded discretion) are certified tiers whose extractable value is bounded to a certified `extractableBoundBps` (bps of notional). Tier 2 (`TIER_ARBITRARY = 2`, bound `FULL_NOTIONAL_BPS = 10_000`) is arbitrary calldata at full notional and SHALL be the default for any uncertified `(target, selector)`. No on-chain tier ceiling exists: tier-2 exposure is admissible (the ADR 2026-07-27 tier-2 refusal was reversed 2026-07-31; the guardian ROE gap at tier 2 is closed by off-chain team token incentives, not by refusing the tier).
@@ -111,9 +111,10 @@ The allowlist clear is DELIBERATELY over-broad: certification is keyed `(target,
 - **WHEN** a key whose bond is already pending release is demoted again (e.g. owner `demote` after a challenge demotion)
 - **THEN** `releasableAt` is unchanged — the timelock starts once
 
-#### Scenario: Every demotion path clears the allowlist
+#### Scenario: Every demotion path clears the FUNDS axis and leaves the CALLEE axis
 - **WHEN** an allowlisted adapter is demoted via owner `demote`, via `demoteByChallenge`, or via permissionless `poke` after a codehash change
 - **THEN** `isAdapterAllowed(adapter)` returns false and `AdapterAllowedSet(adapter, false)` was emitted, on each of the three paths
+- **AND** `isCallableTarget(adapter)` still returns true on each of the three paths, provided the adapter's codehash has not drifted — the axes are specified separately below, and asserting only the first half of this scenario would let a regression that re-closes the callee axis pass
 
 #### Scenario: Demoting a never-allowlisted target is silent on the allowlist channel
 - **WHEN** a certified pair whose target was never allowlisted is demoted
@@ -122,6 +123,49 @@ The allowlist clear is DELIBERATELY over-broad: certification is keyed `(target,
 #### Scenario: One selector's demotion de-allowlists the whole adapter (intended)
 - **WHEN** an adapter certified for several selectors and allowlisted is demoted on exactly one selector
 - **THEN** `isAdapterAllowed(adapter)` returns false even though the other selectors remain certified — the over-broad clear is the specified behavior, not a bug
+
+### Requirement: The callee axis is separate from the funds axis and outlives a demotion
+The registry SHALL expose `isCallableTarget(target)` answering exactly one question — "may the vault name this address as a callee inside a governor batch?" (`SyndicateVault._guardBatchCalls` PART 2a) — held SEPARATE from `isAdapterAllowed`, which answers "may this address RECEIVE vault-fund movements?" (PART 2b).
+
+Both axes SHALL be granted together by an EXPLICIT owner decision (`setAdapterAllowed(a, true)` on the address path, `setClassAllowed(t, true)` on the class path) and SHALL diverge only on revocation:
+- An EXPLICIT owner revocation (`setAdapterAllowed(a, false)`, `setClassAllowed(t, false)`) SHALL close BOTH axes. On the address path this SHALL bite for a CLASS member that has no address entry of its own, which requires a denial flag that demotion never writes (`_calleeRevoked`) — clearing an address-path grant that was never set would otherwise bite nothing and the class fallback would re-allow the member forever, and since anyone may permissionlessly deploy an ERC-1167 clone of a certified template to become a member, that would be a strict widening.
+- A DEMOTION (`_demote`, `_demoteClass`, on all of their paths) SHALL close the funds axis and SHALL LEAVE THE CALLEE AXIS STANDING.
+
+The reason demotion is asymmetric: revoking the right to be PAID must not revoke the vault's ability to RECLAIM. Demotion is reachable permissionlessly — `ChallengeGame.file` only requires the `(target, selector)` pair to appear in the executed proposal's calldata, and every execute batch names `(clone, execute())` — so a single bit answering both questions let anyone revoke the vault's ability to CALL the strategy clone HOLDING its capital: `settleProposal`, `unstick` and `finalizeEmergencySettle` all reverted `DisallowedBatchCallee`, the proposal pinned in `Executed`, `redemptionsLocked()` stayed true, and every LP exit shut until the registry multisig re-granted standing.
+
+The callee axis SHALL retain the grant-time codehash equality check on the address path, so a bytecode swap under an allowlisted address closes it exactly as it closes the funds axis. A clone's runtime is immutable, so this never strands the case the split exists to rescue.
+
+This asymmetry SHALL be recorded in the `_demote`, `_demoteClass` and `isCallableTarget` natspec, and pinned by test, so it is not "fixed" into clearing both — a demotion that deliberately does NOT clear a flag reads as an omission rather than a decision, and is therefore more vulnerable to a well-meaning correction than the over-breadth above.
+
+SCOPE, stated so it is not over-read: the callee axis confers no right to receive ERC-20 fund movements, which PART 2b gates on `isAdapterAllowed` over its enumerated spender/recipient selectors. It is NOT a guarantee about native `value`, which no part of the guard inspects — a `value`-bearing call with fewer than 4 calldata bytes passes PART 2b unexamined on any callable target. The vault holds no native balance by design (no `receive()`/`fallback()`), so this is a stated residual rather than a funded path.
+
+#### Scenario: Demotion leaves an address-path target callable so its capital can be reclaimed
+- **WHEN** an allowlisted target holding vault capital is demoted via `demoteByChallenge`
+- **THEN** `isAdapterAllowed` returns false, `isCallableTarget` returns true, and a governor batch naming that target executes — recovering the capital
+
+#### Scenario: Demotion leaves a CLASS member callable
+- **WHEN** a certified, class-allowed template is demoted via `demoteClassByChallenge`
+- **THEN** `isCallableTarget(clone)` still returns true for a clone of that template, whose only standing was ever the class path
+
+#### Scenario: A demoted target still cannot receive vault funds
+- **WHEN** a governor batch tries to `transfer` or `approve` vault funds to a demoted target
+- **THEN** the call reverts `DisallowedTransferTarget` — restoring callability SHALL NOT restore fundability
+
+#### Scenario: Explicit owner revocation closes the callee axis too
+- **WHEN** the owner calls `setAdapterAllowed(target, false)`
+- **THEN** `isCallableTarget(target)` returns false and a governor batch naming it reverts `DisallowedBatchCallee`
+
+#### Scenario: Explicit owner revocation closes the callee axis for a class member with no address entry
+- **WHEN** the owner calls `setAdapterAllowed(clone, false)` for a clone whose only standing is class membership
+- **THEN** `isCallableTarget(clone)` returns false — the revocation bites through the class fallback, not merely on an address entry that was never set
+
+#### Scenario: A codehash swap closes the callee axis
+- **WHEN** code is replaced at an allowlisted address after the grant
+- **THEN** `isCallableTarget` returns false without any state write, on the same read that closes `isAdapterAllowed`
+
+#### Scenario: A counterparty grant does not open the callee axis
+- **WHEN** an address holds only `setCounterpartyAllowed` standing
+- **THEN** `isCallableTarget` returns false — the WEAK grant implies neither axis of the strong one
 
 ### Requirement: Demoter role rotation is always safe, including to zero
 `setAuthorizedDemoter(demoter)` SHALL be owner-only and SHALL accept `address(0)` — the unwire switch, revoking the challenge game's demotion role while a replacement is wired. The unwired state fails closed for future demotions (nothing can `demoteByChallenge`), and the ChallengeGame treats a failed demotion as best-effort (emitting `AdapterDemotionFailed` rather than reverting the verdict), so the role is safe to rotate at any time; owner `demote` is the remedy for any revocation a rotation lost. The setter emits `AuthorizedDemoterSet`.

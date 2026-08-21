@@ -115,8 +115,7 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         // agent instead, and the fee level is sized for a pool receiving
         // nothing. Seat both inside the broadcast, while the deployer still
         // owns the config.
-        ProtocolConfig(d.protocolConfig).setProtocolFeeRecipient(deployer);
-        ProtocolConfig(d.protocolConfig).setGuardiansFeeRecipient(deployer);
+        _seatOwnerWrites(d, deployer);
 
         // Multisig handoff (final action inside the broadcast).
         if (!skipHandoff) _handoffRobinhood(d, ownerMultisig);
@@ -139,6 +138,10 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         // WireTokenCourt; without this key the later phases have nothing to
         // read and the operator has to recover it from broadcast logs.
         _patchAddress("TIER_REGISTRY", d.tierRegistry);
+        // CREATE3-salted, so not recoverable from a nonce; the factory's
+        // `sandboxImpl()` is the only on-chain copy and reading it presupposes
+        // already knowing the factory. Persist it for the CLI/SDK address books.
+        _patchAddress("CALL_SANDBOX_IMPL", d.sandboxImpl);
         _patchAddress("STAKED_WOOD", d.swoodProxy);
         _patchAddress("WOOD_TOKEN", woodToken);
 
@@ -150,6 +153,46 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         console.log(
             "\nNext: forge script script/robinhood-mainnet/DeployPortfolioStrategy.s.sol --rpc-url robinhood --broadcast"
         );
+    }
+
+    /// @notice Every write that REQUIRES the deployer to still be the owner,
+    ///         collected into one place so the set can be asserted as a set.
+    /// @dev    THIS GROUPING IS THE POINT. Each of these is an `onlyOwner` write
+    ///         on a contract `_handoffRobinhood` is about to transfer, so each
+    ///         has exactly one window in which it is cheap and an eternity
+    ///         afterwards in which it is a multisig chore. Scattered inline,
+    ///         they were three unrelated-looking statements and one of them went
+    ///         missing for the entire life of this script.
+    ///
+    ///         Fee recipients: `ProtocolConfig`'s constructor seeds only the
+    ///         SPLITS, and a zero recipient does NOT strand its leg — it folds
+    ///         into the agent's remainder in both `_chargeManagementFee` and
+    ///         `_chargePerformanceFee`. So an unseated recipient is not a
+    ///         missing payment, it is a SILENT RE-ROUTING to the proposer.
+    ///         BOTH legs, not just the protocol one: the guardian leg is why
+    ///         `MANAGEMENT_FEE_BPS` is 200, since 20% of management and 25% of
+    ///         performance fund the guardian pool. Left unseated, that whole
+    ///         budget pays the agent while depositors are charged at a rate
+    ///         sized for a pool receiving nothing. Both are seeded to the
+    ///         DEPLOYER as a PLACEHOLDER, never as the destination — the runbook
+    ///         directs the multisig to repoint them after `acceptOwnership()`.
+    ///
+    ///         TierRegistry launch set: `deployCore` mints the registry EMPTY
+    ///         and wires it into the factory; the attestations are separate
+    ///         `onlyOwner` writes. The canonical `DeploySherwood.run()` makes
+    ///         them, but this script overrides `run()` and calls `deployCore`
+    ///         directly — so until this existed, the Robinhood ceremony deployed
+    ///         an empty registry and handed it straight to the Safe. Not
+    ///         cosmetic: `isCounterpartyAllowed` GATES CLONE-INIT, so an empty
+    ///         registry makes every ConcentratedLiquidity clone revert
+    ///         `CounterpartyNotAllowed` and makes
+    ///         `DeployConcentratedLiquidityStrategy` refuse to run at all.
+    ///         Caught by the fork redeploy, where phase 4 stopped on exactly
+    ///         that.
+    function _seatOwnerWrites(Deployed memory d, address deployer) internal {
+        ProtocolConfig(d.protocolConfig).setProtocolFeeRecipient(deployer);
+        ProtocolConfig(d.protocolConfig).setGuardiansFeeRecipient(deployer);
+        _seedTierRegistry(deployer, d.tierRegistry);
     }
 
     /// @dev THE OWNERSHIP MODELS ARE NOT UNIFORM, and treating them as if they
@@ -222,6 +265,35 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         _checkAddr("protocolConfig.guardiansFeeRecipient", protocolConfig.guardiansFeeRecipient(), deployer);
 
         _checkAddr("factory.beacon", factory.beacon(), d.beacon);
+        // WITHOUT THIS THE PERMISSIONLESS TIER-2 PATH IS DEAD ON ARRIVAL. Every
+        // vault binds its sandbox at `createSyndicate` and the binding is
+        // set-once, so a factory that goes live unbound produces vaults that can
+        // never run a payload and can never be repaired.
+        //
+        // The FUNDING CEILING is deliberately not asserted here. `tier2CallCapBps`
+        // is per-governor and governors are minted at `createSyndicate`, so there
+        // is no instance to seed at deploy time; and it is being left at its
+        // 10,000 default (no tier-2-specific ceiling) by explicit decision — see
+        // the change's tasks.md §6.2. What still bounds a payload is the
+        // proposal's own envelope, the guardian coverage scaling, and the vault's
+        // buffer and queue-reserve checks.
+        //
+        // NOT IN CONFLICT WITH `script/DeployPlanB.s.sol`, which pins
+        // `TIER2_CALL_CAP_BPS = 200` and pre-flights it. THE TWO ACT AT DIFFERENT
+        // LIFECYCLE POINTS: this assertion block runs during the CORE ceremony,
+        // before any governor exists, so the only honest thing it can say about
+        // the ceiling is that it has no subject. Plan B's constant is not a value
+        // that script seats either — `setTier2CallCapBps` is `onlyVaultOwner`, a
+        // role no deploy script holds — it is the POLICY figure its post-broadcast
+        // MANUAL NEXT tells each vault owner to call with, AFTER `createSyndicate`
+        // (`script/DeployPlanB.s.sol:327`, `:672`, `:1087`). Neither script writes
+        // this parameter; one records that the ceremony leaves it inert, the other
+        // recommends what the owner should later make it. Seeding it per vault is
+        // exactly the escape hatch `openspec/specs/deployment-docs/spec.md:103`
+        // names, and the gate that catches an owner who never did is
+        // `script/CheckSyndicateParams.s.sol` (issue SHE-127/SHE-42;
+        // `docs/pre-deployment-parameter-review.md`).
+        _checkAddr("factory.sandboxImpl", factory.sandboxImpl(), d.sandboxImpl);
         _checkAddr("factory.tierRegistry", address(factory.tierRegistry()), d.tierRegistry);
         _checkAddr("factory.ensRegistrar", address(factory.ensRegistrar()), address(0));
         _checkAddr("factory.agentRegistry", address(factory.agentRegistry()), address(0));

@@ -14,6 +14,8 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {unwireTierRegistry} from "../helpers/TierRegistryUnwire.sol";
 
 /// @notice Issue #43 — per-call capital declarations. Tests this change owes
 ///         beyond the ABI-migration sweep (tasks.md §8): the issue's own
@@ -71,7 +73,8 @@ contract PerCallCapitalDeclarationsTest is Test {
                 address(vault),
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -652,8 +655,12 @@ contract PerCallCapitalDeclarationsTest is Test {
 
     // ── 8.4: unwired-registry default ───────────────────────────────────────
 
+    /// @dev Models a PRE-FIX governor (see `unwireTierRegistry`): the registry
+    ///      is a mandatory `initialize` argument since pashov finding #1, so
+    ///      this pricing branch is now reachable only for governors deployed
+    ///      before it — which is precisely why it still needs a test.
     function test_unwiredRegistry_defaultIgnoresCapsForPricing_butStillMeters() public {
-        // Deliberately NOT wiring a TierRegistry.
+        unwireTierRegistry(address(governor));
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
         execCalls[0] = BatchExecutorLib.Call({
             target: address(usdc), data: abi.encodeCall(usdc.transfer, (address(0xBEEF), 1)), value: 0
@@ -679,12 +686,22 @@ contract PerCallCapitalDeclarationsTest is Test {
         assertEq(governor.getProposalTier(pid), 2, "unwired -> tier 2 regardless of caps");
         assertEq(governor.getRequiredCoverage(pid), maxCapital, "unwired -> requiredCoverage == maxCapital flat");
 
-        // Caps are STILL metered at execution even though pricing ignored them:
-        // the call moves 1 wei, well under its declared 500e6 cap, so it
-        // executes fine.
+        // But EXECUTION is refused outright (pashov finding #1). This used to
+        // assert the opposite — that the 1-wei call, well under its declared
+        // 500e6 cap, "executes fine" — which is the whole finding: an unwired
+        // governor ran batches with the callee allowlist and the
+        // spender/recipient gate dropped, and the per-call cap it did meter
+        // reads zero for the `approve` that actually drains the vault. Pricing
+        // still degrades to the flat default above; the CAPABILITY gate does
+        // not degrade at all.
         _advancePastVoting();
+        vm.expectRevert(ISyndicateVault.TierRegistryUnresolved.selector);
         governor.executeProposal(pid);
-        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Executed));
+        assertEq(
+            uint256(governor.getProposalState(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Approved),
+            "the revert rolls the proposal back to Approved, not Executed"
+        );
     }
 }
 

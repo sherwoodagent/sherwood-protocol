@@ -40,9 +40,14 @@ interface IUniswapV3Pool {
     ///         actually compete with.
     function liquidity() external view returns (uint128);
 
-    /// @notice The pool's factory. Read to prove a caller-supplied pool address
-    ///         was actually created by the factory this strategy trusts, rather
-    ///         than being an arbitrary contract that answers the same selectors.
+    /// @notice The pool's factory, as the pool reports it.
+    /// @dev    NOT a provenance check, and `src/` deliberately does not consult
+    ///         it: an arbitrary contract answering these selectors reports
+    ///         whatever address suits it, including the genuine factory's. A
+    ///         pool's provenance is established the other way round, by asking
+    ///         an allowlisted factory's `getPool` — see
+    ///         `ConcentratedLiquidityStrategy._initialize` check (1). Retained
+    ///         only because it is part of the vendored upstream surface.
     function factory() external view returns (address);
 
     /// @notice The 0th storage slot: current price, tick, and the observation

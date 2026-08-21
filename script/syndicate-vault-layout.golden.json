@@ -4,13 +4,13 @@
       "label": "_agents",
       "slot": "0",
       "offset": 0,
-      "type": "t_mapping(t_address,t_struct(AgentConfig)_storage)"
+      "type": "t_mapping(t_address,t_struct(ISyndicateVault.AgentConfig)_storage)"
     },
     {
       "label": "_agentSet",
       "slot": "1",
       "offset": 0,
-      "type": "t_struct(AddressSet)_storage"
+      "type": "t_struct(EnumerableSet.AddressSet)_storage"
     },
     {
       "label": "_executorImpl",
@@ -22,7 +22,7 @@
       "label": "_approvedDepositors",
       "slot": "4",
       "offset": 0,
-      "type": "t_struct(AddressSet)_storage"
+      "type": "t_struct(EnumerableSet.AddressSet)_storage"
     },
     {
       "label": "_openDeposits",
@@ -115,22 +115,108 @@
       "type": "t_uint256"
     },
     {
-      "label": "__gap",
+      "label": "_residueAmount",
       "slot": "17",
       "offset": 0,
-      "type": "t_array(t_uint256)31_storage"
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "_residueTotal",
+      "slot": "18",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_residueCap",
+      "slot": "19",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "_residueUnvalued",
+      "slot": "20",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_bool)"
+    },
+    {
+      "label": "_unvaluedCount",
+      "slot": "21",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_residuePid",
+      "slot": "22",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "_residueNet",
+      "slot": "23",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "_unvaluedSince",
+      "slot": "24",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_unvaluedBurned",
+      "slot": "25",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_bool)"
+    },
+    {
+      "label": "_unvaluedMarkedAt",
+      "slot": "26",
+      "offset": 0,
+      "type": "t_mapping(t_address,t_uint256)"
+    },
+    {
+      "label": "_sandboxImplementation",
+      "slot": "27",
+      "offset": 0,
+      "type": "t_address"
+    },
+    {
+      "label": "_proposalSandbox",
+      "slot": "28",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_address)"
+    },
+    {
+      "label": "__gap",
+      "slot": "29",
+      "offset": 0,
+      "type": "t_array(t_uint256)19_storage"
     }
   ],
   "types": {
-    "t_struct(AddressSet)_storage": [
+    "t_struct(EnumerableSet.AddressSet)_storage": [
       {
         "label": "_inner",
         "slot": "0",
         "offset": 0,
-        "type": "t_struct(Set)_storage"
+        "type": "t_struct(EnumerableSet.Set)_storage"
       }
     ],
-    "t_struct(AgentConfig)_storage": [
+    "t_struct(EnumerableSet.Set)_storage": [
+      {
+        "label": "_values",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_array(t_bytes32)dyn_storage"
+      },
+      {
+        "label": "_positions",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_mapping(t_bytes32,t_uint256)"
+      }
+    ],
+    "t_struct(ISyndicateVault.AgentConfig)_storage": [
       {
         "label": "agentId",
         "slot": "0",
@@ -148,20 +234,6 @@
         "slot": "1",
         "offset": 20,
         "type": "t_bool"
-      }
-    ],
-    "t_struct(Set)_storage": [
-      {
-        "label": "_values",
-        "slot": "0",
-        "offset": 0,
-        "type": "t_array(t_bytes32)dyn_storage"
-      },
-      {
-        "label": "_positions",
-        "slot": "1",
-        "offset": 0,
-        "type": "t_mapping(t_bytes32,t_uint256)"
       }
     ]
   }
