@@ -186,10 +186,19 @@ The canonical `DeploySherwood.deployCore` SHALL wire in this order: executor lib
 - **THEN** validation asserts `pendingOwner == multisig` and the runbook requires the multisig to call `acceptOwnership()` — a deployer that forgot the acceptance step is caught at deploy time
 
 ### Requirement: Fork funding via Tenderly cheats only
-Only two cheats exist on the vnet: `tenderly_setBalance` (native) and `tenderly_setStorageAt` (any slot); `tenderly_setErc20Balance` is NOT available. ERC-20 funding SHALL write the `_balances` mapping slot directly: `keccak256(abi.encode(holder, balancesSlot))` with WOOD at slot 0 (plain OZ ERC20) and USDG at slot 1 (slot 0 holds other proxy state). `cast rpc` params SHALL be passed as separate positional args, not one JSON array (the array form returns `-32602`). For an unlisted token, the balances slot SHALL be discovered by brute-forcing slots 0..40 (write a sentinel to `keccak(holder, S)`, read `balanceOf`), falling back to the OZ v5 ERC-7201 namespaced location. Time travel uses `evm_increaseTime` + `evm_mine`.
+Three cheats are available: `tenderly_setBalance` (native), `tenderly_setErc20Balance`, and `tenderly_setStorageAt` (any slot). Time travel uses `evm_increaseTime` + `evm_mine`, and `evm_snapshot` / `evm_revert` are available for baseline resets.
 
-#### Scenario: Funding WOOD to a wallet
-- **WHEN** the operator computes `KEY=$(cast index address <wallet> 0)` and writes it on the WOOD token via `tenderly_setStorageAt` over the admin RPC
+**`tenderly_setErc20Balance` IS available and is the preferred ERC-20 path.** Verified 2026-08-20 on the `a3fb16` vnet against both WOOD (a plain OZ ERC20) and USDG (a proxy) — the balance lands and `balanceOf` reads it back. This spec previously asserted the method did NOT exist, which was measured on the older `dbe358` vnet; the claim did not survive re-measurement and SHALL NOT be restored without one. It matters beyond convenience: `cli/src/e2e` funds every scenario through that method, so "unavailable" implied the e2e harness could never run against the fork.
+
+The direct-storage route remains the DOCUMENTED FALLBACK for a vnet or token where the cheat does not work: write the `_balances` mapping slot as `keccak256(abi.encode(holder, balancesSlot))`, with WOOD at slot 0 and USDG at slot 1 (slot 0 holds other proxy state). `cast rpc` params SHALL be passed as separate positional args, not one JSON array (the array form returns `-32602`). For an unlisted token, the balances slot SHALL be discovered by brute-forcing slots 0..40 (write a sentinel to `keccak(holder, S)`, read `balanceOf`), falling back to the OZ v5 ERC-7201 namespaced location.
+
+#### Scenario: Funding an ERC-20 to a wallet
+- **WHEN** the operator calls `tenderly_setErc20Balance` with the token, holder and amount over the admin RPC
+- **THEN** `balanceOf(wallet)` returns the written amount, for both plain and proxied tokens
+
+#### Scenario: Funding WOOD by direct storage write
+- **GIVEN** a vnet or token where the ERC-20 cheat does not take
+- **WHEN** the operator computes `KEY=$(cast index address <wallet> 0)` and writes it on the WOOD token via `tenderly_setStorageAt`
 - **THEN** `balanceOf(wallet)` returns the written amount
 
 #### Scenario: Array-form RPC params rejected
