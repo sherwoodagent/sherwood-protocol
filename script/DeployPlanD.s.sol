@@ -66,8 +66,9 @@ interface ISwoodExposureLedger {
  *      asserts this on the ledger it MINTS; this asserts it on the ledger this
  *      script is POINTED AT, after however long and however many governed
  *      parameter changes separate the two ceremonies. Above 0, every proposal
- *      below the threshold -- sandbox payloads included -- executes with no
- *      stake-backed approver covering it. See the block itself.
+ *      below the threshold executes with no stake-backed approver covering it
+ *      -- at 3, the setter's documented "quorum disabled for all tiers" value,
+ *      that is EVERY proposal including sandbox payloads. See the block itself.
  *
  *      Ownership: the broadcaster becomes the game's owner and must ALREADY own
  *      the ExposureLedger, the TierRegistry and StakedWood (all three setters
@@ -212,11 +213,21 @@ contract DeployPlanD is ScriptBase {
         // `_deriveAndStoreEffectiveCapital` gates the coverage quorum on
         // `proposal.envelopeTier >= ledger.quorumTierThreshold()`. Above zero,
         // proposals BELOW the threshold skip `requireApproveQuorum` entirely and
-        // execute with no stake-backed approver on the hook — sandbox payloads,
-        // whose whole safety argument is that an underwriter covered the
-        // arbitrary calldata, included. The coverage is still SIZED correctly at
-        // every tier; only the enforcement is gated, which is what makes a
-        // non-zero threshold look healthy from every other angle.
+        // execute with no stake-backed approver on the hook. The coverage is
+        // still SIZED correctly at every tier; only the enforcement is gated,
+        // which is what makes a non-zero threshold look healthy from every
+        // other angle.
+        //
+        // WHAT EACH NON-ZERO VALUE COSTS. 1 unguards tier 0; 2 unguards tiers 0
+        // and 1; 3 is the setter's own documented "quorum disabled for all
+        // tiers" (`ExposureLedger.setQuorumTierThreshold` refuses anything
+        // above it) and unguards everything. SANDBOX PAYLOADS ARE NOT IN THE
+        // FIRST TWO. `_snapshotTierAndGate` forces `tier_ = 2` whenever
+        // `_sandboxFunding[p.id] != 0`, and `proposeWithSandbox` reverts
+        // `ZeroSandboxFunding` on a zero, so a sandbox proposal is ALWAYS tier 2
+        // — precisely so it cannot ride along under a raised threshold. Only 3
+        // strips its underwriter. The tiers 1 and 2 give away are the ordinary
+        // certified-batch ones, which is enough on its own to refuse.
         //
         // Read TYPED, not probed. Unlike `woodPriceX8()` above this is a plain
         // storage getter that cannot revert on a real ledger, and a ledger

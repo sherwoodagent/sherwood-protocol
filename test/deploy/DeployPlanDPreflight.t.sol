@@ -214,11 +214,17 @@ contract DeployPlanDPreflightTest is Test {
     ///      the setter once.
     ///
     ///      WHY IT MATTERS AT 1 SPECIFICALLY. `SyndicateGovernor` gates the
-    ///      coverage quorum on `envelopeTier >= quorumTierThreshold`. At 1, a
-    ///      tier-0 proposal — which is what `proposeWithSandbox` produces —
-    ///      skips `requireApproveQuorum` entirely and executes with no
-    ///      stake-backed approver on the hook, while every other reading of the
-    ///      deployment looks healthy.
+    ///      coverage quorum on `envelopeTier >= quorumTierThreshold`. At 1 a
+    ///      tier-0 proposal skips `requireApproveQuorum` entirely and executes
+    ///      with no stake-backed approver on the hook, while every other reading
+    ///      of the deployment looks healthy.
+    ///
+    ///      NOT sandbox payloads, at 1 or 2. `_snapshotTierAndGate` forces
+    ///      `tier_ = 2` on any proposal with non-zero `_sandboxFunding`, and
+    ///      `proposeWithSandbox` refuses zero funding — so a sandbox is always
+    ///      tier 2 and stays gated until the threshold reaches 3, the setter's
+    ///      own "quorum disabled for all tiers" ceiling. The ordinary
+    ///      certified-batch tiers are what 1 and 2 give away.
     function test_preflight_bites_whenTheQuorumTierThresholdHasDrifted() public {
         vm.prank(DEFAULT_SENDER);
         ledger.setQuorumTierThreshold(1);
@@ -230,8 +236,18 @@ contract DeployPlanDPreflightTest is Test {
     /// @dev And the refusal is TOTAL, same argument as the exit-gate case: a
     ///      Plan D that granted the freeze role before refusing would make
     ///      pre-flight 1 unsatisfiable on the re-run that fixes the threshold.
-    ///      This is also what pins the assertion's POSITION — it has to sit
-    ///      ahead of the broadcast, and only the untouched roles show that.
+    ///
+    ///      THIS DOES NOT PIN THE ASSERTION'S POSITION, and an earlier version
+    ///      of this comment claimed it did. `_runExpecting` drives the whole of
+    ///      `deploy()` in ONE call that reverts, and the revert rolls the role
+    ///      grants back regardless of where the `require` sits — measured:
+    ///      moving the pre-flight below `vm.stopBroadcast()` leaves all ten
+    ///      tests in this suite green. Same trap as a post-revert counter
+    ///      assertion. What the three reads below actually prove is that the
+    ///      refusal leaves NO residue, which is the property that matters for a
+    ///      re-run; position is a non-issue here anyway, since a `forge script`
+    ///      that reverts anywhere broadcasts nothing at all (`DeployPlanB` puts
+    ///      the same assertion after its broadcast for exactly that reason).
     function test_preflight_leavesEveryRoleUnwired_whenTheQuorumTierThresholdHasDrifted() public {
         vm.prank(DEFAULT_SENDER);
         ledger.setQuorumTierThreshold(2);
