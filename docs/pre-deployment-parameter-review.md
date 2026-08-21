@@ -101,9 +101,9 @@ first `propose`.
 
 ### Recommendation: **200 bps (2% of TVL)**
 
-Justified from the repo, not invented: `script/DeployPlanB.s.sol:312` already
+Justified from the repo, not invented: `script/DeployPlanB.s.sol:327` already
 pins `TIER2_CALL_CAP_BPS = 200` as the policy value it instructs operators to
-seat, with a pre-flight (`:654`) refusing anything outside the approved
+seat, with a pre-flight (`:672`) refusing anything outside the approved
 `1–200 bps` band from issue #43 / `design.md` D2. Seeding 200 makes the deployed
 state match the policy the repo already ships.
 
@@ -136,9 +136,12 @@ be an answer, which is what `ALLOW_INERT_TIER2_CALL_CAP=true` records.
 Same 0-sentinel shape as §1 — the two are written to mirror each other exactly
 (`GovernorParameters.sol:115-117`). `_capitalCeiling()`
 (`src/SyndicateGovernor.sol:1631`) returns `totalAssets() * maxCapitalBps() /
-10_000`, and it is the ceiling a proposal's `envelope.maxCapital` is clamped to
-at propose. At 10_000 a proposer can declare `maxCapital == totalAssets()`, so
-the vault's batch-wide net-outflow check (`SyndicateVault.sol:836`) permits a
+10_000`, and a proposal declaring `envelope.maxCapital` above it is REJECTED,
+not silently clamped: `_checkMaxCapitalCeiling`
+(`src/SyndicateGovernor.sol:1648`) reverts `MaxCapitalExceedsCeiling`, and
+`executeProposal` re-runs the same ratio against live totals (`:818`,
+`MaxCapitalCeilingRegressed`). At 10_000 a proposer can declare
+`maxCapital == totalAssets()`, so the vault's batch-wide net-outflow check (`SyndicateVault.sol:836`) permits a
 batch to move the entire float.
 
 It is **not** as dangerous as §1 in the same way: a proposal still has to clear

@@ -189,6 +189,65 @@ contract CheckSyndicateParamsTest is Test {
         gate.exposed_readParams(governor, vault);
     }
 
+    // ── run(): the env wiring ───────────────────────────────────────────────
+
+    /// @dev The three `ALLOW_*` names live ONLY inside `run()`; every test above
+    ///      drives `_requireSeeded` directly with booleans, so a typo in an env
+    ///      var name — or a waiver wired to the wrong parameter — would be
+    ///      invisible to all of them. The revert strings and
+    ///      `docs/pre-deployment-parameter-review.md` both promise these exact
+    ///      names, so the promise is what gets pinned here.
+    ///
+    ///      ONE TEST, NOT FOUR, DELIBERATELY. `vm.setEnv` mutates the FORGE
+    ///      PROCESS's environment, which is shared by every test in the suite,
+    ///      while forge is free to run those tests concurrently. Split across
+    ///      four functions these raced: the all-waivers case set the three vars
+    ///      to "true" while the no-waiver case was reading them, and the
+    ///      no-waiver case failed as "next call did not revert as expected" —
+    ///      i.e. reported the gate as broken when the gate was fine. Sequencing
+    ///      the states inside a single function is what makes them deterministic.
+    function test_run_envWiring() public {
+        address seededGov = address(new GovernorStub(SEEDED_TIER2, SEEDED_MAX_CAPITAL));
+        address seededVault = address(new VaultStub(SEEDED_BUFFER));
+        address virginGov = address(new GovernorStub(10_000, 10_000));
+        address virginVault = address(new VaultStub(0));
+
+        vm.setEnv("ALLOW_INERT_TIER2_CALL_CAP", "false");
+        vm.setEnv("ALLOW_INERT_MAX_CAPITAL", "false");
+        vm.setEnv("ALLOW_ZERO_MIN_BUFFER", "false");
+
+        // 1. A seeded syndicate passes with no waiver. NON-VACUITY CONTROL for
+        //    every refusal below: the gate is not one that refuses everything.
+        vm.setEnv("GOVERNOR", vm.toString(seededGov));
+        vm.setEnv("VAULT", vm.toString(seededVault));
+        gate.run();
+
+        // 2. A virgin syndicate is refused, and `run()` reads BOTH contracts —
+        //    the vault's zero buffer is named, not just the governor's pair.
+        vm.setEnv("GOVERNOR", vm.toString(virginGov));
+        vm.setEnv("VAULT", vm.toString(virginVault));
+        vm.expectRevert(bytes(_reasonFor(10_000, 10_000, 0)));
+        gate.run();
+
+        // 3. Waiving only the buffer must leave the two governor parameters
+        //    reported — i.e. each name binds to the parameter it names.
+        vm.setEnv("ALLOW_ZERO_MIN_BUFFER", "true");
+        vm.expectRevert(bytes(_reasonFor(10_000, 10_000, 1)));
+        gate.run();
+
+        // 4. All three waived, same virgin syndicate, now accepted. An unset or
+        //    misspelled var defaults to `false`, so a typo would leave this
+        //    reverting — which is what makes step 4 evidence about the NAMES.
+        vm.setEnv("ALLOW_INERT_TIER2_CALL_CAP", "true");
+        vm.setEnv("ALLOW_INERT_MAX_CAPITAL", "true");
+        gate.run();
+
+        // Leave the process env as we found it; the suite is shared.
+        vm.setEnv("ALLOW_INERT_TIER2_CALL_CAP", "false");
+        vm.setEnv("ALLOW_INERT_MAX_CAPITAL", "false");
+        vm.setEnv("ALLOW_ZERO_MIN_BUFFER", "false");
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────
 
     /// @dev Rebuilds the expected revert string from the same pieces the script

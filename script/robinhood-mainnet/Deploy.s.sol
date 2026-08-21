@@ -282,7 +282,7 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         // that script seats either — `setTier2CallCapBps` is `onlyVaultOwner`, a
         // role no deploy script holds — it is the POLICY figure its post-broadcast
         // MANUAL NEXT tells each vault owner to call with, AFTER `createSyndicate`
-        // (`script/DeployPlanB.s.sol:312`, `:654`, `:1069`). Neither script writes
+        // (`script/DeployPlanB.s.sol:327`, `:672`, `:1087`). Neither script writes
         // this parameter; one records that the ceremony leaves it inert, the other
         // recommends what the owner should later make it. Seeding it per vault is
         // exactly the escape hatch `openspec/specs/deployment-docs/spec.md:103`
