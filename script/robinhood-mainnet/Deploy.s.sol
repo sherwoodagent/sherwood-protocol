@@ -273,6 +273,22 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         // the change's tasks.md §6.2. What still bounds a payload is the
         // proposal's own envelope, the guardian coverage scaling, and the vault's
         // buffer and queue-reserve checks.
+        //
+        // NOT IN CONFLICT WITH `script/DeployPlanB.s.sol`, which pins
+        // `TIER2_CALL_CAP_BPS = 200` and pre-flights it. THE TWO ACT AT DIFFERENT
+        // LIFECYCLE POINTS: this assertion block runs during the CORE ceremony,
+        // before any governor exists, so the only honest thing it can say about
+        // the ceiling is that it has no subject. Plan B's constant is not a value
+        // that script seats either — `setTier2CallCapBps` is `onlyVaultOwner`, a
+        // role no deploy script holds — it is the POLICY figure its post-broadcast
+        // MANUAL NEXT tells each vault owner to call with, AFTER `createSyndicate`
+        // (`script/DeployPlanB.s.sol:312`, `:654`, `:1069`). Neither script writes
+        // this parameter; one records that the ceremony leaves it inert, the other
+        // recommends what the owner should later make it. Seeding it per vault is
+        // exactly the escape hatch `openspec/specs/deployment-docs/spec.md:103`
+        // names, and the gate that catches an owner who never did is
+        // `script/CheckSyndicateParams.s.sol` (issue SHE-127/SHE-42;
+        // `docs/pre-deployment-parameter-review.md`).
         _checkAddr("factory.sandboxImpl", factory.sandboxImpl(), d.sandboxImpl);
         _checkAddr("factory.tierRegistry", address(factory.tierRegistry()), d.tierRegistry);
         _checkAddr("factory.ensRegistrar", address(factory.ensRegistrar()), address(0));

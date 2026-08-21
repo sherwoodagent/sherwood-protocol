@@ -309,6 +309,21 @@ contract DeployPlanB is ScriptBase {
     ///         varies per syndicate. Printed as a MANUAL NEXT step instead
     ///         (see the end of `deploy()`); new governors read the inert
     ///         10_000 default until their vault owner sets it.
+    /// @dev    READS AS A CONFLICT WITH `script/robinhood-mainnet/Deploy.s.sol`
+    ///         AND IS NOT ONE. That script's validation block (search
+    ///         "The FUNDING CEILING is deliberately not asserted here") records
+    ///         the ceiling as left at 10_000, citing the
+    ///         `permissionless-tier2-sandbox` tasks.md §6.2 decision. THE TWO
+    ///         ACT AT DIFFERENT LIFECYCLE POINTS: that block runs during the
+    ///         CORE ceremony, before any governor exists, so it has no subject
+    ///         to assert against; this constant is the POLICY figure the
+    ///         MANUAL NEXT below hands to each vault owner AFTER
+    ///         `createSyndicate`. Neither script ever writes the parameter.
+    ///         Seeding it per vault is the escape hatch
+    ///         `openspec/specs/deployment-docs/spec.md:103` already names, and
+    ///         the gate that catches an owner who never did is
+    ///         `script/CheckSyndicateParams.s.sol` (issue SHE-127/SHE-42;
+    ///         `docs/pre-deployment-parameter-review.md`).
     uint256 internal constant TIER2_CALL_CAP_BPS = 200;
 
     /// @notice The address book this deployment runs against, exactly as
@@ -649,7 +664,10 @@ contract DeployPlanB is ScriptBase {
         // natspec: `setTier2CallCapBps` is `onlyVaultOwner`, not
         // factory-gated), so the one thing left for a pre-flight to protect
         // is the constant the MANUAL NEXT instructions below tell every
-        // operator to use.
+        // operator to use. (The core ceremony's matching comment lives in
+        // `script/robinhood-mainnet/Deploy.s.sol` and covers the OTHER lifecycle
+        // point — no governor yet — not a competing policy; see the constant's
+        // natspec.)
         require(
             TIER2_CALL_CAP_BPS > 0 && TIER2_CALL_CAP_BPS <= 200,
             "PRE-FLIGHT: TIER2_CALL_CAP_BPS is outside issue #43's approved 1-200bps policy band -- "
@@ -1072,6 +1090,13 @@ contract DeployPlanB is ScriptBase {
         );
         console.log("  Owner-instant, not factory-gated -- this script cannot do it on any owner's behalf.");
         console.log("  Until set, tier2CallCapBps reads the inert 10_000 default (no per-call ceiling).");
+        // The core ceremony (`script/robinhood-mainnet/Deploy.s.sol`) records the
+        // SAME parameter as deliberately left at 10_000. Not a contradiction: it
+        // speaks about the core-deploy lifecycle point, where no governor exists
+        // to seed; this line speaks about the post-`createSyndicate` point, where
+        // one does. See the natspec on TIER2_CALL_CAP_BPS above.
+        console.log("  Verify with: GOVERNOR=<gov> VAULT=<vault> forge script");
+        console.log("  script/CheckSyndicateParams.s.sol:CheckSyndicateParams -- it FAILS on the inert default.");
     }
 
     /// @notice True when `swood` answers `delegationEnabled()` with a non-zero
