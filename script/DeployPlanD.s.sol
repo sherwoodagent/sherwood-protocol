@@ -62,6 +62,12 @@ interface ISwoodExposureLedger {
  *      figure `file` actually divides by: the raw `woodUsdPriceX8` scalar would
  *      pass this pre-flight while the game was unpriced, and fail it while the
  *      game was healthy off a live feed (review 🟠F16).
+ * @dev PRE-FLIGHT 4: `quorumTierThreshold` must still be 0. `DeployPlanB`
+ *      asserts this on the ledger it MINTS; this asserts it on the ledger this
+ *      script is POINTED AT, after however long and however many governed
+ *      parameter changes separate the two ceremonies. Above 0, every proposal
+ *      below the threshold -- sandbox payloads included -- executes with no
+ *      stake-backed approver covering it. See the block itself.
  *
  *      Ownership: the broadcaster becomes the game's owner and must ALREADY own
  *      the ExposureLedger, the TierRegistry and StakedWood (all three setters
@@ -190,8 +196,41 @@ contract DeployPlanD is ScriptBase {
             "chain 4663 has no Chainlink WOOD/USD feed, so the ledger needs setWoodTwapOracle."
         );
 
+        // ── Pre-flight 4: a covering approve quorum at EVERY tier ──
+        // `DeployPlanB` asserts this on the ledger it MINTS. This re-asserts it
+        // on the ledger this script is POINTED AT, which is not the same claim:
+        // `quorumTierThreshold` moves through `setQuorumTierThreshold`, a plain
+        // `onlyOwner` setter with NO timelock — it emits
+        // `ParameterChangeFinalized(PARAM_QUORUM_TIER_THRESHOLD, ...)` and
+        // assigns in the same call. So the drift needs no exotic state and no
+        // waiting period, just the owner having used the setter once in
+        // whatever interval separates the two ceremonies. Plan D is the last
+        // ceremony that touches this ledger with owner powers, so it is the
+        // last cheap place to catch it.
+        //
+        // WHY ZERO IS THE ONLY ADMISSIBLE VALUE. `SyndicateGovernor`'s
+        // `_deriveAndStoreEffectiveCapital` gates the coverage quorum on
+        // `proposal.envelopeTier >= ledger.quorumTierThreshold()`. Above zero,
+        // proposals BELOW the threshold skip `requireApproveQuorum` entirely and
+        // execute with no stake-backed approver on the hook — sandbox payloads,
+        // whose whole safety argument is that an underwriter covered the
+        // arbitrary calldata, included. The coverage is still SIZED correctly at
+        // every tier; only the enforcement is gated, which is what makes a
+        // non-zero threshold look healthy from every other angle.
+        //
+        // Read TYPED, not probed. Unlike `woodPriceX8()` above this is a plain
+        // storage getter that cannot revert on a real ledger, and a ledger
+        // without the selector is not a ledger this script should wire at all.
+        require(
+            IExposureLedger(ledger).quorumTierThreshold() == 0,
+            "PRE-FLIGHT: ExposureLedger.quorumTierThreshold != 0 -- a covering approve quorum is "
+            "required at EVERY tier, and above 0 the tiers below it execute with no underwriter "
+            "on the hook. Call setQuorumTierThreshold(0) as ledger owner, then re-run."
+        );
+
         console.log("deployer / game owner:  %s", deployer);
         console.log("ledger woodPriceX8:     %s", priceX8);
+        console.log("quorumTierThreshold:    %s", IExposureLedger(ledger).quorumTierThreshold());
 
         vm.startBroadcast();
 

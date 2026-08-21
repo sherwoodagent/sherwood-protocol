@@ -220,6 +220,14 @@ contract DeploySherwood is ScriptBase {
         _patchAddress("PROTOCOL_CONFIG", d.protocolConfig);
         _patchAddress("GUARDIAN_REGISTRY", d.registryProxy);
         _patchAddress("TIER_REGISTRY", d.tierRegistry);
+        // The CallSandbox implementation every vault clones. Persisted because
+        // it is otherwise recoverable ONLY from the broadcast log: it is
+        // CREATE3-salted rather than deployed at a predictable nonce, and the
+        // factory's `sandboxImpl()` getter is the only on-chain copy, and
+        // reading it presupposes already knowing which factory to ask. Every
+        // downstream address book (CLI / SDK / guardian / skill) needs it
+        // by name rather than by derivation.
+        _patchAddress("CALL_SANDBOX_IMPL", d.sandboxImpl);
         // sWOOD is the sole WOOD custodian — persist it for the CLI / admin
         // scripts.
         _patchAddress("STAKED_WOOD", d.swoodProxy);
