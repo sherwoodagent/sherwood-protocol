@@ -16,13 +16,23 @@ import {DeploySherwood} from "../../script/Deploy.s.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
-// Pinned Robinhood L2 testnet fork block. Chosen AFTER today's V2 redeployment
-// (2026-07-08) — the full core + strategy stack in chains/46630.json has code
-// from ~block 88,751,000, so this pin sits comfortably above the deploy and
-// below the chain head at fix time (88,751,996). Pinning keeps Synthra pool
-// state + guardian/owner-stake reads deterministic across runs. File-level so
-// derived suites can pin identically.
-uint256 constant ROBINHOOD_TESTNET_FORK_BLOCK = 88_767_205;
+// Pinned Robinhood L2 testnet fork block. Chosen AFTER the 2026-08-21 core +
+// StrategyFactory redeploy (commit a1a11e8):
+//   - core stack (Deploy.s.sol run-latest): blocks 105,124,829 – 105,125,200
+//   - STRATEGY_FACTORY 0xb683…e670: first has code at block 105,134,474
+// so this pin sits above every address in chains/46630.json and below the
+// chain head at fix time (105,655,284). Verified at this exact block: every
+// non-EOA key in the book returns non-empty `eth_getCode`, and SYNTHRA_WETH /
+// TSLA / AMZN / AMD / NFLX / PLTR all answer `symbol()`.
+//
+// DO NOT re-pin below 105,134,474. The previous pin (88_767_205, the 2026-07-08
+// V2 deploy) predated the redeploy, so UNISWAP_SWAP_ADAPTER, PORTFOLIO_TEMPLATE
+// and the whole core had ZERO code at the forked block — `_readAddress` still
+// returned the book's addresses, and every call into them silently hit an EOA.
+//
+// Pinning keeps Synthra pool state + guardian/owner-stake reads deterministic
+// across runs. File-level so derived suites can pin identically.
+uint256 constant ROBINHOOD_TESTNET_FORK_BLOCK = 105_140_000;
 
 /**
  * @title RobinhoodIntegrationTest
@@ -32,12 +42,16 @@ uint256 constant ROBINHOOD_TESTNET_FORK_BLOCK = 88_767_205;
  *         UniswapSwapAdapter + quoter shim, the deployed strategy templates)
  *         read from chains/46630.json.
  *
- *         #421 (per-vault governors): the LIVE 46630 core in chains/46630.json
- *         predates the per-vault BeaconProxy governor (singleton
- *         SYNDICATE_GOVERNOR, one-arg registry reviews) — head-compiled tests
- *         can no longer drive it, so the core is deployed fresh on the fork
- *         until the testnet core is
- *         redeployed post-#421. `governor` is resolved per-vault AFTER
+ *         #421 (per-vault governors): the 46630 core WAS redeployed post-#421
+ *         on 2026-08-21 (a1a11e8) — chains/46630.json now carries
+ *         GOVERNOR_BEACON and a zeroed SYNDICATE_GOVERNOR, so the live core is
+ *         drivable again in principle. The harness still deploys fresh anyway,
+ *         deliberately: a fork test that mutates the live core's storage
+ *         (owner stakes, tier allowlists, guardian cohorts) is only
+ *         reproducible because the fork is pinned, and binding to live core
+ *         storage would make every future redeploy a test break. What stays
+ *         under test is the LIVE PERIPHERY bytecode.
+ *         `governor` is resolved per-vault AFTER
  *         createSyndicate; the live STRATEGY_FACTORY is likewise replaced by a
  *         fresh one because its `_authClone` checks `vaultToSyndicate` on the
  *         OLD core factory. This harness must track the live deploy + factory
@@ -112,8 +126,8 @@ abstract contract RobinhoodIntegrationTest is Test {
         vm.createSelectFork(rpc, ROBINHOOD_TESTNET_FORK_BLOCK);
         require(block.chainid == 46630, "not on Robinhood L2 testnet fork");
 
-        // Fresh post-#421 core (see the contract-level natspec for why the LIVE
-        // pre-#421 core in chains/46630.json can't be driven by head tests).
+        // Fresh core (see the contract-level natspec for why this harness keeps
+        // deploying fresh even now that the live 46630 core is post-#421).
         _deployStack();
 
         // LIVE periphery stays under test: the deployed Synthra-wired swap
