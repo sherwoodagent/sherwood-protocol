@@ -76,8 +76,9 @@ contract LighterForkBench is ScriptBase {
     //    `slashableBondUsd` is ~$6.5k, and required coverage is
     //    `(execCap + settleCap) * 9999 / 10_000` USDG priced ~1:1. 2k + 2k
     //    leaves comfortable headroom; 40k (the 2026-07 run's figure) would be
-    //    scaled down by `_deriveAndStoreEffectiveCapital` and then revert
-    //    `CallCapExceeded` when `_execute` pulled the unscaled `depositAmount`.
+    //    scaled down by `_deriveAndStoreEffectiveCapital` and the clone would
+    //    deploy the scaled figure instead — which is a legal bench run, just not
+    //    the one the phases below assert sizes against. Keep it coverable.
     uint256 constant LP_DEPOSIT = 5_000e6;
     uint256 constant DEFAULT_DEPLOY_AMOUNT = 2_000e6;
     uint256 constant STRATEGY_DURATION = 1 hours;
@@ -219,12 +220,9 @@ contract LighterForkBench is ScriptBase {
 
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
         execCalls[0] = BatchExecutorLib.Call({
-            target: address(USDG),
-            data: abi.encodeCall(IERC20.approve, (clone, _deployAmount())),
-            value: 0
+            target: address(USDG), data: abi.encodeCall(IERC20.approve, (clone, _deployAmount())), value: 0
         });
-        execCalls[1] =
-            BatchExecutorLib.Call({target: clone, data: abi.encodeWithSignature("execute()"), value: 0});
+        execCalls[1] = BatchExecutorLib.Call({target: clone, data: abi.encodeWithSignature("execute()"), value: 0});
         uint256[] memory execCaps = new uint256[](2);
         execCaps[1] = _deployAmount(); // the MOVER is the last call
 
@@ -257,7 +255,6 @@ contract LighterForkBench is ScriptBase {
         ISyndicateGovernor.StrategyProposal memory p = gov.getProposal(pid);
         console.log("envelopeTier / requiredCoverage:", p.envelopeTier, p.requiredCoverage);
         console.log("voteEnd / reviewEnd:", p.voteEnd, p.reviewEnd);
-
     }
 
     /// @notice The LP vote, as its OWN phase.
@@ -287,17 +284,20 @@ contract LighterForkBench is ScriptBase {
 
     /// @dev The bond the ledger will demand, computed the way `_snapshotTierAndGate`
     ///      does, so the driver can approve exactly it before `propose` pulls.
-    function _bondFor(
-        SyndicateGovernor gov,
-        address v,
-        uint256[] memory execCaps,
-        uint256[] memory settleCaps
-    ) internal view returns (uint256) {
+    function _bondFor(SyndicateGovernor gov, address v, uint256[] memory execCaps, uint256[] memory settleCaps)
+        internal
+        view
+        returns (uint256)
+    {
         address ledger = gov.exposureLedger();
         if (ledger == address(0)) return 0;
         uint256 coverage;
-        for (uint256 i; i < execCaps.length; i++) coverage += (execCaps[i] * 9_999) / 10_000;
-        for (uint256 i; i < settleCaps.length; i++) coverage += (settleCaps[i] * 9_999) / 10_000;
+        for (uint256 i; i < execCaps.length; i++) {
+            coverage += (execCaps[i] * 9_999) / 10_000;
+        }
+        for (uint256 i; i < settleCaps.length; i++) {
+            coverage += (settleCaps[i] * 9_999) / 10_000;
+        }
         (bool ok, bytes memory ret) = ledger.staticcall(
             abi.encodeWithSignature("proposerBondWood(address,uint256)", IERC4626(v).asset(), coverage)
         );
@@ -350,8 +350,18 @@ contract LighterForkBench is ScriptBase {
         console.log("BENCH_ACCOUNT_INDEX=%s", uint256(acct));
         require(acct != 0, "ZkLighter did not register the account");
         uint256 spent = vaultBefore - USDG.balanceOf(address(v));
-        console.log("vault USDG delta (pulled):", spent);
-        require(spent == _deployAmount(), "vault outflow != depositAmount");
+        uint256 deployed = LighterPerpStrategy(clone).deployedAmount();
+        console.log("vault USDG delta (pulled) / clone deployedAmount:", spent, deployed);
+        // THE CLONE'S OWN FIGURE IS THE ORACLE, not the declaration. Under a
+        // short approve quorum the governor scales the proposal and `_execute`
+        // deploys `depositAmount * effectiveMaxCapital / maxCapital`; the run is
+        // still valid, it just deployed less. What must hold is that the vault
+        // lost exactly what the clone says it took, and never more than declared.
+        require(spent == deployed, "vault outflow != clone deployedAmount");
+        require(deployed <= _deployAmount(), "clone deployed more than declared");
+        if (deployed != _deployAmount()) {
+            console.log("NOTE: under-covered proposal - scaled down from:", _deployAmount());
+        }
         require(USDG.balanceOf(clone) == 0, "clone did not forward the deposit to the venue");
         require(v.redemptionsLocked(), "vault not locked while deployed");
         // Surplus float untouched: 10k deposited, 2k deployed.
@@ -391,21 +401,24 @@ contract LighterForkBench is ScriptBase {
 
         // Retired action 4 must be a named refusal, not a silent no-op.
         vm.prank(AGENT);
-        (bool ok4,) =
-            address(s).call(abi.encodeWithSignature("updateParams(bytes)", abi.encode(uint8(4), bytes(""))));
+        (bool ok4,) = address(s).call(abi.encodeWithSignature("updateParams(bytes)", abi.encode(uint8(4), bytes(""))));
         require(!ok4, "retired WITHDRAW action 4 still dispatches");
         console.log("updateParams action 4 (retired WITHDRAW) reverts as expected");
 
         vm.prank(OUTSIDER);
-        (bool okO,) = address(s).call(abi.encodeWithSignature("guardrailAction(bytes)", abi.encode(uint8(1), bytes(""))));
+        (bool okO,) =
+            address(s).call(abi.encodeWithSignature("guardrailAction(bytes)", abi.encode(uint8(1), bytes(""))));
         require(!okO, "a non-proposer non-owner drove a guardrail");
         console.log("guardrailAction from an outsider reverts as expected");
     }
 
     // ================= PHASE 6: unwind =================
 
-    /// @param ticks the drain to queue. Pass the full deposit for the clean path,
-    ///        1 for the C1 under-withdraw regression.
+    /// @param ticks the drain to queue. Pass the clone's `deployedAmount()` for
+    ///        the clean path (NOT `LIGHTER_BENCH_DEPLOY_AMOUNT` — an
+    ///        under-covered proposal deployed less, and asking for the
+    ///        declaration reverts venue-side on a balance never there), or 1 for
+    ///        the C1 under-withdraw regression.
     function unwind(uint256 salt, uint64 ticks) external {
         _load();
         LighterPerpStrategy s = LighterPerpStrategy(_clone(salt));
@@ -504,23 +517,23 @@ contract LighterForkBench is ScriptBase {
         _probes(address(s), "after post-settle queueWithdraw");
     }
 
-
-    /// @notice REFUSE BEFORE THE VOTE, NOT AT THE EXECUTE BATCH. The approve
-    ///         quorum does not fail closed when it is short — it returns the
-    ///         coverage actually raised, and `_deriveAndStoreEffectiveCapital`
-    ///         SCALES the proposal's per-call caps by `raised / required`. For
-    ///         most templates that is a graceful degrade. For this one it is not:
-    ///         `LighterPerpStrategy._execute` pulls exactly `depositAmount`,
-    ///         which `_initialize` pinned and nothing can scale, so a partially
-    ///         covered Lighter proposal does not deploy less — it reverts
-    ///         `CallCapExceeded(1, depositAmount, scaledCap)` at the execute
-    ///         batch, a governance cycle after the sizing decision was made.
+    /// @notice SIZE BEFORE THE VOTE, BECAUSE THE EXECUTE BATCH NO LONGER
+    ///         REFUSES. The approve quorum does not fail closed when it is short
+    ///         — it returns the coverage actually raised, and
+    ///         `_deriveAndStoreEffectiveCapital` SCALES the proposal's per-call
+    ///         caps by `raised / required`. `LighterPerpStrategy._execute` now
+    ///         scales its pull by the same ratio, so an under-covered Lighter
+    ///         proposal DEPLOYS LESS rather than reverting `CallCapExceeded` —
+    ///         which is the graceful degrade every other template already had,
+    ///         and which is why this check is now about getting the size you
+    ///         asked for rather than about executing at all.
     ///
     ///         Observed on vnet a3fb16 on 2026-08-22, back to back on one
     ///         guardian: the first 2,000-USDG proposal booked $3,999.27 of a
     ///         $6,520.56 bond, and the second raised only the $2,521.29
-    ///         remainder — 63% — so its cap scaled to 1,260,872,310 and the
-    ///         unscaled 2,000,000,000 pull broke it. A reservation is released
+    ///         remainder — 63% — so its cap scaled to 1,260,872,310. Pre-fix the
+    ///         unscaled 2,000,000,000 pull broke the batch; post-fix that
+    ///         proposal deploys 1,260,872,310 and runs. A reservation is released
     ///         by a vote change or by the epoch bucket expiring, NOT by the
     ///         earlier proposal settling, so "the last one is finished" is not
     ///         the question to ask. This is.
@@ -531,19 +544,18 @@ contract LighterForkBench is ScriptBase {
         uint256 want = _deployAmount();
         // Both legs, at the certified bound, exactly as `_resolveTierAndCoverage` sums them.
         uint256 coverage = (want * 9_999) / 10_000 * 2;
-        (, bytes memory needRet) = ledger.staticcall(
-            abi.encodeWithSignature("coverageUsd(address,uint256)", address(USDG), coverage)
-        );
+        (, bytes memory needRet) =
+            ledger.staticcall(abi.encodeWithSignature("coverageUsd(address,uint256)", address(USDG), coverage));
         uint256 needUsd = abi.decode(needRet, (uint256));
-        (, bytes memory haveRet) =
-            ledger.staticcall(abi.encodeWithSignature("slashableBondUsd(address)", guardian));
+        (, bytes memory haveRet) = ledger.staticcall(abi.encodeWithSignature("slashableBondUsd(address)", guardian));
         uint256 bondUsd = abi.decode(haveRet, (uint256));
         console.log("deployAmount / requiredCoverageUsd:", want, needUsd);
         console.log("guardian slashableBondUsd (GROSS, before existing bookings):", bondUsd);
         require(bondUsd >= needUsd, "guardian bond cannot cover this deployAmount even unbooked");
         console.log("preflight ok on the GROSS bond. If a prior proposal of this");
         console.log("guardian is still booked, the raised figure will be lower and");
-        console.log("executeStep will revert CallCapExceeded - lower LIGHTER_BENCH_DEPLOY_AMOUNT.");
+        console.log("the clone will deploy a SCALED-DOWN amount - executeStep prints");
+        console.log("the gap. Lower LIGHTER_BENCH_DEPLOY_AMOUNT to deploy the full size.");
     }
 
     // ================= helpers =================

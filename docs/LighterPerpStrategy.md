@@ -58,8 +58,10 @@ price rather than guessing at it. See "Residue reporting" below.
 propose(strategy = LighterPerp clone)
         │
         ▼
-execute()                pull USDG from vault → deposit into Lighter →
-  (onlyVault)            account registered synchronously (accountIndex != 0)
+execute()                pull min(declared, coverage-scaled) USDG from the vault
+  (onlyVault)            → deposit into Lighter → account registered
+                         synchronously (accountIndex != 0). The amount that
+                         moved is recorded in deployedAmount()
         │
         ▼
 registerAgentKey()       proposer OR vault owner registers the 40-byte
@@ -83,8 +85,10 @@ initiateReturn()         cancel all → both-side market-close every market →
         ▼
 queueWithdraw(ticks)     queue withdraw(ticks) → queuedTicks += ticks
   (proposer OR           [ticks = observed L2 balance, read off-chain AFTER
-   vault owner)           the closes filled]. Repeatable, and callable in the
-                          Settled state so an under-withdraw is correctable.
+   vault owner)           the closes filled — sized against deployedAmount(),
+                          never against depositAmount]. Repeatable, and callable
+                          in the Settled state so an under-withdraw is
+                          correctable.
         │
         ▼
   ⏳ async maturity       Lighter's sequencer matures the withdrawal into
@@ -117,7 +121,7 @@ vault.collectResidue(clone) → clone.sweep()   the single MEASURED door: claim 
 | `apiKeyPubKey` | length **exactly 40** (`InvalidPubKey`) | Goldilocks-canonical L2 trading key |
 | `apiKeyIndex` | `2..254` (`InvalidApiKeyIndex`) | API key slot (0/1 reserved by the web app, 255 out of range) |
 | `markets` | nonempty (`NoMarkets`), at most **16** (`TooManyMarkets`), each `≤ 254` (`InvalidMarket`), no duplicates (`DuplicateMarket`) | perp markets `initiateReturn()` auto-closes. **Not** a venue-enforced trading whitelist — see "Residual trust" |
-| `depositAmount` | `≥ MIN_DEPOSIT = 1e6` (`DepositTooSmall`) and `≤ type(uint64).max` (`DepositTooLarge`) | the **exact** USDG amount `execute()` pulls. Mandatory — there is no dynamic mode |
+| `depositAmount` | `≥ MIN_DEPOSIT = 1e6` (`DepositTooSmall`) and `≤ type(uint64).max` (`DepositTooLarge`) | the USDG **ceiling** `execute()` pulls. Mandatory — there is no dynamic mode. The amount actually deployed is this figure scaled by the proposal's approve coverage; read `deployedAmount()` after execute, never this |
 
 `initialize` additionally reverts `AssetMismatch` unless `IERC4626(vault()).asset() == USDG`,
 and `TierRegistryUnresolved` / `CounterpartyNotAllowed` unless the vault's governor resolves
@@ -138,8 +142,47 @@ therefore `_settle` permanently unreachable — locking vault redemptions.
 
 `depositAmount` is bounded by `type(uint64).max` at init because `IZkLighter.withdraw` takes
 `uint64` ticks: a larger deposit could never be drained in a single request. Both bounds are
-enforced once, at init; `_execute` re-reads nothing, so the pull size a proposal declares is
-the pull size it performs.
+enforced once, at init, and `_execute` never re-reads the vault's balance — the declaration is
+the ceiling and nothing about the vault's live float can enlarge it.
+
+### The declaration is a ceiling, not a promise: coverage scaling
+
+`execute()` deploys **`depositAmount × effectiveMaxCapital / maxCapital`**, floored, and
+records it in `deployedAmount()`.
+
+When the bond-encumbered approve quorum comes in short, the governor does not fail closed.
+`SyndicateGovernor._deriveAndStoreEffectiveCapital` takes the coverage actually raised and
+scales the whole proposal by `raised / required` — the batch-level net-outflow meter
+(`effectiveMaxCapital`) **and** every per-call cap (`_scaleCaps`). Pulling the pinned
+declaration into a scaled batch reverted `CallCapExceeded` at the execute leg: a governance
+cycle spent, the vault untouched, and nothing deployed. Every other template degrades
+gracefully here; this one now does too.
+
+**Why the ratio and not `min(depositAmount, effectiveMaxCapital)`.** There are two caps and
+the binding one is not the batch's. `BatchExecutorLib` meters this call's own gross outflow
+against `floor(cap_i × raised / required)`, and a proposal normally declares `maxCapital` as
+the vault's whole TVL while `cap_i` is just the deploy size — so the `min` form resolves to
+the unscaled `depositAmount` and still breaks the per-call meter. The ratio form cannot:
+`floor(dep × floor(max × r/q) / max) ≤ floor(dep × r/q)` for any `dep ≤ cap_i`, because the
+inner floor only moves the numerator down. The residue is at most a couple of base units,
+always on the safe side.
+
+**A scaled amount below `MIN_DEPOSIT` reverts `DepositTooSmall` — from `_execute`, not just
+from `initialize`.** Deploying dust is worse than deploying nothing: the unwind is two venue
+round-trips per market regardless of size, so a deeply under-covered clone would cost more to
+close than it holds. The proposal expires with the vault untouched, which is recoverable.
+
+Reads degrade to the pinned amount whenever the governor cannot be asked — no resolvable
+`governor()`, no active proposal, a governor predating `getEffectiveMaxCapital` (issue #27),
+a zero declared envelope, or an effective capital at or above the declared one. That is the
+only safe degradation: a governor that does not scale the envelope does not scale the
+per-call caps either, so the pinned pull is exactly what such a batch expects. Every hop is a
+length-checked raw staticcall, so a missing selector can never become an undecodable
+`execute()` failure.
+
+**Size the drain off `deployedAmount()`, not off `depositAmount`.** `queueWithdraw(ticks)`
+asks the venue for a balance that has to be there; the declaration may name a balance that
+never was.
 
 The **template** constructor pins `block.chainid` to `4663` (Robinhood mainnet) or
 `9994663` (the fork), reverting `UnsupportedChain` otherwise — the venue and asset
@@ -477,7 +520,8 @@ is still fully recoverable through `collectResidue`.
 
 ## Events & errors
 
-**Events:** `Deposited(amount, accountIndex)`, `AgentKeyRegistered(accountIndex, apiKeyIndex)`,
+**Events:** `Deposited(amount, accountIndex)` (`amount` is what was *deployed* — the
+coverage-scaled figure, not the declaration), `AgentKeyRegistered(accountIndex, apiKeyIndex)`,
 `OrdersCancelled(accountIndex)`, `MarketClosed(market, isAsk)`,
 `WithdrawQueued(ticks, cumulativeTicks)`, `ReturnsInitiated(address indexed caller)`,
 `ShortfallAcknowledged(address indexed caller, uint256 queuedTicks, uint256 accounted)`
@@ -498,6 +542,10 @@ counterparty bind. Note that `NotAuthorized` now covers the de-registered-agent 
 `queueWithdraw` / `acknowledgeShortfall` / `registerAgentKey` / `guardrailAction`, since
 those paths admit the vault owner too and therefore cannot report `ProposerNoLongerAgent`.
 
+`DepositTooSmall` is raised from **two** places, and the second is new: `initialize`
+rejects a declaration below `MIN_DEPOSIT`, and `_execute` rejects a coverage-*scaled* amount
+below it — see "coverage scaling" above.
+
 `AccountNotRegistered` is raised by a single shared `_acct()` helper that every
 venue-calling path goes through — including `_execute`, which fails the whole deposit
 rather than custodying capital in an account this contract cannot address. Account index
@@ -507,6 +555,8 @@ rather than custodying capital in an account this contract cannot address. Accou
 
 | Read | Source |
 |---|---|
+| USDG actually deployed at execute (0 before) — **the figure to size a drain against** | `strategy.deployedAmount()` |
+| USDG the proposal DECLARED (the ceiling) | `strategy.depositAmount()` |
 | Lighter account index (0 until first deposit) | `strategy.accountIndex()` |
 | USDG ticks matured & awaiting claim | `strategy.pendingBalance()` |
 | Configured markets | `strategy.markets(i)` |

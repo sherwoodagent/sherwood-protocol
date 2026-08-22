@@ -14,7 +14,10 @@
 #              `_growthGatedVoteWeight` zero and `voteOnProposal` reverts
 #              `NotActiveGuardian()` — see the warp in step 0.
 #   SALT       clone salt (default 1). Use a fresh one per run.
-#   TICKS      what `queueWithdraw` asks for (default = the full deposit).
+#   TICKS      what `queueWithdraw` asks for (default = whatever the clone
+#              actually deployed, read off `deployedAmount()` after execute —
+#              which is BELOW `LIGHTER_BENCH_DEPLOY_AMOUNT` on an under-covered
+#              proposal).
 #
 # Usage:
 #   set -a; source .env; set +a
@@ -24,12 +27,13 @@ set -euo pipefail
 : "${GUARDIAN:?set GUARDIAN to an address with live, 30d-old sWOOD stake}"
 SALT="${SALT:-1}"
 # Sized against the APPROVE COVERAGE the cohort can still raise, not against the
-# vault. `LighterPerpStrategy._execute` pulls a pinned `depositAmount`, so a
-# partially-covered proposal does not deploy less — it reverts `CallCapExceeded`
-# at the execute batch. See `coveragePreflight`.
+# vault. This is the DECLARED ceiling: `LighterPerpStrategy._execute` scales it
+# by `effectiveMaxCapital / maxCapital`, so a partially-covered proposal deploys
+# LESS rather than reverting `CallCapExceeded`. Every size assertion downstream
+# therefore reads the clone's `deployedAmount()`, not this. See
+# `coveragePreflight` for sizing it so no scaling happens at all.
 DEPLOY_AMOUNT="${LIGHTER_BENCH_DEPLOY_AMOUNT:-2000000000}"   # 2,000 USDG (6dp)
 export LIGHTER_BENCH_DEPLOY_AMOUNT="$DEPLOY_AMOUNT"
-TICKS="${TICKS:-$DEPLOY_AMOUNT}"
 
 cd "$(dirname "$0")/../.."
 SCRIPT=script/fork/LighterForkBench.s.sol:LighterForkBench
@@ -103,6 +107,13 @@ SENDER=$OUTSIDER run 'executeStep(uint256)' "$SALT"
 say "6. guardrails"
 SENDER=$AGENT run 'guardrails(uint256)' "$SALT"
 
+# THE DRAIN IS SIZED OFF THE CLONE, NOT OFF THE DECLARATION. Under a short
+# approve quorum `_execute` deployed the scaled figure, and asking the venue for
+# the declared one would revert venue-side on a balance that was never there.
+DEPLOYED=$(cast call "$CLONE" 'deployedAmount()(uint256)' --rpc-url "$RPC" | awk '{print $1}')
+TICKS="${TICKS:-$DEPLOYED}"
+echo "declared $DEPLOY_AMOUNT / deployed $DEPLOYED / draining $TICKS"
+
 say "7. initiateReturn + queueWithdraw($TICKS)"
 SENDER=$AGENT run 'unwind(uint256,uint64)' "$SALT" "$TICKS"
 
@@ -139,7 +150,7 @@ BEFORE=$(cast call $USDG 'balanceOf(address)(uint256)' "$VAULT" --rpc-url "$RPC"
 cast send "$GOVERNOR" 'settleProposal(uint256)' "$PID" --rpc-url "$RPC" --unlocked --from $AGENT \
   | egrep '^(status|transactionHash)'
 AFTER=$(cast call $USDG 'balanceOf(address)(uint256)' "$VAULT" --rpc-url "$RPC" | awk '{print $1}')
-echo "vault USDG delta on settle: $((AFTER-BEFORE))  (deposit was $DEPLOY_AMOUNT; the gap is the settlement fee)"
+echo "vault USDG delta on settle: $((AFTER-BEFORE))  (deployed was $DEPLOYED; the gap is the settlement fee)"
 forge script "$SCRIPT" --sig 'assertSettled(uint256)' "$SALT" --rpc-url "$RPC" \
   --unlocked --sender $AGENT 2>&1 | sed -n '/== Logs ==/,/^$/p'
 
