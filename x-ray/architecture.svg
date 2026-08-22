@@ -1,0 +1,204 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2237" height="645" viewBox="0 0 895 258" font-family="Arial, sans-serif">
+  <defs>
+    <marker id="ah" viewBox="0 0 8 6" refX="8" refY="3"
+      markerWidth="4" markerHeight="3" orient="auto">
+      <path d="M0.5,0.5 L7,3 L0.5,5.5" fill="none" stroke="#94A3B8"
+        stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+    </marker>
+    <filter id="shadow" x="-6%" y="-8%" width="112%" height="128%">
+      <feDropShadow dx="0" dy="0.5" stdDeviation="0.8"
+        flood-color="#000" flood-opacity="0.05"/>
+    </filter>
+  </defs>
+  <rect width="895" height="258" fill="#F8F9FB" rx="3"/>
+  <text x="448" y="11" text-anchor="middle" font-size="6" font-weight="700" fill="#1E293B">Sherwood Protocol Architecture</text>
+  <rect x="373" y="16" width="150" height="10" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.4"/>
+  <rect x="378" y="18.5" width="5" height="5" rx="2.5" fill="#fff" stroke="#E2E5EA" stroke-width="0.4"/>
+  <text x="386" y="22.5" font-size="3.5" fill="#1E293B">Actor</text>
+  <rect x="418" y="18.5" width="5" height="5" rx="1.5" fill="#fff" stroke="#E2E5EA" stroke-width="0.4"/>
+  <rect x="419" y="19.5" width="0.8" height="3" rx="0.4" fill="#3B82F6"/>
+  <text x="426" y="22.5" font-size="3.5" fill="#1E293B">Protocol</text>
+  <rect x="466" y="18.5" width="5" height="5" rx="1.5" fill="#fff" stroke="#E2E5EA" stroke-width="0.4"/>
+  <rect x="467" y="19.5" width="0.8" height="3" rx="0.4" fill="#F59E0B"/>
+  <text x="474" y="22.5" font-size="3.5" fill="#1E293B">External</text>
+  <rect x="20.0" y="84.0" width="855.1" height="40.0" rx="5" fill="#EDEEF2"/>
+  <text x="872.1" y="89.0" text-anchor="end" font-size="3.5" fill="#94A3B8" font-weight="500">Syndicate Lane</text>
+  <rect x="20.0" y="146.0" width="855.1" height="40.0" rx="5" fill="#EDEEF2"/>
+  <text x="872.1" y="151.0" text-anchor="end" font-size="3.5" fill="#94A3B8" font-weight="500">Collateral, Tiers &amp; Dispute</text>
+  <path d="M103.6,46.0 C103.6,70.0 132.9,70.0 132.9,94.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M223.0,46.0 C223.0,70.0 260.1,70.0 260.1,94.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M339.5,46.0 C339.5,70.0 382.6,70.0 382.6,94.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M465.6,46.0 C465.6,70.0 525.5,70.0 525.5,94.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M573.1,46.0 C573.1,70.0 637.1,70.0 637.1,94.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M211.7,112.0 C205.1,134.0 196.3,134.0 189.7,114.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M308.5,112.0 C315.5,126.0 324.8,126.0 331.8,114.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M331.8,112.0 C289.2,130.0 232.3,130.0 189.7,114.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M433.4,112.0 C446.5,134.0 464.0,134.0 477.1,114.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M132.9,114.0 C132.9,135.0 110.2,135.0 110.2,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M132.9,114.0 C132.9,135.0 283.6,135.0 283.6,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M382.6,114.0 C382.6,135.0 283.6,135.0 283.6,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M382.6,114.0 C382.6,135.0 467.5,135.0 467.5,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M382.6,114.0 C382.6,135.0 586.3,135.0 586.3,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M525.5,114.0 C525.5,135.0 586.3,135.0 586.3,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M525.5,114.0 C525.5,135.0 697.9,135.0 697.9,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M637.1,114.0 C637.1,135.0 467.5,135.0 467.5,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M637.1,114.0 C637.1,135.0 586.3,135.0 586.3,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M637.1,114.0 C637.1,135.0 697.9,135.0 697.9,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M637.1,114.0 C637.1,135.0 815.5,135.0 815.5,156.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M110.2,176.0 C110.2,197.0 108.4,197.0 108.4,218.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M586.3,176.0 C586.3,197.0 568.6,197.0 568.6,218.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M697.9,176.0 C697.9,197.0 680.2,197.0 680.2,218.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <path d="M525.0,236.0 C423.5,258.0 288.3,258.0 186.8,238.0" fill="none" stroke="#94A3B8" stroke-width="0.5" marker-end="url(#ah)"/>
+  <g filter="url(#shadow)">
+    <rect x="64.8" y="32.0" width="77.6" height="14" rx="7" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <text x="103.6" y="40.8" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">Depositor</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="179.4" y="32.0" width="87.2" height="14" rx="7" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <text x="223.0" y="40.8" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">Protocol Admin</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="298.9" y="32.0" width="81.2" height="14" rx="7" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <text x="339.5" y="40.8" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">Agent</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="423.2" y="32.0" width="84.8" height="14" rx="7" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <text x="465.6" y="40.8" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">Guardian</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="537.9" y="32.0" width="70.4" height="14" rx="7" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <text x="573.1" y="40.8" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">Challenger</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="76.1" y="94.0" width="113.6" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <rect x="79.1" y="97.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
+    <text x="132.9" y="103.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">SyndicateVault</text>
+    <text x="132.9" y="108.5" text-anchor="middle" font-size="3.5" fill="#64748B">ERC-4626 + WithdrawalQueue</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="211.7" y="94.0" width="96.8" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <rect x="214.7" y="97.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
+    <text x="260.1" y="103.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">SyndicateFactory</text>
+    <text x="260.1" y="108.5" text-anchor="middle" font-size="3.5" fill="#64748B">Deployer / Wiring</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="331.8" y="94.0" width="101.6" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <rect x="334.8" y="97.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
+    <text x="382.6" y="103.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">SyndicateGovernor</text>
+    <text x="382.6" y="108.5" text-anchor="middle" font-size="3.5" fill="#64748B">Proposal Lifecycle</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="477.1" y="94.0" width="96.8" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <rect x="480.1" y="97.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
+    <text x="525.5" y="103.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">GuardianRegistry</text>
+    <text x="525.5" y="108.5" text-anchor="middle" font-size="3.5" fill="#64748B">Review + Slash</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="595.9" y="94.0" width="82.4" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <rect x="598.9" y="97.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
+    <text x="637.1" y="103.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">ChallengeGame</text>
+    <text x="637.1" y="108.5" text-anchor="middle" font-size="3.5" fill="#64748B">Bonded Disputes</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="30.0" y="156.0" width="160.4" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <rect x="33.0" y="159.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
+    <text x="110.2" y="165.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">Strategies</text>
+    <text x="110.2" y="170.5" text-anchor="middle" font-size="3.5" fill="#64748B">Factory / Portfolio / Morpho / Adapters</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="212.4" y="156.0" width="142.4" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <rect x="215.4" y="159.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
+    <text x="283.6" y="165.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">TierRegistry</text>
+    <text x="283.6" y="170.5" text-anchor="middle" font-size="3.5" fill="#64748B">Tiers / Allowlist / ProtocolConfig</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="414.3" y="156.0" width="106.4" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <rect x="417.3" y="159.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
+    <text x="467.5" y="165.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">ProposerBondEscrow</text>
+    <text x="467.5" y="170.5" text-anchor="middle" font-size="3.5" fill="#64748B">WOOD Custody</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="542.7" y="156.0" width="87.2" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <rect x="545.7" y="159.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
+    <text x="586.3" y="165.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">ExposureLedger</text>
+    <text x="586.3" y="170.5" text-anchor="middle" font-size="3.5" fill="#64748B">USD Coverage</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="651.9" y="156.0" width="92.0" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <rect x="654.9" y="159.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
+    <text x="697.9" y="165.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">StakedWood</text>
+    <text x="697.9" y="170.5" text-anchor="middle" font-size="3.5" fill="#64748B">Stake Custody + Burn</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="765.9" y="156.0" width="99.2" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <rect x="768.9" y="159.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
+    <text x="815.5" y="165.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">TokenCourt</text>
+    <text x="815.5" y="170.5" text-anchor="middle" font-size="3.5" fill="#64748B">Verdicts, Zero Custody</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="30.0" y="218.0" width="156.8" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <rect x="33.0" y="221.0" width="1.4" height="14" rx="0.6" fill="#F59E0B"/>
+    <text x="108.4" y="227.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">Venues + Feeds</text>
+    <text x="108.4" y="232.5" text-anchor="middle" font-size="3.5" fill="#64748B">Uniswap / Synthra / Morpho / Chainlink</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="525.0" y="218.0" width="87.2" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <rect x="528.0" y="221.0" width="1.4" height="14" rx="0.6" fill="#3B82F6"/>
+    <text x="568.6" y="227.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">WoodTwapOracle</text>
+    <text x="568.6" y="232.5" text-anchor="middle" font-size="3.5" fill="#64748B">WOOD/USD TWAP</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="639.6" y="218.0" width="81.2" height="20" rx="3" fill="#fff" stroke="#E2E5EA" stroke-width="0.5"/>
+    <rect x="642.6" y="221.0" width="1.4" height="14" rx="0.6" fill="#F59E0B"/>
+    <text x="680.2" y="227.5" text-anchor="middle" font-size="4.8" font-weight="600" fill="#1E293B">WOOD</text>
+    <text x="680.2" y="232.5" text-anchor="middle" font-size="3.5" fill="#64748B">Governance ERC-20</text>
+  </g>
+  <rect x="97.0" y="65.0" width="42.4" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="118.2" y="70.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">deposit / redeem</text>
+  <rect x="221.5" y="65.0" width="40.0" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="241.5" y="70.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">protocol wiring</text>
+  <rect x="339.8" y="65.0" width="42.4" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="361.0" y="70.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">propose strategy</text>
+  <rect x="475.6" y="65.0" width="40.0" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="495.6" y="70.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">approve / block</text>
+  <rect x="586.3" y="65.0" width="37.6" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="605.1" y="70.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">file challenge</text>
+  <rect x="183.1" y="133.0" width="35.2" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="200.7" y="138.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">deploys vault</text>
+  <rect x="298.9" y="125.0" width="42.4" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="320.1" y="130.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">deploys governor</text>
+  <rect x="243.1" y="129.0" width="35.2" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="260.7" y="134.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">execute batch</text>
+  <rect x="435.3" y="133.0" width="40.0" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="455.3" y="138.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">register review</text>
+  <rect x="106.3" y="130.0" width="30.4" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="121.5" y="135.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">batch calls</text>
+  <rect x="187.0" y="126.0" width="42.4" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="208.2" y="131.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">callee allowlist</text>
+  <rect x="310.7" y="134.0" width="44.8" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="333.1" y="139.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">tier + fee splits</text>
+  <rect x="401.5" y="126.0" width="47.2" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="425.1" y="131.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">lock proposer bond</text>
+  <rect x="464.5" y="126.0" width="40.0" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="484.5" y="131.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">coverage quorum</text>
+  <rect x="538.3" y="130.0" width="35.2" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="555.9" y="135.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">book approval</text>
+  <rect x="595.3" y="130.0" width="32.8" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="611.7" y="135.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">review slash</text>
+  <rect x="535.9" y="122.0" width="32.8" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="552.3" y="127.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">forfeit bond</text>
+  <rect x="591.7" y="122.0" width="40.0" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="611.7" y="127.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">freeze coverage</text>
+  <rect x="649.9" y="130.0" width="35.2" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="667.5" y="135.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">verdict slash</text>
+  <rect x="708.7" y="130.0" width="35.2" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="726.3" y="135.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">refer dispute</text>
+  <rect x="91.7" y="192.0" width="35.2" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="109.3" y="197.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">swap / supply</text>
+  <rect x="563.5" y="192.0" width="28.0" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="577.5" y="197.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">WOOD price</text>
+  <rect x="670.3" y="192.0" width="37.6" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="689.1" y="197.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">custody + burn</text>
+  <rect x="335.9" y="257.0" width="40.0" height="6.0" rx="1" fill="#F8F9FB"/>
+  <text x="355.9" y="262.0" font-size="4" fill="#1E293B" font-weight="500" text-anchor="middle">pair + ETH feed</text>
+</svg>

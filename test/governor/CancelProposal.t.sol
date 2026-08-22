@@ -14,6 +14,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title CancelProposal — regression suite for proposer cancel branches
 /// @notice Covers the V1.5 extension that lets the proposer cancel during
@@ -87,7 +88,8 @@ contract CancelProposalTest is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -149,7 +151,9 @@ contract CancelProposalTest is Test {
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -221,7 +225,9 @@ contract CancelProposalTest is Test {
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
         assertGt(pid2, pid);

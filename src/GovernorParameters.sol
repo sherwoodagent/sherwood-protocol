@@ -2,7 +2,9 @@
 pragma solidity 0.8.28;
 
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
+import {IProtocolConfig} from "./interfaces/IProtocolConfig.sol";
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
+import {ProposalLifecycle} from "./ProposalLifecycle.sol";
 import {FeeConstants} from "./FeeConstants.sol";
 
 /**
@@ -21,33 +23,31 @@ import {FeeConstants} from "./FeeConstants.sol";
  *         so indexers can subscribe to a single topic regardless of which
  *         parameter changed.
  */
-abstract contract GovernorParameters is ISyndicateGovernor {
+abstract contract GovernorParameters is ProposalLifecycle {
     // ── Safety bounds (hardcoded) ──
 
     // Per-deployment timing floors are constructor-set immutables (see constructor).
-    // Mainnet impls deploy with the historical values (`votingPeriod` >= 24h,
-    // `cooldownPeriod` >= 1h); a testnet impl can deploy with lower floors to
-    // compress fund lifecycles. Immutables live in bytecode (not storage), so the
-    // storage layout is UNCHANGED vs. the prior `constant` form and reads resolve
-    // correctly through the beacon proxy. The absolute floor-of-floors below caps
-    // how low a deploy may set them, so a misconfigured impl fails loudly.
+    // Mainnet impls deploy with `votingPeriod` >= 24h and `cooldownPeriod` >= 1h;
+    // a testnet impl can deploy with lower floors to compress fund lifecycles.
+    // Immutables live in bytecode (not storage), so reads resolve correctly
+    // through the beacon proxy. The absolute floor-of-floors below caps how low
+    // a deploy may set them, so a misconfigured impl fails loudly.
     uint256 internal constant ABSOLUTE_MIN_TIMING_FLOOR = 1 minutes;
 
     /// @notice Hard floor for `votingPeriod` (per-deployment; mainnet 24h).
     /// @custom:oz-upgrades-unsafe-allow state-variable-immutable
     uint256 public immutable MIN_VOTING_PERIOD;
-    uint256 public constant MAX_VOTING_PERIOD = 30 days;
+    uint256 public constant MAX_VOTING_PERIOD = 3 days;
     uint256 public constant MIN_EXECUTION_WINDOW = 1 hours;
     uint256 public constant MAX_EXECUTION_WINDOW = 7 days;
     uint256 public constant MIN_VETO_THRESHOLD_BPS = 2000; // 20%
-    uint256 public constant MAX_VETO_THRESHOLD_BPS = 5000; // 50%
-    uint256 public constant MAX_PERFORMANCE_FEE_CAP = FeeConstants.MAX_PERFORMANCE_FEE_BPS; // 15%
+    uint256 public constant MAX_VETO_THRESHOLD_BPS = 8000; // 80%
+    uint256 public constant MAX_PERFORMANCE_FEE_CAP = FeeConstants.MAX_PERFORMANCE_FEE_BPS; // 30%
     uint256 public constant ABSOLUTE_MIN_STRATEGY_DURATION = 1 hours;
-    // ~10y: supports indefinitely-lived strategies (e.g. leveraged Aerodrome CL). Params freeze and
-    // the owner bond stays locked only WHILE a proposal is open — the proposer can self-settle 1h
-    // after execute (MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE); only a non-proposer settle waits the
-    // full duration, so the long tail binds only an abandoned proposal on a vault whose owner ≠ proposer.
-    uint256 public constant ABSOLUTE_MAX_STRATEGY_DURATION = 3650 days;
+    // Strategies are short-lived by design: the proposer can self-settle 1h after execute
+    // (MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE); a non-proposer settle waits the full
+    // duration, so this cap bounds how long an abandoned proposal can pin a vault.
+    uint256 public constant ABSOLUTE_MAX_STRATEGY_DURATION = 30 days;
     /// @notice Hard floor for `cooldownPeriod` (per-deployment; mainnet 1h).
     /// @custom:oz-upgrades-unsafe-allow state-variable-immutable
     uint256 public immutable MIN_COOLDOWN_PERIOD;
@@ -77,6 +77,7 @@ abstract contract GovernorParameters is ISyndicateGovernor {
     bytes32 public constant PARAM_COLLAB_WINDOW = keccak256("collaborationWindow");
     bytes32 public constant PARAM_MAX_CO_PROPOSERS = keccak256("maxCoProposers");
     bytes32 public constant PARAM_MAX_CAPITAL_BPS = keccak256("maxCapitalBps");
+    bytes32 public constant PARAM_TIER2_CALL_CAP_BPS = keccak256("tier2CallCapBps");
 
     // ── Storage ──
 
@@ -102,17 +103,24 @@ abstract contract GovernorParameters is ISyndicateGovernor {
     address internal _bootstrapOwner;
 
     /// @notice Ceiling on a proposal's `envelope.maxCapital`, in bps of the
-    ///         vault's `totalAssets()` at propose time (finding 3: without a
-    ///         ceiling a proposer sets maxCapital = uint256.max and the
-    ///         net-outflow cap never binds). Stored 0 means "unset" and reads
-    ///         as the 10_000 (100% of TVL) default via `maxCapitalBps()` — no
-    ///         initialize change needed, existing governors keep working.
+    ///         vault's `totalAssets()` at propose time — without a ceiling a
+    ///         proposer could set maxCapital = uint256.max and the
+    ///         net-outflow cap never binds. Stored 0 means "unset" and reads
+    ///         as the 10_000 (100% of TVL) default via `maxCapitalBps()`.
     uint256 internal _maxCapitalBps;
+
+    /// @notice Per-call tier-2 (uncertified) capital-cap ceiling, in bps of the
+    ///         vault's `totalAssets()` at propose time (issue #43, design.md
+    ///         D2). Stored 0 means "unset" and reads as 10_000 (no ceiling —
+    ///         inert default) via `tier2CallCapBps()`, mirroring
+    ///         `_maxCapitalBps`/`maxCapitalBps()` exactly.
+    uint256 internal _tier2CallCapBps;
 
     /// @dev Reserved storage slots at the `GovernorParameters` layer so future
     ///      param additions here don't shift `SyndicateGovernor`'s layout.
-    ///      (Shrunk 8 → 7 for `_maxCapitalBps` — append-only.)
-    uint256[7] private __paramsGap;
+    ///      Carved by 1 slot (from 7) for `_tier2CallCapBps` above —
+    ///      append-only (see `script/syndicate-governor-layout.golden.json`).
+    uint256[6] private __paramsGap;
 
     // ── Constructor (impl-time; sets per-deployment timing floors) ──
 
@@ -147,10 +155,8 @@ abstract contract GovernorParameters is ISyndicateGovernor {
         _;
     }
 
-    modifier whenNoActiveProposal() {
-        if (openProposalCount() > 0) revert ParamsFrozenDuringProposal();
-        _;
-    }
+    // `whenNoActiveProposal` is inherited from ProposalLifecycle (the base owns
+    // the `_openProposalCount` lifecycle counter it guards on).
 
     // ── Bounds validator ──
 
@@ -170,10 +176,15 @@ abstract contract GovernorParameters is ISyndicateGovernor {
             p.minStrategyDuration < ABSOLUTE_MIN_STRATEGY_DURATION
                 || p.maxStrategyDuration > ABSOLUTE_MAX_STRATEGY_DURATION
                 || p.minStrategyDuration > p.maxStrategyDuration
+                // The PROTOCOL ceiling binds here too — otherwise
+                // `forceSetParams` seats a duration `setMaxStrategyDuration`
+                // would reject, and guardians inherit an exposure window the
+                // protocol never sanctioned.
+                || p.maxStrategyDuration > _protocolMaxStrategyDuration()
         ) revert InvalidStrategyDurationBounds();
-        // I2 (review): the individual setters bound these, so the rescue path
-        // (initialize / forceSetParams) must too, or setParamsOverride could
-        // seat an out-of-range value the setters would reject.
+        // The individual setters bound these, so the rescue path (initialize /
+        // forceSetParams) must too, or setParamsOverride could seat an
+        // out-of-range value the setters would reject.
         if (p.collaborationWindow < MIN_COLLABORATION_WINDOW || p.collaborationWindow > MAX_COLLABORATION_WINDOW) {
             revert InvalidCollaborationWindow();
         }
@@ -214,6 +225,25 @@ abstract contract GovernorParameters is ISyndicateGovernor {
         emit ParameterChangeFinalized(PARAM_MAX_PERF_FEE, old, newValue);
     }
 
+    /// @dev The protocol-wide `strategyDuration` ceiling, or `type(uint256).max`
+    ///      when unset so the check is a no-op.
+    ///
+    ///      Read LIVE rather than mirrored into governor storage: the governor is
+    ///      behind a beacon with a pinned layout, and a protocol-wide value has no
+    ///      business being copied per vault where it could drift. The cost is one
+    ///      external call on two owner-only paths.
+    ///
+    ///      UNSET (0) MEANS NO CEILING, not nothing-is-proposable. Failing closed
+    ///      would brick every vault deployed before this parameter existed the
+    ///      moment the config were upgraded — right for coverage, wrong for a
+    ///      bound that did not previously exist.
+    function _protocolMaxStrategyDuration() private view returns (uint256) {
+        address cfg = protocolConfig;
+        if (cfg == address(0)) return type(uint256).max;
+        uint256 ceiling = IProtocolConfig(cfg).maxStrategyDuration();
+        return ceiling == 0 ? type(uint256).max : ceiling;
+    }
+
     /// @inheritdoc ISyndicateGovernor
     function setMinStrategyDuration(uint256 newValue) external onlyVaultOwner whenNoActiveProposal {
         if (newValue < ABSOLUTE_MIN_STRATEGY_DURATION || newValue > _params.maxStrategyDuration) {
@@ -229,6 +259,7 @@ abstract contract GovernorParameters is ISyndicateGovernor {
         if (newValue > ABSOLUTE_MAX_STRATEGY_DURATION || newValue < _params.minStrategyDuration) {
             revert InvalidStrategyDurationBounds();
         }
+        if (newValue > _protocolMaxStrategyDuration()) revert InvalidStrategyDurationBounds();
         uint256 old = _params.maxStrategyDuration;
         _params.maxStrategyDuration = newValue;
         emit ParameterChangeFinalized(PARAM_MAX_STRATEGY_DURATION, old, newValue);
@@ -275,13 +306,26 @@ abstract contract GovernorParameters is ISyndicateGovernor {
     }
 
     /// @inheritdoc ISyndicateGovernor
+    function setTier2CallCapBps(uint256 newValue) external onlyVaultOwner whenNoActiveProposal {
+        if (newValue == 0 || newValue > BPS_DENOMINATOR) revert InvalidTier2CallCapBps();
+        uint256 old = tier2CallCapBps();
+        _tier2CallCapBps = newValue;
+        emit ParameterChangeFinalized(PARAM_TIER2_CALL_CAP_BPS, old, newValue);
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function tier2CallCapBps() public view returns (uint256) {
+        uint256 v = _tier2CallCapBps;
+        return v == 0 ? BPS_DENOMINATOR : v; // 0 sentinel = unset = inert (no per-call tier-2 ceiling)
+    }
+
+    /// @inheritdoc ISyndicateGovernor
     function getGovernorParams() external view returns (GovernorParams memory) {
         return _params;
     }
 
-    // ── Abstract view (implemented by SyndicateGovernor) ──
-
-    function openProposalCount() public view virtual returns (uint256);
+    // `openProposalCount()` is a concrete virtual on ProposalLifecycle (the
+    // base owns `_openProposalCount`); no abstract declaration needed here.
 
     // ── Validation helpers ──
 

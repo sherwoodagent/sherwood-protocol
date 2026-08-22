@@ -81,9 +81,49 @@ abstract contract ScriptBase is Script {
         vm.writeJson(string.concat("\"", vm.toString(value), "\""), _chainsPath(), string.concat(".", key));
     }
 
+    /// @notice Patch a key ONLY when this chain already has an address book.
+    /// @dev    For phases whose `run()` is also driven by a test suite. The
+    ///         pre-flight suites call `run()` under `vm.setEnv` on the default
+    ///         test chain id, where `_patchAddress` would CREATE
+    ///         `chains/31337.json` — a junk file committed into the repo by the
+    ///         act of running the tests.
+    ///
+    ///         Silence is correct here rather than a revert: a chain with no
+    ///         address book is not a chain this key belongs to, and the deploy
+    ///         phases that matter all run against a book the core ceremony
+    ///         wrote several phases earlier. A missing book on a real deploy
+    ///         target is caught long before this, by the `_readAddress` calls
+    ///         that every one of those phases opens with.
+    function _patchAddressIfBook(string memory key, address value) internal {
+        if (!_fileExists(_chainsPath())) {
+            console.log("address book absent for this chain - %s not persisted", key);
+            return;
+        }
+        _patchAddress(key, value);
+    }
+
     /// @notice Read a deployed address from chains/{chainId}.json
     function _readAddress(string memory key) internal view returns (address) {
         return vm.parseJsonAddress(vm.readFile(_chainsPath()), string.concat(".", key));
+    }
+
+    /// @notice Read an OPTIONAL address from chains/{chainId}.json.
+    /// @dev    `_readAddress` reverts on a missing file or key, which is right
+    ///         for a mandatory dependency and wrong for one that legitimately
+    ///         varies per chain — a phase that must run both before and after
+    ///         the core deploy cannot ask "is TIER_REGISTRY in the book yet?"
+    ///         without a tolerant read. Returns `address(0)` for a missing
+    ///         file, key, or value; callers treat zero as "not on this chain".
+    ///         (`Deploy.s.sol` predates this and keeps its own equivalent —
+    ///         a differently-named helper here avoids shadowing that one.)
+    function _optionalAddress(string memory key) internal view returns (address) {
+        string memory path = _chainsPath();
+        if (!_fileExists(path)) return address(0);
+        try vm.parseJsonAddress(vm.readFile(path), string.concat(".", key)) returns (address a) {
+            return a;
+        } catch {
+            return address(0);
+        }
     }
 
     /// @notice Write tokenomics addresses to chains/{chainId}.json (appends to existing)

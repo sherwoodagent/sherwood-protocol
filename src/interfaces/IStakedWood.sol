@@ -3,16 +3,54 @@ pragma solidity 0.8.28;
 
 /// @title IStakedWood
 /// @notice Interface for the StakedWood (sWOOD) contract — the sole WOOD-token
-///         custodian. sWOOD absorbs guardian staking, DPoS delegation, owner
-///         bonds, vote checkpoints, and slashing, all of which previously
-///         lived in `GuardianRegistry`. The slimmed `GuardianRegistry`,
-///         `SyndicateGovernor`, and `SyndicateFactory` call sWOOD through
-///         this interface.
-/// @dev See `docs/superpowers/specs/2026-05-21-swood-staking-split-design.md`.
-///      Staking/delegation/owner-bond signatures are carried verbatim from the
-///      pre-split `IGuardianRegistry`. Checkpoint reads are timestamp-keyed
-///      (EIP-6372 timestamp-mode clock).
+///         custodian, holding guardian staking, owner bonds, vote
+///         checkpoints, and slashing. `GuardianRegistry`, `SyndicateGovernor`,
+///         and `SyndicateFactory` call sWOOD through this interface.
+/// @dev See `openspec/specs/guardian-staking/spec.md`. Checkpoint reads are
+///      timestamp-keyed (EIP-6372 timestamp-mode clock).
 interface IStakedWood {
+    /// @notice Reverts when a non-slasher calls the verdict slash path.
+    error NotAuthorizedSlasher();
+
+    /// @notice Reverts when `slashVerdict` is handed a rate array whose length
+    ///         does not match `approvers`. Positional alignment is the only
+    ///         thing binding a guardian to their own rate, so a mismatch is a
+    ///         caller bug that would otherwise slash the tail of the batch at a
+    ///         rate nobody chose.
+    error SlashBpsLengthMismatch();
+
+    /// @notice Reverts when `slashVerdict`'s `openedAt` is in the future — the
+    ///         at-open anchor the slash legs are sized against must be a real
+    ///         past instant.
+    error VerdictNotPast();
+
+    /// @notice Reverts when `slashVerdict`'s `approvers` names an address
+    ///         twice — the dedup that keeps a repeated approver from
+    ///         compounding past `maxSlashBps`. Order is NOT constrained
+    ///         (`ExposureLedger.slashBpsFor` feeds vote-order arrays).
+    error DuplicateApprover();
+
+    /// @notice Reverts when `slashVerdict` names an approver already slashed under
+    ///         the same `caseKey` by an EARLIER call.
+    /// @dev The intra-call dedup only bounds ONE array, so without this the
+    ///      severity ceiling binds per CALL rather than per verdict: `_slashOne`
+    ///      re-reads the live stake each time while sizing off the same `openedAt`
+    ///      checkpoint, so repeated calls against one approver can exceed the
+    ///      governance-set ceiling. Splitting a quorum-sized batch across
+    ///      transactions stays legal; replaying an approver does not.
+    error ApproverAlreadySlashed();
+
+    event AuthorizedSlasherSet(address indexed slasher);
+
+    /// @notice A verdict slash was settled: what it took, all of which was
+    ///         destroyed.
+    /// @dev ONE FIELD, BECAUSE THERE IS ONE LEG. `gross == burned` by construction
+    ///      — the slash has no payee — so there is no split for an indexer to
+    ///      re-derive, and `burned` is also `slashVerdict`'s return value. The
+    ///      prosecutor's fee is a separate leg on a separate contract and surfaces
+    ///      as `IProposerBondEscrow.ProsecutorFeePaid`.
+    event VerdictSlashBurned(bytes32 indexed caseKey, uint256 burned);
+
     // ── Guardian stake ──
     function stakeAsGuardian(uint256 amount, uint256 agentId) external;
     function requestUnstakeGuardian() external;
@@ -25,66 +63,93 @@ interface IStakedWood {
     function bindOwnerStake(address owner, address vault) external;
     function requestUnstakeOwner(address vault) external;
     function claimUnstakeOwner(address vault) external;
+
+    /// @notice Consent to having your prepared owner stake bound to `vault` by
+    ///         the factory's owner-rotation flow (issue #98). Callable only by
+    ///         the prospective owner themselves; one approved vault per
+    ///         address, overwritten on re-approval, consumed by the bind.
+    function approveOwnerStakeBinding(address vault) external;
+
+    /// @notice Withdraw a previously granted binding consent.
+    function revokeOwnerStakeBinding() external;
+
+    /// @notice Re-point a vault's owner-stake slot to `newOwner`'s prepared
+    ///         stake. Reverts `BindingNotApproved` unless `newOwner` approved
+    ///         exactly `vault` first.
     function transferOwnerStakeSlot(address vault, address newOwner) external;
 
-    /// @notice The owner bond a vault must hold. TVL scaling is not implemented
-    ///         in V1; the bond is unconditionally `minOwnerStake`. The `vault`
-    ///         parameter is retained for forward-compatibility.
+    /// @notice The owner bond a vault must hold to reach the emergency
+    ///         settlement path: `max(minOwnerStake, MIN_OWNER_BOND_FLOOR)`.
+    /// @dev    TVL scaling is still not implemented, so the `vault` parameter
+    ///         is retained for forward-compatibility and ignored today. The
+    ///         floor is NOT ignored: `minOwnerStake` may legally be zero (the
+    ///         open-onboarding sentinel), and a zero required bond made
+    ///         `emergencySettleWithCalls`' gate pass at `0 >= 0` with nothing
+    ///         posted and `slashOwnerBond` a no-op on an empty slot.
+    ///
+    ///         This is NOT the vault-creation floor — that is `minOwnerStake`
+    ///         itself, which `IGuardianRegistry.minOwnerStake()` exposes. The
+    ///         two answer different questions and diverge under the sentinel.
     function requiredOwnerBond(address vault) external view returns (uint256);
 
-    // ── Delegation ──
-    function delegateStake(address delegate, uint256 amount) external;
-    function requestUnstakeDelegation(address delegate) external;
-    function cancelUnstakeDelegation(address delegate) external;
-    function claimUnstakeDelegation(address delegate) external;
-    function setCommission(uint256 newBps) external;
+    /// @notice The vault-CREATION owner-stake floor, verbatim — zero under the
+    ///         open-onboarding sentinel.
+    /// @dev    Distinct from `requiredOwnerBond`, which floors the same slot at
+    ///         `MIN_OWNER_BOND_FLOOR` for the emergency gate. Asking this one
+    ///         "what does creating a vault require?" and that one "what does
+    ///         reaching emergency settlement require?" is the intended split;
+    ///         `IGuardianRegistry.minOwnerStake()` forwards to THIS.
+    function minOwnerStake() external view returns (uint256);
 
     // ── Snapshot-compatible vote-read surface (timestamp-keyed) ──
     //
     // `getVotes` / `getPastVotes` / `getPastTotalSupply` form the read surface
-    // Snapshot's `erc20-votes` strategy consumes. sWOOD intentionally does NOT
-    // implement the full OZ `IVotes` (no `delegate` / `delegates` /
-    // `delegateBySig`) — sWOOD delegation is the custodial DPoS mechanism, a
-    // different concept. Vote weight = AGE-WEIGHTED own staked +
-    // delegated-inbound capped at `delegatedWeightCapX ×` aged own.
+    // Snapshot's `erc20-votes` strategy consumes. sWOOD does not implement the
+    // full OZ `IVotes` (no `delegate` / `delegates` / `delegateBySig`). Vote
+    // weight = age-weighted own staked WOOD; there is no delegated component.
 
     /// @notice An account's CURRENT vote weight: age-weighted own votable
-    ///         stake + k-capped delegated inbound. Live counterpart of
-    ///         `getPastVotes`.
+    ///         stake. Live counterpart of `getPastVotes`.
     function getVotes(address account) external view returns (uint256);
 
-    /// @notice Guardian's own + delegated vote weight at a past timestamp.
+    /// @notice The WOOD a verdict slash anchored at `anchor` could recover
+    ///         from `guardian`'s own stake right now: `min(max(liability at
+    ///         anchor, votableStake at anchor), liveStake)`. Byte-for-byte the basis
+    ///         `_slashOne` sizes its per-approver take from (issue #35) — a
+    ///         guardian who tops up its stake after `anchor` is not counted.
+    ///         Reverts `VerdictNotPast` on a future `anchor`.
+    function slashableStakeAt(address guardian, uint256 anchor) external view returns (uint256);
+
+    /// @notice Guardian's age-weighted own vote weight at a past timestamp.
+    /// @dev    Not a term of `getPastTotalVotes`: the total sums RAW own stake;
+    ///         this applies `_ageFactorBps` on top, so the two are different
+    ///         measures of the same WOOD. Correct for weighing a vote, wrong for a
+    ///         subtraction against the total — use `getPastStake` there. Aging
+    ///         only ever shrinks weight, so per-account weight is bounded above by
+    ///         raw stake, biasing `TokenCourt._participationFloor` too HIGH when
+    ///         the accused are freshly staked.
+    /// @dev    ANCHOR-EXACT: the age factor is evaluated against the `stakedAt`
+    ///         anchor AS IT STOOD at `timestamp`, checkpointed alongside the raw
+    ///         stake, not the live anchor — so a re-anchor AFTER `timestamp` can
+    ///         neither inflate nor deflate an already-past read, including the
+    ///         frozen ballots review votes snapshot at `openedAt`.
     function getPastVotes(address guardian, uint256 timestamp) external view returns (uint256);
 
+    /// @notice A guardian's RAW votable own stake at a past timestamp — the same
+    ///         basis `getPastTotalVotes` sums, so the two are comparable and
+    ///         subtractable. This is the operand `TokenCourt._participationFloor`
+    ///         needs; `getPastVotes` there would let delegation drive the floor
+    ///         to zero.
+    function getPastStake(address guardian, uint256 timestamp) external view returns (uint256);
+
     /// @notice Total guardian vote weight (quorum denominator) at a past timestamp.
+    /// @dev    A sum of RAW own stake. Pair it with `getPastStake`, never with
+    ///         `getPastVotes`.
     function getPastTotalVotes(uint256 timestamp) external view returns (uint256);
 
-    /// @notice Total system vote weight at a past timestamp — own-stake total
-    ///         plus delegated total. Snapshot quorum/total denominator.
+    /// @notice Total system vote weight at a past timestamp — the raw own-stake
+    ///         total. Snapshot quorum/total denominator.
     function getPastTotalSupply(uint256 timestamp) external view returns (uint256);
-
-    /// @notice Total delegated stake at a past timestamp — `totalDelegatedStake`
-    ///         frozen against the global delegation history checkpoint. Used
-    ///         by `GuardianRegistry.openReview` so the quorum denominator is
-    ///         read at the same `t-1` anchor as the per-voter weight lookups
-    ///         (closes Sherlock #35 / Run-1 #18 timestamp asymmetry).
-    function getPastTotalDelegated(uint256 timestamp) external view returns (uint256);
-
-    /// @notice Total ACTIVE-ONLY delegated stake at a past timestamp — sum of
-    ///         `poolTokens[g]` over guardians g that were active at `timestamp`.
-    ///         Used by `GuardianRegistry.openReview` to exclude dead-weight
-    ///         delegations to inactive guardians from the quorum denominator
-    ///         (Sherlock #39 / Run-1 #22).
-    function getPastTotalActiveDelegated(uint256 timestamp) external view returns (uint256);
-
-    /// @notice A delegate's DPoS commission rate (bps) frozen at a past timestamp.
-    function getPastCommission(address delegate, uint256 timestamp) external view returns (uint256);
-
-    /// @notice A delegator's stake delegated to `delegate` at a past timestamp.
-    function getPastDelegation(address delegator, address delegate, uint256 timestamp) external view returns (uint256);
-
-    /// @notice A delegate's total inbound delegated WOOD at a past timestamp.
-    function getPastDelegatedInbound(address delegate, uint256 timestamp) external view returns (uint256);
 
     // ── Live reads ──
     /// @notice The WOOD ERC20 token sWOOD custodies. The registry reads this
@@ -94,16 +159,16 @@ interface IStakedWood {
     function guardianStake(address guardian) external view returns (uint256);
     function ownerStake(address vault) external view returns (uint256);
     function totalGuardianStake() external view returns (uint256);
-    function totalDelegatedStake() external view returns (uint256);
-    function delegationOf(address delegator, address delegate) external view returns (uint256);
-    function delegatedInbound(address delegate) external view returns (uint256);
-    function commissionOf(address delegate) external view returns (uint256);
     function preparedStakeOf(address owner) external view returns (uint256);
     function canCreateVault(address owner) external view returns (bool);
 
+    /// @notice The single vault `owner` has consented to have their prepared
+    ///         stake bound to. Zero when there is no standing consent.
+    function approvedBindVault(address owner) external view returns (address);
+
     /// @notice The guardian unstake cooldown period. The registry reads this
-    ///         in `setReviewPeriod` to enforce the `coolDownPeriod >=
-    ///         reviewPeriod` cross-contract invariant (Sherlock #16).
+    ///         in `setReviewPeriod` to enforce the cross-contract invariant
+    ///         `coolDownPeriod >= reviewPeriod`.
     function coolDownPeriod() external view returns (uint256);
 
     /// @notice Lower clamp bound (bps) for the graduated slash severity.
@@ -112,21 +177,13 @@ interface IStakedWood {
     /// @notice Upper clamp bound (bps) for the graduated slash severity.
     function maxSlashBps() external view returns (uint256);
 
-    // ── Registry-only mutations ──
-    /// @notice Slash `approvers` for a blocked proposal. Burns `slashBps` of
-    ///         each approver's own stake plus `min(slashBps,
-    ///         maxDelegatedSlashBps)` of their delegated pools (pro-rata via
-    ///         the share model); the uncovered delegated remainder spills onto
-    ///         the approver's own remaining stake (first-loss bond, spec
-    ///         2026-07-19 Part A). Registry-only.
-    /// @param reviewKey  Composite review key keccak256(abi.encode(governor, proposalId)) whose approvers are slashed.
-    /// @param openedAt   The review's open timestamp. `_slashOne` sizes each
-    ///                   approver's own slash off their raw own-stake
-    ///                   checkpoint at this instant and the delegated legs off
-    ///                   `getPastDelegatedInbound(approver, openedAt)` — two
-    ///                   disjoint at-open snapshots (Sherlock run #3 #6: no
-    ///                   double-slash of the delegated contribution).
-    /// @param approvers  Plain `address[]` of approver addresses to slash.
+    // Registry-only mutations
+    /// @notice Slash `approvers` for a blocked proposal. Burns `slashBps` of each
+    ///         approver's own stake. Registry-only.
+    /// @param reviewKey  keccak256(abi.encode(governor, proposalId)).
+    /// @param openedAt   The review's open timestamp — the checkpoint each
+    ///                   approver's slash is sized off.
+    /// @param approvers  Approver addresses to slash.
     /// @param slashBps   Slash fraction in basis points.
     function slashGuardians(bytes32 reviewKey, uint256 openedAt, address[] calldata approvers, uint256 slashBps)
         external;
@@ -135,11 +192,42 @@ interface IStakedWood {
     ///         Registry-only.
     function slashOwnerBond(address vault) external;
 
+    // Slasher-only mutations (verdict path)
+    /// @notice Verdict-driven slash whose proceeds are BURNED.
+    /// @dev PUNITIVE, NOT COMPENSATORY. Nothing is paid to the harmed vault or its
+    ///      holders. Each non-zero rate is clamped to `[minSlashBps, maxSlashBps]`,
+    ///      the same severity envelope the review path enforces.
+    ///
+    ///      `approvers` must be duplicate-free (any order) AND must not repeat an
+    ///      approver already slashed under this `caseKey` by an earlier call — one
+    ///      verdict takes one slash per approver, so the envelope binds per VERDICT
+    ///      and not merely per call. `openedAt` must not be in the future: an
+    ///      honest-caller sanity bound that does NOT bind a compromised slasher.
+    ///
+    ///      NO EXTERNAL SINK. The burn is unconditional and internal, so there is
+    ///      no child call whose revert could hold a conviction hostage, no
+    ///      allowance against sWOOD's custody balance, and no gas to reserve.
+    /// @return total  WOOD burned across all approvers. The slash pays no one; the
+    ///                prosecutor is paid from the convicted proposer's bond.
+    function slashVerdict(
+        bytes32 caseKey,
+        uint256 openedAt,
+        address[] calldata approvers,
+        uint256[] calldata slashBpsPer
+    ) external returns (uint256 total);
+
+    function setAuthorizedSlasher(address slasher) external;
+    function authorizedSlasher() external view returns (address);
+
+    /// @notice Whether `approver` has already been slashed under `caseKey`.
+    /// @dev Lets a slasher (e.g. a keeper resuming a batch that ran out of
+    ///      gas) resume a split verdict without re-slashing anyone.
+    function verdictSlashed(bytes32 caseKey, address approver) external view returns (bool);
+
     // ── Admin (owner-instant; owner is a multisig with external delay) ──
     function setMinGuardianStake(uint256 newMin) external;
     function setMinOwnerStake(uint256 newMin) external;
     function setCooldownPeriod(uint256 newPeriod) external;
-    function setDelegationEnabled(bool enabled) external;
     function setMinSlashBps(uint256 newBps) external;
     function setMaxSlashBps(uint256 newBps) external;
 }

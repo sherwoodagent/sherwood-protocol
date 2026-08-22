@@ -34,10 +34,8 @@ contract StakedWoodAgeWeightTest is Test {
                     minOwnerStake: 1_000e18,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(impl), initData)));
@@ -87,89 +85,6 @@ contract StakedWoodAgeWeightTest is Test {
         swood.stakeAsGuardian(100e18, 1);
         // Quorum denominator is deliberately un-aged (spec Part C).
         assertEq(swood.getPastTotalVotes(block.timestamp), 100e18);
-    }
-
-    /// @dev Enables delegation (owner), funds bob, and delegates `amount` to
-    ///      `to` — shared fixture for the k-cap tests below.
-    function _delegateFromBob(address to, uint256 amount) internal {
-        vm.prank(owner);
-        swood.setDelegationEnabled(true);
-        wood.mint(bob, amount);
-        vm.startPrank(bob);
-        wood.approve(address(swood), type(uint256).max);
-        swood.delegateStake(to, amount);
-        vm.stopPrank();
-    }
-
-    /// @notice Own-discount + delegated-term interaction (Task-4 flip of the
-    ///         Task-2 flat baseline): the delegated inbound term is capped at
-    ///         min(delegated, delegatedWeightCapX × agedOwn), with the AGED
-    ///         own weight as the cap base — so an age-0 guardian's cap is
-    ///         floored along with their own weight (spec §5).
-    function test_ageWeight_delegatedTermCappedByAgedOwn() public {
-        vm.prank(alice);
-        swood.stakeAsGuardian(100e18, 1);
-        _delegateFromBob(alice, 200e18);
-        // Same-block read: own term at the 25% floor (age 0) → agedOwn =
-        // 25e18, cap = 4 × 25e18 = 100e18 < 200e18 raw inbound.
-        assertEq(swood.getVotes(alice), 25e18 + 100e18);
-    }
-
-    // ── delegated-weight k-cap (spec §5, Task 4) ──
-
-    /// @notice Delegated inbound above `delegatedWeightCapX × agedOwn` is
-    ///         clipped to the cap: 1000e18 raw inbound counts as only
-    ///         4 × 100e18 for a fully matured 100e18 own stake.
-    function test_delegatedWeight_cappedAtKTimesAgedOwn() public {
-        vm.prank(alice);
-        swood.stakeAsGuardian(100e18, 1);
-        skip(30 days); // alice at par: agedOwn = 100e18
-        _delegateFromBob(alice, 1000e18); // raw inbound 1000e18
-        // cap = 4 × 100e18 = 400e18 → total = 100 + 400.
-        assertEq(swood.getVotes(alice), 500e18);
-    }
-
-    /// @notice Delegated inbound under the cap counts flat (no discount).
-    function test_delegatedWeight_underCapCountsFlat() public {
-        vm.prank(alice);
-        swood.stakeAsGuardian(100e18, 1);
-        skip(30 days);
-        _delegateFromBob(alice, 300e18); // under the 400e18 cap
-        assertEq(swood.getVotes(alice), 400e18);
-    }
-
-    /// @notice Exactly AT the cap counts in full — pins the `min()` boundary
-    ///         (inclusive) against future `<`/`<=` refactors.
-    function test_delegatedWeight_exactlyAtCapCountsFlat() public {
-        vm.prank(alice);
-        swood.stakeAsGuardian(100e18, 1);
-        skip(30 days); // par: agedOwn = 100e18, cap = 4 × 100e18
-        _delegateFromBob(alice, 400e18); // == cap
-        assertEq(swood.getVotes(alice), 500e18);
-    }
-
-    /// @notice The cap base is AGED own weight, so the cap itself matures
-    ///         with the guardian — aging is NOT bypassable via delegation
-    ///         (spec Part C, aged cap base).
-    function test_delegatedWeight_capScalesWithAge() public {
-        vm.prank(alice);
-        swood.stakeAsGuardian(100e18, 1); // age 0: agedOwn = 25e18
-        _delegateFromBob(alice, 1000e18);
-        // cap = 4 × 25e18 = 100e18 → total = 125e18.
-        assertEq(swood.getVotes(alice), 125e18);
-    }
-
-    /// @notice Zero own votable weight ⇒ zero cap ⇒ zero total: a guardian
-    ///         with a pending unstake request (own checkpoint 0) carries NO
-    ///         delegated weight, however large the pool.
-    function test_delegatedWeight_zeroOwnZeroesDelegated() public {
-        vm.prank(alice);
-        swood.stakeAsGuardian(100e18, 1);
-        skip(30 days);
-        _delegateFromBob(alice, 1000e18);
-        vm.prank(alice);
-        swood.requestUnstakeGuardian();
-        assertEq(swood.getVotes(alice), 0);
     }
 
     // ── stakedAt lifecycle (spec §4): top-up re-anchor + request reset ──
@@ -258,5 +173,77 @@ contract StakedWoodAgeWeightTest is Test {
         // Age since the request == 30 days == maturationPeriod → par, despite
         // the pre-request 10 days being dropped.
         assertEq(swood.getVotes(alice), 100e18);
+    }
+
+    // ── issue #82: anchor checkpoint exactness (the mock cannot witness this
+    //    — TokenCourt.t.sol's MockStakedWood has no age-factor model at all,
+    //    so only the REAL contract can prove a historical read is immune to
+    //    a LATER anchor write) ──
+
+    /// @notice A top-up strictly AFTER `ts` must not move `getPastVotes(g,
+    ///         ts)` — the top-up's forward re-anchor (`stakeAsGuardian`'s
+    ///         weighted-average branch) only ever pushes a NEW checkpoint at
+    ///         `block.timestamp`; `upperLookupRecent(ts)` still resolves to
+    ///         the anchor that existed at `ts`. Pre-#82 (live-anchor read),
+    ///         this same top-up would have dragged the read toward age 0.
+    function test_ageWeight_topUpAfterTsDoesNotChangePastRead() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        skip(15 days); // age 15d -> factor 2500 + 7500*15/30 = 6250
+        uint256 ts = vm.getBlockTimestamp();
+        uint256 before = swood.getPastVotes(alice, ts);
+        assertEq(before, 62.5e18);
+
+        skip(1 days);
+        vm.prank(alice);
+        swood.stakeAsGuardian(300e18, 1); // top-up: re-anchors the LIVE stakedAt forward
+
+        assertEq(swood.getPastVotes(alice, ts), before, "a later top-up must not change an already-past read");
+    }
+
+    /// @notice An unstake request strictly AFTER `ts` must not move
+    ///         `getPastVotes(g, ts)` either — `requestUnstakeGuardian` also
+    ///         re-anchors `stakedAt` (to the request instant) and zeroes the
+    ///         raw checkpoint, but both writes land at `block.timestamp`, a
+    ///         later instant than `ts`.
+    function test_ageWeight_unstakeRequestAfterTsDoesNotChangePastRead() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        skip(10 days); // age 10d -> factor 2500 + 7500*10/30 = 5000
+        uint256 ts = vm.getBlockTimestamp();
+        uint256 before = swood.getPastVotes(alice, ts);
+        assertEq(before, 50e18);
+
+        skip(5 days);
+        vm.prank(alice);
+        swood.requestUnstakeGuardian();
+
+        assertEq(swood.getPastVotes(alice, ts), before, "a later unstake request must not change an already-past read");
+    }
+
+    /// @notice A read at a timestamp strictly before the guardian's first
+    ///         anchor checkpoint sees an empty trace (anchor 0) — and the raw
+    ///         checkpoint trace is empty there too, so the product is 0
+    ///         regardless of `_ageFactorBps(0, ts) == ageFloorBps`.
+    function test_ageWeight_readBeforeFirstStakeReturnsZero() public {
+        uint256 tBefore = vm.getBlockTimestamp();
+        skip(1 days);
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        assertEq(swood.getPastVotes(alice, tBefore), 0);
+    }
+
+    /// @notice `getVotes` (the live read, delegating to `getPastVotes` at
+    ///         `block.timestamp`) is bit-identical before and after the
+    ///         anchor-checkpoint change: at the CURRENT timestamp the
+    ///         checkpointed anchor IS the live anchor, so this guards that
+    ///         the historical-exactness fix did not perturb the live path at
+    ///         all.
+    function test_ageWeight_getVotesStaysBitIdenticalToLiveGetPastVotes() public {
+        vm.prank(alice);
+        swood.stakeAsGuardian(100e18, 1);
+        skip(12 days); // factor 2500 + 7500*12/30 = 5500
+        assertEq(swood.getVotes(alice), swood.getPastVotes(alice, block.timestamp));
+        assertEq(swood.getVotes(alice), 100e18 * 5500 / 10_000); // 55e18
     }
 }

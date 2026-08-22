@@ -2,7 +2,7 @@
 pragma solidity 0.8.28;
 
 import {IProposalStatus} from "../../src/interfaces/IProposalStatus.sol";
-import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Canonical test adapter for the vault↔governance seam: satisfies
 ///         `IProposalStatus` (the ONLY governance surface the vault reads) in a
@@ -15,10 +15,21 @@ contract MockProposalStatus is IProposalStatus {
     address public strategy;
 
     /// @dev Mirrors `SyndicateGovernor.tierRegistry()` — the vault resolves the
-    ///      TierRegistry through its governor for the value-moving-selector
-    ///      guard in `executeGovernorBatch`. address(0) (the default) means the
-    ///      guard is off, matching the unset-registry safe-default posture.
+    ///      TierRegistry through its governor for the callee and
+    ///      value-moving-selector guards in `executeGovernorBatch`.
+    ///
+    ///      DEFAULTS TO A WIRED, PERMISSIVE REGISTRY (pashov finding #1). It
+    ///      used to default to address(0), which turned the whole of PART 2 off
+    ///      — that is now a hard `TierRegistryUnresolved` revert, so an unset
+    ///      default would fail every batch in every suite using this adapter.
+    ///      Tests pinning the fail-closed behavior itself call
+    ///      `setTierRegistry(address(0))` explicitly, which still models a
+    ///      pre-fix governor.
     address public tierRegistry;
+
+    constructor() {
+        tierRegistry = address(deployTierRegistry(address(this)));
+    }
 
     function setTierRegistry(address registry) external {
         tierRegistry = registry;
@@ -36,12 +47,37 @@ contract MockProposalStatus is IProposalStatus {
         return activePid;
     }
 
+    /// @dev The vault reads this as the upper bound on what a settled strategy
+    ///      may still owe (`_residueCap`). Defaults high so fixtures that do not
+    ///      care about the cap are not silently clamped to zero; a test probing
+    ///      the bound sets it explicitly.
+    uint256 public capitalSnapshot = type(uint128).max;
+
+    function setCapitalSnapshot(uint256 v) external {
+        capitalSnapshot = v;
+    }
+
+    function getCapitalSnapshot(uint256) external view returns (uint256) {
+        return capitalSnapshot;
+    }
+
+    /// @dev The vault bounds a residue report by the TIGHTER of this and the
+    ///      capital snapshot. Defaults high for the same reason.
+    uint256 public effectiveMaxCapital = type(uint128).max;
+
+    function setEffectiveMaxCapital(uint256 v) external {
+        effectiveMaxCapital = v;
+    }
+
+    function getEffectiveMaxCapital(uint256) external view returns (uint256) {
+        return effectiveMaxCapital;
+    }
+
     function openProposalCount() external view returns (uint256) {
         return openCount;
     }
 
-    function getProposal(uint256) external view returns (ISyndicateGovernor.StrategyProposal memory p) {
-        p.id = activePid;
-        p.strategy = strategy;
+    function strategyOf(uint256) external view returns (address) {
+        return strategy;
     }
 }

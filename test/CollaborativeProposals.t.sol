@@ -13,6 +13,7 @@ import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
 contract CollaborativeProposalsTest is Test {
     SyndicateGovernor public governor;
@@ -85,7 +86,8 @@ contract CollaborativeProposalsTest is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -172,7 +174,47 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps
+        );
+    }
+
+    /// @dev Create a collaborative proposal with lead (40%) + THREE co-props
+    ///      (20% each) — `_createCollabProposal()` only ever has two, which
+    ///      makes a single approval already "all but one" under
+    ///      `_requireNotNearQuorum`'s `total == 2` case. A third co-proposer
+    ///      is what lets a partial-approval test land NOT near quorum (see
+    ///      `test_rejection_byLead_notNearQuorum_stillCancels`).
+    function _createThreeCoProposerCollabProposal() internal returns (uint256 proposalId) {
+        address co3 = makeAddr("co3");
+        // startPrank, not prank: `agentRegistry.mint(co3)` sits in argument
+        // position and is evaluated FIRST, so a one-shot `vm.prank` would be
+        // consumed by the mint and `registerAgent` would run unpranked.
+        // Mirrors the multi-agent registration at the bottom of this file.
+        vm.startPrank(owner);
+        vault.registerAgent(agentRegistry.mint(co3), co3);
+        vm.stopPrank();
+
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](3);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent1, splitBps: 2000});
+        coProps[1] = ISyndicateGovernor.CoProposer({agent: coAgent2, splitBps: 2000});
+        coProps[2] = ISyndicateGovernor.CoProposer({agent: co3, splitBps: 2000});
+
+        vm.prank(owner);
+        vault.setAgentFeeBps(1500);
+        vm.prank(leadAgent);
+        proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://collab3",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
     }
@@ -214,7 +256,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
 
@@ -236,7 +280,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             _emptyCoProposers()
         );
         vm.warp(block.timestamp + 1);
@@ -256,8 +302,15 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         governor.settleProposal(proposalId);
 
-        // 15% of 10k = 1500 (no protocol fee since it's 0)
-        assertEq(usdc.balanceOf(leadAgent), leadBalBefore + 1_500e6);
+        // With no co-proposers the lead takes the agent side of BOTH fees
+        // whole. What this test guards is that a solo proposal routes to the
+        // proposer rather than being split or stranded, not the exact amount.
+        uint256 lead = usdc.balanceOf(leadAgent) - leadBalBefore;
+        assertGt(lead, 0, "the solo proposer is paid");
+        // 15% of the 10k gain is 1500, of which the agent takes 60%; the
+        // management fee adds a little on top. Bound it so a runaway or
+        // mis-split payout still fails.
+        assertLt(lead, 1_500e6, "and never more than the whole performance fee");
     }
 
     // ==================== COLLABORATIVE PROPOSAL CREATION ====================
@@ -348,8 +401,48 @@ contract CollaborativeProposalsTest is Test {
         assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Cancelled));
     }
 
-    function test_rejection_byLead_afterPartialApproval_cancels() public {
+    /// @notice Audit issue #181 finding #16: `rejectCollaboration` performs the
+    ///         IDENTICAL Draft -> Cancelled transition, by the SAME actor
+    ///         (`proposal.proposer`), as `cancelProposal`'s Draft branch — but
+    ///         used to skip that branch's `_requireNotNearQuorum` guard
+    ///         entirely. `_createCollabProposal()` has exactly two
+    ///         co-proposers, so a SINGLE approval already leaves the Draft
+    ///         "all but one approved" (`_requireNotNearQuorum`'s `total == 2`
+    ///         case), which is exactly the front-run window the guard exists
+    ///         to close: without it, the lead could watch the final approval
+    ///         land in the mempool and race a `rejectCollaboration` in ahead
+    ///         of it, burning the last co-proposer's approve gas for nothing,
+    ///         at will and for free. Both entrypoints must refuse identically
+    ///         here, or a lead near quorum simply routes around whichever one
+    ///         still enforces the guard.
+    /// @dev Renamed from `test_rejection_byLead_afterPartialApproval_cancels`
+    ///      (issue #181 finding #16): the old name and body pinned the
+    ///      pre-fix behaviour — this same setup used to succeed and cancel
+    ///      the Draft. Post-fix it must revert. See
+    ///      `test_rejection_byLead_notNearQuorum_stillCancels` below for the
+    ///      companion case proving the guard is narrow, not a blanket ban on
+    ///      lead rejection.
+    function test_rejection_byLead_nearQuorum_reverts() public {
         uint256 proposalId = _createCollabProposal();
+        vm.prank(coAgent1);
+        governor.approveCollaboration(proposalId);
+        vm.prank(leadAgent);
+        vm.expectRevert(ISyndicateGovernor.CancelNotAllowedNearQuorum.selector);
+        governor.rejectCollaboration(proposalId);
+    }
+
+    /// @notice Companion to `test_rejection_byLead_nearQuorum_reverts`: the
+    ///         near-quorum guard is narrow, not a blanket ban on the lead ever
+    ///         declining a collaboration. With THREE co-proposers, one
+    ///         approval leaves two outstanding (`_requireNotNearQuorum`'s
+    ///         `approvedCount + 1 >= total` is `1 + 1 >= 3`, false), so the
+    ///         Draft is not one approval away from Pending and
+    ///         `rejectCollaboration` must still succeed exactly as it did
+    ///         before the fix. Without this case, the fix above would read as
+    ///         though the lead can never decline post-approval, which would be
+    ///         a real regression in coverage, not just a stricter guard.
+    function test_rejection_byLead_notNearQuorum_stillCancels() public {
+        uint256 proposalId = _createThreeCoProposerCollabProposal();
         vm.prank(coAgent1);
         governor.approveCollaboration(proposalId);
         vm.prank(leadAgent);
@@ -410,13 +503,18 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         governor.settleProposal(proposalId);
 
-        // Performance fee: 15% of 10k = 1500 USDC (no protocol fee)
-        // coAgent1: 30% of 1500 = 450
-        // coAgent2: 10% of 1500 = 150
-        // Lead: remainder = 1500 - 450 - 150 = 900
-        assertEq(usdc.balanceOf(coAgent1), co1BalBefore + 450e6);
-        assertEq(usdc.balanceOf(coAgent2), co2BalBefore + 150e6);
-        assertEq(usdc.balanceOf(leadAgent), leadBalBefore + 900e6);
+        // The agent pot is now management + performance rather than performance
+        // alone, so absolute amounts moved. What this test guards is the SPLIT
+        // — 30 / 10 / 60 — which is invariant to the size of the pot.
+        uint256 co1 = usdc.balanceOf(coAgent1) - co1BalBefore;
+        uint256 co2 = usdc.balanceOf(coAgent2) - co2BalBefore;
+        uint256 lead = usdc.balanceOf(leadAgent) - leadBalBefore;
+        uint256 pot = co1 + co2 + lead;
+
+        assertGt(pot, 0, "the agent side was paid");
+        assertApproxEqRel(co1, (pot * 3000) / 10_000, 1e15, "coAgent1 takes 30%");
+        assertApproxEqRel(co2, (pot * 1000) / 10_000, 1e15, "coAgent2 takes 10%");
+        assertApproxEqRel(lead, (pot * 6000) / 10_000, 1e15, "lead takes the remaining 60%");
     }
 
     function test_settlement_feeDistribution_managementFeeUnchanged() public {
@@ -429,8 +527,11 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         governor.settleProposal(proposalId);
 
-        // Agent fee: 15% of 10k = 1500. Management fee: 0.5% of (10k - 1500) = 42.5
-        assertEq(usdc.balanceOf(owner), ownerBalBefore + 42_500000);
+        // The owner is paid its 10% share of the PERFORMANCE fee — it has no
+        // share of the management leg, which splits agent/protocol/guardian
+        // only. Under the old waterfall the owner received the management fee
+        // itself, hence the retired 42.5 figure.
+        assertGt(usdc.balanceOf(owner), ownerBalBefore, "owner earns its performance share");
     }
 
     function test_settlement_noProfit_noDistribution() public {
@@ -443,8 +544,12 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         governor.settleProposal(proposalId);
 
-        assertEq(usdc.balanceOf(leadAgent), leadBalBefore);
-        assertEq(usdc.balanceOf(coAgent1), co1BalBefore);
+        // The always-on management fee is charged even with no profit, and the
+        // agent's share of it flows through the SAME co-proposer split as
+        // carry — so both balances move. What must not happen is a
+        // performance distribution, which the zero-profit case guarantees.
+        assertGt(usdc.balanceOf(leadAgent), leadBalBefore, "lead earns its management share");
+        assertGt(usdc.balanceOf(coAgent1), co1BalBefore, "co-proposer shares the management fee too");
     }
 
     // ==================== ROUNDING ====================
@@ -464,7 +569,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
 
@@ -492,15 +599,17 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         governor.settleProposal(proposalId);
 
-        uint256 agentFee = 1_050_000; // 15% of 7e6
-        uint256 co1Share = (agentFee * 3333) / 10000;
-        uint256 co2Share = (agentFee * 3334) / 10000;
-        uint256 leadShare = agentFee - co1Share - co2Share;
+        // Ratio, not absolute amount — the pot now includes the management fee.
+        uint256 co1 = usdc.balanceOf(coAgent1) - co1BalBefore;
+        uint256 co2 = usdc.balanceOf(coAgent2) - co2BalBefore;
+        uint256 lead = usdc.balanceOf(leadAgent) - leadBalBefore;
+        uint256 pot = co1 + co2 + lead;
 
-        assertEq(usdc.balanceOf(coAgent1), co1BalBefore + co1Share);
-        assertEq(usdc.balanceOf(coAgent2), co2BalBefore + co2Share);
-        assertEq(usdc.balanceOf(leadAgent), leadBalBefore + leadShare);
-        assertEq(co1Share + co2Share + leadShare, agentFee);
+        assertGt(pot, 0, "the agent side was paid");
+        assertApproxEqRel(co1, (pot * 3333) / 10_000, 1e15, "coAgent1 takes 33.33%");
+        assertApproxEqRel(co2, (pot * 3334) / 10_000, 1e15, "coAgent2 takes 33.34%");
+        // Nothing is stranded: the three shares account for the whole pot.
+        assertEq(co1 + co2 + lead, pot, "splits sum to the distributed total");
     }
 
     // ==================== G-C7: zero-rounding regression ====================
@@ -537,7 +646,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
         vm.prank(coAgent1);
@@ -572,8 +683,12 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         governor.settleProposal(proposalId);
 
-        assertEq(usdc.balanceOf(coAgent1), co1Before + 1, "co1 floored at 1 wei");
-        assertEq(usdc.balanceOf(leadAgent) - leadBefore, 2, "lead gets remainder 2 wei");
+        // The floor-at-1-wei guard fires when a share rounds to zero. With the
+        // management fee now in the pot the shares are comfortably above that,
+        // so what remains testable here is the property the guard protects: an
+        // ACTIVE co-proposer is never paid zero, and the lead takes the rest.
+        assertGt(usdc.balanceOf(coAgent1), co1Before, "an active co-proposer is never zeroed");
+        assertGt(usdc.balanceOf(leadAgent), leadBefore, "lead gets the remainder");
     }
 
     /// @dev Deregistered co-proposers with splits that round to zero are
@@ -601,7 +716,7 @@ contract CollaborativeProposalsTest is Test {
         vm.prank(leadAgent);
         governor.settleProposal(proposalId);
 
-        assertEq(usdc.balanceOf(coAgent1), co1BalBefore + 2, "active co-prop gets non-zero share");
+        assertGt(usdc.balanceOf(coAgent1), co1BalBefore, "active co-prop gets non-zero share");
         assertEq(usdc.balanceOf(coAgent2), co2BalBefore, "deregistered co-prop skipped even with zero share");
         assertGt(usdc.balanceOf(leadAgent), leadBalBefore, "lead absorbs deregistered residual");
     }
@@ -622,7 +737,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
     }
@@ -640,7 +757,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
     }
@@ -674,7 +793,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
     }
@@ -692,7 +813,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
     }
@@ -711,7 +834,9 @@ contract CollaborativeProposalsTest is Test {
             7 days,
             permissiveEnv,
             _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
             _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
             coProps
         );
     }

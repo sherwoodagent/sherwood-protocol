@@ -11,7 +11,7 @@ import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet
  *         extracted from `SyndicateVault` to free EIP-170 runtime headroom.
  *
  *   Deployed once and DELEGATECALLed (Foundry auto-links, same idiom as
- *   `LeveragedAeroManager`). Every function runs in the calling vault's storage
+ *   a delegatecall-linked manager library). Every function runs in the calling vault's storage
  *   context: the vault passes its own storage (`EnumerableSet.AddressSet` /
  *   `mapping`) by reference, so the state stays declared in — and owned by —
  *   the vault. Its storage layout is unchanged.
@@ -74,8 +74,8 @@ library SyndicateVaultAdminLib {
     ) external {
         if (agentAddress == address(0)) revert ISyndicateVault.ZeroAddress();
         if (agents[agentAddress].active) revert ISyndicateVault.AgentAlreadyRegistered();
-        // PR #324 review R4: bound `agentSet` so `rotateOwnership`'s deactivation
-        // loop (Sherlock #38) can't OOG. `removeAgent` frees a slot.
+        // Bounds `agentSet` so `rotateOwnership`'s deactivation loop can't
+        // OOG. `removeAgent` frees a slot.
         if (agentSet.length() >= MAX_AGENTS_PER_VAULT) revert ISyndicateVault.AgentCapExceeded();
 
         // Verify ERC-8004 identity (skipped on chains without agent registry)
@@ -91,7 +91,7 @@ library SyndicateVaultAdminLib {
         emit ISyndicateVault.AgentRegistered(agentId, agentAddress);
     }
 
-    /// @dev Body of `SyndicateVault.removeAgent`. Full-deletes the struct (V-M5)
+    /// @dev Body of `SyndicateVault.removeAgent`. Full-deletes the struct
     ///      so a stale `agentId` can't be silently reused.
     function removeAgent(
         mapping(address => ISyndicateVault.AgentConfig) storage agents,
@@ -108,7 +108,7 @@ library SyndicateVaultAdminLib {
         emit ISyndicateVault.AgentRemoved(agentAddress);
     }
 
-    /// @dev Agent-drain loop of `SyndicateVault.rotateOwnership` (Sherlock #38 v2).
+    /// @dev Agent-drain loop of `SyndicateVault.rotateOwnership`.
     ///      The vault retains the factory-only check and `_transferOwnership`.
     ///      Snapshot via `.values()` first so the in-loop `remove` doesn't
     ///      invalidate iteration (OZ swap-and-pop on `at(i)`).
@@ -128,7 +128,7 @@ library SyndicateVaultAdminLib {
 
     // ==================== PAGINATION ====================
 
-    /// @dev Body of the vault's `_pageAddresses` (V-M3): a slice
+    /// @dev Body of the vault's `_pageAddresses`: a slice
     ///      `[offset, offset + min(limit, MAX_PAGE_LIMIT))` clipped to the set's
     ///      length. Returns an empty array when `offset >= length`. Shared by
     ///      `approvedDepositorsPaginated` / `agentsPaginated`.

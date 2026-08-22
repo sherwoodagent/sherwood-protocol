@@ -4,3 +4,22 @@ lcov.info
 broadcast/
 script/tenderly/*.log
 node_modules/
+
+# Fuzzing campaign artifacts. All regenerable by re-running the campaign, and the
+# corpora reach five figures of files — the harness, configs and reports under
+# fizz_data/ are tracked, the run output is not.
+fizz_data/corpus_medusa/
+fizz_data/corpus_echidna/
+fizz_data/logs_medusa/
+fizz_data/crytic-export/
+# Run-local manifest. Records source hashes so a later fizz run can detect
+# drift — committing one makes it stale on the next upstream change, which
+# reports "no drift" precisely when everything moved.
+fizz_data/last-run.json
+crytic-export/
+slither_results.json
+
+# Fork-only exploit PoCs kept locally: they vm.skip() without an RPC, and
+# ci.yml's --no-match-path excludes test/integration/** but not this path,
+# so committing them turns the RPC-less job red with [FAIL: skipped].
+test/pocs/

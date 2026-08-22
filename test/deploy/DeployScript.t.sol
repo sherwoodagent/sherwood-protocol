@@ -9,6 +9,7 @@ import {StakedWood} from "../../src/StakedWood.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
@@ -74,10 +75,8 @@ contract DeployScriptTest is Test {
                     minOwnerStake: 10_000e18,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         address swood = address(new ERC1967Proxy(address(swoodImpl), swoodInit));
@@ -121,7 +120,10 @@ contract DeployScriptTest is Test {
                     beacon: beacon,
                     protocolConfig: address(protocolConfig),
                     managementFeeBps: 50,
-                    guardianRegistry: registryProxy
+                    guardianRegistry: registryProxy,
+                    // Mandatory since pashov finding #1. Every asserted address
+                    // is CREATE3-derived, so the extra nonce moves none.
+                    tierRegistry: address(new TierRegistry(deployer))
                 }))
         );
         address factoryProxy = c3.deploy(

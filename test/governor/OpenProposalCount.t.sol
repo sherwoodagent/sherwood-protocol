@@ -17,6 +17,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title OpenProposalCount.t
 /// @notice Regression tests for Fix 2 — track open proposals per vault to plug
@@ -96,6 +97,10 @@ contract OpenProposalCountTest is Test {
         //   swoodImpl (+0), swoodProxy (+1), govImpl (+2), govProxy (+3),
         //   regImpl (+4), regProxy (+5).
         ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
+        // Hoisted ABOVE the nonce snapshot: the governor's mandatory tier-registry
+        // argument (pashov finding #1) is a DEPLOYMENT, so leaving it inline in the
+        // `initialize` tuple would consume a nonce and slide every predicted address.
+        address fixtureTierRegistry = address(deployTierRegistry(address(this)));
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
@@ -113,10 +118,8 @@ contract OpenProposalCountTest is Test {
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -128,7 +131,8 @@ contract OpenProposalCountTest is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 predictedRegistryProxy,
                 address(_hoistedPC),
-                address(this), // factory (test contract)
+                address(this),
+                fixtureTierRegistry, // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -155,8 +159,11 @@ contract OpenProposalCountTest is Test {
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
         // Authorize the per-vault governor on the composite-key registry
         // (replaces the removed governor.addVault wiring).
+        // Hoisted: `vault()` is a call, so evaluating it as an argument would
+        // consume the prank and leave `addGovernor` unauthorized.
+        address govVault = governor.vault();
         vm.prank(registry.factory());
-        registry.addGovernor(address(governor));
+        registry.addGovernor(address(governor), govVault);
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
 
         // Resolve the registry ↔ sWOOD circular dependency.
@@ -225,7 +232,9 @@ contract OpenProposalCountTest is Test {
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
     }
@@ -434,17 +443,22 @@ contract OpenProposalCountTest is Test {
         uint256 pid = _propose();
         _voteFor(pid);
 
-        // Past voteEnd → GuardianReview, past reviewEnd with no blockers
-        // would be Approved, past executeBy with no executeProposal call
-        // would be Expired. The VIEW remains at GuardianReview until a
-        // mutating `_resolveState` calls `resolveReview` on the registry.
+        // Past voteEnd → GuardianReview; past reviewEnd with no blockers →
+        // Approved; past executeBy with no executeProposal call → Expired.
+        // `stateOf` is a true view, so it reports Expired straight away rather
+        // than pinning at GuardianReview until someone pokes the registry.
+        //
+        // The COUNTER, however, is storage: it can only move in a transaction.
+        // That gap — view already resolved, bookkeeping not yet committed — is
+        // precisely why the permissionless `resolveProposalState` flush still
+        // exists after the refactor.
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + REVIEW_PERIOD + EXECUTION_WINDOW + 1);
         assertEq(
             uint256(governor.getProposalState(pid)),
-            uint256(ISyndicateGovernor.ProposalState.GuardianReview),
-            "view pins at GuardianReview until registry resolves"
+            uint256(ISyndicateGovernor.ProposalState.Expired),
+            "true view: Expired once executeBy passes, no poke required"
         );
-        assertEq(governor.openProposalCount(), 1, "counter stuck at 1 pre-flush");
+        assertEq(governor.openProposalCount(), 1, "counter stuck at 1 until the flush commits");
 
         // Permissionless flush resolves the registry review AND commits the
         // state transition, decrementing the counter.
@@ -550,7 +564,9 @@ contract OpenProposalCountTest is Test {
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             coProps
         );
 
@@ -598,7 +614,9 @@ contract OpenProposalCountTest is Test {
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             coProps
         );
         // Sherlock #8: Draft binds the vault.
@@ -636,7 +654,9 @@ contract OpenProposalCountTest is Test {
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             coProps
         );
         // Sherlock #8: Draft binds the vault.
@@ -667,7 +687,9 @@ contract OpenProposalCountTest is Test {
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
         assertGt(pid2, pid, "new proposal created post-emergencyCancel");
@@ -697,7 +719,9 @@ contract OpenProposalCountTest is Test {
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             coProps
         );
 

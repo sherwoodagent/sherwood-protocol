@@ -7,9 +7,9 @@ optimizer = true
 optimizer_runs = 50
 via_ir = true
 ffi = false
-# storageLayout in every artifact: script/check-storage-parity.sh runs `forge inspect
-# <probe> storageLayout` after incremental builds — without this, a partial rebuild
-# drops the layout from cached artifacts and inspect fails spuriously.
+# storageLayout in every artifact: the upgradeable contracts' layout goldens run
+# `forge inspect <probe> storageLayout` after incremental builds — without this, a
+# partial rebuild drops the layout from cached artifacts and inspect fails spuriously.
 extra_output = ["storageLayout"]
 fs_permissions = [
   { access = "read-write", path = "chains" },
@@ -23,9 +23,85 @@ bracket_spacing = false
 [lint]
 exclude_lints = ["screaming-snake-case-immutable", "mixed-case-variable"]
 
-# forge coverage is incompatible with via_ir (Yul stack-too-deep) — pin to legacy pipeline
+# `forge coverage` force-disables the optimizer and via_ir for the whole project
+# (it needs unoptimized bytecode to keep source maps accurate), so `via_ir = false`
+# here only documents that — forge would do it regardless, and plain optimizer /
+# optimizer_runs / via_ir keys in this profile are ignored by the coverage command.
+#
+# Unoptimized legacy codegen then blows the EVM stack in the eight largest
+# contracts. The escape hatch that does survive forge's override is per-file
+# compilation restrictions: those eight compile in a second solc group that keeps
+# via_ir + the optimizer, while every other file stays on the legacy pipeline and
+# reports accurate coverage.
+#
+# What this costs: the eight restricted files are absent from the report entirely
+# (forge drops via_ir units rather than mis-mapping them) — they show up in neither
+# the summary nor lcov.info. Their TESTS still run and still gate the job; only the
+# line/branch instrumentation is missing. The alternative was no coverage signal at
+# all, since the run previously died at the first stack-too-deep.
+#
+# The list is empirical: each entry is a file that failed `forge build` under
+# coverage codegen with "Stack too deep" / "Yul exception". Growing a contract past
+# the stack limit adds it here. Reproduce with:
+#   FOUNDRY_PROFILE=coverage FOUNDRY_OPTIMIZER=false FOUNDRY_VIA_IR=false forge build
+# Tracked in #73; drop entries as the underlying stack pressure is refactored away.
 [profile.coverage]
 via_ir = false
+
+[[profile.coverage.additional_compiler_profiles]]
+name = "ir"
+via_ir = true
+optimizer = true
+optimizer_runs = 50
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/ChallengeGame.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/ExposureLedger.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/StakedWood.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/SyndicateGovernor.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/TokenCourt.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/queue/VaultWithdrawalQueue.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/strategies/PortfolioStrategy.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "src/strategies/ConcentratedLiquidityStrategy.sol"
+via_ir = true
+
+# Profile used by the Medusa/Echidna harness under test/fizz/. The fuzzers compile
+# through crytic-compile, which shells out to this profile.
+#
+# via_ir stays on for the same reason [profile.coverage] has to special-case eight
+# files: the harness links against the largest contracts, and legacy codegen blows
+# the stack on them. Unlike coverage, nothing here overrides via_ir, so one setting
+# covers the whole project.
+#
+# The optimizer is off deliberately. A fuzzing campaign rebuilds far more often than
+# it runs any single sequence, so 50 optimizer runs cost more wall-clock in compiles
+# than they save in execution — and unoptimized bytecode keeps Medusa's per-line
+# coverage output mapped to real source lines.
+[profile.fuzz]
+via_ir = true
+optimizer = false
+optimizer_runs = 0
 
 [rpc_endpoints]
 base = "${BASE_RPC_URL}"

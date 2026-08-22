@@ -10,6 +10,7 @@ import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Own
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {IProtocolConfig} from "../src/interfaces/IProtocolConfig.sol";
+import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
 /// @notice Unit tests targeting the abstract `GovernorParameters` surface
 ///         through a deployed `SyndicateGovernor` proxy. Covers happy path,
@@ -40,7 +41,6 @@ contract GovernorParametersTest is Test {
         vm.prank(owner);
         protocolConfig.setProtocolFeeRecipient(owner);
         vm.prank(owner);
-        protocolConfig.setProtocolFeeBps(PROTOCOL_FEE_BPS);
 
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(
@@ -49,7 +49,8 @@ contract GovernorParametersTest is Test {
                 address(0), // vault_: bootstrap governor; factory acts as bootstrap owner
                 address(guardianRegistry),
                 address(protocolConfig),
-                owner, // factory == bootstrap owner: param setters are onlyVaultOwner → _bootstrapOwner
+                owner,
+                address(deployTierRegistry(address(this))), // factory == bootstrap owner: param setters are onlyVaultOwner → _bootstrapOwner
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -204,6 +205,51 @@ contract GovernorParametersTest is Test {
         assertEq(governor.getGovernorParams().maxStrategyDuration, newVal);
     }
 
+    // ── ADR 2026-07-26: protocol-wide strategy-duration ceiling ───────────
+
+    /// @notice The vault owner may no longer bind guardians for as long as they
+    ///         like. Duration determines how long APPROVERS carry exposure, so
+    ///         the ceiling belongs to the protocol, not to the party proposing.
+    function test_setMaxStrategyDuration_respectsTheProtocolCeiling() public {
+        vm.prank(owner);
+        protocolConfig.setMaxStrategyDuration(30 days);
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.InvalidStrategyDurationBounds.selector);
+        governor.setMaxStrategyDuration(30 days + 1);
+
+        // Exactly at the ceiling is fine.
+        vm.prank(owner);
+        governor.setMaxStrategyDuration(30 days);
+        assertEq(governor.getGovernorParams().maxStrategyDuration, 30 days);
+    }
+
+    /// @notice UNSET (0) MEANS NO CEILING. Failing closed would brick every
+    ///         vault deployed before this parameter existed, the moment the
+    ///         config were upgraded — a fail-closed default is right for
+    ///         coverage, wrong for a bound that did not previously exist.
+    function test_setMaxStrategyDuration_unsetCeilingIsUnbounded() public {
+        assertEq(protocolConfig.maxStrategyDuration(), 0, "fixture leaves it unset");
+        // Hoisted: a call in ARGUMENT position is evaluated first and would
+        // consume the one-shot prank, leaving the setter to run unpranked.
+        uint256 absoluteMax = governor.ABSOLUTE_MAX_STRATEGY_DURATION();
+        vm.prank(owner);
+        governor.setMaxStrategyDuration(absoluteMax);
+        assertEq(governor.getGovernorParams().maxStrategyDuration, absoluteMax);
+    }
+
+    /// @notice A ceiling below the usable floor would make every vault
+    ///         unproposable protocol-wide in one transaction.
+    function test_protocolConfig_rejectsADegenerateCeiling() public {
+        vm.startPrank(owner);
+        vm.expectRevert(IProtocolConfig.InvalidMaxStrategyDuration.selector);
+        protocolConfig.setMaxStrategyDuration(1 hours);
+
+        protocolConfig.setMaxStrategyDuration(0); // unset stays legal
+        assertEq(protocolConfig.maxStrategyDuration(), 0);
+        vm.stopPrank();
+    }
+
     function test_setMaxStrategyDuration_aboveAbsoluteMax_reverts() public {
         uint256 aboveMax = governor.ABSOLUTE_MAX_STRATEGY_DURATION() + 1;
         vm.prank(owner);
@@ -212,10 +258,9 @@ contract GovernorParametersTest is Test {
     }
 
     function test_setMaxStrategyDuration_allowsLongHorizon() public {
-        // Beyond the old 30-day cap — now allowed after raising ABSOLUTE_MAX to 3650d,
-        // so an indefinitely-lived strategy (leveraged Aerodrome CL) can run.
-        assertEq(governor.ABSOLUTE_MAX_STRATEGY_DURATION(), 3650 days);
-        uint256 longHorizon = 365 days;
+        // Up to the absolute cap (30 days). Strategies are short-lived by design.
+        assertEq(governor.ABSOLUTE_MAX_STRATEGY_DURATION(), 30 days);
+        uint256 longHorizon = 30 days;
         vm.prank(owner);
         governor.setMaxStrategyDuration(longHorizon);
         assertEq(governor.getGovernorParams().maxStrategyDuration, longHorizon);
@@ -305,24 +350,9 @@ contract GovernorParametersTest is Test {
         governor.setMaxCoProposers(aboveMax);
     }
 
-    // ==================== setProtocolFeeBps ====================
-
-    function test_setProtocolFeeBps_happyPath() public {
-        uint256 oldVal = protocolConfig.protocolFeeBps();
-        uint256 newVal = 50;
-        vm.expectEmit(true, false, false, true, address(protocolConfig));
-        emit IProtocolConfig.ParameterChangeFinalized(keccak256("protocolFeeBps"), oldVal, newVal);
-        vm.prank(owner);
-        protocolConfig.setProtocolFeeBps(newVal);
-        assertEq(protocolConfig.protocolFeeBps(), newVal);
-    }
-
-    function test_setProtocolFeeBps_aboveMax_reverts() public {
-        uint256 aboveMax = protocolConfig.MAX_PROTOCOL_FEE_BPS() + 1;
-        vm.prank(owner);
-        vm.expectRevert(IProtocolConfig.InvalidProtocolFeeBps.selector);
-        protocolConfig.setProtocolFeeBps(aboveMax);
-    }
+    // `setProtocolFeeBps` / `setGuardianFeeBps` removed with the two-number fee
+    // model — the protocol's and guardian network's shares are now
+    // `mgmtSplit` / `perfSplit`, covered by test/fees/ProtocolConfigSplits.t.sol.
 
     // ==================== setProtocolFeeRecipient ====================
 
@@ -339,45 +369,18 @@ contract GovernorParametersTest is Test {
 
     function test_setProtocolFeeRecipient_zero_reverts() public {
         vm.prank(owner);
-        vm.expectRevert(IProtocolConfig.InvalidProtocolFeeRecipient.selector);
         protocolConfig.setProtocolFeeRecipient(address(0));
     }
 
-    // ==================== setGuardianFeeBps ====================
-
-    function test_setGuardianFeeBps_happyPath() public {
-        // Raising the guardian fee above 0 now requires a guardians-fee
-        // recipient (coupling mirrors the protocol-fee recipient rule).
-        vm.prank(owner);
-        protocolConfig.setGuardiansFeeRecipient(makeAddr("guardiansFeeRecipient"));
-
-        uint256 oldVal = protocolConfig.guardianFeeBps();
-        uint256 newVal = 250;
-        vm.expectEmit(true, false, false, true, address(protocolConfig));
-        emit IProtocolConfig.ParameterChangeFinalized(keccak256("guardianFeeBps"), oldVal, newVal);
-        vm.prank(owner);
-        protocolConfig.setGuardianFeeBps(newVal);
-        assertEq(protocolConfig.guardianFeeBps(), newVal);
-    }
-
-    function test_setGuardianFeeBps_aboveMax_reverts() public {
-        uint256 aboveMax = protocolConfig.MAX_GUARDIAN_FEE_BPS() + 1;
-        vm.prank(owner);
-        vm.expectRevert(IProtocolConfig.InvalidGuardianFeeBps.selector);
-        protocolConfig.setGuardianFeeBps(aboveMax);
-    }
+    // `setGuardianFeeBps` removed with the two-number fee model — the guardian
+    // network's share is now `mgmtSplit.guardianBps` / `perfSplit.guardianBps`,
+    // covered by test/fees/ProtocolConfigSplits.t.sol.
 
     // setFactory removed in per-vault governor design — factory is set-once at initialize.
 
-    // ==================== Cross-setter: protocolFeeBps requires recipient ====================
-
-    function test_setProtocolFeeBps_noRecipient_reverts() public {
-        // Deploy a fresh ProtocolConfig with no recipient set.
-        ProtocolConfig pc2 = new ProtocolConfig(owner);
-        vm.prank(owner);
-        vm.expectRevert(IProtocolConfig.InvalidProtocolFeeRecipient.selector);
-        pc2.setProtocolFeeBps(100);
-    }
+    // The "a nonzero rate requires a recipient" cross-check is gone with the
+    // rates themselves. A recipient may now be set or cleared freely; an unset
+    // one simply unwires that leg at settlement.
 
     // ==================== onlyOwner blanket coverage ====================
 
@@ -409,11 +412,9 @@ contract GovernorParametersTest is Test {
         bytes memory expectedOwnable =
             abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, random);
         vm.expectRevert(expectedOwnable);
-        protocolConfig.setProtocolFeeBps(500);
-        vm.expectRevert(expectedOwnable);
         protocolConfig.setProtocolFeeRecipient(makeAddr("r"));
         vm.expectRevert(expectedOwnable);
-        protocolConfig.setGuardianFeeBps(250);
+        protocolConfig.setGuardiansFeeRecipient(makeAddr("g"));
         // governor.setFactory removed in per-vault design — factory is set-once at initialize.
         vm.stopPrank();
     }

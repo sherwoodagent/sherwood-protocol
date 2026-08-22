@@ -6,26 +6,44 @@ import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Raw-slot pins for `SyndicateGovernor`'s proxy-upgraded storage layout
 ///         — the in-`forge test` layer of the golden-layout guard (the full
 ///         field-by-field JSON diff lives in `script/check-layout-goldens.sh`
 ///         against `script/syndicate-governor-layout.golden.json`, mirroring the
-///         LeveragedAero parity harness). Slot numbers below are FROZEN: live
-///         beacon-upgraded governors store state at exactly these words, so a
-///         reorder/insert/retype in `GovernorParameters` / `GovernorEmergency` /
-///         `SyndicateGovernor` moves a sentinel and fails an assert here even
-///         when the shell script isn't run. New fields are APPEND-ONLY (carved
-///         from the FRONT of a __gap): extend the pins, never edit them.
+///         LeveragedAero parity harness). Slot numbers below are FROZEN: a
+///         reorder/insert/retype in `ProposalLifecycle` / `GovernorParameters` /
+///         `GovernorEmergency` / `SyndicateGovernor` moves a sentinel and fails
+///         an assert here even when the shell script isn't run. New fields are
+///         APPEND-ONLY (carved from the FRONT of a __gap): extend the pins,
+///         never edit them.
 ///
-///         Layout map (linear, inheritance order GovernorParameters →
-///         GovernorEmergency → SyndicateGovernor; OZ Initializable is ERC-7201
-///         namespaced and holds no linear slot):
-///           0  vault                     13 _maxCapitalBps (finding 3)
-///           1  protocolConfig            14..20 __paramsGap[7]
-///           2  factory                   21..30 __emergencyGap[10]
-///           3..11 _params (9 words)      31 _proposalCount ... 43 _guardianRegistry
-///           12 _bootstrapOwner           48 _tierRegistry, 49..81 __gap[33]
+///         RE-BASELINED ONCE (proposal-lifecycle refactor): extracting the state
+///         machine into the `ProposalLifecycle` base put its storage FIRST in the
+///         C3 linearization, shifting every governor field down 15 words
+///         (`vault` 0 -> 15, `_guardianRegistry` 43 -> 0, `_tierRegistry`
+///         48 -> 58). That is a deliberate break, legitimate only because this
+///         stack is a FRESH deployment with no live proxy to stay compatible
+///         with (same fresh-deploy note as `GuardianRegistry`). Do NOT
+///         cherry-pick the fold onto a deployed beacon: every live governor
+///         would read garbage. From here the append-only rule applies again.
+///
+///         Layout map (linear, inheritance order ProposalLifecycle ->
+///         GovernorParameters -> GovernorEmergency -> SyndicateGovernor; OZ
+///         Initializable is ERC-7201 namespaced and holds no linear slot):
+///           0  _guardianRegistry         15 vault
+///           1  _proposals                16 protocolConfig
+///           2  _openProposalCount        17 factory
+///           3  _lastSettledAt            18..26 _params (9 words)
+///           4  collaborationDeadline     27 _bootstrapOwner
+///           5..14 __lifecycleGap[10]     28 _maxCapitalBps (finding 3)
+///                                        29..35 __paramsGap[7]
+///                                        36..45 __emergencyGap[10]
+///                                        46 _proposalCount ... 58 _tierRegistry
+///                                        59 _exposureLedger (Plan B)
+///                                        60 _bondEscrow (Plan B)
+///                                        61..91 __gap[31]
 contract GovernorLayoutPinsTest is Test {
     SyndicateGovernor governor;
     MockRegistryMinimal guardianRegistry;
@@ -33,12 +51,18 @@ contract GovernorLayoutPinsTest is Test {
     address constant VAULT_SENTINEL = address(0xA1);
     address constant PROTOCOL_CONFIG_SENTINEL = address(0xA2);
     address constant TIER_REGISTRY_SENTINEL = address(0xB1);
+    /// @dev The registry passed to `initialize` — mandatory since pashov
+    ///      finding #1, so slot 58 is already populated when `setUp` returns.
+    address internal fixtureTierRegistry;
+    address constant EXPOSURE_LEDGER_SENTINEL = address(0xB2);
+    address constant BOND_ESCROW_SENTINEL = address(0xB3);
     address owner = makeAddr("owner");
 
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 2 days;
 
     function setUp() public {
+        fixtureTierRegistry = address(deployTierRegistry(address(this)));
         guardianRegistry = new MockRegistryMinimal();
         SyndicateGovernor impl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory init = abi.encodeCall(
@@ -47,7 +71,8 @@ contract GovernorLayoutPinsTest is Test {
                 VAULT_SENTINEL,
                 address(guardianRegistry),
                 PROTOCOL_CONFIG_SENTINEL,
-                address(this), // factory (this test) — may call setTierRegistry
+                address(this),
+                fixtureTierRegistry, // factory (this test) — may call setTierRegistry
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -74,34 +99,72 @@ contract GovernorLayoutPinsTest is Test {
     /// @notice GovernorParameters prefix: init-written fields land at their
     ///         frozen words.
     function test_layout_paramsPrefixPinned() public view {
-        assertEq(_slot(0), bytes32(uint256(uint160(VAULT_SENTINEL))), "slot 0: vault");
-        assertEq(_slot(1), bytes32(uint256(uint160(PROTOCOL_CONFIG_SENTINEL))), "slot 1: protocolConfig");
-        assertEq(_slot(2), bytes32(uint256(uint160(address(this)))), "slot 2: factory");
-        assertEq(_slot(3), bytes32(VOTING_PERIOD), "slot 3: _params.votingPeriod");
-        assertEq(_slot(4), bytes32(EXECUTION_WINDOW), "slot 4: _params.executionWindow");
-        assertEq(_slot(11), bytes32(uint256(30 days)), "slot 11: _params.maxStrategyDuration");
+        assertEq(_slot(15), bytes32(uint256(uint160(VAULT_SENTINEL))), "slot 15: vault");
+        assertEq(_slot(16), bytes32(uint256(uint160(PROTOCOL_CONFIG_SENTINEL))), "slot 16: protocolConfig");
+        assertEq(_slot(17), bytes32(uint256(uint160(address(this)))), "slot 17: factory");
+        assertEq(_slot(18), bytes32(VOTING_PERIOD), "slot 18: _params.votingPeriod");
+        assertEq(_slot(19), bytes32(EXECUTION_WINDOW), "slot 19: _params.executionWindow");
+        assertEq(_slot(26), bytes32(uint256(30 days)), "slot 26: _params.maxStrategyDuration");
+    }
+
+    /// @notice The `ProposalLifecycle` base now occupies the first 15 words.
+    ///         `_guardianRegistry` at slot 0 is the anchor: if the base ever
+    ///         stops linearizing first, this is the assert that catches it.
+    function test_layout_lifecycleBasePrefixPinned() public view {
+        assertEq(_slot(0), bytes32(uint256(uint160(address(guardianRegistry)))), "slot 0: _guardianRegistry");
+        assertEq(_slot(2), bytes32(0), "slot 2: _openProposalCount starts at zero");
     }
 
     /// @notice Finding 3's `_maxCapitalBps` was carved from the FRONT of
-    ///         `__paramsGap` (8 → 7): it must sit at slot 13, immediately after
-    ///         `_bootstrapOwner` (12), leaving every pre-existing slot intact.
-    function test_layout_maxCapitalBpsPinnedToSlot13() public {
-        assertEq(_slot(13), bytes32(0), "slot 13 starts unset (sentinel 0 = 100% default)");
+    ///         `__paramsGap` (8 -> 7): it sits immediately after
+    ///         `_bootstrapOwner` (27), leaving every pre-existing slot intact
+    ///         within the GovernorParameters region.
+    function test_layout_maxCapitalBpsPinnedToSlot28() public {
+        assertEq(_slot(28), bytes32(0), "slot 28 starts unset (sentinel 0 = 100% default)");
         vm.prank(owner);
         governor.setMaxCapitalBps(4_321);
-        assertEq(_slot(13), bytes32(uint256(4_321)), "slot 13: _maxCapitalBps");
+        assertEq(_slot(28), bytes32(uint256(4_321)), "slot 28: _maxCapitalBps");
         assertEq(governor.maxCapitalBps(), 4_321);
     }
 
-    /// @notice Appended-region anchors: `_guardianRegistry` (43, written at
-    ///         initialize) and `_tierRegistry` (48, Task-5 append). If either
-    ///         moved, an upgrade would read garbage for every live governor.
+    /// @notice Appended-region anchor: `_tierRegistry` (58, Task-5 append), the
+    ///         last field before `__gap`. `_guardianRegistry` moved into the
+    ///         lifecycle base and is pinned by
+    ///         `test_layout_lifecycleBasePrefixPinned` instead.
     function test_layout_appendedFieldsPinned() public {
-        assertEq(_slot(43), bytes32(uint256(uint160(address(guardianRegistry)))), "slot 43: _guardianRegistry");
-
-        assertEq(_slot(48), bytes32(0), "slot 48 starts unset");
+        // Starts WIRED, not unset: the registry is a mandatory `initialize`
+        // argument (pashov finding #1), so slot 58 already holds the fixture
+        // registry this suite passed in. That it is nonzero here is itself the
+        // pin that init writes this slot and no other.
+        assertEq(_slot(58), bytes32(uint256(uint160(fixtureTierRegistry))), "slot 58: _tierRegistry, set at init");
+        // `setTierRegistry` refuses codeless addresses (pashov finding #1), so
+        // the sentinel needs code. Arbitrary byte — the pin is on the VALUE.
+        vm.etch(TIER_REGISTRY_SENTINEL, hex"00");
         governor.setTierRegistry(TIER_REGISTRY_SENTINEL); // this test is the factory
-        assertEq(_slot(48), bytes32(uint256(uint160(TIER_REGISTRY_SENTINEL))), "slot 48: _tierRegistry");
+        assertEq(_slot(58), bytes32(uint256(uint160(TIER_REGISTRY_SENTINEL))), "slot 58: _tierRegistry");
         assertEq(governor.tierRegistry(), TIER_REGISTRY_SENTINEL);
+    }
+
+    /// @notice Plan B appends: `_exposureLedger` (49) and `_bondEscrow` (50)
+    ///         were carved from the FRONT of `__gap` (33 → 31), so they must
+    ///         land immediately after `_tierRegistry` (48) and leave every
+    ///         pre-existing slot untouched. Pinned here as well as in the JSON
+    ///         golden because this layer runs under plain `forge test` — a
+    ///         reorder that slipped past an un-run shell script still fails here.
+    function test_layout_planBFieldsPinned() public {
+        assertEq(_slot(59), bytes32(0), "slot 59 starts unset");
+        assertEq(_slot(60), bytes32(0), "slot 60 starts unset");
+
+        // This test is the factory, so it may call the onlyFactory setters.
+        governor.setExposureLedger(EXPOSURE_LEDGER_SENTINEL);
+        governor.setBondEscrow(BOND_ESCROW_SENTINEL);
+
+        assertEq(_slot(59), bytes32(uint256(uint160(EXPOSURE_LEDGER_SENTINEL))), "slot 59: _exposureLedger");
+        assertEq(_slot(60), bytes32(uint256(uint160(BOND_ESCROW_SENTINEL))), "slot 60: _bondEscrow");
+        assertEq(governor.exposureLedger(), EXPOSURE_LEDGER_SENTINEL);
+        assertEq(governor.bondEscrow(), BOND_ESCROW_SENTINEL);
+
+        // The Plan B appends must not have disturbed the slot below them.
+        assertEq(_slot(58), bytes32(uint256(uint160(fixtureTierRegistry))), "slot 58 untouched by Plan B writes");
     }
 }

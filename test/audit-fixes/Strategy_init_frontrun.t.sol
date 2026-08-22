@@ -5,12 +5,13 @@ import {Test} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
-import {MoonwellSupplyStrategy} from "../../src/strategies/MoonwellSupplyStrategy.sol";
-import {AerodromeLPStrategy} from "../../src/strategies/AerodromeLPStrategy.sol";
 import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
-import {WstETHMoonwellStrategy} from "../../src/strategies/WstETHMoonwellStrategy.sol";
-import {MamoYieldStrategy} from "../../src/strategies/MamoYieldStrategy.sol";
-import {VeniceInferenceStrategy} from "../../src/strategies/VeniceInferenceStrategy.sol";
+import {MockStrategy} from "../mocks/MockStrategy.sol";
+import {
+    MockGovernorAlwaysActive,
+    MockVaultGovernorStub,
+    MockPermissiveTierRegistry
+} from "../mocks/MockGovernorAlwaysActive.sol";
 
 /// @title Strategy_init_frontrun — MS-C3 regression
 /// @notice Verifies that every concrete strategy template is *uninitializable*
@@ -32,10 +33,15 @@ contract StrategyInitFrontrunTest is Test {
     address public stubToken = makeAddr("stubToken");
     address public stubProtocol = makeAddr("stubProtocol");
 
-    // ── MoonwellSupplyStrategy ──
+    // ── MockStrategy — the property in isolation ──
+    //
+    // MS-C3 is a `BaseStrategy` property, not a per-protocol one, so it is
+    // worth exercising once against a subclass that adds nothing. This case
+    // replaces the former `MoonwellSupplyStrategy` one, which carried the
+    // same trivial init payload but dragged a Base-chain integration with it.
 
-    function test_moonwell_template_is_locked() public {
-        MoonwellSupplyStrategy template = new MoonwellSupplyStrategy();
+    function test_mock_template_is_locked() public {
+        MockStrategy template = new MockStrategy();
         bytes memory initData = abi.encode(stubToken, stubProtocol, uint256(1), uint256(0), false);
 
         vm.prank(attacker);
@@ -43,71 +49,15 @@ contract StrategyInitFrontrunTest is Test {
         template.initialize(vault, proposer, initData);
     }
 
-    function test_moonwell_clone_initializes() public {
-        MoonwellSupplyStrategy template = new MoonwellSupplyStrategy();
+    function test_mock_clone_initializes() public {
+        MockStrategy template = new MockStrategy();
         address payable clone = payable(Clones.clone(address(template)));
         bytes memory initData = abi.encode(stubToken, stubProtocol, uint256(1), uint256(0), false);
 
-        MoonwellSupplyStrategy(clone).initialize(vault, proposer, initData);
+        MockStrategy(clone).initialize(vault, proposer, initData);
 
-        assertEq(MoonwellSupplyStrategy(clone).vault(), vault);
-        assertEq(MoonwellSupplyStrategy(clone).proposer(), proposer);
-    }
-
-    // ── AerodromeLPStrategy ──
-
-    function test_aerodrome_template_is_locked() public {
-        AerodromeLPStrategy template = new AerodromeLPStrategy();
-        AerodromeLPStrategy.InitParams memory p = AerodromeLPStrategy.InitParams({
-            tokenA: stubToken,
-            tokenB: makeAddr("tokenB"),
-            stable: false,
-            factory: makeAddr("factory"),
-            router: makeAddr("router"),
-            gauge: address(0),
-            lpToken: makeAddr("lp"),
-            amountADesired: 1e18,
-            amountBDesired: 1e18,
-            amountAMin: 1,
-            amountBMin: 1,
-            minAmountAOut: 1,
-            minAmountBOut: 1,
-            // Sherlock #30: no reward-swap target — legacy behaviour.
-            rewardSwapTarget: address(0),
-            rewardSwapStable: false,
-            rewardSwapMinOutPerAero: 0
-        });
-
-        vm.prank(attacker);
-        vm.expectRevert(BaseStrategy.AlreadyInitialized.selector);
-        template.initialize(vault, proposer, abi.encode(p));
-    }
-
-    function test_aerodrome_clone_initializes() public {
-        AerodromeLPStrategy template = new AerodromeLPStrategy();
-        address payable clone = payable(Clones.clone(address(template)));
-        AerodromeLPStrategy.InitParams memory p = AerodromeLPStrategy.InitParams({
-            tokenA: stubToken,
-            tokenB: makeAddr("tokenB"),
-            stable: false,
-            factory: makeAddr("factory"),
-            router: makeAddr("router"),
-            gauge: address(0),
-            lpToken: makeAddr("lp"),
-            amountADesired: 1e18,
-            amountBDesired: 1e18,
-            amountAMin: 1,
-            amountBMin: 1,
-            minAmountAOut: 1,
-            minAmountBOut: 1,
-            // Sherlock #30: no reward-swap target — legacy behaviour.
-            rewardSwapTarget: address(0),
-            rewardSwapStable: false,
-            rewardSwapMinOutPerAero: 0
-        });
-
-        AerodromeLPStrategy(clone).initialize(vault, proposer, abi.encode(p));
-        assertEq(AerodromeLPStrategy(clone).vault(), vault);
+        assertEq(MockStrategy(clone).vault(), vault);
+        assertEq(MockStrategy(clone).proposer(), proposer);
     }
 
     // ── PortfolioStrategy ──
@@ -176,77 +126,16 @@ contract StrategyInitFrontrunTest is Test {
             feedIds
         );
 
-        PortfolioStrategy(clone).initialize(vault, proposer, initData);
-        assertEq(PortfolioStrategy(clone).vault(), vault);
-    }
+        // `PortfolioStrategy._initialize` is fail-closed on registry
+        // resolution, so the shared codeless `vault` above no longer gets a
+        // clone through init. This test is about the front-run window, not
+        // about governance binding, so it wires the minimum that resolves:
+        // vault -> governor() -> tierRegistry() -> permissive answers.
+        MockGovernorAlwaysActive governorStub = new MockGovernorAlwaysActive();
+        governorStub.setTierRegistry(address(new MockPermissiveTierRegistry()));
+        address wiredVault = address(new MockVaultGovernorStub(address(governorStub)));
 
-    // ── WstETHMoonwellStrategy ──
-
-    function test_wsteth_template_is_locked() public {
-        WstETHMoonwellStrategy template = new WstETHMoonwellStrategy();
-        WstETHMoonwellStrategy.InitParams memory p = WstETHMoonwellStrategy.InitParams({
-            weth: stubToken,
-            wsteth: makeAddr("wsteth"),
-            mwsteth: makeAddr("mwsteth"),
-            aeroRouter: makeAddr("router"),
-            aeroFactory: makeAddr("factory"),
-            chainlinkWstethEthFeed: makeAddr("chainlink"),
-            supplyAmount: 1e18,
-            minWstethOutPerWeth: 1e17,
-            minWethOutPerWsteth: 1e17,
-            deadlineOffset: 0
-        });
-
-        vm.prank(attacker);
-        vm.expectRevert(BaseStrategy.AlreadyInitialized.selector);
-        template.initialize(vault, proposer, abi.encode(p));
-    }
-
-    function test_wsteth_clone_initializes() public {
-        WstETHMoonwellStrategy template = new WstETHMoonwellStrategy();
-        address payable clone = payable(Clones.clone(address(template)));
-        address feed = makeAddr("chainlink-wsteth-eth");
-        // Mock IAggregatorV3.decimals() so init can cache _oracleDecimals
-        vm.mockCall(feed, abi.encodeWithSignature("decimals()"), abi.encode(uint8(18)));
-
-        WstETHMoonwellStrategy.InitParams memory p = WstETHMoonwellStrategy.InitParams({
-            weth: stubToken,
-            wsteth: makeAddr("wsteth"),
-            mwsteth: makeAddr("mwsteth"),
-            aeroRouter: makeAddr("router"),
-            aeroFactory: makeAddr("factory"),
-            chainlinkWstethEthFeed: feed,
-            supplyAmount: 1e18,
-            minWstethOutPerWeth: 1e17,
-            minWethOutPerWsteth: 1e17,
-            deadlineOffset: 0
-        });
-
-        WstETHMoonwellStrategy(clone).initialize(vault, proposer, abi.encode(p));
-        assertEq(WstETHMoonwellStrategy(clone).vault(), vault);
-    }
-
-    // ── Other concrete strategies — template lock only ──
-    // Coverage check: confirm every concrete strategy that derives from
-    // BaseStrategy is uninitializable on the template. We don't need to
-    // cover the clone-init path for these — the BaseStrategy constructor
-    // is the single mechanism, and the four cases above already prove
-    // that clones still initialize correctly.
-
-    function test_mamo_template_is_locked() public {
-        MamoYieldStrategy template = new MamoYieldStrategy();
-        bytes memory initData = abi.encode(stubToken, makeAddr("mamoFactory"), uint256(0), bytes32(0));
-
-        vm.prank(attacker);
-        vm.expectRevert(BaseStrategy.AlreadyInitialized.selector);
-        template.initialize(vault, proposer, initData);
-    }
-
-    function test_venice_template_is_locked() public {
-        VeniceInferenceStrategy template = new VeniceInferenceStrategy();
-
-        vm.prank(attacker);
-        vm.expectRevert(BaseStrategy.AlreadyInitialized.selector);
-        template.initialize(vault, proposer, "");
+        PortfolioStrategy(clone).initialize(wiredVault, proposer, initData);
+        assertEq(PortfolioStrategy(clone).vault(), wiredVault);
     }
 }

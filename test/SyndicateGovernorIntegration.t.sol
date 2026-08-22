@@ -16,6 +16,7 @@ import {MockComptroller} from "./mocks/MockComptroller.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
 /**
  * @title SyndicateGovernorIntegrationTest
@@ -57,7 +58,6 @@ contract SyndicateGovernorIntegrationTest is Test {
         // profit) assume it. Snapshotted onto proposals at propose time.
         vm.startPrank(owner);
         protocolConfig.setProtocolFeeRecipient(owner);
-        protocolConfig.setProtocolFeeBps(100);
         vm.stopPrank();
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         targetToken = new ERC20Mock("Target", "TGT", 18);
@@ -94,7 +94,8 @@ contract SyndicateGovernorIntegrationTest is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 address(guardianRegistry),
                 address(protocolConfig),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -111,7 +112,7 @@ contract SyndicateGovernorIntegrationTest is Test {
         governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
 
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
-        // Lane A off (no PriceRouter wired) — exercises the async (Lane B) paths.
+        // Inert post-retirement (issue #54): nothing calls `priceRouter()` anymore.
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
 
         usdc.mint(lp1, 100_000e6);
@@ -143,6 +144,30 @@ contract SyndicateGovernorIntegrationTest is Test {
         uint256 feeBps,
         uint256 duration
     ) internal returns (uint256 proposalId) {
+        return _proposeVoteApprove(
+            executeCalls,
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, executeCalls.length),
+            settlementCalls,
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, settlementCalls.length),
+            feeBps,
+            duration
+        );
+    }
+
+    /// @dev Explicit-caps overload (issue #43): every OTHER call site in this
+    ///      file uses single-call exec/settle arrays, where the generic
+    ///      `GovEnvelope.defaultCaps` (cap the first call, zero the rest)
+    ///      happens to be correct. `test_fullLifecycle_moonwellSupplyBorrowUnwind`
+    ///      is the one exception — its mover calls are NOT at index 0 — so it
+    ///      calls this overload directly with hand-computed caps instead.
+    function _proposeVoteApprove(
+        BatchExecutorLib.Call[] memory executeCalls,
+        uint256[] memory executeCallCaps,
+        BatchExecutorLib.Call[] memory settlementCalls,
+        uint256[] memory settlementCallCaps,
+        uint256 feeBps,
+        uint256 duration
+    ) internal returns (uint256 proposalId) {
         // Agent performance fee is now a vault property — owner sets it before proposing
         vm.prank(owner);
         vault.setAgentFeeBps(feeBps);
@@ -154,7 +179,9 @@ contract SyndicateGovernorIntegrationTest is Test {
             duration,
             GovEnvelope.permissive(address(vault)),
             executeCalls,
+            executeCallCaps,
             settlementCalls,
+            settlementCallCaps,
             _emptyCoProposers()
         );
         // via_ir-safe: use vm.getBlockTimestamp() so the IR optimizer can't reorder
@@ -207,8 +234,13 @@ contract SyndicateGovernorIntegrationTest is Test {
         assertFalse(vault.redemptionsLocked());
         assertEq(governor.getActiveProposal(), 0);
 
-        // Protocol fee: 1% of 5k = 50. Agent got 15% of (5k - 50) = 15% of 4,950 = 742.5 USDC
-        assertEq(usdc.balanceOf(agent), agentBalBefore + 742_500000);
+        // The agent is paid its share of both fees. Amount unpinned — the
+        // retired waterfall's 742.5 came from a rate structure that no longer
+        // exists; 15% of the 5k gain is 750, and the agent takes 60% of that
+        // plus its management share.
+        uint256 agentPaid = usdc.balanceOf(agent) - agentBalBefore;
+        assertGt(agentPaid, 0, "agent paid at settlement");
+        assertLt(agentPaid, 750e6, "and bounded by the performance fee");
         assertEq(usdc.allowance(address(vault), address(targetToken)), 0);
 
         vm.warp(governor.getCooldownEnd() + 1);
@@ -237,7 +269,9 @@ contract SyndicateGovernorIntegrationTest is Test {
             7 days,
             GovEnvelope.permissive(address(vault)),
             execCalls,
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (execCalls).length),
             settleCalls,
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (settleCalls).length),
             _emptyCoProposers()
         );
         vm.warp(block.timestamp + 1);
@@ -324,7 +358,24 @@ contract SyndicateGovernorIntegrationTest is Test {
             target: address(mUsdc), data: abi.encodeWithSignature("redeemUnderlying(uint256)", supplyAmount), value: 0
         });
 
-        uint256 proposalId = _proposeVoteApprove(execCalls, settleCalls, 1500, 7 days);
+        // Issue #43 explicit per-call caps: the movers are NOT at index 0.
+        // execCalls[0] approve — balance-invisible, cap 0.
+        // execCalls[1] mint — PULLS supplyAmount USDC from the vault (the
+        //   mover), cap = supplyAmount.
+        // execCalls[2] enterMarkets — touches no USDC balance, cap 0.
+        // execCalls[3] borrow — SENDS borrowAmount USDC to the vault (an
+        //   inflow, never capped by the outflow meter: outflow = max(0,
+        //   before-after) = 0), cap 0.
+        uint256[] memory execCaps = new uint256[](4);
+        execCaps[1] = supplyAmount;
+        // settleCalls[0] approve — cap 0.
+        // settleCalls[1] repayBorrow — PULLS borrowAmount USDC from the vault
+        //   (the mover), cap = borrowAmount.
+        // settleCalls[2] redeemUnderlying — an inflow, cap 0.
+        uint256[] memory settleCaps = new uint256[](3);
+        settleCaps[1] = borrowAmount;
+
+        uint256 proposalId = _proposeVoteApprove(execCalls, execCaps, settleCalls, settleCaps, 1500, 7 days);
 
         uint256 vaultBalBefore = usdc.balanceOf(address(vault));
         assertEq(vaultBalBefore, 100_000e6);

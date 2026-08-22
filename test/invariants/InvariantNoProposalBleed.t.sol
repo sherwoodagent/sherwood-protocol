@@ -51,10 +51,11 @@ contract ProposalBleedHandler is Test {
     function openReview(uint256 seed) external {
         MockGovernorMinimal gov = _gov(seed);
         uint256 pid = 1 + (seed % PID_SPACE);
-        (bool opened,,,) = registry.getReviewState(address(gov), pid);
+        (bool opened,,) = registry.getReviewState(address(gov), pid);
         if (opened) return;
         uint256 ve = vm.getBlockTimestamp();
-        gov.setProposal(pid, ve, ve + REVIEW_PERIOD);
+        vm.prank(address(gov));
+        registry.registerReview(pid, ve, ve + REVIEW_PERIOD);
         registry.openReview(address(gov), pid);
     }
 
@@ -62,7 +63,7 @@ contract ProposalBleedHandler is Test {
         MockGovernorMinimal gov = _gov(seed);
         uint256 pid = 1 + (seed % PID_SPACE);
         address g = guardians[(seed / 7) % 3];
-        (bool opened, bool resolved,,) = registry.getReviewState(address(gov), pid);
+        (bool opened, bool resolved,) = registry.getReviewState(address(gov), pid);
         if (!opened || resolved) return;
         // Skip if this guardian already voted under (gov, pid) or the window closed.
         if (approvedUnder[address(gov)][pid][g]) return;
@@ -121,10 +122,8 @@ contract InvariantNoProposalBleed is StdInvariant, Test {
                     minOwnerStake: 10_000e18,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -138,8 +137,13 @@ contract InvariantNoProposalBleed is StdInvariant, Test {
         swood.setRegistry(address(registry));
 
         vm.startPrank(regFactory);
-        registry.addGovernor(address(governorA));
-        registry.addGovernor(address(governorB));
+        // `vaultOf` is load-bearing for the emergency owner-bond slash, but these
+        // mock governors serve no real vault and this suite asserts open-count
+        // bleed, not slash amounts. Distinct non-zero sentinels keep the two
+        // registrations distinguishable and read as deliberately synthetic
+        // rather than as a real bonded vault.
+        registry.addGovernor(address(governorA), address(0xFA017A));
+        registry.addGovernor(address(governorB), address(0xFA017B));
         vm.stopPrank();
 
         for (uint256 i = 0; i < 3; i++) {

@@ -5,7 +5,7 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 
 /// @notice Minimal mock governor for SyndicateVault.StrategyHooks tests.
 ///         Exposes only the two selectors the vault's `_activeStrategy()` reads:
-///         `getActiveProposal()` and `getProposal(uint256)`. Per-vault (#421):
+///         `getActiveProposal()` and `strategyOf(uint256)`. Per-vault (#421):
 ///         a governor serves exactly one vault, so `getActiveProposal` is
 ///         zero-arg. `setActiveProposal` keeps the vault param for call-site
 ///         compatibility but writes a single slot.
@@ -25,7 +25,7 @@ contract MockGovernorForStrategyHooks {
         return _activeProposal;
     }
 
-    function getProposal(uint256 pid) external view returns (ISyndicateGovernor.StrategyProposal memory) {
-        return _proposals[pid];
+    function strategyOf(uint256 pid) external view returns (address) {
+        return _proposals[pid].strategy;
     }
 }

@@ -13,6 +13,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title Governor_proposerSelfSettle_minDuration — MS-H3 regression
 /// @notice Confirms the proposer's self-settle fast-path requires at least
@@ -78,7 +79,8 @@ contract Governor_proposerSelfSettle_minDuration_Test is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -135,7 +137,9 @@ contract Governor_proposerSelfSettle_minDuration_Test is Test {
             STRATEGY_DURATION,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
         vm.warp(vm.getBlockTimestamp() + 1);

@@ -1,0 +1,31 @@
+testMode: "assertion"
+prefix: "property_"
+seqLen: 100
+testLimit: 50000
+# 1e24 wei (1,000,000 ether). The scaffold default (2^192-1) exceeds what the
+# deployer account holds, so chain init fails before any fuzzing starts.
+balanceContract: 0xd3c21bcecceda1000000
+coverage: true
+corpusDir: "fizz_data/corpus_echidna"
+# `--compile-libraries` is required, not optional: Echidna refuses to run if ANY
+# contract in the compilation unit has unlinked library bytecode.
+#
+# The address is NOT arbitrary. `SyndicateVaultAdminLib` has external functions,
+# so it is a real deployed dependency that `SyndicateVault` reaches by
+# DELEGATECALL (`registerAgent`, `removeAgent`) — not an inlined internal
+# library. Linking it to an empty address makes those calls revert with no data,
+# which shows up as `setup()` dying at `vault.registerAgent` on the last line of
+# deployment. So the library is linked here AND deployed at the same address via
+# `deployContracts` below, before the harness constructor runs.
+cryticArgs: ["--foundry-compile-all", "--compile-libraries=(SyndicateVaultAdminLib,0x1111111111111111111111111111111111111111)"]
+deployContracts: [["0x1111111111111111111111111111111111111111", "SyndicateVaultAdminLib"]]
+contractAddr: "0x7FA9385bE102ac3EAc297483Dd6233D62b3e1496"
+deployer: "0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38"
+# output format (comment out for TUI)
+format: "text"
+# Hide solc stderr output and additional information during the testing.
+quiet: false
+stopOnFail: false
+disableSlither: false
+
+# https://secure-contracts.com/program-analysis/echidna/configuration.html

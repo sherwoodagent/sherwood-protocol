@@ -1,0 +1,242 @@
+name: CI
+
+on:
+  # NO BASE FILTER ON `pull_request`, deliberately. A `branches: [main]` filter
+  # here means a PR stacked on an integration branch triggers NOTHING — and it
+  # surfaces as an EMPTY check list, which reads like "nothing wrong" rather
+  # than "nothing verified". Stacked PRs are where CI matters most: the diff is
+  # reviewed against a base that is itself unmerged and moving. The `push`
+  # filter below is what keeps post-merge runs scoped to `main`; this one only
+  # bought silence. (Found 2026-08-01: PRs #75/#78/#80 each ran zero checks.)
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Must match the forge version developers format/build with — forge fmt rules
+  # drift across versions, so bump this together with a repo-wide `forge fmt`.
+  FOUNDRY_VERSION: v1.7.1
+  FOUNDRY_PROFILE: default
+
+jobs:
+  build-test:
+    name: Build & test (non-fork)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache
+            out
+          key: forge-${{ env.FOUNDRY_VERSION }}-${{ hashFiles('foundry.toml', 'src/**/*.sol', 'lib/**/*.sol', 'test/**/*.sol', 'script/**/*.sol') }}
+          restore-keys: |
+            forge-${{ env.FOUNDRY_VERSION }}-
+
+      - name: Build
+        run: forge build
+
+      # Fork/integration tests need live RPC endpoints (no secrets in CI), so
+      # everything under test/integration/ is excluded. All other tests run.
+      #
+      # `test/WstETHMoonwellStrategy.t.sol` was excluded here too until the
+      # Base-chain strategies were deleted (PR #53). That path no longer exists,
+      # so the glob was dead — and worse than dead: a future file landing there
+      # would have been silently skipped by CI. Removed rather than kept "just
+      # in case" (issue #73).
+      - name: Test
+        run: forge test --no-match-path "test/integration/**" -vv
+
+  coverage:
+    name: Coverage (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # forge coverage is the least stable forge subcommand — it may not hold PRs
+    # hostage. Its red/green status stays visible in the checks list; revisit
+    # making it blocking once it has proven stable.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      # Own cache key: the coverage profile builds with via_ir off, so its
+      # artifacts are incompatible with the default profile's — sharing the
+      # `forge-` key would make the two jobs thrash each other's cache.
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache
+            out
+          key: forge-coverage-${{ env.FOUNDRY_VERSION }}-${{ hashFiles('foundry.toml', 'src/**/*.sol', 'lib/**/*.sol', 'test/**/*.sol', 'script/**/*.sol') }}
+          restore-keys: |
+            forge-coverage-${{ env.FOUNDRY_VERSION }}-
+
+      # `forge coverage` disables the optimizer and via_ir project-wide to keep
+      # source maps accurate, and unoptimized legacy codegen blows the stack in
+      # this repo's eight largest contracts. `[profile.coverage]` works around
+      # that with per-file `compilation_restrictions` that keep exactly those
+      # eight on the IR pipeline; see the comment block in foundry.toml for the
+      # list, the reproduce command, and what the workaround costs. Same
+      # fork-path exclusion as the Test step above: those suites need live RPC.
+      #
+      # Still `continue-on-error` (see above) on stability grounds only — as of
+      # forge 1.7.1 this step passes: 1478 tests, ~52% line coverage over the 83
+      # instrumented files.
+      - name: forge coverage
+        env:
+          FOUNDRY_PROFILE: coverage
+        run: |
+          forge coverage \
+            --report lcov \
+            --report summary \
+            --no-match-path "test/integration/**"
+
+      # TODO(#63): sink is artifact-only for now — wiring Codecov needs a
+      # CODECOV_TOKEN repository secret, a decision deferred out of this change.
+      - name: Upload lcov report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 14
+          if-no-files-found: warn
+
+  fmt:
+    name: Format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: forge fmt --check
+        run: forge fmt --check src test script
+
+  openspec:
+    name: OpenSpec validate
+    runs-on: ubuntu-latest
+    # A malformed delta does NOT fail loudly on its own: OpenSpec parses
+    # positionally, so `## ADDED Requirement: <name>` — which collapses the
+    # section header into the requirement header — makes a change parse as
+    # having no deltas at all. Two changes sat in that state from 2026-08-01
+    # until 2026-08-05 (PR #210), describing nothing while looking complete.
+    #
+    # Deliberately NOT filtered on `paths: openspec/**`: a spec goes stale
+    # because the CODE moved under it, which is exactly how wood-pricing came
+    # to document a `woodFallbackPriceX8` that no longer existed.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Pinned for the same reason FOUNDRY_VERSION is: a validator's rules are
+      # as version-sensitive as a formatter's, and an unpinned bump would turn
+      # unrelated PRs red. Note the SCOPE — the unscoped `openspec` on npm is a
+      # placeholder at 0.0.0, not this tool.
+      - name: openspec validate --all --strict
+        run: npx --yes @fission-ai/openspec@1.7.0 validate --all --strict
+
+  storage-layout:
+    name: Storage-layout gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache
+            out
+          key: forge-${{ env.FOUNDRY_VERSION }}-${{ hashFiles('foundry.toml', 'src/**/*.sol', 'lib/**/*.sol', 'test/**/*.sol', 'script/**/*.sol') }}
+          restore-keys: |
+            forge-${{ env.FOUNDRY_VERSION }}-
+
+      # Runs `forge build` itself and relies on extra_output = ["storageLayout"]
+      # being present in every artifact.
+      #
+      # The LeveragedAero storage-parity step was dropped with the seam it
+      # guarded: `check-storage-parity.sh` pinned the delegatecall layout shared
+      # by LeveragedAerodromeCLStrategy and LeveragedAeroManager, and both were
+      # removed with the Base-chain strategies. Nothing delegatecalls a shared
+      # 7201 struct any more, so there is no seam left to drift. Restore the step
+      # alongside the script if a delegatecall pair is ever reintroduced.
+      - name: Layout goldens (governor + factory)
+        run: ./script/check-layout-goldens.sh
+
+  contract-size:
+    name: Contract size (Robinhood 96 KiB limit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache
+            out
+          key: forge-size-${{ env.FOUNDRY_VERSION }}-${{ hashFiles('foundry.toml', 'src/**/*.sol', 'lib/**/*.sol') }}
+          restore-keys: |
+            forge-size-${{ env.FOUNDRY_VERSION }}-
+
+      # Robinhood Chain (4663, ArbOS) MaxCodeSize is 98,304 bytes (4x EIP-170).
+      # `forge build --sizes` alone enforces the wrong limit (24,576), so apply
+      # the chain's real threshold ourselves. `|| true`: forge exits non-zero on
+      # the 24,576 warning, which is not our gate.
+      - name: Check deployable contract sizes
+        run: |
+          forge build --skip test --skip script --sizes --json > sizes.json || true
+          python3 - <<'PY'
+          import json, sys
+
+          LIMIT = 98_304  # Robinhood Chain MaxCodeSize (see issue #16)
+          with open("sizes.json") as f:
+              sizes = json.load(f)
+          if not sizes:
+              print("FAIL: empty --sizes output — build failed?", file=sys.stderr)
+              sys.exit(1)
+
+          offenders = [
+              (name, info["runtime_size"])
+              for name, info in sizes.items()
+              if info.get("runtime_size", 0) > LIMIT
+          ]
+          for name, size in sorted(offenders, key=lambda x: -x[1]):
+              print(f"FAIL: {name} runtime bytecode {size:,} B > {LIMIT:,} B", file=sys.stderr)
+          if offenders:
+              sys.exit(1)
+          print(f"OK: all {len(sizes)} contracts within {LIMIT:,} B runtime limit")
+          PY

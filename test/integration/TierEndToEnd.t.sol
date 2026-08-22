@@ -14,6 +14,8 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice A minimal DeFi adapter that pulls capital out of the calling vault.
 ///         `deploy` moves `amount` of `token` from the caller (the vault, in the
@@ -99,7 +101,8 @@ contract TierEndToEndTest is Test {
                 address(vault),
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract) — may call setTierRegistry
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract) — may call setTierRegistry
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -141,6 +144,18 @@ contract TierEndToEndTest is Test {
         tierRegistry.setAdapterAllowed(address(adapter), true);
     }
 
+    /// @dev Shared fixture helper (design.md / tasks.md 2.1): the test
+    ///      contract IS the TierRegistry owner (`new TierRegistry(address(this))`
+    ///      in setUp), so no prank is needed — propose, warp past the pinned
+    ///      `readyAt` (via `vm.getBlockTimestamp()`, never a cached
+    ///      `block.timestamp` local — this repo's optimizer CSEs it across
+    ///      `vm.warp`), then execute.
+    function _certifyNow(address target_, bytes4 selector_, uint8 tier_, uint16 bound_, address submitter_) internal {
+        tierRegistry.proposeCertification(target_, selector_, tier_, bound_, submitter_, target_.codehash);
+        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
+        tierRegistry.certify(target_, selector_);
+    }
+
     function _settleCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
@@ -157,7 +172,41 @@ contract TierEndToEndTest is Test {
             7 days,
             ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
             executeCalls,
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (executeCalls).length
+            ),
             _settleCalls(),
+            GovEnvelope.defaultCaps(
+                (ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000})).maxCapital,
+                (_settleCalls()).length
+            ),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+    }
+
+    /// @dev Variant for `_deployCalls`-shaped batches (issue #43): the MOVER is
+    ///      call INDEX 1 (`deploy`), not index 0 (`approve`, balance-invisible)
+    ///      — the generic `GovEnvelope.defaultCaps` convention caps only the
+    ///      FIRST call, which would give the actual mover a ZERO cap and trip
+    ///      `CallCapExceeded` on every legitimate deploy. Give `approve` (index
+    ///      0) a zero cap and `deploy` (index 1) the full `MAX_CAPITAL`
+    ///      headroom instead (sum-legal: 0 + MAX_CAPITAL == MAX_CAPITAL).
+    function _proposeDeployCalls(BatchExecutorLib.Call[] memory executeCalls) internal returns (uint256 proposalId) {
+        uint256[] memory execCaps = new uint256[](2);
+        execCaps[0] = 0;
+        execCaps[1] = MAX_CAPITAL;
+        vm.prank(agent);
+        proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://tier-e2e",
+            7 days,
+            ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000}),
+            executeCalls,
+            execCaps,
+            _settleCalls(),
+            GovEnvelope.defaultCaps(MAX_CAPITAL, _settleCalls().length),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -192,28 +241,43 @@ contract TierEndToEndTest is Test {
 
     // ── Flow 1: uncertified adapter → tier 2, full-notional coverage ──
 
-    /// @notice An uncertified adapter resolves to tier 2 (full-notional
-    ///         coverage). A batch within maxCapital executes cleanly; a batch
-    ///         exceeding maxCapital trips the custody-level net-outflow ceiling.
+    /// @notice An uncertified adapter resolves to tier 2. A batch within
+    ///         maxCapital executes cleanly; a batch exceeding the declared
+    ///         per-call cap on the mover (`deploy`, call index 1) trips
+    ///         `BatchExecutorLib.CallCapExceeded` — issue #43's per-call meter
+    ///         is strictly tighter than (and structurally fires before) the
+    ///         vault's own coarse `maxNetOutflow` check whenever the caps
+    ///         cover the moving call (design.md D4's own math: batch net
+    ///         outflow <= Σ per-call gross outflows <= Σ caps <= maxCapital,
+    ///         so a correctly-metered batch's vault-level meter cannot fire
+    ///         first). The vault meter remains the ONLY meter on empty-caps
+    ///         (emergency) batches — exercised elsewhere, not here.
     function test_e2e_tier2UnknownAdapterFullNotionalCoverage() public {
         _wireTierRegistry(); // registry is wired but nothing is certified
 
-        // --- Over-cap proposal: net outflow > maxCapital → MaxNetOutflowExceeded.
+        // --- Over-cap proposal: gross outflow on the `deploy` call (index 1)
+        // exceeds its declared cap (MAX_CAPITAL) -> CallCapExceeded.
         // Run FIRST: the revert rolls the whole tx back (proposal stays Approved,
         // slot still held, no settlement), so the proposer can cancel to free the
         // single-open-proposal slot without a prior settlement muddying state.
         uint256 amountOver = MAX_CAPITAL * 2; // 2_000e6 > 1_000e6 cap, < 60_000e6 balance
-        uint256 pidOver = _propose(_deployCalls(amountOver));
+        uint256 pidOver = _proposeDeployCalls(_deployCalls(amountOver));
         assertEq(governor.getProposalTier(pidOver), 2, "uncertified => tier 2");
-        // Finding 5: coverage = per-call SUM over execute AND settlement calls;
-        // each uncertified call contributes full notional (2 exec + 1 settle).
-        assertEq(governor.getRequiredCoverage(pidOver), 3 * MAX_CAPITAL, "tier 2 => full notional per call");
+        // Finding 5: coverage = per-call SUM over execute AND settlement calls.
+        // `_proposeDeployCalls` caps: exec `approve`=0, exec `deploy`=MAX_CAPITAL,
+        // settle (1 call, default cap)=MAX_CAPITAL — all three calls uncertified
+        // (10_000 bps): 0 + MAX_CAPITAL + MAX_CAPITAL = 2 * MAX_CAPITAL (not the
+        // pre-#43 3x: the balance-invisible `approve` call now correctly prices
+        // at its own declared cap of zero, not a shared maxCapital notional).
+        assertEq(governor.getRequiredCoverage(pidOver), 2 * MAX_CAPITAL, "tier 2 => full notional per declared cap");
 
         _advancePastVoting();
-        // MaxNetOutflowExceeded carries (netOutflow, cap) — full encode so the
+        // CallCapExceeded carries (index, outflow, cap) — full encode so the
         // args match too (bare-selector expectRevert only matches no-arg errors).
-        // The whole `amountOver` is moved out, so netOutflow == amountOver.
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, amountOver, MAX_CAPITAL));
+        // The whole `amountOver` is moved out by the `deploy` call (index 1),
+        // so its measured outflow == amountOver, against its declared cap of
+        // MAX_CAPITAL.
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, amountOver, MAX_CAPITAL));
         governor.executeProposal(pidOver);
 
         // Free the (still-Approved) slot so a fresh proposal can be filed.
@@ -222,9 +286,9 @@ contract TierEndToEndTest is Test {
 
         // --- Within-cap proposal: executes and moves exactly `amountOk` out.
         uint256 amountOk = MAX_CAPITAL / 2; // 500e6 <= cap
-        uint256 pidOk = _propose(_deployCalls(amountOk));
+        uint256 pidOk = _proposeDeployCalls(_deployCalls(amountOk));
         assertEq(governor.getProposalTier(pidOk), 2);
-        assertEq(governor.getRequiredCoverage(pidOk), 3 * MAX_CAPITAL); // 2 exec + 1 settle, all uncertified
+        assertEq(governor.getRequiredCoverage(pidOk), 2 * MAX_CAPITAL); // see arithmetic above
 
         // Same warp clears both the voting window AND the cancel-stamped cooldown.
         _advancePastVoting();
@@ -251,10 +315,10 @@ contract TierEndToEndTest is Test {
     ///         at the stale, under-covered price.
     function test_e2e_certifiedAdapterReducedCoverage() public {
         _wireTierRegistry();
-        tierRegistry.certify(address(adapter), adapter.deploy.selector, 0, 100); // tier 0, 1%
+        _certifyNow(address(adapter), adapter.deploy.selector, 0, 100, address(0)); // tier 0, 1%
         // Finding 5: settlement calls count toward coverage too — certify the
         // settle call's (usdc, approve) pair so the whole proposal is bounded.
-        tierRegistry.certify(address(usdc), usdc.approve.selector, 0, 100);
+        _certifyNow(address(usdc), usdc.approve.selector, 0, 100, address(0));
 
         uint256 pid = _propose(_singleDeployCall(MAX_CAPITAL));
         assertEq(governor.getProposalTier(pid), 0, "certified tier 0 snapshotted at propose");

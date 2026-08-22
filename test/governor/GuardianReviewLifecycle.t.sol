@@ -17,6 +17,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title GuardianReviewLifecycle.t
 /// @notice End-to-end tests for the Task 25 guardian-review proposal lifecycle.
@@ -108,6 +109,10 @@ contract GuardianReviewLifecycleTest is Test {
         //   swoodImpl (+0), swoodProxy (+1), govImpl (+2), govProxy (+3),
         //   regImpl (+4), regProxy (+5).
         ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
+        // Hoisted ABOVE the nonce snapshot: the governor's mandatory tier-registry
+        // argument (pashov finding #1) is a DEPLOYMENT, so leaving it inline in the
+        // `initialize` tuple would consume a nonce and slide every predicted address.
+        address fixtureTierRegistry = address(deployTierRegistry(address(this)));
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
@@ -125,10 +130,8 @@ contract GuardianReviewLifecycleTest is Test {
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -140,7 +143,8 @@ contract GuardianReviewLifecycleTest is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 predictedRegistryProxy,
                 address(_hoistedPC),
-                address(this), // factory (test contract)
+                address(this),
+                fixtureTierRegistry, // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -170,8 +174,11 @@ contract GuardianReviewLifecycleTest is Test {
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
         // Authorize the per-vault governor on the composite-key registry
         // (replaces the removed governor.addVault wiring).
+        // Hoisted: `vault()` is a call, so evaluating it as an argument would
+        // consume the prank and leave `addGovernor` unauthorized.
+        address govVault = governor.vault();
         vm.prank(registry.factory());
-        registry.addGovernor(address(governor));
+        registry.addGovernor(address(governor), govVault);
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
 
         // Resolve the registry ↔ sWOOD circular dependency.
@@ -251,7 +258,9 @@ contract GuardianReviewLifecycleTest is Test {
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
     }
@@ -291,15 +300,18 @@ contract GuardianReviewLifecycleTest is Test {
         vm.prank(g2);
         registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
 
-        // Review ends → state resolves to Approved (no blocks).
+        // Review ends → the view resolves to Approved IMMEDIATELY. Pre-refactor
+        // it reported GuardianReview here until a mutating call poked
+        // `resolveReview`; `stateOf` is now a true view and never lags a
+        // determinable outcome, so no poke is needed to learn the fate.
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         assertEq(
             uint256(governor.getProposalState(pid)),
-            uint256(ISyndicateGovernor.ProposalState.GuardianReview),
-            "before resolveReview, the view path still sees GuardianReview"
+            uint256(ISyndicateGovernor.ProposalState.Approved),
+            "true view: Approved as soon as reviewEnd passes with no block quorum"
         );
 
-        // Execute drives `_resolveState` which calls `resolveReview`.
+        // Execute drives `_commitState`, which performs the economic commit.
         governor.executeProposal(pid);
         assertEq(
             uint256(governor.getProposal(pid).state),
@@ -315,6 +327,151 @@ contract GuardianReviewLifecycleTest is Test {
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
         governor.settleProposal(pid);
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
+    /// @notice PR #195 review, item 7 — the piece that was documented but never
+    ///         driven: pause-deferral MEETING the governor's wall-clock expiry,
+    ///         against a real governor rather than asserted in a comment.
+    /// @dev    `GuardianRegistry`'s own `test_finding7_repeatedPauseCyclesCompound`
+    ///         pins that resolution is refused past the raw `reviewEnd`, but it
+    ///         runs on a `MockGovernorMinimal` with no `executeBy` at all, so it
+    ///         cannot see what the deferral costs the proposal. This can.
+    ///
+    ///         BOTH HALVES OF THE TRADEOFF IN ONE TRACE. Pre-fix, a pause
+    ///         spanning `[voteEnd, reviewEnd)` left `r.opened == false` with no
+    ///         guardian able to change it — `openReview` and `voteOnProposal`
+    ///         are both `whenNotPaused` — and `outcomeOf` scored that emptiness
+    ///         as `Cleared`, so the proposal became executable off a review that
+    ///         structurally could not happen. Post-fix the registry hands the
+    ///         review its window back on its own clock and reports the honest
+    ///         `Unresolved`; `ProposalLifecycle._afterVote` maps that to
+    ///         terminal `Expired`, because `p.executeBy` lives on the governor
+    ///         and is NOT pause-adjusted.
+    ///
+    ///         So the deferral does not rescue the proposal — it kills it. That
+    ///         is the accepted cost recorded in `GuardianRegistry.unpause`, and
+    ///         the direction is what matters: REFUSAL, never an unearned
+    ///         approval. An ordinary incident pause is enough; no malice is
+    ///         required, which is exactly why it is pinned rather than assumed.
+    function test_reviewItem7_pauseSpanningReviewWindow_expiresProposal_neverClearsIt() public {
+        uint256 pid = _propose();
+        _voteFor(pid);
+
+        // Voting closes. The proposal now waits on a guardian review that
+        // nobody has opened yet — the state finding #7 is about.
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        assertEq(
+            uint256(governor.getProposalState(pid)),
+            uint256(ISyndicateGovernor.ProposalState.GuardianReview),
+            "waiting on a guardian review before the pause"
+        );
+
+        // The registry goes down across the whole review window AND the
+        // execution window behind it.
+        vm.prank(owner);
+        registry.pause();
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + EXECUTION_WINDOW + 1);
+        vm.prank(owner);
+        registry.unpause();
+        assertGt(registry.pauseShiftTotal(), REVIEW_PERIOD, "the pause really did span the whole review window");
+
+        // The registry refuses to call it: the review's own clock has not
+        // reached `reviewEnd`, so the outcome is UNDETERMINED, not clean.
+        assertEq(
+            uint256(registry.outcomeOf(address(governor), pid)),
+            uint256(IGuardianRegistry.ReviewOutcome.Unresolved),
+            "a deferred review must not report Cleared"
+        );
+
+        // THE INTERACTION: the governor's deadline never moved, so the proposal
+        // lands terminal-Expired rather than Approved.
+        assertEq(
+            uint256(governor.getProposalState(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Expired),
+            "a pause spanning the review window must expire the proposal, never approve it"
+        );
+    }
+
+    /// @notice Pashov 2026-08 finding #2 — the OTHER half of the pause tradeoff.
+    /// @dev    `test_reviewItem7_pauseSpanningReviewWindow_expiresProposal_neverClearsIt`
+    ///         above pins a pause that outlives `executeBy`, where terminal
+    ///         Expired is the correct and intended outcome. This pins the case
+    ///         it does not reach: a SHORT pause, with the whole execution window
+    ///         still ahead of the proposal.
+    ///
+    ///         Pre-fix, `_afterVote` mapped the registry's honest "deferred, not
+    ///         yet decided" `Unresolved` onto terminal `Expired` unconditionally,
+    ///         so ANY pause — an ordinary incident pause of a single minute —
+    ///         permanently killed every in-flight proposal the moment WALL time
+    ///         crossed `reviewEnd`, while the registry's own `_effNow` had not.
+    ///         The window is exactly `pauseShiftTotal` wide and the write is
+    ///         latched by the permissionless `resolveProposalState`, so no
+    ///         malice and no privileged actor is required on the harmful step.
+    ///
+    ///         Asserted here: inside that window the proposal stays
+    ///         GuardianReview rather than Expired, and once the deferred window
+    ///         genuinely closes it resolves and executes normally.
+    function test_pashovFinding2_shortPauseDefersReview_doesNotExpireProposal() public {
+        uint256 pid = _propose();
+        _voteFor(pid);
+
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        registry.openReview(address(governor), pid);
+        vm.prank(g1);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve);
+
+        // An ordinary, SHORT incident pause partway through the review window.
+        uint256 pauseSpan = 1 hours;
+        vm.prank(owner);
+        registry.pause();
+        vm.warp(vm.getBlockTimestamp() + pauseSpan);
+        vm.prank(owner);
+        registry.unpause();
+        assertEq(registry.pauseShiftTotal(), pauseSpan, "the shift is the pause span, nothing more");
+
+        // Wall clock crosses the governor's reviewEnd while the registry's
+        // effective clock has not: the registry honestly reports Unresolved.
+        // Anchored to the value the CONTRACT stored, not to a local read of
+        // `block.timestamp` — the optimizer CSEs those across `vm.warp`.
+        uint256 reviewEnd = governor.getProposal(pid).reviewEnd;
+        vm.warp(reviewEnd + 1);
+        assertEq(
+            uint256(registry.outcomeOf(address(governor), pid)),
+            uint256(IGuardianRegistry.ReviewOutcome.Unresolved),
+            "a deferred review is undetermined, not absent"
+        );
+
+        // THE FIX. Pre-fix this read Expired, terminally, with ~23h of execution
+        // window left. The proposal is still alive and still in review.
+        assertEq(
+            uint256(governor.getProposalState(pid)),
+            uint256(ISyndicateGovernor.ProposalState.GuardianReview),
+            "a short pause must defer the review, never expire the proposal"
+        );
+
+        // And the permissionless latch must not be able to write it terminal
+        // either — this is the call an attacker front-runs the proposer with.
+        governor.resolveProposalState(pid);
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.GuardianReview),
+            "resolveProposalState must not latch a deferred review as Expired"
+        );
+
+        // Once the deferred window actually closes, the review resolves and the
+        // proposal executes normally — the deferral cost it nothing.
+        vm.warp(reviewEnd + pauseSpan + 1);
+        assertEq(
+            uint256(governor.getProposalState(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Approved),
+            "the deferred window closes and the review clears"
+        );
+        governor.executeProposal(pid);
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Executed),
+            "a proposal that survived a short pause still executes"
+        );
     }
 
     /// @notice Block quorum hit → proposal rejected and approvers slashed.
@@ -372,7 +529,12 @@ contract GuardianReviewLifecycleTest is Test {
     /// @notice When the guardian cohort is below MIN_COHORT_STAKE_AT_OPEN at
     ///         openReview time, the review auto-resolves to Approved with zero
     ///         slashing regardless of how any vote shakes out.
-    function test_lifecycle_cohortTooSmall_autoApproves_noSlashing() public {
+    /// @dev Inverted with the removal of the cold-start waiver. A thin cohort
+    ///      no longer auto-approves: whoever is staked decides. Nobody votes
+    ///      here, so the review clears and the proposal executes — but it
+    ///      clears because there were no BLOCK votes, not because the cohort
+    ///      was waived through.
+    function test_lifecycle_thinCohortStillReviewsNormally() public {
         // Drain the cohort below 50k: request unstake from 3 guardians so only
         // g1 + g2 remain active (40k < 50k).
         vm.prank(g3);
@@ -388,8 +550,8 @@ contract GuardianReviewLifecycleTest is Test {
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
         registry.openReview(address(governor), pid);
 
-        (,,, bool cohortTooSmall) = registry.getReviewState(address(governor), pid);
-        assertTrue(cohortTooSmall, "cohort flagged as too small");
+        (bool opened,,) = registry.getReviewState(address(governor), pid);
+        assertTrue(opened, "a thin cohort opens a real review rather than being waived");
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
 
@@ -453,7 +615,15 @@ contract GuardianReviewLifecycleTest is Test {
 
         // Age-weighted voting: mature the freshly staked blockers to par so
         // their block votes carry full weight against the raw denominator.
-        skip(30 days);
+        //
+        // 31 days, not 30, and the extra day is load-bearing. Vote weight is
+        // now read at the PROPOSE-time snapshot rather than at review-open, so
+        // the growth gate's `snapshot - FLOOR_LOOKBACK` lookback lands a
+        // voting period earlier than it used to. At exactly 30 days that
+        // lookback falls just BEFORE these guardians staked, so the gate reads
+        // their stake as having grown from zero and clamps them to zero —
+        // `NotActiveGuardian`. That is the gate working, not a regression.
+        skip(31 days);
 
         uint256 pid = _propose();
         _voteFor(pid);
@@ -592,12 +762,10 @@ contract GuardianReviewLifecycleTest is Test {
         );
 
         // Registry review is now cached as resolved=true, blocked=false, opened=false.
-        (bool opened, bool resolved, bool blocked, bool cohortTooSmall) =
-            registry.getReviewState(address(governor), pid);
+        (bool opened, bool resolved, bool blocked) = registry.getReviewState(address(governor), pid);
         assertFalse(opened, "review never opened");
         assertTrue(resolved, "review cached resolved");
         assertFalse(blocked, "review not blocked");
-        assertFalse(cohortTooSmall, "cohortTooSmall flag stays unset when !opened");
 
         // No guardian slashing occurred.
         assertEq(swood.guardianStake(g1), GUARDIAN_STAKE, "g1 stake untouched");

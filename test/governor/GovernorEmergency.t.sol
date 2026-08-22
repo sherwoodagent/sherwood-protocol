@@ -18,6 +18,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title GovernorEmergency.t
 /// @notice Tests for the Task 24 guardian-review emergency settle lifecycle.
@@ -105,6 +106,10 @@ contract GovernorEmergencyTest is Test {
         //   swoodImpl (+0), swoodProxy (+1), govImpl (+2), govProxy (+3),
         //   regImpl (+4), regProxy (+5).
         ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
+        // Hoisted ABOVE the nonce snapshot: the governor's mandatory tier-registry
+        // argument (pashov finding #1) is a DEPLOYMENT, so leaving it inline in the
+        // `initialize` tuple would consume a nonce and slide every predicted address.
+        address fixtureTierRegistry = address(deployTierRegistry(address(this)));
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
@@ -122,10 +127,8 @@ contract GovernorEmergencyTest is Test {
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -137,7 +140,8 @@ contract GovernorEmergencyTest is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 predictedRegistryProxy,
                 address(_hoistedPC),
-                address(this), // factory (test contract)
+                address(this),
+                fixtureTierRegistry, // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -170,7 +174,10 @@ contract GovernorEmergencyTest is Test {
         // Authorize the per-vault governor on the composite-key registry
         // (replaces the removed governor.addVault wiring).
         vm.prank(registry.factory());
-        registry.addGovernor(address(governor));
+        // The vault is load-bearing, not a placeholder: the emergency slash path
+        // resolves its owner-bond target from `vaultOf[governor]` (it no longer
+        // calls back into the governor for it).
+        registry.addGovernor(address(governor), address(vault));
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
 
         // Resolve the registry ↔ sWOOD circular dependency.
@@ -264,7 +271,9 @@ contract GovernorEmergencyTest is Test {
             duration,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -363,6 +372,277 @@ contract GovernorEmergencyTest is Test {
         governor.emergencySettleWithCalls(pid, _customCalls());
     }
 
+    /// @notice pashov 2026-08 finding 22. Under the documented `minOwnerStake ==
+    ///         0` open-onboarding sentinel, `requiredOwnerBond` used to collapse
+    ///         to 0 with it, so this gate evaluated `0 < 0` — FALSE — and opened
+    ///         an emergency review with NO bond posted. `bindOwnerStake` had
+    ///         bound a zero-amount stake and `slashOwnerBond` returns early on
+    ///         `amount == 0`, so the deterrent behind `finalizeEmergencySettle`
+    ///         (owner-supplied calldata, per-call metering off, bounded only by
+    ///         `effectiveMaxCapital`) was a complete no-op — and, since the slot
+    ///         is deleted after any successful slash, it stayed one forever.
+    ///
+    ///         sWOOD's `requiredOwnerBond` now floors at `MIN_OWNER_BOND_FLOOR`
+    ///         regardless of the sentinel. The sentinel's other half — anyone
+    ///         may OPEN a vault with no bond — is untouched.
+    function test_emergencySettleWithCalls_revertsAtZeroBondUnderOpenOnboarding() public {
+        // The protocol-wide creation floor drops to the open-onboarding sentinel…
+        vm.prank(owner);
+        swood.setMinOwnerStake(0);
+        // …and this vault holds no bond at all.
+        _zeroOwnerStake(address(vault));
+        assertEq(registry.ownerStake(address(vault)), 0, "no bond posted");
+        assertEq(swood.minOwnerStake(), 0, "sentinel active");
+        assertEq(
+            registry.requiredOwnerBond(address(vault)),
+            swood.MIN_OWNER_BOND_FLOOR(),
+            "emergency requirement does not follow the sentinel to zero"
+        );
+
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.OwnerBondInsufficient.selector);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+    }
+
+    /// @notice The governor-local half of the same fix: `posted == 0` is checked
+    ///         on its own, not left to `posted < required`. `_guardianRegistry`
+    ///         is a settable pointer, so a registry that stops enforcing the
+    ///         bond (here: one reporting a zero requirement) must not be able to
+    ///         reopen the hole. Deliberately redundant with the sWOOD floor —
+    ///         this is a security gate and it fails closed on its own terms.
+    function test_emergencySettleWithCalls_revertsAtZeroBondEvenIfRegistryReportsNoRequirement() public {
+        _zeroOwnerStake(address(vault));
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.mockCall(
+            address(registry),
+            abi.encodeCall(IGuardianRegistry.requiredOwnerBond, (address(vault))),
+            abi.encode(uint256(0))
+        );
+        assertEq(registry.requiredOwnerBond(address(vault)), 0, "registry reports no requirement");
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.OwnerBondInsufficient.selector);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+    }
+
+    // ── 2026-08 sweep finding #11 — the gate read what the call burns ──
+    //
+    // `emergencySettleWithCalls` measured the owner bond BEFORE
+    // `reg.openEmergency`, and `openEmergency` does not only open: when a
+    // previous round is unresolved it calls `_resolveEmergency`, which on a
+    // blocked verdict calls `slashOwnerBond` — and that DELETES the stake.
+    // Nothing re-asserted the bond afterwards, so the gate passed on collateral
+    // the same transaction was about to destroy.
+    //
+    // The owner does not race anyone for this. `_resolveEmergency` is gated on
+    // `_effNow >= er.reviewEnd`, and so is the permissionless
+    // `resolveEmergencyReview` — both predicates flip at the SAME instant, and
+    // `openEmergency`'s own natspec says so. The owner simply picks that block.
+
+    /// @dev THE TRACE from the issue, end to end. Round 1 is blocked by
+    ///      guardian quorum; at exactly `reviewEnd` the owner re-opens rather
+    ///      than letting anyone resolve. Before the fix this SUCCEEDED: the
+    ///      gate read the live bond, `openEmergency` then burned it in place,
+    ///      and round 2 went live with zero slashable collateral — one free
+    ///      unbonded run at owner-authored calldata, which
+    ///      `finalizeEmergencySettle` executes with EMPTY per-call caps.
+    function test_emergencySettleWithCalls_cannotReopenOnABondTheSameCallBurns() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        vm.prank(guardianA);
+        registry.voteBlockEmergencySettle(address(governor), pid);
+        vm.prank(guardianB);
+        registry.voteBlockEmergencySettle(address(governor), pid);
+
+        // EXACTLY `reviewEnd` — the instant both predicates flip. Warping past
+        // it would work too; landing on it is the adversary's actual move and
+        // pins that the boundary itself is covered.
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.OwnerBondInsufficient.selector);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+    }
+
+    /// @dev THE STATE THE REVERT PROTECTS, asserted rather than inferred. A
+    ///      passing `expectRevert` above says only "this call failed"; it does
+    ///      not say the vault was left with an intact bond and no live round.
+    ///      Both matter — an unbonded OPEN round is the actual defect.
+    function test_emergencySettleWithCalls_reopenAttemptLeavesTheBondAndRoundIntact() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+        vm.prank(guardianA);
+        registry.voteBlockEmergencySettle(address(governor), pid);
+        vm.prank(guardianB);
+        registry.voteBlockEmergencySettle(address(governor), pid);
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.OwnerBondInsufficient.selector);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        // The whole transaction unwound, slash included — so the verdict round 1
+        // earned is still THERE to be committed by the permissionless resolver,
+        // rather than having been spent to admit an unbonded round 2.
+        assertEq(registry.ownerStake(address(vault)), MIN_OWNER_STAKE, "the bond was burned by the failed re-open");
+
+        registry.resolveEmergencyReview(address(governor), pid);
+        assertEq(registry.ownerStake(address(vault)), 0, "the honest resolver could no longer slash");
+    }
+
+    /// @dev THE CHECK AT THE POINT OF USE. The bond is the only economic
+    ///      deterrent behind `finalizeEmergencySettle`'s owner-authored calls,
+    ///      which run with EMPTY per-call caps — so the invariant that matters
+    ///      is "bonded when the calls RUN", and the open-time gate is only a
+    ///      proxy for it. Finding #11 was that proxy failing. This pins the
+    ///      backstop: a round that reaches finalize with the slot emptied
+    ///      cannot execute, whatever route emptied it.
+    ///
+    ///      The bond is zeroed directly here because no route to that state
+    ///      survives the fix — which is the point of a defence-in-depth check.
+    ///      `_zeroOwnerStake` is the same stdstore helper the zero-bond gate
+    ///      tests above use.
+    function test_finalizeEmergencySettle_revertsIfTheBondIsGoneByExecutionTime() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        // Review elapses with no block votes — the calls are approved.
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
+        _zeroOwnerStake(address(vault));
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.OwnerBondInsufficient.selector);
+        governor.finalizeEmergencySettle(pid);
+    }
+
+    /// @dev Non-vacuity for the check above: the SAME sequence with the bond
+    ///      left in place must finalize. Without this, the test above would
+    ///      also pass against a finalize that reverted unconditionally.
+    function test_finalizeEmergencySettle_stillRunsWithTheBondPosted() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
+
+        assertEq(registry.ownerStake(address(vault)), MIN_OWNER_STAKE, "precondition: the bond is not posted");
+
+        vm.prank(owner);
+        governor.finalizeEmergencySettle(pid);
+    }
+
+    /// @dev THE SUB-QUORUM ROUND — a state this file had no coverage for at
+    ///      all. Votes were cast, the bar was not met, and the re-open must
+    ///      therefore SUCCEED: nothing is slashed, so the bond the gate reads
+    ///      after `openEmergency` is still there. That is the boundary between
+    ///      this and the two finding #11 tests above, which differ only in
+    ///      whether quorum was reached.
+    ///
+    ///      WHAT IT DOES NOT PIN, stated because an earlier draft of this
+    ///      comment claimed otherwise and was wrong: the closing vote here does
+    ///      NOT measure `openEmergency`'s in-place `_resolveEmergency`. Votes
+    ///      are retired by the unconditional `er.round++`, so guardian C can
+    ///      vote again whether or not the resolve ran — verified by deleting
+    ///      the resolve and watching this test stay green while the two above
+    ///      went red. The in-place resolve is pinned by THOSE tests, being the
+    ///      call that empties the bond their gate then catches.
+    ///
+    ///      A third guardian is registered LOCALLY rather than in `setUp`
+    ///      because the fixture's two guardians hold 30k each: any single vote
+    ///      is 50% of the cohort and clears the 30% block quorum on its own, so
+    ///      a sub-quorum round is unconstructible with them. `guardianC` at the
+    ///      10k minimum votes alone for 10k/70k = 14%, under the bar.
+    function test_emergencySettleWithCalls_reopenAfterASubQuorumRoundRetiresItsVotes() public {
+        address guardianC = makeAddr("guardianC");
+        wood.mint(guardianC, 100_000e18);
+        vm.prank(guardianC);
+        wood.approve(address(swood), type(uint256).max);
+        vm.prank(guardianC);
+        swood.stakeAsGuardian(MIN_GUARDIAN_STAKE, 3);
+        // Mature to par, so the vote carries full weight rather than an
+        // age-discounted one that would clear the bar for the wrong reason.
+        skip(30 days);
+
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        vm.prank(guardianC);
+        registry.voteBlockEmergencySettle(address(governor), pid);
+
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
+
+        // The re-open must succeed: the prior round was under quorum, so the
+        // in-place resolve records "not blocked", no slash fires, and the bond
+        // the gate now reads afterwards is still there.
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+        assertEq(registry.ownerStake(address(vault)), MIN_OWNER_STAKE, "a sub-quorum round slashed the bond");
+
+        // Round 1's vote was retired by the round bump, so the same guardian
+        // votes again without `AlreadyVoted`. This pins the round-keying of
+        // `_emergencyBlockVotes`, not the in-place resolve — see the note above.
+        vm.prank(guardianC);
+        registry.voteBlockEmergencySettle(address(governor), pid);
+    }
+
+    /// @dev NOT A BLANKET REFUSAL of re-opening. With the prior round resolved
+    ///      as NOT blocked, no slash fires, the bond survives `openEmergency`,
+    ///      and the owner may open again — which is the legitimate flow this
+    ///      fix must leave alone. Without this control the two tests above
+    ///      would also hold for a change that simply broke re-opening.
+    function test_emergencySettleWithCalls_reopenStillWorksWhenTheLastRoundWasNotBlocked() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        // No block votes this round, so the elapsed window resolves clean.
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        assertTrue(registry.isEmergencyOpen(address(governor), pid), "a clean round could no longer be re-opened");
+        assertEq(registry.ownerStake(address(vault)), MIN_OWNER_STAKE, "an unblocked round slashed the bond");
+    }
+
+    /// @notice Positive control for both tests above: with a real bond posted
+    ///         the escape hatch still opens. Guards against the gate degrading
+    ///         into "always revert".
+    function test_emergencySettleWithCalls_stillOpensAtZeroSentinelWithARealBond() public {
+        vm.prank(owner);
+        swood.setMinOwnerStake(0);
+        // The vault's bond from setUp (MIN_OWNER_STAKE) is left in place.
+        assertGe(registry.ownerStake(address(vault)), swood.MIN_OWNER_BOND_FLOOR());
+
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+        assertTrue(registry.isEmergencyOpen(address(governor), pid), "review opened");
+    }
+
     // ──────────────────────────────────────────────────────────────
     // cancelEmergencySettle
     // ──────────────────────────────────────────────────────────────
@@ -387,6 +667,35 @@ contract GovernorEmergencyTest is Test {
         vm.prank(owner);
         vm.expectRevert(IGuardianRegistry.ReviewNotReadyForResolve.selector);
         governor.finalizeEmergencySettle(pid);
+    }
+
+    /// @notice `voteOnProposal` carries an explicit `if (r.resolved) revert
+    ///         ReviewNotOpen()` and calls it defence in depth. Its emergency
+    ///         twin had no such guard — it tested only `er.reviewEnd`, which
+    ///         `cancelEmergency` REPURPOSES as a post-cancel cooldown deadline
+    ///         (`reviewEnd = block.timestamp + reviewPeriod`, Sherlock #15).
+    ///         So for a full `reviewPeriod` after a cancel, `block.timestamp <
+    ///         er.reviewEnd` still held and votes were accepted into a resolved
+    ///         review — guardians reacting to `EmergencyReviewOpened` burn gas
+    ///         on a vote that can never count and consume their `AlreadyVoted`
+    ///         flag for that nonce.
+    function test_voteBlockEmergencySettle_revertsAfterCancel() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+
+        // Cancel with no votes cast, so the Sherlock #44 quorum gate allows it.
+        vm.prank(owner);
+        governor.cancelEmergencySettle(pid);
+        assertFalse(registry.isEmergencyOpen(address(governor), pid), "cancel resolves the emergency review");
+
+        // Still inside the repurposed cooldown window, so the reviewEnd test
+        // alone would let this through.
+        vm.prank(guardianA);
+        vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
+        registry.voteBlockEmergencySettle(address(governor), pid);
     }
 
     /// @notice Regression for PR #229 critical fix: cancelling an emergency
@@ -534,6 +843,62 @@ contract GovernorEmergencyTest is Test {
         assertFalse(vault.redemptionsLocked());
     }
 
+    /// @notice The settle-price floor (pashov #2/#12) is defended as "not stuck,
+    ///         just redirected to `finalizeEmergencySettle`". That claim is worth
+    ///         exactly what it is tested at, and nothing else in the suite walks
+    ///         the redirection end to end — so walk it here.
+    ///
+    /// @dev    This is the band the floor NEWLY closes, and it is a band the
+    ///         protocol explicitly permits: `GovEnvelope.permissive` declares
+    ///         `maxDrawdownBps == 10_000`, i.e. voters accepted a total loss, so
+    ///         the CAPITAL floor does not bind and a genuine >90% loss is an
+    ///         allowed outcome. Both permissionless-ish exits now refuse it —
+    ///         `settleProposal` on the declared-envelope bar and `unstick` on the
+    ///         absolute backstop, which are the same 10% number here — which
+    ///         leaves `_activeProposal` set and the whole vault frozen. The only
+    ///         remaining exit is the bonded, guardian-reviewed one, and it must
+    ///         actually work.
+    function test_subFloorSettlementIsClearedByFinalizeEmergencySettle() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        // A near-total loss. Modelled on the vault balance directly: the floor
+        // reads the realized price, and how it got there (flash loan, genuine
+        // loss, a strategy that did not deliver) is not something the governor
+        // distinguishes.
+        deal(address(usdc), address(vault), 0);
+
+        vm.prank(random);
+        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
+        governor.settleProposal(pid);
+
+        vm.prank(owner);
+        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
+        governor.unstick(pid);
+
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Executed),
+            "both refusals leave the proposal, and therefore the vault, locked"
+        );
+        assertTrue(vault.redemptionsLocked(), "the vault really is frozen in the meantime");
+
+        // The documented exit: owner bond (posted in setUp), an opened
+        // emergency, a full review period, no guardian block.
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _customCalls());
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
+        vm.prank(owner);
+        governor.finalizeEmergencySettle(pid);
+
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Settled),
+            "the redirection target must actually clear a sub-floor settlement"
+        );
+        assertFalse(vault.redemptionsLocked(), "and must unfreeze the vault");
+    }
+
     function test_finalizeEmergencySettle_blocked_reverts() public {
         uint256 pid = _createExecutedProposal(7 days);
         vm.warp(vm.getBlockTimestamp() + 7 days);
@@ -551,6 +916,47 @@ contract GovernorEmergencyTest is Test {
 
         vm.prank(owner);
         vm.expectRevert(ISyndicateGovernor.EmergencySettleBlocked.selector);
+        governor.finalizeEmergencySettle(pid);
+    }
+
+    /// @notice Issue #93 — the emergency path is the WEAKEST way into
+    ///         `executeGovernorBatch`, and therefore the one that matters most:
+    ///         the calls are owner-supplied, there is no LP vote, no coverage
+    ///         quorum, and with no guardian block votes cast, no second
+    ///         signature either. `_guardBatchCalls` runs on every
+    ///         `executeGovernorBatch` invocation regardless of which governor
+    ///         entrypoint drove it, so the privileged-target denylist covers
+    ///         this path for free — no per-entrypoint duplication.
+    ///
+    /// @dev    Asserts the vault-self target, because this harness binds no
+    ///         withdrawal queue. The queue variant of the same claim — a
+    ///         batch naming the bound queue rejected by
+    ///         `executeGovernorBatch` — is pinned at the unit level in
+    ///         `test/audit-fixes/Vault_batchQueueTargets.t.sol`, which drives
+    ///         that entrypoint directly. (Issue #118 retired the lifecycle
+    ///         version reached via `unstick`: it required a STORED
+    ///         queue-targeting settlement batch, and `propose` now rejects
+    ///         such a batch before it can ever be stored — see
+    ///         `test/audit-fixes/Vault_batchQueueTargets_lifecycle.t.sol`.)
+    function test_finalizeEmergencySettle_vaultSelfTargetingCalls_reverts() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(vault),
+            data: abi.encodeCall(ISyndicateVault.transferPerformanceFee, (address(usdc), random, 1_000e6)),
+            value: 0
+        });
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, calls);
+
+        // No guardian blocks → the review resolves clean and the owner is
+        // entitled to finalize. The batch itself is what refuses.
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(vault)));
         governor.finalizeEmergencySettle(pid);
     }
 
@@ -838,5 +1244,146 @@ contract GovernorEmergencyTest is Test {
             "proposal settled via registry-returned calls"
         );
         assertFalse(vault.redemptionsLocked());
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Issue #43 §8.5 — the cap-breach lifecycle end to end
+    // ──────────────────────────────────────────────────────────────
+
+    /// @dev Propose, vote, and let the guardian review resolve to Approved —
+    ///      mirrors `_createExecutedProposal` exactly up to (but not
+    ///      including) `executeProposal`, so callers can drive execute/settle
+    ///      themselves and assert on a breach.
+    function _proposeVoteApprove(
+        BatchExecutorLib.Call[] memory execCalls,
+        uint256[] memory execCaps,
+        BatchExecutorLib.Call[] memory settleCalls,
+        uint256[] memory settleCaps,
+        uint256 duration
+    ) internal returns (uint256 proposalId) {
+        vm.prank(agent);
+        proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://cap-breach",
+            duration,
+            GovEnvelope.permissive(address(vault)),
+            execCalls,
+            execCaps,
+            settleCalls,
+            settleCaps,
+            _emptyCoProposers()
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        registry.openReview(address(governor), proposalId);
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
+    }
+
+    /// @notice An execute-leg cap breach reverts `executeProposal` and the
+    ///         proposal stays `Approved` (it simply expires at `executeBy` if
+    ///         never re-executed within bounds) — matching the vault's own
+    ///         `MaxNetOutflowExceeded` idiom at execute time.
+    function test_capBreach_executeLeg_leavesProposalApproved() public {
+        address sink = makeAddr("execSink");
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0
+        });
+        uint256[] memory execCaps = new uint256[](1);
+        execCaps[0] = 500e6; // too tight -- the call moves 1_000e6
+
+        uint256 pid = _proposeVoteApprove(execCalls, execCaps, _settleCalls(), new uint256[](1), 7 days);
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
+
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1_000e6, 500e6));
+        governor.executeProposal(pid);
+
+        assertEq(
+            uint256(governor.getProposalState(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Approved),
+            "stays Approved -- expires at executeBy, never silently executed"
+        );
+        assertEq(usdc.balanceOf(sink), 0, "nothing moved");
+    }
+
+    /// @notice A settle-leg cap breach leaves the proposal stuck `Executed`
+    ///         (matching a settlement-leg `MaxNetOutflowExceeded` breach's
+    ///         existing shape), and `unstick` — which REPLAYS the exact
+    ///         stored settlement calls under the exact stored caps — reverts
+    ///         identically. Relief is the guardian-reviewed
+    ///         `emergencySettleWithCalls` path (next test), not `unstick`.
+    function test_capBreach_settleLeg_leavesExecutedAndUnstickReplaysIdentically() public {
+        address sink = makeAddr("settleSink");
+        uint256[] memory execCaps = GovEnvelope.defaultCaps(GovEnvelope.permissive(address(vault)).maxCapital, 1);
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0
+        });
+        uint256[] memory settleCaps = new uint256[](1);
+        settleCaps[0] = 500e6; // too tight -- the call moves 1_000e6
+
+        uint256 pid = _proposeVoteApprove(_execCalls(), execCaps, settleCalls, settleCaps, 7 days);
+        governor.executeProposal(pid); // exec leg is benign (approve only) -- succeeds
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Executed));
+
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1_000e6, 500e6));
+        governor.settleProposal(pid);
+        assertEq(
+            uint256(governor.getProposalState(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Executed),
+            "stuck Executed, not silently settled"
+        );
+
+        // unstick replays the SAME stored settlement calls under the SAME
+        // stored caps -- it does not relax the declaration, so it fails
+        // identically.
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1_000e6, 500e6));
+        governor.unstick(pid);
+        assertEq(usdc.balanceOf(sink), 0, "nothing moved by either attempt");
+    }
+
+    /// @notice The spec's rescue story end to end: from the SAME stuck-Executed
+    ///         proposal a settlement-leg cap breach produces, the owner's
+    ///         guardian-reviewed `emergencySettleWithCalls` ->
+    ///         `finalizeEmergencySettle` path succeeds under EMPTY caps —
+    ///         bounded only by the batch-level `maxCapital`, not the
+    ///         declaration that stranded the proposal. This is precisely why
+    ///         the rescue path must accept empty caps (design.md D3): a
+    ///         settlement-leg `CallCapExceeded` is a legitimate reason to
+    ///         need it.
+    function test_capBreach_settleLeg_emergencyRescueSucceedsUnderEmptyCaps() public {
+        address sink = makeAddr("rescueSink");
+        uint256[] memory execCaps = GovEnvelope.defaultCaps(GovEnvelope.permissive(address(vault)).maxCapital, 1);
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0
+        });
+        uint256[] memory settleCaps = new uint256[](1);
+        settleCaps[0] = 500e6;
+
+        uint256 pid = _proposeVoteApprove(_execCalls(), execCaps, settleCalls, settleCaps, 7 days);
+        governor.executeProposal(pid);
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1_000e6, 500e6));
+        governor.settleProposal(pid); // confirms the stuck state this test starts from
+
+        // Owner rescues with the SAME calls (an honest unwind, just re-declared
+        // outside the per-call cap system) via the guardian-reviewed path.
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, settleCalls);
+        // No guardian block votes cast -> not blocked.
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
+        vm.prank(owner);
+        governor.finalizeEmergencySettle(pid);
+
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertEq(usdc.balanceOf(sink), 1_000e6, "the rescue actually moved the funds");
     }
 }

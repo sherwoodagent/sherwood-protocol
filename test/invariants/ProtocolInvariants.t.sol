@@ -6,6 +6,7 @@ import {StdInvariant} from "forge-std/StdInvariant.sol";
 
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
@@ -20,6 +21,7 @@ import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {IProtocolConfig} from "../../src/interfaces/IProtocolConfig.sol";
 
 import {ProtocolHandler} from "./handlers/ProtocolHandler.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title ProtocolInvariantsTest
 /// @notice 7-invariant harness closing INV-2, INV-3, INV-9, INV-10, INV-30,
@@ -107,10 +109,8 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                                     minOwnerStake: MIN_OWNER_STAKE,
                                     minSlashBps: 1000,
                                     maxSlashBps: 9999,
-                                    maxDelegatedSlashBps: 2000,
                                     ageFloorBps: 2500,
-                                    maturationPeriod: 30 days,
-                                    delegatedWeightCapX: 4
+                                    maturationPeriod: 30 days
                                 }))
                         )
                     )
@@ -154,7 +154,6 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
             protocolConfig = new ProtocolConfig(governorOwner);
             vm.startPrank(governorOwner);
             protocolConfig.setProtocolFeeRecipient(initialFeeRecipient);
-            protocolConfig.setProtocolFeeBps(INITIAL_PROTOCOL_FEE_BPS);
             vm.stopPrank();
         }
 
@@ -182,7 +181,14 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                         address(govImpl),
                         abi.encodeCall(
                             SyndicateGovernor.initialize,
-                            (placeholderVault, address(registry), address(protocolConfig), address(0xbeef), p)
+                            (
+                                placeholderVault,
+                                address(registry),
+                                address(protocolConfig),
+                                address(0xbeef),
+                                address(deployTierRegistry(address(this))),
+                                p
+                            )
                         )
                     )
                 )
@@ -202,7 +208,9 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                 beacon: address(governor),
                 protocolConfig: address(governor),
                 managementFeeBps: 200,
-                guardianRegistry: address(registry)
+                guardianRegistry: address(registry),
+                // Mandatory since pashov finding #1.
+                tierRegistry: address(new TierRegistry(factoryOwner))
             });
             factory = SyndicateFactory(
                 address(new ERC1967Proxy(address(facImpl), abi.encodeCall(SyndicateFactory.initialize, (fp))))
@@ -268,8 +276,11 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
         // Governor: addGovernor is factory-only (I3) — call as the newly-set
         // factory to register the real governor. The registry was initialized
         // with governor_=address(0) so the authorized set starts empty.
+        // Hoisted: `vault()` is a call, so evaluating it as an argument would
+        // consume the prank and leave `addGovernor` unauthorized.
+        address govVault = SyndicateGovernor(newGovernor).vault();
         vm.prank(newFactory);
-        registry.addGovernor(newGovernor);
+        registry.addGovernor(newGovernor, govVault);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -301,11 +312,12 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
             uint256 maxPerf = governor.getGovernorParams().maxPerformanceFeeBps;
             if (perfFeeBps > maxPerf) perfFeeBps = maxPerf;
             assertLe(perfFeeBps, MAX_PERF_FEE_BPS, "INV-2: perf fee bps exceeds cap");
-            assertLe(protocolConfig.protocolFeeBps(), 10_000, "INV-2: protocol fee bps out of range");
-            // Sum of all bps must not exceed 10_000 (would take >100% of
-            // gross profit; nonsense state).
-            uint256 totalBps = perfFeeBps + protocolConfig.protocolFeeBps();
-            assertLe(totalBps, 10_000, "INV-2: total fee bps > 100%");
+            // The old sum-of-rates check added `protocolFeeBps` and
+            // `guardianFeeBps` here; both are gone with the two-number fee
+            // model. Those parties are now paid a SHARE of the performance fee,
+            // so the clamped rate above IS the whole profit-side take and
+            // bounding it is the complete check.
+            assertLe(perfFeeBps, 10_000, "INV-2: total fee bps > 100%");
         }
     }
 
@@ -438,12 +450,15 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
     ///         the `_validateForFinalize` re-check actually holds under
     ///         adversarial ordering (queue bps → queue recipient-zero
     ///         attempt → finalize, etc.).
-    function invariant_protocolFeeRecipientNonZero() public view {
-        if (protocolConfig.protocolFeeBps() > 0) {
-            assertTrue(
-                protocolConfig.protocolFeeRecipient() != address(0), "INV-30: protocolFeeBps > 0 but recipient is zero"
-            );
-        }
+    /// @dev Previously gated on `protocolFeeBps > 0`. That rate is gone with the
+    ///      two-number fee model, and a zero recipient is now legal — it unwires
+    ///      the protocol leg, folding its share into the agent's remainder
+    ///      rather than escrowing against address(0). What survives is the
+    ///      weaker property: the recipient is always readable, so no sequence of
+    ///      handler actions can leave the config in a state settlement cannot
+    ///      resolve.
+    function invariant_protocolFeeRecipientReadable() public view {
+        protocolConfig.protocolFeeRecipient();
     }
 
     // ──────────────────────────────────────────────────────────────

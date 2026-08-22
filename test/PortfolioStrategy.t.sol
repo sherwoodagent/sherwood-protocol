@@ -8,6 +8,11 @@ import {BaseStrategy} from "../src/strategies/BaseStrategy.sol";
 import {MockSwapAdapter} from "./mocks/MockSwapAdapter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
+import {
+    MockGovernorAlwaysActive,
+    MockVaultGovernorStub,
+    MockPermissiveTierRegistry
+} from "./mocks/MockGovernorAlwaysActive.sol";
 
 /// @notice Mock Chainlink Data Streams verifier proxy.
 /// @dev Sherlock #56: signed reports now carry a `feedId` so the strategy can
@@ -24,7 +29,14 @@ contract MockVerifierProxy {
         obsSkew = s;
     }
 
-    function verify(bytes calldata signedReport) external payable returns (bytes memory) {
+    /// @dev Two arguments, matching the deployed `VerifierProxy 2.0.0`. The
+    ///      single-argument 1.x shape this mock used to expose is not on the
+    ///      real proxy at all -- calling it there reverts with empty returndata,
+    ///      so a one-argument mock would have gone on passing against a
+    ///      contract that could never work on chain. `parameterPayload` names
+    ///      the fee token when a `FeeManager` is wired; none is, so it is
+    ///      ignored here exactly as the live proxy ignores it.
+    function verify(bytes calldata signedReport, bytes calldata) external payable returns (bytes memory) {
         (bytes32 feedId, int192 price) = abi.decode(signedReport, (bytes32, int192));
         uint256 observedAt = uint256(int256(block.timestamp) + obsSkew);
         ChainlinkReport memory report = ChainlinkReport({
@@ -87,7 +99,14 @@ contract PortfolioStrategyTest is Test {
     ERC20Mock public amzn;
     ERC20Mock public nflx;
 
-    address public vault = makeAddr("vault");
+    /// @dev Issue #150 fix: `BaseStrategy.execute()` now resolves
+    ///      `vault() -> governor()` and requires the governor's active
+    ///      proposal to declare the executing clone as its strategy. This
+    ///      suite is about `PortfolioStrategy`'s own math/lifecycle, not that
+    ///      binding property, so `vault` is wired to a permissive
+    ///      `MockGovernorAlwaysActive` (see that file for the dedicated,
+    ///      non-permissive binding tests) instead of a bare `makeAddr`.
+    address public vault;
     address public proposer = makeAddr("proposer");
 
     uint256 constant TOTAL_AMOUNT = 10e18; // 10 WETH
@@ -95,6 +114,16 @@ contract PortfolioStrategyTest is Test {
     uint256 constant RATE_PRECISION = 1e18;
 
     function setUp() public {
+        // Issue #150 fix wiring: vault -> governor() -> permissive strategyOf.
+        // The governor also has to answer `tierRegistry()` now: init is
+        // fail-closed on registry resolution, so a strategy whose walk dead-ends
+        // reverts `TierRegistryUnresolved` before any of this suite's math runs.
+        // This suite is about strategy math, not governance binding, so it
+        // points at a permissive registry.
+        MockGovernorAlwaysActive governorStub = new MockGovernorAlwaysActive();
+        governorStub.setTierRegistry(address(new MockPermissiveTierRegistry()));
+        vault = address(new MockVaultGovernorStub(address(governorStub)));
+
         // Deploy mock tokens
         weth = new ERC20Mock("Wrapped Ether", "WETH", 18);
         tsla = new ERC20Mock("Tesla Token", "TSLA", 18);
@@ -195,6 +224,55 @@ contract PortfolioStrategyTest is Test {
     ///      (echoed by the MockVerifierProxy back into ChainlinkReport).
     function _signedReport(uint256 slotIndex, int192 price) internal pure returns (bytes memory) {
         return abi.encode(keccak256(abi.encode("portfolio.feed", slotIndex)), price);
+    }
+
+    /// @dev Seed every allocation's price anchor so `_execute` will deploy in
+    ///      Data Streams mode. Permissionless by design — no prank needed.
+    ///
+    ///      REQUIRED BEFORE EVERY DS-MODE `execute()`, and the fact that it is
+    ///      required is the finding: before the anchor requirement existed these
+    ///      tests all executed with `_lastGoodPrice[i] == 0`, so every buy floor
+    ///      fell through to `_quoteMinOut` — a quote taken from the same pool the
+    ///      swap was about to hit. They passed because the mock adapter quotes
+    ///      honestly; against a real venue an attacker moves it first.
+    ///
+    ///      Prices match this fixture's mock adapter rate so the floors bind at
+    ///      the same value the swap returns.
+    function _seedAnchors() internal {
+        bytes[] memory reports = new bytes[](3);
+        reports[0] = _signedReport(0, int192(int256(0.01e18)));
+        reports[1] = _signedReport(1, int192(int256(0.02e18)));
+        reports[2] = _signedReport(2, int192(int256(0.005e18)));
+        strategy.submitPriceReports(reports);
+    }
+
+    /// @dev As `_seedAnchors`, for a locally-built clone with its own basket.
+    ///
+    ///      Reads each slot's price from the MOCK ADAPTER's own configured rate
+    ///      rather than taking one as a parameter, so a fixture whose tokens
+    ///      trade at different rates (tsla 0.01, amzn 0.02, nflx 0.005) gets a
+    ///      floor per slot that binds exactly where the swap lands. A uniform
+    ///      price here fails `SlippageExceeded` on any mixed-rate basket.
+    ///
+    ///      NO-OP IN PUSH MODE, because `submitPriceReports` correctly refuses
+    ///      there: a push-mode clone reads its own aggregator and consumes no
+    ///      report. That keeps this helper safe to call from any fixture without
+    ///      the caller having to know which mode the clone was built in.
+    ///
+    ///      FEED IDS COME FROM THE CLONE, via `feedIdOf`, rather than from
+    ///      `_signedReport`'s index-derived guess. This file builds fixtures both
+    ///      ways — `_feedIds` keys on the slot index, `_feedIdsForTokens` on the
+    ///      token address — so a helper that assumed the former would hand a
+    ///      token-keyed fixture a `WrongFeedId` from its own SETUP.
+    function _seedAnchorsFor(PortfolioStrategy s) internal {
+        if (s.chainlinkVerifier() == address(0)) return;
+        PortfolioStrategy.TokenAllocation[] memory allocs = s.getAllocations();
+        bytes[] memory reports = new bytes[](allocs.length);
+        for (uint256 i; i < allocs.length; ++i) {
+            uint256 rate = adapter.rates(keccak256(abi.encodePacked(allocs[i].token, address(weth))));
+            reports[i] = abi.encode(s.feedIdOf(i), int192(int256(rate)));
+        }
+        s.submitPriceReports(reports);
     }
 
     // ==================== INITIALIZATION ====================
@@ -410,6 +488,7 @@ contract PortfolioStrategyTest is Test {
         vm.prank(vault);
         weth.approve(address(strategy), TOTAL_AMOUNT);
 
+        _seedAnchors();
         vm.prank(vault);
         strategy.execute();
 
@@ -433,6 +512,7 @@ contract PortfolioStrategyTest is Test {
     }
 
     function test_execute_onlyVault() public {
+        _seedAnchors();
         vm.prank(proposer);
         vm.expectRevert(BaseStrategy.NotVault.selector);
         strategy.execute();
@@ -441,9 +521,11 @@ contract PortfolioStrategyTest is Test {
     function test_execute_twice_reverts() public {
         vm.prank(vault);
         weth.approve(address(strategy), TOTAL_AMOUNT);
+        _seedAnchors();
         vm.prank(vault);
         strategy.execute();
 
+        _seedAnchors();
         vm.prank(vault);
         vm.expectRevert(BaseStrategy.AlreadyExecuted.selector);
         strategy.execute();
@@ -455,6 +537,7 @@ contract PortfolioStrategyTest is Test {
         // Execute first
         vm.prank(vault);
         weth.approve(address(strategy), TOTAL_AMOUNT);
+        _seedAnchors();
         vm.prank(vault);
         strategy.execute();
 
@@ -481,6 +564,7 @@ contract PortfolioStrategyTest is Test {
     function test_settle_withProfit() public {
         vm.prank(vault);
         weth.approve(address(strategy), TOTAL_AMOUNT);
+        _seedAnchors();
         vm.prank(vault);
         strategy.execute();
 
@@ -507,6 +591,7 @@ contract PortfolioStrategyTest is Test {
     function test_settle_onlyVault() public {
         vm.prank(vault);
         weth.approve(address(strategy), TOTAL_AMOUNT);
+        _seedAnchors();
         vm.prank(vault);
         strategy.execute();
 
@@ -566,6 +651,93 @@ contract PortfolioStrategyTest is Test {
         vm.prank(proposer);
         vm.expectRevert(BaseStrategy.NotExecuted.selector);
         strategy.updateParams(abi.encode(new uint256[](0), uint256(200), new bytes[](0)));
+    }
+
+    /// @notice The `> 0` sentinel means "keep the current value" — it was never
+    ///         a monotonicity guard. So the proposer could raise the tolerance
+    ///         to 99.99% AFTER the proposal was reviewed and executed, then
+    ///         self-settle into a sandwich they control: every floor in
+    ///         `execute` / `settle` / `rebalance` / `rebalanceDelta` collapses to
+    ///         a rounding error. This class of self-relaxation bug was already
+    ///         fixed once before (Sherlock #49); this is the same pattern.
+    function test_updateParams_slippageCannotBeLoosened() public {
+        _executeStrategy();
+        assertEq(strategy.maxSlippageBps(), MAX_SLIPPAGE, "fixture starts at 1%");
+
+        vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
+        strategy.updateParams(abi.encode(new uint256[](0), uint256(MAX_SLIPPAGE + 1), new bytes[](0)));
+
+        assertEq(strategy.maxSlippageBps(), MAX_SLIPPAGE, "tolerance unchanged after a rejected loosen");
+    }
+
+    /// @notice Tightening stays available — the guard bounds the direction, not
+    ///         the ability to react.
+    function test_updateParams_slippageCanBeTightened() public {
+        _executeStrategy();
+
+        vm.prank(proposer);
+        strategy.updateParams(abi.encode(new uint256[](0), uint256(MAX_SLIPPAGE - 1), new bytes[](0)));
+
+        assertEq(strategy.maxSlippageBps(), MAX_SLIPPAGE - 1, "tightening is allowed");
+    }
+
+    /// @notice `_quoteMinOut` prices the SAME route it is about to swap, so the
+    ///         floor tracks whatever pool the route names. Rewriting the route
+    ///         after approval moves the floor with it, and the slippage ceiling
+    ///         cannot bound that — the ceiling is applied to the attacker's own
+    ///         quote. Routes are reviewed as part of the proposal, so they are
+    ///         frozen once it executes.
+    function test_updateParams_routesAreFrozenAfterExecute() public {
+        _executeStrategy();
+        bytes[] memory routesBefore = strategy.getSwapExtraData();
+
+        bytes[] memory hostileRoutes = new bytes[](3);
+        for (uint256 i; i < 3; ++i) {
+            hostileRoutes[i] = abi.encode(uint24(10_000)); // a fee tier the proposer seeded
+        }
+
+        vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.RoutesFrozen.selector);
+        strategy.updateParams(abi.encode(new uint256[](0), uint256(0), hostileRoutes));
+
+        bytes[] memory routesAfter = strategy.getSwapExtraData();
+        for (uint256 i; i < 3; ++i) {
+            assertEq(routesAfter[i], routesBefore[i], "route must be unchanged");
+        }
+    }
+
+    /// @notice The init bound was only `< BPS_DENOMINATOR`, so a proposal could
+    ///         seat a 99.99% tolerance from the very start and never need to
+    ///         relax it — the tighten-only guard alone would not have helped.
+    function test_initialize_rejectsSlippageAboveTheProtocolCeiling() public {
+        PortfolioStrategy fresh = PortfolioStrategy(Clones.clone(address(template)));
+
+        address[] memory tokens = new address[](3);
+        tokens[0] = address(tsla);
+        tokens[1] = address(amzn);
+        tokens[2] = address(nflx);
+        uint256[] memory weights = new uint256[](3);
+        weights[0] = 4000;
+        weights[1] = 3500;
+        weights[2] = 2500;
+        bytes[] memory extraData = new bytes[](3);
+
+        bytes memory initData = abi.encode(
+            address(weth),
+            address(adapter),
+            address(verifier),
+            tokens,
+            weights,
+            TOTAL_AMOUNT,
+            fresh.MAX_SLIPPAGE_CEILING_BPS() + 1,
+            extraData,
+            _pd(tokens.length),
+            _feedIdsFor(tokens.length)
+        );
+
+        vm.expectRevert(PortfolioStrategy.InvalidSlippage.selector);
+        fresh.initialize(vault, proposer, initData);
     }
 
     // ==================== REBALANCE (SIMPLE) ====================
@@ -685,6 +857,7 @@ contract PortfolioStrategyTest is Test {
         // 1. Execute
         vm.prank(vault);
         weth.approve(address(strategy), TOTAL_AMOUNT);
+        _seedAnchors();
         vm.prank(vault);
         strategy.execute();
 
@@ -783,6 +956,7 @@ contract PortfolioStrategyTest is Test {
         // Execute: 5 WETH → 500 TSLA
         vm.prank(vault);
         weth.approve(address(s), 5e18);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -853,6 +1027,7 @@ contract PortfolioStrategyTest is Test {
         weth.mint(vault, 20e18); // extra WETH for this test
         vm.prank(vault);
         weth.approve(address(s), 20e18);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -912,6 +1087,7 @@ contract PortfolioStrategyTest is Test {
         // Execute: NFLX should get 0 allocation
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1078,6 +1254,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s2), TOTAL_AMOUNT);
+        _seedAnchorsFor(s2);
         vm.prank(vault);
         s2.execute();
 
@@ -1149,6 +1326,7 @@ contract PortfolioStrategyTest is Test {
         weth.mint(vault, 20e18);
         vm.prank(vault);
         weth.approve(address(s), 20e18);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1171,6 +1349,7 @@ contract PortfolioStrategyTest is Test {
         weth.mint(vault, 20e18);
         vm.prank(vault);
         weth.approve(address(s2), 20e18);
+        _seedAnchorsFor(s2);
         vm.prank(vault);
         s2.execute();
 
@@ -1195,6 +1374,7 @@ contract PortfolioStrategyTest is Test {
     function _executeStrategy() internal {
         vm.prank(vault);
         weth.approve(address(strategy), TOTAL_AMOUNT);
+        _seedAnchors();
         vm.prank(vault);
         strategy.execute();
     }
@@ -1250,6 +1430,7 @@ contract PortfolioStrategyTest is Test {
         //   TSLA: 1e6 (= 0.01 × 1e8)   AMZN: 2e6 (= 0.02 × 1e8)   NFLX: 5e5 (= 0.005 × 1e8)
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1418,6 +1599,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1449,6 +1631,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1470,6 +1653,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1489,6 +1673,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1545,6 +1730,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1566,6 +1752,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1585,6 +1772,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 
@@ -1635,6 +1823,7 @@ contract PortfolioStrategyTest is Test {
 
         vm.prank(vault);
         weth.approve(address(s), TOTAL_AMOUNT);
+        _seedAnchorsFor(s);
         vm.prank(vault);
         s.execute();
 

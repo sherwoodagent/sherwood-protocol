@@ -17,6 +17,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title SwoodReviewSlash.t
 /// @notice End-to-end integration test for the sWOOD staking-split (Task 11.1).
@@ -27,18 +28,18 @@ import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 ///           SyndicateGovernor → propose / vote / GuardianReview
 ///           GuardianRegistry  → openReview / voteOnProposal / resolveReview
 ///                               → _severityBps → swood.slashGuardians
-///           StakedWood (sWOOD)→ stakeAsGuardian / delegateStake
-///                               → _slashOne (own stake + delegated pool)
+///           StakedWood (sWOOD)→ stakeAsGuardian
+///                               → _slashOne (single own-stake leg — DPoS
+///                                 delegation removed/postponed)
 ///                               → _burnWood
 ///
 ///         A blocked proposal slashes the approver guardian at the
 ///         DETERMINISTIC severity derived from block-side decisiveness
 ///         (spec 2026-07-19 Part D) — severity is NOT voted. This fixture's
-///         block side is overwhelming (79.68% of the at-open total, past the
+///         block side is overwhelming (80% of the at-open total, past the
 ///         2/3 SUPERMAJORITY_BPS ceiling), so the severity is maxSlashBps =
-///         9999 and the first-loss spill is clamped by the approver's
-///         remaining own stake. See the fixture comment block for the
-///         hand-computed derivation.
+///         9999. See the fixture comment block for the hand-computed
+///         derivation.
 contract SwoodReviewSlashTest is Test {
     // `governor` MUST be public: the vault reads its governor via
     // `factory.governor()`, and this test contract impersonates the factory —
@@ -64,9 +65,6 @@ contract SwoodReviewSlashTest is Test {
     address internal gBlock1 = makeAddr("guardianBlock1");
     address internal gBlock2 = makeAddr("guardianBlock2");
     address internal gBlock3 = makeAddr("guardianBlock3");
-    // Delegators into the approver's DPoS pool.
-    address internal del1 = makeAddr("delegator1");
-    address internal del2 = makeAddr("delegator2");
 
     address internal factoryEoa; // test contract impersonates the factory
 
@@ -95,18 +93,17 @@ contract SwoodReviewSlashTest is Test {
     //
     //   Blocker stake: gBlock1 = 10k, gBlock2 = 20k, gBlock3 = 50k → 80k.
     //   Cohort own stake at open = 20k (approver) + 80k (blockers) = 100k.
-    //   Denominator = 100k own + 400 delegated = 100_400.
+    //   Denominator = 100k own stake (vote weight = own stake only — DPoS
+    //   delegation removed).
     //
-    //   Block quorum: 80k*10000 = 8e8 ≥ 3000 * 100_400 = 3.012e8 → BLOCKED.
+    //   Block quorum: 80k*10000 = 8e8 ≥ 3000 * 100_000 = 3e8 → BLOCKED.
     //
-    //   Decisiveness: bBps = 80_000e18 × 10_000 / 100_400e18 = 7968 (floor).
-    //   7968 ≥ SUPERMAJORITY_BPS (6667) → severity = maxSlashBps = 9999.
+    //   Decisiveness: bBps = 80_000e18 × 10_000 / 100_000e18 = 8000.
+    //   8000 ≥ SUPERMAJORITY_BPS (6667) → severity = maxSlashBps = 9999.
     uint256 constant APPROVER_STAKE = 20_000e18;
     uint256 constant BLOCKER1_STAKE = 10_000e18;
     uint256 constant BLOCKER2_STAKE = 20_000e18;
     uint256 constant BLOCKER3_STAKE = 50_000e18;
-    uint256 constant DEL1_AMOUNT = 300e18;
-    uint256 constant DEL2_AMOUNT = 100e18;
 
     // Hand-computed deterministic severity (see derivation above). This is
     // the slash factor the contract MUST apply.
@@ -154,6 +151,10 @@ contract SwoodReviewSlashTest is Test {
         //   swoodImpl (+0), swoodProxy (+1), govImpl (+2), govProxy (+3),
         //   regImpl (+4), regProxy (+5).
         ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
+        // Hoisted ABOVE the nonce snapshot: the governor's mandatory tier-registry
+        // argument (pashov finding #1) is a DEPLOYMENT, so leaving it inline in the
+        // `initialize` tuple would consume a nonce and slide every predicted address.
+        address fixtureTierRegistry = address(deployTierRegistry(address(this)));
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
@@ -171,10 +172,8 @@ contract SwoodReviewSlashTest is Test {
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -186,7 +185,8 @@ contract SwoodReviewSlashTest is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 predictedRegistryProxy,
                 address(_hoistedPC),
-                address(this), // factory (test contract)
+                address(this),
+                fixtureTierRegistry, // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -214,15 +214,11 @@ contract SwoodReviewSlashTest is Test {
         // Authorize the per-vault governor with the registry (factory-only;
         // this test impersonates the factory). Required for openReview /
         // resolveReview to pass the registry's authorized-governor guard (P2).
-        registry.addGovernor(address(governor));
+        registry.addGovernor(address(governor), governor.vault());
 
         // Resolve the registry ↔ sWOOD circular dependency.
         vm.prank(owner);
         swood.setRegistry(address(registry));
-
-        // DPoS delegation must be explicitly enabled on sWOOD.
-        vm.prank(owner);
-        swood.setDelegationEnabled(true);
 
         // LPs deposit so the proposal vote has votable supply.
         usdc.mint(lp1, 100_000e6);
@@ -247,17 +243,13 @@ contract SwoodReviewSlashTest is Test {
         swood.bindOwnerStake(owner, address(vault));
 
         // Guardian cohort: 1 approver (20k) + 3 blockers (10k/20k/50k) →
-        // 100k own stake total. The 80k block side is 79.68% of the at-open
+        // 100k own stake total. The 80k block side is 80% of the at-open
         // total — past the 2/3 supermajority ceiling of the deterministic
         // severity ramp (Part D).
         _stakeGuardian(gApprove, APPROVER_STAKE, 1);
         _stakeGuardian(gBlock1, BLOCKER1_STAKE, 2);
         _stakeGuardian(gBlock2, BLOCKER2_STAKE, 3);
         _stakeGuardian(gBlock3, BLOCKER3_STAKE, 4);
-
-        // Delegators delegate into the approver guardian's DPoS pool.
-        _delegate(del1, gApprove, DEL1_AMOUNT);
-        _delegate(del2, gApprove, DEL2_AMOUNT);
 
         // Age-weighted voting: mature the cohort to par so vote weights and
         // slash bases below run on full stake weight.
@@ -272,14 +264,6 @@ contract SwoodReviewSlashTest is Test {
         wood.approve(address(swood), type(uint256).max);
         vm.prank(who);
         swood.stakeAsGuardian(amount, agentId);
-    }
-
-    function _delegate(address delegator, address delegate, uint256 amount) internal {
-        wood.mint(delegator, amount);
-        vm.prank(delegator);
-        wood.approve(address(swood), type(uint256).max);
-        vm.prank(delegator);
-        swood.delegateStake(delegate, amount);
     }
 
     function _emptyCoProposers() internal pure returns (ISyndicateGovernor.CoProposer[] memory) {
@@ -309,7 +293,9 @@ contract SwoodReviewSlashTest is Test {
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
     }
@@ -323,7 +309,7 @@ contract SwoodReviewSlashTest is Test {
     ///   3. gApprove votes Approve; gBlock1/2/3 vote Block at stake weights
     ///      10k/20k/50k (no severity argument — Part D).
     ///   4. resolveReview → block quorum hit → deterministic severity from
-    ///      block decisiveness (79.68% ≥ 2/3 supermajority → maxSlashBps =
+    ///      block decisiveness (80% ≥ 2/3 supermajority → maxSlashBps =
     ///      9999) → slashGuardians.
     ///
     /// Asserts:
@@ -331,26 +317,15 @@ contract SwoodReviewSlashTest is Test {
     ///   - the deterministic ceiling severity (9999 bps) was the slash factor
     ///     applied — severity is a function of decisiveness, not of anything
     ///     the blockers propose;
-    ///   - the approver's OWN stake was slashed pro-rata to the severity,
-    ///     plus the first-loss spill of the delegated damage the
-    ///     `maxDelegatedSlashBps` cap absorbed (spec 2026-07-19 Part A) —
-    ///     here the spill is clamped by the tiny own-stake remainder, wiping
-    ///     the approver;
-    ///   - the approver's DELEGATED pool was slashed pro-rata at
-    ///     min(severity, C = 2000), each delegator's `delegationOf` diluted
-    ///     by the same share-factor;
-    ///   - the slashed WOOD (20k own incl. clamped spill + 80 pool) was
-    ///     burned to BURN_ADDRESS;
+    ///   - the approver's OWN stake was slashed pro-rata to the severity —
+    ///     the single slash leg since the DPoS-delegation removal;
+    ///   - the slashed WOOD (19_998e18) was burned to BURN_ADDRESS;
     ///   - the GuardianRegistry holds no WOOD and no reward pool was funded —
     ///     the slash path does not touch reward-pool state.
     function test_review_blockQuorum_deterministicSeveritySlash_endToEnd() public {
-        // ── Pre-conditions: pool wired correctly before the review ──
+        // ── Pre-conditions: cohort wired correctly before the review ──
         assertEq(swood.guardianStake(gApprove), APPROVER_STAKE, "approver own stake pre-slash");
-        assertEq(swood.poolTokens(gApprove), DEL1_AMOUNT + DEL2_AMOUNT, "pool tokens pre-slash");
-        assertEq(swood.delegationOf(del1, gApprove), DEL1_AMOUNT, "del1 stake pre-slash");
-        assertEq(swood.delegationOf(del2, gApprove), DEL2_AMOUNT, "del2 stake pre-slash");
         assertEq(swood.totalGuardianStake(), 100_000e18, "cohort total stake (20k + 10k + 20k + 50k)");
-        assertEq(swood.totalDelegatedStake(), DEL1_AMOUNT + DEL2_AMOUNT, "total delegated pre-slash");
 
         uint256 burnBefore = wood.balanceOf(BURN_ADDRESS);
         assertEq(wood.balanceOf(address(registry)), 0, "registry holds no WOOD post-split");
@@ -388,7 +363,7 @@ contract SwoodReviewSlashTest is Test {
 
         // ── Assert: proposal rejected/blocked ──
         assertTrue(blocked, "review resolved as blocked");
-        (, bool resolved, bool blockedFlag,) = registry.getReviewState(address(governor), pid);
+        (, bool resolved, bool blockedFlag) = registry.getReviewState(address(governor), pid);
         assertTrue(resolved, "review resolved");
         assertTrue(blockedFlag, "review blocked flag set");
         assertEq(
@@ -408,54 +383,33 @@ contract SwoodReviewSlashTest is Test {
         // absorbed by a mirrored expression on the expected side.
         //
         // Arithmetic rationale (slash factor = deterministic severity, spec
-        // 2026-07-19 Part D: decisiveness 7968 bps ≥ SUPERMAJORITY_BPS 6667 →
-        // severity = maxSlashBps = 9999; delegated legs capped at C =
-        // maxDelegatedSlashBps = 2000 with the absorbed excess spilling onto
-        // the approver's own stake, clamped to what remains — spec Part A):
-        //   own base slash = 20_000e18 * 9999 / 10_000 = 19_998e18
-        //   pool slash     =    400e18 * 2000 / 10_000 =     80e18  →  320e18 remains
-        //   spill (raw)    =    400e18 * (9999 - 2000) / 10_000 = 319.96e18
-        //   spill (clamped)= min(319.96e18, 20_000e18 - 19_998e18) = 2e18
-        //   own remains    = 20_000e18 - 19_998e18 - 2e18           = 0
-        //   del1 remains   =    300e18 - (300e18 * 2000 / 10_000)   = 240e18
-        //   del2 remains   =    100e18 - (100e18 * 2000 / 10_000)   =  80e18
-        //   total burned   = 19_998e18 + 2e18 + 80e18               = 20_080e18
-        //   totalGuardianStake post = 100_000e18 - 20_000e18        = 80_000e18
+        // 2026-07-19 Part D: decisiveness 8000 bps ≥ SUPERMAJORITY_BPS 6667 →
+        // severity = maxSlashBps = 9999; single own-stake leg since the
+        // DPoS-delegation removal):
+        //   own slash      = 20_000e18 * 9999 / 10_000 = 19_998e18
+        //   own remains    = 20_000e18 - 19_998e18     =      2e18
+        //   total burned   = 19_998e18
+        //   totalGuardianStake post = 100_000e18 - 19_998e18 = 80_002e18
         //
         // If the contract had (incorrectly) kept e.g. a sub-ceiling severity,
-        // the approver would retain own stake and every literal below would
-        // mismatch — the ceiling wipe is the property this fixture proves.
-        assertEq(swood.guardianStake(gApprove), 0, "approver own wiped: 19_998 base + 2 clamped spill");
+        // the approver would retain far more own stake and every literal below
+        // would mismatch — the near-total wipe is the property this fixture
+        // proves.
+        assertEq(swood.guardianStake(gApprove), 2e18, "approver own = 20k - 19_998 ceiling slash");
         // Self-documenting Part D guard: the slash factor actually applied is
         // the deterministic ceiling (EXPECTED_SEVERITY_BPS = 9999) because
-        // block decisiveness (7968 bps) exceeds the 2/3 supermajority.
+        // block decisiveness (8000 bps) exceeds the 2/3 supermajority.
         assertEq(EXPECTED_SEVERITY_BPS, 9999, "deterministic ceiling severity = maxSlashBps");
-        // Cohort total stake dropped by exactly the approver's own debit
-        // (19_998 base + 2 clamped spill = full 20k bond).
-        assertEq(swood.totalGuardianStake(), 80_000e18, "totalGuardianStake = 100k - 20k own debit");
+        // Cohort total stake dropped by exactly the approver's own debit.
+        assertEq(swood.totalGuardianStake(), 80_002e18, "totalGuardianStake = 100k - 19_998 own debit");
 
         // ── Assert: blockers untouched ──
         assertEq(swood.guardianStake(gBlock1), BLOCKER1_STAKE, "blocker1 untouched");
         assertEq(swood.guardianStake(gBlock2), BLOCKER2_STAKE, "blocker2 untouched");
         assertEq(swood.guardianStake(gBlock3), BLOCKER3_STAKE, "blocker3 untouched");
 
-        // ── Assert: delegated pool slashed at min(severity, C) = 20% ──
-        // pool 400 − (400 × 2000 / 10000) = 400 − 80 = 320.
-        assertEq(swood.poolTokens(gApprove), 320e18, "pool slashed at C (20%) -> 320");
-        assertEq(swood.totalDelegatedStake(), 320e18, "totalDelegatedStake -> 320");
-
-        // Each delegator's token-equivalent diluted by the SAME 20% share-factor
-        // (no per-delegator loop — one poolTokens write dilutes the share rate).
-        assertEq(swood.delegationOf(del1, gApprove), 240e18, "del1 diluted 20% -> 240");
-        assertEq(swood.delegationOf(del2, gApprove), 80e18, "del2 diluted 20% -> 80");
-
-        // ── Assert: slashed WOOD burned (own incl. spill + delegated) ──
-        // 19_998e18 own + 2e18 clamped spill + 80e18 pool = 20_080e18 burned.
-        assertEq(
-            wood.balanceOf(BURN_ADDRESS),
-            burnBefore + 20_080e18,
-            "20k own (incl. spill) + 80 pool burned to dead address"
-        );
+        // ── Assert: slashed WOOD burned (own stake only) ──
+        assertEq(wood.balanceOf(BURN_ADDRESS), burnBefore + 19_998e18, "19_998 own slash burned to dead address");
         assertEq(swood.pendingBurn(), 0, "no pending burn - ERC20Mock burn transfer succeeded");
 
         // ── Assert: registry holds no assets; fee attribution is off-chain ──

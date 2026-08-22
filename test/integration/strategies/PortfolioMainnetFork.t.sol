@@ -5,6 +5,7 @@ import {console2} from "forge-std/Test.sol";
 import {RobinhoodMainnetIntegrationTest} from "../RobinhoodMainnetIntegrationTest.sol";
 import {PortfolioStrategy, AggregatorV3Interface} from "../../../src/strategies/PortfolioStrategy.sol";
 import {UniswapSwapAdapter, PathHop} from "../../../src/adapters/UniswapSwapAdapter.sol";
+import {TierRegistry} from "../../../src/TierRegistry.sol";
 import {BatchExecutorLib} from "../../../src/BatchExecutorLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -35,6 +36,13 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
         swapAdapter =
             address(new UniswapSwapAdapter(UNISWAP_SWAP_ROUTER, UNISWAP_QUOTER_V2, V4_POOL_MANAGER, V4_QUOTER));
         template = address(new PortfolioStrategy());
+        // Issue #147: `PortfolioStrategy._initialize` now walks
+        // vault()→governor()→tierRegistry() and refuses a non-allowlisted
+        // swap adapter on this wired stack. Allowlist it before any clone can
+        // bind — the strategy CLONE itself is allowlisted separately, inside
+        // `_cloneAndInit` (a pre-existing fix, not fallout of this change).
+        vm.prank(deployer);
+        TierRegistry(tierRegistry).setAdapterAllowed(swapAdapter, true);
     }
 
     // ── Init-data builder: 100% WETH basket, push-feed mode ──
@@ -145,7 +153,12 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
     // At the pinned block the direct v4 TSLA pool trades ~8.5% above the
     // Chainlink TSLA/USD answer before impact (5% fee tier + drift), so the
     // oracle-anchored rebalanceDelta floor needs headroom above that.
-    uint256 constant MIXED_SLIPPAGE_BPS = 1200;
+    // CLAMPED TO THE TEMPLATE'S CEILING. This was 1200, which
+    // `PortfolioStrategy._initialize` rejects outright with `InvalidSlippage`
+    // (`MAX_SLIPPAGE_CEILING_BPS == 1_000`) — so both mixed-basket tests died
+    // at clone-init and the only mainnet-fork coverage of the v4 and mode-3
+    // native routes had been dead code. 1000 is the largest legal value.
+    uint256 constant MIXED_SLIPPAGE_BPS = 1000;
     // Smaller than TOTAL_AMOUNT: the direct USDG/TSLA 5% pool is thin, and the
     // execute-leg's own price impact at 2500 USDG pushes the pool far enough
     // above the Chainlink price that the oracle-floored rebalance buy can't

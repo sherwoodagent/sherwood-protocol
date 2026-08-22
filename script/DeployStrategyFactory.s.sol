@@ -58,15 +58,23 @@ contract DeployStrategyFactory is ScriptBase {
         _patchAddress("STRATEGY_FACTORY", address(sf));
     }
 
-    /// @dev Every template the StrategyFactory must allowlist.
+    /// @dev Every template the StrategyFactory must allowlist. THIS LIST IS THE
+    ///      ALLOWLIST — a template absent from here can never be proposed,
+    ///      because `StrategyFactory`'s approval map starts empty and nothing
+    ///      else populates it.
+    ///
+    ///      MOONWELL_SUPPLY / AERODROME_LP / WSTETH_MOONWELL / MAMO_YIELD were
+    ///      REMOVED (deprecated, 2026-08-04). None had a contract left in
+    ///      `src/strategies/`, so on every chain the loop below skipped all four
+    ///      and the list overstated what the protocol could actually propose.
+    ///      They resolve only in `chains/8453.json` and `chains/84532.json`, the
+    ///      legacy Base books, and only for a NEW StrategyFactory — already
+    ///      deployed factories keep whatever they approved at their own deploy.
     function _templateKeys() internal pure returns (string[] memory keys) {
-        keys = new string[](6);
-        keys[0] = "MOONWELL_SUPPLY_TEMPLATE";
-        keys[1] = "AERODROME_LP_TEMPLATE";
-        keys[2] = "VENICE_INFERENCE_TEMPLATE";
-        keys[3] = "WSTETH_MOONWELL_TEMPLATE";
-        keys[4] = "MAMO_YIELD_TEMPLATE";
-        keys[5] = "PORTFOLIO_TEMPLATE";
+        keys = new string[](3);
+        keys[0] = "PORTFOLIO_TEMPLATE";
+        keys[1] = "MORPHO_SUPPLY_TEMPLATE";
+        keys[2] = "CONCENTRATED_LIQUIDITY_TEMPLATE";
     }
 
     function _tryParseAddress(string memory json, string memory key) internal view returns (address) {

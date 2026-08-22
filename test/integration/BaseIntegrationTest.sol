@@ -18,7 +18,7 @@ import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 /**
  * @title BaseIntegrationTest
  * @notice Abstract base for fork-based integration tests against real Base mainnet
- *         protocols (Moonwell, Aerodrome, Venice). Deploys a FRESH Sherwood core on
+ *         protocols (Moonwell, Aerodrome). Deploys a FRESH Sherwood core on
  *         the fork via the real deploy script and creates a test syndicate with
  *         funded LPs for each test.
  *
@@ -44,8 +44,6 @@ abstract contract BaseIntegrationTest is Test {
     address constant AERO_ROUTER = 0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43;
     address constant AERO_FACTORY = 0x420DD381b31aEf6683db6B902084cB0FFECe40Da;
     address constant AERO_TOKEN = 0x940181a94A35A4569E4529A3CDfB74e38FD98631;
-    address constant VVV_TOKEN = 0xacfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf;
-    address constant SVVV = 0x321b7ff75154472B18EDb199033fF4D116F340Ff;
     address constant WST_ETH = 0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452;
     address constant UNISWAP_ROUTER = 0x2626664c2603336E57B271c5C0b26F421741e481;
 
@@ -79,7 +77,7 @@ abstract contract BaseIntegrationTest is Test {
 
     function setUp() public virtual {
         // Fork-gated: these suites need Base-mainnet protocol state (USDC,
-        // Moonwell, Aerodrome, Venice). Skip cleanly when run without a Base
+        // Moonwell, Aerodrome). Skip cleanly when run without a Base
         // fork (mirrors the env-gated skips in RobinhoodIntegrationTest /
         // LeveragedAeroForkBase) instead of dying inside deal()/venue calls.
         if (USDC.code.length == 0) {
@@ -114,8 +112,7 @@ abstract contract BaseIntegrationTest is Test {
         DeploySherwood.Config memory cfg = DeploySherwood.Config({
             ensRegistrar: address(0), // ENS identity is not under test here
             agentRegistry: AGENT_REGISTRY, // real Base ERC-8004 registry; ownerOf mocked below
-            managementFeeBps: 0, // keep settle PnL asserts exact (Venice equality asserts)
-            protocolFeeBps: 0, // keep settle PnL math clean (e2e convention)
+            managementFeeBps: 0, // keep settle PnL asserts exact (no fee dilution)
             maxStrategyDays: 30,
             votingPeriod: 1 hours,
             woodToken: address(wood),
@@ -219,6 +216,18 @@ abstract contract BaseIntegrationTest is Test {
         vm.prank(owner);
         vault.setAgentFeeBps(feeBps);
 
+        // Issue #43: every exec batch built by this file's strategy test
+        // suites is `[approve(strategy, amount), strategy.execute()]` — the
+        // MOVER (`execute()`, which pulls `amount` from the vault) is at the
+        // LAST index, not the first, so the generic
+        // `GovEnvelope.defaultCaps` convention (cap the FIRST call) would
+        // zero-cap the actual mover and trip `CallCapExceeded`. Cap the LAST
+        // exec call instead; settle batches here are single-call, so first
+        // and last coincide and the generic default stays correct for them.
+        uint256 maxCapital = GovEnvelope.permissive(address(vault)).maxCapital;
+        uint256[] memory execCaps = new uint256[](execCalls.length);
+        if (execCalls.length > 0) execCaps[execCalls.length - 1] = maxCapital;
+
         // Agent proposes
         vm.prank(agent);
         proposalId = governor.propose(
@@ -228,7 +237,9 @@ abstract contract BaseIntegrationTest is Test {
             duration,
             GovEnvelope.permissive(address(vault)),
             execCalls,
+            execCaps,
             settleCalls,
+            GovEnvelope.defaultCaps(maxCapital, settleCalls.length),
             _emptyCoProposers()
         );
 

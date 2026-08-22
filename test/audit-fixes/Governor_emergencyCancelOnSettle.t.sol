@@ -15,6 +15,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title Governor_emergencyCancelOnSettle — MS-H2 regression
 /// @notice Confirms `_finishSettlement` no longer auto-cancels an open
@@ -91,6 +92,10 @@ contract Governor_emergencyCancelOnSettle_Test is Test {
         // From `baseNonce`: swoodImpl(+0), swoodProxy(+1), govImpl(+2),
         // govProxy(+3), regImpl(+4), regProxy(+5).
         ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
+        // Hoisted ABOVE the nonce snapshot: the governor's mandatory tier-registry
+        // argument (pashov finding #1) is a DEPLOYMENT, so leaving it inline in the
+        // `initialize` tuple would consume a nonce and slide every predicted address.
+        address fixtureTierRegistry = address(deployTierRegistry(address(this)));
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedGovernor = vm.computeCreateAddress(address(this), baseNonce + 3);
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 5);
@@ -108,10 +113,8 @@ contract Governor_emergencyCancelOnSettle_Test is Test {
                     minOwnerStake: MIN_OWNER_STAKE,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -123,7 +126,8 @@ contract Governor_emergencyCancelOnSettle_Test is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 predictedRegistryProxy,
                 address(_hoistedPC),
-                address(this), // factory (test contract)
+                address(this),
+                fixtureTierRegistry, // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -150,8 +154,11 @@ contract Governor_emergencyCancelOnSettle_Test is Test {
         registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
         // Authorize the per-vault governor on the composite-key registry
         // (replaces the removed governor.addVault wiring).
+        // Hoisted: `vault()` is a call, so evaluating it as an argument would
+        // consume the prank and leave `addGovernor` unauthorized.
+        address govVault = governor.vault();
         vm.prank(registry.factory());
-        registry.addGovernor(address(governor));
+        registry.addGovernor(address(governor), govVault);
         require(address(registry) == predictedRegistryProxy, "registry addr mismatch");
 
         // Resolve the registry ↔ sWOOD circular dependency.
@@ -228,7 +235,9 @@ contract Governor_emergencyCancelOnSettle_Test is Test {
             duration,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
         vm.warp(vm.getBlockTimestamp() + 1);

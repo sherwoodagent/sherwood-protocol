@@ -26,6 +26,10 @@ abstract contract RegistryTestHarness is Test {
 
     address internal regOwner = address(0xA11CE);
     address internal regFactory = address(0xFAC10);
+    /// @dev Stand-in vault for the mock governor's `vaultOf` registration. Named
+    ///      rather than `address(this)` so it reads as a deliberate sentinel and
+    ///      never as a real bonded vault.
+    address internal constant HARNESS_VAULT_SENTINEL = address(0xFA017);
 
     /// @dev Deploys WOOD, a governor mock, sWOOD, and the registry, then wires
     ///      sWOOD ↔ registry. Call from a test's `setUp`.
@@ -46,10 +50,8 @@ abstract contract RegistryTestHarness is Test {
                     minOwnerStake: 10_000e18,
                     minSlashBps: 1000,
                     maxSlashBps: 9999,
-                    maxDelegatedSlashBps: 2000,
                     ageFloorBps: 2500,
-                    maturationPeriod: 30 days,
-                    delegatedWeightCapX: 4
+                    maturationPeriod: 30 days
                 }))
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
@@ -67,7 +69,22 @@ abstract contract RegistryTestHarness is Test {
         // Authorize the mock governor on the composite-key registry (the factory
         // does this in production via createSyndicate).
         vm.prank(regFactory);
-        registry.addGovernor(address(governor));
+        // `vaultOf` IS load-bearing: the emergency path resolves its owner-bond
+        // slash target from it. `MockGovernorMinimal` serves no real vault, so
+        // this harness registers an explicit sentinel — a suite that exercises
+        // an owner-bond slash MUST re-register the governor against the vault it
+        // actually bonded (see GuardianRegistry.t.sol), or the slash silently
+        // targets an address with no stake and no-ops.
+        registry.addGovernor(address(governor), HARNESS_VAULT_SENTINEL);
+    }
+
+    /// @dev Pushes a proposal's review window into the registry AS the mock
+    ///      governor. Post-refactor the registry reads the window from this
+    ///      stored registration (via `registerReview`) instead of calling back
+    ///      into the governor's removed `getProposalView`.
+    function _registerReview(uint256 proposalId, uint256 voteEnd, uint256 reviewEnd) internal {
+        vm.prank(address(governor));
+        registry.registerReview(proposalId, voteEnd, reviewEnd);
     }
 
     /// @dev Mints WOOD to `g`, approves sWOOD, and stakes `amount` as a
@@ -77,23 +94,6 @@ abstract contract RegistryTestHarness is Test {
         vm.startPrank(g);
         wood.approve(address(swood), type(uint256).max);
         swood.stakeAsGuardian(amount, agentId);
-        vm.stopPrank();
-    }
-
-    /// @dev Owner-enables DPoS delegation on sWOOD. `delegationEnabled` defaults
-    ///      false at deploy; tests that exercise `delegateStake` must flip it.
-    function _enableDelegation() internal {
-        vm.prank(regOwner);
-        swood.setDelegationEnabled(true);
-    }
-
-    /// @dev Mints WOOD to `delegator`, approves sWOOD, and delegates `amount`
-    ///      to `delegate`. Requires `_enableDelegation` to have been called.
-    function _delegate(address delegator, address delegate, uint256 amount) internal {
-        wood.mint(delegator, amount);
-        vm.startPrank(delegator);
-        wood.approve(address(swood), type(uint256).max);
-        swood.delegateStake(delegate, amount);
         vm.stopPrank();
     }
 }

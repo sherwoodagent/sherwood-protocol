@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "_about": [
+    "Provenance record for everything vendored under lib/. This repository has no",
+    ".gitmodules and no package manager for Solidity dependencies: lib/ is a plain",
+    "copy of upstream source. This manifest is the only statement of where that",
+    "copy came from, and script/check-vendor-provenance.sh is the only thing that",
+    "proves the statement is still true.",
+    "",
+    "Every pin below was established empirically (fetch upstream at the candidate",
+    "ref, `diff -r` against the vendored tree, iterate until the diff is empty) -",
+    "not asserted from package.json version strings. See the `verification` field",
+    "on each entry.",
+    "",
+    "To update a dependency: re-vendor it, then update `ref` / `version` (and the",
+    "npm `integrity`) here in the same commit. CI will fail the PR otherwise."
+  ],
+  "verified_at": "2026-08-01",
+  "dependencies": [
+    {
+      "name": "forge-std",
+      "local_path": "lib/forge-std",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/foundry-rs/forge-std.git",
+        "ref": "3e6d5cd6dd0dbe61952e6075ea6d55ed31d26381",
+        "ref_kind": "commit",
+        "ref_describe": "v1.15.0-6-g3e6d5cd",
+        "committed_at": "2026-03-13T10:44:27Z",
+        "subject": "Clarify requestRedeem docs (#831)",
+        "submodules": false
+      },
+      "compare": [
+        {
+          "upstream": ".",
+          "local": "."
+        }
+      ],
+      "pruned": [],
+      "local_modifications": [],
+      "verification": "Exact match. The vendored tree hashes to git tree 8612f1bb1e98a46ebef08d05eda619d0996c3217, which is the tree of upstream commit 3e6d5cd; `diff -r -x .git` against a checkout of that commit is empty. NOTE: this is an untagged master commit 6 commits after the v1.15.0 tag. package.json still reads 1.15.0, but the tree is NOT v1.15.0 - the tag differs in .github/workflows/ci.yml and in doc comments of src/interfaces/{IERC4626,IERC7540,IERC7575}.sol."
+    },
+    {
+      "name": "openzeppelin-contracts",
+      "local_path": "lib/openzeppelin-contracts",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/OpenZeppelin/openzeppelin-contracts.git",
+        "ref": "45f032d1bcf1a88b7bc90154d7eef76c87bf9d45",
+        "ref_kind": "commit",
+        "ref_describe": "untagged master commit (post-v5.6.1)",
+        "committed_at": "2026-03-06T10:46:23Z",
+        "subject": "AccountERC7579Hooked: prevent bugged or malicious hook module from reverting its own uninstallation (#6390)",
+        "submodules": true,
+        "submodule_pins": {
+          "lib/erc4626-tests": "232ff9ba8194e406967f52ecc5cb52ed764209e9",
+          "lib/forge-std": "1801b0541f4fda118a10798fd3486bb7051c5dd6",
+          "lib/halmos-cheatcodes": "7328abe100445fc53885c21d0e713b95293cf14c"
+        }
+      },
+      "compare": [
+        {
+          "upstream": ".",
+          "local": "."
+        }
+      ],
+      "pruned": [],
+      "local_modifications": [],
+      "verification": "Exact match, including the three nested submodules (vendored here as ordinary files rather than gitlinks): `diff -r -x .git` against a recursive checkout of 45f032d1 is empty. NOTE: untagged master commit, not the v5.6.1 release its package.json version claims - v5.6.1 differs in contracts/access/manager/AccessManager.sol (the reserved setAuthority selector branch), in audits/, in .changeset/, and in CI action pins."
+    },
+    {
+      "name": "openzeppelin-contracts-upgradeable",
+      "local_path": "lib/openzeppelin-contracts-upgradeable",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/OpenZeppelin/openzeppelin-contracts-upgradeable.git",
+        "ref": "524c8c98922b00741a2bd84d504885324e848d0f",
+        "ref_kind": "commit",
+        "ref_describe": "untagged master commit (post-v5.6.1)",
+        "committed_at": "2026-03-06T10:48:02Z",
+        "subject": "Transpile 45f032d1b",
+        "submodules": true,
+        "submodule_pins": {
+          "lib/erc4626-tests": "232ff9ba8194e406967f52ecc5cb52ed764209e9",
+          "lib/forge-std": "1801b0541f4fda118a10798fd3486bb7051c5dd6",
+          "lib/halmos-cheatcodes": "7328abe100445fc53885c21d0e713b95293cf14c",
+          "lib/openzeppelin-contracts": "45f032d1bcf1a88b7bc90154d7eef76c87bf9d45"
+        }
+      },
+      "compare": [
+        {
+          "upstream": ".",
+          "local": "."
+        }
+      ],
+      "pruned": [],
+      "local_modifications": [],
+      "verification": "Exact match, including nested submodules resolved recursively. This commit is the transpilation of openzeppelin-contracts 45f032d1, and its lib/openzeppelin-contracts submodule pin is exactly the ref pinned above - so the two OpenZeppelin trees in lib/ are mutually consistent."
+    }
+  ]
+}

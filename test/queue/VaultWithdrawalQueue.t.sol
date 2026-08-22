@@ -54,6 +54,111 @@ contract VaultWithdrawalQueueTest is Test {
         queue.stampSettlement(PID, NUM, DEN);
     }
 
+    /// @notice PASHOV REVIEW FINDING #10: a deposit's `claim` and `cancel`
+    ///         gates keyed on DIFFERENT pids, so both exits stayed open at once
+    ///         and the depositor held a costless permanent straddle.
+    /// @dev    `claim` was moved onto `_lastStampedPid` for Deposits precisely
+    ///         because a deposit's own `r.pid` may never be stamped —
+    ///         cancelled / vetoed / rejected / expired proposals all call
+    ///         `_decOpen()` and never `onProposalSettled`. `cancel` was left on
+    ///         `r.pid`, which for exactly that class reads false FOREVER. The
+    ///         holder could wait, watch the price, and take whichever leg paid
+    ///         (`amount * max(1, ppsNow / ppsStamp)`), the upside funded by the
+    ///         incumbent shareholders — the same "perpetual look-back call on
+    ///         the vault's NAV" the `_lastStampedPid` change closed on the
+    ///         claim side, reopened through the un-migrated cancel side. It
+    ///         also falsified `claim`'s own natspec: "`cancel` shuts once its
+    ///         proposal stamps, so waiting is strictly free".
+    ///
+    ///         THE STRADDLE IS NOW CLOSED AT ITS SOURCE, not by shutting one
+    ///         leg. Since finding #3, a deposit converts LIVE at claim time, so
+    ///         the frozen number the option was written against no longer
+    ///         exists. Both legs may stay open precisely because neither pays:
+    ///         claiming always mints at the current price, and cancelling just
+    ///         returns the escrow. Cancel MUST stay open, because the deposit
+    ///         gate can hold a claim shut while a residue is outstanding and a
+    ///         depositor must never be wedged between two closed exits.
+    function test_finding10_depositCancelStaysOpenBecauseTheOptionIsWorthless() public {
+        uint256 pidOther = PID + 1;
+        uint256 id = _queueDeposit(alice, 1_000e6);
+
+        // The request's OWN proposal never settles. A different one does — the
+        // exact configuration that used to arm the claim leg.
+        vm.prank(address(vault));
+        queue.stampSettlement(pidOther, NUM, DEN);
+
+        assertFalse(queue.getRequest(id).claimed, "fixture: not yet claimed");
+
+        // Cancel stays OPEN, and returns the escrow.
+        uint256 before = asset.balanceOf(alice);
+        vm.prank(alice);
+        queue.cancel(id);
+        assertTrue(queue.getRequest(id).cancelled, "deposit cancel is unconditional");
+        assertEq(asset.balanceOf(alice) - before, 1_000e6, "escrow returned in full");
+    }
+
+    /// @notice The other half of the same property: a depositor whose claim is
+    ///         gated shut by an outstanding residue can always still walk. This
+    ///         is why deposit-cancel must be unconditional rather than merely
+    ///         convenient.
+    function test_depositCancelOpenEvenWhileTheResidueGateHoldsClaimShut() public {
+        uint256 id = _queueDeposit(alice, 1_000e6);
+        vault.setDepositsLocked(true);
+
+        vm.expectRevert(IVaultWithdrawalQueue.VaultLocked.selector);
+        queue.claim(id);
+
+        vm.prank(alice);
+        queue.cancel(id);
+        assertTrue(queue.getRequest(id).cancelled, "not wedged: cancel is the exit");
+    }
+
+    /// @dev THE CONTROL THE FIRST VERSION OF THIS FIX LACKED (PR #195 review,
+    ///      blocker 1). `stampSettlement` sets `sp.stamped = true` BEFORE
+    ///      `_lastStampedPid = pid`, so `_settlePrice[_lastStampedPid].stamped`
+    ///      is true by construction from the protocol's first settlement
+    ///      onward — permanently, for every request. Gating cancel on that
+    ///      expression alone therefore bricked EVERY deposit cancel forever
+    ///      rather than closing the straddle, and the sibling test above
+    ///      passed anyway because it only ever asserted the revert.
+    ///
+    ///      A deposit created AFTER a settlement, with no settlement since,
+    ///      must still be cancellable.
+    function test_finding10_depositCancelStillOpenBeforeAnySettlementSinceRequest() public {
+        // A settlement exists before the request is even made.
+        vm.prank(address(vault));
+        queue.stampSettlement(PID, NUM, DEN);
+
+        // The deposit is tagged to the proposal open at request time, which is
+        // necessarily LATER than anything already settled — that is what
+        // `_openProposalPid` returns.
+        asset.mint(address(queue), 1_000e6);
+        vm.prank(address(vault));
+        uint256 id = queue.queueDeposit(alice, 1_000e6, PID + 1);
+
+        // Nothing has stamped SINCE. The claim price is not yet fixed for this
+        // request, so its cancel must still be open.
+        vm.prank(alice);
+        queue.cancel(id);
+        assertTrue(queue.getRequest(id).cancelled, "a deposit must be cancellable until a settlement lands after it");
+    }
+
+    /// @dev The control for finding #10: a REDEEM request keeps gating on its
+    ///      OWN pid. Those shares left the supply at that settlement and
+    ///      `_pidReserved` is denominated against that same price, so an
+    ///      unrelated settlement must not shut its cancel.
+    function test_finding10_redeemCancelStillGatesOnItsOwnPid() public {
+        uint256 pidOther = PID + 1;
+        uint256 id = _queueRedeem(alice, 100e18);
+
+        vm.prank(address(vault));
+        queue.stampSettlement(pidOther, NUM, DEN);
+
+        vm.prank(alice);
+        queue.cancel(id); // must NOT revert
+        assertTrue(queue.getRequest(id).cancelled, "an unrelated stamp cannot shut a redeem's cancel");
+    }
+
     // ── queueing ──
 
     function test_queueRedeem_recordsRequest() public {
@@ -74,6 +179,45 @@ contract VaultWithdrawalQueueTest is Test {
         assertEq(r.amount, 500e6);
         assertEq(uint256(r.kind), uint256(IVaultWithdrawalQueue.RequestKind.Deposit));
         assertEq(queue.pendingDepositAssets(), 500e6);
+    }
+
+    /// @notice A queued deposit carries NO claim deadline and no frozen price.
+    ///         It converts at whatever the vault is worth in the instant it
+    ///         actually joins the pool — no stamp, of its own or anyone else's,
+    ///         is consulted. Stamps moving underneath it change nothing.
+    function test_claimDeposit_ignoresStampsEntirely() public {
+        uint256 id = _queueDeposit(alice, 1_000e6);
+        _stamp(); // PID 1 at 2 assets/share — irrelevant to a deposit
+        vm.prank(address(vault));
+        queue.stampSettlement(PID + 1, 4, 1); // and so is this one
+
+        // The only thing that decides the mint is the LIVE price.
+        vault.setConvertRate(1, 4);
+
+        vm.prank(alice);
+        uint256 shares = queue.claim(id);
+
+        assertEq(shares, 250e6, "deposit mints at the live price, not any stamp");
+    }
+
+    /// @notice The look-back option pashov #10 closed is now worth ZERO by
+    ///         construction rather than by gate-complementarity: whenever the
+    ///         holder claims, they get that instant's price, so there is no
+    ///         stale number to wait for and exercise against.
+    function test_claimDeposit_waitingConfersNoAdvantage() public {
+        uint256 idEarly = _queueDeposit(alice, 1_000e6);
+        uint256 idLate = _queueDeposit(bob, 1_000e6);
+
+        vault.setConvertRate(1, 2);
+        vm.prank(alice);
+        uint256 sharesEarly = queue.claim(idEarly);
+
+        // Bob waits through a settlement, then claims at the SAME live price.
+        _stamp();
+        vm.prank(bob);
+        uint256 sharesLate = queue.claim(idLate);
+
+        assertEq(sharesLate, sharesEarly, "waiting buys nothing: same live price");
     }
 
     function test_queueRedeem_onlyVault() public {
@@ -164,24 +308,61 @@ contract VaultWithdrawalQueueTest is Test {
         queue.claim(1);
     }
 
-    // ── deposit claim (frozen) ──
+    // ── deposit claim (priced LIVE, gated on depositsLocked) ──
 
-    function test_claim_deposit_mintsFrozenShares() public {
+    function test_claim_deposit_mintsAtTheLivePrice() public {
         _queueDeposit(alice, 200e18);
-        _stamp();
+        // 2 assets per share, expressed as the vault's live conversion.
+        vault.setConvertRate(1, 2);
         uint256 out = queue.claim(1);
-        // shares = 200 assets * den/num = 200 * 1/2 = 100
-        assertEq(out, 100e18, "200 assets / price 2 = 100 shares");
+        assertEq(out, 100e18, "200 assets at 2 assets/share = 100 shares");
         assertEq(vault.balanceOf(alice), 100e18);
         assertEq(vault.lastDepositTo(), alice);
         assertEq(asset.balanceOf(address(vault)), 1_000_000e18 + 200e18, "escrowed assets pushed to vault");
         assertEq(queue.pendingDepositAssets(), 0);
     }
 
-    function test_claim_deposit_revertsBeforeStamp() public {
-        _queueDeposit(alice, 200e6);
-        vm.expectRevert(IVaultWithdrawalQueue.NotSettled.selector);
+    /// @notice NO STAMP IS REQUIRED ANYMORE. A deposit carries no frozen price,
+    ///         so there is nothing to wait for — it needs an honest instant to
+    ///         mint, not a settlement. This also un-bricks the class of deposits
+    ///         tagged to a proposal that never settles.
+    function test_claim_deposit_succeedsWithNoStampAtAll() public {
+        _queueDeposit(alice, 200e18);
+        vault.setConvertRate(1, 2);
+        uint256 out = queue.claim(1);
+        assertEq(out, 100e18, "claimable with no settlement ever stamped");
+    }
+
+    /// @notice THE FINDING-#3 GATE. While the vault reports a residue
+    ///         outstanding, a queued deposit cannot mint — that is the instant
+    ///         at which the price is blind to strategy-held value and minting
+    ///         would skim it from the incumbents.
+    function test_claim_deposit_refusedWhileResidueOutstanding() public {
+        _queueDeposit(alice, 200e18);
+        vault.setDepositsLocked(true);
+        vm.expectRevert(IVaultWithdrawalQueue.VaultLocked.selector);
         queue.claim(1);
+
+        // Residue cleared (swept in) — the claim opens, at the corrected price.
+        vault.setDepositsLocked(false);
+        vault.setConvertRate(1, 2);
+        assertEq(queue.claim(1), 100e18, "claimable once the residue is in");
+    }
+
+    /// @notice THE SKIM ITSELF, INVERTED. A residue arriving between request and
+    ///         claim raises the price, so the depositor mints FEWER shares — it
+    ///         is priced in rather than skimmed. Under the old frozen stamp the
+    ///         same sequence minted at the pre-residue price and the difference
+    ///         was taken from the incumbents.
+    function test_claim_deposit_residueArrivingBeforeClaimIsPricedIn() public {
+        _queueDeposit(alice, 200e18);
+
+        // Pre-residue the vault is worth 2 assets/share; the residue lands and
+        // each share is now backed by 4.
+        vault.setConvertRate(1, 4);
+
+        uint256 out = queue.claim(1);
+        assertEq(out, 50e18, "minted at the post-residue price, not the stale one");
     }
 
     // ── one frozen price for the whole proposal ──

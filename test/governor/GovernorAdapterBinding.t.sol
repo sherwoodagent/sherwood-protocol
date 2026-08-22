@@ -15,6 +15,7 @@ import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {MockStrategyAdapter} from "../mocks/MockStrategyAdapter.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title GovernorStrategyOnProposalTest
 /// @notice Coverage for the strategy-on-proposal model: the proposer passes
@@ -78,7 +79,8 @@ contract GovernorStrategyOnProposalTest is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -134,6 +136,50 @@ contract GovernorStrategyOnProposalTest is Test {
         return cs;
     }
 
+    /// @notice PASHOV REVIEW FINDING #8: `propose` wrote `p.strategy` verbatim
+    ///         from calldata, but `BaseStrategy.execute()` treats
+    ///         `strategyOf(activePid) == address(this)` as its whole
+    ///         authorisation — so the equality held BY CONSTRUCTION for whoever
+    ///         DECLARED the clone, not for whoever owned it.
+    /// @dev    `StrategyFactory.cloneAndInit` enforces `proposer == msg.sender`
+    ///         so `_proposer` is "a known authorized address", and
+    ///         `StrategyFactory` itself records the governor-side check as
+    ///         "deferred". Unbound, any registered agent could name a rival's
+    ///         pre-deployed, governance-allowlisted clone and drive it
+    ///         Pending -> Executed. The ratchet is one-way, so the rightful
+    ///         proposer's own later proposal reverts `AlreadyExecuted` forever;
+    ///         recovery needs a redeploy plus a fresh `setAdapterAllowed` and,
+    ///         if tier-certified, a new `proposeCertification` + `certifyDelay`.
+    function test_finding8_cannotProposeAnotherProposersClone() public {
+        address rival = makeAddr("rivalAgent");
+        StrategyOwnedBy foreign = new StrategyOwnedBy(rival, address(vault));
+
+        // HOISTED, NOT VIA `_propose`. Every argument here is itself a call
+        // (`GovEnvelope.permissive`, `_execCalls`, `defaultCaps`), and Solidity
+        // evaluates arguments BEFORE the callee — so building them inline would
+        // consume the one-shot `expectRevert` and the assertion would pass for
+        // the wrong reason (or, as here, fail with "next call did not revert").
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
+        BatchExecutorLib.Call[] memory ex = _execCalls();
+        BatchExecutorLib.Call[] memory st = _settleCalls();
+        uint256[] memory exCaps = GovEnvelope.defaultCaps(env.maxCapital, ex.length);
+        uint256[] memory stCaps = GovEnvelope.defaultCaps(env.maxCapital, st.length);
+        ISyndicateGovernor.CoProposer[] memory cps = _emptyCoProposers();
+
+        vm.prank(agent);
+        vm.expectRevert(ISyndicateGovernor.StrategyProposerMismatch.selector);
+        governor.propose(address(vault), address(foreign), "ipfs://test", 7 days, env, ex, exCaps, st, stCaps, cps);
+    }
+
+    /// @dev The control: the SAME shape, owned by the caller, must still work.
+    ///      Without it, the test above would also pass for a fix that simply
+    ///      refused every strategy.
+    function test_finding8_ownClonePropsesFine() public {
+        StrategyOwnedBy own = new StrategyOwnedBy(agent, address(vault));
+        uint256 pid = _propose(address(own));
+        assertEq(governor.getProposal(pid).strategy, address(own), "the caller's own clone is accepted");
+    }
+
     function _propose(address strategy) internal returns (uint256 proposalId) {
         vm.prank(agent);
         proposalId = governor.propose(
@@ -143,7 +189,9 @@ contract GovernorStrategyOnProposalTest is Test {
             7 days,
             GovEnvelope.permissive(address(vault)),
             _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
             _emptyCoProposers()
         );
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -231,5 +279,29 @@ contract GovernorStrategyOnProposalTest is Test {
         governor.vote(pid, ISyndicateGovernor.VoteType.For);
         ISyndicateGovernor.StrategyProposal memory afterVote = governor.getProposal(pid);
         assertEq(before.strategy, afterVote.strategy, "strategy unchanged across vote");
+    }
+}
+
+/// @notice Minimal stand-in for a `BaseStrategy` clone: it answers the two
+///         views `SyndicateGovernor.propose` binds against, and nothing else.
+/// @dev    Deliberately NOT a full `IStrategy` — `propose` reaches it by raw
+///         staticcall, so only these selectors matter, and keeping the surface
+///         this small is what makes the two finding-#8 tests read as "who owns
+///         this clone" rather than "is this a valid strategy".
+contract StrategyOwnedBy {
+    address internal immutable _proposer;
+    address internal immutable _vault;
+
+    constructor(address proposer_, address vault_) {
+        _proposer = proposer_;
+        _vault = vault_;
+    }
+
+    function proposer() external view returns (address) {
+        return _proposer;
+    }
+
+    function vault() external view returns (address) {
+        return _vault;
     }
 }

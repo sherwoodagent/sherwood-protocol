@@ -27,11 +27,10 @@ contract MockRegistryMinimalTest is Test {
 
     function test_liveSurface_keepsNoReviewDefaults() public {
         assertFalse(mock.resolveReview(address(this), 1));
-        (bool opened, bool resolved, bool blocked, bool cohortTooSmall) = mock.getReviewState(address(this), 1);
+        (bool opened, bool resolved, bool blocked) = mock.getReviewState(address(this), 1);
         assertTrue(opened);
         assertTrue(resolved);
         assertFalse(blocked);
-        assertFalse(cohortTooSmall);
         assertFalse(mock.isEmergencyOpen(address(this), 1));
 
         mock.setReviewPeriod(2 days);

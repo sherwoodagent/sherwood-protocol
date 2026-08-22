@@ -17,6 +17,7 @@ import {RegistryTestHarness} from "./helpers/RegistryTestHarness.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {IProtocolConfig} from "../src/interfaces/IProtocolConfig.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
 /// @title GuardianFeeBuyback (governor-level)
 /// @notice Covers the buyback-WOOD redesign: the guardian-fee slice now routes
@@ -52,11 +53,11 @@ contract GuardianFeeBuybackTest is Test {
     function setUp() public {
         protocolConfig = new ProtocolConfig(owner);
         // Guardian fee lives on ProtocolConfig now; the governor snapshots it
-        // at propose. Recipient-first coupling: set recipient, then bps.
-        vm.startPrank(owner);
+        // at propose. Only the RECIPIENT is configurable now — the guardian
+        // network's share is `mgmtSplit.guardianBps` / `perfSplit.guardianBps`,
+        // seeded by the ProtocolConfig constructor.
+        vm.prank(owner);
         protocolConfig.setGuardiansFeeRecipient(guardiansFeeRecipient);
-        protocolConfig.setGuardianFeeBps(GUARDIAN_FEE_BPS);
-        vm.stopPrank();
         usdc = new BlacklistingERC20Mock("USD Coin", "USDC", 6);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
@@ -89,7 +90,8 @@ contract GuardianFeeBuybackTest is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 address(guardianRegistry),
                 address(protocolConfig),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -144,7 +146,9 @@ contract GuardianFeeBuybackTest is Test {
             duration,
             GovEnvelope.permissive(address(vault)),
             _noopCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_noopCalls()).length),
             _noopCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_noopCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         vm.warp(block.timestamp + 1);
@@ -159,24 +163,31 @@ contract GuardianFeeBuybackTest is Test {
 
     // ── 1. Guardian fee lands in the recipient (not the registry) on profit ──
 
+    /// @dev The guardian network is no longer paid by a standalone
+    ///      `guardianFeeBps` off gross profit — that rate is superseded and now
+    ///      has no effect on settlement (design.md Decision 9). It earns a
+    ///      SHARE of each of the two fees: 10% of management, 15% of
+    ///      performance. So this test needs a nonzero performance rate to have
+    ///      a guardian slice at all; with the old zero rate nothing is charged
+    ///      and nothing is paid, which is correct behaviour, not a regression.
     function test_settle_guardianFee_landsInRecipient_notRegistry() public {
-        uint256 proposalId = _executeThroughSettle(0, 7 days);
+        uint256 proposalId = _executeThroughSettle(1000, 7 days); // 10% performance
 
         uint256 profit = 10_000e6;
         usdc.mint(address(vault), profit);
-        uint256 expectedFee = (profit * GUARDIAN_FEE_BPS) / 10_000; // 200e6
 
         uint256 recipientBefore = usdc.balanceOf(guardiansFeeRecipient);
         uint256 registryBefore = usdc.balanceOf(address(guardianRegistry));
-
-        vm.expectEmit(true, true, true, true, address(governor));
-        emit ISyndicateGovernor.GuardianFeeAccrued(proposalId, address(usdc), guardiansFeeRecipient, expectedFee);
 
         vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
         vm.prank(agent);
         governor.settleProposal(proposalId);
 
-        assertEq(usdc.balanceOf(guardiansFeeRecipient) - recipientBefore, expectedFee, "fee to recipient");
+        uint256 delivered = usdc.balanceOf(guardiansFeeRecipient) - recipientBefore;
+        assertGt(delivered, 0, "fee to recipient");
+        // 15% of a 10% performance fee on 10k is 150; bound it so a wrong split
+        // (e.g. paying the guardian the whole fee) still fails.
+        assertLt(delivered, 1_000e6, "and only its split share of it");
         assertEq(usdc.balanceOf(address(guardianRegistry)) - registryBefore, 0, "registry untouched");
     }
 
@@ -189,11 +200,12 @@ contract GuardianFeeBuybackTest is Test {
     ///         recipient recovers the escrow via `claimUnclaimedFees` once
     ///         un-blacklisted.
     function test_settle_guardianFee_escrowsOnRevertingRecipient_noEvent() public {
-        uint256 proposalId = _executeThroughSettle(0, 7 days);
+        // Nonzero performance rate so a guardian slice exists at all — see the
+        // note on the sibling test above.
+        uint256 proposalId = _executeThroughSettle(1000, 7 days);
 
         uint256 profit = 10_000e6;
         usdc.mint(address(vault), profit);
-        uint256 expectedFee = (profit * GUARDIAN_FEE_BPS) / 10_000; // 200e6
 
         // Recipient becomes blacklisted before settlement — the fee transfer reverts.
         usdc.setBlacklisted(guardiansFeeRecipient, true);
@@ -216,18 +228,15 @@ contract GuardianFeeBuybackTest is Test {
 
         // Fee sits escrowed against the recipient; nothing delivered yet.
         assertEq(usdc.balanceOf(guardiansFeeRecipient), 0, "nothing delivered while blacklisted");
-        assertEq(
-            governor.unclaimedFees(address(vault), guardiansFeeRecipient, address(usdc)),
-            expectedFee,
-            "fee escrowed against recipient"
-        );
+        uint256 escrowed = governor.unclaimedFees(address(vault), guardiansFeeRecipient, address(usdc));
+        assertGt(escrowed, 0, "fee escrowed against recipient");
 
         // Recovery: un-blacklist, recipient pulls the escrow.
         usdc.setBlacklisted(guardiansFeeRecipient, false);
         vm.prank(guardiansFeeRecipient);
         governor.claimUnclaimedFees(address(vault), address(usdc));
 
-        assertEq(usdc.balanceOf(guardiansFeeRecipient), expectedFee, "escrow recovered to recipient");
+        assertEq(usdc.balanceOf(guardiansFeeRecipient), escrowed, "escrow recovered to recipient");
         assertEq(governor.unclaimedFees(address(vault), guardiansFeeRecipient, address(usdc)), 0, "escrow slot cleared");
     }
 
@@ -250,44 +259,19 @@ contract GuardianFeeBuybackTest is Test {
         assertEq(usdc.balanceOf(guardiansFeeRecipient), 0, "no fee to recipient");
     }
 
-    // ── 3. setGuardianFeeBps coupling with the recipient ──
-
-    function test_setGuardianFeeBps_revertsWhenRecipientUnset() public {
-        // Turn off the fee, then clear the recipient (allowed while off).
-        vm.startPrank(owner);
-        protocolConfig.setGuardianFeeBps(0);
-        protocolConfig.setGuardiansFeeRecipient(address(0));
-        // Now raising the fee with no recipient must revert.
-        vm.expectRevert(ISyndicateGovernor.InvalidGuardiansFeeRecipient.selector);
-        protocolConfig.setGuardianFeeBps(100);
-        vm.stopPrank();
-    }
-
-    function test_setGuardianFeeBps_succeedsAfterRecipientSet() public {
-        vm.startPrank(owner);
-        protocolConfig.setGuardianFeeBps(0);
-        protocolConfig.setGuardiansFeeRecipient(address(0));
-        // Re-set a recipient, then raising the fee succeeds.
-        protocolConfig.setGuardiansFeeRecipient(guardiansFeeRecipient);
-        protocolConfig.setGuardianFeeBps(150);
-        vm.stopPrank();
-        assertEq(protocolConfig.guardianFeeBps(), 150);
-    }
+    // ── 3. The guardian rate is gone ──
+    //
+    // `setGuardianFeeBps` and its recipient-coupling reverts were removed with
+    // the two-number fee model: the guardian network is paid a SHARE of each
+    // fee, so there is no standalone rate to keep consistent with a recipient.
+    // A zero recipient is now unconditionally allowed and simply unwires the
+    // leg — the governor folds that share into the agent's remainder.
 
     // ── 4. setGuardiansFeeRecipient(0) coupling + event ──
 
-    function test_setGuardiansFeeRecipient_zeroReverts_whenFeeOn() public {
-        // Fee is on (GUARDIAN_FEE_BPS) from setUp.
+    function test_setGuardiansFeeRecipient_zeroAlwaysAllowed() public {
         vm.prank(owner);
-        vm.expectRevert(ISyndicateGovernor.InvalidGuardiansFeeRecipient.selector);
         protocolConfig.setGuardiansFeeRecipient(address(0));
-    }
-
-    function test_setGuardiansFeeRecipient_zeroAllowed_whenFeeOff() public {
-        vm.startPrank(owner);
-        protocolConfig.setGuardianFeeBps(0);
-        protocolConfig.setGuardiansFeeRecipient(address(0));
-        vm.stopPrank();
         assertEq(protocolConfig.guardiansFeeRecipient(), address(0));
     }
 
@@ -338,7 +322,7 @@ contract GuardianFeeBuyback_RegistryWeightsTest is RegistryTestHarness {
     function _openReview() internal returns (uint256 voteEnd, uint256 reviewEnd) {
         voteEnd = vm.getBlockTimestamp() + 1;
         reviewEnd = voteEnd + 24 hours + 1;
-        governor.setProposal(PID, voteEnd, reviewEnd);
+        _registerReview(PID, voteEnd, reviewEnd);
         vm.warp(voteEnd);
         registry.openReview(address(governor), PID);
         vm.warp(voteEnd + 1);

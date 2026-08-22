@@ -10,6 +10,7 @@ import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {StrategyFactory} from "../../src/StrategyFactory.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {DeploySherwood} from "../../script/Deploy.s.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
@@ -51,8 +52,8 @@ uint256 constant ROBINHOOD_TESTNET_FORK_BLOCK = 88_767_205;
  *           - WOOD is a non-production fixture (18 dec) minted 100M to the
  *             deployer at deploy. On the fork we `deal` WOOD to the test owner
  *             for the V2 owner-bond flow.
- *           - PriceRouter is zero-adapter → PortfolioStrategy is Lane-B-only
- *             (deposits/withdraws never consult a strategy price).
+ *           - Lane A is retired (issue #54): deposits/withdraws never consult a
+ *             strategy price.
  *           - No ENS / ERC-8004 (factory has address(0) for both) → identity
  *             checks are skipped.
  *
@@ -92,6 +93,11 @@ abstract contract RobinhoodIntegrationTest is Test {
     address swapAdapter;
     address portfolioTemplate;
     address chainlinkVerifier;
+    /// @dev `msg.sender` inside `deployCore` (the pranked `deployScript`
+    ///      address) — also the initial owner of `tierRegistry` below. See
+    ///      `_cloneAndInit` / `setUp` (issue #147).
+    address deployer;
+    address tierRegistry;
 
     // ── Per-test syndicate ──
 
@@ -115,6 +121,16 @@ abstract contract RobinhoodIntegrationTest is Test {
         swapAdapter = _readAddress("UNISWAP_SWAP_ADAPTER");
         portfolioTemplate = _readAddress("PORTFOLIO_TEMPLATE");
         chainlinkVerifier = _readAddress("CHAINLINK_VERIFIER");
+
+        // Issue #147: `PortfolioStrategy._initialize` now walks
+        // vault()→governor()→tierRegistry() and refuses a non-allowlisted
+        // swap adapter on this wired stack (deployCore wires the fresh
+        // TierRegistry into every per-vault governor at createSyndicate).
+        // Allowlist the live adapter before any clone can bind to it — the
+        // strategy CLONE itself is allowlisted separately, inside
+        // `_cloneAndInit` (a pre-existing fix, not fallout of this change).
+        vm.prank(deployer);
+        TierRegistry(tierRegistry).setAdapterAllowed(swapAdapter, true);
 
         // The LIVE StrategyFactory gates `_authClone` on `vaultToSyndicate` of
         // the OLD core factory, so a fresh vault would revert VaultNotRegistered.
@@ -144,7 +160,6 @@ abstract contract RobinhoodIntegrationTest is Test {
             ensRegistrar: address(0), // no ENS on Robinhood testnet
             agentRegistry: address(0), // no ERC-8004 on Robinhood testnet
             managementFeeBps: 50, // deploy-script defaults (mirrors the live-deploy config)
-            protocolFeeBps: 100,
             maxStrategyDays: 14,
             votingPeriod: 1 days,
             woodToken: address(wood),
@@ -161,6 +176,8 @@ abstract contract RobinhoodIntegrationTest is Test {
         factory = SyndicateFactory(d.factoryProxy);
         registry = GuardianRegistry(d.registryProxy);
         swood = StakedWood(d.swoodProxy);
+        deployer = d.deployer;
+        tierRegistry = d.tierRegistry;
     }
 
     // ── Address reader ──
@@ -233,6 +250,15 @@ abstract contract RobinhoodIntegrationTest is Test {
     function _cloneAndInit(address template, bytes memory initData) internal returns (address clone) {
         vm.prank(agent);
         clone = strategyFactory.cloneAndInit(template, address(vault), agent, initData);
+        // PRE-EXISTING fix, not fallout of issue #147: `_guardBatchCalls`
+        // (guard + registry wiring landed 9fafa00, post-dating this suite;
+        // RPC gating hid it) requires the strategy CLONE itself to be
+        // allowlisted before a governor batch's `asset.approve(strategy,
+        // amount)` can pass. The swap adapter is allowlisted separately, in
+        // `setUp`, before this function ever runs — `initialize` above
+        // enforces #147's `_requireAllowedAdapter` synchronously.
+        vm.prank(deployer);
+        TierRegistry(tierRegistry).setAdapterAllowed(clone, true);
     }
 
     // ── Propose → vote → guardian review (cold-start) → execute ──
@@ -249,6 +275,17 @@ abstract contract RobinhoodIntegrationTest is Test {
         vm.prank(owner);
         vault.setAgentFeeBps(feeBps);
 
+        // Issue #43: `PortfolioIntegrationTest`'s exec batch is
+        // `[approve(strategy, amount), strategy.execute()]` — the MOVER
+        // (`execute()`) is at the LAST index, not the first, so the generic
+        // `GovEnvelope.defaultCaps` convention (cap the FIRST call) would
+        // zero-cap the actual mover and trip `CallCapExceeded`. Cap the LAST
+        // exec call instead; the settle batch here is single-call, so first
+        // and last coincide and the generic default stays correct for it.
+        uint256 maxCapital = GovEnvelope.permissive(address(vault)).maxCapital;
+        uint256[] memory execCaps = new uint256[](execCalls.length);
+        if (execCalls.length > 0) execCaps[execCalls.length - 1] = maxCapital;
+
         vm.prank(agent);
         proposalId = governor.propose(
             address(vault),
@@ -257,7 +294,9 @@ abstract contract RobinhoodIntegrationTest is Test {
             duration,
             GovEnvelope.permissive(address(vault)),
             execCalls,
+            execCaps,
             settleCalls,
+            GovEnvelope.defaultCaps(maxCapital, settleCalls.length),
             _emptyCoProposers()
         );
 

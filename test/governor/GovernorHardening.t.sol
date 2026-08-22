@@ -14,6 +14,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Regression suite for G-H2 / G-H3 / G-H4 / G-H6 hardening fixes
 ///         from the pre-mainnet protocol checklist (#236).
@@ -72,7 +73,8 @@ contract GovernorHardeningTest is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -145,8 +147,18 @@ contract GovernorHardeningTest is Test {
         if (vault.totalAssets() == 0) _depositLps();
         ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(leadAgent);
-        proposalId =
-            governor.propose(address(vault), address(0), "ipfs://gh2", 7 days, env, _execCalls(), _settleCalls(), cps);
+        proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://gh2",
+            7 days,
+            env,
+            _execCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_execCalls()).length),
+            _settleCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_settleCalls()).length),
+            cps
+        );
     }
 
     /// @dev Create a 2-party collab: lead + 1 co-prop to land in Draft quickly.
@@ -158,7 +170,16 @@ contract GovernorHardeningTest is Test {
         ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(leadAgent);
         proposalId = governor.propose(
-            address(vault), address(0), "ipfs://draft", 7 days, env, _execCalls(), _settleCalls(), cps
+            address(vault),
+            address(0),
+            "ipfs://draft",
+            7 days,
+            env,
+            _execCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_execCalls()).length),
+            _settleCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_settleCalls()).length),
+            cps
         );
     }
 
@@ -237,7 +258,9 @@ contract GovernorHardeningTest is Test {
             7 days,
             env,
             _execCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -342,7 +365,9 @@ contract GovernorHardeningTest is Test {
             7 days,
             env,
             _execCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -431,7 +456,9 @@ contract GovernorHardeningTest is Test {
             7 days,
             env,
             _execCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -530,7 +557,9 @@ contract GovernorHardeningTest is Test {
             7 days,
             env,
             oversized,
+            GovEnvelope.defaultCaps((env).maxCapital, (oversized).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -550,7 +579,9 @@ contract GovernorHardeningTest is Test {
             7 days,
             env,
             _execCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_execCalls()).length),
             oversized,
+            GovEnvelope.defaultCaps((env).maxCapital, (oversized).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -578,7 +609,9 @@ contract GovernorHardeningTest is Test {
             7 days,
             env,
             _execCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -604,7 +637,9 @@ contract GovernorHardeningTest is Test {
             7 days,
             env,
             _execCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -620,7 +655,18 @@ contract GovernorHardeningTest is Test {
         cps[0] = ISyndicateGovernor.CoProposer({agent: co1, splitBps: 3000});
         ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         vm.prank(leadAgent);
-        governor.propose(address(vault), address(0), "ipfs://draft", 7 days, env, _execCalls(), _settleCalls(), cps);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://draft",
+            7 days,
+            env,
+            _execCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_execCalls()).length),
+            _settleCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_settleCalls()).length),
+            cps
+        );
 
         // Vault already has a counted Draft — a second propose reverts.
         vm.prank(co2);
@@ -632,7 +678,9 @@ contract GovernorHardeningTest is Test {
             7 days,
             env,
             _execCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_execCalls()).length),
             _settleCalls(),
+            GovEnvelope.defaultCaps((env).maxCapital, (_settleCalls()).length),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
