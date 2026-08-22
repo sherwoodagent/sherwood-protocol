@@ -74,7 +74,9 @@ contract LighterForkBench is ScriptBase {
 
     // ── Sizing. Bounded by what the fork's ONE live guardian can underwrite:
     //    `slashableBondUsd` is ~$6.5k, and required coverage is
-    //    `(execCap + settleCap) * 9999 / 10_000` USDG priced ~1:1. 2k + 2k
+    //    `execCap + settleCap` USDG priced ~1:1 (the FULL notional: `execute()`
+    //    and `settle()` are deliberately uncertified, so they resolve to the
+    //    tier-2 / 10_000-bps default — see DeployLighterTemplate). 2k + 2k
     //    leaves comfortable headroom; 40k (the 2026-07 run's figure) would be
     //    scaled down by `_deriveAndStoreEffectiveCapital` and the clone would
     //    deploy the scaled figure instead — which is a legal bench run, just not
@@ -215,8 +217,13 @@ contract LighterForkBench is ScriptBase {
         // `setClassAllowed(template, true)` alone — no per-clone owner call.
         require(tiers.isCallableTarget(clone), "clone not callable via the class path");
         require(tiers.isAdapterAllowed(clone), "clone not an allowed spender via the class path");
+        // ...while `execute()` itself stays UNCERTIFIED, which is the deploy
+        // ceremony's deliberate choice: the class anchor is minted off the inert
+        // `name()` selector so the allowlist opens without pricing the
+        // money-moving selectors as bounded. Expect `2 / 10000`.
         (uint8 t, uint16 b) = tiers.classTierOf(template, IStrategy.execute.selector);
-        console.log("classTierOf(execute) tier / boundBps:", t, b);
+        console.log("classTierOf(execute) tier / boundBps (expect 2 / 10000):", t, b);
+        require(t == 2 && b == 10_000, "execute() is class-certified - re-run DeployLighterTemplate's ceremony");
 
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
         execCalls[0] = BatchExecutorLib.Call({
@@ -291,12 +298,15 @@ contract LighterForkBench is ScriptBase {
     {
         address ledger = gov.exposureLedger();
         if (ledger == address(0)) return 0;
+        // FULL NOTIONAL on both legs: neither `execute()` nor `settle()` is
+        // class-certified, so `tierOf` returns the `(2, 10_000)` default and
+        // `_scanCalls` sums the caps verbatim.
         uint256 coverage;
         for (uint256 i; i < execCaps.length; i++) {
-            coverage += (execCaps[i] * 9_999) / 10_000;
+            coverage += execCaps[i];
         }
         for (uint256 i; i < settleCaps.length; i++) {
-            coverage += (settleCaps[i] * 9_999) / 10_000;
+            coverage += settleCaps[i];
         }
         (bool ok, bytes memory ret) = ledger.staticcall(
             abi.encodeWithSignature("proposerBondWood(address,uint256)", IERC4626(v).asset(), coverage)
@@ -542,8 +552,9 @@ contract LighterForkBench is ScriptBase {
         _load();
         address ledger = _gov().exposureLedger();
         uint256 want = _deployAmount();
-        // Both legs, at the certified bound, exactly as `_resolveTierAndCoverage` sums them.
-        uint256 coverage = (want * 9_999) / 10_000 * 2;
+        // Both legs at the UNCERTIFIED full-notional bound, exactly as
+        // `_resolveTierAndCoverage` sums them.
+        uint256 coverage = want * 2;
         (, bytes memory needRet) =
             ledger.staticcall(abi.encodeWithSignature("coverageUsd(address,uint256)", address(USDG), coverage));
         uint256 needUsd = abi.decode(needRet, (uint256));

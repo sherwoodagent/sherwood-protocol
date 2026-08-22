@@ -20,9 +20,16 @@ import {LighterPerpStrategy} from "../src/strategies/LighterPerpStrategy.sol";
  *   after `proposeClassCertification`, so the ceremony cannot be one broadcast:
  *
  *     run()       deploy → approve on the factory → `setCounterpartyAllowed(ZK_LIGHTER)`
- *                 → `proposeClassCertification(template, execute|settle, ...)`
- *     finalize()  (after readyAt) `certifyClass(template, execute|settle)`
+ *                 → `proposeClassCertification(template, name(), ...)`
+ *     finalize()  (after readyAt) `certifyClass(template, name())`
  *                 → `setClassAllowed(template, true)`
+ *
+ *   `execute()` AND `settle()` ARE DELIBERATELY LEFT UNCERTIFIED. That is the
+ *   whole point of the ceremony's shape and it is the opposite of what the
+ *   sibling templates do, so read `_classTier` below before "fixing" it: this
+ *   template is priced at the uncertified tier-2 / full-notional default, and
+ *   the only thing certified is an inert selector that exists to mint the class
+ *   ANCHOR `setClassAllowed` requires.
  *
  *   Usage — Robinhood mainnet (4663):
  *     forge script script/DeployLighterTemplate.s.sol:DeployLighterTemplate \
@@ -82,28 +89,82 @@ contract DeployLighterTemplate is ScriptBase {
     address internal constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     uint16 internal constant USDG_ASSET_INDEX = 3;
 
-    /// @dev The class grant is keyed on (clone codehash, SELECTOR), and the
-    ///      governor scans BOTH batch legs: `_scanCalls` takes the max tier over
-    ///      the execute calls and sums `cap * boundBps` over execute AND settle.
-    ///      Certifying only `execute()` would leave every settle call resolving
-    ///      to the uncertified default `(2, 10_000)` and inflate the coverage the
-    ///      proposal must post. So both, always.
+    /// @dev The two selectors the governor prices, named here only so the
+    ///      verification reads below can print what they resolve to. NEITHER IS
+    ///      CERTIFIED — see `SEL_ANCHOR`.
     bytes4 internal constant SEL_EXECUTE = IStrategy.execute.selector;
     bytes4 internal constant SEL_SETTLE = IStrategy.settle.selector;
 
-    /// @dev Tier and extractable bound for the class grant. `proposeClassCertification`
-    ///      rejects `tier >= 2` and a bound of `0` or `>= 10_000`, so 9_999 is the
-    ///      loosest legal bound and is the honest one here: `execute()` moves the
-    ///      whole declared cap into an off-chain perp venue, so essentially all of
-    ///      the notional is extractable in the guardian-coverage sense. Overridable
-    ///      per deployment, because this is a governance parameter and not a
-    ///      constant of the design — see docs/adapter-onboarding-checklist.md §1.
+    /// @dev THE ANCHOR SELECTOR, AND THE ONLY CERTIFIED ONE. `name()` is `pure`,
+    ///      returns a string literal, and moves nothing — so certifying it at
+    ///      tier 0 / bound 1 is a true statement rather than a convenient one.
+    ///
+    ///      It exists because the two class axes are not the same axis.
+    ///      `setClassAllowed(template, true)` is what makes a per-proposal clone
+    ///      a legal batch callee at all (`SyndicateVault._guardBatchCalls` PART
+    ///      2a via `isCallableTarget`), and it reverts `ClassNotCertified`
+    ///      unless a class ANCHOR exists — which only `certifyClass` writes, and
+    ///      which is keyed on the clone codehash, NOT on the selector
+    ///      (`TierRegistry:1303`). So certifying any ONE selector opens the
+    ///      allowlist for the whole class while leaving every OTHER selector at
+    ///      the uncertified default. That is exactly the combination this
+    ///      template wants, and there is no other way to reach it: the class
+    ///      path cannot express tier 2 or a 10_000 bound directly (see
+    ///      `_classTier`).
+    bytes4 internal constant SEL_ANCHOR = IStrategy.name.selector;
+
+    /// @dev Tier and extractable bound FOR THE ANCHOR GRANT ONLY.
+    ///
+    ///      THE DECISION THIS ENCODES: `LighterPerpStrategy.execute()` moves the
+    ///      whole declared cap into an off-chain perp venue whose sequencer this
+    ///      protocol does not control and whose margin no on-chain reader can
+    ///      price. There is no honest sub-10_000 extractable bound for that
+    ///      call, and no honest claim that it is a bounded, reviewed money
+    ///      movement in the tier-0/1 sense. It should be priced exactly like an
+    ///      uncertified call: tier 2, full notional.
+    ///
+    ///      THE REGISTRY CANNOT BE ASKED FOR THAT DIRECTLY. Verified, not
+    ///      assumed: `proposeClassCertification` reverts `InvalidTier` on
+    ///      `tier >= TIER_ARBITRARY (2)` and `BoundRequired` on a bound of `0`
+    ///      or `>= FULL_NOTIONAL_BPS (10_000)` (`TierRegistry:1245-1246`). Tier
+    ///      2 / 10_000 is not a certification you can buy — it is what `tierOf`
+    ///      RETURNS when no certification exists (`TierRegistry:358`). So the
+    ///      correct encoding of "tier 2 / full notional" is to certify neither
+    ///      `execute()` nor `settle()`, and to mint the anchor off `SEL_ANCHOR`.
+    ///
+    ///      GUARDIAN-COVERAGE CONSEQUENCE, stated plainly because it is the
+    ///      point and not a side effect: `_scanCalls` sums
+    ///      `cap_i * boundBps_i / 10_000` across BOTH legs, so a proposal's
+    ///      `requiredCoverage` becomes `sum(execCaps) + sum(settleCaps)` at the
+    ///      full 10_000 bound — for the canonical one-mover-per-leg shape,
+    ///      `2 x maxCapital`. It was `9_999/10_000` of that under the old
+    ///      default, so the delta is 0.01%; the substantive change is
+    ///      `envelopeTier`, which is now 2 and can never be lowered by a
+    ///      parameter change. Three things follow, all of them the safe
+    ///      direction:
+    ///        - the bond-encumbered approve quorum can never be escaped by an
+    ///          owner raising `ExposureLedger.quorumTierThreshold` to 2. A
+    ///          template that moves the whole cap off-chain must always have an
+    ///          identified, stake-backed approver on the hook.
+    ///        - the per-call tier-2 ceiling (`tier2CallCapBps`, default 10_000 =
+    ///          inert) now binds this template if an owner ever tightens it.
+    ///        - `executeProposal`'s `TierRegressed` / `CoverageRegressed` guards
+    ///          become unreachable for this template: tier cannot rise above 2
+    ///          and coverage cannot rise above the full bound, so a class
+    ///          demotion landing between propose and execute can no longer brick
+    ///          an in-flight proposal.
+    ///
+    ///      Still overridable, because it is a governance parameter — but note
+    ///      that the override now moves the ANCHOR's grant, not `execute()`'s.
+    ///      Certifying `execute()` itself is a deliberate act that this script
+    ///      will not perform; the RUNBOOK lines print the call shape for an
+    ///      operator who decides otherwise.
     function _classTier() internal view returns (uint8) {
-        return uint8(vm.envOr("LIGHTER_CLASS_TIER", uint256(1)));
+        return uint8(vm.envOr("LIGHTER_CLASS_TIER", uint256(0)));
     }
 
     function _classBoundBps() internal view returns (uint16) {
-        return uint16(vm.envOr("LIGHTER_CLASS_BOUND_BPS", uint256(9_999)));
+        return uint16(vm.envOr("LIGHTER_CLASS_BOUND_BPS", uint256(1)));
     }
 
     // ── Phase 1 ──
@@ -152,7 +213,7 @@ contract DeployLighterTemplate is ScriptBase {
 
     // ── Phase 2 (after `readyAt`) ──
 
-    /// @notice Execute the pending class certification and open the class axis.
+    /// @notice Execute the pending ANCHOR certification and open the class axis.
     /// @dev    Split from `run()` because `certifyClass` reverts
     ///         `CertifyDelayNotElapsed` until `certifyDelay` has passed. On the
     ///         Tenderly fork that wait is `evm_increaseTime`; on 4663 it is three
@@ -172,9 +233,8 @@ contract DeployLighterTemplate is ScriptBase {
         vm.startBroadcast();
         address sender = msg.sender;
 
-        TierRegistry(registry).certifyClass(template, SEL_EXECUTE);
-        TierRegistry(registry).certifyClass(template, SEL_SETTLE);
-        console.log("class certified for execute() + settle():", template);
+        TierRegistry(registry).certifyClass(template, SEL_ANCHOR);
+        console.log("class ANCHOR certified on name():", template);
 
         if (TierRegistry(registry).owner() == sender) {
             TierRegistry(registry).setClassAllowed(template, true);
@@ -186,6 +246,15 @@ contract DeployLighterTemplate is ScriptBase {
         vm.stopBroadcast();
 
         console.log("isClassAllowed:", TierRegistry(registry).isClassAllowed(template));
+        // THE READ THAT PROVES THE DECISION. Both must print `2 10000` — the
+        // uncertified full-notional default. Anything else means someone
+        // certified the money-moving selectors and the template is being priced
+        // as a bounded adapter, which it is not.
+        (uint8 te, uint16 be) = TierRegistry(registry).classTierOf(template, SEL_EXECUTE);
+        (uint8 ts, uint16 bs) = TierRegistry(registry).classTierOf(template, SEL_SETTLE);
+        console.log("classTierOf(execute) tier / boundBps (expect 2 / 10000):", te, be);
+        console.log("classTierOf(settle)  tier / boundBps (expect 2 / 10000):", ts, bs);
+        require(te == 2 && be == 10_000 && ts == 2 && bs == 10_000, "execute()/settle() must stay UNCERTIFIED");
     }
 
     // ── Internals ──
@@ -204,9 +273,10 @@ contract DeployLighterTemplate is ScriptBase {
             console.log("RUNBOOK: the registry owner must call, in order:");
             console.log("RUNBOOK:   setCounterpartyAllowed(<ZK_LIGHTER>, true):", ZK_LIGHTER);
             console.log(
-                "RUNBOOK:   proposeClassCertification(<template>, execute()|settle(), tier, bound, submitter, codehash)"
+                "RUNBOOK:   proposeClassCertification(<template>, name(), 0, 1, submitter, codehash) - ANCHOR ONLY"
             );
-            console.log("RUNBOOK:   certifyClass + setClassAllowed(<template>, true) after certifyDelay:", template);
+            console.log("RUNBOOK:   do NOT certify execute()/settle(): they must stay tier-2 full-notional");
+            console.log("RUNBOOK:   certifyClass(<template>, name()) + setClassAllowed(<template>, true):", template);
             return;
         }
         if (TierRegistry(registry).owner() != deployer) {
@@ -214,9 +284,10 @@ contract DeployLighterTemplate is ScriptBase {
             console.log("RUNBOOK: the registry owner must call, in order:");
             console.log("RUNBOOK:   setCounterpartyAllowed(<ZK_LIGHTER>, true):", ZK_LIGHTER);
             console.log(
-                "RUNBOOK:   proposeClassCertification(<template>, execute()|settle(), tier, bound, submitter, codehash)"
+                "RUNBOOK:   proposeClassCertification(<template>, name(), 0, 1, submitter, codehash) - ANCHOR ONLY"
             );
-            console.log("RUNBOOK:   certifyClass + setClassAllowed(<template>, true) after certifyDelay:", template);
+            console.log("RUNBOOK:   do NOT certify execute()/settle(): they must stay tier-2 full-notional");
+            console.log("RUNBOOK:   certifyClass(<template>, name()) + setClassAllowed(<template>, true):", template);
             return;
         }
 
@@ -227,12 +298,15 @@ contract DeployLighterTemplate is ScriptBase {
         // which case `certifyClass` becomes submitter-only and pulls WOOD from
         // it. Naming the deployer either way is harmless and keeps the bonded
         // configuration workable without a second script.
+        // THE ANCHOR SELECTOR ONLY. `execute()` and `settle()` are left
+        // uncertified on purpose so `tierOf` resolves them to the tier-2 /
+        // full-notional default — see `SEL_ANCHOR` and `_classTier`.
         uint8 tier = _classTier();
         uint16 boundBps = _classBoundBps();
         bytes32 codehash = template.codehash;
-        TierRegistry(registry).proposeClassCertification(template, SEL_EXECUTE, tier, boundBps, deployer, codehash);
-        TierRegistry(registry).proposeClassCertification(template, SEL_SETTLE, tier, boundBps, deployer, codehash);
-        console.log("class certification proposed; tier / boundBps:", tier, boundBps);
+        TierRegistry(registry).proposeClassCertification(template, SEL_ANCHOR, tier, boundBps, deployer, codehash);
+        console.log("class ANCHOR certification proposed on name(); tier / boundBps:", tier, boundBps);
+        console.log("execute() + settle() left UNCERTIFIED - they price at tier 2 / 10000 bps");
         console.log("readyAt is now + TierRegistry.certifyDelay:", TierRegistry(registry).certifyDelay());
         if (TierRegistry(registry).submitterBondWood() != 0) {
             console.log("RUNBOOK: submitterBondWood is nonzero - the submitter must approve WOOD to the registry");

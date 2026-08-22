@@ -174,11 +174,40 @@ Robinhood's 98,304-byte `MaxCodeSize`. It patches `LIGHTER_PERP_TEMPLATE` into
 
 **Both TierRegistry axes are mandatory, and skipping either is silent.** Without
 `setCounterpartyAllowed(ZK_LIGHTER, true)` every clone-init reverts
-`CounterpartyNotAllowed`; without `setClassAllowed(template, true)` clones sit at
-the uncertified tier-2 default and inflate the coverage a proposal must post. Any
+`CounterpartyNotAllowed`; without `setClassAllowed(template, true)` no proposal
+can name a clone at all — `SyndicateVault._guardBatchCalls` PART 2a refuses it,
+because a per-proposal clone has no address entry to fall back on. Any
 owner-gated step the broadcaster cannot perform degrades to a `RUNBOOK:` console
 line rather than a silent skip — read the log. `script/verify-robinhood-fork.sh`
 checks all of it.
+
+**What the ceremony certifies is `name()`, and that is deliberate.** The class
+grant is keyed on `(clone codehash, selector)`, but the class **anchor** that
+`setClassAllowed` requires is keyed on the codehash alone — so certifying one
+inert selector opens the allowlist for every clone while leaving `execute()` and
+`settle()` at the uncertified `(tier 2, 10_000 bps)` default. That is the
+intended pricing: `execute()` moves the whole declared cap into an off-chain perp
+venue, so a proposal's `requiredCoverage` is the **full notional** of every cap
+across both legs — `2 x maxCapital` for the canonical one-mover-per-leg shape.
+The registry cannot be asked for it directly (`proposeClassCertification` rejects
+`tier >= 2` and a bound `>= 10_000`), which is why the ceremony reaches it by
+*not* certifying. `finalize()` asserts `classTierOf(execute) == (2, 10000)` and
+`classTierOf(settle) == (2, 10000)` before it finishes.
+
+Verify by hand:
+
+```bash
+cast call "$TIERS" 'classTierOf(address,bytes4)(uint8,uint16)' "$TEMPLATE" 0x61461954  # execute() -> 2 10000
+cast call "$TIERS" 'classTierOf(address,bytes4)(uint8,uint16)' "$TEMPLATE" 0x11da60b4  # settle()  -> 2 10000
+cast call "$TIERS" 'classTierOf(address,bytes4)(uint8,uint16)' "$TEMPLATE" 0x06fdde03  # name()    -> 0 1 (the anchor)
+cast call "$TIERS" 'isClassAllowed(address)(bool)'             "$TEMPLATE"             # -> true
+```
+
+An already-certified registry (the pre-2026-08-22 default certified `execute()`
+and `settle()` at `(1, 9_999)`) migrates with `demoteClass` on both selectors,
+then `setClassAllowed(template, true)` again — `_demoteClass` clears the funds
+axis but deliberately leaves the callee axis standing so a live clone is never
+stranded.
 
 ## 5. Full strategy lifecycle test
 

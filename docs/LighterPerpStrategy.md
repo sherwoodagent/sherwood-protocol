@@ -47,6 +47,7 @@ price rather than guessing at it. See "Residue reporting" below.
 | **Agent key is trade-only** | `changePubKey(acct, apiKeyIndex, pubKey)` registers an L2 key that can place/cancel orders through the API. It **cannot** withdraw — `withdraw` / `withdrawPendingBalance` are venue-authed to the account owner, never the API key. A compromised agent key can churn/lose the position but cannot exfiltrate principal. |
 | **On-chain kill switch** | The proposer can `CANCEL_ALL`, `CLOSE_MARKET`, `ROTATE_KEY` or `REGISTER_KEY` at any time via `updateParams`, `initiateReturn()` force-closes every configured market both directions, and `queueWithdraw(ticks)` drains the account — all without the agent's cooperation. **The vault owner holds the same levers** via `guardrailAction(...)`, `registerAgentKey()`, `initiateReturn()` and `queueWithdraw(...)`. That second key is not redundancy for its own sake: `onlyProposer` re-reads the vault's live agent set, so without it `SyndicateVault.removeAgent` would *kill the kill switch* — de-registering a misbehaving agent would leave nobody able to cancel its orders or close its positions until `strategyDuration` elapsed. |
 | **Venue is bound to governance** | `ZK_LIGHTER` is bound on the TierRegistry **counterparty** axis at `_initialize` (`vault() → governor() → tierRegistry() → isCounterpartyAllowed`) and re-checked at `_execute`. `ZK_LIGHTER` is a `constant`, so this is not protection against a hostile address — it is the switch that lets an owner make the whole template inert in one call, without touching the `StrategyFactory` allowlist or waiting for a redeploy. It is deliberately **not** consulted on the exit path (`_settle` / `sweep` / `recoverResiduals`), so a demotion can never freeze capital already at the venue. |
+| **Priced as an uncertified call, on purpose** | `execute()` and `settle()` are deliberately **not** class-certified in the TierRegistry, so `tierOf` resolves both to the uncertified default `(tier 2, 10_000 bps)` and a proposal's `requiredCoverage` is the **full notional** of every declared cap across both legs. `execute()` moves the whole cap into an off-chain venue whose sequencer this protocol does not control and whose margin no on-chain reader can price — there is no honest sub-`10_000` extractable bound for it. See "Tiering" below for how the class allowlist is still opened without certifying those two selectors. |
 | **Vault asset is bound** | `_initialize` reverts `AssetMismatch` unless `IERC4626(vault()).asset() == USDG`. Same bind, same reason, as `MorphoSupplyStrategy`'s `LoanAssetMismatch`: every pull and every push here is denominated in a `constant`, and a vault accounting in a different asset would never see the value move. |
 | **Value is never self-reported** | The venue exposes no on-chain mark the PriceRouter could trust for an in-flight perp — positions and margin are off-chain sequencer state and `IZkLighter` exposes no accessor for either. The vault reads float only while the proposal is open; realized PnL is the USDG that actually round-trips back at settle. Post-settlement the clone reports residue through `IStrategyDelivery`, and reports the part it cannot value as *unvalued* rather than as zero. |
 | **Residual trust: `markets` ≠ the agent's reach** | The registered L2 key can trade **any** Lighter market — the venue enforces no per-key whitelist. `markets` is only the list `initiateReturn()` auto-closes, so a position the agent opens outside it is **not** closed by the automatic unwind and its margin stays locked. See "Residual trust" below. |
@@ -198,6 +199,56 @@ since the fork replays mainnet state):
 
 `initialize` reverts `DepositTooSmall` below `MIN_DEPOSIT = 1e6` (1 USDG). USDG tick size
 is 1, so any 6-dp amount is trivially a valid tick multiple.
+
+## Tiering: certified as a class, uncertified as a call
+
+Two axes, and they are not the same axis. Getting this wrong is the difference
+between "no proposal can name the clone at all" and "guardians underwrite half of
+what is actually at risk".
+
+| Axis | Question | Set by | This template |
+|---|---|---|---|
+| Class **allowlist** (`isCallableTarget` / `isAdapterAllowed`) | may a batch *call* this clone, and may it *receive* vault funds? | `setClassAllowed(template, true)` | **yes** — otherwise every proposal reverts at `SyndicateVault._guardBatchCalls` PART 2a, since a per-proposal clone has no address entry |
+| Class **certification** (`tierOf`) | how much of a declared cap is extractable, and at what tier? | `certifyClass(template, selector)` | **no**, for `execute()` and `settle()` — they stay at the `(2, 10_000)` default |
+
+The registry cannot express "tier 2 / full notional" as a *certification*:
+`proposeClassCertification` reverts `InvalidTier` on `tier >= 2` and
+`BoundRequired` on a bound of `0` or `>= 10_000`. Tier 2 / 10_000 is what
+`tierOf` **returns when nothing is certified**. So the correct encoding of the
+decision is to certify neither money-moving selector.
+
+But `setClassAllowed` reverts `ClassNotCertified` without a class **anchor**, and
+only `certifyClass` writes one — keyed on the *clone codehash*, not on the
+selector. So `script/DeployLighterTemplate.s.sol` certifies exactly one inert
+selector, `name()` (`pure`, returns a string literal, moves nothing), at tier 0 /
+bound 1. That mints the anchor, `setClassAllowed(template, true)` opens both
+allowlist axes for every clone, and `execute()` / `settle()` keep resolving to
+the uncertified default. `finalize()` asserts that last part rather than
+assuming it.
+
+**What follows from tier 2**, all of it the safe direction:
+
+- The bond-encumbered approve quorum can never be escaped by an owner raising
+  `ExposureLedger.quorumTierThreshold` to 2. A template that moves the whole cap
+  off-chain always has an identified, stake-backed approver on the hook.
+- The per-call tier-2 ceiling (`tier2CallCapBps`, default `10_000` = inert) binds
+  this template if an owner ever tightens it.
+- `executeProposal`'s `TierRegressed` / `CoverageRegressed` guards become
+  unreachable here: the tier cannot rise above 2 and coverage cannot rise above
+  the full bound, so a demotion landing between propose and execute can no longer
+  brick an in-flight proposal.
+- `requiredCoverage` is `sum(execCaps) + sum(settleCaps)` — for the canonical
+  one-mover-per-leg proposal, `2 × maxCapital`. Size the guardian cohort against
+  that, and read `coveragePreflight` in `script/fork/LighterForkBench.s.sol`
+  before proposing: an under-covered proposal no longer reverts, it **deploys
+  less** (see "coverage scaling" above).
+
+**Migrating an already-certified deployment.** A registry where `execute()` /
+`settle()` were certified at `(1, 9_999)` — the pre-2026-08-22 default — moves
+with `demoteClass(template, execute())` and `demoteClass(template, settle())`.
+`_demoteClass` also clears the class **funds** axis, so follow with
+`setClassAllowed(template, true)` to restore it; the callee axis is left standing
+throughout, deliberately, so a live clone is never stranded.
 
 ## Guardrail actions (`updateParams` / `guardrailAction`)
 
