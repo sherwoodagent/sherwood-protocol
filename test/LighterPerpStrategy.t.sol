@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {LighterPerpStrategy} from "../src/strategies/LighterPerpStrategy.sol";
 import {BaseStrategy} from "../src/strategies/BaseStrategy.sol";
@@ -1614,6 +1614,155 @@ contract LighterPerpStrategyDeliveryTest is LighterPerpStrategyBase {
 
 // ── Minimal mocks for the initiateReturn auth path ──
 
+/// @notice The coverage-scaled deposit (`_execute` deploys what the proposal's
+///         `effectiveMaxCapital` can actually cover, not the pinned
+///         `depositAmount`). Its own contract for the same solc tag-space reason
+///         the file is already split.
+contract LighterPerpStrategyCoverageTest is LighterPerpStrategyBase {
+    event Deposited(uint256 amount, uint48 accountIndex);
+
+    /// @dev The pre-#27 governor shape: neither getter answers, so the pinned
+    ///      amount is pulled verbatim. This is the ONLY safe degradation — such
+    ///      a governor also never scales the per-call caps.
+    function test_execute_legacyGovernor_pullsPinnedAmount() public {
+        _executeFirst();
+        assertEq(strategy.deployedAmount(), DEPOSIT, "deployedAmount");
+        assertEq(zk.l2Balance(address(strategy)), DEPOSIT, "venue balance");
+        assertEq(usdg.balanceOf(vault), 0, "vault float");
+    }
+
+    function test_execute_fullyCovered_pullsPinnedAmount() public {
+        gov.setCapital(100_000e6, 100_000e6);
+        _executeFirst();
+        assertEq(strategy.deployedAmount(), DEPOSIT, "deployedAmount");
+        assertEq(zk.l2Balance(address(strategy)), DEPOSIT, "venue balance");
+    }
+
+    /// @dev The vnet a3fb16 shape, exactly: a 100k envelope covered to 63%.
+    ///      Pre-fix this reverted `CallCapExceeded` at the execute batch.
+    function test_execute_underCovered_deploysScaledAmount() public {
+        gov.setCapital(100_000e6, 63_000e6);
+        uint256 expected = (DEPOSIT * 63_000e6) / 100_000e6; // 12_600e6
+
+        // The `Deposited` amount must be the SCALED figure, not the declaration:
+        // it is what an indexer reconstructs the position size from. Read off
+        // the logs rather than `expectEmit`ed, because the venue picks the
+        // account index and this assertion is about the amount.
+        vm.recordLogs();
+        _executeFirst();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool seen;
+        for (uint256 i; i < logs.length; i++) {
+            if (logs[i].emitter != address(strategy) || logs[i].topics[0] != Deposited.selector) continue;
+            (uint256 amount, uint48 acct) = abi.decode(logs[i].data, (uint256, uint48));
+            assertEq(amount, expected, "Deposited.amount");
+            assertEq(acct, strategy.accountIndex(), "Deposited.accountIndex");
+            seen = true;
+        }
+        assertTrue(seen, "no Deposited event");
+
+        assertEq(strategy.deployedAmount(), expected, "deployedAmount");
+        assertEq(zk.l2Balance(address(strategy)), expected, "venue balance");
+        assertEq(usdg.balanceOf(vault), DEPOSIT - expected, "surplus float stays in the vault");
+        assertEq(strategy.depositAmount(), DEPOSIT, "the pinned declaration is untouched");
+    }
+
+    /// @dev FAIL CLOSED RATHER THAN DEPLOY DUST. A scaled amount under
+    ///      `MIN_DEPOSIT` is not a smaller strategy, it is a strategy that
+    ///      cannot be unwound for more than it cost in gas.
+    function test_execute_scaledBelowMinDeposit_reverts() public {
+        gov.setCapital(100_000e6, 4e6); // 20_000e6 * 4e6 / 100_000e6 = 800_000 < 1e6
+        vm.prank(vault);
+        vm.expectRevert(LighterPerpStrategy.DepositTooSmall.selector);
+        strategy.execute();
+    }
+
+    /// @dev Coverage that floors to a zero envelope: `_deriveAndStoreEffectiveCapital`
+    ///      accepts that outcome as a zero net-outflow cap, and the honest answer
+    ///      here is to deploy nothing rather than to deploy zero.
+    function test_execute_zeroEffectiveCapital_reverts() public {
+        gov.setCapital(100_000e6, 0);
+        vm.prank(vault);
+        vm.expectRevert(LighterPerpStrategy.DepositTooSmall.selector);
+        strategy.execute();
+    }
+
+    /// @dev A governor answering a ZERO declared envelope is not a scaling
+    ///      signal — it is an unreadable one. Degrade to the pinned amount.
+    function test_execute_zeroDeclaredEnvelope_pullsPinnedAmount() public {
+        gov.setCapital(0, 0);
+        _executeFirst();
+        assertEq(strategy.deployedAmount(), DEPOSIT, "deployedAmount");
+    }
+
+    /// @dev No active proposal means nothing to scale against — but
+    ///      `BaseStrategy.execute` refuses that case first, so the pull never
+    ///      happens at all. Pinned here as the ordering it relies on.
+    function test_execute_noActiveProposal_stillRefusedUpstream() public {
+        gov.setActiveProposal(0);
+        vm.prank(vault);
+        vm.expectRevert(BaseStrategy.NotActiveProposalStrategy.selector);
+        strategy.execute();
+    }
+
+    /// @dev THE ROUNDING EDGE, AND THE WHOLE REASON THE PULL IS RATIO-SCALED
+    ///      RATHER THAN `min(depositAmount, effectiveMaxCapital)`. The governor
+    ///      floors the per-call caps at `floor(cap_i * raised / required)`
+    ///      (`_scaleCaps`) and the batch cap at
+    ///      `floor(maxCapital * raised / required)` (`effectiveMaxCapital`).
+    ///      The pull must be `<=` the FORMER, which is the smaller of the two
+    ///      whenever `cap_i < maxCapital` — the bench's own shape (cap = the
+    ///      deploy amount, maxCapital = the vault's whole TVL).
+    function testFuzz_execute_neverExceedsTheScaledCallCap(uint256 raised, uint256 required, uint256 maxCapital)
+        public
+    {
+        required = bound(required, 1, 1e30);
+        raised = bound(raised, 1, required);
+        maxCapital = bound(maxCapital, DEPOSIT, 1e30);
+
+        uint256 effective = (maxCapital * raised) / required; // _deriveAndStoreEffectiveCapital
+        uint256 scaledCallCap = (DEPOSIT * raised) / required; // _scaleCaps, on cap_i == DEPOSIT
+        gov.setCapital(maxCapital, effective);
+
+        uint256 expected = effective >= maxCapital ? DEPOSIT : (DEPOSIT * effective) / maxCapital;
+
+        if (expected < 1e6) {
+            vm.prank(vault);
+            vm.expectRevert(LighterPerpStrategy.DepositTooSmall.selector);
+            strategy.execute();
+            return;
+        }
+
+        _executeFirst();
+        assertEq(strategy.deployedAmount(), expected, "deployedAmount");
+        assertLe(strategy.deployedAmount(), scaledCallCap, "pull exceeds the scaled per-call cap");
+        assertLe(strategy.deployedAmount(), DEPOSIT, "pull exceeds the pinned declaration");
+    }
+
+    /// @dev The unwind accounts against what was DEPLOYED, not what was
+    ///      declared: a scaled clone that queues its deployed amount settles
+    ///      clean, with no shortfall waiver and no unvalued-residue mark.
+    function test_scaledClone_settlesCleanAgainstDeployedAmount() public {
+        gov.setCapital(100_000e6, 63_000e6);
+        _executeFirst();
+        uint256 deployed = strategy.deployedAmount();
+        assertEq(deployed, 12_600e6);
+
+        vm.startPrank(proposer);
+        strategy.initiateReturn();
+        strategy.queueWithdraw(uint64(deployed));
+        vm.stopPrank();
+        zk.mature(address(strategy));
+        vm.roll(block.number + 1);
+        vm.prank(vault);
+        strategy.settle();
+
+        assertEq(strategy.returnedAssets(), deployed, "returnedAssets");
+        assertFalse(strategy.hasUnvaluedResidue(), "clean settle marks nothing");
+        assertEq(usdg.balanceOf(vault), DEPOSIT, "every USDG is home");
+    }
+}
+
 contract MockVaultForLighter {
     address public governor;
     address public owner;
@@ -1690,6 +1839,31 @@ contract MockGovernorForLighter {
 
     function setActiveProposal(uint256 pid) external {
         _activeProposal = pid;
+    }
+
+    /// @dev The coverage-scaling pair `_execute` reads. OFF BY DEFAULT and
+    ///      deliberately so: both getters revert until `setCapital` is called,
+    ///      which is exactly what a governor predating issue #27 does to a
+    ///      staticcall for a selector it does not carry. Every other case in
+    ///      this file therefore exercises the unscaled fallback.
+    uint256 internal _maxCapital;
+    uint256 internal _effectiveMaxCapital;
+    bool internal _answersCapital;
+
+    function setCapital(uint256 maxCapital_, uint256 effective_) external {
+        _maxCapital = maxCapital_;
+        _effectiveMaxCapital = effective_;
+        _answersCapital = true;
+    }
+
+    function getRiskEnvelope(uint256) external view returns (uint256, uint16) {
+        require(_answersCapital, "governor predates the risk envelope");
+        return (_maxCapital, 10_000);
+    }
+
+    function getEffectiveMaxCapital(uint256) external view returns (uint256) {
+        require(_answersCapital, "governor predates effectiveMaxCapital");
+        return _effectiveMaxCapital;
     }
 
     function setProposal(address strategy_, uint256 executedAt_, uint256 duration_) external {

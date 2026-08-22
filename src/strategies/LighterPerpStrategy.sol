@@ -8,6 +8,7 @@ import {IZkLighter} from "../lighter/IZkLighter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ISyndicateGovernor} from "../interfaces/ISyndicateGovernor.sol";
 import {ISyndicateVault} from "../interfaces/ISyndicateVault.sol";
 
@@ -132,6 +133,14 @@ contract LighterPerpStrategy is BaseStrategy {
     /// @notice Proposer/vault-owner assertion that settling below `queuedTicks`
     ///         is intended (venue under-fill / write-off). Settle's escape hatch.
     bool public shortfallAcknowledged;
+    /// @notice USDG actually pulled and deposited at `execute()`. Equal to
+    ///         `depositAmount` on a fully covered proposal, and the
+    ///         coverage-scaled figure otherwise — see `_execute`. Zero before
+    ///         execution. THIS, not `depositAmount`, is what the unwind is
+    ///         accounted against: `queueWithdraw` should drain this, and every
+    ///         off-chain sizing (the CLI's `queue-withdraw --all`, the bench's
+    ///         vault-delta assertion) must read it rather than the declaration.
+    uint256 public deployedAmount;
 
     // ── Events ──
     event Deposited(uint256 amount, uint48 accountIndex);
@@ -249,11 +258,28 @@ contract LighterPerpStrategy is BaseStrategy {
     /// @notice Pull USDG from the vault and deposit into a strategy-owned Lighter
     ///         margin account (registers the account synchronously in this tx).
     function _execute() internal override {
-        // FIXED SIZE, NEVER RE-READ FROM THE VAULT. `_initialize` already bounded
-        // this to [MIN_DEPOSIT, MAX_DEPOSIT] and nothing can change it afterwards,
-        // so re-asserting the bounds here would be dead code. See `_initialize`
-        // for why the amount cannot be derived from the vault's live balance.
-        uint256 amountIn = depositAmount;
+        // NEVER RE-READ FROM THE VAULT, BUT SCALED BY THE PROPOSAL'S OWN
+        // COVERAGE. `_initialize` pinned `depositAmount` and bounded it to
+        // [MIN_DEPOSIT, MAX_DEPOSIT]; that declaration is still the CEILING and
+        // the vault's live balance still never enters the sizing. What has
+        // changed is that the ceiling is not always reachable: when the approve
+        // quorum comes in short, `SyndicateGovernor._deriveAndStoreEffectiveCapital`
+        // scales the whole proposal down by `raised / required` — the batch cap
+        // AND every per-call cap. Pulling the unpinned declaration into a scaled
+        // batch reverts `CallCapExceeded` at the execute leg, a governance cycle
+        // after the sizing decision was made and with the vault untouched.
+        // Deploying less is the strictly better outcome, and the proposal was
+        // already voted on as a ceiling.
+        uint256 amountIn = _coverageScaledDeposit();
+
+        // FAIL CLOSED RATHER THAN DEPLOY DUST. The bounds `_initialize`
+        // enforced were on the DECLARATION; this is the first point at which
+        // the amount that will actually move is known, so `MIN_DEPOSIT` is
+        // re-asserted against it. A deeply under-covered proposal is not a
+        // smaller strategy — it is a Lighter account whose unwind costs more in
+        // venue round-trips than it holds, and the recoverable failure (the
+        // proposal expires, the vault is untouched) beats the unrecoverable one.
+        if (amountIn < MIN_DEPOSIT) revert DepositTooSmall();
 
         // RE-CERTIFY THE VENUE, and here only. Blocking `execute()` strands
         // nothing — the proposal expires at `executeBy` with the vault untouched
@@ -269,6 +295,11 @@ contract LighterPerpStrategy is BaseStrategy {
         _pullFromVault(address(USDG), amountIn);
         USDG.forceApprove(address(ZK_LIGHTER), amountIn);
         ZK_LIGHTER.deposit(address(this), USDG_ASSET_INDEX, ROUTE_PERPS, amountIn);
+
+        // RECORDED, because from here on `depositAmount` is only a declaration.
+        // The unwind, the CLI's drain sizing and the residue probes all reason
+        // about what actually left the vault.
+        deployedAmount = amountIn;
 
         // `_acct()` reverts if the venue did not register the account in this tx.
         // Every kill-switch path needs a nonzero index, so failing the whole
@@ -784,6 +815,74 @@ contract LighterPerpStrategy is BaseStrategy {
             word := mload(add(ret, 0x20))
         }
         return word != 0;
+    }
+
+    // ── Coverage scaling ──
+
+    /// @dev The USDG `_execute` will actually pull: `depositAmount` scaled by
+    ///      the SAME `raised / required` ratio the governor applied to the
+    ///      proposal at execute time, expressed as `effectiveMaxCapital /
+    ///      maxCapital` because those are the two figures a strategy can read.
+    ///
+    ///      WHY THE RATIO AND NOT `min(depositAmount, effectiveMaxCapital)`.
+    ///      There are TWO caps in play and the smaller one is not the one that
+    ///      names the batch. `effectiveMaxCapital` is the batch-level net-outflow
+    ///      meter; `BatchExecutorLib` additionally meters THIS call's gross
+    ///      outflow against `_scaleCaps`'s `floor(cap_i * raised / required)`.
+    ///      A proposal normally declares `maxCapital` as the vault's whole TVL
+    ///      and `cap_i` as just the deploy size (the fork bench does exactly
+    ///      that), so `min(depositAmount, effectiveMaxCapital)` resolves to the
+    ///      unscaled `depositAmount` and still breaks the per-call cap. The
+    ///      ratio form cannot: `floor(dep * floor(max*r/q) / max) <=
+    ///      floor(dep * r / q) = scaledCap_i` for any `dep <= cap_i`, because the
+    ///      inner floor only ever moves the numerator DOWN. The residue is at
+    ///      most a couple of base units, always on the safe side.
+    ///
+    ///      DEGRADES TO THE PINNED AMOUNT, and only there. An unresolvable
+    ///      governor, a governor predating `getEffectiveMaxCapital` (issue #27),
+    ///      a zero declared envelope, or an effective capital at or above the
+    ///      declared one all mean "nothing scaled this proposal" — and a
+    ///      governor that does not scale the envelope does not scale the caps
+    ///      either, so the pinned pull is exactly what such a batch expects.
+    ///      Every read is a length-checked raw staticcall for the reason the
+    ///      rest of this file gives: a typed call into a governor that cannot
+    ///      answer would revert in THIS frame with no data, turning a missing
+    ///      selector into an undecodable `execute()` failure.
+    function _coverageScaledDeposit() private view returns (uint256) {
+        uint256 pinned = depositAmount;
+
+        address governor_ = _readAddress(vault(), abi.encodeCall(ITierBindingPath.governor, ()));
+        if (governor_ == address(0)) return pinned;
+        (bool okPid, uint256 pid) = _readUint(governor_, abi.encodeCall(ISyndicateGovernor.getActiveProposal, ()));
+        if (!okPid || pid == 0) return pinned;
+
+        (bool okMax, uint256 declared) = _readUint(governor_, abi.encodeCall(ISyndicateGovernor.getRiskEnvelope, (pid)));
+        if (!okMax || declared == 0) return pinned;
+        (bool okEff, uint256 effective) =
+            _readUint(governor_, abi.encodeCall(ISyndicateGovernor.getEffectiveMaxCapital, (pid)));
+        if (!okEff || effective >= declared) return pinned;
+
+        // `mulDiv` rather than `*` then `/`: the product is bounded in practice
+        // (`pinned <= type(uint64).max`) but `declared` is proposer input, and a
+        // revert here would brick `execute()` on an arithmetic edge instead of
+        // sizing it. Floors, matching `_scaleCaps` and `effectiveMaxCapital`.
+        return Math.mulDiv(pinned, effective, declared);
+    }
+
+    /// @dev Staticcall-safe leading-word read. Codeless target, revert, or short
+    ///      return all resolve to `(false, 0)` — distinguishable from a genuine
+    ///      zero answer, which the callers above need.
+    function _readUint(address target, bytes memory data) private view returns (bool, uint256) {
+        if (target.code.length == 0) return (false, 0);
+        (bool ok, bytes memory ret) = target.staticcall(data);
+        if (!ok || ret.length < 32) return (false, 0);
+        uint256 word;
+        // Leading word of the payload; `getRiskEnvelope` returns two and only
+        // the first (`maxCapital`) is wanted, which `abi.decode` cannot express.
+        assembly ("memory-safe") {
+            word := mload(add(ret, 0x20))
+        }
+        return (true, word);
     }
 
     /// @dev Staticcall-safe address read: codeless target, revert, short return,
