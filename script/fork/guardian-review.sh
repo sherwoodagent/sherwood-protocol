@@ -27,6 +27,23 @@
 # That is not a bug; it is the coverage quorum doing its job against a cohort
 # that never showed up. Warp to the review window, run this, then warp again.
 #
+# COHORT COLLATERAL SCALES WITH APPROVERS x PROPOSALS, NOT PROPOSALS.
+#
+# `recordApproval` books a RESERVATION, not an allocation: each approver commits
+# "the MOST this guardian could ever carry — the whole proposal, if every other
+# approver walks away". So backing P concurrent proposals with A approvers each
+# demands roughly A x P x need of cohort bond, not P x need.
+#
+# Measured on this fork: five concurrent 500-USDG proposals with six approvers
+# apiece needed ~3.45M WOOD (6 x 5 x $500 at $0.004347). A 350k cohort — which
+# comfortably covers ONE proposal — silently covered only two, and the other
+# three booked nothing at all. That is the failure mode to watch: capacity
+# exhaustion looks exactly like a stale price, because both end in an approval
+# that landed while booking zero.
+#
+# `stake` and `reaffirm` are the two levers: raise the bond, then re-book the
+# proposals that got nothing, while their reviews are still OPEN.
+#
 # Usage:
 #   RPC=<vnet ADMIN rpc> ./script/fork/guardian-review.sh status  <vault> <proposalId>
 #   RPC=<vnet ADMIN rpc> ./script/fork/guardian-review.sh approve <vault> <proposalId> <guardian...>
