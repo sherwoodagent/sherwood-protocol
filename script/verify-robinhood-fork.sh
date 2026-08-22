@@ -75,16 +75,23 @@ check "config.protocolFeeRecipient"   "$(call "$CONFIG" 'protocolFeeRecipient()(
 check "config.guardiansFeeRecipient"  "$(call "$CONFIG" 'guardiansFeeRecipient()(address)')" "$DEPLOYER"
 
 echo; echo "── Strategy templates (the allowlist IS _templateKeys) ──"
-for t in PORTFOLIO_TEMPLATE MORPHO_SUPPLY_TEMPLATE CONCENTRATED_LIQUIDITY_TEMPLATE; do
+for t in PORTFOLIO_TEMPLATE MORPHO_SUPPLY_TEMPLATE CONCENTRATED_LIQUIDITY_TEMPLATE LIGHTER_PERP_TEMPLATE; do
   check "strategyFactory.approved($t)" \
     "$(cast call "$SFACTORY" 'approvedTemplate(address)(bool)' "$(a $t)" --rpc-url "$RPC" 2>/dev/null)" "true"
 done
 
 echo; echo "── TierRegistry launch set (empty registry ⇒ every clone-init reverts) ──"
-for c in UNISWAP_V3_POSITION_MANAGER UNISWAP_V3_FACTORY MORPHO_BLUE; do
+for c in UNISWAP_V3_POSITION_MANAGER UNISWAP_V3_FACTORY MORPHO_BLUE ZK_LIGHTER; do
   check "tiers.counterpartyAllowed($c)" \
     "$(cast call "$TIERS" 'isCounterpartyAllowed(address)(bool)' "$(a $c)" --rpc-url "$RPC" 2>/dev/null)" "true"
 done
+
+# The Lighter template is INERT without both of these: `_initialize` binds
+# ZK_LIGHTER through `isCounterpartyAllowed` (above), and clones stay at the
+# uncertified tier-2 default until the class axis is open. See
+# DeployLighterTemplate's `finalize()`.
+check "tiers.isClassAllowed(LIGHTER_PERP_TEMPLATE)" \
+  "$(cast call "$TIERS" 'isClassAllowed(address)(bool)' "$(a LIGHTER_PERP_TEMPLATE)" --rpc-url "$RPC" 2>/dev/null)" "true"
 
 echo; echo "── Plan B ──"
 check "swood.exposureLedger (exit gate armed)" "$(call "$SWOOD" 'exposureLedger()(address)')" "$LEDGER"
