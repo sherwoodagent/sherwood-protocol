@@ -265,7 +265,7 @@ contract LighterPerpStrategy is BaseStrategy {
         // changed is that the ceiling is not always reachable: when the approve
         // quorum comes in short, `SyndicateGovernor._deriveAndStoreEffectiveCapital`
         // scales the whole proposal down by `raised / required` — the batch cap
-        // AND every per-call cap. Pulling the unpinned declaration into a scaled
+        // AND every per-call cap. Pulling the pinned declaration into a scaled
         // batch reverts `CallCapExceeded` at the execute leg, a governance cycle
         // after the sizing decision was made and with the vault untouched.
         // Deploying less is the strictly better outcome, and the proposal was
