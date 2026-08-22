@@ -21,6 +21,12 @@ L2 API key — never the owner key, and it can never move funds off the account.
 | `test/harness/LighterAccountOwner.sol` | The `Ownable` account-owner harness (3,358 B) |
 | `script/DeployLighterCanary.s.sol` | Deploy script (owner = broadcaster) |
 | `test/harness/lighter_canary_driver.py` | Agent-side driver (keygen + trade), runs on a venv |
+| `test/harness/LighterH2Canary.md` | **H2 follow-up**: does `baseAmount = 0` no-op against a FLAT position? (runbook) |
+| `test/harness/lighter_h2_driver.py` | H2 driver — reuses this file's helpers; L2 key via `$LIGHTER_L2_PRIV` |
+
+> This runbook's Step 6 fires only the closing side. `LighterPerpStrategy.initiateReturn()`
+> fires **both** sides per market and assumes the non-opposing one no-ops. That assumption
+> is untested and unprovable on the fork — see `LighterH2Canary.md`.
 
 ## Verified 4663 constants
 
