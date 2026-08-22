@@ -1,18 +1,37 @@
 # Lighter integration — testing on the Robinhood fork (chain 9994663)
 
-> **Proven 2026-07-22.** The full lifecycle ran green on the fork against real
-> Sherwood core + real ZkLighter: template deployed + approved
-> (`0x7ffBd8D5…901AD4`), fund created + 50k USDG deposited, `lighter-perp` clone
-> proposed → voted → executed (**deposited 40k USDG into ZkLighter, registered
-> real account 843**) → `registerAgentKey` → `initiateReturn` (cancel +
-> both-side closes + withdraw enqueued — that run predates the C1/C2 split, so
-> the withdraw leg is now the separate `queueWithdraw(ticks)` step) → settle (**USDG round-tripped
-> to the vault, ~0 PnL, proposal Settled**). Withdrawal maturity was simulated by
-> crediting the clone's USDG (the `withdrawPendingBalance` claim itself is
-> covered by unit tests + the real-4663 canary); a faithful
-> `tenderly_setStorageAt` on `pendingAssetBalances` is the higher-fidelity option
-> (§2). This closed the deposit-side of D4 (tick/decimal math against the real
-> venue).
+> **Proven 2026-08-22** on vnet a3fb16, against the LIVE post-audit Sherwood
+> stack (not a freshly-deployed one) and the real ZkLighter. Template
+> `0x7F1D266828Cc5c88AA2ef1E99E8F5e5a1d56E6C7` deployed, approved, venue
+> counterparty-allowlisted and class-certified for `execute()`+`settle()`.
+> Bench vault `0xB66C37361403CC98F9Ef74c38F989856BCCA9Be0` (10,000 USDG from two
+> LPs), clone `0x5A46D4517589D221B57C7abf864183545d7dF990` proposed → LP-voted →
+> guardian-**approved** → executed (**2,000 USDG deposited into ZkLighter,
+> real account 15534**) → `registerAgentKey` from BOTH the proposer and the vault
+> owner → `CANCEL_ALL` / `CLOSE_MARKET` / `ROTATE_KEY` through `updateParams` and
+> `guardrailAction` → `initiateReturn` → `queueWithdraw(2_000e6)` → settle
+> (**1,999,951,846 USDG back to the vault, proposal Settled, ~0 PnL less the
+> settlement fee**). Then the post-audit residue surface: all three
+> `IStrategyDelivery` probes empty after a clean settle, and the **C1**
+> regression — post-`Settled` `queueWithdraw(500e6)` flipped
+> `hasUnvaluedResidue()` true, `recoverResiduals()` claimed onto the clone
+> WITHOUT pushing, `collectResidue` drained it through the single `sweep()` door,
+> a direct `sweep()` from a non-vault caller reverted. Every venue-touching call
+> emitted a real `NewPriorityRequest` (`0xefdd379e`); `initiateReturn` emitted
+> exactly 5 (one cancel + two markets x two sides).
+>
+> **Real vs simulated.** Everything above is real on-chain execution except
+> withdrawal maturity, which the sequencer never delivers on a fork. That was
+> simulated the HIGH-FIDELITY way this time — a `tenderly_setStorageAt` on the
+> venue's own `pendingAssetBalances` slot (§2), not by crediting the clone's
+> USDG — so `getPendingBalance` and `withdrawPendingBalance` both executed for
+> real against the forked venue's real TVL. Order fills, funding and PnL remain
+> out of scope on a fork by construction.
+>
+> Not exercised: the §6 liveness check (`removeAgent(proposer)`, then prove the
+> owner can still act and the de-registered proposer cannot). The owner-side half
+> IS covered — `registerAgentKey` and `guardrailAction(CANCEL_ALL)` both ran from
+> the vault owner — but the revocation itself was not performed.
 
 How to exercise the Lighter (zkLighter) integration against the **real** venue
 contract on the Tenderly Robinhood-mainnet fork, before anything ships to 4663.
@@ -59,9 +78,18 @@ which never happens on the fork. Simulate it with the vnet's storage cheat:
 
 - Pending claims live in `pendingAssetBalances[assetIndex][masterAccountIndex]
   .balanceToWithdraw` (`ExtendableStorage` in the verified ZkLighter source).
-- Derive the concrete slot once at implementation time (`forge inspect` on the
-  verified source, or `cast storage`-diff a real mainnet
-  `withdrawPendingBalance` tx), then:
+- **The base slot is 498, and `balanceToWithdraw` is at offset 0.** Derived, not
+  guessed: `script/fork/LighterSlotProbe.s.sol` runs `vm.record()` around a real
+  `getPendingBalance(owner, 3)` against the forked venue and prints the SLOADs;
+  498 is the only base in `[0, 600)` that reproduces the observed key for a
+  registered account. (`debug_traceCall` is **not supported** on this vnet —
+  it answers `-32002 not supported` — which is why the probe uses `vm.record`.)
+
+```
+slot = keccak256( accountIndex || keccak256( assetIndex || 498 ) )
+```
+
+  `LighterForkBench.maturitySlot(salt)` computes it for a given clone:
 
 ```bash
 cast rpc tenderly_setStorageAt $ZK_LIGHTER <slot> <ticksAsBytes32> \
@@ -154,7 +182,72 @@ checks all of it.
 
 ## 5. Full strategy lifecycle test
 
-The end-to-end bench, all against real deployed Sherwood core + real ZkLighter:
+**Run it:** `script/fork/lighter-bench.sh` drives
+`script/fork/LighterForkBench.s.sol` phase by phase, interleaving the
+`evm_increaseTime` waits and the `tenderly_*` cheats that cannot live inside a
+broadcast.
+
+```bash
+set -a; source .env; set +a
+RPC="$TENDERLY_ROBINHOOD_RPC_URL" \
+GUARDIAN=0x571D47547f9c54Ec8D71afbF5b641484dA58cB05 \
+SALT=1 ./script/fork/lighter-bench.sh
+```
+
+No phase takes an address argument and none writes a state file: the vault is
+found by its subdomain, the clone is the deterministic
+`predictDeterministicAddress`, the proposal is the governor's latest. So any
+phase is re-runnable on its own.
+
+### Five things about the FORK that will stop you, none of which are template bugs
+
+1. **The guardian's stake must be 30 days old AT PROPOSE TIME.**
+   `GuardianRegistry._growthGatedVoteWeight` takes the min of the voter's stake
+   at `snapshotAt` and at `snapshotAt - FLOOR_LOOKBACK` (30 days), so a guardian
+   who staked recently in fork-time has zero weight and `voteOnProposal` reverts
+   `NotActiveGuardian()`. Warp the vnet past it BEFORE proposing — the snapshot
+   is frozen at propose, so warping afterwards does nothing.
+2. **The approve quorum SCALES rather than refusing, and this template cannot
+   absorb the scaling.** `quorumTierThreshold == 0` here, so the bond-encumbered
+   approve quorum is mandatory at every tier; when it comes up short
+   `_deriveAndStoreEffectiveCapital` scales the per-call caps by
+   `raised / required`. `LighterPerpStrategy._execute` pulls a pinned
+   `depositAmount` that nothing scales, so a partially-covered proposal does not
+   deploy less — it reverts `CallCapExceeded(1, depositAmount, scaledCap)` at the
+   execute batch, a full governance cycle after sizing. Measured on one guardian
+   with a $6,520.56 bond: the first 2,000-USDG proposal booked $3,999.27, the
+   second raised only the $2,521.29 remainder (63%) and broke on a scaled cap of
+   1,260,872,310. **A reservation is released by a vote change or by the 28-day
+   epoch bucket expiring — NOT by the earlier proposal settling or expiring.**
+   `LighterForkBench.coveragePreflight(guardian)` checks the gross bond up front;
+   size with `LIGHTER_BENCH_DEPLOY_AMOUNT`.
+3. **`block.number` means two different things on this vnet.**
+   `evm_increaseTime` advances the number contracts see through the `NUMBER`
+   opcode while `eth_blockNumber` does not: measured 2026-08-22, a real tx
+   stamped `returnsInitiatedAt = 25,813,800` while `eth_blockNumber` returned
+   21,178,087. Forge forks at `eth_blockNumber`, so any forge-script simulation
+   of a `block.number` guard runs ~4.6M blocks in the past — every settle
+   simulates as `SettleTooSoon()` regardless of the truth. Drive settle, and the
+   pre-maturity refusal, with `cast send` / `cast call`, which execute in the
+   node's context.
+4. **The LP vote needs its own transaction.** `vote` weighs
+   `getPastVotes(voter, p.snapshotTimestamp)` and the snapshot is stamped inside
+   `propose`, so a vote at the same timestamp weighs zero (`NoVotingPower()`).
+   The fork-test harness hides this behind `vm.warp(+1)`; a broadcast script
+   needs a real `evm_increaseTime` between the two.
+5. **Even the proposer owes a wait before settling.** `settleProposal` gates on
+   `msg.sender == proposer ? MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE (1h) :
+   strategyDuration`, so a self-settle straight after `queueWithdraw` reverts
+   `StrategyDurationNotElapsed()` (`0x418c8bb9`) and never reaches the strategy's
+   own `WithdrawalInFlight` guard.
+
+Read the REGISTRY's `reviewWindow(governor, pid)` for the vote/review deadlines,
+never a figure copied from an earlier log — a re-run shifts them by however long
+the first attempt took, and the registry's copy is the one `openReview` and
+`voteOnProposal` gate on.
+
+### The bench itself
+
 
 1. Create a USDG fund (deployment doc §7), deposit LPs. The fund's ERC-4626
    asset **must be USDG** — `_initialize` reverts `AssetMismatch` otherwise.
