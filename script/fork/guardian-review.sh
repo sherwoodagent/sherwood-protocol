@@ -44,6 +44,14 @@
 # `stake` and `reaffirm` are the two levers: raise the bond, then re-book the
 # proposals that got nothing, while their reviews are still OPEN.
 #
+# A LIVE CHALLENGE IS A THIRD WAY TO GET ZERO. `file` freezes the accused
+# cohort's coverage, and frozen capacity is capacity the next proposal cannot
+# book — so a cohort that comfortably covered a proposal yesterday books
+# NOTHING today, with no stale price and no obvious change. Same symptom
+# (`requireApproveQuorum` reverting `0xf7448092` /
+# `InsufficientApproveCoverage`), same recovery: `stake`, then `reaffirm`.
+# Check `liveChallengeOf` before concluding the feed is at fault.
+#
 # Usage:
 #   RPC=<vnet ADMIN rpc> ./script/fork/guardian-review.sh status  <vault> <proposalId>
 #   RPC=<vnet ADMIN rpc> ./script/fork/guardian-review.sh approve <vault> <proposalId> <guardian...>
@@ -148,6 +156,14 @@ cmd_approve() {
 # still 1, so the vault refuses every new proposal with `VaultHasOpenProposal`
 # and the campaign silently stalls with nothing obviously wrong. This is the
 # call that reconciles the two.
+#
+# A GUARDIAN-BLOCKED PROPOSAL NEEDS THIS TOO. `Rejected` is terminal by the same
+# lazy rule as `Expired`, so a review that resolves BLOCKED leaves the vault
+# wedged exactly as an expiry does: the next `propose` reverts
+# `VaultHasOpenProposal()` and nothing in that error names the block as the
+# cause. Blocking a proposal is therefore two steps, not one — resolve, then
+# flush — and the second is easy to forget precisely because the first
+# succeeded.
 # Re-book coverage for guardians who already voted Approve.
 #
 # WHY THIS IS NEEDED. `recordApproval` SWALLOWS a price failure by design — a
