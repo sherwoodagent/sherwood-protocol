@@ -110,17 +110,32 @@ entrypoints**, because `TierRegistry.certifyClass` cannot run until
 DEPLOYER=0x5A00afAecE9CF61A768E2AE2713084C8d354DF94   # fork StrategyFactory + TierRegistry owner
 
 # Phase 1 — deploy, approve on the factory, allowlist the venue, propose the class.
+# --slow IS MANDATORY under --unlocked. See the warning below.
 forge script script/DeployLighterTemplate.s.sol:DeployLighterTemplate --sig 'run()' \
-  --rpc-url robinhood_fork --unlocked --sender $DEPLOYER --broadcast
+  --rpc-url robinhood_fork --unlocked --sender $DEPLOYER --broadcast --slow
 
 # Skip the certify delay (params positional — never a JSON array).
-cast rpc evm_increaseTime 0x3F480 --rpc-url robinhood_fork   # 3 days + slack
+# 0x3F480 is EXACTLY certifyDelay (259,200s) with no slack at all; 0x40000
+# (262,144s) is the same three days with an hour to spare.
+cast rpc evm_increaseTime 0x40000 --rpc-url robinhood_fork
 cast rpc evm_mine --rpc-url robinhood_fork
 
 # Phase 2 — certify the class and open the class axis.
 forge script script/DeployLighterTemplate.s.sol:DeployLighterTemplate --sig 'finalize()' \
-  --rpc-url robinhood_fork --unlocked --sender $DEPLOYER --broadcast
+  --rpc-url robinhood_fork --unlocked --sender $DEPLOYER --broadcast --slow
 ```
+
+> **`--slow` or the ceremony silently deploys to the wrong address.** Under
+> `--unlocked` forge pipelines the batch into `eth_sendTransaction` and the NODE
+> assigns nonces, so the CREATE need not land on the nonce the simulation
+> assumed. Hit for real on 2026-08-22: the two owner calls took nonces 256/257
+> and the CREATE took 258, so `setTemplateApproval` approved the **simulated**
+> address (which holds no code), both `proposeClassCertification` calls reverted
+> `NotAContract()` (`0x09ee12d5`), and `_patchAddressIfBook` wrote the phantom
+> address into `chains/9994663.json`. Recovery is
+> `setTemplateApproval(<phantom>, false)` then a re-run with `--slow`.
+> `script/deploy-robinhood-fork.sh` has always passed `--slow`; only this runbook
+> had omitted it.
 
 `run()` asserts before it spends anything: the chain is 4663 or 9994663 (46630
 is **not** valid — Lighter has no deployment there), `ZK_LIGHTER` holds code and

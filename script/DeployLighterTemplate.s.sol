@@ -33,11 +33,23 @@ import {LighterPerpStrategy} from "../src/strategies/LighterPerpStrategy.sol";
  *
  *   Usage — Tenderly Robinhood fork (9994663), where the delay is skippable:
  *     forge script script/DeployLighterTemplate.s.sol:DeployLighterTemplate \
- *       --sig 'run()' --rpc-url robinhood_fork --unlocked --sender <factory owner> --broadcast
- *     cast rpc evm_increaseTime 0x3F480 --rpc-url robinhood_fork   # 3 days + slack
+ *       --sig 'run()' --rpc-url robinhood_fork --unlocked --sender <factory owner> --broadcast --slow
+ *     cast rpc evm_increaseTime 0x40000 --rpc-url robinhood_fork   # 3 days + slack
  *     cast rpc evm_mine --rpc-url robinhood_fork
  *     forge script script/DeployLighterTemplate.s.sol:DeployLighterTemplate \
- *       --sig 'finalize()' --rpc-url robinhood_fork --unlocked --sender <registry owner> --broadcast
+ *       --sig 'finalize()' --rpc-url robinhood_fork --unlocked --sender <registry owner> --broadcast --slow
+ *
+ *   `--slow` IS MANDATORY UNDER `--unlocked`, NOT A POLITENESS. Without it forge
+ *   pipelines the whole batch into `eth_sendTransaction` and the NODE assigns the
+ *   nonces, so the CREATE does not necessarily land on the nonce the simulation
+ *   assumed. Observed on vnet a3fb16 on 2026-08-22: the two owner calls took
+ *   nonces 256/257 and the CREATE took 258, so `setTemplateApproval` approved the
+ *   SIMULATED address — which holds no code — and both
+ *   `proposeClassCertification` calls reverted `NotAContract()`. That failure mode
+ *   is worse than a crash: the factory ends up carrying an approved codeless
+ *   template, and `_patchAddressIfBook` writes the phantom address into
+ *   `chains/{chainId}.json`. `script/deploy-robinhood-fork.sh` has always passed
+ *   `--slow` for this reason; this runbook simply omitted it.
  *
  *   EVERY OWNER-GATED STEP DEGRADES TO A RUNBOOK LINE, NEVER TO A SILENT SKIP.
  *   `StrategyFactory` and `TierRegistry` are both handed to the parameter

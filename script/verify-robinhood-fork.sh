@@ -75,9 +75,22 @@ check "config.protocolFeeRecipient"   "$(call "$CONFIG" 'protocolFeeRecipient()(
 check "config.guardiansFeeRecipient"  "$(call "$CONFIG" 'guardiansFeeRecipient()(address)')" "$DEPLOYER"
 
 echo; echo "── Strategy templates (the allowlist IS _templateKeys) ──"
+# CODE FIRST, THEN APPROVAL. `setTemplateApproval` does not check that its
+# argument is a contract, so a broadcast whose CREATE landed on a different
+# nonce than the simulation assumed (the `--slow` failure mode — see
+# DeployLighterTemplate's header) leaves the factory approving a CODELESS
+# address while the address book records it. `approvedTemplate` alone reads
+# `true` for that state; a codesize probe is what names it.
 for t in PORTFOLIO_TEMPLATE MORPHO_SUPPLY_TEMPLATE CONCENTRATED_LIQUIDITY_TEMPLATE LIGHTER_PERP_TEMPLATE; do
+  TADDR=$(a $t)
+  TSIZE=$(cast codesize "$TADDR" --rpc-url "$RPC" 2>/dev/null)
+  if [ -n "$TSIZE" ] && [ "$TSIZE" != "0" ]; then
+    printf '  \033[32mok\033[0m   %-46s %s bytes\n' "$t holds code" "$TSIZE"; PASS=$((PASS+1))
+  else
+    printf '  \033[31mFAIL\033[0m %-46s %s is CODELESS (phantom deploy)\n' "$t holds code" "$TADDR"; FAIL=$((FAIL+1))
+  fi
   check "strategyFactory.approved($t)" \
-    "$(cast call "$SFACTORY" 'approvedTemplate(address)(bool)' "$(a $t)" --rpc-url "$RPC" 2>/dev/null)" "true"
+    "$(cast call "$SFACTORY" 'approvedTemplate(address)(bool)' "$TADDR" --rpc-url "$RPC" 2>/dev/null)" "true"
 done
 
 echo; echo "── TierRegistry launch set (empty registry ⇒ every clone-init reverts) ──"
