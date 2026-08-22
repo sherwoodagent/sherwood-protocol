@@ -10,7 +10,14 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
 
-contract LighterPerpStrategyTest is Test {
+/// @dev SPLIT INTO TWO TEST CONTRACTS, ON PURPOSE AND NOT FOR TASTE. A single
+///      contract carrying every case in this file plus everything `forge-std`'s
+///      `Test` inherits pushes the compiled test contract past the point where
+///      solc's legacy tag encoding runs out of reserved space, and the build dies
+///      with `Internal compiler error ... Tag too large for reserved space` —
+///      which names neither the contract nor the cause. The fixtures live here;
+///      the cases live in the two contracts below.
+abstract contract LighterPerpStrategyBase is Test {
     // Constant venue addresses hardcoded in the strategy (4663 + fork share them).
     address internal constant ZK = 0x94bAB9693Ba2f6358507eFfcbd372b0660AFfF9d;
     address internal constant USDG_ADDR = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
@@ -23,6 +30,7 @@ contract LighterPerpStrategyTest is Test {
 
     MockVaultForLighter internal vaultC;
     MockGovernorForLighter internal gov;
+    MockTierRegistryForLighter internal tiers;
     address internal vault;
     address internal proposer = makeAddr("proposer");
     address internal owner = makeAddr("owner");
@@ -48,10 +56,16 @@ contract LighterPerpStrategyTest is Test {
         template = new LighterPerpStrategy();
 
         gov = new MockGovernorForLighter();
-        vaultC = new MockVaultForLighter(address(gov), owner);
+        vaultC = new MockVaultForLighter(address(gov), owner, USDG_ADDR);
         vault = address(vaultC);
         // `onlyProposer` re-reads the vault's live agent set on every call.
         vaultC.setAgent(proposer, true);
+
+        // `_initialize` binds ZK_LIGHTER through
+        // `vault() -> governor() -> tierRegistry() -> isCounterpartyAllowed`.
+        tiers = new MockTierRegistryForLighter();
+        tiers.setCounterpartyAllowed(ZK, true);
+        gov.setTierRegistry(address(tiers));
 
         strategy = LighterPerpStrategy(Clones.clone(address(template)));
         strategy.initialize(vault, proposer, _initData(DEPOSIT));
@@ -98,6 +112,20 @@ contract LighterPerpStrategyTest is Test {
         strategy.execute();
     }
 
+    /// @dev The real recovery path: `SyndicateVault.collectResidue(strategy)` is
+    ///      permissionless and dispatches `sweep()` (selector 0x35faa416) from the
+    ///      VAULT, measuring the arrival as a balance delta. Every test that used
+    ///      to call `sweepToVault()` directly goes through here instead, because
+    ///      that direct door is exactly what was removed.
+    function _collectResidue() internal returns (uint256) {
+        return _collectResidue(strategy);
+    }
+
+    function _collectResidue(LighterPerpStrategy s) internal returns (uint256) {
+        vm.prank(attacker); // permissionless at the vault
+        return vaultC.collectResidue(address(s));
+    }
+
     /// @dev Full happy-path unwind: close → queue the true balance → mature → settle.
     function _settleClean() internal {
         _executeFirst();
@@ -111,6 +139,22 @@ contract LighterPerpStrategyTest is Test {
         strategy.settle();
     }
 
+    /// @dev Drives the strategy to a REAL, currently-observable shortfall: the
+    ///      unwind is initiated, a drain was queued, and the venue matured less
+    ///      than that.
+    function _armedShortfall() internal {
+        _executeFirst();
+        zk.debitL2(address(strategy), 5_000e6); // trading loss on the venue
+        vm.startPrank(proposer);
+        strategy.initiateReturn();
+        strategy.queueWithdraw(uint64(DEPOSIT - 5_000e6));
+        vm.stopPrank();
+        zk.maturePartial(address(strategy), DEPOSIT - 10_000e6); // venue under-fills
+        vm.roll(block.number + 1);
+    }
+}
+
+contract LighterPerpStrategyTest is LighterPerpStrategyBase {
     // ==================== INITIALIZATION ====================
 
     function test_initialize() public view {
@@ -172,9 +216,37 @@ contract LighterPerpStrategyTest is Test {
         s.initialize(vault, proposer, data);
     }
 
-    function test_initialize_zeroDeposit_allowsDynamicAll() public {
-        LighterPerpStrategy s = _clone(_initData(0));
-        assertEq(s.depositAmount(), 0);
+    /// @dev The "dynamic-all" mode (`depositAmount == 0` ⇒ pull the vault's whole
+    ///      USDG balance at execute) is GONE. It could not satisfy the post-audit
+    ///      `executeGovernorBatch` per-call caps, and a batch whose pull size is
+    ///      only knowable at execute time cannot be checked against
+    ///      `QueueReserveBreached` / `BufferBreached` when the proposal is voted.
+    function test_initialize_zeroDeposit_reverts() public {
+        LighterPerpStrategy s = LighterPerpStrategy(Clones.clone(address(template)));
+        vm.expectRevert(LighterPerpStrategy.DepositTooSmall.selector);
+        s.initialize(vault, proposer, _initData(0));
+    }
+
+    function test_initialize_belowMinDeposit_reverts() public {
+        LighterPerpStrategy s = LighterPerpStrategy(Clones.clone(address(template)));
+        vm.expectRevert(LighterPerpStrategy.DepositTooSmall.selector);
+        s.initialize(vault, proposer, _initData(0.5e6)); // < 1 USDG
+    }
+
+    function test_initialize_minDepositExactly_ok() public {
+        LighterPerpStrategy s = _clone(_initData(1e6));
+        assertEq(s.depositAmount(), 1e6);
+    }
+
+    /// @dev The venue asset is a `constant` in this template, so a vault whose
+    ///      ERC-4626 asset is anything else would have every pull and every push
+    ///      denominated in a token the vault does not account for. Bound at init,
+    ///      matching `MorphoSupplyStrategy`'s `LoanAssetMismatch`.
+    function test_initialize_assetMismatch_reverts() public {
+        vaultC.setAsset(makeAddr("someOtherToken"));
+        LighterPerpStrategy s = LighterPerpStrategy(Clones.clone(address(template)));
+        vm.expectRevert(LighterPerpStrategy.AssetMismatch.selector);
+        s.initialize(vault, proposer, _initData(DEPOSIT));
     }
 
     // ── M2: unbounded / duplicated market list ──
@@ -255,50 +327,30 @@ contract LighterPerpStrategyTest is Test {
         strategy.execute();
     }
 
-    function test_execute_dynamicAll_usesFullVaultBalance() public {
-        // The main `strategy` (from setUp) never executed, so ZK starts empty and
-        // the vault still holds its full DEPOSIT; dynamic-all pulls all of it.
-        LighterPerpStrategy s = _clone(_initData(0));
-        usdg.mint(vault, 5_000e6);
-        uint256 vaultBal = usdg.balanceOf(vault); // DEPOSIT + 5_000e6
-        vm.prank(vault);
-        usdg.approve(address(s), type(uint256).max);
+    /// @dev The pull size is FIXED at init and never re-read from the vault's
+    ///      balance. A surplus float left in the vault stays there, which is what
+    ///      makes the pull size predictable at propose time — the property the
+    ///      per-call caps and the buffer/queue-reserve guards need.
+    function test_execute_pullsExactlyDepositAmount_ignoringSurplus() public {
+        usdg.mint(vault, 5_000e6); // vault now holds DEPOSIT + 5_000e6
+        _executeFirst();
 
-        vm.prank(vault);
-        s.execute();
-
-        assertEq(usdg.balanceOf(vault), 0);
-        assertEq(usdg.balanceOf(ZK), vaultBal);
-        assertEq(s.depositAmount(), 0); // dynamic mode is sticky
+        assertEq(usdg.balanceOf(vault), 5_000e6); // surplus untouched
+        assertEq(usdg.balanceOf(ZK), DEPOSIT);
+        assertEq(strategy.depositAmount(), DEPOSIT);
     }
 
-    function test_execute_belowMinDeposit_reverts() public {
-        LighterPerpStrategy s = _clone(_initData(0));
-        // Drain the vault, then leave under 1 USDG. Read the balance BEFORE
-        // pranking — an arg-position call would otherwise consume the prank.
+    /// @dev The vault cannot cover the fixed pull: the ERC20 transferFrom fails
+    ///      and the whole execute rolls back with the float still in the vault.
+    function test_execute_vaultCannotCoverDeposit_reverts() public {
         uint256 bal = usdg.balanceOf(vault);
         vm.prank(vault);
-        usdg.transfer(address(0xdead), bal);
-        usdg.mint(vault, 0.5e6); // < 1 USDG
-        vm.prank(vault);
-        usdg.approve(address(s), type(uint256).max);
+        usdg.transfer(address(0xdead), bal - 1e6); // leaves 1 USDG, needs 20k
 
         vm.prank(vault);
-        vm.expectRevert(LighterPerpStrategy.DepositTooSmall.selector);
-        s.execute();
-    }
-
-    /// @dev Dynamic-all must respect the uint64 withdraw ceiling too — otherwise
-    ///      the deposit could never be drained in one request.
-    function test_execute_dynamicAll_aboveUint64_reverts() public {
-        LighterPerpStrategy s = _clone(_initData(0));
-        usdg.mint(vault, uint256(type(uint64).max) + 1);
-        vm.prank(vault);
-        usdg.approve(address(s), type(uint256).max);
-
-        vm.prank(vault);
-        vm.expectRevert(LighterPerpStrategy.DepositTooLarge.selector);
-        s.execute();
+        vm.expectRevert();
+        strategy.execute();
+        assertEq(usdg.balanceOf(vault), 1e6);
     }
 
     /// @dev Async registration: the venue defers account assignment, so the
@@ -355,8 +407,17 @@ contract LighterPerpStrategyTest is Test {
     function test_registerAgentKey_notProposer_reverts() public {
         _executeFirst();
         vm.prank(attacker);
-        vm.expectRevert(BaseStrategy.NotProposer.selector);
+        vm.expectRevert(LighterPerpStrategy.NotAuthorized.selector);
         strategy.registerAgentKey();
+    }
+
+    /// @dev The owner's second key on the agent-key path — see
+    ///      `test_liveness_ownerKeepsGuardrailsAfterRemoveAgent`.
+    function test_registerAgentKey_vaultOwner_works() public {
+        _executeFirst();
+        vm.prank(owner);
+        strategy.registerAgentKey();
+        assertEq(zk.changePubKeyCount(), 1);
     }
 
     function test_registerAgentKey_idempotent() public {
@@ -710,8 +771,8 @@ contract LighterPerpStrategyTest is Test {
         strategy.settle();
     }
 
-    /// @dev `returnedAssets` makes the guard monotone: a permissionless
-    ///      `sweepToVault()` right before settle must not brick settlement.
+    /// @dev `returnedAssets` makes the guard monotone: a `collectResidue` sweep
+    ///      right before settle must not brick settlement.
     function test_settle_sweepBeforeSettle_doesNotBrick() public {
         _executeFirst();
         vm.startPrank(proposer);
@@ -721,9 +782,8 @@ contract LighterPerpStrategyTest is Test {
         zk.mature(address(strategy));
         vm.roll(block.number + 1);
 
-        // Anyone claims + forwards to the vault ahead of settle.
-        vm.prank(attacker);
-        strategy.recoverResiduals();
+        // Anyone drives the vault's permissionless door ahead of settle.
+        assertEq(_collectResidue(), DEPOSIT);
         assertEq(strategy.returnedAssets(), DEPOSIT);
         assertEq(usdg.balanceOf(address(strategy)), 0);
         assertEq(strategy.pendingBalance(), 0);
@@ -839,20 +899,6 @@ contract LighterPerpStrategyTest is Test {
 
     // ============ R3 REGRESSION (acknowledgeShortfall pre-arm bypass) ============
 
-    /// @dev Drives the strategy to a REAL, currently-observable shortfall: the
-    ///      unwind is initiated, a drain was queued, and the venue matured less
-    ///      than that.
-    function _armedShortfall() internal {
-        _executeFirst();
-        zk.debitL2(address(strategy), 5_000e6); // trading loss on the venue
-        vm.startPrank(proposer);
-        strategy.initiateReturn();
-        strategy.queueWithdraw(uint64(DEPOSIT - 5_000e6));
-        vm.stopPrank();
-        zk.maturePartial(address(strategy), DEPOSIT - 10_000e6); // venue under-fills
-        vm.roll(block.number + 1);
-    }
-
     /// @dev R3 PoC, permanently pinned.
     ///
     ///      Pre-fix: `acknowledgeShortfall()` had NO precondition — it could be
@@ -955,8 +1001,7 @@ contract LighterPerpStrategyTest is Test {
 
         // The 5k the venue never matured is still drainable post-settle.
         zk.mature(address(strategy));
-        vm.prank(attacker);
-        strategy.recoverResiduals();
+        assertEq(_collectResidue(), 5_000e6);
         assertEq(usdg.balanceOf(vault), DEPOSIT - 5_000e6);
     }
 
@@ -1000,8 +1045,9 @@ contract LighterPerpStrategyTest is Test {
         strategy.queueWithdraw(uint64(stranded));
         zk.mature(address(strategy));
 
-        vm.prank(attacker); // recovery is permissionless
-        strategy.recoverResiduals();
+        // Recovery stays permissionless — it just runs through the vault's own
+        // `collectResidue` door now, so the arrival is measured once.
+        assertEq(_collectResidue(), stranded);
 
         assertEq(usdg.balanceOf(vault), DEPOSIT); // fully recovered
         assertEq(zk.l2Balance(address(strategy)), 0);
@@ -1023,7 +1069,7 @@ contract LighterPerpStrategyTest is Test {
         vm.prank(owner);
         strategy.queueWithdraw(uint64(DEPOSIT - 1));
         zk.mature(address(strategy));
-        strategy.recoverResiduals();
+        _collectResidue();
         assertEq(usdg.balanceOf(vault), DEPOSIT);
     }
 
@@ -1113,27 +1159,35 @@ contract LighterPerpStrategyTest is Test {
         assertEq(strategy.settled(), false);
 
         uint256 vaultBefore = usdg.balanceOf(vault);
-        vm.prank(attacker); // permissionless
-        strategy.recoverResiduals();
+        assertEq(_collectResidue(), DEPOSIT);
 
         assertEq(usdg.balanceOf(vault) - vaultBefore, DEPOSIT);
         assertEq(strategy.returnedAssets(), DEPOSIT);
     }
 
-    function test_H4_sweepToVaultWorksBeforeSettle() public {
+    /// @dev H-4, restated for the renamed door: `sweep()` is NOT gated on
+    ///      `State.Settled` (both sibling templates are), because an
+    ///      emergency-settled Lighter clone stays `Executed` forever while still
+    ///      holding USDG the vault cannot see.
+    function test_H4_sweepWorksBeforeSettle() public {
         _executeFirst();
         usdg.mint(address(strategy), 250e6); // stray USDG lands mid-strategy
 
         uint256 vaultBefore = usdg.balanceOf(vault);
-        vm.prank(attacker);
-        strategy.sweepToVault();
+        assertEq(_collectResidue(), 250e6);
         assertEq(usdg.balanceOf(vault) - vaultBefore, 250e6);
         assertEq(strategy.returnedAssets(), 250e6);
+        assertEq(uint8(strategy.state()), uint8(BaseStrategy.State.Executed));
     }
 
     // ==================== RESIDUAL RECOVERY ====================
 
-    function test_recoverResiduals_claimsLateMaturityToVault() public {
+    /// @dev CLAIM-ONLY. `recoverResiduals` stays permissionless — that is the
+    ///      H-4 property — but it now lands the USDG on the CLONE and never
+    ///      pushes. Pushing directly was a second door onto the balance delta
+    ///      `SyndicateVault._recoverResidueVia` measures, which would credit the
+    ///      exited redeem cohort nothing and lift the stayers' price instead.
+    function test_recoverResiduals_claimsToCloneNotVault() public {
         _settleClean();
         // A late tranche matures after settlement.
         usdg.mint(ZK, 500e6); // fund the venue for the extra claim
@@ -1146,27 +1200,72 @@ contract LighterPerpStrategyTest is Test {
         vm.prank(attacker); // permissionless
         strategy.recoverResiduals();
 
+        assertEq(usdg.balanceOf(vault), vaultBefore); // NOT pushed
+        assertEq(usdg.balanceOf(address(strategy)), 500e6); // claimed onto the clone
+        assertEq(strategy.returnedAssets(), DEPOSIT); // unchanged: nothing delivered
+        assertEq(strategy.pendingBalance(), 0);
+
+        // The single measured door then delivers it.
+        assertEq(_collectResidue(), 500e6);
         assertEq(usdg.balanceOf(vault) - vaultBefore, 500e6);
         assertEq(strategy.returnedAssets(), DEPOSIT + 500e6);
     }
 
-    function test_sweepToVault_pushesHeldBalance() public {
+    /// @dev `sweep()` claims AND pushes, so `collectResidue` alone recovers a
+    ///      matured tranche in one call — no separate `recoverResiduals` needed.
+    function test_sweep_claimsAndPushesInOneCall() public {
+        _settleClean();
+        usdg.mint(ZK, 500e6);
+        zk.creditL2(address(strategy), 500e6);
+        vm.prank(proposer);
+        strategy.queueWithdraw(500e6);
+        zk.mature(address(strategy));
+
+        uint256 vaultBefore = usdg.balanceOf(vault);
+        assertEq(_collectResidue(), 500e6);
+        assertEq(usdg.balanceOf(vault) - vaultBefore, 500e6);
+        assertEq(strategy.pendingBalance(), 0);
+    }
+
+    function test_sweep_pushesHeldBalance() public {
         _settleClean();
         // USDG lands directly on the strategy (e.g. a third party claimed here).
         usdg.mint(address(strategy), 250e6);
 
         uint256 vaultBefore = usdg.balanceOf(vault);
-        strategy.sweepToVault();
+        assertEq(_collectResidue(), 250e6);
         assertEq(usdg.balanceOf(vault) - vaultBefore, 250e6);
         assertEq(strategy.returnedAssets(), DEPOSIT + 250e6);
         assertEq(usdg.balanceOf(address(strategy)), 0);
     }
 
-    function test_sweepToVault_zeroBalance_isNoOp() public {
+    function test_sweep_zeroBalance_isNoOp() public {
         _settleClean();
         uint256 vaultBefore = usdg.balanceOf(vault);
-        strategy.sweepToVault();
+        assertEq(_collectResidue(), 0);
         assertEq(usdg.balanceOf(vault), vaultBefore);
+    }
+
+    /// @dev THE POINT OF THE RENAME. `sweep()` is `onlyVault` so the vault's
+    ///      delta measurement stays the single door; a keeper calling it directly
+    ///      is what breaks `_payCohortShare`, and it does not need an attacker.
+    function test_sweep_nonVaultCaller_reverts() public {
+        _settleClean();
+        usdg.mint(address(strategy), 250e6);
+
+        vm.prank(attacker);
+        vm.expectRevert(BaseStrategy.NotVault.selector);
+        strategy.sweep();
+
+        vm.prank(proposer);
+        vm.expectRevert(BaseStrategy.NotVault.selector);
+        strategy.sweep();
+
+        vm.prank(owner);
+        vm.expectRevert(BaseStrategy.NotVault.selector);
+        strategy.sweep();
+
+        assertEq(usdg.balanceOf(address(strategy)), 250e6); // nothing moved
     }
 
     // ==================== CHAIN GUARD ====================
@@ -1220,11 +1319,306 @@ contract LighterPerpStrategyTest is Test {
     }
 }
 
+/// @notice The post-audit additions: the `IStrategyDelivery` residue probes, the
+///         live-agent re-check on the proposer paths, the vault-owner liveness
+///         doors, and the TierRegistry counterparty bind.
+contract LighterPerpStrategyDeliveryTest is LighterPerpStrategyBase {
+    // ==================== IStrategyDelivery (residue probes) ====================
+
+    function test_delivery_pendingBeforeSettle_reportsNothing() public {
+        _executeFirst();
+        vm.startPrank(proposer);
+        strategy.initiateReturn();
+        strategy.queueWithdraw(uint64(DEPOSIT));
+        vm.stopPrank();
+        zk.mature(address(strategy));
+
+        // Executed, holding a matured claim — and still silent, because the
+        // vault is already gated by `openProposalCount() != 0` over this window.
+        assertFalse(strategy.hasUndeliveredValue());
+        assertEq(strategy.undeliveredValue(), 0);
+        assertFalse(strategy.hasUnvaluedResidue());
+    }
+
+    function test_delivery_cleanSettle_reportsNothing() public {
+        _settleClean();
+        assertFalse(strategy.hasUndeliveredValue());
+        assertEq(strategy.undeliveredValue(), 0);
+        assertFalse(strategy.hasUnvaluedResidue());
+    }
+
+    /// @dev Matured-but-unclaimed ticks are undelivered value: `sweep()` would
+    ///      move them, so the vault must not price a mint as if they were gone.
+    function test_delivery_maturedPendingAfterSettle_isUndelivered() public {
+        _settleClean();
+        usdg.mint(ZK, 500e6);
+        zk.creditL2(address(strategy), 500e6);
+        vm.prank(proposer);
+        strategy.queueWithdraw(500e6);
+        zk.mature(address(strategy));
+
+        assertTrue(strategy.hasUndeliveredValue());
+        assertEq(strategy.undeliveredValue(), 500e6);
+
+        _collectResidue();
+        assertFalse(strategy.hasUndeliveredValue());
+        assertEq(strategy.undeliveredValue(), 0);
+    }
+
+    /// @dev Idle USDG sitting on a settled clone counts the same way.
+    function test_delivery_idleBalanceAfterSettle_isUndelivered() public {
+        _settleClean();
+        usdg.mint(address(strategy), 250e6);
+        assertTrue(strategy.hasUndeliveredValue());
+        assertEq(strategy.undeliveredValue(), 250e6);
+    }
+
+    /// @dev `RESIDUE_DUST` (1e3) floors the BOOL but not the AMOUNT — same shape
+    ///      as both sibling templates. A 1-wei donation must not shut deposits.
+    function test_delivery_dustDonation_doesNotTripTheLock() public {
+        _settleClean();
+        usdg.mint(address(strategy), 1);
+        assertFalse(strategy.hasUndeliveredValue());
+        assertEq(strategy.undeliveredValue(), 1);
+
+        usdg.mint(address(strategy), 1_000); // now 1001 > RESIDUE_DUST
+        assertTrue(strategy.hasUndeliveredValue());
+    }
+
+    /// @dev A post-settle top-up drain is value the clone cannot price: the
+    ///      margin is still with the off-chain sequencer.
+    function test_delivery_queuedButUnreturned_isUnvalued() public {
+        _settleClean();
+        assertFalse(strategy.hasUnvaluedResidue());
+
+        usdg.mint(ZK, 500e6);
+        zk.creditL2(address(strategy), 500e6);
+        vm.prank(proposer);
+        strategy.queueWithdraw(500e6);
+        assertTrue(strategy.hasUnvaluedResidue()); // asked for, not back yet
+
+        zk.mature(address(strategy));
+        _collectResidue();
+        assertFalse(strategy.hasUnvaluedResidue()); // returnedAssets caught up
+    }
+
+    /// @dev An acknowledged shortfall is the contract SAYING it could not verify
+    ///      its own L2 balance, so it must declare the residue unvalued. This one
+    ///      never clears on its own — the vault bounds the cost at
+    ///      `UNVALUED_MAX_LOCK` and `pruneUnvaluedMark` burns the mark after.
+    function test_delivery_acknowledgedShortfall_isUnvaluedForever() public {
+        _armedShortfall();
+        vm.prank(proposer);
+        strategy.acknowledgeShortfall();
+        vm.prank(vault);
+        strategy.settle();
+
+        assertTrue(strategy.hasUnvaluedResidue());
+
+        // Even after draining everything the venue will ever pay.
+        zk.mature(address(strategy));
+        _collectResidue();
+        assertTrue(strategy.hasUnvaluedResidue());
+    }
+
+    /// @dev Every probe must fit inside `SyndicateVault._PROBE_GAS` (150k) or the
+    ///      vault reads it as unreadable and leaves the strategy counted forever.
+    function test_delivery_probesFitTheVaultGasCap() public {
+        _settleClean();
+        usdg.mint(address(strategy), 250e6);
+
+        uint256 g = gasleft();
+        strategy.hasUndeliveredValue();
+        uint256 usedBool = g - gasleft();
+
+        g = gasleft();
+        strategy.undeliveredValue();
+        uint256 usedAmount = g - gasleft();
+
+        g = gasleft();
+        strategy.hasUnvaluedResidue();
+        uint256 usedUnvalued = g - gasleft();
+
+        assertLt(usedBool, 150_000);
+        assertLt(usedAmount, 150_000);
+        assertLt(usedUnvalued, 150_000);
+    }
+
+    // ==================== LIVE-AGENT RE-CHECK (pashov #9) ====================
+
+    /// @dev `queueWithdraw` / `acknowledgeShortfall` / `initiateReturn` used to
+    ///      compare `msg.sender == proposer()` by hand, which skipped the live
+    ///      agent-set read `onlyProposer` performs — so `removeAgent` revoked
+    ///      nothing on an already-deployed clone.
+    function test_deregisteredAgent_losesQueueWithdraw() public {
+        _executeFirst();
+        vm.prank(proposer);
+        strategy.initiateReturn();
+
+        vaultC.setAgent(proposer, false); // SyndicateVault.removeAgent
+
+        vm.prank(proposer);
+        vm.expectRevert(LighterPerpStrategy.NotAuthorized.selector);
+        strategy.queueWithdraw(1);
+    }
+
+    function test_deregisteredAgent_losesAcknowledgeShortfall() public {
+        _armedShortfall();
+        vaultC.setAgent(proposer, false);
+
+        vm.prank(proposer);
+        vm.expectRevert(LighterPerpStrategy.NotAuthorized.selector);
+        strategy.acknowledgeShortfall();
+    }
+
+    function test_deregisteredAgent_losesRegisterAgentKey() public {
+        _executeFirst();
+        vaultC.setAgent(proposer, false);
+
+        vm.prank(proposer);
+        vm.expectRevert(LighterPerpStrategy.NotAuthorized.selector);
+        strategy.registerAgentKey();
+    }
+
+    /// @dev The de-registered proposer keeps no PRIVILEGED `initiateReturn`
+    ///      branch: it falls through to the permissionless one and is refused
+    ///      until `strategyDuration` elapses, exactly like anyone else.
+    function test_deregisteredAgent_losesPrivilegedInitiateReturn() public {
+        _executeFirst();
+        vaultC.setAgent(proposer, false);
+
+        vm.prank(proposer);
+        vm.expectRevert(LighterPerpStrategy.NotAuthorized.selector);
+        strategy.initiateReturn();
+
+        vm.warp(block.timestamp + DURATION + 1);
+        vm.prank(proposer); // now only as good as any other caller
+        strategy.initiateReturn();
+        assertTrue(strategy.returnsInitiatedAt() != 0);
+    }
+
+    // ==================== OWNER LIVENESS PATHS ====================
+
+    /// @dev THE HOLE: every guardrail was `updateParams`-only, so `removeAgent`
+    ///      killed the kill switch and pinned settlement until `strategyDuration`.
+    function test_liveness_ownerKeepsGuardrailsAfterRemoveAgent() public {
+        _executeFirst();
+        vaultC.setAgent(proposer, false);
+
+        // Proposer is gone; the owner still holds every lever.
+        vm.startPrank(owner);
+        strategy.guardrailAction(abi.encode(uint8(1), bytes("")));
+        assertEq(zk.cancelAllCount(), 1);
+
+        strategy.guardrailAction(abi.encode(uint8(2), abi.encode(uint16(1), uint32(1), uint8(1))));
+        strategy.registerAgentKey();
+        strategy.initiateReturn();
+        strategy.queueWithdraw(uint64(DEPOSIT));
+        vm.stopPrank();
+
+        assertTrue(strategy.returnsInitiatedAt() != 0);
+        assertEq(strategy.queuedTicks(), DEPOSIT);
+    }
+
+    function test_guardrailAction_proposerAlsoWorks() public {
+        _executeFirst();
+        vm.prank(proposer);
+        strategy.guardrailAction(abi.encode(uint8(1), bytes("")));
+        assertEq(zk.cancelAllCount(), 1);
+    }
+
+    function test_guardrailAction_attacker_reverts() public {
+        _executeFirst();
+        vm.prank(attacker);
+        vm.expectRevert(LighterPerpStrategy.NotAuthorized.selector);
+        strategy.guardrailAction(abi.encode(uint8(1), bytes("")));
+    }
+
+    function test_guardrailAction_beforeExecute_reverts() public {
+        vm.prank(owner);
+        vm.expectRevert(BaseStrategy.NotExecuted.selector);
+        strategy.guardrailAction(abi.encode(uint8(1), bytes("")));
+    }
+
+    function test_guardrailAction_invalidAction_reverts() public {
+        _executeFirst();
+        vm.prank(owner);
+        vm.expectRevert(LighterPerpStrategy.InvalidAction.selector);
+        strategy.guardrailAction(abi.encode(uint8(4), bytes("")));
+    }
+
+    // ==================== COUNTERPARTY BINDING ====================
+
+    /// @dev Init is FAIL-CLOSED on the counterparty axis, matching
+    ///      `ConcentratedLiquidityStrategy`'s Uniswap-factory bind. This is the
+    ///      owner's switch for making the template inert without touching the
+    ///      StrategyFactory allowlist.
+    function test_counterparty_notAllowedAtInit_reverts() public {
+        tiers.setCounterpartyAllowed(ZK, false);
+        LighterPerpStrategy s = LighterPerpStrategy(Clones.clone(address(template)));
+        vm.expectRevert(abi.encodeWithSelector(LighterPerpStrategy.CounterpartyNotAllowed.selector, ZK, address(tiers)));
+        s.initialize(vault, proposer, _initData(DEPOSIT));
+    }
+
+    /// @dev An unresolved registry is FATAL at init and only at init: a no-op
+    ///      bind would read as armed while gating nothing.
+    function test_counterparty_unresolvedRegistryAtInit_reverts() public {
+        gov.setTierRegistry(address(0));
+        LighterPerpStrategy s = LighterPerpStrategy(Clones.clone(address(template)));
+        vm.expectRevert(LighterPerpStrategy.TierRegistryUnresolved.selector);
+        s.initialize(vault, proposer, _initData(DEPOSIT));
+    }
+
+    /// @dev Re-certified at `_execute`: a venue demoted between clone-init and
+    ///      execute must not receive `forceApprove` of the whole deposit.
+    ///      Blocking here strands nothing — the float never leaves the vault.
+    function test_counterparty_demotedBeforeExecute_blocksExecute() public {
+        tiers.setCounterpartyAllowed(ZK, false);
+        vm.prank(vault);
+        vm.expectRevert(abi.encodeWithSelector(LighterPerpStrategy.CounterpartyNotAllowed.selector, ZK, address(tiers)));
+        strategy.execute();
+        assertEq(usdg.balanceOf(vault), DEPOSIT); // untouched
+    }
+
+    /// @dev NEVER on the exit path. A demotion — or an unreachable registry —
+    ///      must not be able to freeze capital already at the venue.
+    function test_counterparty_demotedAfterExecute_doesNotBlockTheExit() public {
+        _executeFirst();
+        tiers.setCounterpartyAllowed(ZK, false);
+
+        vm.startPrank(proposer);
+        strategy.initiateReturn();
+        strategy.queueWithdraw(uint64(DEPOSIT));
+        vm.stopPrank();
+        zk.mature(address(strategy));
+        vm.roll(block.number + 1);
+
+        vm.prank(vault);
+        strategy.settle();
+        assertEq(usdg.balanceOf(vault), DEPOSIT);
+
+        // And the residue door too.
+        usdg.mint(address(strategy), 250e6);
+        assertEq(_collectResidue(), 250e6);
+    }
+
+    /// @dev A registry unwired AFTER init degrades OPEN at execute, matching
+    ///      `MorphoSupplyStrategy._requireAllowedMorpho` and the vault's own
+    ///      "no registry ⇒ no batch guard" default.
+    function test_counterparty_registryUnwiredAfterInit_executeStillRuns() public {
+        gov.setTierRegistry(address(0));
+        _executeFirst();
+        assertEq(zk.l2Balance(address(strategy)), DEPOSIT);
+    }
+}
+
 // ── Minimal mocks for the initiateReturn auth path ──
 
 contract MockVaultForLighter {
     address public governor;
     address public owner;
+    /// @dev `_initialize` binds `USDG` against `IERC4626(vault()).asset()`.
+    address public asset;
 
     /// @dev `BaseStrategy.onlyProposer` staticcalls this fail-closed (pashov
     ///      finding #9), so every proposer-gated path on a clone needs the vault
@@ -1232,9 +1626,14 @@ contract MockVaultForLighter {
     ///      the de-registration tests flip.
     mapping(address => bool) private _agents;
 
-    constructor(address gov_, address owner_) {
+    constructor(address gov_, address owner_, address asset_) {
         governor = gov_;
         owner = owner_;
+        asset = asset_;
+    }
+
+    function setAsset(address asset_) external {
+        asset = asset_;
     }
 
     function setAgent(address who, bool ok) external {
@@ -1244,6 +1643,35 @@ contract MockVaultForLighter {
     function isAgent(address who) external view returns (bool) {
         return _agents[who];
     }
+
+    /// @dev A faithful shrink of `SyndicateVault._recoverResidueVia`: measure the
+    ///      vault's asset balance across a low-level, gas-capped `sweep()` into
+    ///      the strategy and report the delta. Permissionless here exactly as it
+    ///      is there, and the reason `sweep()` must be `onlyVault` — the real one
+    ///      splits this delta with the exited redeem cohort, which is only a
+    ///      complete measurement while `sweep()` is the single door.
+    function collectResidue(address strategy) external returns (uint256 collected) {
+        uint256 before = IERC20(asset).balanceOf(address(this));
+        // solhint-disable-next-line avoid-low-level-calls
+        (bool ok,) = strategy.call{gas: 1_500_000}(abi.encodeWithSelector(bytes4(0x35faa416)));
+        ok; // result deliberately ignored, as in the vault
+        return IERC20(asset).balanceOf(address(this)) - before;
+    }
+}
+
+/// @notice The counterparty axis `LighterPerpStrategy._initialize` binds
+///         `ZK_LIGHTER` through. Answers only `isCounterpartyAllowed`, which is
+///         the single selector the strategy's raw staticcall asks for.
+contract MockTierRegistryForLighter {
+    mapping(address => bool) private _allowed;
+
+    function setCounterpartyAllowed(address who, bool ok) external {
+        _allowed[who] = ok;
+    }
+
+    function isCounterpartyAllowed(address who) external view returns (bool) {
+        return _allowed[who];
+    }
 }
 
 contract MockGovernorForLighter {
@@ -1251,6 +1679,14 @@ contract MockGovernorForLighter {
     address internal _strategy;
     uint256 internal _executedAt;
     uint256 internal _duration;
+
+    /// @dev Second hop of the `vault() -> governor() -> tierRegistry()` walk the
+    ///      strategy uses to bind `ZK_LIGHTER` on the counterparty axis.
+    address public tierRegistry;
+
+    function setTierRegistry(address r) external {
+        tierRegistry = r;
+    }
 
     function setActiveProposal(uint256 pid) external {
         _activeProposal = pid;
