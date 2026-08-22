@@ -17,13 +17,13 @@ import {IVaultWithdrawalQueue} from "../../src/interfaces/IVaultWithdrawalQueue.
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 
-// LEGACY pin (US market hours, 2026-07-08 ~15:10 UTC). DEAD ON THE PUBLIC RPC:
-// `https://rpc.mainnet.chain.robinhood.com` is pruned and serves state only for
-// roughly the last 5k-50k blocks (head was ~34.9M on 2026-08-12), so a fork at
-// this block returns `error code -32000` for every state read. Kept only because
-// `UniswapAdapterRobinhoodForkTest` still imports it; this harness no longer
-// uses it as a default — see the ROBINHOOD_FORK_BLOCK env var.
-uint256 constant ROBINHOOD_FORK_BLOCK = 4_453_020;
+// The legacy `ROBINHOOD_FORK_BLOCK = 4_453_020` constant used to live here. It
+// was removed 2026-08-22: it was already unreachable (the public RPC
+// `https://rpc.mainnet.chain.robinhood.com` is pruned to roughly the last
+// 5k-50k blocks — head was 43,475,332 on 2026-08-22 — so forking at it returns
+// `error code -32000` for every state read), and its only remaining consumer,
+// `UniswapAdapterRobinhoodForkTest`, imported it without ever reading it. Pin
+// via the ROBINHOOD_FORK_BLOCK **env var** instead; 0 (the default) = latest.
 
 /// @dev Minimal Chainlink AggregatorV3 surface, declared locally so the harness
 ///      does not have to import a strategy just to read a feed clock.
@@ -50,14 +50,15 @@ interface IAggregatorV3Clock {
  *
  * @dev Skips if ROBINHOOD_RPC_URL is not set (shared fork-test convention).
  *
- *      RPC REALITY (verified on-chain 2026-08-12 — trust this over any older
+ *      RPC REALITY (re-verified on-chain 2026-08-22 — trust this over any older
  *      comment):
  *        - The public RPC `https://rpc.mainnet.chain.robinhood.com` is chainid
  *          4663 and PRUNED. State reads work only for roughly the last
- *          5,000–50,000 blocks behind head (~34.9M on 2026-08-12). Any historic
- *          pin (including the legacy `ROBINHOOD_FORK_BLOCK` constant above)
- *          fails with `error code -32000`. Forking at LATEST is therefore the
- *          only thing that works against the public endpoint — which is why the
+ *          5,000–50,000 blocks behind head (43,475,332 on 2026-08-22; it was
+ *          ~34.9M on 2026-08-12, so this chain moves ~1M blocks/day and ANY pin
+ *          you write down is unreachable within the hour). A historic pin fails
+ *          with `error code -32000`. Forking at LATEST is therefore the only
+ *          thing that works against the public endpoint — which is why the
  *          default here is "latest", not a pin.
  *        - Archive state comes from a Tenderly virtual testnet. It serves the
  *          same addresses but reports chainid 9994663, hence the
