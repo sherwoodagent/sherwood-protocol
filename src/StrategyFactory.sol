@@ -53,8 +53,14 @@ contract StrategyFactory is Ownable {
     /// @notice Owner-managed allowlist of strategy templates
     ///         that may be cloned through this factory. Default: empty
     ///         (everything reverts). The owner (deployer / Sherwood multisig)
-    ///         adds the canonical templates (Aerodrome / Moonwell / Portfolio
-    ///         / HL Grid / HL Perp / WstETH / Mamo) at deploy.
+    ///         adds the canonical templates at deploy.
+    /// @dev    THE SHIPPED SET IS `DeployStrategyFactory._templateKeys()`, which
+    ///         is the list that actually populates this map — read it there
+    ///         rather than trusting a name in this comment. As of 2026-08 that
+    ///         is Portfolio, MorphoSupply, ConcentratedLiquidity and LighterPerp.
+    ///         The Aerodrome / Moonwell / WstETH / Mamo names this comment used
+    ///         to carry were removed from `src/strategies/` in 2026-08 and had
+    ///         no contract behind them.
     mapping(address template => bool approved) public approvedTemplate;
 
     error Unauthorized();
