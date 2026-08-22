@@ -48,6 +48,9 @@
 #   RPC=<vnet ADMIN rpc> ./script/fork/guardian-review.sh status  <vault> <proposalId>
 #   RPC=<vnet ADMIN rpc> ./script/fork/guardian-review.sh approve <vault> <proposalId> <guardian...>
 #   RPC=<vnet ADMIN rpc> ./script/fork/guardian-review.sh stake   <wood-amount> <guardian...>
+#   RPC=<vnet ADMIN rpc> ./script/fork/guardian-review.sh block   <vault> <proposalId> <guardian...>
+#   RPC=<vnet ADMIN rpc> ./script/fork/guardian-review.sh outcome <vault> <proposalId>
+#   RPC=<vnet ADMIN rpc> ./script/fork/guardian-review.sh slash-report <guardian...>
 #   RPC=<vnet ADMIN rpc> ./script/fork/guardian-review.sh resolve <vault> <proposalId>
 #   RPC=<vnet ADMIN rpc> ./script/fork/guardian-review.sh flush   <vault> <proposalId>
 #   RPC=<vnet ADMIN rpc> ./script/fork/guardian-review.sh feed-maxdelay <seconds>   # fork-only
@@ -65,6 +68,7 @@ LEDGER=$(a EXPOSURE_LEDGER);   SWOOD=$(a STAKED_WOOD); WOOD=$(a WOOD_TOKEN)
 # `GuardianVoteType { None, Approve, Block }` — Approve is 1. Ordering matters:
 # passing 0 reverts, and 2 is a BLOCK vote that slashes approvers.
 VOTE_APPROVE=1
+VOTE_BLOCK=2
 
 num() { echo "$1" | sed 's/ .*//'; }
 governor_of() { num "$(cast call "$FACTORY" 'governorOf(address)(address)' "$1" --rpc-url "$RPC" 2>/dev/null)"; }
@@ -241,12 +245,101 @@ cmd_resolve() {
     && echo "  resolved" || echo "  resolve refused (review window may not have ended)"
 }
 
+# Cast BLOCK votes, the half of the review path `approve` cannot reach.
+#
+# `GuardianVoteType.Block` is 2. Structurally it is the same call as approve —
+# same open-review requirement, same late-vote lockout — but it accumulates
+# `blockStakeWeight` instead of booking coverage, and the review resolves as
+# BLOCKED once
+#
+#     blockStakeWeight * 10_000 >= blockQuorumBpsAtOpen * totalStakeAtOpen
+#
+# with both the quorum and the denominator read from the AT-OPEN envelope, not
+# the live slots. So a cohort that stakes MORE after the review opens does not
+# dilute the blockers, and an owner cannot move the bar mid-review.
+#
+# WHAT A BLOCK COSTS THE APPROVERS. On resolve, `slashGuardians` slashes every
+# approver and BURNS the proceeds — WOOD `totalSupply` falls and nobody is paid.
+# Blockers gain nothing on-chain; their reward is epoch-level, emitted as
+# `BlockerAttributed` for Merkl to pick up off-chain.
+#
+# SEVERITY IS NOT VOTED. It is a deterministic quadratic ramp of block-side
+# decisiveness, from `minSlashBps` at a bare-scraped quorum to `maxSlashBps` at
+# `SUPERMAJORITY_BPS` — `_severityBps` in GuardianRegistry. The winning side
+# does not choose the losers' penalty, so there is no severity to pass here and
+# no median to compute.
+#
+# ORDER MATTERS AGAINST `reaffirm`. Both drive vote type 2. `reaffirm` flips one
+# guardian at a time PRECISELY so accumulated block weight never crosses the
+# quorum by accident; this command is the deliberate opposite. Do not mix them
+# on the same review.
+cmd_block() {
+  local vault=$1 pid=$2; shift 2
+  local gov; gov=$(governor_of "$vault")
+
+  if cast send "$REGISTRY" 'openReview(address,uint256)' "$gov" "$pid" \
+      --rpc-url "$RPC" --unlocked --from "$(a DEPLOYER)" >/dev/null 2>&1; then
+    echo "  review opened (or already was)"
+  else
+    echo "  openReview REFUSED — voting period has not ended, or the review is resolved"
+    return 1
+  fi
+
+  local ok=0 fail=0
+  for g in "$@"; do
+    if cast send "$REGISTRY" 'voteOnProposal(address,uint256,uint8)' "$gov" "$pid" "$VOTE_BLOCK" \
+        --rpc-url "$RPC" --unlocked --from "$g" >/dev/null 2>&1; then
+      echo "  BLOCKED   $g"; ok=$((ok+1))
+    else
+      echo "  FAILED    $g  (not an active guardian, outside the window, or already voted)"; fail=$((fail+1))
+    fi
+  done
+  echo "  $ok blocked, $fail failed"
+}
+
+# Snapshot what a slash is supposed to move: each guardian's own stake, the
+# cohort total, and the burn sink. Run it either side of `resolve`.
+#
+# WATCH THE SINK, NOT `totalSupply`. "Burned" here is a TRANSFER to
+# `BURN_ADDRESS` (0x…dEaD), not an ERC20 `burn()` — `_burnWood` in StakedWood
+# does `wood.transfer(BURN_ADDRESS, amount)` inside a try/catch, falling back to
+# `_pendingBurn` if the token refuses. So `totalSupply` is UNCHANGED across a
+# slash, and reading it is the natural way to conclude, wrongly, that no burn
+# happened. The sink balance is the number that moves, and it should move by
+# exactly the cohort-total drop.
+cmd_slash_report() {
+  local burn=0x000000000000000000000000000000000000dEaD
+  echo "  burn sink         $(python3 -c "print(f'{$(num "$(cast call "$WOOD" 'balanceOf(address)(uint256)' "$burn" --rpc-url "$RPC")")/1e18:,.4f}')")"
+  echo "  cohort total      $(python3 -c "print(f'{$(num "$(cast call "$SWOOD" 'totalGuardianStake()(uint256)' --rpc-url "$RPC")")/1e18:,.4f}')")"
+  echo "  slash envelope    min $(num "$(cast call "$SWOOD" 'minSlashBps()(uint256)' --rpc-url "$RPC")") bps / max $(num "$(cast call "$SWOOD" 'maxSlashBps()(uint256)' --rpc-url "$RPC")") bps"
+  for g in "$@"; do
+    printf '  %s  own %s\n' "$g" \
+      "$(python3 -c "print(f'{$(num "$(cast call "$SWOOD" 'guardianStake(address)(uint256)' "$g" --rpc-url "$RPC")")/1e18:,.4f}')")"
+  done
+}
+
+# Read the review's committed outcome: 0 Unresolved, 1 Cleared, 2 Blocked.
+cmd_outcome() {
+  local vault=$1 pid=$2
+  local gov; gov=$(governor_of "$vault")
+  local o; o=$(num "$(cast call "$REGISTRY" 'outcomeOf(address,uint256)(uint8)' "$gov" "$pid" --rpc-url "$RPC" 2>&1)")
+  case "$o" in
+    0) echo "  outcome: Unresolved" ;;
+    1) echo "  outcome: Cleared" ;;
+    2) echo "  outcome: BLOCKED" ;;
+    *) echo "  outcome: unreadable ($o)" ;;
+  esac
+}
+
 case "${1:-}" in
   status)  shift; cmd_status "$@" ;;
   stake)   shift; cmd_stake "$@" ;;
   approve) shift; cmd_approve "$@" ;;
   resolve) shift; cmd_resolve "$@" ;;
   flush)   shift; cmd_flush "$@" ;;
+  block)   shift; cmd_block "$@" ;;
+  outcome) shift; cmd_outcome "$@" ;;
+  slash-report) shift; cmd_slash_report "$@" ;;
   reaffirm) shift; cmd_reaffirm "$@" ;;
   attest-clone) shift; cmd_attest_clone "$@" ;;
   feed-maxdelay) shift; cmd_feed_maxdelay "$@" ;;
