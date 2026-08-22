@@ -50,6 +50,8 @@ contract LighterPerpStrategyTest is Test {
         gov = new MockGovernorForLighter();
         vaultC = new MockVaultForLighter(address(gov), owner);
         vault = address(vaultC);
+        // `onlyProposer` re-reads the vault's live agent set on every call.
+        vaultC.setAgent(proposer, true);
 
         strategy = LighterPerpStrategy(Clones.clone(address(template)));
         strategy.initialize(vault, proposer, _initData(DEPOSIT));
@@ -80,9 +82,15 @@ contract LighterPerpStrategyTest is Test {
         return abi.encode(_validPubKey(), API_KEY_INDEX, _markets(), depositAmt);
     }
 
+    /// @dev Re-seats the mock governor's active proposal on the NEW clone.
+    ///      `BaseStrategy.execute` requires `strategyOf(activePid) == msg.target`,
+    ///      so a clone the governor does not name can never execute. No test here
+    ///      wants the active proposal pointed elsewhere at clone time; the ones
+    ///      that do (`initiateReturn` auth) re-point it explicitly afterwards.
     function _clone(bytes memory data) internal returns (LighterPerpStrategy s) {
         s = LighterPerpStrategy(Clones.clone(address(template)));
         s.initialize(vault, proposer, data);
+        gov.setProposal(address(s), block.timestamp, DURATION);
     }
 
     function _executeFirst() internal {
@@ -1218,9 +1226,23 @@ contract MockVaultForLighter {
     address public governor;
     address public owner;
 
+    /// @dev `BaseStrategy.onlyProposer` staticcalls this fail-closed (pashov
+    ///      finding #9), so every proposer-gated path on a clone needs the vault
+    ///      to answer. Default TRUE for the seeded proposer; `setAgent` is what
+    ///      the de-registration tests flip.
+    mapping(address => bool) private _agents;
+
     constructor(address gov_, address owner_) {
         governor = gov_;
         owner = owner_;
+    }
+
+    function setAgent(address who, bool ok) external {
+        _agents[who] = ok;
+    }
+
+    function isAgent(address who) external view returns (bool) {
+        return _agents[who];
     }
 }
 
@@ -1242,6 +1264,15 @@ contract MockGovernorForLighter {
 
     function getActiveProposal() external view returns (uint256) {
         return _activeProposal;
+    }
+
+    /// @dev `BaseStrategy.execute` requires `strategyOf(getActiveProposal())` to
+    ///      name the calling clone (issue #150 clone-ratchet fix). Mirrors the
+    ///      real governor: pid 0 is "no active proposal" and resolves to the zero
+    ///      address, which is never a clone.
+    function strategyOf(uint256 pid) external view returns (address) {
+        if (pid == 0) return address(0);
+        return _strategy;
     }
 
     /// @dev Mirrors the real governor: a nonexistent id returns a ZEROED struct
