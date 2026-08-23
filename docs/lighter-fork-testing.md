@@ -422,5 +422,9 @@ the first attempt took, and the registry's copy is the one `openReview` and
     `clone.sweep()` from an EOA must revert `NotVault`.
 
 What this bench cannot prove — real fills, funding, API-leg behavior — is
-covered by the rh-testnet API loop and a small-notional 4663 canary at ship
-time.
+covered by the rh-testnet API loop and the small-notional 4663 canaries.
+**H2 is CLOSED (2026-08-23):** the 4663 canary (`test/harness/LighterH2Canary.md`)
+opened a real 0.005 ETH long on account 623, flattened it with the exact
+`closeMarket(m, 1, ASK)` `initiateReturn` emits, then fired the second leg
+`closeMarket(m, 2**32-1, BID)` against the flat book — verdict **NOOP** (37
+samples / 2 min, size 0.0 throughout). The both-side close is sound as written.

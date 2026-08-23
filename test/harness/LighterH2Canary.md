@@ -1,5 +1,14 @@
 # H2 canary — does `baseAmount = 0` no-op against a FLAT position?
 
+> **RUN 2026-08-23 — VERDICT: `H2 = NOOP`.** Real 0.005 ETH long opened on
+> account 623 (entry 2439.04, 5.000000 USDG margin at 10x), flattened by
+> close #1 (`closeMarket(0, 1, 1)`), then close #2 (`closeMarket(0,
+> 4294967295, 0)`) fired against the flat book: **size 0.0 across all 37
+> samples over the 2-minute window** (20:10:31Z-20:12:29Z), zero resting
+> orders, collateral 5.013100 untouched. `initiateReturn`'s both-side close
+> is sound as written; the ship blocker is closed. Round-trip PnL +0.013100
+> USDG (fees are zero on the venue).
+
 **Chain:** Robinhood mainnet, id `4663`. **Real funds.** Every `cast send` is yours to run.
 
 ## The question
