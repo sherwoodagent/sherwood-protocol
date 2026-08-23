@@ -23,3 +23,4 @@ slither_results.json
 # ci.yml's --no-match-path excludes test/integration/** but not this path,
 # so committing them turns the RPC-less job red with [FAIL: skipped].
 test/pocs/
+test/harness/__pycache__/
