@@ -2,10 +2,12 @@
 pragma solidity 0.8.28;
 
 import {console} from "forge-std/Script.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {ScriptBase} from "../ScriptBase.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
@@ -16,6 +18,7 @@ import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {StrategyFactory} from "../../src/StrategyFactory.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
+import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 import {LighterPerpStrategy} from "../../src/strategies/LighterPerpStrategy.sol";
 import {IStrategy} from "../../src/interfaces/IStrategy.sol";
 import {IZkLighter} from "../../src/lighter/IZkLighter.sol";
@@ -64,6 +67,15 @@ contract LighterForkBench is ScriptBase {
     ///      `498` is the only base that reproduces them. See §2 of
     ///      docs/lighter-fork-testing.md.
     uint256 constant PENDING_BALANCES_BASE_SLOT = 498;
+
+    /// @dev ZkLighter's priority-queue event. THE ONLY PROOF ON A FORK that a
+    ///      guardrail actually reached the venue rather than no-oping: the
+    ///      sequencer never answers here, so a call that enqueues nothing is
+    ///      indistinguishable from one that succeeded, unless the enqueue itself
+    ///      is asserted. Taken off a REAL receipt on vnet a3fb16 (the 2026-08-22
+    ///      `guardrails` tx 0x7067470934749519d05e2262c93561bf02bfe4811424601748874383bda77300),
+    ///      not derived from a signature - `IZkLighter` does not declare it.
+    bytes32 constant NEW_PRIORITY_REQUEST = 0xefdd379e3e15772fcc7d2a67fa5bbb0790b932724153aded4648307094733b2f;
 
     // ── Bench actors. Impersonated; the admin RPC signs for anyone. ──
     address constant OWNER = 0x1111111111111111111111111111111111111111;
@@ -155,6 +167,18 @@ contract LighterForkBench is ScriptBase {
         for (uint256 i; i < all.length; i++) {
             if (keccak256(bytes(all[i].subdomain)) == want) {
                 console.log("BENCH_VAULT=%s (already created)", all[i].vault);
+                // RE-SEAT, because the §6 liveness leg DE-REGISTERS the agent and
+                // that is the whole point of it. Without this the bench is
+                // single-shot: the next `cloneAndPropose` reverts `NotAgent` at
+                // the governor a phase later, with nothing naming the cause.
+                // `removeAgent` full-deletes the struct, so re-registering the
+                // same id is legal rather than an `AgentAlreadyRegistered`.
+                SyndicateVault existing = SyndicateVault(payable(all[i].vault));
+                if (!existing.isAgent(AGENT)) {
+                    vm.broadcast(OWNER);
+                    existing.registerAgent(9002, AGENT);
+                    console.log("re-seated the bench agent after a liveness run:", AGENT);
+                }
                 return;
             }
         }
@@ -369,8 +393,28 @@ contract LighterForkBench is ScriptBase {
         // lost exactly what the clone says it took, and never more than declared.
         require(spent == deployed, "vault outflow != clone deployedAmount");
         require(deployed <= _deployAmount(), "clone deployed more than declared");
+
+        // THE SCALING LAW ITSELF, ASSERTED RATHER THAN NARRATED, and it is the
+        // same statement in both regimes: `_coverageScaledDeposit` returns
+        // `mulDiv(depositAmount, effectiveMaxCapital, maxCapital)`, which
+        // degenerates to `depositAmount` exactly when the proposal was fully
+        // covered (`effective == declared`). One `require` therefore covers the
+        // fully-covered leg AND the scaled one, and a template that ever went
+        // back to pulling the pinned declaration into a scaled batch would fail
+        // it here rather than reverting `CallCapExceeded` and looking like a
+        // coverage problem.
+        (uint256 declared, uint256 effective) = _envelope(gov, pid);
+        uint256 want = declared == 0 || effective >= declared
+            ? _deployAmount()
+            : Math.mulDiv(_deployAmount(), effective, declared);
+        console.log("maxCapital / effectiveMaxCapital:", declared, effective);
+        console.log("expected deployedAmount (declared x effective / max):", want);
+        require(deployed == want, "deployedAmount != depositAmount x effective / maxCapital");
         if (deployed != _deployAmount()) {
             console.log("NOTE: under-covered proposal - scaled down from:", _deployAmount());
+            require(!_expectFullCoverage(), "LIGHTER_BENCH_EXPECT_FULL=1 but the proposal was SCALED DOWN");
+        } else {
+            console.log("FULLY COVERED: deployedAmount == depositAmount");
         }
         require(USDG.balanceOf(clone) == 0, "clone did not forward the deposit to the venue");
         require(v.redemptionsLocked(), "vault not locked while deployed");
@@ -449,6 +493,141 @@ contract LighterForkBench is ScriptBase {
         _probes(address(s), "after queueWithdraw");
     }
 
+    // ================= PHASE 6b: §6 LIVENESS =================
+
+    /// @notice §6 of docs/lighter-fork-testing.md: `removeAgent(proposer)` must
+    ///         REVOKE without STRANDING.
+    /// @dev    THE TWO HALVES ARE ONE CLAIM, and testing either alone proves the
+    ///         wrong thing. Before the `guardrailAction` / `_isLiveProposer`
+    ///         work, revocation was simultaneously TOO WEAK and TOO STRONG: the
+    ///         hand-rolled `msg.sender == proposer()` in `queueWithdraw` /
+    ///         `initiateReturn` / `acknowledgeShortfall` skipped the live
+    ///         agent-set re-check, so a de-registered agent kept the privileged
+    ///         branch; and every guardrail hung off `updateParams`, which is
+    ///         `onlyProposer`, so removing the agent also removed the only key
+    ///         that could cancel its resting orders. Revoking made the position
+    ///         LESS controllable AND left the agent in charge of the drain.
+    ///
+    ///         So this leg asserts both directions on one clone, in one tx
+    ///         sequence, against the real venue:
+    ///           - the proposer loses `updateParams`, `guardrailAction`,
+    ///             `registerAgentKey`, `queueWithdraw` and the PRIVILEGED branch
+    ///             of `initiateReturn` — with the exact named errors, not just
+    ///             "it reverted";
+    ///           - the owner keeps every one of them, and each venue-touching
+    ///             call is proven by the venue's OWN `NewPriorityRequest` rather
+    ///             than by the call not reverting. On a fork a no-op and a
+    ///             success look identical from the return value alone.
+    ///
+    ///         `initiateReturn` from the de-registered proposer resolves to
+    ///         `NotAuthorized` rather than `ProposerNoLongerAgent` and that is
+    ///         the design: it does not have a proposer modifier, it FALLS THROUGH
+    ///         to the permissionless branch, where the timing gate
+    ///         (`executedAt + strategyDuration`) has not elapsed yet. The
+    ///         demotion is exactly "as much authority as anyone else, and no
+    ///         more".
+    ///
+    ///         Leaves the agent REMOVED. `setup()` re-seats it on the next run.
+    /// @param  ticks the drain the owner queues — the clone's `deployedAmount()`.
+    function liveness(uint256 salt, uint64 ticks) external {
+        _load();
+        SyndicateVault v = _vault();
+        LighterPerpStrategy s = LighterPerpStrategy(_clone(salt));
+        require(uint8(s.state()) == 1, "clone is not Executed - liveness is the post-execute leg");
+        require(s.returnsInitiatedAt() == 0, "unwind already started - the liveness leg must own the whole unwind");
+        require(v.isAgent(AGENT), "bench agent is not seated - re-run setup()");
+        require(v.owner() == OWNER, "bench OWNER does not own the vault");
+
+        // ── The revocation ──
+        vm.broadcast(OWNER);
+        v.removeAgent(AGENT);
+        require(!v.isAgent(AGENT), "removeAgent did not clear the live agent set");
+        console.log("removeAgent(proposer) ok - vault.isAgent(proposer) is now false");
+
+        // ── It BITES: every proposer-gated door is shut ──
+        console.log("--- the de-registered proposer ---");
+        _mustRevert(
+            address(s),
+            AGENT,
+            abi.encodeWithSignature("updateParams(bytes)", abi.encode(uint8(1), bytes(""))),
+            BaseStrategy.ProposerNoLongerAgent.selector,
+            "updateParams(CANCEL_ALL)"
+        );
+        _mustRevert(
+            address(s),
+            AGENT,
+            abi.encodeWithSignature("guardrailAction(bytes)", abi.encode(uint8(1), bytes(""))),
+            LighterPerpStrategy.NotAuthorized.selector,
+            "guardrailAction(CANCEL_ALL)"
+        );
+        _mustRevert(
+            address(s),
+            AGENT,
+            abi.encodeWithSignature("registerAgentKey()"),
+            LighterPerpStrategy.NotAuthorized.selector,
+            "registerAgentKey"
+        );
+        _mustRevert(
+            address(s),
+            AGENT,
+            abi.encodeWithSignature("queueWithdraw(uint64)", ticks),
+            LighterPerpStrategy.NotAuthorized.selector,
+            "queueWithdraw"
+        );
+        _mustRevert(
+            address(s),
+            AGENT,
+            abi.encodeWithSignature("initiateReturn()"),
+            LighterPerpStrategy.NotAuthorized.selector,
+            "initiateReturn (falls through to the permissionless branch)"
+        );
+
+        // ── ...and the OWNER still holds every one of them ──
+        console.log("--- the vault owner ---");
+        uint256 markets = _marketList().length;
+
+        vm.recordLogs();
+        vm.broadcast(OWNER);
+        s.guardrailAction(abi.encode(uint8(1), bytes("")));
+        _requirePriorityRequests(1, "owner guardrailAction(CANCEL_ALL)");
+
+        vm.recordLogs();
+        vm.broadcast(OWNER);
+        s.registerAgentKey();
+        _requirePriorityRequests(1, "owner registerAgentKey");
+
+        // One cancel-all + a both-side market close per configured market.
+        vm.recordLogs();
+        vm.broadcast(OWNER);
+        s.initiateReturn();
+        _requirePriorityRequests(1 + 2 * markets, "owner initiateReturn");
+        require(s.returnsInitiatedAt() != 0, "initiateReturn did not stamp returnsInitiatedAt");
+        require(s.queuedTicks() == 0, "initiateReturn queued a withdrawal - C1 split broken");
+        console.log("returnsInitiatedAt:", s.returnsInitiatedAt());
+
+        vm.recordLogs();
+        vm.broadcast(OWNER);
+        s.queueWithdraw(ticks);
+        _requirePriorityRequests(1, "owner queueWithdraw");
+        console.log("queuedTicks:", s.queuedTicks());
+
+        _probes(address(s), "after the owner-driven unwind");
+        console.log("BENCH_LIVENESS=ok - the agent is REMOVED; setup() re-seats it");
+    }
+
+    /// @notice Re-seat the bench agent by hand (setup() also does it).
+    function reseatAgent() external {
+        _load();
+        SyndicateVault v = _vault();
+        if (v.isAgent(AGENT)) {
+            console.log("agent already seated:", AGENT);
+            return;
+        }
+        vm.broadcast(OWNER);
+        v.registerAgent(9002, AGENT);
+        console.log("re-seated:", AGENT, v.isAgent(AGENT));
+    }
+
     // ================= PHASE 7: settle =================
 
     /// @notice Post-settle assertions. The `settleProposal` CALL ITSELF is not
@@ -521,10 +700,105 @@ contract LighterForkBench is ScriptBase {
         _load();
         LighterPerpStrategy s = LighterPerpStrategy(_clone(salt));
         require(uint8(s.state()) == 2, "clone is not Settled - this is the post-settle path");
-        vm.broadcast(AGENT);
+        // WHICHEVER KEY IS STILL LIVE. After the §6 leg the proposer is no longer
+        // an agent and `_requireProposerOrOwner` refuses it; the owner is the
+        // holder the liveness fix exists to preserve, so use it rather than
+        // failing a residue assertion for an auth reason that is the point.
+        address caller = _vault().isAgent(AGENT) ? AGENT : OWNER;
+        vm.broadcast(caller);
         s.queueWithdraw(ticks);
         console.log("post-Settled queueWithdraw ok; queuedTicks:", s.queuedTicks());
         _probes(address(s), "after post-settle queueWithdraw");
+    }
+
+    /// @notice Sweep the guardian's DEAD approvals off the shared-stake
+    ///         denominator, so the next approve allocates its full reservation.
+    /// @dev    THE SECOND HALF OF "THE RESERVATION CLEARS", AND THE HALF THAT IS
+    ///         NOT AUTOMATIC. Two different ledger counters carry a guardian's
+    ///         approval and only ONE of them decays on the clock:
+    ///           - `_buckets` / `openExposureUsd` — the BUDGET. Bucket `e` stops
+    ///             counting at `genesis + (e+1)*L + W`, so warping past that
+    ///             frees the guardian to reserve again, and `recordApproval` will
+    ///             happily book the full `requiredCoverage`.
+    ///           - `_livePledgedUsd` — the DENOMINATOR `_sharedSlashableUsd`
+    ///             divides the bond by. It has no clock at all: `releaseApproval`
+    ///             is gated on `block.timestamp < reviewEnd`, so once a review
+    ///             closes nothing decrements it except the permissionless
+    ///             `retireApproval`.
+    ///
+    ///         So a guardian whose old bookings have expired still reports a full
+    ///         reservation and STILL allocates only `bond * reserved /
+    ///         livePledged`. Measured on vnet a3fb16 on 2026-08-22, one guardian,
+    ///         two dead approvals worth $6,520.56 of pledge: the next proposal
+    ///         reserved the whole $3,999.67 it needed, `openExposureUsd` agreed,
+    ///         and `allocatedUsd` came out at $2,479.04 — 62% — so a proposal
+    ///         nothing was competing for still deployed 1,239,622,687 of a
+    ///         declared 2,000,000,000. The bench read that as an under-covered
+    ///         run because on the budget axis it was not one.
+    ///
+    ///         `retireApproval` is permissionless and refuses exactly the cases
+    ///         it must (`CoverageFrozen`, `CoveragePinnedActive`, bucket not yet
+    ///         expired), so the sweepable set is discovered by PROBING inside a
+    ///         state snapshot and only then broadcast — a revert inside
+    ///         `vm.broadcast` would take the whole script down for a pid that was
+    ///         merely still live.
+    ///
+    ///         SCOPE: this governor only. A guardian that approved on some OTHER
+    ///         vault carries that pledge too, and only that vault's governor can
+    ///         name it.
+    function retireStale(address guardian) external {
+        _load();
+        SyndicateGovernor gov = _gov();
+        address ledger = gov.exposureLedger();
+        require(ledger != address(0), "no exposure ledger on this governor");
+        uint256 last = gov.proposalCount();
+
+        uint256[] memory hits = new uint256[](last + 1);
+        uint256 n;
+        uint256 snap = vm.snapshotState();
+        for (uint256 pid = 1; pid <= last; pid++) {
+            if (_allocatedUsd(ledger, address(gov), pid, guardian) == 0) continue;
+            vm.prank(OUTSIDER);
+            (bool ok,) = ledger.call(_retireCall(address(gov), pid, guardian));
+            if (ok) {
+                hits[n++] = pid;
+            } else {
+                console.log("  pid NOT sweepable yet (frozen, pinned, or bucket unexpired):", pid);
+            }
+        }
+        vm.revertToState(snap);
+
+        for (uint256 i; i < n; i++) {
+            vm.broadcast(OUTSIDER); // retireApproval is permissionless
+            (bool ok,) = ledger.call(_retireCall(address(gov), hits[i], guardian));
+            require(ok, "retireApproval reverted on broadcast");
+            console.log("  retired dead approval on pid:", hits[i]);
+        }
+        console.log("BENCH_RETIRED=%s", n);
+        console.log("openExposureUsd after sweep:", _openExposureUsd(ledger, guardian));
+    }
+
+    function _retireCall(address gov_, uint256 pid, address guardian) private pure returns (bytes memory) {
+        return abi.encodeWithSignature("retireApproval(address,uint256,address)", gov_, pid, guardian);
+    }
+
+    function _allocatedUsd(address ledger, address gov_, uint256 pid, address guardian)
+        private
+        view
+        returns (uint256)
+    {
+        (bool ok, bytes memory ret) = ledger.staticcall(
+            abi.encodeWithSignature("allocatedUsd(address,uint256,address)", gov_, pid, guardian)
+        );
+        if (!ok || ret.length < 32) return 0;
+        return abi.decode(ret, (uint256));
+    }
+
+    function _openExposureUsd(address ledger, address guardian) private view returns (uint256) {
+        (bool ok, bytes memory ret) =
+            ledger.staticcall(abi.encodeWithSignature("openExposureUsd(address)", guardian));
+        if (!ok || ret.length < 32) return 0;
+        return abi.decode(ret, (uint256));
     }
 
     /// @notice SIZE BEFORE THE VOTE, BECAUSE THE EXECUTE BATCH NO LONGER
@@ -563,13 +837,71 @@ contract LighterForkBench is ScriptBase {
         console.log("deployAmount / requiredCoverageUsd:", want, needUsd);
         console.log("guardian slashableBondUsd (GROSS, before existing bookings):", bondUsd);
         require(bondUsd >= needUsd, "guardian bond cannot cover this deployAmount even unbooked");
-        console.log("preflight ok on the GROSS bond. If a prior proposal of this");
-        console.log("guardian is still booked, the raised figure will be lower and");
-        console.log("the clone will deploy a SCALED-DOWN amount - executeStep prints");
-        console.log("the gap. Lower LIGHTER_BENCH_DEPLOY_AMOUNT to deploy the full size.");
+
+        // BOTH AXES, BECAUSE THE BUDGET ONE ALONE LIES. `openExposureUsd` is the
+        // clock-decaying BUDGET; a guardian can read zero here and still allocate
+        // a fraction of what it reserves, because `_livePledgedUsd` — the
+        // denominator the bond is shared across — has no clock. See
+        // `retireStale`, which is the only thing that clears it.
+        uint256 booked = _openExposureUsd(ledger, guardian);
+        console.log("guardian openExposureUsd (the BUDGET already booked):", booked);
+        if (bondUsd < booked + needUsd) {
+            console.log("WARNING: the budget axis is short - this proposal will be SCALED DOWN.");
+        }
+        console.log("preflight ok on the GROSS bond. Two things can still scale it:");
+        console.log("  1. a live booking of this guardian (the figure above);");
+        console.log("  2. a DEAD approval still on _livePledgedUsd - run retireStale(guardian).");
+        console.log("executeStep prints the gap either way; the clone's deployedAmount is the oracle.");
     }
 
     // ================= helpers =================
+
+    /// @dev The proposal's declared and post-quorum envelope, read the way
+    ///      `LighterPerpStrategy._coverageScaledDeposit` reads them so the bench
+    ///      asserts the template's own inputs rather than a re-derivation.
+    function _envelope(SyndicateGovernor gov, uint256 pid) internal view returns (uint256, uint256) {
+        (uint256 declared,) = gov.getRiskEnvelope(pid);
+        return (declared, gov.getEffectiveMaxCapital(pid));
+    }
+
+    /// @notice Set `LIGHTER_BENCH_EXPECT_FULL=1` to make a scaled-down execute a
+    ///         FAILURE rather than a note. The fully-covered leg wants that; the
+    ///         deliberate under-coverage leg does not.
+    function _expectFullCoverage() internal view returns (bool) {
+        return vm.envOr("LIGHTER_BENCH_EXPECT_FULL", uint256(0)) != 0;
+    }
+
+    /// @dev A NAMED refusal, not just "it reverted". A bare `require(!ok)` passes
+    ///      on an out-of-gas, on a wrong-selector typo, and on a revert that
+    ///      happened three frames deeper for an unrelated reason — which on an
+    ///      auth test is precisely the failure it is supposed to catch.
+    function _mustRevert(address target, address who, bytes memory data, bytes4 want, string memory label) internal {
+        vm.prank(who);
+        (bool ok, bytes memory ret) = target.call(data);
+        require(!ok, string.concat(label, ": expected a revert, the call SUCCEEDED"));
+        require(ret.length >= 4, string.concat(label, ": reverted with EMPTY returndata"));
+        bytes4 got;
+        assembly ("memory-safe") {
+            got := mload(add(ret, 0x20))
+        }
+        require(got == want, string.concat(label, ": wrong revert - got ", vm.toString(ret)));
+        console.log("  %s reverts %s (expected)", label, vm.toString(abi.encodePacked(got)));
+    }
+
+    /// @dev Count the venue's own priority-queue events in the last recorded
+    ///      span. `vm.recordLogs()` must have been armed immediately before.
+    function _requirePriorityRequests(uint256 want, string memory label) internal {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint256 n;
+        for (uint256 i; i < logs.length; i++) {
+            if (
+                logs[i].emitter == address(ZKL) && logs[i].topics.length != 0
+                    && logs[i].topics[0] == NEW_PRIORITY_REQUEST
+            ) n++;
+        }
+        console.log("  %s ok - NewPriorityRequest x%s", label, n);
+        require(n == want, string.concat(label, ": wrong NewPriorityRequest count"));
+    }
 
     /// @notice The three `IStrategyDelivery` answers, printed at every stage.
     function _probes(address clone, string memory ctx) internal view {
