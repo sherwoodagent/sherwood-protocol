@@ -105,6 +105,19 @@ done
 # DeployLighterTemplate's `finalize()`.
 check "tiers.isClassAllowed(LIGHTER_PERP_TEMPLATE)" \
   "$(cast call "$TIERS" 'isClassAllowed(address)(bool)' "$(a LIGHTER_PERP_TEMPLATE)" --rpc-url "$RPC" 2>/dev/null)" "true"
+# AND THE MONEY-MOVING SELECTORS MUST STAY UNCERTIFIED. `isClassAllowed` alone
+# passes identically whether the anchor was minted off the inert `name()` (the
+# ceremony's choice: execute()/settle() price at the tier-2 / full-notional
+# default) or off `execute()` itself at some bounded tier — and the second
+# reading is a guardian cohort underwriting a fraction of what actually leaves
+# for the venue. The `(2, 10000)` pair is the only read that tells them apart.
+# 0x61461954 = execute(), 0x11da60b4 = settle(), 0x06fdde03 = name() (the anchor).
+check "tiers.classTierOf(LIGHTER, execute) == 2/10000 (UNCERTIFIED)" \
+  "$(cast call "$TIERS" 'classTierOf(address,bytes4)(uint8,uint16)' "$(a LIGHTER_PERP_TEMPLATE)" 0x61461954 --rpc-url "$RPC" 2>/dev/null | tr '\n' ' ' | awk '{print $1"/"$2}')" "2/10000"
+check "tiers.classTierOf(LIGHTER, settle)  == 2/10000 (UNCERTIFIED)" \
+  "$(cast call "$TIERS" 'classTierOf(address,bytes4)(uint8,uint16)' "$(a LIGHTER_PERP_TEMPLATE)" 0x11da60b4 --rpc-url "$RPC" 2>/dev/null | tr '\n' ' ' | awk '{print $1"/"$2}')" "2/10000"
+check "tiers.classTierOf(LIGHTER, name)    == 0/1 (the ANCHOR)" \
+  "$(cast call "$TIERS" 'classTierOf(address,bytes4)(uint8,uint16)' "$(a LIGHTER_PERP_TEMPLATE)" 0x06fdde03 --rpc-url "$RPC" 2>/dev/null | tr '\n' ' ' | awk '{print $1"/"$2}')" "0/1"
 
 echo; echo "── Plan B ──"
 check "swood.exposureLedger (exit gate armed)" "$(call "$SWOOD" 'exposureLedger()(address)')" "$LEDGER"
