@@ -106,7 +106,29 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
     // Liquid v3 pools (verified on-chain): USDG/WETH fee 500 and fee 3000.
     uint24 constant FEE_500 = 500;
     uint24 constant FEE_3000 = 3000;
-    // Live TSLA/USDG v4 pool: 5% fee, tickSpacing 1000, hookless.
+    // Live v4 pools, all hookless. THREE exist for TSLA and they are NOT
+    // interchangeable — probed with the v4 quoter against the public RPC at
+    // head on 2026-08-22 (block 43,547,859; Chainlink TSLA/USD 362.2649,
+    // ETH/USD 2,424.68), quoting USDG in and comparing the effective fill to
+    // the push feed:
+    //
+    //   TSLA/USDG fee 3000  ts 60    10 USDG +0.20% | 500 +0.30% | 2500 +0.68%
+    //                                5000 +1.18% | 10000 +2.31%
+    //   TSLA/USDG fee 50000 ts 1000  10 USDG +1.64% |  50 +5.54% |  100 +10.42%
+    //                                500 +65.5%, and the pool is EXHAUSTED there:
+    //                                1000 and 2500 USDG both return ~0.8355 TSLA
+    //                                (~$303), i.e. that is the whole reserve.
+    //   TSLA/native fee 50000 ts 1000  deep: 0.01/0.05/0.2 ETH all fill at
+    //                                ~-5.9%, i.e. the 5% fee and nothing else.
+    //
+    // So the 5% DIRECT pool is a dust pool and the 0.3% direct pool is the real
+    // venue; the 5% NATIVE pool (reached through native/USDG fee 500 ts 10,
+    // itself deep: +0.04% at 100 USDG, +0.42% at 2500) is real too. Anything
+    // that has to survive `PortfolioStrategy.rebalanceDelta`'s oracle-anchored
+    // floor must route through a deep one. Re-probe before trusting these
+    // numbers: this is live mainnet liquidity, not a pin.
+    uint24 constant V4_FEE_3000 = 3000;
+    int24 constant V4_TICK_SPACING_60 = 60;
     uint24 constant V4_FEE_50000 = 50_000;
     int24 constant V4_TICK_SPACING_1000 = 1000;
 

@@ -150,19 +150,21 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
 
     // ── Mixed basket: 50% WETH (mode 0, v3) + 50% TSLA (mode 2, v4) ──
 
-    // At the pinned block the direct v4 TSLA pool trades ~8.5% above the
-    // Chainlink TSLA/USD answer before impact (5% fee tier + drift), so the
-    // oracle-anchored rebalanceDelta floor needs headroom above that.
+    // Headroom over the fee tier the TSLA leg routes through, since
+    // `rebalanceDelta` floors min-out at the Chainlink answer and the fee comes
+    // straight off that. The mode-3 native route pays 5% at its TSLA hop, so
+    // this cannot go much below 1000 anyway.
     // CLAMPED TO THE TEMPLATE'S CEILING. This was 1200, which
     // `PortfolioStrategy._initialize` rejects outright with `InvalidSlippage`
     // (`MAX_SLIPPAGE_CEILING_BPS == 1_000`) — so both mixed-basket tests died
     // at clone-init and the only mainnet-fork coverage of the v4 and mode-3
     // native routes had been dead code. 1000 is the largest legal value.
     uint256 constant MIXED_SLIPPAGE_BPS = 1000;
-    // Smaller than TOTAL_AMOUNT: the direct USDG/TSLA 5% pool is thin, and the
-    // execute-leg's own price impact at 2500 USDG pushes the pool far enough
-    // above the Chainlink price that the oracle-floored rebalance buy can't
-    // fill. 500 USDG/leg keeps self-impact well inside MIXED_SLIPPAGE_BPS.
+    // Smaller than TOTAL_AMOUNT, and it is the mode-3 leg that sets the size:
+    // that route buys TSLA through the 5% native pool, so 500 USDG/leg keeps
+    // the round trip inside MIXED_SLIPPAGE_BPS with room for impact. The direct
+    // v4 leg (0.3% pool) fills at +0.30% at this size and would tolerate ~20x
+    // more; both tests share the constant.
     uint256 constant MIXED_TOTAL_AMOUNT = 1_000e6;
 
     function _buildMixedBasketInitData(uint256 totalAmt) internal view returns (bytes memory) {
@@ -174,7 +176,11 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
         weights[1] = 5_000; // 50%
         bytes[] memory extraData = new bytes[](2);
         extraData[0] = abi.encodePacked(uint8(0), abi.encode(FEE_500)); // v3 single-hop
-        extraData[1] = abi.encodePacked(uint8(2), abi.encode(V4_FEE_50000, V4_TICK_SPACING_1000)); // v4 single-hop
+        // v4 single-hop through the 0.3% TSLA/USDG pool, NOT the 5% one. See
+        // the test's natspec and the pool table on the harness: the 5% direct
+        // pool holds ~$300 in total, so the execute leg alone empties it and
+        // every later oracle-anchored trade is refused.
+        extraData[1] = abi.encodePacked(uint8(2), abi.encode(V4_FEE_3000, V4_TICK_SPACING_60)); // v4 single-hop
         uint8[] memory priceDecimals = new uint8[](2);
         priceDecimals[0] = 8;
         priceDecimals[1] = 8;
@@ -196,6 +202,41 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
         );
     }
 
+    /// @notice 50% WETH via v3 + 50% TSLA via a v4 single-hop, driven all the
+    ///         way through execute → rebalanceDelta → settle.
+    /// @dev THE V4 LEG ROUTES THROUGH THE 0.3% TSLA/USDG POOL, AND THAT IS THE
+    ///      TEST'S PREMISE, NOT A TUNING KNOB. It used to name the 5% pool, and
+    ///      against live liquidity that made the premise below — "both legs are
+    ///      already at their 50% target, so `rebalanceDelta` has nothing to do"
+    ///      — false, so the call reverted `SlippageExceeded()`.
+    ///
+    ///      THE PROTOCOL WAS RIGHT AND THE TEST WAS WRONG. `execute` sizes
+    ///      min-out from the QUOTER, so it accepts whatever the pool says; the
+    ///      5% pool's entire reserve is ~0.8355 TSLA (~$300), so a 500 USDG buy
+    ///      swallowed all of it at ~65% above the Chainlink answer and left the
+    ///      pool dry. That fill leaves the TSLA leg under-weight AT ORACLE
+    ///      VALUATION, so `rebalanceDelta` correctly wanted to buy more — and
+    ///      `rebalanceDelta` floors min-out at the PUSH FEED, not the quoter, so
+    ///      it refused the only fill on offer: 99.078569 USDG in for
+    ///      874,290,703,140,135 TSLA, about $0.32 of TSLA for $99, a 99.7% loss.
+    ///      Refusing that is the oracle-anchored guard doing its job. Widening
+    ///      MIXED_SLIPPAGE_BPS to make it pass would have deleted the guard from
+    ///      the only place this suite exercises it.
+    ///
+    ///      SO THE BASKET MOVED TO A POOL THAT EXISTS. The 0.3% TSLA/USDG v4
+    ///      pool fills 500 USDG at +0.30% vs the feed and 10,000 USDG at +2.31%
+    ///      (probe table on `RobinhoodMainnetIntegrationTest`), which restores
+    ///      the premise: both legs land within a few tenths of a percent of
+    ///      their targets, `rebalanceDelta` trades a near-zero delta, and the
+    ///      assertions below mean what they say. Identical code path — mode 2,
+    ///      v4 single-hop — only a liquid pool key.
+    ///
+    ///      PINNING A BLOCK IS NOT AVAILABLE HERE. The public RPC is pruned to
+    ///      roughly the last 5k–50k blocks and this chain moves ~1M blocks/day
+    ///      (see the harness header), so any block at which the 5% pool was deep
+    ///      is unreachable within the hour. Live liquidity is the only premise
+    ///      this suite can have, which is why the pool choice is documented
+    ///      rather than pinned.
     function test_portfolio_mixedBasket_v3AndV4() public {
         uint256 vaultBefore = IERC20(USDG).balanceOf(address(vault));
         console2.log("Vault USDG before:", vaultBefore);
@@ -250,9 +291,9 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
 
         uint256 vaultAfterSettle = IERC20(USDG).balanceOf(address(vault));
         console2.log("Vault USDG after settle:", vaultAfterSettle);
-        // Two 5% v4 legs (in + out) dominate the roundtrip cost, so a net loss
-        // is expected; assert the lifecycle completed with a sane balance rather
-        // than a specific PnL sign.
+        // Four swap legs in and out (v3 0.05% x2, v4 0.3% x2) plus impact, so a
+        // net loss is expected; assert the lifecycle completed with a sane
+        // balance rather than a specific PnL sign.
         assertGt(vaultAfterSettle, 0, "vault holds USDG after settle");
         if (vaultAfterSettle >= vaultBefore) {
             console2.log("NET PROFIT:", vaultAfterSettle - vaultBefore);
