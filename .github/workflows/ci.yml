@@ -50,11 +50,14 @@ jobs:
       # Fork/integration tests need live RPC endpoints (no secrets in CI), so
       # everything under test/integration/ is excluded. All other tests run.
       #
-      # `test/WstETHMoonwellStrategy.t.sol` was excluded here too until the
-      # Base-chain strategies were deleted (PR #53). That path no longer exists,
-      # so the glob was dead — and worse than dead: a future file landing there
-      # would have been silently skipped by CI. Removed rather than kept "just
-      # in case" (issue #73).
+      # THIS GLOB IS THE EXACT COMPLEMENT OF fork-tests.yml's `--match-path`,
+      # and the two must stay byte-identical: every suite in the repo runs in
+      # exactly one of the two jobs. A stale extra entry on either side is not
+      # harmless — `test/WstETHMoonwellStrategy.t.sol` sat in both filters after
+      # the Base-chain strategies were deleted (PR #53), and a future file
+      # landing at that path would have been skipped by CI while the fork job
+      # pretended to cover it. Excluded here means covered there; nothing may be
+      # in neither (issue #73).
       - name: Test
         run: forge test --no-match-path "test/integration/**" -vv
 

@@ -1,9 +1,8 @@
 name: Fork tests
 
 # Opt-in counterpart to CI's `build-test` job: runs exactly the suites that job
-# excludes (`test/integration/**` plus `test/WstETHMoonwellStrategy.t.sol`).
-# Never runs on PR/push cadence — public RPC forks are rate-limited and
-# nondeterministic, so they must not gate PRs.
+# excludes (`test/integration/**`). Never runs on PR/push cadence — public RPC
+# forks are rate-limited and nondeterministic, so they must not gate PRs.
 on:
   workflow_dispatch:
   schedule:
@@ -28,10 +27,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      # Public fallbacks for the two endpoints whose URLs are already public
+      # Public fallback for the one endpoint whose URL is already public
       # knowledge in this repo's docs/scripts, so a dispatch works out of the
       # box before any secret is configured.
-      BASE_RPC_URL: ${{ secrets.BASE_RPC_URL || 'https://mainnet.base.org' }}
+      #
+      # `BASE_RPC_URL` used to live here for the Base-mainnet suites. Those
+      # strategies were deleted in e9c3512 and their only harness
+      # (`test/integration/BaseIntegrationTest.sol`) had no subclasses left, so
+      # both the harness and this variable are gone. Nothing under
+      # test/integration/ reads a Base endpoint any more.
       ROBINHOOD_RPC_URL: ${{ secrets.ROBINHOOD_RPC_URL || 'https://rpc.mainnet.chain.robinhood.com' }}
       # Robinhood testnet (46630) has no public endpoint documented in this
       # repo, so it gets no fallback: secret-only, preflighted below. Read by
@@ -48,21 +52,24 @@ jobs:
       - name: Build
         run: forge build
 
-      # `--fork-url $BASE_RPC_URL` supplies the default fork the Base-mainnet
-      # suites assume (see the "Run with: forge test --fork-url $BASE_RPC_URL"
-      # natspec on BaseIntegrationTest and UniswapAdapterForkTest). The
-      # Robinhood suites call `vm.createSelectFork` themselves off the env vars
-      # above, so the default fork does not affect them.
+      # THE PATH FILTER IS THE EXACT COMPLEMENT OF ci.yml's `--no-match-path`
+      # (both the `Test` and the `forge coverage` step). Keep the two strings
+      # byte-identical: every suite in the repo runs in exactly one of the two
+      # jobs, and a glob that drifts on one side either double-runs a suite or
+      # — the failure that matters — silently runs it nowhere.
       #
-      # The path filter is the exact complement of ci.yml's `--no-match-path`;
-      # keep the two in sync. `test/WstETHMoonwellStrategy.t.sol` was deleted in
-      # e9c3512 along with the Base-chain strategies — the glob keeps the stale
-      # entry purely so the two filters stay verifiably complementary.
+      # NO `--fork-url`. Every remaining suite under test/integration/ either
+      # calls `vm.createSelectFork` itself off the env vars above
+      # (RobinhoodIntegrationTest, RobinhoodMainnetIntegrationTest,
+      # UniswapAdapterRobinhoodForkTest, ConcentratedLiquidityMainnetForkTest,
+      # MorphoSupplyMainnetForkTest) or needs no fork at all (TierEndToEndTest,
+      # SwoodReviewSlashTest — both mock-only). The flag used to supply a
+      # default Base fork for `BaseIntegrationTest`, which was deleted along
+      # with the last of the Base-chain strategies.
       - name: Fork tests
         run: |
           forge test \
-            --match-path "{test/integration/**,test/WstETHMoonwellStrategy.t.sol}" \
-            --fork-url "$BASE_RPC_URL" \
+            --match-path "test/integration/**" \
             -vv
 
       # RUNS AFTER THE TESTS, AND THAT ORDER IS THE WHOLE POINT. The fork suites
