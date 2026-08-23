@@ -31,10 +31,29 @@ import {LighterPerpStrategy} from "../src/strategies/LighterPerpStrategy.sol";
  *   the only thing certified is an inert selector that exists to mint the class
  *   ANCHOR `setClassAllowed` requires.
  *
+ *   MAINNET CEREMONY (4663) — the real thing, not yet run. Three preconditions
+ *   before either entrypoint:
+ *     1. The CORE ceremony has run first (script/robinhood-mainnet/Deploy.s.sol):
+ *        chains/4663.json must carry STRATEGY_FACTORY and the governor's
+ *        TierRegistry, or _readAddress reverts on the first line. Nothing is
+ *        deployed on 4663 today.
+ *     2. The broadcaster is a PURPOSE-HELD deploy key, not simulation material.
+ *        (The H2/lifecycle canaries were signed by index 0 of the throwaway
+ *        sim mnemonic in ~/.sherwood/ — fine for a 5 USDG canary, not for the
+ *        ceremony that mints the template the Safe will allowlist.)
+ *     3. StrategyFactory/TierRegistry owner is the parameter Safe by this point,
+ *        so EVERY owner-gated step below degrades to a RUNBOOK line for the
+ *        Safe — expect to relay those calls, not to broadcast them.
+ *   And one deadline: `finalize()` must land within `MAX_CERTIFY_WINDOW`
+ *   (14 days) of `readyAt`, or the pending certification EXPIRES
+ *   (`CertificationExpired`) and run()'s `proposeClassCertification` must be
+ *   re-broadcast. The window exists so a stale proposal cannot be certified
+ *   against a changed codehash — do not schedule the Safe ceremony without it.
+ *
  *   Usage — Robinhood mainnet (4663):
  *     forge script script/DeployLighterTemplate.s.sol:DeployLighterTemplate \
  *       --sig 'run()' --rpc-url robinhood --account sherwood-deployer --broadcast
- *     # ...wait out TierRegistry.certifyDelay...
+ *     # ...wait out TierRegistry.certifyDelay (3 days), then within 14 days:
  *     forge script script/DeployLighterTemplate.s.sol:DeployLighterTemplate \
  *       --sig 'finalize()' --rpc-url robinhood --account sherwood-deployer --broadcast
  *
