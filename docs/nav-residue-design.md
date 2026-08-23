@@ -175,6 +175,16 @@ are deliberately red and are the finding, not breakage:
 what the honest LPs lost, to the unit. Pre-#243 the same test measured +952 USDG
 on the same setup, so #243 shrank it ~34,600x. It did not change its sign.
 
+**THE MAGNITUDE DRIFTS; THE IDENTITY DOES NOT.** The under-count is interest
+that has not been written to Morpho's storage yet, so it depends on how long the
+market has gone unaccrued at whatever block the fork lands on — quote no single
+figure as "the" number. Re-measured against live mainnet on 2026-08-22, both
+tests in one run: under-count `135,804`, attacker `+27,161`, honest LPs
+`19,999,861,828` → `19,999,834,666` (`-27,162`), and
+`20% x 135,804 = 27,160.8`. Instant door in the same run: `+6,466` on 1,000 USDG
+into ~21,000, against `135,804 x 1,000/21,000 = 6,466.9`. Different day,
+different size, same two identities to the unit.
+
 **BOTH DOORS LEAK, IN THE SAME PROPORTION.** The tempting reading — that the
 instant path is fixed and only the queued path is exposed — is wrong: a queued
 claim routes through `VaultWithdrawalQueue.claim` → `previewDeposit`, which
