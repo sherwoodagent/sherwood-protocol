@@ -89,6 +89,13 @@ Cross-contract timing invariants (all enforced at the setters):
 - **Proposer bond** pulled into `ProposerBondEscrow`:
   `bondWood = coverageUsd × proposerBondBps (default 1%) / woodPrice`. Fail-closed —
   unpriceable WOOD blocks proposing (`src/ExposureLedger.sol:951`).
+
+  This is **not** the 10k owner stake. The amount **scales** (tier-2 uncertified =
+  full notional × ~1% in USD, converted at `woodPriceX8()`). Do not treat a fixed
+  WOOD number as the requirement. Example only: ~230 WOOD for a 100 USDG book on
+  the fork at a then-current price. The CLI quotes `proposerBondWood` and must
+  refuse with `InsufficientProposerBondWood` if the wallet does not **hold** that
+  WOOD (allowance alone is not enough). See [proposer-bond.md](proposer-bond.md).
 - With co-proposers → `Draft`; each co-proposer must `approveCollaboration` within
   `collaborationWindow` or the draft expires. The lead can `rejectCollaboration`.
 - Vault funds: **untouched**. Deposits and withdrawals stay open through propose,
