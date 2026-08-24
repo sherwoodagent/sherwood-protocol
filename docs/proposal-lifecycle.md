@@ -132,8 +132,11 @@ Cross-contract timing invariants (all enforced at the setters):
 - Gates, in order: cooldown elapsed → `executedAt` stamped → tier/coverage
   regression re-check (`TierRegressed` / `CoverageRegressed` if a certification was
   demoted since propose) → guardian **approve-quorum** on the exposure ledger
-  (`requireApproveQuorum` — enough guardian coverage must back the strategy) → the
-  voted batch runs via `executeGovernorBatch`, sweeping capital into the strategy.
+  (`requireApproveQuorum` — returns `(coverageRaisedUsd, requiredCoverageUsd)`;
+  a **shortfall scales** `effectiveMaxCapital` rather than blocking;
+  empty / zero aggregate reverts `InsufficientApproveCoverage`) → the voted
+  batch runs via `executeGovernorBatch` under that effective cap. See
+  [coverage.md](coverage.md).
 - Effects: capital snapshot taken, `_activeProposal = id` (**redemptions lock**),
   management-fee clock starts.
 - Batch metering: per-call caps (`CallCapExceeded`), net outflow ≤ `maxCapital`
@@ -193,9 +196,14 @@ prosecutor fee (default 5%, ≤ 20%) to the challenger, remainder burned.
 - **LP veto** — AGAINST ≥ threshold → `Rejected` at `voteEnd`.
 - **Guardian block** — block quorum reached → `Rejected` + approvers slashed.
 - **Execution missed** — nobody executed before `executeBy` → `Expired`.
-- **Insufficient guardian coverage** — `requireApproveQuorum` reverts; the proposal
-  stays `Approved` and expires at `executeBy` unless coverage arrives. Suppressing
-  the cohort blocks execution without forcing cancellation.
+- **No underwriter on the hook** — `requireApproveQuorum` reverts
+  `InsufficientApproveCoverage` only when the approver set is empty or the raised
+  aggregate is exactly zero. The proposal stays `Approved` and expires at
+  `executeBy` unless a covering Approve arrives.
+- **Coverage shortfall** — a nonzero-but-partial book does **not** revert. Execution
+  scales: `effectiveMaxCapital = floor(maxCapital * coverageRaisedUsd / requiredCoverageUsd)`.
+  Guardian daemons that treat a shortfall as disqualifying are wrong. See
+  [coverage.md](coverage.md).
 - **Registry paused mid-review** — proposal stays in `GuardianReview` until unpause
   (anyone can unpause after the 7-d dead-man delay).
 - **Unresolvable review** — governor/registry disagreement → terminal `Expired`.

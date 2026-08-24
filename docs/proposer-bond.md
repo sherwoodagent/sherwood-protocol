@@ -1,6 +1,8 @@
 # Proposer bond (propose path)
 
-This is the propose-path WOOD bond, **not** the SHE-126 fee split.
+This is the propose-path WOOD bond, **not** the fee split.
+
+Quoted from [`requiredCoverage`](coverage.md). A later guardian-coverage shortfall [scales execution](coverage.md); it does not resize this bond.
 
 At `propose`, `SyndicateGovernor` pulls WOOD into `ProposerBondEscrow` via
 `lockBond`. Amount:
