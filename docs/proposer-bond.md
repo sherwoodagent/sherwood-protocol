@@ -1,6 +1,6 @@
 # Proposer bond (propose path)
 
-Focused coverage note (SHE-161; later folds into SHE-122). **Not** SHE-126 fee-split.
+This is the propose-path WOOD bond, **not** the SHE-126 fee split.
 
 At `propose`, `SyndicateGovernor` pulls WOOD into `ProposerBondEscrow` via
 `lockBond`. Amount:
