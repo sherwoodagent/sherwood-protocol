@@ -474,6 +474,77 @@ contract OpenProposalCountTest is Test {
         swood.requestUnstakeOwner(address(vault));
     }
 
+    /// @notice A proposal that clears the vote and is never executed past
+    ///         `executeBy` must not pin `getProposalState` at GuardianReview,
+    ///         and must not leave `propose()` permanently reverted. The view
+    ///         reports Expired as soon as the window lapses; the permissionless
+    ///         `resolveProposalState` flush is the designed path that
+    ///         decrements `openProposalCount` so a fresh propose can land.
+    function test_unexecutedPastExecuteBy_resolveAllowsPropose() public {
+        uint256 pid = _propose();
+        _voteFor(pid);
+
+        // One jump past voteEnd, reviewEnd, and executeBy. No `openReview` /
+        // `executeProposal` / `resolveProposalState` in between — the live
+        // path that used to report GuardianReview forever while
+        // `openProposalCount` stayed at 1.
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + REVIEW_PERIOD + EXECUTION_WINDOW + 1);
+
+        ISyndicateGovernor.ProposalState s = governor.getProposalState(pid);
+        assertTrue(
+            s != ISyndicateGovernor.ProposalState.GuardianReview,
+            "view must not hide Expired behind GuardianReview past executeBy"
+        );
+        assertEq(
+            uint256(s),
+            uint256(ISyndicateGovernor.ProposalState.Expired),
+            "true view: Expired once executeBy passes, no poke required"
+        );
+        assertEq(governor.openProposalCount(), 1, "counter still binds the vault until flushed");
+
+        // Hoist the envelope before `expectRevert`: `GovEnvelope.permissive`
+        // staticcalls `totalAssets()` and would otherwise consume the cheatcode.
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
+        BatchExecutorLib.Call[] memory execCalls = _execCalls();
+        BatchExecutorLib.Call[] memory settleCalls = _settleCalls();
+        vm.prank(agent);
+        vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://blocked-by-unexecuted",
+            7 days,
+            env,
+            execCalls,
+            GovEnvelope.defaultCaps(env.maxCapital, execCalls.length),
+            settleCalls,
+            GovEnvelope.defaultCaps(env.maxCapital, settleCalls.length),
+            _emptyCoProposers()
+        );
+
+        // Designed path: permissionless expire flush, then propose succeeds.
+        governor.resolveProposalState(pid);
+        assertEq(governor.openProposalCount(), 0, "flush released the vault binding");
+        assertEq(
+            uint256(governor.getProposalState(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Expired),
+            "state stays Expired after flush"
+        );
+
+        uint256 pid2 = _propose();
+        assertGt(pid2, pid, "fresh proposal minted after expire flush");
+        assertEq(
+            uint256(governor.getProposalState(pid2)),
+            uint256(ISyndicateGovernor.ProposalState.Pending),
+            "new proposal opens in Pending"
+        );
+        assertEq(governor.openProposalCount(), 1, "new proposal binds the vault");
+        assertTrue(
+            governor.getProposalState(pid) != ISyndicateGovernor.ProposalState.GuardianReview,
+            "expired proposal must not read GuardianReview after the next propose"
+        );
+    }
+
     function test_resolveProposalState_idempotent() public {
         uint256 pid = _propose();
         vm.prank(owner);
