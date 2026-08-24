@@ -69,17 +69,27 @@ Mechanics worth knowing:
 
 ## The exposure ledger — economic security sizing
 
-`ExposureLedger.sol` prices what a strategy could extract and requires guardian
-stake to cover it before execution.
+`ExposureLedger.sol` is the coverage book: it prices what a strategy could
+extract and books bonded WOOD against that price when a guardian Approves.
+Full detail: [coverage.md](coverage.md).
 
 - **Coverage requirement:** at propose, each call's tier bound prices its
   extractable value: `requiredCoverage = Σ (cap_i × boundBps_i) / 10 000`. Untiered
-  calls default to tier 2 = full notional.
-- **Approve quorum at execute:** `requireApproveQuorum` reverts execution unless
-  booked guardian coverage ≥ required coverage (fail-closed;
-  `quorumTierThreshold = 0` applies it to every tier).
+  calls default to tier 2 = full notional. Written by
+  `_snapshotTierAndGate`; read with `getRequiredCoverage`.
+- **Approve is underwriting:** `voteOnProposal` → `recordApproval`. An under-bonded
+  guardian is not rejected at vote time; the cap is enforced by booking zero.
+- **Approve quorum at execute:** `requireApproveQuorum` is a measurement, not an
+  all-or-nothing gate. It returns `(coverageRaisedUsd, requiredCoverageUsd)` and
+  reverts `InsufficientApproveCoverage` only when the approver set is empty or the
+  raised aggregate is exactly zero. A **shortfall scales** `maxCapital` and the
+  per-call caps via `_deriveAndStoreEffectiveCapital`
+  (`floor(maxCapital * raised / required)`). `quorumTierThreshold = 0` applies the
+  gate to every tier. Guardian daemons that treat a shortfall as disqualifying
+  are wrong.
 - **Proposer bond:** `coverageUsd × proposerBondBps (default 1%) / woodPrice`,
   locked in `ProposerBondEscrow` for the life of the proposal + challenge window.
+  See [proposer-bond.md](proposer-bond.md).
 
 | Parameter | Default | Min | Max | Setter |
 |---|---|---|---|---|
