@@ -36,11 +36,11 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 
 ## 5. Blockable capacity
 
-- [ ] 5.1 Compute fleet weight with the registry's own growth gate, so the reported number matches what the contract would compute
-- [ ] 5.2 Count an identity only when its heartbeat is fresh and its gas balance is above the level needed to send a vote
-- [ ] 5.3 Expose blockable capacity against `blockQuorumBps × totalStake` as a distinct signal from per-instance health
-- [ ] 5.4 Alert on loss of blockable capacity, not on individual instance liveness
-- [ ] 5.5 Unit-test that an unfunded identity is excluded from capacity rather than counted as healthy
+- [x] 5.1 Compute fleet weight with the registry's own growth gate, so the reported number matches what the contract would compute
+- [x] 5.2 Count an identity only when its heartbeat is fresh and its gas balance is above the level needed to send a vote
+- [x] 5.3 Expose blockable capacity against `blockQuorumBps × totalStake` as a distinct signal from per-instance health
+- [x] 5.4 Alert on loss of blockable capacity, not on individual instance liveness
+- [x] 5.5 Unit-test that an unfunded identity is excluded from capacity rather than counted as healthy
 
 ## 6. Deployment
 
