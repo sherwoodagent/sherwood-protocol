@@ -28,16 +28,16 @@ THE REVIEWER OF AN ARBITRARY TARGET IS THE GUARDIAN COHORT, NOT THE REGISTRY OWN
 ### Requirement: Governance certification discipline
 Certification SHALL be treated as a governance judgment the code cannot check: governance SHALL NOT certify proxied adapters at tier 0/1 (the codehash guard cannot see implementation swaps), and SHALL NOT certify with a loose `extractableBoundBps` — an over-generous bound slides the economics continuously back toward the tier-2 result while looking safe. Coverage sizing consumes the bound directly (`requiredCoverage = maxCapital × Σ boundBps / 10_000`, tier-2 calls contributing full notional), so the bound is the real risk parameter.
 
-THE SANDBOX TEMPLATE IS A CLASS GRANT, AND ITS CODE IS THE REVIEWED ARTIFACT. Admitting the sandbox path is a one-time class ceremony on the sandbox template — a class allowlist entry plus a class certification for its lifecycle selectors — and SHALL NOT be read as vouching for any target a sandbox will later reach. What governance attests is that the template confines loss to funded capital, refuses privileged protocol addresses, and surrenders its balance at settlement; the targets are proposer-chosen, unreviewed by design, and priced accordingly at full notional. Governance SHALL NOT class-certify a sandbox template at tier 0 or 1, because a bound on extractable value cannot hold under proposer-supplied calldata.
+THE SANDBOX TEMPLATE IS NOT A CLASS GRANT — NO TIERREGISTRY CEREMONY ADMITS THE PATH. Admitting the sandbox path is a structural, one-time wiring on the vault, not a registry action: the factory binds the `CallSandbox` implementation through the vault's factory-only, set-once `setSandboxImplementation`, and neither the template nor any clone SHALL hold a TierRegistry entry of any kind — no class allowlist entry, no class certification, no address entry (see `sandbox-execution`: "admitted by nobody"). No path reads the registry against a sandbox address: the vault reaches a clone only through direct `init` / `run` / `sweep` calls that never traverse the batch callee gate, and coverage pricing forces tier 2 at the full funded amount without a `tierOf` read against the payload. The reviewed artifact is still the template's code — reviewed when the implementation is audited and bound at deployment, attesting that it confines loss to funded capital, refuses privileged protocol addresses, and surrenders its balance at settlement — and that review SHALL NOT be read as vouching for any target a sandbox will later reach: targets are proposer-chosen, unreviewed by design, and priced accordingly at full notional. A sandbox SHALL NOT carry a tier-0/1 certification, because a bound on extractable value cannot hold under proposer-supplied calldata — and since it holds no registry entry at all, no certification path exists to grant one.
 
 #### Scenario: Loose bound distorts coverage
 - **WHEN** a tier-0 certification carries a bound far above the adapter's true extractable value
 - **THEN** every proposal touching it demands correspondingly inflated guardian coverage priced as if the leak were real — the certification is worse than refusing to certify
 
-#### Scenario: Sandbox template stays at tier 2
-- **WHEN** a sandbox template is class-certified
-- **THEN** it SHALL carry tier 2 / full notional, never a bounded tier
+#### Scenario: Sandbox pricing needs no registry entry
+- **WHEN** a sandbox proposal's required coverage is priced
+- **THEN** the funded amount SHALL be charged at tier 2 / full notional, with no `tierOf`, allowlist, or class read against the sandbox template or clone
 
-#### Scenario: A class grant vouches for the template only
+#### Scenario: The sandbox vouches for no target
 - **WHEN** a sandbox clone dispatches calls to an unreviewed target
-- **THEN** that target SHALL gain no allowlist or certification standing from the template's class grant
+- **THEN** that target SHALL gain no allowlist or certification standing — the sandbox has no registry standing of its own to pass on
