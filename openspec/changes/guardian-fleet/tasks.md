@@ -4,7 +4,7 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 
 - [x] 1.1 Set M from an uptime target, and record the target — M buys availability and key containment only, never blocking power (4 voters + 2 keepers; see design Decision 7)
 - [x] 1.2 Set the operator's intended share of total staked WOOD, since that number and not M decides whether the cohort can block at all (~100%; block quorum is 3000 bps)
-- [ ] 1.3 Fix the per-identity stake allocation before staking; `FLOOR_LOOKBACK` is 30 days and reallocation costs a full lookback of fleet weight — shape settled (1 veto-only holding >= the block quorum with margin, 3 active voters); exact percentages still to pin against the live staked total
+- [x] 1.3 Fix the per-identity stake allocation before staking; `FLOOR_LOOKBACK` is 30 days and reallocation costs a full lookback of fleet weight (veto-only 10%, three active voters 30% each — any one active voter clears the 3000 bps quorum alone)
 - [x] 1.4 Decide whether the keeper serves every governor it sees or a configured vault list; every governor is the safer default (every governor)
 
 ## 2. Keeper role

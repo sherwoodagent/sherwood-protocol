@@ -93,15 +93,17 @@ anyway.
 
 A worked composition, all reading one evidence record:
 
-| | Drawdown bound | Posture | Model |
-|---|---|---|---|
-| g1 | — | `defend` | on |
-| g2 | tight | `autonomous` | on |
-| g3 | loose | `autonomous` | off |
-| g4 | — | `defend` | off |
+| | Drawdown bound | Posture | Model | Share |
+|---|---|---|---|---|
+| g1 | tightest | `defend` | on | 10% |
+| g2 | tight | `autonomous` | on | 30% |
+| g3 | medium | `autonomous` | on | 30% |
+| g4 | loose | `autonomous` | off | 30% |
 
-The two `defend` guardians carry no slash exposure at all, so the veto stays live even when every
-underwriter abstains on capacity.
+The `defend` guardian carries no slash exposure, but note what that does and does not buy — see
+Decision 7. Posture removes its ability to approve; it does not make it vote Block where the others
+approve. Only its tighter drawdown bound can do that, which is why the column that matters here is
+the policy one and not the posture one.
 
 *Revisit if third parties ever run guardians.* Shared evidence across independent operators would
 reintroduce correlation between bonds that are not all yours, and the argument above would no longer
@@ -134,39 +136,47 @@ allocation before staking**; revising it costs 30 days of blocking weight.
 
 Four voters, two keepers. The operator expects to hold essentially all staked
 WOOD. One voter is veto-only; the other three vote both ways. Keepers serve every
-governor they see.
+governor they see. Allocation: veto-only 10%, active voters 30% each.
 
 `blockQuorumBps` is seeded at **3000 (30%)** — `script/Deploy.s.sol:94`, matching
 `script/testnet/Deploy.s.sol:114`.
 
-**The veto-only voter must hold at least the block quorum on its own, with
-margin.** This is forced, not chosen. The scenario that voter exists for is the
-one where the other three approved something they should not have — a shared
-verdict bug, since they run the same code against the same evidence. In that
-scenario it is the *only* blocker, so `blockStakeWeight` is its weight alone and
-must clear `3000 × totalStake / 10_000` by itself. A veto-only voter holding an
-even quarter of the stake cannot block anything in the only situation it was
-created for.
+**A veto-only posture does not produce dissent.** This is the load-bearing fact
+and it is easy to get backwards. `maySign` refuses an Approve in `defend` mode
+and permits a Block; it does not turn an Approve into a Block. A `defend` voter
+runs the same judge over the same evidence as the rest of the fleet, so on a
+proposal the rules read as clean its decision is Approve, its posture declines to
+sign it, and it sends nothing. It abstains.
 
-Margin, not exactly 30%, because `stakeAsGuardian` is permissionless and
-uncapped. Holding 100% today means any third party staking WOOD shrinks the
-operator's share immediately, and a veto-only voter sitting at exactly the quorum
-breaks on the first outside stake. The `fleet.blockable` signal detects this
-drift; the margin is what keeps it from being routine.
+So the veto-only voter is NOT a safety net against a shared verdict bug. In the
+scenario where a gap in the risk rules waves a malicious proposal through, it
+reaches the same wrong conclusion as the other three and stays silent — at any
+stake share. Sizing it to clear the block quorum alone would buy nothing, because
+the case it would be sized for never produces a vote from it.
 
-Indicative split, to be pinned before staking since reallocation costs
-`FLOOR_LOOKBACK`: veto-only 35–40%, the three active voters ~20% each. That also
-leaves any two active voters able to block on their own (~40% > 30%), so the veto
-survives one active voter being down or being the one at fault.
+Dissent comes from POLICY, not posture: a stricter drawdown bound, a lower
+coverage ceiling, a model consulted where others have none. A fleet that wants a
+genuine second opinion has to differ there, and only such a voter would need
+weight enough to block on its own.
+
+What the split therefore has to survive is unavailability, not disagreement. At
+10/30/30/30 against a 30% quorum, any single active voter clears the quorum by
+itself, so the veto holds while one of the three is alive. That is stronger than
+concentrating the stake on the veto-only voter, which would have required it plus
+one active voter to be up.
+
+The margin is thin by construction: an active voter clears 3000 bps exactly, so
+the first outside `stakeAsGuardian` drops it below and two live voters become
+necessary. `stakeAsGuardian` is permissionless and uncapped, so this is expected
+rather than hypothetical — `fleet.blockable` is what surfaces it, and the
+response is to re-weight, which costs `FLOOR_LOOKBACK`.
 
 **Accepted, and stated so it is not mistaken for an oversight:** three of four
-voters carry slashable exposure, and they share a verdict path. A bug that
-approves a malicious proposal is approved by all three at once, so roughly 60% of
-the staked position is slashed together on the severity ramp. That is the
-operator's call. The cheap mitigation is Decision 4's policy divergence — give
-the three active voters different drawdown bounds and coverage ceilings so they
-do not all approve the same marginal proposal — which costs nothing and does not
-change the fleet's shape.
+voters carry slashable exposure and share a verdict path, so a bug that approves
+a malicious proposal is approved by all three at once and roughly 90% of the
+staked position is slashed together on the severity ramp. The cheap mitigation is
+Decision 4's policy divergence — different drawdown bounds and coverage ceilings
+across the three — which costs nothing and does not change the fleet's shape.
 
 Keepers serve every governor. A configured vault list fails silently: a fund
 nobody remembered to add is a fund whose proposals execute unreviewed, and the
@@ -189,12 +199,14 @@ gap is only visible afterwards.
 Fleet size, stake share, allocation shape, and keeper scope are settled — see
 Decision 7. What remains:
 
-- What exact percentage does the veto-only voter get? Decision 7 bounds it below
-  (at least the block quorum, with margin) but the figure has to be picked
-  against the real staked total at the moment of staking, since it cannot be
-  revised for `FLOOR_LOOKBACK`.
 - How much bond do the three active voters need to underwrite the proposals the
-  operator actually wants approved? That sizes their share from below, and needs
-  real `getRequiredCoverage` figures rather than an estimate.
+  operator actually wants approved? A voter whose free stake is below a
+  proposal's `getRequiredCoverage` abstains instead of approving — safe, but it
+  books no coverage and earns no guardian fee. Sizing this needs real coverage
+  figures from live vaults, so it is a revenue question rather than a
+  correctness one and can wait for real proposals.
+- Which policy dimension actually differentiates the four voters, and by how
+  much? Decision 7 establishes that dissent comes from policy alone. Untuned,
+  the fleet is four copies of one opinion.
 - Should the pipeline cast the fleet's own votes inside the fork to measure the
   block outcome before any real vote is signed?
