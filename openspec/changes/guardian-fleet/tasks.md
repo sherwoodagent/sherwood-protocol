@@ -9,21 +9,21 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 
 ## 2. Keeper role
 
-- [ ] 2.1 Add a role selector so one image runs as keeper or voter, defaulting to voter
-- [ ] 2.2 Build the keeper loop on the existing `openReview` and `resolveReview` in `src/signer.ts` — both are implemented and unreachable from `src/index.ts` today
-- [ ] 2.3 Schedule work from `ReviewRegistered` rather than reacting to `ReviewOpened`, so the keeper acts on reviews that have not opened yet
-- [ ] 2.4 Open a review as soon as chain time passes its `voteEnd`; the cohort's usable voting time is `reviewEnd - openedAt` minus the late-vote lockout, so keeper delay silences the cohort
-- [ ] 2.5 Add randomized jitter before sending, and treat a losing race as a successful no-op rather than an error
-- [ ] 2.6 Pass `registrationSearchFromBlock` from the registry's deployment block — `src/index.ts` passes no options today, so the default of `0n` rescans from genesis on every cold start
-- [ ] 2.7 Refuse to start a keeper that holds stake, and refuse to start a voter configured to open or resolve reviews
-- [ ] 2.8 Unit-test that a keeper casts no vote, and that a second keeper acting on an already-opened review records a no-op rather than a failure
+- [x] 2.1 Add a role selector so one image runs as keeper or voter, defaulting to voter
+- [x] 2.2 Build the keeper loop on the existing `openReview` and `resolveReview` in `src/signer.ts` — both are implemented and unreachable from `src/index.ts` today
+- [x] 2.3 Schedule work from `ReviewRegistered` rather than reacting to `ReviewOpened`, so the keeper acts on reviews that have not opened yet
+- [x] 2.4 Open a review as soon as chain time passes its `voteEnd`; the cohort's usable voting time is `reviewEnd - openedAt` minus the late-vote lockout, so keeper delay silences the cohort
+- [x] 2.5 Add randomized jitter before sending, and treat a losing race as a successful no-op rather than an error
+- [x] 2.6 Pass `registrationSearchFromBlock` from the registry's deployment block — `src/index.ts` passes no options today, so the default of `0n` rescans from genesis on every cold start
+- [x] 2.7 Refuse to start a keeper that holds stake, and refuse to start a voter configured to open or resolve reviews
+- [x] 2.8 Unit-test that a keeper casts no vote, and that a second keeper acting on an already-opened review records a no-op rather than a failure
 
 ## 3. Identity isolation
 
 - [ ] 3.1 Give each identity its own Railway service, signing key, volume, and health port
-- [ ] 3.2 Refuse to start when two instances are configured with the same signing key
-- [ ] 3.3 Verify `assertNotAnAgent` runs for every identity against every vault it reviews, not only the first
-- [ ] 3.4 Document the gas funding path for M voter plus K keeper accounts, without a single funder account as a serialization point
+- [x] 3.2 Refuse to start when two instances are configured with the same signing key
+- [x] 3.3 Verify `assertNotAnAgent` runs for every identity against every vault it reviews, not only the first
+- [x] 3.4 Document the gas funding path for M voter plus K keeper accounts, without a single funder account as a serialization point
 
 ## 4. Shared simulation, per-guardian policy
 
