@@ -348,6 +348,20 @@ interface ISyndicateVault {
     /// @notice The set-once `CallSandbox` implementation was bound.
     event SandboxImplementationSet(address indexed implementation);
     /// @notice A proposal's sandbox was minted, funded and run.
+    /// @dev    NAME COLLISION, DIFFERENT SIGNATURE: `ICallSandbox` also
+    ///         declares a `SandboxRun` event with a different parameter list —
+    ///         `SandboxRun(address indexed vault, uint256 callCount, uint256 funded)`,
+    ///         emitted by the sandbox clone in the same `runSandbox`
+    ///         transaction. The topic0 hashes differ, so filters never
+    ///         conflate them: this one is
+    ///         keccak256("SandboxRun(uint256,address,uint256)") =
+    ///         0x6fbfaa03c3db533cf914b5a5b997d8244b90daa0e259cf25627e7901d536dc16,
+    ///         the sandbox's is keccak256("SandboxRun(address,uint256,uint256)") =
+    ///         0x2638b6715d6f2d6a21af38b137146ad55f2781d9619ff5ab49352058575b9565.
+    ///         Both contracts are already deployed on multiple networks, so
+    ///         neither event will be renamed. Indexers MUST bind by emitting
+    ///         address (this one fires from the vault, the other from the
+    ///         per-proposal sandbox clone), never by event name alone.
     event SandboxRun(uint256 indexed pid, address indexed sandbox, uint256 funding);
 
     /// @notice The `CallSandbox` implementation this vault clones per proposal.
