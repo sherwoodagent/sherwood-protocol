@@ -44,6 +44,6 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 
 ## 6. Deployment
 
-- [ ] 6.1 Extend `railway.json` for the keeper and voter roles and the pipeline service
-- [ ] 6.2 Verify the mainnet posture gate still refuses `autonomous` on every chain but the fork, for every service in the fleet
-- [ ] 6.3 Document the fleet as an operator-run cohort, not a decentralised one, wherever the guardian network is described
+- [x] 6.1 Extend `railway.json` for the keeper and voter roles and the pipeline service (`railway/{voter,keeper,pipeline}.json`, each with its own healthcheck budget)
+- [x] 6.2 Verify the mainnet posture gate still refuses `autonomous` on every chain but the fork, for every service in the fleet — it does, and a second gate now refuses `autonomous` for any role that cannot cast Approve
+- [x] 6.3 Document the fleet as an operator-run cohort, not a decentralised one, wherever the guardian network is described (`docs/guardian-network.md` and the guardian README)

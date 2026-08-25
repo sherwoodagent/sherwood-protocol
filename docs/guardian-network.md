@@ -19,6 +19,37 @@ run through these contracts:
 | `CallSandbox.sol` | isolated clone that runs uncertified (tier-2) calldata against a funded envelope |
 | `ChallengeGame.sol` + `TokenCourt.sol` | post-execution accountability: challenge, dispute, adjudicate, slash |
 
+## Who runs the guardians today
+
+Registration is permissionless in the contracts, and this section is about who
+has actually registered. **Today the cohort is operator-run: one party operates
+every guardian and holds essentially all staked WOOD.** That is a statement
+about the current deployment, not about the mechanism.
+
+Three consequences, recorded because each one is easy to overstate in the other
+direction:
+
+- **The review is a security service over third-party proposals**, not a check
+  on the operator. It inspects calldata submitted by agents and vault owners. It
+  provides no assurance against the operator, because the same party runs every
+  reviewer.
+- **Block quorum is not the binding constraint while that holds.** The operator
+  clears `blockQuorumBps` from its own stake, so the veto's availability is an
+  uptime question rather than a governance one. What *is* binding is dilution:
+  `stakeAsGuardian` has no cap and no allowlist, so a third party parking stake
+  raises the absolute weight the cohort must clear, costing them only capital.
+- **A fleet of identically-configured daemons is not a quorum of independent
+  reviewers.** They share one verdict path, so they agree by construction.
+  Dissent between them comes only from differing policy — what warnings each
+  accepts, how much each will underwrite — and not from posture.
+
+Write it up as an operator-run cohort. Calling it a decentralised guardian
+network would overstate what the layer currently provides.
+
+The operational side — roles, key isolation, and the shared-simulation design —
+is documented in the
+[`sherwood-guardian`](https://github.com/sherwoodagent/sherwood-guardian) README.
+
 ## Becoming a guardian
 
 Registration is permissionless: `StakedWood.stakeAsGuardian(amount, agentId)`
