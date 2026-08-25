@@ -141,55 +141,29 @@ restamping is one whose verdict depends on price freshness.
 - **WHEN** the control run fails to produce a result
 - **THEN** the agent abstains rather than approving on the warped run alone
 
-### Requirement: The verdict gate never abstains
+### Requirement: The unresolved band is adjudicated rather than universally abstained
 
-Every proposal on which a vote can be cast SHALL resolve to Approve or Block. The agent SHALL NOT
-withhold a vote as an expression of uncertainty, and SHALL Block wherever it cannot establish that a
-proposal is safe — coverage unreadable, capacity exhausted, warnings unadjudicated, or model
-unavailable.
+The agent SHALL supply an adjudicating model to the verdict gate so that proposals left unresolved by
+deterministic evaluation receive a decision. The model's verdict SHALL remain constrained to Block or
+Abstain, and Approve SHALL remain unreachable from any non-deterministic component.
 
-The adversary is the assumption that abstention is neutral. It is not. A review resolves as cleared
-unless the block quorum is reached, so a withheld vote has the same on-chain effect as an approval —
-without the fee and without the record. A fleet running one judge abstains in unison, so an
-abstention is not one guardian deferring to others but the whole cohort standing aside. Blocking
-costs the voter nothing, since only approvers are slashed.
+The adversary is prompt injection carried in proposal calldata, token names, or metadata URIs — all
+attacker-controlled strings that reach the model's context. Confining the model to the safe half of
+the decision means a successful injection costs liveness and never stake. An unconfigured model is
+not a safe default but a silent one: it abstains on every warning-band proposal, which is a review
+that never happens.
 
-The agent SHALL report a closed review window or a late-vote lockout as a distinct non-verdict rather
-than as a decision, because the contract rejects a vote in both cases and no verdict is castable.
-That outcome SHALL NOT be reachable for any proposal whose window is still open.
+#### Scenario: A warning-band proposal is adjudicated
 
-The agent SHALL supply an adjudicating model for proposals the deterministic rules leave unresolved.
-Its verdict SHALL be constrained such that Approve is unreachable from any non-deterministic
-component. The adversary there is prompt injection carried in proposal calldata, token names, or
-metadata URIs — attacker-controlled strings that reach the model's context — so a successful
-injection costs liveness and never stake.
+- **WHEN** deterministic evaluation raises warnings but nothing critical
+- **THEN** the model is consulted and its narrowed verdict is recorded as the outcome
 
-#### Scenario: Underwriting capacity is exhausted
+#### Scenario: The model is unavailable
 
-- **WHEN** a proposal's required coverage exceeds the agent's free bond or its configured ceiling
-- **THEN** the agent votes Block, rather than withholding a vote and letting the review clear
-
-#### Scenario: An input cannot be read
-
-- **WHEN** a coverage read fails, or the model errors, times out, or is rate-limited
-- **THEN** the agent votes Block and records the cause
-
-#### Scenario: Warnings with no model configured
-
-- **WHEN** deterministic evaluation raises warnings but nothing critical and no model is available
-- **THEN** the agent votes Block — an unadjudicated warning is not a cleared one
+- **WHEN** the model errors, times out, or is rate-limited
+- **THEN** the agent abstains and records the failure, and does not fall through to Approve
 
 #### Scenario: The model returns an approval
 
-- **WHEN** the model's response resolves to Approve, or is malformed
-- **THEN** the response is recorded, the outcome is Block, and no Approve vote is cast
-
-#### Scenario: No vote is castable
-
-- **WHEN** the review window has closed or the late-vote lockout has begun
-- **THEN** the agent reports a non-verdict distinct from Approve and Block, and sends no transaction
-
-#### Scenario: Indecision inside an open window
-
-- **WHEN** the agent cannot resolve a proposal and its review window is still open
-- **THEN** the outcome is Block, never the closed-window non-verdict
+- **WHEN** the model's response resolves to Approve
+- **THEN** the response is recorded, the verdict is treated as Abstain, and no Approve vote is cast

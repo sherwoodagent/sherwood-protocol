@@ -29,11 +29,10 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 ## 4. Control run and model
 
 - [ ] 4.1 Run the unwarped control simulation at fork state with no mocking, alongside the warped run
-- [ ] 4.2 Escalate verdict disagreement between the two runs into the unresolved band; block when the control run cannot complete
-- [x] 4.3 Remove abstention from the verdict gate: every branch where a vote is castable resolves to Approve or Block, and a closed window reports a distinct non-verdict
-- [ ] 4.4 Pass a `model` into `decide` from `src/index.ts` — the escalation tier exists in `judge.ts` and is unreachable today
-- [ ] 4.5 Include both runs' evidence in the model's context, and keep Approve unreachable from the model
-- [ ] 4.6 Unit-test that an unavailable model blocks and never falls through to the clean-path Approve
+- [ ] 4.2 Escalate verdict disagreement between the two runs into the unresolved band; abstain when the control run cannot complete
+- [ ] 4.3 Pass a `model` into `decide` from `src/index.ts` — the escalation tier exists in `judge.ts` and is unreachable today, so every warning-band proposal abstains
+- [ ] 4.4 Include both runs' evidence in the model's context, and keep the narrowing to Block or Abstain unchanged
+- [ ] 4.5 Unit-test that an unavailable model abstains and never falls through to the clean-path Approve
 
 ## 5. Calibration before enforcement
 
