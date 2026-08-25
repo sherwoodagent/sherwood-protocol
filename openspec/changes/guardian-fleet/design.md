@@ -130,6 +130,48 @@ days.
 Splitting one guardian into M is precisely this operation. **Choose M and the per-guardian
 allocation before staking**; revising it costs 30 days of blocking weight.
 
+### Decision 7 — Fleet composition (operator-set, 2026-08-25)
+
+Four voters, two keepers. The operator expects to hold essentially all staked
+WOOD. One voter is veto-only; the other three vote both ways. Keepers serve every
+governor they see.
+
+`blockQuorumBps` is seeded at **3000 (30%)** — `script/Deploy.s.sol:94`, matching
+`script/testnet/Deploy.s.sol:114`.
+
+**The veto-only voter must hold at least the block quorum on its own, with
+margin.** This is forced, not chosen. The scenario that voter exists for is the
+one where the other three approved something they should not have — a shared
+verdict bug, since they run the same code against the same evidence. In that
+scenario it is the *only* blocker, so `blockStakeWeight` is its weight alone and
+must clear `3000 × totalStake / 10_000` by itself. A veto-only voter holding an
+even quarter of the stake cannot block anything in the only situation it was
+created for.
+
+Margin, not exactly 30%, because `stakeAsGuardian` is permissionless and
+uncapped. Holding 100% today means any third party staking WOOD shrinks the
+operator's share immediately, and a veto-only voter sitting at exactly the quorum
+breaks on the first outside stake. The `fleet.blockable` signal detects this
+drift; the margin is what keeps it from being routine.
+
+Indicative split, to be pinned before staking since reallocation costs
+`FLOOR_LOOKBACK`: veto-only 35–40%, the three active voters ~20% each. That also
+leaves any two active voters able to block on their own (~40% > 30%), so the veto
+survives one active voter being down or being the one at fault.
+
+**Accepted, and stated so it is not mistaken for an oversight:** three of four
+voters carry slashable exposure, and they share a verdict path. A bug that
+approves a malicious proposal is approved by all three at once, so roughly 60% of
+the staked position is slashed together on the severity ramp. That is the
+operator's call. The cheap mitigation is Decision 4's policy divergence — give
+the three active voters different drawdown bounds and coverage ceilings so they
+do not all approve the same marginal proposal — which costs nothing and does not
+change the fleet's shape.
+
+Keepers serve every governor. A configured vault list fails silently: a fund
+nobody remembered to add is a fund whose proposals execute unreviewed, and the
+gap is only visible afterwards.
+
 ## Risks / Trade-offs
 
 - **Correlated verdicts by construction.** Accepted deliberately under Decision 4, and load-bearing
@@ -144,10 +186,15 @@ allocation before staking**; revising it costs 30 days of blocking weight.
 
 ## Open Questions
 
-- What is M? Decision 1 says it follows from an uptime target, which has not been stated.
-- What share of total staked WOOD will the operator hold? That number, not M, decides whether the
-  cohort can block at all.
-- Does the keeper open reviews for every governor it sees, or only for vaults on a configured list?
-  Every governor is the safer default and the more expensive one.
-- Should the pipeline cast the fleet's own votes inside the fork to measure the block outcome before
-  any real vote is signed?
+Fleet size, stake share, allocation shape, and keeper scope are settled — see
+Decision 7. What remains:
+
+- What exact percentage does the veto-only voter get? Decision 7 bounds it below
+  (at least the block quorum, with margin) but the figure has to be picked
+  against the real staked total at the moment of staking, since it cannot be
+  revised for `FLOOR_LOOKBACK`.
+- How much bond do the three active voters need to underwrite the proposals the
+  operator actually wants approved? That sizes their share from below, and needs
+  real `getRequiredCoverage` figures rather than an estimate.
+- Should the pipeline cast the fleet's own votes inside the fork to measure the
+  block outcome before any real vote is signed?
