@@ -27,12 +27,12 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 
 ## 4. Shared simulation, per-guardian policy
 
-- [ ] 4.1 Split the review pipeline out of the voting loop; the pipeline holds no signing key
-- [ ] 4.2 Define the evidence record — risk findings, simulation outcome, invariant measurements, coverage inputs — and persist one per review
-- [ ] 4.3 Move per-guardian policy into configuration: drawdown bound, posture, coverage ceiling, whether a model is consulted
-- [ ] 4.4 Abstain across every identity when no evidence record exists for a review, rather than voting on absent evidence
-- [ ] 4.5 Give the pipeline the same heartbeat and staleness treatment as the daemons — it holds no stake, but its failure silences every guardian at once
-- [ ] 4.6 Unit-test that two policies over one evidence record can reach different verdicts
+- [x] 4.1 Split the review pipeline out of the voting loop; the pipeline holds no signing key
+- [x] 4.2 Define the evidence record — risk findings, simulation outcome, proposal metadata, review window — and persist one per review. Coverage is deliberately excluded: affordability is a property of the guardian, not the proposal, so each voter reads its own
+- [x] 4.3 Move per-guardian policy into configuration: warning tolerance, posture, coverage ceiling, whether a model is consulted. The drawdown bound is not among them — outcome invariants do not exist yet and land with `guardian-review-depth`
+- [x] 4.4 Abstain across every identity when no evidence record exists for a review, rather than voting on absent evidence
+- [x] 4.5 Give the pipeline the same heartbeat and staleness treatment as the daemons — it holds no stake, but its failure silences every guardian at once
+- [x] 4.6 Unit-test that two policies over one evidence record can reach different verdicts
 
 ## 5. Blockable capacity
 
