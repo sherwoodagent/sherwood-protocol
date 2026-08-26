@@ -15,7 +15,7 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 - [x] 2.4 Refuse to start when no blocks-per-second constant is configured for the connected chain — `BLOCKS_PER_SECOND` is required, not defaulted
 - [x] 2.5 Add `vm.mockCall` restamping of each consulted feed's `latestRoundData`, preserving the answer and setting `updatedAt` to the current timestamp — 16 feeds re-stamped before and after the warp, answers preserved
 - [x] 2.6 Emit the invariant measurements — capital snapshot, `totalAssets()` after settlement, residual allowances, residual non-asset balances, native balance — as parseable log lines — `INV ` lines for snapshot, totalAssets, asset balance, native, residual tokens and allowances. Snapshot is captured BEFORE settlement, which clears it — plus `INV spendersChecked`/`tokensChecked` counts and an `INV END` sentinel, so a truncated log cannot read as clean
-- [ ] 2.7 Retire the pranked raw-call path only after group 5 confirms verdict parity — HELD ON EVIDENCE: parity shows the lifecycle harness loses `SIMULATION_FAILED`, which is per-call attribution the lifecycle path structurally cannot produce (it invokes `settleProposal` once). Retiring the legacy harness today would drop a detection.
+- [x] 2.7 Retire the pranked raw-call path only after group 5 confirms verdict parity — retired from every production path. The lifecycle harness now replays calls for per-call attribution on a `snapshotState()` and reverts, so it produces both granularities; the legacy file and parity script stay so the comparison remains reproducible.
 
 ## 3. Carry the measurements into the verdict
 
@@ -36,7 +36,7 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 
 ## 5. Calibration before enforcement
 
-- [x] 5.1 Run the lifecycle harness and the existing harness side by side across every proposal on the vnet, and diff the verdicts — `scripts/harness-parity.ts`; compares risk CODES, not exit codes. Result: legacy raises `SIMULATION_FAILED`, lifecycle does not.
+- [x] 5.1 Run the lifecycle harness and the existing harness side by side across every proposal on the vnet, and diff the verdicts — `scripts/harness-parity.ts`, run on four proposals. CAVEAT recorded in the README: every code but `SIMULATION_FAILED` is a pure function of calldata, so the arms agree by construction. The run is corroboration, not evidence.
 - [x] 5.2 Collect the round-trip cost distribution for honest proposals and derive `maxDrawdownBps` from it — collected (7 runs), and the WITHIN-PROPOSAL series settles the shape: 3 bps across a 7x duration increase, so cost is fixed and a flat bps bound is right. No value is derived: choosing one is a risk decision needing the miss rate stated with it.
 - [ ] 5.3 Promote residual allowance, residual balance, native imbalance, and non-vault beneficiary to critical once each has fired zero false positives across the collected set — HELD for the right reason this time: these codes have never fired on a real run. `SWAP_RECIPIENT_NOT_VAULT` is already critical, so part of this task is stale.
 - [ ] 5.4 Promote the capital-shortfall code to critical only after `maxDrawdownBps` is measured, not before — HELD: promotion needs a sample that isolates duration from basket; three confounded points is not a distribution.
