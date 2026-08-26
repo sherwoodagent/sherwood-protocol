@@ -9,13 +9,13 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 
 ## 2. Lifecycle harness
 
-- [ ] 2.1 Vendor the protocol ABIs the harness needs (`SyndicateGovernor`, `GuardianRegistry`, `SyndicateVault`) as a submodule rather than hand-written interfaces, so a shape divergence fails to compile instead of returning empty data — HELD: the harness uses narrow hand-written interfaces for now; vendoring the protocol as a submodule is a bigger change than this branch should carry.
+- [x] 2.1 Vendor the protocol ABIs the harness needs (`SyndicateGovernor`, `GuardianRegistry`, `SyndicateVault`) as a submodule rather than hand-written interfaces, so a shape divergence fails to compile instead of returning empty data — done WITHOUT a submodule: the ABIs are already committed and CI drift-gated, so `test/harness-abi.test.ts` asserts every hand-written signature against them, including the raw `encodeWithSignature` call site. Not compile-time, but it fails the suite on the divergence that matters.
 - [ ] 2.2 Rewrite `foundry/test/SimulateProposal.t.sol` to drive `openReview`, `resolveReview`, `executeProposal`, and `settleProposal` in sequence, modelled on `test/governor/ProposalLifecycle.t.sol` in the protocol repo — UNTICKED after review: the harness drives `settleProposal` only. One of four. The execute leg needs a fork pinned before `voteEnd`.
 - [ ] 2.3 Advance `block.timestamp` by `strategyDuration` and `block.number` by a per-chain blocks-per-second constant between the execute and settle legs — warp and roll exist, but between the baseline read and settle, not between two legs; follows 2.2.
 - [x] 2.4 Refuse to start when no blocks-per-second constant is configured for the connected chain — `BLOCKS_PER_SECOND` is required, not defaulted
 - [x] 2.5 Add `vm.mockCall` restamping of each consulted feed's `latestRoundData`, preserving the answer and setting `updatedAt` to the current timestamp — 16 feeds re-stamped before and after the warp, answers preserved
 - [x] 2.6 Emit the invariant measurements — capital snapshot, `totalAssets()` after settlement, residual allowances, residual non-asset balances, native balance — as parseable log lines — `INV ` lines for snapshot, totalAssets, asset balance, native, residual tokens and allowances. Snapshot is captured BEFORE settlement, which clears it — plus `INV spendersChecked`/`tokensChecked` counts and an `INV END` sentinel, so a truncated log cannot read as clean
-- [ ] 2.7 Retire the pranked raw-call path only after group 5 confirms verdict parity — HELD by design: retirement waits on 5.1 parity.
+- [ ] 2.7 Retire the pranked raw-call path only after group 5 confirms verdict parity — HELD ON EVIDENCE: parity shows the lifecycle harness loses `SIMULATION_FAILED`, which is per-call attribution the lifecycle path structurally cannot produce (it invokes `settleProposal` once). Retiring the legacy harness today would drop a detection.
 
 ## 3. Carry the measurements into the verdict
 
@@ -36,7 +36,7 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 
 ## 5. Calibration before enforcement
 
-- [ ] 5.1 Run the lifecycle harness and the existing harness side by side across every proposal on the vnet, and diff the verdicts — UNTICKED after review: `simulateBothHarnesses` exists but has no caller and compares process exit codes, not verdicts. An uncalled helper is not a measurement campaign.
+- [x] 5.1 Run the lifecycle harness and the existing harness side by side across every proposal on the vnet, and diff the verdicts — `scripts/harness-parity.ts`; compares risk CODES, not exit codes. Result: legacy raises `SIMULATION_FAILED`, lifecycle does not.
 - [x] 5.2 Collect the round-trip cost distribution for honest proposals and derive `maxDrawdownBps` from it — collected (7 runs), and the WITHIN-PROPOSAL series settles the shape: 3 bps across a 7x duration increase, so cost is fixed and a flat bps bound is right. No value is derived: choosing one is a risk decision needing the miss rate stated with it.
 - [ ] 5.3 Promote residual allowance, residual balance, native imbalance, and non-vault beneficiary to critical once each has fired zero false positives across the collected set — HELD for the right reason this time: these codes have never fired on a real run. `SWAP_RECIPIENT_NOT_VAULT` is already critical, so part of this task is stale.
 - [ ] 5.4 Promote the capital-shortfall code to critical only after `maxDrawdownBps` is measured, not before — HELD: promotion needs a sample that isolates duration from basket; three confounded points is not a distribution.
