@@ -18,6 +18,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockL2Registrar} from "../mocks/MockL2Registrar.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 
 /// @title OwnerStakeAtCreation.t
 /// @notice Tests for Task 26: factory creation gates on prepared owner stake,
@@ -62,6 +63,9 @@ contract OwnerStakeAtCreationTest is Test {
         // beacon (+3), factoryImpl (+4), regImpl (+5), regProxy (+6),
         // factoryProxy (+7).
         ProtocolConfig _hoistedPC = new ProtocolConfig(owner);
+        // Mandatory `InitParams` field (pashov finding #1). Deployed above
+        // `baseNonce` like `_hoistedPC`, so no offset below shifts.
+        TierRegistry _hoistedTierRegistry = new TierRegistry(owner);
         uint256 baseNonce = vm.getNonce(address(this));
         address predictedRegistryProxy = vm.computeCreateAddress(address(this), baseNonce + 6);
         address predictedFactoryProxy = vm.computeCreateAddress(address(this), baseNonce + 7);
@@ -116,7 +120,8 @@ contract OwnerStakeAtCreationTest is Test {
                     beacon: address(beacon),
                     protocolConfig: address(_hoistedPC),
                     managementFeeBps: 50,
-                    guardianRegistry: address(registry)
+                    guardianRegistry: address(registry),
+                    tierRegistry: address(_hoistedTierRegistry)
                 }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));

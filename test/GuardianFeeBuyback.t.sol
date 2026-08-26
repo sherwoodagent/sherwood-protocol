@@ -17,6 +17,7 @@ import {RegistryTestHarness} from "./helpers/RegistryTestHarness.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {IProtocolConfig} from "../src/interfaces/IProtocolConfig.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
 /// @title GuardianFeeBuyback (governor-level)
 /// @notice Covers the buyback-WOOD redesign: the guardian-fee slice now routes
@@ -89,7 +90,8 @@ contract GuardianFeeBuybackTest is Test {
                 address(vault), // vault_: this test's vault (per-vault governor)
                 address(guardianRegistry),
                 address(protocolConfig),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,

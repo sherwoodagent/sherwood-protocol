@@ -11,6 +11,7 @@ import {MockMToken} from "./mocks/MockMToken.sol";
 import {MockComptroller} from "./mocks/MockComptroller.sol";
 import {MockSwapRouter} from "./mocks/MockSwapRouter.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
+import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
 contract SyndicateVaultTest is Test {
     SyndicateVault public vault;
@@ -93,6 +94,14 @@ contract SyndicateVaultTest is Test {
         // MS-H4: vault `_deposit` also reads `openProposalCount(address)` —
         // mock to zero so deposits aren't blocked by garbage memory.
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
+        // The batch guard resolves the TierRegistry through the governor and now
+        // REFUSES the batch when it resolves none (pashov finding #1), so a
+        // placeholder governor has to answer this too.
+        vm.mockCall(
+            MOCK_GOVERNOR,
+            abi.encodeWithSignature("tierRegistry()"),
+            abi.encode(address(deployTierRegistry(address(this))))
+        );
     }
 
     /// @dev Deterministic placeholder for factory.governor() in tests.
@@ -1099,6 +1108,11 @@ contract SyndicateVaultTest is Test {
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(target)));
         vm.mockCall(address(target), abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(address(target), abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
+        vm.mockCall(
+            address(target),
+            abi.encodeWithSignature("tierRegistry()"),
+            abi.encode(address(deployTierRegistry(address(this))))
+        );
 
         // Outer batch: one call into `target.ping()`, which re-enters the vault.
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);

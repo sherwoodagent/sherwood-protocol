@@ -81,12 +81,23 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         bool opened;
         bool resolved;
         bool blocked;
-        /// @dev DEPRECATED and never written. The cold-start waiver it carried
-        ///      was removed: it made the guardian veto and the emergency
-        ///      owner-bond slash switchable off by anyone able to dip the
-        ///      staked total for one block via `requestUnstakeGuardian` +
-        ///      `cancelUnstakeGuardian`, which is free. The field stays so the
-        ///      storage layout of this upgradeable contract does not shift.
+        /// @dev LIVE — the block-quorum DENOMINATOR. Written once by
+        ///      `openReview` as `getPastTotalVotes(r.snapshotAt)`: the total
+        ///      staked weight at the PROPOSE instant, not at open, because
+        ///      `openReview` is permissionless and reading at open would let
+        ///      the caller pick when the electorate is measured. `_isBlocked`
+        ///      divides `blockStakeWeight` against it, and `_resolveEmergency`
+        ///      / `cancelEmergency` use the emergency review's own copy the
+        ///      same way. Zero means no electorate, and every one of those
+        ///      call sites must short-circuit before comparing — `0 >= 0` is
+        ///      vacuously true and would Block a review nobody voted in.
+        ///
+        ///      What WAS removed is the cold-start waiver that used to read
+        ///      this field against a floor: it made the guardian veto and the
+        ///      emergency owner-bond slash switchable off by anyone able to
+        ///      dip the staked total for one block via
+        ///      `requestUnstakeGuardian` + `cancelUnstakeGuardian`, which is
+        ///      free. The field itself outlived that waiver.
         uint128 totalStakeAtOpen;
         uint128 approveStakeWeight;
         uint128 blockStakeWeight;
@@ -457,6 +468,41 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         return (r.voteEnd, r.reviewEnd);
     }
 
+    /// @notice The pause-shift baseline stamped into a review at `registerReview`,
+    ///         i.e. the value of `pauseShiftTotal` (plus any pause in progress)
+    ///         as of propose time — see `Review.clockShiftAtRegister` and the
+    ///         stamping at `registerReview`.
+    /// @dev    Exposed for the off-chain guardian daemon (SHE-167). `_effNow`
+    ///         subtracts only the pause time accrued SINCE this baseline, so a
+    ///         reader that mirrors the on-chain effective clock (`clock.ts`) must
+    ///         know it exactly rather than approximate it as `0` (the safe
+    ///         over-credit fallback the daemon used per SHE-57 / PR#15). Combined
+    ///         with the already-public `pauseShiftTotal` / `paused` / `pausedAt`,
+    ///         this lets an off-chain reader reproduce `_effNow` for any review:
+    ///         `effNow = now - ((pauseShiftTotal + (paused ? now - pausedAt : 0)) - clockShiftAtRegister)`.
+    ///         `0` for a review registered while not paused (the common case) and
+    ///         for an unknown `(governor, proposalId)` — mirrors `reviewWindow`'s
+    ///         zero-for-unknown-key convention.
+    function reviewClockShift(address governor, uint256 proposalId)
+        external
+        view
+        returns (uint64 clockShiftAtRegister)
+    {
+        return _reviews[_reviewKey(governor, proposalId)].clockShiftAtRegister;
+    }
+
+    /// @notice The effective "now" the registry judges a review's window against,
+    ///         computed on-chain exactly as the resolution readers see it.
+    /// @dev    Convenience wrapper over the private `_effNow` for the guardian
+    ///         daemon (SHE-167): reading this in ONE atomic call yields the exact
+    ///         computed effective clock, eliminating the daemon's mirror math and
+    ///         the read-race between fetching `clockShiftAtRegister` and the live
+    ///         pause fields. For an unknown `(governor, proposalId)` the baseline
+    ///         is `0`, so this returns the wall-clock `_effNow(0)`.
+    function effectiveNowFor(address governor, uint256 proposalId) external view returns (uint256) {
+        return _effNow(_reviews[_reviewKey(governor, proposalId)].clockShiftAtRegister);
+    }
+
     /// @dev The instant a review's WINDOW is judged against: wall clock less
     ///      the registry downtime that accrued after this review's clock
     ///      started (pashov review finding #7). Every writer into a review
@@ -688,8 +734,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     // ── Guardian review voting ──
 
     /// @inheritdoc IGuardianRegistry
-    /// @dev First-vote path OR vote-change. Requires `openReview` to have been
-    ///      called and `voteEnd <= now < reviewEnd`. Snapshots the caller's vote
+    /// @dev First-vote path OR vote-change. Requires `voteEnd <= now < reviewEnd`;
+    ///      a due-but-unopened review is auto-opened here (SHE-163) via the same
+    ///      `_openReview` body the keeper `openReview` uses, so an explicit
+    ///      `openReview` is no longer a precondition. Snapshots the caller's vote
     ///      weight at `r.openedAt`, growth-gated via `_growthGatedVoteWeight` so a
     ///      voter's own numerator weight cannot outrun the denominator's dilution
     ///      defense, and adds it to the chosen side's tally. Approvers and
@@ -702,19 +750,36 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
 
         bytes32 key = _reviewKey(governor, proposalId);
         Review storage r = _reviews[key];
-        if (!r.opened) revert ReviewNotOpen();
         // Defence in depth alongside `openReview`'s resolved guard: a resolved
         // review (cancelled, or already committed) accepts no further votes,
         // so no approve weight can accrue on a proposal that carries no slash
-        // risk. Unreachable while `openReview` refuses to re-open — kept so a
-        // future edit to either guard cannot silently arm the other.
+        // risk. Checked BEFORE the auto-open below so a resolved review can
+        // never be re-opened by a vote.
         if (r.resolved) revert ReviewNotOpen();
 
         // Pause-adjusted on both bounds — see `_effNow` (pashov review
         // finding #7). This is the writer whose `whenNotPaused` gate made the
         // window consumable in the first place.
         uint256 nowEff = _effNow(r.clockShiftAtRegister);
+        // The open window `[voteEnd, reviewEnd)` — the EXACT predicate this
+        // function already enforced. An unregistered review (`voteEnd == 0`),
+        // one before `voteEnd`, and one at/after `reviewEnd` all still revert
+        // `ReviewNotOpen`, unchanged.
         if (r.voteEnd == 0 || nowEff < r.voteEnd || nowEff >= r.reviewEnd) revert ReviewNotOpen();
+
+        // SHE-163: a due-but-unopened review auto-opens here instead of
+        // reverting `ReviewNotOpen`. Reaching this line already proves the
+        // review is registered, unresolved, and inside its open window — the
+        // genuinely-due case, and the ONLY case that opens. `openReview` is
+        // already permissionless, so no new timing freedom is granted:
+        // `totalStakeAtOpen` reads at propose-time (`snapshotAt`,
+        // opener-independent), the block-quorum and slash-envelope snapshots
+        // guard OWNER mutability (opener-independent), and `openedAt` at
+        // auto-open equals the voter's own instant — the earliest possible
+        // open, the same value a keeper racing `openReview` at the first
+        // opportunity would produce. `_openReview` emits `ReviewOpened` exactly
+        // once; a later vote lands with `r.opened == true` and re-emits nothing.
+        if (!r.opened) _openReview(r, proposalId);
 
         if (!swood.isActiveGuardian(msg.sender)) revert NotActiveGuardian();
 
@@ -903,6 +968,26 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // already earned, then lets the re-open proceed on a clean record.
         // Cheap in the common case — a first open leaves `callsHash` zero, and a
         // round already resolved short-circuits.
+        //
+        // IN SERIES WITH THE CALLER'S BOND GATE (2026-08 sweep finding #11).
+        // That finding moved `emergencySettleWithCalls`'s owner-bond check to
+        // AFTER this call, and the two now form one mechanism against a
+        // re-open that would void a blocked verdict:
+        //
+        //   this resolve computes `blocked` -> `slashOwnerBond` empties the
+        //   slot -> the caller's gate reads zero and REVERTS the whole
+        //   transaction, re-open and slash together.
+        //
+        // Neither half works alone. Delete this line and the bond survives the
+        // re-open, the gate passes, and the owner voids the votes exactly as
+        // before — measured, not argued: removing it turns
+        // `test_emergencySettleWithCalls_cannotReopenOnABondTheSameCallBurns`
+        // and its sibling red. Those two tests pin THIS call as much as they
+        // pin the gate.
+        //
+        // Note what does NOT depend on it: `er.round++` below retires
+        // prior-round votes on its own, so vote hygiene across a re-open is the
+        // round bump's job, not this resolve's.
         if (er.callsHash != bytes32(0) && !er.resolved) _resolveEmergency(eKey, proposalId, er);
         // Denominator read at `t-1`, the same checkpoint anchor the numerator
         // uses (`voteBlockEmergencySettle` reads its weight at `er.openedAt`),
@@ -1078,6 +1163,17 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // Pause-adjusted — see `_effNow` (pashov review finding #7).
         if (ve == 0 || _effNow(r.clockShiftAtRegister) < ve) revert ReviewNotOpen();
 
+        _openReview(r, proposalId);
+    }
+
+    /// @dev Snapshot-and-open body shared by the permissionless `openReview`
+    ///      keeper entrypoint and `voteOnProposal`'s SHE-163 auto-open path.
+    ///      EXACTLY the propose-time snapshot logic — no guard of its own: every
+    ///      caller MUST have already established that the review is registered,
+    ///      unresolved, not yet opened, and inside its open window. Sets
+    ///      `opened`, `totalStakeAtOpen`, `blockQuorumBpsAtOpen`, the slash
+    ///      envelope, `openedAt`, and emits `ReviewOpened` exactly once.
+    function _openReview(Review storage r, uint256 proposalId) private {
         IStakedWood sw = swood;
         // BOTH SIDES OF THE QUORUM COMPARISON ARE READ AT `r.snapshotAt`, the
         // propose-time instant — see `Review.snapshotAt` and the numerator read
@@ -1138,8 +1234,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @inheritdoc IGuardianRegistry
     /// @dev Permissionless and idempotent — once resolved, returns the cached
     ///      `blocked` flag without re-slashing. Requires
-    ///      `block.timestamp >= reviewEnd`. Short-circuits to `false` when
-    ///      `!opened` or `cohortTooSmall`. CEI: sets `resolved`/`blocked` before
+    ///      `block.timestamp >= reviewEnd`. Short-circuits to `false` when the
+    ///      review was never opened — that is the ONLY short-circuit left; a
+    ///      thin cohort decides its own review, since the `cohortTooSmall`
+    ///      waiver was removed. Everything else goes to `_isBlocked`, which
+    ///      fails open on a zero electorate. CEI: sets `resolved`/`blocked` before
     ///      any token transfer, which is why no `nonReentrant` is needed — a
     ///      reentrant call hits the early return.
     function resolveReview(address governor, uint256 proposalId) external whenNotPaused returns (bool) {
@@ -1546,9 +1645,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @dev Pure mirror of `resolveReview`'s committed result. Branch order:
     ///      (1) resolved -> the cached `blocked` flag; (2) before `reviewEnd`, or
     ///      unregistered -> `Unresolved`; (3) window elapsed but not committed ->
-    ///      `Cleared` when the review was never opened or the cohort was too
-    ///      small, else `_isBlocked` decides. The short-circuits stay OUTSIDE
-    ///      `_isBlocked`, exactly as `resolveReview` applies them.
+    ///      `Cleared` when the review was never opened, else `_isBlocked`
+    ///      decides. The never-opened short-circuit stays OUTSIDE `_isBlocked`,
+    ///      exactly as `resolveReview` applies it.
     function outcomeOf(address governor, uint256 proposalId) external view returns (ReviewOutcome) {
         Review storage r = _reviews[_reviewKey(governor, proposalId)];
         if (r.resolved) {

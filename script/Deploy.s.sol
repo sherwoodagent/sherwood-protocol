@@ -13,6 +13,7 @@ import {SyndicateGovernor} from "../src/SyndicateGovernor.sol";
 import {GuardianRegistry} from "../src/GuardianRegistry.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 import {StakedWood} from "../src/StakedWood.sol";
+import {CallSandbox} from "../src/CallSandbox.sol";
 import {ISyndicateGovernor} from "../src/interfaces/ISyndicateGovernor.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
@@ -78,6 +79,7 @@ contract DeploySherwood is ScriptBase {
     bytes32 constant SALT_REGISTRY_PROXY = keccak256("sherwood.deploy.guardian-registry-proxy.2");
     bytes32 constant SALT_SWOOD_IMPL = keccak256("sherwood.deploy.staked-wood-impl.1");
     bytes32 constant SALT_SWOOD_PROXY = keccak256("sherwood.deploy.staked-wood-proxy.1");
+    bytes32 constant SALT_SANDBOX_IMPL = keccak256("sherwood.deploy.call-sandbox-impl.1");
 
     // ── Registry default parameters (spec §3.1; overridable via env) ──
     uint256 constant DEFAULT_MIN_GUARDIAN_STAKE = 10_000e18;
@@ -122,6 +124,7 @@ contract DeploySherwood is ScriptBase {
         address registryProxy;
         address swoodProxy;
         address tierRegistry; // adapter-selector tier certification (spec §3.2)
+        address sandboxImpl; // CallSandbox implementation every new vault clones
     }
 
     function run() external virtual {
@@ -164,6 +167,12 @@ contract DeploySherwood is ScriptBase {
         // on zero amounts. MUST run before the multisig handoff while the
         // deployer is still the owner.
         _seedRegistry(d.deployer, d.registryProxy, cfg);
+
+        // Same constraint as the registry seed above, for the TierRegistry:
+        // these are `onlyOwner` writes, so they MUST precede the handoff.
+        // Without them no strategy template can initialize (see the function's
+        // own natspec for the full dependency list).
+        _seedTierRegistry(d.deployer, d.tierRegistry);
 
         // Multisig handoff: prod hands all proxies to the multisig.
         address effectiveOwner = d.deployer;
@@ -211,6 +220,14 @@ contract DeploySherwood is ScriptBase {
         _patchAddress("PROTOCOL_CONFIG", d.protocolConfig);
         _patchAddress("GUARDIAN_REGISTRY", d.registryProxy);
         _patchAddress("TIER_REGISTRY", d.tierRegistry);
+        // The CallSandbox implementation every vault clones. Persisted because
+        // it is otherwise recoverable ONLY from the broadcast log: it is
+        // CREATE3-salted rather than deployed at a predictable nonce, and the
+        // factory's `sandboxImpl()` getter is the only on-chain copy, and
+        // reading it presupposes already knowing which factory to ask. Every
+        // downstream address book (CLI / SDK / guardian / skill) needs it
+        // by name rather than by derivation.
+        _patchAddress("CALL_SANDBOX_IMPL", d.sandboxImpl);
         // sWOOD is the sole WOOD custodian — persist it for the CLI / admin
         // scripts.
         _patchAddress("STAKED_WOOD", d.swoodProxy);
@@ -272,17 +289,16 @@ contract DeploySherwood is ScriptBase {
         // Wire the set-once registry reference on sWOOD.
         StakedWood(d.swoodProxy).setRegistry(d.registryProxy);
 
-        address factoryImpl = c3.deploy(SALT_FACTORY_IMPL, abi.encodePacked(type(SyndicateFactory).creationCode));
-        d.factoryProxy = _deployFactoryProxy(c3, factoryImpl, d, cfg);
-        require(d.factoryProxy == predictedFactoryProxy, "factory addr mismatch");
-
         // Adapter-selector tier registry (spec §3.2). Owned by the deployer at
         // birth so `demote`/`poke` and the launch-set announcement can run
-        // before the multisig handoff; wired into the factory now (deployer
-        // still owns it) so every governor `createSyndicate` stamps out picks
-        // it up via the factory-only `setTierRegistry`. A plain Ownable2Step
-        // contract — no proxy needed (certifications are re-issuable, not
-        // upgrade-state).
+        // before the multisig handoff; passed into the factory's `InitParams`
+        // below so every governor `createSyndicate` stamps out picks it up via
+        // the factory-only `setTierRegistry`. A plain Ownable2Step contract —
+        // no proxy needed (certifications are re-issuable, not upgrade-state).
+        //
+        // Deployed BEFORE the factory: mandatory `InitParams` field since pashov
+        // finding #1. Free of ordering cost — the factory proxy is CREATE3, so
+        // an extra nonce ahead of it does not move `predictedFactoryProxy`.
         //
         // Granting is two-step (issue #45): `proposeCertification` is
         // owner-only and now takes the reviewed codehash as
@@ -303,7 +319,6 @@ contract DeploySherwood is ScriptBase {
         // ownership handoff overlap instead of serializing; demotion
         // (`demote`/`poke`) stays instant throughout.
         d.tierRegistry = address(new TierRegistry(d.deployer));
-        SyndicateFactory(d.factoryProxy).setTierRegistry(d.tierRegistry);
         // Issue #40: the submitter bond has no slash path yet, so it must
         // stay disabled until the launch gate documented on
         // `TierRegistry.submitterBondWood` is met. This script never calls
@@ -312,6 +327,27 @@ contract DeploySherwood is ScriptBase {
         require(
             TierRegistry(d.tierRegistry).submitterBondWood() == 0,
             "submitter bond must stay 0 at launch - see issue #40"
+        );
+
+        // The CallSandbox implementation every vault clones for a
+        // `proposeWithSandbox` payload. Deployed BEFORE the factory so the
+        // wiring below cannot be deferred to a follow-up transaction — a
+        // factory live without it creates vaults that can never run a payload,
+        // and the vault's binding is set-once, so those vaults could never be
+        // fixed.
+        d.sandboxImpl = c3.deploy(SALT_SANDBOX_IMPL, abi.encodePacked(type(CallSandbox).creationCode));
+
+        address factoryImpl = c3.deploy(SALT_FACTORY_IMPL, abi.encodePacked(type(SyndicateFactory).creationCode));
+        d.factoryProxy = _deployFactoryProxy(c3, factoryImpl, d, cfg);
+        require(d.factoryProxy == predictedFactoryProxy, "factory addr mismatch");
+
+        // Bound here, in the same transaction batch that created the factory,
+        // for the reason above. The deployer still owns the factory at this
+        // point; the ownership handoff happens later.
+        SyndicateFactory(d.factoryProxy).setSandboxImpl(d.sandboxImpl);
+        require(
+            SyndicateFactory(d.factoryProxy).sandboxImpl() == d.sandboxImpl,
+            "sandbox impl must be bound before the factory goes live"
         );
     }
 
@@ -359,7 +395,8 @@ contract DeploySherwood is ScriptBase {
                     beacon: d.beacon,
                     protocolConfig: d.protocolConfig,
                     managementFeeBps: cfg.managementFeeBps,
-                    guardianRegistry: d.registryProxy
+                    guardianRegistry: d.registryProxy,
+                    tierRegistry: d.tierRegistry
                 }))
         );
         return c3.deploy(
@@ -387,6 +424,123 @@ contract DeploySherwood is ScriptBase {
     ///      deployer holds WOOD. Skipped silently if either seed is 0 or the
     ///      balance is insufficient — testnet deploys without a WOOD balance
     ///      can top up post-deploy.
+    /// @dev The chain-constant half of the TierRegistry launch set, applied
+    ///      while the deployer still owns the registry.
+    ///
+    ///      WHY HERE. Every strategy template refuses to initialize against an
+    ///      unattested dependency: `PortfolioStrategy` checks each Chainlink
+    ///      aggregator (`_requireAllowedPriceSource`) AND its pairing to the
+    ///      slot's token (`_requirePairedPriceSource`), `MorphoSupplyStrategy`
+    ///      checks `isAdapterAllowed(morpho)`, `ConcentratedLiquidityStrategy`
+    ///      checks `isCounterpartyAllowed` on the position manager, Morpho and
+    ///      the Uniswap v3 factory. A fresh registry answers false to all of
+    ///      them, so a just-deployed protocol cannot run a single strategy
+    ///      until these land. Leaving them to a runbook means the first
+    ///      proposal on a new chain reverts, and the revert names a role
+    ///      (`PriceSourceNotAllowed`) rather than the missing step.
+    ///
+    ///      WHY ONLY THIS HALF. Seeded here is exactly what is already a
+    ///      constant of the chain — third-party addresses read from the
+    ///      address book, reviewable in the same diff as the deploy. Addresses
+    ///      this deploy MINTS (the swap adapter, strategy templates) do not
+    ///      exist yet: their scripts run later and seed themselves the same
+    ///      way, which the two-step `Ownable2Step` handoff below deliberately
+    ///      leaves room for — `transferOwnership` only sets `pendingOwner`, so
+    ///      the deployer stays owner until the multisig calls
+    ///      `acceptOwnership()`. THE RUNBOOK ORDER IS THEREFORE: core deploy →
+    ///      strategy deploys → multisig accepts. Accepting early is safe but
+    ///      costs a multisig transaction per dependency.
+    ///
+    ///      Per-clone `setAdapterAllowed` stays manual by construction — a
+    ///      clone's address is not known until an agent creates it.
+    ///
+    ///      Best-effort per key: a chain whose address book lacks an entry
+    ///      simply does not get that attestation. Silence is logged, never
+    ///      assumed.
+    function _seedTierRegistry(address deployer, address tierRegistry) internal {
+        console.log("\n=== Seeding TierRegistry launch set ===");
+        if (TierRegistry(tierRegistry).owner() != deployer) {
+            console.log("RUNBOOK: deployer no longer owns TierRegistry - seeding SKIPPED.");
+            console.log("RUNBOOK: the owner must apply the launch set manually before any proposal.");
+            return;
+        }
+
+        // Counterparties: addresses a certified template may BIND to (pools,
+        // position managers, lending singletons) as distinct from addresses
+        // that may RECEIVE vault funds. Morpho needs both axes — CL binds it
+        // as a counterparty, MorphoSupplyStrategy spends into it as an adapter.
+        _seedCounterparty(tierRegistry, "UNISWAP_V3_POSITION_MANAGER");
+        _seedCounterparty(tierRegistry, "UNISWAP_V3_FACTORY");
+        if (_seedCounterparty(tierRegistry, "MORPHO_BLUE")) {
+            _seedAdapter(tierRegistry, "MORPHO_BLUE");
+        }
+
+        // Push-feed price sources. `symbols` drives BOTH lookups: the feed key
+        // is CHAINLINK_<SYM>_USD_FEED and the token key is <SYM>, except ETH,
+        // whose token is wrapped. A symbol whose feed exists but whose token
+        // does not (BTC/LINK/USDC on Robinhood) is allowlisted without a
+        // pairing — harmless, because the pairing check is what actually gates
+        // a slot, and it stays unsatisfiable until someone attests it.
+        string[13] memory symbols =
+            ["ETH", "USDG", "USDC", "BTC", "LINK", "AAPL", "AMD", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "TSLA"];
+        for (uint256 i; i < symbols.length; ++i) {
+            _seedPriceSource(tierRegistry, symbols[i]);
+        }
+        // Index/commodity trackers whose token key matches the symbol.
+        string[3] memory funds = ["QQQ", "SPY", "SLV"];
+        for (uint256 i; i < funds.length; ++i) {
+            _seedPriceSource(tierRegistry, funds[i]);
+        }
+    }
+
+    function _seedCounterparty(address tierRegistry, string memory key) internal returns (bool) {
+        address target = _tryReadAddress(key);
+        if (target == address(0)) {
+            console.log("  counterparty skipped (not in address book):", key);
+            return false;
+        }
+        TierRegistry(tierRegistry).setCounterpartyAllowed(target, true);
+        console.log("  counterparty allowed:", key, target);
+        return true;
+    }
+
+    function _seedAdapter(address tierRegistry, string memory key) internal returns (bool) {
+        address target = _tryReadAddress(key);
+        if (target == address(0)) {
+            console.log("  adapter skipped (not in address book):", key);
+            return false;
+        }
+        TierRegistry(tierRegistry).setAdapterAllowed(target, true);
+        console.log("  adapter allowed:", key, target);
+        return true;
+    }
+
+    /// @dev Allowlists the aggregator and pairs it to the token it prices.
+    ///      `priceSource` MUST be the bare aggregator address widened to
+    ///      bytes32 with no packed max-age — that is the exact normalization
+    ///      `PortfolioStrategy._initialize` applies before calling
+    ///      `_requirePairedPriceSource`, so one attestation covers every
+    ///      staleness variant of the same feed. Encoding it any other way
+    ///      produces an attestation that is never consulted.
+    function _seedPriceSource(address tierRegistry, string memory symbol) internal {
+        address feed = _tryReadAddress(string.concat("CHAINLINK_", symbol, "_USD_FEED"));
+        if (feed == address(0)) {
+            console.log("  feed skipped (not in address book):", symbol);
+            return;
+        }
+        TierRegistry(tierRegistry).setAdapterAllowed(feed, true);
+
+        // ETH's feed prices the wrapped token — every other symbol's token key
+        // is the symbol itself.
+        address token = _tryReadAddress(keccak256(bytes(symbol)) == keccak256("ETH") ? "WETH" : symbol);
+        if (token == address(0)) {
+            console.log("  feed allowlisted, NO token pairing (token not on this chain):", symbol, feed);
+            return;
+        }
+        TierRegistry(tierRegistry).setPriceSourceForToken(token, bytes32(uint256(uint160(feed))), true);
+        console.log("  feed allowlisted + paired:", symbol, feed);
+    }
+
     function _seedRegistry(address deployer, address registryProxy, Config memory cfg) internal {
         IERC20 wood = IERC20(cfg.woodToken);
         uint256 bal = wood.balanceOf(deployer);

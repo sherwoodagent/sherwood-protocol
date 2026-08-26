@@ -8,6 +8,7 @@ import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
@@ -199,6 +200,13 @@ contract DeployPlanBPreflightTest is Test {
     ///      against the refusing branch and `test_preflight10_bites_*` keeps
     ///      meaning what it meant. Only the bypass test raises it.
     bool internal bookAllowEoaLedgerOwner;
+    /// @dev The optional Chainlink-shaped WOOD/USD feed. ZERO by default: the
+    ///      mainnet posture is TWAP-only, because chain 4663 publishes no such
+    ///      aggregator. Only the fork-shaped tests set it.
+    address internal bookWoodUsdFeed;
+    /// @dev Its staleness bound. Paired with the field above — pre-flight 12
+    ///      refuses one without the other.
+    uint256 internal bookWoodFeedMaxDelay;
 
     function setUp() public {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
@@ -252,7 +260,9 @@ contract DeployPlanBPreflightTest is Test {
                     beacon: address(beacon),
                     protocolConfig: address(protocolConfig),
                     managementFeeBps: 50,
-                    guardianRegistry: address(registry)
+                    guardianRegistry: address(registry),
+                    // Mandatory since pashov finding #1.
+                    tierRegistry: address(new TierRegistry(DEFAULT_SENDER))
                 }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
@@ -598,6 +608,93 @@ contract DeployPlanBPreflightTest is Test {
         assertFalse(capBinding, "a cap seeded BELOW market would bind and make the oracle inert");
     }
 
+    // ── PRE-FLIGHT 12: the WOOD/USD feed and its delay move together ───────
+
+    /// @dev A feed named with no staleness bound. `setWoodFeed` would revert
+    ///      `InvalidParameter` for this, but only from INSIDE the broadcast,
+    ///      after the ledger and escrow are already deployed and four setters
+    ///      have already run. Pre-flight 12 turns that half-applied run into a
+    ///      refusal that costs nothing.
+    function test_preflight12_bites_whenTheFeedHasNoDelay() public {
+        bookWoodUsdFeed = address(new MockAggregatorV3(8, int256(WOOD_MARKET_X8)));
+        bookWoodFeedMaxDelay = 0;
+        _runExpecting("PRE-FLIGHT: WOOD_USD_FEED and WOOD_FEED_MAX_DELAY must be set together");
+    }
+
+    /// @dev The mirror slip: the operator set the delay and forgot the address.
+    ///      Nothing downstream would notice — the ledger would simply ship
+    ///      TWAP-only while the environment claims a feed was configured.
+    function test_preflight12_bites_whenTheDelayHasNoFeed() public {
+        bookWoodUsdFeed = address(0);
+        bookWoodFeedMaxDelay = 1 hours;
+        _runExpecting("PRE-FLIGHT: WOOD_USD_FEED and WOOD_FEED_MAX_DELAY must be set together");
+    }
+
+    /// @dev A typo'd address that happens to hold no code. `setWoodFeed` calls
+    ///      `decimals()` on it, so this would surface mid-broadcast as an
+    ///      undecodable EVM revert rather than as the thing it is.
+    function test_preflight12_bites_whenTheFeedHoldsNoCode() public {
+        bookWoodUsdFeed = address(0xFEED);
+        bookWoodFeedMaxDelay = 1 hours;
+        _runExpecting("PRE-FLIGHT: WOOD_USD_FEED holds no code");
+    }
+
+    /// @dev THE FORK SHAPE, and the reason the knob exists. With no TWAP oracle
+    ///      the ledger has no source a vnet can prime — but a Chainlink-shaped
+    ///      feed prices it fine, and pre-flight 8 passes on that alone. This is
+    ///      the configuration the Robinhood fork ceremony actually runs.
+    function test_deploy_pricesOffTheFeed_whenNoOracleCanBePrimed() public {
+        bookTwapOracle = address(0);
+        bookWoodUsdFeed = address(new MockAggregatorV3(8, int256(WOOD_MARKET_X8)));
+        bookWoodFeedMaxDelay = 1 hours;
+
+        _run();
+
+        ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
+        assertEq(ledger.woodTwapOracle(), address(0), "no oracle is wired on the fork shape");
+        assertEq(
+            ledger.woodPriceX8(),
+            (WOOD_MARKET_X8 * DeployPlanB(script).DEFAULT_WOOD_HAIRCUT_BPS()) / 10_000,
+            "the feed alone must carry the composed price, haircut applied"
+        );
+        (, bool fromFeed,) = ledger.woodPriceDetail();
+        assertTrue(fromFeed, "the composed price must be attributed to the feed");
+    }
+
+    /// @dev Both sources wired: the FEED wins and the oracle stays the fallback.
+    ///      Asserted because the two are seeded by separate env keys and an
+    ///      operator who wires both should know which one is being served.
+    function test_deploy_prefersTheFeed_whenBothSourcesAreWired() public {
+        // Deliberately different from `WOOD_MARKET_X8` so the assertion can tell
+        // the two sources apart rather than passing on a coincidence.
+        uint256 feedPriceX8 = WOOD_MARKET_X8 / 2;
+        bookWoodUsdFeed = address(new MockAggregatorV3(8, int256(feedPriceX8)));
+        bookWoodFeedMaxDelay = 1 hours;
+
+        _run();
+
+        ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
+        assertEq(ledger.woodTwapOracle(), bookTwapOracle, "the oracle stays wired as the fallback");
+        assertEq(
+            ledger.woodPriceX8(),
+            (feedPriceX8 * DeployPlanB(script).DEFAULT_WOOD_HAIRCUT_BPS()) / 10_000,
+            "the feed is the preferred source when both are present"
+        );
+    }
+
+    /// @dev The mainnet posture is unchanged by the new keys: leave both unset
+    ///      and no feed is wired at all. This is what proves the addition is
+    ///      inert for the ceremony that does not opt into it.
+    function test_deploy_wiresNoFeed_whenTheKeysAreUnset() public {
+        _run();
+
+        // `_woodFeed` is internal, so the observable proof that none was wired
+        // is the attribution on the composed price: it comes from the oracle.
+        ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
+        (, bool fromFeed,) = ledger.woodPriceDetail();
+        assertFalse(fromFeed, "an unset WOOD_USD_FEED must leave the ledger TWAP-only");
+    }
+
     // ── PRE-FLIGHT 9: a real haircut allowance must exist ──────────────────
 
     /// @dev THE LEDGER'S OWN DEFAULT IS THE FAILING VALUE, which is what makes
@@ -786,23 +883,27 @@ contract DeployPlanBPreflightTest is Test {
         bookFactory = factory_;
     }
 
-    function _book() internal view returns (DeployPlanB.AddressBook memory) {
-        return DeployPlanB.AddressBook({
-            swood: bookSwood,
-            factory: bookFactory,
-            registry: bookRegistry,
-            wood: address(wood),
-            usdg: address(usdg),
-            usdgFeed: address(usdgFeed),
-            feedMaxDelay: FEED_MAX_DELAY,
-            woodPriceCapX8: bookCapPriceX8,
-            woodHaircutBps: bookHaircutBps,
-            coveredTvlCapUsd: bookCap,
-            protocolConfig: address(protocolConfig),
-            maxStrategyDuration: bookMaxStrategyDuration,
-            woodTwapOracle: bookTwapOracle,
-            allowEoaLedgerOwner: bookAllowEoaLedgerOwner
-        });
+    /// @dev Field-by-field rather than one struct literal. The literal form put
+    ///      all sixteen values live on the stack at once and tripped solc's
+    ///      "1 too deep" under the default (non-IR) pipeline; assigning into an
+    ///      already-allocated memory struct keeps only one at a time.
+    function _book() internal view returns (DeployPlanB.AddressBook memory book) {
+        book.swood = bookSwood;
+        book.factory = bookFactory;
+        book.registry = bookRegistry;
+        book.wood = address(wood);
+        book.usdg = address(usdg);
+        book.usdgFeed = address(usdgFeed);
+        book.feedMaxDelay = FEED_MAX_DELAY;
+        book.woodPriceCapX8 = bookCapPriceX8;
+        book.woodHaircutBps = bookHaircutBps;
+        book.coveredTvlCapUsd = bookCap;
+        book.protocolConfig = address(protocolConfig);
+        book.maxStrategyDuration = bookMaxStrategyDuration;
+        book.woodTwapOracle = bookTwapOracle;
+        book.woodUsdFeed = bookWoodUsdFeed;
+        book.woodFeedMaxDelay = bookWoodFeedMaxDelay;
+        book.allowEoaLedgerOwner = bookAllowEoaLedgerOwner;
     }
 
     function _run() internal {

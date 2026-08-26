@@ -22,6 +22,7 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
 /// @dev Chainlink-shaped USD feed: fixed answer, `decimals`, fresh `updatedAt`.
 contract MockFeedSCT {
@@ -276,6 +277,7 @@ contract SettleCoverageSelfTriggerTest is Test {
                 address(registry),
                 address(protocolConfig),
                 address(this),
+                address(deployTierRegistry(address(this))),
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,
@@ -307,6 +309,13 @@ contract SettleCoverageSelfTriggerTest is Test {
         });
     }
 
+    /// @dev The settle leg is `approve(targetToken, 0)` — it moves nothing out,
+    ///      so every proposal here declares a ZERO settle cap.
+    ///      `requiredCoverage` sums the exec and settle legs, so declaring a
+    ///      full `MAX_CAPITAL` on both would bill twice the notional these
+    ///      proposals can move. It went unnoticed while the harness governors
+    ///      ran registry-less, where the flat tier-2 default ignores declared
+    ///      caps; the registry is mandatory at init since pashov finding #1.
     function _settleCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
@@ -327,7 +336,7 @@ contract SettleCoverageSelfTriggerTest is Test {
             exec,
             GovEnvelope.defaultCaps(MAX_CAPITAL, exec.length),
             settle,
-            GovEnvelope.defaultCaps(MAX_CAPITAL, settle.length),
+            GovEnvelope.defaultCaps(0, settle.length),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -702,7 +711,7 @@ contract SettleCoverageSelfTriggerTest is Test {
             exec,
             GovEnvelope.defaultCaps(MAX_CAPITAL, exec.length),
             settle,
-            GovEnvelope.defaultCaps(MAX_CAPITAL, settle.length),
+            GovEnvelope.defaultCaps(0, settle.length),
             coProposers
         );
 

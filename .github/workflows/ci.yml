@@ -41,8 +41,16 @@ jobs:
             cache
             out
           key: forge-${{ env.FOUNDRY_VERSION }}-${{ hashFiles('foundry.toml', 'src/**/*.sol', 'lib/**/*.sol', 'test/**/*.sol', 'script/**/*.sol') }}
-          restore-keys: |
-            forge-${{ env.FOUNDRY_VERSION }}-
+          # NO `restore-keys`, DELIBERATELY. A bare prefix fallback restores `out/`
+          # and `cache/` from whatever commit built last — in practice a cache keyed
+          # on `main` — and Foundry then compiles INCREMENTALLY against artifacts
+          # built from different sources. Under `via_ir` that changes the
+          # compilation-unit set and therefore the Yul stack allocation, which is
+          # how `post-audit` produced "Cannot swap ... too deep in the stack by 1
+          # slots" in `ConcentratedLiquidityVaultE2EFork.t.sol` while the same sha
+          # compiled clean on a cold build. Same sha, two runs, opposite results:
+          # the only difference was the restored cache. An exact-key miss now means
+          # a full clean build — slower, and correct.
 
       - name: Build
         run: forge build
@@ -84,8 +92,16 @@ jobs:
             cache
             out
           key: forge-coverage-${{ env.FOUNDRY_VERSION }}-${{ hashFiles('foundry.toml', 'src/**/*.sol', 'lib/**/*.sol', 'test/**/*.sol', 'script/**/*.sol') }}
-          restore-keys: |
-            forge-coverage-${{ env.FOUNDRY_VERSION }}-
+          # NO `restore-keys`, DELIBERATELY. A bare prefix fallback restores `out/`
+          # and `cache/` from whatever commit built last — in practice a cache keyed
+          # on `main` — and Foundry then compiles INCREMENTALLY against artifacts
+          # built from different sources. Under `via_ir` that changes the
+          # compilation-unit set and therefore the Yul stack allocation, which is
+          # how `post-audit` produced "Cannot swap ... too deep in the stack by 1
+          # slots" in `ConcentratedLiquidityVaultE2EFork.t.sol` while the same sha
+          # compiled clean on a cold build. Same sha, two runs, opposite results:
+          # the only difference was the restored cache. An exact-key miss now means
+          # a full clean build — slower, and correct.
 
       # `forge coverage` disables the optimizer and via_ir project-wide to keep
       # source maps accurate, and unoptimized legacy codegen blows the stack in
@@ -176,8 +192,16 @@ jobs:
             cache
             out
           key: forge-${{ env.FOUNDRY_VERSION }}-${{ hashFiles('foundry.toml', 'src/**/*.sol', 'lib/**/*.sol', 'test/**/*.sol', 'script/**/*.sol') }}
-          restore-keys: |
-            forge-${{ env.FOUNDRY_VERSION }}-
+          # NO `restore-keys`, DELIBERATELY. A bare prefix fallback restores `out/`
+          # and `cache/` from whatever commit built last — in practice a cache keyed
+          # on `main` — and Foundry then compiles INCREMENTALLY against artifacts
+          # built from different sources. Under `via_ir` that changes the
+          # compilation-unit set and therefore the Yul stack allocation, which is
+          # how `post-audit` produced "Cannot swap ... too deep in the stack by 1
+          # slots" in `ConcentratedLiquidityVaultE2EFork.t.sol` while the same sha
+          # compiled clean on a cold build. Same sha, two runs, opposite results:
+          # the only difference was the restored cache. An exact-key miss now means
+          # a full clean build — slower, and correct.
 
       # Runs `forge build` itself and relies on extra_output = ["storageLayout"]
       # being present in every artifact.
@@ -209,8 +233,16 @@ jobs:
             cache
             out
           key: forge-size-${{ env.FOUNDRY_VERSION }}-${{ hashFiles('foundry.toml', 'src/**/*.sol', 'lib/**/*.sol') }}
-          restore-keys: |
-            forge-size-${{ env.FOUNDRY_VERSION }}-
+          # NO `restore-keys`, DELIBERATELY. A bare prefix fallback restores `out/`
+          # and `cache/` from whatever commit built last — in practice a cache keyed
+          # on `main` — and Foundry then compiles INCREMENTALLY against artifacts
+          # built from different sources. Under `via_ir` that changes the
+          # compilation-unit set and therefore the Yul stack allocation, which is
+          # how `post-audit` produced "Cannot swap ... too deep in the stack by 1
+          # slots" in `ConcentratedLiquidityVaultE2EFork.t.sol` while the same sha
+          # compiled clean on a cold build. Same sha, two runs, opposite results:
+          # the only difference was the restored cache. An exact-key miss now means
+          # a full clean build — slower, and correct.
 
       # Robinhood Chain (4663, ArbOS) MaxCodeSize is 98,304 bytes (4x EIP-170).
       # `forge build --sizes` alone enforces the wrong limit (24,576), so apply

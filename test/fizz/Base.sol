@@ -34,6 +34,7 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
 import {MockWoodTwapOracle} from "../mocks/MockWoodTwapOracle.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Base contract with state variables and setup functions.
 ///
@@ -324,6 +325,7 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
                         address(registry),
                         address(protocolConfig),
                         address(fizzFactory),
+                        address(deployTierRegistry(address(this))),
                         ISyndicateGovernor.GovernorParams({
                             votingPeriod: VOTING_PERIOD,
                             executionWindow: EXECUTION_WINDOW,
