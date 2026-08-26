@@ -219,6 +219,21 @@ interface IGuardianRegistry {
     ///         `(0, 0)` if never registered.
     function reviewWindow(address governor, uint256 proposalId) external view returns (uint64 voteEnd, uint64 reviewEnd);
 
+    /// @notice The pause-shift baseline stamped into a review at `registerReview`
+    ///         (value of `pauseShiftTotal`, plus any pause in progress, at propose
+    ///         time). Exposed for the off-chain guardian daemon (SHE-167) so it can
+    ///         reproduce `_effNow` exactly instead of approximating the baseline as
+    ///         `0` (SHE-57 / PR#15). Combined with the public `pauseShiftTotal` /
+    ///         `paused` / `pausedAt` it lets an off-chain reader compute effNow for
+    ///         any review. `0` for a not-paused registration and for an unknown key.
+    function reviewClockShift(address governor, uint256 proposalId) external view returns (uint64 clockShiftAtRegister);
+
+    /// @notice The effective "now" the registry judges a review's window against,
+    ///         computed on-chain exactly as the resolution readers see it. One
+    ///         atomic read for the guardian daemon (SHE-167), avoiding the mirror
+    ///         math and the read-race across the pause fields.
+    function effectiveNowFor(address governor, uint256 proposalId) external view returns (uint256);
+
     /// @notice The vault served by an authorized governor (factory-wired at
     ///         `addGovernor`). `address(0)` if the governor is not authorized.
     function vaultOf(address governor) external view returns (address);

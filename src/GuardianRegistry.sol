@@ -468,6 +468,41 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         return (r.voteEnd, r.reviewEnd);
     }
 
+    /// @notice The pause-shift baseline stamped into a review at `registerReview`,
+    ///         i.e. the value of `pauseShiftTotal` (plus any pause in progress)
+    ///         as of propose time — see `Review.clockShiftAtRegister` and the
+    ///         stamping at `registerReview`.
+    /// @dev    Exposed for the off-chain guardian daemon (SHE-167). `_effNow`
+    ///         subtracts only the pause time accrued SINCE this baseline, so a
+    ///         reader that mirrors the on-chain effective clock (`clock.ts`) must
+    ///         know it exactly rather than approximate it as `0` (the safe
+    ///         over-credit fallback the daemon used per SHE-57 / PR#15). Combined
+    ///         with the already-public `pauseShiftTotal` / `paused` / `pausedAt`,
+    ///         this lets an off-chain reader reproduce `_effNow` for any review:
+    ///         `effNow = now - ((pauseShiftTotal + (paused ? now - pausedAt : 0)) - clockShiftAtRegister)`.
+    ///         `0` for a review registered while not paused (the common case) and
+    ///         for an unknown `(governor, proposalId)` — mirrors `reviewWindow`'s
+    ///         zero-for-unknown-key convention.
+    function reviewClockShift(address governor, uint256 proposalId)
+        external
+        view
+        returns (uint64 clockShiftAtRegister)
+    {
+        return _reviews[_reviewKey(governor, proposalId)].clockShiftAtRegister;
+    }
+
+    /// @notice The effective "now" the registry judges a review's window against,
+    ///         computed on-chain exactly as the resolution readers see it.
+    /// @dev    Convenience wrapper over the private `_effNow` for the guardian
+    ///         daemon (SHE-167): reading this in ONE atomic call yields the exact
+    ///         computed effective clock, eliminating the daemon's mirror math and
+    ///         the read-race between fetching `clockShiftAtRegister` and the live
+    ///         pause fields. For an unknown `(governor, proposalId)` the baseline
+    ///         is `0`, so this returns the wall-clock `_effNow(0)`.
+    function effectiveNowFor(address governor, uint256 proposalId) external view returns (uint256) {
+        return _effNow(_reviews[_reviewKey(governor, proposalId)].clockShiftAtRegister);
+    }
+
     /// @dev The instant a review's WINDOW is judged against: wall clock less
     ///      the registry downtime that accrued after this review's clock
     ///      started (pashov review finding #7). Every writer into a review
