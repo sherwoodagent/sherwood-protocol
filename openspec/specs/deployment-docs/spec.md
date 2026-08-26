@@ -3,9 +3,7 @@
 ## Purpose
 
 Requirements on the Sherwood deployment process: the mainnet-faithful Robinhood fork environment (Tenderly vnet, chain 9994663), the core deploy ceremony and its wiring order, the guardian-econ layered deployments (Plan B ledger, Plan D challenge game, TokenCourt) with their pre-flight checks, and chain-specific constraints. Scenarios are the verification steps an operator runs to prove each requirement held.
-
 ## Requirements
-
 ### Requirement: Chain targeting and fork identity
 The Robinhood mainnet deploy script SHALL refuse to run unless `block.chainid` is 4663 (Robinhood mainnet) or equals the value of `ROBINHOOD_FORK_CHAIN_ID` (e.g. 9994663 for the Tenderly vnet fork). The fork is mainnet-faithful: USDG stablecoin, official Uniswap v3+v4, Chainlink push feeds, real tokenized-stock liquidity, and the live WOOD token (`0xf8bc08092c06db6148114dcf82af881f1085f92b`, 18-dec, 1B supply, ownership renounced).
 
@@ -135,11 +133,23 @@ A full one-fund lifecycle (owner stake → fund create → deposit → strategy 
 - **THEN** it trips `StalePrice`; passing `--max-price-ages 2592000` (or refreshing `updatedAt`) clears it
 
 ### Requirement: Guardian-network simulation preconditions
-To make guardian blocking real (not the cold-start bypass), total staked guardian weight at review-open SHALL exceed `MIN_COHORT_STAKE_AT_OPEN` = 50,000 WOOD — e.g. ≥6 wallets staking 10,000 WOOD each. `agentId = 0` is acceptable (no agentRegistry on the fork). Guardians become active at `block.timestamp`, and checkpoints are read at `t−1`, so the operator SHALL advance time by ≥1s (`evm_increaseTime 1`) between staking and opening a review. Reviews snapshot cohort stake + `blockQuorumBps` at entry; 30% of cohort stake voting Block rejects the proposal, slashes approvers (WOOD burned), and attributes blockers for off-chain Merkl rewards. Vote-change is allowed until the final 10% of the window; approvers are capped at 100/proposal, blockers uncapped. Slash severity is the stake-weighted median of blockers' proposed `slashBps` clamped to sWOOD's `[minSlashBps, maxSlashBps]`; the own bond is the only slash leg (DPoS delegation removed/postponed 2026-07-26). `emergencySettleWithCalls` re-checks `requiredOwnerBond = max(minOwnerStake, MIN_OWNER_BOND_FLOOR = 1,000 WOOD)` at call time (TVL scaling is not implemented in V1 → flat 10k floor at the deployed `minOwnerStake`), and additionally requires the posted bond to be strictly positive. The Slash Appeal Reserve is NOT auto-seeded by the mainnet deploy override — the operator SHALL seed it post-deploy (`approve` + `registry.fundSlashAppealReserve`).
+To make guardian blocking real (not the cold-start bypass), total staked guardian weight at review-open SHALL exceed `MIN_COHORT_STAKE_AT_OPEN` = 50,000 WOOD — e.g. ≥6 wallets staking 10,000 WOOD each. `agentId = 0` is acceptable (no agentRegistry on the fork). Guardians become active at `block.timestamp`, and checkpoints are read at `t−1`, so the operator SHALL advance time by ≥1s (`evm_increaseTime 1`) between staking and opening a review.
+
+Clearing the cohort floor is necessary but NOT sufficient, because the two sides of the block-quorum comparison are measured differently: `cohortTooSmall` and the quorum denominator read `getPastTotalVotes`, which is RAW staked WOOD ("totals stay raw"), while a blocker's contribution reads `getPastVotes`, which applies `_ageFactorBps` on top. Fresh stake therefore counts in full against the bar it must clear and at only `ageFloorBps` (25%) toward clearing it. A cohort whose stake is all fresh cannot reach a 30% block quorum even at 100% participation — 0.25 × 60,000 = 15,000 against the 18,000 required. This asymmetry is deliberate: it denies an attacker a veto bought with stake parked seconds before the review. The operator SHALL therefore age the cohort before opening a review that is meant to be blocked, advancing time by at least `maturationPeriod × (blockQuorumBps − ageFloorBps) / (10 000 − ageFloorBps)` — 2 days at the fork's defaults (30 d, 30%, 25%) — and proportionally more when participation is partial.
+
+Reviews snapshot cohort stake + `blockQuorumBps` at entry; 30% of cohort stake voting Block rejects the proposal, slashes approvers (WOOD burned), and attributes blockers for off-chain Merkl rewards. Vote-change is allowed until the final 10% of the window; approvers are capped at 100/proposal, blockers uncapped. Slash severity is NOT voted: `voteOnProposal(address,uint256,GuardianVoteType)` carries no severity argument, and `_severityBps(Review storage)` derives it deterministically from the review — a quadratic ramp from `minSlashBps` to `maxSlashBps` that saturates at a 66.67% block supermajority, with the bounds snapshotted at `openReview` (stored plus one, so a genuine snapshot can never read as the unset sentinel) to deny an owner any mid-review re-rating. The own bond is the only slash leg (DPoS delegation removed/postponed 2026-07-26). `emergencySettleWithCalls` re-checks `requiredOwnerBond = max(minOwnerStake, MIN_OWNER_BOND_FLOOR = 1,000 WOOD)` at call time (TVL scaling is not implemented in V1 → flat 10k floor at the deployed `minOwnerStake`), and additionally requires the posted bond to be strictly positive. The Slash Appeal Reserve is NOT auto-seeded by the mainnet deploy override — the operator SHALL seed it post-deploy (`approve` + `registry.fundSlashAppealReserve`).
 
 #### Scenario: Cold-start floor cleared
 - **WHEN** six guardians each stake 10,000 WOOD and time advances 1s before a review opens
-- **THEN** cohort stake 60,000 > 50,000 makes blocking possible, and 30% of the snapshot voting Block rejects the proposal
+- **THEN** cohort stake 60,000 > 50,000 clears `cohortTooSmall`, so the review is votable rather than auto-cleared
+
+#### Scenario: Fresh cohort cannot reach the block quorum
+- **WHEN** all six guardians vote Block on a review opened 1s after staking
+- **THEN** their combined age-weighted weight is 15,000 against an 18,000 bar and the proposal is NOT rejected — the sim MUST advance time ≥2 days after staking for a block to be achievable
+
+#### Scenario: Aged cohort blocks
+- **WHEN** the operator advances `evm_increaseTime 172800` after staking and then opens the review
+- **THEN** `_ageFactorBps` has reached 30%, and 30% of the snapshot voting Block rejects the proposal and slashes approvers
 
 #### Scenario: Appeal without a seeded reserve
 - **WHEN** `refundSlash` is attempted before the Slash Appeal Reserve is funded
@@ -368,3 +378,4 @@ This is a TRUST-MODEL CHANGE and SHALL be documented as one in both the setter n
 #### Scenario: Short averaging window with a slow USD feed
 - **WHEN** the operator configures `twapWindow = 1 hour` alongside `ethUsdMaxDelay = 24 hours`
 - **THEN** the configuration is ACCEPTED — the two are independent by design, and coupling them would force a ~12-hour window and surrender the crash tracking the oracle exists to provide
+
