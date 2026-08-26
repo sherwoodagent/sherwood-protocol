@@ -699,8 +699,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     // ── Guardian review voting ──
 
     /// @inheritdoc IGuardianRegistry
-    /// @dev First-vote path OR vote-change. Requires `openReview` to have been
-    ///      called and `voteEnd <= now < reviewEnd`. Snapshots the caller's vote
+    /// @dev First-vote path OR vote-change. Requires `voteEnd <= now < reviewEnd`;
+    ///      a due-but-unopened review is auto-opened here (SHE-163) via the same
+    ///      `_openReview` body the keeper `openReview` uses, so an explicit
+    ///      `openReview` is no longer a precondition. Snapshots the caller's vote
     ///      weight at `r.openedAt`, growth-gated via `_growthGatedVoteWeight` so a
     ///      voter's own numerator weight cannot outrun the denominator's dilution
     ///      defense, and adds it to the chosen side's tally. Approvers and
@@ -713,19 +715,36 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
 
         bytes32 key = _reviewKey(governor, proposalId);
         Review storage r = _reviews[key];
-        if (!r.opened) revert ReviewNotOpen();
         // Defence in depth alongside `openReview`'s resolved guard: a resolved
         // review (cancelled, or already committed) accepts no further votes,
         // so no approve weight can accrue on a proposal that carries no slash
-        // risk. Unreachable while `openReview` refuses to re-open — kept so a
-        // future edit to either guard cannot silently arm the other.
+        // risk. Checked BEFORE the auto-open below so a resolved review can
+        // never be re-opened by a vote.
         if (r.resolved) revert ReviewNotOpen();
 
         // Pause-adjusted on both bounds — see `_effNow` (pashov review
         // finding #7). This is the writer whose `whenNotPaused` gate made the
         // window consumable in the first place.
         uint256 nowEff = _effNow(r.clockShiftAtRegister);
+        // The open window `[voteEnd, reviewEnd)` — the EXACT predicate this
+        // function already enforced. An unregistered review (`voteEnd == 0`),
+        // one before `voteEnd`, and one at/after `reviewEnd` all still revert
+        // `ReviewNotOpen`, unchanged.
         if (r.voteEnd == 0 || nowEff < r.voteEnd || nowEff >= r.reviewEnd) revert ReviewNotOpen();
+
+        // SHE-163: a due-but-unopened review auto-opens here instead of
+        // reverting `ReviewNotOpen`. Reaching this line already proves the
+        // review is registered, unresolved, and inside its open window — the
+        // genuinely-due case, and the ONLY case that opens. `openReview` is
+        // already permissionless, so no new timing freedom is granted:
+        // `totalStakeAtOpen` reads at propose-time (`snapshotAt`,
+        // opener-independent), the block-quorum and slash-envelope snapshots
+        // guard OWNER mutability (opener-independent), and `openedAt` at
+        // auto-open equals the voter's own instant — the earliest possible
+        // open, the same value a keeper racing `openReview` at the first
+        // opportunity would produce. `_openReview` emits `ReviewOpened` exactly
+        // once; a later vote lands with `r.opened == true` and re-emits nothing.
+        if (!r.opened) _openReview(r, proposalId);
 
         if (!swood.isActiveGuardian(msg.sender)) revert NotActiveGuardian();
 
@@ -1109,6 +1128,17 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // Pause-adjusted — see `_effNow` (pashov review finding #7).
         if (ve == 0 || _effNow(r.clockShiftAtRegister) < ve) revert ReviewNotOpen();
 
+        _openReview(r, proposalId);
+    }
+
+    /// @dev Snapshot-and-open body shared by the permissionless `openReview`
+    ///      keeper entrypoint and `voteOnProposal`'s SHE-163 auto-open path.
+    ///      EXACTLY the propose-time snapshot logic — no guard of its own: every
+    ///      caller MUST have already established that the review is registered,
+    ///      unresolved, not yet opened, and inside its open window. Sets
+    ///      `opened`, `totalStakeAtOpen`, `blockQuorumBpsAtOpen`, the slash
+    ///      envelope, `openedAt`, and emits `ReviewOpened` exactly once.
+    function _openReview(Review storage r, uint256 proposalId) private {
         IStakedWood sw = swood;
         // BOTH SIDES OF THE QUORUM COMPARISON ARE READ AT `r.snapshotAt`, the
         // propose-time instant — see `Review.snapshotAt` and the numerator read
