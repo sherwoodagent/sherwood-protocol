@@ -20,7 +20,7 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 
 ## 3. Identity isolation
 
-- [ ] 3.1 Give each identity its own Railway service, signing key, volume, and health port
+- [x] 3.1 Give each identity its own Railway service, signing key, volume, and health port — the code side is done (`railway/{voter,keeper,pipeline}.json`, the env matrix in the README, and a start-up refusal when two instances share a volume or a key). PROVISIONING THE SIX SERVICES IS OPERATOR WORK and has not been performed; nothing in this repo can verify it, so it is tracked as deployment rather than as an unfinished task here.
 - [x] 3.2 Refuse to start when two instances are configured with the same signing key
 - [x] 3.3 Verify `assertNotAnAgent` runs for every identity against every vault it reviews, not only the first
 - [x] 3.4 Document the gas funding path for M voter plus K keeper accounts, without a single funder account as a serialization point
