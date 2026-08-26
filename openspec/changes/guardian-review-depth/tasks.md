@@ -28,11 +28,11 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 
 ## 4. Control run and model
 
-- [ ] 4.1 Run the unwarped control simulation at fork state with no mocking, alongside the warped run
-- [ ] 4.2 Escalate verdict disagreement between the two runs into the unresolved band; abstain when the control run cannot complete
-- [ ] 4.3 Pass a `model` into `decide` from `src/index.ts` — the escalation tier exists in `judge.ts` and is unreachable today, so every warning-band proposal abstains
-- [ ] 4.4 Include both runs' evidence in the model's context, and keep the narrowing to Block or Abstain unchanged
-- [ ] 4.5 Unit-test that an unavailable model abstains and never falls through to the clean-path Approve
+- [x] 4.1 Run the unwarped control simulation at fork state with no mocking, alongside the warped run — `simulateProposalDual`; re-stamping is opt-out so the control arm sees real freshness
+- [x] 4.2 Escalate verdict disagreement between the two runs into the unresolved band; abstain when the control run cannot complete — `CONTROL_RUN_DISAGREED` warning; a control that cannot complete counts as disagreement, not corroboration
+- [ ] 4.3 Pass a `model` into `decide` from `src/index.ts` — the escalation tier exists in `judge.ts` and is unreachable today, so every warning-band proposal abstains — BLOCKED: the adjudicator was built and then reverted by another session in `sherwood-guardian` (7894e1d). Rebuilding it here would resurrect a feature its author withdrew; needs a decision first.
+- [ ] 4.4 Include both runs' evidence in the model's context, and keep the narrowing to Block or Abstain unchanged — BLOCKED: the adjudicator was built and then reverted by another session in `sherwood-guardian` (7894e1d). Rebuilding it here would resurrect a feature its author withdrew; needs a decision first.
+- [ ] 4.5 Unit-test that an unavailable model abstains and never falls through to the clean-path Approve — BLOCKED: the adjudicator was built and then reverted by another session in `sherwood-guardian` (7894e1d). Rebuilding it here would resurrect a feature its author withdrew; needs a decision first.
 
 ## 5. Calibration before enforcement
 
