@@ -233,11 +233,17 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
     }
 
+    /// @dev SHE-163: a DUE, registered, in-window review now auto-opens on the
+    ///      first vote instead of reverting, so this "not open" case retargets to
+    ///      an UNREGISTERED proposal (`voteEnd == 0`) — still a genuine
+    ///      `ReviewNotOpen`, and one auto-open must never satisfy. The
+    ///      due-review auto-open path is covered in `GuardianRegistryAutoOpenTest`.
     function test_voteOnProposal_revertsIfReviewNotOpen() public {
         address g = _guardian(0);
+        uint256 unregistered = PROPOSAL_ID + 999;
         vm.prank(g);
         vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), unregistered, IGuardianRegistry.GuardianVoteType.Approve);
     }
 
     function test_voteOnProposal_revertsAfterReviewEnd() public {
@@ -1299,3 +1305,250 @@ contract GuardianRegistryParamTest is RegistryTestHarness {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SHE-163: `voteOnProposal` auto-opens a due-but-unopened review instead of
+// reverting `ReviewNotOpen`. These tests pin (1) the auto-open only fires on the
+// genuinely-due case, (2) every currently-reverting case still reverts, (3) the
+// auto-open path produces byte-identical snapshot state to an explicit
+// `openReview`, and (4) `ReviewOpened` still emits exactly once and the
+// late-vote lockout still applies to the auto-opened first vote.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// @dev Test-only exposer: surfaces the packed at-open snapshot fields of a
+///      `Review` (no production getter exists for them) so the auto-open path
+///      can be asserted field-for-field against an explicit `openReview`.
+///      Storage layout is identical to `GuardianRegistry` — it only appends a
+///      view — so upgrading a live proxy to it is layout-safe.
+contract GuardianRegistryAutoOpenExposed is GuardianRegistry {
+    constructor(uint256 minReviewPeriod_) GuardianRegistry(minReviewPeriod_) {}
+
+    function exposeSnapshot(address gov, uint256 proposalId)
+        external
+        view
+        returns (
+            bool opened,
+            uint128 totalStakeAtOpen,
+            uint16 blockQuorumBpsAtOpen,
+            uint16 minSlashBpsAtOpen,
+            uint16 maxSlashBpsAtOpen,
+            uint64 openedAt
+        )
+    {
+        Review storage r = _reviews[keccak256(abi.encode(gov, proposalId))];
+        return
+            (r.opened, r.totalStakeAtOpen, r.blockQuorumBpsAtOpen, r.minSlashBpsAtOpen, r.maxSlashBpsAtOpen, r.openedAt);
+    }
+}
+
+contract GuardianRegistryAutoOpenTest is RegistryTestHarness {
+    uint256 constant REVIEW_PERIOD = 24 hours;
+    uint256 constant PROPOSAL_ID = 1;
+    uint256 constant PROPOSAL_ID_2 = 2;
+    uint256 voteEnd;
+    uint256 reviewEnd;
+
+    GuardianRegistryAutoOpenExposed exposed;
+
+    function setUp() public {
+        _deployRegistryAndSwood(REVIEW_PERIOD, 3000);
+
+        // Swap the proxy impl for the exposer (layout-identical, adds one view).
+        GuardianRegistryAutoOpenExposed impl = new GuardianRegistryAutoOpenExposed(6 hours);
+        vm.prank(regOwner);
+        registry.upgradeToAndCall(address(impl), "");
+        exposed = GuardianRegistryAutoOpenExposed(address(registry));
+
+        // 5 guardians × 10_000e18 = 50_000e18, matured to par so vote weight
+        // reads the full staked amount.
+        for (uint256 i = 0; i < 5; i++) {
+            _stakeGuardian(_guardian(i), 10_000e18, 1 + i);
+        }
+        skip(30 days);
+        // ToB C-1: open snapshots at `block.timestamp - 1`.
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        voteEnd = vm.getBlockTimestamp();
+        reviewEnd = voteEnd + REVIEW_PERIOD;
+        _registerReview(PROPOSAL_ID, voteEnd, reviewEnd);
+    }
+
+    function _guardian(uint256 i) internal pure returns (address) {
+        return address(uint160(0xAA00 + i + 1));
+    }
+
+    // ── (1) genuinely-due case auto-opens ──
+
+    /// @notice A guardian votes with NO prior `openReview`, inside
+    ///         `[voteEnd, reviewEnd)`: the review auto-opens, weight is tallied.
+    function test_voteAutoOpensDueReview() public {
+        (bool openedBefore,,,,,) = exposed.exposeSnapshot(address(governor), PROPOSAL_ID);
+        assertFalse(openedBefore, "precondition: review must start unopened");
+
+        address g = _guardian(0);
+        // `ReviewOpened` fires from the auto-open, then the vote is cast.
+        vm.expectEmit(true, false, false, true);
+        emit IGuardianRegistry.ReviewOpened(PROPOSAL_ID, 50_000e18);
+        vm.expectEmit(true, true, false, true);
+        emit IGuardianRegistry.GuardianVoteCast(PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Approve, 10_000e18);
+        vm.prank(g);
+        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+
+        (bool opened,,,,,) = exposed.exposeSnapshot(address(governor), PROPOSAL_ID);
+        assertTrue(opened, "review must be opened by the vote");
+        (address[] memory approvers, uint128[] memory weights, uint128 total) =
+            registry.getApproverWeights(address(governor), PROPOSAL_ID);
+        assertEq(approvers.length, 1, "one approver");
+        assertEq(approvers[0], g);
+        assertEq(weights[0], 10_000e18, "weight tallied");
+        assertEq(total, 10_000e18, "denominator tallied");
+    }
+
+    // ── (2) every currently-reverting case still reverts ──
+
+    /// @notice `nowEff < voteEnd`: still reverts `ReviewNotOpen`, no auto-open.
+    function test_voteBeforeVoteEndStillReverts() public {
+        _registerReview(PROPOSAL_ID_2, voteEnd + 1 hours, voteEnd + 1 hours + REVIEW_PERIOD);
+        address g = _guardian(0);
+        vm.prank(g);
+        vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
+        registry.voteOnProposal(address(governor), PROPOSAL_ID_2, IGuardianRegistry.GuardianVoteType.Approve);
+
+        (bool opened,,,,,) = exposed.exposeSnapshot(address(governor), PROPOSAL_ID_2);
+        assertFalse(opened, "must not auto-open before voteEnd");
+    }
+
+    /// @notice `nowEff >= reviewEnd`: still reverts `ReviewNotOpen`, no auto-open.
+    function test_voteAfterReviewEndStillReverts() public {
+        vm.warp(reviewEnd);
+        address g = _guardian(0);
+        vm.prank(g);
+        vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
+        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+
+        (bool opened,,,,,) = exposed.exposeSnapshot(address(governor), PROPOSAL_ID);
+        assertFalse(opened, "must not auto-open at/after reviewEnd");
+    }
+
+    /// @notice An already-resolved review (cancelled inside the window) still
+    ///         reverts and is never re-opened by a vote — the resolved guard
+    ///         fires ahead of the auto-open.
+    function test_voteOnResolvedReviewStillReverts() public {
+        // Cancel inside the window, before any keeper opened it: the
+        // never-opened short-circuit sets `resolved = true, opened = false`.
+        vm.prank(address(governor));
+        registry.cancelReview(PROPOSAL_ID);
+        (bool resolved,,) = _stateResolved(PROPOSAL_ID);
+        assertTrue(resolved, "precondition: review resolved, still in window");
+
+        address g = _guardian(0);
+        vm.prank(g);
+        vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
+        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+
+        (bool opened,,,,,) = exposed.exposeSnapshot(address(governor), PROPOSAL_ID);
+        assertFalse(opened, "resolved review must never re-open via a vote");
+    }
+
+    function _stateResolved(uint256 pid) internal view returns (bool resolved, bool opened, bool blocked) {
+        (opened, resolved, blocked) = registry.getReviewState(address(governor), pid);
+    }
+
+    // ── (3) auto-open == explicit openReview, field for field ──
+
+    /// @notice Two reviews registered at the SAME instant with identical stake:
+    ///         one opened explicitly-then-voted, the other auto-opened by the
+    ///         vote. Every at-open snapshot field is identical.
+    function test_autoOpenSnapshotEqualsExplicitOpen() public {
+        // Register the second review at the SAME block instant as the first
+        // (setUp already registered PROPOSAL_ID here), so `snapshotAt` matches.
+        _registerReview(PROPOSAL_ID_2, voteEnd, reviewEnd);
+
+        address g = _guardian(0);
+
+        // Path A — explicit openReview, then vote.
+        registry.openReview(address(governor), PROPOSAL_ID);
+        vm.prank(g);
+        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+
+        // Path B — auto-open via the vote, same block instant.
+        vm.prank(g);
+        registry.voteOnProposal(address(governor), PROPOSAL_ID_2, IGuardianRegistry.GuardianVoteType.Block);
+
+        (bool openedA, uint128 totalA, uint16 quorumA, uint16 minA, uint16 maxA, uint64 openedAtA) =
+            exposed.exposeSnapshot(address(governor), PROPOSAL_ID);
+        (bool openedB, uint128 totalB, uint16 quorumB, uint16 minB, uint16 maxB, uint64 openedAtB) =
+            exposed.exposeSnapshot(address(governor), PROPOSAL_ID_2);
+
+        assertTrue(openedA && openedB, "both opened");
+        assertEq(totalB, totalA, "totalStakeAtOpen identical");
+        assertEq(quorumB, quorumA, "blockQuorumBpsAtOpen identical");
+        assertEq(minB, minA, "minSlashBpsAtOpen identical");
+        assertEq(maxB, maxA, "maxSlashBpsAtOpen identical");
+        assertEq(openedAtB, openedAtA, "openedAt identical");
+
+        // Non-vacuity: the snapshots are actually populated, not both zero.
+        assertEq(totalA, 50_000e18, "totalStakeAtOpen populated");
+        assertEq(quorumA, 3000, "blockQuorumBpsAtOpen populated");
+        assertEq(openedAtA, uint64(voteEnd - 1), "openedAt == block.timestamp - 1");
+        // sWOOD envelope stored PLUS ONE (1000/9999 live -> 1001/10000 stored).
+        assertEq(minA, 1001, "minSlashBpsAtOpen populated (+1)");
+        assertEq(maxA, 10000, "maxSlashBpsAtOpen populated (+1)");
+    }
+
+    // ── (4) ReviewOpened emits exactly once; lockout still applies ──
+
+    /// @notice The auto-open emits `ReviewOpened` once; a second vote on the
+    ///         now-opened review emits NO `ReviewOpened`.
+    function test_reviewOpenedEmitsOnceAcrossAutoOpenThenSecondVote() public {
+        // First vote auto-opens — exactly one ReviewOpened.
+        vm.recordLogs();
+        vm.prank(_guardian(0));
+        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(_countReviewOpened(vm.getRecordedLogs()), 1, "auto-open emits ReviewOpened once");
+
+        // Second vote lands on the already-opened review — no ReviewOpened.
+        vm.recordLogs();
+        vm.prank(_guardian(1));
+        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(_countReviewOpened(vm.getRecordedLogs()), 0, "second vote emits no ReviewOpened");
+    }
+
+    function _countReviewOpened(Vm.Log[] memory logs) internal pure returns (uint256 n) {
+        bytes32 sig = IGuardianRegistry.ReviewOpened.selector;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics.length > 0 && logs[i].topics[0] == sig) n++;
+        }
+    }
+
+    /// @notice The late-vote lockout still bites an auto-opened FIRST vote cast
+    ///         inside the final tenth: the auto-open runs, then the lockout
+    ///         check (on the same `nowEff`) reverts and rolls the whole tx back.
+    function test_lateVoteLockoutAppliesToAutoOpenedFirstVote() public {
+        // lockoutStart = reviewEnd - REVIEW_PERIOD * 1000 / 10_000 = final tenth.
+        uint256 lockoutStart = reviewEnd - (REVIEW_PERIOD * registry.LATE_VOTE_LOCKOUT_BPS()) / 10_000;
+        vm.warp(lockoutStart);
+
+        address g = _guardian(0);
+        vm.prank(g);
+        vm.expectRevert(IGuardianRegistry.VoteChangeLockedOut.selector);
+        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+
+        // The reverted auto-open left no trace.
+        (bool opened,,,,,) = exposed.exposeSnapshot(address(governor), PROPOSAL_ID);
+        assertFalse(opened, "locked-out auto-open must roll back");
+    }
+
+    /// @notice Non-vacuity control for the lockout test: the SAME auto-open vote
+    ///         one second BEFORE lockoutStart succeeds and opens the review.
+    function test_lateVoteLockoutControl_justBeforeLockoutAutoOpens() public {
+        uint256 lockoutStart = reviewEnd - (REVIEW_PERIOD * registry.LATE_VOTE_LOCKOUT_BPS()) / 10_000;
+        vm.warp(lockoutStart - 1);
+
+        address g = _guardian(0);
+        vm.prank(g);
+        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve);
+
+        (bool opened,,,,,) = exposed.exposeSnapshot(address(governor), PROPOSAL_ID);
+        assertTrue(opened, "auto-open just before lockout must succeed");
+    }
+}
