@@ -28,7 +28,7 @@ Groups 1–7 are implemented in the `sherwood-guardian` repo; group 8 lands here
 
 - [x] 4.1 Add `src/ledger.ts` reading required coverage for a proposal plus the agent's free staked weight, with an explicit fail branch on empty returndata
 - [x] 4.2 Add `src/judge.ts` as a pure function from risk report plus coverage facts to `APPROVE | BLOCK | ABSTAIN`, with the deterministic gate ordered: simulation failure → block; any critical code → block; coverage over capacity or ceiling → abstain; clean and fully known → approve; otherwise escalate
-- [x] 4.3 Implement the model tier behind that escalation, narrowing any response to `BLOCK | ABSTAIN` and treating an approval-shaped response as abstain
+- [ ] 4.3 Implement the model tier behind that escalation, narrowing any response to `BLOCK | ABSTAIN` and treating an approval-shaped response as abstain — UNTICKED: `narrowModelVerdict` and the escalation branch exist, but there is no model tier. `src/model.ts` was reverted (7894e1d) and `decide` is called with no `model`. Marked done here while `guardian-review-depth` 4.3 called it blocked; same fact, two answers.
 - [x] 4.4 Add the achievable-block-weight computation and emit an unreachable-quorum result distinct from a cleared review
 - [x] 4.5 Unit-test the full gate table over fixture proposals, including that no model response can produce `APPROVE`, and that every unavailable input resolves to block or abstain
 
