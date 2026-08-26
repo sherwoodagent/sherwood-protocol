@@ -69,6 +69,19 @@ interface ICallSandbox is IStrategyDelivery {
     error DuplicateDeclaredToken(address token);
 
     /// @notice Emitted once per successful run, naming what was dispatched.
+    /// @dev    NAME COLLISION, DIFFERENT SIGNATURE: `ISyndicateVault` also
+    ///         declares a `SandboxRun` event with a different parameter list —
+    ///         `SandboxRun(uint256 indexed pid, address indexed sandbox, uint256 funding)`,
+    ///         emitted by the vault in the same `runSandbox` transaction. The
+    ///         topic0 hashes differ, so filters never conflate them: this one
+    ///         is keccak256("SandboxRun(address,uint256,uint256)") =
+    ///         0x2638b6715d6f2d6a21af38b137146ad55f2781d9619ff5ab49352058575b9565,
+    ///         the vault's is keccak256("SandboxRun(uint256,address,uint256)") =
+    ///         0x6fbfaa03c3db533cf914b5a5b997d8244b90daa0e259cf25627e7901d536dc16.
+    ///         Both contracts are already deployed on multiple networks, so
+    ///         neither event will be renamed. Indexers MUST bind by emitting
+    ///         address (this one fires from the per-proposal sandbox clone,
+    ///         the other from the vault), never by event name alone.
     event SandboxRun(address indexed vault, uint256 callCount, uint256 funded);
     /// @notice The sandbox returned assets to the vault.
     event SandboxSwept(uint256 assets);

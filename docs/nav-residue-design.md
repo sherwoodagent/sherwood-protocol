@@ -202,6 +202,49 @@ are recovered by `releaseUnconvertible` in a token the vault cannot attribute in
 asset terms, so the cohort under-recovers on that leg specifically. Counting it
 would require the oracle machinery non-negotiable #1 forbids.
 
+### The sandbox's under-declared leftover, on the redeem side (accepted — same gap, not a new one)
+
+`CallSandbox` bounds its residue reporting by the proposer's declared-token set:
+`undeliveredValue()` speaks only for the vault asset, and `hasUnvaluedResidue()`
+walks `_declaredTokens` only (`CallSandbox.sol`, "BOUNDED BY THE DECLARED SET").
+A token the proposer failed to declare is therefore stranded on the clone
+forever — `sweep()` never pushes it, `collectResidue` never measures an arrival
+for it, and no pricing read ever counts it. The deposit side documents that as
+the safe direction of error: never counted, so never over-charged to a minter.
+This section settles whether the reasoning survives the redeem side. It does,
+and the stranding is finding #3's accepted under-count residual, not a new gap:
+
+- **The senior floor is untouched.** A queued redeemer is paid the float-only
+  stamp, which never included the stranded token at any point in its life. They
+  are never paid less than today's guarantee, and never paid against phantom
+  value (non-negotiable #3, bias low).
+- **No cohort-vs-stayer transfer arises — which is what finding #3(b) actually
+  was.** The (b) harm was a TRANSFER: the leaver's shortfall accrued to the
+  stayers when the residue came home. An under-declared token never arrives for
+  ANYONE: `_payCohortShare` splits only measured balance-delta arrivals, so the
+  exiting cohort and the stayers forgo their `q : (1-q)` slices symmetrically.
+  The junior leg's promise — "floor plus your share of what physically
+  arrives" — is honored vacuously, and a redeeming LP is owed nothing the
+  machinery fails to pay.
+- **The principal loss is the ordinary in-envelope strategy loss, not a redeem
+  artifact.** The stranded value came out of the proposal's funded capital
+  (bounded by `maxCapital`, charged at full notional for coverage), and the
+  resulting pps drop is held to the declared drawdown envelope by the settle
+  price floor (`SyndicateGovernor._checkSettlePriceFloor`) — below the floor,
+  plain settle refuses and the bonded, reviewed emergency path takes over.
+  Every shareholder as of the stamp bears the loss pro rata, redeemers and
+  stayers alike.
+
+So "the proposer's own loss rather than the LPs'" is exact as a statement about
+ACCOUNTING direction — no LP is over-paid, over-charged, or paid at another
+LP's expense — and approximate as a statement about principal: the stranded
+principal is vault capital lost inside the envelope the vote approved, the same
+bucket as any other strategy loss the voters accepted. What the redeem
+machinery guarantees, and keeps guaranteeing here, is that stranding cannot
+re-open the (b) transfer: both payout legs spend only measured money, so an
+amount that never arrives is simply absent from every ledger rather than
+silently reassigned to whoever stayed.
+
 ---
 
 ## What shipped
