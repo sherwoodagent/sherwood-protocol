@@ -97,6 +97,14 @@ contract MockRegistryMinimal is IGuardianRegistry {
         revert NotImplemented();
     }
 
+    function reviewClockShift(address, uint256) external pure returns (uint64) {
+        revert NotImplemented();
+    }
+
+    function effectiveNowFor(address, uint256) external pure returns (uint256) {
+        revert NotImplemented();
+    }
+
     function vaultOf(address) external pure returns (address) {
         revert NotImplemented();
     }

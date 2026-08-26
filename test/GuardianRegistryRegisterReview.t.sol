@@ -27,6 +27,62 @@ contract GuardianRegistryRegisterReviewTest is RegistryTestHarness {
         assertEq(re, block.timestamp + 2 days);
     }
 
+    // --- SHE-167: expose the pause-shift baseline the daemon mirrors -----------
+
+    /// @notice The common case: a review registered while the registry is NOT
+    ///         paused stamps a zero baseline, so the getter reads `0` — exactly
+    ///         the value the daemon previously had to assume (SHE-57 / PR#15).
+    function test_reviewClockShift_zeroWhenRegisteredNotPaused() public {
+        vm.prank(address(governor));
+        registry.registerReview(1, block.timestamp + 1 days, block.timestamp + 2 days);
+        assertEq(registry.reviewClockShift(address(governor), 1), 0);
+        // effectiveNowFor with a zero baseline and no pause is plain wall clock.
+        assertEq(registry.effectiveNowFor(address(governor), 1), block.timestamp);
+    }
+
+    /// @notice A review registered MID-pause stamps the in-progress span, and the
+    ///         getter surfaces exactly that non-zero value — matching
+    ///         GuardianRegistry's stamping (`paused ? pauseShiftTotal + (now -
+    ///         pausedAt) : pauseShiftTotal`). Cross-checks that the surfaced value
+    ///         is the same baseline the contract's own `_effNow` math consumes, by
+    ///         reproducing `_effNow` off-chain against `effectiveNowFor`.
+    function test_reviewClockShift_stampsInProgressPauseSpan() public {
+        // Pause, then let 3h of outage elapse before the governor proposes.
+        vm.prank(regOwner);
+        registry.pause();
+        uint64 pausedAt = registry.pausedAt();
+        uint256 span = 3 hours;
+        vm.warp(block.timestamp + span);
+
+        // registerReview is the one review-clock writer without `whenNotPaused`,
+        // so it lands during the pause.
+        vm.prank(address(governor));
+        registry.registerReview(2, block.timestamp + 1 days, block.timestamp + 2 days);
+
+        // pauseShiftTotal is still 0 (advanced only by unpause), so the stamped
+        // baseline is exactly the in-progress span.
+        uint64 baseline = registry.reviewClockShift(address(governor), 2);
+        assertEq(baseline, uint64(block.timestamp - uint256(pausedAt)));
+        assertEq(baseline, uint64(span));
+        assertGt(baseline, 0);
+
+        // Cross-check: the value the getter returns is the SAME baseline the
+        // contract's lockout math (`_effNow`) uses. Reproduce `_effNow` off-chain
+        // from the public fields and assert it equals the on-chain `effectiveNowFor`.
+        uint256 total = uint256(registry.pauseShiftTotal())
+            + (registry.paused() ? block.timestamp - uint256(registry.pausedAt()) : 0);
+        uint256 expectedEffNow = block.timestamp - (total - uint256(baseline));
+        assertEq(registry.effectiveNowFor(address(governor), 2), expectedEffNow);
+    }
+
+    /// @notice Unknown `(governor, proposalId)` reads `0` — mirrors
+    ///         `reviewWindow`'s zero-for-unknown-key convention (no revert).
+    function test_reviewClockShift_zeroForUnknownKey() public {
+        assertEq(registry.reviewClockShift(address(governor), 999), 0);
+        // effectiveNowFor(unknown) uses a zero baseline => wall clock (no pause).
+        assertEq(registry.effectiveNowFor(address(governor), 999), block.timestamp);
+    }
+
     function test_registerReview_revertsForNonGovernor() public {
         vm.prank(address(0xBEEF));
         vm.expectRevert(IGuardianRegistry.UnauthorizedGovernor.selector);
