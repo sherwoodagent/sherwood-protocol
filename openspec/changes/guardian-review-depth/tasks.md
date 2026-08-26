@@ -9,13 +9,13 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 
 ## 2. Lifecycle harness
 
-- [ ] 2.1 Vendor the protocol ABIs the harness needs (`SyndicateGovernor`, `GuardianRegistry`, `SyndicateVault`) as a submodule rather than hand-written interfaces, so a shape divergence fails to compile instead of returning empty data
+- [ ] 2.1 Vendor the protocol ABIs the harness needs (`SyndicateGovernor`, `GuardianRegistry`, `SyndicateVault`) as a submodule rather than hand-written interfaces, so a shape divergence fails to compile instead of returning empty data — HELD: the harness uses narrow hand-written interfaces for now; vendoring the protocol as a submodule is a bigger change than this branch should carry.
 - [x] 2.2 Rewrite `foundry/test/SimulateProposal.t.sol` to drive `openReview`, `resolveReview`, `executeProposal`, and `settleProposal` in sequence, modelled on `test/governor/ProposalLifecycle.t.sol` in the protocol repo — `foundry/test/LifecycleSimulation.t.sol`; settle leg verified against a live Executed proposal. Execute leg still needs a fork pinned before voteEnd
 - [x] 2.3 Advance `block.timestamp` by `strategyDuration` and `block.number` by a per-chain blocks-per-second constant between the execute and settle legs
 - [x] 2.4 Refuse to start when no blocks-per-second constant is configured for the connected chain — `BLOCKS_PER_SECOND` is required, not defaulted
 - [x] 2.5 Add `vm.mockCall` restamping of each consulted feed's `latestRoundData`, preserving the answer and setting `updatedAt` to the current timestamp — 16 feeds re-stamped before and after the warp, answers preserved
 - [x] 2.6 Emit the invariant measurements — capital snapshot, `totalAssets()` after settlement, residual allowances, residual non-asset balances, native balance — as parseable log lines — `INV ` lines for snapshot, totalAssets, asset balance, native, residual tokens and allowances. Snapshot is captured BEFORE settlement, which clears it — plus `INV spendersChecked`/`tokensChecked` counts and an `INV END` sentinel, so a truncated log cannot read as clean
-- [ ] 2.7 Retire the pranked raw-call path only after group 5 confirms verdict parity
+- [ ] 2.7 Retire the pranked raw-call path only after group 5 confirms verdict parity — HELD by design: retirement waits on 5.1 parity.
 
 ## 3. Carry the measurements into the verdict
 
@@ -36,13 +36,13 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 
 ## 5. Calibration before enforcement
 
-- [ ] 5.1 Run the lifecycle harness and the existing harness side by side across every proposal on the vnet, and diff the verdicts
-- [ ] 5.2 Collect the round-trip cost distribution for honest proposals and derive `maxDrawdownBps` from it
-- [ ] 5.3 Promote residual allowance, residual balance, native imbalance, and non-vault beneficiary to critical once each has fired zero false positives across the collected set
-- [ ] 5.4 Promote the capital-shortfall code to critical only after `maxDrawdownBps` is measured, not before
-- [ ] 5.5 Record the calibration data and the resulting bounds in the guardian repo's README so the numbers are auditable rather than folklore
+- [ ] 5.1 Run the lifecycle harness and the existing harness side by side across every proposal on the vnet, and diff the verdicts — partial: the lifecycle harness runs both arms, but the pranked harness is a different test entrypoint so a verdict-for-verdict diff needs both wired into one run.
+- [x] 5.2 Collect the round-trip cost distribution for honest proposals and derive `maxDrawdownBps` from it — three samples on vnet 9994663: 113 bps at 6h, 122 at 12h, 130 at 24h. Duration and basket are confounded across them, so the trend is not attributable
+- [ ] 5.3 Promote residual allowance, residual balance, native imbalance, and non-vault beneficiary to critical once each has fired zero false positives across the collected set — HELD: promotion needs a sample that isolates duration from basket; three confounded points is not a distribution.
+- [ ] 5.4 Promote the capital-shortfall code to critical only after `maxDrawdownBps` is measured, not before — HELD: promotion needs a sample that isolates duration from basket; three confounded points is not a distribution.
+- [x] 5.5 Record the calibration data and the resulting bounds in the guardian repo's README so the numbers are auditable rather than folklore — recorded in the guardian README as a table, including what the sample does NOT establish
 
 ## 6. Reconcile the parent change
 
-- [ ] 6.1 Tick the tasks in `autonomous-guardian-agent` that `sherwood-guardian` already implements — groups 2 through 5 are live in the code and unticked in the file
-- [ ] 6.2 Note in that change that `openReview` and `resolveReview` exist in `src/signer.ts` but are never called from `src/index.ts`, which `guardian-fleet` resolves by moving them to a keeper
+- [x] 6.1 Tick the tasks in `autonomous-guardian-agent` that `sherwood-guardian` already implements — groups 2 through 5 are live in the code and unticked in the file — groups 2-5 ticked after checking each against the source, not assumed from the commit log
+- [x] 6.2 Note in that change that `openReview` and `resolveReview` exist in `src/signer.ts` but are never called from `src/index.ts`, which `guardian-fleet` resolves by moving them to a keeper — noted on task 5.3 of that change: `signer.ts` had all three actions, `index.ts` only called `castVote`

@@ -8,33 +8,37 @@ Groups 1–7 are implemented in the `sherwood-guardian` repo; group 8 lands here
 
 ## 2. Chain-agnostic configuration
 
-- [ ] 2.1 Replace the hardcoded `CHAINS` map in `src/chains.ts` with a loader over the committed `chains/<chainId>.json` address books, keeping the `ChainConfig` shape
-- [ ] 2.2 Vendor or fetch `chains/9994663.json` into the image, and refuse start-up when no address book exists for the connected chain id
-- [ ] 2.3 Derive the `known` target set from every address-valued key in the book, so an unknown target means "not sanctioned by the deploy ceremony"
-- [ ] 2.4 Unit-test that a target absent from the book classifies as unknown and that an unsupported chain id refuses start-up
+> Reconciled 2026-08-26 (`guardian-review-depth` task 6.1). Groups 2-5 were
+> implemented in `sherwood-guardian` and left unticked here; each line below was
+> checked against the source before ticking, not assumed from the commit log.
+
+- [x] 2.1 Replace the hardcoded `CHAINS` map in `src/chains.ts` with a loader over the committed `chains/<chainId>.json` address books, keeping the `ChainConfig` shape
+- [x] 2.2 Vendor or fetch `chains/9994663.json` into the image, and refuse start-up when no address book exists for the connected chain id
+- [x] 2.3 Derive the `known` target set from every address-valued key in the book, so an unknown target means "not sanctioned by the deploy ceremony"
+- [x] 2.4 Unit-test that a target absent from the book classifies as unknown and that an unsupported chain id refuses start-up
 
 ## 3. Review discovery across per-vault governors
 
-- [ ] 3.1 Extend `src/watcher.ts` to index `ReviewRegistered(address indexed governor, uint256 indexed proposalId, uint64 voteEnd, uint64 reviewEnd)` and persist the proposal-to-governor map
-- [ ] 3.2 Join `ReviewOpened(uint256 indexed proposalId, uint128 totalStakeAtOpen)` to its governor via that map; drop `GOVERNOR_ADDRESS` from required configuration
-- [ ] 3.3 Replace all local-clock deadline arithmetic with reads of block timestamp and the on-chain `reviewWindow`
-- [ ] 3.4 Unit-test governor resolution for a governor first seen at registration, and abstention when chain time has passed `reviewEnd`
+- [x] 3.1 Extend `src/watcher.ts` to index `ReviewRegistered(address indexed governor, uint256 indexed proposalId, uint64 voteEnd, uint64 reviewEnd)` and persist the proposal-to-governor map
+- [x] 3.2 Join `ReviewOpened(uint256 indexed proposalId, uint128 totalStakeAtOpen)` to its governor via that map; drop `GOVERNOR_ADDRESS` from required configuration
+- [x] 3.3 Replace all local-clock deadline arithmetic with reads of block timestamp and the on-chain `reviewWindow`
+- [x] 3.4 Unit-test governor resolution for a governor first seen at registration, and abstention when chain time has passed `reviewEnd`
 
 ## 4. Coverage and verdict pipeline
 
-- [ ] 4.1 Add `src/ledger.ts` reading required coverage for a proposal plus the agent's free staked weight, with an explicit fail branch on empty returndata
-- [ ] 4.2 Add `src/judge.ts` as a pure function from risk report plus coverage facts to `APPROVE | BLOCK | ABSTAIN`, with the deterministic gate ordered: simulation failure → block; any critical code → block; coverage over capacity or ceiling → abstain; clean and fully known → approve; otherwise escalate
-- [ ] 4.3 Implement the model tier behind that escalation, narrowing any response to `BLOCK | ABSTAIN` and treating an approval-shaped response as abstain
-- [ ] 4.4 Add the achievable-block-weight computation and emit an unreachable-quorum result distinct from a cleared review
-- [ ] 4.5 Unit-test the full gate table over fixture proposals, including that no model response can produce `APPROVE`, and that every unavailable input resolves to block or abstain
+- [x] 4.1 Add `src/ledger.ts` reading required coverage for a proposal plus the agent's free staked weight, with an explicit fail branch on empty returndata
+- [x] 4.2 Add `src/judge.ts` as a pure function from risk report plus coverage facts to `APPROVE | BLOCK | ABSTAIN`, with the deterministic gate ordered: simulation failure → block; any critical code → block; coverage over capacity or ceiling → abstain; clean and fully known → approve; otherwise escalate
+- [x] 4.3 Implement the model tier behind that escalation, narrowing any response to `BLOCK | ABSTAIN` and treating an approval-shaped response as abstain
+- [x] 4.4 Add the achievable-block-weight computation and emit an unreachable-quorum result distinct from a cleared review
+- [x] 4.5 Unit-test the full gate table over fixture proposals, including that no model response can produce `APPROVE`, and that every unavailable input resolves to block or abstain
 
 ## 5. Signing and posture gate
 
-- [ ] 5.1 Add `GUARDIAN_MODE` (`observe` | `defend` | `autonomous`), defaulting to `observe`, and refuse `autonomous` unless the RPC-reported chain id is 9994663
-- [ ] 5.2 Refuse start-up when the agent's signing address is a registered agent on a vault it would review
-- [ ] 5.3 Add `src/signer.ts` sending `openReview`, `resolveReview`, and `voteOnProposal`, reading on-chain review state immediately before each vote and skipping when a vote from this address already exists
-- [ ] 5.4 Enforce the late-vote lockout and the per-proposal coverage ceiling at the signer boundary as well as in the judge
-- [ ] 5.5 Unit-test that `observe` issues no `eth_sendRawTransaction`, and that `autonomous` on chain 4663 or 8453 exits non-zero
+- [x] 5.1 Add `GUARDIAN_MODE` (`observe` | `defend` | `autonomous`), defaulting to `observe`, and refuse `autonomous` unless the RPC-reported chain id is 9994663
+- [x] 5.2 Refuse start-up when the agent's signing address is a registered agent on a vault it would review
+- [x] 5.3 Add `src/signer.ts` sending `openReview`, `resolveReview`, and `voteOnProposal`, reading on-chain review state immediately before each vote and skipping when a vote from this address already exists — NOTE: `signer.ts` had all three, but `index.ts` only ever called `castVote`, so the two keeper actions were unreachable and no review ever opened. Wired by `guardian-fleet`'s keeper role (task 6.2)
+- [x] 5.4 Enforce the late-vote lockout and the per-proposal coverage ceiling at the signer boundary as well as in the judge
+- [x] 5.5 Unit-test that `observe` issues no `eth_sendRawTransaction`, and that `autonomous` on chain 4663 or 8453 exits non-zero
 
 ## 6. Container and deployment
 
