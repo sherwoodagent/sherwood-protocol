@@ -3,7 +3,7 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 ## 1. Prove the warp before building on it
 
 - [x] 1.1 Take one real proposal on the vnet and run `openReview` → warp to `reviewEnd` → `resolveReview` → `executeProposal` → warp `strategyDuration` → `settleProposal` on a fork with no oracle mocking; record what reverts first — ran on vnet 9994663, governor 0xFBeC18B3 pid 3. The warp works: settleProposal succeeded through the real entrypoint
-- [x] 1.2 Confirm the expected failure is `StalePrice()` from `PortfolioStrategy`, and enumerate every other staleness or freshness check reached during the run — `StalePrice()` did NOT fire, because the feeds were re-stamped. 16 Chainlink feeds are reached; the vnet clock is ~154 days ahead of wall time, so they are already stale by the chain's own clock before any warp
+- [x] 1.2 Confirm the expected failure is `StalePrice()` from `PortfolioStrategy`, and enumerate every other staleness or freshness check reached during the run — **CORRECTED**: `StalePrice()` does not fire, and the earlier note here was wrong about why. Re-running the same proposal with `RESTAMP_FEEDS=false` settles identically (same `totalAssetsAfter`), so the settle path of these strategies reaches no staleness-checked feed at all. Re-stamping is currently unexercised rather than load-bearing, and the control arm has produced no disagreement on any proposal measured so far. A settle leg that DOES price through an oracle is still untested.
 - [x] 1.3 Measure the capital round trip for that proposal — `totalAssets()` after settlement against `getCapitalSnapshot` — to get a first data point for the drawdown bound — capital snapshot 1_500_000_000 vs totalAssets 1_482_919_917 after settlement: a 17_080_083 shortfall, ~114 bps. One sample, not a distribution
 - [x] 1.4 Record whether `vm.warp` alone breaks anything beyond oracle freshness; if it does, stop and re-scope before group 2 — nothing broke beyond oracle freshness. Group 2 proceeds
 
@@ -36,7 +36,7 @@ All groups land in the `sherwood-guardian` repo. This repo carries the spec only
 
 ## 5. Calibration before enforcement
 
-- [ ] 5.1 Run the lifecycle harness and the existing harness side by side across every proposal on the vnet, and diff the verdicts — partial: the lifecycle harness runs both arms, but the pranked harness is a different test entrypoint so a verdict-for-verdict diff needs both wired into one run.
+- [x] 5.1 Run the lifecycle harness and the existing harness side by side across every proposal on the vnet, and diff the verdicts — `simulateBothHarnesses` runs both; the daemon now defaults to the lifecycle harness, which it previously did NOT (it invoked the legacy pranked replay while parsing INV lines the legacy harness never emits)
 - [x] 5.2 Collect the round-trip cost distribution for honest proposals and derive `maxDrawdownBps` from it — three samples on vnet 9994663: 113 bps at 6h, 122 at 12h, 130 at 24h. Duration and basket are confounded across them, so the trend is not attributable
 - [ ] 5.3 Promote residual allowance, residual balance, native imbalance, and non-vault beneficiary to critical once each has fired zero false positives across the collected set — HELD: promotion needs a sample that isolates duration from basket; three confounded points is not a distribution.
 - [ ] 5.4 Promote the capital-shortfall code to critical only after `maxDrawdownBps` is measured, not before — HELD: promotion needs a sample that isolates duration from basket; three confounded points is not a distribution.
