@@ -603,6 +603,32 @@ not just one deployment's configuration. Only certify a template where:
 
 Step 3 is what **replaces `setAdapterAllowed(clone, true)` per proposal**.
 
+### Anchor-only certification: opening the allowlist without pricing the call
+
+The class **anchor** that step 3 requires is keyed on the clone codehash alone,
+not on the selector (`certifyClass` writes `_classAnchors[cch]`). So certifying
+**one** selector opens the allowlist for every clone while every *other* selector
+keeps resolving to the uncertified `(tier 2, 10_000 bps)` default.
+
+That is the only way to express "allowlisted, but priced as an uncertified
+full-notional call" — `proposeClassCertification` rejects `tier >= 2` and a bound
+of `0` or `>= 10_000`, so tier 2 / full notional is never something you *grant*,
+only something you decline to override.
+
+Use it when a template is structurally certifiable (every external address bound,
+plain `Clones.clone`, not a proxy) but its money-moving selectors have no honest
+extractable bound — a call that hands the whole declared cap to an off-chain
+venue, say. Certify an inert selector: `pure`, no state, no transfer.
+`IStrategy.name()` is the one `LighterPerpStrategy` uses, at tier 0 / bound 1,
+and `script/DeployLighterTemplate.s.sol` is the worked example.
+
+Two consequences to plan for. `demoteClass(template, execute())` reverts
+`ClassNotCertified` — there is nothing to demote, the selector is already at the
+floor; the rollback lever is `setClassAllowed(template, false)` (sequenced as
+below) plus `demoteClass` on the anchor selector. And `envelopeTier` is pinned at
+2, so the proposal always faces the approve quorum and the `tier2CallCapBps`
+ceiling.
+
 ### Verification reads
 
 ```

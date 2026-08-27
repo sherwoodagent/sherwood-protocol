@@ -59,15 +59,22 @@ import {INonfungiblePositionManager} from "../../../src/vendor/uniswap/INonfungi
  *       (~1.89M USDG lendable — the 7k borrowed here is noise against it)
  *
  *  ── Fork clock ────────────────────────────────────────────────────────────
- *     The Tenderly vnet's `block.timestamp` (1,783,526,915) lags the state it
- *     serves: the Chainlink feeds report `updatedAt` 1,786,562,123 and this
- *     Morpho market's `lastUpdate` is 1,786,576,990, LATER still. The harness
- *     `_normalizeFeedClock()` only warps past the feeds, which leaves
- *     `block.timestamp < market.lastUpdate` — and Morpho's `_accrueInterest`
- *     computes `block.timestamp - lastUpdate` unchecked-of-nothing, so every
- *     `supplyCollateral`/`borrow` would panic 0x11. `setUp` below warps past the
+ *     A fork clock behind this Morpho market's `lastUpdate` panics 0x11 on
+ *     every `supplyCollateral`/`borrow`: `_accrueInterest` computes
+ *     `block.timestamp - lastUpdate` with nothing guarding the subtraction. The
+ *     harness `_normalizeFeedClock()` only warps past the Chainlink feeds, and
+ *     `lastUpdate` can be LATER than any feed, so `setUp` below warps past the
  *     market clock too. Forward-only (`vm.warp` backwards is a no-op in forge
  *     1.7.1) and idempotent on a fork whose clock is already ahead.
+ *
+ *     Measured 2026-08-22, after the 2026-08-19 vnet re-mint:
+ *       Tenderly vnet 9994663  block.timestamp 1,788,363,814
+ *       public 4663 at latest  block.timestamp 1,787,435,394
+ *       market lastUpdate                      1,787,433,772
+ *       Chainlink ETH/USD updatedAt            1,787,434,790
+ *     Both endpoints now lead both clocks, so both warps are currently inert.
+ *     That is a property of the CURRENT vnet, not a guarantee — a vnet minted
+ *     from older state brings the lag straight back, so the warps stay.
  *
  * @dev Run:
  *        set -a; source .env; set +a

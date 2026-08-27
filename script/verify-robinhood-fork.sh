@@ -75,16 +75,49 @@ check "config.protocolFeeRecipient"   "$(call "$CONFIG" 'protocolFeeRecipient()(
 check "config.guardiansFeeRecipient"  "$(call "$CONFIG" 'guardiansFeeRecipient()(address)')" "$DEPLOYER"
 
 echo; echo "── Strategy templates (the allowlist IS _templateKeys) ──"
-for t in PORTFOLIO_TEMPLATE MORPHO_SUPPLY_TEMPLATE CONCENTRATED_LIQUIDITY_TEMPLATE; do
+# CODE FIRST, THEN APPROVAL. `setTemplateApproval` does not check that its
+# argument is a contract, so a broadcast whose CREATE landed on a different
+# nonce than the simulation assumed (the `--slow` failure mode — see
+# DeployLighterTemplate's header) leaves the factory approving a CODELESS
+# address while the address book records it. `approvedTemplate` alone reads
+# `true` for that state; a codesize probe is what names it.
+for t in PORTFOLIO_TEMPLATE MORPHO_SUPPLY_TEMPLATE CONCENTRATED_LIQUIDITY_TEMPLATE LIGHTER_PERP_TEMPLATE; do
+  TADDR=$(a $t)
+  TSIZE=$(cast codesize "$TADDR" --rpc-url "$RPC" 2>/dev/null)
+  if [ -n "$TSIZE" ] && [ "$TSIZE" != "0" ]; then
+    printf '  \033[32mok\033[0m   %-46s %s bytes\n' "$t holds code" "$TSIZE"; PASS=$((PASS+1))
+  else
+    printf '  \033[31mFAIL\033[0m %-46s %s is CODELESS (phantom deploy)\n' "$t holds code" "$TADDR"; FAIL=$((FAIL+1))
+  fi
   check "strategyFactory.approved($t)" \
-    "$(cast call "$SFACTORY" 'approvedTemplate(address)(bool)' "$(a $t)" --rpc-url "$RPC" 2>/dev/null)" "true"
+    "$(cast call "$SFACTORY" 'approvedTemplate(address)(bool)' "$TADDR" --rpc-url "$RPC" 2>/dev/null)" "true"
 done
 
 echo; echo "── TierRegistry launch set (empty registry ⇒ every clone-init reverts) ──"
-for c in UNISWAP_V3_POSITION_MANAGER UNISWAP_V3_FACTORY MORPHO_BLUE; do
+for c in UNISWAP_V3_POSITION_MANAGER UNISWAP_V3_FACTORY MORPHO_BLUE ZK_LIGHTER; do
   check "tiers.counterpartyAllowed($c)" \
     "$(cast call "$TIERS" 'isCounterpartyAllowed(address)(bool)' "$(a $c)" --rpc-url "$RPC" 2>/dev/null)" "true"
 done
+
+# The Lighter template is INERT without both of these: `_initialize` binds
+# ZK_LIGHTER through `isCounterpartyAllowed` (above), and clones stay at the
+# uncertified tier-2 default until the class axis is open. See
+# DeployLighterTemplate's `finalize()`.
+check "tiers.isClassAllowed(LIGHTER_PERP_TEMPLATE)" \
+  "$(cast call "$TIERS" 'isClassAllowed(address)(bool)' "$(a LIGHTER_PERP_TEMPLATE)" --rpc-url "$RPC" 2>/dev/null)" "true"
+# AND THE MONEY-MOVING SELECTORS MUST STAY UNCERTIFIED. `isClassAllowed` alone
+# passes identically whether the anchor was minted off the inert `name()` (the
+# ceremony's choice: execute()/settle() price at the tier-2 / full-notional
+# default) or off `execute()` itself at some bounded tier — and the second
+# reading is a guardian cohort underwriting a fraction of what actually leaves
+# for the venue. The `(2, 10000)` pair is the only read that tells them apart.
+# 0x61461954 = execute(), 0x11da60b4 = settle(), 0x06fdde03 = name() (the anchor).
+check "tiers.classTierOf(LIGHTER, execute) == 2/10000 (UNCERTIFIED)" \
+  "$(cast call "$TIERS" 'classTierOf(address,bytes4)(uint8,uint16)' "$(a LIGHTER_PERP_TEMPLATE)" 0x61461954 --rpc-url "$RPC" 2>/dev/null | tr '\n' ' ' | awk '{print $1"/"$2}')" "2/10000"
+check "tiers.classTierOf(LIGHTER, settle)  == 2/10000 (UNCERTIFIED)" \
+  "$(cast call "$TIERS" 'classTierOf(address,bytes4)(uint8,uint16)' "$(a LIGHTER_PERP_TEMPLATE)" 0x11da60b4 --rpc-url "$RPC" 2>/dev/null | tr '\n' ' ' | awk '{print $1"/"$2}')" "2/10000"
+check "tiers.classTierOf(LIGHTER, name)    == 0/1 (the ANCHOR)" \
+  "$(cast call "$TIERS" 'classTierOf(address,bytes4)(uint8,uint16)' "$(a LIGHTER_PERP_TEMPLATE)" 0x06fdde03 --rpc-url "$RPC" 2>/dev/null | tr '\n' ' ' | awk '{print $1"/"$2}')" "0/1"
 
 echo; echo "── Plan B ──"
 check "swood.exposureLedger (exit gate armed)" "$(call "$SWOOD" 'exposureLedger()(address)')" "$LEDGER"

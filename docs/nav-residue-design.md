@@ -1,7 +1,9 @@
 # Strategy-held value and the vault's pricing (finding #3)
 
 Status: **BOTH halves are implemented. The attack half in PR #243, the
-fairness half in PR #245. Issue #233 is closed.** This file is kept as the
+fairness half in PR #245.** The mechanism of (a) is gone; a bounded RESIDUAL of
+it is measurably still open, at roughly 1/34,600 of the original size — see
+"(a) The skim" below before treating this as finished. This file is kept as the
 design record: the trap in the middle is a live hazard for anyone touching the
 settle stamp, and the non-negotiables still bind any future change here.
 
@@ -10,7 +12,11 @@ mechanisms:
 
 - **(a) the skim** — a depositor mints against a price that excludes value a
   settled strategy still holds, then calls the permissionless `sweep()` to pull
-  it into the enlarged pool. An ATTACK, inducible on demand. **CLOSED.**
+  it into the enlarged pool. An ATTACK, inducible on demand. **MECHANISM
+  CLOSED, RESIDUAL OPEN**: the price now includes the residue, but only as the
+  call-free probe quotes it, and the probe is short by the interest accrued
+  since the venue's last on-chain accrual. The same transfer survives at that
+  scale.
 - **(b) the underpayment** — a queued redeemer is paid at a stamp that excludes
   the same value, and the shortfall accrues to the LPs who stayed. A FAIRNESS
   gap: no attacker, no loss to the protocol, a transfer between LPs. **CLOSED.**
@@ -78,7 +84,7 @@ Each traceable to a finding already hit:
 
 ---
 
-## (a) The skim — CLOSED, PR #243
+## (a) The skim — MECHANISM CLOSED IN PR #243, RESIDUAL STILL OPEN
 
 **Deposits are PRICED against the residue, not blocked by it.**
 
@@ -93,9 +99,11 @@ Charging is safe in both branches. A mint pays
 - the residue arrives → the depositor paid a fair price
 - it never arrives → the depositor overpaid, incumbents unharmed either way
 
-and the skim dies by construction rather than by refusal: it *was* "mint at a
-price excluding the residue, then sweep it in", and there is nothing to take once
-the price includes it.
+and the skim's MECHANISM dies by construction rather than by refusal: it *was*
+"mint at a price excluding the residue, then sweep it in", and there is nothing
+left to take once the price includes it — **to the extent the price includes it**.
+That qualifier is the whole of the residual below: the leak is now exactly the
+part of the residue the probe cannot see, and not a byte more.
 
 **DEPOSIT SIDE ONLY, and that asymmetry is the whole safety argument.** On a mint,
 counting a receivable makes the depositor receive FEWER shares, so over-counting
@@ -121,12 +129,105 @@ LP position always returns its tokens, there is no illiquid market to wait on.
 `depositNav()` or floor a mint to zero shares. The bound covers PRINCIPAL, not
 principal-plus-yield.
 
-**Residuals, both under-counts** — they cost the depositor a sliver and never the
-incumbents:
+### The residual, and why it is the same bug at 1/34,600 scale
 
-1. Interest since `lastUpdate` is excluded (the price of keeping the proposer's
-   IRM off the read that prices a mint).
-2. The capital clamp truncates yield above the ceiling.
+This section used to end at the clamp, listing two under-counts and calling them
+harmless — "they cost the depositor a sliver and never the incumbents".
+**That is backwards, and the correction matters more than the arithmetic.** The
+"One narrow lock survives" paragraph above already states the rule: *once the
+figure sets the price, "biased low" IS the skim.* `depositNav()` IS the price.
+An under-count under-states it, the mint therefore buys shares too cheaply, and
+the difference comes out of the LPs who were already in — the exact direction
+finding #3 named. The rule was applied to `ConcentratedLiquidityStrategy` and
+not to the two residuals sitting directly underneath it.
+
+**The two under-counts are unchanged; only the verdict on them is wrong.**
+
+1. **Interest since `lastUpdate` is excluded** — the price of keeping the
+   proposer's IRM off the read that prices a mint. `MorphoSupplyStrategy.
+   undeliveredValue()` values the position over Morpho's RAW stored market
+   totals (`_ownRaw`), with zero external calls, because the accruing read
+   (`expectedSupplyAssets`) calls `IIrm(marketParams.irm).borrowRateView` and
+   `_initialize` binds nothing about that address — an IRM whose view burns past
+   the vault's `_PROBE_GAS` cap would fail the read entirely and price mints as
+   if there were no residue at all, which is finding #3 restored whole.
+2. **The capital clamp truncates yield above the ceiling** — same direction,
+   bounded by whatever the position earned above its principal ceiling.
+
+**MEASURED, on the live Robinhood fork, in
+`test/integration/strategies/MorphoSupplyVaultE2EFork.t.sol`.** Two tests there
+are deliberately red and are the finding, not breakage:
+
+- `test_e2e_residue_pricedLockedAndSweptExactlyOnce` measures the gap directly.
+  On a 4,000 USDG residue the probe quoted `3,999.999999` against Morpho's own
+  view accrual of `4,000.142747` — short by `142,748` (units of 1e-6 USDG),
+  about 0.36 bps of the position. `collectResidue` then delivers the true value,
+  so exactly that much more arrives than was priced.
+- `test_e2e_residueSkim_isolatedAgainstTheNoAttackerCounterfactual` establishes
+  that the gap is a TRANSFER rather than yield, by running the identical
+  settlement with and without the attacker off one `snapshotState`. Honest LPs
+  alone: `19,999,868,772`. Honest LPs with the attacker present:
+  `19,999,840,222`, i.e. `-28,550`. Attacker: `+28,549`. Conservation to one
+  unit of share-math rounding.
+
+**The identity is exact**: gain = (the minter's share of the post-mint pool) x
+(the under-count). 5,000/25,000 = 20%, and 20% x 142,748 = 28,550 — which is
+what the honest LPs lost, to the unit. Pre-#243 the same test measured +952 USDG
+on the same setup, so #243 shrank it ~34,600x. It did not change its sign.
+
+**THE MAGNITUDE DRIFTS; THE IDENTITY DOES NOT.** The under-count is interest
+that has not been written to Morpho's storage yet, so it depends on how long the
+market has gone unaccrued at whatever block the fork lands on — quote no single
+figure as "the" number. Re-measured against live mainnet on 2026-08-22, both
+tests in one run: under-count `135,804`, attacker `+27,161`, honest LPs
+`19,999,861,828` → `19,999,834,666` (`-27,162`), and
+`20% x 135,804 = 27,160.8`. Instant door in the same run: `+6,466` on 1,000 USDG
+into ~21,000, against `135,804 x 1,000/21,000 = 6,466.9`. Different day,
+different size, same two identities to the unit.
+
+**BOTH DOORS LEAK, IN THE SAME PROPORTION.** The tempting reading — that the
+instant path is fixed and only the queued path is exposed — is wrong: a queued
+claim routes through `VaultWithdrawalQueue.claim` → `previewDeposit`, which
+converts LIVE against `depositNav()` exactly as an instant `deposit` does, and
+reads no stamp at all. The same test file measures the instant door at
+`+6,797` on a 1,000 USDG deposit into a ~21,000 pool, and
+`142,748 x 1,000/21,000 = 6,797.5`. One under-count, two entrances.
+
+**Bounded, and the bound is the whole under-count.** A minter approaching 100%
+of the pool captures at most all of it. It grows with the residue's size and
+with the time the position sits unaccrued, so it is not a constant — it is
+small on a market that accrues often and larger on one that does not.
+
+### What would actually close it
+
+The probe has to accrue without routing through an address the proposer chose.
+Three shapes, in the order they should be tried:
+
+1. **Vendor the rate math.** The repo already vendors Morpho's view accrual
+   (`MorphoBalancesLib`), and `test_e2e_navTracksLiveIrmAccrual_notAStaleSnapshot`
+   pins the port against the singleton's own storage accrual to the wei. Vendor
+   the AdaptiveCurve rate the same way and the projection needs no external call,
+   which removes the gas-grief lever by construction rather than by declining to
+   look.
+2. **Pin the IRM.** Bind `marketParams.irm` at `_initialize` against an attested
+   allowlist, then call the accruing read directly. Cheaper to write, but it
+   moves a safety property into registry curation and makes the template refuse
+   markets it can otherwise serve.
+3. **Bound the gap from above.** Add a call-free ceiling on the unaccrued
+   interest (max rate x elapsed) instead of zero, staying inside the existing
+   `min(capitalSnapshot, effectiveMaxCapital)` clamp so a mint can still never be
+   floored to zero shares.
+
+**NOTE THE DIRECTION, because non-negotiable #3 reads the other way and is
+written for a different figure.** "Bias low, always" is correct for a
+`totalAssets()`-style number that also prices redemptions: over-counting there
+pays out value that may never arrive. `depositNav()` is read by nothing but
+`previewDeposit` / `previewMint`, and on a deposit-only figure the asymmetry
+argument above applies instead — over-counting makes the depositor receive FEWER
+shares and costs only them, while under-counting dilutes the incumbents. On this
+figure specifically, the safe bias is HIGH, bounded by the clamp. Option 3 is
+the only one of the three that depends on getting that right; 1 and 2 are
+corrections rather than biases, and are preferable for exactly that reason.
 
 ---
 

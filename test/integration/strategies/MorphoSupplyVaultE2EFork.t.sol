@@ -99,12 +99,23 @@ contract FlashLoanSettler {
  * `IERC20(USDG).balanceOf(morpho)` = 35,337,373.707442 USDG across all markets —
  * the figure the flash loan has to move.
  *
- * @dev CLOCK. The archive vnet's `block.timestamp` (1,783,526,915) is BEHIND
- *      both the Chainlink feeds and Morpho's `lastUpdate`. The base harness
- *      warps past the feeds; Morpho needs its own warp, because
- *      `Morpho._accrueInterest` computes `block.timestamp - market.lastUpdate`
- *      under checked arithmetic and a fork clock behind `lastUpdate` makes every
- *      supply/withdraw/view UNDERFLOW. See `_normalizeMorphoClock`.
+ * @dev CLOCK. `Morpho._accrueInterest` computes `block.timestamp -
+ *      market.lastUpdate` under checked arithmetic, so a fork clock BEHIND
+ *      `lastUpdate` makes every supply/withdraw/view UNDERFLOW. The base
+ *      harness warps past the Chainlink feeds; Morpho needs its own warp on top
+ *      of that, because `lastUpdate` can be later than any feed's `updatedAt`.
+ *      See `_normalizeMorphoClock`.
+ *
+ *      The warp is FORWARD-ONLY, so it is a no-op whenever the fork clock is
+ *      already ahead — which is the case on BOTH endpoints as of 2026-08-22.
+ *      Measured that day (the vnet was re-minted 2026-08-19):
+ *        Tenderly vnet 9994663  block.timestamp 1,788,363,814
+ *        public 4663 at latest  block.timestamp 1,787,435,394
+ *        Morpho market lastUpdate               1,787,433,772
+ *        Chainlink ETH/USD updatedAt            1,787,434,790
+ *      Both clocks now lead both, so the ~35-day lag this warp was written for
+ *      is NOT currently reproducible. Keep the warp: it costs nothing when
+ *      inert and the lag returns the moment a vnet is minted from older state.
  *
  *      Run:
  *        set -a; source .env; set +a

@@ -70,11 +70,18 @@ contract DeployStrategyFactory is ScriptBase {
     ///      They resolve only in `chains/8453.json` and `chains/84532.json`, the
     ///      legacy Base books, and only for a NEW StrategyFactory — already
     ///      deployed factories keep whatever they approved at their own deploy.
+    ///      LIGHTER_PERP_TEMPLATE resolves ONLY in the Robinhood books
+    ///      (`chains/4663.json` and the fork's `chains/9994663.json`), because
+    ///      `LighterPerpStrategy`'s constructor refuses to deploy anywhere else.
+    ///      On every other chain the key is absent, `_tryParseAddress` returns
+    ///      zero and the loop skips it — which is why listing it here is safe and
+    ///      why a re-minted fork re-approves it without a manual step.
     function _templateKeys() internal pure returns (string[] memory keys) {
-        keys = new string[](3);
+        keys = new string[](4);
         keys[0] = "PORTFOLIO_TEMPLATE";
         keys[1] = "MORPHO_SUPPLY_TEMPLATE";
         keys[2] = "CONCENTRATED_LIQUIDITY_TEMPLATE";
+        keys[3] = "LIGHTER_PERP_TEMPLATE";
     }
 
     function _tryParseAddress(string memory json, string memory key) internal view returns (address) {
