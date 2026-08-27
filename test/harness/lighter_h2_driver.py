@@ -358,13 +358,17 @@ async def cmd_open(args):
             await client.close()
             sys.exit(1)
 
-        # LONG (is_ask = 0) so that closeMarket #1 (SELL) is the closing side and
-        # closeMarket #2 (BUY) is the one fired against a flat book.
+        # Default LONG (is_ask = 0): closeMarket #1 (SELL) is the closing side
+        # and closeMarket #2 (BUY) fires against a flat book. --side short flips
+        # it for the mirror half of H2: SELL fires FIRST against the OPEN short
+        # (must not add exposure), BUY is the closing side.
+        short = getattr(args, "side", "long") == "short"
         slip = args.slippage_bps / 10_000
-        avg_px = max(1, int(round(mark * (1 + slip) * 10**pdec)))
-        log(f"[open] LONG {ticks} ticks = {base} {det['symbol']} "
+        px = mark * (1 - slip) if short else mark * (1 + slip)
+        avg_px = max(1, int(round(px * 10**pdec)))
+        log(f"[open] {'SHORT' if short else 'LONG'} {ticks} ticks = {base} {det['symbol']} "
             f"(~{notional:.4f} USDG notional), bound {avg_px} ticks "
-            f"(~{mark*(1+slip):.2f}, {args.slippage_bps}bps)")
+            f"(~{px:.2f}, {args.slippage_bps}bps)")
 
         nonce = await next_nonce(session, args.account_index, aki)
         tx, resp, err = await client.create_market_order(
@@ -372,7 +376,7 @@ async def cmd_open(args):
             client_order_index=int(time.time()) % 1_000_000,
             base_amount=ticks,
             avg_execution_price=avg_px,
-            is_ask=False,
+            is_ask=short,
             reduce_only=False,
             nonce=nonce,
             api_key_index=aki,
@@ -386,8 +390,9 @@ async def cmd_open(args):
         while time.time() < deadline:
             await asyncio.sleep(2)
             rec = await snapshot(session, args.account_index, args.market, "post-open")
-            if rec["size"] > 0:
-                log(f"[open] FILLED: long {rec['size']} @ {rec['avg_entry']}")
+            filled = rec["size"] < 0 if short else rec["size"] > 0
+            if filled:
+                log(f"[open] FILLED: {'short' if short else 'long'} {rec['size']} @ {rec['avg_entry']}")
                 await client.close()
                 return rec
         log("[open] NOT FILLED within timeout — do NOT proceed to the cast steps.")
@@ -615,7 +620,9 @@ def main():
     lv = common(sub.add_parser("leverage", help="set per-market leverage (L2 config tx)"))
     lv.add_argument("--leverage", type=int, required=True)
 
-    op = common(sub.add_parser("open", help="open the minimal legal LONG"))
+    op = common(sub.add_parser("open", help="open the minimal legal position (long by default)"))
+    op.add_argument("--side", choices=["long", "short"], default="long",
+                    help="short = the H2 mirror half: SELL then fires against the OPEN short")
     op.add_argument("--slippage-bps", type=int, default=500)
     op.add_argument("--fill-timeout", type=int, default=90)
 
