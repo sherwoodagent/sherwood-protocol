@@ -635,11 +635,17 @@ contract LighterPerpStrategy is BaseStrategy {
     ///      that window, because `totalAssets()` prices anything held here at
     ///      zero and a depositor would otherwise mint against a NAV missing it.
     ///
-    ///      SAME BASIS AS `undeliveredValue()`, so the bool and the amount can
-    ///      never diverge: both read the pending balance plus the idle balance,
-    ///      and ticks are 1:1 with USDG base units (both 6dp), so no conversion
-    ///      and no price source enters either one. Two staticcalls, no loops —
-    ///      comfortably inside the probe cap.
+    ///      SAME BASIS AS `undeliveredValue()` — both read the pending balance
+    ///      plus the idle balance, ticks 1:1 with USDG base units (both 6dp), no
+    ///      conversion and no price source in either — but NOT the same
+    ///      arithmetic: this bool applies the `RESIDUE_DUST` floor to EACH term,
+    ///      while the amount is the unfiltered sum. Two sub-dust terms
+    ///      (e.g. 900 + 900) therefore report `false` here with a nonzero
+    ///      `undeliveredValue()` of 1,800 — deliberate (each term alone is
+    ///      donation-sized dust; `test_delivery_dustDonation_doesNotTripTheLock`
+    ///      pins the shape) and bounded at `2 * RESIDUE_DUST`, matching
+    ///      `MorphoSupplyStrategy`'s identical per-term floor. Two staticcalls,
+    ///      no loops — comfortably inside the probe cap.
     ///
     ///      `Settled` ONLY, matching both sibling templates and for their reason
     ///      rather than a new one: answering for `Executed` too would report
