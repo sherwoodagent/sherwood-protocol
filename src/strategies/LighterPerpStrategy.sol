@@ -434,9 +434,14 @@ contract LighterPerpStrategy is BaseStrategy {
         // Trustless close: the contract can't read a position's sign, so it emits
         // both a SELL-close and a BUY-close per market — the one opposing the open
         // position fills, the other no-ops against a flat/absent position.
-        // PROVEN on 4663 (2026-08-23, H2 canary, account 623): a baseAmount=0
-        // market order fired against a FLAT book did nothing — 37 API samples
-        // over 2 minutes, size 0.0 throughout. See test/harness/LighterH2Canary.md.
+        // PROVEN on 4663, BOTH DIRECTIONS (H2 canary, account 623; see
+        // test/harness/LighterH2Canary.md). 2026-08-23, long side: the SELL
+        // closed a real long, the follow-on BUY no-opped against the flat book
+        // (37 samples / 2 min). 2026-08-26, short mirror: the FIRST-fired SELL
+        // left a real open short exactly unchanged, the BUY closed it, and a
+        // final SELL against the flat book no-opped (37 samples / 2 min). Every
+        // cell this ordering can produce is covered — BUY-vs-long cannot occur,
+        // since the SELL always fires first and flattens a long.
         uint256 n = markets.length;
         for (uint256 i; i < n; i++) {
             uint16 m = markets[i];

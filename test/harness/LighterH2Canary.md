@@ -1,6 +1,17 @@
 # H2 canary — does `baseAmount = 0` no-op against a FLAT position?
 
-> **RUN 2026-08-23 — VERDICT: `H2 = NOOP`.** Real 0.005 ETH long opened on
+> **RUN 2026-08-26 (short mirror) — VERDICT: `H2 = NOOP`, matrix complete.**
+> Real 0.005 ETH SHORT opened on account 623 (entry 2504.18, same 5 USDG at
+> 10x). `initiateReturn`'s first-fired SELL (`closeMarket(0, 1, 1)`) left the
+> open short EXACTLY unchanged at -0.005 (5 consecutive samples + a 30s
+> watcher across the window); the BUY (`closeMarket(0, 4294967295, 0)`)
+> closed it to flat; a final SELL against the flat book no-opped (37 samples
+> / 2 min). With the 2026-08-23 long run below, every cell the ordered pair
+> can produce is proven: SELL fills-vs-long / no-ops-vs-short /
+> no-ops-vs-flat, BUY closes-vs-short / no-ops-vs-flat (BUY-vs-long cannot
+> occur — SELL fires first). Round-trip PnL across both runs +0.023050 USDG.
+>
+> **RUN 2026-08-23 (long side) — VERDICT: `H2 = NOOP`.** Real 0.005 ETH long opened on
 > account 623 (entry 2439.04, 5.000000 USDG margin at 10x), flattened by
 > close #1 (`closeMarket(0, 1, 1)`), then close #2 (`closeMarket(0,
 > 4294967295, 0)`) fired against the flat book: **size 0.0 across all 37

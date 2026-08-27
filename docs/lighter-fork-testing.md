@@ -423,8 +423,9 @@ the first attempt took, and the registry's copy is the one `openReview` and
 
 What this bench cannot prove — real fills, funding, API-leg behavior — is
 covered by the rh-testnet API loop and the small-notional 4663 canaries.
-**H2 is CLOSED (2026-08-23):** the 4663 canary (`test/harness/LighterH2Canary.md`)
-opened a real 0.005 ETH long on account 623, flattened it with the exact
-`closeMarket(m, 1, ASK)` `initiateReturn` emits, then fired the second leg
-`closeMarket(m, 2**32-1, BID)` against the flat book — verdict **NOOP** (37
-samples / 2 min, size 0.0 throughout). The both-side close is sound as written.
+**H2 is CLOSED, both directions (2026-08-23 long, 2026-08-26 short):** the 4663
+canary (`test/harness/LighterH2Canary.md`) proved every cell of the ordered
+pair on real filled positions on account 623 — SELL fills against a long,
+no-ops against an open short (position exactly unchanged) and against a flat
+book; BUY closes a short and no-ops against a flat book. BUY-vs-long cannot
+occur (SELL fires first). The both-side close is sound as written.
