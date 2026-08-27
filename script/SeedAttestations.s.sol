@@ -32,12 +32,24 @@ contract SeedAttestations is ScriptBase {
         IEAS eas = IEAS(_readAddress("EAS"));
         address me = msg.sender;
 
-        // A stand-in vault/agent so the decoded fields are not all zero. These
-        // are NOT real Sherwood deployments — chain 4663 has no core contracts
-        // yet — they exist so the agent page has something to render.
-        uint256 syndicateId = 1;
-        uint256 agentId = 42;
-        address vault = address(uint160(uint256(keccak256("sherwood.seed.vault"))));
+        // AGENT: the wallet these attestations are about. Defaults to the
+        // broadcaster; override to seed a specific agent's page:
+        //   AGENT=0x… forge script … --broadcast
+        //
+        // It matters WHERE this address goes, because the schemas identify
+        // agents two different ways and the app filters on both:
+        //   AGENT_APPROVED   -> recipient is the agent wallet
+        //   VENICE_PROVISION -> agent wallet is in the decoded payload,
+        //                       recipient is the vault
+        // Putting it in the wrong slot produces attestations that exist but
+        // never surface on the agent page.
+        address agent = vm.envOr("AGENT", msg.sender);
+
+        // Stand-in fund identifiers so decoded fields are not all zero. NOT real
+        // Sherwood deployments — chain 4663 has no core contracts yet.
+        uint256 syndicateId = vm.envOr("SYNDICATE_ID", uint256(1));
+        uint256 agentId = vm.envOr("AGENT_ID", uint256(42));
+        address vault = vm.envOr("VAULT", address(uint160(uint256(keccak256("sherwood.seed.vault")))));
 
         vm.startBroadcast();
 
@@ -49,7 +61,7 @@ contract SeedAttestations is ScriptBase {
             abi.encode(syndicateId, agentId, vault, "Seed join request - indexer smoke test")
         );
 
-        _attest(eas, AGENT_APPROVED, me, true, abi.encode(syndicateId, agentId, vault));
+        _attest(eas, AGENT_APPROVED, agent, true, abi.encode(syndicateId, agentId, vault));
 
         _attest(
             eas,
@@ -61,7 +73,7 @@ contract SeedAttestations is ScriptBase {
             )
         );
 
-        _attest(eas, VENICE_PROVISION, vault, false, abi.encode(me, "provisioned"));
+        _attest(eas, VENICE_PROVISION, vault, false, abi.encode(agent, "provisioned"));
 
         _attest(
             eas,
@@ -89,6 +101,9 @@ contract SeedAttestations is ScriptBase {
         vm.stopBroadcast();
 
         console.log("Seeded 6 attestations against EAS", address(eas));
+        console.log("  agent:", agent);
+        console.log("  vault:", vault);
+        console.log("  agentId:", agentId);
     }
 
     function _attest(IEAS eas, bytes32 schema, address recipient, bool revocable, bytes memory data) internal {
