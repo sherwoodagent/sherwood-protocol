@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {IStrategy} from "../interfaces/IStrategy.sol";
 import {IProposalStatus} from "../interfaces/IProposalStatus.sol";
+import {IStrategyDelivery} from "../interfaces/IStrategyDelivery.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -42,7 +43,7 @@ interface IAgentSet {
  *   Proposer can update tunable params (slippage, amounts) between execute
  *   and settle — no new proposal needed.
  */
-abstract contract BaseStrategy is IStrategy {
+abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
     using SafeERC20 for IERC20;
 
     // ── Errors ──
@@ -225,6 +226,52 @@ abstract contract BaseStrategy is IStrategy {
     function state() external view returns (State) {
         return _state;
     }
+
+    /// @inheritdoc IStrategyDelivery
+    /// @dev FALSE BY DEFAULT, and that is the safe default rather than a lazy
+    ///      one: this base has no idea what a given template can strand, and a
+    ///      template that answers true when it holds nothing would shut the
+    ///      vault's deposits until someone calls a sweep that moves nothing.
+    ///      Templates whose settlement is deliverable-maximum override it —
+    ///      `MorphoSupplyStrategy` (market utilization caps the withdrawal) and
+    ///      `ConcentratedLiquidityStrategy` (debt, collateral wrapper, LP legs).
+    ///      A template that always settles all-or-nothing correctly inherits
+    ///      this.
+    function hasUndeliveredValue() public view virtual returns (bool) {
+        return false;
+    }
+
+    /// @notice The vault-asset value this strategy still holds undelivered.
+    /// @dev    Default 0, matching `hasUndeliveredValue`'s default of false: a
+    ///         template that settles all-or-nothing has no residue to report.
+    ///         Overriding one without the other is a bug — the bool gates the
+    ///         deposit lock, this figure corrects the settle price, and they
+    ///         must describe the same value.
+    function undeliveredValue() public view virtual returns (uint256) {
+        return 0;
+    }
+
+    /// @inheritdoc IStrategyDelivery
+    /// @dev Default FALSE, matching the zero default above: a template that
+    ///      holds nothing has nothing it cannot value. A template that DOES
+    ///      hold value its `undeliveredValue()` override cannot express must
+    ///      override this too, or the vault will price mints against a figure
+    ///      that silently omits it.
+    function hasUnvaluedResidue() public view virtual returns (bool) {
+        return false;
+    }
+
+    /// @dev Dust floor for the residue probes. Anyone may transfer 1 wei to a
+    ///      long-settled clone, and `hasUndeliveredValue()` keying on `!= 0`
+    ///      turned that into an indefinite deposit DoS: `sweep()` clears it,
+    ///      the griefer re-donates for 1 wei plus gas, forever. A residue below
+    ///      this is not worth shutting deposits over — it cannot move a share
+    ///      price meaningfully, which is the only thing the lock protects.
+    ///
+    ///      Denominated in the strategy's own units on purpose: the templates
+    ///      that override this hold the VAULT ASSET, so the threshold reads in
+    ///      the same units as the value being judged.
+    uint256 internal constant RESIDUE_DUST = 1e3;
 
     // ── Internal helpers ──
 

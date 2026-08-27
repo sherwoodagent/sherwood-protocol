@@ -5,11 +5,13 @@ import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title SetGuardianRegistry — owner-only registry repointing
 /// @notice Lets the protocol upgrade from a stub registry
@@ -36,7 +38,8 @@ contract SetGuardianRegistryTest is Test {
                 address(0), // vault_: bootstrap (factory auto-deploys per-vault governors)
                 address(initialRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: 24 hours,
                     executionWindow: 1 days,
@@ -70,7 +73,9 @@ contract SetGuardianRegistryTest is Test {
                     beacon: address(governor),
                     protocolConfig: address(governor),
                     managementFeeBps: 0,
-                    guardianRegistry: address(initialRegistry)
+                    guardianRegistry: address(initialRegistry),
+                    // Mandatory since pashov finding #1.
+                    tierRegistry: address(new TierRegistry(owner))
                 }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));

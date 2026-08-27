@@ -76,8 +76,19 @@ contract MorphoSupplyMainnetForkTest is Test {
         string memory rpc = vm.envOr("ROBINHOOD_RPC_URL", string(""));
         if (bytes(rpc).length == 0) return; // tests skip via _requireFork()
 
-        vm.createSelectFork(rpc, FORK_BLOCK);
-        require(block.chainid == 4663, "not on Robinhood mainnet fork");
+        // PIN FROM THE ENVIRONMENT, like RobinhoodMainnetIntegrationTest. The
+        // hardcoded pin this replaced is unreachable: the public RPC prunes to
+        // a ~5k-block window and returns -32000 for it, and the archive vnet
+        // reports a different chain id, which the old `require` refused. 0 =
+        // fork at latest.
+        uint256 pin = vm.envOr("ROBINHOOD_FORK_BLOCK", uint256(0));
+        if (pin == 0) {
+            vm.createSelectFork(rpc);
+        } else {
+            vm.createSelectFork(rpc, pin);
+        }
+        uint256 wantChain = vm.envOr("ROBINHOOD_FORK_CHAIN_ID", uint256(4663));
+        require(block.chainid == wantChain, "unexpected chain: set ROBINHOOD_FORK_CHAIN_ID (archive vnet is 9994663)");
 
         // Vendored-layout validation: decode the live market params and pin
         // them against the values read via `cast` when this test was written.

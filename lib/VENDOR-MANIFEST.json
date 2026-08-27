@@ -15,7 +15,7 @@
     "To update a dependency: re-vendor it, then update `ref` / `version` (and the",
     "npm `integrity`) here in the same commit. CI will fail the PR otherwise."
   ],
-  "verified_at": "2026-08-01",
+  "verified_at": "2026-08-26",
   "dependencies": [
     {
       "name": "forge-std",
@@ -96,6 +96,50 @@
       "pruned": [],
       "local_modifications": [],
       "verification": "Exact match, including nested submodules resolved recursively. This commit is the transpilation of openzeppelin-contracts 45f032d1, and its lib/openzeppelin-contracts submodule pin is exactly the ref pinned above - so the two OpenZeppelin trees in lib/ are mutually consistent."
+    },
+    {
+      "name": "eas-contracts",
+      "local_path": "lib/eas-contracts",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/ethereum-attestation-service/eas-contracts.git",
+        "ref": "e6e970286ff18bbdfc5d8eff2742c5ece46040e4",
+        "ref_kind": "commit",
+        "ref_describe": "e6e9702",
+        "committed_at": "2026-07-17T00:36:12+01:00",
+        "subject": "Merge pull request #176 from MarkovianProtocol/add-self-verifying-resolver",
+        "submodules": false
+      },
+      "compare": [
+        {
+          "upstream": "contracts",
+          "local": "contracts"
+        }
+      ],
+      "pruned": [
+        "contracts/tests",
+        "contracts/resolver/examples",
+        "contracts/eip712",
+        "contracts/Indexer.sol"
+      ],
+      "local_modifications": [
+        {
+          "path": "contracts/EAS.sol",
+          "local_sha256": "71c1c47133799985aa70cbedf9e752fed23b6254431af37092bb65730d937645",
+          "reason": "pragma relaxed 0.8.29 -> 0.8.28 (single token, line 3). This repo pins solc = 0.8.28 in foundry.toml, and a pinned solc overrides per-file compilation_restrictions in forge 1.7.1 - verified in isolation: a restriction requesting 0.8.29 fails with 'No solc version exists that matches'. The alternatives were unpinning the repo compiler (floats every caret-pragma test file onto a newer solc) or not compiling EAS here at all. EAS v1.4.0 uses no 0.8.29-only language feature and compiles clean at 0.8.28. Consequence: our bytecode is NOT identical to a canonical 0.8.29 EAS build - which is already true regardless, since this repo builds via_ir with optimizer_runs = 50 against upstream's 1,000,000."
+        },
+        {
+          "path": "contracts/SchemaRegistry.sol",
+          "local_sha256": "0f0c0ac9d3355c47c440cc1bc426a9a12c81b65d1c51925a80023837e2332ec8",
+          "reason": "pragma relaxed 0.8.29 -> 0.8.28, line 3. Same reason as EAS.sol."
+        },
+        {
+          "path": "contracts/eip1271/EIP1271Verifier.sol",
+          "local_sha256": "134cccbaf4d864873d7a53b328291572629e7a5b457fe06b5a634dba40c9cd03",
+          "reason": "pragma relaxed 0.8.29 -> 0.8.28, line 3. Same reason as EAS.sol."
+        }
+      ],
+      "verification": "Vendored from contracts/ at commit e6e9702 (EAS v1.4.0 - both EAS.sol and SchemaRegistry.sol construct Semver(1, 4, 0)). Only the three pragma lines above differ from upstream; every other vendored file is byte-identical. Prunes drop what is not deployed: the test contracts, the example resolvers, the EIP-712 proxy, and Indexer.sol. Event signatures were checked against the indexer that will consume them - Attested/Revoked/Timestamped/RevokedOffchain and the V2 Registered(bytes32,address,(bytes32,address,bool,string)) all match."
     }
   ]
 }

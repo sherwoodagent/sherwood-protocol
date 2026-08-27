@@ -7,6 +7,7 @@ import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {DeploySherwood} from "../../script/Deploy.s.sol";
 import {DeployRobinhoodMainnet} from "../../script/robinhood-mainnet/Deploy.s.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 
 /// @notice Stand-in for a Gnosis Safe. The script's only check is
@@ -41,6 +42,10 @@ contract DeployRobinhoodMainnetHarness is DeployRobinhoodMainnet {
         _handoffRobinhood(d, ownerMultisig);
     }
 
+    function exposed_seatOwnerWrites(Deployed memory d, address deployer) external {
+        _seatOwnerWrites(d, deployer);
+    }
+
     function exposed_validate(Deployed memory d, address deployer, address ownerMultisig, address wood) external view {
         _validateMainnet(d, deployer, ownerMultisig, wood);
     }
@@ -68,7 +73,18 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
     ERC20Mock internal wood;
     DeploySherwood.Deployed internal d;
 
+    // Verified live on Robinhood Chain mainnet; mirrors chains/4663.json. The
+    // launch set is read out of that real book, so a key renamed or dropped
+    // there breaks this suite rather than silently seeding nothing.
+    address constant MORPHO_BLUE = 0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010;
+    address constant UNISWAP_V3_FACTORY = 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA;
+    address constant UNISWAP_V3_POSITION_MANAGER = 0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3;
+
     function setUp() public {
+        // The chain the ceremony actually runs on, and the book
+        // `_seedTierRegistry` walks. Without this the seeding reads no address
+        // book, attests nothing, and every assertion below would pass vacuously.
+        vm.chainId(4663);
         harness = new DeployRobinhoodMainnetHarness();
         multisig = new MockMultisig();
         wood = new ERC20Mock("WOOD", "WOOD", 18);
@@ -90,13 +106,79 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
         vm.prank(address(harness));
         d = harness.deployCore(cfg);
 
-        // What `run()` does inside the broadcast before any handoff. BOTH
-        // recipients: a zero one folds its leg into the agent's remainder
-        // instead of failing, so validation asserts both and so does the run.
-        vm.startPrank(address(harness));
-        ProtocolConfig(d.protocolConfig).setProtocolFeeRecipient(address(harness));
-        ProtocolConfig(d.protocolConfig).setGuardiansFeeRecipient(address(harness));
-        vm.stopPrank();
+        // EXACTLY what `run()` does inside the broadcast before any handoff —
+        // the real method, not a restatement of it. Re-listing those writes here
+        // is what let one of them go missing from `run()` unnoticed: the suite
+        // asserted a state it had set up itself.
+        vm.prank(address(harness));
+        harness.exposed_seatOwnerWrites(d, address(harness));
+    }
+
+    // ── The TierRegistry launch set ──
+
+    /// @dev THE THIRD DEFECT IN THIS GAP, found by the 2026-08-19 fork redeploy.
+    ///      `deployCore` mints the TierRegistry EMPTY and wires it into the
+    ///      factory; the attestations are separate `onlyOwner` writes that the
+    ///      canonical `DeploySherwood.run()` makes and this override — which
+    ///      reimplements `run()` rather than extending it — did not.
+    ///
+    ///      The consequence is not cosmetic. `isCounterpartyAllowed` gates
+    ///      CLONE-INIT, so an unattested counterparty means every
+    ///      ConcentratedLiquidity clone reverts `CounterpartyNotAllowed`, and
+    ///      `DeployConcentratedLiquidityStrategy` refuses to run at all — which
+    ///      is exactly how the fork ceremony surfaced it, stopping at phase 4
+    ///      with a complete and validated core already on-chain.
+    function test_seatOwnerWrites_attestsTheLaunchSetTheTemplatesBindTo() public view {
+        assertTrue(
+            TierRegistry(d.tierRegistry).isCounterpartyAllowed(UNISWAP_V3_FACTORY),
+            "uniswap v3 factory unattested: every CL clone-init reverts CounterpartyNotAllowed"
+        );
+        assertTrue(
+            TierRegistry(d.tierRegistry).isCounterpartyAllowed(UNISWAP_V3_POSITION_MANAGER),
+            "position manager unattested: every CL clone-init reverts CounterpartyNotAllowed"
+        );
+        assertTrue(
+            TierRegistry(d.tierRegistry).isCounterpartyAllowed(MORPHO_BLUE),
+            "morpho unattested on the counterparty axis: CL binds it as a counterparty"
+        );
+        // Morpho needs BOTH axes — CL binds it as a counterparty, while
+        // MorphoSupplyStrategy spends vault funds into it as an adapter.
+        assertTrue(
+            TierRegistry(d.tierRegistry).isAdapterAllowed(MORPHO_BLUE),
+            "morpho unattested on the adapter axis: MorphoSupplyStrategy cannot spend into it"
+        );
+    }
+
+    /// @dev THE ORDERING THIS DEPENDS ON. Every write in `_seatOwnerWrites` is
+    ///      `onlyOwner` on a contract `_handoffRobinhood` then transfers, so the
+    ///      seeding has exactly one window. `TierRegistry` is `Ownable2Step`, so
+    ///      the transfer alone leaves the deployer in charge — the window closes
+    ///      only when the Safe accepts. This pins the failure that a later
+    ///      refactor moving the seed call BELOW the handoff would introduce.
+    function test_seatOwnerWrites_isSkippedOnceTheSafeHasAccepted() public {
+        DeployRobinhoodMainnetHarness fresh = new DeployRobinhoodMainnetHarness();
+        TierRegistry registry = new TierRegistry(address(fresh));
+
+        vm.prank(address(fresh));
+        Ownable2Step(address(registry)).transferOwnership(address(multisig));
+        vm.prank(address(multisig));
+        Ownable2Step(address(registry)).acceptOwnership();
+
+        DeploySherwood.Deployed memory stale = d;
+        stale.tierRegistry = address(registry);
+        stale.protocolConfig = d.protocolConfig;
+
+        // Seeding SKIPS rather than reverting — it is best-effort by design and
+        // logs a RUNBOOK line. The point of the assert is that the launch set
+        // does NOT land, so a seed call that drifted below the handoff produces
+        // a ceremony that looks clean and ships an empty registry.
+        vm.prank(address(harness));
+        harness.exposed_seatOwnerWrites(stale, address(harness));
+
+        assertFalse(
+            registry.isCounterpartyAllowed(UNISWAP_V3_FACTORY),
+            "seeding after the Safe accepted must NOT land - the window is closed"
+        );
     }
 
     // ── The fee recipients ──

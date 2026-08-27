@@ -81,12 +81,23 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         bool opened;
         bool resolved;
         bool blocked;
-        /// @dev DEPRECATED and never written. The cold-start waiver it carried
-        ///      was removed: it made the guardian veto and the emergency
-        ///      owner-bond slash switchable off by anyone able to dip the
-        ///      staked total for one block via `requestUnstakeGuardian` +
-        ///      `cancelUnstakeGuardian`, which is free. The field stays so the
-        ///      storage layout of this upgradeable contract does not shift.
+        /// @dev LIVE — the block-quorum DENOMINATOR. Written once by
+        ///      `openReview` as `getPastTotalVotes(r.snapshotAt)`: the total
+        ///      staked weight at the PROPOSE instant, not at open, because
+        ///      `openReview` is permissionless and reading at open would let
+        ///      the caller pick when the electorate is measured. `_isBlocked`
+        ///      divides `blockStakeWeight` against it, and `_resolveEmergency`
+        ///      / `cancelEmergency` use the emergency review's own copy the
+        ///      same way. Zero means no electorate, and every one of those
+        ///      call sites must short-circuit before comparing — `0 >= 0` is
+        ///      vacuously true and would Block a review nobody voted in.
+        ///
+        ///      What WAS removed is the cold-start waiver that used to read
+        ///      this field against a floor: it made the guardian veto and the
+        ///      emergency owner-bond slash switchable off by anyone able to
+        ///      dip the staked total for one block via
+        ///      `requestUnstakeGuardian` + `cancelUnstakeGuardian`, which is
+        ///      free. The field itself outlived that waiver.
         uint128 totalStakeAtOpen;
         uint128 approveStakeWeight;
         uint128 blockStakeWeight;
@@ -903,6 +914,26 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // already earned, then lets the re-open proceed on a clean record.
         // Cheap in the common case — a first open leaves `callsHash` zero, and a
         // round already resolved short-circuits.
+        //
+        // IN SERIES WITH THE CALLER'S BOND GATE (2026-08 sweep finding #11).
+        // That finding moved `emergencySettleWithCalls`'s owner-bond check to
+        // AFTER this call, and the two now form one mechanism against a
+        // re-open that would void a blocked verdict:
+        //
+        //   this resolve computes `blocked` -> `slashOwnerBond` empties the
+        //   slot -> the caller's gate reads zero and REVERTS the whole
+        //   transaction, re-open and slash together.
+        //
+        // Neither half works alone. Delete this line and the bond survives the
+        // re-open, the gate passes, and the owner voids the votes exactly as
+        // before — measured, not argued: removing it turns
+        // `test_emergencySettleWithCalls_cannotReopenOnABondTheSameCallBurns`
+        // and its sibling red. Those two tests pin THIS call as much as they
+        // pin the gate.
+        //
+        // Note what does NOT depend on it: `er.round++` below retires
+        // prior-round votes on its own, so vote hygiene across a re-open is the
+        // round bump's job, not this resolve's.
         if (er.callsHash != bytes32(0) && !er.resolved) _resolveEmergency(eKey, proposalId, er);
         // Denominator read at `t-1`, the same checkpoint anchor the numerator
         // uses (`voteBlockEmergencySettle` reads its weight at `er.openedAt`),
@@ -1138,8 +1169,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @inheritdoc IGuardianRegistry
     /// @dev Permissionless and idempotent — once resolved, returns the cached
     ///      `blocked` flag without re-slashing. Requires
-    ///      `block.timestamp >= reviewEnd`. Short-circuits to `false` when
-    ///      `!opened` or `cohortTooSmall`. CEI: sets `resolved`/`blocked` before
+    ///      `block.timestamp >= reviewEnd`. Short-circuits to `false` when the
+    ///      review was never opened — that is the ONLY short-circuit left; a
+    ///      thin cohort decides its own review, since the `cohortTooSmall`
+    ///      waiver was removed. Everything else goes to `_isBlocked`, which
+    ///      fails open on a zero electorate. CEI: sets `resolved`/`blocked` before
     ///      any token transfer, which is why no `nonReentrant` is needed — a
     ///      reentrant call hits the early return.
     function resolveReview(address governor, uint256 proposalId) external whenNotPaused returns (bool) {
@@ -1546,9 +1580,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @dev Pure mirror of `resolveReview`'s committed result. Branch order:
     ///      (1) resolved -> the cached `blocked` flag; (2) before `reviewEnd`, or
     ///      unregistered -> `Unresolved`; (3) window elapsed but not committed ->
-    ///      `Cleared` when the review was never opened or the cohort was too
-    ///      small, else `_isBlocked` decides. The short-circuits stay OUTSIDE
-    ///      `_isBlocked`, exactly as `resolveReview` applies them.
+    ///      `Cleared` when the review was never opened, else `_isBlocked`
+    ///      decides. The never-opened short-circuit stays OUTSIDE `_isBlocked`,
+    ///      exactly as `resolveReview` applies it.
     function outcomeOf(address governor, uint256 proposalId) external view returns (ReviewOutcome) {
         Review storage r = _reviews[_reviewKey(governor, proposalId)];
         if (r.resolved) {

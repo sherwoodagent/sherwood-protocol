@@ -13,6 +13,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Task 3 — per-proposal risk envelope (spec 2026-07-22 §3.1). The
 ///         proposer declares `maxCapital` (net-outflow ceiling, vault-enforced
@@ -64,7 +65,8 @@ contract RiskEnvelopeTest is Test {
                 address(vault),
                 address(guardianRegistry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory (test contract)
+                address(this),
+                address(deployTierRegistry(address(this))), // factory (test contract)
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: EXECUTION_WINDOW,

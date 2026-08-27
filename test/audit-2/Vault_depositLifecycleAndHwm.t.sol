@@ -138,25 +138,20 @@ contract VaultDepositLifecycleAndHwmTest is Test {
         // gate, exactly as `_decOpen()` does.
         _setProposal(0, 0, 1);
 
-        // Boundary check: with NO settlement having EVER occurred, the claim
-        // must still revert (nothing to price against yet) — this is the
-        // honest "not claimable yet" case, not the bug.
-        vm.expectRevert(IVaultWithdrawalQueue.NotSettled.selector);
-        queue.claim(requestId);
-
-        // A LATER, UNRELATED proposal (pid 2) opens, executes, and genuinely
-        // settles. `requestId`'s own pid (1) is still, and will forever be,
-        // unstamped.
-        _setProposal(2, 1, 2);
-        _settle(2);
+        // THE FIX, STRENGTHENED BY FINDING #3. A deposit no longer prices
+        // against ANY stamp — it converts live at the instant it joins the pool
+        // — so recovery no longer has to wait for some later, unrelated
+        // proposal to settle on its behalf. With the open-proposal gate
+        // released and no residue outstanding, this is already an honest
+        // instant to mint, and the claim succeeds immediately.
+        //
+        // The dead-proposal premise still holds and is asserted: pid 1 is, and
+        // will forever be, unstamped. It simply no longer matters.
         assertFalse(queue.getSettlePrice(1).stamped, "pid 1 never settles - confirms the dead-proposal premise");
-        assertTrue(queue.getSettlePrice(2).stamped, "pid 2 is the real, later settlement");
 
-        // THE FIX: the claim must now succeed, priced at pid 2's stamp (the
-        // latest real settlement), not revert forever against dead pid 1.
         uint256 expectedShares = vault.convertToShares(500e6);
         uint256 minted = queue.claim(requestId);
-        assertEq(minted, expectedShares, "claims at the next real settlement's price");
+        assertEq(minted, expectedShares, "claims at the live price, with no stamp anywhere");
 
         r = queue.getRequest(requestId);
         assertTrue(r.claimed, "request is now claimed");

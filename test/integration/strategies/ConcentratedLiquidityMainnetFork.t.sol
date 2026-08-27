@@ -96,7 +96,15 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
     function setUp() public {
         string memory rpc = vm.envOr("ROBINHOOD_RPC_URL", string(""));
         if (bytes(rpc).length == 0) return;
-        vm.createSelectFork(rpc, FORK_BLOCK);
+        // PIN FROM THE ENVIRONMENT, like RobinhoodMainnetIntegrationTest. The
+        // hardcoded pin this replaced is unreachable: the public RPC prunes to
+        // a ~5k-block window and returns -32000 for it. 0 = fork at latest.
+        uint256 pin = vm.envOr("ROBINHOOD_FORK_BLOCK", uint256(0));
+        if (pin == 0) {
+            vm.createSelectFork(rpc);
+        } else {
+            vm.createSelectFork(rpc, pin);
+        }
 
         // ── Identity, not code presence ──
         assertEq(

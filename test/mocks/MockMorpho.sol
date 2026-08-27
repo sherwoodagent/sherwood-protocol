@@ -5,6 +5,14 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IMorpho, IIrm, Id, MarketParams, Market, Position as MorphoPosition} from "../../src/vendor/morpho/IMorpho.sol";
 import {MathLib, SharesMathLib, MarketParamsLib} from "../../src/vendor/morpho/MorphoLibs.sol";
 
+/// @notice Morpho Blue's oracle surface: collateral price quoted in loan-token
+///         units, scaled by `ORACLE_PRICE_SCALE` (1e36).
+interface IMockOracle {
+    function price() external view returns (uint256);
+}
+
+uint256 constant ORACLE_PRICE_SCALE = 1e36;
+
 /// @notice Settable per-second borrow rate (WAD), with a revert switch so
 ///         adapter tests can prove the fail-closed path on IRM failure.
 contract MockIrm is IIrm {
@@ -19,8 +27,23 @@ contract MockIrm is IIrm {
         reverting = reverting_;
     }
 
+    /// @dev Burn this much gas in the view. Models the finding-#3 suppression
+    ///      vector: `marketParams.irm` is proposer-chosen and unbound, so an IRM
+    ///      whose view exceeds the vault's `_PROBE_GAS` cap makes the residue
+    ///      probe fail while the uncapped `sweep()` path still works.
+    uint256 public gasToBurn;
+
+    function setGasToBurn(uint256 g) external {
+        gasToBurn = g;
+    }
+
     function borrowRateView(MarketParams memory, Market memory) external view returns (uint256) {
         require(!reverting, "MockIrm: reverting");
+        uint256 burn = gasToBurn;
+        if (burn != 0) {
+            uint256 target = gasleft() > burn ? gasleft() - burn : 0;
+            while (gasleft() > target) {}
+        }
         return rate;
     }
 }
@@ -234,8 +257,25 @@ contract MockMorpho is IMorpho {
 
         _accrue(marketParams, id);
         MorphoPosition storage pos = _position[id][onBehalf];
-        require(pos.borrowShares == 0, "MockMorpho: insufficient collateral");
         require(pos.collateral >= assets, "MockMorpho: insufficient collateral");
+        // MODELS MORPHO BLUE'S ACTUAL RULE, not "debt must be zero" (pashov
+        // finding #8). Upstream `withdrawCollateral` permits a withdrawal while
+        // debt is outstanding provided the position stays healthy —
+        //   maxBorrow = collateral * price / ORACLE_PRICE_SCALE * lltv / WAD
+        //   require(maxBorrow >= borrowed)
+        // The previous `borrowShares == 0` require encoded the SAME wrong
+        // assumption the strategy bug was made of, so a fix could not be
+        // observed through it. Zero-debt behaviour is unchanged.
+        if (pos.borrowShares != 0) {
+            Market storage m = _market[id];
+            uint256 borrowed = m.totalBorrowShares == 0
+                ? 0
+                : (uint256(pos.borrowShares) * uint256(m.totalBorrowAssets)) / uint256(m.totalBorrowShares);
+            uint256 price = IMockOracle(marketParams.oracle).price();
+            uint256 maxBorrow =
+                ((uint256(pos.collateral) - assets) * price / ORACLE_PRICE_SCALE) * marketParams.lltv / 1e18;
+            require(maxBorrow >= borrowed, "MockMorpho: insufficient collateral");
+        }
 
         pos.collateral -= uint128(assets);
         IERC20(marketParams.collateralToken).transfer(receiver, assets);

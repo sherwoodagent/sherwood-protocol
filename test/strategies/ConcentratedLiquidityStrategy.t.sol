@@ -12,6 +12,7 @@ import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
 import {MockPermissiveTierRegistry} from "../mocks/MockPermissiveTierRegistry.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 import {MockUniswapV3Pool} from "../mocks/MockUniswapV3Pool.sol";
+import {MockUniswapV3Factory} from "../mocks/MockUniswapV3Factory.sol";
 import {MockPositionManager} from "../mocks/MockPositionManager.sol";
 
 import {ConcentratedLiquidityStrategy} from "../../src/strategies/ConcentratedLiquidityStrategy.sol";
@@ -90,7 +91,14 @@ abstract contract CLFixture is Test {
     ConcentratedLiquidityStrategy template;
     ConcentratedLiquidityStrategy strategy;
 
-    address factory = makeAddr("uniswapFactory");
+    /// @dev A DEPLOYED factory, not `makeAddr`. The strategy resolves a pool's
+    ///      provenance by asking the factory `getPool`, so a codeless stand-in
+    ///      answers nothing and every configuration in this file would read as
+    ///      un-vouched. Pools this fixture means to be genuine must be
+    ///      `register`ed on it.
+    MockUniswapV3Factory factoryMock;
+    address factory;
+
     address proposer = makeAddr("proposer");
     address keeper = makeAddr("keeper");
     address supplier = makeAddr("supplier");
@@ -114,9 +122,13 @@ abstract contract CLFixture is Test {
         marketId = morpho.createMarket(mp);
         _fundMarket(mp);
 
+        factoryMock = new MockUniswapV3Factory();
+        factory = address(factoryMock);
+
         pool = new MockUniswapV3Pool(address(usdg), address(nvda), POOL_FEE, TICK_SPACING, factory);
         pool.setLiquidity(POOL_LIQUIDITY);
         pool.setTicks(0, 0);
+        factoryMock.register(address(usdg), address(nvda), POOL_FEE, address(pool));
 
         posm = new MockPositionManager(factory);
         adapter = new MockSwapAdapter();
@@ -241,6 +253,64 @@ contract ConcentratedLiquidityStrategyLifecycleTest is CLFixture {
         assertEq(morpho.position(marketId, address(strategy)).collateral > 0, true, "collateral not posted");
     }
 
+    // ── Pashov 2026-08 finding #9 — the mint floor bounded the leftovers ──
+    //
+    // `_mintPosition` offers the clone's WHOLE balance of both tokens and used
+    // to set `amountXMin` to a fraction of that offer. Uniswap's `amountXMin`
+    // bounds price movement between quote and execution; a fraction of the
+    // OFFER bounds the unconsumed remainder instead, which the file's own
+    // comment calls routine: "A mint consumes only the side the range actually
+    // needs, so the offered balances are routinely larger than what is taken."
+    //
+    // WHY THE SUITE NEVER SAW IT. `MockPositionManager` consumes both legs in
+    // full by default (`consume0Bps = consume1Bps = 10_000`), and until these
+    // tests nothing in the repo called `setConsumption`. Every mint in 2800+
+    // tests therefore agreed with the assumption the floor encodes. A mock
+    // cannot falsify an assumption it shares.
+
+    /// @dev THE REPRODUCTION. The range needs 30% of the volatile leg at the
+    ///      execute-time price and leaves the rest — the ordinary outcome of
+    ///      spot drifting inside the band between propose and execute. The old
+    ///      floor demanded 95% of the offer, so the mint reverted, `_execute`
+    ///      reverted with it, and the proposal expired at `executeBy` with the
+    ///      proposer bond locked.
+    function test_execute_partialLegConsumptionStillMints() public {
+        posm.setConsumption(10_000, 3_000);
+
+        _execute();
+
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed), "execute reverted on a normal mint");
+        assertGt(strategy.tokenId(), 0, "no position minted");
+    }
+
+    /// @dev THE CONCESSION, PINNED. Dropping the floor means a mint that takes
+    ///      little of a leg no longer reverts — it under-deploys and the
+    ///      remainder stays on the clone. That is the intended trade (the
+    ///      residue is recoverable at settle, and a revert strands the whole
+    ///      proposal), but it must not be silent: the leftover is asserted here
+    ///      so a future change that starts burning or losing it fails loudly.
+    function test_execute_partialConsumptionLeavesTheRemainderRecoverable() public {
+        posm.setConsumption(10_000, 3_000);
+        _execute();
+
+        assertGt(nvda.balanceOf(address(strategy)), 0, "the unconsumed leg vanished rather than staying recoverable");
+    }
+
+    /// @dev NOT A BLANKET RELAXATION. `mintSlippageBps` still bounds the
+    ///      `_rebalanceToTarget` swap that runs first, through `_quoteMinOut` —
+    ///      so the parameter keeps its meaning and the zero-rejection shipped
+    ///      for finding #16 stays load-bearing. Only the mint's own per-leg
+    ///      floor, which measured the wrong quantity, is gone.
+    function test_execute_mintSlippageStillBoundsTheRebalanceSwap() public {
+        // A quote far below the pool's own price must still be refused by the
+        // swap floor, even though the mint no longer bands its legs.
+        adapter.setRate(address(usdg), address(nvda), 1);
+
+        vm.prank(address(vaultStub));
+        vm.expectRevert();
+        strategy.execute();
+    }
+
     /// @dev The clone-ratchet bypass (issue #150): a foreign proposal's batch
     ///      reaching this clone's `execute()` would flip the one-shot ratchet and
     ///      permanently brick the clone's own later proposal.
@@ -331,17 +401,28 @@ contract DirtyWordTierRegistry {
 contract ConcentratedLiquidityStrategyInitTest is CLFixture {
     // ── 6.2 Init validation, one test per check ──
 
+    /// @dev The rogue pool is never registered with the factory, so `getPool`
+    ///      for its own key names the genuine pool instead. `setFactory` puts it
+    ///      on the strongest footing the old self-attestation check could give
+    ///      it — claiming the real factory — which is precisely what that check
+    ///      accepted and this one does not.
     function test_init_poolNotFromFactoryReverts() public {
         MockUniswapV3Pool rogue = new MockUniswapV3Pool(address(usdg), address(nvda), POOL_FEE, TICK_SPACING, factory);
-        rogue.setFactory(makeAddr("attackerFactory"));
+        rogue.setFactory(factory);
         ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
         p.pool = address(rogue);
         _expectInitRevert(ConcentratedLiquidityStrategy.PoolNotFromFactory.selector, p);
     }
 
+    /// @dev Registered with the factory on purpose. Provenance is checked
+    ///      BEFORE the asset check, so an unregistered pool would revert
+    ///      `PoolNotFromFactory` and this test would pass without ever reaching
+    ///      the mismatch it is named for. The pool under test is genuine; it
+    ///      simply quotes the wrong pair.
     function test_init_poolDoesNotQuoteVaultAssetReverts() public {
         ERC20Mock other = new ERC20Mock("OTHER", "OTHER", 18);
         MockUniswapV3Pool bad = new MockUniswapV3Pool(address(other), address(nvda), POOL_FEE, TICK_SPACING, factory);
+        factoryMock.register(address(other), address(nvda), POOL_FEE, address(bad));
         ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
         p.pool = address(bad);
         _expectInitRevert(ConcentratedLiquidityStrategy.PoolAssetMismatch.selector, p);
@@ -506,6 +587,62 @@ contract ConcentratedLiquidityStrategyInitTest is CLFixture {
         _expectInitRevert(ConcentratedLiquidityStrategy.InvalidRerangePolicy.selector, p);
     }
 
+    // ── Pashov 2026-08 finding #16 — a zero slippage floor is a self-brick ──
+    //
+    // ZERO IS THE STRICTEST VALUE HERE, NOT THE LOOSEST, which is why it reads
+    // as a safe default and survives review. `_quoteMinOut` computes
+    // `expected * (BPS_DENOMINATOR - slippageBps) / BPS_DENOMINATOR`, so zero
+    // puts the floor exactly ON the quote — and the quote is taken BEFORE the
+    // swap moves the pool, so no honest fill ever clears it.
+    //
+    // The consequence is unrecoverable rather than merely annoying:
+    // `_updateParams` reaches only `settleSlippageBps` and `settleDeadline` and
+    // is a one-way ratchet, so neither of these two can be corrected after
+    // init. Every `rerange()` reverts for the clone's whole life — up to
+    // `ABSOLUTE_MAX_STRATEGY_DURATION` frozen in the initial band, earning no
+    // fees while the Morpho borrow accrues.
+    //
+    // This file ALREADY rejects `settleSlippageBps == 0` for the same reason,
+    // and `PortfolioStrategy` carries `MIN_SLIPPAGE_BPS = 50` with the note
+    // that it "turns a permanent self-brick into a rejected input". These two
+    // fields were the ones left out.
+
+    function test_init_rerangeSlippageZeroReverts() public {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.rerange.slippageBps = 0;
+        _expectInitRevert(ConcentratedLiquidityStrategy.InvalidRerangePolicy.selector, p);
+    }
+
+    /// @dev The mint side of the same shape, and ALSO finding #9's guaranteed
+    ///      trigger: `_mintPosition` derives `amountXMin` from the amounts
+    ///      OFFERED, so zero slippage demands the pool consume every wei of both
+    ///      legs — which a two-sided mint never does. Rejecting zero closes that
+    ///      trigger outright. Finding #9's other half (spot drifting outside the
+    ///      band, leaving one leg untouched at any non-zero setting) needs the
+    ///      floors derived from the range-implied amounts and is NOT fixed here.
+    function test_init_mintSlippageZeroReverts() public {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.mintSlippageBps = 0;
+        _expectInitRevert(ConcentratedLiquidityStrategy.InvalidBound.selector, p);
+    }
+
+    /// @dev NOT A BLANKET REJECTION. The bar is "non-zero", the same bar
+    ///      `settleSlippageBps` clears — one basis point is admissible. Without
+    ///      this the two tests above would also hold for a guard that refused
+    ///      every value, which would brick the template far harder than the
+    ///      finding does.
+    function test_init_oneBasisPointSlippageIsAccepted() public {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.mintSlippageBps = 1;
+        p.rerange.slippageBps = 1;
+
+        ConcentratedLiquidityStrategy s = _newStrategy(p);
+
+        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Pending));
+        assertEq(s.mintSlippageBps(), 1, "the mint floor was not stored as given");
+        assertEq(s.rerangePolicy().slippageBps, 1, "the rerange floor was not stored as given");
+    }
+
     function test_init_twapWindowTooShortReverts() public {
         ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
         p.twapWindow = strategy.MIN_TWAP_WINDOW() - 1;
@@ -554,11 +691,12 @@ contract ConcentratedLiquidityStrategyInitTest is CLFixture {
     // ── Pashov 2026-08 finding #3 — governance binding of counterparties ──
     //
     // Every init-time check in this template resolves THROUGH an address the
-    // proposer chose: `pool.factory() == p.uniswapFactory` compares an
-    // attacker's pool's answer against an attacker's own parameter,
-    // `market(id).lastUpdate` asks an attacker's Morpho whether an attacker's
-    // market exists, `_isWrapperOf` asks an attacker's token what it wraps.
-    // Self-consistent by construction, every one of them.
+    // proposer chose: `getPool` asks a factory which pool it created,
+    // `market(id).lastUpdate` asks a Morpho whether a market exists,
+    // `_isWrapperOf` asks a token what it wraps. Unless the address answering
+    // is bound first, every one of them is self-consistent by construction —
+    // which is what finding #4 turned out to be for the pool, and why
+    // `uniswapFactory` is on this list too.
     //
     // The vault's batch guard does not cover it either: `_guardBatchCalls`
     // PART 2a checks the CLONE is an allowlisted callee, while the approvals
@@ -855,6 +993,7 @@ contract ConcentratedLiquidityStrategyPoolAnchoredFloorTest is CLFixture {
     ///      0.99` fill, and this reverts.
     function test_execute_poolFeeIsNettedOutOfTheAnchor() public {
         MockUniswapV3Pool widePool = new MockUniswapV3Pool(address(usdg), address(nvda), 10_000, TICK_SPACING, factory);
+        factoryMock.register(address(usdg), address(nvda), 10_000, address(widePool));
         widePool.setLiquidity(POOL_LIQUIDITY);
         widePool.setTicks(0, 0);
         widePool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96);
@@ -931,7 +1070,7 @@ contract ConcentratedLiquidityStrategyPoolAnchoredFloorTest is CLFixture {
         // The pool returns to itself; anyone may retry.
         pool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96);
         pool.setTicks(0, 0);
-        vm.prank(keeper);
+        vm.prank(address(vaultStub));
         strategy.sweep();
 
         assertEq(nvda.balanceOf(address(strategy)), 0, "sweep must recover the residue once the pool is honest");

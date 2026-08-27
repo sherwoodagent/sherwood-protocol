@@ -3,10 +3,11 @@ pragma solidity 0.8.28;
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
+import {IStrategyDelivery} from "../interfaces/IStrategyDelivery.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {IMorpho, Id, MarketParams} from "../vendor/morpho/IMorpho.sol";
+import {IMorpho, Id, MarketParams, Market} from "../vendor/morpho/IMorpho.sol";
 import {MarketParamsLib, MorphoBalancesLib, SharesMathLib} from "../vendor/morpho/MorphoLibs.sol";
 
 /// @notice The hops walked to resolve the governance-owned adapter allowlist from
@@ -266,14 +267,31 @@ contract MorphoSupplyStrategy is BaseStrategy {
     }
 
     /// @notice Return any supply position left behind by an incomplete settlement
-    ///         to the vault. Permissionless and post-settlement only: it moves
-    ///         value in exactly one direction — out of this strategy, into the
-    ///         vault it was always owed to — so there is nothing to gate.
-    /// @dev    Idempotent and safe to call when there is nothing to move. Takes the
-    ///         deliverable maximum on each call, so a market that frees up
+    ///         to the vault.
+    /// @dev    VAULT-ONLY, THOUGH THE VALUE ONLY EVER MOVES THE RIGHT WAY. This
+    ///         was permissionless on the reasoning that a one-directional push
+    ///         needs no gate. The push is fine; the ACCOUNTING is what breaks.
+    ///
+    ///         `SyndicateVault.collectResidue` measures what arrives as a
+    ///         balance delta across this call and hands the exited redeem cohort
+    ///         their frozen fraction of it (`_payCohortShare`). A delta is only
+    ///         a complete measurement if it is the ONLY way value arrives.
+    ///         Called directly, the assets land outside that window: the cohort
+    ///         is credited nothing, and the arrival silently lifts the price for
+    ///         whoever STAYED — the exact misallocation the junior leg was
+    ///         written to correct. Unrepairable too, since the delta is spent:
+    ///         a later `collectResidue` measures zero and pays zero.
+    ///
+    ///         Not an attack that needs an attacker. Any keeper calling the
+    ///         function on its own does it, which is why the fix is to remove
+    ///         the second door rather than document around it. The public entry
+    ///         point is `collectResidue`, still permissionless, which calls this.
+    ///
+    ///         Idempotent and safe to call when there is nothing to move. Takes
+    ///         the deliverable maximum on each call, so a market that frees up
     ///         gradually can be swept repeatedly.
     /// @return assets The vault-asset amount pushed to the vault this call.
-    function sweep() external returns (uint256 assets) {
+    function sweep() external onlyVault returns (uint256 assets) {
         if (_state != State.Settled) revert NotSettled();
         (uint256 shares, uint256 own, uint256 deliverable) = _deliverableNow();
         if (shares != 0 && deliverable != 0) {
@@ -290,12 +308,115 @@ contract MorphoSupplyStrategy is BaseStrategy {
         }
     }
 
+    /// @inheritdoc IStrategyDelivery
+    /// @dev True while a settled proposal still has a supply position or idle
+    ///      asset on this clone — exactly what `sweep()` above would move. The
+    ///      vault reads this to keep deposits shut over that window, because
+    ///      `totalAssets()` prices anything held here at zero and a depositor
+    ///      would otherwise mint against a NAV missing the residue.
+    ///
+    ///      MEASURED ON WHAT THE POSITION IS WORTH, NEVER ON WHAT THE MARKET
+    ///      CAN PAY OUT RIGHT NOW. Both come from `_deliverableNow()`, and the
+    ///      distinction is which element is read: `own` is this clone's claim,
+    ///      a function of its own shares and the supply index. `deliverable` is
+    ///      that claim clamped to the market's idle balance, which is exactly
+    ///      the quantity a flash loan moves — so it is never consulted here. A
+    ///      residue that cannot be withdrawn this instant is still value the
+    ///      vault does not count, and must still hold deposits.
+    ///
+    ///      Only meaningful once Settled: before that the vault is already
+    ///      gated by `openProposalCount() != 0`, and answering true early would
+    ///      be redundant rather than wrong.
+    function hasUndeliveredValue() public view override returns (bool) {
+        // `Settled` ONLY, and that is a deliberate reversal. Answering for
+        // `Executed` too was tried, to cover a clone left holding everything by
+        // `finalizeEmergencySettle`. It WEDGES the vault: `sweep()` is itself
+        // `Settled`-gated, so such a clone reports residue forever, cannot be
+        // swept, and deposits shut permanently with no permissionless way out —
+        // and a proposer can reach it cheaply by omitting `settle()` from a
+        // `maxDrawdownBps == 10_000` batch. A permanent DoS is worse than the
+        // fail-open it was closing, and it would have falsified
+        // `depositsLocked`'s "NOBODY IS WEDGED" doctrine.
+        //
+        // Closing the emergency-path gap needs `sweep()` reachable for a
+        // terminal-but-`Executed` clone first — either by relaxing its gate or
+        // by a permissionless `forceSettle()`. Tracked with the NAV work in
+        // issue #233 / `docs/nav-residue-design.md`. Until then this stays
+        // narrow.
+        if (_state != State.Settled) return false;
+        // VALUED, NOT COUNTED. `supply` takes `onBehalf` and requires no
+        // authorization — Morpho gates the withdraw/borrow side, not the credit
+        // side — so anyone can mint 1 wei of shares to a settled clone. Keying
+        // on `supplyShares != 0` let that bypass the dust floor and shut vault
+        // deposits indefinitely, which is the grief `RESIDUE_DUST` exists for.
+        // SAME RAW BASIS AS `undeliveredValue()` below, so the bool and the
+        // amount can never diverge — and so this probe is equally immune to a
+        // gas-griefing IRM. See `_ownRaw`.
+        if (_ownRaw() > RESIDUE_DUST) return true;
+        return IERC20(asset).balanceOf(address(this)) > RESIDUE_DUST;
+    }
+
+    /// @inheritdoc IStrategyDelivery
+    /// @dev Loan token IS the vault asset for this template (`_initialize`
+    ///      pins `marketParams.loanToken == asset`), so the supply position is
+    ///      already denominated in vault-asset units — no oracle, and nothing
+    ///      an attacker can move inside the settlement transaction. `own` is
+    ///      the redeemable value of the remaining shares; the idle balance is
+    ///      whatever a partial withdrawal already pulled but has not pushed.
+    function undeliveredValue() public view override returns (uint256) {
+        if (_state != State.Settled) return 0;
+        return _ownRaw() + IERC20(asset).balanceOf(address(this));
+    }
+
+    /// @dev This clone's supply position in loan-token units, valued over the
+    ///      market's RAW stored totals — deliberately NOT `_deliverableNow` /
+    ///      `expectedMarketBalances`.
+    ///
+    ///      THE ACCRUING READ ROUTES THROUGH A PROPOSER-CHOSEN CONTRACT.
+    ///      `expectedMarketBalances` calls `IIrm(marketParams.irm).borrowRateView`
+    ///      to project interest since `lastUpdate`, and `_initialize` binds
+    ///      neither `mp.irm` nor the registry against it. The vault reads the
+    ///      probes above under a gas cap (`SyndicateVault._PROBE_GAS`), so an IRM
+    ///      whose view burns past that cap makes the read fail — and a failed
+    ///      read means the residue is never recorded and deposits are priced as
+    ///      if there were none, which is finding #3 restored. `_settle` and
+    ///      `sweep()` call the accruing path with full gas and are unaffected,
+    ///      which is exactly what made the asymmetry reachable.
+    ///
+    ///      A raw `morpho.market(id)` read has no external call at all, so the
+    ///      suppression has nowhere to enter. The cost is that it excludes
+    ///      interest accrued since `lastUpdate`, i.e. it is stale-LOW by that
+    ///      amount — the same bounded staleness the vault already documents and
+    ///      accepts for a snapshot between refreshes, and a far smaller gap than
+    ///      an unbounded suppression of the whole figure.
+    ///
+    ///      `_deliverableNow` KEEPS the accruing read: `_settle` and `sweep`
+    ///      size real withdrawals with it and must not under-withdraw, and they
+    ///      are not gas-capped by a caller.
+    function _ownRaw() private view returns (uint256) {
+        uint256 shares = morpho.position(marketId, address(this)).supplyShares;
+        if (shares == 0) return 0;
+        Market memory m = morpho.market(marketId);
+        return shares.toAssetsDown(m.totalSupplyAssets, m.totalSupplyShares);
+    }
+
+    /// @inheritdoc IStrategyDelivery
+    /// @dev Always FALSE, and by construction rather than by policy: this
+    ///      template's only position is a Morpho supply whose loan token IS the
+    ///      vault asset, so `undeliveredValue()` expresses everything it holds
+    ///      in vault-asset units with no price conversion anywhere. There is no
+    ///      leg it cannot value.
+    function hasUnvaluedResidue() public pure override returns (bool) {
+        return false;
+    }
+
     /// @dev (own supply shares, their redeemable value, the amount the market
-    ///      can actually pay out right now). Shared core for `_settle` and
-    ///      `sweep` — deliberately WITHOUT a `_state` gate: both run in
-    ///      `State.Settled` (see `BaseStrategy.settle`, which flips state
-    ///      BEFORE calling `_settle`), so a state gate here would zero them
-    ///      out entirely.
+    ///      can actually pay out right now). Shared core for `_settle`, `sweep`
+    ///      and the two delivery probes — deliberately WITHOUT a `_state` gate:
+    ///      `_settle` and `sweep` both run in `State.Settled` (see
+    ///      `BaseStrategy.settle`, which flips state BEFORE calling `_settle`),
+    ///      so a state gate here would zero them out entirely. The probes carry
+    ///      their own gate instead.
     function _deliverableNow() private view returns (uint256 shares, uint256 own, uint256 deliverable) {
         MarketParams memory mp = _marketParams;
         (uint256 totalSupplyAssets, uint256 totalSupplyShares, uint256 totalBorrowAssets,) =

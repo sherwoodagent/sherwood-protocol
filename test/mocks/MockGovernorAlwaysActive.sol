@@ -49,6 +49,13 @@ contract MockPermissiveTierRegistry {
         return true;
     }
 
+    /// @dev Callee axis (pashov finding #14). Permissive like its sibling —
+    ///      fixtures using this mock are resolving the binding path, not
+    ///      exercising the demotion asymmetry.
+    function isCallableTarget(address) external pure returns (bool) {
+        return true;
+    }
+
     function isPriceSourceForToken(address, bytes32) external pure returns (bool) {
         return true;
     }

@@ -53,6 +53,16 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         internal
         virtual
         returns (int256 pnl, uint256 totalFee);
+    /// @dev Settle-price floor (pashov findings #2, #12). Declared here because
+    ///      `unstick` stamps through `_finishSettlementHook` exactly as
+    ///      `settleProposal` does, while the anchor it measures against lives in
+    ///      the concrete governor's storage. Gating only `settleProposal` closed
+    ///      the front door and left this one open — the attack through `unstick`
+    ///      needs no 100% drawdown declaration at all.
+    function _requireSettlePriceAboveFloorHook(uint256 pid, StrategyProposal storage p, bool rescuePath)
+        internal
+        view
+        virtual;
 
     // ── Reentrancy modifier (shares status var with SyndicateGovernor) ──
 
@@ -98,6 +108,28 @@ abstract contract GovernorEmergency is ProposalLifecycle {
             .executeGovernorBatch(
                 _getSettlementCalls(proposalId), _getEffectiveSettlementCallCaps(proposalId), p.effectiveMaxCapital
             );
+        // Same settle-price floor `settleProposal` enforces (pashov #12). An
+        // honest rescue replays an already-voted batch and is net-INFLOW, so it
+        // clears the floor trivially; only a near-zero stamp — the shape a
+        // flash-loaned settle manufactures — is refused, and that case is
+        // redirected to `finalizeEmergencySettle`.
+        // `rescuePath = true`: the floor here is the ABSOLUTE backstop, not the
+        // declared envelope. `unstick` exists precisely to settle a proposal the
+        // declared-envelope floor REFUSED, so deriving its bar from that same
+        // envelope would delete its reason to exist — pinned by
+        // `test_pashovFinding1_unstickRecoversAProposalTheFloorRefused`. An
+        // ordinary or even severe loss still unsticks; only a near-zero stamp is
+        // refused.
+        //
+        // WHAT THAT REDIRECTION IS WORTH, STATED HONESTLY: it costs an
+        // attacking owner a posted bond and a full guardian REVIEW WINDOW, not
+        // the ability to stamp a near-zero price. `finalizeEmergencySettle` is
+        // itself ungated on this floor (see the note there), and the same owner
+        // gate `_requireVaultOwner` guards both, so the barrier this adds on the
+        // `unstick` door is delay and visibility rather than arithmetic. It is
+        // still the load-bearing difference: `unstick` is instant and unbonded,
+        // the emergency path is neither.
+        _requireSettlePriceAboveFloorHook(proposalId, p, true);
         _finishSettlementHook(proposalId, p);
     }
 
@@ -114,6 +146,11 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
 
         IGuardianRegistry reg = IGuardianRegistry(_guardianRegistry);
+
+        // OPENED FIRST, THEN BONDED — the order is the fix, see below.
+        bytes32 h = keccak256(abi.encode(calls));
+        reg.openEmergency(proposalId, h, calls);
+
         // STRICTLY POSITIVE, not merely "meets the requirement". `posted == 0`
         // is checked on its own rather than left to the comparison because the
         // comparison alone is satisfiable at zero: a registry (or sWOOD) whose
@@ -131,11 +168,32 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         // settlement batch above with no bond requirement at all, so the honest
         // stuck-proposal path is untouched. This gate covers only the path that
         // lets the owner write the calldata.
+        //
+        // MEASURED AFTER THE CALL THAT CAN BURN IT (2026-08 sweep finding #11).
+        // `openEmergency` does not only open: when a previous round is still
+        // unresolved it calls `_resolveEmergency` in place, and a blocked
+        // verdict there calls `slashOwnerBond`, which DELETES the stake. Read
+        // before that call, this gate passed on collateral the same transaction
+        // was about to destroy — and the round it admitted went live with
+        // nothing slashable behind it. A second block verdict then hits
+        // `slashOwnerBond`'s `amount == 0` early return, so the deterrent
+        // guarding owner-authored calldata (run by `finalizeEmergencySettle`
+        // with EMPTY per-call caps) was a no-op for that round.
+        //
+        // The owner races no one for it. `_resolveEmergency` and the
+        // permissionless `resolveEmergencyReview` are BOTH gated on
+        // `_effNow >= er.reviewEnd`, so both predicates flip at the same
+        // instant — a timestamp the owner knows in advance and can simply pick.
+        // `openEmergency`'s own natspec spells that out while closing the
+        // sibling race.
+        //
+        // Reverting here unwinds the open AND the slash, which is the right
+        // direction on both counts: no unbonded round is admitted, and the
+        // verdict the elapsed window earned stays on the record for the
+        // permissionless resolver to commit. Cost of moving it is one wasted
+        // `openEmergency` in the failing case, which reverts anyway.
         uint256 posted = reg.ownerStake(p.vault);
         if (posted == 0 || posted < reg.requiredOwnerBond(p.vault)) revert OwnerBondInsufficient();
-
-        bytes32 h = keccak256(abi.encode(calls));
-        reg.openEmergency(proposalId, h, calls);
         emit EmergencySettleProposed(proposalId, msg.sender, h, uint64(block.timestamp + reg.reviewPeriod()));
     }
 
@@ -161,6 +219,28 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         (bool blocked, BatchExecutorLib.Call[] memory calls) = reg.finalizeEmergency(proposalId);
         if (blocked) revert EmergencySettleBlocked();
 
+        // RE-ASSERTED AT THE POINT OF USE, not only at the point of admission
+        // (2026-08 sweep finding #11, defence in depth). The bond is the only
+        // economic deterrent behind the calls executed below — owner-authored,
+        // EMPTY per-call caps — so the invariant that actually matters is
+        // "bonded WHEN THE CALLS RUN", and the open-time gate is a proxy for it.
+        // Finding #11 was that proxy failing: the gate passed on collateral the
+        // same transaction then burned. Checking here closes the class rather
+        // than the instance — any future path that opens a round without a live
+        // bond, or burns one mid-review, still cannot reach these calls.
+        //
+        // Mirrors `StakedWood.claimUnstakeOwner`, which re-checks
+        // `openProposalCount()` at claim time for the same reason and says so:
+        // a gate that fires once can be walked around by changing the state it
+        // measured.
+        //
+        // EXISTENCE ONLY, deliberately NOT `posted < requiredOwnerBond`. The
+        // requirement is governance-mutable, and re-imposing a live threshold
+        // here would let a `minOwnerStake` raise landed mid-review strand the
+        // finalize of an honest emergency that was correctly bonded when it
+        // opened. Zero is the property with no legitimate reading.
+        if (reg.ownerStake(p.vault) == 0) revert OwnerBondInsufficient();
+
         // Same EFFECTIVE capital cap as `settleProposal`/`unstick` — NOT
         // `p.maxCapital`: using the full propose-time declaration here reopens the
         // same coverage widening `unstick` had, just gated behind guardian review
@@ -181,6 +261,25 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         // on the very declaration that stranded the proposal. The BATCH-level
         // ceiling is tightened regardless, since that is not what the escape hatch
         // was designed to relax.
+        // DELIBERATELY NOT GATED ON THE SETTLE-PRICE FLOOR (pashov #2/#12),
+        // unlike `settleProposal` and `unstick`. This is the terminus every
+        // sub-floor settlement is redirected TO: a position that genuinely lost
+        // more than 90% of the execute-time price has to be able to close, and
+        // gating here would leave it with no exit at all while `_activeProposal`
+        // keeps the whole vault frozen — redemptions, deposits, queue claims and
+        // any further proposal. Pinned by
+        // `test_subFloorSettlementIsClearedByFinalizeEmergencySettle`.
+        //
+        // WHAT STANDS BEHIND IT INSTEAD, accurately: a posted owner bond, an
+        // opened emergency, a full `reviewPeriod` elapsed, and no guardian
+        // block. Note the limits of that — the bond is slashed only when
+        // guardians actively block (`GuardianRegistry._resolveEmergency`), and
+        // guardians review the submitted CALLDATA, not the block this call
+        // eventually lands in. An owner may therefore submit honest replay
+        // calls, let the review lapse, and finalize from inside a flash-loan
+        // frame, stamping the same near-zero price with no slash. So the claim
+        // this path supports is "an attacking owner must wait out a guardian
+        // review", NOT "the stamp is bounded on every path".
         ISyndicateVault(p.vault).executeGovernorBatch(calls, new uint256[](0), p.effectiveMaxCapital);
         (int256 pnl,) = _finishSettlementHook(proposalId, p);
         emit EmergencySettleFinalized(proposalId, pnl);

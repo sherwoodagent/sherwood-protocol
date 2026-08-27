@@ -206,6 +206,66 @@ contract DeployPlanDPreflightTest is Test {
         _runExpecting("PRE-FLIGHT: ExposureLedger.woodPriceX8 is 0");
     }
 
+    /// @dev PRE-FLIGHT 4 (SHE-128): `quorumTierThreshold` must still be 0.
+    ///      `DeployPlanB` asserts this on the ledger it MINTS; Plan D runs
+    ///      later, against a ledger that has been under governance in between,
+    ///      and `setQuorumTierThreshold` is a plain `onlyOwner` setter — so the
+    ///      drift this catches needs no exotic state, just the owner having used
+    ///      the setter once.
+    ///
+    ///      WHY IT MATTERS AT 1 SPECIFICALLY. `SyndicateGovernor` gates the
+    ///      coverage quorum on `envelopeTier >= quorumTierThreshold`. At 1 a
+    ///      tier-0 proposal skips `requireApproveQuorum` entirely and executes
+    ///      with no stake-backed approver on the hook, while every other reading
+    ///      of the deployment looks healthy.
+    ///
+    ///      NOT sandbox payloads, at 1 or 2. `_snapshotTierAndGate` forces
+    ///      `tier_ = 2` on any proposal with non-zero `_sandboxFunding`, and
+    ///      `proposeWithSandbox` refuses zero funding — so a sandbox is always
+    ///      tier 2 and stays gated until the threshold reaches 3, the setter's
+    ///      own "quorum disabled for all tiers" ceiling. The ordinary
+    ///      certified-batch tiers are what 1 and 2 give away.
+    function test_preflight_bites_whenTheQuorumTierThresholdHasDrifted() public {
+        vm.prank(DEFAULT_SENDER);
+        ledger.setQuorumTierThreshold(1);
+        assertEq(ledger.quorumTierThreshold(), 1, "the drift did not land - the test would be vacuous");
+
+        _runExpecting("PRE-FLIGHT: ExposureLedger.quorumTierThreshold != 0");
+    }
+
+    /// @dev And the refusal is TOTAL, same argument as the exit-gate case: a
+    ///      Plan D that granted the freeze role before refusing would make
+    ///      pre-flight 1 unsatisfiable on the re-run that fixes the threshold.
+    ///
+    ///      THIS DOES NOT PIN THE ASSERTION'S POSITION, and an earlier version
+    ///      of this comment claimed it did. `_runExpecting` drives the whole of
+    ///      `deploy()` in ONE call that reverts, and the revert rolls the role
+    ///      grants back regardless of where the `require` sits — measured:
+    ///      moving the pre-flight below `vm.stopBroadcast()` leaves all ten
+    ///      tests in this suite green. Same trap as a post-revert counter
+    ///      assertion. What the three reads below actually prove is that the
+    ///      refusal leaves NO residue, which is the property that matters for a
+    ///      re-run; position is a non-issue here anyway, since a `forge script`
+    ///      that reverts anywhere broadcasts nothing at all (`DeployPlanB` puts
+    ///      the same assertion after its broadcast for exactly that reason).
+    function test_preflight_leavesEveryRoleUnwired_whenTheQuorumTierThresholdHasDrifted() public {
+        vm.prank(DEFAULT_SENDER);
+        ledger.setQuorumTierThreshold(2);
+        _runExpecting("PRE-FLIGHT: ExposureLedger.quorumTierThreshold != 0");
+
+        assertEq(ledger.coverageFreezer(), address(0), "coverageFreezer must be untouched");
+        assertEq(tiers.authorizedDemoter(), address(0), "authorizedDemoter must be untouched");
+        assertEq(swood.authorizedSlasher(), address(0), "authorizedSlasher must be untouched");
+    }
+
+    /// @dev Non-vacuity control for the two above: the happy path runs with the
+    ///      default 0, so the new pre-flight is not simply refusing everything.
+    function test_deploy_succeedsAtTheDefaultQuorumTierThreshold() public {
+        assertEq(ledger.quorumTierThreshold(), 0, "ExposureLedger's default is no longer 0");
+        ChallengeGame game = _run();
+        assertEq(ledger.coverageFreezer(), address(game), "coverageFreezer");
+    }
+
     // ─────────────────────────────── helpers ───────────────────────────────
 
     /// @dev THE ADDRESS BOOK IS PASSED, NOT SET IN THE ENVIRONMENT. `run()`'s

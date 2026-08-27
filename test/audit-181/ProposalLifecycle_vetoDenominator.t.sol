@@ -16,6 +16,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title ProposalLifecycle_vetoDenominator
 /// @notice Audit issue #181, FINDING #14 (HIGH) —
@@ -136,7 +137,8 @@ contract ProposalLifecycleVetoDenominatorTest is Test {
                 address(vault),
                 address(registry),
                 address(new ProtocolConfig(owner)),
-                address(this), // factory
+                address(this),
+                address(deployTierRegistry(address(this))), // factory
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: 1 days,
                     executionWindow: 1 days,

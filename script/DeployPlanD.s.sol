@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Script, console} from "forge-std/Script.sol";
+import {console} from "forge-std/Script.sol";
+import {ScriptBase} from "./ScriptBase.sol";
 import {ChallengeGame} from "../src/ChallengeGame.sol";
 import {IExposureLedger} from "../src/interfaces/IExposureLedger.sol";
 import {IStakedWood} from "../src/interfaces/IStakedWood.sol";
@@ -61,6 +62,13 @@ interface ISwoodExposureLedger {
  *      figure `file` actually divides by: the raw `woodUsdPriceX8` scalar would
  *      pass this pre-flight while the game was unpriced, and fail it while the
  *      game was healthy off a live feed (review 🟠F16).
+ * @dev PRE-FLIGHT 4: `quorumTierThreshold` must still be 0. `DeployPlanB`
+ *      asserts this on the ledger it MINTS; this asserts it on the ledger this
+ *      script is POINTED AT, after however long and however many governed
+ *      parameter changes separate the two ceremonies. Above 0, every proposal
+ *      below the threshold executes with no stake-backed approver covering it
+ *      -- at 3, the setter's documented "quorum disabled for all tiers" value,
+ *      that is EVERY proposal including sandbox payloads. See the block itself.
  *
  *      Ownership: the broadcaster becomes the game's owner and must ALREADY own
  *      the ExposureLedger, the TierRegistry and StakedWood (all three setters
@@ -77,7 +85,7 @@ interface ISwoodExposureLedger {
  *   Usage (simulate; never --broadcast blind):
  *     forge script script/DeployPlanD.s.sol:DeployPlanD --rpc-url <rpc> -vvvv
  */
-contract DeployPlanD is Script {
+contract DeployPlanD is ScriptBase {
     /// @notice The address book this deployment runs against, exactly as
     ///         `run()` reads it out of the environment.
     /// @dev    THE ENV READ AND THE DEPLOYMENT ARE SPLIT ON PURPOSE. `vm.setEnv`
@@ -96,7 +104,7 @@ contract DeployPlanD is Script {
     }
 
     function run() external {
-        deploy(
+        address gameAddr = deploy(
             AddressBook({
                 swood: vm.envAddress("STAKED_WOOD"),
                 wood: vm.envAddress("WOOD_TOKEN"),
@@ -104,12 +112,18 @@ contract DeployPlanD is Script {
                 tierRegistry: vm.envAddress("TIER_REGISTRY")
             })
         );
+
+        // PERSISTED FOR THE COURT PHASES. `DeployTokenCourt` and
+        // `WireTokenCourt` both read CHALLENGE_GAME as an env address; without
+        // this key the operator scrapes it out of the broadcast log by hand.
+        // Written from `run()`, never from `deploy()` — see `DeployPlanB`.
+        _patchAddressIfBook("CHALLENGE_GAME", gameAddr);
     }
 
     /// @notice Every pre-flight, deploy and wiring step. Public so the
     ///         pre-flight tests can drive the real thing without the process
     ///         environment — see `AddressBook`.
-    function deploy(AddressBook memory book) public {
+    function deploy(AddressBook memory book) public returns (address gameAddr) {
         address deployer = msg.sender;
 
         address swood = book.swood;
@@ -183,8 +197,51 @@ contract DeployPlanD is Script {
             "chain 4663 has no Chainlink WOOD/USD feed, so the ledger needs setWoodTwapOracle."
         );
 
+        // ── Pre-flight 4: a covering approve quorum at EVERY tier ──
+        // `DeployPlanB` asserts this on the ledger it MINTS. This re-asserts it
+        // on the ledger this script is POINTED AT, which is not the same claim:
+        // `quorumTierThreshold` moves through `setQuorumTierThreshold`, a plain
+        // `onlyOwner` setter with NO timelock — it emits
+        // `ParameterChangeFinalized(PARAM_QUORUM_TIER_THRESHOLD, ...)` and
+        // assigns in the same call. So the drift needs no exotic state and no
+        // waiting period, just the owner having used the setter once in
+        // whatever interval separates the two ceremonies. Plan D is the last
+        // ceremony that touches this ledger with owner powers, so it is the
+        // last cheap place to catch it.
+        //
+        // WHY ZERO IS THE ONLY ADMISSIBLE VALUE. `SyndicateGovernor`'s
+        // `_deriveAndStoreEffectiveCapital` gates the coverage quorum on
+        // `proposal.envelopeTier >= ledger.quorumTierThreshold()`. Above zero,
+        // proposals BELOW the threshold skip `requireApproveQuorum` entirely and
+        // execute with no stake-backed approver on the hook. The coverage is
+        // still SIZED correctly at every tier; only the enforcement is gated,
+        // which is what makes a non-zero threshold look healthy from every
+        // other angle.
+        //
+        // WHAT EACH NON-ZERO VALUE COSTS. 1 unguards tier 0; 2 unguards tiers 0
+        // and 1; 3 is the setter's own documented "quorum disabled for all
+        // tiers" (`ExposureLedger.setQuorumTierThreshold` refuses anything
+        // above it) and unguards everything. SANDBOX PAYLOADS ARE NOT IN THE
+        // FIRST TWO. `_snapshotTierAndGate` forces `tier_ = 2` whenever
+        // `_sandboxFunding[p.id] != 0`, and `proposeWithSandbox` reverts
+        // `ZeroSandboxFunding` on a zero, so a sandbox proposal is ALWAYS tier 2
+        // — precisely so it cannot ride along under a raised threshold. Only 3
+        // strips its underwriter. The tiers 1 and 2 give away are the ordinary
+        // certified-batch ones, which is enough on its own to refuse.
+        //
+        // Read TYPED, not probed. Unlike `woodPriceX8()` above this is a plain
+        // storage getter that cannot revert on a real ledger, and a ledger
+        // without the selector is not a ledger this script should wire at all.
+        require(
+            IExposureLedger(ledger).quorumTierThreshold() == 0,
+            "PRE-FLIGHT: ExposureLedger.quorumTierThreshold != 0 -- a covering approve quorum is "
+            "required at EVERY tier, and above 0 the tiers below it execute with no underwriter "
+            "on the hook. Call setQuorumTierThreshold(0) as ledger owner, then re-run."
+        );
+
         console.log("deployer / game owner:  %s", deployer);
         console.log("ledger woodPriceX8:     %s", priceX8);
+        console.log("quorumTierThreshold:    %s", IExposureLedger(ledger).quorumTierThreshold());
 
         vm.startBroadcast();
 
@@ -192,6 +249,7 @@ contract DeployPlanD is Script {
         // approver set from one and demotes through the other, and neither
         // pointer has a sane default.
         ChallengeGame game = new ChallengeGame(deployer, wood, ledger, tierRegistry);
+        gameAddr = address(game);
 
         // Drift guard: the game's challenge window is only meaningful while it
         // matches the ledger's coverage window. A filing outside that window

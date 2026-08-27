@@ -11,6 +11,7 @@ import {StakedWood} from "../../src/StakedWood.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
 import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
@@ -256,7 +257,10 @@ contract DeployMultisigHandoffTest is Test {
                     beacon: governor, // the GovernorBeacon deployed above
                     protocolConfig: address(new ProtocolConfig(deployer)),
                     managementFeeBps: 50,
-                    guardianRegistry: registry
+                    guardianRegistry: registry,
+                    // Mandatory since pashov finding #1. Factory proxy is
+                    // CREATE3, so the extra nonce moves no prediction.
+                    tierRegistry: address(new TierRegistry(deployer))
                 }))
         );
         factory = c3.deploy(
