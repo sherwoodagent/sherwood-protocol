@@ -29,6 +29,22 @@
     "UniswapV3NonfungiblePositionManager": {
       "address": "0x73991a25c818bf1f1128deaab1492d45638de0d3",
       "verification": "24384 bytes of code; name() == \"Uniswap V3 Positions NFT-V1\", symbol() == \"UNI-V3-POS\", factory() == UniswapV3Factory above, WETH9() == WETH below. Discovered from the owner topic of a Mint log on the USDG/WETH 0.01% pool rather than from a published address list."
+    },
+    "SushiLaunchpadV1": {
+      "address": "0x104F1Ab42674565EC3DF0BFEbCcC4186f72fA7ED",
+      "verification": "Verified source on robinhoodchain.blockscout.com as SushiLaunchpad (solc v0.8.36); 2366 TokenLaunched events. Identity, not presence: WETH() == WETH below, v3Factory() == SushiV3Factory below, positionManager() == SushiV3NonfungiblePositionManager below. Live params read 2026-08-28: launchFee() == 5e14 wei, protocolReserveBps() == 300, defaultSushiFeeBps() == 3000, owner() == 0x6fA4080b70eed82Cf48570DDE705026905a64657. quoteTokenPriceFeed(WOOD) == address(0) at that date -- WOOD-paired launches revert UnsupportedQuoteToken until the venue owner registers a WOOD/USD aggregator."
+    },
+    "SushiV3Factory": {
+      "address": "0xE51960f1B45f1C9FB6D166E6a884F866fC70433B",
+      "verification": "feeAmountTickSpacing(10000) == 200 (the 1% tier the launchpad mints into). Round-trip closed: getPool(WOOD, WETH, 3000) == WoodWethSushiV3Pool below, whose own factory() returns this address. Distinct from UniswapV3Factory above -- the two venues do NOT share a factory on this chain."
+    },
+    "SushiV3NonfungiblePositionManager": {
+      "address": "0x51d0e5188afe12d502e29D982d20C190e7816107",
+      "verification": "name() == \"SushiSwap V3 Positions NFT-V1\", symbol() == \"SUSHI-V3-POS\", factory() == SushiV3Factory above, WETH9() == WETH below. Holds every launchpad LP position -- the launch creator never custodies one."
+    },
+    "WoodWethSushiV3Pool": {
+      "address": "0xF6831AaF374B353757F0dE6B3DD2a74697671C69",
+      "verification": "fee() == 3000, factory() == SushiV3Factory above, liquidity() == 2.128e22 read 2026-08-28. The live WOOD/WETH venue behind the SHARE/WOOD pairing; also the only on-chain WOOD price source, and thin enough (~$437k) that the protocol admits its TWAP only under the min() ceiling in WoodTwapOracle."
     }
   },
   "tokens": {

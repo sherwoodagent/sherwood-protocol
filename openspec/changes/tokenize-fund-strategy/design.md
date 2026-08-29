@@ -47,9 +47,12 @@ interface ILaunchAdapter {
     function finalize(bytes32 launchRef) external;                        // drive graduate/bond where the venue needs it; no-op on Sushi
     function collectFees(bytes32 launchRef) external returns (uint256 quoteOut, uint256 tokenOut); // creator share → strategy
     function quoteSupported(address quoteToken) external view returns (bool);
+    function nativeFeeSource() external view returns (address token, uint256 amount); // what the adapter pulls to cover a native launch fee
     function launchTarget() external view returns (address);
 }
 ```
+
+`nativeFeeSource` was added during implementation, and the omission it fixes is worth recording. Sushi charges its launch fee in native ETH, and the obvious way to fund that from a strategy — unwrap some of the launch quote — silently assumes the quote IS the wrapped native. **It is not: the pair is the agent's choice**, so a proposal pairing against a stable, a stock token, or WOOD would have reverted at execute on exactly the pairings this template exists to enable. The adapter therefore NAMES its fee token and amount, read live (the venue owner can reprice between propose and execute), and the strategy acquires that token through its own allowlisted swap adapter. A venue charging no native fee answers `(address(0), 0)`.
 
 Rules every implementation MUST satisfy (normative in the spec):
 
