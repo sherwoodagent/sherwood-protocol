@@ -5,18 +5,27 @@ import {console} from "forge-std/Script.sol";
 import {ScriptBase} from "../ScriptBase.sol";
 import {TokenizeFundStrategy} from "../../src/strategies/TokenizeFundStrategy.sol";
 import {SushiLaunchAdapter} from "../../src/adapters/SushiLaunchAdapter.sol";
+import {StonkLaunchAdapter} from "../../src/adapters/StonkLaunchAdapter.sol";
 import {ISushiLaunchpad} from "../../src/vendor/sushi/ISushiLaunchpad.sol";
+import {IStonkSafeLaunchpadV2} from "../../src/vendor/stonkbrokers/IStonkSafeLaunchpadV2.sol";
 import {ITierRegistry} from "../../src/interfaces/ITierRegistry.sol";
 
 /**
- * @notice Deploy the TokenizeFundStrategy template and the SushiLaunchAdapter
- *         to Robinhood Chain mainnet (chain 4663).
+ * @notice Deploy the TokenizeFundStrategy template with BOTH launch adapters —
+ *         SushiLaunchAdapter and StonkLaunchAdapter — to Robinhood Chain
+ *         mainnet (chain 4663).
  *
- *   MAINNET-ONLY BY CONSTRUCTION. Sushi Launchpad V1 exists on 4663 and
- *   nowhere else — `cast code` against the testnet (46630) address returns
- *   empty — so the testnet ceremony SKIPS this script entirely rather than
- *   deploying a template whose every clone would revert at init. Fork
- *   rehearsal happens on a 4663 fork via ROBINHOOD_FORK_CHAIN_ID.
+ *   MAINNET-ONLY BY CONSTRUCTION. Both venues exist on 4663 and nowhere else —
+ *   `cast code` against the testnet (46630) Sushi address returns empty — so
+ *   the testnet ceremony SKIPS this script entirely rather than deploying a
+ *   template whose every clone would revert at init. Fork rehearsal happens on
+ *   a 4663 fork via ROBINHOOD_FORK_CHAIN_ID.
+ *
+ *   WHY BOTH ADAPTERS IN ONE SCRIPT: they are two implementations of one
+ *   interface serving one template, and an agent picks between them per
+ *   proposal. Deploying them apart would let the template ship with only one
+ *   venue certified, which reads to an agent as "the other pair is broken"
+ *   rather than "not yet approved".
  *
  *   Prerequisites:
  *     - Core stack deployed (Deploy.s.sol) and StrategyFactory deployed.
@@ -26,10 +35,15 @@ import {ITierRegistry} from "../../src/interfaces/ITierRegistry.sol";
  *       addresses and their identity evidence live in addresses/4663.json.
  *
  *   Post-deploy, the REGISTRY OWNER must, and the runbook below prints it:
- *     - `TierRegistry.setAdapterAllowed(SUSHI_LAUNCH_ADAPTER, true)` + tier
- *       certification (Gate A + Gate B, docs/adapter-onboarding-checklist.md).
- *     - `TierRegistry.setCounterpartyAllowed(SUSHI_LAUNCHPAD_V1, true)`.
+ *     - `setAdapterAllowed` + tier certification for BOTH adapters (Gate A +
+ *       Gate B, docs/adapter-onboarding-checklist.md).
+ *     - `setCounterpartyAllowed(SUSHI_LAUNCHPAD_V1, true)` and the same for
+ *       every Smart Launch pad the Stonk adapter serves.
  *     - `StrategyFactory.setTemplateApproval(TOKENIZE_FUND_TEMPLATE, true)`.
+ *
+ *   Record the printed `padSetHash` with the certification: the codehash gate
+ *   pins the Stonk adapter's CODE, and that hash is the only on-chain witness
+ *   of the lane CONFIGURATION the code was certified against.
  *
  *   Usage:
  *     forge script script/robinhood-mainnet/DeployTokenizeFundStrategy.s.sol:DeployTokenizeFundStrategy \
@@ -56,6 +70,8 @@ contract DeployTokenizeFundStrategy is ScriptBase {
         console.log("Network: Robinhood Chain (chain ID 4663)");
 
         SushiLaunchAdapter adapter = new SushiLaunchAdapter(launchpad);
+        (address[] memory quotes, address[] memory pads) = _stonkLaneSet();
+        StonkLaunchAdapter stonkAdapter = new StonkLaunchAdapter(quotes, pads, _readAddress("SAFE_LAUNCH_LENS_V2"));
         TokenizeFundStrategy template = new TokenizeFundStrategy();
 
         vm.stopBroadcast();
@@ -65,11 +81,43 @@ contract DeployTokenizeFundStrategy is ScriptBase {
         require(size <= ROBINHOOD_MAX_CODE_SIZE, "template exceeds Robinhood MaxCodeSize");
 
         _patchAddress("SUSHI_LAUNCH_ADAPTER", address(adapter));
+        _patchAddress("STONK_LAUNCH_ADAPTER", address(stonkAdapter));
         _patchAddress("TOKENIZE_FUND_TEMPLATE", address(template));
         console.log("SushiLaunchAdapter:   ", address(adapter));
+        console.log("StonkLaunchAdapter:   ", address(stonkAdapter));
         console.log("TokenizeFundStrategy: ", address(template));
+        console.log("StonkLaunchAdapter padSetHash:");
+        console.logBytes32(stonkAdapter.padSetHash());
 
-        _printRegistryRunbook(address(adapter), launchpad, address(template));
+        _printRegistryRunbook(address(adapter), address(stonkAdapter), launchpad, address(template));
+    }
+
+    /// @dev The eight V2 (mint-launch) lanes, read from the address book.
+    ///
+    ///      MINT PADS ONLY. The V3 pads exist for EXTERNAL tokens — a launch
+    ///      that brings its own ERC-20 — and this template always mints, so
+    ///      serving a V3 lane would be dead configuration that still widened
+    ///      the certified surface. A future BYO-token template gets its own
+    ///      implementation and its own certification, which is exactly the
+    ///      granularity `padSetHash` is designed to make checkable.
+    ///
+    ///      The adapter's constructor re-derives identity for every pair by
+    ///      asking each pad `quote()` and comparing — so a typo here fails the
+    ///      deploy rather than shipping a mis-wired lane. That check is not
+    ///      theoretical: it caught a transcribed USDG address during this
+    ///      change's own address-book work.
+    function _stonkLaneSet() internal view returns (address[] memory quotes, address[] memory pads) {
+        string[8] memory lanes = ["WETH", "STONK", "USDG", "GME", "NVDA", "AAPL", "SPCX", "USO"];
+        quotes = new address[](8);
+        pads = new address[](8);
+        for (uint256 i; i < 8; ++i) {
+            pads[i] = _readAddress(string.concat("STONK_SAFE_LAUNCHPAD_V2_", lanes[i]));
+            // The pad is the authority on its own lane; the book only says
+            // WHICH pad. Reading the quote off the pad keeps the two from
+            // drifting.
+            quotes[i] = IStonkSafeLaunchpadV2(pads[i]).quote();
+            require(quotes[i] != address(0), "stonk pad reports no quote token");
+        }
     }
 
     /// @dev IDENTITY, NOT PRESENCE — the assertion this chain specifically
@@ -119,7 +167,10 @@ contract DeployTokenizeFundStrategy is ScriptBase {
     ///      address the script itself is minting is impossible, so the runbook
     ///      is the honest form and the post-deploy reads below are how it is
     ///      verified.
-    function _printRegistryRunbook(address adapter, address launchpad, address template) internal view {
+    function _printRegistryRunbook(address adapter, address stonkAdapter, address launchpad, address template)
+        internal
+        view
+    {
         // TOLERANT read: this script can legitimately run on a fork whose book
         // predates the core deploy, and a mandatory read would revert the whole
         // ceremony over a runbook printout.
@@ -128,13 +179,19 @@ contract DeployTokenizeFundStrategy is ScriptBase {
         console.log("== REGISTRY OWNER RUNBOOK (not executed by this script) ==");
         console.log("1. TierRegistry.setAdapterAllowed(adapter, true)      ", adapter);
         console.log("2. Tier certification for that adapter (Gate A)       ", adapter);
-        console.log("3. TierRegistry.setCounterpartyAllowed(launchpad,true)", launchpad);
-        console.log("4. StrategyFactory.setTemplateApproval(template, true)", template);
+        console.log("3. TierRegistry.setAdapterAllowed(stonkAdapter, true) ", stonkAdapter);
+        console.log("4. Tier certification for that adapter (Gate A)       ", stonkAdapter);
+        console.log("5. TierRegistry.setCounterpartyAllowed(launchpad,true)", launchpad);
+        console.log("6. setCounterpartyAllowed for EACH Smart Launch pad served by the Stonk adapter");
+        console.log("7. StrategyFactory.setTemplateApproval(template, true)", template);
         console.log("");
         console.log("== POST-DEPLOY VALIDATION READS ==");
         if (registry != address(0)) {
             console.log(
                 "tierRegistry.isAdapterAllowed(adapter):     ", ITierRegistry(registry).isAdapterAllowed(adapter)
+            );
+            console.log(
+                "tierRegistry.isAdapterAllowed(stonkAdapter):", ITierRegistry(registry).isAdapterAllowed(stonkAdapter)
             );
             console.log(
                 "tierRegistry.isCounterpartyAllowed(launchpad):",

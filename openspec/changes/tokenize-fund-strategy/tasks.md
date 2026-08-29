@@ -14,7 +14,7 @@ Spec-first change: tasks below are the implementation plan and are all unchecked
 ## 1. Vendored venue interfaces
 
 - [x] 1.1 `src/vendor/sushi/ISushiLaunchpad.sol` — reduced surface: `launch`, `launchAndBuy`, `distributeFees`, `transferCreator`, `launchInfo`, `quoteTokenPriceFeed`, `launchFee`, `WETH`; provenance natspec header (verified source, address, chain).
-- [ ] 1.2 `src/vendor/stonkbrokers/IStonkSafeLaunchpadV2.sol` — `createLaunch`, `arm`, `abort`, `buy`, `sell`, `graduate`, `bond`, `flushCreatorQuote`, `getLaunch`, `modesOf`, `launchIdOfToken`, `quote`, `launchFeeWei`; and `ISafeLaunchLensV2.sol` — `quoteBuy`, `quoteSell`, `priceWei`, `viewLaunch`; provenance headers.
+- [x] 1.2 `src/vendor/stonkbrokers/IStonkSafeLaunchpadV2.sol` — `createLaunch`, `arm`, `abort`, `buy`, `sell`, `graduate`, `bond`, `flushCreatorQuote`, `getLaunch`, `modesOf`, `launchIdOfToken`, `quote`, `launchFeeWei`; and `ISafeLaunchLensV2.sol` — `quoteBuy`, `quoteSell`, `priceWei`, `viewLaunch`; provenance headers.
 - [x] 1.3 `forge build` clean; no manifest entries (in-file provenance is the repo convention for reduced-surface vendors).
 
 ## 2. ILaunchAdapter + SushiLaunchAdapter
@@ -22,15 +22,15 @@ Spec-first change: tasks below are the implementation plan and are all unchecked
 - [x] 2.1 `src/interfaces/ILaunchAdapter.sol` per design Decision 1, natspec carrying the custody invariant verbatim.
 - [x] 2.2 `SushiLaunchAdapter` singleton: pull quote, unwrap launch-fee ETH from quote WETH, `launchAndBuy(recipient = msg.sender)`, `transferCreator(token, msg.sender)`, zero-balance/zero-role postcondition asserted in tests.
 - [x] 2.3 `quoteSupported` mirrors `quoteTokenPriceFeed != 0`; `phase`/ref validity derived from `launchInfo(token)` only — zero adapter storage — returning `Live` for issued launches and `None` otherwise; `finalize` no-op; `collectFees` wraps `distributeFees` and reports strategy-side deltas; `receive()` restricted to WETH withdrawals (assert a plain-value send reverts).
-- [ ] 2.4 Fork tests (4663): full launch with WETH quote; reserve floor enforcement; WOOD quote reverts pre-registration; fee distribution reaches the strategy; post-`transferCreator`-to-vault, `distributeFees` pays BOTH legs to the vault and nothing to the strategy.
+- [x] 2.4 Fork tests (4663): full launch with WETH quote; reserve floor enforcement; WOOD quote reverts pre-registration; fee distribution reaches the strategy; post-`transferCreator`-to-vault, `distributeFees` pays BOTH legs to the vault and nothing to the strategy.
 
 ## 3. StonkLaunchAdapter (implementation + per-launch clone)
 
-- [ ] 3.1 Implementation with `initialize(owner, pad)` clone-init lock (constructor locks the implementation, `BaseStrategy` precedent); constructor-set immutable lane → pad set with no setter (test: no reachable write path post-deploy); factory entry `launchWithClone` deploying the ERC-1167 clone inside `launch()`.
-- [ ] 3.2 Clone flow: `createLaunch` (clone = creator) with `venueData`-decoded economics, transfer `reserveAmount` to owner, `forceApprove` + `arm` remainder; never sets `eoaOnly`.
-- [ ] 3.3 Owner-only lifecycle verbs: `finalize` (graduate/bond by phase), `collectFees` (`flushCreatorQuote` → forward), `abort` passthrough while trade-free; `phase` derived from `getLaunch` flags per task 0.1's findings. Plus `forwardToVault()` — owner-only pre-settlement, permissionless after — flushing creator quote and sending every clone balance to the owner strategy's vault (never to the caller, never through the strategy).
-- [ ] 3.4 ERC-1167 target introspection helper so consumers can verify clone → allowed implementation.
-- [ ] 3.5 Fork tests (4663): fair-launch shape (zero `quoteIn`), reserve withheld before arm, curve dev-buy via pad `buy(recipient = strategy)`, graduation + bond driving, stock-lane `StalePrice` surfaced unchanged, foreign-caller reverts on every clone verb, and post-settlement `forwardToVault()` from a random caller landing both legs on the vault.
+- [x] 3.1 Implementation with `initialize(owner, pad)` clone-init lock (constructor locks the implementation, `BaseStrategy` precedent); constructor-set immutable lane → pad set with no setter (test: no reachable write path post-deploy); factory entry `launchWithClone` deploying the ERC-1167 clone inside `launch()`.
+- [x] 3.2 Clone flow: `createLaunch` (clone = creator) with `venueData`-decoded economics, transfer `reserveAmount` to owner, `forceApprove` + `arm` remainder; never sets `eoaOnly`.
+- [x] 3.3 Owner-only lifecycle verbs: `finalize` (graduate/bond by phase), `collectFees` (`flushCreatorQuote` → forward), `abort` passthrough while trade-free; `phase` derived from `getLaunch` flags per task 0.1's findings. Plus `forwardToVault()` — owner-only pre-settlement, permissionless after — flushing creator quote and sending every clone balance to the owner strategy's vault (never to the caller, never through the strategy).
+- [x] 3.4 ERC-1167 target introspection helper so consumers can verify clone → allowed implementation.
+- [x] 3.5 Fork tests (4663): fair-launch shape (zero `quoteIn`), reserve withheld before arm, curve dev-buy via pad `buy(recipient = strategy)`, graduation + bond driving, stock-lane `StalePrice` surfaced unchanged, foreign-caller reverts on every clone verb, and post-settlement `forwardToVault()` from a random caller landing both legs on the vault.
 
 ## 4. TokenizeFundStrategy template
 
@@ -44,7 +44,7 @@ Spec-first change: tasks below are the implementation plan and are all unchecked
 
 ## 5. Deploy + address book
 
-- [ ] 5.1 `DeployTokenizeFundStrategy.s.sol` with venue-identity asserts (not just code-presence), template approval, adapter allow + certification runbook, counterparty writes.
+- [x] 5.1 `DeployTokenizeFundStrategy.s.sol` with venue-identity asserts (not just code-presence), template approval, adapter allow + certification runbook, counterparty writes.
 - [x] 5.2 `chains/4663.json` + `addresses/4663.json` entries with verification evidence; note 46630 skip.
 - [ ] 5.3 Fork ceremony rehearsal on a 4663 fork; post-deploy validation reads extended.
 

@@ -652,6 +652,14 @@ contract TokenizeFundStrategy is BaseStrategy {
         //      exists to enable, that round trip is the difference between a
         //      launch and a failed one. So hold the fee back instead.
         (address feeToken, uint256 feeAmount) = launchAdapter.nativeFeeSource();
+        // A fee with NO NAMED SOURCE is unfundable, and must say so. A venue
+        // that charges natively but names no token to charge it in — the shape
+        // `StonkLaunchAdapter` reports if its pads ever start charging, since
+        // it has no wrapped-native lane to name — would otherwise reach
+        // `_acquireFeeToken` and revert inside `IERC20(address(0))` with no
+        // returndata at all, which reads as a bug in this template rather than
+        // as the venue changing its terms.
+        if (feeAmount != 0 && feeToken == address(0)) revert FeeAcquisitionFailed(feeToken, feeAmount, 0);
         uint256 heldBack = (feeAmount != 0 && feeToken == asset) ? feeAmount : 0;
 
         // 4 ── quote leg
@@ -1236,6 +1244,9 @@ contract TokenizeFundStrategy is BaseStrategy {
             word := mload(add(ret, 0x20))
         }
         if (word >> 160 != 0) return address(0);
+        // casting to `uint160` is safe because the dirty-high-bits check above
+        // already rejected any word that would truncate.
+        // forge-lint: disable-next-line(unsafe-typecast)
         return address(uint160(word));
     }
 }
