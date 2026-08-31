@@ -133,9 +133,9 @@ Numbers a proposer needs and the spec previously only implied. All from `SushiLa
 - **Fork tests cannot pin a block in source.** Measured block time on 4663 is **0.101s** (~10 blocks/sec), and the public RPC retains roughly 5k–50k blocks — 8 to 83 minutes of state. Any pin written into a file is unreachable before review. Fork tests therefore take the block from `ROBINHOOD_FORK_BLOCK` (0 = latest) and skip entirely without `ROBINHOOD_RPC_URL`.
 - **V2 vs V3 pads (task 0.3)**: a bring-your-own token is ACCEPTED on both families — the V2-only pad set is a deliberate choice (the mint path hands the fund its whole supply as a free allocation), not a safety constraint. The V3 build carries a hardened `abort` that only matters for reused external tokens, so it is inert on our mint path.
 
-## Venue 3 — Pons (researched; BUILD DEFERRED pending the launcher gate, tasks.md 0.7)
+## Venue 3 — Pons (BUILT IN A SEPARATE PR — #282; gated out of mainnet, tasks.md 0.7)
 
-Investigated at the product owner's request; recorded here so the next round starts from facts rather than the docs. All reads are live against mainnet 4663 on 2026-08-30, against the **v2 / "active" factory** (`PonsLaunchFactory`, `0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB`, verified, solc 0.8.30, ~266k transactions). The legacy factory (`0x0c37a24F…`) is v1 and out of scope.
+Investigated at the product owner's request. The adapter itself lives in #282, stacked on this change; the research stays here because it is what justifies the split — the venue is closed to us, so shipping it alongside two mainnet-ready venues would hold them hostage to a third party's decision. All reads are live against mainnet 4663 on 2026-08-30, against the **v2 / "active" factory** (`PonsLaunchFactory`, `0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB`, verified, solc 0.8.30, ~266k transactions). The legacy factory (`0x0c37a24F…`) is v1 and out of scope.
 
 Shape, and how it maps onto `ILaunchAdapter`:
 
