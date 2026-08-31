@@ -69,9 +69,12 @@ pragma solidity 0.8.28;
 ///             `StonkLaunchAdapter.NativeFeeUnsupported`.
 ///           - `creatorFeeBps() == 1650`, `protocolFeeBps() == 1650`,
 ///             `lpFeeBps() == 5000` — the creator's 16.5% of the per-trade tax
-///             accrues as `creatorQuoteOwed[id]` and is paid by the
-///             PERMISSIONLESS `flushCreatorQuote` to the CREATOR, never to the
-///             caller. That is why the adapter clones: the creator is pinned at
+///             is PUSHED to the CREATOR at every trade, and accrues as
+///             `creatorQuoteOwed[id]` only when that push FAILS — so
+///             `flushCreatorQuote` reverts `NothingOwed` in the ordinary case
+///             and is a retry lane, not the normal payout path (verified on
+///             4663 in `StonkLaunchRobinhoodFork.t.sol`). Either way the payee
+///             is the CREATOR, never the caller. That is why the adapter clones: the creator is pinned at
 ///             `createLaunch` and there is NO transfer.
 ///           - `bounds()`: `minStartMcapUsd8 = 1e11` ($1k),
 ///             `maxStartMcapUsd8 = 1e14` ($1M), `minGradMcapUsd8 = 5e12` ($50k),
@@ -232,9 +235,13 @@ interface IStonkSafeLaunchpadV2 {
     /// @dev PERMISSIONLESS; requires `graduated`.
     function bond(uint256 id) external;
 
-    /// @notice Pay `creatorQuoteOwed[id]` to the CREATOR.
+    /// @notice Pay any UNPUSHED `creatorQuoteOwed[id]` to the CREATOR.
     /// @dev Permissionless, and it pays the creator — the CLONE — not the
-    ///      caller. That is exactly why the clone must forward afterwards: the
+    ///      caller. A RETRY LANE, not the normal payout path: the pad pushes
+    ///      the creator's share at each trade and only accrues here when that
+    ///      push fails, so this reverts `NothingOwed` in the ordinary case.
+    ///      That is why `cloneCollectFees` tolerates a revert from it and
+    ///      forwards the clone's balance regardless. That is exactly why the clone must forward afterwards: the
     ///      venue's payee is not the strategy.
     function flushCreatorQuote(uint256 id) external;
 

@@ -107,9 +107,18 @@ interface ILaunchAdapter {
 
     /// @notice Where a launch is in its venue's lifecycle.
     /// @dev `Live` means a tradable pool exists — immediately on Sushi, only
-    ///      after bonding on StonkBrokers. `Failed` is a curve that closed
-    ///      without graduating. Settlement branches on this, so it must be
-    ///      answerable for every ref an implementation ever issued.
+    ///      after bonding on StonkBrokers.
+    ///
+    ///      `Failed` means the venue CANCELLED the launch and returned it — not
+    ///      merely that a curve closed short of its target. Fork verification on
+    ///      StonkBrokers found timer expiry is itself a graduation trigger, so a
+    ///      closed window is one permissionless call from a locked pool and is
+    ///      `Closing`, not `Failed`. A venue may therefore have no reachable
+    ///      `Failed` state at all once trading has begun, and an implementation
+    ///      should not invent one to fill the enum.
+    ///
+    ///      Settlement branches on this, so it must be answerable for every ref
+    ///      an implementation ever issued.
     enum LaunchPhase {
         None,
         Curve,

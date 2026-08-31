@@ -215,10 +215,24 @@ contract MockStonkPad {
     }
 
     /// @dev Permissionless; refuses until the launch qualifies.
+    ///
+    ///      MODELS THE TIMER CLOSE, because the real pad does and a stand-in
+    ///      that did not could never reach the state the venue actually reaches
+    ///      on its own. The live predicate, confirmed on 4663 in
+    ///      `StonkLaunchRobinhoodFork.t.sol`, is:
+    ///        `timerClose = !openEnded && block.timestamp >= deadline`
+    ///        `if (!timerClose && mcap < gradMcap) revert NotGraduatable()`
+    ///      i.e. expiry is itself a graduation trigger, so a non-open-ended
+    ///      curve past its deadline is always graduatable regardless of the
+    ///      `graduatable` knob below. That knob remains for the OTHER case —
+    ///      an open-ended curve, or one still inside its window, where reaching
+    ///      the market cap is what qualifies it.
     function graduate(uint256 id) external {
         IStonkSafeLaunchpadV2.Launch storage l = _load(id);
         if (l.aborted) revert Aborted();
-        if (!graduatable || l.graduated) revert NotGraduatable();
+        if (l.graduated) revert NotGraduatable();
+        bool timerClose = !_modes[id].openEnded && l.deadline != 0 && block.timestamp >= l.deadline;
+        if (!timerClose && !graduatable) revert NotGraduatable();
         l.graduated = true;
     }
 

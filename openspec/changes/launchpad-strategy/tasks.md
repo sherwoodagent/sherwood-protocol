@@ -4,9 +4,11 @@ Spec-first change: tasks below are the implementation plan and are all unchecked
 
 ## 0. Pre-implementation verification (answers feed back into design.md)
 
-- [ ] 0.1 StonkBrokers never-graduates path: on a 4663 fork, run a Smart Launch through a closed window below `gradMcapUsd8` with buys present, and record what `closing` permits — can the creator recover arm'd supply or realized quote, or is the launch permanently stranded? Resolves design Open Question 3 and fixes the `LaunchPhase.Failed` semantics.
-- [ ] 0.2 Confirm Sushi `launchAndBuy` accounting end-to-end on a 4663 fork (WETH quote): launch fee in native ETH, dev-buy output vs `minTokensOut`, `transferCreator` in the same tx, `distributeFees` paying the new creator.
-- [ ] 0.3 Confirm the Smart Launch V3 (BYO) pads accept an external token minted by an arbitrary contract, and whether V2-vs-V3 pad choice changes anything besides token provenance (doc says same ABI; verify `createLaunch(token != 0)` is rejected on V2 pads or merely conventional).
+- [x] 0.1 StonkBrokers never-graduates path: on a 4663 fork, run a Smart Launch through a closed window below `gradMcapUsd8` with buys present, and record what `closing` permits — can the creator recover arm'd supply or realized quote, or is the launch permanently stranded? Resolves design Open Question 3 and fixes the `LaunchPhase.Failed` semantics.
+      - **RESOLVED: there is no never-graduates state.** Timer expiry is itself a graduation trigger, so a closed non-open-ended window is `Closing`, one permissionless call from a locked LP. `phase()` corrected from `Failed`, boundary tightened to exclusive. `Failed` means `aborted` only. Evidence: `test/integration/strategies/StonkLaunchRobinhoodFork.t.sol`.
+- [x] 0.2 Confirm Sushi `launchAndBuy` accounting end-to-end on a 4663 fork (WETH quote): launch fee in native ETH, dev-buy output vs `minTokensOut`, `transferCreator` in the same tx, `distributeFees` paying the new creator.
+- [x] 0.3 Confirm the Smart Launch V3 (BYO) pads accept an external token minted by an arbitrary contract, and whether V2-vs-V3 pad choice changes anything besides token provenance (doc says same ABI; verify `createLaunch(token != 0)` is rejected on V2 pads or merely conventional).
+      - **RESOLVED: convention, not enforcement.** BYO tokens are accepted on both families. The V2-only pad set stays a deliberate choice (mint path = free allocation), and the deploy script now rejects a V3 pad filed under a V2 key, which no existing guard caught.
 - [ ] 0.4 Open the WOOD-quote conversation with the Sushi owner (business task, SHE-153 Open Question 1); until resolved the Sushi fork tests use WETH quote.
 - [ ] 0.5 Decide the default reserve fraction (below the now-fixed `MAX_RESERVE_BPS = 2_000` ceiling) and the Stonk start/grad mcap and tax-schedule defaults — product input, recorded in design.md when settled.
 - [ ] 0.6 File and track the vault-side finding this review surfaced: a strategy that truthfully clears residue and later truthfully reports it again can be re-marked by permissionless `collectResidue`, re-stamping a fresh `UNVALUED_MAX_LOCK` deposit lock indefinitely — `_unvaluedBurned` guards only the post-prune direction (`SyndicateVault.sol:1988`, `:2011-2013`, `:2023-2024`). Protocol-level hardening candidate; out of scope for this change, which routes around it by latching the template's views.
@@ -51,7 +53,7 @@ Spec-first change: tasks below are the implementation plan and are all unchecked
 
 - [x] 5.1 `DeployLaunchpadStrategy.s.sol` with venue-identity asserts (not just code-presence), template approval, adapter allow + certification runbook, counterparty writes.
 - [x] 5.2 `chains/4663.json` + `addresses/4663.json` entries with verification evidence; note 46630 skip.
-- [ ] 5.3 Fork ceremony rehearsal on a 4663 fork; post-deploy validation reads extended.
+- [x] 5.3 Fork ceremony rehearsal on a 4663 fork; post-deploy validation reads extended.
 
 ## 6. Follow-ups (explicitly out of this change)
 

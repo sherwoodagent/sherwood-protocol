@@ -460,14 +460,19 @@ contract StonkLaunchAdapterTest is Test {
         assertEq(uint256(adapter.phase(res.launchRef)), uint256(ILaunchAdapter.LaunchPhase.Failed));
     }
 
-    /// @dev The PROVISIONAL branch — see `clonePhase`'s natspec and task 0.1.
-    function test_Phase_ClosedWindowWithoutGraduationIsFailed() public {
+    /// @dev VERIFIED, not provisional. `StonkLaunchRobinhoodFork.t.sol` proved
+    ///      against the live pad that timer expiry is ITSELF a graduation
+    ///      trigger — a closed non-open-ended window is one permissionless
+    ///      `graduate()` away from a locked LP, so it is `Closing`, never
+    ///      `Failed`. The boundary is exclusive: at exactly `deadline` the
+    ///      venue has already barred trades and already permits the close.
+    function test_Phase_ClosedWindowWithoutGraduationIsClosing() public {
         ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
         uint256 deadline = wethPad.getLaunch(_clone(res).launchId()).deadline;
         vm.warp(deadline);
-        assertEq(uint256(adapter.phase(res.launchRef)), uint256(ILaunchAdapter.LaunchPhase.Curve), "at the deadline");
+        assertEq(uint256(adapter.phase(res.launchRef)), uint256(ILaunchAdapter.LaunchPhase.Closing), "at the deadline");
         vm.warp(deadline + 1);
-        assertEq(uint256(adapter.phase(res.launchRef)), uint256(ILaunchAdapter.LaunchPhase.Failed), "past it");
+        assertEq(uint256(adapter.phase(res.launchRef)), uint256(ILaunchAdapter.LaunchPhase.Closing), "past it");
     }
 
     function test_Phase_OpenEndedCurveNeverCloses() public {

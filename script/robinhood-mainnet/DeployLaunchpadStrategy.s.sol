@@ -101,11 +101,23 @@ contract DeployLaunchpadStrategy is ScriptBase {
     ///      implementation and its own certification, which is exactly the
     ///      granularity `padSetHash` is designed to make checkable.
     ///
-    ///      The adapter's constructor re-derives identity for every pair by
-    ///      asking each pad `quote()` and comparing — so a typo here fails the
-    ///      deploy rather than shipping a mis-wired lane. That check is not
-    ///      theoretical: it caught a transcribed USDG address during this
-    ///      change's own address-book work.
+    ///      WHAT ACTUALLY CATCHES A MIS-FILED PAD, stated precisely because the
+    ///      obvious answer is wrong. Since this function DERIVES `quotes[i]`
+    ///      from `pads[i].quote()`, the adapter constructor's `PadQuoteMismatch`
+    ///      compares a value against itself and can never fire from here. The
+    ///      guard that does bite is `DuplicateQuote`: a pad filed under the
+    ///      wrong lane key reports the quote of its REAL lane, collides with
+    ///      that lane's own entry, and aborts the deploy. That is not
+    ///      theoretical — it is how a transcribed USDG address was caught
+    ///      during this change's address-book work.
+    ///
+    ///      `DuplicateQuote` only fires on a COLLISION, though, and a V3 pad
+    ///      reports the same `quote()` as its V2 sibling — so a V3 pad filed
+    ///      under a V2 key collides with nothing and would sail through, giving
+    ///      this always-minting template a lane pointed at a bring-your-own-
+    ///      token pad it can never use. Codehashes cannot separate the families
+    ///      (every pad's differs, since its lane is an immutable), so the check
+    ///      below is explicit: no chosen pad may be any V3 pad the book knows.
     function _stonkLaneSet() internal view returns (address[] memory quotes, address[] memory pads) {
         string[8] memory lanes = ["WETH", "STONK", "USDG", "GME", "NVDA", "AAPL", "SPCX", "USO"];
         quotes = new address[](8);
@@ -117,6 +129,21 @@ contract DeployLaunchpadStrategy is ScriptBase {
             // drifting.
             quotes[i] = IStonkSafeLaunchpadV2(pads[i]).quote();
             require(quotes[i] != address(0), "stonk pad reports no quote token");
+        }
+        _requireNoV3Pads(pads, lanes);
+    }
+
+    /// @dev Refuse any pad that the address book files as a V3 (external-token)
+    ///      pad. See `_stonkLaneSet` for why `DuplicateQuote` cannot cover this
+    ///      case. Compares against every V3 lane, not just the matching one, so
+    ///      a V3 pad filed under a DIFFERENT lane's V2 key is caught too.
+    function _requireNoV3Pads(address[] memory pads, string[8] memory lanes) internal view {
+        for (uint256 j; j < 8; ++j) {
+            address v3 = _optionalAddress(string.concat("STONK_SAFE_LAUNCHPAD_V3_", lanes[j]));
+            if (v3 == address(0)) continue;
+            for (uint256 i; i < 8; ++i) {
+                require(pads[i] != v3, "a V3 (external-token) pad is filed under a V2 lane key");
+            }
         }
     }
 
@@ -137,8 +164,18 @@ contract DeployLaunchpadStrategy is ScriptBase {
         require(launchpad != address(0), "SUSHI_LAUNCHPAD_V1 unset");
         require(launchpad.code.length != 0, "SUSHI_LAUNCHPAD_V1 holds no code");
 
+        // READ THE FIRST HOP DEFENSIVELY, so the squatter case produces a
+        // SENTENCE rather than a panic. A codeful-but-unrelated address (the
+        // hazard `addresses/4663.json` records for this chain) has no `WETH()`,
+        // and a typed call there aborts on an ABI-decode panic with no reason
+        // string — an operator sees an opaque revert instead of being told the
+        // address is not a launchpad. Every later hop is typed, because by then
+        // the target has answered one launchpad-shaped question correctly.
+        (bool ok, bytes memory ret) = launchpad.staticcall(abi.encodeCall(ISushiLaunchpad.WETH, ()));
+        require(ok && ret.length == 32, "SUSHI_LAUNCHPAD_V1 does not answer WETH() - not a launchpad");
+        require(abi.decode(ret, (address)) == weth, "launchpad WETH() disagrees with the address book");
+
         ISushiLaunchpad pad = ISushiLaunchpad(launchpad);
-        require(pad.WETH() == weth, "launchpad WETH() disagrees with the address book");
 
         address v3Factory = _readAddress("SUSHI_V3_FACTORY");
         address positionManager = _readAddress("SUSHI_V3_POSITION_MANAGER");

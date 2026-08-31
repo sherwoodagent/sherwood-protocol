@@ -108,7 +108,13 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     /// @param taxDecayPerMinuteBps Per-minute decay; with `startTaxBps` this
     ///                             DERIVES the curve window at the venue.
     /// @param sellsEnabled         Whether the curve accepts sells.
-    /// @param bufferSecs           Post-window buffer the venue applies.
+    /// @param bufferSecs           OPENING anti-snipe shield, in seconds — the
+    ///                             venue taxes trades at 99.99% while it runs
+    ///                             and FOLDS it into the deadline
+    ///                             (`deadline = armTime + bufferSecs +
+    ///                             windowSecs`). It is not a post-window grace
+    ///                             period; verified on 4663 by
+    ///                             `StonkLaunchRobinhoodFork.t.sol`.
     /// @param unsoldMode           Unsold-supply disposition at graduation.
     /// @param openEnded            No closing deadline (see `clonePhase`).
     /// @param postTaxBps           Tax after the decay schedule ends.
@@ -728,33 +734,48 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///      length-checked raw staticcalls; an unreadable pad answers `None`.
     ///
     ///      THE MAPPING:
-    ///        `aborted`                  -> `Failed`  (terminal, supply returned)
-    ///        `bonded`                   -> `Live`    (the locked LP exists)
-    ///        `graduated && !bonded`     -> `Closing` (curve done, LP pending)
-    ///        `!armed`                   -> `Curve`   (created, not yet loaded)
-    ///        `armed && openEnded`       -> `Curve`   (no closing deadline at all)
-    ///        `armed && now <= deadline` -> `Curve`
-    ///        otherwise                  -> `Failed`  <-- PROVISIONAL
+    ///        `aborted`                 -> `Failed`  (terminal, supply returned)
+    ///        `bonded`                  -> `Live`    (the locked LP exists)
+    ///        `graduated && !bonded`    -> `Closing` (curve done, LP pending)
+    ///        `!armed`                  -> `Curve`   (created, not yet loaded)
+    ///        `armed && openEnded`      -> `Curve`   (no closing deadline at all)
+    ///        `armed && now < deadline` -> `Curve`
+    ///        otherwise                 -> `Closing` (window closed = graduatable)
     ///
-    ///      THE PROVISIONAL BRANCH IS THE LAST ONE, and only that one: a curve
-    ///      whose window closed without graduating. It is reported `Failed`
-    ///      because the spec fixes that mapping pending verification, and
-    ///      because `Failed` is the conservative direction — it sends
-    ///      settlement down the deliverable-maximum path instead of waiting on
-    ///      a graduation that may never come.
+    ///      `Failed` IS REACHABLE ONLY THROUGH `aborted`, and that is a
+    ///      VERIFIED property of the venue, not a modelling choice. The last
+    ///      branch — an armed, non-open-ended curve past its `deadline` and
+    ///      short of `gradMcapUsd8` — used to report `Failed` provisionally.
+    ///      It does not. `StonkSafeLaunchpadV2.graduate` closes on EITHER
+    ///      trigger:
     ///
-    ///      WHAT TASK 0.1 MUST CONFIRM (design Open Question 3): on a 4663
-    ///      fork, run a launch through a closed window below `gradMcapUsd8`
-    ///      WITH BUYS PRESENT and record whether `graduate()` still succeeds
-    ///      inside `bufferSecs`, and whether the creator can recover the armed
-    ///      supply or the realized quote (`abort` is barred once `buyCount != 0`).
-    ///      If a post-deadline graduation is possible, this branch should split
-    ///      into `Closing` while that window is open and `Failed` after it —
-    ///      which needs a graduatability predicate the venue does not currently
-    ///      expose, so it would arrive with a lens read or a pad view. Until
-    ///      then: `cloneFinalize()` is safe to call in this state and will flip
-    ///      the answer to `Closing`/`Live` if the venue does permit it, so the
-    ///      provisional reading is self-correcting rather than sticky.
+    ///        timerClose = !openEnded && block.timestamp >= deadline;
+    ///        if (!timerClose && mcapUsd8(id) < gradMcapUsd8) revert NotGraduatable();
+    ///
+    ///      so timer expiry IS a graduation. A closed window is one
+    ///      permissionless `graduate` + `bond` away from a locked LP — which
+    ///      is exactly what `Closing` means — and `cloneFinalize()` drives
+    ///      both legs. Reporting `Failed` there would have sent settlement
+    ///      down the deliverable-maximum path for a launch that still delivers
+    ///      a tradable pool.
+    ///
+    ///      EVIDENCE (Task 0.1, resolved): `StonkLaunchRobinhoodFork.t.sol`
+    ///      against live 4663 at block 50_934_300. On the WETH V2 pad, with
+    ///      buys present and the cap unmet, `graduate` is refused before the
+    ///      deadline (`NotGraduatable`), SUCCEEDS at the deadline and still
+    ///      succeeds a year later; `bond` then mints the LP. In the same state
+    ///      `abort` is refused (`buyCount != 0`) and `sell` is refused
+    ///      (`WindowClosed`), so nothing is creator-recoverable — but nothing
+    ///      is stranded either, because the close is permissionless and never
+    ///      expires. `getLaunch`/`modesOf` expose no graduatability predicate
+    ///      because none is needed: there is no never-graduates state to tell
+    ///      apart.
+    ///
+    ///      THE COMPARISON IS STRICT (`now < deadline`), matching the pad
+    ///      exactly on the boundary second: at `now == deadline` the venue has
+    ///      already barred trades (`_tradeGates` reverts `WindowClosed` on
+    ///      `>=`) and already permits the timer close, so `Curve` would be
+    ///      wrong by one second in the direction that matters.
     function clonePhase() public view returns (LaunchPhase) {
         address padAddress = pad;
         if (padAddress == address(0) || launchToken == address(0)) return LaunchPhase.None;
@@ -770,8 +791,8 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         (bool modesOk, bool openEnded) = _readOpenEnded(padAddress, launchId);
         if (!modesOk) return LaunchPhase.None;
         if (openEnded) return LaunchPhase.Curve;
-        if (block.timestamp <= f.deadline) return LaunchPhase.Curve;
-        return LaunchPhase.Failed;
+        if (block.timestamp < f.deadline) return LaunchPhase.Curve;
+        return LaunchPhase.Closing;
     }
 
     /// @notice Drive this launch's lifecycle as far as the venue permits.
