@@ -66,7 +66,15 @@ Fee destination: `launch` SHALL `transferCreator(token, p.feeRecipient)` in the 
 
 The dev buy is funded in NATIVE here (`initialBuyAmount = msg.value - launchFee`), so the adapter SHALL unwrap `launchFee + quoteIn` of the WETH it pulls, not merely the fee. `quoteSupported` SHALL be CONFIG-gated — true only where some ENABLED launch config pairs against the quote — unlike Sushi's feed registry; only the WETH config is live today, which is a venue configuration rather than a protocol limit. `collectFees` SHALL drive `locker.collectFees`, tolerate its `NoFeesToCollect()` as `(0, 0)`, and report deltas on the current redirect target.
 
-The venue is CLOSED today: `launchToken` reverts `NotWhitelisted` unless `launchEnabled` (false) or the caller is whitelisted, and the v1 factory carries the identical gate under the same owner. The adapter is therefore deployable but INERT until Pons flips the flag or admits our address, and the deploy runbook SHALL say so with the address to hand them.
+**THE VENUE ENFORCES NO SLIPPAGE FLOOR OF ITS OWN.** The factory hardcodes `amountOutMinimum: 0` into the router call, which inverts the Sushi arrangement — there the venue's own floor fires first and the adapter's check is belt-and-braces. Here the adapter's post-launch balance check is the ONLY thing standing between a proposal's `minTokensOut` and an arbitrarily sandwiched dev buy, so it SHALL check `p.minTokensOut` strictly, with the `reserveAmount` assertion behind it.
+
+`venueData` SHALL carry `{uint256 launchConfigId, uint256 dexId, bytes32 salt}`, each validated before any transfer (in range, enabled, `pairToken == p.quoteToken`, router set). Pinning the ids instead would freeze the adapter at one configuration and force a redeploy plus re-certification the moment Pons adds a pairing.
+
+The salt SHALL be namespaced per caller — `keccak256(abi.encode(msg.sender, salt))`. Adversary, and it is specific to a SINGLETON on this venue: the token address is CREATE2-derived from the metadata and the deployer, and for a shared adapter the deployer is one constant, so two funds choosing the same name, symbol and salt would collide and the second launch would fail. Namespacing gives every strategy its own salt space and makes squatting another fund's launch impossible.
+
+`quoteSupported` SHALL apply TWO gates of different kinds, documented apart so the constraint is not misattributed: the VENUE's, that some enabled config pairs against the quote; and THIS ADAPTER's, that the quote is the wrapped native, because the venue funds the dev buy from `msg.value` and a non-wrapped-native pairing cannot be funded by us at all.
+
+The venue is CLOSED today: `launchToken` reverts `NotWhitelisted` unless `launchEnabled` (false) or the caller is whitelisted, and the v1 factory carries the identical gate under the same owner. The adapter is therefore deployable but INERT until Pons flips the flag or admits our address, and the deploy runbook SHALL say so with the address to hand them. TWO separate approvals gate a Pons proposal: our own `setCounterpartyAllowed(PONS_LAUNCH_FACTORY_V2)`, and the Pons-side whitelist — neither substitutes for the other.
 
 #### Scenario: Reserve and fees reach different destinations
 - **WHEN** `launch(p)` completes

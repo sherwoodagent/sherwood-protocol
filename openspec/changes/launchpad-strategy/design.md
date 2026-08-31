@@ -148,6 +148,15 @@ Shape, and how it maps onto `ILaunchAdapter`:
 
 That gate also settles the adapter's shape before we write a line of it: whitelisting is **per address**, so a per-launch clone pattern is impossible — every clone would need its own whitelist entry. A Pons adapter MUST be a singleton, and fortunately `feeWallet` makes a singleton correct anyway (it names the payee at launch and keeps nothing), so this is the `SushiLaunchAdapter` shape rather than the `StonkLaunchAdapter` one.
 
+**What the build found that reading the docs did not.** Nine venue facts came back different from the brief; four changed the code rather than the prose:
+
+- **`Socials` has five members, not four.** Arity is part of both the `launchToken` selector and the CREATE2 init-code hash, so a four-string guess produces a selector absent from the deployed bytecode. Worth stating because it is the kind of thing an ABI transcribed from prose gets wrong silently.
+- **The venue enforces no slippage floor.** `amountOutMinimum` is hardcoded to zero, so our post-launch balance check is the *only* protection for `minTokensOut` — the reverse of Sushi, where the venue's own floor fires first.
+- **A CREATE2 collision is a cross-fund hazard for a singleton.** The token address derives from metadata plus deployer, and a shared adapter has one deployer, so two funds picking the same name/symbol/salt collide. The salt is namespaced by caller to give each strategy its own space.
+- **The locker returns gross while paying net** (30% protocol share), so reporting its return tuple would overstate the fund's take.
+
+Two pleasant surprises: the launch's own dev buy already accrues collectable fees — the vault was in profit from the launch transaction itself — and the per-wallet cap does not bind the reserve, because the token grants the atomic launch buy a one-call exemption.
+
 **Built anyway, and the earlier "defer until the ask lands" call was wrong.** The reasoning was that an adapter we cannot launch through is untestable end to end — but a fork test can prank the Pons owner to whitelist us, so the real path IS exercisable today. What the gate actually costs is deployment timing, not build confidence, and having the finished address in hand makes the ask concrete rather than hypothetical. The adapter is therefore complete and inert on mainnet until Pons acts.
 
 **The mechanic that shapes the implementation: `feeWallet` does double duty.** The factory sets `initialBuyRecipient = feeWallet == 0 ? msg.sender : feeWallet` AND `locker.setFeeRedirect(token, feeWallet)`, so one field decides both where the dev buy (our RESERVE) lands and where FEES go. Our template needs those split — reserve to the strategy for holder claims, fees to the vault. The resolution is a two-step inside one transaction: launch with `feeWallet = strategy` so the reserve is delivered there, then immediately `locker.setFeeRedirect(token, vault)`, which is permitted because the locker authorises `launched.deployer` and that is our adapter.
