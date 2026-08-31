@@ -11,9 +11,12 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @notice Stands in for `TokenizeFundStrategy`: the `launch` caller, the clone
 ///         owner, and the address the custody invariant says must end up
-///         holding the reserve. Exposes only the two reads the clone makes of
-///         its owner (`state()`, `vault()`) so the fail-closed behaviour of
-///         `forwardToVault` can be driven from the test.
+///         holding the reserve.
+/// @dev It still exposes `state()` and `vault()`, but the adapter no longer
+///      reads EITHER. They are kept precisely so the tests can move the owner
+///      through settlement and assert that nothing about the fee destination
+///      changes — that indifference is the whole point of naming the recipient
+///      at launch.
 contract MockFundStrategy {
     uint8 public stateValue; // 0 Pending, 1 Executed, 2 Settled
     address public vaultAddress;
@@ -36,34 +39,11 @@ contract MockFundStrategy {
 }
 
 /// @notice An owner contract that answers NEITHER `state()` nor `vault()`.
-/// @dev The fail-closed adversary: an unreadable `state()` must read as NOT
-///      settled (owner-only), and an unresolvable `vault()` must revert rather
-///      than pick a destination.
+/// @dev Formerly the fail-closed adversary for `forwardToVault`'s owner reads.
+///      Those reads are gone, so it now proves something stronger: an owner
+///      that answers nothing at all cannot influence where a fund's fees go,
+///      or whether they move.
 contract MuteOwner {}
-
-/// @notice A SETTLED owner whose `vault()` is unreadable until it is armed.
-/// @dev The post-settlement edge case: `state()` says Settled, so the fee lane
-///      must not pay the strategy — but there is no vault address to pay
-///      either. The verb under test must move nothing rather than fall back to
-///      the owner, and the value must still be deliverable afterwards.
-contract SettledOwnerLateVault {
-    error VaultNotArmed();
-
-    address private _vault;
-
-    function state() external pure returns (uint8) {
-        return 2; // Settled
-    }
-
-    function vault() external view returns (address) {
-        if (_vault == address(0)) revert VaultNotArmed();
-        return _vault;
-    }
-
-    function armVault(address vault_) external {
-        _vault = vault_;
-    }
-}
 
 /// @notice Reverts loudly on ANY call, including its fallback.
 /// @dev The forged-ref probe. If a ref-taking verb ever calls the address it
@@ -167,11 +147,25 @@ contract StonkLaunchAdapterTest is Test {
         );
     }
 
+    /// @dev The production shape: the fund's VAULT is the fee recipient, named
+    ///      by the launch. The owning strategy is the RESERVE's destination,
+    ///      which is a different address on a different lane.
     function _params(address quoteToken, uint256 quoteIn, uint256 minOut, uint256 reserve, bytes memory venueData)
         internal
         view
         returns (ILaunchAdapter.LaunchParams memory)
     {
+        return _paramsTo(quoteToken, quoteIn, minOut, reserve, venueData, vault);
+    }
+
+    function _paramsTo(
+        address quoteToken,
+        uint256 quoteIn,
+        uint256 minOut,
+        uint256 reserve,
+        bytes memory venueData,
+        address feeRecipient
+    ) internal view returns (ILaunchAdapter.LaunchParams memory) {
         return ILaunchAdapter.LaunchParams({
             name: "Fund Token",
             symbol: "FUND",
@@ -180,6 +174,7 @@ contract StonkLaunchAdapterTest is Test {
             minTokensOut: minOut,
             reserveAmount: reserve,
             deadline: uint64(block.timestamp + 1 hours),
+            feeRecipient: feeRecipient,
             venueData: venueData
         });
     }
@@ -252,6 +247,49 @@ contract StonkLaunchAdapterTest is Test {
         assertEq(uint256(res.launchRef) >> 160, 0, "the ref carries no dirty high bits");
         assertEq(StonkLaunchAdapter(clone).owner(), address(strategy), "owned by the calling strategy");
         assertEq(StonkLaunchAdapter(clone).pad(), address(wethPad), "bound to the lane's pad");
+        assertEq(StonkLaunchAdapter(clone).feeRecipient(), vault, "and pinned to the launch's fee recipient");
+    }
+
+    /// @dev The clone must remain the VENUE's creator — `arm` and `abort` are
+    ///      creator-only levers it genuinely needs — so "fees go to the vault"
+    ///      is achieved by forwarding, not by naming the vault at the pad.
+    function test_Launch_CloneIsTheVenueCreatorButTheVaultIsTheFeeRecipient() public {
+        ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
+        StonkLaunchAdapter clone = _clone(res);
+
+        assertEq(wethPad.getLaunch(clone.launchId()).creator, address(clone), "the venue creator is the clone");
+        assertEq(clone.feeRecipient(), vault, "the fee destination is the vault");
+        assertTrue(clone.feeRecipient() != clone.owner(), "and it is not the owning strategy");
+    }
+
+    /// @dev Per-launch, not implementation-wide: each clone carries its own.
+    function test_Launch_FeeRecipientIsPerClone() public {
+        address vaultA = makeAddr("vaultA");
+        vm.prank(address(strategy));
+        ILaunchAdapter.LaunchResult memory a =
+            adapter.launch(_paramsTo(address(weth), 0, 0, RESERVE, _venueData(), vaultA));
+        ILaunchAdapter.LaunchResult memory b = _launch(0, 0, RESERVE);
+
+        assertEq(_clone(a).feeRecipient(), vaultA);
+        assertEq(_clone(b).feeRecipient(), vault);
+
+        wethPad.creditCreatorQuote(_clone(a).launchId(), 3 ether);
+        vm.prank(keeper);
+        adapter.collectFees(a.launchRef);
+        assertEq(weth.balanceOf(vaultA), 3 ether, "each clone pays its own recipient");
+        assertEq(weth.balanceOf(vault), 0);
+    }
+
+    function test_RevertWhen_FeeRecipientIsZero_NoFundsMove() public {
+        uint256 before = weth.balanceOf(address(strategy));
+        vm.prank(address(strategy));
+        weth.approve(address(adapter), QUOTE_IN);
+
+        vm.prank(address(strategy));
+        vm.expectRevert(StonkLaunchAdapter.ZeroFeeRecipient.selector);
+        adapter.launch(_paramsTo(address(weth), QUOTE_IN, 0, RESERVE, _venueData(), address(0)));
+
+        assertEq(weth.balanceOf(address(strategy)), before, "no quote pulled");
     }
 
     function test_RevertWhen_ReserveIsTheWholeSupply() public {
@@ -538,30 +576,50 @@ contract StonkLaunchAdapterTest is Test {
         assertEq(uint256(adapter.phase(res.launchRef)), uint256(ILaunchAdapter.LaunchPhase.Live));
     }
 
-    function test_CollectFees_PaysTheOwnerAndNeverTheCaller() public {
+    function test_CollectFees_PaysTheFeeRecipientAndNeverTheStrategyOrCaller() public {
         ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
         StonkLaunchAdapter clone = _clone(res);
         wethPad.creditCreatorQuote(clone.launchId(), 3 ether);
-        // A token leg too, so both legs of the pre-settlement lane are exercised.
+        // A token leg too, so both legs are exercised.
         deal(res.token, address(clone), 4 ether, true);
 
-        uint256 ownerQuoteBefore = weth.balanceOf(address(strategy));
-        uint256 ownerTokenBefore = IERC20(res.token).balanceOf(address(strategy));
+        uint256 strategyQuoteBefore = weth.balanceOf(address(strategy));
+        uint256 strategyTokenBefore = IERC20(res.token).balanceOf(address(strategy));
+
+        vm.expectEmit(true, false, false, true, address(clone));
+        emit StonkLaunchAdapter.FeesCollected(vault, 3 ether, 4 ether);
         vm.prank(keeper);
         (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
 
-        assertEq(quoteOut, 3 ether, "the delta that actually landed on the owner");
+        assertEq(quoteOut, 3 ether, "the delta that actually landed on the fee recipient");
         assertEq(tokenOut, 4 ether, "the token leg, likewise measured where it landed");
-        assertEq(weth.balanceOf(address(strategy)) - ownerQuoteBefore, quoteOut, "reported == moved, quote leg");
+        assertEq(weth.balanceOf(vault), quoteOut, "reported == moved, quote leg");
+        assertEq(IERC20(res.token).balanceOf(vault), tokenOut, "reported == moved, token leg");
+        assertEq(weth.balanceOf(address(strategy)), strategyQuoteBefore, "fees never transit strategy custody");
         assertEq(
-            IERC20(res.token).balanceOf(address(strategy)) - ownerTokenBefore, tokenOut, "reported == moved, token leg"
+            IERC20(res.token).balanceOf(address(strategy)), strategyTokenBefore, "fees never transit strategy custody"
         );
         assertEq(weth.balanceOf(keeper), 0, "keeper receives nothing");
         assertEq(IERC20(res.token).balanceOf(keeper), 0, "keeper receives nothing");
-        assertEq(weth.balanceOf(vault), 0, "before settlement the vault is not the destination");
-        assertEq(IERC20(res.token).balanceOf(vault), 0, "before settlement the vault is not the destination");
         assertEq(weth.balanceOf(address(clone)), 0, "the clone forwarded everything it was paid");
+        assertEq(IERC20(res.token).balanceOf(address(clone)), 0, "the clone forwarded everything it was paid");
         assertEq(weth.balanceOf(address(adapter)), 0, "the implementation holds nothing");
+    }
+
+    /// @dev The same lane, driven by the OWNER instead of a keeper: who calls
+    ///      changes nothing, because the payee is a pinned storage slot.
+    function test_CollectFees_SameDestinationWhoeverCalls() public {
+        ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
+        StonkLaunchAdapter clone = _clone(res);
+        wethPad.creditCreatorQuote(clone.launchId(), 2 ether);
+
+        uint256 strategyQuoteBefore = weth.balanceOf(address(strategy));
+        vm.prank(address(strategy));
+        (uint256 quoteOut,) = adapter.collectFees(res.launchRef);
+
+        assertEq(quoteOut, 2 ether);
+        assertEq(weth.balanceOf(vault), 2 ether, "still the vault");
+        assertEq(weth.balanceOf(address(strategy)), strategyQuoteBefore, "the owner calling is paid nothing");
     }
 
     function test_CollectFees_ReturnsZeroesWhenNothingAccrued() public {
@@ -572,36 +630,54 @@ contract StonkLaunchAdapterTest is Test {
         assertEq(tokenOut, 0);
     }
 
-    /// @dev The lock-lever PoC, inverted. Once the owner has settled, a
-    ///      permissionless `collectFees` must NOT be a way to push value back
-    ///      into strategy custody: before the strategy's residue latch arms,
-    ///      every such arrival lets `collectResidue` re-stamp a fresh 7-day
-    ///      deposit lock on the vault. The verb stays permissionless; the
-    ///      DESTINATION is what settlement moves.
-    function test_CollectFees_PostSettlementPaysTheVaultAndNeverTheStrategy() public {
+    /// @dev THE SIMPLIFICATION'S WHOLE POINT, asserted directly: a LIVE owner
+    ///      and a SETTLED owner produce the SAME destination, from the same
+    ///      permissionless call, in the same test. This replaces the pair
+    ///      `test_CollectFees_PaysTheOwner...` /
+    ///      `test_CollectFees_PostSettlementPaysTheVault...`, which existed to
+    ///      pin a destination SWITCH there is no longer any code for.
+    ///
+    ///      The lock lever those tests guarded is gone rather than guarded:
+    ///      value never lands in strategy custody in any phase, so there is no
+    ///      arrival for a permissionless `SyndicateVault.collectResidue` to
+    ///      convert into a fresh 7-day deposit lock.
+    function test_CollectFees_SameDestinationWhetherTheOwnerIsLiveOrSettled() public {
         ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
         StonkLaunchAdapter clone = _clone(res);
+        address passerby = makeAddr("passerby");
+        uint256 strategyQuoteBefore = weth.balanceOf(address(strategy));
+        uint256 strategyTokenBefore = IERC20(res.token).balanceOf(address(strategy));
+
+        // ── leg 1: the owner is LIVE (Executed) ──
+        strategy.setState(1);
         wethPad.creditCreatorQuote(clone.launchId(), 5 ether);
         deal(res.token, address(clone), 7 ether, true);
 
-        strategy.setState(2); // Settled
-
-        uint256 strategyQuoteBefore = weth.balanceOf(address(strategy));
-        uint256 strategyTokenBefore = IERC20(res.token).balanceOf(address(strategy));
-        address passerby = makeAddr("passerby");
-
-        vm.expectEmit(true, true, false, true, address(clone));
-        emit StonkLaunchAdapter.FeesCollected(address(strategy), vault, 5 ether, 7 ether);
         vm.prank(passerby);
-        (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
+        (uint256 liveQuote, uint256 liveToken) = adapter.collectFees(res.launchRef);
 
-        assertEq(quoteOut, 5 ether, "reported against the vault, not the settled strategy");
-        assertEq(tokenOut, 7 ether, "reported against the vault, not the settled strategy");
-        assertEq(weth.balanceOf(vault), quoteOut, "quote leg on the vault");
-        assertEq(IERC20(res.token).balanceOf(vault), tokenOut, "token leg on the vault");
-        assertEq(weth.balanceOf(address(strategy)), strategyQuoteBefore, "the settled strategy receives nothing");
+        assertEq(liveQuote, 5 ether);
+        assertEq(liveToken, 7 ether);
+        assertEq(weth.balanceOf(vault), 5 ether, "live owner: the vault is paid");
+        assertEq(IERC20(res.token).balanceOf(vault), 7 ether);
+
+        // ── leg 2: the owner is SETTLED. Same call, same destination. ──
+        strategy.setState(2);
+        wethPad.creditCreatorQuote(clone.launchId(), 5 ether);
+        deal(res.token, address(clone), 7 ether, true);
+
+        vm.prank(passerby);
+        (uint256 settledQuote, uint256 settledToken) = adapter.collectFees(res.launchRef);
+
+        assertEq(settledQuote, liveQuote, "settlement changes nothing about the amount");
+        assertEq(settledToken, liveToken, "settlement changes nothing about the amount");
+        assertEq(weth.balanceOf(vault), 10 ether, "settled owner: the same vault is paid");
+        assertEq(IERC20(res.token).balanceOf(vault), 14 ether);
+
+        // In neither leg did value transit the strategy or reach the caller.
+        assertEq(weth.balanceOf(address(strategy)), strategyQuoteBefore, "no fee ever transits strategy custody");
         assertEq(
-            IERC20(res.token).balanceOf(address(strategy)), strategyTokenBefore, "the settled strategy receives nothing"
+            IERC20(res.token).balanceOf(address(strategy)), strategyTokenBefore, "no fee ever transits strategy custody"
         );
         assertEq(weth.balanceOf(passerby), 0, "the caller receives nothing");
         assertEq(IERC20(res.token).balanceOf(passerby), 0, "the caller receives nothing");
@@ -609,50 +685,63 @@ contract StonkLaunchAdapterTest is Test {
         assertEq(IERC20(res.token).balanceOf(address(clone)), 0, "the clone is emptied");
     }
 
-    /// @dev Settled owner, unreadable `vault()`. Paying the owner as a fallback
-    ///      would reopen the lock lever, so the call is a NO-OP that reports
-    ///      `(0, 0)` — and nothing is stranded, because the clone is the
-    ///      custodian either way and delivers in full once the vault reads.
-    function test_CollectFees_SettledWithUnreadableVaultMovesNothingAndStrandsNothing() public {
-        SettledOwnerLateVault lateOwner = new SettledOwnerLateVault();
-        vm.prank(address(lateOwner));
+    /// @dev An owner that answers NEITHER `state()` nor `vault()`. Under the
+    ///      old destination switch this was the fail-closed edge that decided
+    ///      between two lanes; now the owner is not read at all, so it cannot
+    ///      stall, redirect or gate the fee stream. This replaces
+    ///      `test_CollectFees_SettledWithUnreadableVaultMovesNothingAndStrandsNothing`,
+    ///      whose `(0, 0)` no-op branch has been deleted.
+    function test_CollectFees_UnreadableOwnerCannotAffectTheDestination() public {
+        MuteOwner mute = new MuteOwner();
+        vm.prank(address(mute));
         ILaunchAdapter.LaunchResult memory res = adapter.launch(_params(address(weth), 0, 0, RESERVE, _venueData()));
         StonkLaunchAdapter clone = _clone(res);
 
         wethPad.creditCreatorQuote(clone.launchId(), 6 ether);
-        // The armed remainder is on the pad; put a token balance on the clone.
         deal(res.token, address(clone), 9 ether, true);
 
-        // The owner already holds the withheld reserve from `launch`; the fee
-        // lane must add nothing to either leg.
-        uint256 ownerQuoteBefore = weth.balanceOf(address(lateOwner));
-        uint256 ownerTokenBefore = IERC20(res.token).balanceOf(address(lateOwner));
+        uint256 ownerTokenBefore = IERC20(res.token).balanceOf(address(mute));
 
         vm.prank(keeper);
         (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
 
-        assertEq(quoteOut, 0, "no destination, so nothing is reported");
-        assertEq(tokenOut, 0, "no destination, so nothing is reported");
-        assertEq(weth.balanceOf(address(lateOwner)), ownerQuoteBefore, "the settled owner is never the fallback");
-        assertEq(
-            IERC20(res.token).balanceOf(address(lateOwner)), ownerTokenBefore, "the settled owner is never the fallback"
-        );
-        assertEq(weth.balanceOf(keeper), 0, "the caller receives nothing");
-        assertEq(IERC20(res.token).balanceOf(keeper), 0, "the caller receives nothing");
-        // Nothing moved: the fee is still unflushed on the pad, the token leg
-        // is still on the clone, which is the custodian in every branch.
-        assertEq(weth.balanceOf(address(clone)), 0, "the venue leg was never flushed");
-        assertEq(IERC20(res.token).balanceOf(address(clone)), 9 ether, "the token leg stayed on the clone");
+        assertEq(quoteOut, 6 ether, "delivered in full on the first call");
+        assertEq(tokenOut, 9 ether, "delivered in full on the first call");
+        assertEq(weth.balanceOf(vault), 6 ether);
+        assertEq(IERC20(res.token).balanceOf(vault), 9 ether);
+        assertEq(weth.balanceOf(address(mute)), 0, "the unreadable owner is never a destination");
+        assertEq(IERC20(res.token).balanceOf(address(mute)), ownerTokenBefore, "it keeps only its reserve");
+        assertEq(weth.balanceOf(address(clone)), 0, "nothing is left behind");
+        assertEq(IERC20(res.token).balanceOf(address(clone)), 0, "nothing is left behind");
+    }
 
-        // Once the vault reads, the value is delivered in full — nothing lost.
-        lateOwner.armVault(vault);
-        vm.prank(keeper);
-        clone.forwardToVault();
+    /// @dev The deleted `forwardToVault()` was the post-settlement sweep lane.
+    ///      Its job is now covered by `collectFees` itself, which is
+    ///      permissionless and moves the clone's ENTIRE balance of both assets
+    ///      — not just what this call flushed — so nothing can rest on a clone.
+    ///      This replaces the four `forwardToVault` tests.
+    function test_CollectFees_SweepsAnyCloneHeldBalance_NothingCanBeStranded() public {
+        ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
+        StonkLaunchAdapter clone = _clone(res);
 
-        assertEq(weth.balanceOf(vault), 6 ether, "quote leg delivered late, in full");
-        assertEq(IERC20(res.token).balanceOf(vault), 9 ether, "token leg delivered late, in full");
-        assertEq(weth.balanceOf(address(clone)), 0, "the clone is emptied");
-        assertEq(IERC20(res.token).balanceOf(address(clone)), 0, "the clone is emptied");
+        // Balances that arrived by no venue flush at all: a donation of quote,
+        // and launch token pushed onto the clone.
+        weth.mint(address(clone), 11 ether);
+        deal(res.token, address(clone), 13 ether, true);
+        // Plus a real accrual, unflushed.
+        wethPad.creditCreatorQuote(clone.launchId(), 2 ether);
+
+        strategy.setState(2); // and it makes no difference
+
+        vm.prank(makeAddr("anyone"));
+        (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
+
+        assertEq(quoteOut, 13 ether, "flushed accrual plus the resting donation");
+        assertEq(tokenOut, 13 ether, "the whole resting token balance");
+        assertEq(weth.balanceOf(vault), 13 ether);
+        assertEq(IERC20(res.token).balanceOf(vault), 13 ether);
+        assertEq(weth.balanceOf(address(clone)), 0, "the clone cannot hold quote after this");
+        assertEq(IERC20(res.token).balanceOf(address(clone)), 0, "nor launch token");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -689,65 +778,19 @@ contract StonkLaunchAdapterTest is Test {
         clone.abort();
     }
 
-    function test_RevertWhen_ForeignCallerForwardsBeforeSettlement() public {
+    /// @dev `abort` recovers the launch's SUPPLY, which — like the reserve — is
+    ///      the strategy's to distribute, not a fee. It stays owner-only and
+    ///      keeps paying the owner; only the fee ROLE moved to the vault.
+    function test_Abort_ReturnsSupplyToTheOwnerNotTheFeeRecipient() public {
         ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
         StonkLaunchAdapter clone = _clone(res);
-        strategy.setState(1); // Executed, not Settled
-
-        vm.prank(keeper);
-        vm.expectRevert(abi.encodeWithSelector(StonkLaunchAdapter.NotOwner.selector, keeper, address(strategy)));
-        clone.forwardToVault();
-    }
-
-    function test_ForwardToVault_OwnerMayForwardBeforeSettlement() public {
-        ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
-        StonkLaunchAdapter clone = _clone(res);
-        wethPad.creditCreatorQuote(clone.launchId(), 2 ether);
-        strategy.setState(1);
 
         vm.prank(address(strategy));
-        clone.forwardToVault();
-        assertEq(weth.balanceOf(vault), 2 ether, "vault paid direct, never through the strategy");
-    }
+        clone.abort();
 
-    function test_ForwardToVault_PermissionlessOnceTheOwnerSettles() public {
-        ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
-        StonkLaunchAdapter clone = _clone(res);
-        wethPad.creditCreatorQuote(clone.launchId(), 5 ether);
-        // Give the clone a launch-token balance too, so both legs are exercised.
-        deal(res.token, address(clone), 7 ether, true);
-
-        strategy.setState(2); // Settled
-
-        uint256 strategyQuoteBefore = weth.balanceOf(address(strategy));
-        vm.prank(keeper);
-        clone.forwardToVault();
-
-        assertEq(weth.balanceOf(vault), 5 ether, "quote leg on the vault");
-        assertEq(IERC20(res.token).balanceOf(vault), 7 ether, "token leg on the vault");
-        assertEq(weth.balanceOf(keeper), 0, "keeper receives nothing");
-        assertEq(IERC20(res.token).balanceOf(keeper), 0, "keeper receives nothing");
-        assertEq(weth.balanceOf(address(strategy)), strategyQuoteBefore, "nothing passes through the strategy");
-        assertEq(weth.balanceOf(address(clone)), 0, "the clone is emptied");
-        assertEq(IERC20(res.token).balanceOf(address(clone)), 0, "the clone is emptied");
-    }
-
-    function test_ForwardToVault_UnreadableOwnerStateFailsClosed() public {
-        MuteOwner mute = new MuteOwner();
-        // A clone owned by a contract that answers neither read.
-        vm.prank(address(mute));
-        ILaunchAdapter.LaunchResult memory res = adapter.launch(_params(address(weth), 0, 0, RESERVE, _venueData()));
-        StonkLaunchAdapter clone = _clone(res);
-
-        // An unreadable `state()` reads as NOT settled: owner-only.
-        vm.prank(keeper);
-        vm.expectRevert(abi.encodeWithSelector(StonkLaunchAdapter.NotOwner.selector, keeper, address(mute)));
-        clone.forwardToVault();
-
-        // And even the owner cannot forward to a vault that cannot be resolved.
-        vm.prank(address(mute));
-        vm.expectRevert(abi.encodeWithSelector(StonkLaunchAdapter.VaultUnresolved.selector, address(mute)));
-        clone.forwardToVault();
+        assertEq(IERC20(res.token).balanceOf(address(strategy)), SUPPLY, "supply back with the owner");
+        assertEq(IERC20(res.token).balanceOf(vault), 0, "the fee recipient is not the supply's destination");
+        assertEq(IERC20(res.token).balanceOf(address(clone)), 0, "and nothing rests on the clone");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -811,12 +854,12 @@ contract StonkLaunchAdapterTest is Test {
     function test_RevertWhen_InitializingTheImplementation() public {
         vm.expectRevert(StonkLaunchAdapter.AlreadyInitialized.selector);
         vm.prank(address(adapter));
-        adapter.initialize(address(strategy), address(wethPad), address(weth));
+        adapter.initialize(address(strategy), address(wethPad), address(weth), vault);
 
         // ...and from anyone else it fails one step earlier.
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(StonkLaunchAdapter.NotImplementation.selector, keeper));
-        adapter.initialize(address(strategy), address(wethPad), address(weth));
+        adapter.initialize(address(strategy), address(wethPad), address(weth), vault);
     }
 
     function test_RevertWhen_ForeignCallerInitializesAClone() public {
@@ -824,7 +867,7 @@ contract StonkLaunchAdapterTest is Test {
         StonkLaunchAdapter clone = _clone(res);
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(StonkLaunchAdapter.NotImplementation.selector, keeper));
-        clone.initialize(keeper, address(wethPad), address(weth));
+        clone.initialize(keeper, address(wethPad), address(weth), vault);
     }
 
     function test_RevertWhen_ReLaunchingThroughAnExistingClone() public {
@@ -851,8 +894,6 @@ contract StonkLaunchAdapterTest is Test {
         assertEq(t, 0);
         vm.expectRevert(StonkLaunchAdapter.NotInitialized.selector);
         adapter.abort();
-        vm.expectRevert(StonkLaunchAdapter.NotInitialized.selector);
-        adapter.forwardToVault();
     }
 
     /// @dev A clone anyone can mint from public code, but never initialize —
@@ -871,7 +912,7 @@ contract StonkLaunchAdapterTest is Test {
 
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(StonkLaunchAdapter.NotImplementation.selector, keeper));
-        StonkLaunchAdapter(rogue).initialize(keeper, address(wethPad), address(weth));
+        StonkLaunchAdapter(rogue).initialize(keeper, address(wethPad), address(weth), vault);
     }
 
     // ── wiring ──
@@ -884,8 +925,10 @@ contract StonkLaunchAdapterTest is Test {
 
     function test_LaunchTargetZeroMeansSettlementSkipsTheCreatorHandoff() public view {
         // `TokenizeFundStrategy._settle` only calls `transferCreator` when
-        // `launchTarget()` is nonzero; this venue has no such selector and the
-        // clone's `forwardToVault()` is the post-settlement lane instead.
+        // `launchTarget()` is nonzero; this venue has no such selector, and it
+        // needs none — the clone has been forwarding to the launch's
+        // `feeRecipient` since the first block, so settlement has no fee lane
+        // left to open.
         assertEq(adapter.launchTarget(), address(0));
     }
 

@@ -63,7 +63,9 @@ contract StrategyStub {
         return ILaunchAdapter(adapter).launch{value: value}(p);
     }
 
-    /// @dev The settle-time handoff: the strategy calls the venue itself.
+    /// @dev Kept only to PROVE the settle-time handoff is gone: a strategy that
+    ///      is not the creator cannot re-point the fee stream, and does not
+    ///      need to.
     function transferCreator(address launchpad, address token, address newCreator) external {
         ISushiLaunchpad(launchpad).transferCreator(token, newCreator);
     }
@@ -126,7 +128,18 @@ contract SushiLaunchAdapterTest is Test {
         weth.deposit{value: wethAmount}();
     }
 
+    /// @dev The production shape: the fund's VAULT is the fee recipient, named
+    ///      by the launch itself. The strategy is only ever the reserve's
+    ///      destination, which is a different address on a different lane.
     function _params(address quoteToken, uint256 quoteIn, uint256 minOut, uint256 reserve)
+        internal
+        view
+        returns (ILaunchAdapter.LaunchParams memory)
+    {
+        return _paramsTo(quoteToken, quoteIn, minOut, reserve, vault);
+    }
+
+    function _paramsTo(address quoteToken, uint256 quoteIn, uint256 minOut, uint256 reserve, address feeRecipient)
         internal
         view
         returns (ILaunchAdapter.LaunchParams memory)
@@ -139,6 +152,7 @@ contract SushiLaunchAdapterTest is Test {
             minTokensOut: minOut,
             reserveAmount: reserve,
             deadline: uint64(block.timestamp + 1 hours),
+            feeRecipient: feeRecipient,
             venueData: ""
         });
     }
@@ -175,16 +189,66 @@ contract SushiLaunchAdapterTest is Test {
         assertEq(weth.balanceOf(address(adapter)), 0, "no weth on adapter");
         assertEq(address(adapter).balance, 0, "no native on adapter");
         assertEq(quote.allowance(address(adapter), address(pad)), 0, "no standing allowance");
+
+        // ...and the reserve lane is the STRATEGY's, not the fee recipient's.
+        assertEq(IERC20(res.token).balanceOf(vault), 0, "the fee recipient gets no reserve");
+        assertEq(quote.balanceOf(vault), 0, "and no quote");
     }
 
-    function test_Launch_CreatorRoleIsTheCaller() public {
+    /// @dev THE CRUX OF THE FEE ROUTING. Two destinations, and they are not the
+    ///      same one: the reserve goes to the CALLER (it is the pot holders
+    ///      claim against), the creator fee stream goes to the launch's
+    ///      `feeRecipient` — the fund's VAULT — from the first block.
+    function test_Launch_CreatorRoleIsTheFeeRecipientNotTheCaller() public {
         ILaunchAdapter.LaunchResult memory res = _launchAsStrategy();
-        assertEq(pad.launchInfo(res.token).creator, strategy, "creator handed to the caller in-tx");
 
-        // And the adapter kept no path back to it.
+        assertEq(pad.launchInfo(res.token).creator, vault, "creator IS the fee recipient, in-tx");
+        assertTrue(pad.launchInfo(res.token).creator != strategy, "the strategy is never the creator");
+        assertEq(IERC20(res.token).balanceOf(strategy), res.reserveHeld, "but the reserve is still the strategy's");
+
+        // The adapter kept no path back to the role...
         vm.prank(address(adapter));
         vm.expectRevert(MockSushiLaunchpad.NotCreator.selector);
         pad.transferCreator(res.token, address(adapter));
+
+        // ...and neither did the strategy, which is the point: there is no
+        // settle-time handoff to fail because there is no role to hand over.
+        vm.expectRevert(MockSushiLaunchpad.NotCreator.selector);
+        stub.transferCreator(address(pad), res.token, strategy);
+    }
+
+    /// @dev The recipient is per-launch, not adapter-wide: a shared singleton
+    ///      that pinned one fee destination would be a shared custody surface.
+    function test_Launch_FeeRecipientIsPerLaunch() public {
+        address vaultA = makeAddr("vaultA");
+        address vaultB = makeAddr("vaultB");
+
+        _approve(strategy, address(quote), QUOTE_IN * 2, FEE * 2);
+        ILaunchAdapter.LaunchResult memory a =
+            stub.launch(address(adapter), _paramsTo(address(quote), QUOTE_IN, RESERVE, RESERVE, vaultA));
+        ILaunchAdapter.LaunchResult memory b =
+            stub.launch(address(adapter), _paramsTo(address(quote), QUOTE_IN, RESERVE, RESERVE, vaultB));
+
+        assertEq(pad.launchInfo(a.token).creator, vaultA);
+        assertEq(pad.launchInfo(b.token).creator, vaultB);
+
+        pad.setFeesOwed(a.token, 1 ether, 2 ether);
+        adapter.collectFees(a.launchRef);
+        assertEq(quote.balanceOf(vaultA), 1 ether, "each launch pays its own recipient");
+        assertEq(quote.balanceOf(vaultB), 0);
+    }
+
+    function test_RevertWhen_FeeRecipientIsZero_NoFundsMove() public {
+        uint256 quoteBefore = quote.balanceOf(strategy);
+        uint256 wethBefore = weth.balanceOf(strategy);
+        _approve(strategy, address(quote), QUOTE_IN, FEE);
+
+        vm.expectRevert(SushiLaunchAdapter.ZeroFeeRecipient.selector);
+        stub.launch(address(adapter), _paramsTo(address(quote), QUOTE_IN, RESERVE, RESERVE, address(0)));
+
+        assertEq(quote.balanceOf(strategy), quoteBefore, "no quote pulled");
+        assertEq(weth.balanceOf(strategy), wethBefore, "no fee pulled");
+        assertEq(quote.balanceOf(address(adapter)), 0, "nothing reached the adapter");
     }
 
     // ── reserve enforcement ──
@@ -248,7 +312,7 @@ contract SushiLaunchAdapterTest is Test {
 
         assertEq(IERC20(res.token).balanceOf(strategy), res.reserveHeld);
         assertEq(pad.launchInfo(res.token).quoteToken, address(wood), "paired against WOOD");
-        assertEq(pad.launchInfo(res.token).creator, strategy);
+        assertEq(pad.launchInfo(res.token).creator, vault, "fee stream on the vault, whatever the quote");
         assertEq(wood.balanceOf(address(adapter)), 0, "no WOOD dust on adapter");
     }
 
@@ -354,7 +418,7 @@ contract SushiLaunchAdapterTest is Test {
         ILaunchAdapter.LaunchResult memory res = _launchAsStrategy();
 
         assertEq(IERC20(res.token).balanceOf(strategy), res.reserveHeld, "reserve delivered to the contract caller");
-        assertEq(pad.launchInfo(res.token).creator, strategy, "creator handed over in-tx");
+        assertEq(pad.launchInfo(res.token).creator, vault, "creator handed to the fee recipient in-tx");
         assertEq(address(adapter).balance, 0, "adapter holds no native");
 
         // The caller genuinely cannot take native — this is the property the
@@ -387,7 +451,7 @@ contract SushiLaunchAdapterTest is Test {
         assertEq(res.quoteSpent, QUOTE_IN, "buy consumed in full");
         assertEq(IERC20(res.token).balanceOf(strategy), res.reserveHeld, "reserve still delivered to the strategy");
         assertGe(res.reserveHeld, RESERVE, "reserve floor still honoured");
-        assertEq(pad.launchInfo(res.token).creator, strategy, "creator role still transferred");
+        assertEq(pad.launchInfo(res.token).creator, vault, "creator role still handed to the fee recipient");
         assertEq(quote.allowance(address(adapter), address(pad)), 0, "no standing allowance");
         assertEq(quote.balanceOf(address(adapter)), 0, "token sweeps still assert clean");
         assertEq(IERC20(res.token).balanceOf(address(adapter)), 0);
@@ -441,24 +505,49 @@ contract SushiLaunchAdapterTest is Test {
 
     // ── fees ──
 
-    function test_CollectFees_ReportsTheCreatorsDeltas() public {
+    function test_CollectFees_PaysTheFeeRecipientAndNeverTheStrategy() public {
         ILaunchAdapter.LaunchResult memory res = _launchAsStrategy();
         pad.setFeesOwed(res.token, 3 ether, 7 ether);
 
-        uint256 quoteBefore = quote.balanceOf(strategy);
-        uint256 tokenBefore = IERC20(res.token).balanceOf(strategy);
+        uint256 strategyQuoteBefore = quote.balanceOf(strategy);
+        uint256 strategyTokenBefore = IERC20(res.token).balanceOf(strategy);
 
-        // A permissionless keeper drives it; the venue still pays the creator.
+        // A permissionless keeper drives it; the venue pays the creator, and
+        // the creator has been the fee recipient since `launch`.
         vm.prank(keeper);
         (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
 
-        assertEq(quoteOut, 3 ether, "quote leg measured on the creator");
-        assertEq(tokenOut, 7 ether, "token leg measured on the creator");
-        assertEq(quote.balanceOf(strategy) - quoteBefore, 3 ether);
-        assertEq(IERC20(res.token).balanceOf(strategy) - tokenBefore, 7 ether);
+        assertEq(quoteOut, 3 ether, "quote leg measured on the fee recipient");
+        assertEq(tokenOut, 7 ether, "token leg measured on the fee recipient");
+        assertEq(quote.balanceOf(vault), 3 ether, "vault paid direct by the venue");
+        assertEq(IERC20(res.token).balanceOf(vault), 7 ether);
+        assertEq(quote.balanceOf(strategy), strategyQuoteBefore, "the strategy receives no fees, ever");
+        assertEq(IERC20(res.token).balanceOf(strategy), strategyTokenBefore, "the strategy receives no fees, ever");
         assertEq(quote.balanceOf(keeper), 0, "keeper receives nothing");
         assertEq(IERC20(res.token).balanceOf(keeper), 0, "keeper receives nothing");
         assertEq(quote.balanceOf(address(adapter)), 0, "adapter receives nothing");
+    }
+
+    /// @dev The destination does not depend on WHO drives the collection: the
+    ///      strategy itself calling gets the same answer a passer-by does,
+    ///      because the payee is the venue's creator and that was fixed at
+    ///      launch.
+    function test_CollectFees_SameDestinationWhoeverCalls() public {
+        ILaunchAdapter.LaunchResult memory res = _launchAsStrategy();
+        pad.setFeesOwed(res.token, 1 ether, 2 ether);
+
+        uint256 callerQuoteBefore = quote.balanceOf(strategy);
+        uint256 callerTokenBefore = IERC20(res.token).balanceOf(strategy);
+
+        vm.prank(strategy);
+        (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
+
+        assertEq(quoteOut, 1 ether);
+        assertEq(tokenOut, 2 ether);
+        assertEq(quote.balanceOf(vault), 1 ether, "still the vault");
+        assertEq(IERC20(res.token).balanceOf(vault), 2 ether, "still the vault");
+        assertEq(quote.balanceOf(strategy), callerQuoteBefore, "the caller is paid nothing for calling");
+        assertEq(IERC20(res.token).balanceOf(strategy), callerTokenBefore, "the caller is paid nothing for calling");
     }
 
     function test_CollectFees_ReturnsZeroesWhenNothingAccrued() public {
@@ -485,29 +574,44 @@ contract SushiLaunchAdapterTest is Test {
         assertEq(t, 0);
     }
 
-    function test_CollectFees_FollowsTheCreatorAfterTheSettleTimeHandoff() public {
+    /// @dev THE DELETED HANDOFF, asserted as absent. This replaces
+    ///      `test_CollectFees_FollowsTheCreatorAfterTheSettleTimeHandoff`,
+    ///      which staged `_settle` re-pointing the creator role from the
+    ///      strategy to the vault. There is nothing to re-point now: the
+    ///      strategy was never the creator, so it cannot move the fee stream —
+    ///      and the fee stream never needs moving, because it has paid the
+    ///      vault since the launch transaction. Fees are collectable
+    ///      permissionlessly, to the same address, before and after the fund
+    ///      settles.
+    function test_CollectFees_NeedsNoSettleTimeHandoffAndTheStrategyCannotRepoint() public {
         ILaunchAdapter.LaunchResult memory res = _launchAsStrategy();
+        address attacker = makeAddr("attacker");
 
-        // `_settle` hands the creator role to the vault, straight at the venue —
-        // the adapter supplies only the target address and the ref-is-the-token
-        // keying. (Resolve the target BEFORE the prank: it is itself a call.)
+        // Resolve the target BEFORE the call: it is itself a call.
         address target = adapter.launchTarget();
+        assertEq(target, address(pad), "settlement would address the venue here...");
+
+        // ...and find nothing to do: the strategy is not the creator, so the
+        // settle-time `transferCreator` this adapter used to need is refused.
+        vm.expectRevert(MockSushiLaunchpad.NotCreator.selector);
         stub.transferCreator(target, res.token, vault);
-        assertEq(pad.launchInfo(res.token).creator, vault);
 
+        // Nor can anyone else steer the stream elsewhere.
+        vm.prank(attacker);
+        vm.expectRevert(MockSushiLaunchpad.NotCreator.selector);
+        pad.transferCreator(res.token, attacker);
+
+        // Fees keep landing on the vault, driven by anyone, with no handoff.
         pad.setFeesOwed(res.token, 2 ether, 4 ether);
-        uint256 oldCreatorQuote = quote.balanceOf(strategy);
-        uint256 oldCreatorToken = IERC20(res.token).balanceOf(strategy);
-
         vm.prank(keeper);
         (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
 
-        assertEq(quoteOut, 2 ether, "reports the NEW creator's delta");
+        assertEq(quoteOut, 2 ether);
         assertEq(tokenOut, 4 ether);
-        assertEq(quote.balanceOf(vault), 2 ether, "vault paid direct");
+        assertEq(quote.balanceOf(vault), 2 ether, "vault paid direct, with no role transfer in between");
         assertEq(IERC20(res.token).balanceOf(vault), 4 ether);
-        assertEq(quote.balanceOf(strategy), oldCreatorQuote, "old creator paid nothing");
-        assertEq(IERC20(res.token).balanceOf(strategy), oldCreatorToken, "old creator paid nothing");
+        assertEq(quote.balanceOf(attacker), 0);
+        assertEq(IERC20(res.token).balanceOf(attacker), 0);
     }
 
     // ── wiring ──

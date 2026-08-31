@@ -90,50 +90,44 @@ For a venue whose launch is still in `Curve`/`Closing`/`Failed` phase at settlem
 - **WHEN** a strategy settles with fund-token custody already below `RESIDUE_DUST` — only vault-asset residue outstanding, so no clearing `sweep()` ever runs — and someone later donates fund tokens to it
 - **THEN** `hasUnvaluedResidue()` stays false, `collectResidue` cannot re-mark the strategy, and no deposit lock is re-stamped
 
-### Requirement: Fee routing is a per-proposal choice
+### Requirement: Creator fees are paid to the vault, named at launch
 
-The proposal SHALL choose, at initialization, where the venue's creator-fee stream goes, via a `FeeMode` whose zero value is `ToVault` — so the default is the behaviour that existed before this option and an un-set field cannot silently redirect a fund's fees.
+The strategy SHALL name the FUND'S VAULT as the launch's fee recipient, passing `vault()` into `ILaunchAdapter.LaunchParams.feeRecipient` at execute. It SHALL NOT accept that address as proposer input: a proposer-supplied recipient would let a proposal point a fund's fee stream at something other than the fund.
 
-- `ToVault`: fees reach the vault and lift every holder's share price. Nothing else changes.
-- `ToDepositors`: fees collected DURING the claim window are added to the claimable reserve, so the snapshot holders take them pro-rata alongside their slice of the launch.
+Creator fees SHALL therefore never enter strategy custody at any point in the launch's life. Collection SHALL be permissionless — the venues expose their payouts permissionlessly, the payee is fixed at launch and cannot be re-pointed, and a later proposal decides what the vault does with what accumulates.
 
-A permissionless `collectFees()` SHALL exist on the strategy, callable only while the clone is `Executed` and at or before `windowEnd`. It SHALL drive the adapter's collection through a call whose failure is tolerated, measure what arrived by the strategy's OWN balance deltas rather than by the adapter's return values, and — under `ToDepositors` only — add the launch-token delta to the reserve. Quote proceeds stay on the strategy in both modes, where settlement's existing conversion handles them.
+THIS DELETES A CLASS OF PROBLEM RATHER THAN GUARDING IT. Routing fees through the strategy gave the stream a destination that had to change when the strategy settled, and value sitting in a settled strategy is a permissionless deposit-lock lever: anyone can drive the vault's residue collection and re-stamp a fresh lock episode. Naming the vault up front means there is no second lane to get wrong, no handoff that can fail at settlement, and no settlement-dependent branch to reason about.
 
-THE TIMING IS THE REQUIREMENT, not an implementation detail. Collecting at settlement cannot serve `ToDepositors` at all: `settle()` is gated on the claim window having already closed, so anything added to the reserve then is unclaimable by construction. Collection therefore happens inside the window, and it is permissionless precisely so a keeper or any holder can top the pot up before the window shuts.
+Two consequences are ACCEPTED, not overlooked. First, no protocol code path pushes accrued fees: with the payee fixed at launch, collection is left to whoever cares — a keeper, a holder, or a later proposal — and the template makes no venue call for fees at any point, so a settled launch keeps earning at the venue with no on-chain reminder. Second, fees reach the vault IN KIND and unpriced, including a quote the vault may not be able to price, and disposing of them is a governance act rather than a template one. Both follow directly from wanting fees to be a plain vault receipt rather than a second distribution mechanism.
 
-`MAX_RESERVE_BPS` SHALL NOT be re-applied to the grown reserve, and that is deliberate. The cap exists to stop a proposer HOLDING BACK float at launch — supply withheld from the market and handed to a chosen snapshot — and its teeth are the execute-time supply check. Fees are post-launch EARNED value on liquidity the fund already paid for, so clamping them would cap the fund's own income against a ceiling written for a different adversary, and would strand the excess in a settled clone for no stated reason. The launch-time reserve stays capped; the pot it grows into does not.
+One CONSTRAINT falls out of naming the recipient at the venue: it is irrevocable. The venues bind the payee at launch and this template offers no re-point, so a fund that ever migrates vaults leaves its existing launches paying the OLD vault forever. `_execute` reads `vault()`, so the address is correct by construction at launch time; the exposure is migration, not misconfiguration. Any future vault-migration work must treat live launches as a thing it cannot carry across.
 
-Because the reserve can now GROW after some holders have claimed, per-holder claim accounting SHALL be an ACCUMULATOR — entitlement is the holder's pro-rata share of the current reserve minus what they have already taken — and a holder MAY claim more than once. Adversary the accumulator answers: a once-only claim flag would permanently under-pay whoever claimed before a top-up, turning an early claim into a penalty and handing the difference to whoever waited.
+The SNAPSHOT machinery SHALL remain scoped to the launch RESERVE alone. The reserve is fixed at execute and cannot grow, so per-holder claim accounting is once-only.
 
-#### Scenario: Fees enlarge the pot mid-window
-- **WHEN** `feeMode` is `ToDepositors` and `collectFees()` lands launch tokens while the window is open
-- **THEN** the reserve grows, a holder who already claimed can claim exactly the increment, and a holder claiming for the first time receives their full share of the enlarged reserve
+#### Scenario: Fees are the vault's from the first block
+- **WHEN** a launch completes
+- **THEN** the venue's fee recipient is the fund's vault, and it remains so without any later handoff
 
-#### Scenario: Collection outside the window
-- **WHEN** `collectFees()` is called before execution or after `windowEnd`
-- **THEN** it reverts, and no reserve accounting changes
+#### Scenario: Fees never reach the strategy
+- **WHEN** anyone drives a fee payout, at any point before or after settlement
+- **THEN** the value lands on the vault, the strategy's balances are unchanged, the reserve is unchanged, and the caller receives nothing
 
-#### Scenario: Vault mode is unaffected
-- **WHEN** `feeMode` is `ToVault` and the same collection happens
-- **THEN** the reserve is unchanged and the tokens reach the vault through settlement and `sweep()` as before
+#### Scenario: The reserve is not a fee sink
+- **WHEN** fees accrue over the life of a launch
+- **THEN** the claimable reserve is exactly what execute recorded — snapshot holders claim the launch allocation, never the fee stream
 
-#### Scenario: Sum of claims is still bounded
-- **WHEN** the reserve grows arbitrarily between claims
-- **THEN** the sum of everything claimed never exceeds the reserve
+### Requirement: The fee stream outlives settlement without a proposal
 
-### Requirement: Fee-stream custody after settlement
+A launch keeps earning after the strategy settles, and that value SHALL stay collectable permissionlessly, forever, without a new proposal — the recipient named at launch is the vault, and settlement does not change it.
 
-Creator-fee value accruing after settlement SHALL remain collectable without a new proposal, and SHALL NEVER transit strategy custody — the unvalued flag is latched, so a fund-token balance arriving there is invisible, or before the latch a re-lock lever. `_settle` SHALL hand the stream to the vault, venue-shaped:
+- **Sushi**: the vault is the venue's creator, so the permissionless `distributeFees(token)` pays it both legs — quote and launch token — with no involvement from the strategy at all.
+- **StonkBrokers**: the per-launch clone must stay creator (the venue's `arm`/`abort` levers are creator-only), so it forwards what it receives to the recipient it was initialized with. The clone is not the strategy, so what it briefly holds is invisible to the vault's residue machinery either way.
 
-- **Sushi**: `_settle` calls `transferCreator(token, vault())` on the adapter's `launchTarget()`, making the VAULT the creator; the venue's permissionless `distributeFees(token)` thereafter pays BOTH legs — quote and fund token — straight to the vault.
-- **StonkBrokers**: no creator transfer exists and the creator is the per-launch clone, which is not the strategy and so is invisible to the vault's residue machinery. The clone's `forwardToVault()` — owner-only before settlement, permissionless after — flushes creator quote and sends every clone balance to the strategy's vault.
+Both deliver IN KIND — quote and launch token, warehoused unpriced, counted in NAV by neither. There is no post-settlement conversion, and no requirement here claims one.
 
-Both post-settlement paths deliver IN KIND: quote and fund token, warehoused unpriced under the vault's owner-gated rescue surface, priced into NAV by neither. Conversion to the vault asset is a settle-time act only, the `_settle` swap already specced; no requirement here claims post-settlement conversion.
+Note what this requirement no longer has to say. It previously specified a settle-time handoff that moved the fee role to the vault, and the residue-latch reasoning that made a post-settlement fee arrival safe. Naming the vault at launch removes the need for both: nothing arrives at the strategy, so there is no arrival to make safe.
 
-#### Scenario: Fees accrue post-settlement
-- **WHEN** the launch pool earns creator fees after the clone is `Settled`
-- **THEN** a permissionless call (`distributeFees` on Sushi, `forwardToVault` on Stonk) delivers both legs to the vault in kind, and no balance passes through the strategy
+#### Scenario: Fees accrue long after settlement
+- **WHEN** the launch earns fees after the strategy is `Settled`
+- **THEN** any caller can push them to the vault, no proposal is required, and no balance passes through the strategy
 
-#### Scenario: Fees accrue after the latch
-- **WHEN** fees accrue after `hasUnvaluedResidue()` has first read false post-settlement, however it cleared
-- **THEN** it stays false, `collectResidue` cannot re-mark the strategy or re-stamp a deposit lock, and the value still reaches the vault venue-direct

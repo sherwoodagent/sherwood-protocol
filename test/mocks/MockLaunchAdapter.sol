@@ -12,9 +12,12 @@ import {ERC20Mock} from "./ERC20Mock.sol";
  *         production. Every venue behaviour the strategy must survive is a
  *         switch here: an unsupported quote lane, a live native launch fee in
  *         an arbitrary token, an under-delivered reserve, a supply that does
- *         not match what the proposer declared, a reverting `collectFees`, and
- *         a `launchTarget()` that does or does not implement
- *         `transferCreator`.
+ *         not match what the proposer declared, and a reverting `collectFees`.
+ *
+ *   `collectFees` pays `lastFeeRecipient` — the address the LAUNCH named, never
+ *   the caller and never the owning strategy unless the strategy named itself.
+ *   That is the whole point of the recorded field: a test can prove fees land
+ *   at the vault and nowhere else.
  *
  *   `launch` deploys a fresh `ERC20Mock` per call, mints `mintToCaller` to
  *   `msg.sender` (the strategy) and the remainder of `mintTotal` to itself, so
@@ -42,22 +45,11 @@ contract MockLaunchAdapter is ILaunchAdapter {
     /// @notice The venue contract `launchTarget()` reports.
     address public target;
 
-    /// @notice Toggles for the settle-time tolerated-failure legs.
+    /// @notice Makes the permissionless fee payout revert — a paused pad, a
+    ///         venue with nothing accrued, an adapter that changed its mind.
     bool public collectFeesReverts;
 
-    /// @notice OPT-IN, DEFAULT OFF: reproduce the destination switch
-    ///         `ILaunchAdapter.collectFees` makes normative and
-    ///         `StonkLaunchAdapter` implements — pay the owning strategy while
-    ///         it is live, and that strategy's VAULT once it has settled.
-    ///
-    /// @dev    Off by default so every pre-existing test keeps meaning exactly
-    ///         what it meant: the flat "always pays the owner" behaviour. The
-    ///         switch is what makes the settle-time lane observable in a unit
-    ///         test, and that lane is the reason the strategy's in-window
-    ///         `collectFees()` exists at all.
-    bool public payVaultWhenOwnerSettled;
-
-    /// @notice Fee accrual `collectFees` delivers to the launch's owner.
+    /// @notice Fee accrual `collectFees` delivers to `lastFeeRecipient`.
     uint256 public feeQuoteOut;
     uint256 public feeTokenOut;
 
@@ -72,6 +64,9 @@ contract MockLaunchAdapter is ILaunchAdapter {
     uint256 public lastMinTokensOut;
     uint256 public lastReserveAmount;
     uint64 public lastDeadline;
+    /// @notice The `feeRecipient` the launch named. Pinned at launch, never
+    ///         re-pointed — exactly as `ILaunchAdapter` requires.
+    address public lastFeeRecipient;
     bytes public lastVenueData;
 
     error CollectFeesBroken();
@@ -110,10 +105,6 @@ contract MockLaunchAdapter is ILaunchAdapter {
         reportedPhase = p;
     }
 
-    function setPayVaultWhenOwnerSettled(bool v) external {
-        payVaultWhenOwnerSettled = v;
-    }
-
     // ── ILaunchAdapter ──
 
     /// @inheritdoc ILaunchAdapter
@@ -135,6 +126,7 @@ contract MockLaunchAdapter is ILaunchAdapter {
         lastMinTokensOut = p.minTokensOut;
         lastReserveAmount = p.reserveAmount;
         lastDeadline = p.deadline;
+        lastFeeRecipient = p.feeRecipient;
         lastVenueData = p.venueData;
 
         return LaunchResult({token: address(token), launchRef: lastRef, reserveHeld: toCaller, quoteSpent: p.quoteIn});
@@ -149,29 +141,17 @@ contract MockLaunchAdapter is ILaunchAdapter {
     function finalize(bytes32) external {}
 
     /// @inheritdoc ILaunchAdapter
-    /// @dev NEVER PAYS THE CALLER. The destination is the owning strategy, or —
-    ///      when `payVaultWhenOwnerSettled` is on and that strategy reports
-    ///      `Settled` — the strategy's vault.
+    /// @dev NEVER PAYS THE CALLER, and never the owning strategy: the payee is
+    ///      the `feeRecipient` the launch named and cannot be re-pointed. No
+    ///      settlement-dependent branch exists here because the real adapters
+    ///      no longer have one either.
     function collectFees(bytes32) external returns (uint256 quoteOut, uint256 tokenOut) {
         if (collectFeesReverts) revert CollectFeesBroken();
         quoteOut = feeQuoteOut;
         tokenOut = feeTokenOut;
-        address destination = _destination();
+        address destination = lastFeeRecipient;
         if (quoteOut != 0) IERC20(lastQuoteToken).safeTransfer(destination, quoteOut);
         if (tokenOut != 0) IERC20(lastToken).safeTransfer(destination, tokenOut);
-    }
-
-    /// @dev `BaseStrategy.State.Settled == 2`, read by raw staticcall the way a
-    ///      real adapter must: the owner is not necessarily a `BaseStrategy`,
-    ///      and an unreadable answer means "not settled" (fail-closed toward
-    ///      the pre-settlement lane).
-    function _destination() private view returns (address) {
-        if (!payVaultWhenOwnerSettled) return ownerOf;
-        (bool ok, bytes memory ret) = ownerOf.staticcall(abi.encodeWithSignature("state()"));
-        if (!ok || ret.length != 32 || abi.decode(ret, (uint256)) != 2) return ownerOf;
-        (bool vOk, bytes memory vRet) = ownerOf.staticcall(abi.encodeWithSignature("vault()"));
-        if (!vOk || vRet.length != 32) return ownerOf;
-        return abi.decode(vRet, (address));
     }
 
     /// @inheritdoc ILaunchAdapter

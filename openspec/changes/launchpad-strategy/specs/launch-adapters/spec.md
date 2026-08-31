@@ -18,7 +18,7 @@
 
 ### Requirement: Custody invariant
 
-At the successful end of `launch(p)`, the calling strategy SHALL hold at least `p.reserveAmount` of the launched token, and SHALL hold (directly, or through an adapter instance it exclusively owns) the venue's creator economics: the creator fee stream and every creator-only recovery lever the venue offers. The adapter SHALL retain no token balance and no role exercisable for any strategy other than through that strategy's own calls. `collectFees` SHALL deliver the creator share only to the launch's owning strategy — or, once that strategy has settled, to its vault (see the StonkLaunchAdapter requirement for why the destination switches) — and SHALL return `(0, 0)` rather than revert when nothing has accrued. In no case SHALL it pay the caller.
+At the successful end of `launch(p)`, the calling strategy SHALL hold at least `p.reserveAmount` of the launched token, and SHALL hold (directly, or through an adapter instance it exclusively owns) the venue's creator economics: the creator fee stream and every creator-only recovery lever the venue offers. The adapter SHALL retain no token balance and no role exercisable for any strategy other than through that strategy's own calls. `collectFees` SHALL deliver the creator share only to the `feeRecipient` named in `launch`, which callers set to the fund's vault, and SHALL return `(0, 0)` rather than revert when nothing has accrued. In no case SHALL it pay the caller, and in no case SHALL the destination change over the launch's life.
 
 Adversary: a shared adapter that accumulates creator roles or balances becomes a single contract whose compromise or mis-accounting reaches every tokenized fund at once — the shared-mutable-custody shape prior audit rounds removed elsewhere.
 
@@ -28,11 +28,11 @@ Adversary: a shared adapter that accumulates creator roles or balances becomes a
 
 #### Scenario: Fees cannot be redirected
 - **WHEN** any address other than the owning strategy calls `collectFees(ref)`
-- **THEN** no value moves to the caller — the call reverts, or pays the launch's owning strategy, or (once that strategy has settled) its vault
+- **THEN** no value moves to the caller — the payout goes to the `feeRecipient` fixed at launch
 
-#### Scenario: Post-settlement fees bypass strategy custody
-- **WHEN** an arbitrary caller invokes `collectFees(ref)` after the owning strategy has settled
-- **THEN** both legs land on the vault, the settled strategy's balances are unchanged, and no deposit lock can be re-stamped off the back of the call
+#### Scenario: Fees never transit the strategy
+- **WHEN** an arbitrary caller invokes `collectFees(ref)`, whether the owning strategy is live or settled
+- **THEN** both legs land on the `feeRecipient`, the strategy's balances are unchanged either way, and no deposit lock can be re-stamped off the back of the call
 
 ### Requirement: Registry gating
 
@@ -48,7 +48,7 @@ Adapter implementations SHALL be admitted through the existing `TierRegistry` du
 
 `phase` and ref validity SHALL derive entirely from venue state — `launchRef` IS the token address and `launchInfo(token)` distinguishes an issued launch from an unknown one — so the singleton keeps no storage and no per-launch bookkeeping. `phase` SHALL report `Live` for every completed launch (the venue mints the pool in-tx) and `None` for a token the venue never issued; `finalize` is a no-op.
 
-Settle-time creator handoff: since the venue pins `transferCreator` to the current creator (the strategy, after launch), the adapter SHALL supply the mechanism rather than perform it — `launchTarget()` plus the ref-is-the-token keying is the whole mechanism, and the strategy's `_settle` calls `transferCreator(token, vault())` on that target so the VAULT becomes the creator and permissionless `distributeFees` pays both legs vault-direct thereafter. The adapter SHALL retain no path to re-take the creator role.
+Fee destination: `launch` SHALL `transferCreator(token, p.feeRecipient)` in the same transaction, so the FUND'S VAULT is the venue creator from the first block and the permissionless `distributeFees` pays it both legs forever after. The adapter SHALL retain no path to re-take or re-point the role. Two destinations are in play and they are NOT the same one — the dev buy's recipient stays the calling strategy, because the reserve is the strategy's to distribute to snapshot holders; only the fee role goes to the vault. Note what the vault receives is the venue's CREATOR role in full, not merely a fee pointer: it also carries the venue's protocol-reserve levers, which the vault has no verb of its own to exercise. Because the vault holds a transferable role, a governance batch can re-point it — which is the migration recovery path the cloned venue below structurally lacks.
 
 #### Scenario: Reserve equals the dev buy
 - **WHEN** `launch(p)` runs with `p.reserveAmount > 0`
@@ -62,7 +62,7 @@ Settle-time creator handoff: since the venue pins `transferCreator` to the curre
 
 `src/adapters/StonkLaunchAdapter.sol` SHALL front the Smart Launch V2/V3 pads (`StonkSafeLaunchpadV2`; reads and trade quotes exclusively through `SafeLaunchLensV2` — curve math SHALL NOT be reimplemented). Because the venue pins the creator role at `createLaunch` with no transfer, `launch` SHALL deploy and initialize an ERC-1167 clone owned by the calling strategy; the clone SHALL `createLaunch` (becoming creator), transfer `reserveAmount` of the minted supply to the strategy, and `arm` the remainder. Post-launch verbs on the clone SHALL be gated by WHERE VALUE GOES, not by who calls. `finalize` (`graduate`/`bond`) and `collectFees` (`flushCreatorQuote`) SHALL be permissionless: both are permissionless at the venue itself, the payee is fixed and is never the caller, and a keeper driving a launch to bond or fees to the fund is a service the fund wants — gating them owner-only would add friction and no safety.
 
-`collectFees` SHALL switch its DESTINATION at settlement, exactly as `forwardToVault` does: the owning strategy while that strategy is pre-settlement, and the strategy's vault once it reports settled. Adversary: a `collectFees` that always paid the strategy would let anyone push creator value into SETTLED strategy custody, and before that strategy's residue latch has armed, that is a permissionless way to re-stamp a fresh `UNVALUED_MAX_LOCK` deposit episode on the whole vault — the very lever the venue-direct post-settlement routing exists to remove, and a direct contradiction of the launchpad-strategy capability's rule that post-settlement value SHALL NEVER transit strategy custody. Where the strategy reports settled but its vault cannot be read, the call SHALL move nothing and report `(0, 0)` rather than falling back to paying the strategy: the fallback would silently reopen the lever, while doing nothing strands nothing, since the clone remains custodian and a later call delivers the value once the read succeeds. The venue's `abort` (creator-only, zero-trades-only) SHALL be owner-only, being a recovery lever whose whole value is that nobody else can pull it. No verb SHALL ever pay the caller. The adapter SHALL never set `eoaOnly`, and SHALL select the pad by quote lane (`quoteSupported` answers per configured pad set — WOOD has no lane and always answers false). That pad set SHALL be immutable: constructor-set on the implementation, with no setter and no owner able to add, remove, or re-point a lane. Adversary: a mutable pad mapping is a routing lever living outside the codehash gate — `setAdapterAllowed` snapshots the implementation's codehash, so a post-certification lane swap would redirect every future launch to an uncertified venue without changing anything the gate can see. Changing lanes means a new implementation and fresh TierRegistry certification.
+`collectFees` SHALL pay the `feeRecipient` stored at launch, unconditionally — there is no settlement branch and no other destination. Adversary this REMOVES rather than guards: a fee stream that paid the strategy would land value in a settled clone, and until that strategy's residue latch arms, anyone could then drive the vault's permissionless residue collection and re-stamp a fresh `UNVALUED_MAX_LOCK` deposit episode on the whole vault. Naming the recipient at launch means no such balance ever exists, so the lever has no foothold rather than a guard.
 
 Because the codehash gate cannot see storage AT ALL, "no setter exists" is a claim a certifier would have to establish by reading the code. The implementation SHALL therefore also expose an IMMUTABLE `padSetHash` over the ordered `(quote, pad)` pairs it was constructed with, so the certified lane set is verifiable on-chain in one read: the codehash pins the code, the pad-set hash pins the configuration that code was certified against, and together they close the gap the adversary above walks through.
 
@@ -70,7 +70,9 @@ Because the codehash gate cannot see storage AT ALL, "no setter exists" is a cla
 
 `phase` SHALL derive from the venue's launch state (armed/deadline/graduated/bonded/aborted flags), mapping curve-closed-without-graduation to `Failed` pending the on-chain verification in design Open Question 3.
 
-The clone SHALL additionally expose `forwardToVault()`: owner-only before the owning strategy settles, permissionless after, flushing `flushCreatorQuote` and sending every clone balance (quote and fund token) to the strategy's vault. This is the post-settlement fee lane — the clone is the creator and is not the strategy, so what it holds is invisible to the vault's residue machinery and what it forwards never passes through strategy custody.
+The clone SHALL store `feeRecipient` at initialization and reject a zero value. `collectFees` SHALL move the clone's ENTIRE balance of both the lane quote and the launch token to that recipient, not merely what the venue's flush produced — those are the only two assets any path in the adapter can leave on a clone, so this doubles as the permissionless sweep and nothing can be stranded. It SHALL make no call into the owner at all, so an owner that reverts, returns short, or ceases to exist cannot influence where fees go or whether they move. `abort()` remains owner-only and returns recovered supply to the OWNER, not the fee recipient — recovered supply is the fund's launch allocation, not fee income.
+
+The destination is IMMUTABLE for the clone's life. That is deliberate — a settable recipient is a creator-role transfer by another name — but it is a real loss of a recovery path: unlike the Sushi venue, where the vault holds a transferable role a governance batch can re-point, a fund that migrates vaults leaves its Stonk clones forwarding to the old one forever.
 
 #### Scenario: Reserve withheld before arming
 - **WHEN** `launch(p)` runs with supply `S` and `p.reserveAmount = r`
@@ -85,12 +87,12 @@ The clone SHALL additionally expose `forwardToVault()`: owner-only before the ow
 - **THEN** no such entry point exists; serving a new lane requires a new implementation and a fresh `setAdapterAllowed` + certification
 
 #### Scenario: Foreign caller on a clone
-- **WHEN** any address other than the owning strategy calls `abort()`, or calls `forwardToVault()` before the owning strategy has settled
+- **WHEN** any address other than the owning strategy calls `abort()`
 - **THEN** the call reverts — the recovery lever is the owner's alone
 
 #### Scenario: Keeper drives a clone's permissionless verbs
-- **WHEN** an arbitrary caller invokes `finalize`, `collectFees`, or post-settlement `forwardToVault()`
-- **THEN** the call succeeds and every unit of value lands on the owning strategy or its vault; the caller receives nothing
+- **WHEN** an arbitrary caller invokes `finalize` or `collectFees`
+- **THEN** the call succeeds, every unit of value lands on the launch's fixed destination, and the caller receives nothing
 
 #### Scenario: Forged launch ref
 - **WHEN** any ref-taking verb is given an address that is not a clone of this implementation

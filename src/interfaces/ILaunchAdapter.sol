@@ -49,6 +49,28 @@ interface ILaunchAdapter {
     /// @param reserveAmount Launch tokens the STRATEGY must hold when `launch`
     ///                      returns — the pot the fund's holders claim from.
     /// @param deadline      Venue deadline for the launch transaction.
+    /// @param feeRecipient  Where the venue's creator fee stream is to be paid,
+    ///                      pointed at from the launch itself rather than
+    ///                      re-pointed later. Callers pass the FUND'S VAULT.
+    ///
+    ///                      NAMED AT LAUNCH ON PURPOSE, and it is the whole
+    ///                      reason this member exists. Routing fees through the
+    ///                      strategy and forwarding them onward gave the fee
+    ///                      stream a destination that had to CHANGE when the
+    ///                      strategy settled — and while a settled strategy
+    ///                      holds fee tokens, anyone can drive the vault's
+    ///                      permissionless residue collection and re-stamp a
+    ///                      fresh deposit lock on the whole vault. Naming the
+    ///                      vault up front deletes that lever rather than
+    ///                      guarding it: fees never enter strategy custody in
+    ///                      the first place, so there is no lane to get wrong,
+    ///                      no handoff to fail at settlement, and no
+    ///                      settlement-dependent branch to reason about.
+    ///
+    ///                      The snapshot machinery is therefore left doing
+    ///                      exactly one job — the pro-rata claim on the launch
+    ///                      RESERVE — and fees stay a plain vault receipt that
+    ///                      a later proposal disposes of.
     /// @param venueData     Venue-specific economics, opaque here. Sushi takes
     ///                      none (the venue fixes price and supply);
     ///                      StonkBrokers takes its `CreateParams` economics —
@@ -62,6 +84,7 @@ interface ILaunchAdapter {
         uint256 minTokensOut;
         uint256 reserveAmount;
         uint64 deadline;
+        address feeRecipient;
         bytes venueData;
     }
 
@@ -135,23 +158,21 @@ interface ILaunchAdapter {
     ///      the launch in one transaction. Safe to call in any phase.
     function finalize(bytes32 launchRef) external;
 
-    /// @notice Sweep the venue's creator fee share to the launch's owner.
+    /// @notice Drive the venue's creator fee payout to the launch's
+    ///         `feeRecipient`.
     ///
-    /// @dev NEVER PAYS THE CALLER, whoever calls. The destination is the
-    ///      strategy that owns the launch while that strategy is live, and its
-    ///      VAULT once the strategy has settled.
+    /// @dev NEVER PAYS THE CALLER, and never pays the strategy. The destination
+    ///      is fixed at launch (see `LaunchParams.feeRecipient`) and cannot be
+    ///      re-pointed afterwards, so this verb has ONE destination for the
+    ///      life of the launch and no settlement-dependent branch.
     ///
-    ///      The switch is not tidiness. Post-settlement value landing in
-    ///      strategy custody is a permissionless deposit-lock lever: until the
-    ///      strategy's residue latch arms, anyone can push fee tokens back into
-    ///      a settled clone and let the vault's permissionless residue
-    ///      collection re-stamp a fresh multi-day deposit lock on the whole
-    ///      vault. Paying the vault directly removes the lever and keeps the
-    ///      tokenize-fund rule that post-settlement value never transits the
-    ///      strategy.
+    ///      PERMISSIONLESS on every implementation. Fees are the fund's, the
+    ///      payee is fixed, and the venues themselves expose their payout as a
+    ///      permissionless call — so anyone may push accrued fees to the vault,
+    ///      and a later proposal decides what the vault does with them.
     ///
     ///      Returns `(0, 0)` rather than reverting when nothing has accrued, so
-    ///      a settlement path may call it unconditionally.
+    ///      a caller may invoke it unconditionally.
     function collectFees(bytes32 launchRef) external returns (uint256 quoteOut, uint256 tokenOut);
 
     /// @notice Whether this venue can pair a launch against `quoteToken`.
@@ -181,9 +202,15 @@ interface ILaunchAdapter {
     ///      stale figure would either under-fund the launch or over-pull.
     function nativeFeeSource() external view returns (address token, uint256 amount);
 
-    /// @notice The venue contract this adapter fronts.
-    /// @dev The deploy ceremony asserts counterparty standing against this, and
-    ///      a strategy needing a venue-native handoff at settlement (e.g.
-    ///      transferring a creator role to the vault) addresses it here.
+    /// @notice The venue contract this adapter fronts, for counterparty
+    ///         standing in the deploy ceremony. `address(0)` where the venue is
+    ///         not a single contract.
+    ///
+    /// @dev NOT A HANDOFF ADDRESS. An earlier design had the strategy call a
+    ///      venue-native `transferCreator` here at settlement to move the fee
+    ///      stream to the vault; `LaunchParams.feeRecipient` replaced that by
+    ///      naming the destination at launch, so no such call exists and one
+    ///      would be refused anyway (the strategy is not the creator). Stated
+    ///      so a future adapter author does not rebuild the lane.
     function launchTarget() external view returns (address);
 }

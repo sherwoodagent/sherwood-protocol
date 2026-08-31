@@ -13,11 +13,19 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
  *   WHY A SINGLETON IS ADMISSIBLE HERE. The interface's custody invariant bans
  *   an adapter that accumulates balances or creator roles; it does not ban a
  *   shared adapter. This venue makes the creator role TRANSFERABLE, so the
- *   adapter can be creator for a few opcodes and hand the role to the calling
- *   strategy inside the same transaction — it ends every call role-free and
- *   balance-free, and there is nothing left for a compromise of it to reach.
- *   The sibling StonkBrokers venue pins the creator at creation and therefore
- *   has to clone; the difference lives entirely in the venue, not the interface.
+ *   adapter can be creator for a few opcodes and hand the role on inside the
+ *   same transaction — it ends every call role-free and balance-free, and there
+ *   is nothing left for a compromise of it to reach. The sibling StonkBrokers
+ *   venue pins the creator at creation and therefore has to clone; the
+ *   difference lives entirely in the venue, not the interface.
+ *
+ *   WHO IT HANDS THE ROLE TO: `p.feeRecipient`, the FUND'S VAULT, never the
+ *   calling strategy. The reserve still goes to the strategy — that is the pot
+ *   the fund's holders claim against — but the fee stream is pointed at the
+ *   vault from the launch transaction, so creator fees never enter strategy
+ *   custody and there is no settle-time handoff for anything to get wrong. See
+ *   `launch`, and `ILaunchAdapter.LaunchParams.feeRecipient` for the lever that
+ *   deletes.
  *
  *   ZERO STORAGE, deliberately. Not a gas micro-optimisation: `launchRef` IS the
  *   token address and `launchInfo(token)` already distinguishes an issued launch
@@ -62,6 +70,12 @@ contract SushiLaunchAdapter is ILaunchAdapter {
     ///         ahead of the venue owner's feed registration fails without ever
     ///         moving the vault's capital.
     error UnsupportedQuote(address quoteToken);
+    /// @notice `p.feeRecipient == address(0)`. The creator role is handed to
+    ///         that address INSIDE `launch` and this venue's `transferCreator`
+    ///         would accept the zero address, permanently orphaning the fee
+    ///         stream of a launch that had otherwise succeeded. Checked before
+    ///         any transfer, so a malformed proposal costs the vault nothing.
+    error ZeroFeeRecipient();
     /// @notice `p.quoteIn == 0`. The venue mints the creator nothing, so the
     ///         dev buy IS the reserve — a zero buy is a launch the fund holds
     ///         no part of (and the venue would reject it as
@@ -108,13 +122,33 @@ contract SushiLaunchAdapter is ILaunchAdapter {
     ///           is minted-to-market and delivered to the strategy DIRECTLY —
     ///           it is never an adapter balance forwarded afterwards, so there
     ///           is no window in which a shared contract holds a fund's tokens;
-    ///        2. `transferCreator(token, msg.sender)` runs in this same
+    ///        2. `transferCreator(token, p.feeRecipient)` runs in this same
     ///           transaction, so the fee stream and every creator-only lever
-    ///           belong to the strategy before this returns and the adapter
+    ///           belong to the fund's VAULT before this returns and the adapter
     ///           keeps no path back to the role;
     ///        3. the two token sweeps below leave the adapter holding zero
     ///           launch token and zero quote — asserted — and the native sweep
     ///           offers back any native balance.
+    ///
+    ///      TWO DESTINATIONS, AND THEY ARE NOT THE SAME ONE. This is the crux
+    ///      of the fee routing and the easiest thing here to get backwards:
+    ///        - the RESERVE goes to `msg.sender`, THE STRATEGY. The reserve is
+    ///          the pot the fund's holders claim pro-rata, so it is the
+    ///          strategy's to hold, snapshot and distribute. `recipient` on the
+    ///          dev buy therefore stays the caller and is untouched by any of
+    ///          this;
+    ///        - the FEE STREAM goes to `p.feeRecipient`, THE FUND'S VAULT. Only
+    ///          the creator ROLE moves; no reserve token, no quote and no fee
+    ///          ever routes anywhere new.
+    ///      Naming the vault at the venue in the launch transaction is what
+    ///      deletes the settle-time handoff this adapter used to need: the
+    ///      strategy was creator, so fees landed in strategy custody and the
+    ///      role had to be re-pointed at settlement — a lane that could be got
+    ///      wrong, a handoff that could fail, and (while a settled strategy held
+    ///      fee tokens) a permissionless `collectResidue` that could re-stamp a
+    ///      fresh deposit lock on the whole vault. Fees now never enter strategy
+    ///      custody at all, so that lever has no state to exist in rather than
+    ///      being guarded against. See `ILaunchAdapter.LaunchParams.feeRecipient`.
     ///
     ///      Sweeps go to `msg.sender` rather than being left in place because
     ///      residue on a SHARED contract belongs to whoever calls next: the
@@ -138,6 +172,7 @@ contract SushiLaunchAdapter is ILaunchAdapter {
     ///      back, and stays here if the caller cannot receive it.
     function launch(LaunchParams calldata p) external payable override returns (LaunchResult memory) {
         // Ordered so every rejection happens before any transfer.
+        if (p.feeRecipient == address(0)) revert ZeroFeeRecipient();
         if (!quoteSupported(p.quoteToken)) revert UnsupportedQuote(p.quoteToken);
         if (p.quoteIn == 0) revert ZeroQuoteIn();
         if (p.minTokensOut < p.reserveAmount) revert ReserveFloorBelowReserve(p.minTokensOut, p.reserveAmount);
@@ -166,8 +201,10 @@ contract SushiLaunchAdapter is ILaunchAdapter {
         if (amountOut < p.reserveAmount) revert ReserveNotDelivered(amountOut, p.reserveAmount);
 
         // Same transaction, before any external call that could observe the
-        // adapter as creator.
-        launchpad.transferCreator(token, msg.sender);
+        // adapter as creator. Straight to the VAULT — not to the strategy and
+        // not via it — so the fee stream is pointed at its final destination
+        // from the first block and never needs re-pointing.
+        launchpad.transferCreator(token, p.feeRecipient);
 
         _sweepToken(token, msg.sender);
         if (p.quoteToken != token) _sweepToken(p.quoteToken, msg.sender);
@@ -223,10 +260,15 @@ contract SushiLaunchAdapter is ILaunchAdapter {
     ///      driving fees to the fund, and, worse, would read as "nothing
     ///      accrued" to a settlement path deciding whether it can finish.
     ///
-    ///      This is also what makes the settle-time handoff work unchanged:
-    ///      once the strategy transfers the creator role onward to the vault,
-    ///      the deltas reported here are the VAULT's, because that is who the
-    ///      venue paid.
+    ///      THE DESTINATION IS FIXED AT LAUNCH and cannot be re-pointed by
+    ///      anything this adapter does. `launch` hands the creator role to
+    ///      `p.feeRecipient` — the fund's VAULT — in the launch transaction, so
+    ///      the creator this reads has been the vault since the first block:
+    ///      one destination for the life of the launch, no settled-vs-live
+    ///      branch, and no handoff whose failure could leave the deltas pointing
+    ///      at the wrong address. The `launchInfo` read is kept anyway rather
+    ///      than caching the recipient, because the venue — not this stateless
+    ///      adapter — is the authority on who it just paid.
     ///
     ///      Returns `(0, 0)` rather than reverting on an unknown launch or a
     ///      venue call that fails (nothing accrued, a paused venue): the
@@ -305,11 +347,16 @@ contract SushiLaunchAdapter is ILaunchAdapter {
     }
 
     /// @inheritdoc ILaunchAdapter
-    /// @dev Also the settle-time handoff mechanism: the venue pins
-    ///      `transferCreator` to the CURRENT creator — the strategy, after
-    ///      `launch` — so the adapter supplies the address and the keying
-    ///      (`launchRef` is the token) and the strategy makes the call itself.
-    ///      The adapter deliberately exposes no re-take path.
+    /// @dev NAMES THE VENUE, AND NOTHING ELSE NOW. The deploy ceremony asserts
+    ///      counterparty standing against this address; the interface also
+    ///      offers it as the place a strategy would address a settle-time
+    ///      creator handoff, and this adapter no longer has one to address.
+    ///      `launch` makes `p.feeRecipient` the creator in the launch
+    ///      transaction, so there is no later role to move: a settlement that
+    ///      called `transferCreator` here would find neither the strategy nor
+    ///      this adapter is the creator and be refused, which is why the
+    ///      strategy must not make that call rather than merely tolerating it.
+    ///      The adapter deliberately exposes no re-take path either.
     function launchTarget() external view override returns (address) {
         return address(launchpad);
     }

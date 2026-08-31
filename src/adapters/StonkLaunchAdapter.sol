@@ -7,17 +7,6 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 
-/// @notice The two reads the clone needs from the strategy that owns it.
-/// @dev Deliberately NOT `IStrategy`: the clone must be able to ask these
-///      questions of an owner that answers neither, and a typed import would
-///      invite a typed call. Both are read by length-checked raw staticcall.
-interface IOwningStrategy {
-    /// @dev `BaseStrategy.State` — `0 Pending, 1 Executed, 2 Settled`.
-    function state() external view returns (uint8);
-    /// @dev The vault the owning strategy delivers to.
-    function vault() external view returns (address);
-}
-
 /**
  * @title StonkLaunchAdapter
  * @notice `ILaunchAdapter` over the StonkBrokers Smart Launch pads — an
@@ -45,8 +34,7 @@ interface IOwningStrategy {
  *       initialize the implementation itself and turn the certified address
  *       into somebody's clone.
  *     - CLONE ROLE (owned by one strategy): `initialize`, `executeLaunch`,
- *       `clonePhase`, `cloneFinalize`, `cloneCollectFees`, `abort`,
- *       `forwardToVault`.
+ *       `clonePhase`, `cloneFinalize`, `cloneCollectFees`, `abort`.
  *   The roles do not overlap: a clone-role verb on the implementation finds
  *   `owner == address(0)` and fails closed, and `launch` on a clone finds
  *   `address(this) != implementation` and reverts.
@@ -72,12 +60,27 @@ interface IOwningStrategy {
  *   the arrays to hash. Serving a new lane means a new implementation and a
  *   fresh certification.
  *
+ *   WHERE FEES GO: `feeRecipient`, PINNED AT `initialize` FROM THE LAUNCH.
+ *   This venue pins the creator too, and the creator has to stay the clone —
+ *   `arm` and `abort` are creator-only levers the clone genuinely needs — so
+ *   "fees go to the vault" is achieved by the clone always FORWARDING to the
+ *   stored `feeRecipient` rather than by naming the vault at the venue the way
+ *   the Sushi adapter can. The destination is unconditional: not the caller,
+ *   not the owning strategy, and not a function of whether that strategy has
+ *   settled. Creator fees therefore never enter strategy custody, which is what
+ *   deletes the settlement-dependent destination this verb used to carry — see
+ *   `cloneCollectFees` and `ILaunchAdapter.LaunchParams.feeRecipient`. The
+ *   RESERVE is the exception that proves the rule: it goes to the owner, along
+ *   with anything `abort` claws back, because the reserve is the strategy's to
+ *   distribute.
+ *
  *   REENTRANCY. No guard, deliberately. The implementation holds no balance and
  *   no role between calls and its only mutable state is constructor-written. A
  *   clone holds value only inside `executeLaunch`, which is callable exactly
  *   once (`launchToken == address(0)`) and only by the implementation; every
- *   other clone verb sends to a FIXED destination — the owner or the owner's
- *   vault — read before the transfer, so a re-entrant token cannot redirect it.
+ *   other clone verb sends to a FIXED destination — the owner, or the
+ *   `feeRecipient` pinned at `initialize` — so a re-entrant token has nothing
+ *   to redirect.
  *
  *   The caller approves the IMPLEMENTATION for `p.quoteIn` of the quote before
  *   calling `launch`; the implementation forwards it to the fresh clone. It
@@ -147,10 +150,6 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     bytes10 private constant _CLONE_PREFIX = 0x363d3d373d3d3d363d73;
     uint120 private constant _CLONE_SUFFIX = 0x5af43d82803e903d91602b57fd5bf3;
 
-    /// @dev `BaseStrategy.State.Settled`. The value, not the type, because the
-    ///      owner is read by raw staticcall and may not be a `BaseStrategy`.
-    uint256 private constant _STATE_SETTLED = 2;
-
     // ── shared immutables (live in code, so a clone reads them identically) ──
 
     /// @notice This code's implementation address — the one `TierRegistry`
@@ -206,6 +205,17 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///         the constructor already proved matches `pad.quote()`.
     address public laneQuote;
 
+    /// @notice Where this clone forwards creator fees — the FUND'S VAULT,
+    ///         named by the launch and pinned here for the life of the clone.
+    /// @dev NONZERO ON EVERY INITIALIZED CLONE, and there is no setter: a
+    ///      re-pointable fee destination would be a creator-role transfer by
+    ///      another name on a venue that deliberately has none, and it would
+    ///      restore exactly the mutable-destination reasoning naming the vault
+    ///      up front exists to delete. Immutability is what lets every fee verb
+    ///      here be permissionless with no gate on the caller and no branch on
+    ///      the owner's state.
+    address public feeRecipient;
+
     /// @notice The launched ERC-20. Nonzero IFF this clone has launched — the
     ///         sentinel every clone verb keys off, deliberately NOT `launchId`,
     ///         which the venue is free to number from zero.
@@ -226,14 +236,13 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///         to call in any phase. A refused leg reverted its own state, so
     ///         nothing moved and anyone may retry it forever.
     event VenueLegSkipped(bytes32 indexed leg);
-    /// @notice Creator fees swept out of the clone. `destination` is the owning
-    ///         strategy before it settles and the strategy's VAULT after, so
-    ///         the two lanes of `cloneCollectFees` are distinguishable on-chain
-    ///         rather than both reading as "paid the owner".
-    event FeesCollected(address indexed owner, address indexed destination, uint256 quoteOut, uint256 tokenOut);
-    /// @notice The post-settlement lane: everything the clone held, delivered
-    ///         to the owning strategy's vault.
-    event ForwardedToVault(address indexed vault, uint256 quoteOut, uint256 tokenOut);
+    /// @notice Creator fees swept out of the clone to its `feeRecipient`.
+    /// @dev ONE DESTINATION, ALWAYS. This used to carry both the owner and a
+    ///      resolved destination so the two lanes of `cloneCollectFees` were
+    ///      distinguishable on-chain; there is only one lane now, so the
+    ///      recipient is the whole story and the clone that emitted it names
+    ///      the launch.
+    event FeesCollected(address indexed recipient, uint256 quoteOut, uint256 tokenOut);
     /// @notice The owner pulled the venue's zero-trades recovery lever.
     event LaunchAborted(address indexed owner, uint256 returned);
 
@@ -280,10 +289,16 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     error NotLaunched();
     /// @notice `executeLaunch` ran twice on one clone.
     error AlreadyLaunched(address token);
-    /// @notice An owner-only verb was called by somebody else. `abort` is a
-    ///         recovery lever whose whole value is that nobody else can pull
-    ///         it; `forwardToVault` is owner-only until the owner settles.
+    /// @notice `abort()` was called by somebody other than the owning strategy.
+    ///         It is the ONLY owner-gated verb on a clone — a recovery lever
+    ///         whose whole value is that nobody else can pull it. Every fee
+    ///         verb is permissionless, because the destination is pinned and is
+    ///         never the caller.
     error NotOwner(address caller, address expectedOwner);
+    /// @notice `p.feeRecipient == address(0)`. It is the clone's permanent fee
+    ///         destination, so a zero would send every later flush to the zero
+    ///         address. Checked before any transfer.
+    error ZeroFeeRecipient();
     /// @notice The venue started charging a native launch fee. This adapter has
     ///         no lane to fund one from — see `nativeFeeSource` — so it REFUSES
     ///         rather than calling `createLaunch` with `msg.value == 0` and
@@ -315,11 +330,6 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///         NOTHING ELSE; this fires on a fee-on-transfer or rebasing token
     ///         rather than letting a balance sit on the clone.
     error DustRemains(address token, uint256 amount);
-    /// @notice The owning strategy's `vault()` could not be read, so
-    ///         `forwardToVault` had no destination. Reverting is the point: the
-    ///         alternative is sending a fund's fees to an address derived from
-    ///         an unreadable call.
-    error VaultUnresolved(address ownerStrategy);
 
     /// @notice Wire the immutable lane set.
     /// @param quotes Ordered lane quote assets.
@@ -372,10 +382,12 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///
     /// @dev HOW THE CUSTODY INVARIANT IS MET, in order:
     ///        1. a FRESH CLONE is minted and initialized with
-    ///           `owner = msg.sender` before it touches the venue, so the
-    ///           creator role this launch pins is pinned to an instance the
-    ///           calling strategy exclusively owns — never to this shared,
-    ///           certified implementation;
+    ///           `owner = msg.sender` and `feeRecipient = p.feeRecipient`
+    ///           before it touches the venue, so the creator role this launch
+    ///           pins is pinned to an instance the calling strategy exclusively
+    ///           owns — never to this shared, certified implementation — and
+    ///           the fee stream that role earns already has its final
+    ///           destination;
     ///        2. the clone transfers `p.reserveAmount` to the OWNER before it
     ///           arms anything, and any dev buy is delivered by the pad
     ///           DIRECTLY to the owner (`recipient = owner`), so the reserve is
@@ -394,6 +406,7 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         if (msg.value != 0) revert NativeValueRejected(msg.value);
 
         // Ordered so every rejection happens before any transfer.
+        if (p.feeRecipient == address(0)) revert ZeroFeeRecipient();
         address padAddress = padOf[p.quoteToken];
         if (padAddress == address(0)) revert UnsupportedQuote(p.quoteToken);
 
@@ -403,7 +416,7 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         if (feeWei != 0) revert NativeFeeUnsupported(padAddress, feeWei);
 
         address clone = Clones.clone(implementation);
-        StonkLaunchAdapter(clone).initialize(msg.sender, padAddress, p.quoteToken);
+        StonkLaunchAdapter(clone).initialize(msg.sender, padAddress, p.quoteToken, p.feeRecipient);
 
         // The caller could not have approved an address that did not exist, so
         // the quote is pulled here and forwarded in one move; this contract is
@@ -459,10 +472,11 @@ contract StonkLaunchAdapter is ILaunchAdapter {
 
     /// @inheritdoc ILaunchAdapter
     /// @dev PURE ROUTING: it measures nothing of its own and forwards the
-    ///      clone's report verbatim, so the clone's destination switch is
-    ///      inherited whole — the OWNER before settlement, the owner's VAULT
-    ///      after, and the caller never. A forged ref answers `(0, 0)` without
-    ///      calling the supplied address.
+    ///      clone's report verbatim. The clone pays the `feeRecipient` its
+    ///      launch named and nothing else — never the caller, never the owning
+    ///      strategy, and with no branch on that strategy's state — so this
+    ///      inherits a destination fixed for the life of the launch. A forged
+    ///      ref answers `(0, 0)` without calling the supplied address.
     ///      Typed rather than raw, unlike the Sushi adapter's venue call: the
     ///      callee here is THIS CODE, written not to revert when nothing has
     ///      accrued, so a revert would be a bug worth surfacing rather than a
@@ -542,9 +556,13 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///      the truthful record. The lens would also "work" (no such selector,
     ///      so the call reverts and is tolerated), but it would spend the gas
     ///      and log a FAILED transfer against a contract that has nothing to do
-    ///      with creator roles. The post-settlement lane on this venue is the
-    ///      clone's `forwardToVault()`, which goes permissionless once the
-    ///      owning strategy settles.
+    ///      with creator roles.
+    ///
+    ///      AND THERE IS NOTHING FOR SUCH A CALL TO ACHIEVE HERE. The launch
+    ///      named its `feeRecipient` up front and the clone has been forwarding
+    ///      to it since the first block, so settlement has no fee lane left to
+    ///      open: `cloneCollectFees()` is permissionless, unconditional, and
+    ///      the same verb before and after the fund settles.
     ///
     ///      Consumers wanting the pad set can read `lanes()`; the lens is at
     ///      `lens()`.
@@ -572,10 +590,12 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     // clone role
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Bind a fresh clone to its owning strategy and its pad.
+    /// @notice Bind a fresh clone to its owning strategy, its pad and its
+    ///         permanent fee destination.
     /// @dev ONE-SHOT, AND IMPLEMENTATION-ONLY. Both halves matter:
-    ///        - one-shot stops an owner change, which would be a creator-role
-    ///          transfer this venue deliberately does not have;
+    ///        - one-shot stops an owner change AND a fee-destination change,
+    ///          either of which would be a creator-role transfer this venue
+    ///          deliberately does not have;
     ///        - implementation-only means a clone minted by anyone ELSE (this
     ///          code is public; `Clones.clone` is one call) can NEVER be
     ///          initialized. It passes ERC-1167 introspection but has
@@ -584,13 +604,21 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///          between "looks like our clone" and "is one of ours".
     ///      The implementation locks itself in its constructor, so this can
     ///      never run there.
-    function initialize(address owner_, address pad_, address laneQuote_) external {
+    ///
+    ///      `feeRecipient_` is re-checked here rather than trusted from
+    ///      `launch`: this is the write that makes it permanent, and every fee
+    ///      verb on the clone reads it with no further validation. A zero would
+    ///      not strand the value — nothing is stranded when the clone is the
+    ///      custodian — it would BURN it on the first flush.
+    function initialize(address owner_, address pad_, address laneQuote_, address feeRecipient_) external {
         if (msg.sender != implementation) revert NotImplementation(msg.sender);
         if (_initialized) revert AlreadyInitialized();
+        if (feeRecipient_ == address(0)) revert ZeroFeeRecipient();
         _initialized = true;
         owner = owner_;
         pad = pad_;
         laneQuote = laneQuote_;
+        feeRecipient = feeRecipient_;
     }
 
     /// @notice Open the launch, withhold the reserve, arm the remainder, and
@@ -787,55 +815,39 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         }
     }
 
-    /// @notice Sweep accrued creator fees out of the clone — to the OWNING
-    ///         STRATEGY before it settles, to the strategy's VAULT after.
+    /// @notice Flush accrued creator fees out of the venue and send everything
+    ///         this clone holds to its `feeRecipient` — the fund's vault.
     ///
-    /// @dev PERMISSIONLESS, and it never pays the caller. The gate here is on
-    ///      WHERE VALUE GOES, never on who calls: the destination is read from
-    ///      storage and from the owner's own state, so there is no version of
-    ///      this that pays a keeper. A keeper flushing a fund's fee stream is a
-    ///      service the fund wants, and it stays one on both lanes.
+    /// @dev PERMISSIONLESS, and it never pays the caller. The gate is on WHERE
+    ///      VALUE GOES, never on who calls: the destination is one storage slot
+    ///      written once at `initialize`, so there is no version of this that
+    ///      pays a keeper. A keeper flushing a fund's fee stream is a service
+    ///      the fund wants.
     ///
-    ///      WHY THE DESTINATION SWITCHES AT SETTLEMENT. Post-settlement creator
-    ///      fees must NEVER transit strategy custody (design Decision 4, and
-    ///      the fee-stream requirement in the strategy spec). This is not an
-    ///      accounting nicety and it is not about stranding value — value in
-    ///      settled-strategy custody is still reachable, because
-    ///      `SyndicateVault.collectResidue` sweeps BEFORE its tracked gate. It
-    ///      is about a LOCK LEVER: until the strategy's residue latch has
-    ///      armed, every arrival into settled-strategy custody lets a
-    ///      permissionless `collectResidue` re-stamp a fresh 7-day
-    ///      `depositsLocked` episode on the vault. Left ungated, this verb
-    ///      would hand any passer-by exactly that lever for the price of gas —
-    ///      the one the vault-direct post-settlement routing exists to remove.
-    ///      Paying the vault instead skips strategy custody entirely and closes
-    ///      it, while `forwardToVault`'s lane stays available as before.
+    ///      ONE DESTINATION, UNCONDITIONALLY — no owner read, no settled/live
+    ///      branch, and no "settled but the vault is unreadable" special case.
+    ///      All of that existed to keep post-settlement fees out of strategy
+    ///      custody, because until a settled strategy's residue latch arms,
+    ///      every arrival there lets a permissionless `SyndicateVault.
+    ///      collectResidue` re-stamp a fresh 7-day `depositsLocked` episode on
+    ///      the whole vault. Naming the vault at launch removes the lever
+    ///      rather than switching away from it: fees never enter strategy
+    ///      custody in ANY phase, so there is no lane to get wrong, no handoff
+    ///      to fail, and nothing here that has to read the owner at all. That
+    ///      also means this verb behaves identically before and after the
+    ///      owning strategy settles — an owner that reverts, self-destructs or
+    ///      returns short from `state()`/`vault()` can no longer influence
+    ///      where a fund's fees land, or whether they move.
     ///
-    ///      SETTLED BUT THE VAULT IS UNREADABLE -> NO-OP, `(0, 0)`. Falling
-    ///      back to the owner would silently reopen the lever this branch
-    ///      closes, and guessing a destination is not on the table either. So
-    ///      the call moves nothing and reports nothing, leaving the value where
-    ///      it already is: ON THE CLONE, which is the custodian in every case
-    ///      anyway. Nothing is stranded — a later call here, or
-    ///      `forwardToVault`, delivers it in full once `vault()` reads. Unlike
-    ///      `forwardToVault` this does NOT revert: `TokenizeFundStrategy`
-    ///      settlement calls the routing verb unconditionally, and a revert
-    ///      there is a settlement path held hostage by an owner read.
-    ///
-    ///      `_ownerSettled` keeps its fail-closed posture unchanged: unreadable
-    ///      means NOT settled, which on this verb means the pre-settlement lane
-    ///      — the same destination this verb has always used, for an owner that
-    ///      by that same read is still running.
-    ///
-    ///      WHY THE FORWARD IS NECESSARY, unlike on Sushi. The venue's
+    ///      WHY A FORWARD IS NECESSARY AT ALL, unlike on Sushi. The venue's
     ///      `flushCreatorQuote` pays THE CREATOR, and the creator is this
-    ///      CLONE, not the strategy. Sushi's `distributeFees` pays a creator
-    ///      that IS the strategy, so its adapter only has to measure. Here the
-    ///      value physically lands on the clone and has to be moved on, which
-    ///      is why the deltas below are measured on the RESOLVED DESTINATION —
-    ///      what actually arrived where it was actually sent, not what the
-    ///      venue said it paid, and not a fixed address the post-settlement
-    ///      lane would report zeros against while value moved.
+    ///      CLONE — it must stay the clone, because `arm` and `abort` are
+    ///      creator-only levers the fund needs. Sushi's transferable creator
+    ///      role can simply BE the vault, so its adapter only has to measure.
+    ///      Here the value physically lands on the clone and has to be moved
+    ///      on, which is why the deltas are measured on the RECIPIENT: what
+    ///      actually arrived where it was actually sent, not what the venue
+    ///      said it paid.
     ///
     ///      `(0, 0)` RATHER THAN A REVERT when nothing accrued: the venue call
     ///      is tolerated (a paused pad, a launch with no trades) and the
@@ -843,35 +855,35 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///      nothing-accrued path touches no token at all and cannot revert. A
     ///      failed venue call reverted its own state, so nothing moved and
     ///      `(0, 0)` is the honest report rather than a swallowed error.
+    ///
+    ///      THIS IS ALSO THE CLONE'S ONLY SWEEP, by design. It moves the whole
+    ///      clone balance of both the lane quote and the launch token, not just
+    ///      what this call flushed, so anything resting here for any reason
+    ///      leaves with it. Nothing can be stranded on a clone: those are the
+    ///      only two assets any path in this contract can leave here, the verb
+    ///      is permissionless, and it is callable forever.
     function cloneCollectFees() external returns (uint256 quoteOut, uint256 tokenOut) {
-        address owner_ = owner;
         address padAddress = pad;
         address token = launchToken;
-        if (owner_ == address(0) || padAddress == address(0) || token == address(0)) return (0, 0);
-
-        // The destination — never the caller — is what settlement switches.
-        address destination = owner_;
-        if (_ownerSettled(owner_)) {
-            destination = _readVault(owner_);
-            if (destination == address(0)) return (0, 0);
-        }
+        address recipient = feeRecipient;
+        if (recipient == address(0) || padAddress == address(0) || token == address(0)) return (0, 0);
 
         address quoteAsset = laneQuote;
-        uint256 quoteBefore = _balanceOf(quoteAsset, destination);
-        uint256 tokenBefore = _balanceOf(token, destination);
+        uint256 quoteBefore = _balanceOf(quoteAsset, recipient);
+        uint256 tokenBefore = _balanceOf(token, recipient);
 
         // solhint-disable-next-line avoid-low-level-calls
         (bool flushed,) = padAddress.call(abi.encodeCall(IStonkSafeLaunchpadV2.flushCreatorQuote, (launchId)));
         if (!flushed) emit VenueLegSkipped("flushCreatorQuote");
 
-        _forward(quoteAsset, destination);
-        if (token != quoteAsset) _forward(token, destination);
+        _forward(quoteAsset, recipient);
+        if (token != quoteAsset) _forward(token, recipient);
 
-        uint256 quoteAfter = _balanceOf(quoteAsset, destination);
-        uint256 tokenAfter = _balanceOf(token, destination);
+        uint256 quoteAfter = _balanceOf(quoteAsset, recipient);
+        uint256 tokenAfter = _balanceOf(token, recipient);
         quoteOut = quoteAfter > quoteBefore ? quoteAfter - quoteBefore : 0;
         tokenOut = tokenAfter > tokenBefore ? tokenAfter - tokenBefore : 0;
-        emit FeesCollected(owner_, destination, quoteOut, tokenOut);
+        emit FeesCollected(recipient, quoteOut, tokenOut);
     }
 
     /// @notice Cancel the launch and take the armed supply back.
@@ -900,56 +912,6 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         uint256 returned = IERC20(token).balanceOf(address(this));
         if (returned != 0) IERC20(token).safeTransfer(owner_, returned);
         emit LaunchAborted(owner_, returned);
-    }
-
-    /// @notice Flush creator fees and send everything this clone holds to the
-    ///         owning strategy's VAULT.
-    ///
-    /// @dev THE POST-SETTLEMENT FEE LANE, and it exists because of a gap
-    ///      nothing else covers: this clone is the venue's creator, it is NOT
-    ///      the strategy, and what it holds is therefore invisible to the
-    ///      vault's residue machinery. Value that accrues here after the fund
-    ///      has settled would otherwise sit unreachable forever.
-    ///
-    ///      IT GOES TO THE VAULT, NOT THROUGH THE STRATEGY, and that is
-    ///      deliberate (design Decision 4). Post-settlement value landing in
-    ///      STRATEGY custody is a lever: permissionless `collectResidue`
-    ///      re-marks the strategy and re-stamps a fresh 7-day vault deposit
-    ///      lock on every arrival. Delivering vault-direct skips that entirely.
-    ///
-    ///      OWNER-ONLY BEFORE SETTLEMENT, PERMISSIONLESS AFTER. Before the fund
-    ///      settles, fees are the strategy's to account for and pulling them
-    ///      past it would break its books; after, there are no books left to
-    ///      break and a keeper doing the sweep is a service. The owner's state
-    ///      is read by LENGTH-CHECKED RAW STATICCALL and an unreadable answer
-    ///      means NOT SETTLED — fail closed to owner-only. Adversary: an owner
-    ///      contract that reverts, self-destructs or returns short from
-    ///      `state()` would, under a typed read, either brick this verb or
-    ///      (worse, if the failure were read as "settled") open it to anyone
-    ///      mid-fund.
-    ///
-    ///      `vault()` is read the same way but is REQUIRED: an unresolvable
-    ///      vault reverts rather than picking a fallback destination.
-    function forwardToVault() external {
-        address owner_ = owner;
-        if (owner_ == address(0)) revert NotInitialized();
-        if (msg.sender != owner_ && !_ownerSettled(owner_)) revert NotOwner(msg.sender, owner_);
-
-        address vaultAddress = _readVault(owner_);
-        if (vaultAddress == address(0)) revert VaultUnresolved(owner_);
-
-        address padAddress = pad;
-        address token = launchToken;
-        if (padAddress != address(0) && token != address(0)) {
-            // solhint-disable-next-line avoid-low-level-calls
-            (bool flushed,) = padAddress.call(abi.encodeCall(IStonkSafeLaunchpadV2.flushCreatorQuote, (launchId)));
-            if (!flushed) emit VenueLegSkipped("flushCreatorQuote");
-        }
-
-        address quoteAsset = laneQuote;
-        uint256 quoteOut = _forward(quoteAsset, vaultAddress);
-        uint256 tokenOut = (token != address(0) && token != quoteAsset) ? _forward(token, vaultAddress) : 0;
-        emit ForwardedToVault(vaultAddress, quoteOut, tokenOut);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1090,28 +1052,5 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         if (token == address(0) || token.code.length == 0) return 0;
         moved = IERC20(token).balanceOf(address(this));
         if (moved != 0) IERC20(token).safeTransfer(to, moved);
-    }
-
-    /// @dev `state() == Settled`, read defensively. UNREADABLE MEANS NOT
-    ///      SETTLED: this gate only ever WIDENS access, so every failure mode
-    ///      must resolve to the narrow answer.
-    function _ownerSettled(address owner_) private view returns (bool) {
-        if (owner_.code.length == 0) return false;
-        (bool ok, bytes memory ret) = owner_.staticcall(abi.encodeCall(IOwningStrategy.state, ()));
-        if (!ok || ret.length < 32) return false;
-        return abi.decode(ret, (uint256)) == _STATE_SETTLED;
-    }
-
-    /// @dev `vault()`, read defensively. Unreadable or dirty answers zero and
-    ///      the caller reverts — a destination is not something to guess at.
-    function _readVault(address owner_) private view returns (address) {
-        if (owner_.code.length == 0) return address(0);
-        (bool ok, bytes memory ret) = owner_.staticcall(abi.encodeCall(IOwningStrategy.vault, ()));
-        if (!ok || ret.length < 32) return address(0);
-        uint256 word = abi.decode(ret, (uint256));
-        if (word >> 160 != 0) return address(0);
-        // Safe: the guard above rejects any word with set bits above 160.
-        // forge-lint: disable-next-line(unsafe-typecast)
-        return address(uint160(word));
     }
 }

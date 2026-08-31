@@ -15,12 +15,7 @@ import {ISwapAdapter} from "../../src/interfaces/ISwapAdapter.sol";
 
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
-import {
-    MockLaunchAdapter,
-    MockCreatorVenue,
-    MockRevertingCreatorVenue,
-    MockNoCreatorVenue
-} from "../mocks/MockLaunchAdapter.sol";
+import {MockLaunchAdapter, MockCreatorVenue} from "../mocks/MockLaunchAdapter.sol";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stand-ins
@@ -314,7 +309,6 @@ contract LaunchpadStrategyTest is Test {
             claimWindow: CLAIM_WINDOW,
             deadline: uint64(block.timestamp + 1 days),
             settleSlippageBps: 500,
-            feeMode: LaunchpadStrategy.FeeMode.ToVault,
             name: "Fund Token",
             symbol: "FUND",
             venueData: ""
@@ -335,14 +329,6 @@ contract LaunchpadStrategyTest is Test {
 
     function _cloneDefault() internal returns (LaunchpadStrategy) {
         return _clone(_params());
-    }
-
-    /// @dev A clone configured to route the creator stream to the fund's own
-    ///      depositors rather than to the vault.
-    function _cloneToDepositors() internal returns (LaunchpadStrategy) {
-        LaunchpadStrategy.InitParams memory p = _params();
-        p.feeMode = LaunchpadStrategy.FeeMode.ToDepositors;
-        return _clone(p);
     }
 
     /// @dev A funded, allowlisted `RecordingSwapAdapter` wired for every pair
@@ -387,16 +373,6 @@ contract LaunchpadStrategyTest is Test {
         assertEq(s.claimWindow(), CLAIM_WINDOW);
         assertEq(s.tokenSymbol(), "FUND");
         assertEq(uint256(s.state()), uint256(BaseStrategy.State.Pending));
-        assertEq(uint256(s.feeMode()), uint256(LaunchpadStrategy.FeeMode.ToVault), "ToVault is the zero value");
-    }
-
-    /// @dev The zero value MUST be today's behaviour, so a params struct that
-    ///      never mentions `feeMode` decodes to `ToVault`.
-    function test_init_feeModeDefaultsToVault() public {
-        LaunchpadStrategy.InitParams memory p = _params();
-        assertEq(uint256(p.feeMode), 0, "ToVault is enum member 0");
-        assertEq(uint256(_clone(p).feeMode()), uint256(LaunchpadStrategy.FeeMode.ToVault));
-        assertEq(uint256(_cloneToDepositors().feeMode()), uint256(LaunchpadStrategy.FeeMode.ToDepositors));
     }
 
     function test_init_revertsOnUnsupportedQuote() public {
@@ -891,22 +867,19 @@ contract LaunchpadStrategyTest is Test {
         assertEq(IERC20(s.launchToken()).balanceOf(alice), 0);
     }
 
-    /// @dev UPDATED FOR THE ACCUMULATOR. A second claim against an UNCHANGED
-    ///      reserve is not "already claimed" any more — it is an entitlement of
-    ///      exactly zero, and reverts as one. The outcome a caller sees is
-    ///      identical (revert, no tokens move); only the selector changed,
-    ///      because `AlreadyClaimed` stopped being true in general once
-    ///      `collectFees()` could enlarge the pot.
-    function test_claim_revertsOnDoubleClaimWithUnchangedReserve() public {
+    /// @dev ONE SHOT PER HOLDER. `reserve` is immutable after execute — nothing
+    ///      can grow it — so a second claim is `AlreadyClaimed`, not a
+    ///      zero-value top-up.
+    function test_claim_revertsOnDoubleClaim() public {
         LaunchpadStrategy s = _executedWithHolders();
         vm.prank(alice);
         s.claim();
         uint256 balBefore = IERC20(s.launchToken()).balanceOf(alice);
-        assertEq(s.claimedOf(alice), balBefore, "claimedOf records the cumulative amount, not a flag");
+        assertTrue(s.claimed(alice), "the flag is set");
         assertEq(s.claimable(alice), 0, "nothing outstanding");
 
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.ZeroEntitlement.selector, alice));
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.AlreadyClaimed.selector, alice));
         s.claim();
         assertEq(IERC20(s.launchToken()).balanceOf(alice), balBefore, "no tokens moved");
     }
@@ -983,301 +956,56 @@ contract LaunchpadStrategyTest is Test {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // collectFees — the in-window, permissionless fee lane
-    //
-    // THE TIMING IS THE MECHANISM. `settle()` cannot serve `ToDepositors`: it is
-    // gated on the claim window having ALREADY closed, so anything it added to
-    // `reserve` would be unclaimable by construction. Everything below is about
-    // that window.
+    // creator fees — named at launch, paid to the vault, never in clone custody
     // ─────────────────────────────────────────────────────────────────────────
 
-    uint256 internal constant TOPUP = 10_000e18;
-
-    function test_collectFees_toDepositors_growsTheReserve() public {
-        LaunchpadStrategy s = _cloneToDepositors();
+    /// @dev THE ONE THING THE STRATEGY DOES ABOUT FEES. `feeRecipient` is not an
+    ///      `InitParams` member at all, so no proposer can steer it: `_execute`
+    ///      reads `vault()` and puts that in the `LaunchParams` it builds.
+    function test_feeRouting_executeNamesTheVaultAsFeeRecipient() public {
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
-        launchAdapter.setFeeAccrual(0, TOPUP);
 
-        vm.expectEmit(false, false, false, true, address(s));
-        emit LaunchpadStrategy.ReserveToppedUp(TOPUP, RESERVE + TOPUP);
-        (uint256 quoteOut, uint256 tokenOut) = s.collectFees();
-
-        assertEq(tokenOut, TOPUP, "measured from the strategy's own balance delta");
-        assertEq(quoteOut, 0);
-        assertEq(s.reserve(), RESERVE + TOPUP, "the claim pot grew");
-        assertEq(IERC20(s.launchToken()).balanceOf(address(s)), RESERVE + TOPUP, "custody matches the books");
+        assertEq(launchAdapter.lastFeeRecipient(), address(vault), "the launch named the FUND'S vault");
+        assertTrue(launchAdapter.lastFeeRecipient() != address(s), "and never the strategy");
     }
 
-    /// @dev THE REASON THE CLAIM HAD TO BECOME AN ACCUMULATOR. Alice claims her
-    ///      half of the original pot, the pot then grows, and she must be able
-    ///      to come back for exactly the difference — no more, no less. Under
-    ///      the old once-only rule her share of the top-up was unreachable
-    ///      forever and would have settled to the vault as inventory.
-    function test_collectFees_toDepositors_earlyClaimantClaimsExactlyTheDelta() public {
-        vault.setVotes(alice, 500e18);
-        vault.setVotes(bob, 500e18);
-        LaunchpadStrategy s = _cloneToDepositors();
-        _execute(s);
-        vm.warp(block.timestamp + 1);
-        IERC20 token = IERC20(s.launchToken());
-
-        vm.prank(alice);
-        s.claim();
-        assertEq(token.balanceOf(alice), RESERVE / 2, "half of the ORIGINAL pot");
-
-        launchAdapter.setFeeAccrual(0, TOPUP);
-        s.collectFees();
-
-        // Alice comes back for the difference only.
-        assertEq(s.claimable(alice), TOPUP / 2, "the outstanding difference, not a stale zero");
-        vm.prank(alice);
-        uint256 second = s.claim();
-        assertEq(second, TOPUP / 2, "exactly the delta");
-        assertEq(token.balanceOf(alice), (RESERVE + TOPUP) / 2, "half of the ENLARGED pot, total");
-        assertEq(s.claimedOf(alice), (RESERVE + TOPUP) / 2);
-
-        // Bob, who never claimed early, takes his full enlarged share in one go.
-        vm.prank(bob);
-        uint256 bobAmount = s.claim();
-        assertEq(bobAmount, (RESERVE + TOPUP) / 2, "a late claimant is not advantaged");
-        assertEq(token.balanceOf(bob), (RESERVE + TOPUP) / 2, "and the two are paid identically");
-
-        assertEq(s.totalClaimed(), RESERVE + TOPUP);
-        assertLe(s.totalClaimed(), s.reserve(), "the invariant survives a growing pot");
-        assertEq(token.balanceOf(address(s)), 0);
-    }
-
-    /// @dev The same collection under `ToVault` must change NOTHING about the
-    ///      claim: `reserve` is untouched, the extra tokens are ordinary custody
-    ///      and reach the vault at settle/sweep as unpriced inventory.
-    function test_collectFees_toVault_leavesReserveUntouchedAndTokensReachTheVault() public {
+    /// @dev FEES NEVER ENTER CLONE CUSTODY, so there is nothing for the strategy
+    ///      to hold, convert, hand over or re-point — which is why `collectFees`
+    ///      is gone from this contract entirely. Anyone drives the ADAPTER's
+    ///      permissionless verb; the strategy's balances and its claim pot are
+    ///      untouched by the payout.
+    function test_feeRouting_payoutNeverTouchesTheStrategy() public {
         vault.setVotes(alice, 1_000e18);
         LaunchpadStrategy s = _cloneDefault();
-        assertEq(uint256(s.feeMode()), uint256(LaunchpadStrategy.FeeMode.ToVault));
         _execute(s);
+        IERC20 token = IERC20(s.launchToken());
+
+        uint256 strategyTokenBefore = token.balanceOf(address(s));
+        uint256 strategyQuoteBefore = quote.balanceOf(address(s));
+        uint256 reserveBefore = s.reserve();
+        uint256 vaultTokenBefore = token.balanceOf(address(vault));
+        uint256 vaultQuoteBefore = quote.balanceOf(address(vault));
+
+        launchAdapter.setFeeAccrual(100e18, 25e18);
+        vm.prank(address(0xFEED)); // an arbitrary keeper, no strategy hop
+        launchAdapter.collectFees(s.launchRef());
+
+        assertEq(token.balanceOf(address(vault)) - vaultTokenBefore, 25e18, "fee tokens landed at the vault");
+        assertEq(quote.balanceOf(address(vault)) - vaultQuoteBefore, 100e18, "fee quote landed at the vault");
+        assertEq(token.balanceOf(address(s)), strategyTokenBefore, "strategy launch-token balance untouched");
+        assertEq(quote.balanceOf(address(s)), strategyQuoteBefore, "strategy quote balance untouched");
+        assertEq(s.reserve(), reserveBefore, "and a fee payout cannot move the claim pot");
+
+        // The claim is still exactly the execute-time reserve, fees or no fees.
         vm.warp(block.timestamp + 1);
-
-        launchAdapter.setFeeAccrual(0, TOPUP);
-        (, uint256 tokenOut) = s.collectFees();
-        assertEq(tokenOut, TOPUP, "the tokens still arrived");
-        assertEq(s.reserve(), RESERVE, "but the claim pot did NOT move");
-
-        // Alice's claim is still priced against the original reserve.
         vm.prank(alice);
-        assertEq(s.claim(), RESERVE, "sole holder claims the original pot, not the fees");
-
-        launchAdapter.setFeeAccrual(0, 0);
-        vm.warp(s.windowEnd() + 1);
-        _settle(s);
-
-        uint256 vaultBefore = IERC20(s.launchToken()).balanceOf(address(vault));
-        _sweep(s);
-        assertEq(
-            IERC20(s.launchToken()).balanceOf(address(vault)) - vaultBefore,
-            TOPUP,
-            "the fee tokens reach the vault as unpriced inventory"
-        );
-        assertEq(IERC20(s.launchToken()).balanceOf(address(s)), 0);
-    }
-
-    /// @dev BOTH MODES leave the quote half alone, where `_settle`'s existing
-    ///      conversion picks it up. This is the second reason to collect during
-    ///      the window: quote pulled in here is converted, quote the venue pays
-    ///      the vault post-settlement is not.
-    function test_collectFees_quoteStaysOnTheStrategyAndIsConvertedAtSettle() public {
-        LaunchpadStrategy s = _cloneToDepositors();
-        _execute(s);
-        launchAdapter.setPayVaultWhenOwnerSettled(true);
-        launchAdapter.setFeeAccrual(100e18, 0);
-
-        (uint256 quoteOut,) = s.collectFees();
-        assertEq(quoteOut, 100e18);
-        assertEq(quote.balanceOf(address(s)), 100e18, "quote is custody, not claim pot");
-        assertEq(s.reserve(), RESERVE, "the quote half never enters the reserve");
-
-        launchAdapter.setFeeAccrual(0, 0);
-        uint256 vaultBefore = asset.balanceOf(address(vault));
-        vm.warp(s.windowEnd() + 1);
-        _settle(s);
-
-        assertEq(quote.balanceOf(address(s)), 0, "converted");
-        assertEq(asset.balanceOf(address(vault)) - vaultBefore, 100e18, "and delivered in the vault asset");
-    }
-
-    function test_collectFees_revertsBeforeExecute() public {
-        LaunchpadStrategy s = _cloneDefault();
-        vm.expectRevert(LaunchpadStrategy.NotClaimable.selector);
-        s.collectFees();
-    }
-
-    function test_collectFees_revertsAfterSettlement() public {
-        LaunchpadStrategy s = _cloneDefault();
-        _execute(s);
-        vm.warp(s.windowEnd() + 1);
-        _settle(s);
-        vm.expectRevert(LaunchpadStrategy.NotClaimable.selector);
-        s.collectFees();
-    }
-
-    /// @dev At `windowEnd` exactly it still works; one second later it does not
-    ///      — the same boundary `claim()` uses, because a top-up that arrives
-    ///      after the last claim could never be claimed.
-    function test_collectFees_revertsAfterWindowEnd() public {
-        LaunchpadStrategy s = _cloneToDepositors();
-        _execute(s);
-        launchAdapter.setFeeAccrual(0, TOPUP);
-
-        vm.warp(s.windowEnd());
-        s.collectFees();
-        assertEq(s.reserve(), RESERVE + TOPUP, "the last block of the window still counts");
-
-        vm.warp(s.windowEnd() + 1);
-        vm.expectRevert(
-            abi.encodeWithSelector(LaunchpadStrategy.ClaimWindowClosed.selector, block.timestamp, s.windowEnd())
-        );
-        s.collectFees();
-    }
-
-    /// @dev PERMISSIONLESS AND CANNOT REVERT ON A VENUE HICCUP. This verb is
-    ///      open to anyone, so an adapter that reverts must not brick it — a
-    ///      keeper's automation is exactly what an adversary would point at.
-    function test_collectFees_toleratesRevertingAdapter() public {
-        LaunchpadStrategy s = _cloneToDepositors();
-        _execute(s);
-        launchAdapter.setCollectFeesReverts(true);
-
-        vm.expectEmit(true, false, false, false, address(s));
-        emit LaunchpadStrategy.SettlementLegSkipped("collectFees");
-        (uint256 quoteOut, uint256 tokenOut) = s.collectFees();
-
-        assertEq(quoteOut, 0);
-        assertEq(tokenOut, 0);
-        assertEq(s.reserve(), RESERVE, "a failed leg adds nothing");
-        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Executed), "and bricks nothing");
-    }
-
-    /// @dev An ARBITRARY caller can drive it, and receives nothing for doing so.
-    function test_collectFees_permissionlessAndPaysTheCallerNothing() public {
-        LaunchpadStrategy s = _cloneToDepositors();
-        _execute(s);
-        launchAdapter.setFeeAccrual(50e18, TOPUP);
-
-        address stranger = address(0xFEED);
-        vm.prank(stranger);
-        s.collectFees();
-
-        assertEq(s.reserve(), RESERVE + TOPUP, "the pot grew for the holders");
-        assertEq(IERC20(s.launchToken()).balanceOf(stranger), 0, "the caller got no launch tokens");
-        assertEq(quote.balanceOf(stranger), 0, "and no quote");
-        assertEq(quote.balanceOf(address(s)), 50e18, "the quote stayed on the strategy");
-    }
-
-    /// @dev The adapter's SELF-REPORT is ignored: `reserve` grows by what
-    ///      actually arrived. An adapter that claims to have paid 10x while
-    ///      moving nothing would otherwise mint claim rights against tokens that
-    ///      do not exist, and the first honest claimant would drain the pot the
-    ///      rest were owed.
-    function test_collectFees_ignoresTheAdapterSelfReport() public {
-        LaunchpadStrategy s = _cloneToDepositors();
-        _execute(s);
-        // The adapter now SAYS it paid `TOPUP * 10` while moving nothing at all.
-        vm.mockCall(
-            address(launchAdapter),
-            abi.encodeWithSelector(ILaunchAdapter.collectFees.selector, s.launchRef()),
-            abi.encode(uint256(0), TOPUP * 10)
-        );
-        (, uint256 tokenOut) = s.collectFees();
-        vm.clearMockedCalls();
-
-        assertEq(tokenOut, 0, "the balance delta is zero, whatever the adapter returned");
-        assertEq(s.reserve(), RESERVE, "the lie never reached the claim pot");
-        assertEq(IERC20(s.launchToken()).balanceOf(address(s)), RESERVE, "and custody is unchanged");
-    }
-
-    /// @dev Σ(claims) SHALL never exceed the reserve EVEN WHEN THE RESERVE GROWS
-    ///      between claims — the property the accumulator had to preserve.
-    ///      Alice claims first, the pot then grows, and everyone (Alice
-    ///      included) claims again.
-    function testFuzz_growingReserveNeverLetsClaimsExceedReserve(uint128 wA, uint128 wB, uint128 wC, uint96 topUpRaw)
-        public
-    {
-        vm.assume(uint256(wA) + uint256(wB) + uint256(wC) > 0);
-        uint256 topUp = bound(uint256(topUpRaw), 0, LAUNCH_SUPPLY - RESERVE);
-
-        vault.setVotes(alice, wA);
-        vault.setVotes(bob, wB);
-        vault.setVotes(carol, wC);
-
-        LaunchpadStrategy s = _cloneToDepositors();
-        _execute(s);
-        vm.warp(block.timestamp + 1);
-
-        // An EARLY claimant, before the pot grows.
-        vm.prank(alice);
-        try s.claim() {} catch {}
-
-        launchAdapter.setFeeAccrual(0, topUp);
-        s.collectFees();
-        assertEq(s.reserve(), RESERVE + topUp, "the pot grew by exactly what arrived");
-
-        address[3] memory holders = [alice, bob, carol];
-        for (uint256 i; i < 3; ++i) {
-            vm.prank(holders[i]);
-            try s.claim() {} catch {}
-        }
-        // Alice a third time: whatever is left for her is zero by now.
-        vm.prank(alice);
-        try s.claim() {} catch {}
-
-        assertLe(s.totalClaimed(), s.reserve(), "claims never exceed the reserve");
-        assertEq(
-            IERC20(s.launchToken()).balanceOf(address(s)), s.reserve() - s.totalClaimed(), "custody matches the books"
-        );
+        assertEq(s.claim(), RESERVE, "sole holder claims the reserve, never the fees");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // settle
     // ─────────────────────────────────────────────────────────────────────────
-
-    /// @dev PINS THE DOCUMENTED SETTLE-TIME BEHAVIOUR so nobody "fixes" it by
-    ///      accident. `BaseStrategy.settle()` flips `_state` to `Settled` BEFORE
-    ///      `_settle()` runs, so an adapter that switches destination on the
-    ///      owner being settled — the Stonk lane, and `ILaunchAdapter` makes it
-    ///      normative — pays the VAULT directly. The consequence, recorded in
-    ///      `_settle`'s natspec: the fee quote never enters strategy custody, so
-    ///      `_convertQuote` never sees it and it lands RAW rather than converted.
-    ///
-    ///      That destination is correct (paying a settled clone is the
-    ///      deposit-lock lever the vault-direct routing removes). The in-window
-    ///      `collectFees()` is what keeps the unconverted residue small, and the
-    ///      companion test above proves that lane converts.
-    function test_settle_postSettlementFeeLanePaysVaultInKindAndSkipsConversion() public {
-        launchAdapter.setPayVaultWhenOwnerSettled(true);
-        LaunchpadStrategy s = _cloneDefault();
-        _execute(s);
-        launchAdapter.setFeeAccrual(100e18, 25e18);
-
-        uint256 vaultQuoteBefore = quote.balanceOf(address(vault));
-        uint256 vaultAssetBefore = asset.balanceOf(address(vault));
-        uint256 vaultTokenBefore = IERC20(s.launchToken()).balanceOf(address(vault));
-
-        vm.warp(s.windowEnd() + 1);
-        _settle(s);
-
-        assertEq(
-            quote.balanceOf(address(vault)) - vaultQuoteBefore,
-            100e18,
-            "the fee quote reached the vault RAW, in kind - never converted"
-        );
-        assertEq(asset.balanceOf(address(vault)) - vaultAssetBefore, 0, "nothing was converted at settle");
-        assertEq(quote.balanceOf(address(s)), 0, "the quote never entered strategy custody at all");
-        assertEq(
-            IERC20(s.launchToken()).balanceOf(address(vault)) - vaultTokenBefore,
-            25e18,
-            "the fee tokens likewise went straight to the vault"
-        );
-        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Settled));
-    }
 
     function test_settle_revertsWhileClaimWindowOpen() public {
         LaunchpadStrategy s = _cloneDefault();
@@ -1327,50 +1055,13 @@ contract LaunchpadStrategyTest is Test {
         assertEq(uint256(s.state()), uint256(BaseStrategy.State.Settled), "backstop opened settlement");
     }
 
-    function test_settle_toleratesRevertingCollectFees() public {
-        LaunchpadStrategy s = _cloneDefault();
-        _execute(s);
-        launchAdapter.setCollectFeesReverts(true);
-        vm.warp(s.windowEnd() + 1);
-        _settle(s);
-        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Settled));
-    }
-
-    function test_settle_toleratesRevertingCreatorHandoff() public {
-        launchAdapter.setTarget(address(new MockRevertingCreatorVenue()));
-        LaunchpadStrategy s = _cloneDefault();
-        _execute(s);
-        vm.warp(s.windowEnd() + 1);
-        _settle(s);
-        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Settled));
-    }
-
-    function test_settle_toleratesVenueWithoutCreatorTransfer() public {
-        launchAdapter.setTarget(address(new MockNoCreatorVenue()));
-        LaunchpadStrategy s = _cloneDefault();
-        _execute(s);
-        vm.warp(s.windowEnd() + 1);
-        _settle(s);
-        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Settled));
-    }
-
-    function test_settle_handsCreatorRoleToVault() public {
-        MockCreatorVenue venue = new MockCreatorVenue();
-        launchAdapter.setTarget(address(venue));
-        LaunchpadStrategy s = _cloneDefault();
-        _execute(s);
-        vm.warp(s.windowEnd() + 1);
-        _settle(s);
-
-        assertEq(venue.calls(), 1);
-        assertEq(venue.lastToken(), s.launchToken());
-        assertEq(venue.lastCreator(), address(vault), "the ONGOING fee stream goes to the vault, not the strategy");
-    }
-
+    /// @dev The quote residue is what the LAUNCH left behind (a venue that
+    ///      spent less than `quoteIn`), never a fee arrival: fees are the
+    ///      vault's from the launch block and never reach this clone.
     function test_settle_convertsQuoteResidueToVaultAsset() public {
         LaunchpadStrategy s = _cloneDefault();
         _execute(s);
-        launchAdapter.setFeeAccrual(100e18, 0); // creator quote accrues
+        quote.mint(address(s), 100e18); // unspent launch quote
         uint256 vaultBefore = asset.balanceOf(address(vault));
         vm.warp(s.windowEnd() + 1);
         _settle(s);
@@ -1382,7 +1073,7 @@ contract LaunchpadStrategyTest is Test {
     function test_settle_leavesQuoteInCustodyWhenSwapFails() public {
         LaunchpadStrategy s = _cloneDefault();
         _execute(s);
-        launchAdapter.setFeeAccrual(100e18, 0);
+        quote.mint(address(s), 100e18);
         swapAdapter.setRate(address(quote), address(asset), 0); // unquotable
         vm.warp(s.windowEnd() + 1);
         _settle(s);
@@ -1503,7 +1194,7 @@ contract LaunchpadStrategyTest is Test {
         launchAdapter.setTarget(address(venue));
         LaunchpadStrategy s = _cloneDefault();
         _execute(s);
-        launchAdapter.setFeeAccrual(50e18, 0);
+        quote.mint(address(s), 50e18);
         swapAdapter.setRate(address(quote), address(asset), 0); // leave quote behind
         vm.warp(s.windowEnd() + 1);
         _settle(s);
@@ -1539,7 +1230,7 @@ contract LaunchpadStrategyTest is Test {
     function test_sweep_fitsTheVaultSweepGasCap() public {
         LaunchpadStrategy s = _cloneDefault();
         _execute(s);
-        launchAdapter.setFeeAccrual(50e18, 0);
+        quote.mint(address(s), 50e18);
         swapAdapter.setRate(address(quote), address(asset), 0);
         vm.warp(s.windowEnd() + 1);
         _settle(s);
