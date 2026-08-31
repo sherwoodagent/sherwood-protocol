@@ -133,9 +133,9 @@ Numbers a proposer needs and the spec previously only implied. All from `SushiLa
 - **Fork tests cannot pin a block in source.** Measured block time on 4663 is **0.101s** (~10 blocks/sec), and the public RPC retains roughly 5k–50k blocks — 8 to 83 minutes of state. Any pin written into a file is unreachable before review. Fork tests therefore take the block from `ROBINHOOD_FORK_BLOCK` (0 = latest) and skip entirely without `ROBINHOOD_RPC_URL`.
 - **V2 vs V3 pads (task 0.3)**: a bring-your-own token is ACCEPTED on both families — the V2-only pad set is a deliberate choice (the mint path hands the fund its whole supply as a free allocation), not a safety constraint. The V3 build carries a hardened `abort` that only matters for reused external tokens, so it is inert on our mint path.
 
-## Venue 3 — Pons (BUILT IN A SEPARATE PR — #282; gated out of mainnet, tasks.md 0.7)
+## Venue 3 — Pons (BUILT; inert on mainnet until the launcher gate opens, tasks.md 0.7)
 
-Investigated at the product owner's request. The adapter itself lives in #282, stacked on this change; the research stays here because it is what justifies the split — the venue is closed to us, so shipping it alongside two mainnet-ready venues would hold them hostage to a third party's decision. All reads are live against mainnet 4663 on 2026-08-30, against the **v2 / "active" factory** (`PonsLaunchFactory`, `0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB`, verified, solc 0.8.30, ~266k transactions). The legacy factory (`0x0c37a24F…`) is v1 and out of scope.
+Investigated at the product owner's request. The adapter ships in THIS change, which is stacked on the Sushi/StonkBrokers work rather than folded into it: the venue is closed to us, and shipping it alongside two mainnet-ready venues would hold them hostage to a third party's decision. All reads are live against mainnet 4663 on 2026-08-30, against the **v2 / "active" factory** (`PonsLaunchFactory`, `0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB`, verified, solc 0.8.30, ~266k transactions). The legacy factory (`0x0c37a24F…`) is v1 and out of scope.
 
 Shape, and how it maps onto `ILaunchAdapter`:
 
@@ -148,7 +148,13 @@ Shape, and how it maps onto `ILaunchAdapter`:
 
 That gate also settles the adapter's shape before we write a line of it: whitelisting is **per address**, so a per-launch clone pattern is impossible — every clone would need its own whitelist entry. A Pons adapter MUST be a singleton, and fortunately `feeWallet` makes a singleton correct anyway (it names the payee at launch and keeps nothing), so this is the `SushiLaunchAdapter` shape rather than the `StonkLaunchAdapter` one.
 
-Consequences worth carrying into the build:
-1. Get `setWhitelistedLauncher(adapter, true)` agreed before implementation, and note that it pins the adapter address — a re-deploy needs re-whitelisting, which couples our upgrade cadence to theirs. Worth asking whether they will instead flip `launchEnabled`.
-2. `nativeFeeSource()` names WETH, as on Sushi, but the adapter must unwrap `launchFee + quoteIn` (the initial buy is native too), not just the fee.
-3. Fork tests can prank the Pons owner to whitelist, so the venue is testable before the business ask lands.
+**Built anyway, and the earlier "defer until the ask lands" call was wrong.** The reasoning was that an adapter we cannot launch through is untestable end to end — but a fork test can prank the Pons owner to whitelist us, so the real path IS exercisable today. What the gate actually costs is deployment timing, not build confidence, and having the finished address in hand makes the ask concrete rather than hypothetical. The adapter is therefore complete and inert on mainnet until Pons acts.
+
+**The mechanic that shapes the implementation: `feeWallet` does double duty.** The factory sets `initialBuyRecipient = feeWallet == 0 ? msg.sender : feeWallet` AND `locker.setFeeRedirect(token, feeWallet)`, so one field decides both where the dev buy (our RESERVE) lands and where FEES go. Our template needs those split — reserve to the strategy for holder claims, fees to the vault. The resolution is a two-step inside one transaction: launch with `feeWallet = strategy` so the reserve is delivered there, then immediately `locker.setFeeRedirect(token, vault)`, which is permitted because the locker authorises `launched.deployer` and that is our adapter.
+
+That leaves the adapter permanently able to re-point any launch's fees, which would be exactly the shared-custody shape the invariant forbids — except the adapter exposes NO caller-reachable path to `setFeeRedirect` after the launch call. The power exists in principle and is unexercisable in fact, and a test asserts it.
+
+Other build notes:
+1. The whitelist pins the adapter ADDRESS, so a redeploy needs a fresh approval from Pons — which is why flipping `launchEnabled` is the better ask.
+2. `nativeFeeSource()` names WETH as on Sushi, but the adapter unwraps `launchFee + quoteIn`: on this venue the dev buy is funded in native too, not just the fee.
+3. `quoteSupported` is CONFIG-gated here, unlike Sushi's feed registry — a quote works only if some enabled launch config pairs against it, and only the WETH config is live. That is a venue configuration, not a protocol limit.

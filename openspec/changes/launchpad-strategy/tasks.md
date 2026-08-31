@@ -16,7 +16,7 @@ Spec-first change: tasks below are the implementation plan and are all unchecked
 - [ ] 0.7 **Pons: open the launcher gate.** (The ADAPTER IS BUILT — sherwoodagent/sherwood-protocol#282, stacked on this PR. Only the business ask remains, and it is what keeps Pons off this change's critical path.) `PonsLaunchFactory` v2 (`0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB`) opens `launchToken` with `if (!launchEnabled && !whitelistedLaunchers[msg.sender]) revert NotWhitelisted()`, and `launchEnabled()` reads **false** today — so no Sherwood launch can succeed there at all. Ask the Pons owner (`0x263ed295dAFaE1d9AAdD6E56c4B6F9f38eE019Dd`) for ONE of:
       - (a) flip `launchEnabled` to true — preferred, because it leaves our deploy cadence independent of theirs; or
       - (b) `setWhitelistedLauncher(<our adapter>, true)` — workable, but it pins the adapter ADDRESS, so every redeploy of ours needs a fresh approval from them.
-      Until one is agreed the adapter cannot reach mainnet, which is exactly why it lives in its own PR rather than here: Sushi and StonkBrokers are mainnet-ready and should not wait on a third party. The adapter is nonetheless fully verified — a fork test pranks the venue owner, so the real launch path runs today.
+      The ADAPTER IS BUILT (the earlier defer-until-agreed call was wrong: a fork test pranks the Pons owner, so the real launch path is exercisable today and the gate costs deployment timing, not build confidence). What remains is purely the business ask; until it lands the adapter is deployed-but-inert and the deploy runbook says so.
 
 ## 1. Vendored venue interfaces
 

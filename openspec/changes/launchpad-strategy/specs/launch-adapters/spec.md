@@ -58,6 +58,28 @@ Fee destination: `launch` SHALL `transferCreator(token, p.feeRecipient)` in the 
 - **WHEN** `launch(p)` is called with `p.quoteToken = WOOD` while `quoteTokenPriceFeed(WOOD) == 0`
 - **THEN** the adapter reverts before moving funds, with an error naming the unsupported quote
 
+### Requirement: PonsLaunchAdapter (stateless singleton, gated venue)
+
+`src/adapters/PonsLaunchAdapter.sol` SHALL front `PonsLaunchFactory` v2 (`0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB`) and its locker (`0x736D76699C26D0d966744cAe304C000d471f7F35`). It SHALL be a SINGLETON, and that is forced rather than chosen: the venue admits launchers by ADDRESS (`whitelistedLaunchers`), so per-launch clones could never each be admitted.
+
+`feeWallet` at this venue decides TWO things — `initialBuyRecipient = feeWallet == 0 ? msg.sender : feeWallet`, and the locker's fee redirect. The template needs them split, so `launch` SHALL set `feeWallet` to the CALLING STRATEGY, so the dev buy that is the reserve lands where holders can claim it, and SHALL then immediately call `locker.setFeeRedirect(token, p.feeRecipient)` in the same transaction, which the locker permits because it authorises `launched.deployer`. The adapter SHALL expose no caller-reachable path to `setFeeRedirect` thereafter: it remains `deployer` forever and therefore retains the theoretical power to re-point any launch's fees, and the custody invariant holds only because that power is unexercisable in fact.
+
+The dev buy is funded in NATIVE here (`initialBuyAmount = msg.value - launchFee`), so the adapter SHALL unwrap `launchFee + quoteIn` of the WETH it pulls, not merely the fee. `quoteSupported` SHALL be CONFIG-gated — true only where some ENABLED launch config pairs against the quote — unlike Sushi's feed registry; only the WETH config is live today, which is a venue configuration rather than a protocol limit. `collectFees` SHALL drive `locker.collectFees`, tolerate its `NoFeesToCollect()` as `(0, 0)`, and report deltas on the current redirect target.
+
+The venue is CLOSED today: `launchToken` reverts `NotWhitelisted` unless `launchEnabled` (false) or the caller is whitelisted, and the v1 factory carries the identical gate under the same owner. The adapter is therefore deployable but INERT until Pons flips the flag or admits our address, and the deploy runbook SHALL say so with the address to hand them.
+
+#### Scenario: Reserve and fees reach different destinations
+- **WHEN** `launch(p)` completes
+- **THEN** the launch tokens bought are held by the calling strategy, and the locker's fee redirect for that token is `p.feeRecipient`
+
+#### Scenario: The gate is real
+- **WHEN** the adapter is not whitelisted and `launchEnabled` is false
+- **THEN** `launch` reverts at the venue and no funds have moved
+
+#### Scenario: Fees cannot be re-pointed after launch
+- **WHEN** any caller tries to make the adapter change a launch's fee redirect after `launch` returned
+- **THEN** no such entry point exists
+
 ### Requirement: StonkLaunchAdapter (per-launch clone)
 
 `src/adapters/StonkLaunchAdapter.sol` SHALL front the Smart Launch V2/V3 pads (`StonkSafeLaunchpadV2`; reads and trade quotes exclusively through `SafeLaunchLensV2` — curve math SHALL NOT be reimplemented). Because the venue pins the creator role at `createLaunch` with no transfer, `launch` SHALL deploy and initialize an ERC-1167 clone owned by the calling strategy; the clone SHALL `createLaunch` (becoming creator), transfer `reserveAmount` of the minted supply to the strategy, and `arm` the remainder. Post-launch verbs on the clone SHALL be gated by WHERE VALUE GOES, not by who calls. `finalize` (`graduate`/`bond`) and `collectFees` (`flushCreatorQuote`) SHALL be permissionless: both are permissionless at the venue itself, the payee is fixed and is never the caller, and a keeper driving a launch to bond or fees to the fund is a service the fund wants — gating them owner-only would add friction and no safety.
