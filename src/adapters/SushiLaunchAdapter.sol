@@ -43,6 +43,12 @@ contract SushiLaunchAdapter is ILaunchAdapter {
     ///         mis-wired relative to the launchpad it funds.
     address public immutable weth;
 
+    /// @notice The best-effort native sweep at the end of `launch` did not go
+    ///         through, so `amount` stays on the adapter. Emitted instead of
+    ///         reverting — see `_sweepNative` for why that direction is the
+    ///         safe one. Nothing here is the launch's money.
+    event NativeSweepSkipped(address indexed to, uint256 amount);
+
     /// @notice The constructor's launchpad is not a contract, or exposes no
     ///         readable `WETH()`. Fail at deploy rather than at the first
     ///         launch, where a mis-wired singleton would already hold funds.
@@ -80,8 +86,6 @@ contract SushiLaunchAdapter is ILaunchAdapter {
     ///         it fires on a fee-on-transfer or rebasing quote rather than
     ///         letting residue accumulate on a shared contract.
     error DustRemains(address token, uint256 amount);
-    /// @notice The native dust sweep back to the caller failed.
-    error NativeSweepFailed();
     /// @notice Native value arrived from something other than `weth`. The only
     ///         legitimate inbound native payment is the WETH unwrap that funds
     ///         the launch fee; anything else is either a mistake or an attempt
@@ -108,8 +112,9 @@ contract SushiLaunchAdapter is ILaunchAdapter {
     ///           transaction, so the fee stream and every creator-only lever
     ///           belong to the strategy before this returns and the adapter
     ///           keeps no path back to the role;
-    ///        3. the three postcondition sweeps below leave the adapter holding
-    ///           zero launch token, zero quote and zero native.
+    ///        3. the two token sweeps below leave the adapter holding zero
+    ///           launch token and zero quote — asserted — and the native sweep
+    ///           offers back any native balance.
     ///
     ///      Sweeps go to `msg.sender` rather than being left in place because
     ///      residue on a SHARED contract belongs to whoever calls next: the
@@ -119,9 +124,18 @@ contract SushiLaunchAdapter is ILaunchAdapter {
     ///      partially-consumed buy (`PartialInitialBuy`), so `quoteSpent`
     ///      always equals `p.quoteIn`, and the fee is pulled exactly.
     ///
+    ///      The two TOKEN sweeps assert their postcondition; the NATIVE sweep is
+    ///      best-effort and never reverts the launch. That asymmetry is
+    ///      deliberate and load-bearing: token residue can only come from a
+    ///      lossy quote this launch itself moved, whereas native can be
+    ///      force-sent to this address by anyone for one wei, and a shared
+    ///      certified singleton that stops serving every fund because someone
+    ///      gave it a wei has the wrong invariant. See `_sweepNative`.
+    ///
     ///      `payable` is honoured but unnecessary: the fee is sourced by
     ///      unwrapping WETH pulled from the caller precisely so a governor batch
-    ///      never has to carry value. Value sent anyway is swept straight back.
+    ///      never has to carry value. Value sent anyway is offered straight
+    ///      back, and stays here if the caller cannot receive it.
     function launch(LaunchParams calldata p) external payable override returns (LaunchResult memory) {
         // Ordered so every rejection happens before any transfer.
         if (!quoteSupported(p.quoteToken)) revert UnsupportedQuote(p.quoteToken);
@@ -303,12 +317,18 @@ contract SushiLaunchAdapter is ILaunchAdapter {
     /// @notice Accept native ONLY from `weth`.
     /// @dev The single legitimate inbound payment is the unwrap inside
     ///      `launch`. A shared, stateless contract that accepted native from
-    ///      anyone would accumulate a balance belonging to no one, which the
-    ///      next caller's sweep would collect — so anything else is refused.
-    ///      (Force-sends via `selfdestruct` cannot be refused by any contract;
-    ///      such a balance is swept to the next launcher, which is why the
-    ///      sweep is bounded to the current balance and asserts nothing about
-    ///      provenance.)
+    ///      anyone would accumulate a balance belonging to no one, so anything
+    ///      else is refused here.
+    ///
+    ///      This guard is not airtight and is not relied on to be: a
+    ///      `selfdestruct` force-send reaches any address and cannot be refused
+    ///      by this or any other contract. That case is handled downstream
+    ///      instead of here — `_sweepNative` is best-effort, so a force-sent
+    ///      balance CANNOT brick `launch`; it is offered to whoever launches
+    ///      next, and if that caller cannot receive native it simply sits here
+    ///      until one can. No accounting anywhere reads this balance, which is
+    ///      why the sweep is bounded to whatever is present and asserts nothing
+    ///      about provenance.
     receive() external payable {
         if (msg.sender != weth) revert UnexpectedNativePayment(msg.sender);
     }
@@ -371,6 +391,16 @@ contract SushiLaunchAdapter is ILaunchAdapter {
 
     /// @dev Send any residual balance of `token` to `to`, then assert none is
     ///      left. The assert is the invariant; the transfer is how it is met.
+    ///
+    ///      Unlike native, this assert is NOT a griefing surface. Anyone may
+    ///      dust this address with an ERC20, but a well-behaved `transfer` of
+    ///      the whole balance clears it, so the dust is forwarded and the assert
+    ///      passes. The only residue it can catch is a transfer that moves less
+    ///      than it was asked to — fee-on-transfer, or a share-rounding rebase —
+    ///      which is a property of the quote the fund itself chose, is scoped to
+    ///      launches using THAT quote, and already breaks the venue's
+    ///      exact-amount pull a few lines earlier. The launch token cannot be
+    ///      pre-dusted at all: it does not exist until this transaction.
     function _sweepToken(address token, address to) private {
         uint256 bal = IERC20(token).balanceOf(address(this));
         if (bal != 0) IERC20(token).safeTransfer(to, bal);
@@ -378,14 +408,36 @@ contract SushiLaunchAdapter is ILaunchAdapter {
         if (remaining != 0) revert DustRemains(token, remaining);
     }
 
-    /// @dev Same for native: the unwrap is exact and the venue takes the whole
-    ///      fee, so this normally moves nothing — it exists so that a repriced
-    ///      fee, a refund, or value the caller attached to `launch` leaves with
-    ///      the caller instead of sitting on a shared contract.
+    /// @dev Native, and BEST-EFFORT on purpose: it attempts the send and, if the
+    ///      send fails, leaves the balance where it is rather than reverting the
+    ///      launch.
+    ///
+    ///      Why that is the right direction, and not a concession. By the time
+    ///      this runs, native sitting here is provably not the launch's money:
+    ///      the fee was pulled from the caller in WETH, unwrapped exactly, and
+    ///      forwarded to the venue in full, and the strategy attaches no value of
+    ///      its own. Any balance is therefore either value a caller attached
+    ///      voluntarily or native force-sent by `selfdestruct`, which no contract
+    ///      can refuse.
+    ///
+    ///      Reverting on a failed send would hand that force-send the power to
+    ///      disable `launch` FOR EVERY FUND, permanently, for one wei: the caller
+    ///      is a `BaseStrategy` clone, no strategy declares `receive` or
+    ///      `fallback`, so the send to it can never succeed, and this is the only
+    ///      path that moves native off this contract — recovery would mean a new
+    ///      implementation plus re-certification. The invariant a SHARED,
+    ///      CERTIFIED singleton has to hold is that it keeps working, and that
+    ///      strictly dominates "it always returns dust". Leaving the balance
+    ///      takes nothing from anyone with a claim on it, and the next caller
+    ///      whose send DOES succeed sweeps it.
+    ///
+    ///      Expect this to move nothing in the ordinary case: the unwrap is exact
+    ///      and the venue takes the whole fee.
     function _sweepNative(address to) private {
         uint256 bal = address(this).balance;
         if (bal == 0) return;
         (bool ok,) = to.call{value: bal}("");
-        if (!ok) revert NativeSweepFailed();
+        // Deliberately not a revert. The event is the whole handling.
+        if (!ok) emit NativeSweepSkipped(to, bal);
     }
 }

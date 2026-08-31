@@ -41,6 +41,30 @@ contract MockFundStrategy {
 ///      than pick a destination.
 contract MuteOwner {}
 
+/// @notice A SETTLED owner whose `vault()` is unreadable until it is armed.
+/// @dev The post-settlement edge case: `state()` says Settled, so the fee lane
+///      must not pay the strategy — but there is no vault address to pay
+///      either. The verb under test must move nothing rather than fall back to
+///      the owner, and the value must still be deliverable afterwards.
+contract SettledOwnerLateVault {
+    error VaultNotArmed();
+
+    address private _vault;
+
+    function state() external pure returns (uint8) {
+        return 2; // Settled
+    }
+
+    function vault() external view returns (address) {
+        if (_vault == address(0)) revert VaultNotArmed();
+        return _vault;
+    }
+
+    function armVault(address vault_) external {
+        _vault = vault_;
+    }
+}
+
 /// @notice Reverts loudly on ANY call, including its fallback.
 /// @dev The forged-ref probe. If a ref-taking verb ever calls the address it
 ///      was handed instead of rejecting it on ERC-1167 introspection, the test
@@ -518,15 +542,24 @@ contract StonkLaunchAdapterTest is Test {
         ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
         StonkLaunchAdapter clone = _clone(res);
         wethPad.creditCreatorQuote(clone.launchId(), 3 ether);
+        // A token leg too, so both legs of the pre-settlement lane are exercised.
+        deal(res.token, address(clone), 4 ether, true);
 
-        uint256 ownerBefore = weth.balanceOf(address(strategy));
+        uint256 ownerQuoteBefore = weth.balanceOf(address(strategy));
+        uint256 ownerTokenBefore = IERC20(res.token).balanceOf(address(strategy));
         vm.prank(keeper);
         (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
 
         assertEq(quoteOut, 3 ether, "the delta that actually landed on the owner");
-        assertEq(tokenOut, 0);
-        assertEq(weth.balanceOf(address(strategy)) - ownerBefore, 3 ether, "paid to the strategy");
+        assertEq(tokenOut, 4 ether, "the token leg, likewise measured where it landed");
+        assertEq(weth.balanceOf(address(strategy)) - ownerQuoteBefore, quoteOut, "reported == moved, quote leg");
+        assertEq(
+            IERC20(res.token).balanceOf(address(strategy)) - ownerTokenBefore, tokenOut, "reported == moved, token leg"
+        );
         assertEq(weth.balanceOf(keeper), 0, "keeper receives nothing");
+        assertEq(IERC20(res.token).balanceOf(keeper), 0, "keeper receives nothing");
+        assertEq(weth.balanceOf(vault), 0, "before settlement the vault is not the destination");
+        assertEq(IERC20(res.token).balanceOf(vault), 0, "before settlement the vault is not the destination");
         assertEq(weth.balanceOf(address(clone)), 0, "the clone forwarded everything it was paid");
         assertEq(weth.balanceOf(address(adapter)), 0, "the implementation holds nothing");
     }
@@ -537,6 +570,89 @@ contract StonkLaunchAdapterTest is Test {
         (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
         assertEq(quoteOut, 0);
         assertEq(tokenOut, 0);
+    }
+
+    /// @dev The lock-lever PoC, inverted. Once the owner has settled, a
+    ///      permissionless `collectFees` must NOT be a way to push value back
+    ///      into strategy custody: before the strategy's residue latch arms,
+    ///      every such arrival lets `collectResidue` re-stamp a fresh 7-day
+    ///      deposit lock on the vault. The verb stays permissionless; the
+    ///      DESTINATION is what settlement moves.
+    function test_CollectFees_PostSettlementPaysTheVaultAndNeverTheStrategy() public {
+        ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
+        StonkLaunchAdapter clone = _clone(res);
+        wethPad.creditCreatorQuote(clone.launchId(), 5 ether);
+        deal(res.token, address(clone), 7 ether, true);
+
+        strategy.setState(2); // Settled
+
+        uint256 strategyQuoteBefore = weth.balanceOf(address(strategy));
+        uint256 strategyTokenBefore = IERC20(res.token).balanceOf(address(strategy));
+        address passerby = makeAddr("passerby");
+
+        vm.expectEmit(true, true, false, true, address(clone));
+        emit StonkLaunchAdapter.FeesCollected(address(strategy), vault, 5 ether, 7 ether);
+        vm.prank(passerby);
+        (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
+
+        assertEq(quoteOut, 5 ether, "reported against the vault, not the settled strategy");
+        assertEq(tokenOut, 7 ether, "reported against the vault, not the settled strategy");
+        assertEq(weth.balanceOf(vault), quoteOut, "quote leg on the vault");
+        assertEq(IERC20(res.token).balanceOf(vault), tokenOut, "token leg on the vault");
+        assertEq(weth.balanceOf(address(strategy)), strategyQuoteBefore, "the settled strategy receives nothing");
+        assertEq(
+            IERC20(res.token).balanceOf(address(strategy)), strategyTokenBefore, "the settled strategy receives nothing"
+        );
+        assertEq(weth.balanceOf(passerby), 0, "the caller receives nothing");
+        assertEq(IERC20(res.token).balanceOf(passerby), 0, "the caller receives nothing");
+        assertEq(weth.balanceOf(address(clone)), 0, "the clone is emptied");
+        assertEq(IERC20(res.token).balanceOf(address(clone)), 0, "the clone is emptied");
+    }
+
+    /// @dev Settled owner, unreadable `vault()`. Paying the owner as a fallback
+    ///      would reopen the lock lever, so the call is a NO-OP that reports
+    ///      `(0, 0)` — and nothing is stranded, because the clone is the
+    ///      custodian either way and delivers in full once the vault reads.
+    function test_CollectFees_SettledWithUnreadableVaultMovesNothingAndStrandsNothing() public {
+        SettledOwnerLateVault lateOwner = new SettledOwnerLateVault();
+        vm.prank(address(lateOwner));
+        ILaunchAdapter.LaunchResult memory res = adapter.launch(_params(address(weth), 0, 0, RESERVE, _venueData()));
+        StonkLaunchAdapter clone = _clone(res);
+
+        wethPad.creditCreatorQuote(clone.launchId(), 6 ether);
+        // The armed remainder is on the pad; put a token balance on the clone.
+        deal(res.token, address(clone), 9 ether, true);
+
+        // The owner already holds the withheld reserve from `launch`; the fee
+        // lane must add nothing to either leg.
+        uint256 ownerQuoteBefore = weth.balanceOf(address(lateOwner));
+        uint256 ownerTokenBefore = IERC20(res.token).balanceOf(address(lateOwner));
+
+        vm.prank(keeper);
+        (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
+
+        assertEq(quoteOut, 0, "no destination, so nothing is reported");
+        assertEq(tokenOut, 0, "no destination, so nothing is reported");
+        assertEq(weth.balanceOf(address(lateOwner)), ownerQuoteBefore, "the settled owner is never the fallback");
+        assertEq(
+            IERC20(res.token).balanceOf(address(lateOwner)), ownerTokenBefore, "the settled owner is never the fallback"
+        );
+        assertEq(weth.balanceOf(keeper), 0, "the caller receives nothing");
+        assertEq(IERC20(res.token).balanceOf(keeper), 0, "the caller receives nothing");
+        // Nothing moved: the fee is still unflushed on the pad, the token leg
+        // is still on the clone, which is the custodian in every branch.
+        assertEq(weth.balanceOf(address(clone)), 0, "the venue leg was never flushed");
+        assertEq(IERC20(res.token).balanceOf(address(clone)), 9 ether, "the token leg stayed on the clone");
+
+        // Once the vault reads, the value is delivered in full — nothing lost.
+        lateOwner.armVault(vault);
+        vm.prank(keeper);
+        clone.forwardToVault();
+
+        assertEq(weth.balanceOf(vault), 6 ether, "quote leg delivered late, in full");
+        assertEq(IERC20(res.token).balanceOf(vault), 9 ether, "token leg delivered late, in full");
+        assertEq(weth.balanceOf(address(clone)), 0, "the clone is emptied");
+        assertEq(IERC20(res.token).balanceOf(address(clone)), 0, "the clone is emptied");
     }
 
     // ─────────────────────────────────────────────────────────────────────────

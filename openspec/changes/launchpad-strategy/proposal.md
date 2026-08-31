@@ -1,4 +1,4 @@
-# Tokenize-Fund Strategy Template + Launch Adapters
+# Launchpad Strategy Template + Launch Adapters
 
 Linear: SHE-153. Spec-only change — this PR is the design for review; implementation follows after feedback.
 
@@ -6,7 +6,7 @@ Linear: SHE-153. Spec-only change — this PR is the design for review; implemen
 
 A Sherwood fund's only liquidity today is the vault's own deposit/redeem queue, priced once per proposal cycle. The stated product direction ([@sherwoodagent, 2026-08-19](https://x.com/sherwoodagent/status/2090119901918769290)) is that "every agentic fund can have its own LP pool" and that "agents within a fund can choose to 'IPO' onchain" — a secondary market per fund, with the deposit queue no longer the only exit.
 
-A `TokenizeFundStrategy` lets an agent propose exactly that: launch a fund token on a launchpad, seed it with vault capital, hold back a reserve, and let share holders claim a pro-rata slice of the reserve. The launch venue is pluggable through a new `ILaunchAdapter` surface, the same way `PortfolioStrategy` is venue-agnostic through `ISwapAdapter`.
+A `LaunchpadStrategy` lets an agent propose exactly that: launch a fund token on a launchpad, seed it with vault capital, hold back a reserve, and let share holders claim a pro-rata slice of the reserve. The launch venue is pluggable through a new `ILaunchAdapter` surface, the same way `PortfolioStrategy` is venue-agnostic through `ISwapAdapter`.
 
 Live venue data on Robinhood Chain (measured 2026-08-22/26, both from verified explorer source and `cast` against mainnet 4663) shapes the design and makes the abstraction non-trivial — the two launch targets are *structurally different*, not two skins of one flow:
 
@@ -21,7 +21,7 @@ Designing the adapter surface against only one of these would bake that venue's 
   - `src/adapters/SushiLaunchAdapter.sol` — stateless singleton fronting Sushi Launchpad V1 (creator role handed to the strategy via `transferCreator`).
   - `src/adapters/StonkLaunchAdapter.sol` — an ERC-1167-cloned, per-launch adapter owned by its strategy, fronting the Smart Launch V2/V3 pads (creator role is the clone itself; the clone is the custody boundary).
   - Both gated by the existing `TierRegistry` dual gate (`isAdapterAllowed` codehash snapshot + tier certification) and the counterparty axis for the venue contracts, per `docs/adapter-onboarding-checklist.md`.
-- **New capability `tokenize-fund-strategy`**: `src/strategies/TokenizeFundStrategy.sol`, a `BaseStrategy` clone template:
+- **New capability `launchpad-strategy`**: `src/strategies/LaunchpadStrategy.sol`, a `BaseStrategy` clone template:
   - `execute()` — pull vault capital, optionally swap into the launch quote asset through the allowlisted `ISwapAdapter`, drive `ILaunchAdapter.launch`, record the snapshot timestamp.
   - A **claim window** in which snapshot share holders claim `reserve × getPastVotes(holder, snap) / getPastTotalSupply(snap)` of the retained fund-token reserve (dividend-in-kind; shares are not burned in v1).
   - `settle()` — return quote-asset proceeds and collected creator fees to the vault, and hand the *ongoing* fee stream to the vault itself (Sushi: `transferCreator` to the vault; Stonk: the clone's `forwardToVault()` goes permissionless), so no post-settlement value re-enters strategy custody; declare any remaining fund-token custody through the `IStrategyDelivery` views (`hasUnvaluedResidue`, latching false once cleared) with a balance-only `sweep()` recovery path, per `docs/nav-residue-design.md`.
@@ -34,7 +34,7 @@ Deliberately **not** in this change: CLI hookup and user docs (separate PR in th
 ### New Capabilities
 
 - `launch-adapters`: the `ILaunchAdapter` lifecycle contract, the custody rules every implementation must satisfy (reserve, fee stream, and recovery levers must end at the strategy), and the two v1 implementations with their venue-specific constraints.
-- `tokenize-fund-strategy`: the strategy template — lifecycle, snapshot and claim math, quote-asset routing, and the residue/settlement posture for a template that by construction holds a token the protocol cannot price.
+- `launchpad-strategy`: the strategy template — lifecycle, snapshot and claim math, quote-asset routing, and the residue/settlement posture for a template that by construction holds a token the protocol cannot price.
 
 ### Modified Capabilities
 
@@ -45,9 +45,9 @@ Deliberately **not** in this change: CLI hookup and user docs (separate PR in th
 **New code**
 - `src/interfaces/ILaunchAdapter.sol`
 - `src/adapters/SushiLaunchAdapter.sol`, `src/adapters/StonkLaunchAdapter.sol`
-- `src/strategies/TokenizeFundStrategy.sol`
+- `src/strategies/LaunchpadStrategy.sol`
 - `src/vendor/sushi/ISushiLaunchpad.sol`, `src/vendor/stonkbrokers/IStonkSafeLaunchpadV2.sol` + `ISafeLaunchLensV2.sol` (reduced-surface vendored interfaces with provenance headers, per the `src/vendor/` convention)
-- `script/robinhood-mainnet/DeployTokenizeFundStrategy.s.sol`
+- `script/robinhood-mainnet/DeployLaunchpadStrategy.s.sol`
 - Tests: template suite (init-lock, clone-ratchet, live proposer re-check, delivery views), claim-math invariants, adapter allowlist harness, mainnet-4663 fork tests against both live venues.
 
 **Touched state / config (deploy-time only, no contract changes)**

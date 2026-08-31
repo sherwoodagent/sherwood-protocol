@@ -1,4 +1,4 @@
-# Tasks — tokenize-fund-strategy
+# Tasks — launchpad-strategy
 
 Spec-first change: tasks below are the implementation plan and are all unchecked. Tasks 0.x are verification work that can invalidate parts of the design and SHOULD land (as review comments or design.md amendments) before contract code starts.
 
@@ -10,6 +10,11 @@ Spec-first change: tasks below are the implementation plan and are all unchecked
 - [ ] 0.4 Open the WOOD-quote conversation with the Sushi owner (business task, SHE-153 Open Question 1); until resolved the Sushi fork tests use WETH quote.
 - [ ] 0.5 Decide the default reserve fraction (below the now-fixed `MAX_RESERVE_BPS = 2_000` ceiling) and the Stonk start/grad mcap and tax-schedule defaults — product input, recorded in design.md when settled.
 - [ ] 0.6 File and track the vault-side finding this review surfaced: a strategy that truthfully clears residue and later truthfully reports it again can be re-marked by permissionless `collectResidue`, re-stamping a fresh `UNVALUED_MAX_LOCK` deposit lock indefinitely — `_unvaluedBurned` guards only the post-prune direction (`SyndicateVault.sol:1988`, `:2011-2013`, `:2023-2024`). Protocol-level hardening candidate; out of scope for this change, which routes around it by latching the template's views.
+
+- [ ] 0.7 **Pons: confirm the launcher gate before ANY implementation work.** `PonsLaunchFactory` v2 (`0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB`) opens `launchToken` with `if (!launchEnabled && !whitelistedLaunchers[msg.sender]) revert NotWhitelisted()`, and `launchEnabled()` reads **false** today — so no Sherwood launch can succeed there at all. Ask the Pons owner (`0x263ed295dAFaE1d9AAdD6E56c4B6F9f38eE019Dd`) for ONE of:
+      - (a) flip `launchEnabled` to true — preferred, because it leaves our deploy cadence independent of theirs; or
+      - (b) `setWhitelistedLauncher(<our adapter>, true)` — workable, but it pins the adapter ADDRESS, so every redeploy of ours needs a fresh approval from them.
+      Until one is agreed, a Pons adapter is not worth building: it would be untestable end-to-end and inert on mainnet. The venue research (shape, structs, live config, why the adapter must be a singleton) is already recorded in design.md so the build can start from facts the day this clears.
 
 ## 1. Vendored venue interfaces
 
@@ -32,7 +37,7 @@ Spec-first change: tasks below are the implementation plan and are all unchecked
 - [x] 3.4 ERC-1167 target introspection helper so consumers can verify clone → allowed implementation.
 - [x] 3.5 Fork tests (4663): fair-launch shape (zero `quoteIn`), reserve withheld before arm, curve dev-buy via pad `buy(recipient = strategy)`, graduation + bond driving, stock-lane `StalePrice` surfaced unchanged, foreign-caller reverts on every clone verb, and post-settlement `forwardToVault()` from a random caller landing both legs on the vault.
 
-## 4. TokenizeFundStrategy template
+## 4. LaunchpadStrategy template
 
 - [x] 4.1 Skeleton on `BaseStrategy`, struct init decode, fail-closed init checks in spec order (including `reserveAmount ≤ launchSupply × MAX_RESERVE_BPS / 10_000` against Stonk `venueData` supply / Sushi `TOKEN_TOTAL_SUPPLY`, and `quoteIn ≤` proposal budget); `updateParams` monotonic — `minTokensOut` raise-only, lowering reverts; errors one-per-check with adversary natspec.
 - [x] 4.2 `_execute`: pull → optional swap to quote (live adapter re-certs) → `launch` → custody assertion → snapshot `clock()` → cache `pid` from `getActiveProposal()` and compute `windowEnd = min(executedAt + configuredWindow, executedAt + strategyDuration − CLAIM_SETTLE_BUFFER)` from `getProposal(pid)` → push unspent; execute event with token, launchRef, reserve, snapshot, windowEnd. Unit tests for the truncation math at both branches of the `min`, at `configuredWindow` exactly on the boundary, and at `strategyDuration ≤ CLAIM_SETTLE_BUFFER` — which must revert with the template's named error (no panic, no saturating clamp) before any capital is deployed.
@@ -44,11 +49,11 @@ Spec-first change: tasks below are the implementation plan and are all unchecked
 
 ## 5. Deploy + address book
 
-- [x] 5.1 `DeployTokenizeFundStrategy.s.sol` with venue-identity asserts (not just code-presence), template approval, adapter allow + certification runbook, counterparty writes.
+- [x] 5.1 `DeployLaunchpadStrategy.s.sol` with venue-identity asserts (not just code-presence), template approval, adapter allow + certification runbook, counterparty writes.
 - [x] 5.2 `chains/4663.json` + `addresses/4663.json` entries with verification evidence; note 46630 skip.
 - [ ] 5.3 Fork ceremony rehearsal on a 4663 fork; post-deploy validation reads extended.
 
 ## 6. Follow-ups (explicitly out of this change)
 
-- [ ] 6.1 sherwood repo PR: CLI `strategy propose --template tokenize-fund` + docs walkthrough entry (after this spec settles).
+- [ ] 6.1 sherwood repo PR: CLI `strategy propose --template launchpad` + docs walkthrough entry (after this spec settles).
 - [ ] 6.2 v2 questions parked in SHE-153: burn-to-redeem variant, Uniswap/Bankr adapters. (Post-settlement fee-stream ownership is no longer open — review settled it on the vault; see design Decision 4.)

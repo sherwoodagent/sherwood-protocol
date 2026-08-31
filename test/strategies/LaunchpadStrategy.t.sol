@@ -7,7 +7,7 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-import {TokenizeFundStrategy} from "../../src/strategies/TokenizeFundStrategy.sol";
+import {LaunchpadStrategy} from "../../src/strategies/LaunchpadStrategy.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 import {ILaunchAdapter} from "../../src/interfaces/ILaunchAdapter.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
@@ -235,10 +235,10 @@ contract MockFundRegistry {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-contract TokenizeFundStrategyTest is Test {
+contract LaunchpadStrategyTest is Test {
     using stdStorage for StdStorage;
 
-    TokenizeFundStrategy internal template;
+    LaunchpadStrategy internal template;
     MockFundVault internal vault;
     MockFundGovernor internal governor;
     MockFundRegistry internal registry;
@@ -294,13 +294,13 @@ contract TokenizeFundStrategyTest is Test {
 
         asset.mint(address(vault), 10_000e18);
 
-        template = new TokenizeFundStrategy();
+        template = new LaunchpadStrategy();
     }
 
     // ── helpers ──
 
-    function _params() internal view returns (TokenizeFundStrategy.InitParams memory p) {
-        p = TokenizeFundStrategy.InitParams({
+    function _params() internal view returns (LaunchpadStrategy.InitParams memory p) {
+        p = LaunchpadStrategy.InitParams({
             launchAdapter: address(launchAdapter),
             swapAdapter: address(swapAdapter),
             assetIn: ASSET_IN,
@@ -314,26 +314,35 @@ contract TokenizeFundStrategyTest is Test {
             claimWindow: CLAIM_WINDOW,
             deadline: uint64(block.timestamp + 1 days),
             settleSlippageBps: 500,
+            feeMode: LaunchpadStrategy.FeeMode.ToVault,
             name: "Fund Token",
             symbol: "FUND",
             venueData: ""
         });
     }
 
-    function _clone(TokenizeFundStrategy.InitParams memory p) internal returns (TokenizeFundStrategy s) {
-        s = TokenizeFundStrategy(Clones.clone(address(template)));
+    function _clone(LaunchpadStrategy.InitParams memory p) internal returns (LaunchpadStrategy s) {
+        s = LaunchpadStrategy(Clones.clone(address(template)));
         s.initialize(address(vault), proposer, abi.encode(p));
     }
 
     /// @dev An UNINITIALIZED clone. Init-failure tests need the deploy to
     ///      happen before `vm.expectRevert`, which otherwise consumes the
     ///      `CREATE` of the proxy rather than the `initialize` call.
-    function _rawClone() internal returns (TokenizeFundStrategy) {
-        return TokenizeFundStrategy(Clones.clone(address(template)));
+    function _rawClone() internal returns (LaunchpadStrategy) {
+        return LaunchpadStrategy(Clones.clone(address(template)));
     }
 
-    function _cloneDefault() internal returns (TokenizeFundStrategy) {
+    function _cloneDefault() internal returns (LaunchpadStrategy) {
         return _clone(_params());
+    }
+
+    /// @dev A clone configured to route the creator stream to the fund's own
+    ///      depositors rather than to the vault.
+    function _cloneToDepositors() internal returns (LaunchpadStrategy) {
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.feeMode = LaunchpadStrategy.FeeMode.ToDepositors;
+        return _clone(p);
     }
 
     /// @dev A funded, allowlisted `RecordingSwapAdapter` wired for every pair
@@ -350,17 +359,17 @@ contract TokenizeFundStrategyTest is Test {
         registry.setAllowed(address(rec), true);
     }
 
-    function _execute(TokenizeFundStrategy s) internal {
+    function _execute(LaunchpadStrategy s) internal {
         governor.setProposal(block.timestamp, DURATION);
         vault.approveToken(address(asset), address(s), ASSET_IN);
         vault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
     }
 
-    function _settle(TokenizeFundStrategy s) internal {
+    function _settle(LaunchpadStrategy s) internal {
         vault.callStrategy(address(s), abi.encodeWithSignature("settle()"));
     }
 
-    function _sweep(TokenizeFundStrategy s) internal {
+    function _sweep(LaunchpadStrategy s) internal {
         vault.callStrategy(address(s), abi.encodeWithSignature("sweep()"));
     }
 
@@ -369,8 +378,8 @@ contract TokenizeFundStrategyTest is Test {
     // ─────────────────────────────────────────────────────────────────────────
 
     function test_init_storesConfigAndVaultAsset() public {
-        TokenizeFundStrategy s = _cloneDefault();
-        assertEq(s.name(), "Tokenize Fund");
+        LaunchpadStrategy s = _cloneDefault();
+        assertEq(s.name(), "Launchpad");
         assertEq(s.asset(), address(asset), "vault asset read once at init");
         assertEq(address(s.launchAdapter()), address(launchAdapter));
         assertEq(address(s.swapAdapter()), address(swapAdapter));
@@ -378,30 +387,40 @@ contract TokenizeFundStrategyTest is Test {
         assertEq(s.claimWindow(), CLAIM_WINDOW);
         assertEq(s.tokenSymbol(), "FUND");
         assertEq(uint256(s.state()), uint256(BaseStrategy.State.Pending));
+        assertEq(uint256(s.feeMode()), uint256(LaunchpadStrategy.FeeMode.ToVault), "ToVault is the zero value");
+    }
+
+    /// @dev The zero value MUST be today's behaviour, so a params struct that
+    ///      never mentions `feeMode` decodes to `ToVault`.
+    function test_init_feeModeDefaultsToVault() public {
+        LaunchpadStrategy.InitParams memory p = _params();
+        assertEq(uint256(p.feeMode), 0, "ToVault is enum member 0");
+        assertEq(uint256(_clone(p).feeMode()), uint256(LaunchpadStrategy.FeeMode.ToVault));
+        assertEq(uint256(_cloneToDepositors().feeMode()), uint256(LaunchpadStrategy.FeeMode.ToDepositors));
     }
 
     function test_init_revertsOnUnsupportedQuote() public {
         launchAdapter.setQuoteSupported(address(quote), false);
-        TokenizeFundStrategy.InitParams memory p = _params();
-        TokenizeFundStrategy s = _rawClone();
-        vm.expectRevert(abi.encodeWithSelector(TokenizeFundStrategy.QuoteNotSupported.selector, address(quote)));
+        LaunchpadStrategy.InitParams memory p = _params();
+        LaunchpadStrategy s = _rawClone();
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.QuoteNotSupported.selector, address(quote)));
         s.initialize(address(vault), proposer, abi.encode(p));
     }
 
     function test_init_revertsWhenRegistryUnresolved() public {
         MockVaultNoGovernor bare = new MockVaultNoGovernor(address(asset));
-        TokenizeFundStrategy s = TokenizeFundStrategy(Clones.clone(address(template)));
-        vm.expectRevert(TokenizeFundStrategy.TierRegistryUnresolved.selector);
+        LaunchpadStrategy s = LaunchpadStrategy(Clones.clone(address(template)));
+        vm.expectRevert(LaunchpadStrategy.TierRegistryUnresolved.selector);
         s.initialize(address(bare), proposer, abi.encode(_params()));
     }
 
     function test_init_revertsWhenLaunchAdapterNotAllowed() public {
         registry.setAllowed(address(launchAdapter), false);
-        TokenizeFundStrategy.InitParams memory p = _params();
-        TokenizeFundStrategy s = _rawClone();
+        LaunchpadStrategy.InitParams memory p = _params();
+        LaunchpadStrategy s = _rawClone();
         vm.expectRevert(
             abi.encodeWithSelector(
-                TokenizeFundStrategy.LaunchAdapterNotAllowed.selector, address(launchAdapter), address(registry)
+                LaunchpadStrategy.LaunchAdapterNotAllowed.selector, address(launchAdapter), address(registry)
             )
         );
         s.initialize(address(vault), proposer, abi.encode(p));
@@ -409,77 +428,75 @@ contract TokenizeFundStrategyTest is Test {
 
     function test_init_revertsWhenSwapAdapterNotAllowed() public {
         registry.setAllowed(address(swapAdapter), false);
-        TokenizeFundStrategy.InitParams memory p = _params();
-        TokenizeFundStrategy s = _rawClone();
+        LaunchpadStrategy.InitParams memory p = _params();
+        LaunchpadStrategy s = _rawClone();
         vm.expectRevert(
             abi.encodeWithSelector(
-                TokenizeFundStrategy.SwapAdapterNotAllowed.selector, address(swapAdapter), address(registry)
+                LaunchpadStrategy.SwapAdapterNotAllowed.selector, address(swapAdapter), address(registry)
             )
         );
         s.initialize(address(vault), proposer, abi.encode(p));
     }
 
     function test_init_revertsOnZeroReserve() public {
-        TokenizeFundStrategy.InitParams memory p = _params();
+        LaunchpadStrategy.InitParams memory p = _params();
         p.reserveAmount = 0;
-        TokenizeFundStrategy s = _rawClone();
-        vm.expectRevert(TokenizeFundStrategy.ZeroReserve.selector);
+        LaunchpadStrategy s = _rawClone();
+        vm.expectRevert(LaunchpadStrategy.ZeroReserve.selector);
         s.initialize(address(vault), proposer, abi.encode(p));
     }
 
     function test_init_revertsWhenReserveAboveCap() public {
-        TokenizeFundStrategy.InitParams memory p = _params();
+        LaunchpadStrategy.InitParams memory p = _params();
         uint256 maxReserve = (LAUNCH_SUPPLY * template.MAX_RESERVE_BPS()) / 10_000;
         p.reserveAmount = maxReserve + 1;
-        TokenizeFundStrategy s = _rawClone();
-        vm.expectRevert(
-            abi.encodeWithSelector(TokenizeFundStrategy.ReserveTooLarge.selector, maxReserve + 1, maxReserve)
-        );
+        LaunchpadStrategy s = _rawClone();
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.ReserveTooLarge.selector, maxReserve + 1, maxReserve));
         s.initialize(address(vault), proposer, abi.encode(p));
     }
 
     function test_init_acceptsReserveExactlyAtCap() public {
-        TokenizeFundStrategy.InitParams memory p = _params();
+        LaunchpadStrategy.InitParams memory p = _params();
         p.reserveAmount = (LAUNCH_SUPPLY * template.MAX_RESERVE_BPS()) / 10_000;
-        TokenizeFundStrategy s = _clone(p);
+        LaunchpadStrategy s = _clone(p);
         assertEq(s.reserveAmount(), p.reserveAmount);
     }
 
     function test_init_revertsWhenWindowAboveMax() public {
-        TokenizeFundStrategy.InitParams memory p = _params();
+        LaunchpadStrategy.InitParams memory p = _params();
         p.claimWindow = template.MAX_CLAIM_WINDOW() + 1;
-        TokenizeFundStrategy s = _rawClone();
+        LaunchpadStrategy s = _rawClone();
         vm.expectRevert(
             abi.encodeWithSelector(
-                TokenizeFundStrategy.InvalidClaimWindow.selector, p.claimWindow, template.MAX_CLAIM_WINDOW()
+                LaunchpadStrategy.InvalidClaimWindow.selector, p.claimWindow, template.MAX_CLAIM_WINDOW()
             )
         );
         s.initialize(address(vault), proposer, abi.encode(p));
     }
 
     function test_init_revertsOnZeroWindow() public {
-        TokenizeFundStrategy.InitParams memory p = _params();
+        LaunchpadStrategy.InitParams memory p = _params();
         p.claimWindow = 0;
-        TokenizeFundStrategy s = _rawClone();
+        LaunchpadStrategy s = _rawClone();
         vm.expectRevert(
-            abi.encodeWithSelector(TokenizeFundStrategy.InvalidClaimWindow.selector, 0, template.MAX_CLAIM_WINDOW())
+            abi.encodeWithSelector(LaunchpadStrategy.InvalidClaimWindow.selector, 0, template.MAX_CLAIM_WINDOW())
         );
         s.initialize(address(vault), proposer, abi.encode(p));
     }
 
     function test_init_revertsOnSlippageOutOfBounds() public {
-        TokenizeFundStrategy.InitParams memory p = _params();
+        LaunchpadStrategy.InitParams memory p = _params();
         p.settleSlippageBps = template.MAX_SLIPPAGE_BPS() + 1;
-        TokenizeFundStrategy s = _rawClone();
-        vm.expectRevert(abi.encodeWithSelector(TokenizeFundStrategy.InvalidSlippage.selector, p.settleSlippageBps));
+        LaunchpadStrategy s = _rawClone();
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.InvalidSlippage.selector, p.settleSlippageBps));
         s.initialize(address(vault), proposer, abi.encode(p));
     }
 
     function test_init_revertsOnZeroAssetIn() public {
-        TokenizeFundStrategy.InitParams memory p = _params();
+        LaunchpadStrategy.InitParams memory p = _params();
         p.assetIn = 0;
-        TokenizeFundStrategy s = _rawClone();
-        vm.expectRevert(TokenizeFundStrategy.InvalidAmount.selector);
+        LaunchpadStrategy s = _rawClone();
+        vm.expectRevert(LaunchpadStrategy.InvalidAmount.selector);
         s.initialize(address(vault), proposer, abi.encode(p));
     }
 
@@ -488,11 +505,11 @@ contract TokenizeFundStrategyTest is Test {
     // ─────────────────────────────────────────────────────────────────────────
 
     function test_updateParams_raisesMinTokensOut() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         vm.prank(proposer);
         s.updateParams(
             abi.encode(
-                TokenizeFundStrategy.UpdateParams({
+                LaunchpadStrategy.UpdateParams({
                     minTokensOut: RESERVE + 1,
                     minQuoteOut: 950e18,
                     settleSlippageBps: 300,
@@ -507,12 +524,12 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_updateParams_revertsWhenLoweringMinTokensOut() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         vm.prank(proposer);
-        vm.expectRevert(TokenizeFundStrategy.NotTightening.selector);
+        vm.expectRevert(LaunchpadStrategy.NotTightening.selector);
         s.updateParams(
             abi.encode(
-                TokenizeFundStrategy.UpdateParams({
+                LaunchpadStrategy.UpdateParams({
                     minTokensOut: RESERVE - 1,
                     minQuoteOut: 900e18,
                     settleSlippageBps: 500,
@@ -523,12 +540,12 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_updateParams_revertsWhenWideningSlippage() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         vm.prank(proposer);
-        vm.expectRevert(TokenizeFundStrategy.NotTightening.selector);
+        vm.expectRevert(LaunchpadStrategy.NotTightening.selector);
         s.updateParams(
             abi.encode(
-                TokenizeFundStrategy.UpdateParams({
+                LaunchpadStrategy.UpdateParams({
                     minTokensOut: RESERVE,
                     minQuoteOut: 900e18,
                     settleSlippageBps: 501,
@@ -539,13 +556,13 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_updateParams_revertsAfterExecute() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.prank(proposer);
-        vm.expectRevert(TokenizeFundStrategy.NotPending.selector);
+        vm.expectRevert(LaunchpadStrategy.NotPending.selector);
         s.updateParams(
             abi.encode(
-                TokenizeFundStrategy.UpdateParams({
+                LaunchpadStrategy.UpdateParams({
                     minTokensOut: RESERVE + 1,
                     minQuoteOut: 900e18,
                     settleSlippageBps: 500,
@@ -556,12 +573,12 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_updateParams_revertsForNonProposer() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         vm.prank(alice);
         vm.expectRevert(BaseStrategy.NotProposer.selector);
         s.updateParams(
             abi.encode(
-                TokenizeFundStrategy.UpdateParams({
+                LaunchpadStrategy.UpdateParams({
                     minTokensOut: RESERVE + 1,
                     minQuoteOut: 900e18,
                     settleSlippageBps: 500,
@@ -576,7 +593,7 @@ contract TokenizeFundStrategyTest is Test {
     // ─────────────────────────────────────────────────────────────────────────
 
     function test_execute_happyPath_quoteDiffersFromAsset() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         uint256 vaultBefore = asset.balanceOf(address(vault));
         _execute(s);
 
@@ -596,10 +613,10 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_execute_happyPath_quoteEqualsAsset() public {
-        TokenizeFundStrategy.InitParams memory p = _params();
+        LaunchpadStrategy.InitParams memory p = _params();
         p.quoteToken = address(asset);
         p.minQuoteOut = 0;
-        TokenizeFundStrategy s = _clone(p);
+        LaunchpadStrategy s = _clone(p);
         _execute(s);
 
         assertEq(launchAdapter.lastQuoteToken(), address(asset));
@@ -609,7 +626,7 @@ contract TokenizeFundStrategyTest is Test {
 
     function test_execute_acquiresNamedNativeFeeToken() public {
         launchAdapter.setNativeFee(address(feeToken), 1e18);
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
 
         assertEq(feeToken.balanceOf(address(launchAdapter)), 1e18, "venue fee pulled in the token it named");
@@ -630,10 +647,10 @@ contract TokenizeFundStrategyTest is Test {
         uint256 fee = 5e18;
         launchAdapter.setNativeFee(address(asset), fee);
 
-        TokenizeFundStrategy.InitParams memory p = _params();
+        LaunchpadStrategy.InitParams memory p = _params();
         p.swapAdapter = address(rec);
         p.minQuoteOut = 0;
-        TokenizeFundStrategy s = _clone(p);
+        LaunchpadStrategy s = _clone(p);
         _execute(s);
 
         assertEq(rec.swapCalls(), 1, "the pair is crossed exactly once");
@@ -654,17 +671,15 @@ contract TokenizeFundStrategyTest is Test {
         RecordingSwapAdapter rec = _recorder();
         launchAdapter.setNativeFee(address(asset), ASSET_IN);
 
-        TokenizeFundStrategy.InitParams memory p = _params();
+        LaunchpadStrategy.InitParams memory p = _params();
         p.swapAdapter = address(rec);
         p.minQuoteOut = 0;
-        TokenizeFundStrategy s = _clone(p);
+        LaunchpadStrategy s = _clone(p);
 
         governor.setProposal(block.timestamp, DURATION);
         vault.approveToken(address(asset), address(s), ASSET_IN);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                TokenizeFundStrategy.FeeAcquisitionFailed.selector, address(asset), ASSET_IN, ASSET_IN
-            )
+            abi.encodeWithSelector(LaunchpadStrategy.FeeAcquisitionFailed.selector, address(asset), ASSET_IN, ASSET_IN)
         );
         vault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
 
@@ -682,10 +697,10 @@ contract TokenizeFundStrategyTest is Test {
         uint256 fee = 1e18;
         launchAdapter.setNativeFee(address(feeToken), fee);
 
-        TokenizeFundStrategy.InitParams memory p = _params();
+        LaunchpadStrategy.InitParams memory p = _params();
         p.swapAdapter = address(rec);
         p.minQuoteOut = 0;
-        TokenizeFundStrategy s = _clone(p);
+        LaunchpadStrategy s = _clone(p);
         _execute(s);
 
         assertEq(rec.swapCalls(), 2, "quote leg plus the fee leg");
@@ -708,10 +723,10 @@ contract TokenizeFundStrategyTest is Test {
         uint256 fee = 10e18;
         launchAdapter.setNativeFee(address(quote), fee);
 
-        TokenizeFundStrategy.InitParams memory p = _params();
+        LaunchpadStrategy.InitParams memory p = _params();
         p.swapAdapter = address(rec);
         p.minQuoteOut = 0;
-        TokenizeFundStrategy s = _clone(p);
+        LaunchpadStrategy s = _clone(p);
         _execute(s);
 
         assertEq(rec.swapCalls(), 1, "the quote leg already bought the fee");
@@ -725,10 +740,10 @@ contract TokenizeFundStrategyTest is Test {
     ///      whole budget.
     function test_execute_noNativeFee_swapsWholeBudgetOnce() public {
         RecordingSwapAdapter rec = _recorder();
-        TokenizeFundStrategy.InitParams memory p = _params();
+        LaunchpadStrategy.InitParams memory p = _params();
         p.swapAdapter = address(rec);
         p.minQuoteOut = 0;
-        TokenizeFundStrategy s = _clone(p);
+        LaunchpadStrategy s = _clone(p);
         _execute(s);
 
         assertEq(rec.swapCalls(), 1);
@@ -738,13 +753,13 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_execute_revertsWhenLaunchAdapterDemotedAfterInit() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         registry.setAllowed(address(launchAdapter), false);
         governor.setProposal(block.timestamp, DURATION);
         vault.approveToken(address(asset), address(s), ASSET_IN);
         vm.expectRevert(
             abi.encodeWithSelector(
-                TokenizeFundStrategy.LaunchAdapterNotAllowed.selector, address(launchAdapter), address(registry)
+                LaunchpadStrategy.LaunchAdapterNotAllowed.selector, address(launchAdapter), address(registry)
             )
         );
         vault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
@@ -752,13 +767,13 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_execute_revertsWhenSwapAdapterDemotedAfterInit() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         registry.setAllowed(address(swapAdapter), false);
         governor.setProposal(block.timestamp, DURATION);
         vault.approveToken(address(asset), address(s), ASSET_IN);
         vm.expectRevert(
             abi.encodeWithSelector(
-                TokenizeFundStrategy.SwapAdapterNotAllowed.selector, address(swapAdapter), address(registry)
+                LaunchpadStrategy.SwapAdapterNotAllowed.selector, address(swapAdapter), address(registry)
             )
         );
         vault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
@@ -766,11 +781,11 @@ contract TokenizeFundStrategyTest is Test {
 
     function test_execute_revertsWhenLaunchUnderDeliversReserve() public {
         launchAdapter.setMint(LAUNCH_SUPPLY, RESERVE - 1, true);
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         governor.setProposal(block.timestamp, DURATION);
         vault.approveToken(address(asset), address(s), ASSET_IN);
         vm.expectRevert(
-            abi.encodeWithSelector(TokenizeFundStrategy.ReserveNotDelivered.selector, RESERVE - 1, RESERVE - 1, RESERVE)
+            abi.encodeWithSelector(LaunchpadStrategy.ReserveNotDelivered.selector, RESERVE - 1, RESERVE - 1, RESERVE)
         );
         vault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
     }
@@ -778,18 +793,18 @@ contract TokenizeFundStrategyTest is Test {
     function test_execute_revertsWhenDeclaredSupplyMismatches() public {
         // The proposer declared LAUNCH_SUPPLY at init; the venue mints double.
         launchAdapter.setMint(LAUNCH_SUPPLY * 2, 0, false);
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         governor.setProposal(block.timestamp, DURATION);
         vault.approveToken(address(asset), address(s), ASSET_IN);
         vm.expectRevert(
-            abi.encodeWithSelector(TokenizeFundStrategy.SupplyMismatch.selector, LAUNCH_SUPPLY * 2, LAUNCH_SUPPLY)
+            abi.encodeWithSelector(LaunchpadStrategy.SupplyMismatch.selector, LAUNCH_SUPPLY * 2, LAUNCH_SUPPLY)
         );
         vault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
     }
 
     /// @dev Branch A of the `min`: the configured window is the tighter arm.
     function test_execute_windowFromConfigWhenProposalIsLong() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         uint256 t0 = block.timestamp;
         _execute(s);
         assertEq(s.windowEnd(), t0 + CLAIM_WINDOW);
@@ -798,7 +813,7 @@ contract TokenizeFundStrategyTest is Test {
 
     /// @dev Branch B of the `min`: the proposal truncates the window.
     function test_execute_windowTruncatedByProposal() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         uint256 t0 = block.timestamp;
         uint256 shortDuration = 2 days;
         governor.setProposal(t0, shortDuration);
@@ -812,7 +827,7 @@ contract TokenizeFundStrategyTest is Test {
 
     /// @dev Exactly on the boundary: both arms of the `min` are equal.
     function test_execute_windowBoundaryExact() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         uint256 t0 = block.timestamp;
         uint256 exact = CLAIM_WINDOW + s.CLAIM_SETTLE_BUFFER();
         governor.setProposal(t0, exact);
@@ -824,11 +839,11 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_execute_revertsWhenDurationAtBuffer() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         uint256 buffer = s.CLAIM_SETTLE_BUFFER();
         governor.setProposal(block.timestamp, buffer);
         vault.approveToken(address(asset), address(s), ASSET_IN);
-        vm.expectRevert(abi.encodeWithSelector(TokenizeFundStrategy.StrategyDurationTooShort.selector, buffer, buffer));
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.StrategyDurationTooShort.selector, buffer, buffer));
         vault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
 
         // Fail-closed BEFORE any capital is committed: the launch never ran.
@@ -841,7 +856,7 @@ contract TokenizeFundStrategyTest is Test {
     // claim
     // ─────────────────────────────────────────────────────────────────────────
 
-    function _executedWithHolders() internal returns (TokenizeFundStrategy s) {
+    function _executedWithHolders() internal returns (LaunchpadStrategy s) {
         vault.setVotes(alice, 500e18);
         vault.setVotes(bob, 300e18);
         vault.setVotes(carol, 200e18);
@@ -851,7 +866,7 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_claim_proRataAcrossHolders() public {
-        TokenizeFundStrategy s = _executedWithHolders();
+        LaunchpadStrategy s = _executedWithHolders();
         IERC20 token = IERC20(s.launchToken());
 
         vm.prank(alice);
@@ -869,41 +884,50 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_claimFor_paysTheHolderNotTheCaller() public {
-        TokenizeFundStrategy s = _executedWithHolders();
+        LaunchpadStrategy s = _executedWithHolders();
         vm.prank(alice); // any caller
         s.claimFor(bob);
         assertEq(IERC20(s.launchToken()).balanceOf(bob), (RESERVE * 3) / 10);
         assertEq(IERC20(s.launchToken()).balanceOf(alice), 0);
     }
 
-    function test_claim_revertsOnDoubleClaim() public {
-        TokenizeFundStrategy s = _executedWithHolders();
+    /// @dev UPDATED FOR THE ACCUMULATOR. A second claim against an UNCHANGED
+    ///      reserve is not "already claimed" any more — it is an entitlement of
+    ///      exactly zero, and reverts as one. The outcome a caller sees is
+    ///      identical (revert, no tokens move); only the selector changed,
+    ///      because `AlreadyClaimed` stopped being true in general once
+    ///      `collectFees()` could enlarge the pot.
+    function test_claim_revertsOnDoubleClaimWithUnchangedReserve() public {
+        LaunchpadStrategy s = _executedWithHolders();
         vm.prank(alice);
         s.claim();
         uint256 balBefore = IERC20(s.launchToken()).balanceOf(alice);
+        assertEq(s.claimedOf(alice), balBefore, "claimedOf records the cumulative amount, not a flag");
+        assertEq(s.claimable(alice), 0, "nothing outstanding");
+
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(TokenizeFundStrategy.AlreadyClaimed.selector, alice));
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.ZeroEntitlement.selector, alice));
         s.claim();
         assertEq(IERC20(s.launchToken()).balanceOf(alice), balBefore, "no tokens moved");
     }
 
     function test_claim_revertsOnZeroEntitlement() public {
-        TokenizeFundStrategy s = _executedWithHolders();
+        LaunchpadStrategy s = _executedWithHolders();
         address latecomer = address(0xDEAD);
         vm.prank(latecomer);
-        vm.expectRevert(abi.encodeWithSelector(TokenizeFundStrategy.ZeroEntitlement.selector, latecomer));
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.ZeroEntitlement.selector, latecomer));
         s.claim();
     }
 
     /// @dev The template's OWN error, never OZ's `ERC5805FutureLookup`.
     function test_claim_atSnapshotBlockRevertsWithTemplateError() public {
         vault.setVotes(alice, 1e18);
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s); // no warp: clock() == snap
 
         vm.prank(alice);
         vm.expectRevert(
-            abi.encodeWithSelector(TokenizeFundStrategy.SnapshotNotFinal.selector, block.timestamp, block.timestamp)
+            abi.encodeWithSelector(LaunchpadStrategy.SnapshotNotFinal.selector, block.timestamp, block.timestamp)
         );
         s.claim();
 
@@ -912,25 +936,25 @@ contract TokenizeFundStrategyTest is Test {
         try s.claim() {
             revert("claim should have reverted");
         } catch (bytes memory err) {
-            assertEq(bytes4(err), TokenizeFundStrategy.SnapshotNotFinal.selector);
+            assertEq(bytes4(err), LaunchpadStrategy.SnapshotNotFinal.selector);
             assertTrue(bytes4(err) != MockFundVault.ERC5805FutureLookup.selector, "OZ error must not bubble");
         }
     }
 
     function test_claim_revertsAfterWindow() public {
-        TokenizeFundStrategy s = _executedWithHolders();
+        LaunchpadStrategy s = _executedWithHolders();
         vm.warp(s.windowEnd() + 1);
         vm.prank(alice);
         vm.expectRevert(
-            abi.encodeWithSelector(TokenizeFundStrategy.ClaimWindowClosed.selector, block.timestamp, s.windowEnd())
+            abi.encodeWithSelector(LaunchpadStrategy.ClaimWindowClosed.selector, block.timestamp, s.windowEnd())
         );
         s.claim();
     }
 
     function test_claim_revertsBeforeExecute() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         vm.prank(alice);
-        vm.expectRevert(TokenizeFundStrategy.NotClaimable.selector);
+        vm.expectRevert(LaunchpadStrategy.NotClaimable.selector);
         s.claim();
     }
 
@@ -942,7 +966,7 @@ contract TokenizeFundStrategyTest is Test {
         vault.setVotes(bob, wB);
         vault.setVotes(carol, wC);
 
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.warp(block.timestamp + 1);
 
@@ -959,22 +983,315 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // collectFees — the in-window, permissionless fee lane
+    //
+    // THE TIMING IS THE MECHANISM. `settle()` cannot serve `ToDepositors`: it is
+    // gated on the claim window having ALREADY closed, so anything it added to
+    // `reserve` would be unclaimable by construction. Everything below is about
+    // that window.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    uint256 internal constant TOPUP = 10_000e18;
+
+    function test_collectFees_toDepositors_growsTheReserve() public {
+        LaunchpadStrategy s = _cloneToDepositors();
+        _execute(s);
+        launchAdapter.setFeeAccrual(0, TOPUP);
+
+        vm.expectEmit(false, false, false, true, address(s));
+        emit LaunchpadStrategy.ReserveToppedUp(TOPUP, RESERVE + TOPUP);
+        (uint256 quoteOut, uint256 tokenOut) = s.collectFees();
+
+        assertEq(tokenOut, TOPUP, "measured from the strategy's own balance delta");
+        assertEq(quoteOut, 0);
+        assertEq(s.reserve(), RESERVE + TOPUP, "the claim pot grew");
+        assertEq(IERC20(s.launchToken()).balanceOf(address(s)), RESERVE + TOPUP, "custody matches the books");
+    }
+
+    /// @dev THE REASON THE CLAIM HAD TO BECOME AN ACCUMULATOR. Alice claims her
+    ///      half of the original pot, the pot then grows, and she must be able
+    ///      to come back for exactly the difference — no more, no less. Under
+    ///      the old once-only rule her share of the top-up was unreachable
+    ///      forever and would have settled to the vault as inventory.
+    function test_collectFees_toDepositors_earlyClaimantClaimsExactlyTheDelta() public {
+        vault.setVotes(alice, 500e18);
+        vault.setVotes(bob, 500e18);
+        LaunchpadStrategy s = _cloneToDepositors();
+        _execute(s);
+        vm.warp(block.timestamp + 1);
+        IERC20 token = IERC20(s.launchToken());
+
+        vm.prank(alice);
+        s.claim();
+        assertEq(token.balanceOf(alice), RESERVE / 2, "half of the ORIGINAL pot");
+
+        launchAdapter.setFeeAccrual(0, TOPUP);
+        s.collectFees();
+
+        // Alice comes back for the difference only.
+        assertEq(s.claimable(alice), TOPUP / 2, "the outstanding difference, not a stale zero");
+        vm.prank(alice);
+        uint256 second = s.claim();
+        assertEq(second, TOPUP / 2, "exactly the delta");
+        assertEq(token.balanceOf(alice), (RESERVE + TOPUP) / 2, "half of the ENLARGED pot, total");
+        assertEq(s.claimedOf(alice), (RESERVE + TOPUP) / 2);
+
+        // Bob, who never claimed early, takes his full enlarged share in one go.
+        vm.prank(bob);
+        uint256 bobAmount = s.claim();
+        assertEq(bobAmount, (RESERVE + TOPUP) / 2, "a late claimant is not advantaged");
+        assertEq(token.balanceOf(bob), (RESERVE + TOPUP) / 2, "and the two are paid identically");
+
+        assertEq(s.totalClaimed(), RESERVE + TOPUP);
+        assertLe(s.totalClaimed(), s.reserve(), "the invariant survives a growing pot");
+        assertEq(token.balanceOf(address(s)), 0);
+    }
+
+    /// @dev The same collection under `ToVault` must change NOTHING about the
+    ///      claim: `reserve` is untouched, the extra tokens are ordinary custody
+    ///      and reach the vault at settle/sweep as unpriced inventory.
+    function test_collectFees_toVault_leavesReserveUntouchedAndTokensReachTheVault() public {
+        vault.setVotes(alice, 1_000e18);
+        LaunchpadStrategy s = _cloneDefault();
+        assertEq(uint256(s.feeMode()), uint256(LaunchpadStrategy.FeeMode.ToVault));
+        _execute(s);
+        vm.warp(block.timestamp + 1);
+
+        launchAdapter.setFeeAccrual(0, TOPUP);
+        (, uint256 tokenOut) = s.collectFees();
+        assertEq(tokenOut, TOPUP, "the tokens still arrived");
+        assertEq(s.reserve(), RESERVE, "but the claim pot did NOT move");
+
+        // Alice's claim is still priced against the original reserve.
+        vm.prank(alice);
+        assertEq(s.claim(), RESERVE, "sole holder claims the original pot, not the fees");
+
+        launchAdapter.setFeeAccrual(0, 0);
+        vm.warp(s.windowEnd() + 1);
+        _settle(s);
+
+        uint256 vaultBefore = IERC20(s.launchToken()).balanceOf(address(vault));
+        _sweep(s);
+        assertEq(
+            IERC20(s.launchToken()).balanceOf(address(vault)) - vaultBefore,
+            TOPUP,
+            "the fee tokens reach the vault as unpriced inventory"
+        );
+        assertEq(IERC20(s.launchToken()).balanceOf(address(s)), 0);
+    }
+
+    /// @dev BOTH MODES leave the quote half alone, where `_settle`'s existing
+    ///      conversion picks it up. This is the second reason to collect during
+    ///      the window: quote pulled in here is converted, quote the venue pays
+    ///      the vault post-settlement is not.
+    function test_collectFees_quoteStaysOnTheStrategyAndIsConvertedAtSettle() public {
+        LaunchpadStrategy s = _cloneToDepositors();
+        _execute(s);
+        launchAdapter.setPayVaultWhenOwnerSettled(true);
+        launchAdapter.setFeeAccrual(100e18, 0);
+
+        (uint256 quoteOut,) = s.collectFees();
+        assertEq(quoteOut, 100e18);
+        assertEq(quote.balanceOf(address(s)), 100e18, "quote is custody, not claim pot");
+        assertEq(s.reserve(), RESERVE, "the quote half never enters the reserve");
+
+        launchAdapter.setFeeAccrual(0, 0);
+        uint256 vaultBefore = asset.balanceOf(address(vault));
+        vm.warp(s.windowEnd() + 1);
+        _settle(s);
+
+        assertEq(quote.balanceOf(address(s)), 0, "converted");
+        assertEq(asset.balanceOf(address(vault)) - vaultBefore, 100e18, "and delivered in the vault asset");
+    }
+
+    function test_collectFees_revertsBeforeExecute() public {
+        LaunchpadStrategy s = _cloneDefault();
+        vm.expectRevert(LaunchpadStrategy.NotClaimable.selector);
+        s.collectFees();
+    }
+
+    function test_collectFees_revertsAfterSettlement() public {
+        LaunchpadStrategy s = _cloneDefault();
+        _execute(s);
+        vm.warp(s.windowEnd() + 1);
+        _settle(s);
+        vm.expectRevert(LaunchpadStrategy.NotClaimable.selector);
+        s.collectFees();
+    }
+
+    /// @dev At `windowEnd` exactly it still works; one second later it does not
+    ///      — the same boundary `claim()` uses, because a top-up that arrives
+    ///      after the last claim could never be claimed.
+    function test_collectFees_revertsAfterWindowEnd() public {
+        LaunchpadStrategy s = _cloneToDepositors();
+        _execute(s);
+        launchAdapter.setFeeAccrual(0, TOPUP);
+
+        vm.warp(s.windowEnd());
+        s.collectFees();
+        assertEq(s.reserve(), RESERVE + TOPUP, "the last block of the window still counts");
+
+        vm.warp(s.windowEnd() + 1);
+        vm.expectRevert(
+            abi.encodeWithSelector(LaunchpadStrategy.ClaimWindowClosed.selector, block.timestamp, s.windowEnd())
+        );
+        s.collectFees();
+    }
+
+    /// @dev PERMISSIONLESS AND CANNOT REVERT ON A VENUE HICCUP. This verb is
+    ///      open to anyone, so an adapter that reverts must not brick it — a
+    ///      keeper's automation is exactly what an adversary would point at.
+    function test_collectFees_toleratesRevertingAdapter() public {
+        LaunchpadStrategy s = _cloneToDepositors();
+        _execute(s);
+        launchAdapter.setCollectFeesReverts(true);
+
+        vm.expectEmit(true, false, false, false, address(s));
+        emit LaunchpadStrategy.SettlementLegSkipped("collectFees");
+        (uint256 quoteOut, uint256 tokenOut) = s.collectFees();
+
+        assertEq(quoteOut, 0);
+        assertEq(tokenOut, 0);
+        assertEq(s.reserve(), RESERVE, "a failed leg adds nothing");
+        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Executed), "and bricks nothing");
+    }
+
+    /// @dev An ARBITRARY caller can drive it, and receives nothing for doing so.
+    function test_collectFees_permissionlessAndPaysTheCallerNothing() public {
+        LaunchpadStrategy s = _cloneToDepositors();
+        _execute(s);
+        launchAdapter.setFeeAccrual(50e18, TOPUP);
+
+        address stranger = address(0xFEED);
+        vm.prank(stranger);
+        s.collectFees();
+
+        assertEq(s.reserve(), RESERVE + TOPUP, "the pot grew for the holders");
+        assertEq(IERC20(s.launchToken()).balanceOf(stranger), 0, "the caller got no launch tokens");
+        assertEq(quote.balanceOf(stranger), 0, "and no quote");
+        assertEq(quote.balanceOf(address(s)), 50e18, "the quote stayed on the strategy");
+    }
+
+    /// @dev The adapter's SELF-REPORT is ignored: `reserve` grows by what
+    ///      actually arrived. An adapter that claims to have paid 10x while
+    ///      moving nothing would otherwise mint claim rights against tokens that
+    ///      do not exist, and the first honest claimant would drain the pot the
+    ///      rest were owed.
+    function test_collectFees_ignoresTheAdapterSelfReport() public {
+        LaunchpadStrategy s = _cloneToDepositors();
+        _execute(s);
+        // The adapter now SAYS it paid `TOPUP * 10` while moving nothing at all.
+        vm.mockCall(
+            address(launchAdapter),
+            abi.encodeWithSelector(ILaunchAdapter.collectFees.selector, s.launchRef()),
+            abi.encode(uint256(0), TOPUP * 10)
+        );
+        (, uint256 tokenOut) = s.collectFees();
+        vm.clearMockedCalls();
+
+        assertEq(tokenOut, 0, "the balance delta is zero, whatever the adapter returned");
+        assertEq(s.reserve(), RESERVE, "the lie never reached the claim pot");
+        assertEq(IERC20(s.launchToken()).balanceOf(address(s)), RESERVE, "and custody is unchanged");
+    }
+
+    /// @dev Σ(claims) SHALL never exceed the reserve EVEN WHEN THE RESERVE GROWS
+    ///      between claims — the property the accumulator had to preserve.
+    ///      Alice claims first, the pot then grows, and everyone (Alice
+    ///      included) claims again.
+    function testFuzz_growingReserveNeverLetsClaimsExceedReserve(uint128 wA, uint128 wB, uint128 wC, uint96 topUpRaw)
+        public
+    {
+        vm.assume(uint256(wA) + uint256(wB) + uint256(wC) > 0);
+        uint256 topUp = bound(uint256(topUpRaw), 0, LAUNCH_SUPPLY - RESERVE);
+
+        vault.setVotes(alice, wA);
+        vault.setVotes(bob, wB);
+        vault.setVotes(carol, wC);
+
+        LaunchpadStrategy s = _cloneToDepositors();
+        _execute(s);
+        vm.warp(block.timestamp + 1);
+
+        // An EARLY claimant, before the pot grows.
+        vm.prank(alice);
+        try s.claim() {} catch {}
+
+        launchAdapter.setFeeAccrual(0, topUp);
+        s.collectFees();
+        assertEq(s.reserve(), RESERVE + topUp, "the pot grew by exactly what arrived");
+
+        address[3] memory holders = [alice, bob, carol];
+        for (uint256 i; i < 3; ++i) {
+            vm.prank(holders[i]);
+            try s.claim() {} catch {}
+        }
+        // Alice a third time: whatever is left for her is zero by now.
+        vm.prank(alice);
+        try s.claim() {} catch {}
+
+        assertLe(s.totalClaimed(), s.reserve(), "claims never exceed the reserve");
+        assertEq(
+            IERC20(s.launchToken()).balanceOf(address(s)), s.reserve() - s.totalClaimed(), "custody matches the books"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // settle
     // ─────────────────────────────────────────────────────────────────────────
 
+    /// @dev PINS THE DOCUMENTED SETTLE-TIME BEHAVIOUR so nobody "fixes" it by
+    ///      accident. `BaseStrategy.settle()` flips `_state` to `Settled` BEFORE
+    ///      `_settle()` runs, so an adapter that switches destination on the
+    ///      owner being settled — the Stonk lane, and `ILaunchAdapter` makes it
+    ///      normative — pays the VAULT directly. The consequence, recorded in
+    ///      `_settle`'s natspec: the fee quote never enters strategy custody, so
+    ///      `_convertQuote` never sees it and it lands RAW rather than converted.
+    ///
+    ///      That destination is correct (paying a settled clone is the
+    ///      deposit-lock lever the vault-direct routing removes). The in-window
+    ///      `collectFees()` is what keeps the unconverted residue small, and the
+    ///      companion test above proves that lane converts.
+    function test_settle_postSettlementFeeLanePaysVaultInKindAndSkipsConversion() public {
+        launchAdapter.setPayVaultWhenOwnerSettled(true);
+        LaunchpadStrategy s = _cloneDefault();
+        _execute(s);
+        launchAdapter.setFeeAccrual(100e18, 25e18);
+
+        uint256 vaultQuoteBefore = quote.balanceOf(address(vault));
+        uint256 vaultAssetBefore = asset.balanceOf(address(vault));
+        uint256 vaultTokenBefore = IERC20(s.launchToken()).balanceOf(address(vault));
+
+        vm.warp(s.windowEnd() + 1);
+        _settle(s);
+
+        assertEq(
+            quote.balanceOf(address(vault)) - vaultQuoteBefore,
+            100e18,
+            "the fee quote reached the vault RAW, in kind - never converted"
+        );
+        assertEq(asset.balanceOf(address(vault)) - vaultAssetBefore, 0, "nothing was converted at settle");
+        assertEq(quote.balanceOf(address(s)), 0, "the quote never entered strategy custody at all");
+        assertEq(
+            IERC20(s.launchToken()).balanceOf(address(vault)) - vaultTokenBefore,
+            25e18,
+            "the fee tokens likewise went straight to the vault"
+        );
+        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Settled));
+    }
+
     function test_settle_revertsWhileClaimWindowOpen() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.expectRevert(
             abi.encodeWithSelector(
-                TokenizeFundStrategy.ClaimWindowStillOpen.selector, block.timestamp, s.windowEnd(), s.anyoneSettleAt()
+                LaunchpadStrategy.ClaimWindowStillOpen.selector, block.timestamp, s.windowEnd(), s.anyoneSettleAt()
             )
         );
         _settle(s);
     }
 
     function test_settle_succeedsAfterWindow() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.warp(s.windowEnd() + 1);
         _settle(s);
@@ -990,7 +1307,7 @@ contract TokenizeFundStrategyTest is Test {
     ///      still open at `anyoneSettleAt`, or the clone pins
     ///      `openProposalCount() != 0` with no permissionless exit.
     function test_settle_backstopOpensAtAnyoneSettleAt() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         uint256 anyoneAt = s.anyoneSettleAt();
 
@@ -1000,7 +1317,7 @@ contract TokenizeFundStrategyTest is Test {
         vm.warp(anyoneAt - 1);
         vm.expectRevert(
             abi.encodeWithSelector(
-                TokenizeFundStrategy.ClaimWindowStillOpen.selector, block.timestamp, type(uint256).max, anyoneAt
+                LaunchpadStrategy.ClaimWindowStillOpen.selector, block.timestamp, type(uint256).max, anyoneAt
             )
         );
         _settle(s);
@@ -1011,7 +1328,7 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_settle_toleratesRevertingCollectFees() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         launchAdapter.setCollectFeesReverts(true);
         vm.warp(s.windowEnd() + 1);
@@ -1021,7 +1338,7 @@ contract TokenizeFundStrategyTest is Test {
 
     function test_settle_toleratesRevertingCreatorHandoff() public {
         launchAdapter.setTarget(address(new MockRevertingCreatorVenue()));
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.warp(s.windowEnd() + 1);
         _settle(s);
@@ -1030,7 +1347,7 @@ contract TokenizeFundStrategyTest is Test {
 
     function test_settle_toleratesVenueWithoutCreatorTransfer() public {
         launchAdapter.setTarget(address(new MockNoCreatorVenue()));
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.warp(s.windowEnd() + 1);
         _settle(s);
@@ -1040,7 +1357,7 @@ contract TokenizeFundStrategyTest is Test {
     function test_settle_handsCreatorRoleToVault() public {
         MockCreatorVenue venue = new MockCreatorVenue();
         launchAdapter.setTarget(address(venue));
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.warp(s.windowEnd() + 1);
         _settle(s);
@@ -1051,7 +1368,7 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_settle_convertsQuoteResidueToVaultAsset() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         launchAdapter.setFeeAccrual(100e18, 0); // creator quote accrues
         uint256 vaultBefore = asset.balanceOf(address(vault));
@@ -1063,7 +1380,7 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_settle_leavesQuoteInCustodyWhenSwapFails() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         launchAdapter.setFeeAccrual(100e18, 0);
         swapAdapter.setRate(address(quote), address(asset), 0); // unquotable
@@ -1076,7 +1393,7 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_settle_neverSellsTheFundToken() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.warp(s.windowEnd() + 1);
         _settle(s);
@@ -1090,7 +1407,7 @@ contract TokenizeFundStrategyTest is Test {
     // ─────────────────────────────────────────────────────────────────────────
 
     function test_residue_flagTrueAtSettlementWithUnclaimedReserve() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.warp(s.windowEnd() + 1);
         _settle(s);
@@ -1106,7 +1423,7 @@ contract TokenizeFundStrategyTest is Test {
         // 100% of the snapshot and claims the whole reserve, so no clearing
         // sweep ever runs.
         vault.setVotes(alice, 1_000e18);
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.warp(block.timestamp + 1);
         vm.prank(alice);
@@ -1137,7 +1454,7 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_residue_latchArmedBySweep() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.warp(s.windowEnd() + 1);
         _settle(s);
@@ -1152,7 +1469,7 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_residue_pokeIsNoOpBeforeSettlement() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         assertFalse(s.pokeResidueLatch(), "no latch before Settled");
         assertFalse(s.hasUnvaluedResidue(), "views answer only for Settled");
@@ -1160,7 +1477,7 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_residue_viewsNeverRevertWithHostileToken() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.warp(s.windowEnd() + 1);
         _settle(s);
@@ -1184,7 +1501,7 @@ contract TokenizeFundStrategyTest is Test {
     function test_sweep_movesAllThreeBalancesAndMakesNoVenueCall() public {
         MockCreatorVenue venue = new MockCreatorVenue();
         launchAdapter.setTarget(address(venue));
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         launchAdapter.setFeeAccrual(50e18, 0);
         swapAdapter.setRate(address(quote), address(asset), 0); // leave quote behind
@@ -1220,7 +1537,7 @@ contract TokenizeFundStrategyTest is Test {
     ///      cap and IGNORES the result, so an out-of-gas sweep silently
     ///      recovers nothing. Balance-only is what keeps it inside the cap.
     function test_sweep_fitsTheVaultSweepGasCap() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         launchAdapter.setFeeAccrual(50e18, 0);
         swapAdapter.setRate(address(quote), address(asset), 0);
@@ -1237,7 +1554,7 @@ contract TokenizeFundStrategyTest is Test {
     ///      `_PROBE_GAS = 150_000`; a probe that runs out of gas reads as "no
     ///      residue", which is finding #3 restored.
     function test_deliveryViews_fitTheVaultProbeGasCap() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.warp(s.windowEnd() + 1);
         _settle(s);
@@ -1249,14 +1566,14 @@ contract TokenizeFundStrategyTest is Test {
     }
 
     function test_sweep_revertsBeforeSettlement() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
-        vm.expectRevert(TokenizeFundStrategy.NotSettled.selector);
+        vm.expectRevert(LaunchpadStrategy.NotSettled.selector);
         _sweep(s);
     }
 
     function test_sweep_revertsForNonVault() public {
-        TokenizeFundStrategy s = _cloneDefault();
+        LaunchpadStrategy s = _cloneDefault();
         _execute(s);
         vm.warp(s.windowEnd() + 1);
         _settle(s);

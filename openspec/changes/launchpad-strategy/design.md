@@ -1,4 +1,4 @@
-# Design — TokenizeFundStrategy + Launch Adapters
+# Design — LaunchpadStrategy + Launch Adapters
 
 All venue facts below were verified against mainnet 4663 (verified explorer source + `cast` reads, 2026-08-22/26). Where the two venues disagree, the disagreement is stated first, because reconciling them *is* the design.
 
@@ -120,3 +120,23 @@ Native-ETH details absorbed by adapters: Sushi's 0.0005 ETH launch fee is paid b
 2. **Default economics**: the *default* reserve fraction (the "~10%" from the product framing) and, on Stonk, the `startMcapUsd8`/`gradMcapUsd8`/tax-schedule defaults the CLI will offer. The *bound* is no longer open — review fixed the hard ceiling at `MAX_RESERVE_BPS = 2_000` (20% of launch supply), enforced at init; what remains open is the default the product picks below it.
 3. **Stonk never-graduates path**: confirm on-chain what `closing` permits (curve closed, `!graduated`) — specifically whether the creator can recover arm'd supply or realized quote after a failed window with buys present (`abort` requires zero buys). The answer decides whether `LaunchPhase.Failed` maps to a recovery verb or to permanent-residue documentation.
 4. ~~**Fee-stream endgame**~~ — **resolved in review**: the endgame is the **vault**, and it has to be. Leaving the stream claimable through the settled strategy's `collectFees`/`sweep` path means post-settlement value keeps landing in strategy custody, which permissionless `collectResidue` can convert into an indefinitely renewed 7-day deposit lock. So `_settle` hands Sushi's creator role to the vault (`transferCreator`), and the Stonk clone's `forwardToVault()` goes permissionless after settlement; the strategy's delivery views latch and never see value again. Both paths deliver in kind — the vault warehouses, it does not price.
+
+## Venue 3 — Pons (researched; BUILD DEFERRED pending the launcher gate, tasks.md 0.7)
+
+Investigated at the product owner's request; recorded here so the next round starts from facts rather than the docs. All reads are live against mainnet 4663 on 2026-08-30, against the **v2 / "active" factory** (`PonsLaunchFactory`, `0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB`, verified, solc 0.8.30, ~266k transactions). The legacy factory (`0x0c37a24F…`) is v1 and out of scope.
+
+Shape, and how it maps onto `ILaunchAdapter`:
+
+- `launchToken(TokenParams, uint256 launchConfigId, uint256 dexId, bytes32 salt) payable returns (address token)`. The entire supply goes into a one-sided Uniswap-V3 position minted to the factory, then transferred to the locker and locked — so, as on Sushi, **the creator receives zero tokens** and a reserve can only come from the initial buy. The initial buy is funded by `msg.value − launchFee`, i.e. in NATIVE ETH rather than by pulling an ERC-20.
+- **The fee recipient is set AT LAUNCH**: `TokenParams.feeWallet` is written straight into the locker via `setFeeRedirect(token, feeWallet)`. There is no creator role to transfer afterwards. This is the cleanest fit of the three venues for the custody invariant — the adapter names the strategy (or the vault) as `feeWallet` and holds no role at any point.
+- Live launch config 0 is the only one: `pairToken` = WETH, `supply` = 1e27 (1e9 × 1e18), `graduationThreshold` = 4.2 WETH, `initialTick` = −204200, 5% max wallet / 5.5% max tx for 2 blocks. `pairToken` is per-config, so WETH-only is a CONFIGURATION rather than a protocol constraint — the owner can add configs, which is the hook a future WOOD or stock-token lane would use.
+- Uses the chain's canonical Uniswap V3 factory and position manager — the same addresses already in `chains/4663.json`, unlike Sushi which runs its own.
+
+**The blocker, and it shapes the design.** `launchToken` opens with `if (!launchEnabled && !whitelistedLaunchers[msg.sender]) revert NotWhitelisted()`, and `launchEnabled()` reads **false** today. Launching is therefore whitelist-only, and admitting us is an action only the Pons owner (`0x263ed295dAFaE1d9AAdD6E56c4B6F9f38eE019Dd`) can take — the same class of external dependency as the WOOD/USD feed on Sushi, but stricter, because without it NO Pons launch works at all rather than one pairing being unavailable.
+
+That gate also settles the adapter's shape before we write a line of it: whitelisting is **per address**, so a per-launch clone pattern is impossible — every clone would need its own whitelist entry. A Pons adapter MUST be a singleton, and fortunately `feeWallet` makes a singleton correct anyway (it names the payee at launch and keeps nothing), so this is the `SushiLaunchAdapter` shape rather than the `StonkLaunchAdapter` one.
+
+Consequences worth carrying into the build:
+1. Get `setWhitelistedLauncher(adapter, true)` agreed before implementation, and note that it pins the adapter address — a re-deploy needs re-whitelisting, which couples our upgrade cadence to theirs. Worth asking whether they will instead flip `launchEnabled`.
+2. `nativeFeeSource()` names WETH, as on Sushi, but the adapter must unwrap `launchFee + quoteIn` (the initial buy is native too), not just the fee.
+3. Fork tests can prank the Pons owner to whitelist, so the venue is testable before the business ask lands.

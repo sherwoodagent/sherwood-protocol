@@ -52,7 +52,7 @@ interface ICreatorTransfer {
 }
 
 /**
- * @title TokenizeFundStrategy
+ * @title LaunchpadStrategy
  * @notice "IPO" a syndicate: launch a fund token on an allowlisted launch
  *         venue with vault capital, retain a reserve, and hand that reserve to
  *         the fund's own share holders pro-rata by a snapshot taken at the
@@ -65,6 +65,11 @@ interface ICreatorTransfer {
  *            return the unspent remainder.
  *   Claim:   `claim()` / `claimFor(holder)` while `Executed` and at or before
  *            the clamped `windowEnd`. Dividend-in-kind: shares are NOT burned.
+ *   Collect: `collectFees()`, permissionless, IN THE SAME WINDOW — sweeps the
+ *            venue's creator stream into the clone and, under
+ *            `FeeMode.ToDepositors`, adds the launch-token part to `reserve` so
+ *            the SAME snapshot holders can claim it. See its natspec for why
+ *            the timing is the whole mechanism.
  *   Settle:  collect the creator fee stream (tolerated failure), hand the
  *            ONGOING stream to the vault (tolerated failure), convert quote to
  *            the vault asset when it can be done honestly, push everything
@@ -80,8 +85,38 @@ interface ICreatorTransfer {
  *   exists to keep that asset out of the vault's NAV until it is either claimed
  *   or warehoused unpriced.
  */
-contract TokenizeFundStrategy is BaseStrategy {
+contract LaunchpadStrategy is BaseStrategy {
     using SafeERC20 for IERC20;
+
+    // ── Fee routing ──
+
+    /// @notice Where the venue's CREATOR FEE STREAM ends up.
+    /// @dev    `ToVault` IS THE ZERO VALUE, AND THAT IS LOAD-BEARING. A
+    ///         proposal encoded before this option existed — or one whose agent
+    ///         simply left the field alone — decodes to `ToVault`, which is the
+    ///         behaviour this template has always had: the fee tokens sit in
+    ///         clone custody and leave at settle/sweep like any other residue.
+    ///         Nothing about custody, pricing or the residue latch changes on
+    ///         that lane.
+    ///
+    ///         `ToDepositors` re-points the LAUNCH-TOKEN half of that stream at
+    ///         the fund's own share holders: `collectFees()` adds it to
+    ///         `reserve`, where the existing pro-rata claim pays it out against
+    ///         the SAME execute-time snapshot. It buys nothing new for a
+    ///         proposer — the snapshot is already frozen and the claim math is
+    ///         already fixed — so the choice is purely "does the creator stream
+    ///         belong to the vault's NAV or to the cohort that funded the
+    ///         launch".
+    ///
+    ///         THE QUOTE HALF IS NOT SWITCHED, on either lane. It stays on the
+    ///         strategy and `_settle`'s conversion delivers it to the vault in
+    ///         the vault asset. Paying a claim in two tokens would double the
+    ///         claim accounting for the one leg the template can already price
+    ///         honestly.
+    enum FeeMode {
+        ToVault,
+        ToDepositors
+    }
 
     // ── Template constants ──
 
@@ -253,10 +288,14 @@ contract TokenizeFundStrategy is BaseStrategy {
     ///         proposal simply never executes and expires at `executeBy`.
     error StrategyDurationTooShort(uint256 strategyDuration, uint256 buffer);
 
-    /// @notice A claim arrived outside `Executed`.
+    /// @notice A claim — or a `collectFees()` — arrived outside `Executed`.
+    /// @dev    SHARED WITH `collectFees()` DELIBERATELY. That entry point is
+    ///         gated on exactly the claim window, and reporting it with exactly
+    ///         the claim's errors is the shortest honest statement of that: a
+    ///         caller who can read one gate has read both.
     error NotClaimable();
 
-    /// @notice A claim arrived after `windowEnd`.
+    /// @notice A claim — or a `collectFees()` — arrived after `windowEnd`.
     /// @dev    The unclaimed remainder is settlement inventory, warehoused
     ///         unpriced at the vault — never redistributed to the holders who
     ///         did claim, which would make the last claimant's share depend on
@@ -272,13 +311,15 @@ contract TokenizeFundStrategy is BaseStrategy {
     ///         claim is simply too early.
     error SnapshotNotFinal(uint256 vaultClock, uint256 snapshot);
 
-    /// @notice This holder already claimed.
-    error AlreadyClaimed(address holder);
-
-    /// @notice The holder's snapshot weight rounds to zero of the reserve.
-    /// @dev    Covers both "acquired shares after `snap`" and "held a dust
-    ///         balance that floors to zero" — a zero transfer would still burn
-    ///         the one-shot claim flag, so it reverts instead.
+    /// @notice The holder has nothing left to claim right now.
+    /// @dev    THE ONE ERROR THE ACCUMULATOR LEFT STANDING, and it now covers
+    ///         three cases rather than two: shares acquired after `snap`, a
+    ///         dust balance that floors to zero of the reserve, and — the case
+    ///         a separate `AlreadyClaimed` used to name — a holder whose
+    ///         cumulative `claimedOf` already equals their share of the CURRENT
+    ///         reserve. The three are indistinguishable to the payer and mean
+    ///         the same thing: this call would move zero tokens, so it reverts
+    ///         rather than emitting a claim that paid nothing.
     error ZeroEntitlement(address holder);
 
     /// @notice Defensive: the running claim total would exceed the recorded
@@ -332,8 +373,19 @@ contract TokenizeFundStrategy is BaseStrategy {
         uint256 anyoneSettleAt
     );
 
-    /// @notice `holder` took their pro-rata slice of the reserve.
-    event ReserveClaimed(address indexed holder, uint256 amount, uint256 totalClaimed);
+    /// @notice `holder` took their pro-rata slice of the reserve. `amount` is
+    ///         what THIS call paid; `holderTotal` is their cumulative take, so
+    ///         a repeat claim after a top-up is legible as a top-up rather than
+    ///         as a second full claim.
+    event ReserveClaimed(address indexed holder, uint256 amount, uint256 totalClaimed, uint256 holderTotal);
+
+    /// @notice `collectFees()` ran. `tokenOut`/`quoteOut` are the MEASURED
+    ///         balance deltas, never the adapter's self-report.
+    event FeesCollected(address indexed caller, uint256 quoteOut, uint256 tokenOut);
+
+    /// @notice `FeeMode.ToDepositors`: `amount` launch tokens joined the claim
+    ///         pot, which now stands at `reserve`.
+    event ReserveToppedUp(uint256 amount, uint256 reserve);
 
     /// @notice Settlement finished. `assetDelivered` is what reached the vault
     ///         in vault-asset units; the other two are what stayed behind as
@@ -379,6 +431,10 @@ contract TokenizeFundStrategy is BaseStrategy {
     /// @param claimWindow       Configured claim duration, clamped at execute.
     /// @param deadline          Venue deadline for the launch transaction.
     /// @param settleSlippageBps Tolerance on the settle-time quote conversion.
+    /// @param feeMode           Where the creator fee stream's LAUNCH-TOKEN
+    ///                          half goes. `ToVault` (the zero value) is the
+    ///                          historical behaviour; `ToDepositors` routes it
+    ///                          into `reserve` via `collectFees()`.
     /// @param name              Launch token name.
     /// @param symbol            Launch token symbol.
     /// @param venueData         Venue-specific economics, opaque here.
@@ -396,6 +452,7 @@ contract TokenizeFundStrategy is BaseStrategy {
         uint256 claimWindow;
         uint64 deadline;
         uint256 settleSlippageBps;
+        FeeMode feeMode;
         string name;
         string symbol;
         bytes venueData;
@@ -440,7 +497,17 @@ contract TokenizeFundStrategy is BaseStrategy {
     uint256 public settleSlippageBps;
     uint64 public deadline;
 
-    /// @notice The claim pot actually recorded at execute.
+    /// @notice Where the creator fee stream's launch-token half goes. See
+    ///         `FeeMode`.
+    FeeMode public feeMode;
+
+    /// @notice The claim pot. Recorded at execute and — under
+    ///         `FeeMode.ToDepositors` only — GROWN by `collectFees()` while the
+    ///         window is open.
+    /// @dev    MONOTONICALLY NON-DECREASING, which is the property the claim
+    ///         accumulator is built on: `claimedOf[holder]` can never exceed a
+    ///         holder's share of a reserve that only ever gets larger, so the
+    ///         entitlement subtraction below can never underflow.
     uint256 public reserve;
     /// @notice The vault-clock timepoint every claim is priced against.
     /// @dev    EXECUTE-TIME, NOT INIT-TIME. Adversary the placement answers: an
@@ -462,9 +529,16 @@ contract TokenizeFundStrategy is BaseStrategy {
     ///         value, is the real containment bound.
     uint256 public anyoneSettleAt;
 
-    /// @notice Reserve already paid out.
+    /// @notice Reserve already paid out, across every holder.
     uint256 public totalClaimed;
-    /// @notice Per-holder claim record. Nonzero == claimed.
+    /// @notice Per-holder CUMULATIVE amount claimed.
+    /// @dev    AN ACCUMULATOR, NOT A ONCE-ONLY FLAG — the change `collectFees()`
+    ///         forced. A boolean (or "nonzero means done") under-pays anyone who
+    ///         claimed before a top-up: their slice of the enlarged pot would be
+    ///         permanently unreachable and would settle to the vault as
+    ///         inventory instead. Subtracting a cumulative figure from a
+    ///         freshly-computed gross entitlement pays exactly the difference
+    ///         and nothing more.
     mapping(address => uint256) public claimedOf;
 
     /// @notice Once set, `hasUnvaluedResidue()` is permanently false.
@@ -479,7 +553,7 @@ contract TokenizeFundStrategy is BaseStrategy {
 
     /// @inheritdoc IStrategy
     function name() external pure returns (string memory) {
-        return "Tokenize Fund";
+        return "Launchpad";
     }
 
     /// @notice The launch token's configured name/symbol.
@@ -565,6 +639,9 @@ contract TokenizeFundStrategy is BaseStrategy {
         claimWindow = p.claimWindow;
         deadline = p.deadline;
         settleSlippageBps = p.settleSlippageBps;
+        // UNVALIDATED ON PURPOSE: `abi.decode` already rejects any word outside
+        // the enum's range, and both members are legitimate configurations.
+        feeMode = p.feeMode;
         _tokenName = p.name;
         _tokenSymbol = p.symbol;
         _quoteSwapData = p.quoteSwapData;
@@ -822,13 +899,17 @@ contract TokenizeFundStrategy is BaseStrategy {
 
     /// @notice What `holder` could claim right now, ignoring the time gates.
     /// @dev    View-only convenience for keepers/UIs. Returns 0 rather than
-    ///         reverting for an already-claimed holder or an un-executed clone.
+    ///         reverting for a fully-claimed holder or an un-executed clone.
+    ///         Reports the REMAINDER, so a holder who claimed before a
+    ///         `collectFees()` top-up reads their outstanding difference here
+    ///         rather than a stale zero.
     function claimable(address holder) external view returns (uint256) {
         if (_state != State.Executed) return 0;
-        if (claimedOf[holder] != 0) return 0;
         uint256 total = IVaultVotes(vault()).getPastTotalSupply(snap);
         if (total == 0) return 0;
-        return Math.mulDiv(reserve, IVaultVotes(vault()).getPastVotes(holder, snap), total);
+        uint256 gross = Math.mulDiv(reserve, IVaultVotes(vault()).getPastVotes(holder, snap), total);
+        uint256 taken = claimedOf[holder];
+        return gross > taken ? gross - taken : 0;
     }
 
     /// @dev THE CLAIM IS A DIVIDEND IN KIND — shares are NOT burned. Burn-to-
@@ -849,6 +930,31 @@ contract TokenizeFundStrategy is BaseStrategy {
     ///      GATE ORDER MATTERS: the clock check runs BEFORE either vote read,
     ///      so a claim in the execute block reverts with `SnapshotNotFinal`
     ///      instead of bubbling OZ's `ERC5805FutureLookup` out of the vault.
+    ///
+    ///      REPEAT CLAIMS ARE ALLOWED, AND THAT IS A DELIBERATE REVERSAL of
+    ///      this template's original once-per-holder rule. `collectFees()` can
+    ///      grow `reserve` at any point inside the window, so a holder who
+    ///      claimed early and a holder who claimed late would otherwise be paid
+    ///      different fractions of the same pot purely on timing — the
+    ///      "last claimant's share depends on when everyone else showed up"
+    ///      failure the window was shaped to avoid, arriving through the fee
+    ///      lane instead. The accumulator removes the timing entirely:
+    ///
+    ///        entitlement = reserve * getPastVotes(holder, snap)
+    ///                              / getPastTotalSupply(snap)
+    ///                      - claimedOf[holder]
+    ///
+    ///      An early claimant simply comes back for the difference. What did
+    ///      NOT change is the outcome of a claim that would move nothing: a
+    ///      fully-claimed holder still reverts, now with `ZeroEntitlement`
+    ///      rather than a separate `AlreadyClaimed`, because a zero-value
+    ///      transfer plus a `ReserveClaimed` event asserting a payment is worse
+    ///      than a revert.
+    ///
+    ///      Σ(all claims) <= `reserve` SURVIVES THE CHANGE, by floor division:
+    ///      each holder's cumulative take is `floor(R_i * w_i / T)` for some
+    ///      `R_i <= reserve`, so the sum is at most `Σ floor(reserve * w_i / T)
+    ///      <= reserve`. `ClaimExceedsReserve` stays as the assertion of it.
     function _claim(address holder) private returns (uint256 amount) {
         if (_state != State.Executed) revert NotClaimable();
         if (block.timestamp > windowEnd) revert ClaimWindowClosed(block.timestamp, windowEnd);
@@ -858,21 +964,109 @@ contract TokenizeFundStrategy is BaseStrategy {
         // complement of the range OZ accepts — no gap, no overlap.
         if (nowClock <= snap) revert SnapshotNotFinal(nowClock, snap);
 
-        if (claimedOf[holder] != 0) revert AlreadyClaimed(holder);
-
         uint256 total = IVaultVotes(vault()).getPastTotalSupply(snap);
         if (total == 0) revert ZeroEntitlement(holder);
-        amount = Math.mulDiv(reserve, IVaultVotes(vault()).getPastVotes(holder, snap), total);
-        if (amount == 0) revert ZeroEntitlement(holder);
+
+        uint256 gross = Math.mulDiv(reserve, IVaultVotes(vault()).getPastVotes(holder, snap), total);
+        uint256 taken = claimedOf[holder];
+        // `reserve` only ever grows, so `gross < taken` is unreachable; the
+        // comparison is written as a guard rather than a bare subtraction so a
+        // future writer who breaks that monotonicity gets `ZeroEntitlement`
+        // instead of a panic.
+        if (gross <= taken) revert ZeroEntitlement(holder);
+        amount = gross - taken;
 
         uint256 claimedTotal = totalClaimed + amount;
         if (claimedTotal > reserve) revert ClaimExceedsReserve(claimedTotal, reserve);
 
-        claimedOf[holder] = amount;
+        claimedOf[holder] = gross;
         totalClaimed = claimedTotal;
 
         IERC20(launchToken).safeTransfer(holder, amount);
-        emit ReserveClaimed(holder, amount, claimedTotal);
+        emit ReserveClaimed(holder, amount, claimedTotal, gross);
+    }
+
+    // ── Creator fee collection (permissionless, IN-WINDOW) ──
+
+    /// @notice Sweep the venue's creator fee stream into this clone, and — under
+    ///         `FeeMode.ToDepositors` — add the launch-token part to the claim
+    ///         pot.
+    ///
+    /// @dev    WHY THIS EXISTS AT ALL, AND WHY IT IS NOT DONE AT SETTLE. The
+    ///         obvious place to collect fees is settlement, and for
+    ///         `FeeMode.ToVault` that is where it still happens. For
+    ///         `ToDepositors` it CANNOT work there: `settle()` is gated on
+    ///         `block.timestamp > windowEnd` (or the anyone-settle backstop,
+    ///         which is strictly later than the clamped window), so by the time
+    ///         `_settle` runs the claim window has already closed. Anything
+    ///         added to `reserve` at that point is unclaimable by construction —
+    ///         every `claim()` reverts `ClaimWindowClosed` — and the "depositor"
+    ///         mode would silently be a vault mode with extra steps. The
+    ///         collection therefore has to happen DURING the window, which is
+    ///         what this entry point is.
+    ///
+    ///         PERMISSIONLESS FOR THE SAME REASON `claimFor` IS. Nothing here
+    ///         pays the caller: the tokens land on the clone and are claimed by
+    ///         snapshot holders, so the worst a hostile caller achieves is
+    ///         paying gas to enlarge someone else's pot. That is precisely the
+    ///         behaviour wanted — a keeper (or any holder who notices fees
+    ///         accruing) can top the pot up right before the window closes,
+    ///         which is when the stream is at its largest and the deadline is
+    ///         real. Gating it on the proposer would hand them a lever over
+    ///         WHETHER the depositor lane pays at all.
+    ///
+    ///         FAILURE IS TOLERATED, NEVER PROPAGATED. The adapter call is raw
+    ///         and its revert is swallowed into `SettlementLegSkipped`. A
+    ///         permissionless verb that can be made to revert by a paused pad,
+    ///         a venue with nothing accrued, or an adapter that simply changed
+    ///         its mind is a verb an adversary can point at the keeper's
+    ///         automation; and there is nothing to fail closed FOR, since the
+    ///         no-op outcome and the failed outcome are the same outcome.
+    ///
+    ///         MEASURED, NOT TRUSTED. Both figures are this strategy's own
+    ///         balance deltas across the call. The adapter's return values are
+    ///         ignored entirely — they are the adapter's word about a payment it
+    ///         may have routed anywhere (the Stonk lane's post-settlement switch
+    ///         is exactly such a redirection), and `reserve` is the number every
+    ///         claim divides. A self-reported figure there would let an adapter
+    ///         mint claim rights against tokens that never arrived, and the
+    ///         first honest claimant would drain the pot the rest were owed.
+    ///
+    ///         THE QUOTE HALF IS LEFT ALONE ON BOTH LANES. It stays on the
+    ///         strategy, where `_settle`'s `_convertQuote` turns it into the
+    ///         vault asset. That is also the second reason to call this during
+    ///         the window rather than after: quote collected here is converted,
+    ///         while quote the post-settlement lane pays straight to the vault
+    ///         is not (see `_settle`).
+    ///
+    /// @return quoteOut The measured quote-token delta. Stays in custody.
+    /// @return tokenOut The measured launch-token delta. Joins `reserve` under
+    ///         `ToDepositors`; sits as ordinary custody under `ToVault`.
+    function collectFees() external returns (uint256 quoteOut, uint256 tokenOut) {
+        if (_state != State.Executed) revert NotClaimable();
+        if (block.timestamp > windowEnd) revert ClaimWindowClosed(block.timestamp, windowEnd);
+
+        address token = launchToken;
+        address quote_ = quoteToken;
+        uint256 tokenBefore = _safeBalance(token);
+        uint256 quoteBefore = _safeBalance(quote_);
+
+        // solhint-disable-next-line avoid-low-level-calls
+        (bool ok,) = address(launchAdapter).call(abi.encodeCall(ILaunchAdapter.collectFees, (launchRef)));
+        if (!ok) emit SettlementLegSkipped("collectFees");
+
+        uint256 tokenAfter = _safeBalance(token);
+        uint256 quoteAfter = _safeBalance(quote_);
+        tokenOut = tokenAfter > tokenBefore ? tokenAfter - tokenBefore : 0;
+        quoteOut = quoteAfter > quoteBefore ? quoteAfter - quoteBefore : 0;
+
+        if (feeMode == FeeMode.ToDepositors && tokenOut != 0) {
+            uint256 reserve_ = reserve + tokenOut;
+            reserve = reserve_;
+            emit ReserveToppedUp(tokenOut, reserve_);
+        }
+
+        emit FeesCollected(msg.sender, quoteOut, tokenOut);
     }
 
     // ── Settle ──
@@ -891,6 +1085,32 @@ contract TokenizeFundStrategy is BaseStrategy {
     ///      `openProposalCount() != 0`. Each skipped leg is emitted, so
     ///      "settlement completed" is never confused with "settlement was
     ///      complete".
+    ///
+    ///      THE SETTLE-TIME FEE SWEEP PAYS THE VAULT IN KIND, AND IS NOT
+    ///      CONVERTED. Recorded honestly rather than defended against, because
+    ///      the behaviour is correct and only the expectation was wrong.
+    ///      `BaseStrategy.settle()` sets `_state = Settled` BEFORE calling this
+    ///      hook, so by the time the `collectFees` call below lands, an adapter
+    ///      that switches destination on the owner being settled — the Stonk
+    ///      lane does exactly that, and `ILaunchAdapter.collectFees` makes it
+    ///      normative — routes the fees straight to `vault()`. They never enter
+    ///      strategy custody, so `_convertQuote` below never sees them: a fee
+    ///      quote that is not the vault asset arrives at the vault RAW, as
+    ///      unpriced inventory, rather than converted.
+    ///
+    ///      That destination is the RIGHT one and must not be "fixed". Paying a
+    ///      settled strategy is the permissionless deposit-lock lever the
+    ///      vault-direct routing exists to remove: until the residue latch arms,
+    ///      each arrival in settled-clone custody lets a permissionless
+    ///      `collectResidue` re-stamp a fresh multi-day deposit lock on the
+    ///      whole vault. Converting is worth less than that is worth avoiding.
+    ///
+    ///      WHAT KEEPS THE UNCONVERTED RESIDUE SMALL IS `collectFees()`, the
+    ///      in-window entry point. It is permissionless precisely so anyone can
+    ///      pull the stream into strategy custody BEFORE settlement, where the
+    ///      conversion below does apply. The conversion is therefore best
+    ///      understood as covering quote the strategy ALREADY HOLDS, not quote
+    ///      the venue is about to pay.
     ///
     ///      IT NEVER SELLS THE FUND TOKEN. Not into its own launch pool, not
     ///      anywhere — that price is attacker-movable inside this very

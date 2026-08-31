@@ -136,7 +136,20 @@ interface ILaunchAdapter {
     function finalize(bytes32 launchRef) external;
 
     /// @notice Sweep the venue's creator fee share to the launch's owner.
-    /// @dev Delivers ONLY to the strategy that owns the launch, whoever calls.
+    ///
+    /// @dev NEVER PAYS THE CALLER, whoever calls. The destination is the
+    ///      strategy that owns the launch while that strategy is live, and its
+    ///      VAULT once the strategy has settled.
+    ///
+    ///      The switch is not tidiness. Post-settlement value landing in
+    ///      strategy custody is a permissionless deposit-lock lever: until the
+    ///      strategy's residue latch arms, anyone can push fee tokens back into
+    ///      a settled clone and let the vault's permissionless residue
+    ///      collection re-stamp a fresh multi-day deposit lock on the whole
+    ///      vault. Paying the vault directly removes the lever and keeps the
+    ///      tokenize-fund rule that post-settlement value never transits the
+    ///      strategy.
+    ///
     ///      Returns `(0, 0)` rather than reverting when nothing has accrued, so
     ///      a settlement path may call it unconditionally.
     function collectFees(bytes32 launchRef) external returns (uint256 quoteOut, uint256 tokenOut);

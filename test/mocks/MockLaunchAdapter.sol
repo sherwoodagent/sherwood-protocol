@@ -45,6 +45,18 @@ contract MockLaunchAdapter is ILaunchAdapter {
     /// @notice Toggles for the settle-time tolerated-failure legs.
     bool public collectFeesReverts;
 
+    /// @notice OPT-IN, DEFAULT OFF: reproduce the destination switch
+    ///         `ILaunchAdapter.collectFees` makes normative and
+    ///         `StonkLaunchAdapter` implements — pay the owning strategy while
+    ///         it is live, and that strategy's VAULT once it has settled.
+    ///
+    /// @dev    Off by default so every pre-existing test keeps meaning exactly
+    ///         what it meant: the flat "always pays the owner" behaviour. The
+    ///         switch is what makes the settle-time lane observable in a unit
+    ///         test, and that lane is the reason the strategy's in-window
+    ///         `collectFees()` exists at all.
+    bool public payVaultWhenOwnerSettled;
+
     /// @notice Fee accrual `collectFees` delivers to the launch's owner.
     uint256 public feeQuoteOut;
     uint256 public feeTokenOut;
@@ -98,6 +110,10 @@ contract MockLaunchAdapter is ILaunchAdapter {
         reportedPhase = p;
     }
 
+    function setPayVaultWhenOwnerSettled(bool v) external {
+        payVaultWhenOwnerSettled = v;
+    }
+
     // ── ILaunchAdapter ──
 
     /// @inheritdoc ILaunchAdapter
@@ -133,12 +149,29 @@ contract MockLaunchAdapter is ILaunchAdapter {
     function finalize(bytes32) external {}
 
     /// @inheritdoc ILaunchAdapter
+    /// @dev NEVER PAYS THE CALLER. The destination is the owning strategy, or —
+    ///      when `payVaultWhenOwnerSettled` is on and that strategy reports
+    ///      `Settled` — the strategy's vault.
     function collectFees(bytes32) external returns (uint256 quoteOut, uint256 tokenOut) {
         if (collectFeesReverts) revert CollectFeesBroken();
         quoteOut = feeQuoteOut;
         tokenOut = feeTokenOut;
-        if (quoteOut != 0) IERC20(lastQuoteToken).safeTransfer(ownerOf, quoteOut);
-        if (tokenOut != 0) IERC20(lastToken).safeTransfer(ownerOf, tokenOut);
+        address destination = _destination();
+        if (quoteOut != 0) IERC20(lastQuoteToken).safeTransfer(destination, quoteOut);
+        if (tokenOut != 0) IERC20(lastToken).safeTransfer(destination, tokenOut);
+    }
+
+    /// @dev `BaseStrategy.State.Settled == 2`, read by raw staticcall the way a
+    ///      real adapter must: the owner is not necessarily a `BaseStrategy`,
+    ///      and an unreadable answer means "not settled" (fail-closed toward
+    ///      the pre-settlement lane).
+    function _destination() private view returns (address) {
+        if (!payVaultWhenOwnerSettled) return ownerOf;
+        (bool ok, bytes memory ret) = ownerOf.staticcall(abi.encodeWithSignature("state()"));
+        if (!ok || ret.length != 32 || abi.decode(ret, (uint256)) != 2) return ownerOf;
+        (bool vOk, bytes memory vRet) = ownerOf.staticcall(abi.encodeWithSignature("vault()"));
+        if (!vOk || vRet.length != 32) return ownerOf;
+        return abi.decode(vRet, (address));
     }
 
     /// @inheritdoc ILaunchAdapter

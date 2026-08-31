@@ -29,6 +29,52 @@ contract MockWETH is ERC20 {
     }
 }
 
+/// @notice Force-sends its balance to `target`. The one native transfer no
+///         `receive()` guard can refuse — post-EIP-6780 `selfdestruct` still
+///         moves the ether even when the account is not deleted.
+contract ForceSender {
+    constructor(address payable target) payable {
+        selfdestruct(target);
+    }
+}
+
+/// @notice Stands in for a `TokenizeFundStrategy` clone: a CONTRACT that
+///         declares NO `receive()` and NO `fallback()`, because no contract
+///         under `src/strategies/` declares either. That is what calls `launch`
+///         in production, and it is the reason the adapter's native sweep must
+///         not be able to revert a launch — an EOA caller accepts native and so
+///         cannot exhibit this class of bug at all.
+contract StrategyStub {
+    function approve(address token, address spender, uint256 amount) external {
+        IERC20(token).approve(spender, amount);
+    }
+
+    function launch(address adapter, ILaunchAdapter.LaunchParams calldata p)
+        external
+        returns (ILaunchAdapter.LaunchResult memory)
+    {
+        return ILaunchAdapter(adapter).launch(p);
+    }
+
+    function launchWithValue(address adapter, uint256 value, ILaunchAdapter.LaunchParams calldata p)
+        external
+        returns (ILaunchAdapter.LaunchResult memory)
+    {
+        return ILaunchAdapter(adapter).launch{value: value}(p);
+    }
+
+    /// @dev The settle-time handoff: the strategy calls the venue itself.
+    function transferCreator(address launchpad, address token, address newCreator) external {
+        ISushiLaunchpad(launchpad).transferCreator(token, newCreator);
+    }
+}
+
+/// @notice Same caller shape, but able to accept native — used only where the
+///         test is about value flowing BACK to the caller.
+contract PayableStrategyStub is StrategyStub {
+    receive() external payable {}
+}
+
 contract SushiLaunchAdapterTest is Test {
     MockWETH internal weth;
     MockSushiLaunchpad internal pad;
@@ -38,7 +84,11 @@ contract SushiLaunchAdapterTest is Test {
 
     /// @dev Stands in for `TokenizeFundStrategy`: the `launch` caller, and the
     ///      address the custody invariant says must end up holding everything.
-    address internal strategy = makeAddr("strategy");
+    ///      A CONTRACT that cannot receive native, exactly like the real clone.
+    StrategyStub internal stub;
+    PayableStrategyStub internal payableStub;
+    address internal strategy;
+
     address internal vault = makeAddr("vault");
     address internal keeper = makeAddr("keeper");
     address internal feed = makeAddr("priceFeed");
@@ -58,7 +108,12 @@ contract SushiLaunchAdapterTest is Test {
         pad.setQuoteTokenPriceFeed(address(quote), feed);
         pad.setLaunchFee(FEE);
 
+        stub = new StrategyStub();
+        payableStub = new PayableStrategyStub();
+        strategy = address(stub);
+
         _fund(strategy, QUOTE_IN * 10, FEE * 10);
+        _fund(address(payableStub), QUOTE_IN * 10, FEE * 10);
     }
 
     // ── helpers ──
@@ -95,10 +150,12 @@ contract SushiLaunchAdapterTest is Test {
         vm.stopPrank();
     }
 
+    /// @dev Goes through the CONTRACT stub, not a prank: production's caller is
+    ///      a strategy clone, and the difference is load-bearing for the native
+    ///      sweep.
     function _launchAsStrategy() internal returns (ILaunchAdapter.LaunchResult memory res) {
         _approve(strategy, address(quote), QUOTE_IN, FEE);
-        vm.prank(strategy);
-        res = adapter.launch(_params(address(quote), QUOTE_IN, RESERVE, RESERVE));
+        res = stub.launch(address(adapter), _params(address(quote), QUOTE_IN, RESERVE, RESERVE));
     }
 
     // ── custody invariant ──
@@ -134,20 +191,18 @@ contract SushiLaunchAdapterTest is Test {
 
     function test_RevertWhen_MinTokensOutBelowReserve() public {
         _approve(strategy, address(quote), QUOTE_IN, FEE);
-        vm.prank(strategy);
         vm.expectRevert(
             abi.encodeWithSelector(SushiLaunchAdapter.ReserveFloorBelowReserve.selector, RESERVE - 1, RESERVE)
         );
-        adapter.launch(_params(address(quote), QUOTE_IN, RESERVE - 1, RESERVE));
+        stub.launch(address(adapter), _params(address(quote), QUOTE_IN, RESERVE - 1, RESERVE));
     }
 
     function test_RevertWhen_InitialBuyUnderDeliversAgainstVenueFloor() public {
         // 0.1 token per quote → 1 token out against a 5-token floor.
         pad.setRate(1e17);
         _approve(strategy, address(quote), QUOTE_IN, FEE);
-        vm.prank(strategy);
         vm.expectRevert(MockSushiLaunchpad.InsufficientInitialBuyOutput.selector);
-        adapter.launch(_params(address(quote), QUOTE_IN, RESERVE, RESERVE));
+        stub.launch(address(adapter), _params(address(quote), QUOTE_IN, RESERVE, RESERVE));
     }
 
     function test_RevertWhen_VenueUnderDeliversPastItsOwnFloor() public {
@@ -156,16 +211,14 @@ contract SushiLaunchAdapterTest is Test {
         pad.setSkipOutputFloor(true);
         pad.setRate(1e17);
         _approve(strategy, address(quote), QUOTE_IN, FEE);
-        vm.prank(strategy);
         vm.expectRevert(abi.encodeWithSelector(SushiLaunchAdapter.ReserveNotDelivered.selector, 1 ether, RESERVE));
-        adapter.launch(_params(address(quote), QUOTE_IN, RESERVE, RESERVE));
+        stub.launch(address(adapter), _params(address(quote), QUOTE_IN, RESERVE, RESERVE));
     }
 
     function test_RevertWhen_ZeroQuoteIn() public {
         _approve(strategy, address(quote), QUOTE_IN, FEE);
-        vm.prank(strategy);
         vm.expectRevert(SushiLaunchAdapter.ZeroQuoteIn.selector);
-        adapter.launch(_params(address(quote), 0, RESERVE, RESERVE));
+        stub.launch(address(adapter), _params(address(quote), 0, RESERVE, RESERVE));
     }
 
     // ── quote gating: the WOOD path ──
@@ -177,9 +230,8 @@ contract SushiLaunchAdapterTest is Test {
         uint256 wethBefore = weth.balanceOf(strategy);
         _approve(strategy, address(wood), QUOTE_IN, FEE);
 
-        vm.prank(strategy);
         vm.expectRevert(abi.encodeWithSelector(SushiLaunchAdapter.UnsupportedQuote.selector, address(wood)));
-        adapter.launch(_params(address(wood), QUOTE_IN, RESERVE, RESERVE));
+        stub.launch(address(adapter), _params(address(wood), QUOTE_IN, RESERVE, RESERVE));
 
         assertEq(wood.balanceOf(strategy), woodBefore, "no quote pulled");
         assertEq(weth.balanceOf(strategy), wethBefore, "no fee pulled");
@@ -191,8 +243,8 @@ contract SushiLaunchAdapterTest is Test {
         assertTrue(adapter.quoteSupported(address(wood)), "WOOD supported after registration");
 
         _approve(strategy, address(wood), QUOTE_IN, FEE);
-        vm.prank(strategy);
-        ILaunchAdapter.LaunchResult memory res = adapter.launch(_params(address(wood), QUOTE_IN, RESERVE, RESERVE));
+        ILaunchAdapter.LaunchResult memory res =
+            stub.launch(address(adapter), _params(address(wood), QUOTE_IN, RESERVE, RESERVE));
 
         assertEq(IERC20(res.token).balanceOf(strategy), res.reserveHeld);
         assertEq(pad.launchInfo(res.token).quoteToken, address(wood), "paired against WOOD");
@@ -260,8 +312,7 @@ contract SushiLaunchAdapterTest is Test {
         uint256 wethBefore = weth.balanceOf(strategy);
         // Approve far more than the fee: the adapter must still pull only the fee.
         _approve(strategy, address(quote), QUOTE_IN, FEE * 10);
-        vm.prank(strategy);
-        adapter.launch(_params(address(quote), QUOTE_IN, RESERVE, RESERVE));
+        stub.launch(address(adapter), _params(address(quote), QUOTE_IN, RESERVE, RESERVE));
 
         assertEq(wethBefore - weth.balanceOf(strategy), FEE, "exactly the fee, no more");
         assertEq(address(pad).balance, FEE, "fee paid to the venue as native");
@@ -273,19 +324,96 @@ contract SushiLaunchAdapterTest is Test {
         pad.setLaunchFee(0);
         uint256 wethBefore = weth.balanceOf(strategy);
         _approve(strategy, address(quote), QUOTE_IN, 0);
-        vm.prank(strategy);
-        adapter.launch(_params(address(quote), QUOTE_IN, RESERVE, RESERVE));
+        stub.launch(address(adapter), _params(address(quote), QUOTE_IN, RESERVE, RESERVE));
         assertEq(weth.balanceOf(strategy), wethBefore, "no WETH pulled when the venue charges nothing");
     }
 
+    /// @dev Uses the RECEIVING stub: attaching value at all requires a caller
+    ///      that can hold native, and getting it back requires one that can
+    ///      accept it. The real strategy clone is neither — see
+    ///      `test_Launch_SurvivesNativeForceSentToTheAdapter` for what happens
+    ///      then.
     function test_Launch_SweepsAttachedValueBackToTheCaller() public {
-        vm.deal(strategy, 1 ether);
-        _approve(strategy, address(quote), QUOTE_IN, FEE);
-        uint256 nativeBefore = strategy.balance;
-        vm.prank(strategy);
-        adapter.launch{value: 0.3 ether}(_params(address(quote), QUOTE_IN, RESERVE, RESERVE));
-        assertEq(strategy.balance, nativeBefore, "attached value returned in full");
+        address caller = address(payableStub);
+        vm.deal(caller, 1 ether);
+        _approve(caller, address(quote), QUOTE_IN, FEE);
+        uint256 nativeBefore = caller.balance;
+        payableStub.launchWithValue(address(adapter), 0.3 ether, _params(address(quote), QUOTE_IN, RESERVE, RESERVE));
+        assertEq(caller.balance, nativeBefore, "attached value returned in full");
         assertEq(address(adapter).balance, 0);
+    }
+
+    // ── native force-send: the sweep must never brick a shared singleton ──
+
+    /// @dev Control for the regression below: the production caller shape (a
+    ///      contract with no `receive`/`fallback`) launches cleanly when the
+    ///      adapter carries no native.
+    function test_Launch_ThroughANonReceivingStrategyContractSucceeds() public {
+        assertEq(address(adapter).balance, 0, "no dust to start");
+
+        ILaunchAdapter.LaunchResult memory res = _launchAsStrategy();
+
+        assertEq(IERC20(res.token).balanceOf(strategy), res.reserveHeld, "reserve delivered to the contract caller");
+        assertEq(pad.launchInfo(res.token).creator, strategy, "creator handed over in-tx");
+        assertEq(address(adapter).balance, 0, "adapter holds no native");
+
+        // The caller genuinely cannot take native — this is the property the
+        // whole regression rests on.
+        assertEq(strategy.balance, 0, "the strategy holds no native");
+        vm.deal(address(this), 1);
+        (bool ok,) = strategy.call{value: 1}("");
+        assertFalse(ok, "the strategy clone shape rejects native");
+    }
+
+    /// @dev THE REGRESSION. One wei force-sent by `selfdestruct` used to make
+    ///      `_sweepNative` revert on every subsequent `launch`, for every fund,
+    ///      permanently: the caller is a contract that cannot accept the send,
+    ///      and that sweep was the only path moving native off this shared,
+    ///      certified singleton. The sweep is now best-effort, so the wei is
+    ///      inert.
+    function test_Launch_SurvivesNativeForceSentToTheAdapter() public {
+        new ForceSender{value: 1}(payable(address(adapter)));
+        assertEq(address(adapter).balance, 1, "no `receive()` guard can refuse a force-send");
+
+        // Approve first: `vm.expectEmit` must be the last thing before the call
+        // whose logs it inspects.
+        _approve(strategy, address(quote), QUOTE_IN, FEE);
+        vm.expectEmit(true, false, false, true, address(adapter));
+        emit SushiLaunchAdapter.NativeSweepSkipped(strategy, 1);
+        ILaunchAdapter.LaunchResult memory res =
+            stub.launch(address(adapter), _params(address(quote), QUOTE_IN, RESERVE, RESERVE));
+
+        // The launch's own outputs are untouched by the stranded wei.
+        assertEq(res.quoteSpent, QUOTE_IN, "buy consumed in full");
+        assertEq(IERC20(res.token).balanceOf(strategy), res.reserveHeld, "reserve still delivered to the strategy");
+        assertGe(res.reserveHeld, RESERVE, "reserve floor still honoured");
+        assertEq(pad.launchInfo(res.token).creator, strategy, "creator role still transferred");
+        assertEq(quote.allowance(address(adapter), address(pad)), 0, "no standing allowance");
+        assertEq(quote.balanceOf(address(adapter)), 0, "token sweeps still assert clean");
+        assertEq(IERC20(res.token).balanceOf(address(adapter)), 0);
+
+        // The wei stays put: it is nobody's, and no accounting reads it.
+        assertEq(address(adapter).balance, 1, "unsendable wei left in place, not reverted over");
+
+        // And it is not a one-shot: the adapter keeps serving, launch after launch.
+        ILaunchAdapter.LaunchResult memory res2 = _launchAsStrategy();
+        assertTrue(res2.token != res.token, "a second launch still goes through");
+        assertEq(address(adapter).balance, 1);
+    }
+
+    /// @dev The best-effort path still SWEEPS whenever the send can land: a
+    ///      caller that accepts native collects whatever an attacker stranded.
+    function test_Launch_ForceSentNativeIsSweptByACallerThatCanReceive() public {
+        new ForceSender{value: 1}(payable(address(adapter)));
+        assertEq(address(adapter).balance, 1);
+
+        address caller = address(payableStub);
+        uint256 nativeBefore = caller.balance;
+        _approve(caller, address(quote), QUOTE_IN, FEE);
+        payableStub.launch(address(adapter), _params(address(quote), QUOTE_IN, RESERVE, RESERVE));
+
+        assertEq(caller.balance, nativeBefore + 1, "stranded wei goes to the next caller that can take it");
+        assertEq(address(adapter).balance, 0, "adapter clean again");
     }
 
     // ── receive() ──
@@ -364,8 +492,7 @@ contract SushiLaunchAdapterTest is Test {
         // the adapter supplies only the target address and the ref-is-the-token
         // keying. (Resolve the target BEFORE the prank: it is itself a call.)
         address target = adapter.launchTarget();
-        vm.prank(strategy);
-        ISushiLaunchpad(target).transferCreator(res.token, vault);
+        stub.transferCreator(target, res.token, vault);
         assertEq(pad.launchInfo(res.token).creator, vault);
 
         pad.setFeesOwed(res.token, 2 ether, 4 ether);

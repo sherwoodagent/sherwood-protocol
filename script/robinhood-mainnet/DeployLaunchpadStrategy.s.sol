@@ -3,7 +3,7 @@ pragma solidity 0.8.28;
 
 import {console} from "forge-std/Script.sol";
 import {ScriptBase} from "../ScriptBase.sol";
-import {TokenizeFundStrategy} from "../../src/strategies/TokenizeFundStrategy.sol";
+import {LaunchpadStrategy} from "../../src/strategies/LaunchpadStrategy.sol";
 import {SushiLaunchAdapter} from "../../src/adapters/SushiLaunchAdapter.sol";
 import {StonkLaunchAdapter} from "../../src/adapters/StonkLaunchAdapter.sol";
 import {ISushiLaunchpad} from "../../src/vendor/sushi/ISushiLaunchpad.sol";
@@ -11,7 +11,7 @@ import {IStonkSafeLaunchpadV2} from "../../src/vendor/stonkbrokers/IStonkSafeLau
 import {ITierRegistry} from "../../src/interfaces/ITierRegistry.sol";
 
 /**
- * @notice Deploy the TokenizeFundStrategy template with BOTH launch adapters —
+ * @notice Deploy the LaunchpadStrategy template with BOTH launch adapters —
  *         SushiLaunchAdapter and StonkLaunchAdapter — to Robinhood Chain
  *         mainnet (chain 4663).
  *
@@ -39,17 +39,17 @@ import {ITierRegistry} from "../../src/interfaces/ITierRegistry.sol";
  *       Gate B, docs/adapter-onboarding-checklist.md).
  *     - `setCounterpartyAllowed(SUSHI_LAUNCHPAD_V1, true)` and the same for
  *       every Smart Launch pad the Stonk adapter serves.
- *     - `StrategyFactory.setTemplateApproval(TOKENIZE_FUND_TEMPLATE, true)`.
+ *     - `StrategyFactory.setTemplateApproval(LAUNCHPAD_TEMPLATE, true)`.
  *
  *   Record the printed `padSetHash` with the certification: the codehash gate
  *   pins the Stonk adapter's CODE, and that hash is the only on-chain witness
  *   of the lane CONFIGURATION the code was certified against.
  *
  *   Usage:
- *     forge script script/robinhood-mainnet/DeployTokenizeFundStrategy.s.sol:DeployTokenizeFundStrategy \
+ *     forge script script/robinhood-mainnet/DeployLaunchpadStrategy.s.sol:DeployLaunchpadStrategy \
  *       --rpc-url robinhood --account sherwood-deployer --broadcast
  */
-contract DeployTokenizeFundStrategy is ScriptBase {
+contract DeployLaunchpadStrategy is ScriptBase {
     /// @dev Robinhood Chain MaxCodeSize is 98,304 bytes (4x EIP-170).
     uint256 constant ROBINHOOD_MAX_CODE_SIZE = 98_304;
 
@@ -72,7 +72,7 @@ contract DeployTokenizeFundStrategy is ScriptBase {
         SushiLaunchAdapter adapter = new SushiLaunchAdapter(launchpad);
         (address[] memory quotes, address[] memory pads) = _stonkLaneSet();
         StonkLaunchAdapter stonkAdapter = new StonkLaunchAdapter(quotes, pads, _readAddress("SAFE_LAUNCH_LENS_V2"));
-        TokenizeFundStrategy template = new TokenizeFundStrategy();
+        LaunchpadStrategy template = new LaunchpadStrategy();
 
         vm.stopBroadcast();
 
@@ -82,10 +82,10 @@ contract DeployTokenizeFundStrategy is ScriptBase {
 
         _patchAddress("SUSHI_LAUNCH_ADAPTER", address(adapter));
         _patchAddress("STONK_LAUNCH_ADAPTER", address(stonkAdapter));
-        _patchAddress("TOKENIZE_FUND_TEMPLATE", address(template));
+        _patchAddress("LAUNCHPAD_TEMPLATE", address(template));
         console.log("SushiLaunchAdapter:   ", address(adapter));
         console.log("StonkLaunchAdapter:   ", address(stonkAdapter));
-        console.log("TokenizeFundStrategy: ", address(template));
+        console.log("LaunchpadStrategy:    ", address(template));
         console.log("StonkLaunchAdapter padSetHash:");
         console.logBytes32(stonkAdapter.padSetHash());
 

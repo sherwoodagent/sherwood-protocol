@@ -1,14 +1,14 @@
-# tokenize-fund-strategy
+# launchpad-strategy
 
 ## Purpose
 
-The tokenize-fund strategy template lets a syndicate "IPO" onchain: launch a fund token on an allowlisted launch venue with vault capital, retain a reserve, and distribute that reserve pro-rata to the fund's share holders — a secondary market per fund, with the deposit/redeem queue no longer the only liquidity. The template's defining constraint is that it deliberately acquires an asset the protocol must refuse to price: everything in this spec about settlement exists to keep that asset out of the vault's NAV until it is either claimed or warehoused unpriced.
+The launchpad strategy template lets a syndicate "IPO" onchain: launch a fund token on an allowlisted launch venue with vault capital, retain a reserve, and distribute that reserve pro-rata to the fund's share holders — a secondary market per fund, with the deposit/redeem queue no longer the only liquidity. The template's defining constraint is that it deliberately acquires an asset the protocol must refuse to price: everything in this spec about settlement exists to keep that asset out of the vault's NAV until it is either claimed or warehoused unpriced.
 
 ## ADDED Requirements
 
 ### Requirement: One-shot lifecycle on BaseStrategy
 
-`src/strategies/TokenizeFundStrategy.sol` SHALL extend `BaseStrategy` and inherit its full posture unchanged: template init-lock in the constructor, one-shot `initialize`, vault-only `execute()` bound to the governor's active proposal, vault-only `settle()` deliberately unbound, and the live `isAgent` re-check on every proposer-gated call. Initialization SHALL decode a single struct (the `ConcentratedLiquidityStrategy` precedent) carrying: launch adapter, swap adapter, launch params (name, symbol, quote token, quote budget, min tokens out, venue data), `reserveAmount`, claim-window duration, and slippage bounds for quote routing.
+`src/strategies/LaunchpadStrategy.sol` SHALL extend `BaseStrategy` and inherit its full posture unchanged: template init-lock in the constructor, one-shot `initialize`, vault-only `execute()` bound to the governor's active proposal, vault-only `settle()` deliberately unbound, and the live `isAgent` re-check on every proposer-gated call. Initialization SHALL decode a single struct (the `ConcentratedLiquidityStrategy` precedent) carrying: launch adapter, swap adapter, launch params (name, symbol, quote token, quote budget, min tokens out, venue data), `reserveAmount`, claim-window duration, and slippage bounds for quote routing.
 
 Initialization SHALL fail closed: registry unresolved reverts; launch adapter and swap adapter must pass `isAdapterAllowed`; `quoteSupported(quoteToken)` must answer true; the configured claim window must satisfy `configuredWindow ≤ MAX_CLAIM_WINDOW`, a template constant and the only ceiling that survives a corrupt governor decode at execute (see the settlement requirement); slippage must sit inside its bounds; and `reserveAmount ≤ launchSupply × MAX_RESERVE_BPS / 10_000`, where `MAX_RESERVE_BPS` is a template constant fixed at `2_000` (20%) and `launchSupply` is DECLARED by the proposer at init and VERIFIED at execute against the launched token's own `totalSupply()` — the template stays venue-agnostic about how supply is decided (Sushi fixes it at 1e9 × 1e18, StonkBrokers takes it from `venueData`), and the execute-time equality is what stops a proposer from inflating the declared figure to lift their own ceiling. `quoteIn` SHALL NOT exceed the proposal's vault-asset budget. `updateParams` SHALL permit only `minTokensOut`, slippage floors, and the launch deadline, only before execution, and only in the tightening direction — `minTokensOut` may be raised, never lowered.
 
@@ -89,6 +89,37 @@ For a venue whose launch is still in `Curve`/`Closing`/`Failed` phase at settlem
 #### Scenario: Donation to a strategy that settled already clear
 - **WHEN** a strategy settles with fund-token custody already below `RESIDUE_DUST` — only vault-asset residue outstanding, so no clearing `sweep()` ever runs — and someone later donates fund tokens to it
 - **THEN** `hasUnvaluedResidue()` stays false, `collectResidue` cannot re-mark the strategy, and no deposit lock is re-stamped
+
+### Requirement: Fee routing is a per-proposal choice
+
+The proposal SHALL choose, at initialization, where the venue's creator-fee stream goes, via a `FeeMode` whose zero value is `ToVault` — so the default is the behaviour that existed before this option and an un-set field cannot silently redirect a fund's fees.
+
+- `ToVault`: fees reach the vault and lift every holder's share price. Nothing else changes.
+- `ToDepositors`: fees collected DURING the claim window are added to the claimable reserve, so the snapshot holders take them pro-rata alongside their slice of the launch.
+
+A permissionless `collectFees()` SHALL exist on the strategy, callable only while the clone is `Executed` and at or before `windowEnd`. It SHALL drive the adapter's collection through a call whose failure is tolerated, measure what arrived by the strategy's OWN balance deltas rather than by the adapter's return values, and — under `ToDepositors` only — add the launch-token delta to the reserve. Quote proceeds stay on the strategy in both modes, where settlement's existing conversion handles them.
+
+THE TIMING IS THE REQUIREMENT, not an implementation detail. Collecting at settlement cannot serve `ToDepositors` at all: `settle()` is gated on the claim window having already closed, so anything added to the reserve then is unclaimable by construction. Collection therefore happens inside the window, and it is permissionless precisely so a keeper or any holder can top the pot up before the window shuts.
+
+`MAX_RESERVE_BPS` SHALL NOT be re-applied to the grown reserve, and that is deliberate. The cap exists to stop a proposer HOLDING BACK float at launch — supply withheld from the market and handed to a chosen snapshot — and its teeth are the execute-time supply check. Fees are post-launch EARNED value on liquidity the fund already paid for, so clamping them would cap the fund's own income against a ceiling written for a different adversary, and would strand the excess in a settled clone for no stated reason. The launch-time reserve stays capped; the pot it grows into does not.
+
+Because the reserve can now GROW after some holders have claimed, per-holder claim accounting SHALL be an ACCUMULATOR — entitlement is the holder's pro-rata share of the current reserve minus what they have already taken — and a holder MAY claim more than once. Adversary the accumulator answers: a once-only claim flag would permanently under-pay whoever claimed before a top-up, turning an early claim into a penalty and handing the difference to whoever waited.
+
+#### Scenario: Fees enlarge the pot mid-window
+- **WHEN** `feeMode` is `ToDepositors` and `collectFees()` lands launch tokens while the window is open
+- **THEN** the reserve grows, a holder who already claimed can claim exactly the increment, and a holder claiming for the first time receives their full share of the enlarged reserve
+
+#### Scenario: Collection outside the window
+- **WHEN** `collectFees()` is called before execution or after `windowEnd`
+- **THEN** it reverts, and no reserve accounting changes
+
+#### Scenario: Vault mode is unaffected
+- **WHEN** `feeMode` is `ToVault` and the same collection happens
+- **THEN** the reserve is unchanged and the tokens reach the vault through settlement and `sweep()` as before
+
+#### Scenario: Sum of claims is still bounded
+- **WHEN** the reserve grows arbitrarily between claims
+- **THEN** the sum of everything claimed never exceeds the reserve
 
 ### Requirement: Fee-stream custody after settlement
 

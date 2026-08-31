@@ -226,8 +226,11 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///         to call in any phase. A refused leg reverted its own state, so
     ///         nothing moved and anyone may retry it forever.
     event VenueLegSkipped(bytes32 indexed leg);
-    /// @notice Creator fees that landed on the owning strategy.
-    event FeesCollected(address indexed owner, uint256 quoteOut, uint256 tokenOut);
+    /// @notice Creator fees swept out of the clone. `destination` is the owning
+    ///         strategy before it settles and the strategy's VAULT after, so
+    ///         the two lanes of `cloneCollectFees` are distinguishable on-chain
+    ///         rather than both reading as "paid the owner".
+    event FeesCollected(address indexed owner, address indexed destination, uint256 quoteOut, uint256 tokenOut);
     /// @notice The post-settlement lane: everything the clone held, delivered
     ///         to the owning strategy's vault.
     event ForwardedToVault(address indexed vault, uint256 quoteOut, uint256 tokenOut);
@@ -455,8 +458,11 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     }
 
     /// @inheritdoc ILaunchAdapter
-    /// @dev Routes to the clone, which pays its OWNER and nobody else. A forged
-    ///      ref answers `(0, 0)` without calling the supplied address.
+    /// @dev PURE ROUTING: it measures nothing of its own and forwards the
+    ///      clone's report verbatim, so the clone's destination switch is
+    ///      inherited whole — the OWNER before settlement, the owner's VAULT
+    ///      after, and the caller never. A forged ref answers `(0, 0)` without
+    ///      calling the supplied address.
     ///      Typed rather than raw, unlike the Sushi adapter's venue call: the
     ///      callee here is THIS CODE, written not to revert when nothing has
     ///      accrued, so a revert would be a bug worth surfacing rather than a
@@ -781,18 +787,55 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         }
     }
 
-    /// @notice Sweep accrued creator fees to the OWNING STRATEGY.
+    /// @notice Sweep accrued creator fees out of the clone — to the OWNING
+    ///         STRATEGY before it settles, to the strategy's VAULT after.
     ///
-    /// @dev PERMISSIONLESS, and it pays the owner whoever calls — the payee is
-    ///      fixed in storage, so there is no version of this that pays a keeper.
+    /// @dev PERMISSIONLESS, and it never pays the caller. The gate here is on
+    ///      WHERE VALUE GOES, never on who calls: the destination is read from
+    ///      storage and from the owner's own state, so there is no version of
+    ///      this that pays a keeper. A keeper flushing a fund's fee stream is a
+    ///      service the fund wants, and it stays one on both lanes.
+    ///
+    ///      WHY THE DESTINATION SWITCHES AT SETTLEMENT. Post-settlement creator
+    ///      fees must NEVER transit strategy custody (design Decision 4, and
+    ///      the fee-stream requirement in the strategy spec). This is not an
+    ///      accounting nicety and it is not about stranding value — value in
+    ///      settled-strategy custody is still reachable, because
+    ///      `SyndicateVault.collectResidue` sweeps BEFORE its tracked gate. It
+    ///      is about a LOCK LEVER: until the strategy's residue latch has
+    ///      armed, every arrival into settled-strategy custody lets a
+    ///      permissionless `collectResidue` re-stamp a fresh 7-day
+    ///      `depositsLocked` episode on the vault. Left ungated, this verb
+    ///      would hand any passer-by exactly that lever for the price of gas —
+    ///      the one the vault-direct post-settlement routing exists to remove.
+    ///      Paying the vault instead skips strategy custody entirely and closes
+    ///      it, while `forwardToVault`'s lane stays available as before.
+    ///
+    ///      SETTLED BUT THE VAULT IS UNREADABLE -> NO-OP, `(0, 0)`. Falling
+    ///      back to the owner would silently reopen the lever this branch
+    ///      closes, and guessing a destination is not on the table either. So
+    ///      the call moves nothing and reports nothing, leaving the value where
+    ///      it already is: ON THE CLONE, which is the custodian in every case
+    ///      anyway. Nothing is stranded — a later call here, or
+    ///      `forwardToVault`, delivers it in full once `vault()` reads. Unlike
+    ///      `forwardToVault` this does NOT revert: `TokenizeFundStrategy`
+    ///      settlement calls the routing verb unconditionally, and a revert
+    ///      there is a settlement path held hostage by an owner read.
+    ///
+    ///      `_ownerSettled` keeps its fail-closed posture unchanged: unreadable
+    ///      means NOT settled, which on this verb means the pre-settlement lane
+    ///      — the same destination this verb has always used, for an owner that
+    ///      by that same read is still running.
     ///
     ///      WHY THE FORWARD IS NECESSARY, unlike on Sushi. The venue's
     ///      `flushCreatorQuote` pays THE CREATOR, and the creator is this
     ///      CLONE, not the strategy. Sushi's `distributeFees` pays a creator
     ///      that IS the strategy, so its adapter only has to measure. Here the
     ///      value physically lands on the clone and has to be moved on, which
-    ///      is why the deltas below are measured on the OWNER: what actually
-    ///      arrived, not what the venue said it paid.
+    ///      is why the deltas below are measured on the RESOLVED DESTINATION —
+    ///      what actually arrived where it was actually sent, not what the
+    ///      venue said it paid, and not a fixed address the post-settlement
+    ///      lane would report zeros against while value moved.
     ///
     ///      `(0, 0)` RATHER THAN A REVERT when nothing accrued: the venue call
     ///      is tolerated (a paused pad, a launch with no trades) and the
@@ -806,22 +849,29 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         address token = launchToken;
         if (owner_ == address(0) || padAddress == address(0) || token == address(0)) return (0, 0);
 
+        // The destination — never the caller — is what settlement switches.
+        address destination = owner_;
+        if (_ownerSettled(owner_)) {
+            destination = _readVault(owner_);
+            if (destination == address(0)) return (0, 0);
+        }
+
         address quoteAsset = laneQuote;
-        uint256 quoteBefore = _balanceOf(quoteAsset, owner_);
-        uint256 tokenBefore = _balanceOf(token, owner_);
+        uint256 quoteBefore = _balanceOf(quoteAsset, destination);
+        uint256 tokenBefore = _balanceOf(token, destination);
 
         // solhint-disable-next-line avoid-low-level-calls
         (bool flushed,) = padAddress.call(abi.encodeCall(IStonkSafeLaunchpadV2.flushCreatorQuote, (launchId)));
         if (!flushed) emit VenueLegSkipped("flushCreatorQuote");
 
-        _forward(quoteAsset, owner_);
-        if (token != quoteAsset) _forward(token, owner_);
+        _forward(quoteAsset, destination);
+        if (token != quoteAsset) _forward(token, destination);
 
-        uint256 quoteAfter = _balanceOf(quoteAsset, owner_);
-        uint256 tokenAfter = _balanceOf(token, owner_);
+        uint256 quoteAfter = _balanceOf(quoteAsset, destination);
+        uint256 tokenAfter = _balanceOf(token, destination);
         quoteOut = quoteAfter > quoteBefore ? quoteAfter - quoteBefore : 0;
         tokenOut = tokenAfter > tokenBefore ? tokenAfter - tokenBefore : 0;
-        emit FeesCollected(owner_, quoteOut, tokenOut);
+        emit FeesCollected(owner_, destination, quoteOut, tokenOut);
     }
 
     /// @notice Cancel the launch and take the armed supply back.
