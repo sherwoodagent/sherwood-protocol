@@ -284,11 +284,7 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
             swapAdapter: address(adapter),
             morpho: address(0),
             marketParams: MarketParams({
-                loanToken: address(0),
-                collateralToken: address(0),
-                oracle: address(0),
-                irm: address(0),
-                lltv: 0
+                loanToken: address(0), collateralToken: address(0), oracle: address(0), irm: address(0), lltv: 0
             }),
             collateralAmount: 0,
             borrowAmount: 0,

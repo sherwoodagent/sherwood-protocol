@@ -32,11 +32,7 @@ contract UnleveredConcentratedLiquidityTest is CLFixture {
         p = _defaultParams();
         p.morpho = address(0);
         p.marketParams = MarketParams({
-            loanToken: address(0),
-            collateralToken: address(0),
-            oracle: address(0),
-            irm: address(0),
-            lltv: 0
+            loanToken: address(0), collateralToken: address(0), oracle: address(0), irm: address(0), lltv: 0
         });
         p.collateralAmount = 0;
         p.borrowAmount = 0;
