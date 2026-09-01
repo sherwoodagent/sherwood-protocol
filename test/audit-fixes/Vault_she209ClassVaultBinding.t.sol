@@ -85,8 +85,7 @@ contract VaultShe209ClassVaultBindingTest is Test {
         SyndicateVault impl = new SyndicateVault();
         bytes memory initData = abi.encodeCall(
             SyndicateVault.initialize,
-            (
-                ISyndicateVault.InitParams({
+            (ISyndicateVault.InitParams({
                     asset: address(usdc),
                     name: "Sherwood Vault",
                     symbol: "swUSDC",
@@ -95,8 +94,7 @@ contract VaultShe209ClassVaultBindingTest is Test {
                     openDeposits: true,
                     agentRegistry: address(agentRegistry),
                     managementFeeBps: 0
-                })
-            )
+                }))
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(impl), initData))));
 
@@ -120,9 +118,7 @@ contract VaultShe209ClassVaultBindingTest is Test {
     function _transferBatch(address recipient) internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc),
-            value: 0,
-            data: abi.encodeCall(IERC20.transfer, (recipient, 0))
+            target: address(usdc), value: 0, data: abi.encodeCall(IERC20.transfer, (recipient, 0))
         });
     }
 
