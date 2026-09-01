@@ -1804,7 +1804,24 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // `executeBy` fail the quorum and brick an otherwise-covered proposal.
         // STRICTLY after `executeBy`, since a proposal is executable while
         // `block.timestamp <= executeBy`.
-        if (pv.executeBy == 0 || block.timestamp <= pv.executeBy) revert ReviewNotClosed();
+        //
+        // OR EXECUTED, WHICHEVER COMES FIRST (SHE-225). `executedAt != 0` means
+        // `requireApproveQuorum` has already run its single call site
+        // (`SyndicateGovernor._deriveAndStoreEffectiveCapital`, reached only from
+        // `executeProposal`, once) and can never run again, so the price-drift
+        // brick the `executeBy` deadline guards against is unreachable — there is
+        // no later quorum left to fail. The deadline branch stays for a proposal
+        // that expired unexecuted, which has no execution to hang this on.
+        //
+        // WITHOUT THIS the collapse is not reliably triggered at all: a proposal
+        // that settles BEFORE its own `executeBy` takes
+        // `_settleCoverageBestEffort`'s silent-skip branch, leaving
+        // `reclaimProposerBond` — an action on the proposer's own schedule — as
+        // the only remaining caller. The A-fold reservation then outlives the
+        // proposal, consuming cohort capacity at N x the true rate.
+        if (pv.executedAt == 0 && (pv.executeBy == 0 || block.timestamp <= pv.executeBy)) {
+            revert ReviewNotClosed();
+        }
 
         uint256 reservedTotal = _committedUsd[key];
         if (reservedTotal == 0) {

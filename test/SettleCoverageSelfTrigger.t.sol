@@ -141,6 +141,10 @@ contract SettleCoverageSelfTriggerTest is Test {
 
     uint256 constant MAX_CAPITAL = 1_000e6; // $1,000 tier-2 notional
     uint256 constant COVERAGE_USD = 1_000e18;
+    /// @dev Each of the four equal approvers' pro-rata share once the
+    ///      A-fold reservation collapses: 4,000e18 reserved against a
+    ///      1,000e18 need -> 250e18 each, summing back to the need exactly.
+    uint256 constant SHARE_USD = COVERAGE_USD / 4;
     uint256 constant BOND_WOOD = 200e18; // $1,000 x 1% / $0.05
 
     function setUp() public {
@@ -396,10 +400,13 @@ contract SettleCoverageSelfTriggerTest is Test {
 
     function test_settleProposal_pastExecuteBy_collapsesReservations() public {
         uint256 pid = _proposeApproveExecute(3 days);
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "g1 reserves full coverage pre-settle");
-        assertEq(ledger.openExposureUsd(g2), COVERAGE_USD, "g2 reserves full coverage pre-settle");
-        assertEq(ledger.openExposureUsd(g3), COVERAGE_USD, "g3 reserves full coverage pre-settle");
-        assertEq(ledger.openExposureUsd(g4), COVERAGE_USD, "g4 reserves full coverage pre-settle");
+        // SHE-225: the collapse now lands AT EXECUTE, so the A-fold reservation
+        // is already gone before settlement runs. Settlement re-running the pass
+        // is idempotent, which is what the rest of this test pins.
+        assertEq(ledger.openExposureUsd(g1), SHARE_USD, "g1 already collapsed at execute");
+        assertEq(ledger.openExposureUsd(g2), SHARE_USD, "g2 already collapsed at execute");
+        assertEq(ledger.openExposureUsd(g3), SHARE_USD, "g3 already collapsed at execute");
+        assertEq(ledger.openExposureUsd(g4), SHARE_USD, "g4 already collapsed at execute");
 
         uint256 executeBy = govA.getProposal(pid).executeBy;
         vm.warp(govA.getProposal(pid).executedAt + 3 days);
@@ -412,18 +419,91 @@ contract SettleCoverageSelfTriggerTest is Test {
 
         Vm.Log[] memory logs = vm.getRecordedLogs();
         assertEq(_countCoverageSettleFailed(logs, address(govA)), 0, "no failure expected");
-        assertEq(_countCoverageSettled(logs, address(ledger)), 1, "ledger settled exactly once");
+        assertEq(_countCoverageSettled(logs, address(ledger)), 1, "settlement re-runs the pass idempotently");
 
         // Pro-rata: 4 equal approvers, aggregate reserved 4,000e18 vs a
-        // 1,000e18 need -> 250e18 each, summing back to the need exactly.
-        assertEq(ledger.openExposureUsd(g1), 250e18, "g1 collapses to its pro-rata share");
-        assertEq(ledger.openExposureUsd(g2), 250e18, "g2 collapses to its pro-rata share");
-        assertEq(ledger.openExposureUsd(g3), 250e18, "g3 collapses to its pro-rata share");
-        assertEq(ledger.openExposureUsd(g4), 250e18, "g4 collapses to its pro-rata share");
+        // 1,000e18 need -> 250e18 each, summing back to the need exactly. The
+        // re-run at settlement re-derives the same split from unchanged pledges.
+        assertEq(ledger.openExposureUsd(g1), SHARE_USD, "g1 holds its pro-rata share");
+        assertEq(ledger.openExposureUsd(g2), SHARE_USD, "g2 holds its pro-rata share");
+        assertEq(ledger.openExposureUsd(g3), SHARE_USD, "g3 holds its pro-rata share");
+        assertEq(ledger.openExposureUsd(g4), SHARE_USD, "g4 holds its pro-rata share");
     }
 
-    // ── 3.2 Proposer self-settle before executeBy skips the trigger silently ──
+    // ── 3.1b The execute-time collapse itself (SHE-225 regression) ──
 
+    /// @notice THE SHE-225 REGRESSION. Before the fix the cohort left
+    ///         `executeProposal` holding `A x coverage` and only
+    ///         `_settleCoverageBestEffort` (past `executeBy`) or
+    ///         `reclaimProposerBond` could collapse it — so a proposal settling
+    ///         inside its own window kept every approver locked at N x their
+    ///         real share indefinitely. The collapse now runs inside
+    ///         `executeProposal`, after the `requireApproveQuorum` gate.
+    function test_executeProposal_collapsesReservationsImmediately() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA, 3 days);
+        _openReview(govA, pid);
+        _voteAllFour(govA, pid);
+        _pastReview(govA, pid);
+
+        // Every approver holds the FULL coverage right up to the execute call.
+        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "g1 holds full coverage pre-execute");
+        assertEq(ledger.openExposureUsd(g4), COVERAGE_USD, "g4 holds full coverage pre-execute");
+
+        vm.recordLogs();
+        govA.executeProposal(pid);
+        assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Executed));
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(_countCoverageSettled(logs, address(ledger)), 1, "execute collapses the cohort exactly once");
+        assertEq(_countCoverageSettleFailed(logs, address(govA)), 0, "no failure on the execute-time pass");
+
+        assertEq(ledger.openExposureUsd(g1), SHARE_USD, "g1 collapsed at execute");
+        assertEq(ledger.openExposureUsd(g2), SHARE_USD, "g2 collapsed at execute");
+        assertEq(ledger.openExposureUsd(g3), SHARE_USD, "g3 collapsed at execute");
+        assertEq(ledger.openExposureUsd(g4), SHARE_USD, "g4 collapsed at execute");
+    }
+
+    /// @notice The collapse must not cost the proposal any capital: a
+    ///         fully-covered proposal keeps `MAX_CAPITAL` across it.
+    ///
+    /// @dev    NOT AN ORDERING CONTROL, DELIBERATELY LABELLED SO. Moving the
+    ///         `settleCoverage` call ahead of `requireApproveQuorum` leaves this
+    ///         test GREEN — verified by mutation, not assumed. At the shipped
+    ///         `kNumerator == 1` a guardian's aggregate booking is capped at its
+    ///         own slashable bond, so `slashable / liveTotal >= 1`,
+    ///         `_sharedSlashableUsd` returns the booking unchanged, and the
+    ///         cross-proposal haircut the ordering guards against cannot bite at
+    ///         all. Collapse-first would only shave the gate's MARGIN (summing to
+    ///         exactly `needUsd` rather than the A-fold aggregate), which this
+    ///         fixture cannot distinguish.
+    ///
+    ///         A real ordering control needs `setKNumerator(2)` plus a guardian
+    ///         over-committed across govA and govB — see SHE-225. Left unbuilt
+    ///         rather than left here looking like proof it is not.
+    function test_executeProposal_collapseDoesNotScaleDownCapital() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA, 3 days);
+        _openReview(govA, pid);
+        _voteAllFour(govA, pid);
+        _pastReview(govA, pid);
+        govA.executeProposal(pid);
+
+        assertEq(
+            govA.getProposal(pid).effectiveMaxCapital,
+            MAX_CAPITAL,
+            "fully-covered proposal keeps its full capital across the execute-time collapse"
+        );
+    }
+
+    // ── 3.2 Proposer self-settle before executeBy: nothing left to collapse ──
+
+    /// @notice PREVIOUSLY ASSERTED THE BUG. This test used to pin
+    ///         "reservations untouched — the documented silent skip", which is
+    ///         precisely SHE-225: a proposal settling inside its own window took
+    ///         the silent-skip branch and left every approver locked at the full
+    ///         coverage with only the proposer's own `reclaimProposerBond` able
+    ///         to release it. The settlement-time trigger still skips here (that
+    ///         part is unchanged and still worth pinning) — but the execute-time
+    ///         collapse means there is nothing left for it to do.
     function test_settleProposal_beforeExecuteBy_proposerSelfSettle_skipsSilently() public {
         uint256 pid = _proposeApproveExecute(7 days);
         uint256 executeBy = govA.getProposal(pid).executeBy;
@@ -438,13 +518,17 @@ contract SettleCoverageSelfTriggerTest is Test {
 
         Vm.Log[] memory logs = vm.getRecordedLogs();
         assertEq(_countCoverageSettleFailed(logs, address(govA)), 0, "no failed event on the documented skip");
-        assertEq(_countCoverageSettled(logs, address(ledger)), 0, "ledger never called before executeBy");
+        assertEq(
+            _countCoverageSettled(logs, address(ledger)), 0, "settlement-time trigger still skips before executeBy"
+        );
 
-        // Reservations untouched — the documented silent skip.
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "g1 unchanged");
-        assertEq(ledger.openExposureUsd(g2), COVERAGE_USD, "g2 unchanged");
-        assertEq(ledger.openExposureUsd(g3), COVERAGE_USD, "g3 unchanged");
-        assertEq(ledger.openExposureUsd(g4), COVERAGE_USD, "g4 unchanged");
+        // SHE-225: collapsed at execute, so the skip above costs nothing. Before
+        // the fix these four read COVERAGE_USD — 4x the real share, on a
+        // finished proposal, with no caller able to release it.
+        assertEq(ledger.openExposureUsd(g1), SHARE_USD, "g1 collapsed at execute, not left at 4x");
+        assertEq(ledger.openExposureUsd(g2), SHARE_USD, "g2 collapsed at execute, not left at 4x");
+        assertEq(ledger.openExposureUsd(g3), SHARE_USD, "g3 collapsed at execute, not left at 4x");
+        assertEq(ledger.openExposureUsd(g4), SHARE_USD, "g4 collapsed at execute, not left at 4x");
     }
 
     // ── 3.3 Failure isolation ──
@@ -471,9 +555,12 @@ contract SettleCoverageSelfTriggerTest is Test {
         assertEq(_countCoverageSettleFailed(logs, address(govA)), 1, "CoverageSettleFailed emitted exactly once");
         assertEq(_countCoverageSettled(logs, address(ledger)), 0, "the ledger pass never completed");
 
-        // Reservations untouched by the reverted pass.
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD);
-        assertEq(ledger.openExposureUsd(g2), COVERAGE_USD);
+        // Reservations untouched by the reverted pass. The baseline is the
+        // execute-time collapse (SHE-225), not the full coverage: the price was
+        // still readable at execute, so the cohort is already at its pro-rata
+        // share before this settlement attempt fails.
+        assertEq(ledger.openExposureUsd(g1), SHARE_USD);
+        assertEq(ledger.openExposureUsd(g2), SHARE_USD);
     }
 
     /// @notice Same failure isolation, at the `reclaimProposerBond` call site:
@@ -569,20 +656,31 @@ contract SettleCoverageSelfTriggerTest is Test {
         assertEq(ledger.openExposureUsd(g1), 250e18);
     }
 
-    // ── 3.5 Reclaim backstop for an early settlement ──
+    // ── 3.5 Reclaim after an early settlement: converges, no longer needed ──
 
-    function test_reclaimProposerBond_backstopsAnEarlySettlement() public {
+    /// @notice ROLE CHANGE (SHE-225). This test previously asserted that reclaim
+    ///         "collapses the reservations the early settle could not" — reclaim
+    ///         was the ONLY backstop for a proposal that settled inside its own
+    ///         window, and a proposer who never reclaimed left the whole cohort
+    ///         locked at 4x indefinitely. The execute-time collapse removes that
+    ///         dependency: there is nothing left uncollapsed by the time reclaim
+    ///         runs, and the reclaim-time pass merely re-derives the same split.
+    ///
+    ///         Reclaim REMAINS the backstop for a proposal that expired
+    ///         unexecuted, which has no execution to collapse at — pinned
+    ///         separately by `test_reclaimProposerBond_expiredUnexecuted_firesTrigger`.
+    function test_reclaimProposerBond_afterEarlySettlement_convergesOnExecuteTimeCollapse() public {
         uint256 pid = _proposeApproveExecute(7 days);
         uint256 executedAt = govA.getProposal(pid).executedAt;
         uint256 executeBy = govA.getProposal(pid).executeBy;
 
-        // Proposer self-settles well before executeBy: settlement-time
-        // trigger skips (3.2), reservations stay at full coverage.
+        // Proposer self-settles well before executeBy: the settlement-time
+        // trigger still skips (3.2), but the cohort is already collapsed.
         vm.warp(executedAt + 1 hours + 1);
         assertLe(block.timestamp, executeBy);
         vm.prank(agentA);
         govA.settleProposal(pid);
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "still uncollapsed after the early settle");
+        assertEq(ledger.openExposureUsd(g1), SHARE_USD, "already collapsed at execute, not by this settle");
 
         // Strategy term + challenge window pass -> reclaim is provably past
         // executeBy. The `+ strategyDuration` anchor (second-audit finding A)
@@ -596,10 +694,10 @@ contract SettleCoverageSelfTriggerTest is Test {
         assertEq(_countCoverageSettleFailed(logs, address(govA)), 0);
         assertEq(_countCoverageSettled(logs, address(ledger)), 1, "reclaim fires the backstop trigger");
 
-        assertEq(ledger.openExposureUsd(g1), 250e18, "reclaim collapses the reservations the early settle could not");
-        assertEq(ledger.openExposureUsd(g2), 250e18);
-        assertEq(ledger.openExposureUsd(g3), 250e18);
-        assertEq(ledger.openExposureUsd(g4), 250e18);
+        assertEq(ledger.openExposureUsd(g1), SHARE_USD, "reclaim-time pass converges on the same split");
+        assertEq(ledger.openExposureUsd(g2), SHARE_USD);
+        assertEq(ledger.openExposureUsd(g3), SHARE_USD);
+        assertEq(ledger.openExposureUsd(g4), SHARE_USD);
     }
 
     // ── 3.6 Idempotence / convergence ──

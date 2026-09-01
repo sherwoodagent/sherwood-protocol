@@ -2046,6 +2046,52 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (gated) {
             (coverageRaisedUsd, requiredCoverageUsd) = IExposureLedger(ledger)
                 .requireApproveQuorum(address(this), proposalId, asset, proposal.requiredCoverage);
+            // COLLAPSE THE A-FOLD RESERVATION HERE, AND STRICTLY AFTER THE GATE
+            // ABOVE (SHE-225).
+            //
+            // WHY HERE. Every approver holds a FULL-coverage reservation until
+            // this runs, so a quorum of A approvers ties up `A x coverage` of
+            // cohort budget. `_settleCoverageBestEffort` is not a reliable
+            // trigger — it silently skips for any proposal that settles before
+            // its own `executeBy` — whereas every proposal that moves value
+            // passes through here exactly once. `proposal.executedAt` is stamped
+            // above, so the ledger's own `executedAt` branch accepts this call.
+            //
+            // WHY IT MAY REVERT, UNLIKE THE SETTLEMENT-TIME TRIGGER. At
+            // settlement a revert would strand `_finishSettlement`, which
+            // releases the vault's deposit/redemption locks — a stale WOOD feed
+            // would freeze user funds, including the emergency-settle path that
+            // exists to unwedge exactly that. Here nothing has moved yet, so
+            // reverting is the safe direction, and `requireApproveQuorum` one
+            // line above ALREADY reads `woodPriceX8()`: a feed outage blocks
+            // execution today regardless. This adds no new failure mode.
+            //
+            // WHY AFTER, NOT BEFORE. The collapse rewrites BOTH inputs the gate
+            // above reads: `_recorded[key][g].usd` (the per-key booking it sums)
+            // and `_liveBookedUsd[g]` (the denominator `_sharedSlashableUsd`
+            // divides by). Ordering it after leaves the gate reading exactly the
+            // state it read before this change; ordering it before makes the
+            // gate measure a quantity the collapse just moved.
+            //
+            // MARGIN, AT THE CURRENT `kNumerator == 1`. The cross-proposal
+            // haircut cannot bite while k is 1, because a guardian's aggregate
+            // booking is then capped at its own slashable bond, so
+            // `slashable / liveTotal >= 1` and `_sharedSlashableUsd` returns the
+            // booking unchanged. What collapse-first would still cost is HEADROOM:
+            // the gate would sum to EXACTLY `needUsd` (settlement's residue
+            // top-up targets precisely that) instead of the pre-collapse A-fold
+            // aggregate, leaving the `>=` check to pass on the boundary with the
+            // rounding as its only slack.
+            //
+            // SYSTEMATIC ONCE `kNumerator > 1`. Above 1 a guardian may underwrite
+            // more in aggregate than its bond, `slashable / liveTotal` drops below
+            // 1, and every over-committed approver is then discounted twice for
+            // the same sharing — once by the collapse, once by the gate. The
+            // shortfall is SILENT: `requireApproveQuorum` returns the short sum
+            // rather than reverting and `effectiveMaxCapital` below scales the
+            // proposal down to match it. Ordering after costs nothing and is
+            // correct at every k, so it does not wait for k to move.
+            IExposureLedger(ledger).settleCoverage(address(this), proposalId);
         }
 
         bool scale = gated && coverageRaisedUsd < requiredCoverageUsd;
