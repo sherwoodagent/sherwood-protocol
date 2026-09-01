@@ -11,19 +11,28 @@ equivalent, verified live 2026-08-31.
 — TWAP execute gate, rerange policy, pool-share cap, settlement/residue
 conformance — but it structurally REQUIRES leverage: `_initialize` reverts on
 `borrowAmount == 0`, and `_execute` funds the LP entirely from a Morpho borrow
-against wrapper collateral. That borrow leg is dead on chain 4663 today, and
-not marginally:
+against wrapper collateral. On chain 4663 that leg rests on a single market:
 
-| collateral | template-compatible? | lendable (2026-08-31, live) |
+| collateral | template-compatible? | lendable (2026-09-01, live) |
 |---|---|---|
-| spUSDG | yes — verified 4626, `asset() == USDG` | **$3** (drained; was $1.19M on 08-04) |
-| syrupUSDG | **no** — no `asset()` selector, `_isWrapperOf` rejects it (correctly) | $9.15M |
-| USDe | no — not a wrapper of the vault asset, by design | $27M |
+| spUSDG (`0x0309c02d…`) | yes — verified 4626, `asset() == USDG` | **~$2.4M** (on-chain: supply 21.58M, borrow 19.14M USDG) |
+| spUSDG (`0x6c023a68…`) | yes — same collateral, duplicate market | $3 (empty; never used) |
+| syrupUSDG | **no** — no `asset()` selector, `_isWrapperOf` rejects it (correctly) | $9.08M |
+| USDe | no — not a wrapper of the vault asset, by design | $30.5M |
 
-So the template's only valid collateral has an empty market, and the deep
-markets are structurally outside its (sound) wrapper rule. Every levered CL
-proposal on this chain is currently unfundable — while the unlevered version
-of the same strategy needs no Morpho at all and is economically live today.
+(An earlier draft of this table reported spUSDG as "$3, drained" — that was
+the empty duplicate market; the deep one is the `MARKET_ID` the levered fork
+test already uses. Corrected per review.)
+
+So a levered CL proposal IS fundable today, up to roughly the lendable figure
+of one market whose depth has swung between $1.2M and $3.9M over the past
+month. The deep markets sit outside the template's (sound) wrapper rule and
+cannot substitute. That makes the borrow leg a single-market dependency the
+strategy's economics do not need: the NVDA/USDG venue is live and deep on its
+own, and an unlevered position carries no liquidation surface, no interest
+drag, and no exposure to that one market's utilization. Unlevered mode makes
+the family proposable at the size the venue supports regardless of what
+Morpho is doing that day.
 
 ## What changes
 

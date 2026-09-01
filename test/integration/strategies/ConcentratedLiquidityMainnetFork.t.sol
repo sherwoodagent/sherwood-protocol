@@ -152,10 +152,15 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
         int24 spacing = pool.tickSpacing();
         (, int24 spot,,,,,) = pool.slot0();
 
-        // A wide band around spot, snapped to spacing — this test is pinning the
-        // integration, not a trading thesis.
-        int24 lower = _snapDown(spot - 5000, spacing);
-        int24 upper = _snapUp(spot + 5000, spacing);
+        // A wide band around a snapped mid — this test is pinning the
+        // integration, not a trading thesis. Offsetting from a snapped mid
+        // (rather than snapping both edges outward) keeps the width at exactly
+        // `2 * halfWidthTicks`, which `_requireValidRerangePolicy` requires.
+        // This pool's 0.01% fee gives spacing 1, so every tick is on-grid and
+        // `5000 % spacing == 0` holds trivially.
+        int24 mid = _snapDown(spot, spacing);
+        int24 lower = mid - 5000;
+        int24 upper = mid + 5000;
 
         ConcentratedLiquidityStrategy.InitParams memory p = ConcentratedLiquidityStrategy.InitParams({
             pool: address(pool),
@@ -273,9 +278,15 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
 
         int24 spacing = nvdaPool.tickSpacing();
         (, int24 spot,,,,,) = nvdaPool.slot0();
-        // The momentum pod's band: ±3% ≈ ±300 ticks, snapped to spacing.
-        int24 lower = _snapDown(spot - 300, spacing);
-        int24 upper = _snapUp(spot + 300, spacing);
+        // The momentum pod's band: ±3% ≈ ±300 ticks around a snapped mid.
+        // NOT snapped edge-by-edge: with spacing 10 an off-grid spot makes an
+        // outward-snapped band 610 wide, and `_requireValidRerangePolicy`
+        // rejects any band wider than `2 * halfWidthTicks` (600). Centering
+        // on `_snapDown(spot)` with `300 % 10 == 0` gives width 600, on-grid,
+        // for every spot.
+        int24 mid = _snapDown(spot, spacing);
+        int24 lower = mid - 300;
+        int24 upper = mid + 300;
 
         ConcentratedLiquidityStrategy.InitParams memory p = ConcentratedLiquidityStrategy.InitParams({
             pool: poolAddr,
@@ -435,13 +446,6 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
     function _snapDown(int24 tick, int24 spacing) internal pure returns (int24) {
         int24 q = tick / spacing;
         if (tick < 0 && tick % spacing != 0) q--;
-        return q * spacing;
-    }
-
-    /// @dev Ceil toward +inf onto the spacing grid — `_snapUp`.
-    function _snapUp(int24 tick, int24 spacing) internal pure returns (int24) {
-        int24 q = tick / spacing;
-        if (tick > 0 && tick % spacing != 0) q++;
         return q * spacing;
     }
 }

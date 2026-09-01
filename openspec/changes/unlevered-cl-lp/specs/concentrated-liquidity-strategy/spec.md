@@ -1,8 +1,9 @@
 ## Purpose
 
 Widen `ConcentratedLiquidityStrategy` with an unlevered mode so the CL LP
-family is proposable when no template-compatible Morpho market has depth,
-without altering one byte of levered behavior.
+family is proposable without a Morpho borrow leg — independent of the depth
+of the single template-compatible market on 4663 — without altering one byte
+of levered behavior.
 
 ## ADDED Requirements
 

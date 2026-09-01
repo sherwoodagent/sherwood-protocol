@@ -39,13 +39,18 @@ contract ProposeUnleveredNvdaVnet is Script {
         IUniswapV3Pool pool = IUniswapV3Pool(NVDA_POOL);
         int24 spacing = pool.tickSpacing();
         (, int24 spot,,,,,) = pool.slot0();
-        // Snap OUTWARD, floor toward -inf for the lower bound and ceil toward
-        // +inf for the upper, matching the contract's `_snapDown`/`_snapUp`.
-        // Plain `(x / spacing) * spacing` truncates toward zero, so below zero
-        // it rounds the lower bound UP and the band lands off-center — alignment
-        // holds so `_requireValidRange` still passes, but the range is skewed.
-        int24 lower = _snapDown(spot - 300, spacing);
-        int24 upper = _snapUp(spot + 300, spacing);
+        // Center the band on a SNAPPED mid, then offset by the half-width.
+        // Snapping the two edges outward instead widens the band past
+        // `2 * halfWidthTicks` whenever spot is off-grid (spacing 10: width
+        // 610 for 9 spots in 10), and `_requireValidRerangePolicy` rejects
+        // that (`halfWidthTicks * 2 < upper - lower` -> InvalidRerangePolicy).
+        // Snapping toward zero (`(x / spacing) * spacing`) kept the width but
+        // skewed the band below tick 0. `_snapDown` floors toward -inf, and
+        // `300 % 10 == 0` keeps both edges on-grid, so the width is exactly
+        // 600 and the band is centered for every spot.
+        int24 mid = _snapDown(spot, spacing);
+        int24 lower = mid - 300;
+        int24 upper = mid + 300;
 
         ConcentratedLiquidityStrategy.InitParams memory p = ConcentratedLiquidityStrategy.InitParams({
             pool: NVDA_POOL,
@@ -125,13 +130,6 @@ contract ProposeUnleveredNvdaVnet is Script {
     function _snapDown(int24 tick, int24 spacing) internal pure returns (int24) {
         int24 q = tick / spacing;
         if (tick < 0 && tick % spacing != 0) q--;
-        return q * spacing;
-    }
-
-    /// @dev Ceil toward +inf onto the spacing grid — the `_snapUp` idiom.
-    function _snapUp(int24 tick, int24 spacing) internal pure returns (int24) {
-        int24 q = tick / spacing;
-        if (tick > 0 && tick % spacing != 0) q++;
         return q * spacing;
     }
 }

@@ -68,7 +68,7 @@ behavior is unchanged.
 ## Sizing note for the first proposal (informative, not normative)
 
 NVDA/USDG 0.05%: tick spacing 10; the momentum pod's ±3% band ≈ ±296 ticks →
-`tickLower/Upper = spot ∓ 300`. In-range depth measured ~$36k per 1% of
+`tickLower/Upper = _snapDown(spot, spacing) ∓ 300` (centered on a snapped mid so the width is exactly `2 * halfWidthTicks`; snapping the edges outward trips `_requireValidRerangePolicy`). In-range depth measured ~$36k per 1% of
 price move (2026-08-11), venue since 4×'d — re-measure at proposal time and
 size `lpAmount` to the existing pool-share cap, which already binds clone
 liquidity to a fraction of pool liquidity.
