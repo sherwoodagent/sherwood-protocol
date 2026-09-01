@@ -5,7 +5,7 @@ The bond SHALL be `coverageUsd * challengerBondBps / 10_000`, converted to WOOD 
 
 #### Scenario: Bond computed from capped coverage at the composed price
 - **WHEN** the approvers' locks at live value exceed the proposal's need
-- **THEN** the bond is priced against the need, at `challengerBondBps` (default 500) of that value, converted at `woodPriceX8()`
+- **THEN** the bond is priced against the need, at `challengerBondBps` (default 150, i.e. 1.5% — the main spec's "500" was stale against `ChallengeGame.sol`) of that value, converted at `woodPriceX8()`
 
 #### Scenario: Under-subscribed proposal prices the bond off what is recoverable
 - **WHEN** the approvers' locks at live value are below the proposal's need

@@ -30,8 +30,8 @@ means `stakedAmount > 0` and no pending unstake request.
 | `minGuardianStake` | 10 000 WOOD | 1 WOOD | — | `StakedWood.sol:756` |
 | `coolDownPeriod` (unstake delay) | 7 d | 1 d | 30 d, and ≥ `registry.reviewPeriod` | `StakedWood.sol:769` |
 | `minOwnerStake` (vault-owner bond at creation) | 10 000 WOOD | 0 (open onboarding) or ≥ 1 000 | — | `StakedWood.sol:790` |
-| `minSlashBps` | 10% | 0 | ≤ `maxSlashBps` | `StakedWood.sol:800` |
-| `maxSlashBps` | 100% | ≥ `minSlashBps` | 100% | `StakedWood.sol:809` |
+| `minSlashBps` — the **deterrence floor**: the least a convicted approver loses, as a fraction of their whole bond, whatever WOOD they declared. Launch value is a governance decision; `DeployPlanB` refuses zero. | 10% | 0 | ≤ `maxSlashBps` | `StakedWood.sol:800` |
+| `maxSlashBps` — must be 100%: a guardian may lock their entire stake behind one proposal, and a ceiling below that would cap the burn beneath the lock. `DeployPlanB` pre-flight asserts it. | 100% | ≥ `minSlashBps` | 100% | `StakedWood.sol:809` |
 | `ageFloorBps` (new-stake vote weight) | 25% | > 0 | 100% | `StakedWood.sol:816` |
 | `maturationPeriod` (ramp to full weight) | 30 d | 7 d | 90 d | `StakedWood.sol:823` |
 
@@ -67,11 +67,18 @@ Mechanics worth knowing:
   and slash every approver. Any positive at-open stake, however small, can reach
   the block quorum.
 - Votes are locked in the final 10% of the window (first votes *and* changes).
-- **Approve votes are underwriting**, not just signaling: each approval books
-  coverage on the `ExposureLedger` against the guardian's free stake.
-- A **blocked** review slashes every approver. Severity is deterministic, not voted:
-  a quadratic ramp from `minSlashBps` (10%) to `maxSlashBps` (100%), saturating at
-  a 66.67% block supermajority (`_severityBps`, `GuardianRegistry.sol:1195`).
+- **Approve votes are underwriting**, not just signaling: an approve vote carries a
+  WOOD amount (`voteOnProposal(governor, proposalId, support, lockWood)`), and the
+  `ExposureLedger` locks that WOOD behind the proposal, clamped to the guardian's
+  free budget. See [Declared coverage locks](#declared-coverage-locks).
+- A **blocked** review slashes every approver, and what is at stake is the
+  **lock**, not the bond. The rate handed to `StakedWood` is the guardian's lock
+  over their live stake; the block's severity — a deterministic quadratic ramp of
+  block-side decisiveness, saturating at a 66.67% supermajority (`_severityBps`,
+  `GuardianRegistry.sol:1195`) — multiplies that lock-derived rate, and the result
+  is clamped into `[minSlashBps, maxSlashBps]`. A guardian who backed a bad
+  proposal with a small lock while holding a large bond loses the lock, and never
+  less than `minSlashBps` of the bond.
 - Slashed WOOD is **burned** (`0x…dEaD`) — the slash pays nobody. A funded
   slash-appeal reserve can refund at most 20% per 7-day epoch
   (`MAX_REFUND_PER_EPOCH_BPS`, `GuardianRegistry.sol:56`).
@@ -81,20 +88,27 @@ Mechanics worth knowing:
 ## The exposure ledger — economic security sizing
 
 `ExposureLedger.sol` is the coverage book: it prices what a strategy could
-extract and books bonded WOOD against that price when a guardian Approves.
-Full detail: [coverage.md](coverage.md).
+extract, in USD, and records the WOOD each approving guardian has locked behind
+it. Full detail: [coverage.md](coverage.md).
 
 - **Coverage requirement:** at propose, each call's tier bound prices its
   extractable value: `requiredCoverage = Σ (cap_i × boundBps_i) / 10 000`. Untiered
   calls default to tier 2 = full notional. Written by
   `_snapshotTierAndGate`; read with `getRequiredCoverage`.
-- **Approve is underwriting:** `voteOnProposal` → `recordApproval`
-  (`ExposureLedger.sol:985`). An under-bonded guardian is not rejected at vote
-  time; the cap is enforced by booking zero.
-- **Approve quorum at execute:** `requireApproveQuorum`
-  (`ExposureLedger.sol:1428`) is a coverage **measurement**, not an all-or-nothing
-  gate. It returns `(coverageRaisedUsd, requiredCoverageUsd)` so the governor can
-  size execution to a coverage-proportional `effectiveMaxCapital`. It reverts
+- **Approve is underwriting:** `voteOnProposal(…, lockWood)` →
+  `recordApproval(governor, proposalId, guardian, lockWood)`. The ledger locks
+  `min(lockWood, free budget)` WOOD, where free budget is
+  `kNumerator × slashableStake − openExposure(guardian)` — no price is read. A
+  guardian with no free budget is not rejected at vote time; the cap is enforced
+  by locking zero, and the vote still counts as weight.
+- **Approve quorum at execute:** `requireApproveQuorum` is a coverage
+  **measurement**, not an all-or-nothing gate. It values each approver's lock
+  live — `Σ min(lock_i, live stake_i) × woodPriceX8()` — and returns
+  `(coverageRaisedUsd, requiredCoverageUsd)` so the governor can size execution
+  to a coverage-proportional `effectiveMaxCapital`. This is the one place WOOD is
+  converted to USD for coverage; a guardian whose lock is now worth less than
+  when they declared it (unstake, WOOD price fall) counts at the shrunken live
+  value. It reverts
   `InsufficientApproveCoverage` **only** when the approver set is empty (`:1437`)
   or the raised aggregate is exactly zero (`:1469`). A nonzero-but-partial book is
   the shortfall case: it **scales** capital via
@@ -109,8 +123,60 @@ Full detail: [coverage.md](coverage.md).
   locked in `ProposerBondEscrow` for the life of the proposal + challenge window.
   See [proposer-bond.md](proposer-bond.md).
 
+### Declared coverage locks
+
+A guardian **declares** how much WOOD stands behind each approve. The lock is the
+declaration; there is no USD conversion on the approval path and no later pass that
+rewrites it. One number per (proposal, guardian) — `lockOf(governor, proposalId,
+guardian)` — is at once the guardian's booking, their pledge, and the base a
+conviction burns. It is written once by `recordApproval` and erased only by release
+(vote change) or retirement; a filed challenge blocks both. The adversary this shape
+removes is anyone who could move a guardian's slash base while a challenge is live:
+with booking and pledge the same storage, no permissionless step exists that can
+shrink or grow it.
+
+- **No cohort cap.** The locks on a proposal may sum to more than its requirement.
+  An over-subscribed proposal is a well-covered one; nothing is pro-rated, nothing
+  is collapsed, and each lock stays each guardian's own liability. Under-coverage
+  needs no new machinery — `effectiveMaxCapital` already scales the proposal down.
+- **Capacity is WOOD, with no price.** Free budget is
+  `kNumerator × slashableStake − Σ live locks`, where `openExposure(guardian)`
+  walks the epoch buckets in WOOD. A WOOD-feed outage or manipulation cannot starve
+  or inflate a guardian's capacity, and an approve vote never depends on a price.
+  Budget recycles when a bucket ages past `bucketEnd + challengeWindow`, or
+  earlier on release or retirement.
+- **`k = 1` contains a conviction.** At the default `kNumerator = 1`,
+  `Σ locks ≤ stake`, so burning proposal A's lock leaves
+  `stake − lock_A ≥ Σ other locks`: every other proposal the guardian backs stays
+  fully covered. Raising `k` is deliberate leverage — a guardian may then lock more
+  across proposals than they hold, and one conviction can leave the others
+  under-covered by exactly the excess. The adversary is a future operator who
+  raises `k` for capital efficiency without seeing that it reintroduces
+  cross-proposal contagion.
+- **Slash = the lock, floored by `minSlashBps`.** On conviction (review-path block
+  or challenge verdict) the burn for (proposal, guardian) is `min(lock, slash
+  basis)`, expressed to `StakedWood` as bps of that basis, rounded up, then clamped
+  into `[minSlashBps, maxSlashBps]`. The basis is `min(stake at the anchor, live
+  stake)` — `openedAt` for a review block, `executedAt` for a verdict — so a top-up
+  after the fact neither shields the lock nor is burned. `minSlashBps` is the
+  **single deterrence floor**: a 1-wei declaration adds nothing to quorum and still
+  costs `minSlashBps` of everything the guardian holds. Its launch value is a
+  governance decision, not a code default; `DeployPlanB` refuses zero and requires
+  `maxSlashBps = 100%` so a full-stake lock can burn in full.
+- **Fee attribution is the lock.** `GuardianRegistry.getApproverCoverage` reads
+  `coverageUsdOf` — `min(lock, live stake) × woodPriceX8()`, **uncapped**: a
+  guardian who locked more took more risk and earns proportionally more, even when
+  the cohort over-subscribed. There is no settlement step before payout; the lock a
+  guardian holds at payout is their attribution. `priced == false` means retry, not
+  pay zeros.
+- **Challenger bonds are sized at need.** `liabilityUsd` is
+  `min(needUsd, Σ min(lock_i, live stake_i) × woodPriceX8())`. The cap applies to
+  bond sizing only — full locks still burn on conviction — and exists so a cohort
+  cannot lock surplus WOOD to price challengers out.
+
 | Parameter | Default | Min | Max | Setter |
 |---|---|---|---|---|
+| `kNumerator` (exposure budget multiplier) | 1 | 1 (zero reverts `InvalidParameter`) | — | `setKNumerator` |
 | `challengeWindow` | 14 d | > 0 and ≥ `reviewPeriod` + 7 d | scan-bounded (16 buckets) | `ExposureLedger.sol:768` |
 | `epochLength` | 28 d (immutable) | — | — | ctor |
 | `MAX_COVERAGE_HORIZON` | 60 d | const | const | `ExposureLedger.sol:132` |
@@ -219,8 +285,8 @@ Anyone can challenge an executed proposal during the challenge window by posting
 bond. The game is a two-stage bond battle with a court backstop:
 
 ```
-file (bond = 1.5% of coverage) ─┬─ nobody disputes within autoSlashDelay (7 d)
-                                │    → SILENCE CONVICTION: approvers slashed 100%,
+file (bond = 1.5% of liability) ─┬─ nobody disputes within autoSlashDelay (7 d)
+                                │    → SILENCE CONVICTION: approvers' locks burned,
                                 │      proposer bond forfeited, adapter demoted
                                 └─ counter-bond pool fills to exactly bondWood
                                      → Disputed → referred to TokenCourt
@@ -234,7 +300,7 @@ file (bond = 1.5% of coverage) ─┬─ nobody disputes within autoSlashDelay (
 | Parameter | Default | Min | Max | Setter |
 |---|---|---|---|---|
 | `challengeWindow` | 14 d | > 0 | ≤ ledger's window | `ChallengeGame.sol:2088` |
-| `challengerBondBps` | 1.5% of frozen coverage | > 0 | 100% | `ChallengeGame.sol:2104` |
+| `challengerBondBps` | 1.5% of `liabilityUsd` (locks at live value, capped at the proposal's need) | > 0 | 100% | `ChallengeGame.sol:2104` |
 | `autoSlashDelay` (silence → conviction) | 7 d | 2 d | < `disputeTimeout` | `ChallengeGame.sol:2176` |
 | `disputeTimeout` | 30 d | > `autoSlashDelay` | 60 d | `ChallengeGame.sol:2187` |
 | `settleBurnBps` (win burn) | 5% | 0 | 50% | `ChallengeGame.sol:2203` |
@@ -252,8 +318,11 @@ Anti-griefing details:
   on earlier rounds.
 - One live challenge per challenger per proposal; conviction is once-per-accused
   (survives even a game redeploy via an sWOOD-side flag).
-- Verdict slashing anchors at **`executedAt`**, not filing time — requesting unstake
-  after execution cannot zero the slash basis.
+- Verdict slashing burns each approver's **lock** for the proposal
+  (`slashBpsFor`, clamped into `[minSlashBps, maxSlashBps]` by sWOOD) and anchors
+  at **`executedAt`**, not filing time — requesting unstake after execution cannot
+  zero the slash basis, and staking more after execution cannot dilute it. A
+  released or zero lock owes nothing and is skipped.
 - The slash transaction carries a gas floor (`180 000 × approvers + 2 000 000`) so an
   under-gassed caller cannot burn a verdict.
 
@@ -269,7 +338,7 @@ the verdict. No panel, no appeal.
 | `participationFloorBps` | 10% | > 0 | < `sWOOD.ageFloorBps` (25%) |
 
 - Electorate: all sWOOD stakers **except the accused** (accused = guardians whose
-  coverage backs the challenged proposal). No vote changes.
+  locks back the challenged proposal). No vote changes.
 - Verdict: turnout below the participation floor → `Inconclusive`; strict majority
   guilty → `Guilty`; tie or majority not-guilty → `NotGuilty` (fails safe).
 - Referral is only accepted if a full vote + finalize buffer fits before the
@@ -327,6 +396,8 @@ new-calldata escape hatch is gated.
 The guardian network earns 20% of every management fee and 25% of every
 performance fee (see [fees.md](fees.md)). Fees are delivered in the vault's asset to
 `guardiansFeeRecipient` and converted to WOOD off-chain via weekly Merkl buyback;
-`GuardianFeeAccrued` events provide per-guardian attribution weights. There are no
-on-chain staking emissions — review honestly, earn the fee stream; approve a
-malicious strategy, get slashed and burned.
+`GuardianFeeAccrued` events provide per-guardian attribution weights, and the
+weights come from `getApproverCoverage` — each approver's lock at live value
+(`coverageUsdOf`), not their vote-stake. There are no on-chain staking emissions —
+review honestly, earn the fee stream in proportion to what you locked; approve a
+malicious strategy, and the lock is burned.
