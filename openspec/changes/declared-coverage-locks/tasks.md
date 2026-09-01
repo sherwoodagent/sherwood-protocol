@@ -6,33 +6,35 @@
 
 ## 2. ExposureLedger — the lock replaces booking and pledge
 
-- [ ] 2.1 Restructure ledger storage for the lock model: the per-(reviewKey, guardian) record holds one WOOD `lock`; `_liveBookedUsd`/`_livePledgedUsd` collapse to one `_liveLockedWood`; drop `_reservedUsd`, `_committedUsd` (USD pledge family) and `_settled`. `ExposureLedger` is a plain constructor-deployed contract (no proxy, no gap, no layout golden), so storage may be restructured freely — there is no layout gate for this contract.
-- [ ] 2.2 Change `recordApproval(governor, proposalId, guardian)` → `recordApproval(governor, proposalId, guardian, lockWood)`: lock `min(lockWood, kNumerator × slashableStake − openExposure)` in WOOD; drop the `woodPriceX8()` read and its "book nothing on outage" branch; keep idempotence, horizon, zero-coverage and zero-budget no-op paths (spec: "Approval recording books a guardian-declared WOOD lock", "Booking failures never fail the approve vote").
-- [ ] 2.3 Re-denominate `_buckets` and the bucket scan in WOOD; rename `openExposureUsd` → `openExposure` (or drop the unit suffix) and update every internal caller. Bucket expiry, horizon and the 16-bucket scan bound are unchanged in shape (design D5).
-- [ ] 2.4 Delete `settleCoverage`, `CoverageSettled`, `_settled`, and `_rebook`'s downward branch; keep `releaseApproval`/`retireApproval`/`_unwindApproval` operating on the single lock figure.
-- [ ] 2.5 Rewrite `slashBpsFor` to `ceil(lock × 10_000 / liveStake)`, saturating at 10_000 when `lock >= liveStake` or `liveStake == 0`, zero for a zero lock; no price read. Replace the pashov-#13 "binary ceiling" comment with the new rationale and record why the old one no longer applies (spec: "Per-approver slash rates").
-- [ ] 2.6 Rewrite `liabilityUsd` and `unsharedLiabilityUsd` to `min(needUsd, Σ min(lock_i, liveStake_i) × woodPriceX8())`, reverting on an unpriceable WOOD feed; delete `allocatedUsd` (spec: "Cohort liability is the lock sum capped at need").
-- [ ] 2.7 Rewrite `requireApproveQuorum` to `Σ min(lock_i, liveStake_i) × woodPriceX8() >= coverageUsd(asset, requiredCoverage)`; keep zero-approvers-always-revert.
-- [ ] 2.8 Update `setKNumerator` natspec and the `IExposureLedger` interface: state the k = 1 containment property and that k > 1 is deliberate leverage (spec: "Exposure cap multiplier").
-- [ ] 2.9 Update `IExposureLedger` for the new `recordApproval` signature, removed functions/events, and renamed views.
+- [x] 2.1 Restructure ledger storage for the lock model: the per-(reviewKey, guardian) record holds one WOOD `lock`; `_liveBookedUsd`/`_livePledgedUsd` collapse to one `_liveLockedWood`; drop `_reservedUsd`, `_committedUsd` (USD pledge family) and `_settled`. `ExposureLedger` is a plain constructor-deployed contract (no proxy, no gap, no layout golden), so storage may be restructured freely — there is no layout gate for this contract.
+- [x] 2.2 Change `recordApproval(governor, proposalId, guardian)` → `recordApproval(governor, proposalId, guardian, lockWood)`: lock `min(lockWood, kNumerator × slashableStake − openExposure)` in WOOD; drop the `woodPriceX8()` read and its "book nothing on outage" branch; keep idempotence, horizon, zero-coverage and zero-budget no-op paths (spec: "Approval recording books a guardian-declared WOOD lock", "Booking failures never fail the approve vote").
+- [x] 2.3 Re-denominate `_buckets` and the bucket scan in WOOD; rename `openExposureUsd` → `openExposure` (or drop the unit suffix) and update every internal caller. Bucket expiry, horizon and the 16-bucket scan bound are unchanged in shape (design D5).
+- [x] 2.4 Delete `settleCoverage`, `CoverageSettled`, `_settled`, and `_rebook`'s downward branch; keep `releaseApproval`/`retireApproval`/`_unwindApproval` operating on the single lock figure.
+- [x] 2.5 Rewrite `slashBpsFor` to `ceil(lock × 10_000 / liveStake)`, saturating at 10_000 when `lock >= liveStake` or `liveStake == 0`, zero for a zero lock; no price read. Replace the pashov-#13 "binary ceiling" comment with the new rationale and record why the old one no longer applies (spec: "Per-approver slash rates").
+- [x] 2.6 Rewrite `liabilityUsd` and `unsharedLiabilityUsd` to `min(needUsd, Σ min(lock_i, liveStake_i) × woodPriceX8())`, reverting on an unpriceable WOOD feed; delete `allocatedUsd` (spec: "Cohort liability is the lock sum capped at need").
+- [x] 2.7 Rewrite `requireApproveQuorum` to `Σ min(lock_i, liveStake_i) × woodPriceX8() >= coverageUsd(asset, requiredCoverage)`; keep zero-approvers-always-revert.
+- [x] 2.8 Update `setKNumerator` natspec and the `IExposureLedger` interface: state the k = 1 containment property and that k > 1 is deliberate leverage (spec: "Exposure cap multiplier").
+- [x] 2.9 Update `IExposureLedger` for the new `recordApproval` signature, removed functions/events, and renamed views.
 
 ## 3. GuardianRegistry — carry the declaration
 
-- [ ] 3.1 Add a `lockWood` parameter to the approve vote path (`voteOnProposal` or a sibling overload; pick one and delete the other so there is a single entry) and forward it to `recordApproval`.
+- [x] 3.1 Add a `lockWood` parameter to the approve vote path (`voteOnProposal` or a sibling overload; pick one and delete the other so there is a single entry) and forward it to `recordApproval`.
 - [ ] 3.2 Vote-change round trip: `Approve → Block → Approve` must release and re-lock cleanly with the new signature; pin with a test.
 - [ ] 3.3 Update `IGuardianRegistry` and every registry stand-in in `test/` that implements the approve path (grep `function voteOnProposal`).
 
 ## 4. StakedWood and ChallengeGame — burn the lock
 
 - [ ] 4.1 `StakedWood._slashOne`: confirm the existing bps-of-live-stake leg plus the `[minSlashBps, maxSlashBps]` clamp yields `min(lock, liveStake)` when fed the new rate; adjust natspec on both `slashGuardians` and `slashVerdict` to the lock basis (spec: both slash requirements). No arithmetic change expected — verify with tests rather than assume.
-- [ ] 4.2 `ChallengeGame._accusedWithRates`: consume the lock-derived rates; confirm zero-lock approvers are still filtered out.
-- [ ] 4.3 `ChallengeGame.file`: size the bond off the capped `liabilityUsd`; remove the try/catch fallback that substitutes the uncapped sum on failure — a stale feed must make filing wait, never enlarge the bond (spec: "Challenger bond sized to the coverage the filing freezes").
+- [x] 4.2 `ChallengeGame._accusedWithRates`: consume the lock-derived rates; confirm zero-lock approvers are still filtered out.
+- [x] 4.3 `ChallengeGame.file`: size the bond off the capped `liabilityUsd`; remove the try/catch fallback that substitutes the uncapped sum on failure — a stale feed must make filing wait, never enlarge the bond (spec: "Challenger bond sized to the coverage the filing freezes").
+- [ ] 3.4 Review-path slash carries the lock basis (design D3 — BOTH slash paths): in `GuardianRegistry.resolveReview`'s Blocked branch, compute a per-approver rate for the ledger's approver set — `bps_i = ceil( ceil(lock_i × 1e4 / slashableStakeAt(g, openedAt)) × severityBps / 1e4 )`, saturating at 10_000 and 0 for a zero lock — and pass the array to `swood.slashGuardians`. Severity stays the deterministic block-decisiveness ramp, applied as a multiplier on the lock-derived rate (spec: guardian-staking "Review-path slash"). Basis at `openedAt` because a review-path slash lands BEFORE execution, so `executedAt` is zero. State the adversary in natspec.
+- [ ] 4.5 `StakedWood.slashGuardians(reviewKey, openedAt, approvers, slashBps)` → per-approver `uint256[] slashBpsPer`, mirroring `slashVerdict`'s existing shape (length check → `SlashBpsLengthMismatch`, per-element envelope clamp, zero rate skipped). ABI change only — StakedWood is layout-pinned and this touches no storage; `script/staked-wood-layout.golden.json` must diff zero. Update `IStakedWood`, the registry call site, and finish 4.1's `slashGuardians` natspec to the lock basis.
 - [ ] 4.4 `script/DeployPlanB.s.sol`: rewrite the `maxSlashBps == 10_000` pre-flight's message to the lock rationale (a lock may equal the whole stake and must burn in full) and ADD a pre-broadcast `minSlashBps != 0` pre-flight naming it the deterrence floor (spec: deployment-docs "Plan B deployment pre-flights and wiring"). Pin both with `test/deploy/` cases that run the script against a mis-set sWOOD and assert the revert message.
 
 ## 5. SyndicateGovernor — remove the trigger
 
-- [ ] 5.1 Delete `_settleCoverageBestEffort`, both call sites (`_finishSettlement` tail, `reclaimProposerBond` tail), and the `CoverageSettleFailed` event from `ISyndicateGovernor`.
-- [ ] 5.2 Confirm `script/syndicate-governor-layout.golden.json` diffs ZERO — this section changes no storage.
+- [x] 5.1 Delete `_settleCoverageBestEffort`, both call sites (`_finishSettlement` tail, `reclaimProposerBond` tail), and the `CoverageSettleFailed` event from `ISyndicateGovernor`.
+- [x] 5.2 Confirm `script/syndicate-governor-layout.golden.json` diffs ZERO — this section changes no storage.
 
 ## 6. Tests
 

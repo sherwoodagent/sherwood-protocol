@@ -73,15 +73,19 @@ Exposure SHALL be booked into epoch buckets of immutable width `epochLength` anc
 - **THEN** execution reverts `InsufficientApproveCoverage` and the proposal expires at `executeBy` unless covering approvals arrive
 
 ### Requirement: Per-approver slash rates
-`slashBpsFor(governor, proposalId)` SHALL return, positionally aligned with the ledger's approver list, each approver's slash rate in bps of their own live slashable stake: their LOCK for this proposal divided by their live stake, rounding UP so the burn never falls below the lock by truncation. A rate SHALL saturate at 10_000 bps when the lock meets or exceeds the live stake or the live stake is zero. A guardian with a zero lock (released, or an approval that locked nothing) SHALL owe 0 bps. The basis SHALL be the lock and nothing else — never a pro-rata allocation, never a live-priced share — because the adversary is anyone able to move a slash basis while a challenge is live: the lock is written once by `recordApproval` and erased only by release or retirement, both of which a filed challenge blocks. The view SHALL NOT read a price: the lock and the stake are both WOOD. The stake envelope `[minSlashBps, maxSlashBps]` applied by the staking contract is what floors the rate, so `minSlashBps` is the single deterrence floor: a guardian who declares a negligible lock contributes negligibly to quorum and is still slashed at least `minSlashBps` of everything they hold on conviction.
+`slashBpsFor(governor, proposalId)` SHALL return, positionally aligned with the ledger's approver list, each approver's slash rate in bps of the SLASH BASIS the staking contract will burn against — `min(stake at the verdict anchor (executedAt), live stake)` once the proposal has executed, live stake before — their LOCK for this proposal divided by that basis, rounding UP so the burn never falls below the lock by truncation. The denominator is the basis and not raw live stake deliberately: the staking contract burns `basis × rate`, so only a basis-denominated rate yields `min(lock, basis)`; a raw-live denominator would let a convicted guardian who tops up AFTER the drain dilute their own burn (double the stake, halve the burn) while the anchored basis excludes the top-up. A rate SHALL saturate at 10_000 bps when the lock meets or exceeds the basis or the basis is zero. A guardian with a zero lock (released, or an approval that locked nothing) SHALL owe 0 bps. The basis SHALL be the lock and nothing else — never a pro-rata allocation, never a live-priced share — because the adversary is anyone able to move a slash basis while a challenge is live: the lock is written once by `recordApproval` and erased only by release or retirement, both of which a filed challenge blocks. The view SHALL NOT read a price: the lock and the stake are both WOOD. The stake envelope `[minSlashBps, maxSlashBps]` applied by the staking contract is what floors the rate, so `minSlashBps` is the single deterrence floor: a guardian who declares a negligible lock contributes negligibly to quorum and is still slashed at least `minSlashBps` of everything they hold on conviction.
 
 #### Scenario: Rate priced on the lock
-- **WHEN** an approver locked 500 WOOD on a proposal and holds 2,000 WOOD of live stake at conviction
-- **THEN** their rate is 2,500 bps — the lock over the live stake — before the staking envelope is applied
+- **WHEN** an approver locked 500 WOOD on a proposal and their slash basis at conviction is 2,000 WOOD
+- **THEN** their rate is 2,500 bps — the lock over the basis — before the staking envelope is applied
+
+#### Scenario: Post-drain top-up does not dilute the burn
+- **WHEN** an approver held 2,000 WOOD at `executedAt`, locked 500, and staked 2,000 more after execution
+- **THEN** the rate is still 2,500 bps of the 2,000 basis, so the burn is 500 — the top-up neither shields the lock nor is burned
 
 #### Scenario: Lock exceeds live stake
-- **WHEN** an approver's live stake is zero or below their lock
-- **THEN** the rate is pinned at 10_000 bps and recovery is bounded by the live stake — the shortfall is the residual after the execute-time quorum, not a gate hole
+- **WHEN** an approver's slash basis is zero or below their lock
+- **THEN** the rate is pinned at 10_000 bps and recovery is bounded by the basis — the shortfall is the residual after the execute-time quorum, not a gate hole
 
 #### Scenario: Negligible declaration still pays the floor
 - **WHEN** an approver locked 1 wei of WOOD and the proposal is convicted

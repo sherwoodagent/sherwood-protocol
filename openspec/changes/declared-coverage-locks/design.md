@@ -43,7 +43,7 @@ The sum of locks across a cohort may exceed the requirement. Nothing is pro-rate
 
 ### D3 — Slash = locked WOOD, under the existing stake envelope
 
-On conviction the burn for (key, guardian) is `min(locked, live stake)`, expressed to `StakedWood` as bps of live stake and then clamped to `[minSlashBps, maxSlashBps]` exactly as today.
+On conviction the burn for (key, guardian) is `min(lock, basis)`, where the basis is what `StakedWood._slashOne` already burns against — `min(stake at the anchor, live stake)`, anchored at `executedAt` for a verdict and `openedAt` for a review-path block — expressed to `StakedWood` as bps of that basis and then clamped to `[minSlashBps, maxSlashBps]` exactly as today. Denominating the rate on the basis rather than raw live stake is what stops a post-drain top-up from diluting the burn.
 
 *Why:* The lock is written once by `recordApproval` and erased only by release/retire — the same lifecycle that made `_reservedUsd` safe as a slash predicate. `settleCoverage` no longer exists, so nothing permissionless can move it. The envelope clamp is what answers SHE-227's deterrence objection: `minSlashBps` is a bond-wide floor a guardian cannot declare their way under, so a 1-wei declaration contributes nothing to quorum and still costs `minSlashBps` of everything they hold. One floor, already owner-tunable, already enforced on both slash paths.
 
