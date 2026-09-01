@@ -1,0 +1,13 @@
+{
+  "name": "allocated-slash",
+  "title": "Allocated slash",
+  "ticket": "SHE-232",
+  "question": "What changes if a conviction burns only the WOOD allocated to that proposal?",
+  "note": "Today slashBpsFor returns a flat 10000 for every approver with a live pledge, clamped into [minSlashBps, maxSlashBps] = [1000, 10000], and DeployPlanB hard-requires maxSlashBps == 10000 -- so every approver loses 100% of their at-anchor stake regardless of how much coverage they carried. Under SHE-232 only the allocated share burns. The depositor still receives nothing either way.",
+  "cells": [
+    {"label": "whole-stake slash (today)",
+     "overrides": {"stage": "growth", "slash_mode": "whole", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "allocated slash (SHE-232)",
+     "overrides": {"stage": "growth", "slash_mode": "allocated", "tvl": 10000000.0, "wood_price": 0.05}}
+  ]
+}

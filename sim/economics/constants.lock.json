@@ -1,0 +1,272 @@
+{
+  "_comment": "Snapshot of the protocol constants the economics model reads. Regenerate with `python3 sim/economics/extract_constants.py --write` and review the diff -- a change here is a change to the economics.",
+  "branch": "post-audit",
+  "constants": {
+    "BPS_DENOMINATOR": {
+      "file": "src/FeeConstants.sol",
+      "line": 55,
+      "note": "Basis-point denominator used by every fee computation.",
+      "raw": "10_000",
+      "value": 10000
+    },
+    "CHALLENGER_BOND_BPS": {
+      "file": "src/ChallengeGame.sol",
+      "line": 273,
+      "note": "Challenger bond as bps of the coverage a filing freezes (1.5%).",
+      "raw": "150",
+      "value": 150
+    },
+    "DEFAULT_AGENT_FEE_BPS": {
+      "file": "src/FeeConstants.sol",
+      "line": 45,
+      "note": "The performance fee a vault charges out of the box (the '20' in 2-and-20).",
+      "raw": "2000",
+      "value": 2000
+    },
+    "DEFAULT_MAX_PERFORMANCE_FEE_BPS": {
+      "file": "src/FeeConstants.sol",
+      "line": 31,
+      "note": "Per-vault performance ceiling a new vault starts at; equals the default rate, so the vault fails closed rather than open.",
+      "raw": "2000",
+      "value": 2000
+    },
+    "EPOCH_LENGTH_DAYS": {
+      "file": "script/DeployPlanB.s.sol",
+      "line": 217,
+      "note": "Exposure epoch length; immutable in the ledger once constructed.",
+      "raw": "28",
+      "value": 28
+    },
+    "FORFEIT_BURN_BPS": {
+      "file": "src/ChallengeGame.sol",
+      "line": 291,
+      "note": "Slice of a LOSING challenger's forfeited bond that is burned.",
+      "raw": "2_000",
+      "value": 2000
+    },
+    "FULL_NOTIONAL_BPS": {
+      "file": "src/TierRegistry.sol",
+      "line": 98,
+      "note": "Coverage bound for an uncertified (tier-2) call: the full notional.",
+      "raw": "10_000",
+      "value": 10000
+    },
+    "GAME_CHALLENGE_WINDOW_DAYS": {
+      "file": "src/ChallengeGame.sol",
+      "line": 264,
+      "note": "The game's own copy of the challenge window; must track the ledger's.",
+      "raw": "14",
+      "value": 14
+    },
+    "GUARDIAN_EPOCH_DURATION_DAYS": {
+      "file": "src/GuardianRegistry.sol",
+      "line": 40,
+      "note": "Registry epoch, also the refundSlash cap window.",
+      "raw": "7",
+      "value": 7
+    },
+    "K_NUMERATOR": {
+      "file": "src/ExposureLedger.sol",
+      "line": 181,
+      "note": "USD of coverage bookable per USD of haircut-priced stake.",
+      "raw": "1",
+      "value": 1
+    },
+    "LEDGER_CHALLENGE_WINDOW_DAYS": {
+      "file": "src/ExposureLedger.sol",
+      "line": 179,
+      "note": "Post-epoch challenge window held by the ledger.",
+      "raw": "14",
+      "value": 14
+    },
+    "LEDGER_DEFAULT_WOOD_HAIRCUT_BPS": {
+      "file": "src/ExposureLedger.sol",
+      "line": 238,
+      "note": "The ledger's OWN default haircut. Written symbolically as BPS_DENOMINATOR, i.e. NO haircut. Only DeployPlanB overwrites it.",
+      "raw": "BPS_DENOMINATOR",
+      "value": 10000
+    },
+    "MANAGEMENT_FEE_BPS_DEPLOYED": {
+      "file": "script/Deploy.s.sol",
+      "line": 137,
+      "note": "The management rate a mainnet deploy actually ships with (env-overridable).",
+      "raw": "200",
+      "value": 200
+    },
+    "MAX_APPROVERS_PER_PROPOSAL": {
+      "file": "src/GuardianRegistry.sol",
+      "line": 41,
+      "note": "Ceiling on the approver ladder.",
+      "raw": "100",
+      "value": 100
+    },
+    "MAX_MANAGEMENT_FEE_BPS": {
+      "file": "src/SyndicateFactory.sol",
+      "line": 177,
+      "note": "Hard ceiling on the management fee (5%/yr).",
+      "raw": "500",
+      "value": 500
+    },
+    "MAX_PERFORMANCE_FEE_BPS": {
+      "file": "src/FeeConstants.sol",
+      "line": 20,
+      "note": "Hard protocol ceiling on the performance fee. The `worst_stack` fee set runs here.",
+      "raw": "3000",
+      "value": 3000
+    },
+    "MAX_SLASH_BPS": {
+      "file": "script/Deploy.s.sol",
+      "line": 102,
+      "note": "Upper clamp on any slash. 100% as deployed.",
+      "raw": "10_000",
+      "value": 10000
+    },
+    "MAX_STRATEGY_DAYS_DEPLOYED": {
+      "file": "script/Deploy.s.sol",
+      "line": 138,
+      "note": "Deploy-time strategy-duration ceiling in DAYS. Lower than the factory's 30d.",
+      "raw": "14",
+      "value": 14
+    },
+    "MAX_STRATEGY_DURATION_DAYS": {
+      "file": "src/SyndicateFactory.sol",
+      "line": 518,
+      "note": "Governor-parameter ceiling on a single strategy. Note Deploy.s.sol ships MAX_STRATEGY_DAYS at 14, which binds first.",
+      "raw": "30",
+      "value": 30
+    },
+    "MGMT_SPLIT_AGENT_BPS": {
+      "file": "src/ProtocolConfig.sol",
+      "line": 76,
+      "note": "Agent share of the management fee.",
+      "raw": "6000",
+      "value": 6000
+    },
+    "MGMT_SPLIT_GUARDIAN_BPS": {
+      "file": "src/ProtocolConfig.sol",
+      "line": 76,
+      "note": "Guardian share of the management fee. docs/guardian-network.md still says 10% (SHE-229); the code says this.",
+      "raw": "2000",
+      "value": 2000
+    },
+    "MGMT_SPLIT_PROTOCOL_BPS": {
+      "file": "src/ProtocolConfig.sol",
+      "line": 76,
+      "note": "Protocol share of the management fee.",
+      "raw": "2000",
+      "value": 2000
+    },
+    "MIN_GUARDIAN_STAKE_WOOD": {
+      "file": "script/Deploy.s.sol",
+      "line": 85,
+      "note": "WOOD a guardian must stake to register at all.",
+      "raw": "10_000e18",
+      "value": 10000.0
+    },
+    "MIN_OWNER_BOND_FLOOR_WOOD": {
+      "file": "src/StakedWood.sol",
+      "line": 210,
+      "note": "Hard floor under the vault-owner bond; the effective bond is max(minOwnerStake, this).",
+      "raw": "1_000 * 1e18",
+      "value": 1000.0
+    },
+    "MIN_OWNER_STAKE_WOOD": {
+      "file": "script/Deploy.s.sol",
+      "line": 86,
+      "note": "WOOD a vault owner must bond per fund.",
+      "raw": "10_000e18",
+      "value": 10000.0
+    },
+    "MIN_SLASH_BPS": {
+      "file": "script/Deploy.s.sol",
+      "line": 99,
+      "note": "Lower clamp on any slash. An approver who underwrote a sliver still pays this share of their whole stake.",
+      "raw": "1000",
+      "value": 1000
+    },
+    "PARTICIPATION_FLOOR_BPS": {
+      "file": "src/TokenCourt.sol",
+      "line": 94,
+      "note": "Turnout floor below which a verdict is Inconclusive and the window re-arms. The model does not price re-arms (caveat A8).",
+      "raw": "1_000",
+      "value": 1000
+    },
+    "PERF_SPLIT_AGENT_BPS": {
+      "file": "src/ProtocolConfig.sol",
+      "line": 80,
+      "note": "Agent share of the performance fee.",
+      "raw": "5000",
+      "value": 5000
+    },
+    "PERF_SPLIT_GUARDIAN_BPS": {
+      "file": "src/ProtocolConfig.sol",
+      "line": 80,
+      "note": "Guardian share of the performance fee. docs say 15% (SHE-229); the code says this.",
+      "raw": "2500",
+      "value": 2500
+    },
+    "PERF_SPLIT_OWNER_BPS": {
+      "file": "src/ProtocolConfig.sol",
+      "line": 80,
+      "note": "Vault-owner share of the performance fee. There is no owner leg on management.",
+      "raw": "1000",
+      "value": 1000
+    },
+    "PERF_SPLIT_PROTOCOL_BPS": {
+      "file": "src/ProtocolConfig.sol",
+      "line": 80,
+      "note": "Protocol share of the performance fee.",
+      "raw": "1500",
+      "value": 1500
+    },
+    "PLANB_REQUIRED_MAX_SLASH_BPS": {
+      "file": "script/DeployPlanB.s.sol",
+      "line": 501,
+      "note": "Plan B pre-flight HARD-REQUIRES this maxSlashBps. It is why the slash is 100%.",
+      "raw": "10_000",
+      "value": 10000
+    },
+    "PROPOSER_BOND_BPS": {
+      "file": "src/ExposureLedger.sol",
+      "line": 197,
+      "note": "Proposer bond as bps of USD coverage (1%).",
+      "raw": "100",
+      "value": 100
+    },
+    "PROSECUTOR_FEE_BPS": {
+      "file": "src/ChallengeGame.sol",
+      "line": 361,
+      "note": "Slice of the forfeited proposer bond paid to a winning challenger. The papers say 5%; the code says this.",
+      "raw": "2_000",
+      "value": 2000
+    },
+    "SETTLE_BURN_BPS": {
+      "file": "src/ChallengeGame.sol",
+      "line": 335,
+      "note": "Slice of a WINNING challenger's own bond that is burned.",
+      "raw": "500",
+      "value": 500
+    },
+    "TIER_ARBITRARY": {
+      "file": "src/TierRegistry.sol",
+      "line": 97,
+      "note": "The uncertified tier id. Everything ships in it: no script certifies.",
+      "raw": "2",
+      "value": 2
+    },
+    "WOOD_HAIRCUT_BPS": {
+      "file": "script/DeployPlanB.s.sol",
+      "line": 287,
+      "note": "The haircut a Plan B deploy applies to the WOOD price when pricing stake. The model uses this, NOT the ledger default.",
+      "raw": "7_000",
+      "value": 7000
+    },
+    "WOOD_USD_PRICE_X8_FORK": {
+      "file": "script/fork/DeployForkWoodUsdFeed.s.sol",
+      "line": 106,
+      "note": "Derived spot WOOD/USD from the Robinhood fork's pool reserves. Extracted from a doc-comment usage line -- fragile by nature, see README 'Fragile patterns'.",
+      "raw": "627821",
+      "value": 0.00627821
+    }
+  }
+}

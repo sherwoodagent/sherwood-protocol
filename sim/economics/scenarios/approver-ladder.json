@@ -1,0 +1,13 @@
+{
+  "name": "approver-ladder",
+  "title": "Approver ladder",
+  "ticket": "SHE-227",
+  "question": "What does each extra approver cost in TVL capacity?",
+  "note": "Under today's full-reservation rule the aggregate staked-WOOD face value needed is approvers / haircut / k times the open coverage: 4.3x at 3 approvers, 7.1x at 5, 10.0x at 7, 14.3x at 10. Decentralising the guardian set is a direct tax on capacity, which is the opposite incentive from the one you want. Compare against the shared-coverage scenario.",
+  "cells": [
+    {"label": "3 approvers", "overrides": {"stage": "growth", "approvers_per_proposal": 3, "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "5 approvers", "overrides": {"stage": "growth", "approvers_per_proposal": 5, "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "7 approvers", "overrides": {"stage": "growth", "approvers_per_proposal": 7, "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "10 approvers", "overrides": {"stage": "growth", "approvers_per_proposal": 10, "tvl": 10000000.0, "wood_price": 0.05}}
+  ]
+}

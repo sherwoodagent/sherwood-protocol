@@ -1,0 +1,13 @@
+{
+  "name": "shared-coverage",
+  "title": "Shared coverage reservation",
+  "ticket": "SHE-227",
+  "question": "What changes if approvers declare amounts that sum to the coverage instead of each reserving all of it?",
+  "note": "Today each approver reserves the FULL coverage, so a cohort of A approvers ties up A x coverage of budget until settleCoverage runs (ExposureLedger.sol:268). Under SHE-227 the cohort budget is the coverage itself, so the stake multiple stops scaling with cohort size and decentralising the guardian set stops taxing TVL capacity.",
+  "cells": [
+    {"label": "full reservation (today)",
+     "overrides": {"stage": "growth", "reservation_mode": "full", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "shared reservation (SHE-227)",
+     "overrides": {"stage": "growth", "reservation_mode": "shared", "tvl": 10000000.0, "wood_price": 0.05}}
+  ]
+}
