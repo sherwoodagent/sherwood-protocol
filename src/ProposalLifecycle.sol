@@ -116,8 +116,13 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             // bar without ever voting. Their ballot, if any, was withdrawn at the
             // same moment (see `notifyShareExit`), which is what stops this
             // netting from becoming a cheaper way to FORCE a veto.
-            uint256 exited = _exitedDuringVote(p.id);
-            liveSupply = liveSupply > exited ? liveSupply - exited : 0;
+            // Scoped so the local dies immediately: this function is close
+            // enough to the stack limit that an extra live slot breaks the
+            // no-optimizer build `forge coverage` uses.
+            {
+                uint256 exited = _exitedDuringVote(p.id);
+                liveSupply = liveSupply > exited ? liveSupply - exited : 0;
+            }
             if (liveSupply > 0) {
                 uint256 vetoThreshold = (liveSupply * p.vetoThresholdBps) / BPS_DENOMINATOR;
                 if (p.votesAgainst >= vetoThreshold) {
