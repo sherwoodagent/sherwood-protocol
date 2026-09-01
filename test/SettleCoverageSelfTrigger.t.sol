@@ -477,9 +477,11 @@ contract SettleCoverageSelfTriggerTest is Test {
     ///         exactly `needUsd` rather than the A-fold aggregate), which this
     ///         fixture cannot distinguish.
     ///
-    ///         A real ordering control needs `setKNumerator(2)` plus a guardian
-    ///         over-committed across govA and govB — see SHE-225. Left unbuilt
-    ///         rather than left here looking like proof it is not.
+    ///         The real ordering control lives in `CoverageEndToEnd.t.sol` as
+    ///         `test_she225_collapseOrderedAfterQuorumGate_keepsFullCapital`: it
+    ///         sets `kNumerator = 2` and over-commits g2 across both syndicates,
+    ///         and it DOES fail under the same mutation. This one is kept for the
+    ///         capital assertion alone.
     function test_executeProposal_collapseDoesNotScaleDownCapital() public {
         uint256 pid = _propose(govA, address(vaultA), agentA, 3 days);
         _openReview(govA, pid);
@@ -849,6 +851,75 @@ contract SettleCoverageSelfTriggerTest is Test {
     ///      whether `_settleCoverageBestEffort` actually calls the ledger.
     ///      Bounds are generous sanity checks against design D3's
     ///      ~50-120k/approver + ~40-60k base envelope, not tight pins.
+    /// @notice SHE-225 gas snapshot: what the EXECUTE-TIME collapse costs at a
+    ///         ONE-approver cohort. Pairs with the 4-approver case below.
+    ///
+    /// @dev    ONE EXECUTE PER TEST, DELIBERATELY. A first attempt measured both
+    ///         cohort sizes inside a single function and produced nonsense: the
+    ///         second `executeProposal` runs against warm storage, so on the
+    ///         pre-SHE-225 code the FOUR-approver execute measured 263,921 gas
+    ///         against the one-approver execute's 310,832 — cheaper with more
+    ///         approvers. Warm/cold dominates cohort size by a wide margin, so
+    ///         the two sizes are only comparable when each is the first execute
+    ///         in its own test.
+    ///
+    /// @dev    THE GATE'S OWN SCALING CANCELS. `requireApproveQuorum` also loops
+    ///         the approver set, so a raw `executeProposal` figure mixes the
+    ///         gate's per-approver cost with the collapse's. What isolates the
+    ///         collapse is the delta against the same tests run with the
+    ///         `settleCoverage` call removed from `_deriveAndStoreEffectiveCapital`
+    ///         — the gate runs identically either way. Measured that way:
+    ///
+    ///           1 approver:  363,579 with, 310,832 without  => +52,747
+    ///           4 approvers: 417,943 with, 310,832 without  => +107,111
+    ///
+    ///         NOTE THE BASELINE IS IDENTICAL AT BOTH SIZES (310,832). That is
+    ///         `requireApproveQuorum`'s early exit: every approver holds a full
+    ///         coverage reservation pre-collapse, so the first one already
+    ///         satisfies `haveUsd >= requiredCoverageUsd` and the loop returns.
+    ///         The gate does not scale with cohort size here, which is what makes
+    ///         the delta above attributable to the collapse alone.
+    ///
+    ///         The one-approver collapse writes NOTHING — its allocation equals
+    ///         its existing booking, so `_rebook` returns early on
+    ///         `target == current`. Its 52,747 is therefore the collapse's FIXED
+    ///         cost (price read, view calls, the `_settled` write, the event).
+    ///         The four-approver case adds four real `_rebook` write paths for
+    ///         54,364, about 13.6k each — so cost(n) ~= 52.7k + 13.6k * n.
+    ///
+    ///         Two cohort sizes fit that line but cannot test it. A third size
+    ///         would confirm or falsify the linearity; it is assumed here because
+    ///         the per-approver work is `_rebook`'s fixed set of bucket and
+    ///         accumulator writes.
+    function test_gasSnapshot_executeTimeCollapse_1Approver() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA, 3 days);
+        _openReview(govA, pid);
+        _vote(govA, pid, gGas1);
+        _pastReview(govA, pid);
+        govA.executeProposal(pid);
+        uint256 gasExec = vm.lastCallGas().gasTotalUsed;
+
+        emit log_named_uint("executeProposal gas, 1 approver", gasExec);
+        // Envelope, not a target: catches an order-of-magnitude regression
+        // without pinning a number legitimate work would move.
+        assertLt(gasExec, 1_000_000, "1-approver execute within a generous envelope");
+    }
+
+    /// @notice SHE-225 gas snapshot: the EXECUTE-TIME collapse at a FOUR-approver
+    ///         cohort. See the 1-approver case above for why each cohort size
+    ///         gets its own test and how the collapse cost is isolated.
+    function test_gasSnapshot_executeTimeCollapse_4Approvers() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA, 3 days);
+        _openReview(govA, pid);
+        _voteAllFour(govA, pid);
+        _pastReview(govA, pid);
+        govA.executeProposal(pid);
+        uint256 gasExec = vm.lastCallGas().gasTotalUsed;
+
+        emit log_named_uint("executeProposal gas, 4 approvers", gasExec);
+        assertLt(gasExec, 1_500_000, "4-approver execute within a generous envelope");
+    }
+
     function test_gasSnapshot_triggerCost_1And4Approvers() public {
         // Baseline: trigger SKIPS (settled at/before executeBy). Uses a
         // strategyDuration of 1 hours so the proposer's minimum self-settle

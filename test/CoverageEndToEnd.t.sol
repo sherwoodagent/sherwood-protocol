@@ -501,6 +501,78 @@ contract CoverageEndToEndTest is Test {
         );
     }
 
+    // ── SHE-225: the execute-time collapse must sit AFTER the quorum gate ──
+
+    /// @notice ORDERING CONTROL for the execute-time `settleCoverage` call added
+    ///         in SHE-225. `SyndicateGovernor._deriveAndStoreEffectiveCapital`
+    ///         calls the collapse immediately AFTER `requireApproveQuorum`;
+    ///         moving it ahead of the gate must break this test.
+    ///
+    ///         WHY THE ORDER MATTERS. The collapse rewrites both inputs the gate
+    ///         reads: `_recorded[key][g].usd` (the per-key booking the gate sums)
+    ///         and `_liveBookedUsd[g]` (the denominator `_sharedSlashableUsd`
+    ///         divides by). Collapse-first therefore discounts an over-committed
+    ///         approver TWICE for the same cross-proposal sharing — once when the
+    ///         collapse pro-rates it, again when the gate re-applies the ratio to
+    ///         the freshly-shrunk booking. The result is SILENT: the gate returns
+    ///         the short sum instead of reverting and `effectiveMaxCapital` is
+    ///         scaled down to match, so a fully-covered proposal executes small.
+    ///
+    /// @dev    REQUIRES `kNumerator == 2`. At the shipped default of 1 a
+    ///         guardian's aggregate booking is capped at its own slashable bond,
+    ///         so `slashable / liveTotal >= 1`, `_sharedSlashableUsd` returns the
+    ///         booking unchanged, and the double-haircut cannot bite at all —
+    ///         which is exactly why the first attempt at this control (in
+    ///         `SettleCoverageSelfTrigger.t.sol`) stayed green under mutation.
+    ///
+    ///         FIXTURE. g2 (filler, $1,000 slashable) backs BOTH syndicates, so
+    ///         its live bookings total $2,000 against a $1,000 bond. g1 (whale,
+    ///         $1,500) backs only A. VOTE ORDER IS LOAD-BEARING: g2 votes first
+    ///         so its discounted term is summed before g1's, otherwise
+    ///         `requireApproveQuorum`'s early exit (`haveUsd >= required`)
+    ///         returns on g1 alone and never reaches the discounted term.
+    ///
+    ///         MUTATION-VERIFIED. With the collapse moved ahead of the gate this
+    ///         test fails at `effectiveMaxCapital == 916_666_666` against a
+    ///         `MAX_CAPITAL` of `1_000e6` — the cohort measures $916.67 of the
+    ///         $1,000 it genuinely covers, and the proposal silently executes at
+    ///         91.7% size with no revert anywhere.
+    function test_she225_collapseOrderedAfterQuorumGate_keepsFullCapital() public {
+        vm.prank(ledgerOwner);
+        ledger.setKNumerator(2); // allow g2 to underwrite across both syndicates
+
+        // Syndicate B consumes g2's first $1,000.
+        uint256 pidB = _propose(govB, address(vaultB), agentB);
+        _openReview(govB, pidB);
+        _vote(govB, pidB, g2, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(ledger.openExposureUsd(g2), COVERAGE_USD, "g2 fully committed on B");
+
+        // Syndicate A: g2 doubles up (now $2,000 booked against a $1,000 bond),
+        // then g1 covers the rest. g2 FIRST — see the vote-order note above.
+        uint256 pidA = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pidA);
+        _vote(govA, pidA, g2, IGuardianRegistry.GuardianVoteType.Approve);
+        assertEq(ledger.openExposureUsd(g2), 2 * COVERAGE_USD, "g2 over-committed across both");
+        _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Approve);
+
+        _pastReview(govA, pidA);
+        govA.executeProposal(pidA);
+        assertEq(_state(govA, pidA), uint256(ISyndicateGovernor.ProposalState.Executed));
+
+        // THE ASSERTION. The cohort genuinely covers the $1,000 need, so the
+        // proposal must keep every dollar of its declared capital. Collapse-first
+        // scales this down without reverting.
+        assertEq(
+            govA.getProposal(pidA).effectiveMaxCapital,
+            MAX_CAPITAL,
+            "collapse must not shave capital: the gate has to read pre-collapse bookings"
+        );
+
+        // Non-vacuity: the collapse really did run at execute, so the assertion
+        // above is not passing merely because nothing happened.
+        assertLt(ledger.openExposureUsd(g1), COVERAGE_USD, "g1 collapsed at execute");
+    }
+
     // ── N1: budget exhaustion must not silence the approve side ───────────
 
     /// @notice N1 (re-review) — a guardian whose budget went on an earlier
