@@ -24,7 +24,7 @@
 - [x] 2.3 Levered regression: existing CL suite passes untouched; add one
       test asserting a levered clone's `PositionOpened` event fields are
       unchanged by this diff.
-- [ ] 2.4 Fork test (pinned block, vnet): unlevered NVDA/USDG 0.05% position
+- [x] 2.4 Fork test (pinned block, vnet): unlevered NVDA/USDG 0.05% position
       — real pool, real position manager; execute, one rerange, settle;
       assert delivery within slippage bounds.
 - [ ] 2.5 Invariant/lifecycle harness run with an unlevered clone (pid-22
