@@ -1457,16 +1457,42 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         view
         returns (address[] memory approvers, uint256[] memory bps)
     {
+        // The anchor every conviction on this proposal sizes from. Read once
+        // for the cohort; the governor is a protocol contract, not an oracle.
+        uint256 anchor = ILedgerGovernorMinimal(governor).getProposalView(proposalId).executedAt;
+        return slashBpsForAt(governor, proposalId, anchor);
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev ONE FORMULA FOR BOTH SLASH PATHS. `slashBpsFor` is this view at the
+    ///      verdict anchor (`executedAt`); `GuardianRegistry.resolveReview` calls
+    ///      it directly at the review-open instant, because a review-path block
+    ///      lands BEFORE execution, when `executedAt` is still zero and the live
+    ///      basis `slashBpsFor` would fall back to is not the one
+    ///      `StakedWood.slashGuardians` burns against. Exposing the anchor rather
+    ///      than letting the registry re-derive `ceil(lock / basis)` is what keeps
+    ///      the two paths from drifting: the registry contributes only the
+    ///      severity multiplier, never a second copy of the rate.
+    ///
+    ///      `anchor` IS A RAW INSTANT. `_slashBasis` hands it to
+    ///      `swood.slashableStakeAt`, which applies the same-block top-up `-1`
+    ///      itself — so a caller holding an ALREADY-hardened stamp (the registry's
+    ///      `Review.openedAt == open block - 1`) must pass the raw open instant
+    ///      (`openedAt + 1`) to land the lookup on the checkpoint `_slashOne`
+    ///      will multiply. `anchor == 0` reads live stake (no verdict anchor
+    ///      exists yet). Reverts `VerdictNotPast` through sWOOD on a future
+    ///      anchor.
+    function slashBpsForAt(address governor, uint256 proposalId, uint256 anchor)
+        public
+        view
+        returns (address[] memory approvers, uint256[] memory bps)
+    {
         bytes32 key = _reviewKey(governor, proposalId);
         address[] storage listed = _approversOf[key];
         uint256 n = listed.length;
         approvers = new address[](n);
         bps = new uint256[](n);
         if (n == 0) return (approvers, bps);
-
-        // The anchor every conviction on this proposal sizes from. Read once
-        // for the cohort; the governor is a protocol contract, not an oracle.
-        uint256 anchor = ILedgerGovernorMinimal(governor).getProposalView(proposalId).executedAt;
 
         for (uint256 i = 0; i < n; i++) {
             address g = listed[i];

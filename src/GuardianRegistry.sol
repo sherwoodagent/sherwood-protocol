@@ -11,6 +11,7 @@ import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/Reentrancy
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @dev Narrow read of the ledger's own `guardianRegistry` pointer, used only by
 ///      `setExposureLedger` to check the reciprocal grant. Declared locally
@@ -1219,17 +1220,151 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         r.blocked = blocked_;
 
         if (blocked_) {
-            // Slash every approver. The slash factor is DETERMINISTIC — a
-            // quadratic ramp of block-side decisiveness from the at-open block
-            // quorum to `SUPERMAJORITY_BPS`, computed by `_severityBps`. Severity
-            // is not voted. Pass `r.openedAt` so sWOOD sizes each slash off the
-            // approver's raw own-stake checkpoint at review open.
-            swood.slashGuardians(key, uint256(r.openedAt), _approvers[key], _severityBps(r));
+            // Slash every approver — each for ITS LOCK, scaled by severity, never
+            // for a fraction of its whole bond (design D3: both slash paths burn
+            // the lock). Severity is DETERMINISTIC — a quadratic ramp of
+            // block-side decisiveness from the at-open block quorum to
+            // `SUPERMAJORITY_BPS`, computed by `_severityBps`; it is not voted,
+            // and it multiplies the lock-derived rate rather than replacing it.
+            // Pass `r.openedAt` so sWOOD sizes each slash off the approver's raw
+            // own-stake checkpoint at review open — the same basis the rates
+            // below were sized from.
+            (address[] memory approvers, uint256[] memory bpsPer) = _reviewSlashRates(key, governor, proposalId, r);
+            swood.slashGuardians(key, uint256(r.openedAt), approvers, bpsPer);
             _emitBlockerAttribution(key, governor, proposalId);
         }
 
         emit ReviewResolved(proposalId, blocked_, 0);
         return blocked_;
+    }
+
+    /// @dev THE REVIEW-PATH SLASH RATES. For each approver the ledger holds a
+    ///      lock for on this proposal:
+    ///
+    ///          lockBps_i = 0                               lock_i == 0
+    ///                    = 10_000                          basis_i == 0 || lock_i >= basis_i
+    ///                    = ceil(lock_i x 10_000 / basis_i) otherwise
+    ///          bps_i     = ceil(lockBps_i x severityBps / 10_000)
+    ///          bps_i     = min(max(bps_i, loAtOpen), hiAtOpen)      if bps_i != 0
+    ///
+    ///      where `basis_i` is `swood.slashableStakeAt(g, review open)` — the
+    ///      checkpoint `StakedWood._slashOne` will multiply — `severityBps` is
+    ///      `_severityBps(r)`, and `[loAtOpen, hiAtOpen]` is the slash envelope
+    ///      SNAPSHOTTED AT REVIEW OPEN (`_envelopeAtOpen`, the same values
+    ///      `_severityBps` ramps between). `lockBps` comes from
+    ///      `ExposureLedger.slashBpsForAt`, the SAME formula the verdict path's
+    ///      `slashBpsFor` uses, so the two paths cannot drift; this function
+    ///      contributes the severity multiplier and the at-open envelope, nothing
+    ///      else. sWOOD then applies only its LIVE `maxSlashBps` as a ceiling.
+    ///
+    ///      THE ENVELOPE IS THE AT-OPEN ONE, NOT THE LIVE ONE (pashov review
+    ///      finding #11). The adversary here is the OWNER: with the floor read
+    ///      from sWOOD's live `minSlashBps` at resolve, an owner who disliked a
+    ///      specific cohort could wait for the review to decide against them and
+    ///      then raise `minSlashBps` in the same block, punishing exactly those
+    ///      approvers beyond the terms they voted under — and lower it back
+    ///      afterwards, so no other review ever saw the change. Flooring against
+    ///      `Review.minSlashBpsAtOpen` makes the penalty a function of the rules
+    ///      in force when the approvers committed, and only of those. sWOOD keeps
+    ///      its live MAX as a cap because a ceiling lowered after the fact can
+    ///      only protect guardians; it deliberately applies NO live floor.
+    ///
+    ///      THE ADVERSARY is a guardian who backed a bad proposal with a small
+    ///      lock while holding a large bond. Under the previous uniform-severity
+    ///      call it lost `severity` of EVERYTHING it held, which punished the
+    ///      well-capitalised more than the reckless and left every other proposal
+    ///      it backed under-covered (cross-proposal contagion). Now it loses at
+    ///      most its lock, scaled by how decisively the review condemned the
+    ///      proposal — and never less than `minSlashBps` of the bond, because the
+    ///      envelope floor is applied downstream to every non-zero rate. A
+    ///      1-wei declaration therefore buys neither quorum weight nor a token
+    ///      penalty. A non-zero lock at a non-zero severity always rounds UP to
+    ///      at least 1 bps, so the floor can bind on it; the ONLY ways to owe 0
+    ///      are to hold no lock (released by a vote change, or an approval that
+    ///      locked nothing) or a zero severity, which was already a zero burn
+    ///      under the old uniform call.
+    ///
+    ///      ANCHOR. `r.openedAt` is stored ALREADY `-1`-hardened (`open block - 1`),
+    ///      and `slashGuardians` hands it to `_slashOne` verbatim. The ledger's
+    ///      `slashBpsForAt` goes through `swood.slashableStakeAt`, which applies
+    ///      its own `-1` to a RAW instant — so this passes `openedAt + 1`, the raw
+    ///      open instant, and both lookups land on the same checkpoint. Passing
+    ///      `openedAt` itself would size the rate off `open block - 2`: a stake
+    ///      checkpoint landing exactly at `open block - 1` would then be in the
+    ///      burn basis but not the rate denominator, over-shooting the lock.
+    ///      `openedAt + 1 <= block.timestamp` at resolve, so sWOOD's
+    ///      `VerdictNotPast` guard never fires.
+    ///
+    ///      UNWIRED LEDGER. If `exposureLedger` is zero no lock was ever
+    ///      recorded — `voteOnProposal` had nowhere to write it — so no approver
+    ///      holds any liability. The fallback returns the registry's own vote-side
+    ///      `_approvers[key]` with all-zero rates, which `slashGuardians` skips
+    ///      entirely: nothing locked, nothing burned. This is the ONLY fallback;
+    ///      a wired ledger that reverts propagates, because a slash that silently
+    ///      burned nothing on a broken read would be the escape hatch this path
+    ///      exists to close. When wired, the ledger's set is used rather than
+    ///      `_approvers[key]`: the ledger drops released locks from its list while
+    ///      the vote set keeps the voter, and the lock set is the liability set.
+    function _reviewSlashRates(bytes32 key, address governor, uint256 proposalId, Review storage r)
+        private
+        view
+        returns (address[] memory approvers, uint256[] memory bpsPer)
+    {
+        IExposureLedger led = exposureLedger;
+        if (address(led) == address(0)) {
+            approvers = _approvers[key];
+            return (approvers, new uint256[](approvers.length));
+        }
+        (approvers, bpsPer) = led.slashBpsForAt(governor, proposalId, uint256(r.openedAt) + 1);
+        uint256 severity = _severityBps(r);
+        (uint256 lo, uint256 hi) = _envelopeAtOpen(r);
+        for (uint256 i = 0; i < bpsPer.length; i++) {
+            uint256 lockBps = bpsPer[i];
+            if (lockBps == 0) continue;
+            // ceil: a non-zero lock at a non-zero severity never rounds to 0.
+            uint256 bps = (lockBps * severity + 10_000 - 1) / 10_000;
+            // At-open envelope, per element. A zero product (zero severity) is
+            // left at zero: zero is the absence of liability, not a rate to floor.
+            if (bps == 0) continue;
+            bpsPer[i] = Math.min(Math.max(bps, lo), hi);
+        }
+    }
+
+    /// @dev The slash envelope `[lo, hi]` a review is judged under — the values
+    ///      `openReview` snapshotted, shared by `_severityBps` (which ramps between
+    ///      them) and `_reviewSlashRates` (which clamps to them), so the two can
+    ///      never read different envelopes for one review.
+    ///
+    ///      MIGRATION GUARD (PR #195 review, item 5). `minSlashBpsAtOpen` /
+    ///      `maxSlashBpsAtOpen` are APPENDED fields, so every review already
+    ///      `opened` when this upgrade lands reads them as 0 — and a zero
+    ///      envelope collapses every branch of the ramp to 0, which makes
+    ///      `_slashOne`'s `ownSlash` zero and skips the burn entirely. That is
+    ///      precisely the outcome the snapshot exists to prevent, handed for free
+    ///      to every in-flight review at the moment of the upgrade. Falling back
+    ///      to the live reads restores the pre-upgrade behaviour for exactly those
+    ///      reviews, which is strictly better than granting them immunity.
+    ///
+    ///      THE SENTINEL IS THE OFFSET, NOT THE VALUE (PR #195 re-review). The
+    ///      first cut of this guard keyed on `lo == 0 && hi == 0` read straight
+    ///      off the live getters, and that is a LEGAL CONFIGURATION, not just an
+    ///      unset field: `setMinSlashBps(0)` only checks `v > maxSlashBps`, and
+    ///      `setMaxSlashBps(0)` only checks `v < minSlashBps`, so `0/0` is
+    ///      reachable and reads back as "predates the field". An owner who opened
+    ///      a review while the live envelope was 0/0 would hit this fallback at
+    ///      resolve time and get the LIVE slots back — so raising `maxSlashBps`
+    ///      to 10_000 between open and resolve would take every approver's whole
+    ///      stake, which is exactly the mid-review mutability finding #11 closes.
+    ///      `openReview` therefore stores each bound PLUS ONE, making 0
+    ///      unreachable for any genuine snapshot and the sentinel unambiguous.
+    function _envelopeAtOpen(Review storage r) private view returns (uint256 lo, uint256 hi) {
+        if (r.minSlashBpsAtOpen == 0 || r.maxSlashBpsAtOpen == 0) {
+            lo = swood.minSlashBps();
+            hi = swood.maxSlashBps();
+        } else {
+            lo = uint256(r.minSlashBpsAtOpen) - 1;
+            hi = uint256(r.maxSlashBpsAtOpen) - 1;
+        }
     }
 
     /// @dev Deterministic slash severity from block-side decisiveness: the winning
@@ -1245,38 +1380,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      here let the owner nullify or maximise an already-decided review in
     ///      the same transaction that committed it.
     function _severityBps(Review storage r) private view returns (uint256) {
-        // MIGRATION GUARD (PR #195 review, item 5). `minSlashBpsAtOpen` /
-        // `maxSlashBpsAtOpen` are APPENDED fields, so every review already
-        // `opened` when this upgrade lands reads them as 0 — and a zero
-        // envelope collapses every branch below to 0, which makes `_slashOne`'s
-        // `ownSlash` zero and skips the burn entirely. That is precisely the
-        // outcome the snapshot exists to prevent, handed for free to every
-        // in-flight review at the moment of the upgrade. Falling back to the
-        // live reads restores the pre-upgrade behaviour for exactly those
-        // reviews, which is strictly better than granting them immunity.
-        //
-        // THE SENTINEL IS THE OFFSET, NOT THE VALUE (PR #195 re-review).
-        // The first cut of this guard keyed on `lo == 0 && hi == 0` read
-        // straight off the live getters, and that is a LEGAL CONFIGURATION,
-        // not just an unset field: `setMinSlashBps(0)` only checks
-        // `v > maxSlashBps`, and `setMaxSlashBps(0)` only checks
-        // `v < minSlashBps`, so `0/0` is reachable and reads back as
-        // "predates the field". An owner who opened a review while the live
-        // envelope was 0/0 would hit this fallback at resolve time and get the
-        // LIVE slots back — so raising `maxSlashBps` to 10_000 between open and
-        // resolve would take every approver's whole stake, which is exactly the
-        // mid-review mutability finding #11 closes. `openReview` therefore
-        // stores each bound PLUS ONE, making 0 unreachable for any genuine
-        // snapshot and the sentinel unambiguous.
-        uint256 lo;
-        uint256 hi;
-        if (r.minSlashBpsAtOpen == 0 || r.maxSlashBpsAtOpen == 0) {
-            lo = swood.minSlashBps();
-            hi = swood.maxSlashBps();
-        } else {
-            lo = uint256(r.minSlashBpsAtOpen) - 1;
-            hi = uint256(r.maxSlashBpsAtOpen) - 1;
-        }
+        // At-open envelope with the PR #195 migration guard — see `_envelopeAtOpen`.
+        (uint256 lo, uint256 hi) = _envelopeAtOpen(r);
         uint256 denom = uint256(r.totalStakeAtOpen);
         if (denom == 0) return lo; // defensive: a reached quorum implies denom > 0
         uint256 bBps = uint256(r.blockStakeWeight) * 10_000 / denom;

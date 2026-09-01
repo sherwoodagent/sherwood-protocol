@@ -12,8 +12,8 @@ interface IStakedWood {
     /// @notice Reverts when a non-slasher calls the verdict slash path.
     error NotAuthorizedSlasher();
 
-    /// @notice Reverts when `slashVerdict` is handed a rate array whose length
-    ///         does not match `approvers`. Positional alignment is the only
+    /// @notice Reverts when `slashVerdict` or `slashGuardians` is handed a rate
+    ///         array whose length does not match `approvers`. Positional alignment is the only
     ///         thing binding a guardian to their own rate, so a mismatch is a
     ///         caller bug that would otherwise slash the tail of the batch at a
     ///         rate nobody chose.
@@ -178,15 +178,28 @@ interface IStakedWood {
     function maxSlashBps() external view returns (uint256);
 
     // Registry-only mutations
-    /// @notice Slash `approvers` for a blocked proposal. Burns `slashBps` of each
-    ///         approver's own stake. Registry-only.
-    /// @param reviewKey  keccak256(abi.encode(governor, proposalId)).
-    /// @param openedAt   The review's open timestamp — the checkpoint each
-    ///                   approver's slash is sized off.
-    /// @param approvers  Approver addresses to slash.
-    /// @param slashBps   Slash fraction in basis points.
-    function slashGuardians(bytes32 reviewKey, uint256 openedAt, address[] calldata approvers, uint256 slashBps)
-        external;
+    /// @notice Slash `approvers` for a blocked proposal, each at its own rate.
+    ///         Registry-only. Each non-zero rate is clamped into
+    ///         `[minSlashBps, maxSlashBps]`; a zero rate is skipped (zero is the
+    ///         absence of liability, not a severity to floor).
+    /// @dev    The registry derives each rate from the approver's WOOD lock for
+    ///         the reviewed proposal over its slash basis at review open, scaled
+    ///         by the block-decisiveness severity — so the burn is at most the
+    ///         lock, and never less than `minSlashBps` of the bond.
+    /// @param reviewKey   keccak256(abi.encode(governor, proposalId)).
+    /// @param openedAt    The review's open anchor (already `-1`-hardened by the
+    ///                    registry) — the checkpoint each approver's slash is
+    ///                    sized off.
+    /// @param approvers   Approver addresses to slash.
+    /// @param slashBpsPer Per-approver slash fractions in bps, positionally
+    ///                    aligned with `approvers`; a length mismatch reverts
+    ///                    `SlashBpsLengthMismatch`.
+    function slashGuardians(
+        bytes32 reviewKey,
+        uint256 openedAt,
+        address[] calldata approvers,
+        uint256[] calldata slashBpsPer
+    ) external;
 
     /// @notice Burn the owner bond bound to `vault` (emergency-settle failure).
     ///         Registry-only.

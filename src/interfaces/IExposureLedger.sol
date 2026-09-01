@@ -230,6 +230,22 @@ interface IExposureLedger {
         view
         returns (address[] memory approvers, uint256[] memory bps);
 
+    /// @notice `slashBpsFor` at an explicit slash anchor instead of the
+    ///         proposal's `executedAt`. Each rate is the approver's LOCK over
+    ///         `slashableStakeAt(g, anchor)` (live stake when `anchor == 0`),
+    ///         rounded up, saturating at 10_000, 0 for a zero lock.
+    /// @dev    The review-path slash uses this: `GuardianRegistry.resolveReview`
+    ///         blocks BEFORE execution, so `executedAt` is zero and the basis
+    ///         `StakedWood.slashGuardians` burns against is the stake at review
+    ///         open. `anchor` is a RAW instant — sWOOD applies the same-block `-1`
+    ///         hardening itself, so a caller holding a pre-hardened stamp passes
+    ///         `stamp + 1`. Reverts `VerdictNotPast` (via sWOOD) on a future
+    ///         anchor.
+    function slashBpsForAt(address governor, uint256 proposalId, uint256 anchor)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory bps);
+
     /// @notice What `guardian` underwrote on this proposal, in USD-18:
     ///         `min(lock, slashable stake) x woodPriceX8()`. UNCAPPED at the
     ///         proposal's need — a guardian who locked more risked more and earns
