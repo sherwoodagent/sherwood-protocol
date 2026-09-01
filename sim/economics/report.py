@@ -684,7 +684,7 @@ def render_html(payload):
     a = H.append
     a("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">")
     a('<meta name="viewport" content="width=device-width, initial-scale=1">')
-    a("<title>SHE-182 economics scenario run</title>")
+    a("<title>Sherwood Scenario Report</title>")
     a("<style>%s</style></head><body><div class=\"wrap\">" % CSS)
     a("<h1>Sherwood protocol economics</h1>")
     a('<div class="sub">SHE-182 scenario run &middot; generated %s &middot; '
