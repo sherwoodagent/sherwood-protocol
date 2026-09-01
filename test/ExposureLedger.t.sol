@@ -3498,4 +3498,86 @@ contract ExposureLedgerTest is Test {
         // total either.
         assertEq(ledger.liabilityUsd(address(mgov), 1), 800e18, "cohort liability: exactly the sum of both live caps");
     }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // IS THE ANTI-BATCHING FLOOR STILL LOAD-BEARING?
+    //
+    // `setChallengeWindow` floors the window at `reviewPeriod +
+    // MAX_GOVERNOR_EXECUTION_WINDOW`, and `MAX_GOVERNOR_EXECUTION_WINDOW` is a
+    // hand-copied mirror of `GovernorParameters.MAX_EXECUTION_WINDOW`. The two
+    // tests below ask whether the property that floor defends can still be
+    // broken by shrinking the window, or whether the booking rule already
+    // carries it.
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// @notice The floor's stated attack is unreachable under the CURRENT
+    ///         booking rule, at a window an order of magnitude below the floor.
+    ///
+    /// @dev    Quoting the floor's own comment: "approve #1 just before an epoch
+    ///         boundary, let the bucket expire while #1 is still Approved and
+    ///         inside its execution window, then approve #2 at full budget".
+    ///         That requires the approval to book into the epoch the VOTE landed
+    ///         in. `recordApproval` books into the epoch containing `executeBy +
+    ///         strategyDuration`, so the bucket outlives the proposal by
+    ///         construction — `bucketEnd > coverUntil`, hence `bucketEnd +
+    ///         challengeWindow > coverUntil + challengeWindow` for ANY positive
+    ///         window.
+    ///
+    ///         Window here is 1 day against a live floor of 10 days (3d review
+    ///         + 7d). Pair with the control below, which fails at these exact
+    ///         timestamps under the pre-ADR rule.
+    function test_antiBatching_holdsWithChallengeWindowFarBelowTheFloor() public {
+        // The registry pointer is a codeless EOA in this fixture, so neither
+        // floor branch fires — the shrink is legal from the ledger's own view.
+        vm.prank(owner);
+        ledger.setChallengeWindow(1 days);
+        assertEq(ledger.challengeWindow(), 1 days, "fixture must actually be under-floored");
+
+        _wireRecording();
+        mgov.set(1_000e6);
+
+        // Vote lands in epoch 0, settlement in epoch 1 (35d > 28d): exactly the
+        // boundary-straddling shape the floor describes.
+        uint256 executeBy = ledger.epochGenesis() + 35 days;
+        mgov.setScheduleFull(executeBy, 0, executeBy);
+        assertEq(ledger.currentEpoch(), 0, "vote must land in epoch 0 for the straddle to exist");
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 1_000e18, "coverage booked");
+
+        // Day 29: past where an epoch-0 booking ages out (28d bucket + 1d
+        // window), still 6 days inside #1's execution window.
+        vm.warp(ledger.epochGenesis() + 29 days + 1);
+        assertLt(block.timestamp, executeBy, "control: #1 must still be executable at this instant");
+
+        assertEq(
+            ledger.openExposureUsd(guardian),
+            1_000e18,
+            "budget returned while the proposal it backs was still executable - one bond, two drains"
+        );
+    }
+
+    /// @notice NON-VACUITY CONTROL. Same window, same timestamps, but booked the
+    ///         PRE-ADR way — into the vote's own epoch, which is what
+    ///         `executeBy == 0` produces on this stub.
+    ///
+    /// @dev    The budget DOES come back at day 29 here. That is what makes the
+    ///         test above discriminating: it passes because of the
+    ///         settlement-dated bucket, not because 1 day happens to be safe.
+    function test_antiBatching_preAdrCurrentEpochBookingIsWhatTheFloorGuardedAgainst() public {
+        vm.prank(owner);
+        ledger.setChallengeWindow(1 days);
+        _wireRecording();
+        mgov.set(1_000e6);
+
+        // `executeBy` left at 0 => `coverUntil <= epochGenesis` => books into
+        // `currentEpoch()`, the rule the floor was sized against.
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 1_000e18, "booked into epoch 0");
+
+        vm.warp(ledger.epochGenesis() + 29 days + 1);
+        assertEq(ledger.openExposureUsd(guardian), 0, "epoch-0 booking ages out at 28d bucket + 1d window");
+    }
 }
