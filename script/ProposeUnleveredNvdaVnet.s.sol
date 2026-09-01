@@ -39,8 +39,13 @@ contract ProposeUnleveredNvdaVnet is Script {
         IUniswapV3Pool pool = IUniswapV3Pool(NVDA_POOL);
         int24 spacing = pool.tickSpacing();
         (, int24 spot,,,,,) = pool.slot0();
-        int24 lower = ((spot - 300) / spacing) * spacing;
-        int24 upper = ((spot + 300) / spacing) * spacing;
+        // Snap OUTWARD, floor toward -inf for the lower bound and ceil toward
+        // +inf for the upper, matching the contract's `_snapDown`/`_snapUp`.
+        // Plain `(x / spacing) * spacing` truncates toward zero, so below zero
+        // it rounds the lower bound UP and the band lands off-center — alignment
+        // holds so `_requireValidRange` still passes, but the range is skewed.
+        int24 lower = _snapDown(spot - 300, spacing);
+        int24 upper = _snapUp(spot + 300, spacing);
 
         ConcentratedLiquidityStrategy.InitParams memory p = ConcentratedLiquidityStrategy.InitParams({
             pool: NVDA_POOL,
@@ -114,5 +119,19 @@ contract ProposeUnleveredNvdaVnet is Script {
         console2.log("proposalId", pid);
 
         vm.stopBroadcast();
+    }
+
+    /// @dev Floor toward -inf onto the spacing grid — the `_snapDown` idiom.
+    function _snapDown(int24 tick, int24 spacing) internal pure returns (int24) {
+        int24 q = tick / spacing;
+        if (tick < 0 && tick % spacing != 0) q--;
+        return q * spacing;
+    }
+
+    /// @dev Ceil toward +inf onto the spacing grid — the `_snapUp` idiom.
+    function _snapUp(int24 tick, int24 spacing) internal pure returns (int24) {
+        int24 q = tick / spacing;
+        if (tick > 0 && tick % spacing != 0) q++;
+        return q * spacing;
     }
 }

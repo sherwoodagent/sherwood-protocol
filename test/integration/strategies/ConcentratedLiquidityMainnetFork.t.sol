@@ -154,8 +154,8 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
 
         // A wide band around spot, snapped to spacing — this test is pinning the
         // integration, not a trading thesis.
-        int24 lower = ((spot - 5000) / spacing) * spacing;
-        int24 upper = ((spot + 5000) / spacing) * spacing;
+        int24 lower = _snapDown(spot - 5000, spacing);
+        int24 upper = _snapUp(spot + 5000, spacing);
 
         ConcentratedLiquidityStrategy.InitParams memory p = ConcentratedLiquidityStrategy.InitParams({
             pool: address(pool),
@@ -274,8 +274,8 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
         int24 spacing = nvdaPool.tickSpacing();
         (, int24 spot,,,,,) = nvdaPool.slot0();
         // The momentum pod's band: ±3% ≈ ±300 ticks, snapped to spacing.
-        int24 lower = ((spot - 300) / spacing) * spacing;
-        int24 upper = ((spot + 300) / spacing) * spacing;
+        int24 lower = _snapDown(spot - 300, spacing);
+        int24 upper = _snapUp(spot + 300, spacing);
 
         ConcentratedLiquidityStrategy.InitParams memory p = ConcentratedLiquidityStrategy.InitParams({
             pool: poolAddr,
@@ -428,5 +428,20 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
         vm.prank(address(vaultStub));
         strategy.execute();
         assertGt(strategy.tokenId(), 0);
+    }
+
+    /// @dev Floor toward -inf onto the spacing grid — `_snapDown`. Plain
+    ///      truncation toward zero skews the band below zero (finding 5).
+    function _snapDown(int24 tick, int24 spacing) internal pure returns (int24) {
+        int24 q = tick / spacing;
+        if (tick < 0 && tick % spacing != 0) q--;
+        return q * spacing;
+    }
+
+    /// @dev Ceil toward +inf onto the spacing grid — `_snapUp`.
+    function _snapUp(int24 tick, int24 spacing) internal pure returns (int24) {
+        int24 q = tick / spacing;
+        if (tick > 0 && tick % spacing != 0) q++;
+        return q * spacing;
     }
 }

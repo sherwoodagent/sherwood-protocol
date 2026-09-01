@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {Vm} from "forge-std/Vm.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {ConcentratedLiquidityStrategy} from "../../src/strategies/ConcentratedLiquidityStrategy.sol";
@@ -128,11 +129,28 @@ contract UnleveredConcentratedLiquidityTest is CLFixture {
     }
 
     function test_execute_emitsZeroBorrowAndCollateral() public {
-        // The event keeps its levered shape with the Morpho fields at zero —
-        // downstream indexers read one schema for both modes.
-        vm.expectEmit(true, false, false, false);
-        emit ConcentratedLiquidityStrategy.PositionOpened(address(pool), 0, 0, 0, 0, 0, 0);
+        // Decode the actual event and assert the CLAIM — borrowed == 0 and
+        // collateral == 0 — rather than the old `expectEmit(true,...)` that
+        // matched only topic1 (the pool) and left both Morpho data fields
+        // unchecked (a mint emitting 12345/6789 passed it). `liquidity` is a
+        // dynamic `sqrt(a0*a1)` from the mock, so it is read, not asserted; the
+        // point of this test is the two zeros.
+        vm.recordLogs();
         _executeUnlev();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("PositionOpened(address,uint256,int24,int24,uint128,uint256,uint256)");
+        bool seen;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] != sig) continue;
+            seen = true;
+            assertEq(uint256(uint160(uint256(logs[i].topics[1]))), uint160(address(pool)), "wrong pool");
+            assertEq(uint256(logs[i].topics[2]), 1, "wrong tokenId");
+            (,,, uint256 borrowed, uint256 collateral) =
+                abi.decode(logs[i].data, (int24, int24, uint128, uint256, uint256));
+            assertEq(borrowed, 0, "unlevered borrowed != 0");
+            assertEq(collateral, 0, "unlevered collateral != 0");
+        }
+        assertTrue(seen, "PositionOpened not emitted");
     }
 
     function test_execute_twapGateStillBinds() public {
@@ -209,9 +227,11 @@ contract UnleveredConcentratedLiquidityTest is CLFixture {
 
     // ── Levered regression: the original mode is byte-identical ──
 
-    function test_levered_positionOpenedFieldsUnchanged() public {
-        // Pins the event VALUES for the levered clone, not just the shape —
-        // this diff must not have moved what a levered execute reports.
+    function test_levered_stillPostsCollateralAndBorrows() public {
+        // The levered clone's Morpho side is untouched by this diff: it still
+        // posts collateral and books debt. (Renamed from a misleading
+        // "…FieldsUnchanged" that claimed to pin the event but only read the
+        // position — the emit assertion lives in the unlevered test above.)
         // This suite's setUp re-points the fixture's single active-proposal
         // slot at the unlevered clone; point it back for the levered run.
         status.set(1, 1, address(strategy));
@@ -219,5 +239,31 @@ contract UnleveredConcentratedLiquidityTest is CLFixture {
         assertEq(strategy.levered(), true);
         assertGt(morpho.position(marketId, address(strategy)).collateral, 0);
         assertGt(morpho.position(marketId, address(strategy)).borrowShares, 0);
+    }
+
+    // ── rerange() unlevered: unit coverage (finding 4) ──
+
+    function test_rerange_unleveredReplacesPositionTouchingNoMorpho() public {
+        _executeUnlev();
+        uint256 firstTokenId = unlev.tokenId();
+        assertGt(firstTokenId, 0, "no position");
+
+        // Trigger: past minInterval, and twap ≥ threshold from the range mid.
+        // Default band is ±1000 (mid 0, halfRange 1000), trigger 8000bps →
+        // 800-tick threshold; 850 clears it. spot == twap so the deviation
+        // gate (maxTwapDeviationBps 100) passes.
+        skip(1 hours + 1);
+        pool.setTicks(850, 850);
+
+        vm.prank(keeper);
+        uint256 newTokenId = unlev.rerange();
+
+        assertTrue(newTokenId != firstTokenId, "position not replaced");
+        assertEq(unlev.tokenId(), newTokenId, "tokenId not updated");
+        // The whole point: a rerange on an unlevered clone reaches no Morpho
+        // surface. If any path did, it would hit address(0) and revert.
+        assertEq(morpho.position(marketId, address(unlev)).collateral, 0, "touched Morpho collateral");
+        assertEq(morpho.position(marketId, address(unlev)).borrowShares, 0, "touched Morpho borrow");
+        assertEq(unlev.levered(), false, "mode drifted");
     }
 }
