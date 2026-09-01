@@ -793,6 +793,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // price. Tier alone misses a same-tier re-certification with a higher
         // `extractableBoundBps`, so also revert when the re-resolved coverage
         // exceeds the propose-time snapshot.
+        //
+        // PRICE THE SAME QUANTITY PROPOSE PRICED. `_snapshotTierAndGate` adds
+        // the sandbox funding to the stored `requiredCoverage`; comparing a
+        // batch-only live figure against that sum leaves the coverage guard
+        // slack by exactly the funding, so a mid-review re-certification that
+        // raises the batch's coverage by less than the funding executes
+        // undetected. Adding the funding here removes that slack. The tier
+        // needs no matching adjustment: a sandbox proposal is pinned at tier 2,
+        // and 2 is the maximum, so `TierRegressed` cannot fire for it.
+        uint256 sandboxFunding = _sandboxFunding[proposalId];
         (uint8 liveTier, uint256 liveCoverage) = _resolveTierAndCoverage(
             calls,
             _loadCaps(_executeCallCaps, proposalId),
@@ -802,7 +812,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             false
         );
         if (liveTier > proposal.envelopeTier) revert TierRegressed();
-        if (liveCoverage > proposal.requiredCoverage) revert CoverageRegressed();
+        if (liveCoverage + sandboxFunding > proposal.requiredCoverage) revert CoverageRegressed();
 
         // Fail-safe sibling to the two regression checks above. The propose-time
         // ceiling check alone is NOT sufficient: it prices `maxCapital` against
@@ -862,7 +872,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // The subtraction cannot underflow: `proposeWithSandbox` bounds funding
         // by `maxCapital`, and the scaling below is monotone in it.
         uint256 batchCapital = proposal.effectiveMaxCapital;
-        uint256 sandboxFunding = _sandboxFunding[proposalId];
         if (sandboxFunding != 0) {
             // Scaled by the SAME raised-over-required ratio the effective
             // capital and the per-call caps already carry, expressed as

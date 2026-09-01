@@ -359,6 +359,36 @@ contract TierResolutionTest is Test {
         governor.executeProposal(pid);
     }
 
+    /// @notice SHE-210, execute-side half: demoting ONLY the settlement leg
+    ///         between propose and execute must trip `TierRegressed`. The
+    ///         execute leg stays certified tier 0 throughout, so this passes
+    ///         only if the live comparison prices the settle leg too — a
+    ///         refactor that split the propose and execute tier resolutions
+    ///         apart would regress it silently without this pin.
+    function test_she210_executeRevertsWhenSettlementLegTierRegressedSincePropose() public {
+        _wireTierRegistry();
+        _certifyBenignSettleLeg();
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
+
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
+        calls[0] = _certifiedCall();
+        uint256 pid = _propose(calls);
+        assertEq(governor.getProposalTier(pid), 0);
+
+        _advancePastVoting();
+
+        // Owner demotes the settle leg's (usdc, approve) pair; the execute
+        // leg's certification is untouched.
+        tierRegistry.demote(address(usdc), usdc.approve.selector);
+        (uint8 settleTier,) = tierRegistry.tierOf(address(usdc), usdc.approve.selector);
+        assertEq(settleTier, 2);
+        (uint8 execTier,) = tierRegistry.tierOf(address(mockAdapter), mockAdapter.approve.selector);
+        assertEq(execTier, 0); // control: the execute leg alone would still pass
+
+        vm.expectRevert(ISyndicateGovernor.TierRegressed.selector);
+        governor.executeProposal(pid);
+    }
+
     /// @notice Finding 5(b): a demoted-then-RE-certified adapter at the SAME
     ///         tier but with a HIGHER extractableBoundBps passes the tier-only
     ///         check (liveTier == envelopeTier) while the stored
