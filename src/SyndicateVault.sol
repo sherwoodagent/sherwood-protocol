@@ -1224,6 +1224,7 @@ contract SyndicateVault is
                     if (!ITierRegistry(registry).isAdapterAllowed(to)) {
                         revert DisallowedTransferTarget(calls[i].target, sel, to);
                     }
+                    _requireRecipientVaultBinding(registry, to);
                 }
                 continue;
             } else {
@@ -1263,6 +1264,48 @@ contract SyndicateVault is
             if (!ITierRegistry(registry).isAdapterAllowed(recipient)) {
                 revert DisallowedTransferTarget(calls[i].target, sel, recipient);
             }
+            _requireRecipientVaultBinding(registry, recipient);
+        }
+    }
+
+    /// @dev SHE-209 vault-binding for the code-class allowlist path.
+    ///
+    ///      `TierRegistry.isAdapterAllowed` admits a recipient either by an
+    ///      explicit owner grant OR by the CODE-CLASS fallback: any address
+    ///      whose codehash is the ERC-1167 clone of a certified template. The
+    ///      class fallback proves the recipient's CODE is byte-identical to a
+    ///      vetted template, but a clone's fund destination lives in STORAGE
+    ///      (`_vault`), set by an UNPERMISSIONED `initialize`. So anyone can
+    ///      `Clones.clone(template)`, `initialize(_vault = attacker)`, and the
+    ///      rogue clone passes `isAdapterAllowed` (and is priced at the
+    ///      template's cheap certified tier); the strategy's `_pushAllToVault`
+    ///      then ships the batch's funds to the attacker.
+    ///
+    ///      Bind the class path to THIS vault: a class-admitted recipient must
+    ///      name this vault as its own (`vault() == address(this)`). This is the
+    ///      one provenance codehash cannot supply. Explicit per-address grants
+    ///      (routers, Permit2, plain tokens) are NOT clones of a certified
+    ///      strategy template, so `classOf` returns 0 for them and they are
+    ///      exempt — this never restricts a target the owner vetted directly.
+    ///
+    ///      Both probes are raw + length-checked, not typed calls:
+    ///      - `classOf` UNREADABLE (or 0) → recipient is not a class member →
+    ///        return (no binding required). A registry with no class concept
+    ///        cannot be exploited via the class fallback, so this is safe, and it
+    ///        keeps a registry lacking `classOf` behavior-identical to pre-fix.
+    ///      - `vault()` UNREADABLE or mismatched on a CONFIRMED class member →
+    ///        revert. Fail CLOSED: a class member that cannot prove it belongs to
+    ///        this vault must not be paid.
+    function _requireRecipientVaultBinding(address registry, address recipient) private view {
+        (bool okClass, bytes memory retClass) =
+            registry.staticcall(abi.encodeWithSignature("classOf(address)", recipient));
+        // Not a class member (unreadable, short, or zero) → explicit-grant or
+        // non-class path; nothing to bind.
+        if (!okClass || retClass.length < 32 || abi.decode(retClass, (bytes32)) == bytes32(0)) return;
+
+        (bool okVault, bytes memory retVault) = recipient.staticcall(abi.encodeWithSignature("vault()"));
+        if (!okVault || retVault.length < 32 || abi.decode(retVault, (address)) != address(this)) {
+            revert AdapterVaultMismatch(recipient);
         }
     }
 
