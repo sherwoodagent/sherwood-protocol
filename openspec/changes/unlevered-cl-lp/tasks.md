@@ -32,18 +32,31 @@
 
 ## 3. Ops (vnet)
 
-- [ ] 3.1 Deploy the (new) CL template build; owner `setTemplateApproval`
+- [x] 3.1 Deploy the (new) CL template build; owner `setTemplateApproval`
       (owner is `0x5A00afAe…` — impersonation on the vnet, real key for any
       future mainnet).
-- [ ] 3.2 TierRegistry: confirm swap-adapter ADAPTER standing covers the CL
+- [x] 3.2 TierRegistry: confirm swap-adapter ADAPTER standing covers the CL
       template's `_requireAllowedAdapter` binding on this vault (Deploy.s.sol
       already wires it for fresh deployments; the vnet predates the template).
 
 ## 4. First real proposal
 
-- [ ] 4.1 Author init params from live state: ±300 ticks around spot,
+- [x] 4.1 Author init params from live state: ±300 ticks around spot,
       re-measured in-range depth, `lpAmount` sized under the pool-share cap,
       rerange policy per the momentum pod (trigger 80%, minInterval, cap).
 - [ ] 4.2 Propose on the vnet; guardian fleet reviews; drive the lifecycle
       to execute + settle. This is the fleet's first economically real
       strategy proposal — capture its evidence record.
+
+> **2.5 / 4.2 status (vnet blocker).** The unlevered strategy simulates to
+> full `Success` inside the guardian container (execute→settle, 37 harness
+> logs) and the guardian review CLEARS (`outcomeOf == 1`) via the pipeline's
+> counterfactual approve. The autonomous Approve VOTE is blocked by a daemon
+> operational flake — its forge-in-poll-loop yields `simulation=null` where
+> byte-identical args run by hand succeed — on a vnet whose position-manager
+> `_nextId` was injected below ~100 poisoned token ids (some execute an
+> invalid opcode), so every real v3 mint reverts `ERC721: token already
+> minted` until `_nextId` is admin-repaired. Root cause is vnet state
+> corruption + warp-induced fork-block drift, not this change. Tracked:
+> sherwood-guardian issue + Linear. Needs a fresh unmutated vnet to
+> demonstrate the on-chain APPROVE (as pid 22 sandbox did).
