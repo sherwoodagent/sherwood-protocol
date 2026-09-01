@@ -55,6 +55,7 @@ contract GovernorVetoDenominatorExitsTest is Test {
     address public lp1 = makeAddr("lp1");
     address public lp2 = makeAddr("lp2");
     address public attacker = makeAddr("attacker");
+    address public helper = makeAddr("helper");
 
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant EXECUTION_WINDOW = 1 days;
@@ -361,5 +362,161 @@ contract GovernorVetoDenominatorExitsTest is Test {
         _exitAll(lp1);
 
         assertEq(uint256(governor.getProposalState(pid)), before, "post-voteEnd flow must not change a settled verdict");
+    }
+
+    // ── 4. REVIEW OF #286 — the netting must not become its own weapon ────
+    //
+    // All four cases below FAIL against the first version of this fix, which
+    // reported every outbound transfer and accumulated them gross.
+
+    /// @notice A dust holder cannot move the denominator by bouncing shares.
+    ///
+    /// @dev    Plain `transfer` is not gated during a proposal. When the vault
+    ///         reported every outbound move and the governor accumulated them,
+    ///         ~1% of the book could be ping-ponged between two attacker-owned
+    ///         addresses until the netted denominator hit zero — at which point
+    ///         the veto check is skipped and a unanimous Against book is
+    ///         ignored. 101 transfers sufficed. Only a BURN is reported now, so
+    ///         the round trip is invisible and the bar is untouched.
+    function test_she205_transferPingPongCannotDisableTheVeto() public {
+        _deposit(lp1, 70_000e6);
+        _deposit(lp2, 30_000e6);
+        _deposit(attacker, 1_000e6);
+        uint256 supply = vault.totalSupply();
+        uint256 pid = _propose();
+
+        _pingPong(supply);
+
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        vm.prank(lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+
+        assertEq(
+            uint256(_stateAfterVoting(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Rejected),
+            "a unanimous Against book must still veto"
+        );
+    }
+
+    /// @notice A proposal nobody voted on is never Rejected, however small the
+    ///         electorate has become.
+    ///
+    /// @dev    `vetoThreshold = liveSupply * 4000 / 10000` is integer division:
+    ///         once `liveSupply` is small enough the bar is `0`, and
+    ///         `votesAgainst >= 0` holds with an empty tally. Two share-units
+    ///         left standing is the smallest honest way to reach it. The
+    ///         threshold now floors at one vote.
+    function test_she205_tinyElectorateStillNeedsOneVoteAgainst() public {
+        _deposit(lp1, 100_000e6);
+        uint256 pid = _propose();
+
+        uint256 bal = vault.balanceOf(lp1);
+        vm.prank(lp1);
+        vault.redeem(bal - 2, lp1, lp1); // liveSupply == 2 -> bar rounds to 0
+
+        // Nobody votes.
+        assertTrue(
+            _stateAfterVoting(pid) != ISyndicateGovernor.ProposalState.Rejected, "zero votes against must never reject"
+        );
+    }
+
+    /// @notice Exiting BEFORE voting does not buy a cheaper veto.
+    ///
+    /// @dev    The mirror of `test_she205_exitAfterVoting_cannotForceAVeto`,
+    ///         with the two statements swapped. `notifyShareExit` can only
+    ///         rescind a ballot that already exists, so in this order it shrank
+    ///         the denominator and left nothing to withdraw — 30% of the book
+    ///         then cleared a bar set at 40% of the remaining 70%, with the
+    ///         capital already gone. `vote` now caps weight at what the voter
+    ///         still carries.
+    function test_she205_exitBeforeVoting_cannotForceAVeto() public {
+        _deposit(lp1, 70_000e6);
+        _deposit(lp2, 30_000e6);
+        uint256 pid = _propose();
+
+        _exitAll(lp2);
+
+        vm.prank(lp2);
+        vm.expectRevert(ISyndicateGovernor.NoVotingPower.selector);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+
+        assertTrue(
+            _stateAfterVoting(pid) != ISyndicateGovernor.ProposalState.Rejected,
+            "a fully exited holder must not carry a veto"
+        );
+    }
+
+    /// @notice A share round trip leaves the ballot exactly where it was.
+    ///
+    /// @dev    The cut was keyed on gross shares moved, so an honest voter who
+    ///         sent shares out and took them back lost their tally for good
+    ///         (`_hasVoted` blocks re-voting). Worse, `transferFrom` reports
+    ///         `from = the owner`, so any spender holding an allowance could
+    ///         delete a voter's Against ballot without the holder acting at all.
+    ///         Neither path fires now.
+    function test_she205_shareRoundTripLeavesTheBallotIntact() public {
+        _deposit(lp1, 70_000e6);
+        _deposit(lp2, 30_000e6);
+        uint256 pid = _propose();
+
+        vm.prank(lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        uint256 againstBefore = governor.getProposal(pid).votesAgainst;
+        assertGt(againstBefore, 0, "control: the ballot was actually cast");
+
+        uint256 bal = vault.balanceOf(lp2);
+        vm.prank(lp2);
+        vault.transfer(helper, bal);
+        vm.prank(helper);
+        vault.transfer(lp2, bal);
+
+        assertEq(vault.balanceOf(lp2), bal, "control: balance is back where it started");
+        assertEq(governor.getProposal(pid).votesAgainst, againstBefore, "the ballot must survive a round trip");
+    }
+
+    /// @notice A delegatee votes the weight delegated to it, holding no shares.
+    ///
+    /// @dev    NON-VACUITY GUARD for the cap added to `vote`. The cap must read
+    ///         `getVotes`, not `balanceOf`: this vault auto-delegates on receipt
+    ///         but leaves an explicit delegation alone, so a delegatee carries
+    ///         weight with a zero balance. A balance-based cap would silently
+    ///         disenfranchise every delegation — and this test is what fails if
+    ///         someone later "simplifies" it to one.
+    function test_she205_delegateeVotesFullWeightHoldingNoShares() public {
+        _deposit(lp1, 70_000e6);
+        _deposit(lp2, 30_000e6);
+
+        uint256 delegated = vault.balanceOf(lp2);
+        vm.prank(lp2);
+        vault.delegate(helper);
+        vm.warp(vm.getBlockTimestamp() + 1); // let the checkpoint land before the snapshot
+
+        uint256 pid = _propose();
+        assertEq(vault.balanceOf(helper), 0, "control: the delegatee holds nothing");
+
+        vm.prank(helper);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+
+        assertEq(governor.getProposal(pid).votesAgainst, delegated, "delegated weight must survive the live-votes cap");
+    }
+
+    /// @dev Bounce the same shares between two attacker-controlled addresses
+    ///      until `target` share-units have moved. Returns the transfer count so
+    ///      a regression that makes this expensive is visible rather than silent.
+    function _pingPong(uint256 target) internal returns (uint256 transfers) {
+        address a = attacker;
+        address b = helper;
+        uint256 done;
+        while (done < target) {
+            uint256 amt = vault.balanceOf(a);
+            if (amt == 0) break;
+            if (done + amt > target) amt = target - done;
+            vm.prank(a);
+            vault.transfer(b, amt);
+            done += amt;
+            transfers++;
+            (a, b) = (b, a);
+        }
     }
 }

@@ -120,6 +120,12 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             liveSupply = liveSupply > exited ? liveSupply - exited : 0;
             if (liveSupply > 0) {
                 uint256 vetoThreshold = (liveSupply * p.vetoThresholdBps) / BPS_DENOMINATOR;
+                // FLOOR AT ONE VOTE. Integer division sends the threshold to
+                // zero for any electorate small enough that
+                // `liveSupply * bps < BPS_DENOMINATOR`, and `votesAgainst >= 0`
+                // is vacuously true -- so a proposal nobody voted on would be
+                // Rejected. A veto must always cost at least one vote against.
+                if (vetoThreshold == 0) vetoThreshold = 1;
                 if (p.votesAgainst >= vetoThreshold) {
                     // Veto rejection never traversed guardian review.
                     return (ProposalState.Rejected, false);

@@ -1487,16 +1487,38 @@ contract SyndicateVault is
         // MINTS ARE NOT REPORTED (`from == 0`) and need not be: deposits are
         // already shut for the entire window, so supply can only fall.
         //
+        // BURNS ONLY (`to == address(0)`), NOT EVERY OUTBOUND MOVE. The veto
+        // denominator is a SUPPLY figure, and only a burn changes supply. A
+        // holder-to-holder transfer leaves the electorate exactly as large as
+        // it was, so reporting one would net out shares that never left.
+        //
+        // Reporting gross outbound movement instead is unbounded: plain
+        // `transfer` is not gated during a proposal, so a holder of dust could
+        // bounce the same shares between two addresses they control and drive
+        // the netted denominator anywhere they liked -- to `0`, where the veto
+        // check is skipped and a 100%-Against book is ignored, or to `1`, where
+        // the threshold rounds to `0` and every proposal is Rejected with
+        // nobody voting. Both were reachable for the cost of gas. Keying on the
+        // burn makes the counter monotonic in something an attacker must
+        // actually spend: their own capital, bounded by what they hold.
+        //
         // THE QUEUE IS SKIPPED. Escrowed redeem shares are already netted out
         // of the denominator via the queue's checkpointed voting weight, and a
         // queued claim burning them mid-vote would otherwise subtract the same
         // shares twice.
         //
+        // KNOWN RESIDUAL: shares queued DURING the window are in neither figure
+        // -- not in the snapshot's `queueVotes`, and their eventual burn is
+        // skipped here -- so they stay in the denominator until the proposal
+        // settles. That is the conservative direction (the bar stays where it
+        // was) and it matches pre-fix behaviour; it is not the audited path,
+        // which exits through `redeem` while idle float still covers it.
+        //
         // BEST-EFFORT, NOT A GATE. A raw call whose result is ignored: this
-        // runs inside every share transfer, so a governor that cannot answer
+        // runs inside every share burn, so a governor that cannot answer
         // must not be able to brick LP flow. The degraded outcome is the
         // pre-fix denominator, never a stuck vault.
-        if (from != address(0) && from != _withdrawalQueue && value != 0) {
+        if (to == address(0) && from != address(0) && from != _withdrawalQueue && value != 0) {
             address gov = ISyndicateFactory(_factory).governorOf(address(this));
             if (gov != address(0)) {
                 // solhint-disable-next-line avoid-low-level-calls

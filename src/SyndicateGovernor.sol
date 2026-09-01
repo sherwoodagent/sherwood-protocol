@@ -316,7 +316,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         mirror. A voter could cast Against, then withdraw to shrink the
     ///         very denominator their ballot is measured against: at a 40% bar,
     ///         a 30% holder voting then exiting clears `0.4 x (S - e)`, so 30%
-    ///         beats a 40% bar. Exit therefore forfeits the vote, pro rata, and
+    ///         beats a 40% bar. Exit therefore forfeits the vote, one weight unit
+    ///         per share burned, and
     ///         the two halves together leave the effective bar at 40% of supply
     ///         however the attacker splits between voting and exiting.
     mapping(uint256 => mapping(address => Ballot)) private _ballots;
@@ -758,8 +759,28 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_commitState(proposal) != ProposalState.Pending) revert NotWithinVotingPeriod();
         if (_hasVoted[proposalId][msg.sender]) revert AlreadyVoted();
 
-        // Vote weight from ERC20Votes checkpoint at proposal creation.
+        // Vote weight from ERC20Votes checkpoint at proposal creation, CAPPED BY
+        // WHAT THE VOTER STILL CARRIES.
+        //
+        // SHE-205: the snapshot read alone is order-dependent in a way the exit
+        // netting cannot see. `notifyShareExit` rescinds a ballot that already
+        // exists, so vote-then-exit is covered -- but exit-then-vote arrives at
+        // an empty `_ballots` slot, returns early, and leaves the holder free to
+        // cast full snapshot weight against a denominator their own exit just
+        // shrank. That inverts the fix: 28.6% of the book could force a veto
+        // with its capital already withdrawn.
+        //
+        // `getVotes` rather than `balanceOf` is deliberate. This vault
+        // auto-delegates on receipt but leaves an explicit delegation alone, so
+        // a delegatee legitimately votes weight it does not hold and a balance
+        // comparison would zero them. Current votes track the delegation graph,
+        // so an exit by the underlying holder lowers the delegatee's cap too.
+        //
+        // The cap only ever reduces: a holder who ACQUIRED shares after the
+        // snapshot still votes the snapshot figure.
         uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, proposal.snapshotTimestamp);
+        uint256 liveWeight = IVotes(proposal.vault).getVotes(msg.sender);
+        if (liveWeight < weight) weight = liveWeight;
         if (weight == 0) revert NoVotingPower();
 
         _hasVoted[proposalId][msg.sender] = true;
@@ -779,10 +800,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         emit VoteCast(proposalId, msg.sender, support, weight);
     }
 
-    /// @notice SHE-205. The vault reports that `shares` left `holder` — a burn
-    ///         or an outbound transfer. While a proposal is taking votes, those
+    /// @notice SHE-205. The vault reports that `holder` BURNED `shares` —
+    ///         redeemed them out of the vault. Transfers are deliberately not
+    ///         reported: only a burn changes supply, and the veto denominator is
+    ///         a supply figure. While a proposal is taking votes, those burned
     ///         shares stop counting toward the veto denominator, and any ballot
-    ///         `holder` cast is withdrawn pro rata.
+    ///         `holder` cast is withdrawn one weight unit per share burned --
+    ///         a 1:1 cut, not a ratio. The two are equal only because this
+    ///         vault's voting units ARE its share balances; say the mechanism
+    ///         rather than "pro rata", which invites a future reader to
+    ///         introduce a scaling factor that does not exist.
     ///
     /// @dev    VAULT-ONLY, and silent rather than reverting on every other
     ///         condition. This runs inside the vault's ERC20 `_update`, so a
@@ -809,6 +836,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (p.id == 0 || p.state != ProposalState.Pending) return;
         if (block.timestamp > p.voteEnd) return;
 
+        // TAG, DON'T CLEAR. Retagging to a NEW pid silently zeroes
+        // `_exitedDuringVote(oldPid)`, which would retroactively restore the
+        // pre-fix denominator for a verdict already read. That is unreachable
+        // only because a proposal is committed to storage before its successor
+        // can exist: `ProposalLifecycle._decOpen` drops `_openProposalCount` on
+        // a committing terminal transition, and `propose` requires that count to
+        // be zero. This ordering is load-bearing -- keep the two in step.
         if (_voteExitPid != pid) {
             _voteExitPid = pid;
             _voteExitShares = 0;

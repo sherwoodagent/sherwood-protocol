@@ -527,8 +527,10 @@ interface ISyndicateGovernor {
 
     event VoteCast(uint256 indexed proposalId, address indexed voter, VoteType support, uint256 weight);
     /// @notice SHE-205. `weight` of `voter`'s ballot was withdrawn because they
-    ///         moved that many shares out of the vault while the vote was open.
-    ///         A ballot cannot outlive the capital behind it.
+    ///         REDEEMED that many shares out of the vault while the vote was
+    ///         open. A ballot cannot outlive the capital behind it. Transfers do
+    ///         not fire this: they move shares without changing supply, so the
+    ///         electorate the ballot is measured against is unchanged.
     event VoteWithdrawnOnExit(uint256 indexed proposalId, address indexed voter, uint256 weight);
 
     event ProposalExecuted(uint256 indexed proposalId, address indexed vault, uint256 capitalSnapshot);
