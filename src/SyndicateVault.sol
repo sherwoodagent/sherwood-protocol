@@ -1472,6 +1472,39 @@ contract SyndicateVault is
             _highWaterPricePerShare = 0;
         }
 
+        // SHE-205: REPORT SHARES LEAVING A HOLDER WHILE A VOTE IS OPEN.
+        //
+        // The LP veto bar is a fraction of a supply SNAPSHOT, but this vault
+        // shuts deposits and redemptions on DIFFERENT predicates: deposits from
+        // `openProposalCount() != 0` (Draft onward), redemptions only from
+        // `getActiveProposal() != 0` (EXECUTE onward). For the whole vote,
+        // money cannot come in but can leave — so a depositor who arrives one
+        // block before `propose` is counted in the denominator and can exit
+        // before settlement, lifting the bar without ever casting a vote. The
+        // governor nets these shares back out, and withdraws any ballot the
+        // holder cast at the same time.
+        //
+        // MINTS ARE NOT REPORTED (`from == 0`) and need not be: deposits are
+        // already shut for the entire window, so supply can only fall.
+        //
+        // THE QUEUE IS SKIPPED. Escrowed redeem shares are already netted out
+        // of the denominator via the queue's checkpointed voting weight, and a
+        // queued claim burning them mid-vote would otherwise subtract the same
+        // shares twice.
+        //
+        // BEST-EFFORT, NOT A GATE. A raw call whose result is ignored: this
+        // runs inside every share transfer, so a governor that cannot answer
+        // must not be able to brick LP flow. The degraded outcome is the
+        // pre-fix denominator, never a stuck vault.
+        if (from != address(0) && from != _withdrawalQueue && value != 0) {
+            address gov = ISyndicateFactory(_factory).governorOf(address(this));
+            if (gov != address(0)) {
+                // solhint-disable-next-line avoid-low-level-calls
+                (bool ok,) = gov.call(abi.encodeWithSignature("notifyShareExit(address,uint256)", from, value));
+                ok; // deliberately unchecked — see above
+            }
+        }
+
         // AUTO-DELEGATE ON EVERY RECEIPT. Runs AFTER `super._update` so the
         // recipient's post-receipt balance is what checkpoints. Holders that
         // explicitly delegated away keep their choice.

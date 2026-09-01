@@ -54,6 +54,17 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         return _openProposalCount;
     }
 
+    /// @dev SHE-205. Shares that left the vault during `proposalId`'s voting
+    ///      window, to be netted out of the veto denominator. Defaults to zero
+    ///      so this base contract stays self-contained; `SyndicateGovernor`
+    ///      overrides it with the counter it maintains. Declared as a hook
+    ///      rather than storage here deliberately — adding a slot to a base
+    ///      contract would shift every derived slot and break the layout gate.
+    function _exitedDuringVote(uint256 proposalId) internal view virtual returns (uint256) {
+        proposalId; // silence unused-parameter warning in the default
+        return 0;
+    }
+
     /// @dev The ONE resolver. Pure view over proposal storage; no writes, no
     ///      registry mutation.
     /// @return resolved the authoritative current state.
@@ -97,6 +108,16 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             address queue = ISyndicateVault(p.vault).withdrawalQueue();
             uint256 queueVotes = queue == address(0) ? 0 : IVotes(p.vault).getPastVotes(queue, p.snapshotTimestamp);
             uint256 liveSupply = pastTotalSupply > queueVotes ? pastTotalSupply - queueVotes : 0;
+            // SHE-205: shares that LEFT during the voting window are not part of
+            // the electorate the bar is meant to represent. Deposits shut as soon
+            // as a proposal exists but redemptions stay open until EXECUTE, so a
+            // depositor arriving one block before `propose` sits in
+            // `pastTotalSupply` and can be gone before this runs — inflating the
+            // bar without ever voting. Their ballot, if any, was withdrawn at the
+            // same moment (see `notifyShareExit`), which is what stops this
+            // netting from becoming a cheaper way to FORCE a veto.
+            uint256 exited = _exitedDuringVote(p.id);
+            liveSupply = liveSupply > exited ? liveSupply - exited : 0;
             if (liveSupply > 0) {
                 uint256 vetoThreshold = (liveSupply * p.vetoThresholdBps) / BPS_DENOMINATOR;
                 if (p.votesAgainst >= vetoThreshold) {

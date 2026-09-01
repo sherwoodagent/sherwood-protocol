@@ -526,6 +526,10 @@ interface ISyndicateGovernor {
     event PerformanceFeeCharged(uint256 indexed proposalId, address indexed asset, uint256 amount, uint256 aboveMark);
 
     event VoteCast(uint256 indexed proposalId, address indexed voter, VoteType support, uint256 weight);
+    /// @notice SHE-205. `weight` of `voter`'s ballot was withdrawn because they
+    ///         moved that many shares out of the vault while the vote was open.
+    ///         A ballot cannot outlive the capital behind it.
+    event VoteWithdrawnOnExit(uint256 indexed proposalId, address indexed voter, uint256 weight);
 
     event ProposalExecuted(uint256 indexed proposalId, address indexed vault, uint256 capitalSnapshot);
 

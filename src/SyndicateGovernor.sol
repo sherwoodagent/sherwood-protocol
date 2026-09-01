@@ -91,6 +91,14 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @notice Proposal ID -> voter -> bool
     mapping(uint256 => mapping(address => bool)) private _hasVoted;
 
+    /// @notice SHE-205. A cast ballot, retained so that an exiting holder's vote
+    ///         can be withdrawn along with their capital. `weight` is what still
+    ///         stands behind the ballot after any partial exits.
+    struct Ballot {
+        VoteType support;
+        uint256 weight;
+    }
+
     /// @notice Proposal ID -> vault balance at execution time
     mapping(uint256 => uint256) private _capitalSnapshots;
 
@@ -275,12 +283,51 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      collectable — which is the honest failure mode.
     mapping(uint256 => address[]) private _sandboxTokens;
 
+    /// @notice SHE-205. The proposal whose voting-window exits `_voteExitShares`
+    ///         belongs to. Tagged rather than cleared so the counter never has
+    ///         to be reset on a separate write.
+    uint256 private _voteExitPid;
+
+    /// @notice SHE-205. Shares that left the vault during `_voteExitPid`'s
+    ///         voting window, netted out of the veto denominator.
+    ///
+    /// @dev    The veto bar is a fraction of a supply SNAPSHOT, but redemptions
+    ///         stay open for the whole vote (they shut only at EXECUTE, via
+    ///         `getActiveProposal`, while deposits shut at Draft via
+    ///         `openProposalCount`). A depositor arriving one block before
+    ///         `propose` is therefore counted in the denominator and can be gone
+    ///         before settlement — raising the bar without casting a vote.
+    ///         Netting their exit back out is what removes the inflation.
+    ///
+    ///         FROZEN AT `voteEnd`, deliberately. Pricing the bar against LIVE
+    ///         supply instead would make the verdict move after the vote closed:
+    ///         `_computeState` is a true view and `resolveProposalState` is
+    ///         permissionless, so the outcome would become an MEV race —
+    ///         withdraw, resolve, redeposit in one transaction. Counting only
+    ///         while `block.timestamp <= voteEnd` makes the verdict a pure
+    ///         function of the window.
+    uint256 private _voteExitShares;
+
+    /// @notice SHE-205. Per-proposal ballot record: the direction a voter chose
+    ///         and the weight still standing behind it.
+    ///
+    /// @dev    Needed because netting exits out of the denominator WITHOUT also
+    ///         rescinding the departing holder's ballot trades this bug for its
+    ///         mirror. A voter could cast Against, then withdraw to shrink the
+    ///         very denominator their ballot is measured against: at a 40% bar,
+    ///         a 30% holder voting then exiting clears `0.4 x (S - e)`, so 30%
+    ///         beats a 40% bar. Exit therefore forfeits the vote, pro rata, and
+    ///         the two halves together leave the effective bar at 40% of supply
+    ///         however the attacker splits between voting and exiting.
+    mapping(uint256 => mapping(address => Ballot)) private _ballots;
+
     /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31)
     ///      for the three mappings above, then 1 more for `_escrowedFees`, then
     ///      1 more for `_ppsSnapshots`, then 3 more for the sandbox payload
-    ///      (26 -> 23) — append-only. See
+    ///      (26 -> 23), then 3 more for the SHE-205 exit accounting
+    ///      (23 -> 20) — append-only. See
     ///      `script/syndicate-governor-layout.golden.json`.
-    uint256[23] private __gap;
+    uint256[20] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -716,6 +763,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (weight == 0) revert NoVotingPower();
 
         _hasVoted[proposalId][msg.sender] = true;
+        // SHE-205: retain the ballot so `notifyShareExit` can withdraw it if the
+        // voter later leaves. `weight` here is the snapshot weight; exits
+        // decrement it.
+        _ballots[proposalId][msg.sender] = Ballot({support: support, weight: weight});
 
         if (support == VoteType.For) {
             proposal.votesFor += weight;
@@ -726,6 +777,69 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
 
         emit VoteCast(proposalId, msg.sender, support, weight);
+    }
+
+    /// @notice SHE-205. The vault reports that `shares` left `holder` — a burn
+    ///         or an outbound transfer. While a proposal is taking votes, those
+    ///         shares stop counting toward the veto denominator, and any ballot
+    ///         `holder` cast is withdrawn pro rata.
+    ///
+    /// @dev    VAULT-ONLY, and silent rather than reverting on every other
+    ///         condition. This runs inside the vault's ERC20 `_update`, so a
+    ///         revert here would brick every share transfer; each early return
+    ///         below is a state in which there is simply nothing to record.
+    ///
+    ///         Only `Pending` and only up to `voteEnd`: see `_voteExitShares`
+    ///         for why the counter must stop there rather than track live
+    ///         supply.
+    ///
+    ///         The vault never reports the withdrawal queue's own burns, which
+    ///         would otherwise be subtracted twice — escrowed queue shares are
+    ///         already netted out of the denominator via the queue's
+    ///         checkpointed voting weight.
+    function notifyShareExit(address holder, uint256 shares) external {
+        if (msg.sender != GovernorParameters.vault) return;
+        if (shares == 0) return;
+
+        // Exactly one top-level proposal is open at a time, so the monotonic
+        // counter names it — the same identification `SyndicateVault._openProposalPid`
+        // relies on.
+        uint256 pid = _proposalCount;
+        StrategyProposal storage p = _proposals[pid];
+        if (p.id == 0 || p.state != ProposalState.Pending) return;
+        if (block.timestamp > p.voteEnd) return;
+
+        if (_voteExitPid != pid) {
+            _voteExitPid = pid;
+            _voteExitShares = 0;
+        }
+        _voteExitShares += shares;
+
+        // Withdraw the ballot in step with the capital. Capped at the weight
+        // still standing, so repeated partial exits can never underflow the
+        // tallies, and a holder who exits more shares than they voted with
+        // (possible only if they acquired more after the snapshot) forfeits
+        // exactly what they cast and no more.
+        Ballot storage b = _ballots[pid][holder];
+        uint256 standing = b.weight;
+        if (standing == 0) return;
+        uint256 cut = shares < standing ? shares : standing;
+        b.weight = standing - cut;
+        if (b.support == VoteType.For) {
+            p.votesFor -= cut;
+        } else if (b.support == VoteType.Against) {
+            p.votesAgainst -= cut;
+        } else {
+            p.votesAbstain -= cut;
+        }
+        emit VoteWithdrawnOnExit(pid, holder, cut);
+    }
+
+    /// @dev SHE-205. Surfaces the exit counter to `_computeState`, which lives
+    ///      in the base contract. The storage sits here, in the most-derived
+    ///      contract, so the base's layout is untouched.
+    function _exitedDuringVote(uint256 proposalId) internal view override returns (uint256) {
+        return _voteExitPid == proposalId ? _voteExitShares : 0;
     }
 
     /// @inheritdoc ISyndicateGovernor
