@@ -115,7 +115,7 @@ it. Full detail: [coverage.md](coverage.md).
   `_deriveAndStoreEffectiveCapital` (`SyndicateGovernor.sol:1563`) —
   `effectiveMaxCapital = floor(maxCapital * coverageRaisedUsd / requiredCoverageUsd)` —
   and the same ratio scales every per-call cap. `quorumTierThreshold = 0`
-  (`ExposureLedger.sol:195`) applies the gate to every tier. An empty or
+  (`ExposureLedger.sol:209`) applies the gate to every tier. An empty or
   zero book is "no underwriter on the hook," not a shortfall; the proposal stays
   `Approved` until `executeBy`. Guardian daemons that treat any shortfall as
   disqualifying are wrong.
@@ -176,14 +176,14 @@ shrink or grow it.
 
 | Parameter | Default | Min | Max | Setter |
 |---|---|---|---|---|
-| `kNumerator` (exposure budget multiplier) | 1 | 1 (zero reverts `InvalidParameter`) | — | `setKNumerator` |
-| `challengeWindow` | 14 d | > 0 and ≥ `reviewPeriod` + 7 d | scan-bounded (16 buckets) | `ExposureLedger.sol:768` |
+| `kNumerator` (exposure budget multiplier) | 1 | 1 (zero reverts `InvalidParameter`) | — | `ExposureLedger.sol:795` |
+| `challengeWindow` | 14 d | > 0 and ≥ `reviewPeriod` + 7 d | scan-bounded (16 buckets) | `ExposureLedger.sol:707` |
 | `epochLength` | 28 d (immutable) | — | — | ctor |
-| `MAX_COVERAGE_HORIZON` | 60 d | const | const | `ExposureLedger.sol:132` |
-| `proposerBondBps` | 100 (1%) | 0 | 100% | `ExposureLedger.sol:854` |
-| `coveredTvlCapUsd` | 0 = fail-closed (nothing proposable until set) | — | — | `ExposureLedger.sol:843` |
-| `woodHaircutBps` | 100% (no haircut — deploy script refuses this; safe value set at deploy) | 50% | 100% | `ExposureLedger.sol:727` |
-| `woodUsdPriceX8` | owner-set cap (0 = hard stop `NoWoodPrice`) | — | — | `ExposureLedger.sol:648` |
+| `MAX_COVERAGE_HORIZON` | 60 d | const | const | `ExposureLedger.sol:146` |
+| `proposerBondBps` | 100 (1%) | 0 | 100% | `ExposureLedger.sol:812` |
+| `coveredTvlCapUsd` | 0 = fail-closed (nothing proposable until set) | — | — | `ExposureLedger.sol:801` |
+| `woodHaircutBps` | 100% (no haircut — deploy script refuses this; safe value set at deploy) | 50% | 100% | `ExposureLedger.sol:666` |
+| `woodUsdPriceX8` | owner-set cap (0 = hard stop `NoWoodPrice`) | — | — | `ExposureLedger.sol:587` |
 
 ## Adapter certification — TierRegistry
 
