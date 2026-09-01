@@ -477,7 +477,7 @@ contract DeployPlanB is ScriptBase {
         //     Only `initialize` could reach 42, i.e. only a fresh sWOOD.
         //   - The property it approximated (an approver cannot exit from under
         //     a pending challenge) is now enforced exactly by the exit gate on
-        //     `claimUnstakeGuardian`, which reads `openExposureUsd` directly.
+        //     `claimUnstakeGuardian`, which reads `openExposure` directly.
         //
         // Pre-flight 3 below replaces it, and is strictly stronger: it checks
         // the mechanism is WIRED rather than that a proxy for it is large
@@ -796,7 +796,7 @@ contract DeployPlanB is ScriptBase {
         // remedy produced: an operator who deployed a ledger by hand to satisfy
         // the check got a SECOND ledger from this script, with the registry and
         // the factory booking into the new one while sWOOD read the old. Every
-        // guardian then shows `openExposureUsd == 0` and walks out carrying live
+        // guardian then shows `openExposure == 0` and walks out carrying live
         // exposure — the exact failure the check exists to prevent, reached by
         // following its own instructions.
         //

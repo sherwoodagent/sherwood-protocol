@@ -1290,13 +1290,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // re-entrant double-release through a hooked WOOD.
         proposal.proposerBondWood = 0;
         IProposerBondEscrow(escrow).releaseBond(proposalId);
-
-        // Best-effort `settleCoverage` self-trigger: this is the backstop that IS
-        // provably past `executeBy` for every executed proposal, so it collapses
-        // the reservations an early settlement-time trigger had to skip.
-        // Successful-release path only — never on the forfeiture-acknowledge
-        // early return, whose conviction already reprices the cohort.
-        _settleCoverageBestEffort(proposalId, proposal);
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -2197,10 +2190,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      corresponding asset balance it started with. Strategies MUST fully
     ///      unwind non-asset positions before this runs; if one cannot, wait past
     ///      `strategyDuration` and drive the emergency-settle path.
-    /// @dev  Best-effort `settleCoverage` self-trigger. Settlement is NOT reliably
-    ///       past a proposal's `executeBy`, so `_settleCoverageBestEffort` guards
-    ///       on it and skips silently otherwise — the `reclaimProposerBond`
-    ///       trigger is the backstop that IS provably past it.
     function _finishSettlement(uint256 proposalId, StrategyProposal storage proposal)
         internal
         returns (int256 pnl, uint256 agentFee)
@@ -2264,46 +2253,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _decOpen();
 
         emit ProposalSettled(proposalId, vault, pnl, totalFee, block.timestamp - proposal.executedAt);
-
-        // LAST operation of finalization (design D1): a gas-starved child
-        // here leaves no meaningful work unfunded behind it. Covers
-        // `settleProposal`, `unstick`, and `finalizeEmergencySettle` in one
-        // place (all three route through `_finishSettlement`).
-        _settleCoverageBestEffort(proposalId, proposal);
-    }
-
-    /// @notice Best-effort self-trigger of the exposure ledger's
-    ///         `settleCoverage(address(this), proposalId)` so cohort capacity
-    ///         relief does not depend on an external keeper. Never reverts.
-    /// @dev    Guard first: `settleCoverage` itself reverts `ReviewNotClosed`
-    ///         unless `pv.executeBy != 0 && block.timestamp > pv.executeBy`,
-    ///         mirrored here exactly including the `== 0` disjunct.
-    ///         `proposal.executeBy` stays zero for a collaborative Draft that
-    ///         never reaches Pending, and without that check the guard would not
-    ///         skip — the ledger call would run only to revert on the same zero,
-    ///         producing a spurious `CoverageSettleFailed` for a proposal that was
-    ///         never capable of a real failure. Settlement is also not reliably
-    ///         past `executeBy`, so an early call is a statically-knowable no-op:
-    ///         skipping silently keeps `CoverageSettleFailed` meaning the call
-    ///         reverted, not that it ran too early.
-    /// @dev    Ledger resolution mirrors the reclaim gates' pinned-first rule: the
-    ///         ledger pinned at bond-lock time, falling back to the live slot only
-    ///         for a proposal that recorded none, skipping when both are zero.
-    /// @dev    Bare catch, deliberately: everything reaching it is either
-    ///         ledger-side (e.g. `NoWoodPrice` during a feed outage) or gas
-    ///         starvation, and revert data cannot reliably distinguish them. No
-    ///         gas floor: a gas-starved trigger degrades to the exact pre-change
-    ///         status quo — over-reserved, the conservative direction — surfaced
-    ///         by `CoverageSettleFailed` and permissionlessly repairable.
-    function _settleCoverageBestEffort(uint256 proposalId, StrategyProposal storage proposal) private {
-        if (proposal.executeBy == 0 || block.timestamp <= proposal.executeBy) return;
-        address ledger = proposal.proposerBondLedger;
-        if (ledger == address(0)) ledger = _exposureLedger;
-        if (ledger == address(0)) return;
-        try IExposureLedger(ledger).settleCoverage(address(this), proposalId) {}
-        catch {
-            emit CoverageSettleFailed(proposalId, ledger);
-        }
     }
 
     /// @dev Snapshot every fee rate, recipient and split in force at propose time

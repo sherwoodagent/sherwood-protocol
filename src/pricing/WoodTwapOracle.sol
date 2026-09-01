@@ -57,8 +57,9 @@ interface IAggregatorMinimal {
  *
  *         UNAVAILABLE IS NOT A FREE PASS: with no Chainlink WOOD feed it makes
  *         `ExposureLedger._woodPrice` revert `NoWoodPrice`. That is still
- *         fail-SAFE rather than fail-open — `recordApproval` catches it and books
- *         nothing, while propose and execute halt — but it means this contract's
+ *         fail-SAFE rather than fail-open — approve votes never read it (locks
+ *         are WOOD), while propose, execute and challenge filing halt — but it
+ *         means this contract's
  *         liveness is the protocol's liveness, and every bound below is sized
  *         accordingly: tight enough to be meaningful, loose enough that a healthy
  *         chain never trips it.

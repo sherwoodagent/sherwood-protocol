@@ -203,10 +203,12 @@ interface IChallengeGame {
     error NotAccusedApprover();
     error ZeroAddress();
     error InvalidParameter();
-    /// @dev No WOOD price is configured on the ledger, so a bond cannot be
-    ///      denominated at all. Transient and protocol-wide: nothing is
-    ///      challengeable until governance sets one. Split out from
-    ///      `InvalidParameter` because the two call for opposite responses.
+    /// @dev The ledger could not price the bond: no WOOD price source (feed and
+    ///      TWAP both unavailable, or the cap unset), or the vault-asset feed
+    ///      needed for the proposal's need is stale. Transient and
+    ///      protocol-wide: nothing is challengeable until the price returns, and
+    ///      filing WAITS rather than falling back to an inflated figure. Split out
+    ///      from `InvalidParameter` because the two call for opposite responses.
     error WoodPriceUnset();
     /// @dev The bond floored to zero, so the filing would have bought its
     ///      freeze for nothing. Permanent and specific to this proposal:

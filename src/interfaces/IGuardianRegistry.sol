@@ -105,7 +105,13 @@ interface IGuardianRegistry {
     ///         Block votes carry no proposed severity — the slash severity is
     ///         a deterministic function of block-side decisiveness, computed
     ///         at `resolveReview`.
-    function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support) external;
+    /// @param  lockWood On an Approve vote, the WOOD the guardian DECLARES it
+    ///         locks behind the proposal; the ledger locks
+    ///         `min(lockWood, free budget)` and never rejects the vote for it.
+    ///         That lock is what a conviction burns (under sWOOD's
+    ///         `[minSlashBps, maxSlashBps]` envelope) and what counts toward the
+    ///         execute-time coverage quorum at live value. Ignored on Block.
+    function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support, uint256 lockWood) external;
 
     // ── Multi-governor management ──
     function addGovernor(address governor, address vault) external;
@@ -198,15 +204,18 @@ interface IGuardianRegistry {
         returns (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight);
 
     /// @notice Per-proposal approver set plus the COVERAGE each one actually
-    ///         underwrote, from the exposure ledger's settled allocation.
+    ///         underwrote: the exposure ledger's `coverageUsdOf`, i.e.
+    ///         `min(lock, slashable stake)` at the live WOOD price, uncapped at
+    ///         the proposal's need.
     /// @dev    The weight guardian fees should be paid on. `getApproverWeights`
     ///         returns staked WOOD, which pays for parking capital rather than for
-    ///         underwriting — an approver the ledger booked nothing for still
+    ///         underwriting — an approver the ledger locked nothing for still
     ///         appears there at full stake weight. Weighting on this instead pays
-    ///         zero for a zero-coverage approve without touching anyone's right to
-    ///         vote.
+    ///         zero for a zero-lock approve without touching anyone's right to
+    ///         vote, and pays a guardian who locked more (and so stands to burn
+    ///         more) proportionally more.
     /// @return approvers   Registry-side approver set for the proposal.
-    /// @return coverageUsd Allocated coverage per approver, USD-18. Zero entries
+    /// @return coverageUsd Locked coverage per approver, USD-18. Zero entries
     ///                     are real: that approver underwrote nothing.
     /// @return priced      False when the ledger could not value the coverage.
     ///                     RETRY — do not treat the zeros as a payable result.

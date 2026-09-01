@@ -653,22 +653,23 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @inheritdoc IGuardianRegistry
     /// @dev The weight the fee should be paid on. `getApproverWeights` returns
     ///      `_voteStake` — what the approver PARKED, not what they UNDERWROTE —
-    ///      so paying on that would let an approver who booked no coverage earn
-    ///      beside one who booked the full amount.
+    ///      so paying on that would let an approver who locked no coverage earn
+    ///      beside one who locked its whole free budget.
     ///
-    ///      The divergence is reachable: `recordApproval` deliberately books
-    ///      nothing and does not revert when the guardian has no free budget, the
-    ///      asset feed is unpriceable, coverage is zero, or settlement is beyond
-    ///      the coverage horizon. The registry still pushes the voter into
-    ///      `_approvers` before the ledger hook runs, so a guardian can spend its
-    ///      whole budget on one proposal and keep approving everything else at
-    ///      full stake weight, underwriting nothing further.
+    ///      The divergence is reachable: `recordApproval` deliberately locks
+    ///      nothing and does not revert when the guardian declared zero, has no
+    ///      free budget, the asset feed is unpriceable, coverage is zero, or
+    ///      settlement is beyond the coverage horizon. The registry still pushes
+    ///      the voter into `_approvers` before the ledger hook runs, so a
+    ///      guardian can spend its whole budget on one proposal and keep
+    ///      approving everything else at full stake weight, underwriting nothing
+    ///      further.
     ///
-    ///      Returns the ledger's ALLOCATION — each approver's settled pro-rata
-    ///      share — rather than their reservation, since reservations equal the
-    ///      full coverage per approver and would over-pay everyone on an
-    ///      over-subscribed proposal. Allocations require `settleCoverage` to have
-    ///      run; it is permissionless, so the payout job should call it first.
+    ///      Returns the ledger's `coverageUsdOf` — `min(lock, slashable stake)`
+    ///      at the live WOOD price, UNCAPPED at the proposal's need. A guardian
+    ///      who locked more took more risk (its whole lock burns on conviction)
+    ///      and earns fee in proportion; there is no pro-rata allocation to
+    ///      settle first and no keeper step before payout.
     ///
     ///      `priced` is FALSE when the ledger could not value the coverage. The
     ///      caller MUST retry rather than treat the zeros as a result: silently
@@ -687,7 +688,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         IExposureLedger led = exposureLedger;
         if (address(led) == address(0)) return (approvers, coverageUsd, true);
         for (uint256 i = 0; i < n; i++) {
-            try led.allocatedUsd(governor, proposalId, approvers[i]) returns (uint256 v) {
+            try led.coverageUsdOf(governor, proposalId, approvers[i]) returns (uint256 v) {
                 coverageUsd[i] = v;
             } catch {
                 return (approvers, new uint256[](n), false);
@@ -707,7 +708,19 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      Blockers are each capped. Block votes carry no proposed severity: the
     ///      slash severity is a deterministic function of block-side decisiveness
     ///      computed at `resolveReview` (see `_severityBps`).
-    function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support) external whenNotPaused {
+    /// @dev `lockWood` IS THE APPROVER'S DECLARATION — the WOOD it puts behind
+    ///      this proposal — forwarded verbatim to `ExposureLedger.recordApproval`,
+    ///      which clamps it to the guardian's free budget and never rejects it.
+    ///      Ignored on a Block vote: a blocker underwrites nothing. A zero on an
+    ///      Approve vote is legal and locks nothing (the vote still counts toward
+    ///      the review tally; it simply contributes no coverage to the
+    ///      execute-time quorum). THE SINGLE ENTRY: there is deliberately no
+    ///      overload without the amount, so no caller can approve without having
+    ///      stated what it is willing to lose.
+    function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support, uint256 lockWood)
+        external
+        whenNotPaused
+    {
         if (support == GuardianVoteType.None) revert();
         if (!_authorizedGovernors.contains(governor)) revert UnauthorizedGovernor();
 
@@ -769,10 +782,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // write below this hook. Same discipline as resolveReview.
             if (support == GuardianVoteType.Approve && address(exposureLedger) != address(0)) {
                 // The aggregate exposure cap is checked here, at the approve
-                // vote. An over-exposed guardian books nothing rather than
+                // vote. An over-exposed guardian locks nothing rather than
                 // reverting; the vote still lands and the shortfall surfaces
                 // at the execute-time quorum.
-                exposureLedger.recordApproval(governor, proposalId, msg.sender);
+                exposureLedger.recordApproval(governor, proposalId, msg.sender, lockWood);
             }
             emit GuardianVoteCast(proposalId, msg.sender, support, weight);
         } else {
@@ -811,7 +824,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
                 if (support == GuardianVoteType.Block) {
                     exposureLedger.releaseApproval(governor, proposalId, msg.sender);
                 } else {
-                    exposureLedger.recordApproval(governor, proposalId, msg.sender);
+                    // Block -> Approve re-locks from scratch: the earlier
+                    // Approve -> Block released the old lock and swap-popped
+                    // the guardian out of the ledger's list, so this is a fresh
+                    // `min(lockWood, free budget)` against the budget as it
+                    // stands now, not a restoration of the old figure.
+                    exposureLedger.recordApproval(governor, proposalId, msg.sender, lockWood);
                 }
             }
             emit GuardianVoteChanged(proposalId, msg.sender, existing, support);

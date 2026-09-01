@@ -38,7 +38,7 @@ interface IRegistryReviewPeriod {
 ///      Both directions are views, so the mutual reference carries no
 ///      reentrancy concern.
 interface ILedgerExposureMinimal {
-    function openExposureUsd(address guardian) external view returns (uint256);
+    function openExposure(address guardian) external view returns (uint256);
     function hasFrozenCoverage(address guardian) external view returns (bool);
 }
 
@@ -909,7 +909,7 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         // This check covers the challenge path. Neither subsumes the other.
         address ledger = exposureLedger;
         if (ledger != address(0)) {
-            // TWO QUESTIONS, NOT ONE. `openExposureUsd` sums epoch buckets that age
+            // TWO QUESTIONS, NOT ONE. `openExposure` sums epoch buckets that age
             // out on pure wall-clock and do not pause because the guardian is under
             // accusation. The challenge game's disputed tail outlives that by
             // design, so an accused approver could request at execution, wait out
@@ -917,7 +917,7 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
             // A frozen commitment is the accusation itself, and it does not expire
             // on a clock.
             ILedgerExposureMinimal l = ILedgerExposureMinimal(ledger);
-            if (l.openExposureUsd(msg.sender) != 0 || l.hasFrozenCoverage(msg.sender)) {
+            if (l.openExposure(msg.sender) != 0 || l.hasFrozenCoverage(msg.sender)) {
                 revert CoverageStillOpen();
             }
         }
@@ -1261,16 +1261,30 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      envelope binds per VERDICT, not per call: `_verdictSlashed` gives each
     ///      (caseKey, approver) pair exactly one slash, so the ceiling cannot be
     ///      compounded past by splitting one verdict across transactions.
-    /// @dev `minSlashBps` IS A PUNITIVE FLOOR, NOT A PROPORTIONALITY RULE. Any
-    ///      non-zero derived rate is raised to it, so an approver who underwrote $10
-    ///      of a $1,000 bond pays `minSlashBps` of the bond — 10x what they insured
-    ///      at a 1,000-bps floor. Deliberate: below the floor the recovery would not
+    /// @dev THE RATE IS THE LOCK. `ExposureLedger.slashBpsFor` supplies each
+    ///      approver's WOOD lock for the case over its slash basis
+    ///      (`slashableStakeAt(approver, openedAt)` — the same `_slashableAt`
+    ///      `_slashOne` multiplies), rounded up and saturating at 10_000. So
+    ///      `_slashOne`'s `mulDiv(basis, bps, 10_000)` burns `min(lock, basis)`,
+    ///      never a rate of the whole bond: a guardian holding 2,000 WOOD that
+    ///      locked 500 on the convicted proposal loses 500 and keeps 1,500 staked
+    ///      behind its other locks. No arithmetic in this contract changed for
+    ///      that — the lock/basis ratio is exactly what a bps-of-basis leg
+    ///      expects. The adversary is a guardian who backed a bad proposal with a
+    ///      small lock while holding a large bond: it loses the lock, and never
+    ///      less than the floor below.
+    /// @dev `minSlashBps` IS A PUNITIVE FLOOR, NOT A PROPORTIONALITY RULE — AND
+    ///      THE SINGLE DETERRENCE FLOOR OF THE LOCK MODEL. Any non-zero derived
+    ///      rate is raised to it, so an approver who locked 1 wei behind a
+    ///      convicted proposal (rate rounds up to 1 bps) still pays `minSlashBps`
+    ///      of everything it holds. A token declaration buys no quorum weight and
+    ///      no token penalty, which is why the ledger needs no separate
+    ///      declaration floor. Deliberate: below the floor the recovery would not
     ///      cover the cost of running the case. Zero stays exempt, because zero is
     ///      the absence of liability rather than a small amount of it. The
     ///      over-slash multiple is `minSlashBps / derivedRate` and is UNBOUNDED as
-    ///      the allocation shrinks — one point on a hyperbola, not a cap — and
-    ///      `derivedRate` itself moves with the WOOD price, so a price move alone
-    ///      can push a small allocation onto the punitive branch.
+    ///      the lock shrinks — one point on a hyperbola, not a cap. It no longer
+    ///      moves with the WOOD price: lock and basis are both WOOD.
     /// @dev TIMESTAMP BOUND — WHAT IT DOES AND DOES NOT GUARANTEE. `openedAt` must
     ///      not be in the future. This is an HONEST-CALLER sanity bound: it catches
     ///      a mis-built verdict and keeps the `uint32` checkpoint lookup from
