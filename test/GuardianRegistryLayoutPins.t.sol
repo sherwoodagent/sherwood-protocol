@@ -11,13 +11,12 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 ///         the ledger with no try/catch, so a codeless sentinel address
 ///         reverts the wiring outright — this test only cares about the
 ///         STORAGE SLOT the ledger address lands in, so any contract that
-///         answers the two calls the setter makes is sufficient:
-///           - `challengeWindow()` must be >= `reviewPeriod +
-///             MAX_GOVERNOR_EXECUTION_WINDOW` (24h review + 7d window here,
-///             so 30 days clears it with margin).
+///         answers the call the setter makes is sufficient:
 ///           - `guardianRegistry()` must be `address(0)` (unset) or the
 ///             calling registry — `address(0)` is the legitimate
 ///             first-time-wiring reading this fixture exercises.
+///         `challengeWindow()` is kept on the mock for `ChallengeGame`-style
+///         readers; the registry setter no longer floors against it.
 contract MockExposureLedgerMinimal {
     function challengeWindow() external pure returns (uint256) {
         return 30 days;

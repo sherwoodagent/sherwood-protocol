@@ -54,9 +54,6 @@ interface IRegistryApproversMinimal {
         external
         view
         returns (address[] memory approvers, uint128[] memory weights, uint128 totalApproveWeight);
-    /// @dev Read by `setChallengeWindow` to floor the window at the longest
-    ///      approve->execute gap a proposal can have.
-    function reviewPeriod() external view returns (uint256);
 }
 
 /// @dev Narrow `ChallengeGame` read surface: just its own `challengeWindow`.
@@ -117,12 +114,6 @@ interface IChallengeGameWindowMinimal {
  */
 contract ExposureLedger is Ownable2Step, IExposureLedger {
     uint256 internal constant BPS_DENOMINATOR = 10_000;
-
-    /// @dev Mirrors `GovernorParameters.MAX_EXECUTION_WINDOW`. Duplicated rather
-    ///      than read across: the ledger has no handle on any particular governor
-    ///      at `setChallengeWindow` time, so the floor is sized against the worst
-    ///      legal configuration. Keep in step if the governor's ceiling moves.
-    uint256 internal constant MAX_GOVERNOR_EXECUTION_WINDOW = 7 days;
 
     /// @dev How far ahead of NOW a commitment may be dated. Expressed in TIME,
     ///      not epochs: the bucket width is a tuning dial, and an epoch-count
@@ -730,23 +721,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         woodHaircutBps = newBps;
     }
 
+    /// @dev No cross-check against the registry's `reviewPeriod` here. This
+    ///      setter used to re-validate a `challengeWindow >= reviewPeriod +
+    ///      MAX_EXECUTION_WINDOW` floor; that floor guarded a booking rule
+    ///      (`currentEpoch()` keying) that `recordApproval` no longer uses -- see
+    ///      `setChallengeWindow`.
     function setGuardianRegistry(address registry) external onlyOwner {
         if (registry == address(0)) revert ZeroAddress();
-        // RE-CHECKS THE FLOOR: `setChallengeWindow` skips it while no registry is
-        // wired, so an owner could set a short window before wiring a registry
-        // whose `reviewPeriod` makes the floor longer.
-        //
-        // Tolerant read on purpose — this guards against an ordering mistake by
-        // the owner, not an adversary: a registry that cannot answer
-        // `reviewPeriod()` is let through rather than bricking the wiring
-        // transaction. `registry.code.length` first, because Solidity's
-        // extcodesize guard on a high-level call to an EOA reverts in THIS frame,
-        // which `try` cannot catch.
-        if (registry != address(0) && registry.code.length != 0) {
-            try IRegistryApproversMinimal(registry).reviewPeriod() returns (uint256 rp) {
-                if (challengeWindow < rp + MAX_GOVERNOR_EXECUTION_WINDOW) revert InvalidParameter();
-            } catch {}
-        }
         emit GuardianRegistrySet(guardianRegistry, registry);
         guardianRegistry = registry;
     }
@@ -756,34 +737,37 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      coverage early); growing it re-counts buckets that had already expired
     ///      (conservative). Change it between epochs or at low open exposure.
     ///
-    ///      TWO LOWER BOUNDS, BOTH TOLERANT READS OF AN EXTERNAL POINTER. Reading
-    ///      a pointer STRICTLY here while `setGuardianRegistry` admits it
-    ///      TOLERANTLY is a contradiction: a registry the tolerant setter admitted
-    ///      (codeless, or reverting on `reviewPeriod()`) would then make this
-    ///      function revert in THIS frame on every subsequent call, permanently
+    ///      NO `reviewPeriod + MAX_EXECUTION_WINDOW` FLOOR. An earlier revision
+    ///      floored the window at the longest approve->execute gap, against this
+    ///      attack: approve #1 just before an epoch boundary, let the bucket
+    ///      expire while #1 is still Approved and inside its execution window,
+    ///      approve #2 at full budget; one bond, two live drains. That attack
+    ///      needs the approval booked into the epoch the VOTE landed in.
+    ///      `recordApproval` books into the epoch containing
+    ///      `executeBy + strategyDuration` instead, so the bucket ends after
+    ///      settlement by construction and `bucketEnd + W > coverUntil + W` for
+    ///      every positive `W` -- the window cancels out of the property. The two
+    ///      beyond-horizon paths cannot reintroduce it: `_coverageEpochOrSkip`
+    ///      books NOTHING past the horizon (no `currentEpoch()` fallback) and
+    ///      `_rebook` never moves a booking out of its original bucket.
+    ///      `test_antiBatching_holdsWithChallengeWindowFarBelowTheFloor` pins the
+    ///      property at a 1-day window against a pre-ADR control. Deleting the
+    ///      floor is what lets the guardian lock track the proposal instead of
+    ///      `reviewPeriod + 7 days`.
+    ///
+    ///      ONE LOWER BOUND, A TOLERANT READ OF AN EXTERNAL POINTER. A pointer
+    ///      read STRICTLY here would let an unanswerable `coverageFreezer` make
+    ///      this function revert in THIS frame on every call, permanently
     ///      bricking it rather than merely declining to floor it. Liveness of a
     ///      governance setter must not depend on a foreign contract answering a
-    ///      view call, so both bounds use the same `code.length` + try/catch
-    ///      shape: an unanswerable pointer means no floor from that side.
+    ///      view call, so the bound uses `code.length` + try/catch: an
+    ///      unanswerable pointer means no floor from that side.
     function setChallengeWindow(uint256 newWindow) external onlyOwner {
         // Zero would free coverage instantly. The upper bound is whatever keeps
         // `openExposureUsd`'s walk inside `MAX_SCAN_BUCKETS`.
         if (newWindow == 0) revert InvalidParameter();
         _requireScanBounded(newWindow, epochLength);
-        // LOWER BOUND #1: the anti-batching property depends on a bucket outliving
-        // the proposal it backs. A window shorter than the approve-to-execute gap
-        // lets one bond cover two live drains — approve #1 just before an epoch
-        // boundary, let the bucket expire while #1 is still Approved and inside
-        // its execution window, then approve #2 at full budget; both quorums pass,
-        // both execute. `code.length` first, for the same extcodesize reason as
-        // `setGuardianRegistry`.
-        address reg = guardianRegistry;
-        if (reg != address(0) && reg.code.length != 0) {
-            try IRegistryApproversMinimal(reg).reviewPeriod() returns (uint256 rp) {
-                if (newWindow < rp + MAX_GOVERNOR_EXECUTION_WINDOW) revert InvalidParameter();
-            } catch {}
-        }
-        // LOWER BOUND #2: WINDOW COUPLING IS ONE-SIDED. `ChallengeGame` enforces
+        // LOWER BOUND: WINDOW COUPLING IS ONE-SIDED. `ChallengeGame` enforces
         // `game.challengeWindow <= ledger.challengeWindow()` in three places, but
         // all three only check at the instant they run — none re-fire when the
         // LEDGER's window moves. Shrinking it here could silently open a gap where

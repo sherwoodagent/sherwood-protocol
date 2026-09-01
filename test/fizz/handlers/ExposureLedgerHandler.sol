@@ -64,8 +64,11 @@ abstract contract ExposureLedgerHandler is Properties {
             if (count == 0) return;
             _exposureLedger_releaseApproval(address(governor), proposalId, toGuardian(guardianSeed));
         } else if (selector == 5) {
-            // X-1: must stay >= registry.reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW.
-            _exposureLedger_setChallengeWindow(clampBetween(arg1, 8 days, 30 days));
+            // X-1: the old `reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW` floor
+            // is gone; the only remaining lower bound is the wired game's own
+            // window, which this harness does not wire. Drive it down to a day
+            // so the fuzzer exercises the range the floor used to forbid.
+            _exposureLedger_setChallengeWindow(clampBetween(arg1, 1 days, 30 days));
         } else if (selector == 6) {
             _exposureLedger_setCoveredTvlCapUsd(clampBetween(arg1, 1e18, 100_000_000e18));
         } else if (selector == 7) {

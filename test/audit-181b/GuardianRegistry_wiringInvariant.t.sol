@@ -5,46 +5,37 @@ import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
 import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {RegistryTestHarness} from "../helpers/RegistryTestHarness.sol";
 
-/// @notice Regression tests for audit issue #181, finding #26 (confidence 72):
+/// @notice Regression tests for `GuardianRegistry.setExposureLedger`'s wiring
+///         checks, originally filed under audit issue #181, finding #26.
 ///
-///         `ExposureLedger.setChallengeWindow`, `ExposureLedger
-///         .setGuardianRegistry`, and `GuardianRegistry.setReviewPeriod` all
-///         enforce `ledger.challengeWindow() >= reviewPeriod +
-///         MAX_GOVERNOR_EXECUTION_WINDOW` -- the anti-batching floor described
-///         in `ExposureLedger.setChallengeWindow`'s natspec (a challenge
-///         window shorter than the approve->execute gap lets one guardian
-///         bond cover two live drains). `GuardianRegistry.setExposureLedger`
-///         was the fourth door on that same invariant and, before this fix,
-///         enforced nothing at all: a zero check, an assignment, no floor
-///         read, no event.
+///         Finding #26 hardened a `ledger.challengeWindow() >= reviewPeriod +
+///         MAX_GOVERNOR_EXECUTION_WINDOW` floor across four setters, this one
+///         included. That floor has since been DELETED: it defended a booking
+///         rule (`recordApproval` keying on `currentEpoch()`) the ledger no
+///         longer uses, and the anti-batching property it existed for holds
+///         for every positive window under settlement-dated booking -- see
+///         `ExposureLedger.setChallengeWindow`'s natspec and
+///         `test_antiBatching_holdsWithChallengeWindowFarBelowTheFloor`. The
+///         first test below is the old floor test, flipped: the audit's own
+///         reachable order now WIRES rather than reverts.
 ///
-///         Reachable order (mirrors the audit's own PoC): raise
-///         `reviewPeriod` to 7 days while `exposureLedger == address(0)`
-///         (`setReviewPeriod`'s cross-check short-circuits on the null
-///         ledger), then wire a ledger whose `challengeWindow` sits below the
-///         resulting 14-day floor. Nothing revalidates the pair after that --
-///         live state under-floors the challenge window against the
-///         review-execute gap it exists to outlive.
-///
-///         Also covers the reciprocal-grant safeguard added alongside the
-///         floor check: a ledger already bound (via `setGuardianRegistry`) to
+///         Still enforced, and still covered here: the reciprocal-grant
+///         safeguard. A ledger already bound (via `setGuardianRegistry`) to
 ///         some OTHER registry must be rejected, because
 ///         `ExposureLedger.recordApproval` is `onlyRegistry` and a one-sided
 ///         re-point would make every future approve-side vote from this
 ///         registry revert forever. An UNWIRED ledger (`guardianRegistry() ==
 ///         address(0)`) must still be accepted -- that is the ordinary
-///         first-time-wiring case and must not be bricked by the new check.
+///         first-time-wiring case and must not be bricked by the check.
 contract GuardianRegistry_wiringInvariantTest is RegistryTestHarness {
     uint256 internal constant INITIAL_REVIEW_PERIOD = 1 days;
     /// @dev The registry's absolute `reviewPeriod` ceiling. The raise below
     ///      must stay inside it, so this tracks that bound.
     uint256 internal constant RAISED_REVIEW_PERIOD = 3 days;
     uint256 internal constant BLOCK_QUORUM_BPS = 2000;
-    /// @dev Mirrors `GuardianRegistry.MAX_GOVERNOR_EXECUTION_WINDOW` /
-    ///      `ExposureLedger.MAX_GOVERNOR_EXECUTION_WINDOW` (both `internal`,
-    ///      so not readable from the test contract) -- duplicated here the
-    ///      same way the two contracts duplicate it from each other.
-    uint256 internal constant MAX_GOVERNOR_EXECUTION_WINDOW = 7 days;
+    /// @dev The DELETED floor's execution-window term, kept only to stage the
+    ///      exact value the old check refused (one second under it).
+    uint256 internal constant OLD_MAX_GOVERNOR_EXECUTION_WINDOW = 7 days;
 
     address internal ledgerOwner = makeAddr("ledgerOwner");
 
@@ -52,40 +43,36 @@ contract GuardianRegistry_wiringInvariantTest is RegistryTestHarness {
         _deployRegistryAndSwood(INITIAL_REVIEW_PERIOD, BLOCK_QUORUM_BPS);
     }
 
-    /// @notice Core finding #26: wiring a ledger whose `challengeWindow` sits
-    ///         below `reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW` must
-    ///         revert. Against the OLD (unfixed) `setExposureLedger` this
-    ///         call succeeds silently -- the assertion below then fails
-    ///         because no revert occurred. Against the fix it reverts with
-    ///         `InvalidParameter`.
-    function test_setExposureLedger_revertsWhenChallengeWindowBelowReviewPeriodFloor() public {
-        // Raise reviewPeriod to 3 days while the ledger is still unwired --
-        // `setReviewPeriod`'s ledger cross-check short-circuits on
-        // `exposureLedger == address(0)`, so this legitimately succeeds and
-        // leaves the floor at 3d + 7d = 10d for whatever ledger comes next.
+    /// @notice Finding #26's reachable order, flipped: wiring a ledger whose
+    ///         `challengeWindow` sits one second below the OLD
+    ///         `reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW` floor now
+    ///         succeeds, and `setReviewPeriod` no longer reads the ledger at
+    ///         all once it is wired. Against the pre-deletion code the wiring
+    ///         reverts `InvalidParameter`.
+    function test_setExposureLedger_acceptsAChallengeWindowBelowTheOldReviewPeriodFloor() public {
         vm.prank(regOwner);
         registry.setReviewPeriod(RAISED_REVIEW_PERIOD);
 
         ExposureLedger ledger = new ExposureLedger(ledgerOwner, address(swood), 28 days);
-        // Ledger is still unwired to any registry, so `setChallengeWindow`'s
-        // own floor check is skipped (`reg == address(0)`) -- this shrink is
-        // legal purely from the ledger's own point of view.
-        uint256 belowFloor = RAISED_REVIEW_PERIOD + MAX_GOVERNOR_EXECUTION_WINDOW - 1;
+        uint256 belowOldFloor = RAISED_REVIEW_PERIOD + OLD_MAX_GOVERNOR_EXECUTION_WINDOW - 1;
         vm.prank(ledgerOwner);
-        ledger.setChallengeWindow(belowFloor);
+        ledger.setChallengeWindow(belowOldFloor);
 
-        // `belowFloor` is exactly one second short of `reviewPeriod +
-        // MAX_GOVERNOR_EXECUTION_WINDOW` (3d + 7d = 10d): wiring this ledger
-        // into the registry must be refused.
         vm.prank(regOwner);
-        vm.expectRevert(IGuardianRegistry.InvalidParameter.selector);
+        vm.expectEmit(true, true, false, true);
+        emit IGuardianRegistry.ExposureLedgerSet(address(0), address(ledger));
         registry.setExposureLedger(address(ledger));
+        assertEq(address(registry.exposureLedger()), address(ledger), "the old floor must not refuse the wiring");
 
-        assertEq(
-            address(registry.exposureLedger()),
-            address(0),
-            "a ledger that under-floors the challenge window must never get wired in"
-        );
+        // The other side of the old mirror: with the ledger wired, raising
+        // `reviewPeriod` to its ceiling is not floored by the ledger's window
+        // either. 3 days is already the ceiling, so re-seat it via the floor
+        // and back up -- both must pass with the ledger attached.
+        vm.startPrank(regOwner);
+        registry.setReviewPeriod(INITIAL_REVIEW_PERIOD);
+        registry.setReviewPeriod(RAISED_REVIEW_PERIOD);
+        vm.stopPrank();
+        assertEq(registry.reviewPeriod(), RAISED_REVIEW_PERIOD, "setReviewPeriod must not read the ledger's window");
     }
 
     /// @notice A ledger already bound to a DIFFERENT registry must be
@@ -96,13 +83,9 @@ contract GuardianRegistry_wiringInvariantTest is RegistryTestHarness {
     ///         succeeds (no reciprocal check existed at all).
     function test_setExposureLedger_revertsWhenLedgerBoundToDifferentRegistry() public {
         ExposureLedger ledger = new ExposureLedger(ledgerOwner, address(swood), 28 days);
-        // Default challengeWindow (14 days) clears the 1d + 7d = 8d floor
-        // for this harness's INITIAL_REVIEW_PERIOD, so the floor check is not
-        // what trips this test.
         address someOtherRegistry = makeAddr("someOtherRegistry");
-        // `someOtherRegistry` has no code, so `setGuardianRegistry`'s own
-        // tolerant `code.length != 0` guard skips its floor re-check and lets
-        // the (wrong) pointer through -- exactly the ordering mistake this
+        // `setGuardianRegistry` admits any nonzero address, so the (wrong)
+        // pointer goes through -- exactly the ordering mistake this
         // registry-side check exists to catch on the other end.
         vm.prank(ledgerOwner);
         ledger.setGuardianRegistry(someOtherRegistry);
@@ -118,13 +101,12 @@ contract GuardianRegistry_wiringInvariantTest is RegistryTestHarness {
         );
     }
 
-    /// @notice Sanity: the new checks must NOT brick the ordinary,
+    /// @notice Sanity: the reciprocal check must NOT brick the ordinary,
     ///         legitimate first-time wiring order -- a fresh ledger, never
-    ///         pointed at any registry, with a challengeWindow that clears
-    ///         the floor, wires in cleanly and emits `ExposureLedgerSet`.
+    ///         pointed at any registry, wires in cleanly and emits
+    ///         `ExposureLedgerSet`.
     function test_setExposureLedger_succeedsOnLegitimateFirstTimeWiring() public {
         ExposureLedger ledger = new ExposureLedger(ledgerOwner, address(swood), 28 days);
-        // Default challengeWindow (14 days) >= 3d + 7d = 10d floor.
         // `ledger.guardianRegistry()` is still address(0) -- the untouched,
         // ordinary pre-wiring state.
 

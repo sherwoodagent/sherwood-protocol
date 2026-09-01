@@ -45,11 +45,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     uint256 public constant MAX_BLOCKERS_PER_PROPOSAL = 100;
     uint256 public constant LATE_VOTE_LOCKOUT_BPS = 1000;
 
-    /// @dev Mirrors `GovernorParameters.MAX_EXECUTION_WINDOW` and the ledger's
-    ///      copy of it. Duplicated for the same reason the ledger duplicates it:
-    ///      the floor must hold for EVERY governor the registry serves, so it is
-    ///      sized against the worst legal configuration rather than a live one.
-    uint256 internal constant MAX_GOVERNOR_EXECUTION_WINDOW = 7 days;
     /// @notice Block decisiveness (bps of at-open total weight) at which the
     ///         deterministic severity hits `maxSlashBps`. 2/3 supermajority.
     uint256 public constant SUPERMAJORITY_BPS = 6_667;
@@ -1556,21 +1551,16 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      window may not exceed sWOOD's guardian unstake cooldown, or an
     ///      approver could unstake and escape the slash before `resolveReview`.
     ///      The cross-call is gated behind a wired sWOOD for the pre-wiring window.
+    ///
+    ///      Does NOT cross-check `exposureLedger.challengeWindow()`. An earlier
+    ///      revision mirrored a `challengeWindow >= reviewPeriod +
+    ///      MAX_EXECUTION_WINDOW` floor here; that floor guarded a ledger booking
+    ///      rule that no longer exists -- see `ExposureLedger.setChallengeWindow`.
     function setReviewPeriod(uint256 v) external onlyOwner {
         if (v < minReviewPeriod || v > 3 days) revert InvalidParameter();
         IStakedWood sw = swood;
         if (address(sw) != address(0) && v > sw.coolDownPeriod()) {
             revert CooldownBelowReviewPeriod();
-        }
-        // MIRROR OF THE LEDGER'S FLOOR. `ExposureLedger` requires
-        // `challengeWindow >= reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW`, but
-        // can only enforce it when ITS setter runs. Raising `reviewPeriod` here
-        // raises the floor from the other side with nothing revalidating: a window
-        // seated legally at a 3d review period sits below the floor once the
-        // review period reaches 7d.
-        IExposureLedger led = exposureLedger;
-        if (address(led) != address(0) && led.challengeWindow() < v + MAX_GOVERNOR_EXECUTION_WINDOW) {
-            revert InvalidParameter();
         }
         emit ParameterChangeFinalized(PARAM_REVIEW_PERIOD, reviewPeriod, v);
         reviewPeriod = v;
@@ -1586,40 +1576,27 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @inheritdoc IGuardianRegistry
     /// @notice Wire the exposure ledger (owner-instant; the owner is a multisig
     ///         with external delay).
-    /// @dev Mirrors `setReviewPeriod`'s and `ExposureLedger.setGuardianRegistry`'s
-    ///      enforcement of
-    ///      `challengeWindow >= reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW`.
-    ///      This was the fourth door on that invariant and enforced nothing —
-    ///      reachable via an ordinary wiring order: seat `reviewPeriod` while
-    ///      unwired, then wire a ledger whose `challengeWindow` sits below the
-    ///      resulting floor, leaving a live anti-batching break nothing upstream
-    ///      re-validates.
-    ///
-    ///      STRICT, not tolerant, on purpose — the opposite of
-    ///      `ExposureLedger.setGuardianRegistry`'s guarded read. That setter can
-    ///      afford to admit a registry that cannot answer, because nothing
-    ///      downstream depends on the read succeeding. This one cannot: once the
-    ///      ledger is set, `setReviewPeriod` calls `challengeWindow()` directly,
-    ///      with no try/catch, so admitting an unanswerable ledger would
-    ///      permanently freeze `reviewPeriod`. Both external reads below are
-    ///      plain, unguarded calls: a ledger that cannot serve them reverts THIS
-    ///      transaction instead of bricking a later, unrelated one.
-    ///
-    ///      Also checks the reciprocal grant: `ledger.guardianRegistry()` must be
+    /// @dev Checks the reciprocal grant: `ledger.guardianRegistry()` must be
     ///      either unset (the legitimate first-time-wiring order) or already this
     ///      registry. A ledger bound to some OTHER registry would make every
     ///      future `recordApproval` revert forever, silently turning every review
     ///      into a block-only vote with no approve-side coverage.
+    ///
+    ///      STRICT, not tolerant, on purpose — the opposite of
+    ///      `ExposureLedger.setGuardianRegistry`'s guarded admission. A ledger
+    ///      that cannot answer `guardianRegistry()` (no code, a CREATE2
+    ///      counterfactual not yet deployed, any other non-conforming target) is
+    ///      not a ledger this registry can record approvals into, so it reverts
+    ///      THIS wiring transaction instead of being admitted and failing on the
+    ///      first `recordApproval`.
+    ///
+    ///      No `challengeWindow` floor. An earlier revision also required
+    ///      `challengeWindow >= reviewPeriod + MAX_EXECUTION_WINDOW`; that floor
+    ///      guarded a ledger booking rule that no longer exists -- see
+    ///      `ExposureLedger.setChallengeWindow`.
     function setExposureLedger(address ledger) external onlyOwner {
         if (ledger == address(0)) revert ZeroAddress();
         IExposureLedger led = IExposureLedger(ledger);
-        // STRICT, unguarded reads — see the @dev block above. A ledger that
-        // cannot answer `challengeWindow()` or `guardianRegistry()` (no code,
-        // a CREATE2 counterfactual not yet deployed, or any other
-        // non-conforming target) reverts THIS wiring transaction rather than
-        // being admitted and bricking a later, unrelated one.
-        uint256 cw = led.challengeWindow();
-        if (cw < reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW) revert InvalidParameter();
         // Reciprocal-grant check. Only reject a ledger already bound to a
         // DIFFERENT registry — address(0) is the legitimate first-time-wiring
         // state (see the @dev block above).

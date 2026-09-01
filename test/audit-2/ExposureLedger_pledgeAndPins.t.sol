@@ -148,12 +148,13 @@ contract MockChallengeGameWindow {
 ///         (which IS the game address).
 ///
 ///         CAUTION RESOLUTION (`test_setChallengeWindow_toleratesACodelessGuardianRegistry`):
-///         `setGuardianRegistry` admits a registry TOLERANTLY (codeless or
-///         reverting `reviewPeriod()` is let through); `setChallengeWindow`
-///         used to read that same pointer STRICTLY, so a registry the
-///         tolerant setter admitted permanently bricked this setter. Both
-///         sides now use the identical tolerant `code.length` + try/catch
-///         shape.
+///         `setGuardianRegistry` admits a registry TOLERANTLY (any nonzero
+///         address, codeless included); `setChallengeWindow` used to read
+///         that same pointer STRICTLY for a `reviewPeriod` floor, so a
+///         registry the tolerant setter admitted permanently bricked this
+///         setter. The floor has since been deleted outright, so the setter
+///         reads nothing off the registry; the test stays as the regression
+///         against any registry read creeping back in strict form.
 ///
 ///         ALSO (`test_feedPriceX8_truncatingToZeroFallsThroughToTwap`):
 ///         `_feedPriceX8` could return `(0, true)` — a positive answer
@@ -482,10 +483,10 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
     ///         pointer: a registry the tolerant setter admitted must not
     ///         permanently brick this setter.
     ///
-    ///         Fails against the pre-fix code (a raw, non-tolerant call to
+    ///         Failed against the original code (a raw, non-tolerant call to
     ///         `IRegistryApproversMinimal(reg).reviewPeriod()` against a
     ///         codeless address reverts in this frame, unconditionally, on
-    ///         every call), passes against the fix.
+    ///         every call). The setter no longer reads the registry at all.
     function test_setChallengeWindow_toleratesACodelessGuardianRegistry() public {
         assertEq(registry.code.length, 0, "precondition: fixture registry must be codeless");
 

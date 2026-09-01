@@ -178,9 +178,9 @@ contract MockRegistryForLedger {
         total = 0;
     }
 
-    /// @dev `setChallengeWindow` floors the window at
-    ///      `reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW`, so the ledger now
-    ///      needs a registry that actually answers this.
+    /// @dev No longer read by the ledger -- `setChallengeWindow` used to floor
+    ///      the window at `reviewPeriod + MAX_EXECUTION_WINDOW`. Kept so a
+    ///      registry stub still looks like a registry to any future reader.
     uint256 public reviewPeriod = 3 days;
 }
 
@@ -615,26 +615,30 @@ contract ExposureLedgerTest is Test {
         ledger.setWoodHaircutBps(9_000);
     }
 
-    /// @notice M1 — the challenge window must outlive the longest
-    ///         approve->execute gap, or one bond can cover two live drains
-    ///         across an epoch boundary. Only the upper bounds were enforced.
-    function test_setChallengeWindow_rejectsAWindowShorterThanReviewPlusExecution() public {
+    /// @notice The `reviewPeriod + MAX_EXECUTION_WINDOW` floor is gone. With a
+    ///         registry that DOES answer `reviewPeriod()` (3 days) wired in, a
+    ///         window far below the old 10-day floor is accepted -- the
+    ///         anti-batching property it defended is carried by the booking
+    ///         rule (`test_antiBatching_*` below), not by this setter.
+    ///
+    ///         Against the pre-fix code both shrinks revert `InvalidParameter`.
+    function test_setChallengeWindow_acceptsAWindowBelowTheOldReviewPlusExecutionFloor() public {
         _wireRecording();
-        // The shared fixture wires an EOA as the registry, which cannot answer
-        // `reviewPeriod()`. Point at a real stub for the floor check.
         MockRegistryForLedger reg = new MockRegistryForLedger();
+        assertEq(reg.reviewPeriod(), 3 days, "precondition: the registry answers the read the old floor used");
         vm.startPrank(owner);
         ledger.setGuardianRegistry(address(reg));
 
-        // 3d review + 7d max execution window = a 10d floor.
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        ledger.setChallengeWindow(1); // the old code accepted this
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        ledger.setChallengeWindow(10 days - 1);
-
-        ledger.setChallengeWindow(10 days); // exactly the floor -- allowed
-        assertEq(ledger.challengeWindow(), 10 days);
+        ledger.setChallengeWindow(10 days - 1); // one second under the old floor
+        assertEq(ledger.challengeWindow(), 10 days - 1);
+        ledger.setChallengeWindow(1 days);
+        assertEq(ledger.challengeWindow(), 1 days);
         vm.stopPrank();
+
+        // Zero is still the hard stop -- deleting the floor did not open that.
+        vm.prank(owner);
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        ledger.setChallengeWindow(0);
     }
 
     /// @notice ADR 2026-07-26 — THE SETTLEMENT-COVERAGE BUG.
@@ -822,25 +826,29 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposureUsd(guardian), 0, "unpriceable: booked nothing, vote survives");
     }
 
-    /// @notice M1 gap 1 — wiring order was a bypass. `setChallengeWindow` skips
-    ///         the floor while no registry is wired, so an out-of-spec window
-    ///         could be seated first and the registry pointed at afterwards with
-    ///         nothing revalidating.
-    function test_setGuardianRegistry_rechecksTheChallengeWindowFloor() public {
-        MockRegistryForLedger reg = new MockRegistryForLedger(); // reviewPeriod 3d -> floor 10d
+    /// @notice M1 gap 1, flipped. `setGuardianRegistry` used to re-check the
+    ///         `reviewPeriod + MAX_EXECUTION_WINDOW` floor so the wiring order
+    ///         could not bypass it. The floor is gone from both sides, so the
+    ///         same order now wires cleanly: a window under the old 10-day
+    ///         floor, then a registry whose `reviewPeriod` would have raised
+    ///         it. Against the pre-deletion code the wiring reverts
+    ///         `InvalidParameter`.
+    function test_setGuardianRegistry_doesNotFloorAgainstTheRegistryReviewPeriod() public {
+        MockRegistryForLedger reg = new MockRegistryForLedger();
+        assertEq(reg.reviewPeriod(), 3 days, "precondition: the registry answers the read the old floor used");
         ExposureLedger led = new ExposureLedger(owner, address(swood), 28 days);
 
         vm.startPrank(owner);
-        led.setChallengeWindow(8 days); // legal while unwired
+        led.setChallengeWindow(8 days);
         assertEq(led.challengeWindow(), 8 days);
 
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        led.setGuardianRegistry(address(reg)); // 8d < 3d + 7d
+        led.setGuardianRegistry(address(reg)); // 8d < 3d + 7d, and accepted
+        assertEq(led.guardianRegistry(), address(reg), "the old floor must not refuse the wiring");
 
-        led.setChallengeWindow(10 days);
-        led.setGuardianRegistry(address(reg)); // now consistent
+        // Shrinking further with the registry wired is not floored either.
+        led.setChallengeWindow(1 days);
         vm.stopPrank();
-        assertEq(led.guardianRegistry(), address(reg));
+        assertEq(led.challengeWindow(), 1 days);
     }
 
     /// @notice N1 — the over-reservation is returned once the approver set is
@@ -3302,12 +3310,11 @@ contract ExposureLedgerTest is Test {
     ///         batching cap; the bug was reusing the same decaying scan as
     ///         the shared-stake denominator.
     ///
-    ///         Needs a registry WITH CODE (`MockRegistryForLedger`), not the
-    ///         bare EOA `_wireRecording()` wires by default: `setChallengeWindow`
-    ///         re-checks the floor via `IRegistryApproversMinimal(registry)
-    ///         .reviewPeriod()`, which reverts against a codeless address.
+    ///         Uses a registry WITH CODE (`MockRegistryForLedger`) as the
+    ///         `recordApproval` caller; the ledger no longer reads anything
+    ///         off it at `setChallengeWindow` time.
     function test_finding2_trigger3_challengeWindowShrinkDoesNotReopenTheSharedDenominator() public {
-        MockRegistryForLedger reg = new MockRegistryForLedger(); // reviewPeriod 3d -> floor 10d
+        MockRegistryForLedger reg = new MockRegistryForLedger();
         usdgAsset = makeAddr("usdgAssetShrinkTrigger");
         vm.mockCall(usdgAsset, abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
         MockFeed feed = new MockFeed(1e8, 8);
@@ -3315,7 +3322,7 @@ contract ExposureLedgerTest is Test {
         mgov = new MockGovernorForLedger(address(vault));
         vm.startPrank(owner);
         ledger.setAssetFeed(usdgAsset, address(feed), 365 days);
-        ledger.setChallengeWindow(20 days); // legal pre-registry; >= 3d + 7d floor
+        ledger.setChallengeWindow(20 days);
         ledger.setGuardianRegistry(address(reg));
         vm.stopPrank();
         swood.setStake(guardian, 20_000e18); // $1,000 bond
@@ -3497,5 +3504,88 @@ contract ExposureLedgerTest is Test {
         // And the aggregate never overstates the cohort's real recoverable
         // total either.
         assertEq(ledger.liabilityUsd(address(mgov), 1), 800e18, "cohort liability: exactly the sum of both live caps");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // THE ANTI-BATCHING PROPERTY, PINNED WITHOUT THE FLOOR.
+    //
+    // `setChallengeWindow` used to floor the window at `reviewPeriod +
+    // MAX_GOVERNOR_EXECUTION_WINDOW`, a hand-copied mirror of
+    // `GovernorParameters.MAX_EXECUTION_WINDOW`. The two tests below showed the
+    // property that floor defended is carried by the booking rule instead, and
+    // the floor was deleted on their evidence. They are now its regression: the
+    // first must keep passing, and the second must keep FAILING under a mutation
+    // that reverts `recordApproval` to `currentEpoch()` keying.
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// @notice The floor's stated attack is unreachable under the CURRENT
+    ///         booking rule, at a window an order of magnitude below the floor.
+    ///
+    /// @dev    Quoting the floor's own comment: "approve #1 just before an epoch
+    ///         boundary, let the bucket expire while #1 is still Approved and
+    ///         inside its execution window, then approve #2 at full budget".
+    ///         That requires the approval to book into the epoch the VOTE landed
+    ///         in. `recordApproval` books into the epoch containing `executeBy +
+    ///         strategyDuration`, so the bucket outlives the proposal by
+    ///         construction — `bucketEnd > coverUntil`, hence `bucketEnd +
+    ///         challengeWindow > coverUntil + challengeWindow` for ANY positive
+    ///         window.
+    ///
+    ///         Window here is 1 day against a live floor of 10 days (3d review
+    ///         + 7d). Pair with the control below, which fails at these exact
+    ///         timestamps under the pre-ADR rule.
+    function test_antiBatching_holdsWithChallengeWindowFarBelowTheFloor() public {
+        // The registry pointer is a codeless EOA in this fixture, so neither
+        // floor branch fires — the shrink is legal from the ledger's own view.
+        vm.prank(owner);
+        ledger.setChallengeWindow(1 days);
+        assertEq(ledger.challengeWindow(), 1 days, "fixture must actually be under-floored");
+
+        _wireRecording();
+        mgov.set(1_000e6);
+
+        // Vote lands in epoch 0, settlement in epoch 1 (35d > 28d): exactly the
+        // boundary-straddling shape the floor describes.
+        uint256 executeBy = ledger.epochGenesis() + 35 days;
+        mgov.setScheduleFull(executeBy, 0, executeBy);
+        assertEq(ledger.currentEpoch(), 0, "vote must land in epoch 0 for the straddle to exist");
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 1_000e18, "coverage booked");
+
+        // Day 29: past where an epoch-0 booking ages out (28d bucket + 1d
+        // window), still 6 days inside #1's execution window.
+        vm.warp(ledger.epochGenesis() + 29 days + 1);
+        assertLt(block.timestamp, executeBy, "control: #1 must still be executable at this instant");
+
+        assertEq(
+            ledger.openExposureUsd(guardian),
+            1_000e18,
+            "budget returned while the proposal it backs was still executable - one bond, two drains"
+        );
+    }
+
+    /// @notice NON-VACUITY CONTROL. Same window, same timestamps, but booked the
+    ///         PRE-ADR way — into the vote's own epoch, which is what
+    ///         `executeBy == 0` produces on this stub.
+    ///
+    /// @dev    The budget DOES come back at day 29 here. That is what makes the
+    ///         test above discriminating: it passes because of the
+    ///         settlement-dated bucket, not because 1 day happens to be safe.
+    function test_antiBatching_preAdrCurrentEpochBookingIsWhatTheFloorGuardedAgainst() public {
+        vm.prank(owner);
+        ledger.setChallengeWindow(1 days);
+        _wireRecording();
+        mgov.set(1_000e6);
+
+        // `executeBy` left at 0 => `coverUntil <= epochGenesis` => books into
+        // `currentEpoch()`, the rule the floor was sized against.
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposureUsd(guardian), 1_000e18, "booked into epoch 0");
+
+        vm.warp(ledger.epochGenesis() + 29 days + 1);
+        assertEq(ledger.openExposureUsd(guardian), 0, "epoch-0 booking ages out at 28d bucket + 1d window");
     }
 }
