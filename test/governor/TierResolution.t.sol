@@ -116,6 +116,19 @@ contract TierResolutionTest is Test {
         tierRegistry.setAdapterAllowed(address(usdc), true);
     }
 
+    /// @dev Certifies the shared `_settleCalls()` leg (`usdc.approve`) tier-0.
+    ///      Since SHE-210 the settlement leg's tier counts toward the proposal
+    ///      tier, so an uncertified settle call pins any proposal at the
+    ///      fail-closed tier 2. Call this from tests whose subject is the
+    ///      EXECUTE leg's tier and which therefore need the settle leg to be
+    ///      genuinely benign. Deliberately NOT in `_wireTierRegistry`: a
+    ///      certified bound also changes the leg's COVERAGE contribution (full
+    ///      notional -> 100 bps), which the coverage-assertion tests in this
+    ///      file measure.
+    function _certifyBenignSettleLeg() internal {
+        _certifyNow(address(usdc), usdc.approve.selector, 0, 100, address(0));
+    }
+
     /// @dev Shared fixture helper (design.md / tasks.md 2.1): the test
     ///      contract IS the TierRegistry owner (`new TierRegistry(address(this))`
     ///      in setUp), so no prank is needed — propose, warp past the pinned
@@ -326,6 +339,7 @@ contract TierResolutionTest is Test {
     ///         stale bounded-tier coverage price.
     function test_executeRevertsWhenTierRegressedSincePropose() public {
         _wireTierRegistry();
+        _certifyBenignSettleLeg();
         _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
@@ -390,6 +404,7 @@ contract TierResolutionTest is Test {
     ///         execution proceeds normally to Executed.
     function test_executeSucceedsWhenTierUnchanged() public {
         _wireTierRegistry();
+        _certifyBenignSettleLeg();
         _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
