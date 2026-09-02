@@ -847,10 +847,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (pool.completedAt == 0 && bondWood > pool.target) pool.target = bondWood;
 
         // Refcounted: only the first live challenge freezes, only the last one
-        // to terminate unfreezes. The freeze carries this challenge's pinned
-        // worst-case end (`filedAt + disputeTimeoutAtFiling`, both written
-        // above) so the ledger can keep the approvers' locks counting against
-        // capacity for as long as this challenge can be live (SHE-213).
+        // to terminate unfreezes. `liveUntil` = this challenge's worst-case end (SHE-213).
         if (_liveCount[key]++ == 0) {
             exposureLedger.freezeCoverage(governor, proposalId, block.timestamp + disputeTimeout);
         }

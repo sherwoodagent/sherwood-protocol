@@ -936,26 +936,12 @@ contract ExposureLedgerTest is Test {
     }
 
     // ── SHE-213: a frozen or pinned lock keeps counting against capacity ──
-    //
-    // `openExposure` is a wall-clock bucket scan. A freeze or a pin keeps a
-    // lock live (unretirable, exit-blocked) past its bucket's expiry, but the
-    // scan stopped counting it the moment the bucket aged out — so the
-    // guardian's free budget over-reported and it could lock AGAIN on top of a
-    // lock it was still fully on the hook for. The fix moves the lock into the
-    // bucket matching its true liability end (see `_rebucket`).
-    //
     // Fixture clock: epoch 28d, challenge window 14d, so bucket 0 stops
-    // counting at day 42. A lock booked into epoch 0 and then frozen or pinned
-    // past day 42 is the whole reproduction.
+    // counting at day 42; freeze or pin a bucket-0 lock past day 42 to reproduce.
 
-    /// @notice THE SHE-213 REPRODUCTION. Lock on A; a challenge filed on day 20
-    ///         with 30 days of dispute clock keeps A live until day 50; on day
-    ///         43 bucket 0 has aged out. Pre-fix `openExposure` read zero and B
-    ///         locked the same 100k WOOD again — one bond, two live locks.
-    ///         Post-fix A's lock sits in the bucket containing day 50, so no
-    ///         budget is free and B locks nothing. The ledger never REVERTS on
-    ///         capacity (that would silence the Approve vote): the refusal is a
-    ///         zero lock.
+    /// @notice SHE-213 reproduction: A frozen on day 20 for 30d, bucket 0 aged
+    ///         out on day 43. Pre-fix B re-locked the same 100k WOOD; post-fix B
+    ///         locks zero (the ledger never reverts on capacity).
     function test_freezeCoverage_frozenLockCannotBeRelockedAfterItsBucketAgesOut() public {
         _wireRecording();
         uint256 genesis = ledger.epochGenesis();

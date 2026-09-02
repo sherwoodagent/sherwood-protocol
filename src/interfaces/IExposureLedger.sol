@@ -79,9 +79,7 @@ interface IExposureLedger {
     ///         released from its bucket the same way `ExposureReleased` releases
     ///         a vote-change unwind.
     event ExposureRetired(address indexed guardian, bytes32 indexed reviewKey, uint256 wood, uint256 epoch);
-    /// @notice A freeze, unfreeze or pin moved `guardian`'s lock of `wood` from
-    ///         bucket `fromEpoch` to bucket `toEpoch` (SHE-213), so it keeps
-    ///         counting against capacity for exactly as long as it is live.
+    /// @notice A freeze, unfreeze or pin moved `guardian`'s lock between buckets (SHE-213).
     event ExposureRebucketed(
         address indexed guardian, bytes32 indexed reviewKey, uint256 wood, uint256 fromEpoch, uint256 toEpoch
     );
@@ -144,21 +142,12 @@ interface IExposureLedger {
         returns (uint256 coverageRaisedUsd, uint256 requiredCoverageUsd);
 
     // ── Coverage freeze (challenge game) ──
-    /// @notice Pin one proposal's committed coverage while a challenge is live:
-    ///         blocks `releaseApproval`/`retireApproval` for it, marks every
-    ///         listed approver frozen (the sWOOD unstake gate), and moves each
-    ///         approver's lock to the bucket containing `liveUntil` — the latest
-    ///         instant the challenge can still be live, `filedAt +
-    ///         disputeTimeoutAtFiling` — so the lock keeps counting against the
-    ///         guardian's capacity for as long as it is slashable (SHE-213).
-    ///         Raise-only: a lock already in a later bucket does not move. Only
-    ///         the first freeze of a key moves locks; a repeat re-emits the event.
-    /// @param  liveUntil The freezer's pinned worst-case end for this challenge.
-    ///         Clamped to the ledger's coverage horizon.
+    /// @notice Freeze one proposal's coverage while a challenge is live and
+    ///         re-bucket each approver's lock (raise-only) to the bucket
+    ///         containing `liveUntil` (SHE-213).
+    /// @param  liveUntil The challenge's worst-case end, `filedAt + disputeTimeout`.
     function freezeCoverage(address governor, uint256 proposalId, uint256 liveUntil) external;
-    /// @notice Release the freeze and return each lock to ordinary decay: the
-    ///         latest of the current bucket, the bucket it was booked into, and
-    ///         the bucket of any pin still standing on it — never earlier.
+    /// @notice Release the freeze; each lock returns to max(current, booked, pinned) bucket.
     function unfreezeCoverage(address governor, uint256 proposalId) external;
     function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool);
     /// @notice Whether ANY frozen proposal names this guardian as a covering
@@ -178,9 +167,7 @@ interface IExposureLedger {
     ///         instead — a pin issued against one stale proposal must not block
     ///         sweeping a guardian's OTHER commitments. Only ever RAISES either
     ///         value; each decays on its own, so no unpin call exists or is needed.
-    ///         Also moves each approver's lock to the bucket containing
-    ///         `deadline` (raise-only, horizon-clamped) so it keeps counting
-    ///         against capacity until the pin lapses (SHE-213).
+    ///         Also re-buckets each lock to `deadline`, raise-only (SHE-213).
     function pinCoverageUntil(address governor, uint256 proposalId, uint256 deadline) external;
     /// @dev Zero is legal and deliberate — the UNWIRE switch, closing the freeze
     ///      surface when the challenge game is replaced: with no freezer wired
