@@ -690,9 +690,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             _initPendingProposal(p, reviewPeriod_);
         }
 
-        // Tier resolution: proposal tier = MAX tier across execute calls;
-        // `requiredCoverage` is the per-call SUM over execute AND settlement
-        // calls. Resolved from the STORED calls rather than the calldata arrays
+        // Tier resolution: proposal tier = MAX tier across execute AND
+        // settlement calls; `requiredCoverage` is the per-call SUM over execute
+        // AND settlement calls. Resolved from the STORED calls rather than the calldata arrays
         // so those refs are dead by this point — keeps `propose` under Yul's
         // stack budget. Reads the same storage arrays re-resolved at execute.
         _snapshotTierAndGate(p, _loadCalls(_executeCalls, proposalId));
@@ -793,6 +793,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // price. Tier alone misses a same-tier re-certification with a higher
         // `extractableBoundBps`, so also revert when the re-resolved coverage
         // exceeds the propose-time snapshot.
+        //
+        // PRICE THE SAME QUANTITY PROPOSE PRICED. `_snapshotTierAndGate` adds
+        // the sandbox funding to the stored `requiredCoverage`; comparing a
+        // batch-only live figure against that sum leaves the coverage guard
+        // slack by exactly the funding, so a mid-review re-certification that
+        // raises the batch's coverage by less than the funding executes
+        // undetected. Adding the funding here removes that slack. The tier
+        // needs no matching adjustment: a sandbox proposal is pinned at tier 2,
+        // and 2 is the maximum, so `TierRegressed` cannot fire for it.
+        uint256 sandboxFunding = _sandboxFunding[proposalId];
         (uint8 liveTier, uint256 liveCoverage) = _resolveTierAndCoverage(
             calls,
             _loadCaps(_executeCallCaps, proposalId),
@@ -802,7 +812,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             false
         );
         if (liveTier > proposal.envelopeTier) revert TierRegressed();
-        if (liveCoverage > proposal.requiredCoverage) revert CoverageRegressed();
+        if (liveCoverage + sandboxFunding > proposal.requiredCoverage) revert CoverageRegressed();
 
         // Fail-safe sibling to the two regression checks above. The propose-time
         // ceiling check alone is NOT sufficient: it prices `maxCapital` against
@@ -862,7 +872,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // The subtraction cannot underflow: `proposeWithSandbox` bounds funding
         // by `maxCapital`, and the scaling below is monotone in it.
         uint256 batchCapital = proposal.effectiveMaxCapital;
-        uint256 sandboxFunding = _sandboxFunding[proposalId];
         if (sandboxFunding != 0) {
             // Scaled by the SAME raised-over-required ratio the effective
             // capital and the per-call caps already carry, expressed as
@@ -1858,8 +1867,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
     }
 
-    /// @dev Proposal tier = max tier across EXECUTE calls (batch-wide: every
-    ///      consumer of the aggregate tier wants the fail-closed max). Coverage is
+    /// @dev Proposal tier = max tier across EXECUTE and SETTLEMENT calls
+    ///      (batch-wide: every consumer of the aggregate tier wants the
+    ///      fail-closed max). Coverage is
     ///      the SUM of per-call contributions across BOTH execute and settlement
     ///      calls: `coverage = sum(cap_i * boundBps_i) / 10_000`, where
     ///      `boundBps_i` is the certified bound for tier-0/1 calls and 10_000
@@ -1887,8 +1897,15 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             ? (IERC4626(GovernorParameters.vault).totalAssets() * tier2CallCapBps()) / BPS_DENOMINATOR
             : type(uint256).max;
         (uint8 execTier, uint256 execCoverage) = _scanCalls(registry, execCalls, execCaps, checkCeiling, tier2Ceiling);
-        (, uint256 settleCoverage) = _scanCalls(registry, settleCalls, settleCaps, checkCeiling, tier2Ceiling);
-        tier = execTier;
+        (uint8 settleTier, uint256 settleCoverage) =
+            _scanCalls(registry, settleCalls, settleCaps, checkCeiling, tier2Ceiling);
+        // Tier is the MAX across BOTH legs, not execute alone (SHE-210). The
+        // approve-quorum gate and `TierRegressed` both key off this tier; taking
+        // execTier only let a proposer park an uncertified tier-2 extraction in
+        // `settlementCalls` under a low-tier execute leg, so it skipped the
+        // bond-encumbered quorum while coverage (already summed over both legs)
+        // priced it. Coverage was always whole-proposal; now tier is too.
+        tier = execTier >= settleTier ? execTier : settleTier;
         coverage = execCoverage + settleCoverage;
     }
 

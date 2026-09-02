@@ -354,6 +354,60 @@ contract SandboxProposalTest is Test {
         assertEq(spy.lastCaller(), sandbox, "and the call arrived from the sandbox");
     }
 
+    /// @notice The execute-time coverage guard prices the same quantity the
+    ///         propose-time snapshot did. `requiredCoverage` for a sandbox
+    ///         proposal is `batchCoverage + funding`; if the live figure were
+    ///         batch-only, a mid-review re-certification raising the batch's
+    ///         coverage by LESS than the funding would execute undetected —
+    ///         under-covered by exactly that amount.
+    /// @dev    Batch: one certified `usdc.approve` at 50 bps on a 10_000e6 cap
+    ///         (50e6 coverage) plus 1_000e6 sandbox funding → required 1_050e6.
+    ///         Re-certified at 500 bps the batch prices 500e6: a 450e6 rise,
+    ///         strictly inside the 1_000e6 funding, so a batch-only comparison
+    ///         (500e6 <= 1_050e6) passes and only the funding-inclusive one
+    ///         (1_500e6 > 1_050e6) trips. Timing mirrors
+    ///         `TierResolution.test_executeRevertsWhenCoverageRegressedAtSameTier`:
+    ///         `certifyDelay` floored to `MIN_CERTIFY_DELAY` (== VOTING_PERIOD)
+    ///         so one warp lands the replacement inside the execution window.
+    function test_coverageRegression_countsSandboxFundingAtExecute() public {
+        _wireTierRegistry();
+        tierRegistry.proposeCertification(
+            address(usdc), usdc.approve.selector, 0, 50, address(0), address(usdc).codehash
+        );
+        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
+        tierRegistry.certify(address(usdc), usdc.approve.selector);
+
+        uint256[] memory execCaps = new uint256[](1);
+        execCaps[0] = 10_000e6;
+        vm.prank(agent);
+        uint256 pid = governor.proposeWithSandbox(
+            _payload(_oneCall(address(spy), abi.encodeCall(IdentitySpy.ping, ())), FUNDING, new address[](0)),
+            address(vault),
+            address(0),
+            "ipfs://sandbox",
+            7 days,
+            envelope,
+            _benignExec(),
+            execCaps,
+            _benignSettle(),
+            new uint256[](1),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+        assertEq(governor.getRequiredCoverage(pid), 50e6 + FUNDING, "batch coverage + funding");
+
+        tierRegistry.setCertifyDelay(tierRegistry.MIN_CERTIFY_DELAY());
+        tierRegistry.proposeCertification(
+            address(usdc), usdc.approve.selector, 0, 500, address(0), address(usdc).codehash
+        );
+
+        _advancePastVoting(); // == MIN_CERTIFY_DELAY, so the replacement is also ready
+
+        tierRegistry.certify(address(usdc), usdc.approve.selector);
+
+        vm.expectRevert(ISyndicateGovernor.CoverageRegressed.selector);
+        governor.executeProposal(pid);
+    }
+
     // ── 4.2 identity ──────────────────────────────────────────────────────
 
     /// @notice The confinement argument in one assertion: a contract gated on
