@@ -39,11 +39,26 @@ interface IVaultMembership {
 ///         a rogue contract cannot spoof the membership view.
 ///
 ///         `template` is gated by an owner-managed allowlist: an unlisted
-///         template reverts, so a hostile agent cannot clone an
-///         attacker-controlled contract and route vault assets to it via a
-///         governor proposal. The governor doesn't independently validate
-///         the strategy address against an implementation registry, so the
-///         allowlist here is the single chokepoint.
+///         template reverts here, so this factory never clones an
+///         attacker-controlled contract. It is NOT the only chokepoint on what
+///         a vault may pay, though: `TierRegistry`'s code-class fallback admits
+///         ANY ERC-1167 clone of a class-allowed template as a batch recipient,
+///         whether or not this factory produced it (a bare `Clones.clone` +
+///         permissionless `initialize` bound to the paying vault is
+///         indistinguishable from a factory clone to every on-chain check,
+///         SHE-209 / PR #284 finding 1). Consequently:
+///
+///           - `setTemplateApproval(t, false)` stops NEW clones through this
+///             factory only. To stop a template's clones from being FUNDED,
+///             the owner must also run `TierRegistry.setClassAllowed(t, false)`
+///             — the two allowlists must be revoked together.
+///           - The class path's safety rests on a TEMPLATE invariant, checked
+///             at certification review rather than enforced by code: every
+///             certified template must derive its fund destination and its
+///             counterparty allowlist from `vault()` (as `BaseStrategy` and
+///             the shipped templates do) and expose no payout / recipient /
+///             router address settable from `initialize` or `updateParams`
+///             data. See `TierRegistry.proposeClassCertification`.
 contract StrategyFactory is Ownable {
     /// @notice SyndicateFactory used to verify that `vault` is a registered vault.
     /// @dev Immutable: set once at construction. A clone-fn caller-vault gate is

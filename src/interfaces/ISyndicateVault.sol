@@ -81,14 +81,16 @@ interface ISyndicateVault {
     ///         spender/recipient is neither the vault itself nor an adapter
     ///         allowlisted in the TierRegistry.
     error DisallowedTransferTarget(address target, bytes4 selector, address recipient);
-    /// @notice A recipient admitted to receive vault funds VIA THE TierRegistry
-    ///         code-class fallback (`classOf(recipient) != 0`) is not bound to
-    ///         this vault — its own `vault()` does not equal `address(this)`, or
-    ///         is unreadable. Class membership proves the recipient's CODE is a
-    ///         certified template's clone, but `initialize` is unpermissioned, so
-    ///         the clone's fund-destination (`_vault`) can be attacker-set
-    ///         (SHE-209). The class path is bound to this vault; explicit
-    ///         per-address grants (`classOf == 0`) are exempt.
+    /// @notice A recipient that is a MEMBER of a TierRegistry code class
+    ///         (`classOf(recipient) != 0`, i.e. an ERC-1167 clone of a certified
+    ///         strategy template) is not bound to this vault — its own `vault()`
+    ///         does not equal `address(this)`, or is unreadable. Class
+    ///         membership proves the recipient's CODE is a certified template's
+    ///         clone, but `initialize` is unpermissioned, so the clone's
+    ///         fund-destination (`_vault`) can be attacker-set (SHE-209). Every
+    ///         class member is bound to this vault, INCLUDING one the owner also
+    ///         granted per-address via `setAdapterAllowed`; only non-members
+    ///         (`classOf == 0`: routers, Permit2, plain tokens) are exempt.
     error AdapterVaultMismatch(address recipient);
     /// @notice A governor batch named the vault or its withdrawal queue as a
     ///         call target. Rejected as a class, whatever the selector: the

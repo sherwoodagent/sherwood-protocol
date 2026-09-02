@@ -603,6 +603,24 @@ not just one deployment's configuration. Only certify a template where:
 
 Step 3 is what **replaces `setAdapterAllowed(clone, true)` per proposal**.
 
+**Certification review invariant (SHE-209).** Class membership admits *every*
+clone of the template as a batch recipient — including clones minted with a
+bare `Clones.clone` outside `StrategyFactory` and initialized permissionlessly,
+which bypass `StrategyFactory.approvedTemplate` entirely. `SyndicateVault`
+binds each member to the paying vault (`vault() == vault`, reverting
+`AdapterVaultMismatch` otherwise), which neutralizes a hostile clone **only
+if** the template derives its fund destination and its counterparty allowlist
+from `vault()` and exposes no payout / recipient / router address settable
+from `initialize` or `updateParams` data. Nothing on-chain checks this. Before
+step 1, the reviewer must confirm it for the template being certified
+(`BaseStrategy._pushToVault` and the shipped templates satisfy it; grep the
+template for `recipient` / `receiver` / `dest` / `beneficiary` params).
+
+Note that the vault binding applies to every class member, **including a clone
+the owner also granted per-address** with `setAdapterAllowed(clone, true)` —
+the explicit grant vets the address, the binding pins that it still pays this
+vault. The exemption is "not a class member", not "explicitly granted".
+
 ### Verification reads
 
 ```
@@ -634,7 +652,10 @@ keep working throughout, because the address path always wins over the class.
 
 **Closing the class callee axis is a SEQUENCED step, not an immediate one.**
 `setClassAllowed(template, false)` ([`:1347`](../src/TierRegistry.sol#L1347)) is
-the only call that closes it. Running it straight after the conviction
+the only call that closes it. It is also the only call that stops a template's
+clones from being **funded**: `StrategyFactory.setTemplateApproval(t, false)`
+only stops new clones through the factory, and a bare `Clones.clone` of `t`
+bound to the vault is still class-admitted. Revoke both levers together. Running it straight after the conviction
 re-creates exactly the freeze finding #14 fixed — the live clone becomes
 unreachable and every LP exit shuts. Correct order:
 

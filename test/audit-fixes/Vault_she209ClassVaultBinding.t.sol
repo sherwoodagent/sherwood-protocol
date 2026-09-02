@@ -55,6 +55,26 @@ contract StrategyCloneStub {
 ///      the missing `vault()` never matters.
 contract PlainAdapter {}
 
+/// @dev A class member whose `vault()` returns THIS vault's address with dirty
+///      upper bits — an ABI-invalid word. `abi.decode(_, (address))` reverts
+///      with EMPTY returndata on it (same refusal, no named error); the guard
+///      masks instead, so the refusal is the named `AdapterVaultMismatch`.
+contract DirtyVaultStub {
+    uint256 immutable dirtyWord;
+
+    constructor(address v) {
+        dirtyWord = uint256(uint160(v)) | (uint256(1) << 160);
+    }
+
+    fallback() external {
+        uint256 w = dirtyWord;
+        assembly {
+            mstore(0, w)
+            return(0, 32)
+        }
+    }
+}
+
 /// @title Vault_she209ClassVaultBinding
 /// @notice SHE-209 — the TierRegistry code-class allowlist admits ANY address
 ///         whose codehash is a certified template's ERC-1167 clone. Codehash
@@ -160,6 +180,20 @@ contract VaultShe209ClassVaultBindingTest is Test {
 
         vm.prank(MOCK_GOVERNOR);
         vault.executeGovernorBatch(_transferBatch(address(router)), new uint256[](0), 1);
+    }
+
+    /// @notice A class member whose `vault()` word carries dirty upper bits is
+    ///         refused with the NAMED error, not an opaque empty revert
+    ///         (finding 5). The low 160 bits ARE this vault, which pins that the
+    ///         mask resolves the word to `address(0)` rather than truncating it
+    ///         into a pass.
+    function test_she209_dirtyVaultWord_revertsNamed() public {
+        DirtyVaultStub dirty = new DirtyVaultStub(address(vault));
+        tiers.allow(address(dirty), CLASS);
+
+        vm.prank(MOCK_GOVERNOR);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.AdapterVaultMismatch.selector, address(dirty)));
+        vault.executeGovernorBatch(_transferBatch(address(dirty)), new uint256[](0), 1);
     }
 
     /// @notice A class member that cannot even answer `vault()` fails CLOSED —

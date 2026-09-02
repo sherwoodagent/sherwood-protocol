@@ -1281,32 +1281,51 @@ contract SyndicateVault is
     ///      template's cheap certified tier); the strategy's `_pushAllToVault`
     ///      then ships the batch's funds to the attacker.
     ///
-    ///      Bind the class path to THIS vault: a class-admitted recipient must
-    ///      name this vault as its own (`vault() == address(this)`). This is the
-    ///      one provenance codehash cannot supply. Explicit per-address grants
-    ///      (routers, Permit2, plain tokens) are NOT clones of a certified
-    ///      strategy template, so `classOf` returns 0 for them and they are
-    ///      exempt — this never restricts a target the owner vetted directly.
+    ///      Bind every CLASS MEMBER to THIS vault: a recipient with
+    ///      `classOf != 0` must name this vault as its own
+    ///      (`vault() == address(this)`). This is the one provenance codehash
+    ///      cannot supply. The exemption is "not a class member", NOT
+    ///      "explicitly granted": routers, Permit2 and plain tokens are exempt
+    ///      because they are not clones of a certified template, while a clone
+    ///      of a certified template is bound even when the owner ALSO granted
+    ///      it per-address via `setAdapterAllowed` (the intended per-clone
+    ///      pattern, `script/Deploy.s.sol`). That tightening is deliberate: an
+    ///      explicit grant vets the address, and the binding then pins that the
+    ///      address still pays THIS vault — the two checks are independent.
     ///
-    ///      Both probes are raw + length-checked, not typed calls:
-    ///      - `classOf` UNREADABLE (or 0) → recipient is not a class member →
-    ///        return (no binding required). A registry with no class concept
-    ///        cannot be exploited via the class fallback, so this is safe, and it
-    ///        keeps a registry lacking `classOf` behavior-identical to pre-fix.
-    ///      - `vault()` UNREADABLE or mismatched on a CONFIRMED class member →
-    ///        revert. Fail CLOSED: a class member that cannot prove it belongs to
-    ///        this vault must not be paid.
+    ///      `classOf` is a TYPED call. The typed `isAdapterAllowed` on the line
+    ///      above already proved the registry is live and answering, and
+    ///      `classOf` does a strict subset of that call's work (both read
+    ///      `_classOf`), so a registry that cannot answer it is a misconfigured
+    ///      registry, not a "registry with no class concept" — and an
+    ///      out-of-gas child is indistinguishable from either by a raw probe.
+    ///      Fail CLOSED by letting the revert bubble (Carlos, PR #284 finding 2).
+    ///
+    ///      `vault()` is a raw, length-checked probe read via `_readVaultOf`:
+    ///      unreadable, short, dirty-upper-bits or mismatched on a CONFIRMED
+    ///      class member → revert `AdapterVaultMismatch`. Fail CLOSED: a class
+    ///      member that cannot prove it belongs to this vault must not be paid.
     function _requireRecipientVaultBinding(address registry, address recipient) private view {
-        (bool okClass, bytes memory retClass) =
-            registry.staticcall(abi.encodeWithSignature("classOf(address)", recipient));
-        // Not a class member (unreadable, short, or zero) → explicit-grant or
-        // non-class path; nothing to bind.
-        if (!okClass || retClass.length < 32 || abi.decode(retClass, (bytes32)) == bytes32(0)) return;
+        if (ITierRegistry(registry).classOf(recipient) == bytes32(0)) return;
+        if (_readVaultOf(recipient) != address(this)) revert AdapterVaultMismatch(recipient);
+    }
 
-        (bool okVault, bytes memory retVault) = recipient.staticcall(abi.encodeWithSignature("vault()"));
-        if (!okVault || retVault.length < 32 || abi.decode(retVault, (address)) != address(this)) {
-            revert AdapterVaultMismatch(recipient);
+    /// @dev Staticcall-safe `vault()` read, mirroring
+    ///      `PortfolioStrategy._readAddress`: revert, short return, or dirty
+    ///      upper bits all resolve to `address(0)`, which the caller treats as
+    ///      a mismatch. Masks instead of `abi.decode`, which reverts with EMPTY
+    ///      returndata on a dirty word — same refusal, worse diagnostics
+    ///      (Carlos, PR #284 finding 5). `recipient` is a confirmed class
+    ///      member here, so it always has code; no `code.length` pre-check.
+    function _readVaultOf(address recipient) private view returns (address) {
+        (bool ok, bytes memory ret) = recipient.staticcall(abi.encodeWithSignature("vault()"));
+        if (!ok || ret.length < 32) return address(0);
+        uint256 word;
+        assembly ("memory-safe") {
+            word := mload(add(ret, 0x20))
         }
+        if (word >> 160 != 0) return address(0);
+        return address(uint160(word));
     }
 
     /// @dev The standard ERC-20 view selectors, which a governor batch may

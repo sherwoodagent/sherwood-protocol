@@ -81,6 +81,12 @@ contract MockTierRegistry {
         return allowed[adapter];
     }
 
+    /// @dev SHE-209: no class concept in this stand-in — every address is a
+    ///      non-member, so the vault's class-binding check never fires.
+    function classOf(address) external pure returns (bytes32) {
+        return bytes32(0);
+    }
+
     /// @dev The CALLEE axis (`_guardBatchCalls` PART 2a), split out of
     ///      `isAdapterAllowed` per pashov finding #14. MIRRORS the adapter axis
     ///      rather than adding a second switch: nothing in this file exercises

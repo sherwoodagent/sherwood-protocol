@@ -38,6 +38,12 @@ contract PermissiveTierRegistry is ITierRegistry {
     function isCounterpartyAllowed(address) external pure returns (bool) {
         return true;
     }
+
+    /// @dev SHE-209: no class concept in this stand-in — every address is a
+    ///      non-member, so the vault's class-binding check never fires.
+    function classOf(address) external pure returns (bytes32) {
+        return bytes32(0);
+    }
 }
 
 /// @notice Deploy a `PermissiveTierRegistry` to satisfy the governor's mandatory
