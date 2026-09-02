@@ -663,6 +663,49 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
         assertEq(swood.totalGuardianStake(), totalStakeBefore - slashTotal);
     }
 
+    /// @notice SHE-223 (M2): the finalize path FAILS CLOSED when the chain clock
+    ///         runs behind `epochGenesis`, instead of underflowing or emitting
+    ///         attribution under a floored epoch index.
+    ///
+    /// @dev    `_emitBlockerAttribution` derives its epoch as
+    ///         `(block.timestamp - epochGenesis) / EPOCH_DURATION` on the
+    ///         STATE-CHANGING resolve path — the same unguarded subtraction the
+    ///         ledger carried. Flooring it at zero is the wrong repair here for
+    ///         the same reason it is wrong there: `BlockerAttributed` is what
+    ///         Merkl's bot builds the epoch's WOOD campaign roots from, so a
+    ///         floored index does not degrade the emission, it mis-keys it —
+    ///         paying one epoch's blockers out of bucket 0's campaign. A refused
+    ///         `resolveReview` is retryable the moment the clock is sane; a
+    ///         mis-paid campaign is not.
+    ///
+    ///         Reaches the guard through the real 2-approve/2-block quorum
+    ///         shape, so the slash call ahead of it runs and the revert is
+    ///         genuinely coming from the attribution site rather than from an
+    ///         earlier gate. See `_forceEpochGenesis` for why the pre-genesis
+    ///         state is poked rather than warped to.
+    function test_resolveReview_preGenesisClockFailsClosed() public {
+        IGuardianRegistry.GuardianVoteType[5] memory sides = [
+            IGuardianRegistry.GuardianVoteType.Approve,
+            IGuardianRegistry.GuardianVoteType.Approve,
+            IGuardianRegistry.GuardianVoteType.Block,
+            IGuardianRegistry.GuardianVoteType.Block,
+            IGuardianRegistry.GuardianVoteType.None
+        ];
+        _openAndVote(sides);
+        vm.warp(reviewEnd);
+
+        // The clock is now BEHIND genesis by one second.
+        _forceEpochGenesis(vm.getBlockTimestamp() + 1);
+        vm.expectRevert(IGuardianRegistry.ClockBeforeGenesis.selector);
+        registry.resolveReview(address(governor), PROPOSAL_ID);
+
+        // AT genesis is not pre-genesis: the guard is strictly `<`, and the same
+        // call goes through with `elapsed == 0`. Weakening `<` to `<=` breaks
+        // this leg.
+        _forceEpochGenesis(vm.getBlockTimestamp());
+        assertTrue(registry.resolveReview(address(governor), PROPOSAL_ID), "at genesis the finalize path runs");
+    }
+
     /// @dev Inverted with the removal of the cold-start waiver: a thin cohort
     ///      voting unanimously to block now BLOCKS. Previously the flag
     ///      short-circuited this to not-blocked no matter how the cohort voted,
@@ -1127,6 +1170,43 @@ contract GuardianRegistryAppealTest is RegistryTestHarness {
 
         assertEq(wood.balanceOf(recipient), recBalBefore + 500e18);
         assertEq(registry.slashAppealReserve(), 9_500e18);
+    }
+
+    /// @notice SHE-223 (M2): a refund refuses outright while the chain clock is
+    ///         behind `epochGenesis`, rather than underflowing or charging the
+    ///         draw to bucket 0.
+    ///
+    /// @dev    WHY NOT FLOOR AT ZERO. `ep` is the KEY into `refundedInEpoch`,
+    ///         which is the per-epoch cap's only memory. A floored index re-opens
+    ///         bucket 0's allowance for as long as the clock sits behind genesis
+    ///         — and bucket 0's allowance was spent in the vault's first week —
+    ///         so the reserve could be drawn twice against one window. The cap is
+    ///         the whole point of the function; a refused refund is an
+    ///         inconvenience, a re-spendable cap is the loss.
+    ///
+    ///         `refundSlash` is `onlyOwner` and takes no window, so unlike
+    ///         `resolveReview` it is callable at any timestamp — which is what
+    ///         makes this reachable during exactly the twelve-block clock fault
+    ///         SHE-223 records.
+    function test_refundSlash_preGenesisClockFailsClosed() public {
+        vm.prank(regOwner);
+        registry.fundSlashAppealReserve(10_000e18);
+
+        // The clock is now BEHIND genesis by one second.
+        _forceEpochGenesis(vm.getBlockTimestamp() + 1);
+        vm.prank(regOwner);
+        vm.expectRevert(IGuardianRegistry.ClockBeforeGenesis.selector);
+        registry.refundSlash(recipient, 100e18);
+
+        // Nothing moved, and nothing was charged to any epoch.
+        assertEq(registry.slashAppealReserve(), 10_000e18, "the reserve is untouched by the refused draw");
+        assertEq(registry.refundedInEpoch(0), 0, "and bucket 0's allowance was not spent behind genesis");
+
+        // AT genesis is not pre-genesis: strictly `<`, so `elapsed == 0` pays.
+        _forceEpochGenesis(vm.getBlockTimestamp());
+        vm.prank(regOwner);
+        registry.refundSlash(recipient, 100e18);
+        assertEq(registry.refundedInEpoch(0), 100e18, "at genesis the refund lands in bucket 0");
     }
 }
 

@@ -1339,6 +1339,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      campaign's Merkle roots. `governor` disambiguates the (governor,
     ///      proposalId) review since per-vault governors all number from 1.
     function _emitBlockerAttribution(bytes32 key, address governor, uint256 proposalId) private {
+        // FAIL CLOSED before genesis rather than underflowing or flooring at
+        // zero: a floored epoch index would emit this review's attribution under
+        // bucket 0 and silently mis-key the epoch's Merkl campaign roots. See
+        // `IGuardianRegistry.ClockBeforeGenesis`. Strict `<` — at genesis the
+        // subtraction is 0 and valid.
+        if (block.timestamp < epochGenesis) revert ClockBeforeGenesis();
         uint256 epochId = (block.timestamp - epochGenesis) / EPOCH_DURATION;
         address[] storage blockers = _blockers[key];
         uint256 n = blockers.length;
@@ -1470,6 +1476,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     function refundSlash(address recipient, uint256 amount) external onlyOwner {
         if (recipient == address(0)) revert ZeroAddress();
 
+        // FAIL CLOSED before genesis. Flooring the epoch index at zero would
+        // re-open bucket 0's per-epoch refund cap for the whole time the clock
+        // sits behind genesis, letting the reserve be drawn twice against one
+        // window. See `IGuardianRegistry.ClockBeforeGenesis`.
+        if (block.timestamp < epochGenesis) revert ClockBeforeGenesis();
         uint256 ep = (block.timestamp - epochGenesis) / EPOCH_DURATION;
         uint256 cap = (slashAppealReserve * MAX_REFUND_PER_EPOCH_BPS) / BPS_DENOMINATOR;
         if (refundedInEpoch[ep] + amount > cap) revert RefundCapExceeded();

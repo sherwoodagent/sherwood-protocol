@@ -421,8 +421,39 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     // ── Views ──
 
+    /// @dev FAILS CLOSED BEFORE GENESIS with a named error rather than
+    ///      underflowing or answering zero. On a live chain
+    ///      `block.timestamp < epochGenesis` cannot happen — genesis is stamped
+    ///      in the constructor — but a fork, a vnet or a test harness can put the
+    ///      clock behind it, and it happened (a vnet reset its clock to ts=120
+    ///      for twelve blocks against a genesis of 1787182248).
+    ///
+    ///      WHY NOT FLOOR AT ZERO. Answering 0 reads as harmless here and is not:
+    ///      `_coverageEpoch` floors every booking at `currentEpoch()`, so a zero
+    ///      epoch shifts the whole epoch frame down, and `openExposureUsd`'s walk
+    ///      then misses every live bucket on any ledger older than
+    ///      `MAX_COVERAGE_HORIZON`. See `IExposureLedger.ClockBeforeGenesis` for
+    ///      the full argument and the `claimUnstakeGuardian` consequence. The
+    ///      pre-existing 0x11 panic failed CLOSED; this is that same closed
+    ///      failure, named and decodable, so a caller can tell a clock fault from
+    ///      a real revert.
+    ///
+    ///      STRICT `<`: at exactly genesis `elapsed == 0` is a valid answer.
+    ///
+    ///      An off-chain reader that needs to render this state without catching
+    ///      a revert calls `clockBeforeGenesis()`.
     function currentEpoch() public view returns (uint256) {
+        if (block.timestamp < epochGenesis) revert ClockBeforeGenesis();
         return (block.timestamp - epochGenesis) / epochLength;
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev The one epoch-indexed read that stays answerable while the clock is
+    ///      behind genesis, precisely so the indexer has something to branch on.
+    ///      Kept trivial on purpose: it must never acquire a reason of its own to
+    ///      revert.
+    function clockBeforeGenesis() external view returns (bool) {
+        return block.timestamp < epochGenesis;
     }
 
     /// @inheritdoc IExposureLedger
@@ -2042,6 +2073,15 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      i.e. from = (elapsed - W) / L when elapsed > W. from <= cur always
     ///      (W > 0), so the loop is bounded by ceil(W/L) + 1 iterations.
     function openExposureUsd(address guardian) public view returns (uint256 total) {
+        // FAIL CLOSED, NOT OPEN. A clock behind genesis is refused outright
+        // rather than clamped: with `elapsed` floored at zero the walk becomes
+        // [0, MAX_COVERAGE_HORIZON/L] while `_coverageEpoch` has floored every
+        // booking at `currentEpoch()`, so on any ledger older than
+        // MAX_COVERAGE_HORIZON the two ranges are DISJOINT and this view answers
+        // zero with real coverage live — opening `StakedWood`'s unstake gate.
+        // See `IExposureLedger.ClockBeforeGenesis`. Strict `<`: at genesis
+        // itself `elapsed == 0` is valid.
+        if (block.timestamp < epochGenesis) revert ClockBeforeGenesis();
         uint256 elapsed = block.timestamp - epochGenesis;
         uint256 from = elapsed > challengeWindow ? (elapsed - challengeWindow) / epochLength : 0;
         // Scans FORWARD as well as back. Approvals are booked into the bucket

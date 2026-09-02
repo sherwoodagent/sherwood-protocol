@@ -428,8 +428,11 @@ contract SyndicateVault is
     ///         lock from its first mark bounds the whole episode.
     uint256 private _unvaluedSince;
 
-    /// @notice Strategies whose unvalued mark has already been pruned after
-    ///         lapsing, and which may therefore never set it again.
+    /// @notice Strategies whose unvalued mark has already been dropped, and
+    ///         which may therefore never set it again. Set by `_bumpUnvalued`
+    ///         on EVERY drop — a prune after lapsing, a truthful clear, or the
+    ///         codeless force-clear — because all three end the one episode
+    ///         this label was entitled to.
     ///
     ///         WITHOUT THIS, THE PRUNE IS A RENEWABLE LOCK. `_refreshUnvalued`
     ///         re-reads the label on every `collectResidue` and every
@@ -448,12 +451,63 @@ contract SyndicateVault is
     ///         reaches a prune at all, since `sweep()` and
     ///         `releaseUnconvertible` clear it inside the window.
     ///
-    ///         PER STRATEGY, NOT VAULT-WIDE, so an attacker burning its own
-    ///         label cannot disarm the gate for anyone else's: the next
-    ///         strategy to mark is a genuine 0 -> 1 with a fresh deadline. A
-    ///         clone cannot settle twice (`BaseStrategy.execute` requires
-    ///         `State.Pending`), so repeating the grief costs a fresh clone and
-    ///         a fresh proposal carried to Settled, every window, forever.
+    ///         AND A CLEAR SPENDS THE EPISODE JUST AS A PRUNE DOES. Guarding
+    ///         only the post-prune direction left the rule half-enforced: a
+    ///         label cleared TRUTHFULLY was decremented to zero with
+    ///         `_unvaluedSince` reset and no burn, so re-reporting residue was a
+    ///         fresh 0 -> 1 with a fresh seven days — the identical renewable
+    ///         lock, reachable by anyone through `collectResidue`, and one the
+    ///         prune can never break because each re-mark re-stamps
+    ///         `_unvaluedMarkedAt`. Cost to grief with: one clone, one proposal
+    ///         carried to Settled, then gas every seven days, forever.
+    ///
+    ///         WHAT THE STRONGER RULE COSTS, stated without hedging: a label
+    ///         that clears honestly and LATER acquires genuinely unvaluable
+    ///         residue no longer gates deposits, so a depositor mints against a
+    ///         NAV missing it. THE USD SIZE OF THAT MISPRICING IS NOT BOUNDED.
+    ///         An earlier draft of this note claimed it was "bounded twice
+    ///         over", on the grounds that `_residueAmount` still prices the leg;
+    ///         that is false by construction. `hasUnvaluedResidue()` is defined
+    ///         as the complement of what `undeliveredValue()` can price — see
+    ///         `ConcentratedLiquidityStrategy.undeliveredValue`, which returns
+    ///         the idle vault-asset balance and nothing else, and
+    ///         `CallSandbox.undeliveredValue`, which does the same. A nonzero
+    ///         `_residueAmount` is the TRACKING HOOK for the priceable part; it
+    ///         is not a bound on the unpriceable part, and the two sets do not
+    ///         overlap.
+    ///
+    ///         WHAT IS ACTUALLY BOUNDED IS COUNT AND SCOPE, and only those:
+    ///         - COUNT: one episode per label, ever. A burned strategy cannot
+    ///           re-arm the gate, so no single label can hold or re-take the
+    ///           lock repeatedly.
+    ///         - SCOPE: the burn is per-strategy, not vault-wide, so an attacker
+    ///           burning its own label does not disarm the gate for anyone
+    ///           else's — the next strategy to mark is a genuine 0 -> 1 with a
+    ///           fresh deadline.
+    ///
+    ///         THE FRESH-CLONE ROUTE IS NOT CLOSED, it is repriced. A clone
+    ///         cannot settle twice (`BaseStrategy.execute` requires
+    ///         `State.Pending`), so repeating the grief costs a FRESH clone and
+    ///         a FRESH proposal carried to Settled — once per `UNVALUED_MAX_LOCK`
+    ///         window, agent-gated, indefinitely. That raises the cost of the
+    ///         DoS from "gas, forever" to "one clone plus one settled proposal
+    ///         per seven days, by an address the registry admitted". It does not
+    ///         eliminate it, and it should not be described as if it did.
+    ///
+    ///         DOCUMENTED ALTERNATIVE, NOT IMPLEMENTED HERE (review of #298).
+    ///         The burn is not the only way to break the renewable lock. The
+    ///         other shape: keep `_unvaluedMarkedAt[strategy]` across a clear
+    ///         instead of zeroing it, and HONOUR a burned label's re-mark
+    ///         without re-stamping `_unvaluedSince`, refusing only once
+    ///         `block.timestamp >= _markStartOf(strategy) + UNVALUED_MAX_LOCK`.
+    ///         That would keep an honest label's later residue gating deposits —
+    ///         removing the unbounded mispricing above — while still capping the
+    ///         total time any one label can hold the gate, since the deadline is
+    ///         measured from its FIRST mark and no re-mark can move it. The cost
+    ///         is a live storage-semantics change to `_unvaluedMarkedAt` (it
+    ///         stops meaning "a mark is standing") and a re-audit of
+    ///         `pruneUnvaluedMark`, which reads exactly that field. Left as a
+    ///         follow-up rather than folded into a review-remediation commit.
     mapping(address strategy => bool) private _unvaluedBurned;
 
     /// @notice When each strategy's own unvalued mark was set, or 0 while it
@@ -1692,9 +1746,20 @@ contract SyndicateVault is
         if (block.timestamp < _markStartOf(strategy) + UNVALUED_MAX_LOCK) revert UnvaluedLockStillActive();
 
         _residueUnvalued[strategy] = false;
+        // Redundant with `_bumpUnvalued`, which burns on every drop, and kept:
+        // the prune's correctness should not depend on a helper called two
+        // lines later. Same slot, same value, so the second write is a no-op.
         _unvaluedBurned[strategy] = true;
         _bumpUnvalued(strategy, false);
         emit ResidueUnvalued(strategy, false);
+    }
+
+    /// @inheritdoc ISyndicateVault
+    /// @dev Reads `_unvaluedBurned` and nothing else. NO STORAGE CHANGE: the
+    ///      mapping already existed and this only exposes it, so the layout
+    ///      goldens are untouched.
+    function unvaluedEpisodeSpent(address strategy) external view returns (bool) {
+        return _unvaluedBurned[strategy];
     }
 
     /// @dev When `strategy`'s own mark was set. Falls back to the episode clock
@@ -1979,13 +2044,21 @@ contract SyndicateVault is
             now_ = abi.decode(ret, (uint256)) != 0;
         }
         if (now_ == was) return;
-        // A BURNED LABEL CANNOT MARK AGAIN. Its one episode already ran to the
-        // deadline and was pruned; honouring a fresh TRUE here would let anyone
-        // re-shut the vault on demand by calling `collectResidue` on it. See
-        // `_unvaluedBurned`. Only the marking direction is refused — a burned
-        // strategy that somehow still carried a mark must always be able to
-        // clear it.
-        if (now_ && _unvaluedBurned[strategy]) return;
+        // A BURNED LABEL CANNOT MARK AGAIN. Its one episode is already spent —
+        // run to the deadline and pruned, or ended by a truthful clear, which
+        // `_bumpUnvalued` burns alike. Honouring a fresh TRUE here would let
+        // anyone re-shut the vault on demand by calling `collectResidue` on it.
+        // See `_unvaluedBurned`. Only the marking direction is refused — a
+        // burned strategy that somehow still carried a mark must always be able
+        // to clear it.
+        if (now_ && _unvaluedBurned[strategy]) {
+            // ...but the refusal is ANNOUNCED. This branch is the moment the
+            // vault stops gating on a label's unvaluable residue, and it used to
+            // return in silence — indistinguishable, from outside, from the
+            // label simply having no residue. See `UnvaluedMarkRefused`.
+            emit UnvaluedMarkRefused(strategy);
+            return;
+        }
         _residueUnvalued[strategy] = now_;
         _bumpUnvalued(strategy, now_);
         emit ResidueUnvalued(strategy, now_);
@@ -2012,6 +2085,19 @@ contract SyndicateVault is
             _unvaluedMarkedAt[strategy] = block.timestamp;
             _unvaluedCount += 1;
         } else {
+            // ONE EPISODE PER STRATEGY, HOWEVER THE EPISODE ENDS. The burn was
+            // set only inside `pruneUnvaluedMark`, i.e. only for a mark that had
+            // stood a FULL window. The other way out of an episode — a truthful
+            // zero from `hasUnvaluedResidue()` — dropped the mark and reset
+            // `_unvaluedSince` while burning nothing, so the SAME label could
+            // mark again and the next 0 -> 1 stamped a fresh
+            // `UNVALUED_MAX_LOCK`. That is the renewable lock `_unvaluedBurned`
+            // exists to rule out, reached from the other side: permissionless
+            // via `collectResidue`, free but for gas, and beyond the prune's
+            // reach, since every re-mark re-stamps the per-strategy clock
+            // `pruneUnvaluedMark` measures. Burning here covers both exits with
+            // one line, because this is the only place a mark is ever dropped.
+            _unvaluedBurned[strategy] = true;
             // HYGIENE, NOT BEHAVIOUR, and stated as such because a test that
             // claimed otherwise was vacuous. Nothing can observe this reset:
             // `_markStartOf` is read only by `pruneUnvaluedMark`, which returns

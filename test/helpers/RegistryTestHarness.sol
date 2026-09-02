@@ -87,6 +87,34 @@ abstract contract RegistryTestHarness is Test {
         registry.registerReview(proposalId, voteEnd, reviewEnd);
     }
 
+    /// @dev SHE-223 (M2): put the registry's `epochGenesis` AHEAD of the current
+    ///      block timestamp, i.e. reproduce a chain clock running behind genesis.
+    ///
+    ///      WHY A STORAGE POKE AND NOT A WARP. `epochGenesis` is stamped once in
+    ///      `initialize` and never written again, so on a normal timeline
+    ///      `block.timestamp >= epochGenesis` always holds and the state cannot
+    ///      be reached by warping — every review window a test could resolve is
+    ///      itself registered after genesis. The state IS reachable in the field
+    ///      two ways: a fork/vnet resetting its clock (the SHE-223 incident, ts
+    ///      rolled back to 120 for twelve blocks) and a UUPS reinitializer
+    ///      re-stamping genesis over reviews registered against the old one.
+    ///      This helper is the cheapest faithful stand-in for both.
+    ///
+    ///      THE SLOT IS SELF-CHECKED against the public getter, so a layout move
+    ///      fails here with a named message rather than silently poking an
+    ///      unrelated variable. `script/guardian-registry-layout.golden.json`
+    ///      pins it at 10.
+    function _forceEpochGenesis(uint256 genesis) internal {
+        bytes32 slot = bytes32(uint256(10));
+        assertEq(
+            uint256(vm.load(address(registry), slot)),
+            registry.epochGenesis(),
+            "layout: GuardianRegistry.epochGenesis is slot 10 (see guardian-registry-layout.golden.json)"
+        );
+        vm.store(address(registry), slot, bytes32(genesis));
+        assertEq(registry.epochGenesis(), genesis, "fixture: genesis moved");
+    }
+
     /// @dev Mints WOOD to `g`, approves sWOOD, and stakes `amount` as a
     ///      guardian. Guardian is active afterwards.
     function _stakeGuardian(address g, uint256 amount, uint256 agentId) internal {

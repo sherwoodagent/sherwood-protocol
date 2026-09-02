@@ -64,6 +64,23 @@ interface IGuardianRegistry {
     ///         The pushed window is immutable once set.
     error ReviewAlreadyRegistered();
 
+    /// @notice `block.timestamp` is strictly behind `epochGenesis`, so the
+    ///         registry's 7-day epoch index cannot be derived.
+    /// @dev    THE SAME CLASS AS `IExposureLedger.ClockBeforeGenesis`, declared
+    ///         here rather than shared because this repo gives each interface its
+    ///         own error set (`ZeroAddress` and `InvalidParameter` are already
+    ///         declared on both). Two sites subtract from `epochGenesis`:
+    ///         `_emitBlockerAttribution`, on the state-changing finalize path,
+    ///         and `refundSlash`. Both fail closed rather than flooring at zero —
+    ///         a floored `refundSlash` epoch would let the per-epoch refund cap
+    ///         be re-spent against bucket 0 while the clock is behind genesis,
+    ///         and a floored attribution epoch would silently mis-key the Merkl
+    ///         campaign roots. A refused finalize is recoverable; a mis-paid
+    ///         epoch is not.
+    ///
+    ///         STRICT `<`: at exactly genesis the subtraction is 0 and valid.
+    error ClockBeforeGenesis();
+
     // ── Events ──
     event GovernorAdded(address indexed governor);
     /// @notice Governor pushed a proposal's review window at propose time.
