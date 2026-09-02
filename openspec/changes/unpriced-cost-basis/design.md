@@ -145,8 +145,23 @@ taking, and the gate stays armed on the portion that is genuinely at risk.
 `_finishSettlementHook` and remain ungated by the capital floor, and the
 rescue path keeps its existing absolute backstop. Both unchanged.
 
-**Propose-time declaration.** `StrategyProposal` gains
-`bool expectsUnpricedResidue`. At settle:
+**Propose-time declaration.** The governor probes the named strategy for
+`IStrategyDelivery.expectsUnpricedResidue()` at propose time — the same
+bounded staticcall shape it already uses there to read `IStrategy.proposer` —
+and snapshots the answer onto `StrategyProposal`. The flag is a property of the
+TEMPLATE rather than of one proposal's parameters, so it is answerable before
+the clone has run: every launch converts, no Morpho supply does.
+
+Deriving it from the template rather than accepting it from the proposer is
+strictly stronger. A proposer input could be asserted falsely to buy drawdown
+relief a strategy never earned; a template input cannot be set by the proposer
+at all. Guardian visibility — the actual requirement — is unaffected, since the
+snapshot lives on the proposal either way. It also leaves `RiskEnvelope` and
+the `propose` ABI alone: an earlier draft added the field there, which forced
+56 mechanical call-site edits and pushed the full test build past the Yul stack
+limit.
+
+At settle:
 
 | declared | strategy reports | outcome |
 |---|---|---|
@@ -155,11 +170,11 @@ rescue path keeps its existing absolute backstop. Both unchanged.
 | false | basis > 0 | **revert** |
 | false | basis == 0 | ordinary settlement |
 
-The strategy is the source of truth for the amount, so a proposer cannot
-inflate the relief; the declaration is the source of truth for the intent, so
-a guardian reviewing the proposal is never surprised by a conversion at
-settlement. Neither alone is sufficient: the amount must come from code the
-TierRegistry certified, and the intent must be visible before execution.
+Both halves now come from code the TierRegistry certified — the amount at
+settlement, the intent at propose — and neither is proposer-supplied. The
+proposal's snapshot is what makes the intent visible to a guardian before
+execution; the settle-time comparison is what stops a template quietly
+converting on a proposal that never announced it.
 
 **Storage.** `maxDrawdownBps` (`uint16`) and `envelopeTier` (`uint8`) occupy
 3 bytes of a 32-byte slot. The new `bool` packs into the same slot, so no

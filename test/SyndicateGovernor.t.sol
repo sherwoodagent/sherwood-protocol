@@ -16,6 +16,7 @@ import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {VaultWithdrawalQueue} from "../src/queue/VaultWithdrawalQueue.sol";
 import {IVaultWithdrawalQueue} from "../src/interfaces/IVaultWithdrawalQueue.sol";
 import {MockStrategyAdapter} from "./mocks/MockStrategyAdapter.sol";
+import {MockUnpricedStrategy, MockStrategyWithoutBasis} from "./mocks/MockUnpricedStrategy.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
@@ -1540,4 +1541,278 @@ contract SyndicateGovernorTest is Test {
         queue.claim(reqId);
         assertGt(usdc.balanceOf(lp1), balBefore, "lp1 received redeemed assets");
     }
+    // ─────────────────────────────────────────────────────────────────────────
+    // Unpriced cost basis — converted capital must not read as lost
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev As `_createAndExecuteProposalWithEnvelope`, but names a strategy and
+    ///      carries the propose-time conversion declaration.
+    function _createAndExecuteWithStrategy(uint256 maxCapital, uint16 maxDrawdownBps, address strategy_)
+        internal
+        returns (uint256 proposalId)
+    {
+        ISyndicateGovernor.RiskEnvelope memory env =
+            ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: maxDrawdownBps});
+        vm.prank(agent);
+        proposalId = governor.propose(
+            address(vault),
+            strategy_,
+            "ipfs://unpriced",
+            7 days,
+            env,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps(env.maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps(env.maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(proposalId);
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+    }
+
+    /// @dev Settle and return the `pnl` the governor actually reported.
+    function _settleAndReadPnl(uint256 proposalId) internal returns (int256 pnl, uint256 perfFee) {
+        vm.recordLogs();
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("ProposalSettled(uint256,address,int256,uint256,uint256)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics.length != 0 && logs[i].topics[0] == sig) {
+                (pnl, perfFee,) = abi.decode(logs[i].data, (int256, uint256, uint256));
+                return (pnl, perfFee);
+            }
+        }
+        revert("ProposalSettled not emitted");
+    }
+
+    /// @notice THE CLAMP. A strategy reporting an absurd cost basis moves the
+    ///         reported P&L to exactly zero and no further.
+    /// @dev    This is the test that makes the whole change safe. Settlement now
+    ///         consumes a number supplied by the strategy, so the question is
+    ///         not whether an honest template is credited correctly but what a
+    ///         DISHONEST one can extract. The governor clamps the report to the
+    ///         proposal's own apparent loss, so a conversion can erase a
+    ///         reported loss and can never manufacture a gain: no performance
+    ///         fee can arise from it, and the high-water mark cannot ratchet on
+    ///         it. A template returning `type(uint256).max` gets zero, not
+    ///         profit.
+    ///
+    ///         DIFFERENTIAL BY CONSTRUCTION: the same proposal is settled twice
+    ///         from identical state, once with the strategy silent and once with
+    ///         it screaming `type(uint256).max`. Asserting the fee is UNCHANGED
+    ///         between the two is the precise claim — that the credit cannot
+    ///         create a fee — and it does not depend on whatever the fixture's
+    ///         high-water mark happens to be, which an absolute `fee == 0`
+    ///         assertion would.
+    function test_unpricedBasis_clampCannotManufactureGain() public {
+        MockUnpricedStrategy strat = new MockUnpricedStrategy();
+        strat.setDeclares(true);
+
+        uint256 pid = _createAndExecuteWithStrategy(vault.totalAssets(), 10_000, address(strat));
+        uint256 snapshot = governor.getCapitalSnapshot(pid);
+
+        // Half the capital "gone" as far as the vault's asset balance shows.
+        deal(address(usdc), address(vault), snapshot / 2);
+        uint256 state = vm.snapshotState();
+
+        // Baseline: the strategy reports nothing.
+        (int256 pnlBase, uint256 feeBase) = _settleAndReadPnl(pid);
+        uint256 markBase = vault.highWaterPricePerShare();
+        assertEq(pnlBase, -int256(snapshot / 2), "without a report the drop is a plain loss");
+
+        vm.revertToState(state);
+
+        // Same state, same proposal — but the strategy now lies as hard as the
+        // type allows. (The revert restored `basis` to 0, so set it here.)
+        strat.setBasis(type(uint256).max);
+        (int256 pnlHostile, uint256 feeHostile) = _settleAndReadPnl(pid);
+
+        assertEq(pnlHostile, int256(0), "clamped to apparent loss: pnl lands at zero, never above");
+        assertEq(feeHostile, feeBase, "an unbounded report changes no fee: the credit cannot create one");
+        assertEq(vault.highWaterPricePerShare(), markBase, "the mark cannot ratchet on unrealized inventory");
+    }
+
+    /// @notice An honest partial conversion is credited only up to what it
+    ///         actually converted.
+    function test_unpricedBasis_honestCreditIsExact() public {
+        MockUnpricedStrategy strat = new MockUnpricedStrategy();
+        strat.setDeclares(true);
+        uint256 pid = _createAndExecuteWithStrategy(vault.totalAssets(), 10_000, address(strat));
+        uint256 snapshot = governor.getCapitalSnapshot(pid);
+
+        // 30% of the capital converted into unpriced inventory, nothing lost.
+        uint256 converted = snapshot * 30 / 100;
+        strat.setBasis(converted);
+        deal(address(usdc), address(vault), snapshot - converted);
+
+        (int256 pnl,) = _settleAndReadPnl(pid);
+        assertEq(pnl, int256(0), "converted capital is not a loss");
+    }
+
+    /// @notice A conversion the proposal never declared is refused.
+    /// @dev    The strategy owns the AMOUNT and the proposal owns the INTENT;
+    ///         this is where they are made to agree, so a guardian reviewing a
+    ///         proposal cannot be surprised by a conversion at settlement.
+    function test_unpricedBasis_undeclaredConversionReverts() public {
+        // Declares NOTHING — the whole point of this test.
+        MockUnpricedStrategy strat = new MockUnpricedStrategy();
+        uint256 pid = _createAndExecuteWithStrategy(vault.totalAssets(), 10_000, address(strat));
+        uint256 snapshot = governor.getCapitalSnapshot(pid);
+
+        strat.setBasis(1_000e6);
+        deal(address(usdc), address(vault), snapshot - 1_000e6);
+
+        vm.prank(agent);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.UndeclaredUnpricedResidue.selector, 1_000e6));
+        governor.settleProposal(pid);
+    }
+
+    /// @notice Declaring a conversion that never happens costs nothing.
+    function test_unpricedBasis_declaredButUnusedSettlesNormally() public {
+        MockUnpricedStrategy strat = new MockUnpricedStrategy(); // basis stays 0
+        strat.setDeclares(true);
+        uint256 pid = _createAndExecuteWithStrategy(vault.totalAssets(), 10_000, address(strat));
+        uint256 snapshot = governor.getCapitalSnapshot(pid);
+
+        deal(address(usdc), address(vault), snapshot - 1_000e6); // a REAL loss
+        (int256 pnl,) = _settleAndReadPnl(pid);
+        assertEq(pnl, -int256(uint256(1_000e6)), "no credit without a reported basis: the loss stands");
+    }
+
+    /// @notice A strategy predating the view settles exactly as it always did.
+    /// @dev    This is what removes the migration: the probe treats unreadable
+    ///         as zero, so no deployed clone needs redeploying.
+    function test_unpricedBasis_unreadableProbeIsZero() public {
+        MockStrategyWithoutBasis strat = new MockStrategyWithoutBasis();
+        uint256 pid = _createAndExecuteWithStrategy(vault.totalAssets(), 10_000, address(strat));
+        uint256 snapshot = governor.getCapitalSnapshot(pid);
+
+        deal(address(usdc), address(vault), snapshot - 1_000e6);
+        (int256 pnl,) = _settleAndReadPnl(pid);
+        assertEq(pnl, -int256(uint256(1_000e6)), "no view means no credit, exactly as before this existed");
+    }
+
+    /// @notice A reverting probe is a zero basis, not a wedged settlement.
+    function test_unpricedBasis_revertingProbeDoesNotWedgeSettlement() public {
+        MockUnpricedStrategy strat = new MockUnpricedStrategy();
+        strat.setDeclares(true);
+        strat.setBasis(5_000e6);
+        strat.setProbeReverts(true);
+
+        uint256 pid = _createAndExecuteWithStrategy(vault.totalAssets(), 10_000, address(strat));
+        uint256 snapshot = governor.getCapitalSnapshot(pid);
+        deal(address(usdc), address(vault), snapshot - 1_000e6);
+
+        (int256 pnl,) = _settleAndReadPnl(pid);
+        assertEq(pnl, -int256(uint256(1_000e6)), "unreadable is zero, and settlement still finishes");
+    }
+
+    /// @notice A probe that tries to burn the caller's gas is bounded.
+    function test_unpricedBasis_probeGasIsCapped() public {
+        MockUnpricedStrategy strat = new MockUnpricedStrategy();
+        strat.setDeclares(true);
+        strat.setBurnGas(true);
+
+        uint256 pid = _createAndExecuteWithStrategy(vault.totalAssets(), 10_000, address(strat));
+        uint256 snapshot = governor.getCapitalSnapshot(pid);
+        deal(address(usdc), address(vault), snapshot - 1_000e6);
+
+        // Settles rather than running out of gas: the probe's ceiling stops it.
+        (int256 pnl,) = _settleAndReadPnl(pid);
+        assertEq(pnl, -int256(uint256(1_000e6)), "a gas-burning probe contributes nothing and blocks nothing");
+    }
+
+    /// @notice The CAPITAL drawdown floor credits the conversion.
+    /// @dev    The behaviour that is impossible today. Before this change a
+    ///         converting proposal cleared this gate only by declaring
+    ///         `maxDrawdownBps = 10_000`, at which point `allowance == basis`
+    ///         and the gate is skipped entirely — so the only way to settle a
+    ///         launch was to switch the gate off. Here the envelope is a modest
+    ///         10%, the gate stays ARMED, and the conversion clears it on merit.
+    function test_unpricedBasis_creditsCapitalDrawdownFloor() public {
+        MockUnpricedStrategy strat = new MockUnpricedStrategy();
+        strat.setDeclares(true);
+        uint256 pid = _createAndExecuteWithStrategy(vault.totalAssets(), 1_000, address(strat));
+        uint256 snapshot = governor.getCapitalSnapshot(pid);
+        uint256 committed = governor.getProposal(pid).effectiveMaxCapital;
+        uint256 floor = snapshot - (committed * 1_000) / 10_000;
+
+        // Deploy far past the 10% envelope — but as a CONVERSION, not a loss.
+        uint256 converted = snapshot / 2;
+        strat.setBasis(converted);
+        deal(address(usdc), address(vault), snapshot - converted);
+        assertLt(snapshot - converted, floor, "without the credit this is below the floor");
+
+        (int256 pnl,) = _settleAndReadPnl(pid);
+        assertEq(pnl, int256(0), "settles through the armed gate, reporting no loss");
+    }
+
+    /// @notice The floors still bind on a loss the conversion does not explain.
+    /// @dev    The credit relieves only what was converted. A converting
+    ///         strategy that ALSO lost money is still refused.
+    function test_unpricedBasis_capitalFloorStillBindsOnRealLoss() public {
+        MockUnpricedStrategy strat = new MockUnpricedStrategy();
+        strat.setDeclares(true);
+        uint256 pid = _createAndExecuteWithStrategy(vault.totalAssets(), 1_000, address(strat));
+        uint256 snapshot = governor.getCapitalSnapshot(pid);
+        uint256 committed = governor.getProposal(pid).effectiveMaxCapital;
+        uint256 floor = snapshot - (committed * 1_000) / 10_000;
+
+        // Converted a quarter; the rest of the shortfall is a genuine loss that
+        // lands one unit below the floor even after the credit.
+        uint256 converted = snapshot / 4;
+        strat.setBasis(converted);
+        deal(address(usdc), address(vault), floor - converted - 1);
+
+        vm.prank(agent);
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateGovernor.SettlementBelowDrawdownFloor.selector, floor - 1, floor)
+        );
+        governor.settleProposal(pid);
+    }
+
+    /// @notice `UnpricedConversion` carries the credited basis for consumers.
+    /// @dev    A companion event, not a field on `ProposalSettled`: appending to
+    ///         that signature would break every indexer decoding it.
+    function test_unpricedBasis_emitsCompanionEvent() public {
+        MockUnpricedStrategy strat = new MockUnpricedStrategy();
+        strat.setDeclares(true);
+        uint256 pid = _createAndExecuteWithStrategy(vault.totalAssets(), 10_000, address(strat));
+        uint256 snapshot = governor.getCapitalSnapshot(pid);
+        uint256 converted = snapshot / 4;
+        strat.setBasis(converted);
+        deal(address(usdc), address(vault), snapshot - converted);
+
+        vm.expectEmit(true, true, false, true, address(governor));
+        emit ISyndicateGovernor.UnpricedConversion(pid, address(vault), converted);
+        vm.prank(agent);
+        governor.settleProposal(pid);
+    }
+
+    /// @notice The declaration is readable on the proposal, which is the point
+    ///         of carrying it: a guardian sees the intent before execution.
+    function test_unpricedBasis_declarationIsReadable() public {
+        // One open proposal per vault, so the two cases run from the same
+        // state rather than back to back.
+        uint256 state = vm.snapshotState();
+
+        MockUnpricedStrategy declaring = new MockUnpricedStrategy();
+        declaring.setDeclares(true);
+        uint256 yes = _createAndExecuteWithStrategy(vault.totalAssets(), 10_000, address(declaring));
+        assertTrue(governor.expectsUnpricedResidue(yes), "the template's declaration is on the proposal");
+
+        vm.revertToState(state);
+
+        MockUnpricedStrategy silent = new MockUnpricedStrategy();
+        uint256 no = _createAndExecuteWithStrategy(vault.totalAssets(), 10_000, address(silent));
+        assertFalse(governor.expectsUnpricedResidue(no), "a non-converting template declares nothing");
+    }
+
 }

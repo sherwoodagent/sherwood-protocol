@@ -667,6 +667,11 @@ contract LaunchpadStrategy is BaseStrategy {
 
         // 2 ── budget
         _pullFromVault(asset, assetIn);
+        // Flow ledger: this is the vault asset this launch is spending. What
+        // settlement does not hand back is, by definition, what the retained
+        // launch tokens cost — the figure `unpricedCostBasis()` reports so the
+        // governor can tell converted from lost.
+        _recordDeployed(assetIn);
 
         // 3 ── the venue's native fee, in the token the adapter NAMES, read
         //      LIVE. Read BEFORE the quote leg on purpose: when the fee is
@@ -1017,7 +1022,7 @@ contract LaunchpadStrategy is BaseStrategy {
         if (quote_ != asset) _convertQuote(quote_);
 
         uint256 delivered = IERC20(asset).balanceOf(address(this));
-        _pushAllToVault(asset);
+        _recordReturned(_pushAllToVault(asset));
 
         emit FundSettled(
             delivered,
@@ -1060,6 +1065,34 @@ contract LaunchpadStrategy is BaseStrategy {
     }
 
     // ── Delivery views (the split latch) ──
+
+    /// @inheritdoc IStrategyDelivery
+    /// @dev THE COMPANION TO `hasUnvaluedResidue()` BELOW, and required because
+    ///      this template overrides it. The launch reserve is the whole point of
+    ///      the strategy: capital goes in, an unpriceable token comes out and
+    ///      stays out until fund holders claim it or a later proposal sells it.
+    ///      Without this figure settlement would read that deliberate conversion
+    ///      as a total loss of the deployment — which is exactly what a live
+    ///      launch on the fork reported before this existed.
+    ///
+    ///      Derived from the flow ledger, so it covers every leg that did not
+    ///      come back as vault asset: the reserve tokens, and any quote
+    ///      `_convertQuote` could not sell at settlement (which this template
+    ///      treats as residue rather than reverting). Both are capital that
+    ///      changed form, and neither is a loss.
+    function unpricedCostBasis() public view override returns (uint256) {
+        return _flowCostBasis();
+    }
+
+    /// @inheritdoc IStrategyDelivery
+    /// @dev ALWAYS TRUE. Converting vault capital into a token the fund cannot
+    ///      price is not an edge case of this template, it is the entire
+    ///      product: the launch reserve is held for holders to claim and is
+    ///      unpriceable by construction. A launch proposal therefore always
+    ///      carries the declaration, and a guardian reviewing one sees it.
+    function expectsUnpricedResidue() public pure override returns (bool) {
+        return true;
+    }
 
     /// @inheritdoc IStrategyDelivery
     /// @dev TRUE while the settled clone holds fund tokens (or, when the quote

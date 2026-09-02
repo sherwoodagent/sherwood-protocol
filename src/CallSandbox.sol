@@ -485,6 +485,27 @@ contract CallSandbox is ICallSandbox {
         return false;
     }
 
+    /// @inheritdoc IStrategyDelivery
+    /// @dev ALWAYS ZERO, and not an oversight. The credit this view feeds tells
+    ///      settlement that capital was deliberately CONVERTED at a known cost
+    ///      rather than lost, and the sandbox executes proposer-supplied calls
+    ///      against arbitrary declared tokens: it has no recorded deployment
+    ///      cost to report and no way to distinguish an intended conversion from
+    ///      a drain. Reporting zero keeps sandbox residue reading as a loss,
+    ///      which is both the conservative answer and the behaviour that existed
+    ///      before this view — a template earns the credit by knowing what it
+    ///      spent, and this one cannot.
+    function unpricedCostBasis() external pure returns (uint256) {
+        return 0;
+    }
+
+    /// @inheritdoc IStrategyDelivery
+    /// @dev False, consistent with the zero basis above: the sandbox never
+    ///      claims a conversion, so it can never be credited for one.
+    function expectsUnpricedResidue() external pure returns (bool) {
+        return false;
+    }
+
     // ── Views ──
 
     /// @inheritdoc ICallSandbox

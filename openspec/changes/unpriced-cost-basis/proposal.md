@@ -76,10 +76,19 @@ a structural guarantee rather than a coincidence of two subsystems.
   conversion that earned it. This removes both the total-loss declaration and
   the 90% deployment ceiling for converting strategies, and restores
   `maxDrawdownBps` to describing risk the proposer is actually taking.
-- `StrategyProposal` gains `bool expectsUnpricedResidue`, declared at propose
-  time. At settle, a strategy reporting a basis on a proposal that did not
-  declare one SHALL revert. Guardians see the intent during review; the
-  proposer cannot inflate the relief.
+- `IStrategyDelivery` also gains `expectsUnpricedResidue()` — the TEMPLATE's
+  own statement that it converts capital it will not price (a constant per
+  template: every launch does, no Morpho supply does). The governor probes it
+  at propose time and snapshots the answer onto `StrategyProposal`. At settle,
+  a strategy reporting a basis on a proposal carrying no such snapshot SHALL
+  revert.
+
+  Read from the template rather than taken as a proposer input, which is
+  strictly stronger: the proposer cannot assert it at all, so it can never buy
+  drawdown relief a strategy has not earned, and a guardian still sees the
+  intent on the proposal during review. It also leaves `RiskEnvelope` and the
+  `propose` ABI untouched — an earlier draft put the flag there, which forced
+  56 call-site edits and pushed the full test build past the Yul stack limit.
 - New event `UnpricedConversion(proposalId, vault, costBasis)`, emitted only
   when the credited basis is nonzero. `ProposalSettled` keeps its exact
   signature — appending a field would break every consumer decoding it.
@@ -103,7 +112,8 @@ None.
 
 ## Impact
 
-- `src/interfaces/IStrategyDelivery.sol` — new view declaration.
+- `src/interfaces/IStrategyDelivery.sol` — two new view declarations
+  (`unpricedCostBasis`, `expectsUnpricedResidue`).
 - `src/strategies/BaseStrategy.sol` — `virtual` default returning 0.
 - `src/strategies/LaunchpadStrategy.sol` — override: quote spent plus the
   venue's native launch fee, in vault-asset terms at execute-time cost.
@@ -113,8 +123,9 @@ None.
   — unchanged; neither overrides the residue predicates, so both inherit 0.
 - `src/SyndicateGovernor.sol` — probe, clamp, P&L credit, credits in both
   drawdown gates, propose-time declaration, new event.
-- `src/interfaces/ISyndicateGovernor.sol` — `RiskEnvelope` and
-  `StrategyProposal` gain the declaration, plus the new event. The field is a `bool` packed into the existing
+- `src/interfaces/ISyndicateGovernor.sol` — `StrategyProposal` gains the
+  snapshotted declaration, plus the new event and error. `RiskEnvelope` and
+  the `propose` signature are unchanged. The field is a `bool` packed into the existing
   `maxDrawdownBps`/`envelopeTier` slot (3 of 32 bytes used), so the struct's
   layout is unchanged and no later member shifts.
 - No migration: no deployed clone requires redeployment, because an

@@ -100,4 +100,75 @@ interface IStrategyDelivery {
     ///         MUST NOT REVERT and must not depend on a movable price; an
     ///         unreadable answer is treated as the last known one.
     function hasUnvaluedResidue() external view returns (bool);
+
+    /// @notice The vault-asset amount this strategy SPENT acquiring inventory it
+    ///         declines to price — the cost basis of whatever made
+    ///         `hasUnvaluedResidue()` true.
+    ///
+    /// @dev    THE COMPANION TO THE PREDICATE ABOVE, and the two MUST NOT
+    ///         DIVERGE: a template that refuses to price something owes the
+    ///         figure it paid for it, exactly as `hasUndeliveredValue()` owes
+    ///         `undeliveredValue()`. Default `0` on `BaseStrategy`, so only a
+    ///         template that overrides the predicate implements this.
+    ///
+    ///         WHAT IT IS FOR. Settlement measures performance as the vault's
+    ///         ASSET-balance delta, which silently asserts that every strategy
+    ///         round-trips into the vault asset. A template that deliberately
+    ///         does not — a launch holding its launch token, a CL clone holding
+    ///         a live position — would otherwise have its entire deployment
+    ///         reported as a LOSS, and would trip the settlement drawdown gates
+    ///         that exist to catch value which genuinely vanished. This figure
+    ///         is what lets the governor tell CONVERTED from LOST.
+    ///
+    ///         IT IS A COST, NOT A VALUATION. Reporting what was paid keeps this
+    ///         view free of the movable price that `hasUnvaluedResidue()` exists
+    ///         to avoid consulting. It is emphatically NOT a mark-to-market of
+    ///         the inventory, and a caller MUST NOT read it as one — the fund
+    ///         still holds something it cannot price, and this says only what it
+    ///         cost to get.
+    ///
+    ///         RECORDED, NOT MEASURED LIVE. Derive this from a figure recorded
+    ///         when the capital was deployed, never from a live balance read.
+    ///         Inventory can move — `sweep()` hands it to the vault, which does
+    ///         not price it either — and a balance-derived answer would collapse
+    ///         to zero the moment it did, resurrecting the false loss. Moving
+    ///         inventory between two holders that both decline to price it
+    ///         realizes nothing. Report zero only once the capital is genuinely
+    ///         REALIZED: converted back into the vault asset, where the ordinary
+    ///         balance-delta measure sees it again.
+    ///
+    ///         The governor CLAMPS whatever this returns to the settling
+    ///         proposal's own apparent loss, so an over-report can erase a
+    ///         reported loss and can never manufacture a gain. That bound is the
+    ///         reason a strategy-supplied number is safe to consume here at all;
+    ///         it is not licence to return a figure that is not the true cost.
+    ///
+    ///         MUST NOT REVERT. Read through a bounded-gas staticcall whose
+    ///         failure is treated as zero, which is what lets a strategy
+    ///         predating this view settle unchanged.
+    function unpricedCostBasis() external view returns (uint256);
+
+    /// @notice Whether this template is EXPECTED to settle holding inventory it
+    ///         declines to price — true for a launch that keeps its launch
+    ///         token, false for a template that round-trips into the vault
+    ///         asset.
+    ///
+    /// @dev    READ AT PROPOSE TIME and snapshotted onto the proposal, so a
+    ///         guardian reviewing it sees the intent BEFORE execution rather
+    ///         than discovering the conversion at settlement. Settlement then
+    ///         refuses a strategy that reports a basis without this having been
+    ///         recorded.
+    ///
+    ///         DECLARED BY THE TEMPLATE, NOT BY THE PROPOSER, and that is the
+    ///         point. The proposer cannot set it, so it cannot be used to buy
+    ///         drawdown relief for a strategy that has not earned it; it comes
+    ///         from code the TierRegistry certified, exactly like the cost basis
+    ///         itself. A CONSTANT of the template's design rather than of one
+    ///         proposal's parameters — every launch converts, no Morpho supply
+    ///         does — so it is answerable before the clone has run.
+    ///
+    ///         MUST NOT REVERT. Read through a bounded-gas staticcall whose
+    ///         failure is treated as `false`, so a strategy predating this view
+    ///         proposes and settles exactly as it always did.
+    function expectsUnpricedResidue() external view returns (bool);
 }

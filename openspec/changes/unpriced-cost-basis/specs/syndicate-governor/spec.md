@@ -61,9 +61,9 @@ Deliberate conversion into unpriced inventory therefore SHALL NOT consume a prop
 - **THEN** the credited basis SHALL relieve only the converted portion, and the settlement SHALL still be refused by each gate that the remaining loss breaches
 
 ### Requirement: Unpriced conversion is declared at propose time
-A proposal SHALL carry a propose-time declaration that its strategy is expected to settle holding unpriced inventory. At settlement, a strategy reporting a nonzero cost basis on a proposal that carries no such declaration SHALL cause the settlement to revert. A declaration without a corresponding report SHALL settle ordinarily with no credit.
+A strategy SHALL be able to declare, through `IStrategyDelivery.expectsUnpricedResidue()`, that it is expected to settle holding inventory it declines to price. The governor SHALL read that declaration at propose time with a bounded-gas staticcall, treating an unreadable answer as false, and SHALL snapshot it onto the proposal, where it is readable for the proposal's whole lifetime. At settlement, a strategy reporting a nonzero cost basis on a proposal carrying no such snapshot SHALL cause the settlement to revert. A snapshot without a corresponding report SHALL settle ordinarily with no credit.
 
-The amount SHALL come only from the strategy and the intent SHALL come only from the declaration: a proposer cannot inflate the relief, and a guardian reviewing the proposal cannot be surprised by a conversion at settlement.
+The declaration SHALL NOT be a proposer input. Both it and the amount come from the certified template, so a proposer can neither inflate the relief nor assert it for a strategy that has not earned it, while a guardian reviewing the proposal still sees the intent before execution.
 
 When a nonzero basis is credited, the governor SHALL emit a distinct event carrying the proposal, the vault, and the credited basis, leaving the existing settlement event's signature unchanged so that consumers decoding it are not broken.
 
@@ -78,3 +78,7 @@ When a nonzero basis is credited, the governor SHALL emit a distinct event carry
 #### Scenario: Guardians see the intent before execution
 - **WHEN** a proposal that will convert capital into unpriced inventory is under guardian review
 - **THEN** the declaration SHALL be readable on the proposal, so the review sees the intent rather than inferring it from a maximal drawdown envelope
+
+#### Scenario: The proposer cannot assert a conversion
+- **WHEN** a proposal names a strategy whose template does not declare that it converts capital
+- **THEN** the proposal SHALL carry no declaration regardless of anything the proposer supplied, and any cost basis that strategy later reports SHALL cause settlement to revert

@@ -1397,4 +1397,66 @@ contract LaunchpadStrategyTest is Test {
         vm.expectRevert(BaseStrategy.NotVault.selector);
         s.sweep();
     }
+    // ─────────────────────────────────────────────────────────────────────────
+    // Unpriced cost basis
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice The template announces up front that it converts capital.
+    /// @dev    Read by the governor at PROPOSE time and snapshotted onto the
+    ///         proposal, so a guardian reviewing a launch sees the intent before
+    ///         execution instead of meeting it at settlement.
+    function test_unpricedCostBasis_templateDeclaresConversion() public {
+        LaunchpadStrategy s = _cloneDefault();
+        assertTrue(s.expectsUnpricedResidue(), "a launch always converts capital it cannot price");
+    }
+
+    /// @notice Nothing is reported until the strategy has actually settled.
+    /// @dev    Before settlement the difference between what was taken and what
+    ///         was given back is capital IN FLIGHT, not capital converted.
+    function test_unpricedCostBasis_zeroBeforeSettle() public {
+        LaunchpadStrategy s = _cloneDefault();
+        assertEq(s.unpricedCostBasis(), 0, "nothing deployed yet");
+        _execute(s);
+        assertEq(s.unpricedCostBasis(), 0, "mid-strategy is not converted");
+    }
+
+    /// @notice The basis is exactly what the strategy took and did not return.
+    /// @dev    No price is consulted to reach it — that is the point. It is what
+    ///         the fund PAID for the inventory it still holds, which is the one
+    ///         honest number available for something the template refuses to
+    ///         value.
+    function test_unpricedCostBasis_isDeployedLessReturned() public {
+        LaunchpadStrategy s = _cloneDefault();
+        _execute(s);
+
+        vm.warp(block.timestamp + CLAIM_WINDOW + 1);
+        uint256 vaultBefore = asset.balanceOf(address(vault));
+        _settle(s);
+        uint256 returned = asset.balanceOf(address(vault)) - vaultBefore;
+
+        assertEq(s.unpricedCostBasis(), ASSET_IN - returned, "cost of what is still held");
+        assertGt(s.unpricedCostBasis(), 0, "a live launch has converted something");
+        assertTrue(s.hasUnvaluedResidue(), "and the predicate agrees there IS unpriced inventory");
+    }
+
+    /// @notice Sweeping the launch token to the vault does not change the basis.
+    /// @dev    THE REASON THE FIGURE IS RECORDED RATHER THAN MEASURED. A
+    ///         balance-derived answer would collapse to zero the moment `sweep()`
+    ///         moved the inventory — and the vault does not price it either, so
+    ///         the false loss would come straight back. Moving inventory between
+    ///         two holders that both decline to price it realizes nothing.
+    function test_unpricedCostBasis_survivesSweep() public {
+        LaunchpadStrategy s = _cloneDefault();
+        _execute(s);
+        vm.warp(block.timestamp + CLAIM_WINDOW + 1);
+        _settle(s);
+
+        uint256 basisBefore = s.unpricedCostBasis();
+        assertGt(basisBefore, 0, "precondition: something was converted");
+
+        _sweep(s);
+
+        assertEq(s.unpricedCostBasis(), basisBefore, "inventory changed hands; nothing was realized");
+    }
+
 }

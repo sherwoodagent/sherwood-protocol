@@ -96,6 +96,20 @@ Snapshot instant: **execute time** (the moment capital leaves the vault), not in
 - Post-settlement, `hasUnvaluedResidue()` **latches** false on its first post-settlement false reading — however custody cleared, sweep or not — while `undeliveredValue()` stays honest (latching a vault-asset figure on a fund-token observation would be the finding-#3 skim), and no post-settlement value transits strategy custody: on Sushi the creator role goes to the vault at settle (`transferCreator`), on Stonk the clone's `forwardToVault()` becomes permissionless. Reason: a strategy that truthfully clears and then truthfully reports residue again is re-markable by permissionless `collectResidue`, and each re-mark re-stamps a 7-day deposit lock — the `_unvaluedBurned` guard only blocks re-marking after a prune. `sweep()` also stays balance-only (no venue calls) because the vault runs it under a hard 1.5M gas cap and ignores its result.
 - **StonkBrokers un-graduated at settle**: if `phase()` is still `Curve`/`Closing` when settlement comes due, `_settle` does not force an exit (the pad's `SellExceedsCurve` cap means the strategy can sell at most what it dev-bought, and an un-graduated curve holds the arm'd supply). It settles what is expressible, leaves the adapter clone holding its creator position, and the strategy reports unvalued residue until a later `sweep()`/`finalize()` resolves the launch. This is the deliverable-maximum doctrine, not a failure.
 
+**What this decision left broken, and where it is fixed.** Refusing to price the
+fund token is right, but settlement measures P&L as the vault's *asset*-balance
+delta — so a launch that deployed its capital exactly as designed reported the
+whole deployment as a LOSS, and tripped both settlement drawdown gates on the
+way out. A live vnet launch reported its full 1,200 USDG as lost, and the first
+reviewer to see it read the proposal as malicious. That is a defect in the
+governor's measure, not in this template's refusal to price, and it is not
+launchpad-specific: `ConcentratedLiquidityStrategy` has it too, for a live LP
+position. Fixed in the `unpriced-cost-basis` change (same PR):
+`IStrategyDelivery` gains `unpricedCostBasis()`, this template reports what the
+retained reserve cost, and the governor credits it — clamped to the proposal's
+own apparent loss, so a conversion can erase a reported loss and never
+manufacture a gain.
+
 ### Why the claim window is clamped at execute, not bounded at init
 
 An init-time static bound cannot do this job: `initialize` runs when the clone is created, *before* the proposal that will carry it exists, so the strategy cannot know the `strategyDuration` it will be executed under. The only universally safe static bound would be `MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE` (1 hour), which makes the feature useless. So the window is clamped where the proposal is finally known — at execute: `windowEnd = min(executedAt + configuredWindow, executedAt + strategyDuration − CLAIM_SETTLE_BUFFER)`.

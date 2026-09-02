@@ -10,6 +10,7 @@ import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
 import {IProposerBondEscrow} from "./interfaces/IProposerBondEscrow.sol";
 import {IStrategy} from "./interfaces/IStrategy.sol";
+import {IStrategyDelivery} from "./interfaces/IStrategyDelivery.sol";
 import {ICallSandbox} from "./interfaces/ICallSandbox.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
@@ -18,6 +19,7 @@ import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Ini
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {IVotes} from "@openzeppelin/contracts/governance/utils/IVotes.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
  * @title SyndicateGovernor
@@ -114,6 +116,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     /// @notice Simple reentrancy lock for execute/settle entrypoints
     uint256 private _reentrancyStatus;
+
+    /// @dev Gas ceiling on the `unpricedCostBasis()` probe, matching
+    ///      `SyndicateVault._PROBE_GAS`. Bounds what an uncooperative strategy
+    ///      can burn in a call whose failure is already treated as "no basis",
+    ///      so a hostile template can waste this much gas and change nothing.
+    uint256 private constant _PROBE_GAS = 150_000;
 
     uint256 private constant _NOT_ENTERED = 1;
     uint256 private constant _ENTERED = 2;
@@ -663,6 +671,14 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Sequential writes (not struct literal) per the stack-too-deep note above.
         p.maxCapital = envelope.maxCapital;
         p.maxDrawdownBps = envelope.maxDrawdownBps;
+        // Snapshot the TEMPLATE's own declaration that it converts capital into
+        // inventory it will not price. Taken here, at propose, so it is on the
+        // proposal a guardian reviews rather than a surprise at settlement —
+        // and taken from the strategy rather than from the proposer, so it
+        // cannot be asserted to buy drawdown relief the strategy has not
+        // earned. Unreadable is false, which is simply the pre-existing
+        // behaviour.
+        p.expectsUnpricedResidue = _readExpectsUnpricedResidue(strategy);
         // Snapshot protocol and guardian fee config at propose time so settlement
         // uses rates/recipients that voters actually saw, not a post-vote change.
         _snapshotFeeConfig(p);
@@ -965,6 +981,33 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // redirected to the path where a human looks at it.
         {
             uint256 basis = _capitalSnapshots[proposalId];
+            uint256 realized = IERC20(IERC4626(proposal.vault).asset()).balanceOf(proposal.vault);
+
+            // CONVERTED CAPITAL COUNTS AS REALIZED HERE. This gate exists to
+            // catch value that VANISHED, and capital the strategy turned into
+            // inventory it declines to price has not vanished — it changed
+            // form. Without this credit the two templates that deliberately
+            // hold unpriced inventory could only clear the gate by declaring
+            // `maxDrawdownBps = 10_000`, which does not merely read as a
+            // declared total loss: at exactly 10_000 `allowance == basis`, the
+            // branch below is SKIPPED, and the proposal settles with this gate
+            // switched off entirely. Crediting the conversion is what lets a
+            // converting proposal declare a real envelope and keep the gate
+            // ARMED on the portion genuinely at risk.
+            uint256 reported;
+            uint256 convertedBasis;
+            (reported, convertedBasis) = _readUnpricedBasis(proposal.strategy, basis, realized);
+
+            // THE INTENT MUST HAVE BEEN DECLARED. The strategy is the source of
+            // truth for the amount and the proposal for the intent; this is
+            // where they are made to agree. Checked on the RAW report, not the
+            // clamped figure, so a profitable proposal that nonetheless ends
+            // holding undeclared unpriced inventory is caught too. Ordinary
+            // path only — `unstick` and `finalizeEmergencySettle` route around
+            // this block, because wedging the position that most needs to exit
+            // is worse than a late declaration.
+            if (reported != 0 && !proposal.expectsUnpricedResidue) revert UndeclaredUnpricedResidue(reported);
+
             uint256 allowance = (proposal.effectiveMaxCapital * proposal.maxDrawdownBps) / BPS_DENOMINATOR;
             // `allowance >= basis` covers the declared-total-loss envelope
             // (`maxDrawdownBps == 10_000` on a proposal committing the whole
@@ -972,8 +1015,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // is the envelope working as declared, not a hole.
             if (basis > allowance) {
                 uint256 floor = basis - allowance;
-                uint256 realized = IERC20(IERC4626(proposal.vault).asset()).balanceOf(proposal.vault);
-                if (realized < floor) revert SettlementBelowDrawdownFloor(realized, floor);
+                uint256 credited = realized + convertedBasis;
+                if (credited < floor) revert SettlementBelowDrawdownFloor(credited, floor);
             }
         }
 
@@ -1042,6 +1085,59 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      moving it after `_chargePerformanceFee` would make a fee charge
     ///      able to REVERT an otherwise-valid settlement, converting a fee
     ///      rounding edge into a stuck vault.
+    /// @dev Read the settling strategy's declared cost basis for inventory it
+    ///      refuses to price, and BOUND IT. Returns the raw report (for the
+    ///      declaration check, which must see what the strategy actually said)
+    ///      and the clamped figure every consumer is allowed to use.
+    ///
+    ///      THE CLAMP IS THE WHOLE SAFETY ARGUMENT. `apparentLoss` is computed
+    ///      here from values this contract already owns — the capital snapshot
+    ///      and the vault's live asset balance — and the credit can never
+    ///      exceed it. So a conversion may erase a reported LOSS and may never
+    ///      manufacture a GAIN: P&L lands at most at zero, no performance fee
+    ///      can arise from the credit, and the high-water mark cannot ratchet on
+    ///      it. That bound is what makes consuming a strategy-supplied number
+    ///      safe at all. A template that is buggy, miscompiled or outright
+    ///      malicious and returns `type(uint256).max` moves the numbers to
+    ///      exactly zero and no further; the worst it achieves is concealing a
+    ///      loss it already caused, and the drawdown gates — credited by this
+    ///      same bounded figure — still bound how far the fund may have fallen
+    ///      before the ordinary settlement path refuses it.
+    ///
+    ///      Unreadable is zero, deliberately: unlike the vault's residue probe,
+    ///      "unknown" and "nothing" mean the same thing for a credit whose
+    ///      default is no credit. That is what lets a strategy deployed before
+    ///      this view existed settle byte-for-byte as it always did, and is why
+    ///      this change needs no migration.
+    /// @dev Propose-time companion to `_readUnpricedBasis`: ask the template
+    ///      whether it expects to settle holding unpriced inventory. Same
+    ///      bounded-gas staticcall, same unreadable-is-the-safe-default rule —
+    ///      here `false`, which declines the credit rather than granting it.
+    function _readExpectsUnpricedResidue(address strategy) private view returns (bool) {
+        if (strategy == address(0)) return false;
+        (bool ok, bytes memory ret) =
+            strategy.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.expectsUnpricedResidue, ()));
+        if (!ok || ret.length != 32) return false;
+        return abi.decode(ret, (bool));
+    }
+
+    function _readUnpricedBasis(address strategy, uint256 snapshot, uint256 balanceNow)
+        private
+        view
+        returns (uint256 reported, uint256 clamped)
+    {
+        if (strategy == address(0)) return (0, 0);
+
+        (bool ok, bytes memory ret) =
+            strategy.staticcall{gas: _PROBE_GAS}(abi.encodeCall(IStrategyDelivery.unpricedCostBasis, ()));
+        if (!ok || ret.length != 32) return (0, 0);
+        reported = abi.decode(ret, (uint256));
+        if (reported == 0) return (0, 0);
+
+        uint256 apparentLoss = snapshot > balanceNow ? snapshot - balanceNow : 0;
+        clamped = reported < apparentLoss ? reported : apparentLoss;
+    }
+
     function _requireSettlePriceAboveFloorHook(uint256 proposalId, StrategyProposal storage proposal, bool rescuePath)
         internal
         view
@@ -1073,6 +1169,38 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         uint256 ppsFloor = (ppsAtExecute * (BPS_DENOMINATOR - declared)) / BPS_DENOMINATOR;
 
         uint256 ppsNow = ISyndicateVault(proposal.vault).pricePerShare();
+
+        // CONVERSION IS NOT DRAWDOWN. Capital the strategy deliberately turned
+        // into inventory it declines to price left `totalAssets()` and so left
+        // `pricePerShare()`, but it did not leave the fund. Crediting it here is
+        // what lets a launch declare an envelope describing the risk it is
+        // actually taking, instead of the `maxDrawdownBps = 10_000` a converting
+        // proposal needs today.
+        //
+        // Scaled, not added: `pricePerShare()` is `convertToAssets(unit)`, which
+        // is linear in `totalAssets()`, so the price at a NAV credited by
+        // `basis` is exactly `ppsNow * (totalAssets + 1 + basis) / (totalAssets
+        // + 1)` — the `+1` being the vault's own virtual-asset offset. Deriving
+        // it this way needs no knowledge of the share unit, the decimals offset,
+        // or the pricing supply, so it cannot drift from the vault's arithmetic.
+        // `mulDiv` floors, so the relief is always rounded DOWN and can never
+        // exceed the conversion that earned it.
+        //
+        // The floor stays fully armed on the uncredited remainder: a converting
+        // strategy that ALSO lost money is still refused here on the loss.
+        {
+            address vault_ = proposal.vault;
+            (, uint256 basis) = _readUnpricedBasis(
+                proposal.strategy,
+                _capitalSnapshots[proposalId],
+                IERC20(IERC4626(vault_).asset()).balanceOf(vault_)
+            );
+            if (basis != 0) {
+                uint256 nav = IERC4626(vault_).totalAssets() + 1;
+                ppsNow = Math.mulDiv(ppsNow, nav + basis, nav, Math.Rounding.Floor);
+            }
+        }
+
         if (ppsNow < ppsFloor) revert SettlePriceBelowFloor(ppsNow, ppsFloor);
     }
 
@@ -1511,6 +1639,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     function getRiskEnvelope(uint256 proposalId) external view returns (uint256 maxCapital, uint16 maxDrawdownBps) {
         StrategyProposal storage p = _proposals[proposalId];
         return (p.maxCapital, p.maxDrawdownBps);
+    }
+
+    /// @inheritdoc ISyndicateGovernor
+    function expectsUnpricedResidue(uint256 proposalId) external view returns (bool) {
+        return _proposals[proposalId].expectsUnpricedResidue;
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -2194,9 +2327,17 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      PnL is measured purely against `IERC20(asset).balanceOf(vault)`. Any
     ///      non-asset balance the strategy still holds at settlement (mTokens, LP
     ///      NFTs, reward tokens, perp margin) counts as a LOSS of the
-    ///      corresponding asset balance it started with. Strategies MUST fully
-    ///      unwind non-asset positions before this runs; if one cannot, wait past
-    ///      `strategyDuration` and drive the emergency-settle path.
+    ///      corresponding asset balance it started with — UNLESS the strategy
+    ///      declares what that inventory cost via
+    ///      `IStrategyDelivery.unpricedCostBasis()`, which is credited below.
+    ///      Strategies that CAN fully unwind still MUST; the credit is for
+    ///      templates that deliberately do not, and it reports converted capital
+    ///      as converted rather than lost. It is not a valuation of the
+    ///      inventory: the fund still holds something it cannot price, so the
+    ///      credit is capped at cost and the position shows no gain until a
+    ///      later proposal realizes it back into the vault asset. A strategy
+    ///      that cannot unwind AND cannot declare a basis is still a loss here;
+    ///      wait past `strategyDuration` and drive the emergency-settle path.
     /// @dev  Best-effort `settleCoverage` self-trigger. Settlement is NOT reliably
     ///       past a proposal's `executeBy`, so `_settleCoverageBestEffort` guards
     ///       on it and skips silently otherwise — the `reclaimProposerBond`
@@ -2213,7 +2354,21 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         uint256 snapshot = _capitalSnapshots[proposalId];
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 balanceAdjusted = IERC20(asset).balanceOf(vault);
-        pnl = int256(balanceAdjusted) - int256(snapshot);
+
+        // Credit capital the strategy converted into inventory it declines to
+        // price. Clamped inside the helper to this proposal's own apparent
+        // loss, so the credit can bring `pnl` to at most zero and can never
+        // manufacture a gain — see `_readUnpricedBasis`. Applied on EVERY
+        // settlement path, including the owner-gated rescue and emergency ones:
+        // an emergency exit of a converting strategy should report the same
+        // honest figure as an ordinary one, and the clamp makes doing so safe
+        // without the declaration check those paths deliberately skip.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        (, uint256 convertedBasis) = _readUnpricedBasis(proposal.strategy, snapshot, balanceAdjusted);
+        if (convertedBasis != 0) emit UnpricedConversion(proposalId, vault, convertedBasis);
+
+        // forge-lint: disable-next-line(unsafe-typecast)
+        pnl = int256(balanceAdjusted + convertedBasis) - int256(snapshot);
 
         // Two-number fee model. Ordering is load-bearing: management fee first (it
         // lowers assets and therefore price per share), then the high-water-mark
