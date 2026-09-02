@@ -39,6 +39,12 @@ contract MockPermissiveTierRegistry {
         return !denied[adapter] && !deniedAsAdapter[adapter];
     }
 
+    /// @dev SHE-209: no class concept in this stand-in — every address is a
+    ///      non-member, so the vault's class-binding check never fires.
+    function classOf(address) external pure returns (bytes32) {
+        return bytes32(0);
+    }
+
     /// @notice The CALLEE axis (`_guardBatchCalls` PART 2a), split out of
     ///         `isAdapterAllowed` per pashov finding #14.
     /// @dev    Tracks the strong grant here rather than adding a third denial

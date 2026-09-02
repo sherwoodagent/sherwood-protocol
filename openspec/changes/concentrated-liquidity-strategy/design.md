@@ -100,7 +100,7 @@ Add `src/vendor/uniswap/` with only the functions used, following the `src/vendo
 
 ## Migration Plan
 
-Additive — no existing clones, templates, or batches change. Deploy order: vendor interfaces → template → `setTemplateApproval(template, true)`. Rollback is `setTemplateApproval(template, false)`, which blocks new clones while leaving existing clones able to settle and sweep (the factory gates cloning, not the clone's own lifecycle).
+Additive — no existing clones, templates, or batches change. Deploy order: vendor interfaces → template → `setTemplateApproval(template, true)`. Rollback is `setTemplateApproval(template, false)`, which blocks new factory clones while leaving existing clones able to settle and sweep (the factory gates cloning, not the clone's own lifecycle). If the template is ever class-certified in `TierRegistry`, that lever alone leaves the funds axis open — a bare `Clones.clone` of the template bound to the vault stays class-admitted — so rollback must also run `demoteClass` / `setClassAllowed(template, false)` per the sequenced procedure in `docs/adapter-onboarding-checklist.md` (SHE-209 / PR #284).
 
 ## Open Questions
 

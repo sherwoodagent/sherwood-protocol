@@ -1234,6 +1234,18 @@ contract TierRegistry is Ownable2Step {
     ///
     ///         What the owner must check and this cannot: that `template` binds
     ///         every init-supplied external address and is not itself a proxy.
+    ///
+    ///         CERTIFICATION REVIEW INVARIANT (SHE-209). Class membership admits
+    ///         every clone of `template` as a batch recipient, including clones
+    ///         minted outside `StrategyFactory` and initialized permissionlessly.
+    ///         `SyndicateVault` binds each member to the paying vault
+    ///         (`vault() == vault`), which neutralizes a hostile clone ONLY IF
+    ///         the template derives its fund destination and its counterparty
+    ///         allowlist from `vault()` and exposes no payout / recipient /
+    ///         router address settable from `initialize` or `updateParams`
+    ///         data. `BaseStrategy._pushToVault` and the shipped templates
+    ///         satisfy this; the reviewer certifying a new template MUST verify
+    ///         it, because nothing on-chain does.
     function proposeClassCertification(
         address template,
         bytes4 selector,
