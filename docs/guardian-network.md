@@ -54,7 +54,7 @@ Timeline per proposal: `registerReview` (governor pushes the window at propose) 
 | `reviewPeriod` | 24 h | 6 h (mainnet immutable floor) | 3 d | `GuardianRegistry.sol:1460` |
 | `blockQuorumBps` | 30% | 10% | 100% | `GuardianRegistry.sol:1481` |
 | `LATE_VOTE_LOCKOUT_BPS` | last 10% of window | const | const | `GuardianRegistry.sol:46` |
-| `MAX_APPROVERS_PER_PROPOSAL` / `MAX_BLOCKERS_PER_PROPOSAL` | 100 each | const | const | `GuardianRegistry.sol:41-45` |
+| `MAX_APPROVERS_PER_PROPOSAL` | 100 | const | const | `GuardianRegistry.sol:41-50` — approvers only; blockers are uncapped (the tally is a scalar, SHE-207) |
 
 Mechanics worth knowing:
 

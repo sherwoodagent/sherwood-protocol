@@ -205,10 +205,11 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     // ── Counts and state consistency (GL-15, GL-16, GL-17, GL-18) ──
     //
     // GL-19 is still NOT implemented: it needs BLOCKER set membership, and
-    // `GuardianRegistry` exposes no getter for `_blockers` — only
-    // `getApproverWeights` (approvers only) and `getReviewState`/`outcomeOf`
-    // (aggregate flags). Asserting it would mean adding a getter to production
-    // code to suit a test, which is the wrong trade.
+    // `GuardianRegistry` keeps no blocker list at all since SHE-207 (the block
+    // tally is the scalar `blockStakeWeight`) — only `getApproverWeights`
+    // (approvers only) and `getReviewState`/`outcomeOf` (aggregate flags).
+    // Asserting it would mean adding storage to production code to suit a
+    // test, which is the wrong trade.
     //
     // GL-20 IS implemented, further down, but against the ledger rather than
     // the registry: `approversOf`/`pledgedOf` expose exactly the membership and

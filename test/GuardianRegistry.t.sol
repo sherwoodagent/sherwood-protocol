@@ -223,7 +223,9 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         address g = _guardian(0);
 
         vm.expectEmit(true, true, false, true);
-        emit IGuardianRegistry.GuardianVoteCast(PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Approve, 10_000e18);
+        emit IGuardianRegistry.GuardianVoteCast(
+            address(governor), PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Approve, 10_000e18
+        );
         vm.prank(g);
         registry.voteOnProposal(
             address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
@@ -235,7 +237,9 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         address g = _guardian(1);
 
         vm.expectEmit(true, true, false, true);
-        emit IGuardianRegistry.GuardianVoteCast(PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Block, 10_000e18);
+        emit IGuardianRegistry.GuardianVoteCast(
+            address(governor), PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Block, 10_000e18
+        );
         vm.prank(g);
         registry.voteOnProposal(
             address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
@@ -300,7 +304,9 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         // top-up's later re-anchor is invisible to this read. factor = 10_000
         // (par) → 10_000e18, unmoved by the top-up.
         vm.expectEmit(true, true, false, true);
-        emit IGuardianRegistry.GuardianVoteCast(PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Block, 10_000e18);
+        emit IGuardianRegistry.GuardianVoteCast(
+            address(governor), PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Block, 10_000e18
+        );
         vm.prank(g);
         registry.voteOnProposal(
             address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
@@ -372,25 +378,30 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         registry.voteOnProposal(address(governor), capPid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
     }
 
-    /// @notice ToB I-2 regression: blockers are capped at
-    /// `MAX_BLOCKERS_PER_PROPOSAL` so the `_emitBlockerAttribution` loop in
-    /// `resolveReview` is bounded.
-    function test_voteOnProposal_blockerCapHitEmitsEventAndReverts() public {
-        uint256 cap = registry.MAX_BLOCKERS_PER_PROPOSAL();
-        for (uint256 i = 0; i < cap; i++) {
+    /// @notice SHE-207 regression — blocker-slot squatting. The blocker list
+    ///         used to be a fixed 100-slot array: a hundred guardians at
+    ///         `minGuardianStake`, holding well under the block quorum between
+    ///         them, could fill it and every honest Block afterwards reverted
+    ///         `NewSideFull`, so `resolveReview` CLEARED a proposal the honest
+    ///         majority wanted vetoed. The list is gone (the tally is a scalar;
+    ///         nothing on-chain iterated it), so the 101st and every later Block
+    ///         lands and the quorum reads the honest weight.
+    ///
+    ///         Sizing: 100 squatters x 10_000e18 = 1_000_000e18, against a
+    ///         denominator of ~4_050_000e18 (5 fixture guardians + squatters +
+    ///         one 3_000_000e18 honest whale) = 24.7%, under the 30% quorum. The
+    ///         whale alone is 74%. Under the pre-fix code this test fails at the
+    ///         whale's vote with `NewSideFull`.
+    function test_voteOnProposal_hundredDustBlockersCannotCensorAnHonestBlock() public {
+        uint256 squat = 100; // == the deleted MAX_BLOCKERS_PER_PROPOSAL
+        for (uint256 i = 0; i < squat; i++) {
             _stakeGuardian(address(uint160(0x300000 + i)), 10_000e18, 1 + i);
         }
-        address last = address(uint160(0x300000 + cap));
-        _stakeGuardian(last, 10_000e18, 999);
+        address whale = address(uint160(0x300000 + squat));
+        _stakeGuardian(whale, 3_000_000e18, 999);
 
-        // audit-181-second finding A: age this cap-test cohort past
-        // `FLOOR_LOOKBACK` before opening the review, same reasoning as
-        // `test_voteOnProposal_capHitEmitsEventAndReverts` above — a
-        // freshly-staked guardian's own vote weight is growth-gate clamped
-        // to zero (`_growthGatedVoteWeight`, mirrors `TokenCourt.vote`),
-        // which would revert every vote in this loop with
-        // `NotActiveGuardian()` on a 0-weight first vote instead of
-        // exercising the blocker cap this test targets.
+        // Age the cohort past `FLOOR_LOOKBACK` so `_growthGatedVoteWeight`
+        // does not clamp any first vote to zero (see the approver-cap test above).
         skip(registry.FLOOR_LOOKBACK());
 
         vm.warp(vm.getBlockTimestamp() + 1);
@@ -398,18 +409,58 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         _registerReview(newPid, vm.getBlockTimestamp(), vm.getBlockTimestamp() + REVIEW_PERIOD);
         registry.openReview(address(governor), newPid);
 
-        for (uint256 i = 0; i < cap; i++) {
+        for (uint256 i = 0; i < squat; i++) {
             vm.prank(address(uint160(0x300000 + i)));
             registry.voteOnProposal(
                 address(governor), newPid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
             );
         }
+        // Control: the squatters alone do NOT reach quorum — this is the shape
+        // the attack needs, otherwise there is nothing to censor. `outcomeOf`
+        // reads `Unresolved` while the window is open, so peek at the end of
+        // the window on a snapshot and come back.
+        uint256 snap = vm.snapshotState();
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
+        assertEq(
+            uint8(registry.outcomeOf(address(governor), newPid)),
+            uint8(IGuardianRegistry.ReviewOutcome.Cleared),
+            "control: 100 dust blockers must sit under quorum on their own"
+        );
+        vm.revertToState(snap);
 
-        vm.expectEmit(true, false, false, false);
-        emit IGuardianRegistry.BlockerCapReached(newPid);
-        vm.prank(last);
-        vm.expectRevert(IGuardianRegistry.NewSideFull.selector);
+        // The 101st Block: this is the vote the old cap rejected.
+        vm.expectEmit(true, true, true, true);
+        emit IGuardianRegistry.GuardianVoteCast(
+            address(governor), newPid, whale, IGuardianRegistry.GuardianVoteType.Block, 3_000_000e18
+        );
+        vm.prank(whale);
         registry.voteOnProposal(address(governor), newPid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
+
+        // And a 102nd via the vote-CHANGE path: Approve -> Block also had the
+        // cap check inline. It must be gone too.
+        address flipper = _guardian(0);
+        vm.prank(flipper);
+        registry.voteOnProposal(
+            address(governor), newPid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+        );
+        vm.expectEmit(true, true, true, true);
+        emit IGuardianRegistry.GuardianVoteChanged(
+            address(governor),
+            newPid,
+            flipper,
+            IGuardianRegistry.GuardianVoteType.Approve,
+            IGuardianRegistry.GuardianVoteType.Block
+        );
+        vm.prank(flipper);
+        registry.voteOnProposal(address(governor), newPid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
+
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
+        assertEq(
+            uint8(registry.outcomeOf(address(governor), newPid)),
+            uint8(IGuardianRegistry.ReviewOutcome.Blocked),
+            "honest weight reaches quorum once its vote can land"
+        );
+        assertTrue(registry.resolveReview(address(governor), newPid), "resolves blocked, not cleared");
     }
 }
 
@@ -452,7 +503,11 @@ contract GuardianRegistryVoteChangeTest is RegistryTestHarness {
 
         vm.expectEmit(true, true, false, true);
         emit IGuardianRegistry.GuardianVoteChanged(
-            PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Approve, IGuardianRegistry.GuardianVoteType.Block
+            address(governor),
+            PROPOSAL_ID,
+            g,
+            IGuardianRegistry.GuardianVoteType.Approve,
+            IGuardianRegistry.GuardianVoteType.Block
         );
         vm.prank(g);
         registry.voteOnProposal(
@@ -462,7 +517,11 @@ contract GuardianRegistryVoteChangeTest is RegistryTestHarness {
         // Switch back to Approve → still original 10_000e18 weight.
         vm.expectEmit(true, true, false, true);
         emit IGuardianRegistry.GuardianVoteChanged(
-            PROPOSAL_ID, g, IGuardianRegistry.GuardianVoteType.Block, IGuardianRegistry.GuardianVoteType.Approve
+            address(governor),
+            PROPOSAL_ID,
+            g,
+            IGuardianRegistry.GuardianVoteType.Block,
+            IGuardianRegistry.GuardianVoteType.Approve
         );
         vm.prank(g);
         registry.voteOnProposal(

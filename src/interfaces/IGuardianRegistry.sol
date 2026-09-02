@@ -69,27 +69,35 @@ interface IGuardianRegistry {
     /// @notice Governor pushed a proposal's review window at propose time.
     event ReviewRegistered(address indexed governor, uint256 indexed proposalId, uint64 voteEnd, uint64 reviewEnd);
     event ReviewOpened(uint256 indexed proposalId, uint128 totalStakeAtOpen);
+    /// @notice A guardian's first vote on a review. `governor` is part of the
+    ///         event (SHE-207): per-vault governors all number proposals from 1,
+    ///         so `proposalId` alone does not identify the review. Blocker
+    ///         attribution is derived OFF-CHAIN from this event and
+    ///         `GuardianVoteChanged`, joined with `ReviewResolved(blocked=true)`
+    ///         — there is no on-chain blocker list any more, so nothing bounds
+    ///         how many guardians may Block.
     event GuardianVoteCast(
-        uint256 indexed proposalId, address indexed guardian, GuardianVoteType support, uint128 weight
+        address indexed governor,
+        uint256 indexed proposalId,
+        address indexed guardian,
+        GuardianVoteType support,
+        uint128 weight
     );
+    /// @notice A guardian flipped sides before the late-vote lockout. The
+    ///         weight is the one stamped by the matching `GuardianVoteCast`.
     event GuardianVoteChanged(
-        uint256 indexed proposalId, address indexed guardian, GuardianVoteType from, GuardianVoteType to
+        address indexed governor,
+        uint256 indexed proposalId,
+        address indexed guardian,
+        GuardianVoteType from,
+        GuardianVoteType to
     );
     event ApproverCapReached(uint256 indexed proposalId);
-    /// @notice Emitted when a Block vote is rejected because the blocker
-    ///         array has hit `MAX_BLOCKERS_PER_PROPOSAL`. Parallels
-    ///         `ApproverCapReached`.
-    event BlockerCapReached(uint256 indexed proposalId);
     event ReviewResolved(uint256 indexed proposalId, bool blocked, uint256 slashedAmount);
     event EmergencyReviewOpened(uint256 indexed proposalId, bytes32 callsHash, uint64 reviewEnd);
     event EmergencyReviewCancelled(uint256 indexed proposalId);
     event EmergencyBlockVoteCast(uint256 indexed proposalId, address indexed guardian, uint128 weight);
     event EmergencyReviewResolved(uint256 indexed proposalId, bool blocked, uint256 slashedAmount);
-    // Emitted per blocker when a review resolves blocked = true. Merkl's
-    // off-chain bot reads this to build the epoch WOOD campaign's Merkle roots.
-    event BlockerAttributed(
-        address indexed governor, uint256 indexed proposalId, uint256 epochId, address indexed blocker, uint256 weight
-    );
     event Paused(address indexed by);
     event Unpaused(address indexed by, bool deadman);
     event SlashAppealReserveFunded(address indexed by, uint256 amount);
