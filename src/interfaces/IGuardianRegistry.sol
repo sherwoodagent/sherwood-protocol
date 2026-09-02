@@ -159,13 +159,12 @@ interface IGuardianRegistry {
     /// @notice Wire the exposure ledger consulted on approve-side review votes.
     ///         `address(0)` is rejected; `address(0)` as the current value means
     ///         unset, with the hooks skipped.
-    /// @dev Enforces
-    ///      `ledger.challengeWindow() >= reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW`
-    ///      — the same invariant the ledger's own two setters hold, closing the
-    ///      fourth door this one used to leave open. Also requires
-    ///      `ledger.guardianRegistry()` to be either unset or already this
-    ///      registry, so wiring cannot seat a ledger that will reject every
-    ///      `recordApproval` call from here.
+    /// @dev Requires `ledger.guardianRegistry()` to be either unset or already
+    ///      this registry, so wiring cannot seat a ledger that will reject every
+    ///      `recordApproval` call from here. No `challengeWindow` floor: the
+    ///      `reviewPeriod + MAX_EXECUTION_WINDOW` bound this setter once mirrored
+    ///      guarded a ledger booking rule that no longer exists (see
+    ///      `ExposureLedger.setChallengeWindow`).
     function setExposureLedger(address ledger) external;
     /// @dev Returns the interface-typed handle (matches the `IExposureLedger
     ///      public exposureLedger` state variable getter, mirroring the

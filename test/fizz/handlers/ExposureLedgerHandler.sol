@@ -64,8 +64,16 @@ abstract contract ExposureLedgerHandler is Properties {
             if (count == 0) return;
             _exposureLedger_releaseApproval(address(governor), proposalId, toGuardian(guardianSeed));
         } else if (selector == 5) {
-            // X-1: must stay >= registry.reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW.
-            _exposureLedger_setChallengeWindow(clampBetween(arg1, 8 days, 30 days));
+            // X-1: the old `reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW` floor
+            // is gone; the only remaining lower bound is the wired game's own
+            // window (`Base._wireRoles` sets the game as `coverageFreezer`, at
+            // its 14d default). This call has no try/catch, so any draw under
+            // that bound discards the whole sequence step — clamp to the live
+            // bound so every draw is admitted. Exploring the sub-game range
+            // means lowering the game first, which would also shrink the filing
+            // deadlines `ChallengeGameHandler` steers by; the 1-day property is
+            // pinned in `ExposureLedger.t.sol::test_antiBatching_*` instead.
+            _exposureLedger_setChallengeWindow(clampBetween(arg1, game.challengeWindow(), 30 days));
         } else if (selector == 6) {
             _exposureLedger_setCoveredTvlCapUsd(clampBetween(arg1, 1e18, 100_000_000e18));
         } else if (selector == 7) {

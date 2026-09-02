@@ -145,15 +145,18 @@ contract MockChallengeGameWindow {
 ///         ledger.challengeWindow()` in three places, none of which re-fire
 ///         when the LEDGER's window shrinks afterward. Fixed by mirroring the
 ///         check back in `setChallengeWindow` against `coverageFreezer`
-///         (which IS the game address).
+///         (which IS the game address) — and, since the SHE-231 review, in
+///         `setCoverageFreezer` too, so the wiring step cannot reach the
+///         same state from the other side.
 ///
 ///         CAUTION RESOLUTION (`test_setChallengeWindow_toleratesACodelessGuardianRegistry`):
-///         `setGuardianRegistry` admits a registry TOLERANTLY (codeless or
-///         reverting `reviewPeriod()` is let through); `setChallengeWindow`
-///         used to read that same pointer STRICTLY, so a registry the
-///         tolerant setter admitted permanently bricked this setter. Both
-///         sides now use the identical tolerant `code.length` + try/catch
-///         shape.
+///         `setGuardianRegistry` admits a registry TOLERANTLY (any nonzero
+///         address, codeless included); `setChallengeWindow` used to read
+///         that same pointer STRICTLY for a `reviewPeriod` floor, so a
+///         registry the tolerant setter admitted permanently bricked this
+///         setter. The floor has since been deleted outright, so the setter
+///         reads nothing off the registry; the test stays as the regression
+///         against any registry read creeping back in strict form.
 ///
 ///         ALSO (`test_feedPriceX8_truncatingToZeroFallsThroughToTwap`):
 ///         `_feedPriceX8` could return `(0, true)` — a positive answer
@@ -453,14 +456,16 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
     ///         shrink below succeeds), passes against the fix.
     function test_setChallengeWindow_cannotShrinkBelowTheWiredGameWindow() public {
         MockChallengeGameWindow game = new MockChallengeGameWindow(20 days);
-        vm.prank(owner);
-        ledger.setCoverageFreezer(address(game));
 
-        // Bump the ledger's window above the game's first, isolating the
-        // SHRINK direction finding D is about.
+        // Bump the ledger's window above the game's FIRST: `setCoverageFreezer`
+        // now mirrors the same bound (SHE-231 review, finding 2), so a 20d game
+        // cannot be wired onto a 14d ledger. This isolates the SHRINK direction
+        // finding D is about.
         vm.prank(owner);
         ledger.setChallengeWindow(25 days);
         assertEq(ledger.challengeWindow(), 25 days);
+        vm.prank(owner);
+        ledger.setCoverageFreezer(address(game));
 
         // Shrinking below the game's own 20d window must revert.
         vm.prank(owner);
@@ -482,10 +487,10 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
     ///         pointer: a registry the tolerant setter admitted must not
     ///         permanently brick this setter.
     ///
-    ///         Fails against the pre-fix code (a raw, non-tolerant call to
+    ///         Failed against the original code (a raw, non-tolerant call to
     ///         `IRegistryApproversMinimal(reg).reviewPeriod()` against a
     ///         codeless address reverts in this frame, unconditionally, on
-    ///         every call), passes against the fix.
+    ///         every call). The setter no longer reads the registry at all.
     function test_setChallengeWindow_toleratesACodelessGuardianRegistry() public {
         assertEq(registry.code.length, 0, "precondition: fixture registry must be codeless");
 
