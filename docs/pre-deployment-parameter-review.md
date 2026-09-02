@@ -258,6 +258,17 @@ cast call $GOVERNOR "maxCapitalBps()(uint256)"    --rpc-url $RPC   # expect 8000
 cast call $VAULT    "minBufferBps()(uint16)"      --rpc-url $RPC   # expect 500
 ```
 
+**TierRegistry precondition (SHE-209).** `governor.setTierRegistry` validates
+only that the target has code. The vault's recipient guard makes a *typed*
+`classOf(address)` call on every batch that pays an allowed recipient, so a
+registry lacking that selector (any pre-class build) reverts every such batch
+— fail closed, by design. Before wiring or upgrading a registry:
+
+```bash
+cast call $REGISTRY "classOf(address)(bytes32)" 0x0000000000000000000000000000000000000001 --rpc-url $RPC
+# must return 0x00…00 (a zero class), not revert
+```
+
 ---
 
 ## 5. What still bounds a payload if you seed nothing

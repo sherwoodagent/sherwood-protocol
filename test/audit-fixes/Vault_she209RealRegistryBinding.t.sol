@@ -237,4 +237,44 @@ contract VaultShe209RealRegistryBindingTest is Test {
         vm.expectRevert();
         vault.executeGovernorBatch(_transferBatch(bound), new uint256[](0), 1);
     }
+
+    /// @notice Second fail-closed mode: a registry that answers `classOf` with
+    ///         a SHORT word. The typed call's `returndatasize >= 32` check
+    ///         rejects it, where the old raw probe's `length < 32 → return`
+    ///         would have ADMITTED the recipient unbound.
+    function test_she209_realRegistry_classOfShortReturn_failsClosed() public {
+        address bound = _rogueClone(address(vault));
+        vm.mockCall(address(registry), abi.encodeWithSelector(TierRegistry.classOf.selector, bound), hex"01");
+
+        vm.prank(MOCK_GOVERNOR);
+        vm.expectRevert();
+        vault.executeGovernorBatch(_transferBatch(bound), new uint256[](0), 1);
+    }
+
+    /// @notice Third fail-closed mode: a registry with NO `classOf` selector at
+    ///         all (a pre-class registry). `isAdapterAllowed` answers, so the
+    ///         batch reaches the binding, and the missing selector reverts the
+    ///         batch rather than skipping the binding. This is the deploy
+    ///         precondition: the wired registry must expose `classOf(address)`.
+    function test_she209_realRegistry_registryWithoutClassOf_failsClosed() public {
+        NoClassOfRegistry legacy = new NoClassOfRegistry();
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("tierRegistry()"), abi.encode(address(legacy)));
+        address bound = _rogueClone(address(vault));
+
+        vm.prank(MOCK_GOVERNOR);
+        vm.expectRevert();
+        vault.executeGovernorBatch(_transferBatch(bound), new uint256[](0), 1);
+    }
+}
+
+/// @dev A registry from before the class concept: admits everything, exposes
+///      no `classOf`. Models a mis-wired `setTierRegistry` target.
+contract NoClassOfRegistry {
+    function isAdapterAllowed(address) external pure returns (bool) {
+        return true;
+    }
+
+    function isCallableTarget(address) external pure returns (bool) {
+        return true;
+    }
 }

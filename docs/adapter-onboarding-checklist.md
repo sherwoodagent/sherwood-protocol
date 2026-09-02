@@ -648,16 +648,22 @@ class **callee** axis (`_classCalleeAllowed`,
 ([`:1407`](../src/TierRegistry.sol#L1407)) leaves that standing deliberately, for
 the same reason `_demote` does on the address path: a class conviction must not
 strand the capital a live clone is holding. Existing per-clone address grants
-keep working throughout, because the address path always wins over the class.
+keep the clone *admitted* throughout, because the address path always wins
+over the class at the registry — but the vault still binds every class member
+to itself (SHE-209), so a granted clone of a demoted class is paid only while
+its `vault()` is the paying vault.
 
 **Closing the class callee axis is a SEQUENCED step, not an immediate one.**
 `setClassAllowed(template, false)` ([`:1347`](../src/TierRegistry.sol#L1347)) is
-the only call that closes it. It is also the only call that stops a template's
-clones from being **funded**: `StrategyFactory.setTemplateApproval(t, false)`
-only stops new clones through the factory, and a bare `Clones.clone` of `t`
-bound to the vault is still class-admitted. Revoke both levers together. Running it straight after the conviction
+the only call that closes it. Running it straight after the conviction
 re-creates exactly the freeze finding #14 fixed — the live clone becomes
-unreachable and every LP exit shuts. Correct order:
+unreachable and every LP exit shuts.
+
+Note what `StrategyFactory.setTemplateApproval(t, false)` does and does not
+do: it stops NEW clones through the factory, nothing else. The funds axis is
+closed by `demoteClass` (step 1) and stays closed only while `setClassAllowed`
+is false (step 4); a bare `Clones.clone` of `t` bound to the vault is still
+class-admitted until then. Revoke both levers. Correct order:
 
 ```
 1. demoteClass(template, selector)        # funds axis closed, tier -> 2
@@ -668,6 +674,9 @@ unreachable and every LP exit shuts. Correct order:
                                           # governor openProposalCount == 0
                                           # no proposal for this template in Executed
 4. setClassAllowed(template, false)       # NOW close the callee axis
+5. StrategyFactory.setTemplateApproval(template, false)
+                                          # stop NEW factory clones of the
+                                          # template (does not affect 1-4)
 ```
 
 Step 4 is the one the contract no longer does for you, and the one that gets

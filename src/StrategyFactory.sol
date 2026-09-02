@@ -117,7 +117,9 @@ contract StrategyFactory is Ownable {
 
     /// @notice Clone `template` and run `initialize(vault, proposer, data)` atomically.
     /// @param template Strategy template address. MUST be on the allowlist.
-    /// @param vault    Vault that will own the clone's lifecycle. MUST equal `msg.sender`.
+    /// @param vault    Vault that will own the clone's lifecycle. Registered on
+    ///                 `syndicateFactory`, and `msg.sender` MUST be its owner or
+    ///                 one of its agents (`_authClone`) — never the vault itself.
     /// @param proposer Strategy proposer. MUST equal `msg.sender` (see the
     ///                 dev comment below for the rationale).
     /// @param data     Strategy-specific init bytes (decoded inside `_initialize`).
