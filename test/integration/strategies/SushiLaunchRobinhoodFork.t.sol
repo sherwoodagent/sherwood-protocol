@@ -4,9 +4,21 @@ pragma solidity 0.8.28;
 import {Test, console2} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+
 import {SushiLaunchAdapter} from "../../../src/adapters/SushiLaunchAdapter.sol";
 import {ILaunchAdapter} from "../../../src/interfaces/ILaunchAdapter.sol";
 import {ISushiLaunchpad, IWETH} from "../../../src/vendor/sushi/ISushiLaunchpad.sol";
+import {LaunchpadStrategy} from "../../../src/strategies/LaunchpadStrategy.sol";
+import {BaseStrategy} from "../../../src/strategies/BaseStrategy.sol";
+
+import {MockSwapAdapter} from "../../mocks/MockSwapAdapter.sol";
+// The vault/governor/registry stand-ins are IMPORTED, not re-declared: they are
+// the same shapes the unit suite maintains, and `tasks.md` 4.6 requires them to
+// grow with the template in one place. Cross-suite fixture imports are the
+// house pattern (see `test/pashov-final/*` and
+// `test/strategies/ConcentratedLiquidityStrategySettle.t.sol`).
+import {MockFundVault, MockFundGovernor, MockFundRegistry} from "../../strategies/LaunchpadStrategy.t.sol";
 
 /// @dev The two members `IUniswapV3Pool` in `src/vendor/uniswap` does not
 ///      vendor. Declared here rather than widened there: nothing in `src/`
@@ -143,6 +155,44 @@ contract SushiLaunchRobinhoodForkTest is Test {
     address vault = makeAddr("vault"); // p.feeRecipient — the fund's vault
     address keeper = makeAddr("keeper"); // permissionless distributeFees caller
 
+    // ── stand-ins for the parts of Sherwood that are NOT deployed on 4663 ──
+    //
+    // Only the launch VENUES live on this chain. A real `SyndicateVault` /
+    // `SyndicateGovernor` pair cannot be forked here, so the clamp test below
+    // stands them in and says so in its own natspec rather than pretending
+    // otherwise. Everything the clamp actually reads — `asset()`, `governor()`,
+    // `clock()`, the ERC-5805 vote surface, `getActiveProposal()` and the
+    // `StrategyProposal` carrying `executedAt`/`strategyDuration` — is present.
+    LaunchpadStrategy launchpadTemplate;
+    MockFundVault fundVault;
+    MockFundGovernor fundGovernor;
+    MockFundRegistry fundRegistry;
+    MockSwapAdapter swapAdapter;
+
+    address proposer = makeAddr("proposer");
+    address alice = makeAddr("alice");
+    address bob = makeAddr("bob");
+
+    /// @dev 7 days, and it MUST be <= `MAX_CLAIM_WINDOW` (14 days) or init
+    ///      rejects it with `InvalidClaimWindow` — a different, already-tested
+    ///      failure that would never reach the clamp.
+    uint256 constant CONFIGURED_CLAIM_WINDOW = 7 days;
+    /// @dev The proposal the window is clamped against: 168x shorter.
+    uint256 constant STRATEGY_DURATION = 1 hours;
+
+    /// @dev 1005 USDG: `QUOTE_IN` worth of launch budget plus headroom for the
+    ///      fee leg, which is charged in WETH and therefore has to be bought.
+    uint256 constant ASSET_IN = 1005e6;
+
+    /// @dev Mock rate for the FEE LEG ONLY, and deliberately not a venue fact:
+    ///      1 USDG (1e6 units) -> 2.5e14 wei of WETH, i.e. ~$4k/ETH. The venue
+    ///      does not price this pair, `ISwapAdapter` is the fund's own routing
+    ///      surface, and nothing in this test asserts anything about the rate —
+    ///      it exists so `_acquireFeeToken` can fund a REAL launch fee out of a
+    ///      USDG-denominated budget, which is the `_deliverFeeTokenResidue`
+    ///      lane the template documents.
+    uint256 constant USDG_TO_WETH_RATE = 25e25;
+
     uint256 constant QUOTE_IN = 1000e6; // 1000 USDG (6 dec)
 
     /// @dev A REAL floor, not a token one. 1000 USDG buys ~164.6M of the 1e9
@@ -177,6 +227,23 @@ contract SushiLaunchRobinhoodForkTest is Test {
 
         adapter = new SushiLaunchAdapter(SUSHI_LAUNCHPAD_V1);
         strategy = new NoReceiveStrategyStub();
+
+        // ── the stand-in fund the clamp test drives ──
+        fundRegistry = new MockFundRegistry();
+        fundGovernor = new MockFundGovernor(address(fundRegistry));
+        fundVault = new MockFundVault(USDG, address(fundGovernor));
+        swapAdapter = new MockSwapAdapter();
+        fundRegistry.setAllowed(address(adapter), true);
+        fundRegistry.setAllowed(address(swapAdapter), true);
+        swapAdapter.setRate(USDG, WETH, USDG_TO_WETH_RATE);
+        _fundSwapAdapterWithRealWeth(0.01 ether);
+
+        // Two equal holders, so a claim inside the window pays an exact half of
+        // the reserve rather than a rounded-down number that proves less.
+        fundVault.setVotes(alice, 50e18);
+        fundVault.setVotes(bob, 50e18);
+
+        launchpadTemplate = new LaunchpadStrategy();
     }
 
     // ── venue facts the adapter and the template are written against ──
@@ -376,6 +443,123 @@ contract SushiLaunchRobinhoodForkTest is Test {
         _launch(SUSHI_FIXED_SUPPLY);
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // The clamp, against a REAL launch
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * @notice A CONFIGURED CLAIM WINDOW LONGER THAN THE PROPOSAL CANNOT OUTLIVE
+     *         IT. `claimWindow` is 7 days; the proposal it runs under lasts 1
+     *         hour. `_clampWindow` must throw the configured figure away, land
+     *         `windowEnd` at `executedAt + strategyDuration - CLAIM_SETTLE_BUFFER`,
+     *         and leave `settle()` reachable at `anyoneSettleAt` — so a proposer
+     *         cannot pick a window that holds settlement hostage.
+     *
+     * @dev    WHAT THIS TEST OWNS, AND WHAT IT DOES NOT. Task 4.7 names three
+     *         consequences; only the first is a 4663 fact:
+     *
+     *           OWNED HERE — the clamp itself and settlement's reachability,
+     *           measured against the LIVE Sushi Launchpad. The launch, the
+     *           WETH-denominated native fee, the fixed float and the creator
+     *           binding are all the real venue; the clone is a real
+     *           `LaunchpadStrategy` and the adapter a real `SushiLaunchAdapter`.
+     *
+     *           NOT OWNED HERE — `openProposalCount()` returning to 0 and vault
+     *           deposits unlocking. THE SHERWOOD STACK IS NOT DEPLOYED ON 4663;
+     *           only the launch venues are. The vault and governor below are
+     *           therefore stand-ins (the unit suite's `MockFundVault` /
+     *           `MockFundGovernor`), which can report an `executedAt` and a
+     *           `strategyDuration` for the clamp to read but cannot answer for a
+     *           real `SyndicateGovernor`'s bookkeeping. Asserting those two here
+     *           would be asserting the mock.
+     *
+     *         Where the other half WAS proven: the Robinhood-fork vnet, chain
+     *         9994663, which carries the full stack, driven by
+     *         `script/fork/launchpad-e2e.sh`. That run configured
+     *         `claimWindow = 604800` against `strategyDuration = 3600`, saw
+     *         `windowEnd` clamped to `executedAt + 3600 - 300`, a claim past it
+     *         revert `ClaimWindowClosed`, `settleProposal` succeed,
+     *         `openProposalCount()` return to 0 and `depositsLocked()` go false.
+     *
+     *         `settle()` IS `onlyVault` — see `BaseStrategy.settle`. Task 4.7's
+     *         "arbitrary caller" is the GOVERNOR-level permissionless
+     *         `settleProposal(pid)` after `executedAt + strategyDuration`, which
+     *         is the vnet's half. What this test can show is the half that would
+     *         wedge it: that the strategy's own gate is open by then.
+     */
+    function test_fork_longClaimWindowCannotWedgeSettlement() public {
+        if (!forked) return;
+
+        LaunchpadStrategy s = _cloneAgainstStandIns();
+
+        // ── execute against the REAL venue, under a 1-hour proposal ──
+        uint256 executedAt = block.timestamp;
+        fundGovernor.setProposal(executedAt, STRATEGY_DURATION);
+        deal(USDG, address(fundVault), ASSET_IN);
+        fundVault.approveToken(USDG, address(s), ASSET_IN);
+        fundVault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
+
+        // the launch is real: the venue recorded the VAULT as creator.
+        address token = s.launchToken();
+        assertTrue(token != address(0), "no launch token");
+        assertEq(pad.launchInfo(token).creator, address(fundVault), "venue creator must be the vault");
+        assertEq(IERC20(token).totalSupply(), SUSHI_FIXED_SUPPLY, "real venue float");
+
+        uint256 buffer = launchpadTemplate.CLAIM_SETTLE_BUFFER();
+        uint256 we = s.windowEnd();
+        uint256 settleAt = s.anyoneSettleAt();
+
+        console2.log("executedAt:        ", executedAt);
+        console2.log("configured window: ", s.claimWindow());
+        console2.log("windowEnd:         ", we);
+        console2.log("anyoneSettleAt:    ", settleAt);
+        console2.log("reserve:           ", s.reserve());
+
+        // 1 ── THE CONFIGURED WINDOW LOST. `windowEnd` is the proposal's bound,
+        //      not `executedAt + claimWindow`, and it sits strictly inside the
+        //      anyone-settle instant by exactly `CLAIM_SETTLE_BUFFER`.
+        assertEq(s.claimWindow(), CONFIGURED_CLAIM_WINDOW, "the long window really was configured");
+        assertEq(settleAt, executedAt + STRATEGY_DURATION, "anyoneSettleAt is the proposal's own clock");
+        assertEq(we, executedAt + STRATEGY_DURATION - buffer, "windowEnd must be clamped to the proposal");
+        assertLt(we, settleAt, "the window must close BEFORE settlement opens");
+        assertEq(settleAt - we, buffer, "the gap is exactly CLAIM_SETTLE_BUFFER");
+        assertLt(we, executedAt + CONFIGURED_CLAIM_WINDOW, "the configured window must have been discarded");
+
+        // 2 ── the gate is genuinely live: inside the window, settlement is
+        //      refused. Without this the success in step 5 proves nothing.
+        vm.expectRevert(
+            abi.encodeWithSelector(LaunchpadStrategy.ClaimWindowStillOpen.selector, block.timestamp, we, settleAt)
+        );
+        fundVault.callStrategy(address(s), abi.encodeWithSignature("settle()"));
+
+        // 3 ── a claim AT `windowEnd` is still good: the truncation is not a
+        //      confiscation, and the reserve is really payable out of custody.
+        vm.warp(we);
+        vm.prank(alice);
+        uint256 got = s.claim();
+        assertEq(got, s.reserve() / 2, "alice's half of the reserve");
+        assertEq(IERC20(token).balanceOf(alice), got, "reserve paid in the REAL launch token");
+
+        // 4 ── one second later the window is shut — the 7-day figure buys
+        //      nothing past the proposal.
+        vm.warp(we + 1);
+        vm.expectRevert(abi.encodeWithSelector(LaunchpadStrategy.ClaimWindowClosed.selector, block.timestamp, we));
+        vm.prank(bob);
+        s.claim();
+
+        // 5 ── AT THE BOUNDARY, not well past it: `settle()` succeeds at exactly
+        //      `anyoneSettleAt`. This is the assertion the task is about — the
+        //      long window cannot hold settlement hostage.
+        vm.warp(settleAt);
+        assertEq(block.timestamp, settleAt, "settling at the boundary instant, not after it");
+        fundVault.callStrategy(address(s), abi.encodeWithSignature("settle()"));
+
+        // 6 ── and the clone really reached `Settled`.
+        assertEq(uint256(s.state()), uint256(BaseStrategy.State.Settled), "state must be Settled");
+        assertFalse(s.executed(), "no longer Executed");
+        assertEq(IERC20(USDG).balanceOf(address(s)), 0, "no vault asset left behind");
+    }
+
     // ── helpers ──
 
     function _fundStrategy(uint256 fee) internal {
@@ -400,6 +584,48 @@ contract SushiLaunchRobinhoodForkTest is Test {
                 feeRecipient: vault,
                 venueData: ""
             })
+        );
+    }
+
+    /// @dev The mock swap adapter must pay out WETH that is GENUINELY
+    ///      ETH-backed: the launch adapter unwraps what it pulls, so a
+    ///      `deal`-written balance would be a claim the wrapper cannot honour.
+    ///      Wrapping real native here keeps the fee leg honest end to end.
+    function _fundSwapAdapterWithRealWeth(uint256 amount) internal {
+        vm.deal(address(this), address(this).balance + amount);
+        IWETH(WETH).deposit{value: amount}();
+        IERC20(WETH).transfer(address(swapAdapter), amount);
+    }
+
+    /// @dev A real `LaunchpadStrategy` clone bound to the stand-in fund and the
+    ///      REAL `SushiLaunchAdapter`. Quote == vault asset (USDG), so the quote
+    ///      leg is a no-op and the only swap in the whole run is the WETH fee
+    ///      leg — the launch itself is entirely the live venue.
+    function _cloneAgainstStandIns() internal returns (LaunchpadStrategy s) {
+        s = LaunchpadStrategy(Clones.clone(address(launchpadTemplate)));
+        s.initialize(
+            address(fundVault),
+            proposer,
+            abi.encode(
+                LaunchpadStrategy.InitParams({
+                    launchAdapter: address(adapter),
+                    swapAdapter: address(swapAdapter),
+                    assetIn: ASSET_IN,
+                    quoteToken: USDG,
+                    minQuoteOut: 0, // quote IS the vault asset - ignored
+                    quoteSwapData: "",
+                    feeSwapData: "",
+                    launchSupply: SUSHI_FIXED_SUPPLY,
+                    reserveAmount: MIN_OUT, // 10% of the float - inside MAX_RESERVE_BPS
+                    minTokensOut: MIN_OUT,
+                    claimWindow: CONFIGURED_CLAIM_WINDOW,
+                    deadline: uint64(block.timestamp + 1 hours),
+                    settleSlippageBps: 500,
+                    name: "Sherwood Fund Token",
+                    symbol: "SHFT",
+                    venueData: ""
+                })
+            )
         );
     }
 
