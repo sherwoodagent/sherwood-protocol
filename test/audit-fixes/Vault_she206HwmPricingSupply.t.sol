@@ -44,8 +44,34 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 ///         alone would zero a mark that the `totalSupply()`-keyed seed then
 ///         refuses to re-seed.
 ///
-/// @dev    Every test below was written against the unpatched base branch and
-///         FAILED there first; the pre-fix figures are recorded in each.
+/// @dev    PARTIAL. This closes the `_pricingSupply() == 0` case and NOT the
+///         general one. Holding back a single share-wei keeps the pricing
+///         supply at 1, every guard below asks `== 0`, and the original
+///         finding returns at full magnitude — byte-identically to the base
+///         commit. That residual is asserted, with figures, in
+///         `Vault_she206ResidualDustBypass.t.sol`, and SHE-206 stays open.
+///         Read the two files together; this one on its own overstates what
+///         was fixed.
+///
+/// @dev    WHAT FAILS ON THE UNPATCHED BASE BRANCH, precisely — the earlier
+///         blanket claim that "every test below" did was wrong, and the
+///         distinction matters because the controls are the half that must
+///         pass in both worlds:
+///
+///           FAILS on base (the fix is what makes them pass):
+///             * `test_hwm_asyncFullExitThenReseedDepositChargesNoPerformanceFee`
+///             * `test_hwm_aZeroValueDepositIntoAnAllStampedFundBanksNoMark`
+///             * `test_hwm_resetFiresOnAPartialClaimWhileTheRawSupplyIsStillNonZero`
+///             * `test_hwm_ratchetBanksNothingAgainstAnEmptyPricingSupply`
+///
+///           PASSES on base, BY DESIGN — these are controls. They pin the
+///           behaviour the fix must not disturb (the instant lane, a
+///           ratcheting mark, the claim-path drain), so a base-branch pass is
+///           the point, not a gap:
+///             * `test_hwm_instantFullExitThenReseedDepositIsUnchanged`
+///             * `test_hwm_asyncFullExitReseedsTheMarkWithNoResidue`
+///             * `test_hwm_realProfitAboveAReseededMarkIsStillChargeable`
+///             * `test_hwm_resetStillFiresWhenTheEscrowIsClaimedOut`
 contract VaultShe206HwmPricingSupplyTest is Test {
     SyndicateVault internal vault;
     VaultWithdrawalQueue internal queue;
@@ -159,14 +185,33 @@ contract VaultShe206HwmPricingSupplyTest is Test {
     ///         99.99% of bob's brand-new principal, booked as fee base on zero
     ///         P&L. POST-FIX: exactly zero.
     ///
-    /// @dev    MUTATION-CHECKED: reverting EITHER half of the fix on its own
-    ///         re-breaks this. Restoring `totalSupply()` in the `_update`
-    ///         reset leaves the stale mark standing and the pre-fix figure
-    ///         returns in full. Restoring `totalSupply()` in
-    ///         `_initHighWaterMarkIfUnset` is worse than the bug in the other
-    ///         direction: the reset zeroes the mark and the seed then declines
-    ///         to re-seed it, so the mark stays 0 and EVERY later gain reads
-    ///         as chargeable from dollar one.
+    /// @dev    MUTATION-CHECKED, and NARROWLY. This test kills exactly ONE of
+    ///         the fix's four guards: the PRE-STATE mint reset in `_update`.
+    ///         Key that one on `totalSupply()` instead and the stale mark
+    ///         stands, `aboveHighWaterMark()` returns `9_999_990_000`, and
+    ///         this assertion fails.
+    ///
+    ///         An earlier version of this note claimed it also killed the
+    ///         `_initHighWaterMarkIfUnset` gate. IT DOES NOT, and neither does
+    ///         anything else in the end-to-end set. All three of the remaining
+    ///         guards survive this test — verified by reverting each in turn:
+    ///
+    ///           * `_initHighWaterMarkIfUnset`'s `_pricingSupply() != 0` gate
+    ///             can never be the deciding read HERE, because it runs
+    ///             immediately after a mint that has already made both
+    ///             candidate supplies nonzero. It is only distinguishable on a
+    ///             mint that adds no shares — see
+    ///             `test_hwm_aZeroValueDepositIntoAnAllStampedFundBanksNoMark`.
+    ///           * The POST-STATE reset's key is invisible here too: this
+    ///             sequence never runs an `_update` in the split state (raw
+    ///             supply nonzero, pricing supply empty). Pinned by
+    ///             `test_hwm_resetFiresOnAPartialClaimWhileTheRawSupplyIsStillNonZero`.
+    ///           * `ratchetHighWaterMark`'s early return is never reached —
+    ///             nothing in this scenario calls it. Pinned by
+    ///             `test_hwm_ratchetBanksNothingAgainstAnEmptyPricingSupply`.
+    ///
+    ///         With those three tests added, each of the four guards has a
+    ///         test that fails when and only when that guard is reverted.
     function test_hwm_asyncFullExitThenReseedDepositChargesNoPerformanceFee() public {
         uint256 mark1 = _fullAsyncExit();
 
@@ -271,5 +316,147 @@ contract VaultShe206HwmPricingSupplyTest is Test {
 
         assertEq(vault.totalSupply(), 0, "sanity: the escrow is burned out");
         assertEq(vault.highWaterPricePerShare(), 0, "the drain reset fires on the claim burn");
+    }
+
+    // =====================================================================
+    // Pinning the individual guards
+    //
+    // The four tests above are all end-to-end: they drive the fee figure and
+    // the mark through a whole epoch. That is the right shape for the finding
+    // and the wrong shape for the FIX, which is four separate guards. An
+    // end-to-end assertion is satisfied by whichever guard happens to fire
+    // first, so three of the four could be reverted without any of it going
+    // red -- see the corrected note on
+    // `test_hwm_asyncFullExitThenReseedDepositChargesNoPerformanceFee`.
+    //
+    // Each test below is built so that ONE guard is the deciding read and the
+    // others cannot mask it.
+    // =====================================================================
+
+    /// @notice THE SEED GATE, MADE THE DECIDING READ. A zero-value deposit into
+    ///         an all-stamped fund must not bank a mark.
+    ///
+    /// @dev The seed gate (`_initHighWaterMarkIfUnset`) is the hardest of the
+    ///      four to pin, and the reason is structural: it runs immediately
+    ///      AFTER a mint, so by the time it reads the supply the mint has
+    ///      already made both `totalSupply()` and `_pricingSupply()` nonzero
+    ///      and the two candidate reads agree. Every ordinary deposit is like
+    ///      that, which is why every end-to-end test in this file leaves the
+    ///      gate's mutation alive.
+    ///
+    ///      A ZERO-VALUE deposit is the one mint that separates them.
+    ///      `_deposit` refuses `shares == 0 && assets != 0` but permits
+    ///      `deposit(0)`, so this mints nothing: the pre-state reset fires and
+    ///      zeroes the mark, and then `_pricingSupply()` is STILL 0 while
+    ///      `totalSupply()` is the whole stamped escrow. Keyed on the pricing
+    ///      supply the gate correctly declines to seed. Keyed on
+    ///      `totalSupply()` it seeds at `pricePerShare()` -- which here is
+    ///      residual assets divided by the virtual offset alone, a number
+    ///      describing no holder's position, a million times the real mark --
+    ///      and banks it as the peak. The next real depositor would then be
+    ///      measured against a mark no fund can ever clear.
+    ///
+    ///      Permissionless and free: `deposit(0)` costs the caller nothing but
+    ///      gas, so this is not a theoretical mint.
+    function test_hwm_aZeroValueDepositIntoAnAllStampedFundBanksNoMark() public {
+        _fullAsyncExit();
+
+        vm.prank(donor);
+        usdc.transfer(address(vault), RESIDUE);
+
+        // What the mutated gate would bank: assets over the virtual offset.
+        uint256 garbagePrice = vault.pricePerShare();
+        assertGt(garbagePrice, 0, "sanity: there IS a nonzero price here to mis-bank");
+
+        vm.prank(bob);
+        uint256 minted = vault.deposit(0, bob);
+        assertEq(minted, 0, "sanity: a zero-value deposit mints nothing");
+        assertEq(vault.totalSupply(), queue.stampedUnclaimedShares(), "sanity: still every share stamped");
+
+        assertEq(
+            vault.highWaterPricePerShare(),
+            0,
+            "the seed gate must read the PRICING supply: there is no live position to price"
+        );
+    }
+
+    /// @notice THE POST-STATE RESET, MADE THE DECIDING READ. A PARTIAL claim
+    ///         out of an all-stamped escrow: the pricing supply is empty, the
+    ///         raw supply is not.
+    ///
+    /// @dev `test_hwm_resetStillFiresWhenTheEscrowIsClaimedOut` above claims the
+    ///      escrow out completely, so `totalSupply()` and `_pricingSupply()`
+    ///      hit zero in the same call and it cannot tell the two keys apart --
+    ///      it passes either way. This one splits alice's exit across TWO
+    ///      requests and claims only the first, so after the burn the second
+    ///      batch is still escrowed: `totalSupply() != 0`, `_pricingSupply()
+    ///      == 0`. Exactly one of the two candidate reads fires the reset.
+    ///
+    ///      Also still pins the ordering the post-state read depends on
+    ///      (`VaultWithdrawalQueue.claim` decrements `_stampedUnclaimedShares`
+    ///      BEFORE calling `settleRedeem`) -- swap those and the read
+    ///      under-counts by the burn and the reset misses here too.
+    function test_hwm_resetFiresOnAPartialClaimWhileTheRawSupplyIsStillNonZero() public {
+        vm.prank(alice);
+        uint256 shares = vault.deposit(EPOCH1, alice);
+        assertGt(vault.highWaterPricePerShare(), 0, "sanity: mark seeded at alice's entry");
+
+        _setProposalActive(true);
+        vm.startPrank(alice);
+        vault.approve(address(queue), shares);
+        // Two requests, one exit. Nothing here is unusual -- a holder leaving
+        // in two tranches is an ordinary use of the queue.
+        vault.requestRedeem(shares / 2, alice);
+        vault.requestRedeem(shares - shares / 2, alice);
+        vm.stopPrank();
+
+        _settle();
+        assertEq(queue.stampedUnclaimedShares(), shares, "sanity: both tranches stamped");
+
+        vm.prank(alice);
+        queue.claim(1);
+
+        assertGt(vault.totalSupply(), 0, "the RAW supply is still nonzero: tranche two is still escrowed");
+        assertEq(vault.totalSupply(), queue.stampedUnclaimedShares(), "...and every share of it is a stamped share");
+        assertEq(
+            vault.highWaterPricePerShare(),
+            0,
+            "the post-state reset must key on the PRICING supply, which IS empty here"
+        );
+    }
+
+    /// @notice THE RATCHET EARLY-RETURN, MADE THE DECIDING READ. Settling with
+    ///         no live equity must leave the previous peak alone, not bank the
+    ///         meaningless price.
+    ///
+    /// @dev Nothing else in this file calls `ratchetHighWaterMark` at all, so
+    ///      its guard was pure unexercised code. The scenario is the governor
+    ///      settling a proposal in exactly the state the async exit produces:
+    ///      every share stamped, some residue in the contract. `pricePerShare()`
+    ///      there divides that residue by the virtual offset alone and comes
+    ///      back astronomically above the real mark, so a ratchet that ran
+    ///      would bank it as the new peak -- permanently, since the mark is
+    ///      monotonic and the reset path only ever LOWERS it to zero on a
+    ///      genuine drain. Every subsequent epoch would then be fee-free
+    ///      forever, which is the mirror-image loss to the finding this branch
+    ///      is about: the depositors get overcharged, the manager gets
+    ///      zeroed.
+    ///
+    ///      Asserts against `mark1` rather than merely "unchanged", so the test
+    ///      still fails if the guard is replaced by something that zeroes the
+    ///      mark instead of leaving it standing.
+    function test_hwm_ratchetBanksNothingAgainstAnEmptyPricingSupply() public {
+        uint256 mark1 = _fullAsyncExit();
+
+        vm.prank(donor);
+        usdc.transfer(address(vault), RESIDUE);
+
+        uint256 garbagePrice = vault.pricePerShare();
+        assertGt(garbagePrice, mark1, "sanity: an unguarded ratchet WOULD move the mark, and upward");
+
+        vm.prank(MOCK_GOVERNOR);
+        vault.ratchetHighWaterMark();
+
+        assertEq(vault.highWaterPricePerShare(), mark1, "the previous peak stands; the meaningless price is not banked");
     }
 }
