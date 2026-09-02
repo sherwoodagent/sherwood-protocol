@@ -71,6 +71,17 @@ Any target epoch beyond `(now + MAX_COVERAGE_HORIZON) / epochLength` is clamped 
 - [Gas on freeze/unfreeze] → One extra SLOAD/SSTORE pair per approver on a path that already loops over approvers. Bounded by cohort size, which is already bounded.
 - [`RecordedExposure.epoch` becomes mutable] → It was already per-lock state; only its write sites grow. No layout change.
 
+## Implementation notes (post-`declared-coverage-locks`, PR #293)
+
+Recorded at implementation time; each is a deviation from the decisions above, with the reason.
+
+- **D3 is refined: unfreeze floors at the BOOKED bucket and at any standing pin.** `ChallengeGame.file` requires only `executedAt != 0`, so a challenge can be filed and resolved *before* settlement (`executedAt + strategyDuration`) while the lock sits in the bucket containing `executeBy + strategyDuration`. Moving it to the bucket containing `block.timestamp` then would expire it before the settlement drain can be challenged — the pre-ADR `currentEpoch()` hole SHE-231 pins as closed. Unfreeze therefore targets `max(currentEpoch(), bookedEpoch, epochOf(_pinnedUntil[key][g]))`. When the unfreeze happens after settlement (the case D3 reasoned about) this is exactly D3's answer.
+- **The lock record carries its booking epoch.** `LockRecord{uint192 wood; uint64 epoch}` became `{uint128 wood; uint64 bookedEpoch; uint64 epoch}` — still one slot. `epoch` is the current bucket (mutable, what `_unwindApproval` subtracts from); `bookedEpoch` is the floor above. `wood` at uint128 is not a real bound (sWOOD stake is uint128; WOOD supply ~1e27) and the store still fails loudly rather than truncating. The ledger is not proxy-upgradeable and has no layout golden (`script/exposure-ledger-layout.golden.json` in tasks.md never existed), so "layout diffs zero" is vacuous here; the struct change is stated in the commit.
+- **Freeze is raise-only.** D2 did not say; the spec scenario conditions on the bucket expiring before the target. A lock whose settlement lies past the dispute clock stays where it is.
+- **Freeze target arrives as a parameter.** `freezeCoverage(governor, proposalId, liveUntil)`; `ChallengeGame.file` passes `block.timestamp + disputeTimeout`, the same value it pins as `disputeTimeoutAtFiling` in that transaction. No read-back: the ledger makes no call into the freezer on this path.
+- **The ledger never reverts on capacity.** SHE-213's "the second approval is refused" is a zero lock (`recordApproval` returns rather than revert when `open >= cap`, so the Approve vote still lands); the reproduction asserts `lockOf(B) == 0`.
+- **Residual not in D5: a second concurrent filing.** The game refcounts, so only the first filing's `liveUntil` reaches the ledger; a later concurrent filing's dispute clock ends later by at most the filing gap. `hasFrozenCoverage` blocks exit throughout; the capacity tail beyond the first target's bucket expiry is uncounted. Bounded by the challenge-window slack and bucket rounding; would need the game to re-freeze or pin on each concurrent filing to close, which is out of this change's scope.
+
 ## Migration Plan
 
 Ships with the fresh guardian-economics deployment alongside `declared-coverage-locks`. No live state to migrate. Sequenced strictly after that change so the re-bucketed quantity is the lock.
