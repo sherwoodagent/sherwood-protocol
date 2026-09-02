@@ -17,7 +17,7 @@ library FeeConstants {
     ///      `DEFAULT_MAX_PERFORMANCE_FEE_BPS`), and the vault's own
     ///      `agentFeeBps`. High enough that the 20% headline of the two-number
     ///      fee model is reachable without making 30% the default.
-    uint256 internal constant MAX_PERFORMANCE_FEE_BPS = 3000;
+    uint256 internal constant MAX_PERFORMANCE_FEE_BPS = 2000;
 
     /// @notice Per-vault performance-fee ceiling a newly created vault starts
     ///         with, in basis points (20%) — the advertised headline rate.

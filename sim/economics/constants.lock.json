@@ -104,15 +104,15 @@
       "file": "src/SyndicateFactory.sol",
       "line": 177,
       "note": "Hard ceiling on the management fee (5%/yr).",
-      "raw": "500",
-      "value": 500
+      "raw": "300",
+      "value": 300
     },
     "MAX_PERFORMANCE_FEE_BPS": {
       "file": "src/FeeConstants.sol",
       "line": 20,
       "note": "Hard protocol ceiling on the performance fee. The `worst_stack` fee set runs here.",
-      "raw": "3000",
-      "value": 3000
+      "raw": "2000",
+      "value": 2000
     },
     "MAX_SLASH_BPS": {
       "file": "script/Deploy.s.sol",
@@ -258,8 +258,8 @@
       "file": "script/DeployPlanB.s.sol",
       "line": 287,
       "note": "The haircut a Plan B deploy applies to the WOOD price when pricing stake. The model uses this, NOT the ledger default.",
-      "raw": "7_000",
-      "value": 7000
+      "raw": "5_000",
+      "value": 5000
     },
     "WOOD_USD_PRICE_X8_FORK": {
       "file": "script/fork/DeployForkWoodUsdFeed.s.sol",

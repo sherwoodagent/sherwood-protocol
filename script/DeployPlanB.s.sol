@@ -172,7 +172,7 @@ interface IProtocolConfigAdmin {
  *                                 1.25-2x market is the intended band, reviewed
  *                                 monthly. Non-zero (pre-flight 8).
  *     WOOD_HAIRCUT_BPS          — OPTIONAL bond-valuation haircut, bps. Defaults
- *                                 to DEFAULT_WOOD_HAIRCUT_BPS (7,000 = a 30%
+ *                                 to DEFAULT_WOOD_HAIRCUT_BPS (5,000 = a 50%
  *                                 discount) when unset. This is the ALLOWANCE
  *                                 against the two overstatements the design
  *                                 accepts — the oracle's stale ETH/USD leg and
@@ -284,7 +284,7 @@ contract DeployPlanB is ScriptBase {
     ///         same reason the duration ceiling is: a parameter an operator is
     ///         merely TOLD to set afterwards is a parameter that ships at its
     ///         default, and this default is the one with no margin in it.
-    uint256 public constant DEFAULT_WOOD_HAIRCUT_BPS = 7_000;
+    uint256 public constant DEFAULT_WOOD_HAIRCUT_BPS = 5_000;
 
     /// @notice Mirror of `ExposureLedger.MIN_WOOD_HAIRCUT_BPS`, which is
     ///         `internal` and so cannot be read from here.

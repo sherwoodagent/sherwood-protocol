@@ -35,13 +35,25 @@ def params(**overrides):
     return Params(PROTO, ASSUMPTIONS, overrides)
 
 
+# The SHE-182 dossier (worked-examples.md, results.md) was computed against the
+# 2026-09-01 deploy values. Tests that pin dossier numbers say so explicitly, so
+# they keep testing the MECHANICS when a deploy parameter is deliberately moved.
+DOSSIER = dict(wood_haircut_bps=7000)
+DOSSIER_WORST_STACK = dict(mgmt_bps=500, perf_bps=3000)
+
+
+def dossier_params(**overrides):
+    ov = dict(DOSSIER); ov.update(overrides)
+    return params(**ov)
+
+
 class WorkedExamples(unittest.TestCase):
     """worked-examples.md: $100k fund, one 14-day tier-2 proposal, 3 approvers,
     WOOD at $0.05, current fees (200 / 2000)."""
 
     def setUp(self):
-        self.p = params(stage="growth", approvers_per_proposal=3,
-                        wood_price=0.05, fee_set="current")
+        self.p = dossier_params(stage="growth", approvers_per_proposal=3,
+                                wood_price=0.05, fee_set="current")
 
     def test_scenario_1_gain_10pct(self):
         w = worked_proposal(self.p, 100_000.0, 0.10, 14)
@@ -119,8 +131,8 @@ class ResultsSectionA(unittest.TestCase):
         self.assertEqual(c["settlements_charging_perf"], 7)
 
     def test_mature_worst_stack_leaves_39_5_pct(self):
-        c = run_cell(params(stage="mature", tvl=1_000_000.0, wood_price=0.05,
-                            fee_set="worst_stack"))
+        c = run_cell(dossier_params(stage="mature", tvl=1_000_000.0, wood_price=0.05,
+                                    **DOSSIER_WORST_STACK))
         self.assertAlmostEqual(c["depositor_share_of_gross_pct"], 39.5, places=1)
 
     def test_fees_and_depositor_exhaust_the_gross(self):
@@ -132,7 +144,7 @@ class ResultsSectionA(unittest.TestCase):
 
 class BindingTvl(unittest.TestCase):
     def test_growth_25pct_of_float_at_5_cents(self):
-        p = params(stage="growth", wood_price=0.05)
+        p = dossier_params(stage="growth", wood_price=0.05)
         self.assertAlmostEqual(binding_tvl(p, 0.25) / 1e6, 1.81, places=2)
 
     def test_binding_tvl_is_linear_in_threshold(self):
@@ -217,11 +229,11 @@ class SlashMode(unittest.TestCase):
                                    wood_price=px),
                             fund, 0.10, 14, slashed=True)
                         self.assertLessEqual(
-                            alloc["slashed_wood"], whole["slashed_wood"] + 1e-9,
+                            alloc["slashed_wood"], whole["slashed_wood"] * (1 + 1e-12),
                             msg="approvers=%d reservation=%s fund=%s price=%s"
                                 % (approvers, reservation, fund, px))
                         self.assertLessEqual(alloc["total_burned_wood"],
-                                             whole["total_burned_wood"] + 1e-9)
+                                             whole["total_burned_wood"] * (1 + 1e-12))
 
     def test_allocated_is_exactly_one_approvers_share(self):
         p = params(approvers_per_proposal=4, slash_mode="allocated", wood_price=0.05)
@@ -386,8 +398,8 @@ class DriftDetector(unittest.TestCase):
             target = os.path.join(tmp, "script", "DeployPlanB.s.sol")
             with open(target) as fh:
                 text = fh.read()
-            mutated = text.replace("DEFAULT_WOOD_HAIRCUT_BPS = 7_000",
-                                   "DEFAULT_WOOD_HAIRCUT_BPS = 5_000", 1)
+            mutated = text.replace("DEFAULT_WOOD_HAIRCUT_BPS = 5_000",
+                                   "DEFAULT_WOOD_HAIRCUT_BPS = 6_500", 1)
             self.assertNotEqual(text, mutated, "mutation did not apply")
             with open(target, "w") as fh:
                 fh.write(mutated)
