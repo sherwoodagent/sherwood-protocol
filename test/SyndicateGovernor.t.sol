@@ -1541,6 +1541,7 @@ contract SyndicateGovernorTest is Test {
         queue.claim(reqId);
         assertGt(usdc.balanceOf(lp1), balBefore, "lp1 received redeemed assets");
     }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Unpriced cost basis — converted capital must not read as lost
     // ─────────────────────────────────────────────────────────────────────────
@@ -1814,5 +1815,4 @@ contract SyndicateGovernorTest is Test {
         uint256 no = _createAndExecuteWithStrategy(vault.totalAssets(), 10_000, address(silent));
         assertFalse(governor.expectsUnpricedResidue(no), "a non-converting template declares nothing");
     }
-
 }

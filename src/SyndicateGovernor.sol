@@ -1191,9 +1191,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         {
             address vault_ = proposal.vault;
             (, uint256 basis) = _readUnpricedBasis(
-                proposal.strategy,
-                _capitalSnapshots[proposalId],
-                IERC20(IERC4626(vault_).asset()).balanceOf(vault_)
+                proposal.strategy, _capitalSnapshots[proposalId], IERC20(IERC4626(vault_).asset()).balanceOf(vault_)
             );
             if (basis != 0) {
                 uint256 nav = IERC4626(vault_).totalAssets() + 1;

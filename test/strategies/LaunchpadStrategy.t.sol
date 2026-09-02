@@ -1397,6 +1397,7 @@ contract LaunchpadStrategyTest is Test {
         vm.expectRevert(BaseStrategy.NotVault.selector);
         s.sweep();
     }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Unpriced cost basis
     // ─────────────────────────────────────────────────────────────────────────
@@ -1458,5 +1459,4 @@ contract LaunchpadStrategyTest is Test {
 
         assertEq(s.unpricedCostBasis(), basisBefore, "inventory changed hands; nothing was realized");
     }
-
 }
