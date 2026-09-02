@@ -25,8 +25,11 @@ contract FeeConstantsCapTest is Test {
 
     // ── The ceiling itself ──
 
-    function test_performanceFeeCeilingIsThirtyPercent() public pure {
-        assertEq(FeeConstants.MAX_PERFORMANCE_FEE_BPS, 3000, "protocol ceiling should be 30%");
+    function test_performanceFeeCeilingIsTwentyFivePercent() public pure {
+        // 3000 -> 2500 in the launch configuration (SHE-182 / SHE-18): the 20%
+        // headline stays reachable, the per-vault default still sits strictly
+        // below the protocol ceiling, and the worst-case stack tightens.
+        assertEq(FeeConstants.MAX_PERFORMANCE_FEE_BPS, 2500, "protocol ceiling should be 25%");
     }
 
     function test_ceilingPropagatesToVaultAgentFeeCap() public view {

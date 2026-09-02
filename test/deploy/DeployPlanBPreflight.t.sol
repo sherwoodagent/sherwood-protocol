@@ -709,20 +709,23 @@ contract DeployPlanBPreflightTest is Test {
     }
 
     /// @dev The shipped value, asserted on the DEPLOYED state and pinned to the
-    ///      script's own constant so the two cannot drift. 7,000 is a 30%
-    ///      allowance; 5,000 (the ledger floor) was rejected as too costly to
-    ///      guardian return on equity.
+    ///      script's own constant so the two cannot drift. 5,000 is a 50%
+    ///      allowance. It was once rejected as too costly to guardian return on
+    ///      equity, but that was under full-coverage reservation; with declared
+    ///      locks (SHE-227) guardian ROE is 1.6-4.2%/yr at 0.50, and the haircut
+    ///      is the only buffer between the WOOD price at approval and at verdict
+    ///      (SHE-182 launch configuration).
     function test_deploy_seatsTheShippedHaircut() public {
-        assertEq(script.DEFAULT_WOOD_HAIRCUT_BPS(), 7_000, "the shipped haircut is 7,000 -- a 30% allowance");
+        assertEq(script.DEFAULT_WOOD_HAIRCUT_BPS(), 5_000, "the shipped haircut is 5,000 -- a 50% allowance");
 
         _run();
 
         ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
-        assertEq(ledger.woodHaircutBps(), 7_000, "the haircut must be seated by the script, not left at 10,000");
+        assertEq(ledger.woodHaircutBps(), 5_000, "the haircut must be seated by the script, not left at 10,000");
 
         // It is a real discount on a real valuation, not a stored number: the
         // composed price is 70% of what the market source reports.
-        assertEq(ledger.woodPriceX8(), (WOOD_MARKET_X8 * 7_000) / 10_000, "the allowance reaches the price");
+        assertEq(ledger.woodPriceX8(), (WOOD_MARKET_X8 * 5_000) / 10_000, "the allowance reaches the price");
     }
 
     /// @dev An operator override is honoured, and the floor still binds. The

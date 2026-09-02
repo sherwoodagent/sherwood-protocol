@@ -14,7 +14,7 @@
     {"label": "6 growth under launch config @ $0.05", "overrides": {"stage": "growth", "reservation_mode": "shared", "tier2_share": 0.2, "tvl": 10000000.0, "wood_price": 0.05}},
     {"label": "7 growth, 3 approvers @ $0.05", "overrides": {"stage": "growth", "reservation_mode": "shared", "tier2_share": 0.2, "approvers_per_proposal": 3, "tvl": 10000000.0, "wood_price": 0.05}},
     {"label": "8 mature under launch config @ $0.05", "overrides": {"stage": "mature", "reservation_mode": "shared", "tvl": 100000000.0, "wood_price": 0.05}},
-    {"label": "9 mature at NEW fee ceilings 300/2000", "overrides": {"stage": "mature", "reservation_mode": "shared", "mgmt_bps": 300, "perf_bps": 2000, "tvl": 100000000.0, "wood_price": 0.05}},
+    {"label": "9 mature at NEW fee ceilings 300/2500", "overrides": {"stage": "mature", "reservation_mode": "shared", "mgmt_bps": 300, "perf_bps": 2500, "tvl": 100000000.0, "wood_price": 0.05}},
     {"label": "10 mature at OLD fee ceilings 500/3000", "overrides": {"stage": "mature", "reservation_mode": "shared", "mgmt_bps": 500, "perf_bps": 3000, "tvl": 100000000.0, "wood_price": 0.05}}
   ]
 }
