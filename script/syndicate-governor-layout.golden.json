@@ -520,6 +520,12 @@
         "type": "t_uint8"
       },
       {
+        "label": "expectsUnpricedResidue",
+        "slot": "20",
+        "offset": 3,
+        "type": "t_bool"
+      },
+      {
         "label": "requiredCoverage",
         "slot": "21",
         "offset": 0,
