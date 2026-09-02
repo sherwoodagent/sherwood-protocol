@@ -63,6 +63,9 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
     address constant MORPHO = 0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010;
     address constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     address constant WETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
+    /// @dev "NVIDIA • Robinhood Token" — identity asserted on-chain in the
+    ///      unlevered test, not assumed from this constant.
+    address constant NVDA = 0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC;
 
     address constant UNISWAP_V3_FACTORY = 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA;
     address constant POSITION_MANAGER = 0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3;
@@ -149,10 +152,15 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
         int24 spacing = pool.tickSpacing();
         (, int24 spot,,,,,) = pool.slot0();
 
-        // A wide band around spot, snapped to spacing — this test is pinning the
-        // integration, not a trading thesis.
-        int24 lower = ((spot - 5000) / spacing) * spacing;
-        int24 upper = ((spot + 5000) / spacing) * spacing;
+        // A wide band around a snapped mid — this test is pinning the
+        // integration, not a trading thesis. Offsetting from a snapped mid
+        // (rather than snapping both edges outward) keeps the width at exactly
+        // `2 * halfWidthTicks`, which `_requireValidRerangePolicy` requires.
+        // This pool's 0.01% fee gives spacing 1, so every tick is on-grid and
+        // `5000 % spacing == 0` holds trivially.
+        int24 mid = _snapDown(spot, spacing);
+        int24 lower = mid - 5000;
+        int24 upper = mid + 5000;
 
         ConcentratedLiquidityStrategy.InitParams memory p = ConcentratedLiquidityStrategy.InitParams({
             pool: address(pool),
@@ -163,6 +171,7 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
             marketParams: mp,
             collateralAmount: collateralAmount,
             borrowAmount: borrowAmount,
+            lpAmount: 0,
             tickLower: lower,
             tickUpper: upper,
             expectedLiquidity: uint128(pool.liquidity() / 100),
@@ -207,6 +216,7 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
         }
 
         _initStrategy();
+        _repairNextIdIfForkStateCorrupt();
 
         vm.prank(address(vaultStub));
         strategy.execute();
@@ -219,6 +229,7 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
         console2.log("minted liquidity", uint256(liquidity));
 
         // ── Rerange against the live pool ──
+        _repairNextIdIfForkStateCorrupt();
         vm.warp(block.timestamp + 1 hours);
         vm.prank(keeper);
         strategy.rerange();
@@ -241,6 +252,170 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
         console2.log("vault USDG after settle", IERC20(USDG).balanceOf(address(vaultStub)));
     }
 
+    /// @notice UNLEVERED lifecycle against the live NVDA/USDG 0.05% pool — the
+    ///         venue the strategy family actually targets ($33M/day when
+    ///         measured 2026-08-31) and the mode that exists because 4663 has
+    ///         no borrow market this template can fund (spUSDG drained to $3;
+    ///         syrupUSDG fails the wrapper rule, correctly).
+    ///
+    ///         No Morpho address is configured AT ALL, so this doubles as the
+    ///         fork-grade "never touches Morpho" pin: a stray reach for the
+    ///         surface is a typed call to address(0) and fails the test
+    ///         undecodably rather than passing against a mock.
+    function test_fork_unleveredLifecycle() public {
+        _skipIfNoFork();
+
+        address poolAddr = IUniswapV3Factory(UNISWAP_V3_FACTORY).getPool(USDG, NVDA, 500);
+        if (poolAddr == address(0)) vm.skip(true);
+        IUniswapV3Pool nvdaPool = IUniswapV3Pool(poolAddr);
+
+        (,,, uint16 cardinality,,,) = nvdaPool.slot0();
+        if (cardinality < 2) {
+            nvdaPool.increaseObservationCardinalityNext(4);
+            vm.warp(block.timestamp + TWAP_WINDOW + 1);
+            vm.roll(block.number + 1);
+        }
+
+        int24 spacing = nvdaPool.tickSpacing();
+        (, int24 spot,,,,,) = nvdaPool.slot0();
+        // The momentum pod's band: ±3% ≈ ±300 ticks around a snapped mid.
+        // NOT snapped edge-by-edge: with spacing 10 an off-grid spot makes an
+        // outward-snapped band 610 wide, and `_requireValidRerangePolicy`
+        // rejects any band wider than `2 * halfWidthTicks` (600). Centering
+        // on `_snapDown(spot)` with `300 % 10 == 0` gives width 600, on-grid,
+        // for every spot.
+        int24 mid = _snapDown(spot, spacing);
+        int24 lower = mid - 300;
+        int24 upper = mid + 300;
+
+        ConcentratedLiquidityStrategy.InitParams memory p = ConcentratedLiquidityStrategy.InitParams({
+            pool: poolAddr,
+            positionManager: POSITION_MANAGER,
+            uniswapFactory: UNISWAP_V3_FACTORY,
+            swapAdapter: address(adapter),
+            morpho: address(0),
+            marketParams: MarketParams({
+                loanToken: address(0), collateralToken: address(0), oracle: address(0), irm: address(0), lltv: 0
+            }),
+            collateralAmount: 0,
+            borrowAmount: 0,
+            lpAmount: 10_000e6,
+            tickLower: lower,
+            tickUpper: upper,
+            expectedLiquidity: uint128(nvdaPool.liquidity() / 100),
+            swapFractionBps: 5_000,
+            twapWindow: TWAP_WINDOW,
+            maxTwapDeviationBps: 1_000,
+            mintSlippageBps: 1_000,
+            rerange: ConcentratedLiquidityStrategy.RerangePolicy({
+                halfWidthTicks: 300,
+                triggerBps: 1,
+                minInterval: 0,
+                maxReranges: 2,
+                slippageBps: 1_000,
+                swapFractionBps: 5_000
+            }),
+            settleSlippageBps: 1_000,
+            settleDeadline: 0,
+            swapExtraData: abi.encodePacked(bytes1(0x00), abi.encode(uint24(500)))
+        });
+
+        strategy = ConcentratedLiquidityStrategy(Clones.clone(address(template)));
+        strategy.initialize(address(vaultStub), proposer, abi.encode(p));
+        status.set(1, 1, address(strategy));
+        vm.prank(address(vaultStub));
+        IERC20(USDG).approve(address(strategy), type(uint256).max);
+
+        _repairNextIdIfForkStateCorrupt();
+
+        uint256 vaultBefore = IERC20(USDG).balanceOf(address(vaultStub));
+
+        vm.prank(address(vaultStub));
+        strategy.execute();
+        assertEq(strategy.levered(), false, "mode misread");
+        uint256 tokenId = strategy.tokenId();
+        assertGt(tokenId, 0, "no position minted");
+        assertEq(
+            vaultBefore - IERC20(USDG).balanceOf(address(vaultStub)), 10_000e6, "pulled something other than lpAmount"
+        );
+        (,,,,,,, uint128 liquidity,,,,) = INonfungiblePositionManager(POSITION_MANAGER).positions(tokenId);
+        assertGt(liquidity, 0, "position holds no liquidity");
+        console2.log("unlevered minted liquidity", uint256(liquidity));
+
+        // ── Rerange against the live pool, permissionless caller ──
+        // Re-arm the repair: the rerange consumes another token id, and the
+        // orphan range may begin past the id execute just took.
+        _repairNextIdIfForkStateCorrupt();
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(keeper);
+        strategy.rerange();
+        assertTrue(strategy.tokenId() != tokenId, "rerange did not replace the position");
+
+        // ── Settle: everything the venue returns goes home ──
+        vm.prank(address(vaultStub));
+        strategy.settle();
+        assertEq(uint256(strategy.state()), 2, "not settled");
+        assertEq(IERC20(USDG).balanceOf(address(strategy)), 0, "vault asset stranded in the clone");
+        assertEq(strategy.hasUndeliveredValue(), false, "phantom residue");
+        assertEq(strategy.hasUnvaluedResidue(), false, "phantom unvalued residue");
+
+        uint256 delivered = IERC20(USDG).balanceOf(address(vaultStub));
+        // Round trip through a real 5bps pool with two swap legs: bounded loss,
+        // not exact return. 3% of funding is a generous ceiling; the assert is
+        // that value came HOME, not that the trade was free.
+        assertGt(delivered + uint256(10_000e6) / 33, vaultBefore, "settlement lost more than ~3%");
+        console2.log("vault USDG delta after unlevered cycle", vaultBefore - delivered);
+    }
+
+    /// @dev TEST-ENVIRONMENT REPAIR, guarded so it is inert against healthy
+    ///      state. Measured on the shared Tenderly vnet (2026-09-01): the
+    ///      position manager's `_nextId` read 934278 while tokens
+    ///      934278..934289 already had owners — someone state-injected mints
+    ///      without bumping the counter, so every genuine `mint` reverts
+    ///      `ERC721: token already minted`. That is fork corruption, not
+    ///      protocol behavior; on a healthy chain the probe below finds the
+    ///      first id unowned immediately and this writes nothing.
+    ///
+    ///      Slot 13 packs `_nextId` (uint176, low bits) with `_nextPoolId`
+    ///      (uint80, high bits); the write preserves the pool-id half.
+    function _repairNextIdIfForkStateCorrupt() internal {
+        bytes32 raw = vm.load(POSITION_MANAGER, bytes32(uint256(13)));
+        uint256 nextId = uint256(raw) & ((1 << 176) - 1);
+        uint256 poolIdBits = uint256(raw) >> 176;
+        // The injected ids are not merely owned — some are POISONED at the
+        // EVM level: `ownerOf` on them executes an invalid opcode (observed
+        // ids 934599/934604+ on the vnet, 2026-09-01), and an invalid opcode
+        // consumes ALL forwarded gas, so an uncapped probe loop drains the
+        // whole test on four bad ids. Hence three defenses:
+        //   - every probe is GAS-CAPPED, so a poisoned id costs 30k, not 63/64
+        //     of everything;
+        //   - ids are classified by RETURNDATA, not just success: a cleanly
+        //     nonexistent token reverts WITH a reason string, a poisoned one
+        //     dies with EMPTY returndata — and only the clean kind is a safe
+        //     landing zone for `_nextId`, since minting a poisoned id would
+        //     detonate the same slots;
+        //   - the repair settles only after 16 consecutive clean ids, because
+        //     the orphan block has gaps that fooled break-at-first-unowned.
+        uint256 id = nextId;
+        uint256 probe = nextId;
+        uint256 cleanRun = 0;
+        while (cleanRun < 16 && probe < nextId + 512) {
+            (bool ok, bytes memory ret) =
+                POSITION_MANAGER.staticcall{gas: 30_000}(abi.encodeWithSignature("ownerOf(uint256)", probe));
+            if (!ok && ret.length > 0) {
+                cleanRun++; // clean "nonexistent token" revert
+            } else {
+                id = probe + 1; // owned or poisoned: land above it
+                cleanRun = 0;
+            }
+            probe++;
+        }
+        if (id != nextId) {
+            emit log_named_uint("repairing corrupt fork _nextId, skipping owned ids", id - nextId);
+            vm.store(POSITION_MANAGER, bytes32(uint256(13)), bytes32((poolIdBits << 176) | id));
+        }
+    }
+
     /// @notice The TWAP guard reads the REAL observation ring, not a stand-in.
     function test_fork_twapGuardReadsLiveObservations() public {
         _skipIfNoFork();
@@ -248,6 +423,7 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
         if (cardinality < 2) vm.skip(true);
 
         _initStrategy();
+        _repairNextIdIfForkStateCorrupt();
 
         uint32[] memory ago = new uint32[](2);
         ago[0] = TWAP_WINDOW;
@@ -263,5 +439,13 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
         vm.prank(address(vaultStub));
         strategy.execute();
         assertGt(strategy.tokenId(), 0);
+    }
+
+    /// @dev Floor toward -inf onto the spacing grid — `_snapDown`. Plain
+    ///      truncation toward zero skews the band below zero (finding 5).
+    function _snapDown(int24 tick, int24 spacing) internal pure returns (int24) {
+        int24 q = tick / spacing;
+        if (tick < 0 && tick % spacing != 0) q--;
+        return q * spacing;
     }
 }
