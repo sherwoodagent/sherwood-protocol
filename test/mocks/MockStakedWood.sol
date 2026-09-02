@@ -52,9 +52,6 @@ contract MockStakedWood is IStakedWood {
     mapping(uint256 => uint256) internal _pastTotalSupply;
     mapping(address => uint256) internal _requiredOwnerBond;
     mapping(address => uint256) internal _ownerStake;
-    /// @dev Inverted so an untouched slot reads as a LIVE bond — see
-    ///      `ownerBondLive`.
-    mapping(address => bool) internal _ownerBondNotLive;
     mapping(address => bool) internal _isActiveGuardian;
     uint256 public totalGuardianStake;
     mapping(address => uint256) internal _guardianStake;
@@ -133,11 +130,6 @@ contract MockStakedWood is IStakedWood {
         _ownerStake[vault] = v;
     }
 
-    /// @dev Models `requestUnstakeOwner` (exiting) or a claimed/slashed slot.
-    function setOwnerBondLive(address vault, bool live) external {
-        _ownerBondNotLive[vault] = !live;
-    }
-
     function setActiveGuardian(address guardian, bool active) external {
         _isActiveGuardian[guardian] = active;
     }
@@ -214,15 +206,29 @@ contract MockStakedWood is IStakedWood {
         return _ownerStake[vault];
     }
 
-    /// @dev DEFAULTS TO LIVE, the deliberate exception this mock's header
-    ///      describes (SHE-215) — same reasoning as `getVotes`. The real
-    ///      `StakedWood` reads `owner != address(0) && unstakeRequestedAt == 0`,
-    ///      which is true for every normally created vault including a
-    ///      zero-amount `minOwnerStake == 0` one, so "live" is the state an
-    ///      unconfigured fixture is modelling. Stored inverted so the zero
-    ///      value of an untouched slot IS that default.
-    function ownerBondLive(address vault) external view returns (bool) {
-        return !_ownerBondNotLive[vault];
+    /// @dev A CONSTANT, not a settable slot — deliberately, and unlike every
+    ///      other read on this mock (SHE-215 review of #300). `IStakedWood`
+    ///      declares the member so it cannot simply be dropped, but the
+    ///      settable `_ownerBondNotLive` / `setOwnerBondLive` pair it first
+    ///      shipped with had zero callers and no way to acquire one: the gate
+    ///      lives in `SyndicateGovernor`, which reads
+    ///      `IGuardianRegistry.ownerBondLive`, so this function is reachable
+    ///      only with the mock sitting behind a REAL `GuardianRegistry` — and
+    ///      nothing in the suite does that. Every fixture here builds the mock
+    ///      standalone for TokenCourt/ChallengeGame work; the fixtures that are
+    ///      about the gate use `MockRegistryMinimal.setOwnerBondLive` instead.
+    ///      A knob no test can turn models nothing and reads as coverage that
+    ///      does not exist.
+    ///
+    ///      `true` is the right constant for the same reason it is the right
+    ///      default there: the real `StakedWood` reads
+    ///      `owner != address(0) && unstakeRequestedAt == 0`, true for every
+    ///      normally created vault including a zero-amount
+    ///      `minOwnerStake == 0` one, so "live" is the state an unconfigured
+    ///      fixture is modelling. Restore the setter the day a fixture actually
+    ///      wires this mock into a real registry.
+    function ownerBondLive(address) external pure returns (bool) {
+        return true;
     }
 
     /// @dev Anchor-aware slash basis (issue #35). DEFAULTS to live
@@ -275,13 +281,16 @@ contract MockStakedWood is IStakedWood {
         }
     }
 
+    /// @dev Models the FUNDING half of the real `slashOwnerBond` only. The real
+    ///      one `delete`s the record, so the slot also stops being live — but
+    ///      `ownerBondLive` here is a constant with no reachable reader (see its
+    ///      doc), so mirroring that half would be writing state nothing can
+    ///      observe. Whoever first wires this mock behind a real
+    ///      `GuardianRegistry` has to restore both together.
     function slashOwnerBond(address vault) external {
         slashOwnerBondCallCount++;
         lastSlashedVault = vault;
         _ownerStake[vault] = 0;
-        // The real `slashOwnerBond` DELETES the record, so the slot stops
-        // being live as well as stops being funded (SHE-215).
-        _ownerBondNotLive[vault] = true;
     }
 
     // ── Unused interface methods (revert if a test exercises a path the mock

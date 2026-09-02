@@ -730,8 +730,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
         bool isCollaborative = coProposers.length > 0;
 
-        // Review period defaults to zero when registry isn't wired; state machine
-        // still works (voteEnd == reviewEnd → immediate transition to Approved).
         uint256 reviewPeriod_ = IGuardianRegistry(_guardianRegistry).reviewPeriod();
 
         // Sequential storage writes instead of struct literal to avoid Yul

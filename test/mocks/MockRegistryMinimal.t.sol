@@ -41,6 +41,33 @@ contract MockRegistryMinimalTest is Test {
         assertEq(mock.lastCancelledProposalId(), 42);
     }
 
+    /// @notice The OTHER permissive default, pinned like the ones above.
+    ///
+    /// @dev `ownerBondLive` defaults to `true` rather than reverting
+    ///      `NotImplemented` (SHE-215): `SyndicateGovernor.propose` and
+    ///      `executeProposal` read it on every call, so a reverting stub would
+    ///      fail every governor fixture in the repo on a question none of them
+    ///      is about. That default is load-bearing for a large blast radius and
+    ///      was the only member of this mock's live surface with nothing
+    ///      asserting it, so a silent flip to `false` would have surfaced as
+    ///      dozens of unrelated `OwnerBondNotLive` failures rather than as one
+    ///      failing mock test.
+    ///
+    ///      Both directions, because the default is only meaningful if the
+    ///      setter can actually move off it — a hardcoded `return true` would
+    ///      satisfy the first assertion alone, and that is precisely the shape
+    ///      the gate's own fixtures depend on NOT being true.
+    function test_liveSurface_ownerBondLiveDefaultsToLive() public {
+        assertTrue(mock.ownerBondLive(address(this)), "the permissive default the governor fixtures rely on");
+        assertTrue(mock.ownerBondLive(address(0xBEEF)), "the default is per-mock, not per-vault");
+
+        mock.setOwnerBondLive(false);
+        assertFalse(mock.ownerBondLive(address(this)), "setOwnerBondLive(false) must model the closed lane");
+
+        mock.setOwnerBondLive(true);
+        assertTrue(mock.ownerBondLive(address(this)), "and it must be reversible");
+    }
+
     function test_stubbedFunction_revertsNotImplemented() public {
         vm.expectRevert(MockRegistryMinimal.NotImplemented.selector);
         mock.voteOnProposal(address(this), 1, IGuardianRegistry.GuardianVoteType.Approve, 0);
