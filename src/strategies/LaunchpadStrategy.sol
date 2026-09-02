@@ -1021,8 +1021,10 @@ contract LaunchpadStrategy is BaseStrategy {
         address quote_ = quoteToken;
         if (quote_ != asset) _convertQuote(quote_);
 
-        uint256 delivered = IERC20(asset).balanceOf(address(this));
-        _recordReturned(_pushAllToVault(asset));
+        // ONE read, not two: `_pushAllToVault` returns the balance it moved,
+        // which is exactly the figure `delivered` used to fetch for itself.
+        uint256 delivered = _pushAllToVault(asset);
+        _recordReturned(delivered);
 
         emit FundSettled(
             delivered,
