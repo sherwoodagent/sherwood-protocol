@@ -16,6 +16,7 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
 import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
+import {MockCoverageFreezer} from "./mocks/MockCoverageFreezer.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
@@ -116,11 +117,16 @@ contract MockFilingDeadline {
     function setChallengeableUntil(bytes32 key, uint256 until) external {
         challengeableUntil[key] = until;
     }
-}
 
-/// @dev A non-zero freezer that answers neither of those views — a slot rotated
-///      to something that is not a game, or simply a broken address.
-contract MuteFreezer {}
+    /// @dev Unchecked against the ledger, deliberately. Since SHE-214 the
+    ///      ledger refuses to WIRE a game whose window exceeds its own, so a
+    ///      divergence is seated by raising the stub AFTER wiring — the route
+    ///      the real game's own setter also forbids, which is the point of a
+    ///      stub here.
+    function setChallengeWindow(uint256 window_) external {
+        challengeWindow = window_;
+    }
+}
 
 /// @dev The permissive ledger an attacker re-points the governor's LIVE
 ///      `_exposureLedger` slot at (issue #116): zero challenge window, no
@@ -163,6 +169,12 @@ contract MockEscrowAuth {
 ///         every proposal resolves to tier 2 / full notional (coverage ==
 ///         maxCapital) — the simplest coverage arithmetic.
 contract GovernorCoverageGatesTest is Test {
+    /// @dev A few tests wire THIS contract as the ledger's coverage freezer;
+    ///      since SHE-214 a freezer must answer `challengeWindow()` to wire.
+    function challengeWindow() external view returns (uint256) {
+        return ledger.challengeWindow();
+    }
+
     SyndicateGovernor public governor;
     SyndicateVault public vault;
     SyndicateGovernor public unwiredGovernor;
@@ -1396,25 +1408,27 @@ contract GovernorCoverageGatesTest is Test {
 
     /// @notice DESIGN D2 — why the gate is a `max` and not `challengeableUntil`
     ///         alone. The two windows can diverge with no `Inconclusive`
-    ///         anywhere in the picture: `ChallengeGame`'s own setters floor its
-    ///         window under the ledger's, but `ExposureLedger.setChallengeWindow`
-    ///         floors only against the registry's review period and has no
-    ///         game-side check, so the ledger owner can drop the ledger's window
-    ///         below the game's afterwards.
+    ///         anywhere in the picture, and the gate must hold the bond to the
+    ///         LATER of the two whichever way they diverge.
+    ///
+    ///         Since SHE-214 no ledger setter can seat `game > ledger`:
+    ///         `ChallengeGame`'s setters floor its window under the ledger's,
+    ///         and `ExposureLedger.setCoverageFreezer` / `setChallengeWindow`
+    ///         both floor the ledger's over the game's. The divergence is
+    ///         therefore seated from the stub's side, AFTER wiring — a
+    ///         defense-in-depth fixture for the arithmetic, not a reachable
+    ///         configuration.
     ///
     ///         Here `challengeableUntil` is ZERO throughout — a gate reading
     ///         only that value would have released on the ledger's deadline
-    ///         while the game still admitted a filing for another week. The
-    ///         divergence is set up from the game's side (a stub with a longer
-    ///         window) because it is the identical condition and does not
-    ///         require an `ExposureLedger` setter whose floor this fixture's
-    ///         EOA registry cannot answer.
+    ///         while the game still admitted a filing for another week.
     function test_reclaimBond_gameWindowAboveTheLedgers_waitsForTheGame() public {
         uint256 pid = _executeThenSettle();
         uint256 gameWindow = ledger.challengeWindow() + 7 days;
-        MockFilingDeadline stubGame = new MockFilingDeadline(gameWindow);
+        MockFilingDeadline stubGame = new MockFilingDeadline(ledger.challengeWindow());
         vm.prank(ledgerOwner);
         ledger.setCoverageFreezer(address(stubGame));
+        stubGame.setChallengeWindow(gameWindow); // past the wiring check, deliberately
 
         uint256 executedAt = governor.getProposal(pid).executedAt;
         // Every deadline here is anchored at `executedAt + strategyDuration`,
@@ -1479,11 +1493,16 @@ contract GovernorCoverageGatesTest is Test {
     ///         and under fail-open a lying freezer releases early. Matches this
     ///         function's existing posture for an unset ledger, and is
     ///         recoverable the same way: the ledger owner rotates the slot.
+    ///
+    ///         Since SHE-214 the ledger itself refuses to WIRE a freezer that
+    ///         cannot answer, so the muteness is switched on after wiring — a
+    ///         game that answered once and stopped (upgraded, or broken).
     function test_reclaimBond_freezerThatCannotAnswer_failsClosedButIsRecoverable() public {
         uint256 pid = _executeThenSettle();
-        address mute = address(new MuteFreezer());
+        MockCoverageFreezer mute = new MockCoverageFreezer(ledger.challengeWindow());
         vm.prank(ledgerOwner);
-        ledger.setCoverageFreezer(mute);
+        ledger.setCoverageFreezer(address(mute));
+        mute.setMuted(true);
 
         vm.warp(governor.getProposal(pid).executedAt + ledger.challengeWindow() + 365 days);
         vm.expectRevert();

@@ -14,6 +14,7 @@ import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockStakedWood} from "../mocks/MockStakedWood.sol";
+import {MockCoverageFreezer} from "../mocks/MockCoverageFreezer.sol";
 
 /// @dev THE ONLY WAY TO RUN A SCRIPT AS ITS OWN BROADCASTER FROM A TEST.
 ///      `vm.startBroadcast()` executes the script's calls as forge's
@@ -350,7 +351,7 @@ contract DeployTokenCourtPreflightTest is Test {
     function test_wirePreflight_bites_whenPlanDLostTheCoverageFreezer() public {
         _deployAndSetCourtEnv();
         vm.prank(DEFAULT_SENDER);
-        ledger.setCoverageFreezer(address(0xDEAD));
+        ledger.setCoverageFreezer(address(new MockCoverageFreezer(ledger.challengeWindow())));
         _runWireExpecting("PRE-FLIGHT: ExposureLedger.coverageFreezer != CHALLENGE_GAME.");
     }
 
