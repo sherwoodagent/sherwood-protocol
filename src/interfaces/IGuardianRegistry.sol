@@ -240,6 +240,12 @@ interface IGuardianRegistry {
     ///         `GovernorEmergency` reads it through the registry handle.
     function ownerStake(address vault) external view returns (uint256);
 
+    /// @notice True iff `vault`'s owner-stake slot is bound and not exiting.
+    ///         Passthrough to sWOOD — `SyndicateGovernor` reads it through the
+    ///         registry handle it already holds, the same route
+    ///         `GovernorEmergency` uses for `ownerStake` (SHE-215).
+    function ownerBondLive(address vault) external view returns (bool);
+
     /// @notice The minimum WOOD a vault owner must bond. Passthrough to sWOOD.
     function minOwnerStake() external view returns (uint256);
     function requiredOwnerBond(address vault) external view returns (uint256);

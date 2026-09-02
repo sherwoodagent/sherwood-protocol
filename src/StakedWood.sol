@@ -175,6 +175,8 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @notice Emitted when a vault owner claims their bond after cooldown elapsed.
     event OwnerUnstakeClaimed(address indexed vault, address indexed owner, uint256 amount);
 
+    event OwnerUnstakeCancelled(address indexed vault, address indexed owner);
+
     /// @notice Emitted when the factory re-points a vault's owner-stake slot.
     event OwnerStakeSlotTransferred(address indexed vault, address indexed oldOwner, address indexed newOwner);
 
@@ -1071,10 +1073,41 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         emit OwnerUnstakeRequested(vault, block.timestamp);
     }
 
+    /// @notice Cancel a pending owner-bond unstake request.
+    /// @dev Reverses `requestUnstakeOwner`: the slot goes back to live and
+    ///      `ownerBondLive` returns true again, so the vault's proposal lane
+    ///      reopens. Mirrors `cancelUnstakeGuardian`.
+    /// @dev THE REVERSIBILITY THE PROPOSE GATE NEEDS (SHE-215). Once
+    ///      `requestUnstakeOwner` closes the proposal lane, an owner who
+    ///      changes their mind had no way back except claiming the bond (which
+    ///      leaves the lane shut) and then a two-transaction `rotateOwner` ->
+    ///      `transferOwnerStakeSlot`. Without this, a single exploratory
+    ///      request would strand a live vault's agents for the whole cooldown.
+    /// @dev A SLASHED SLOT CANNOT BE CANCELLED BACK TO LIFE. If the bond was
+    ///      slashed between the request and now, `slashOwnerBond` deleted the
+    ///      record entirely, so `s.owner` is zero and `NoActiveStake` fires on
+    ///      the first check — the same "nothing to restore" reasoning
+    ///      `cancelUnstakeGuardian` spells out, reached one field earlier
+    ///      because the owner path deletes rather than zeroes.
+    /// @dev nonReentrant omitted — no external calls, no value movement.
+    function cancelUnstakeOwner(address vault) external {
+        OwnerStake storage s = _ownerStakes[vault];
+        if (s.owner != msg.sender || s.stakedAmount == 0) revert NoActiveStake();
+        if (s.unstakeRequestedAt == 0) revert UnstakeNotRequested();
+
+        s.unstakeRequestedAt = 0;
+        s.cooldownAtRequest = 0;
+
+        emit OwnerUnstakeCancelled(vault, msg.sender);
+    }
+
     /// @notice Claim a vault owner's bond after the cooldown has elapsed.
     /// @dev Releases WOOD to the recorded owner and deletes `_ownerStakes[vault]`
-    ///      entirely — the vault then enters grace-period state and new proposals
-    ///      cannot be created until the slot is re-funded.
+    ///      entirely — `ownerBondLive(vault)` then reads false, and
+    ///      `SyndicateGovernor.propose` / `executeProposal` refuse until the
+    ///      slot is re-funded. The lane in fact closes one step EARLIER, at
+    ///      `requestUnstakeOwner`, since a bond already committed to leaving is
+    ///      not collateral behind anything (SHE-215).
     /// @dev RE-FUNDING THE SLOT: `bindOwnerStake` is reachable only from
     ///      `createSyndicate`, i.e. once per vault at birth. The single route back
     ///      to a funded slot on a LIVE vault is `rotateOwner` ->
@@ -1185,6 +1218,49 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @notice A vault's bound owner stake.
     function ownerStake(address v) external view returns (uint256) {
         return _ownerStakes[v].stakedAmount;
+    }
+
+    /// @notice True iff `v`'s owner-stake slot is bound and not exiting.
+    /// @dev The predicate `SyndicateGovernor.propose` / `executeProposal` gate
+    ///      on (SHE-215). `claimUnstakeOwner` promised a grace period in which
+    ///      "new proposals cannot be created until the slot is re-funded" and
+    ///      nothing enforced it: `_propose` never read the owner bond, so an
+    ///      owner who is also a registered agent could claim their bond in a
+    ///      quiet gap and then propose and execute on a fully unbonded vault.
+    ///
+    ///      TWO CLAUSES, AND BOTH ARE LOAD-BEARING.
+    ///
+    ///      `s.owner != address(0)` is the SLOT-EXISTS test, and it is
+    ///      deliberately not `stakedAmount != 0`. `minOwnerStake == 0` is a
+    ///      documented open-onboarding sentinel under which `bindOwnerStake`
+    ///      binds a zero-amount stake with a real owner — a vault that never
+    ///      posted a bond and was never meant to. Keying on the amount would
+    ///      brick the proposal lane of every such vault at birth, which is not
+    ///      the state this closes. Both routes that empty a funded slot
+    ///      (`claimUnstakeOwner`, `slashOwnerBond`) `delete` the record, so
+    ///      they zero the owner too and are caught; the route back is
+    ///      `rotateOwner` -> `transferOwnerStakeSlot`, exactly as
+    ///      `claimUnstakeOwner`'s natspec describes.
+    ///
+    ///      `s.unstakeRequestedAt == 0` closes the lane one step EARLIER than
+    ///      the claim. A bond inside its exit cooldown is already committed to
+    ///      leaving, and the whole reason `claimUnstakeOwner` re-checks
+    ///      `openProposalCount()` is that a gate which fires once can be walked
+    ///      around by changing the state it measured. Reading the request stamp
+    ///      here means there is no window in which a proposal can be opened
+    ///      against collateral whose exit is already in flight. Reversible via
+    ///      `cancelUnstakeOwner`.
+    ///
+    ///      NOT `>= requiredOwnerBond`, deliberately, and for the same reason
+    ///      `GovernorEmergency.finalizeEmergencySettle` refuses that
+    ///      comparison: the threshold is governance-mutable and there is no
+    ///      top-up path on a live vault, so a raised `minOwnerStake` would
+    ///      permanently brick the proposal lane of every vault correctly
+    ///      bonded under the old floor. Existence is the property with no
+    ///      legitimate reading.
+    function ownerBondLive(address v) external view returns (bool) {
+        OwnerStake storage s = _ownerStakes[v];
+        return s.owner != address(0) && s.unstakeRequestedAt == 0;
     }
 
     /// @notice A prospective owner's escrowed prepared stake amount.

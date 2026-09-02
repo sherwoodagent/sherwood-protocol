@@ -597,6 +597,28 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ) private returns (uint256 proposalId) {
         if (vault != GovernorParameters.vault) revert VaultNotRegistered();
         if (!ISyndicateVault(vault).isAgent(msg.sender)) revert NotRegisteredAgent();
+        // THE OWNER BOND GATES THE NORMAL LANE, NOT ONLY THE EMERGENCY ONE
+        // (SHE-215). `StakedWood.claimUnstakeOwner` has always documented a
+        // grace period in which "new proposals cannot be created until the slot
+        // is re-funded"; nothing enforced it. `_propose` read no owner bond at
+        // all, `isAgent` is `_agents[a].active` and is independent of the
+        // owner's stake, and the only enforcers were `GovernorEmergency` and
+        // `SyndicateFactory.rotateOwner`. So an owner who is also a registered
+        // agent could request their unstake in a quiet gap, sit out the
+        // cooldown, claim the bond, and then propose AND execute a
+        // capital-moving strategy on a vault with nothing slashable behind it —
+        // the deterrent for the whole normal lane gone, with only the emergency
+        // path still asking for collateral.
+        //
+        // Read through the registry handle this contract already holds, the
+        // same route `GovernorEmergency` uses for `ownerStake`. Fails CLOSED:
+        // `ownerBondLive` is false for a slot that was claimed or slashed
+        // (both `delete` the record) and for one inside its exit cooldown, and
+        // true for the documented `minOwnerStake == 0` open-onboarding vault,
+        // whose slot is bound with a real owner and a zero amount. See its
+        // natspec for why the test is existence-and-not-exiting rather than a
+        // live threshold comparison.
+        if (!IGuardianRegistry(_guardianRegistry).ownerBondLive(vault)) revert OwnerBondNotLive();
         // Blocks new proposals when the vault still has a non-terminal
         // lifecycle bound to it (Pending / GuardianReview / Approved / Executed).
         // Draft co-proposals do not count toward openProposalCount and are
@@ -953,6 +975,22 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
         address vault = proposal.vault;
         if (_activeProposal != 0) revert StrategyAlreadyActive();
+        // RE-ASSERTED AT THE POINT OF USE, not only at the point of admission
+        // (SHE-215). `propose` refuses an unbonded vault, but the bond that
+        // matters is the one live WHEN CAPITAL MOVES: the vote and the review
+        // period sit between the two, and `requestUnstakeOwner` only refuses
+        // while `openProposalCount() != 0`, so nothing stops an owner starting
+        // their exit before the proposal that is about to execute even exists.
+        // Checking here closes the class rather than the instance, exactly as
+        // `GovernorEmergency.finalizeEmergencySettle` re-asserts its own bond
+        // gate and says so.
+        //
+        // The dual of `claimUnstakeOwner`'s claim-time `openProposalCount()`
+        // re-check: that one stops the bond leaving while a proposal is open,
+        // this one stops a proposal executing while the bond is leaving. Both
+        // exist because a gate that fires once can be walked around by changing
+        // the state it measured.
+        if (!IGuardianRegistry(_guardianRegistry).ownerBondLive(vault)) revert OwnerBondNotLive();
         // Cooldown check (skip if no prior settlement)
         uint256 lastSettled = _lastSettledAt;
         if (lastSettled != 0 && block.timestamp < lastSettled + _params.cooldownPeriod) {
