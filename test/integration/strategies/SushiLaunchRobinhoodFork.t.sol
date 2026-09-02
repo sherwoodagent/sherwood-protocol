@@ -601,6 +601,69 @@ contract SushiLaunchRobinhoodForkTest is Test {
     ///      REAL `SushiLaunchAdapter`. Quote == vault asset (USDG), so the quote
     ///      leg is a no-op and the only swap in the whole run is the WETH fee
     ///      leg — the launch itself is entirely the live venue.
+    /// @notice THE ORIGINAL REPORT, CLOSED — against the real venue.
+    ///
+    /// @dev    A live launch on the vnet reported its entire 1,200 USDG
+    ///         deployment as a LOSS, and the first reviewer to see it read the
+    ///         proposal as malicious. That reading was correct for the number
+    ///         the protocol emitted: settlement measures performance as the
+    ///         vault's ASSET-balance delta, and this template deliberately does
+    ///         not round-trip into the vault asset.
+    ///
+    ///         This reproduces the governor's own measure — `balanceNow +
+    ///         creditedBasis - snapshot` — against a REAL Sushi launch, and
+    ///         asserts it lands on ZERO rather than on minus the whole
+    ///         deployment. It is the fork-level counterpart to the unit tests:
+    ///         those pin the governor's arithmetic with a mock, this pins that
+    ///         a real launch through the real venue actually produces the basis
+    ///         that arithmetic consumes, slippage and native launch fee
+    ///         included.
+    function test_fork_launchReportsConvertedCapitalNotLoss() public {
+        if (!forked) return;
+
+        LaunchpadStrategy s = _cloneAgainstStandIns();
+
+        // Declared BEFORE anything runs — this is what the governor snapshots
+        // onto the proposal at propose time, so a guardian sees it in review.
+        assertTrue(s.expectsUnpricedResidue(), "the template declares the conversion up front");
+        assertEq(s.unpricedCostBasis(), 0, "nothing converted before execution");
+
+        fundGovernor.setProposal(block.timestamp, STRATEGY_DURATION);
+        deal(USDG, address(fundVault), ASSET_IN);
+        uint256 snapshot = IERC20(USDG).balanceOf(address(fundVault));
+        fundVault.approveToken(USDG, address(s), ASSET_IN);
+        fundVault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
+
+        assertTrue(s.launchToken() != address(0), "the launch is real");
+        assertEq(pad.launchInfo(s.launchToken()).creator, address(fundVault), "real venue, vault is creator");
+
+        vm.warp(s.anyoneSettleAt());
+        fundVault.callStrategy(address(s), abi.encodeWithSignature("settle()"));
+
+        uint256 balanceNow = IERC20(USDG).balanceOf(address(fundVault));
+        uint256 basis = s.unpricedCostBasis();
+
+        // The number settlement USED to report, and would still report without
+        // the credit: the whole deployment, as a loss.
+        uint256 apparentLoss = snapshot - balanceNow;
+        assertGt(apparentLoss, 0, "a real launch really does move capital out of the vault");
+
+        // Every unit of it was converted, none of it lost — so the credit
+        // exactly cancels the apparent loss.
+        assertEq(basis, apparentLoss, "the cost basis accounts for the entire outflow");
+        assertEq(int256(balanceNow + basis) - int256(snapshot), int256(0), "reported pnl is 0, not -ASSET_IN");
+
+        // And the fund really is holding something it declines to price, which
+        // is what the credit is standing in for.
+        assertTrue(s.hasUnvaluedResidue(), "the launch token is held and unpriceable");
+        assertGt(IERC20(s.launchToken()).balanceOf(address(s)), 0, "the reserve is real");
+
+        console2.log("snapshot (deployed):", snapshot);
+        console2.log("balance at settle:  ", balanceNow);
+        console2.log("apparent loss:      ", apparentLoss);
+        console2.log("credited cost basis:", basis);
+    }
+
     function _cloneAgainstStandIns() internal returns (LaunchpadStrategy s) {
         s = LaunchpadStrategy(Clones.clone(address(launchpadTemplate)));
         s.initialize(

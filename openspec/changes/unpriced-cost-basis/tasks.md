@@ -47,7 +47,8 @@ the credit it bounds — a credit merged without its clamp is an extraction path
 - [x] 5.7 Unreadable probe: a template without the view settles byte-for-byte as before.
 - [x] 5.8 Sweep independence: sweeping inventory to the vault does not change the reported basis.
 - [x] 5.9 Bool/basis coupling across all four templates.
-- [ ] 5.10 Re-run the launchpad fork e2e (`script/fork/launchpad-e2e.sh`) and confirm the reported P&L on a live launch is no longer the full deployment as loss.
+- [x] 5.10 Confirm on a REAL Sushi launch that the reported P&L is no longer the full deployment as loss. Done as a fork test (`test_fork_launchReportsConvertedCapitalNotLoss`) rather than via `script/fork/launchpad-e2e.sh`: that harness drives the addresses in `chains/9994663.json`, whose governor and template predate this change, so a re-run would have exercised pre-fix code. Proving it there instead would have meant upgrading the shared vnet's governor beacon — which every fund on that vnet rides. Measured against Robinhood mainnet: deployed 1,005,000,000, balance at settle 0, apparent loss 1,005,000,000, credited basis 1,005,000,000, **pnl 0**.
+      - NOTE for anyone driving the vnet harness: the Tenderly vnet's clock now runs ~227 days ahead of the Chainlink feeds, so Sushi's own `StalePriceFeedRound(updatedAt, now, 259200)` 3-day bound rejects any launch there. Fork tests in this file must run against `ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com`, not the vnet. This is harness gotcha #5 having gotten worse, not a regression in this change.
 
 ## Implementation notes
 
