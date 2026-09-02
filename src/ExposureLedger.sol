@@ -815,6 +815,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      that cannot is not the game, and the reclaim gate downstream
     ///      already fails closed against one. A codeless pointer is accepted:
     ///      it cannot file, so there is no filing deadline to desync from.
+    ///      That carve-out is fail-open by construction — a codeless address
+    ///      wired today that later gains code (CREATE2 at a pre-committed
+    ///      address, EIP-7702 delegation) reaches `game > ledger` with no
+    ///      check firing. Owner-only and requiring deliberate pre-computation,
+    ///      so accepted; closing it would mean an unconditional read here,
+    ///      which the codeless-freezer deploy preflights cannot survive.
     ///
     ///      `SyndicateGovernor.reclaimProposerBond`'s `max` over both deadlines
     ///      stays as defence in depth for the bond; it never covered the
@@ -836,7 +842,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     function _wiredGameWindow(address freezer) private view returns (uint256) {
         (bool ok, bytes memory ret) =
             freezer.staticcall(abi.encodeCall(IChallengeGameWindowMinimal.challengeWindow, ()));
-        if (!ok || ret.length < 32) revert InvalidParameter();
+        if (!ok || ret.length != 32) revert InvalidParameter();
         return abi.decode(ret, (uint256));
     }
 
