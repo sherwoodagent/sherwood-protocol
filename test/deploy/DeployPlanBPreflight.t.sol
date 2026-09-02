@@ -63,6 +63,12 @@ contract DeafStakedWood {
         return 10_000;
     }
 
+    /// @dev Pre-flight 1c reads this too; a stub without it fails the typed
+    ///      call with no data, before the assertion this suite is pinning.
+    function minSlashBps() external pure returns (uint256) {
+        return 500;
+    }
+
     /// @dev The whole point: accepts the call, keeps the pointer at zero.
     function setExposureLedger(address) external {}
 }
@@ -309,7 +315,7 @@ contract DeployPlanBPreflightTest is Test {
     ///      to get past a `!= address(0)` check — and prove the script no
     ///      longer leaves sWOOD reading that stale contract while the registry
     ///      and the factory book into a second one. Under the old code this
-    ///      state PASSED, and every guardian then read `openExposureUsd == 0`
+    ///      state PASSED, and every guardian then read `openExposure == 0`
     ///      from a ledger holding none of this deployment's bookings.
     function test_deploy_repointsSwoodAwayFromAStaleLedger() public {
         ExposureLedger stale = new ExposureLedger(DEFAULT_SENDER, address(swood), 28 days);
@@ -353,13 +359,42 @@ contract DeployPlanBPreflightTest is Test {
         assertEq(address(registry.exposureLedger()), address(0), "a refused deploy must not have wired anything");
     }
 
-    /// @dev PRE-FLIGHT 1b: a slash ceiling below 10_000 clips the allocation
-    ///      the ledger books at 100% of. `setMaxSlashBps` accepts 9_999, so no
-    ///      storage poke is needed to reach the violating state.
+    /// @dev PRE-FLIGHT 1b (declared coverage locks): a guardian's lock may
+    ///      equal its whole live stake and must burn in full on conviction, so
+    ///      a slash ceiling below 10_000 would cap every fully-locked burn
+    ///      beneath the lock. `setMaxSlashBps` accepts 9_999, so no storage
+    ///      poke is needed to reach the violating state. The message is pinned
+    ///      past its prefix because the rationale changed with the model: an
+    ///      operator reading it must be told about the LOCK, not the old
+    ///      allocation.
     function test_preflight_bites_whenMaxSlashBpsIsBelowTheCeiling() public {
         vm.prank(DEFAULT_SENDER);
         swood.setMaxSlashBps(9_999);
-        _runExpecting("PRE-FLIGHT: sWOOD maxSlashBps != 10000");
+        _runExpecting("PRE-FLIGHT: sWOOD maxSlashBps != 10000 -- a lock may equal the whole stake and must");
+        assertEq(address(registry.exposureLedger()), address(0), "a refused deploy must not have wired anything");
+    }
+
+    /// @dev PRE-FLIGHT 1c (declared coverage locks): `minSlashBps` is the single
+    ///      deterrence floor — the least any convicted approver loses, as a
+    ///      fraction of everything they hold, whatever they declared. A zero
+    ///      floor would let a guardian declare a token lock and face a token
+    ///      penalty. `setMinSlashBps(0)` is legal on sWOOD (it only checks
+    ///      `v <= maxSlashBps`), so the violating state needs no storage poke.
+    function test_preflight_bites_whenMinSlashBpsIsZero() public {
+        vm.prank(DEFAULT_SENDER);
+        swood.setMinSlashBps(0);
+        assertEq(swood.minSlashBps(), 0, "precondition: the floor really is zero");
+        _runExpecting("PRE-FLIGHT: sWOOD minSlashBps == 0 -- it is the single deterrence floor");
+        assertEq(address(registry.exposureLedger()), address(0), "a refused deploy must not have wired anything");
+    }
+
+    /// @dev Control for 1c: the fixture's shipped 1_000-bps floor passes, so the
+    ///      pre-flight refuses ZERO specifically rather than any small value —
+    ///      the launch value is a governance decision, not a code default.
+    function test_preflight_passes_atANonZeroMinSlashBps() public {
+        assertEq(swood.minSlashBps(), 1_000, "fixture floor");
+        _run();
+        assertTrue(swood.exposureLedger() != address(0), "deployed and wired");
     }
 
     /// @dev PRE-FLIGHT 2: a zero covered-TVL cap is fail-closed — wired into a

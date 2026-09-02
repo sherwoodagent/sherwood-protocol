@@ -168,19 +168,19 @@ contract MockGovernorForLedger {
 ///         `_feedPriceX8` to a raw staticcall with an explicit length check
 ///         before decoding — the exact pattern `_twapPriceX8` already used.
 ///
-///         FINDING 23 (`test_recordApproval_...`, `test_settleCoverage_...`):
-///         `recordApproval` and `settleCoverage` each used to write the
-///         equivalent of `try this.coverageUsd(IVaultAssetMinimal(pv.vault)
+///         FINDING 23 (`test_recordApproval_...`): `recordApproval` (and the
+///         since-deleted `settleCoverage`) used to write the equivalent of `try this.coverageUsd(IVaultAssetMinimal(pv.vault)
 ///         .asset(), gov.getRequiredCoverage(proposalId)) returns (...) {
 ///         ... } catch { ... }`. Solidity evaluates a call's ARGUMENTS in the
 ///         caller's frame, before the call the `try` actually guards, so a
 ///         revert from either the vault's `asset()` or the governor's
 ///         `getRequiredCoverage` propagated straight past the `catch` —
-///         reverting the whole APPROVE vote (or settlement pass) instead of
-///         booking/settling nothing, exactly the failure mode each
-///         function's own natspec says must never happen. Fixed by hoisting
-///         both reads into their own try/catch in `_tryResolveCoverageInputs`,
-///         called ahead of the `coverageUsd` try each caller still performs.
+///         reverting the whole APPROVE vote instead of locking nothing,
+///         exactly the failure mode the function's own natspec says must never
+///         happen. Fixed by hoisting both reads into their own try/catch in
+///         `_tryResolveCoverageInputs`, called ahead of the `coverageUsd` try
+///         the caller still performs. The `settleCoverage` half of the finding
+///         went with the function itself (declared coverage locks).
 contract ExposureLedgerPriceAndScopeTest is Test {
     ExposureLedger internal ledger;
     MockSwood internal swood;
@@ -306,7 +306,7 @@ contract ExposureLedgerPriceAndScopeTest is Test {
         mgov.setRevertOnRequiredCoverage(true);
 
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), proposalId, guardian);
+        ledger.recordApproval(address(mgov), proposalId, guardian, type(uint256).max);
 
         (address[] memory approvers,) = ledger.pledgedOf(address(mgov), proposalId);
         assertEq(approvers.length, 0, "guardian must not be booked when required coverage is unreadable");
@@ -324,42 +324,9 @@ contract ExposureLedgerPriceAndScopeTest is Test {
         mgov.set(_requiredCoverage6(1_000e18));
 
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), proposalId, guardian);
+        ledger.recordApproval(address(mgov), proposalId, guardian, type(uint256).max);
 
         (address[] memory approvers,) = ledger.pledgedOf(address(mgov), proposalId);
         assertEq(approvers.length, 0, "guardian must not be booked when the vault's asset() is unreadable");
-    }
-
-    /// @notice The same hazard inside `settleCoverage`: once required coverage
-    ///         becomes unreadable between approval and settlement, the
-    ///         permissionless settlement pass must be a no-op retried later,
-    ///         never a revert — and it must not have mutated anything.
-    ///
-    ///         Fails against the pre-fix code (the inline-argument call
-    ///         reverts `settleCoverage` outright), passes against the fix.
-    function test_settleCoverage_requiredCoverageReverts_doesNotRevert() public {
-        uint256 proposalId = 3;
-        uint256 needUsd = 1_000e18;
-
-        swood.setStake(guardian, 10_000e18); // plenty of slashable bond at $2.00
-        mgov.set(_requiredCoverage6(needUsd));
-        mgov.setSchedule(block.timestamp + 1 days, 7 days);
-
-        vm.prank(registry);
-        ledger.recordApproval(address(mgov), proposalId, guardian);
-
-        (, uint256[] memory pledgedBefore) = ledger.pledgedOf(address(mgov), proposalId);
-        assertEq(pledgedBefore.length, 1, "sanity: guardian must have booked before settlement");
-        assertEq(pledgedBefore[0], needUsd, "sanity: guardian must have reserved the full requirement");
-
-        // Close the review window, then make `getRequiredCoverage` start
-        // reverting before the settlement pass runs.
-        vm.warp(mgov.executeBy() + 1);
-        mgov.setRevertOnRequiredCoverage(true);
-
-        ledger.settleCoverage(address(mgov), proposalId); // must not revert
-
-        (, uint256[] memory pledgedAfter) = ledger.pledgedOf(address(mgov), proposalId);
-        assertEq(pledgedAfter[0], pledgedBefore[0], "a failed settlement pass must not mutate the pledge");
     }
 }

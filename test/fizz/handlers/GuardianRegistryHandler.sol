@@ -92,7 +92,7 @@ abstract contract GuardianRegistryHandler is Properties {
     }
 
     function guardianRegistry_voteOnProposal(address governor_, uint256 proposalId, uint8 support) public asActor {
-        registry.voteOnProposal(governor_, proposalId, IGuardianRegistry.GuardianVoteType(support));
+        registry.voteOnProposal(governor_, proposalId, IGuardianRegistry.GuardianVoteType(support), type(uint256).max);
     }
 
     // ── Secondary (owner-gated; dispatcher-only entry) ──

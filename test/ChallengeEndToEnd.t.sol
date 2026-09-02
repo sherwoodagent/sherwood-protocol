@@ -484,15 +484,25 @@ contract ChallengeEndToEndTest is Test {
         //    coverage on the REAL ledger.
         vm.warp(gov.getProposal(pid).voteEnd + 1);
         registry.openReview(address(gov), pid);
-        assertEq(ledger.openExposureUsd(g1), 0, "no exposure before the vote");
+        assertEq(ledger.openExposure(g1), 0, "no exposure before the vote");
+        // g1 DECLARES its whole stake: `type(uint256).max` clamps to the free
+        // budget (`kNumerator x stake - openExposure`, k = 1), so the lock is
+        // the entire 30,000 WOOD bond and a conviction burns all of it — the
+        // shape every dollar figure in the two arcs below was written for.
+        // `test_partialLock_*` is the arc where the lock is smaller than the
+        // bond.
         vm.prank(g1);
-        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve);
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "approve commits the proposal's coverage");
+        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+        assertEq(ledger.openExposure(g1), G1_STAKE, "approve locks the whole declared stake");
 
-        (address[] memory approvers, uint256[] memory shares) = ledger.approversOf(address(gov), pid);
+        (address[] memory approvers, uint256[] memory locks) = ledger.approversOf(address(gov), pid);
         assertEq(approvers.length, 1, "one covering approver");
         assertEq(approvers[0], g1);
-        assertEq(shares[0], COVERAGE_USD, "g1 backed the whole thing");
+        assertEq(locks[0], G1_STAKE, "g1 locked its whole bond");
+        assertEq(ledger.coverageUsdOf(address(gov), pid, g1), 1_500e18, "worth $1,500 at $0.05, uncapped");
+        assertEq(
+            ledger.liabilityUsd(address(gov), pid), COVERAGE_USD, "recoverable for THIS proposal: capped at the need"
+        );
 
         // ── Execute: the §3.3a quorum reads g1's bond live and finds it enough.
         vm.warp(gov.getProposal(pid).reviewEnd + 1);
@@ -558,7 +568,7 @@ contract ChallengeEndToEndTest is Test {
         //    release this commitment and recycle the budget while challenged.
         assertTrue(ledger.isCoverageFrozen(address(gov), pid), "coverage pinned");
         _expectReleaseBlocked(pid);
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "still committed");
+        assertEq(ledger.openExposure(g1), G1_STAKE, "still locked");
 
         // ── The drain settles and a buyer arrives AFTER it. A real deposit —
         //    its shares and its vote checkpoints both move, they just move too
@@ -590,13 +600,12 @@ contract ChallengeEndToEndTest is Test {
         vm.warp(c.filedAt + game.autoSlashDelay());
         game.resolve(cid);
 
-        // ── The verdict landed. PUNITIVE, NOT COMPENSATORY: the approver loses
-        //    its WHOLE bond — not the slice it underwrote — and every wei is
-        //    destroyed rather than paid to anyone.
+        // ── The verdict landed. THE BURN IS THE LOCK: g1 declared its whole
+        //    bond, so its whole bond goes — and every wei is destroyed rather
+        //    than paid to anyone. (A smaller declaration burns a smaller lock;
+        //    see `test_partialLock_*`.)
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "Settled");
-        assertEq(
-            swood.guardianStake(g1), 0, "punitive: the whole bond goes, because a burn has no counterparty to over-pay"
-        );
+        assertEq(swood.guardianStake(g1), 0, "the lock was the whole bond, so the whole bond burns");
         assertEq(
             swoodBalBefore - wood.balanceOf(address(swood)),
             G1_STAKE,
@@ -638,7 +647,7 @@ contract ChallengeEndToEndTest is Test {
         assertFalse(ledger.isCoverageFrozen(address(gov), pid), "unfrozen");
         vm.prank(address(registry));
         ledger.releaseApproval(address(gov), pid, g1);
-        assertEq(ledger.openExposureUsd(g1), 0, "the guardian recycled its budget");
+        assertEq(ledger.openExposure(g1), 0, "the guardian recycled its budget");
 
         // ── CAVEAT EMPTOR. Depositors are NOT made whole: there is no case, no
         //    claim, and no path by which any holder recovers slashed value. The
@@ -784,10 +793,10 @@ contract ChallengeEndToEndTest is Test {
         // ── And the coverage the filing pinned is genuinely free again.
         assertFalse(ledger.isCoverageFrozen(address(gov), pid), "unfrozen on the fail path too");
         assertEq(game.liveChallengeOf(address(gov), pid), 0, "no live challenge remains");
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "still committed until released");
+        assertEq(ledger.openExposure(g1), G1_STAKE, "still locked until released");
         vm.prank(address(registry));
         ledger.releaseApproval(address(gov), pid, g1);
-        assertEq(ledger.openExposureUsd(g1), 0, "the guardian recycled the budget a bad-faith filing had pinned");
+        assertEq(ledger.openExposure(g1), 0, "the guardian recycled the budget a bad-faith filing had pinned");
     }
 
     // ── 3. The proposer bond is a deterrent, not a deposit ─────────────────
@@ -1226,5 +1235,96 @@ contract ChallengeEndToEndTest is Test {
 
         gov.reclaimProposerBond(pid);
         assertEq(wood.balanceOf(agent), agentBalBefore + PROPOSER_BOND, "and the bond goes home the moment it can");
+    }
+
+    // ── 4. Declared coverage locks: the burn is the lock, and only the lock ──
+
+    /// @notice Task 6.4, end to end and with nothing mocked: propose -> approve
+    ///         with a PARTIAL lock -> execute at quorum -> challenge ->
+    ///         conviction burns EXACTLY the lock under the envelope -> an
+    ///         unrelated proposal the same guardian also backs is unaffected,
+    ///         and a stake top-up landed after the drain neither shields the
+    ///         lock nor is burned (spec: "Post-drain top-up does not dilute
+    ///         the burn").
+    ///
+    ///         g1 holds 30,000 WOOD and declares 15,000 on P (5,000 bps of the
+    ///         at-execution basis, inside the [1,000, 10,000] envelope so the
+    ///         clamp is inert). It then backs Q with the other 15,000 — at
+    ///         k = 1 that is exactly its remaining budget — and tops up a
+    ///         further 30,000 after P executed. The verdict on P burns 15,000:
+    ///         `slashBpsFor` prices the lock over `slashableStakeAt(g1,
+    ///         executedAt)` = 30,000, so the top-up is outside the basis, and
+    ///         `_slashOne` multiplies that same basis. 45,000 remains — Q's
+    ///         lock, and then some.
+    function test_partialLock_convictionBurnsExactlyTheLockAndSparesTheOtherProposal() public {
+        // ── P: proposed, approved with a HALF-stake lock, executed.
+        uint256 pid = _propose();
+        vm.warp(gov.getProposal(pid).voteEnd + 1);
+        registry.openReview(address(gov), pid);
+        vm.prank(g1);
+        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve, G1_STAKE / 2);
+        assertEq(ledger.lockOf(address(gov), pid, g1), 15_000e18, "half the stake locked on P");
+        assertEq(ledger.coverageUsdOf(address(gov), pid, g1), 750e18, "$750 of coverage against the $500 need");
+        vm.warp(gov.getProposal(pid).reviewEnd + 1);
+        gov.executeProposal(pid);
+        assertEq(_state(pid), uint256(ISyndicateGovernor.ProposalState.Executed), "executed at quorum on the lock");
+        uint256 executedAt = gov.getProposal(pid).executedAt;
+        (, uint256[] memory rateAtExecute) = ledger.slashBpsFor(address(gov), pid);
+        assertEq(rateAtExecute[0], 5_000, "15,000 over the 30,000 basis");
+
+        // ── The challenge. The bond is sized off the capped liability: the lock
+        //    is worth $750 but the need is $500.
+        vm.prank(challenger);
+        uint256 cid = game.file(
+            address(gov),
+            pid,
+            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            address(adapter),
+            adapter.poke.selector,
+            "ipfs://evidence/partial-lock"
+        );
+        IChallengeGame.Challenge memory c = game.challengeOf(cid);
+        assertEq(c.frozenCoverageUsd, COVERAGE_USD, "liability capped at the need, not the $750 lock");
+        assertEq(c.bondWood, _challengerBond(), "so the challenger bond is the standard one");
+
+        // ── P settles, which lets the vault take Q.
+        vm.warp(executedAt + 1 hours + 1);
+        vm.prank(agent);
+        gov.settleProposal(pid);
+
+        // ── Q: the unrelated proposal g1 also backs, with the OTHER half.
+        uint256 qid = _propose();
+        vm.warp(gov.getProposal(qid).voteEnd + 1);
+        registry.openReview(address(gov), qid);
+        vm.prank(g1);
+        registry.voteOnProposal(address(gov), qid, IGuardianRegistry.GuardianVoteType.Approve, G1_STAKE / 2);
+        assertEq(ledger.lockOf(address(gov), qid, g1), 15_000e18, "the other half locked on Q");
+        assertEq(ledger.openExposure(g1), G1_STAKE, "k = 1: the two locks exactly exhaust the stake");
+        assertEq(ledger.coverageUsdOf(address(gov), qid, g1), 750e18, "Q's coverage from g1, before");
+
+        // ── The post-drain top-up: 30,000 more WOOD, staked AFTER P executed.
+        _stakeGuardian(g1, 30_000e18, 1);
+        assertEq(swood.guardianStake(g1), 60_000e18, "live stake doubled");
+        assertEq(swood.slashableStakeAt(g1, executedAt), 30_000e18, "the verdict basis excludes the top-up");
+        (, uint256[] memory rateAfterTopUp) = ledger.slashBpsFor(address(gov), pid);
+        assertEq(rateAfterTopUp[0], 5_000, "the rate is over the anchored basis, so the top-up does not dilute it");
+
+        // ── Silence; the verdict lands.
+        vm.warp(c.filedAt + game.autoSlashDelay());
+        uint256 swoodBalBefore = wood.balanceOf(address(swood));
+        game.resolve(cid);
+        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "Settled");
+
+        // THE BURN IS THE LOCK: 5,000 bps of the 30,000 basis == 15,000 WOOD,
+        // no more (the top-up is untouched) and no less (the envelope did not
+        // bind).
+        assertEq(swoodBalBefore - wood.balanceOf(address(swood)), 15_000e18, "burned exactly the lock");
+        assertEq(swood.guardianStake(g1), 45_000e18, "the top-up and the other half are still staked");
+
+        // Q IS UNAFFECTED: same lock, same coverage, still fully collectable.
+        assertEq(ledger.lockOf(address(gov), qid, g1), 15_000e18, "Q's lock is intact");
+        assertEq(ledger.coverageUsdOf(address(gov), qid, g1), 750e18, "Q's coverage from g1 is unchanged");
+        assertEq(ledger.liabilityUsd(address(gov), qid), COVERAGE_USD, "Q remains fully covered");
+        assertFalse(ledger.isCoverageFrozen(address(gov), qid), "and was never frozen by P's challenge");
     }
 }

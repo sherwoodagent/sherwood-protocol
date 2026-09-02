@@ -23,6 +23,7 @@ contract GuardianRegistry_severityPauseAndBasisTest is RegistryTestHarness {
 
     function setUp() public {
         _deployRegistryAndSwood(REVIEW_PERIOD, BLOCK_QUORUM_BPS);
+        _wireFullLockLedger(); // review-path slashes need locks to burn against
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -60,9 +61,9 @@ contract GuardianRegistry_severityPauseAndBasisTest is RegistryTestHarness {
         registry.openReview(address(governor), PID);
 
         vm.prank(approver1);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(blocker1);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         // THE ATTACK: the review is decided but not yet committed, and the
         // owner of sWOOD — the same multisig that owns the registry, per
@@ -122,7 +123,7 @@ contract GuardianRegistry_severityPauseAndBasisTest is RegistryTestHarness {
         registry.openReview(address(governor), PID);
 
         vm.prank(blocker1);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(reviewEnd);
         // 20_000e18 raw against a 50_000e18 raw denominator is 4000 bps, clear
@@ -221,9 +222,9 @@ contract GuardianRegistry_severityPauseAndBasisTest is RegistryTestHarness {
         registry.openReview(address(governor), PID);
 
         vm.prank(approver1);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(blocker1);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         // The pre-upgrade state: both appended fields read zero.
         _zeroSeverityEnvelopeAtOpen(PID);
@@ -278,9 +279,9 @@ contract GuardianRegistry_severityPauseAndBasisTest is RegistryTestHarness {
         registry.openReview(address(governor), PID);
 
         vm.prank(approver1);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(blocker1);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         // THE ATTACK, mirrored: the review is decided but not yet committed and
         // the owner now raises the envelope to the ceiling.
@@ -354,7 +355,7 @@ contract GuardianRegistry_severityPauseAndBasisTest is RegistryTestHarness {
         // And the deferred window is genuinely usable.
         registry.openReview(address(governor), PID);
         vm.prank(blocker1);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 2 hours);
         assertTrue(

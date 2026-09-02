@@ -203,10 +203,16 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
         });
     }
 
+    /// @dev Stake `g` and lock its WHOLE stake against `pid`: `type(uint256).max`
+    ///      clamps to the free budget (`kNumerator x stake - openExposure`, k = 1),
+    ///      so the quorum's `min(lock, slashable stake) x price` is exactly the
+    ///      stake at $0.05/WOOD and the stake figure stays the one knob the
+    ///      coverage-ratio tests below reason about.
     function _seatApprover(uint256 pid, address g, uint256 ownStake) internal {
         swood.setStake(g, ownStake);
         vm.prank(ledgerRegistry);
-        ledger.recordApproval(address(governor), pid, g);
+        ledger.recordApproval(address(governor), pid, g, type(uint256).max);
+        assertEq(ledger.lockOf(address(governor), pid, g), ownStake, "fixture: lock == whole stake");
     }
 
     function _toApproved(uint256 pid) internal {

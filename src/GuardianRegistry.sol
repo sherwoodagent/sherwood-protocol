@@ -1255,7 +1255,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      `ExposureLedger.slashBpsForAt`, the SAME formula the verdict path's
     ///      `slashBpsFor` uses, so the two paths cannot drift; this function
     ///      contributes the severity multiplier and the at-open envelope, nothing
-    ///      else. sWOOD then applies only its LIVE `maxSlashBps` as a ceiling.
+    ///      else. sWOOD applies NO live bound afterwards (only a constant
+    ///      saturation at 10_000): a live ceiling would let the owner zero
+    ///      `maxSlashBps` mid-review and nullify the burn, the mirror of #11.
     ///
     ///      THE ENVELOPE IS THE AT-OPEN ONE, NOT THE LIVE ONE (pashov review
     ///      finding #11). The adversary here is the OWNER: with the floor read
@@ -1324,8 +1326,15 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // ceil: a non-zero lock at a non-zero severity never rounds to 0.
             uint256 bps = (lockBps * severity + 10_000 - 1) / 10_000;
             // At-open envelope, per element. A zero product (zero severity) is
-            // left at zero: zero is the absence of liability, not a rate to floor.
-            if (bps == 0) continue;
+            // WRITTEN as zero, not skipped: the slot still holds the raw lock
+            // rate from the ledger, and leaving it there would hand sWOOD a
+            // full-lock rate under a legally-zero envelope (`test_reviewItem5_
+            // legalZeroEnvelopeIsNotMistakenForAnUnsetField`). Zero is the
+            // absence of liability, not a rate to floor.
+            if (bps == 0) {
+                bpsPer[i] = 0;
+                continue;
+            }
             bpsPer[i] = Math.min(Math.max(bps, lo), hi);
         }
     }

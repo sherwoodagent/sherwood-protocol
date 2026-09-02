@@ -1244,22 +1244,21 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      bps-of-basis leg expects. The adversary is a guardian who backed a bad
     ///      proposal with a small lock while holding a large bond: it loses the
     ///      lock scaled by severity, and never less than the floor below.
-    /// @dev LIVE CEILING ONLY, NO LIVE FLOOR — AND THAT ASYMMETRY IS THE POINT.
-    ///      Every non-zero element of `slashBpsPer` is capped at the LIVE
-    ///      `maxSlashBps` here, per element (the envelope is a per-guardian
-    ///      bound; hoisting it would let one approver's rate set everyone's).
-    ///      The `minSlashBps` floor is deliberately NOT applied on this path: it
-    ///      is the REGISTRY's job, against the envelope it SNAPSHOTTED at review
-    ///      open (`Review.minSlashBpsAtOpen` / `maxSlashBpsAtOpen` — pashov review
-    ///      finding #11). Flooring against the live slot here would let the owner
-    ///      raise `minSlashBps` between open and resolve and so raise what an
-    ///      ALREADY-DECIDED review costs the cohort that voted under the old
-    ///      terms — the exact mid-review mutability #11 closed. The live max is
-    ///      kept because it can only move the burn DOWN: lowering a ceiling after
-    ///      the fact protects guardians and harms no one, and it is a last-resort
-    ///      brake governance keeps against a rate the registry mis-sized. So the
-    ///      floor a guardian pays is the one that was law when the review
-    ///      opened, and the ceiling is the tighter of then and now.
+    /// @dev NO LIVE ENVELOPE ON THIS PATH, IN EITHER DIRECTION. Both bounds are
+    ///      the REGISTRY's job, against the envelope it SNAPSHOTTED at review
+    ///      open (`Review.minSlashBpsAtOpen` / `maxSlashBpsAtOpen` — pashov
+    ///      review finding #11). Flooring against the live `minSlashBps` here
+    ///      would let the owner raise what an ALREADY-DECIDED review costs the
+    ///      cohort that voted under the old terms; capping against the live
+    ///      `maxSlashBps` is the same hole mirrored — the owner zeroes the
+    ///      ceiling between open and resolve and the burn is nullified, which
+    ///      `test_finding11_severityUsesAtOpenEnvelope_notLiveSlots` pins. A
+    ///      "guardian-protective" live ceiling is not protective when the same
+    ///      multisig owns the registry. The one cap kept is arithmetic:
+    ///      `_slashOne` multiplies by `bps / 10_000`, so a rate above 100%
+    ///      would burn more than the basis; saturating at 10_000 is a constant
+    ///      no role controls. Per element, never hoisted: the envelope is a
+    ///      per-guardian bound, and one approver's rate must not set everyone's.
     ///      `slashVerdict` keeps its full live clamp; its caller has no at-open
     ///      snapshot to floor against.
     /// @dev `minSlashBps` REMAINS THE SINGLE DETERRENCE FLOOR OF THE LOCK MODEL —
@@ -1288,9 +1287,9 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///        the one the registry sized the rates from.
     /// @param approvers   The approver addresses to slash.
     /// @param slashBpsPer Per-approver slash fractions in bps, positionally
-    ///        aligned with `approvers`, already floored by the registry against
-    ///        the at-open envelope; each capped independently at the live
-    ///        `maxSlashBps` here; zero skips.
+    ///        aligned with `approvers`, already clamped by the registry into
+    ///        the at-open `[minSlashBps, maxSlashBps]` envelope; saturated at
+    ///        10_000 here (never the live slots); zero skips.
     /// @return total      Total WOOD burned across all approvers.
     function slashGuardians(
         bytes32 reviewKey,
@@ -1303,10 +1302,17 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
             // ZERO IS NOT A SEVERITY — see the natspec. Skips the cap entirely.
             uint256 requested = slashBpsPer[i];
             if (requested == 0) continue;
-            // Live CEILING only. The floor was applied by the registry against
-            // the at-open snapshot — see the natspec for why it must not be
-            // re-applied against the live slot here.
-            uint256 bps = Math.min(requested, maxSlashBps);
+            // NO LIVE ENVELOPE HERE, in either direction. The registry already
+            // clamped the rate into the envelope snapshotted at review open
+            // (pashov review #11): re-applying the live floor would let the
+            // owner raise what a decided review costs, and re-applying the
+            // live CEILING would let the same owner zero `maxSlashBps` between
+            // open and resolve and nullify the burn — the mirror of #11, which
+            // `test_finding11_severityUsesAtOpenEnvelope_notLiveSlots` pins.
+            // The only cap is the arithmetic one: `_slashOne` multiplies by
+            // `bps / 10_000`, so a rate above 100% would burn more than the
+            // basis. That saturation is a constant, owned by no one.
+            uint256 bps = Math.min(requested, 10_000);
             total += _slashOne(reviewKey, openedAt, approvers[i], bps);
         }
         if (total == 0) return 0;

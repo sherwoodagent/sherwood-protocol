@@ -1,7 +1,7 @@
 ## 1. Clear the ground
 
 - [x] 1.1 Archive `settle-coverage-self-trigger` WITHOUT merging its delta into the main `syndicate-governor` spec (design D7); record in the archive note that this change deletes the mechanism it wired.
-- [ ] 1.2 Pin the reproduction: convert `test/audit-fixes/ExposureLedger_she212PhantomCapacity.t.sol` from a failing exploit into a "cannot happen" test against the new model (asserts a second lock is refused while the first is live, and that a retired lock frees budget). Keep the attack narrative in its natspec.
+- [x] 1.2 Pin the reproduction: convert `test/audit-fixes/ExposureLedger_she212PhantomCapacity.t.sol` from a failing exploit into a "cannot happen" test against the new model (asserts a second lock is refused while the first is live, and that a retired lock frees budget). Keep the attack narrative in its natspec.
 - [x] 1.3 Inventory every `settleCoverage` call site (36) and every full-reservation assumption in `test/`; list them in the PR description so the rewrite in §6 is auditable.
 
 ## 2. ExposureLedger — the lock replaces booking and pledge
@@ -19,8 +19,8 @@
 ## 3. GuardianRegistry — carry the declaration
 
 - [x] 3.1 Add a `lockWood` parameter to the approve vote path (`voteOnProposal` or a sibling overload; pick one and delete the other so there is a single entry) and forward it to `recordApproval`.
-- [ ] 3.2 Vote-change round trip: `Approve → Block → Approve` must release and re-lock cleanly with the new signature; pin with a test.
-- [ ] 3.3 Update `IGuardianRegistry` and every registry stand-in in `test/` that implements the approve path (grep `function voteOnProposal`).
+- [x] 3.2 Vote-change round trip: `Approve → Block → Approve` must release and re-lock cleanly with the new signature; pin with a test.
+- [x] 3.3 Update `IGuardianRegistry` and every registry stand-in in `test/` that implements the approve path (grep `function voteOnProposal`).
 
 ## 4. StakedWood and ChallengeGame — burn the lock
 
@@ -28,8 +28,8 @@
 - [x] 4.2 `ChallengeGame._accusedWithRates`: consume the lock-derived rates; confirm zero-lock approvers are still filtered out.
 - [x] 4.3 `ChallengeGame.file`: size the bond off the capped `liabilityUsd`; remove the try/catch fallback that substitutes the uncapped sum on failure — a stale feed must make filing wait, never enlarge the bond (spec: "Challenger bond sized to the coverage the filing freezes").
 - [x] 3.4 Review-path slash carries the lock basis (design D3 — BOTH slash paths): `GuardianRegistry._reviewSlashRates` reads `ledger.slashBpsForAt(gov, pid, openedAt + 1)` (the `+1` because `Review.openedAt` is stored pre-hardened as `T−1` and `slashableStakeAt` subtracts one again — passing raw `openedAt` would size the rate off `T−2` while `_slashOne` burns off `T−1`) and multiplies each non-zero rate by the block-decisiveness severity with ceil. The product is clamped into the envelope SNAPSHOTTED AT OPEN via `_envelopeAtOpen(r)`, the helper `_severityBps` also reads (pashov #11) — never live.
-- [x] 4.5 `StakedWood.slashGuardians(reviewKey, openedAt, approvers, uint256[] slashBpsPer)` — done, golden diffs zero. Applies only the LIVE `maxSlashBps` cap (guardian-protective); the at-open floor is the registry's job (3.4). `slashVerdict` keeps its pre-existing live clamp (out of scope; noted).
-- [ ] 4.4 (script DONE; `test/deploy` pin pending §6) `script/DeployPlanB.s.sol`: rewrite the `maxSlashBps == 10_000` pre-flight's message to the lock rationale (a lock may equal the whole stake and must burn in full) and ADD a pre-broadcast `minSlashBps != 0` pre-flight naming it the deterrence floor (spec: deployment-docs "Plan B deployment pre-flights and wiring"). Pin both with `test/deploy/` cases that run the script against a mis-set sWOOD and assert the revert message.
+- [x] 4.5 `StakedWood.slashGuardians(reviewKey, openedAt, approvers, uint256[] slashBpsPer)` — done, golden diffs zero. Applies NO live bound (a live ceiling reopened pashov #11 in the zero direction — `test_finding11_severityUsesAtOpenEnvelope_notLiveSlots` caught it in §6); only a constant 10_000 saturation. Both bounds are the registry's at-open job (3.4), and a zero lock-times-severity product is written as 0, never left as the raw lock rate. `slashVerdict` keeps its pre-existing live clamp (out of scope; noted).
+- [x] 4.4 (script DONE; `test/deploy` pin pending §6) `script/DeployPlanB.s.sol`: rewrite the `maxSlashBps == 10_000` pre-flight's message to the lock rationale (a lock may equal the whole stake and must burn in full) and ADD a pre-broadcast `minSlashBps != 0` pre-flight naming it the deterrence floor (spec: deployment-docs "Plan B deployment pre-flights and wiring"). Pin both with `test/deploy/` cases that run the script against a mis-set sWOOD and assert the revert message.
 
 ## 5. SyndicateGovernor — remove the trigger
 
@@ -38,12 +38,12 @@
 
 ## 6. Tests
 
-- [ ] 6.1 Rewrite every fixture from §1.3 to declared locks; delete tests whose only subject was `settleCoverage`, and re-home any assertion they carried about bucket expiry or retirement onto the surviving paths.
-- [ ] 6.2 New ledger tests: over-subscribed cohort locks in full; declaration clamped to free budget; unpriceable WOOD still locks; `slashBpsFor` at lock < stake, lock ≥ stake, zero lock, and the 1-wei floor case; `liabilityUsd` capped at need and below need.
-- [ ] 6.3 Containment test at k = 1: guardian backs A and B, A convicted, assert B's coverage from that guardian is unchanged. Leverage test at k = 2: assert the documented under-coverage appears — this pins the property the spec now states.
-- [ ] 6.4 End-to-end: propose → approve with locks → execute at quorum → challenge → conviction burns exactly the locks (under the envelope) → other proposals unaffected. Extend `CoverageEndToEnd` / `ChallengeEndToEnd` rather than adding a parallel harness.
-- [ ] 6.5 Mutation-verify the two load-bearing pins: (a) reintroduce a pro-rata write-down and confirm the over-subscription test fails; (b) make `slashBpsFor` return the whole-bond ceiling and confirm the containment test fails.
-- [ ] 6.6 Full non-fork suite green; `forge fmt --check` clean under the CI-pinned forge; contract sizes within the 98,304-byte limit; both layout goldens as expected (ledger regenerated, governor zero-diff).
+- [x] 6.1 Rewrite every fixture from §1.3 to declared locks; delete tests whose only subject was `settleCoverage`, and re-home any assertion they carried about bucket expiry or retirement onto the surviving paths.
+- [x] 6.2 New ledger tests: over-subscribed cohort locks in full; declaration clamped to free budget; unpriceable WOOD still locks; `slashBpsFor` at lock < stake, lock ≥ stake, zero lock, and the 1-wei floor case; `liabilityUsd` capped at need and below need.
+- [x] 6.3 Containment test at k = 1: guardian backs A and B, A convicted, assert B's coverage from that guardian is unchanged. Leverage test at k = 2: assert the documented under-coverage appears — this pins the property the spec now states.
+- [x] 6.4 End-to-end: propose → approve with locks → execute at quorum → challenge → conviction burns exactly the locks (under the envelope) → other proposals unaffected. Extend `CoverageEndToEnd` / `ChallengeEndToEnd` rather than adding a parallel harness.
+- [x] 6.5 (A caught by 4 tests, B caught by 4 tests; ledger restored byte-identical) Mutation-verify the two load-bearing pins: (a) reintroduce a pro-rata write-down and confirm the over-subscription test fails; (b) make `slashBpsFor` return the whole-bond ceiling and confirm the containment test fails.
+- [x] 6.6 (2869 passed, 0 failed, 1 skipped over 189 suites incl. test/deploy; fmt clean; goldens OK; max runtime 43,897 < 98,304) Full non-fork suite green; `forge fmt --check` clean under the CI-pinned forge; contract sizes within the 98,304-byte limit; both layout goldens as expected (ledger regenerated, governor zero-diff).
 
 ## 7. Off-chain and docs
 
