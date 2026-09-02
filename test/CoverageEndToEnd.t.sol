@@ -88,6 +88,14 @@ contract NoopAdapter {
 ///           - proposerBondBps 100 (1%) ⇒ $10 ⇒ 200 WOOD at the $0.05 haircut
 ///           - guardian bonds: 20_000 WOOD == $1,000, 30_000 WOOD == $1,500
 contract CoverageEndToEndTest is Test {
+    /// @dev This contract stands in for the challenge game as `coverageFreezer`
+    ///      in some tests; `ExposureLedger.setCoverageFreezer` requires a
+    ///      code-bearing freezer to answer `challengeWindow()` and refuses one
+    ///      above the ledger's. Zero is always under it.
+    function challengeWindow() external pure returns (uint256) {
+        return 0;
+    }
+
     // ── Shared infrastructure ──
     ERC20Mock public usdg; // vault asset, 6-dec, $1.00
     ERC20Mock public wood; // stake + bond token, 18-dec

@@ -64,15 +64,19 @@ while any proposal is open (`whenNoActiveProposal`). Bounds are hardcoded in
 | 3. Execution window | `executionWindow` | 24 h | 1 h | 7 d | `GovernorParameters.sol:338` |
 | 4. Strategy duration | `minStrategyDuration` / `maxStrategyDuration` | 1 h / 30 d | 1 h absolute | 30 d absolute, clamped by `ProtocolConfig.maxStrategyDuration` (≥ 1 d when set) | `GovernorParameters.sol:250-268` |
 | 5. Cooldown before next strategy | `cooldownPeriod` | 1 h | 1 h (mainnet floor; absolute 1 min) | 30 d | `GovernorParameters.sol:350` |
-| Post-settle challenge window | `ExposureLedger.challengeWindow` | 14 d | > 0 and ≥ `ChallengeGame.challengeWindow` (when the game is wired) | scan-bounded (16 buckets over 28-d epochs) | `ExposureLedger.sol:837-857` |
+| Post-settle challenge window | `ExposureLedger.challengeWindow` | 14 d | > 0 and ≥ `ChallengeGame.challengeWindow` (enforced at both `setChallengeWindow` and `setCoverageFreezer`; a wired game must answer `challengeWindow()`) | scan-bounded (16 buckets over 28-d epochs) | `ExposureLedger.setChallengeWindow` / `setCoverageFreezer` |
 
 Cross-contract timing invariants (all enforced at the setters):
 
 - `reviewPeriod ≤ StakedWood.coolDownPeriod` — a guardian cannot unstake faster than
   a review they might have to answer for (`GuardianRegistry.sol:1004`).
 - `ledger.challengeWindow ≥ ChallengeGame.challengeWindow` — the ledger's
-  `retireApproval` gate may not open before the game's `file` deadline closes
-  (`ExposureLedger.setChallengeWindow`). There is deliberately NO
+  `retireApproval` gate may not open before the game's `file` deadline closes.
+  Enforced at `ExposureLedger.setChallengeWindow` AND `setCoverageFreezer`
+  (so `unwire → shrink → re-wire` cannot reach the gap), and the read of the
+  game's window fails closed: a code-bearing freezer that does not answer
+  `challengeWindow()` is refused. `ChallengeGame`'s own three sites floor the
+  game under the ledger. There is deliberately NO
   `reviewPeriod + executionWindow` floor: coverage is booked into the epoch
   containing settlement, so a bucket outlives the proposal it backs for any
   positive window.

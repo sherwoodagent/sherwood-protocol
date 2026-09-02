@@ -83,7 +83,7 @@ stake to cover it before execution.
 
 | Parameter | Default | Min | Max | Setter |
 |---|---|---|---|---|
-| `challengeWindow` | 14 d | > 0 and ≥ `ChallengeGame.challengeWindow` | scan-bounded (16 buckets) | `ExposureLedger.sol:837` |
+| `challengeWindow` | 14 d | > 0 and ≥ `ChallengeGame.challengeWindow` (checked at `setChallengeWindow` and `setCoverageFreezer`) | scan-bounded (16 buckets) | `ExposureLedger.setChallengeWindow` |
 | `epochLength` | 28 d (immutable) | — | — | ctor |
 | `MAX_COVERAGE_HORIZON` | 60 d | const | const | `ExposureLedger.sol:151` |
 | `proposerBondBps` | 100 (1%) | 0 | 100% | `ExposureLedger.sol:892` |

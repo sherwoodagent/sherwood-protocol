@@ -145,7 +145,9 @@ contract MockChallengeGameWindow {
 ///         ledger.challengeWindow()` in three places, none of which re-fire
 ///         when the LEDGER's window shrinks afterward. Fixed by mirroring the
 ///         check back in `setChallengeWindow` against `coverageFreezer`
-///         (which IS the game address).
+///         (which IS the game address) — and, since the SHE-231 review, in
+///         `setCoverageFreezer` too, so the wiring step cannot reach the
+///         same state from the other side.
 ///
 ///         CAUTION RESOLUTION (`test_setChallengeWindow_toleratesACodelessGuardianRegistry`):
 ///         `setGuardianRegistry` admits a registry TOLERANTLY (any nonzero
@@ -454,14 +456,16 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
     ///         shrink below succeeds), passes against the fix.
     function test_setChallengeWindow_cannotShrinkBelowTheWiredGameWindow() public {
         MockChallengeGameWindow game = new MockChallengeGameWindow(20 days);
-        vm.prank(owner);
-        ledger.setCoverageFreezer(address(game));
 
-        // Bump the ledger's window above the game's first, isolating the
-        // SHRINK direction finding D is about.
+        // Bump the ledger's window above the game's FIRST: `setCoverageFreezer`
+        // now mirrors the same bound (SHE-231 review, finding 2), so a 20d game
+        // cannot be wired onto a 14d ledger. This isolates the SHRINK direction
+        // finding D is about.
         vm.prank(owner);
         ledger.setChallengeWindow(25 days);
         assertEq(ledger.challengeWindow(), 25 days);
+        vm.prank(owner);
+        ledger.setCoverageFreezer(address(game));
 
         // Shrinking below the game's own 20d window must revert.
         vm.prank(owner);

@@ -224,7 +224,7 @@ The bucket walk in `openExposureUsd` SHALL be bounded by `MAX_SCAN_BUCKETS = 16`
 - **THEN** the call reverts `CoverageFrozen`; the rotation is deferred, not forbidden
 
 ### Requirement: Challenge window bounds
-`setChallengeWindow` SHALL reject zero, SHALL enforce the scan bound, and — when a `coverageFreezer` (the challenge game) is wired and answers `challengeWindow()` — SHALL reject a window below the game's own, since the game's `file` deadline is keyed off its window and the ledger's `retireApproval` gate off this one. The window applies retroactively to already-booked buckets: shrinking it frees coverage early, growing it re-counts expired buckets.
+`setChallengeWindow` SHALL reject zero, SHALL enforce the scan bound, and — when a code-bearing `coverageFreezer` (the challenge game) is wired — SHALL reject a window below the game's own, since the game's `file` deadline is keyed off its window and the ledger's `retireApproval` gate off this one. The read of the game's window SHALL fail closed: a code-bearing freezer that does not answer `challengeWindow()` makes the call revert `InvalidParameter` rather than dropping the bound. `setCoverageFreezer` SHALL mirror the same bound — a code-bearing freezer whose `challengeWindow()` exceeds the ledger's, or that cannot answer it, SHALL be refused — so that neither wiring a longer-windowed game nor `unwire → shrink → re-wire` can reach `game.challengeWindow > ledger.challengeWindow`. A codeless freezer SHALL be accepted by both (it cannot file). The window applies retroactively to already-booked buckets: shrinking it frees coverage early, growing it re-counts expired buckets.
 
 There SHALL be no `reviewPeriod + execution window` floor on the challenge window, in this setter, in `setGuardianRegistry`, or in the registry's `setReviewPeriod` / `setExposureLedger`. The anti-batching property (one bond cannot cover two live drains across an epoch boundary) is carried by the booking rule in "Epoch-bucketed exposure accounting": a bucket ends after the settlement it contains, so `bucketEnd + challengeWindow > coverUntil + challengeWindow` for every positive window. Guardian lock duration therefore tracks the proposal's own settlement plus the challenge window, not `reviewPeriod + 7 days`.
 
@@ -235,6 +235,18 @@ There SHALL be no `reviewPeriod + execution window` floor on the challenge windo
 #### Scenario: Window below the wired game's window
 - **WHEN** the owner sets a challenge window below `coverageFreezer.challengeWindow()`
 - **THEN** the call reverts `InvalidParameter`
+
+#### Scenario: Wiring a game whose window is above the ledger's
+- **WHEN** the owner calls `setCoverageFreezer` with a code-bearing freezer whose `challengeWindow()` exceeds `ledger.challengeWindow`
+- **THEN** the call reverts `InvalidParameter`
+
+#### Scenario: Unwire, shrink, re-wire
+- **WHEN** the owner unwires the freezer, shrinks the challenge window below the game's, and re-wires the same game
+- **THEN** the re-wire reverts `InvalidParameter`; raising the ledger's window back to at least the game's lets it succeed
+
+#### Scenario: Freezer that cannot answer
+- **WHEN** a code-bearing freezer does not answer `challengeWindow()` — at wiring, or later while `setChallengeWindow` runs
+- **THEN** the call reverts `InvalidParameter`; a codeless freezer is accepted
 
 #### Scenario: Anti-batching holds at a short window
 - **WHEN** the challenge window is 1 day, a proposal approved in epoch N settles in epoch N+1, and epoch N's bucket-plus-window has elapsed while the proposal is still executable
