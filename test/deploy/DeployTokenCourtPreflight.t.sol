@@ -350,8 +350,10 @@ contract DeployTokenCourtPreflightTest is Test {
     /// @dev PRE-FLIGHT 5 (a): Plan D's coverage-freezer role lost.
     function test_wirePreflight_bites_whenPlanDLostTheCoverageFreezer() public {
         _deployAndSetCourtEnv();
+        // Hoisted: a call in argument position would consume the prank.
+        address stub = address(new MockCoverageFreezer(ledger.challengeWindow()));
         vm.prank(DEFAULT_SENDER);
-        ledger.setCoverageFreezer(address(new MockCoverageFreezer(ledger.challengeWindow())));
+        ledger.setCoverageFreezer(stub);
         _runWireExpecting("PRE-FLIGHT: ExposureLedger.coverageFreezer != CHALLENGE_GAME.");
     }
 

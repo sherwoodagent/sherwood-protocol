@@ -189,8 +189,10 @@ contract DeployPlanDPreflightTest is Test {
     ///      `setCoverageFreezer` outright, and a script that clobbered instead
     ///      of refusing would have left no way back.
     function test_preflight_bites_whenCoverageFreezerIsAlreadyHeld() public {
+        // Hoisted: a call in argument position would consume the prank.
+        address stub = address(new MockCoverageFreezer(ledger.challengeWindow()));
         vm.prank(DEFAULT_SENDER);
-        ledger.setCoverageFreezer(address(new MockCoverageFreezer(ledger.challengeWindow())));
+        ledger.setCoverageFreezer(stub);
         _runExpecting("PRE-FLIGHT: ExposureLedger.coverageFreezer already set.");
     }
 
