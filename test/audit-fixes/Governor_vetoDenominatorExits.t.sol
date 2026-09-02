@@ -501,6 +501,231 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(governor.getProposal(pid).votesAgainst, delegated, "delegated weight must survive the live-votes cap");
     }
 
+    // ── 5. RE-REVIEW OF #286 — the ballot follows the VOTER's weight ──────
+    //
+    // Keying the rescission on the BURNING address left the ballot attached
+    // to an account and the capital free to leave through another: vote, move
+    // the shares, redeem them elsewhere. The denominator fell by the full
+    // amount, the ballot stayed, and 29% forced a veto against a 40% bar with
+    // every cent returned. A ballot is a claim on voting weight, so it now
+    // tracks the weight of the address that cast it — recomputed against live
+    // `getVotes` whenever that weight moves, by transfer, burn or delegation.
+
+    /// @notice Vote, transfer the shares to a second address, redeem there.
+    /// @dev    The burner never voted, so a burner-keyed lookup found nothing to
+    ///         rescind. The transfer itself now empties the ballot: lp2's live
+    ///         weight is zero the moment the shares leave, whoever burns them.
+    function test_she205_voteThenLaunderThenBurn_cannotForceAVeto() public {
+        _deposit(lp1, 70_000e6);
+        _deposit(lp2, 30_000e6);
+        uint256 pid = _propose();
+
+        vm.prank(lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+
+        uint256 bal = vault.balanceOf(lp2);
+        vm.prank(lp2);
+        vault.transfer(helper, bal);
+        _exitAll(helper);
+
+        assertEq(usdc.balanceOf(helper), 30_000e6, "control: the capital came back in full");
+        assertEq(governor.getProposal(pid).votesAgainst, 0, "the ballot must leave with the weight");
+        assertEq(
+            uint256(_stateAfterVoting(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Approved),
+            "30% must not veto a 40% bar by burning from a second address"
+        );
+    }
+
+    /// @notice The delegatee votes; the underlying holder redeems.
+    /// @dev    The ballot lives under the delegatee, the burn is reported for
+    ///         the holder. Resolving the voter through the delegation graph is
+    ///         what connects the two.
+    function test_she205_delegateeVotes_holderExits_cannotForceAVeto() public {
+        _deposit(lp1, 70_000e6);
+        _deposit(lp2, 30_000e6);
+        vm.prank(lp2);
+        vault.delegate(helper);
+        vm.warp(vm.getBlockTimestamp() + 1);
+        uint256 pid = _propose();
+
+        vm.prank(helper);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        _exitAll(lp2);
+
+        assertEq(governor.getProposal(pid).votesAgainst, 0, "a delegatee's ballot must fall with the holder's exit");
+        assertEq(
+            uint256(_stateAfterVoting(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Approved),
+            "30% must not veto a 40% bar through a delegatee"
+        );
+    }
+
+    /// @notice The delegatee votes; the holder re-delegates to itself, then redeems.
+    /// @dev    Resolving `delegates(from)` at burn time is not enough on its own:
+    ///         after the re-delegation the holder's delegate is the holder, and
+    ///         the delegatee's ballot would survive the burn. Delegation moves
+    ///         weight too, so it is reported like a transfer.
+    function test_she205_delegateeVotes_holderRedelegatesThenExits_cannotForceAVeto() public {
+        _deposit(lp1, 70_000e6);
+        _deposit(lp2, 30_000e6);
+        vm.prank(lp2);
+        vault.delegate(helper);
+        vm.warp(vm.getBlockTimestamp() + 1);
+        uint256 pid = _propose();
+
+        vm.prank(helper);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        vm.prank(lp2);
+        vault.delegate(lp2);
+        assertEq(governor.getProposal(pid).votesAgainst, 0, "re-delegation moves the weight out from under the ballot");
+
+        _exitAll(lp2);
+        assertEq(
+            uint256(_stateAfterVoting(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Approved),
+            "30% must not veto a 40% bar by re-delegating before the exit"
+        );
+    }
+
+    /// @notice The ballot is recomputed, not decremented: weight that returns
+    ///         restores it.
+    /// @dev    Keeps finding 3 of the first review closed under the new rule.
+    ///         An honest voter who sends shares out and takes them back ends
+    ///         where they started; a spender pulling on an allowance can only
+    ///         suspend the ballot, not delete it.
+    function test_she205_ballotFollowsTheWeightOutAndBack() public {
+        _deposit(lp1, 70_000e6);
+        _deposit(lp2, 30_000e6);
+        uint256 pid = _propose();
+
+        vm.prank(lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        uint256 cast = governor.getProposal(pid).votesAgainst;
+        assertGt(cast, 0, "control: the ballot was cast");
+
+        uint256 bal = vault.balanceOf(lp2);
+        vm.prank(lp2);
+        vault.transfer(helper, bal);
+        assertEq(governor.getProposal(pid).votesAgainst, 0, "weight out, ballot out");
+
+        vm.prank(helper);
+        vault.transfer(lp2, bal);
+        assertEq(governor.getProposal(pid).votesAgainst, cast, "weight back, ballot back");
+    }
+
+    /// @notice DOCUMENTED TRADEOFF. Shares transferred away BEFORE voting are
+    ///         weight nobody can cast: the sender's cap has fallen, the
+    ///         recipient has no snapshot weight, and the bar does not move.
+    /// @dev    Deliberate. Letting the recipient vote would need a live-weight
+    ///         electorate, which is the MEV race `_voteExitShares` exists to
+    ///         avoid; letting the sender keep the weight is exactly the ballot
+    ///         without capital behind it that this fix removes. A holder who
+    ///         sells mid-vote has chosen not to vote with what they sold. This
+    ///         test pins that choice so a change to it is a decision, not drift.
+    function test_she205_transferBeforeVoting_destroysWeightNotTheBar() public {
+        _deposit(lp1, 50_000e6);
+        _deposit(lp2, 50_000e6);
+        uint256 pid = _propose();
+        uint256 supplyBefore = vault.totalSupply();
+
+        uint256 moved = vault.convertToShares(30_000e6);
+        vm.prank(lp2);
+        vault.transfer(helper, moved);
+
+        vm.prank(helper);
+        vm.expectRevert(ISyndicateGovernor.NoVotingPower.selector);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+
+        vm.prank(lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+
+        assertEq(governor.getProposal(pid).votesAgainst, vault.balanceOf(lp2), "the sender votes only what they kept");
+        assertEq(vault.totalSupply(), supplyBefore, "a transfer does not move the bar");
+        assertEq(
+            uint256(_stateAfterVoting(pid)),
+            uint256(ISyndicateGovernor.ProposalState.Approved),
+            "20% cannot veto: the 30% that moved is cast by nobody"
+        );
+    }
+
+    // ── 6. THE PINNED PROPERTY: the veto floor is 40% under every strategy ─
+
+    uint8 constant STRAT_STAY = 0;
+    uint8 constant STRAT_VOTE_THEN_EXIT = 1;
+    uint8 constant STRAT_EXIT_THEN_VOTE = 2;
+    uint8 constant STRAT_VOTE_LAUNDER_BURN = 3;
+    uint8 constant STRAT_DELEGATEE_VOTES_HOLDER_EXITS = 4;
+    uint8 constant STRAT_VOTE_THEN_HALF_EXIT = 5;
+    uint8 constant STRAT_DELEGATEE_VOTES_REDELEGATE_EXIT = 6;
+    uint8 constant STRAT_COUNT = 7;
+
+    /// @notice Sweep the attacker's share of the book from 20% to 45% across
+    ///         every exit strategy the two reviews found. No strategy vetoes
+    ///         below 40%, and staying put vetoes at 40% and above.
+    /// @dev    This is the assertion the individual cases approximate: the
+    ///         effective bar is 40% of the book whatever the attacker does with
+    ///         their shares during the window. Each case runs from a state
+    ///         snapshot so the cases are independent.
+    function test_she205_vetoFloorIsFortyPercentUnderEveryExitStrategy() public {
+        uint256 floor = type(uint256).max;
+        for (uint256 pct = 20; pct <= 45; pct++) {
+            for (uint8 s = 0; s < STRAT_COUNT; s++) {
+                uint256 snap = vm.snapshotState();
+                bool vetoed = _runStrategy(pct, s);
+                vm.revertToState(snap);
+
+                if (vetoed) {
+                    assertGe(pct, 40, string.concat("strategy ", vm.toString(s), " vetoed below the 40% bar"));
+                    if (pct < floor) floor = pct;
+                }
+                if (s == STRAT_STAY && pct >= 40) {
+                    assertTrue(vetoed, "an honest 40% must still veto");
+                }
+            }
+        }
+        assertEq(floor, 40, "the effective veto floor must be exactly the configured 40%");
+    }
+
+    /// @dev Book is 100k: `pct`% to the attacker, the rest to lp1, who never
+    ///      votes. Returns whether the proposal ends Rejected.
+    function _runStrategy(uint256 pct, uint8 s) internal returns (bool) {
+        _deposit(lp1, (100 - pct) * 1_000e6);
+        _deposit(attacker, pct * 1_000e6);
+        bool viaDelegatee = s == STRAT_DELEGATEE_VOTES_HOLDER_EXITS || s == STRAT_DELEGATEE_VOTES_REDELEGATE_EXIT;
+        if (viaDelegatee) {
+            vm.prank(attacker);
+            vault.delegate(helper);
+            vm.warp(vm.getBlockTimestamp() + 1);
+        }
+        uint256 pid = _propose();
+        address voter = viaDelegatee ? helper : attacker;
+
+        if (s == STRAT_EXIT_THEN_VOTE) {
+            _exitAll(attacker);
+            vm.prank(attacker);
+            try governor.vote(pid, ISyndicateGovernor.VoteType.Against) {} catch {}
+        } else {
+            vm.prank(voter);
+            governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+            if (s == STRAT_VOTE_THEN_EXIT || s == STRAT_DELEGATEE_VOTES_HOLDER_EXITS) {
+                _exitAll(attacker);
+            } else if (s == STRAT_VOTE_LAUNDER_BURN) {
+                uint256 bal = vault.balanceOf(attacker);
+                vm.prank(attacker);
+                vault.transfer(helper, bal);
+                _exitAll(helper);
+            } else if (s == STRAT_VOTE_THEN_HALF_EXIT) {
+                _exitAssets(attacker, pct * 500e6);
+            } else if (s == STRAT_DELEGATEE_VOTES_REDELEGATE_EXIT) {
+                vm.prank(attacker);
+                vault.delegate(attacker);
+                _exitAll(attacker);
+            }
+        }
+        return _stateAfterVoting(pid) == ISyndicateGovernor.ProposalState.Rejected;
+    }
+
     /// @dev Bounce the same shares between two attacker-controlled addresses
     ///      until `target` share-units have moved. Returns the transfer count so
     ///      a regression that makes this expensive is visible rather than silent.

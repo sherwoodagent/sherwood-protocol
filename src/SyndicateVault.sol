@@ -1472,7 +1472,7 @@ contract SyndicateVault is
             _highWaterPricePerShare = 0;
         }
 
-        // SHE-205: REPORT SHARES LEAVING A HOLDER WHILE A VOTE IS OPEN.
+        // SHE-205: REPORT SHARES LEAVING SUPPLY WHILE A VOTE IS OPEN.
         //
         // The LP veto bar is a fraction of a supply SNAPSHOT, but this vault
         // shuts deposits and redemptions on DIFFERENT predicates: deposits from
@@ -1481,8 +1481,7 @@ contract SyndicateVault is
         // money cannot come in but can leave — so a depositor who arrives one
         // block before `propose` is counted in the denominator and can exit
         // before settlement, lifting the bar without ever casting a vote. The
-        // governor nets these shares back out, and withdraws any ballot the
-        // holder cast at the same time.
+        // governor nets these shares back out.
         //
         // MINTS ARE NOT REPORTED (`from == 0`) and need not be: deposits are
         // already shut for the entire window, so supply can only fall.
@@ -1490,7 +1489,7 @@ contract SyndicateVault is
         // BURNS ONLY (`to == address(0)`), NOT EVERY OUTBOUND MOVE. The veto
         // denominator is a SUPPLY figure, and only a burn changes supply. A
         // holder-to-holder transfer leaves the electorate exactly as large as
-        // it was, so reporting one would net out shares that never left.
+        // it was, so reporting one here would net out shares that never left.
         //
         // Reporting gross outbound movement instead is unbounded: plain
         // `transfer` is not gated during a proposal, so a holder of dust could
@@ -1502,29 +1501,34 @@ contract SyndicateVault is
         // burn makes the counter monotonic in something an attacker must
         // actually spend: their own capital, bounded by what they hold.
         //
+        // THE BALLOT IS NOT HANDLED HERE. A ballot is a claim on VOTING
+        // WEIGHT, not on supply, and it must follow the weight through every
+        // kind of move -- burn, transfer, delegation change -- or a voter can
+        // hand their shares to a second address and redeem there with the
+        // ballot intact. That report lives in `_moveDelegateVotes` below, the
+        // one OZ hook every one of those paths runs through.
+        //
         // THE QUEUE IS SKIPPED. Escrowed redeem shares are already netted out
         // of the denominator via the queue's checkpointed voting weight, and a
         // queued claim burning them mid-vote would otherwise subtract the same
-        // shares twice.
-        //
-        // KNOWN RESIDUAL: shares queued DURING the window are in neither figure
-        // -- not in the snapshot's `queueVotes`, and their eventual burn is
-        // skipped here -- so they stay in the denominator until the proposal
-        // settles. That is the conservative direction (the bar stays where it
-        // was) and it matches pre-fix behaviour; it is not the audited path,
-        // which exits through `redeem` while idle float still covers it.
+        // shares twice. There is no "queued during the window" case to worry
+        // about: `requestRedeem` requires `redemptionsLocked()`, which is
+        // `getActiveProposal() != 0` -- EXECUTE onward -- and no proposal can be
+        // Pending while another is active (`propose` needs
+        // `_openProposalCount == 0`). Shares are either in the queue at the
+        // snapshot and netted through `queueVotes`, or they burn through
+        // `redeem` and are reported here. A reader relaxing that gate would
+        // open the gap; this comment is the warning.
         //
         // BEST-EFFORT, NOT A GATE. A raw call whose result is ignored: this
         // runs inside every share burn, so a governor that cannot answer
-        // must not be able to brick LP flow. The degraded outcome is the
-        // pre-fix denominator, never a stuck vault.
+        // must not be able to brick LP flow. The degraded outcome -- a
+        // governor with `vote`'s live-weight cap but neither report -- is an
+        // UNNETTED denominator with CAPPED ballots: strictly harder to veto
+        // than pre-fix, never a stuck vault. Only reachable behind a beacon
+        // implementation that has `vote` but not these hooks.
         if (to == address(0) && from != address(0) && from != _withdrawalQueue && value != 0) {
-            address gov = ISyndicateFactory(_factory).governorOf(address(this));
-            if (gov != address(0)) {
-                // solhint-disable-next-line avoid-low-level-calls
-                (bool ok,) = gov.call(abi.encodeWithSignature("notifyShareExit(address,uint256)", from, value));
-                ok; // deliberately unchecked — see above
-            }
+            _reportToGovernor(abi.encodeWithSignature("notifyShareExit(uint256)", value));
         }
 
         // AUTO-DELEGATE ON EVERY RECEIPT. Runs AFTER `super._update` so the
@@ -1543,6 +1547,53 @@ contract SyndicateVault is
         if (to != address(0) && delegates(to) == address(0)) {
             _delegate(to, to);
         }
+    }
+
+    /// @dev SHE-205: REPORT A DROP IN LIVE VOTING WEIGHT WHILE A VOTE IS OPEN.
+    ///
+    ///      This is the single OZ chokepoint through which voting units move:
+    ///      `_transferVotingUnits` (every transfer and burn) resolves both
+    ///      sides through `delegates()` and lands here, and `_delegate` (every
+    ///      delegation change) lands here with the old and new delegatee. So
+    ///      `from` is exactly the address whose `getVotes` just fell, which is
+    ///      the only address that could have cast a ballot with that weight.
+    ///      The governor recomputes that ballot as `min(cast, getVotes(from))`
+    ///      -- see `SyndicateGovernor.notifyVotingWeightMoved`.
+    ///
+    ///      Reported AFTER `super` so the governor reads the post-move
+    ///      checkpoint. BOTH sides are reported: the losing side so a ballot
+    ///      is cut the moment its weight leaves, the gaining side so a ballot
+    ///      cut earlier is restored when the weight comes back. Without the
+    ///      second, an honest voter's round trip -- or a spender pulling on an
+    ///      allowance and returning the shares -- would delete the ballot for
+    ///      good, since `_hasVoted` blocks a re-vote. The queue never votes
+    ///      and is skipped on either side.
+    ///
+    ///      Best-effort for the same reason as the burn report in `_update`:
+    ///      this runs inside every transfer and every `delegate`, and a
+    ///      governor that cannot answer must not brick either.
+    function _moveDelegateVotes(address from, address to, uint256 amount) internal override {
+        super._moveDelegateVotes(from, to, amount);
+        if (from == to || amount == 0) return;
+        address q = _withdrawalQueue;
+        if (from != address(0) && from != q) {
+            _reportToGovernor(abi.encodeWithSignature("notifyVotingWeightMoved(address)", from));
+        }
+        if (to != address(0) && to != q) {
+            _reportToGovernor(abi.encodeWithSignature("notifyVotingWeightMoved(address)", to));
+        }
+    }
+
+    /// @dev SHE-205. Raw, unchecked call to this vault's governor. The result
+    ///      is deliberately ignored: both reports run inside ERC20 hooks, and a
+    ///      revert here would brick share flow. A vault with no governor
+    ///      (pre-registration) has nothing to report to.
+    function _reportToGovernor(bytes memory data) private {
+        address gov = ISyndicateFactory(_factory).governorOf(address(this));
+        if (gov == address(0)) return;
+        // solhint-disable-next-line avoid-low-level-calls
+        (bool ok,) = gov.call(data);
+        ok; // deliberately unchecked — see above
     }
 
     /// @dev Use timestamp-based voting checkpoints instead of block numbers

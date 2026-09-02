@@ -91,12 +91,18 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @notice Proposal ID -> voter -> bool
     mapping(uint256 => mapping(address => bool)) private _hasVoted;
 
-    /// @notice SHE-205. A cast ballot, retained so that an exiting holder's vote
-    ///         can be withdrawn along with their capital. `weight` is what still
-    ///         stands behind the ballot after any partial exits.
+    /// @notice SHE-205. A cast ballot, retained so that the vote can follow the
+    ///         voting weight behind it. `cast` is the weight counted at `vote`;
+    ///         `weight` is what currently stands in the tally, always
+    ///         `min(cast, live votes of the voter)` after the last movement.
+    /// @dev    Two figures rather than a running decrement because the standing
+    ///         weight is RECOMPUTED, never accumulated: weight that leaves and
+    ///         returns restores the ballot, and no sequence of moves can push it
+    ///         above what was cast.
     struct Ballot {
         VoteType support;
         uint256 weight;
+        uint256 cast;
     }
 
     /// @notice Proposal ID -> vault balance at execution time
@@ -308,18 +314,29 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         function of the window.
     uint256 private _voteExitShares;
 
-    /// @notice SHE-205. Per-proposal ballot record: the direction a voter chose
-    ///         and the weight still standing behind it.
+    /// @notice SHE-205. Per-proposal ballot record, keyed by the VOTER: the
+    ///         direction they chose, the weight they cast, and the weight still
+    ///         standing behind it.
     ///
     /// @dev    Needed because netting exits out of the denominator WITHOUT also
     ///         rescinding the departing holder's ballot trades this bug for its
     ///         mirror. A voter could cast Against, then withdraw to shrink the
     ///         very denominator their ballot is measured against: at a 40% bar,
     ///         a 30% holder voting then exiting clears `0.4 x (S - e)`, so 30%
-    ///         beats a 40% bar. Exit therefore forfeits the vote, one weight unit
-    ///         per share burned, and
-    ///         the two halves together leave the effective bar at 40% of supply
-    ///         however the attacker splits between voting and exiting.
+    ///         beats a 40% bar.
+    ///
+    ///         THE DENOMINATOR AND THE BALLOT ANSWER DIFFERENT QUESTIONS. The
+    ///         denominator is a SUPPLY figure and moves only on burns. The
+    ///         ballot is a claim on VOTING WEIGHT and must move whenever the
+    ///         voter's weight does -- by burn, by transfer, or by a delegation
+    ///         change -- or the two decouple: vote, hand the shares to a second
+    ///         address, redeem there. Keyed on the burner, the ballot survived
+    ///         that and 29% of the book forced a veto against a 40% bar with
+    ///         all of its capital returned. The vault therefore reports every
+    ///         drop in an address's live votes, and the ballot is recomputed as
+    ///         `min(cast, getVotes(voter))`. Together the two halves leave the
+    ///         effective bar at 40% of supply however the attacker splits
+    ///         between voting, moving and exiting.
     mapping(uint256 => mapping(address => Ballot)) private _ballots;
 
     /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31)
@@ -763,8 +780,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // WHAT THE VOTER STILL CARRIES.
         //
         // SHE-205: the snapshot read alone is order-dependent in a way the exit
-        // netting cannot see. `notifyShareExit` rescinds a ballot that already
-        // exists, so vote-then-exit is covered -- but exit-then-vote arrives at
+        // netting cannot see. `notifyVotingWeightMoved` recomputes a ballot that
+        // already exists, so vote-then-exit is covered -- but exit-then-vote arrives at
         // an empty `_ballots` slot, returns early, and leaves the holder free to
         // cast full snapshot weight against a denominator their own exit just
         // shrank. That inverts the fix: 28.6% of the book could force a veto
@@ -784,10 +801,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (weight == 0) revert NoVotingPower();
 
         _hasVoted[proposalId][msg.sender] = true;
-        // SHE-205: retain the ballot so `notifyShareExit` can withdraw it if the
-        // voter later leaves. `weight` here is the snapshot weight; exits
-        // decrement it.
-        _ballots[proposalId][msg.sender] = Ballot({support: support, weight: weight});
+        // SHE-205: retain the ballot so `notifyVotingWeightMoved` can follow it
+        // if the voter's weight later moves. What is stored is the CAPPED
+        // weight -- the snapshot figure less anything already gone -- so the
+        // recompute below can never restore weight the voter did not carry
+        // when they voted.
+        _ballots[proposalId][msg.sender] = Ballot({support: support, weight: weight, cast: weight});
 
         if (support == VoteType.For) {
             proposal.votesFor += weight;
@@ -800,21 +819,17 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         emit VoteCast(proposalId, msg.sender, support, weight);
     }
 
-    /// @notice SHE-205. The vault reports that `holder` BURNED `shares` —
-    ///         redeemed them out of the vault. Transfers are deliberately not
-    ///         reported: only a burn changes supply, and the veto denominator is
-    ///         a supply figure. While a proposal is taking votes, those burned
-    ///         shares stop counting toward the veto denominator, and any ballot
-    ///         `holder` cast is withdrawn one weight unit per share burned --
-    ///         a 1:1 cut, not a ratio. The two are equal only because this
-    ///         vault's voting units ARE its share balances; say the mechanism
-    ///         rather than "pro rata", which invites a future reader to
-    ///         introduce a scaling factor that does not exist.
+    /// @notice SHE-205. The vault reports that `shares` were BURNED — redeemed
+    ///         out of the vault — while a vote is open. Those shares stop
+    ///         counting toward the veto denominator. The denominator is a
+    ///         supply figure, so only a burn moves it; transfers and delegation
+    ///         changes are reported through `notifyVotingWeightMoved` instead,
+    ///         which touches ballots and never the denominator.
     ///
     /// @dev    VAULT-ONLY, and silent rather than reverting on every other
     ///         condition. This runs inside the vault's ERC20 `_update`, so a
-    ///         revert here would brick every share transfer; each early return
-    ///         below is a state in which there is simply nothing to record.
+    ///         revert here would brick every share burn; each early return is
+    ///         a state in which there is simply nothing to record.
     ///
     ///         Only `Pending` and only up to `voteEnd`: see `_voteExitShares`
     ///         for why the counter must stop there rather than track live
@@ -824,17 +839,18 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         would otherwise be subtracted twice — escrowed queue shares are
     ///         already netted out of the denominator via the queue's
     ///         checkpointed voting weight.
-    function notifyShareExit(address holder, uint256 shares) external {
+    ///
+    ///         The burner's ballot is NOT handled here. Burning shares lowers
+    ///         the live votes of whoever they were delegated to, and the vault
+    ///         reports that drop separately (from the OZ delegate-votes hook,
+    ///         which fires inside the same `_update`), so the ballot is
+    ///         recomputed for the right voter whether or not the burner is the
+    ///         one who voted.
+    function notifyShareExit(uint256 shares) external {
         if (msg.sender != GovernorParameters.vault) return;
         if (shares == 0) return;
-
-        // Exactly one top-level proposal is open at a time, so the monotonic
-        // counter names it — the same identification `SyndicateVault._openProposalPid`
-        // relies on.
-        uint256 pid = _proposalCount;
-        StrategyProposal storage p = _proposals[pid];
-        if (p.id == 0 || p.state != ProposalState.Pending) return;
-        if (block.timestamp > p.voteEnd) return;
+        (uint256 pid,) = _openVote();
+        if (pid == 0) return;
 
         // TAG, DON'T CLEAR. Retagging to a NEW pid silently zeroes
         // `_exitedDuringVote(oldPid)`, which would retroactively restore the
@@ -848,25 +864,77 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             _voteExitShares = 0;
         }
         _voteExitShares += shares;
+    }
 
-        // Withdraw the ballot in step with the capital. Capped at the weight
-        // still standing, so repeated partial exits can never underflow the
-        // tallies, and a holder who exits more shares than they voted with
-        // (possible only if they acquired more after the snapshot) forfeits
-        // exactly what they cast and no more.
-        Ballot storage b = _ballots[pid][holder];
-        uint256 standing = b.weight;
-        if (standing == 0) return;
-        uint256 cut = shares < standing ? shares : standing;
-        b.weight = standing - cut;
-        if (b.support == VoteType.For) {
-            p.votesFor -= cut;
-        } else if (b.support == VoteType.Against) {
-            p.votesAgainst -= cut;
+    /// @notice SHE-205. The vault reports that `voter`'s live voting weight
+    ///         just MOVED — shares they carry were transferred or burned, shares
+    ///         arrived, or a delegation moved onto or off them. Any ballot
+    ///         `voter` cast on the open proposal is brought back in step with
+    ///         the weight they now hold: the standing weight becomes
+    ///         `min(cast, getVotes(voter))`.
+    ///
+    /// @dev    RECOMPUTED, NOT DECREMENTED. The tally moves by the difference
+    ///         between what stood before and what stands now, in either
+    ///         direction, so weight that leaves and comes back restores the
+    ///         ballot and a round trip is a no-op. The ceiling is what was
+    ///         cast, so no sequence of moves can grow a ballot.
+    ///
+    ///         KEYED ON THE VOTER, NOT THE HOLDER. The vault resolves the
+    ///         address whose votes dropped -- `delegates(from)` for a transfer
+    ///         or burn, the OLD delegatee for a delegation change -- and that
+    ///         is the only address that can have voted this weight. Keying on
+    ///         the burning account instead let a voter hand their shares to a
+    ///         second address and redeem there: denominator down, ballot
+    ///         intact, 29% forcing a veto against a 40% bar.
+    ///
+    ///         The vault reports both sides of every move, so a rise is seen
+    ///         as promptly as a drop. `test_she205_ballotFollowsTheWeightOutAndBack`
+    ///         pins the restore.
+    ///
+    ///         VAULT-ONLY and silent on every other condition, for the same
+    ///         reason as `notifyShareExit`: this runs inside every share
+    ///         transfer and every delegation.
+    function notifyVotingWeightMoved(address voter) external {
+        if (msg.sender != GovernorParameters.vault) return;
+        (uint256 pid, StrategyProposal storage p) = _openVote();
+        if (pid == 0) return;
+
+        Ballot storage b = _ballots[pid][voter];
+        uint256 cast = b.cast;
+        if (cast == 0) return;
+
+        uint256 live = IVotes(p.vault).getVotes(voter);
+        uint256 want = live < cast ? live : cast;
+        uint256 have = b.weight;
+        if (want == have) return;
+        b.weight = want;
+
+        if (want < have) {
+            uint256 cut = have - want;
+            if (b.support == VoteType.For) p.votesFor -= cut;
+            else if (b.support == VoteType.Against) p.votesAgainst -= cut;
+            else p.votesAbstain -= cut;
+            emit VoteWithdrawnOnExit(pid, voter, cut);
         } else {
-            p.votesAbstain -= cut;
+            uint256 back = want - have;
+            if (b.support == VoteType.For) p.votesFor += back;
+            else if (b.support == VoteType.Against) p.votesAgainst += back;
+            else p.votesAbstain += back;
+            emit VoteRestoredOnReturn(pid, voter, back);
         }
-        emit VoteWithdrawnOnExit(pid, holder, cut);
+    }
+
+    /// @dev SHE-205. The proposal currently taking votes, or `(0, _)` if
+    ///      none. Exactly one top-level proposal is open at a time, so the
+    ///      monotonic counter names it — the same identification
+    ///      `SyndicateVault._openProposalPid` relies on. Bounded by `voteEnd`
+    ///      rather than by state alone because `state` is only committed on
+    ///      the next `_commitState`; a proposal past its window but not yet
+    ///      resolved still reads `Pending`.
+    function _openVote() internal view returns (uint256 pid, StrategyProposal storage p) {
+        pid = _proposalCount;
+        p = _proposals[pid];
+        if (p.id == 0 || p.state != ProposalState.Pending || block.timestamp > p.voteEnd) pid = 0;
     }
 
     /// @dev SHE-205. Surfaces the exit counter to `_computeState`, which lives

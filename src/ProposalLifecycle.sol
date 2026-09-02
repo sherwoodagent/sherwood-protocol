@@ -114,8 +114,16 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             // depositor arriving one block before `propose` sits in
             // `pastTotalSupply` and can be gone before this runs — inflating the
             // bar without ever voting. Their ballot, if any, was withdrawn at the
-            // same moment (see `notifyShareExit`), which is what stops this
-            // netting from becoming a cheaper way to FORCE a veto.
+            // same moment (see `SyndicateGovernor.notifyVotingWeightMoved`),
+            // which is what stops this netting from becoming a cheaper way to
+            // FORCE a veto.
+            //
+            // `liveSupply == 0` SKIPS THE VETO CHECK, BY DECISION. Reaching it
+            // needs every snapshot share to burn during the window, which an
+            // attacker cannot make honest holders do; and with nobody left
+            // holding, there is no LP whose veto is being denied. The floor
+            // below covers the rounding edge for a small-but-nonzero
+            // electorate.
             uint256 exited = _exitedDuringVote(p.id);
             liveSupply = liveSupply > exited ? liveSupply - exited : 0;
             if (liveSupply > 0) {
