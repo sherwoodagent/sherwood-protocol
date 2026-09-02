@@ -19,8 +19,9 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///           - `launchInfo` REVERTING `UnknownToken` for an unissued token —
 ///             the behaviour that forces the adapter's raw staticcalls.
 ///         Test knobs (`setRate`, `setLaunchFee`, `setFeesOwed`,
-///         `setDistributeReverts`) exist to drive the adapter's edges; the real
-///         venue prices the buy off its V3 pool instead.
+///         `setDistributeReverts`, `setDistributeBurnsGas`) exist to drive the
+///         adapter's edges; the real venue prices the buy off its V3 pool
+///         instead.
 contract MockSushiLaunchpad {
     /// @notice The venue's fixed supply: 1e9 tokens, 18 decimals.
     uint256 public constant SUPPLY = 1e9 * 1e18;
@@ -34,6 +35,11 @@ contract MockSushiLaunchpad {
     ///         under-delivery against `amountOutMinimum`.
     uint256 public rate = 1e18;
     bool public distributeReverts;
+    /// @notice Make `distributeFees` BURN EVERY UNIT OF GAS it is forwarded and
+    ///         return no data — the EIP-150 63/64 shape observed on 4663, where
+    ///         the outer `collectFees` succeeded, moved nothing, and logged
+    ///         nothing at all.
+    bool public distributeBurnsGas;
     /// @notice Disables this mock's own `amountOutMinimum` floor, so a test can
     ///         stage a venue that under-delivers and prove the adapter's own
     ///         belt-and-braces reserve assert is what catches it.
@@ -82,6 +88,10 @@ contract MockSushiLaunchpad {
         distributeReverts = value;
     }
 
+    function setDistributeBurnsGas(bool value) external {
+        distributeBurnsGas = value;
+    }
+
     function setSkipOutputFloor(bool value) external {
         skipOutputFloor = value;
     }
@@ -128,6 +138,14 @@ contract MockSushiLaunchpad {
         external
         returns (uint256 quoteCollected, uint256 tokenCollected, uint256 quoteToSushi, uint256 tokenToSushi)
     {
+        // `INVALID` consumes every unit of gas the caller forwarded and returns
+        // no data — the exact signature of a child frame that ran out of gas
+        // under the 63/64 rule, which a raw `call` cannot tell from a revert.
+        if (distributeBurnsGas) {
+            assembly ("memory-safe") {
+                invalid()
+            }
+        }
         if (!isLaunch[token]) revert UnknownToken();
         if (distributeReverts) revert DistributeFailed();
 

@@ -36,7 +36,13 @@ Adversary: a shared adapter that accumulates creator roles or balances becomes a
 
 ### Requirement: Registry gating
 
-Adapter implementations SHALL be admitted through the existing `TierRegistry` dual gate (`setAdapterAllowed` codehash snapshot + tier certification), and the venue contracts each adapter calls (launchpad, pads, lens) SHALL hold counterparty standing. For a cloned adapter, the gate SHALL bind the implementation: a consumer verifies a clone by ERC-1167 target introspection against the allowed implementation address, so ephemeral clones need no per-clone registry writes and a demoted implementation demotes every clone at once.
+Adapter implementations SHALL be admitted through the existing `TierRegistry` dual gate (`setAdapterAllowed` codehash snapshot + tier certification).
+
+Their venues SHALL NOT additionally require counterparty standing, and the reason is a real difference from `ConcentratedLiquidityStrategy` rather than an omission. That template takes its pool, factory and lending-market addresses from PROPOSER input, so an allowlist is the only thing between a fund and an authority the proposer chose. These adapters take none: every venue address is an IMMUTABLE fixed at construction and verified against the venue itself at deploy time (`launchpad` on Sushi; the constructor-written lane map plus `padSetHash` on StonkBrokers), so the codehash gate already pins them and a counterparty check would be redundant with it. A live end-to-end run confirmed the code matches this — launches execute with no counterparty allowances set — so requiring them would have been ceremony that no code reads. For a cloned adapter, the gate SHALL bind the implementation: a consumer verifies a clone by ERC-1167 target introspection against the allowed implementation address, so ephemeral clones need no per-clone registry writes and a demoted implementation demotes every clone at once.
+
+#### Scenario: A venue cannot drift after certification
+- **WHEN** anyone attempts to point a certified adapter at a different venue
+- **THEN** no such entry point exists — the venue is immutable, so re-pointing requires a new implementation and fresh certification
 
 #### Scenario: Demoted implementation blocks new launches
 - **WHEN** the owner clears `setAdapterAllowed(implementation)` and a strategy then reaches `_execute`
@@ -74,7 +80,7 @@ The salt SHALL be namespaced per caller — `keccak256(abi.encode(msg.sender, sa
 
 `quoteSupported` SHALL apply TWO gates of different kinds, documented apart so the constraint is not misattributed: the VENUE's, that some enabled config pairs against the quote; and THIS ADAPTER's, that the quote is the wrapped native, because the venue funds the dev buy from `msg.value` and a non-wrapped-native pairing cannot be funded by us at all.
 
-The venue is CLOSED today: `launchToken` reverts `NotWhitelisted` unless `launchEnabled` (false) or the caller is whitelisted, and the v1 factory carries the identical gate under the same owner. The adapter is therefore deployable but INERT until Pons flips the flag or admits our address, and the deploy runbook SHALL say so with the address to hand them. TWO separate approvals gate a Pons proposal: our own `setCounterpartyAllowed(PONS_LAUNCH_FACTORY_V2)`, and the Pons-side whitelist — neither substitutes for the other.
+The venue is CLOSED today: `launchToken` reverts `NotWhitelisted` unless `launchEnabled` (false) or the caller is whitelisted, and the v1 factory carries the identical gate under the same owner. The adapter is therefore deployable but INERT until Pons flips the flag or admits our address, and the deploy runbook SHALL say so with the address to hand them. The ONLY approval that gates a Pons proposal on our side is the adapter's own `setAdapterAllowed` plus certification; no counterparty allowance is required, for the same reason as the other two venues — this adapter pins its factory and locker in immutables the codehash gate already covers. The remaining gate is entirely the venue's: the Pons-side whitelist, which no action of ours can substitute for.
 
 #### Scenario: Reserve and fees reach different destinations
 - **WHEN** `launch(p)` completes
@@ -87,6 +93,21 @@ The venue is CLOSED today: `launchToken` reverts `NotWhitelisted` unless `launch
 #### Scenario: Fees cannot be re-pointed after launch
 - **WHEN** any caller tries to make the adapter change a launch's fee redirect after `launch` returned
 - **THEN** no such entry point exists
+### Requirement: A failed venue payout is distinguishable from an empty one
+
+`collectFees` tolerates a failing venue call by contract, but SHALL NOT make that failure invisible. Implementations SHALL emit a distinct event when the inner venue call fails, carrying the revert selector and a gas-starvation indication, while still returning `(0, 0)`.
+
+Adversary, observed live: under an estimated gas limit the inner payout ran out of gas, the outer call returned status 1 with zero logs and moved nothing (224,428 gas), while the identical call with a generous limit moved 8.39 USDG. EIP-150's 63/64 rule lets a child starve while the parent succeeds, so without a signal a keeper cannot tell "the venue refused" from "there was nothing to collect", and a monitored fund silently stops being paid. The selector is read as exactly four bytes of returndata so a hostile venue cannot returndata-bomb a path whose contract is that it must not revert; the gas indication is a heuristic and SHALL be documented as one, never as a detector.
+
+Reported amounts SHALL be measured as balance deltas on the destination, never taken from the venue's return value.
+
+#### Scenario: Starved venue call is visible
+- **WHEN** the inner venue payout runs out of gas
+- **THEN** the failure event is emitted, the call still returns `(0, 0)`, and it is distinguishable from an honest zero
+
+#### Scenario: Honest zero is quiet
+- **WHEN** nothing has accrued and the venue call succeeds
+- **THEN** no failure event is emitted
 
 ### Requirement: StonkLaunchAdapter (per-launch clone)
 

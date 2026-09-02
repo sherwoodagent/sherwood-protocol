@@ -354,6 +354,13 @@ contract LaunchpadStrategy is BaseStrategy {
     ///         settlement and is now permanently false.
     event UnvaluedResidueLatched();
 
+    /// @notice The fee-swap OVERSHOOT — fee token bought but not pulled by the
+    ///         venue — was pushed to the vault at the end of `_execute`.
+    /// @param  feeToken The venue's native-fee token, as the adapter named it.
+    /// @param  to       The vault, always.
+    /// @param  amount   The exact residual delivered.
+    event FeeTokenResidueDelivered(address indexed feeToken, address indexed to, uint256 amount);
+
     // ── Init params ──
 
     /// @notice One struct, decoded whole — the `ConcentratedLiquidityStrategy`
@@ -651,7 +658,9 @@ contract LaunchpadStrategy is BaseStrategy {
     ///           non-gameable.
     ///        8. Freeze the snapshot from the VAULT's clock.
     ///        9. Clamp the claim window to the proposal's own clock.
-    ///       10. Zero every approval and return the unspent remainder.
+    ///       10. Zero every approval and return the unspent remainder — the
+    ///           vault asset, AND the fee-swap overshoot, which is structural
+    ///           (see `_deliverFeeTokenResidue`) and has no other way home.
     function _execute() internal override {
         // 1 ── live re-certification
         _requireAllowedAdapters();
@@ -749,9 +758,14 @@ contract LaunchpadStrategy is BaseStrategy {
         windowEnd = windowEnd_;
         anyoneSettleAt = anyoneSettleAt_;
 
-        // 11 ── leave no standing approval, return the remainder
+        // 11 ── leave no standing approval, return the remainder — INCLUDING
+        //       the fee-swap overshoot, which has nowhere else to go. See
+        //       `_deliverFeeTokenResidue`.
         IERC20(quote_).forceApprove(address(launchAdapter), 0);
-        if (feeAmount != 0 && feeToken != quote_) IERC20(feeToken).forceApprove(address(launchAdapter), 0);
+        if (feeAmount != 0 && feeToken != quote_) {
+            IERC20(feeToken).forceApprove(address(launchAdapter), 0);
+            _deliverFeeTokenResidue(feeToken, quote_);
+        }
         _pushAllToVault(asset);
 
         emit FundLaunched(r.token, r.launchRef, reserveAmount, snap_, windowEnd_, anyoneSettleAt_);
@@ -769,6 +783,11 @@ contract LaunchpadStrategy is BaseStrategy {
     ///      No-ops when the strategy already holds enough — which is the common
     ///      case when the fee token IS the quote (a WETH-quoted Sushi launch),
     ///      and is why this never blindly swaps.
+    ///
+    ///      LEAVES AN OVERSHOOT BY CONSTRUCTION when it does swap: the venue
+    ///      pulls exactly `feeAmount` and the headroom stays here.
+    ///      `_deliverFeeTokenResidue`, at the end of `_execute`, is where that
+    ///      goes — it is not optional cleanup.
     function _acquireFeeToken(address feeToken, uint256 feeAmount, address quote_) private {
         uint256 held = IERC20(feeToken).balanceOf(address(this));
         if (held >= feeAmount) return;
@@ -790,6 +809,59 @@ contract LaunchpadStrategy is BaseStrategy {
 
         uint256 after_ = IERC20(feeToken).balanceOf(address(this));
         if (after_ < feeAmount) revert FeeAcquisitionFailed(feeToken, feeAmount, after_);
+    }
+
+    /// @dev THE OVERSHOOT IS STRUCTURAL, SO IT MUST HAVE A DESTINATION.
+    ///
+    ///      `ISwapAdapter` is exact-INPUT only. An exact-input swap cannot land
+    ///      on an exact output: `_acquireFeeToken` therefore derives an input
+    ///      from a forward quote, adds `settleSlippageBps` of headroom so a
+    ///      moving price still clears `feeAmount`, and re-reads the balance to
+    ///      prove it did. Whenever the price did NOT move against it — the
+    ///      ordinary case — the clone is left holding the difference, bounded
+    ///      by `feeAmount * settleSlippageBps / BPS`. There is no sizing that
+    ///      removes this; there is only somewhere for it to go.
+    ///
+    ///      WHY IT USED TO BE UNRECOVERABLE, and why it is handled HERE rather
+    ///      than in `sweep()` or the delivery views. `feeToken` is a local in
+    ///      `_execute` and is never stored, so nothing after this transaction
+    ///      can name the token: `sweep()` moves `asset`, `launchToken` and the
+    ///      quote, `undeliveredValue()` counts vault-asset only, and
+    ///      `hasUnvaluedResidue()` counts launch-token and quote only. On a
+    ///      launch quoted in something OTHER than the fee token — a USDG-quoted
+    ///      Sushi launch whose fee is charged in WETH — the overshoot was none
+    ///      of those three, and it was BOTH unrecoverable and undeclared.
+    ///      Measured live: 15,002,662,640,967 wei of WETH on clone
+    ///      0x6Cb8…511C, still there after two `collectResidue` calls.
+    ///      Pushing it in the same transaction that creates it costs no new
+    ///      storage, leaves `sweep()`'s gas budget and the delivery views
+    ///      untouched, and means nothing is ever stranded — not even
+    ///      transiently.
+    ///
+    ///      TWO LANES ARE DELIBERATELY EXCLUDED, because for them this is not
+    ///      residue at all:
+    ///        - `feeToken == asset`: the hold-back means there is no fee swap
+    ///          and no overshoot, and whatever is left is vault asset that
+    ///          `_pushAllToVault(asset)` returns on the next line anyway;
+    ///        - `feeToken == quote_`: the fee was already held after the quote
+    ///          leg, so again no swap and no overshoot — and the quote is the
+    ///          launch's own declared lane, converted at settlement by
+    ///          `_convertQuote` and warehoused by `sweep()`. Pushing it here
+    ///          would move settlement's job into execute.
+    ///
+    ///      IN KIND AND UNPRICED. The vault receives the token exactly as it
+    ///      already warehouses launch tokens; no price is asserted for it
+    ///      anywhere, which is the same refusal `_settle` makes about the fund
+    ///      token. Selling it would need a second swap leg, a second floor and
+    ///      a second failure mode, all for a residue bounded at ~0.1% of a
+    ///      single launch fee.
+    function _deliverFeeTokenResidue(address feeToken, address quote_) private {
+        if (feeToken == asset || feeToken == quote_) return;
+        uint256 residue = IERC20(feeToken).balanceOf(address(this));
+        if (residue == 0) return;
+        address to = vault();
+        IERC20(feeToken).safeTransfer(to, residue);
+        emit FeeTokenResidueDelivered(feeToken, to, residue);
     }
 
     /// @dev `windowEnd = min(executedAt + claimWindow, executedAt +

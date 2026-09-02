@@ -47,10 +47,15 @@ import {ITierRegistry} from "../../src/interfaces/ITierRegistry.sol";
  *   Post-deploy, the REGISTRY OWNER must, and the runbook below prints it:
  *     - `setAdapterAllowed` + tier certification for EVERY adapter this run
  *       deployed (Gate A + Gate B, docs/adapter-onboarding-checklist.md).
- *     - `setCounterpartyAllowed(SUSHI_LAUNCHPAD_V1, true)`, the same for every
- *       Smart Launch pad the Stonk adapter serves, and the same for
- *       `PONS_LAUNCH_FACTORY_V2` when the Pons adapter was deployed.
  *     - `StrategyFactory.setTemplateApproval(LAUNCHPAD_TEMPLATE, true)`.
+ *
+ *   NO COUNTERPARTY ALLOWANCES ARE NEEDED for these venues, and that is a real
+ *   difference rather than an omission: each adapter pins its venue in
+ *   IMMUTABLES that the codehash gate already covers, whereas
+ *   `ConcentratedLiquidityStrategy` takes its venue addresses from PROPOSER
+ *   input and must allowlist them. A live end-to-end run confirmed launches
+ *   execute with none set, so instructing the owner to set them would be
+ *   ceremony that no code reads.
  *
  *   Record the printed `padSetHash` with the certification: the codehash gate
  *   pins the Stonk adapter's CODE, and that hash is the only on-chain witness
@@ -292,21 +297,24 @@ contract DeployLaunchpadStrategy is ScriptBase {
         console.log("2. Tier certification for that adapter (Gate A)       ", adapter);
         console.log("3. TierRegistry.setAdapterAllowed(stonkAdapter, true) ", stonkAdapter);
         console.log("4. Tier certification for that adapter (Gate A)       ", stonkAdapter);
-        console.log("5. TierRegistry.setCounterpartyAllowed(launchpad,true)", launchpad);
-        console.log("6. setCounterpartyAllowed for EACH Smart Launch pad served by the Stonk adapter");
         if (ponsAdapter != address(0)) {
-            console.log("7. TierRegistry.setAdapterAllowed(ponsAdapter, true) ", ponsAdapter);
-            console.log("8. Tier certification for that adapter (Gate A)      ", ponsAdapter);
-            console.log("9. TierRegistry.setCounterpartyAllowed(ponsFactory,1)", ponsFactory);
+            console.log("5. TierRegistry.setAdapterAllowed(ponsAdapter, true) ", ponsAdapter);
+            console.log("6. Tier certification for that adapter (Gate A)      ", ponsAdapter);
         }
         // Numbered around the optional block above, so a skipped Pons deploy
         // does not leave a gap an operator reads as a missing step.
         console.log(
             ponsAdapter == address(0)
-                ? "7. StrategyFactory.setTemplateApproval(template, true)"
-                : "10. StrategyFactory.setTemplateApproval(template, true)",
+                ? "5. StrategyFactory.setTemplateApproval(template, true)"
+                : "7. StrategyFactory.setTemplateApproval(template, true)",
             template
         );
+        console.log("");
+        console.log("NO counterparty allowances are needed for these venues. Each adapter");
+        console.log("pins its venue in IMMUTABLES the codehash gate already covers, unlike a");
+        console.log("template that takes venue addresses from proposer input. A live e2e run");
+        console.log("confirmed launches execute with none set - listing them here would be");
+        console.log("ceremony that no code reads. Venue:", launchpad);
         console.log("");
         console.log("== POST-DEPLOY VALIDATION READS ==");
         if (registry != address(0)) {
@@ -316,18 +324,10 @@ contract DeployLaunchpadStrategy is ScriptBase {
             console.log(
                 "tierRegistry.isAdapterAllowed(stonkAdapter):", ITierRegistry(registry).isAdapterAllowed(stonkAdapter)
             );
-            console.log(
-                "tierRegistry.isCounterpartyAllowed(launchpad):",
-                ITierRegistry(registry).isCounterpartyAllowed(launchpad)
-            );
             if (ponsAdapter != address(0)) {
                 console.log(
                     "tierRegistry.isAdapterAllowed(ponsAdapter): ",
                     ITierRegistry(registry).isAdapterAllowed(ponsAdapter)
-                );
-                console.log(
-                    "tierRegistry.isCounterpartyAllowed(ponsFactory):",
-                    ITierRegistry(registry).isCounterpartyAllowed(ponsFactory)
                 );
             }
         } else {

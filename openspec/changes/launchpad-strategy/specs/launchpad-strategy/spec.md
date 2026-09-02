@@ -90,6 +90,22 @@ For a venue whose launch is still in `Curve`/`Closing`/`Failed` phase at settlem
 - **WHEN** a strategy settles with fund-token custody already below `RESIDUE_DUST` — only vault-asset residue outstanding, so no clearing `sweep()` ever runs — and someone later donates fund tokens to it
 - **THEN** `hasUnvaluedResidue()` stays false, `collectResidue` cannot re-mark the strategy, and no deposit lock is re-stamped
 
+### Requirement: The native-fee overshoot has a destination
+
+Acquiring the venue's native-fee token uses an exact-INPUT swap, which cannot hit an exact output, so an overshoot is STRUCTURAL rather than incidental. `_execute` SHALL deliver any residual fee-token balance to the vault before it returns, whenever the fee token is neither the vault asset nor the launch quote — those two already have homes (`_pushAllToVault` and the quote lane's conversion plus `sweep()` respectively).
+
+Adversary this closes, found by an end-to-end run rather than by reasoning: the fee token was a local variable, so `sweep()` could not see it, `undeliveredValue()` counts only vault-asset custody and `hasUnvaluedResidue()` only the launch token and quote — leaving the overshoot unrecoverable AND undeclared. Measured on a live fork: a USDG-quoted Sushi launch stranded 15,002,662,640,967 wei of WETH on the clone, still present after two residue collections. Bounded by `launchFee × settleSlippageBps`, so small, but it is vault capital with no path home.
+
+The delivery is a hard transfer, so a fee token that refuses it reverts `execute()`. That is the intended direction: this template's doctrine is that blocking `execute()` strands nothing, while a tolerated transfer would recreate the defect on exactly the token that triggers it.
+
+#### Scenario: Fee-token overshoot reaches the vault
+- **WHEN** the fee token is neither the vault asset nor the quote, and the swap overshoots
+- **THEN** the exact residual is delivered to the vault before `_execute` returns and the clone holds none of it
+
+#### Scenario: The other two lanes are untouched
+- **WHEN** the fee token IS the vault asset, or IS the launch quote
+- **THEN** no residual delivery occurs — the existing lanes already carry it
+
 ### Requirement: Creator fees are paid to the vault, named at launch
 
 The strategy SHALL name the FUND'S VAULT as the launch's fee recipient, passing `vault()` into `ILaunchAdapter.LaunchParams.feeRecipient` at execute. It SHALL NOT accept that address as proposer input: a proposer-supplied recipient would let a proposal point a fund's fee stream at something other than the fund.

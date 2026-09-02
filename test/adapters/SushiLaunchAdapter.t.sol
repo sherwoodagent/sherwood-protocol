@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {SushiLaunchAdapter} from "../../src/adapters/SushiLaunchAdapter.sol";
 import {ILaunchAdapter} from "../../src/interfaces/ILaunchAdapter.sol";
 import {ISushiLaunchpad} from "../../src/vendor/sushi/ISushiLaunchpad.sol";
@@ -572,6 +573,82 @@ contract SushiLaunchAdapterTest is Test {
         (q, t) = adapter.collectFees(res.launchRef);
         assertEq(q, 0, "no delta reported when the venue reverted");
         assertEq(t, 0);
+    }
+
+    // ── DEFECT C: a failed venue call must not look like "nothing accrued" ──
+
+    /// @dev A venue that REFUSES is announced, and the `(0, 0)` return contract
+    ///      is unchanged. The revert selector is indexed, so this refusal is a
+    ///      different topic from a starved child.
+    function test_CollectFees_VenueRefusalIsAnnouncedAndStillReturnsZeroes() public {
+        ILaunchAdapter.LaunchResult memory res = _launchAsStrategy();
+        pad.setFeesOwed(res.token, 3 ether, 7 ether);
+        pad.setDistributeReverts(true);
+
+        vm.expectEmit(true, true, false, true, address(adapter));
+        emit SushiLaunchAdapter.VenueCallFailed(
+            "distributeFees", MockSushiLaunchpad.DistributeFailed.selector, res.launchRef, false
+        );
+        vm.prank(keeper);
+        (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
+
+        assertEq(quoteOut, 0, "the return contract is unchanged");
+        assertEq(tokenOut, 0, "the return contract is unchanged");
+    }
+
+    /// @dev THE 4663 OBSERVATION ITSELF: under `cast send`'s estimated gas
+    ///      limit this call returned status 1, moved nothing and logged NOTHING
+    ///      (224,428 gas); with `--gas-limit 3000000` the same call moved
+    ///      8.391340 USDG. `INVALID` in the child reproduces it exactly — every
+    ///      forwarded unit of gas burned, no returndata — so the selector is
+    ///      `0x00000000` and `gasStarved` is true.
+    function test_CollectFees_OutOfGasVenueCallIsDistinguishableFromNothingAccrued() public {
+        ILaunchAdapter.LaunchResult memory res = _launchAsStrategy();
+        pad.setFeesOwed(res.token, 3 ether, 7 ether);
+        pad.setDistributeBurnsGas(true);
+
+        vm.expectEmit(true, true, false, true, address(adapter));
+        emit SushiLaunchAdapter.VenueCallFailed("distributeFees", bytes4(0), res.launchRef, true);
+        vm.prank(keeper);
+        (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
+
+        assertEq(quoteOut, 0);
+        assertEq(tokenOut, 0);
+        assertEq(pad.quoteFeeOwed(res.token), 3 ether, "the accrual is untouched at the venue, retryable forever");
+    }
+
+    /// @dev THE OTHER HALF OF THE SIGNAL. An honest "nothing accrued" — the
+    ///      venue call SUCCEEDS and there was simply nothing to pay — emits no
+    ///      failure at all, which is what makes the failure event mean
+    ///      something.
+    function test_CollectFees_HonestZeroEmitsNoFailure() public {
+        ILaunchAdapter.LaunchResult memory res = _launchAsStrategy();
+
+        vm.recordLogs();
+        vm.prank(keeper);
+        (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
+
+        assertEq(quoteOut, 0);
+        assertEq(tokenOut, 0);
+        assertEq(_venueCallFailures(vm.getRecordedLogs()), 0, "nothing accrued is not a venue failure");
+    }
+
+    /// @dev An UNKNOWN ref never reaches the venue at all, so there is no venue
+    ///      call to have failed and nothing to announce.
+    function test_CollectFees_UnknownRefMakesNoVenueCallAndAnnouncesNothing() public {
+        vm.recordLogs();
+        (uint256 q, uint256 t) = adapter.collectFees(bytes32(uint256(uint160(makeAddr("neverIssued")))));
+        assertEq(q, 0);
+        assertEq(t, 0);
+        assertEq(_venueCallFailures(vm.getRecordedLogs()), 0, "an unknown launch is not a venue failure");
+    }
+
+    /// @dev Counts `VenueCallFailed` logs in a recorded trace.
+    function _venueCallFailures(Vm.Log[] memory logs) internal pure returns (uint256 n) {
+        bytes32 topic = SushiLaunchAdapter.VenueCallFailed.selector;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics.length != 0 && logs[i].topics[0] == topic) ++n;
+        }
     }
 
     /// @dev THE DELETED HANDOFF, asserted as absent. This replaces

@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {StonkLaunchAdapter} from "../../src/adapters/StonkLaunchAdapter.sol";
 import {ILaunchAdapter} from "../../src/interfaces/ILaunchAdapter.sol";
 import {IStonkSafeLaunchpadV2} from "../../src/vendor/stonkbrokers/IStonkSafeLaunchpadV2.sol";
@@ -231,6 +232,62 @@ contract StonkLaunchAdapterTest is Test {
         assertEq(IERC20(res.token).balanceOf(address(clone)), 0, "no bought token rests on the clone");
         assertEq(weth.balanceOf(address(clone)), 0, "no quote rests on the clone");
         assertEq(weth.balanceOf(address(adapter)), 0, "the implementation never holds the quote");
+    }
+
+    // ── DEFECT B: fee income pushed during `buy` is not unspent quote ──
+
+    /// @dev The pad pays its creator AT TRADE TIME, pushing the creator's share
+    ///      back into the clone inside the very `buy` the clone made. The clone
+    ///      IS the creator, so `leftover = balanceOf(this)` measured after the
+    ///      buy sees fee INCOME and the old `quoteSpent = quoteIn - leftover`
+    ///      reported the budget short by exactly that fee.
+    ///
+    ///      Traced live in cycle B: 1,200.000000 USDG in, 19.800000 USDG of
+    ///      creator fee pushed back mid-call, `quoteSpent` reported as
+    ///      1,180.200000. `LaunchResult.quoteSpent` is "Quote actually
+    ///      consumed", and the pad consumes the buy in full or reverts.
+    function test_Launch_CreatorFeePushedDuringBuyIsNotCountedAsUnspentQuote() public {
+        uint256 strategyBefore = weth.balanceOf(address(strategy));
+        uint256 creatorFee = (QUOTE_IN * wethPad.CREATOR_FEE_BPS()) / 10_000;
+        assertGt(creatorFee, 0, "the fixture must actually push a creator fee, or it proves nothing");
+
+        ILaunchAdapter.LaunchResult memory res = _launch(QUOTE_IN, QUOTE_IN, RESERVE);
+        StonkLaunchAdapter clone = _clone(res);
+
+        assertEq(res.quoteSpent, QUOTE_IN, "the buy consumed the whole budget; fee income is not unspent quote");
+        assertEq(wethPad.getLaunch(clone.launchId()).buyCount, 1, "the buy really happened");
+        assertEq(weth.balanceOf(vault), creatorFee, "fee income landed in the fee recipient's lane");
+        assertEq(
+            weth.balanceOf(address(strategy)), strategyBefore - QUOTE_IN, "the owner is not credited its own fee income"
+        );
+        assertEq(weth.balanceOf(address(clone)), 0, "nothing rests on the clone");
+        assertEq(weth.balanceOf(address(adapter)), 0, "the implementation never holds the quote");
+    }
+
+    /// @dev Fee income arriving during `launch` is ANNOUNCED on the same event
+    ///      the flush lane uses, so an indexer sees one fee stream and not two.
+    function test_Launch_CreatorFeePushedDuringBuyIsAnnounced() public {
+        uint256 creatorFee = (QUOTE_IN * wethPad.CREATOR_FEE_BPS()) / 10_000;
+
+        vm.prank(address(strategy));
+        weth.approve(address(adapter), QUOTE_IN);
+        // The clone does not exist yet, so the emitter is left unchecked.
+        vm.expectEmit(true, false, false, true);
+        emit StonkLaunchAdapter.FeesCollected(vault, creatorFee, 0);
+        vm.prank(address(strategy));
+        adapter.launch(_params(address(weth), QUOTE_IN, QUOTE_IN, RESERVE, _venueData()));
+    }
+
+    /// @dev The zero-buy case still reports ZERO: no trade, no fee, nothing to
+    ///      misattribute. `quoteSpent = p.quoteIn` is honest at both ends.
+    function test_Launch_ZeroBuyStillReportsZeroQuoteSpent() public {
+        uint256 strategyBefore = weth.balanceOf(address(strategy));
+        ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
+
+        assertEq(res.quoteSpent, 0, "a fair launch consumes nothing");
+        assertEq(weth.balanceOf(address(strategy)), strategyBefore, "no quote left the owner");
+        assertEq(weth.balanceOf(vault), 0, "and no fee income exists to route");
+        assertEq(weth.balanceOf(address(_clone(res))), 0, "nothing rests on the clone");
     }
 
     function test_Launch_NeverSetsEoaOnly() public {
@@ -633,6 +690,76 @@ contract StonkLaunchAdapterTest is Test {
         (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
         assertEq(quoteOut, 0);
         assertEq(tokenOut, 0);
+    }
+
+    // ── DEFECT C: a failed venue call must not look like "nothing accrued" ──
+
+    /// @dev A venue that REFUSES is announced, and the `(0, 0)` return contract
+    ///      is unchanged. The revert selector is indexed, so this refusal is a
+    ///      different topic from a starved child.
+    function test_CollectFees_VenueRefusalIsAnnouncedAndStillReturnsZeroes() public {
+        ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
+        StonkLaunchAdapter clone = _clone(res);
+        wethPad.creditCreatorQuote(clone.launchId(), 3 ether);
+        wethPad.setFlushReverts(true);
+
+        vm.expectEmit(true, true, false, true, address(clone));
+        emit StonkLaunchAdapter.VenueCallFailed(
+            "flushCreatorQuote", MockStonkPad.FlushRefused.selector, bytes32(uint256(uint160(address(clone)))), false
+        );
+        vm.prank(keeper);
+        (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
+
+        assertEq(quoteOut, 0, "the return contract is unchanged");
+        assertEq(tokenOut, 0, "the return contract is unchanged");
+        assertEq(weth.balanceOf(vault), 0, "and nothing moved, because the venue reverted its own state");
+    }
+
+    /// @dev THE 4663 OBSERVATION ITSELF. `INVALID` in the child burns every
+    ///      unit of gas EIP-150 forwarded it and returns no data, so the outer
+    ///      call succeeds, moves nothing, and — before this fix — logged
+    ///      nothing. The selector is `0x00000000` and `gasStarved` is true,
+    ///      which is what tells a keeper to retry with a real gas limit.
+    function test_CollectFees_OutOfGasVenueCallIsDistinguishableFromNothingAccrued() public {
+        ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
+        StonkLaunchAdapter clone = _clone(res);
+        wethPad.creditCreatorQuote(clone.launchId(), 3 ether);
+        wethPad.setFlushBurnsGas(true);
+
+        vm.expectEmit(true, true, false, true, address(clone));
+        emit StonkLaunchAdapter.VenueCallFailed(
+            "flushCreatorQuote", bytes4(0), bytes32(uint256(uint160(address(clone)))), true
+        );
+        vm.prank(keeper);
+        (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
+
+        assertEq(quoteOut, 0);
+        assertEq(tokenOut, 0);
+        assertEq(weth.balanceOf(vault), 0, "the accrual is still at the venue, retryable forever");
+    }
+
+    /// @dev THE OTHER HALF OF THE SIGNAL. An honest "nothing accrued" — the
+    ///      venue call SUCCEEDS and there was simply nothing to pay — emits no
+    ///      failure at all, which is what makes the failure event mean
+    ///      something.
+    function test_CollectFees_HonestZeroEmitsNoFailure() public {
+        ILaunchAdapter.LaunchResult memory res = _launch(0, 0, RESERVE);
+
+        vm.recordLogs();
+        vm.prank(keeper);
+        (uint256 quoteOut, uint256 tokenOut) = adapter.collectFees(res.launchRef);
+
+        assertEq(quoteOut, 0);
+        assertEq(tokenOut, 0);
+        assertEq(_venueCallFailures(vm.getRecordedLogs()), 0, "nothing accrued is not a venue failure");
+    }
+
+    /// @dev Counts `VenueCallFailed` logs in a recorded trace.
+    function _venueCallFailures(Vm.Log[] memory logs) internal pure returns (uint256 n) {
+        bytes32 topic = StonkLaunchAdapter.VenueCallFailed.selector;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics.length != 0 && logs[i].topics[0] == topic) ++n;
+        }
     }
 
     /// @dev THE SIMPLIFICATION'S WHOLE POINT, asserted directly: a LIVE owner
