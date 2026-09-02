@@ -175,6 +175,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     // ── Errors ──
 
     error InvalidAmount();
+    /// @notice The config blends the levered and unlevered modes — `lpAmount`
+    ///         set alongside a borrow, or a Morpho surface named in a config
+    ///         that will never touch it. See the mode fork in `_initialize`.
+    error MixedModeConfig();
     /// @notice The configured pool does not quote the vault asset. Adversary: a
     ///         proposer naming a pool whose position could not be unwound into
     ///         the asset the vault redeems in.
@@ -353,6 +357,15 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         uint256 collateralAmount;
         /// @notice Vault asset borrowed against that collateral.
         uint256 borrowAmount;
+        /// @notice UNLEVERED MODE ONLY: vault asset pulled at execute and
+        ///         deployed directly into the position, with no Morpho leg at
+        ///         all. Exactly one of {collateralAmount+borrowAmount, lpAmount}
+        ///         is set — a mixed config reverts at init. A separate field
+        ///         rather than a reuse of `collateralAmount`, because in
+        ///         levered mode the pulled amount IS collateral and the LP is
+        ///         funded by the borrow; one number meaning two things by mode
+        ///         is the ambiguity init exists to kill.
+        uint256 lpAmount;
         int24 tickLower;
         int24 tickUpper;
         /// @notice The agent's expected minted liquidity, bounded here against
@@ -394,6 +407,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     uint256 public collateralAmount;
     uint256 public borrowAmount;
+    /// @notice Unlevered-mode funding; zero in levered mode. See `InitParams.lpAmount`.
+    uint256 public lpAmount;
     uint256 public swapFractionBps;
     uint128 public expectedLiquidity;
 
@@ -437,6 +452,15 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         return _rerange;
     }
 
+    /// @notice True when this clone runs the original borrow-funded
+    ///         configuration; false for the unlevered mode.
+    /// @dev    Derived from `morpho`, never stored separately — a second bit
+    ///         could drift from the state it describes, and init enforces that
+    ///         `morpho == address(0)` exactly characterizes unlevered.
+    function levered() public view returns (bool) {
+        return address(morpho) != address(0);
+    }
+
     // ── Initialization ──
 
     /// @dev Validation runs in the spec's adversary order. Every check below
@@ -446,10 +470,44 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         InitParams memory p = abi.decode(data, (InitParams));
 
         if (p.pool == address(0) || p.positionManager == address(0)) revert ZeroAddress();
-        if (p.morpho == address(0) || p.swapAdapter == address(0)) revert ZeroAddress();
+        if (p.swapAdapter == address(0)) revert ZeroAddress();
         if (p.uniswapFactory == address(0)) revert ZeroAddress();
-        if (p.collateralAmount == 0 || p.borrowAmount == 0) revert InvalidAmount();
         if (p.expectedLiquidity == 0) revert InvalidAmount();
+
+        // TWO MODES, DECIDED HERE, NEVER BLENDED. Levered is the original
+        // configuration and stays byte-identical. Unlevered exists because the
+        // borrow leg can be dead on an entire chain — on 4663 the only
+        // `_isWrapperOf`-compatible market (spUSDG) drained to $3 while the
+        // deep stable markets fail the wrapper rule, correctly — and a venue
+        // this template already serves needs no Morpho at all.
+        //
+        // The discriminator for the rest of the clone's life is
+        // `morpho == address(0)` (see `_levered()`), so the mode is not a
+        // second bit that can drift from the state it describes.
+        //
+        // MIXED CONFIGS REVERT rather than being interpreted. A config with
+        // exactly one of collateral/borrow zero was ALREADY rejected by the
+        // guard this block replaces; `lpAmount` set alongside a borrow, or a
+        // Morpho surface named in a config that will never touch it, are
+        // rejected on the same principle — a reviewer must be able to read the
+        // mode off the proposal without cross-checking fields.
+        bool levered_ = p.collateralAmount != 0 || p.borrowAmount != 0;
+        if (levered_) {
+            if (p.morpho == address(0)) revert ZeroAddress();
+            if (p.collateralAmount == 0 || p.borrowAmount == 0) revert InvalidAmount();
+            if (p.lpAmount != 0) revert MixedModeConfig();
+        } else {
+            if (p.lpAmount == 0) revert InvalidAmount();
+            if (p.morpho != address(0)) revert MixedModeConfig();
+            // The whole market declaration must be empty, not merely unused:
+            // a proposal naming a market it never touches invites review of
+            // the wrong risk surface.
+            if (
+                p.marketParams.loanToken != address(0) || p.marketParams.collateralToken != address(0)
+                    || p.marketParams.oracle != address(0) || p.marketParams.irm != address(0)
+                    || p.marketParams.lltv != 0
+            ) revert MixedModeConfig();
+        }
 
         address vaultAsset = IERC4626(vault()).asset();
 
@@ -545,14 +603,20 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             // for why that is not what separates them.
             _requireAllowedAdapter(registry, p.swapAdapter);
             _requireAllowedCounterparty(registry, p.positionManager);
-            _requireAllowedCounterparty(registry, p.morpho);
             // The factory is the authority check (1) delegates the pool's
             // provenance to, so it has to be an authority the PROTOCOL chose. A
             // proposer-authored factory vouching for a proposer-authored pool is
             // the same self-attestation one hop further out.
             _requireAllowedCounterparty(registry, p.uniswapFactory);
-            if (p.marketParams.collateralToken != vaultAsset) {
-                _requireAllowedCounterparty(registry, p.marketParams.collateralToken);
+            // The Morpho surface is bound only when it exists. In unlevered
+            // mode both addresses are zero by the mode fork above, and binding
+            // a zero address would fail closed against a registry that is
+            // configured exactly right.
+            if (levered_) {
+                _requireAllowedCounterparty(registry, p.morpho);
+                if (p.marketParams.collateralToken != vaultAsset) {
+                    _requireAllowedCounterparty(registry, p.marketParams.collateralToken);
+                }
             }
         }
 
@@ -647,38 +711,47 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         //     match — so the carve-out could never apply.
         _requireAllowedCounterparty(registry, otherToken);
 
-        // (2) The market exists and lends the vault asset.
-        if (p.marketParams.loanToken != vaultAsset) revert LoanAssetMismatch();
-        Id id = p.marketParams.id();
-        if (IMorpho(p.morpho).market(id).lastUpdate == 0) revert MarketNotCreated();
+        // (2)(3)(4) are the Morpho checks — market existence, borrow within
+        // lendable, LTV buffer. In unlevered mode there is no market, no
+        // borrow, and no LTV, so all three are gated on the mode rather than
+        // individually short-circuiting on zeros: a check that "passes"
+        // because its inputs are vacuous reads as verified when nothing was.
+        Id id = Id.wrap(bytes32(0));
+        if (levered_) {
+            // (2) The market exists and lends the vault asset.
+            if (p.marketParams.loanToken != vaultAsset) revert LoanAssetMismatch();
+            id = p.marketParams.id();
+            if (IMorpho(p.morpho).market(id).lastUpdate == 0) revert MarketNotCreated();
 
-        //     Collateral is the vault asset or an ERC-4626 wrapper OF the vault
-        //     asset — never the volatile leg. `otherToken` is excluded
-        //     explicitly rather than relying on the wrapper probe to reject it,
-        //     because a volatile token could itself be an ERC-4626 over the
-        //     vault asset and would otherwise slip through.
-        if (p.marketParams.collateralToken == otherToken) revert CollateralAssetMismatch();
-        if (p.marketParams.collateralToken != vaultAsset) {
-            if (!_isWrapperOf(p.marketParams.collateralToken, vaultAsset)) revert CollateralAssetMismatch();
-        }
+            //     Collateral is the vault asset or an ERC-4626 wrapper OF the vault
+            //     asset — never the volatile leg. `otherToken` is excluded
+            //     explicitly rather than relying on the wrapper probe to reject it,
+            //     because a volatile token could itself be an ERC-4626 over the
+            //     vault asset and would otherwise slip through.
+            if (p.marketParams.collateralToken == otherToken) revert CollateralAssetMismatch();
+            if (p.marketParams.collateralToken != vaultAsset) {
+                if (!_isWrapperOf(p.marketParams.collateralToken, vaultAsset)) revert CollateralAssetMismatch();
+            }
 
-        // (3) The borrow fits the market's currently lendable liquidity.
-        {
-            Market memory m = IMorpho(p.morpho).market(id);
-            uint256 lendable = m.totalSupplyAssets > m.totalBorrowAssets
-                ? uint256(m.totalSupplyAssets) - uint256(m.totalBorrowAssets)
-                : 0;
-            if (p.borrowAmount > lendable) revert BorrowExceedsLiquidity();
-        }
+            // (3) The borrow fits the market's currently lendable liquidity.
+            {
+                Market memory m = IMorpho(p.morpho).market(id);
+                uint256 lendable = m.totalSupplyAssets > m.totalBorrowAssets
+                    ? uint256(m.totalSupplyAssets) - uint256(m.totalBorrowAssets)
+                    : 0;
+                if (p.borrowAmount > lendable) revert BorrowExceedsLiquidity();
+            }
 
-        // (4) The resulting LTV clears the market's own LLTV by the buffer.
-        //     `lltv` is WAD upstream; convert to bps before comparing.
-        {
-            uint256 collateralValue = _collateralValueOf(p.marketParams.collateralToken, vaultAsset, p.collateralAmount);
-            uint256 ltvBps = (p.borrowAmount * BPS_DENOMINATOR) / collateralValue;
-            uint256 lltvBps = (p.marketParams.lltv * BPS_DENOMINATOR) / 1e18;
-            if (lltvBps < MIN_LLTV_BUFFER_BPS) revert LtvInsideLiquidationBuffer();
-            if (ltvBps > lltvBps - MIN_LLTV_BUFFER_BPS) revert LtvInsideLiquidationBuffer();
+            // (4) The resulting LTV clears the market's own LLTV by the buffer.
+            //     `lltv` is WAD upstream; convert to bps before comparing.
+            {
+                uint256 collateralValue =
+                    _collateralValueOf(p.marketParams.collateralToken, vaultAsset, p.collateralAmount);
+                uint256 ltvBps = (p.borrowAmount * BPS_DENOMINATOR) / collateralValue;
+                uint256 lltvBps = (p.marketParams.lltv * BPS_DENOMINATOR) / 1e18;
+                if (lltvBps < MIN_LLTV_BUFFER_BPS) revert LtvInsideLiquidationBuffer();
+                if (ltvBps > lltvBps - MIN_LLTV_BUFFER_BPS) revert LtvInsideLiquidationBuffer();
+            }
         }
 
         // (5) The position does not exceed the pool-share cap. This bounds the
@@ -704,6 +777,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         collateralAmount = p.collateralAmount;
         borrowAmount = p.borrowAmount;
+        lpAmount = p.lpAmount;
         swapFractionBps = p.swapFractionBps;
         expectedLiquidity = p.expectedLiquidity;
 
@@ -954,14 +1028,17 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         if (registry == address(0)) return;
         _requireAllowedAdapter(registry, address(swapAdapter));
         _requireAllowedCounterparty(registry, address(positionManager));
-        _requireAllowedCounterparty(registry, address(morpho));
+        // No Morpho surface exists to re-check in unlevered mode, and asking
+        // the registry about address(0) fails closed — which here would freeze
+        // execute/rerange over a demotion that never happened.
+        if (levered()) _requireAllowedCounterparty(registry, address(morpho));
         // The volatile leg re-checks on the same terms as the rest: `rerange()`
         // is permissionless and re-issues `forceApprove(otherToken, …)` to both
         // the adapter and the position manager on every call, so a leg demoted
         // after init would otherwise keep receiving them.
         _requireAllowedCounterparty(registry, otherToken);
         address coll = _marketParams.collateralToken;
-        if (coll != asset) _requireAllowedCounterparty(registry, coll);
+        if (levered() && coll != asset) _requireAllowedCounterparty(registry, coll);
         // `uniswapFactory` is DELIBERATELY ABSENT, and the asymmetry with
         // `otherToken` above is the reason to say so. Every address re-checked
         // here keeps receiving vault funds or approvals for the clone's whole
@@ -1256,12 +1333,20 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // the swap below can cross a tick and move it too.
         uint256 poolLiquidityBefore = pool.liquidity();
 
-        // Pull, then post as collateral. The wrapper deposit happens here rather
-        // than at init because init moves no funds.
-        _pullFromVault(asset, collateralAmount);
-        uint256 posted = _postCollateral(collateralAmount);
-
-        morpho.borrow(_marketParams, borrowAmount, 0, address(this), address(this));
+        // Levered: pull, post as collateral, and fund the mint from the
+        // borrow. Unlevered: pull the LP funding directly — the mint path
+        // below is identical in both modes because it already consumes the
+        // asset HELD, which is the borrowed amount in one mode and `lpAmount`
+        // in the other. The wrapper deposit happens here rather than at init
+        // because init moves no funds.
+        uint256 posted = 0;
+        if (levered()) {
+            _pullFromVault(asset, collateralAmount);
+            posted = _postCollateral(collateralAmount);
+            morpho.borrow(_marketParams, borrowAmount, 0, address(this), address(this));
+        } else {
+            _pullFromVault(asset, lpAmount);
+        }
 
         (uint256 tid, uint128 liquidity) = _mintPosition(tickLower, tickUpper, swapFractionBps, mintSlippageBps);
         tokenId = tid;
@@ -1798,6 +1883,13 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      `withdrawCollateral` entirely, which would turn a full settlement
     ///      into a stranded one.
     function _repayAndWithdraw() private returns (uint256 debtRemaining, uint256 collateralRemaining) {
+        // UNLEVERED: nothing was ever borrowed or posted, so there is nothing
+        // to repay, withdraw, or report. The early return is load-bearing, not
+        // cosmetic — the position read four lines down is a TYPED call, and
+        // against `morpho == address(0)` it reverts in this frame with empty
+        // returndata, which would turn every settle and sweep of an unlevered
+        // clone into an undecodable failure.
+        if (!levered()) return (0, 0);
         // GUARDED: `accrueInterest` calls the market's IRM, and the IRM address
         // is part of the proposer-supplied `MarketParams`. A reverting IRM would
         // otherwise be a settlement veto handed to the proposer.
@@ -1989,7 +2081,13 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      failing whole and deferring everything to `sweep()`.
     function _tryRedeemWrapper() private returns (bool ok) {
         address collateralToken = _marketParams.collateralToken;
-        if (collateralToken == asset) return true;
+        // The zero arm is the unlevered mode (no wrapper exists to redeem) and
+        // is REQUIRED here, not just in `_repayAndWithdraw`'s early return:
+        // `releaseUnconvertible` calls this directly, ahead of that guard, and
+        // `IERC20(address(0)).balanceOf` reverts undecodably — which would
+        // brick the hatch of last resort for every unlevered clone. Found by
+        // the no-Morpho-mock suite, which is exactly what it exists to catch.
+        if (collateralToken == address(0) || collateralToken == asset) return true;
 
         uint256 shares = IERC20(collateralToken).balanceOf(address(this));
         if (shares == 0) return true;
@@ -2097,6 +2195,15 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // collateral cannot leave while debt remains. The canonical strand — LP
         // burned, loose balances pushed, collateral stuck behind residual debt —
         // answered false without this and reopened deposits.
+        // UNLEVERED CLONES END HERE. The reads below are the Morpho leg, and
+        // both would fail against a zero address — the typed `position` read
+        // undecodably, the `balanceOf` on `collateralToken == address(0)` the
+        // same way. The vault probes this view with a gas-capped raw call and
+        // treats an unreadable answer as "still counted", so an unguarded read
+        // would not crash anything visibly: it would silently hold the deposit
+        // gate shut forever. That failure shape is why this guard is a mode
+        // check and not a try/catch.
+        if (!levered()) return false;
         Position memory pos = morpho.position(marketId, address(this));
         // Dust-floored for the same reason: `supplyCollateral` also takes
         // `onBehalf` and needs no authorization. The floor is on COLLATERAL and
@@ -2139,6 +2246,11 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     function undeliveredValue() public view override returns (uint256) {
         if (_state != State.Settled) return 0;
         uint256 v = IERC20(asset).balanceOf(address(this));
+        // Covers unlevered clones too, and deliberately by the SAME branch: an
+        // unlevered `collateralToken` is address(0), which is not the asset,
+        // so the figure is the idle balance — exactly right for a clone whose
+        // only holdings are its unwound position's proceeds. Do not "fix" this
+        // to an explicit mode check that then reads Morpho in the other arm.
         if (_marketParams.collateralToken != asset) return v;
 
         // ONE read of the struct, not two.
@@ -2191,7 +2303,11 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // The volatile leg, which is by construction not the vault asset.
         if (IERC20(otherToken).balanceOf(address(this)) > RESIDUE_DUST) return true;
         address coll = _marketParams.collateralToken;
-        if (coll != asset) {
+        // `levered()` and not `coll != address(0)`: the two are equivalent
+        // today, but the mode predicate is the one init enforces, and this
+        // view feeds the vault's deposit gate — an unreadable probe here reads
+        // as "residue outstanding" and shuts deposits with no error anywhere.
+        if (levered() && coll != asset) {
             // Loose collateral, and collateral still posted to Morpho — both in
             // a token `undeliveredValue()` bails out on rather than converting.
             if (IERC20(coll).balanceOf(address(this)) > RESIDUE_DUST) return true;
@@ -2292,7 +2408,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // better custodian, because it has an owner-gated rescue and this clone
         // has none.
         address coll = _marketParams.collateralToken;
-        if (coll != asset) {
+        if (coll != address(0) && coll != asset) {
             uint256 collBal = IERC20(coll).balanceOf(address(this));
             if (collBal != 0) {
                 _pushAllToVault(coll);
