@@ -7,7 +7,7 @@
 
 Exits non-zero when a constant has drifted, because a report computed from a
 different set of numbers than the one that was reviewed is worse than no report.
-Pass --allow-drift to render anyway (CI does this, and the report opens with the
+Pass --allow-drift to render anyway (the report opens with the
 diff).
 
     python3 sim/economics/run.py
