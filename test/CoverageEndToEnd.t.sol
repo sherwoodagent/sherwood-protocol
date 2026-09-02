@@ -141,6 +141,14 @@ contract CoverageEndToEndTest is Test {
     ///      out of the registry-LESS flat default instead.)
     uint256 constant MAX_CAPITAL = 1_000e6;
     uint256 constant COVERAGE_USD = 1_000e18;
+    /// @dev The WOOD lock every approve in this file DECLARES: $1,000 of
+    ///      coverage at the $0.05 WOOD price. Under declared coverage locks a
+    ///      guardian names the WOOD it puts behind a proposal and the ledger
+    ///      clamps it to `kNumerator x stake - openExposure`; declaring exactly
+    ///      the need keeps every dollar figure below identical to the USD
+    ///      reservation it replaced (one WOOD-18 unit == $0.05, so
+    ///      `COVERAGE_WOOD == COVERAGE_USD x 20`).
+    uint256 constant COVERAGE_WOOD = 20_000e18;
     uint256 constant BOND_WOOD = 200e18; // $1,000 × 1% ÷ $0.05
 
     function setUp() public {
@@ -382,8 +390,20 @@ contract CoverageEndToEndTest is Test {
     function _vote(SyndicateGovernor gov, uint256 pid, address guardian, IGuardianRegistry.GuardianVoteType support)
         internal
     {
+        _voteLock(gov, pid, guardian, support, COVERAGE_WOOD);
+    }
+
+    /// @dev `_vote` with an explicit declaration; `type(uint256).max` locks the
+    ///      guardian's whole free budget.
+    function _voteLock(
+        SyndicateGovernor gov,
+        uint256 pid,
+        address guardian,
+        IGuardianRegistry.GuardianVoteType support,
+        uint256 lockWood
+    ) internal {
         vm.prank(guardian);
-        registry.voteOnProposal(address(gov), pid, support);
+        registry.voteOnProposal(address(gov), pid, support, lockWood);
     }
 
     /// @dev Warp past `reviewEnd` (still inside the execution window). The
@@ -517,8 +537,8 @@ contract CoverageEndToEndTest is Test {
         // Warm-up on syndicate B consumes g3's budget entirely.
         uint256 pidB = _propose(govB, address(vaultB), agentB);
         _openReview(govB, pidB);
-        _vote(govB, pidB, g3, IGuardianRegistry.GuardianVoteType.Approve);
-        assertEq(ledger.openExposureUsd(g3), COVERAGE_USD, "g3 fully committed on B");
+        _voteLock(govB, pidB, g3, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+        assertEq(ledger.openExposure(g3), FILLER_STAKE, "g3 locked its whole stake on B");
 
         // Target proposal on syndicate A, same epoch.
         uint256 pidA = _propose(govA, address(vaultA), agentA);
@@ -526,7 +546,7 @@ contract CoverageEndToEndTest is Test {
 
         // g3 has nothing left to pledge -- and votes anyway.
         _vote(govA, pidA, g3, IGuardianRegistry.GuardianVoteType.Approve);
-        assertEq(ledger.allocatedUsd(address(govA), pidA, g3), 0, "books nothing: the cap still binds");
+        assertEq(ledger.lockOf(address(govA), pidA, g3), 0, "locks nothing: the cap still binds");
 
         (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pidA);
         assertEq(approvers.length, 1, "but the review counted the vote");
@@ -534,7 +554,7 @@ contract CoverageEndToEndTest is Test {
 
         // g1 still has budget, so the proposal is genuinely coverable.
         _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Approve);
-        assertGt(ledger.openExposureUsd(g1), 0);
+        assertGt(ledger.openExposure(g1), 0);
 
         _pastReview(govA, pidA);
         govA.executeProposal(pidA);
@@ -565,7 +585,7 @@ contract CoverageEndToEndTest is Test {
         uint256 pid = _propose(govA, address(vaultA), agentA);
         _openReview(govA, pid);
         _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
-        assertGt(ledger.openExposureUsd(g1), 0, "g1 is on the hook");
+        assertGt(ledger.openExposure(g1), 0, "g1 is on the hook");
 
         vm.prank(g1);
         swood.requestUnstakeGuardian(); // allowed: stops them taking on more
@@ -573,7 +593,7 @@ contract CoverageEndToEndTest is Test {
         // Past the cooldown but INSIDE the coverage window — the interval the
         // timer alone cannot police, and the whole reason the gate exists.
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
-        assertGt(ledger.openExposureUsd(g1), 0, "precondition: cooldown elapsed, coverage still open");
+        assertGt(ledger.openExposure(g1), 0, "precondition: cooldown elapsed, coverage still open");
 
         vm.prank(g1);
         vm.expectRevert(StakedWood.CoverageStillOpen.selector);
@@ -595,7 +615,7 @@ contract CoverageEndToEndTest is Test {
 
         // Past the bucket covering settlement plus its challenge window.
         vm.warp(vm.getBlockTimestamp() + 365 days);
-        assertEq(ledger.openExposureUsd(g1), 0, "coverage has expired");
+        assertEq(ledger.openExposure(g1), 0, "coverage has expired");
 
         uint256 balBefore = wood.balanceOf(g1);
         vm.prank(g1);
@@ -604,7 +624,7 @@ contract CoverageEndToEndTest is Test {
     }
 
     /// @notice PR #25 review F2/F6: expiry alone is NOT the exit condition while
-    ///         an accusation is live. `openExposureUsd` sums epoch buckets on
+    ///         an accusation is live. `openExposure` sums epoch buckets on
     ///         pure wall-clock, so coverage ages out on a timer that does not
     ///         pause for a challenge — and the challenge game's disputed tail
     ///         (up to `disputeTimeout`, 30d) outlives it by design. The accused
@@ -638,7 +658,7 @@ contract CoverageEndToEndTest is Test {
         // Far past every bucket clock — exactly the window that used to release
         // the bond out from under a live accusation.
         vm.warp(vm.getBlockTimestamp() + 365 days);
-        assertEq(ledger.openExposureUsd(g1), 0, "the buckets have expired, as they always did");
+        assertEq(ledger.openExposure(g1), 0, "the buckets have expired, as they always did");
 
         vm.prank(g1);
         vm.expectRevert(StakedWood.CoverageStillOpen.selector);
@@ -698,7 +718,7 @@ contract CoverageEndToEndTest is Test {
         uint256 pid = _propose(govA, address(vaultA), agentA);
         _openReview(govA, pid);
         _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
-        assertGt(ledger.openExposureUsd(g1), 0, "genuinely on the hook...");
+        assertGt(ledger.openExposure(g1), 0, "genuinely on the hook...");
 
         vm.prank(g1);
         swood.requestUnstakeGuardian();
@@ -735,36 +755,42 @@ contract CoverageEndToEndTest is Test {
         // 1. The attacker gets in first. It reserves the full coverage — but a
         //    reservation is an upper bound on liability, not a claim on the book.
         _vote(govA, pid, g2, IGuardianRegistry.GuardianVoteType.Approve);
-        assertEq(ledger.openExposureUsd(g2), COVERAGE_USD, "attacker reserves the coverage");
+        assertEq(ledger.openExposure(g2), COVERAGE_WOOD, "attacker locks the coverage");
 
         // 2. THE FIX. The honest approver is no longer free-ridden into a zero
         //    commitment, and is on the ledger's approver list. This assertion is
         //    the exact line that read `0` before.
         _vote(govA, pid, g3, IGuardianRegistry.GuardianVoteType.Approve);
-        assertEq(ledger.openExposureUsd(g3), COVERAGE_USD, "honest approver books its own reservation");
+        assertEq(ledger.openExposure(g3), COVERAGE_WOOD, "honest approver locks its own declaration");
         assertGe(ledger.slashableBondUsd(g3), COVERAGE_USD, "and could carry the proposal alone");
 
-        // Both reserved the full coverage, so each carries half of it for now.
-        assertEq(ledger.allocatedUsd(address(govA), pid, g2), COVERAGE_USD / 2, "split while both are in");
-        assertEq(ledger.allocatedUsd(address(govA), pid, g3), COVERAGE_USD / 2);
+        // Both locked the full coverage. NOTHING IS SPLIT: there is no cohort
+        // cap, so each lock stands in full and the proposal is simply
+        // over-subscribed 2x - every guardian's lock is exactly what it loses
+        // on conviction, whoever else is in.
+        assertEq(ledger.lockOf(address(govA), pid, g2), COVERAGE_WOOD, "attacker's lock stands in full");
+        assertEq(ledger.lockOf(address(govA), pid, g3), COVERAGE_WOOD, "and so does the honest approver's");
+        assertEq(ledger.coverageUsdOf(address(govA), pid, g3), COVERAGE_USD, "priced at the whole lock, uncapped");
+        assertEq(ledger.liabilityUsd(address(govA), pid), COVERAGE_USD, "recoverable liability capped at the need");
 
         // 3. The attacker flips to Block at the last permitted instant, which
         //    releases its reservation at zero cost. Exactly as before.
         vm.warp(_lockoutStart(govA, pid) - 1);
         _vote(govA, pid, g2, IGuardianRegistry.GuardianVoteType.Block);
-        assertEq(ledger.openExposureUsd(g2), 0, "attacker walks away paying nothing");
+        assertEq(ledger.openExposure(g2), 0, "attacker walks away paying nothing");
 
-        // 4. ...but the survivor's allocation scales UP to absorb the whole
-        //    proposal, instead of the coverage collapsing to zero.
-        assertEq(ledger.allocatedUsd(address(govA), pid, g3), COVERAGE_USD, "g3 absorbs the full coverage");
-        assertEq(ledger.allocatedUsd(address(govA), pid, g2), 0, "a released approver carries nothing");
+        // 4. ...but the survivor's lock is untouched - it never depended on
+        //    who else was in - so the coverage does not collapse to zero.
+        assertEq(ledger.lockOf(address(govA), pid, g3), COVERAGE_WOOD, "g3's lock is exactly what it declared");
+        assertEq(ledger.coverageUsdOf(address(govA), pid, g3), COVERAGE_USD, "and still prices the full coverage");
+        assertEq(ledger.lockOf(address(govA), pid, g2), 0, "a released approver carries nothing");
 
         // 5. The lockout still binds — g3 genuinely cannot re-register, which is
         //    what made the original veto permanent. It no longer needs to.
         vm.warp(_lockoutStart(govA, pid) + 1);
         vm.prank(g3);
         vm.expectRevert(IGuardianRegistry.VoteChangeLockedOut.selector);
-        registry.voteOnProposal(address(govA), pid, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(govA), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         // 6. The review resolves Approved (g2 never reached block quorum) — and
         //    this time the proposal EXECUTES rather than being bricked.
@@ -779,7 +805,7 @@ contract CoverageEndToEndTest is Test {
     ///         (exposure booked, §3.3 cap checked) → execute (§3.3a quorum
     ///         covered by that same approver's LIVE bond) → settle →
     ///         `reclaimProposerBond` returns the WOOD → warp past
-    ///         epoch + challengeWindow → `openExposureUsd` back to zero.
+    ///         epoch + challengeWindow → `openExposure` back to zero.
     ///
     ///         The one deliberate asymmetry pinned here: settling does NOT free
     ///         coverage. Exposure is released by TIME (bucket ageing), because
@@ -801,10 +827,10 @@ contract CoverageEndToEndTest is Test {
         // ── Guardian approves through the REAL registry: exposure is booked on
         //    the ledger by `voteOnProposal`, and the §3.3 cap is checked there.
         _openReview(govA, pid);
-        assertEq(ledger.openExposureUsd(g1), 0, "no exposure before the vote");
+        assertEq(ledger.openExposure(g1), 0, "no exposure before the vote");
         _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "approve books the proposal's coverage");
-        assertLe(ledger.openExposureUsd(g1), ledger.slashableBondUsd(g1), "booked within g1's slashable bond");
+        assertEq(ledger.openExposure(g1), COVERAGE_WOOD, "approve locks the declared coverage");
+        assertLe(ledger.openExposure(g1), swood.guardianStake(g1), "locked within g1's stake");
 
         // The registry is the quorum's approver source — one real approver.
         (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pid);
@@ -824,7 +850,7 @@ contract CoverageEndToEndTest is Test {
         assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Settled), "settled");
 
         // Settle does NOT recycle the budget — the challenge window is still open.
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "coverage stays booked through settle");
+        assertEq(ledger.openExposure(g1), COVERAGE_WOOD, "coverage stays locked through settle");
 
         // ── But not YET: the proposer self-settled an hour in, and an executed
         //    proposal holds its bond until nothing can still convict it. The
@@ -848,7 +874,7 @@ contract CoverageEndToEndTest is Test {
         // ── Budget recycles once the approval's bucket ages out: bucket `e`
         //    stops counting at genesis + (e+1)·L + W.
         vm.warp(vm.getBlockTimestamp() + EPOCH_LENGTH + ledger.challengeWindow() + 1);
-        assertEq(ledger.openExposureUsd(g1), 0, "epoch + challenge window elapsed => budget recycled");
+        assertEq(ledger.openExposure(g1), 0, "epoch + challenge window elapsed => budget recycled");
     }
 
     /// @notice Issue #35, end-to-end: an accused approver cannot use a
@@ -870,8 +896,13 @@ contract CoverageEndToEndTest is Test {
     function test_n35_postExecutionTopUpCannotPriceUpItsOwnProsecution() public {
         uint256 pid = _propose(govA, address(vaultA), agentA);
         _openReview(govA, pid);
-        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "g1 reserves the full $1,000 coverage");
+        // g1 locks its WHOLE stake (30,000 WOOD, $1,500), not merely the
+        // $1,000 need: the lock is the first bound on what a conviction can
+        // take, and a lock below the stake would make the anchor moot here
+        // (`min(lock, basis)` would be the lock either side of the top-up).
+        // The anchor is pinned on its own in `ExposureLedger.t.sol`.
+        _voteLock(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+        assertEq(ledger.openExposure(g1), WHALE_STAKE, "g1 locks its whole stake behind the proposal");
 
         _pastReview(govA, pid);
         govA.executeProposal(pid);
@@ -901,8 +932,10 @@ contract CoverageEndToEndTest is Test {
         vm.stopPrank();
         assertEq(ledger.slashableBondUsd(g1), 1_000e18, "sanity: live bond IS fully restored by the top-up");
 
-        // The anchored `liabilityUsd` is UNMOVED: the verdict slash, anchored
-        // at `executedAt`, can never reach the top-up tranche.
+        // `liabilityUsd` is UNMOVED: the lock is 30,000 WOOD and the basis is
+        // anchored at `executedAt`, so `min(lock, basis)` is the pre-top-up
+        // 30,000 WOOD at the crashed price whichever bound is read - the
+        // verdict slash can never reach the top-up tranche.
         assertEq(
             ledger.liabilityUsd(address(govA), pid),
             liabilityAfterCrash,
@@ -940,15 +973,17 @@ contract CoverageEndToEndTest is Test {
 
         // Drain #1 approved — coverage booked against g1's aggregate budget.
         _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Approve);
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD);
+        assertEq(ledger.openExposure(g1), COVERAGE_WOOD);
 
-        // Drain #2 while #1 is still open: only the leftover budget is committed.
+        // Drain #2 while #1 is still open: g1 declares the same 20,000 WOOD
+        // again, and the ledger clamps it to the 10,000 of budget left.
         _vote(govB, pidB, g1, IGuardianRegistry.GuardianVoteType.Approve);
         assertEq(
-            ledger.openExposureUsd(g1),
-            ledger.slashableBondUsd(g1),
-            "total committed exposure pinned at the bond, never 2x the drain"
+            ledger.openExposure(g1),
+            swood.guardianStake(g1),
+            "total locked exposure pinned at the stake, never 2x the drain"
         );
+        assertEq(ledger.lockOf(address(govB), pidB, g1), WHALE_STAKE - COVERAGE_WOOD, "drain #2 got only the remainder");
 
         // #1 stays fully covered; #2 is short of the requirement — a nonzero
         // shortfall now SIZES (issue #27) rather than reverting outright, so
@@ -964,9 +999,9 @@ contract CoverageEndToEndTest is Test {
         // Release both bookings, re-approve #2, and it covers in full.
         _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Block);
         _vote(govB, pidB, g1, IGuardianRegistry.GuardianVoteType.Block);
-        assertEq(ledger.openExposureUsd(g1), 0, "approve -> block releases both bookings");
+        assertEq(ledger.openExposure(g1), 0, "approve -> block releases both locks");
         _vote(govB, pidB, g1, IGuardianRegistry.GuardianVoteType.Approve);
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "drain #2 now fully covered");
+        assertEq(ledger.openExposure(g1), COVERAGE_WOOD, "drain #2 now fully covered");
         ledger.requireApproveQuorum(address(govB), pidB, address(usdg), MAX_CAPITAL);
     }
 
@@ -1032,7 +1067,9 @@ contract CoverageEndToEndTest is Test {
     function test_woodPriceCrashBetweenApproveAndExecute_blocksExecute() public {
         uint256 pid = _propose(govA, address(vaultA), agentA);
         _openReview(govA, pid);
-        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        // Whole stake locked, so the coverage g1 raises IS its bond at the
+        // live price - the quantity the crash below moves.
+        _voteLock(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         assertGe(ledger.slashableBondUsd(g1), COVERAGE_USD, "amply covered at approve time");
         _pastReview(govA, pid);
 
@@ -1136,7 +1173,7 @@ contract CoverageEndToEndTest is Test {
         _pastReview(govA, pid);
         (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pid);
         assertEq(approvers.length, 0, "zero approvers");
-        assertEq(ledger.openExposureUsd(g1), 0, "no exposure booked anywhere");
+        assertEq(ledger.openExposure(g1), 0, "no exposure booked anywhere");
 
         vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
         govA.executeProposal(pid);
@@ -1163,5 +1200,106 @@ contract CoverageEndToEndTest is Test {
         govA.executeProposal(pid);
         assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Executed), "bounded lane still executes");
         assertEq(adapter.pokes(), 1, "the batch really ran");
+    }
+
+    // ── 6. Declared coverage locks on the REVIEW path ─────────────────────
+
+    /// @dev `GuardianRegistry._severityBps`, replicated: the quadratic ramp of
+    ///      block-side decisiveness from the at-open quorum (floor) to the
+    ///      supermajority (ceiling), in the same integer arithmetic.
+    function _severity(uint256 bBps, uint256 qBps, uint256 lo, uint256 hi) internal pure returns (uint256) {
+        uint256 supermajority = 6_667;
+        if (qBps >= supermajority || bBps >= supermajority) return hi;
+        if (bBps <= qBps) return lo;
+        uint256 t = ((bBps - qBps) * 1e18) / (supermajority - qBps);
+        return lo + ((hi - lo) * ((t * t) / 1e18)) / 1e18;
+    }
+
+    /// @dev Drives a review on `gov`/`pid` in which g1 approves with `lockWood`
+    ///      and g2 + g3 block (40,000 of the 90,000 cohort: 4,444 bps, past the
+    ///      3,000-bps quorum and short of the supermajority, so the severity
+    ///      ramp lands strictly between the floor and the ceiling). Returns the
+    ///      severity the registry will apply.
+    function _blockedReview(SyndicateGovernor gov, uint256 pid, uint256 lockWood) internal returns (uint256 sev) {
+        _openReview(gov, pid);
+        uint256 openedAt = vm.getBlockTimestamp() - 1;
+        _voteLock(gov, pid, g1, IGuardianRegistry.GuardianVoteType.Approve, lockWood);
+        _vote(gov, pid, g2, IGuardianRegistry.GuardianVoteType.Block);
+        _vote(gov, pid, g3, IGuardianRegistry.GuardianVoteType.Block);
+        uint256 blockWeight = swood.getPastVotes(g2, openedAt) + swood.getPastVotes(g3, openedAt);
+        uint256 total = swood.getPastTotalVotes(openedAt);
+        uint256 bBps = (blockWeight * 10_000) / total;
+        assertGe(bBps, BLOCK_QUORUM_BPS, "fixture: the block reaches quorum");
+        assertLt(bBps, 6_667, "fixture: and stays under the supermajority");
+        // The envelope the review is judged under is the one in force at open.
+        sev = _severity(bBps, BLOCK_QUORUM_BPS, swood.minSlashBps(), swood.maxSlashBps());
+        assertGt(sev, swood.minSlashBps(), "fixture: severity is strictly inside the envelope");
+        assertLt(sev, swood.maxSlashBps());
+    }
+
+    /// @notice Task 6.4, review path: the block-decisiveness severity MULTIPLIES
+    ///         the lock rate. g1 locks half its 30,000 stake (5,000 bps); a
+    ///         mid-decisiveness block resolves at a severity strictly inside the
+    ///         envelope; the burn is `stake x ceil(5,000 x severity / 10,000)`
+    ///         — less than the lock (the severity discounts it) and more than
+    ///         the floor (the envelope does not bind), so neither bound could
+    ///         have produced the number on its own.
+    function test_reviewSlash_severityMultipliesTheLockRate() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        uint256 lock = WHALE_STAKE / 2; // 15,000 WOOD: 5,000 bps of the 30,000 stake
+        uint256 sev = _blockedReview(govA, pid, lock);
+        assertEq(ledger.lockOf(address(govA), pid, g1), lock, "g1 locked half its stake");
+
+        _pastReview(govA, pid);
+        assertTrue(registry.resolveReview(address(govA), pid), "blocked");
+
+        uint256 lockBps = 5_000;
+        uint256 bps = (lockBps * sev + 10_000 - 1) / 10_000; // ceil, as the registry does
+        bps = bps < swood.minSlashBps() ? swood.minSlashBps() : bps;
+        uint256 burn = (WHALE_STAKE * bps) / 10_000;
+        assertEq(swood.guardianStake(g1), WHALE_STAKE - burn, "burned lock rate x severity of the at-open basis");
+        assertLt(burn, lock, "the severity discounts the lock: less than the whole lock burns...");
+        assertGt(burn, (WHALE_STAKE * swood.minSlashBps()) / 10_000, "...and more than the bare floor");
+        assertEq(swood.guardianStake(g2), FILLER_STAKE, "blockers untouched");
+        assertEq(swood.guardianStake(g3), FILLER_STAKE);
+    }
+
+    /// @notice Spec scenarios "Negligible declaration still pays the floor" and
+    ///         "Owner cannot raise the floor on a decided review". g1 locks ONE
+    ///         WEI: its lock rate rounds up to 1 bps, the severity leaves it at
+    ///         1 bps, and the envelope floors it at the `minSlashBps` in force
+    ///         AT OPEN — 1,000 bps of the whole bond, a real penalty for a token
+    ///         declaration. The owner raising the floor to 5,000 after the
+    ///         review opened changes nothing about it; a review opened after the
+    ///         raise is floored at 5,000.
+    function test_reviewSlash_tokenLockPaysTheAtOpenFloor_ownerCannotRaiseItMidReview() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _blockedReview(govA, pid, 1);
+        assertEq(ledger.lockOf(address(govA), pid, g1), 1, "a 1-wei lock");
+        (, uint256[] memory rate) = ledger.slashBpsFor(address(govA), pid);
+        assertEq(rate[0], 1, "which rounds up to 1 bps");
+
+        // The owner raises the floor AFTER the review opened and the votes are in.
+        assertEq(swood.minSlashBps(), 1_000, "fixture floor at open");
+        vm.prank(owner);
+        swood.setMinSlashBps(5_000);
+
+        _pastReview(govA, pid);
+        assertTrue(registry.resolveReview(address(govA), pid), "blocked");
+        uint256 atOpenFloorBurn = (WHALE_STAKE * 1_000) / 10_000;
+        assertEq(swood.guardianStake(g1), WHALE_STAKE - atOpenFloorBurn, "floored at the AT-OPEN 1,000 bps, not 5,000");
+        assertEq(atOpenFloorBurn, 3_000e18, "a token lock still costs 10% of the whole bond");
+
+        // Control: a review opened AFTER the raise is judged under the new floor.
+        uint256 stakeNow = swood.guardianStake(g1);
+        uint256 pidB = _propose(govB, address(vaultB), agentB);
+        _blockedReview(govB, pidB, 1);
+        _pastReview(govB, pidB);
+        assertTrue(registry.resolveReview(address(govB), pidB), "blocked");
+        assertEq(
+            swood.guardianStake(g1),
+            stakeNow - (stakeNow * 5_000) / 10_000,
+            "the raise applies to reviews opened afterwards"
+        );
     }
 }

@@ -420,7 +420,7 @@ contract SlashGasCeilingTest is Test {
         registry.openReview(address(gov), pid);
         for (uint256 i = 0; i < approvers.length; i++) {
             vm.prank(approvers[i]);
-            registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve);
+            registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         }
 
         vm.warp(gov.getProposal(pid).reviewEnd + 1);

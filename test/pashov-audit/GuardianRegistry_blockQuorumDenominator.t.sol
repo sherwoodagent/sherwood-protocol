@@ -142,10 +142,10 @@ contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
         // The honest approver is an OLD guardian, so it is not itself clamped —
         // this is a real approver taking real slash risk, not a strawman.
         vm.prank(honestOld);
-        registry.voteOnProposal(address(governor), 1, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), 1, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
 
         vm.prank(attacker);
-        registry.voteOnProposal(address(governor), 1, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), 1, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(reviewEnd);
         // THE FIX. Both sides of the comparison are now read at the same
@@ -210,7 +210,7 @@ contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
         assertEq(minTotal, 600_000e18, "the lookback read is untouched by two-block-old stake");
 
         vm.prank(honestOld);
-        registry.voteOnProposal(address(governor), 2, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), 2, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(reviewEnd);
         assertTrue(
@@ -249,7 +249,7 @@ contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
         assertEq(minTotal, 2_000_000e18, "31-day-old parked stake is in BOTH reads -- the min buys nothing");
 
         vm.prank(honestOld);
-        registry.voteOnProposal(address(governor), 3, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), 3, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(reviewEnd);
         assertFalse(
@@ -399,7 +399,7 @@ contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
         uint256 reviewEnd = _registerAndOpen(4);
 
         vm.prank(honestOld);
-        registry.voteOnProposal(address(governor), 4, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), 4, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
 
         // The top-up made the attacker's RAW stake grow across the lookback, so
         // `_growthGatedVoteWeight` clamps them back to the 40_000e18 they held
@@ -407,7 +407,7 @@ contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
         vm.expectEmit(true, true, false, true);
         emit IGuardianRegistry.GuardianVoteCast(4, attacker, IGuardianRegistry.GuardianVoteType.Block, 40_000e18);
         vm.prank(attacker);
-        registry.voteOnProposal(address(governor), 4, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), 4, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(reviewEnd);
         assertTrue(

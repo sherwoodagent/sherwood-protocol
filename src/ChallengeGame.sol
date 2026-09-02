@@ -677,43 +677,29 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         bytes32 challengerKey = _challengerKey(key, msg.sender);
         if (_liveChallengeId(_liveByChallenger[challengerKey]) != 0) revert AlreadyChallenged();
 
-        // The accused set is the ledger's committed approvers: slashing
-        // exactly those keeps recovery equal to the sum of their bonds. A
-        // released commitment reports zero and contributes nothing to the
-        // frozen total.
+        // The accused set is the ledger's LOCKED approvers: slashing exactly
+        // those keeps recovery equal to the sum of their locks. A released lock
+        // is swap-popped out of the list and contributes nothing.
         //
-        // READ THE PLEDGE, NOT THE BOOKING (pashov 2026-08 finding #24).
-        // `approversOf` pairs the list with `_recorded[key][g].usd`, the LIVE
-        // booking, which `settleCoverage` — permissionless, re-runnable and
-        // deliberately NOT freeze-gated — may move in either direction while a
-        // challenge is live. `pledgedOf` pairs it with `_reservedUsd`, which
-        // nobody can move. `ExposureLedger.pledgedOf`'s own natspec states the
-        // rule this site was violating: "A caller asking whether a guardian
-        // underwrote this proposal must ask it of the pledge: asked of the
-        // booking, a guardian convicted on a separate concurrent challenge
-        // could be settled down to a zero booking by anyone and drop straight
-        // out of the accused set."
-        //
-        // Three things here are decided from this number and all three were
-        // stranger-movable: `coverageUsd` (which sizes the challenger's bond,
-        // and therefore the counter-bond the accused must match), the
-        // `NothingToFreeze` gate, and the accused set that
-        // `_verdictAlreadyCollected` is checked against — which could diverge
-        // from the set `_settle` actually slashes, since `slashBpsFor` is
-        // already pledge-based.
-        //
-        // The last site to migrate: `slashBpsFor` (pashov review finding #13),
-        // `freezeCoverage` and `pinCoverageUntil` (audit-181 findings A/C) and
-        // `TokenCourt._recordAccused` (issue #83) all moved to the pledge for
-        // exactly this reason and this one was missed.
-        (address[] memory covering, uint256[] memory committedUsd) = exposureLedger.pledgedOf(governor, proposalId);
-        uint256 coverageUsd;
+        // `pledgedOf` pairs the list with each guardian's WOOD lock — the one
+        // figure the ledger holds per (proposal, guardian), written once by
+        // `recordApproval` and erased only by `releaseApproval` (which the
+        // freeze this filing takes blocks outright) or `retireApproval`
+        // (refused while frozen or pinned). Three things are decided from it
+        // and none is stranger-movable any more: the `NothingToFreeze` gate,
+        // the accused set `_verdictAlreadyCollected` is checked against, and —
+        // via `unsharedLiabilityUsd` below — the challenger's bond. The old
+        // booking/pledge split, and the permissionless `settleCoverage` that
+        // could move the booking under a live challenge (pashov 2026-08 finding
+        // #24), no longer exist.
+        (address[] memory covering, uint256[] memory lockedWood) = exposureLedger.pledgedOf(governor, proposalId);
+        uint256 lockedTotal;
         uint256 accusedCount;
-        for (uint256 i = 0; i < committedUsd.length; i++) {
-            coverageUsd += committedUsd[i];
-            if (committedUsd[i] != 0) accusedCount++;
+        for (uint256 i = 0; i < lockedWood.length; i++) {
+            lockedTotal += lockedWood[i];
+            if (lockedWood[i] != 0) accusedCount++;
         }
-        if (coverageUsd == 0) revert NothingToFreeze();
+        if (lockedTotal == 0) revert NothingToFreeze();
 
         // Same refusal as `_convicted` above, but asked of sWOOD directly, whose
         // `verdictSlashed` key survives a redeploy of this game. Without it, a
@@ -722,119 +708,64 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // terminate: `_settle` would revert `ApproverAlreadySlashed` and `rule`
         // is unreachable from `Filed`.
         address[] memory accused = new address[](accusedCount);
-        for (uint256 i = 0; i < committedUsd.length; i++) {
-            if (committedUsd[i] == 0) continue;
+        for (uint256 i = 0; i < lockedWood.length; i++) {
+            if (lockedWood[i] == 0) continue;
             accused[--accusedCount] = covering[i];
         }
         if (_verdictAlreadyCollected(key, accused)) revert AlreadyConvicted();
 
-        // RESERVATIONS ARE NOT LIABILITY. The sum above is what the cohort
-        // RESERVED, and `recordApproval` deliberately over-reserves - every
-        // approver books up to the full coverage, because at vote time any one of
-        // them might carry it alone. It therefore exceeds what a conviction could
-        // take, by a factor that GROWS WITH THE APPROVER COUNT: sizing the bond
-        // off it would make a proposal more expensive to challenge the better
-        // covered it was.
+        // THE BOND IS SIZED OFF WHAT A CONVICTION CAN RECOVER FOR THIS PROPOSAL.
+        // `unsharedLiabilityUsd` is `min(needUsd, sum of min(lock_i, slashable
+        // stake_i) x woodPriceX8())`, anchored at `executedAt`:
         //
-        // UNSHARED, DELIBERATELY - not `liabilityUsd`, which pro-rates a
-        // guardian's slashable basis across every OTHER open proposal it backs.
-        // That shared figure diluted this bond whenever the accused cohort also
-        // backed something else, an ordinary operating condition. The bond must
-        // price what THIS filing freezes for THIS cohort, and must not get
-        // cheaper because the same guardians are busy elsewhere.
+        //   - CAPPED AT THE NEED. There is no cohort cap, so approvers may lock
+        //     more WOOD than the proposal requires. The adversary is a cohort
+        //     that over-subscribes precisely to price challengers out; the cap
+        //     makes surplus locks cost the challenger nothing. The full locks
+        //     still burn on conviction — the cap binds bond sizing only.
+        //   - VALUED AT WHAT IS REACHABLE. A guardian whose stake fell below its
+        //     lock counts at the stake; a post-drain top-up is excluded by the
+        //     anchor, so an accused cohort cannot price up its own prosecution
+        //     with capital the verdict slash can never reach.
         //
-        // CAPPED, NOT REPLACED: an under-covered cohort is still priced on what
-        // it pledged, because that is all there is to take. CAUGHT, because this
-        // reads the asset feed: a stale feed must not make filing impossible
-        // during exactly the market stress a drain happens in. Falling back to
-        // the reservation sum over-charges the challenger, which is recoverable;
-        // being unable to file at all is not.
+        // NO FALLBACK ON A PRICE FAILURE, DELIBERATELY. The previous shape caught
+        // the revert and substituted the raw reservation sum (divided by the
+        // accused count), because being unable to file at all through a feed
+        // outage read as worse than over-charging. Under the lock model the
+        // uncapped sum is the over-subscription the cap exists to remove, and
+        // substituting it would hand the over-subscribing cohort exactly the
+        // inflated bond the cap denies them — a stale feed must make filing WAIT,
+        // never make the bond LARGER. The revert is mapped to `WoodPriceUnset`:
+        // transient and protocol-wide, the same class the raw price read below
+        // reports, so a filer sees one selector for "come back when the ledger
+        // can price" and a different one (`BondTooSmall`) for "this proposal can
+        // never be challenged at this size".
         //
-        // THE CATCH MUST STILL LAND ON A LIABILITY-SCALE NUMBER (pashov review
-        // finding #5). Keeping the RESERVATION sum on the fallback path
-        // reinstates the cohort-size inversion this call exists to remove: the
-        // basis becomes `A * needUsd` for `A` approvers (`A <= 100`). And the
-        // over-charge is not confined to the filer — `dispute`'s pool target IS
-        // `c.bondWood`, so an A-fold bond demands an A-fold counter-bond from a
-        // cohort whose per-guardian free WOOD is sized to `needUsd`. Price the
-        // accused out of adjudication and `_settle`'s silence branch convicts
-        // them at `slashBpsFor`'s ceiling.
-        //
-        // Dividing by the accused count restores the ORDER of the quantity
-        // without the feed the clamp could not read. The skew is one-sided:
-        // each approver books at most `needUsd`, so the quotient can never
-        // exceed the true ceiling — it can only under-charge, worst case by
-        // `accusedN`, which lowers `dispute`'s target in exact proportion.
+        // Wrapped rather than called bare so the ledger's own selector
+        // (`NoWoodPrice`, `StalePrice`, `FeedNotConfigured`) does not leak
+        // through `file` as an unfamiliar error; every price-side failure lands
+        // on the one transient selector this contract documents.
+        uint256 coverageUsd;
         try exposureLedger.unsharedLiabilityUsd(governor, proposalId) returns (uint256 liability) {
-            if (liability != 0 && liability < coverageUsd) coverageUsd = liability;
+            coverageUsd = liability;
         } catch {
-            uint256 accusedN = accused.length;
-            if (accusedN > 1) coverageUsd /= accusedN;
+            revert WoodPriceUnset();
         }
 
-        // The bond scales with the exposure the filing freezes, converted at the
-        // ledger's composed WOOD/USD price (X8) - the same haircut-applied price
-        // every other conversion divides by.
-        //
-        // GUARDED, like the sibling read above. `woodPriceX8` REVERTS
-        // `NoWoodPrice` rather than returning zero when neither the Chainlink
-        // feed nor the TWAP is live, and left unguarded that revert propagates
-        // straight through `file`. On chain 4663 there is no WOOD/USD aggregator
-        // at all - the TWAP is the only live source, and its ETH/USD leg has a
-        // ~10.7h heartbeat - while `challengeWindow` is pure wall clock, extended
-        // for nothing spent unpriceable: an outage spanning the rest of the
-        // window turns a recoverable delay into PERMANENT immunity.
-        //
-        // Falling back to the governance cap keeps filing reachable. The cap is
-        // maintained ABOVE market, so pricing the bond off it UNDER-STATES
-        // `bondWood` - conservative for the filer, never for the protocol. This
-        // is not the misuse `_woodPrice` forecloses: that rule is about pricing
-        // the REAL money the ledger accounts for, whereas this prices the
-        // challenger's own anti-spam deposit, with the divergence stated here
-        // rather than applied silently for every consumer.
+        // The bond scales with the recoverable coverage the filing freezes,
+        // converted at the ledger's composed WOOD/USD price (X8) - the same
+        // haircut-applied price every other conversion divides by. Called BARE:
+        // `unsharedLiabilityUsd` above already read this same price in this same
+        // transaction and did not revert, so a revert here is unreachable and a
+        // fallback would be dead code guarding against a state the previous
+        // statement excludes.
         //
         // Fails closed on both an unpriceable bond (transient, protocol-wide) and
         // a bond that floors to zero (permanent, proposal-specific), named with
-        // separate selectors since the two are opposite failures.
-        uint256 priceX8;
-        try exposureLedger.woodPriceX8() returns (uint256 p) {
-            priceX8 = p;
-        } catch {
-            // APPLY THE HAIRCUT THE PRIMARY READ APPLIES (pashov review
-            // finding #5). `woodPriceX8()` is `haircut(min(market, cap))`;
-            // `woodUsdPriceX8` is the BARE cap, and `_haircut` is reached only
-            // from inside `_woodPrice`. Substituting one for the other changes
-            // the KIND of quantity, not just its freshness, so the "the cap is
-            // seeded above market, therefore this under-states the bond
-            // conservatively" argument above understates by a further
-            // `BPS_DENOMINATOR / woodHaircutBps` — up to 2x at the
-            // `woodHaircutBps` floor of 5_000, on top of the cap/market ratio.
-            //
-            // Under-stating this bond is NOT conservative for the protocol:
-            // it is the anti-spam deposit on a filing that freezes the accused
-            // cohort's coverage and bars every named approver from
-            // `claimUnstakeGuardian` for `autoSlashDelay` — and
-            // `_liveByChallenger` gives each address its own slot with
-            // `_liveCount` uncapped, so cheap filings are repeatable per
-            // address. Re-applying the haircut keeps both branches in the same
-            // units and leaves only the intended cap/market conservatism.
-            //
-            // Raw staticcall for the haircut, degrading to "no haircut": this
-            // whole branch exists BECAUSE the ledger is already answering
-            // badly, so a typed call here would reintroduce the revert the
-            // catch is meant to absorb. Degrading to `BPS_DENOMINATOR`
-            // reproduces exactly the pre-fix figure, so the worst case is the
-            // behaviour this branch already had — never a larger bond than
-            // intended.
-            uint256 haircutBps = BPS_DENOMINATOR;
-            (bool okHc, bytes memory hcRet) =
-                address(exposureLedger).staticcall(abi.encodeCall(IExposureLedger.woodHaircutBps, ()));
-            if (okHc && hcRet.length == 32) {
-                uint256 hc = abi.decode(hcRet, (uint256));
-                if (hc != 0 && hc <= BPS_DENOMINATOR) haircutBps = hc;
-            }
-            priceX8 = (exposureLedger.woodUsdPriceX8() * haircutBps) / BPS_DENOMINATOR;
-        }
+        // separate selectors since the two are opposite failures. A cohort whose
+        // every lock is backed by zero live stake lands on the second: nothing
+        // is recoverable, so nothing is worth freezing.
+        uint256 priceX8 = exposureLedger.woodPriceX8();
         if (priceX8 == 0) revert WoodPriceUnset();
         uint256 bondWood = (((coverageUsd * challengerBondBps) / BPS_DENOMINATOR) * 1e8) / priceX8;
         if (bondWood == 0) revert BondTooSmall();
@@ -1799,10 +1730,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     }
 
     /// @dev The accused set: the ledger's covering approvers, filtered to those
-    ///      whose committed share is still non-zero - a released commitment
-    ///      backed nothing, so it is neither slashed nor paid out of a failed
-    ///      challenge. Filtered rather than passed through raw because the
-    ///      approver array is what names people in the `GuardianSlashed` topics.
+    ///      whose lock-derived rate is non-zero - a zero lock (released, or an
+    ///      approval that locked nothing) backed nothing, so it is neither
+    ///      slashed nor paid out of a failed challenge. Filtered rather than
+    ///      passed through raw because the approver array is what names people
+    ///      in the `GuardianSlashed` topics. Each surviving rate is the
+    ///      approver's lock over its slash basis at `executedAt`, so
+    ///      `slashVerdict` burns `min(lock, basis)` under sWOOD's envelope.
     function _accusedWithRates(address governor, uint256 proposalId)
         private
         view

@@ -242,7 +242,10 @@ abstract contract SyndicateGovernorHandler is Properties {
         // other's functions.
         for (uint256 i; i < APPROVER_COUNT; i++) {
             vm.prank(actors[i]);
-            try registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve) {} catch {}
+            try registry.voteOnProposal(
+                address(governor), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
+            ) {}
+                catch {}
         }
 
         skipTime(registry.reviewPeriod() + 1);

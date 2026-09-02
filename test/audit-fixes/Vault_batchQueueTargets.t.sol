@@ -31,6 +31,12 @@ contract DenyAllTierRegistry {
     function isCallableTarget(address) external pure returns (bool) {
         return false;
     }
+
+    /// @dev SHE-209: no class concept in this stand-in — every address is a
+    ///      non-member, so the vault's class-binding check never fires.
+    function classOf(address) external pure returns (bytes32) {
+        return bytes32(0);
+    }
 }
 
 /// @dev issue #166 companion fixture: `DenyAllTierRegistry` above is
@@ -57,6 +63,12 @@ contract AllowlistableTierRegistry {
     ///      reachable, not to exercise the demotion asymmetry.
     function isCallableTarget(address target) external view returns (bool) {
         return isAdapterAllowed[target];
+    }
+
+    /// @dev SHE-209: no class concept in this stand-in — every address is a
+    ///      non-member, so the vault's class-binding check never fires.
+    function classOf(address) external pure returns (bytes32) {
+        return bytes32(0);
     }
 }
 

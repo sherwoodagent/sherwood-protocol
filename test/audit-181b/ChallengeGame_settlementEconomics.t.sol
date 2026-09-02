@@ -104,8 +104,16 @@ contract MockLedgerSE {
 
     /// @dev Zero means "no override" at the `file()` call site — the raw
     ///      `approversOf` sum is used as-is.
-    function unsharedLiabilityUsd(address, uint256) external pure returns (uint256) {
-        return 0;
+    /// @dev The bond basis `file()` trusts outright under declared coverage
+    ///      locks (the game's uncapped fallback is gone): the cohort's locks at
+    ///      value, which this mock keeps as the `usd` figures set by
+    ///      `setApprovers`.
+    function unsharedLiabilityUsd(address governor, uint256 proposalId) external view returns (uint256 total) {
+        bytes32 k = _key(governor, proposalId);
+        address[] storage list = _approvers[k];
+        for (uint256 i = 0; i < list.length; i++) {
+            total += _committed[k][list[i]];
+        }
     }
 
     function freezeCoverage(address, uint256) external {}

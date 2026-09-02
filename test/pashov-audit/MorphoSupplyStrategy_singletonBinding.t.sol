@@ -128,6 +128,12 @@ contract BindingTierRegistry {
     function isCallableTarget(address a) external view returns (bool) {
         return allowed[a];
     }
+
+    /// @dev SHE-209: no class concept in this stand-in — every address is a
+    ///      non-member, so the vault's class-binding check never fires.
+    function classOf(address) external pure returns (bytes32) {
+        return bytes32(0);
+    }
 }
 
 /// @notice A registry with code but no `isAdapterAllowed` selector: RESOLVED

@@ -229,10 +229,28 @@
       "type": "t_mapping(t_uint256,t_array(t_address)dyn_storage)"
     },
     {
-      "label": "__gap",
+      "label": "_voteExitPid",
       "slot": "69",
       "offset": 0,
-      "type": "t_array(t_uint256)23_storage"
+      "type": "t_uint256"
+    },
+    {
+      "label": "_voteExitShares",
+      "slot": "70",
+      "offset": 0,
+      "type": "t_uint256"
+    },
+    {
+      "label": "_ballots",
+      "slot": "71",
+      "offset": 0,
+      "type": "t_mapping(t_uint256,t_mapping(t_address,t_struct(SyndicateGovernor.Ballot)_storage))"
+    },
+    {
+      "label": "__gap",
+      "slot": "72",
+      "offset": 0,
+      "type": "t_array(t_uint256)20_storage"
     }
   ],
   "types": {
@@ -558,6 +576,26 @@
       {
         "label": "effectiveMaxCapital",
         "slot": "27",
+        "offset": 0,
+        "type": "t_uint256"
+      }
+    ],
+    "t_struct(SyndicateGovernor.Ballot)_storage": [
+      {
+        "label": "support",
+        "slot": "0",
+        "offset": 0,
+        "type": "t_enum(VoteType)"
+      },
+      {
+        "label": "weight",
+        "slot": "1",
+        "offset": 0,
+        "type": "t_uint256"
+      },
+      {
+        "label": "cast",
+        "slot": "2",
         "offset": 0,
         "type": "t_uint256"
       }

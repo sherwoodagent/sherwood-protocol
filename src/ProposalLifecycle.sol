@@ -54,6 +54,17 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         return _openProposalCount;
     }
 
+    /// @dev SHE-205. Shares that left the vault during `proposalId`'s voting
+    ///      window, to be netted out of the veto denominator. Defaults to zero
+    ///      so this base contract stays self-contained; `SyndicateGovernor`
+    ///      overrides it with the counter it maintains. Declared as a hook
+    ///      rather than storage here deliberately — adding a slot to a base
+    ///      contract would shift every derived slot and break the layout gate.
+    function _exitedDuringVote(uint256 proposalId) internal view virtual returns (uint256) {
+        proposalId; // silence unused-parameter warning in the default
+        return 0;
+    }
+
     /// @dev The ONE resolver. Pure view over proposal storage; no writes, no
     ///      registry mutation.
     /// @return resolved the authoritative current state.
@@ -97,8 +108,32 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             address queue = ISyndicateVault(p.vault).withdrawalQueue();
             uint256 queueVotes = queue == address(0) ? 0 : IVotes(p.vault).getPastVotes(queue, p.snapshotTimestamp);
             uint256 liveSupply = pastTotalSupply > queueVotes ? pastTotalSupply - queueVotes : 0;
+            // SHE-205: shares that LEFT during the voting window are not part of
+            // the electorate the bar is meant to represent. Deposits shut as soon
+            // as a proposal exists but redemptions stay open until EXECUTE, so a
+            // depositor arriving one block before `propose` sits in
+            // `pastTotalSupply` and can be gone before this runs — inflating the
+            // bar without ever voting. Their ballot, if any, was withdrawn at the
+            // same moment (see `SyndicateGovernor.notifyVotingWeightMoved`),
+            // which is what stops this netting from becoming a cheaper way to
+            // FORCE a veto.
+            //
+            // `liveSupply == 0` SKIPS THE VETO CHECK, BY DECISION. Reaching it
+            // needs every snapshot share to burn during the window, which an
+            // attacker cannot make honest holders do; and with nobody left
+            // holding, there is no LP whose veto is being denied. The floor
+            // below covers the rounding edge for a small-but-nonzero
+            // electorate.
+            uint256 exited = _exitedDuringVote(p.id);
+            liveSupply = liveSupply > exited ? liveSupply - exited : 0;
             if (liveSupply > 0) {
                 uint256 vetoThreshold = (liveSupply * p.vetoThresholdBps) / BPS_DENOMINATOR;
+                // FLOOR AT ONE VOTE. Integer division sends the threshold to
+                // zero for any electorate small enough that
+                // `liveSupply * bps < BPS_DENOMINATOR`, and `votesAgainst >= 0`
+                // is vacuously true -- so a proposal nobody voted on would be
+                // Rejected. A veto must always cost at least one vote against.
+                if (vetoThreshold == 0) vetoThreshold = 1;
                 if (p.votesAgainst >= vetoThreshold) {
                     // Veto rejection never traversed guardian review.
                     return (ProposalState.Rejected, false);

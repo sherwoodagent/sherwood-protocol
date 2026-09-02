@@ -1183,8 +1183,10 @@ contract StakedWoodTest is Test {
 
         address[] memory approvers = new address[](1);
         approvers[0] = alice;
+        uint256[] memory rates = new uint256[](1);
+        rates[0] = 9_000; // 90%: per-approver rates under declared coverage locks
         vm.prank(registry);
-        swood.slashGuardians(bytes32(uint256(1)), anchor, approvers, 9_000); // 90%
+        swood.slashGuardians(bytes32(uint256(1)), anchor, approvers, rates);
 
         assertEq(swood.guardianStake(alice), 1_000e18, "ground down to a positive residual");
         assertLt(swood.guardianStake(alice), swood.minGuardianStake(), "and now below the entry floor");

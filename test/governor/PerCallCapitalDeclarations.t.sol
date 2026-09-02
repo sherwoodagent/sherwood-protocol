@@ -109,6 +109,11 @@ contract PerCallCapitalDeclarationsTest is Test {
         governor.setTierRegistry(address(tierRegistry));
         tierRegistry.setAdapterAllowed(address(mockAdapter), true);
         tierRegistry.setAdapterAllowed(address(usdc), true);
+        // The shared `_benignSettle()` leg calls `usdc.approve`. Certify it
+        // tier-0 so a benign settlement is genuinely low-tier: since SHE-210
+        // the settlement leg's tier counts toward the proposal tier, and an
+        // uncertified selector resolves to the fail-closed tier 2.
+        _certifyNow(address(usdc), usdc.approve.selector, 0, 100, address(0));
     }
 
     /// @dev Shared fixture helper (mirrors `TierRegistryTest._certifyNow`):
@@ -188,6 +193,96 @@ contract PerCallCapitalDeclarationsTest is Test {
         //     = 80_000e6 + 95_000e6 + 100_000e6 = 275_000e6
         // settle: single call, cap defaults to 0 (new uint256[](1) is zero-initialized).
         assertEq(governor.getRequiredCoverage(pid), 275_000e6, "issue's own worked example: 275,000, not 10M+");
+    }
+
+    // ── SHE-210: settlement-leg tier must lift the whole-proposal tier ──────
+
+    /// @notice A tier-2 (uncertified) extraction parked entirely in
+    ///         `settlementCalls`, under a certified tier-0 execute leg, must
+    ///         still price the proposal at tier 2. Pre-fix `tier = execTier`
+    ///         discarded the settlement leg's tier, so the proposal recorded
+    ///         tier 0 and skipped the bond-encumbered approve quorum
+    ///         (`envelopeTier >= quorumTierThreshold`) while coverage — always
+    ///         summed over both legs — priced the extraction. Now tier is the
+    ///         MAX across both legs.
+    function test_she210_settlementLegLiftsProposalTier() public {
+        _wireTierRegistry();
+        // Execute leg: certified tier-0.
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 100, address(0));
+
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(mockAdapter), data: abi.encodeCall(mockAdapter.approve, (address(usdc), 1)), value: 0
+        });
+        uint256[] memory execCaps = new uint256[](1);
+        execCaps[0] = 1_000_000e6;
+
+        // Settlement leg: uncertified selector -> tier 2.
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(mockAdapter), data: abi.encodeCall(mockAdapter.mint, (address(this), 1)), value: 0
+        });
+        uint256[] memory settleCaps = new uint256[](1);
+        settleCaps[0] = 100_000e6;
+
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://she210-settle-tier2",
+            7 days,
+            ISyndicateGovernor.RiskEnvelope({maxCapital: 10_000_000e6, maxDrawdownBps: 10_000}),
+            execCalls,
+            execCaps,
+            settleCalls,
+            settleCaps,
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+
+        assertEq(
+            governor.getProposalTier(pid), 2, "settlement-leg tier-2 lifts the whole-proposal tier (was execTier=0)"
+        );
+    }
+
+    /// @notice CONTROL: with BOTH legs certified tier-0, the proposal stays
+    ///         tier 0. Pins that the lift above is driven by the settlement
+    ///         leg's TIER, not by the mere presence of a settlement call — so
+    ///         the reject test is not vacuously always-2.
+    function test_she210_certifiedSettlementLegKeepsLowTier() public {
+        _wireTierRegistry();
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 100, address(0));
+        // `usdc.approve` is certified tier-0 inside `_wireTierRegistry`.
+
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(mockAdapter), data: abi.encodeCall(mockAdapter.approve, (address(usdc), 1)), value: 0
+        });
+        uint256[] memory execCaps = new uint256[](1);
+        execCaps[0] = 1_000_000e6;
+
+        // Settlement leg: certified tier-0 (usdc.approve).
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(mockAdapter), 0)), value: 0
+        });
+        uint256[] memory settleCaps = new uint256[](1);
+        settleCaps[0] = 1_000e6;
+
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://she210-settle-tier0",
+            7 days,
+            ISyndicateGovernor.RiskEnvelope({maxCapital: 10_000_000e6, maxDrawdownBps: 10_000}),
+            execCalls,
+            execCaps,
+            settleCalls,
+            settleCaps,
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+
+        assertEq(governor.getProposalTier(pid), 0, "both legs certified tier-0 -> proposal stays tier 0");
     }
 
     // ── 8.1(d) / design.md D2: the per-call tier-2 ceiling ──────────────────

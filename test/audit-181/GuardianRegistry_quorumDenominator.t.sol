@@ -97,7 +97,9 @@ contract GuardianRegistry_quorumDenominatorTest is RegistryTestHarness {
 
         // Honest cohort casts its genuine 40% block vote.
         vm.prank(honestBlocker);
-        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+        );
 
         vm.warp(voteEnd + REVIEW_PERIOD);
         vm.expectEmit(true, false, false, true);

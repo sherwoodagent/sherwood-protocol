@@ -91,6 +91,20 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @notice Proposal ID -> voter -> bool
     mapping(uint256 => mapping(address => bool)) private _hasVoted;
 
+    /// @notice SHE-205. A cast ballot, retained so that the vote can follow the
+    ///         voting weight behind it. `cast` is the weight counted at `vote`;
+    ///         `weight` is what currently stands in the tally, always
+    ///         `min(cast, live votes of the voter)` after the last movement.
+    /// @dev    Two figures rather than a running decrement because the standing
+    ///         weight is RECOMPUTED, never accumulated: weight that leaves and
+    ///         returns restores the ballot, and no sequence of moves can push it
+    ///         above what was cast.
+    struct Ballot {
+        VoteType support;
+        uint256 weight;
+        uint256 cast;
+    }
+
     /// @notice Proposal ID -> vault balance at execution time
     mapping(uint256 => uint256) private _capitalSnapshots;
 
@@ -275,12 +289,63 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      collectable — which is the honest failure mode.
     mapping(uint256 => address[]) private _sandboxTokens;
 
+    /// @notice SHE-205. The proposal whose voting-window exits `_voteExitShares`
+    ///         belongs to. Tagged rather than cleared so the counter never has
+    ///         to be reset on a separate write.
+    uint256 private _voteExitPid;
+
+    /// @notice SHE-205. Shares that left the vault during `_voteExitPid`'s
+    ///         voting window, netted out of the veto denominator.
+    ///
+    /// @dev    The veto bar is a fraction of a supply SNAPSHOT, but redemptions
+    ///         stay open for the whole vote (they shut only at EXECUTE, via
+    ///         `getActiveProposal`, while deposits shut at Draft via
+    ///         `openProposalCount`). A depositor arriving one block before
+    ///         `propose` is therefore counted in the denominator and can be gone
+    ///         before settlement — raising the bar without casting a vote.
+    ///         Netting their exit back out is what removes the inflation.
+    ///
+    ///         FROZEN AT `voteEnd`, deliberately. Pricing the bar against LIVE
+    ///         supply instead would make the verdict move after the vote closed:
+    ///         `_computeState` is a true view and `resolveProposalState` is
+    ///         permissionless, so the outcome would become an MEV race —
+    ///         withdraw, resolve, redeposit in one transaction. Counting only
+    ///         while `block.timestamp <= voteEnd` makes the verdict a pure
+    ///         function of the window.
+    uint256 private _voteExitShares;
+
+    /// @notice SHE-205. Per-proposal ballot record, keyed by the VOTER: the
+    ///         direction they chose, the weight they cast, and the weight still
+    ///         standing behind it.
+    ///
+    /// @dev    Needed because netting exits out of the denominator WITHOUT also
+    ///         rescinding the departing holder's ballot trades this bug for its
+    ///         mirror. A voter could cast Against, then withdraw to shrink the
+    ///         very denominator their ballot is measured against: at a 40% bar,
+    ///         a 30% holder voting then exiting clears `0.4 x (S - e)`, so 30%
+    ///         beats a 40% bar.
+    ///
+    ///         THE DENOMINATOR AND THE BALLOT ANSWER DIFFERENT QUESTIONS. The
+    ///         denominator is a SUPPLY figure and moves only on burns. The
+    ///         ballot is a claim on VOTING WEIGHT and must move whenever the
+    ///         voter's weight does -- by burn, by transfer, or by a delegation
+    ///         change -- or the two decouple: vote, hand the shares to a second
+    ///         address, redeem there. Keyed on the burner, the ballot survived
+    ///         that and 29% of the book forced a veto against a 40% bar with
+    ///         all of its capital returned. The vault therefore reports every
+    ///         drop in an address's live votes, and the ballot is recomputed as
+    ///         `min(cast, getVotes(voter))`. Together the two halves leave the
+    ///         effective bar at 40% of supply however the attacker splits
+    ///         between voting, moving and exiting.
+    mapping(uint256 => mapping(address => Ballot)) private _ballots;
+
     /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31)
     ///      for the three mappings above, then 1 more for `_escrowedFees`, then
     ///      1 more for `_ppsSnapshots`, then 3 more for the sandbox payload
-    ///      (26 -> 23) — append-only. See
+    ///      (26 -> 23), then 3 more for the SHE-205 exit accounting
+    ///      (23 -> 20) — append-only. See
     ///      `script/syndicate-governor-layout.golden.json`.
-    uint256[23] private __gap;
+    uint256[20] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -690,9 +755,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             _initPendingProposal(p, reviewPeriod_);
         }
 
-        // Tier resolution: proposal tier = MAX tier across execute calls;
-        // `requiredCoverage` is the per-call SUM over execute AND settlement
-        // calls. Resolved from the STORED calls rather than the calldata arrays
+        // Tier resolution: proposal tier = MAX tier across execute AND
+        // settlement calls; `requiredCoverage` is the per-call SUM over execute
+        // AND settlement calls. Resolved from the STORED calls rather than the calldata arrays
         // so those refs are dead by this point — keeps `propose` under Yul's
         // stack budget. Reads the same storage arrays re-resolved at execute.
         _snapshotTierAndGate(p, _loadCalls(_executeCalls, proposalId));
@@ -711,11 +776,37 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_commitState(proposal) != ProposalState.Pending) revert NotWithinVotingPeriod();
         if (_hasVoted[proposalId][msg.sender]) revert AlreadyVoted();
 
-        // Vote weight from ERC20Votes checkpoint at proposal creation.
+        // Vote weight from ERC20Votes checkpoint at proposal creation, CAPPED BY
+        // WHAT THE VOTER STILL CARRIES.
+        //
+        // SHE-205: the snapshot read alone is order-dependent in a way the exit
+        // netting cannot see. `notifyVotingWeightMoved` recomputes a ballot that
+        // already exists, so vote-then-exit is covered -- but exit-then-vote arrives at
+        // an empty `_ballots` slot, returns early, and leaves the holder free to
+        // cast full snapshot weight against a denominator their own exit just
+        // shrank. That inverts the fix: 28.6% of the book could force a veto
+        // with its capital already withdrawn.
+        //
+        // `getVotes` rather than `balanceOf` is deliberate. This vault
+        // auto-delegates on receipt but leaves an explicit delegation alone, so
+        // a delegatee legitimately votes weight it does not hold and a balance
+        // comparison would zero them. Current votes track the delegation graph,
+        // so an exit by the underlying holder lowers the delegatee's cap too.
+        //
+        // The cap only ever reduces: a holder who ACQUIRED shares after the
+        // snapshot still votes the snapshot figure.
         uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, proposal.snapshotTimestamp);
+        uint256 liveWeight = IVotes(proposal.vault).getVotes(msg.sender);
+        if (liveWeight < weight) weight = liveWeight;
         if (weight == 0) revert NoVotingPower();
 
         _hasVoted[proposalId][msg.sender] = true;
+        // SHE-205: retain the ballot so `notifyVotingWeightMoved` can follow it
+        // if the voter's weight later moves. What is stored is the CAPPED
+        // weight -- the snapshot figure less anything already gone -- so the
+        // recompute below can never restore weight the voter did not carry
+        // when they voted.
+        _ballots[proposalId][msg.sender] = Ballot({support: support, weight: weight, cast: weight});
 
         if (support == VoteType.For) {
             proposal.votesFor += weight;
@@ -726,6 +817,131 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
 
         emit VoteCast(proposalId, msg.sender, support, weight);
+    }
+
+    /// @notice SHE-205. The vault reports that `shares` were BURNED — redeemed
+    ///         out of the vault — while a vote is open. Those shares stop
+    ///         counting toward the veto denominator. The denominator is a
+    ///         supply figure, so only a burn moves it; transfers and delegation
+    ///         changes are reported through `notifyVotingWeightMoved` instead,
+    ///         which touches ballots and never the denominator.
+    ///
+    /// @dev    VAULT-ONLY, and silent rather than reverting on every other
+    ///         condition. This runs inside the vault's ERC20 `_update`, so a
+    ///         revert here would brick every share burn; each early return is
+    ///         a state in which there is simply nothing to record.
+    ///
+    ///         Only `Pending` and only up to `voteEnd`: see `_voteExitShares`
+    ///         for why the counter must stop there rather than track live
+    ///         supply.
+    ///
+    ///         The vault never reports the withdrawal queue's own burns, which
+    ///         would otherwise be subtracted twice — escrowed queue shares are
+    ///         already netted out of the denominator via the queue's
+    ///         checkpointed voting weight.
+    ///
+    ///         The burner's ballot is NOT handled here. Burning shares lowers
+    ///         the live votes of whoever they were delegated to, and the vault
+    ///         reports that drop separately (from the OZ delegate-votes hook,
+    ///         which fires inside the same `_update`), so the ballot is
+    ///         recomputed for the right voter whether or not the burner is the
+    ///         one who voted.
+    function notifyShareExit(uint256 shares) external {
+        if (msg.sender != GovernorParameters.vault) return;
+        if (shares == 0) return;
+        (uint256 pid,) = _openVote();
+        if (pid == 0) return;
+
+        // TAG, DON'T CLEAR. Retagging to a NEW pid silently zeroes
+        // `_exitedDuringVote(oldPid)`, which would retroactively restore the
+        // pre-fix denominator for a verdict already read. That is unreachable
+        // only because a proposal is committed to storage before its successor
+        // can exist: `ProposalLifecycle._decOpen` drops `_openProposalCount` on
+        // a committing terminal transition, and `propose` requires that count to
+        // be zero. This ordering is load-bearing -- keep the two in step.
+        if (_voteExitPid != pid) {
+            _voteExitPid = pid;
+            _voteExitShares = 0;
+        }
+        _voteExitShares += shares;
+    }
+
+    /// @notice SHE-205. The vault reports that `voter`'s live voting weight
+    ///         just MOVED — shares they carry were transferred or burned, shares
+    ///         arrived, or a delegation moved onto or off them. Any ballot
+    ///         `voter` cast on the open proposal is brought back in step with
+    ///         the weight they now hold: the standing weight becomes
+    ///         `min(cast, getVotes(voter))`.
+    ///
+    /// @dev    RECOMPUTED, NOT DECREMENTED. The tally moves by the difference
+    ///         between what stood before and what stands now, in either
+    ///         direction, so weight that leaves and comes back restores the
+    ///         ballot and a round trip is a no-op. The ceiling is what was
+    ///         cast, so no sequence of moves can grow a ballot.
+    ///
+    ///         KEYED ON THE VOTER, NOT THE HOLDER. The vault resolves the
+    ///         address whose votes dropped -- `delegates(from)` for a transfer
+    ///         or burn, the OLD delegatee for a delegation change -- and that
+    ///         is the only address that can have voted this weight. Keying on
+    ///         the burning account instead let a voter hand their shares to a
+    ///         second address and redeem there: denominator down, ballot
+    ///         intact, 29% forcing a veto against a 40% bar.
+    ///
+    ///         The vault reports both sides of every move, so a rise is seen
+    ///         as promptly as a drop. `test_she205_ballotFollowsTheWeightOutAndBack`
+    ///         pins the restore.
+    ///
+    ///         VAULT-ONLY and silent on every other condition, for the same
+    ///         reason as `notifyShareExit`: this runs inside every share
+    ///         transfer and every delegation.
+    function notifyVotingWeightMoved(address voter) external {
+        if (msg.sender != GovernorParameters.vault) return;
+        (uint256 pid, StrategyProposal storage p) = _openVote();
+        if (pid == 0) return;
+
+        Ballot storage b = _ballots[pid][voter];
+        uint256 cast = b.cast;
+        if (cast == 0) return;
+
+        uint256 live = IVotes(p.vault).getVotes(voter);
+        uint256 want = live < cast ? live : cast;
+        uint256 have = b.weight;
+        if (want == have) return;
+        b.weight = want;
+
+        if (want < have) {
+            uint256 cut = have - want;
+            if (b.support == VoteType.For) p.votesFor -= cut;
+            else if (b.support == VoteType.Against) p.votesAgainst -= cut;
+            else p.votesAbstain -= cut;
+            emit VoteWithdrawnOnExit(pid, voter, cut);
+        } else {
+            uint256 back = want - have;
+            if (b.support == VoteType.For) p.votesFor += back;
+            else if (b.support == VoteType.Against) p.votesAgainst += back;
+            else p.votesAbstain += back;
+            emit VoteRestoredOnReturn(pid, voter, back);
+        }
+    }
+
+    /// @dev SHE-205. The proposal currently taking votes, or `(0, _)` if
+    ///      none. Exactly one top-level proposal is open at a time, so the
+    ///      monotonic counter names it — the same identification
+    ///      `SyndicateVault._openProposalPid` relies on. Bounded by `voteEnd`
+    ///      rather than by state alone because `state` is only committed on
+    ///      the next `_commitState`; a proposal past its window but not yet
+    ///      resolved still reads `Pending`.
+    function _openVote() internal view returns (uint256 pid, StrategyProposal storage p) {
+        pid = _proposalCount;
+        p = _proposals[pid];
+        if (p.id == 0 || p.state != ProposalState.Pending || block.timestamp > p.voteEnd) pid = 0;
+    }
+
+    /// @dev SHE-205. Surfaces the exit counter to `_computeState`, which lives
+    ///      in the base contract. The storage sits here, in the most-derived
+    ///      contract, so the base's layout is untouched.
+    function _exitedDuringVote(uint256 proposalId) internal view override returns (uint256) {
+        return _voteExitPid == proposalId ? _voteExitShares : 0;
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -793,6 +1009,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // price. Tier alone misses a same-tier re-certification with a higher
         // `extractableBoundBps`, so also revert when the re-resolved coverage
         // exceeds the propose-time snapshot.
+        //
+        // PRICE THE SAME QUANTITY PROPOSE PRICED. `_snapshotTierAndGate` adds
+        // the sandbox funding to the stored `requiredCoverage`; comparing a
+        // batch-only live figure against that sum leaves the coverage guard
+        // slack by exactly the funding, so a mid-review re-certification that
+        // raises the batch's coverage by less than the funding executes
+        // undetected. Adding the funding here removes that slack. The tier
+        // needs no matching adjustment: a sandbox proposal is pinned at tier 2,
+        // and 2 is the maximum, so `TierRegressed` cannot fire for it.
+        uint256 sandboxFunding = _sandboxFunding[proposalId];
         (uint8 liveTier, uint256 liveCoverage) = _resolveTierAndCoverage(
             calls,
             _loadCaps(_executeCallCaps, proposalId),
@@ -802,7 +1028,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             false
         );
         if (liveTier > proposal.envelopeTier) revert TierRegressed();
-        if (liveCoverage > proposal.requiredCoverage) revert CoverageRegressed();
+        if (liveCoverage + sandboxFunding > proposal.requiredCoverage) revert CoverageRegressed();
 
         // Fail-safe sibling to the two regression checks above. The propose-time
         // ceiling check alone is NOT sufficient: it prices `maxCapital` against
@@ -862,7 +1088,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // The subtraction cannot underflow: `proposeWithSandbox` bounds funding
         // by `maxCapital`, and the scaling below is monotone in it.
         uint256 batchCapital = proposal.effectiveMaxCapital;
-        uint256 sandboxFunding = _sandboxFunding[proposalId];
         if (sandboxFunding != 0) {
             // Scaled by the SAME raised-over-required ratio the effective
             // capital and the per-call caps already carry, expressed as
@@ -1290,13 +1515,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // re-entrant double-release through a hooked WOOD.
         proposal.proposerBondWood = 0;
         IProposerBondEscrow(escrow).releaseBond(proposalId);
-
-        // Best-effort `settleCoverage` self-trigger: this is the backstop that IS
-        // provably past `executeBy` for every executed proposal, so it collapses
-        // the reservations an early settlement-time trigger had to skip.
-        // Successful-release path only — never on the forfeiture-acknowledge
-        // early return, whose conviction already reprices the cohort.
-        _settleCoverageBestEffort(proposalId, proposal);
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -1858,8 +2076,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
     }
 
-    /// @dev Proposal tier = max tier across EXECUTE calls (batch-wide: every
-    ///      consumer of the aggregate tier wants the fail-closed max). Coverage is
+    /// @dev Proposal tier = max tier across EXECUTE and SETTLEMENT calls
+    ///      (batch-wide: every consumer of the aggregate tier wants the
+    ///      fail-closed max). Coverage is
     ///      the SUM of per-call contributions across BOTH execute and settlement
     ///      calls: `coverage = sum(cap_i * boundBps_i) / 10_000`, where
     ///      `boundBps_i` is the certified bound for tier-0/1 calls and 10_000
@@ -1887,8 +2106,15 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             ? (IERC4626(GovernorParameters.vault).totalAssets() * tier2CallCapBps()) / BPS_DENOMINATOR
             : type(uint256).max;
         (uint8 execTier, uint256 execCoverage) = _scanCalls(registry, execCalls, execCaps, checkCeiling, tier2Ceiling);
-        (, uint256 settleCoverage) = _scanCalls(registry, settleCalls, settleCaps, checkCeiling, tier2Ceiling);
-        tier = execTier;
+        (uint8 settleTier, uint256 settleCoverage) =
+            _scanCalls(registry, settleCalls, settleCaps, checkCeiling, tier2Ceiling);
+        // Tier is the MAX across BOTH legs, not execute alone (SHE-210). The
+        // approve-quorum gate and `TierRegressed` both key off this tier; taking
+        // execTier only let a proposer park an uncertified tier-2 extraction in
+        // `settlementCalls` under a low-tier execute leg, so it skipped the
+        // bond-encumbered quorum while coverage (already summed over both legs)
+        // priced it. Coverage was always whole-proposal; now tier is too.
+        tier = execTier >= settleTier ? execTier : settleTier;
         coverage = execCoverage + settleCoverage;
     }
 
@@ -2197,10 +2423,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      corresponding asset balance it started with. Strategies MUST fully
     ///      unwind non-asset positions before this runs; if one cannot, wait past
     ///      `strategyDuration` and drive the emergency-settle path.
-    /// @dev  Best-effort `settleCoverage` self-trigger. Settlement is NOT reliably
-    ///       past a proposal's `executeBy`, so `_settleCoverageBestEffort` guards
-    ///       on it and skips silently otherwise — the `reclaimProposerBond`
-    ///       trigger is the backstop that IS provably past it.
     function _finishSettlement(uint256 proposalId, StrategyProposal storage proposal)
         internal
         returns (int256 pnl, uint256 agentFee)
@@ -2264,46 +2486,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _decOpen();
 
         emit ProposalSettled(proposalId, vault, pnl, totalFee, block.timestamp - proposal.executedAt);
-
-        // LAST operation of finalization (design D1): a gas-starved child
-        // here leaves no meaningful work unfunded behind it. Covers
-        // `settleProposal`, `unstick`, and `finalizeEmergencySettle` in one
-        // place (all three route through `_finishSettlement`).
-        _settleCoverageBestEffort(proposalId, proposal);
-    }
-
-    /// @notice Best-effort self-trigger of the exposure ledger's
-    ///         `settleCoverage(address(this), proposalId)` so cohort capacity
-    ///         relief does not depend on an external keeper. Never reverts.
-    /// @dev    Guard first: `settleCoverage` itself reverts `ReviewNotClosed`
-    ///         unless `pv.executeBy != 0 && block.timestamp > pv.executeBy`,
-    ///         mirrored here exactly including the `== 0` disjunct.
-    ///         `proposal.executeBy` stays zero for a collaborative Draft that
-    ///         never reaches Pending, and without that check the guard would not
-    ///         skip — the ledger call would run only to revert on the same zero,
-    ///         producing a spurious `CoverageSettleFailed` for a proposal that was
-    ///         never capable of a real failure. Settlement is also not reliably
-    ///         past `executeBy`, so an early call is a statically-knowable no-op:
-    ///         skipping silently keeps `CoverageSettleFailed` meaning the call
-    ///         reverted, not that it ran too early.
-    /// @dev    Ledger resolution mirrors the reclaim gates' pinned-first rule: the
-    ///         ledger pinned at bond-lock time, falling back to the live slot only
-    ///         for a proposal that recorded none, skipping when both are zero.
-    /// @dev    Bare catch, deliberately: everything reaching it is either
-    ///         ledger-side (e.g. `NoWoodPrice` during a feed outage) or gas
-    ///         starvation, and revert data cannot reliably distinguish them. No
-    ///         gas floor: a gas-starved trigger degrades to the exact pre-change
-    ///         status quo — over-reserved, the conservative direction — surfaced
-    ///         by `CoverageSettleFailed` and permissionlessly repairable.
-    function _settleCoverageBestEffort(uint256 proposalId, StrategyProposal storage proposal) private {
-        if (proposal.executeBy == 0 || block.timestamp <= proposal.executeBy) return;
-        address ledger = proposal.proposerBondLedger;
-        if (ledger == address(0)) ledger = _exposureLedger;
-        if (ledger == address(0)) return;
-        try IExposureLedger(ledger).settleCoverage(address(this), proposalId) {}
-        catch {
-            emit CoverageSettleFailed(proposalId, ledger);
-        }
     }
 
     /// @dev Snapshot every fee rate, recipient and split in force at propose time

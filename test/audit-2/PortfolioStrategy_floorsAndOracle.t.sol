@@ -124,6 +124,12 @@ contract MockTierRegistry {
     function isPriceSourceForToken(address token, bytes32 src) external view returns (bool) {
         return !deniedPair[token][src];
     }
+
+    /// @dev SHE-209: no class concept in this stand-in — every address is a
+    ///      non-member, so the vault's class-binding check never fires.
+    function classOf(address) external pure returns (bytes32) {
+        return bytes32(0);
+    }
 }
 
 /// @notice Configurable AggregatorV3-shaped push feed: settable answer,

@@ -81,6 +81,17 @@ interface ISyndicateVault {
     ///         spender/recipient is neither the vault itself nor an adapter
     ///         allowlisted in the TierRegistry.
     error DisallowedTransferTarget(address target, bytes4 selector, address recipient);
+    /// @notice A recipient that is a MEMBER of a TierRegistry code class
+    ///         (`classOf(recipient) != 0`, i.e. an ERC-1167 clone of a certified
+    ///         strategy template) is not bound to this vault — its own `vault()`
+    ///         does not equal `address(this)`, or is unreadable. Class
+    ///         membership proves the recipient's CODE is a certified template's
+    ///         clone, but `initialize` is unpermissioned, so the clone's
+    ///         fund-destination (`_vault`) can be attacker-set (SHE-209). Every
+    ///         class member is bound to this vault, INCLUDING one the owner also
+    ///         granted per-address via `setAdapterAllowed`; only non-members
+    ///         (`classOf == 0`: routers, Permit2, plain tokens) are exempt.
+    error AdapterVaultMismatch(address recipient);
     /// @notice A governor batch named the vault or its withdrawal queue as a
     ///         call target. Rejected as a class, whatever the selector: the
     ///         batch executes under `delegatecall`, so `msg.sender == vault`
@@ -122,6 +133,13 @@ interface ISyndicateVault {
     ///         the tier system prices, so this is refused regardless of the
     ///         TierRegistry's presence or the `to` recipient.
     error DisallowedTransferFromSource(address target, address from);
+    /// @notice SHE-205. A share movement that must report to the governor was
+    ///         sent with too little gas to fund the report. Under EIP-150 the
+    ///         caller could otherwise choose a gas limit at which the movement
+    ///         lands and the report starves, leaving a ballot standing behind
+    ///         weight that has left. Re-send with a higher gas limit; see
+    ///         `SyndicateVault.GOVERNANCE_REPORT_GAS`.
+    error GovernanceReportUnderfunded(uint256 available, uint256 required);
 
     // ── Init Params ──
     struct InitParams {

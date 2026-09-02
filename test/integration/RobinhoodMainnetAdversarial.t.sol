@@ -283,7 +283,7 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
         registry.openReview(address(governor), pid);
         if (blocker != address(0)) {
             vm.prank(blocker);
-            registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block);
+            registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
         }
         vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod() + 1);
         registry.resolveReview(address(governor), pid);

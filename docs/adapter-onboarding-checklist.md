@@ -603,6 +603,24 @@ not just one deployment's configuration. Only certify a template where:
 
 Step 3 is what **replaces `setAdapterAllowed(clone, true)` per proposal**.
 
+**Certification review invariant (SHE-209).** Class membership admits *every*
+clone of the template as a batch recipient — including clones minted with a
+bare `Clones.clone` outside `StrategyFactory` and initialized permissionlessly,
+which bypass `StrategyFactory.approvedTemplate` entirely. `SyndicateVault`
+binds each member to the paying vault (`vault() == vault`, reverting
+`AdapterVaultMismatch` otherwise), which neutralizes a hostile clone **only
+if** the template derives its fund destination and its counterparty allowlist
+from `vault()` and exposes no payout / recipient / router address settable
+from `initialize` or `updateParams` data. Nothing on-chain checks this. Before
+step 1, the reviewer must confirm it for the template being certified
+(`BaseStrategy._pushToVault` and the shipped templates satisfy it; grep the
+template for `recipient` / `receiver` / `dest` / `beneficiary` params).
+
+Note that the vault binding applies to every class member, **including a clone
+the owner also granted per-address** with `setAdapterAllowed(clone, true)` —
+the explicit grant vets the address, the binding pins that it still pays this
+vault. The exemption is "not a class member", not "explicitly granted".
+
 ### Verification reads
 
 ```
@@ -630,13 +648,22 @@ class **callee** axis (`_classCalleeAllowed`,
 ([`:1407`](../src/TierRegistry.sol#L1407)) leaves that standing deliberately, for
 the same reason `_demote` does on the address path: a class conviction must not
 strand the capital a live clone is holding. Existing per-clone address grants
-keep working throughout, because the address path always wins over the class.
+keep the clone *admitted* throughout, because the address path always wins
+over the class at the registry — but the vault still binds every class member
+to itself (SHE-209), so a granted clone of a demoted class is paid only while
+its `vault()` is the paying vault.
 
 **Closing the class callee axis is a SEQUENCED step, not an immediate one.**
 `setClassAllowed(template, false)` ([`:1347`](../src/TierRegistry.sol#L1347)) is
 the only call that closes it. Running it straight after the conviction
 re-creates exactly the freeze finding #14 fixed — the live clone becomes
-unreachable and every LP exit shuts. Correct order:
+unreachable and every LP exit shuts.
+
+Note what `StrategyFactory.setTemplateApproval(t, false)` does and does not
+do: it stops NEW clones through the factory, nothing else. The funds axis is
+closed by `demoteClass` (step 1) and stays closed only while `setClassAllowed`
+is false (step 4); a bare `Clones.clone` of `t` bound to the vault is still
+class-admitted until then. Revoke both levers. Correct order:
 
 ```
 1. demoteClass(template, selector)        # funds axis closed, tier -> 2
@@ -647,6 +674,9 @@ unreachable and every LP exit shuts. Correct order:
                                           # governor openProposalCount == 0
                                           # no proposal for this template in Executed
 4. setClassAllowed(template, false)       # NOW close the callee axis
+5. StrategyFactory.setTemplateApproval(template, false)
+                                          # stop NEW factory clones of the
+                                          # template (does not affect 1-4)
 ```
 
 Step 4 is the one the contract no longer does for you, and the one that gets
