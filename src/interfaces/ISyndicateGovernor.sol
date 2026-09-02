@@ -526,16 +526,22 @@ interface ISyndicateGovernor {
     event PerformanceFeeCharged(uint256 indexed proposalId, address indexed asset, uint256 amount, uint256 aboveMark);
 
     event VoteCast(uint256 indexed proposalId, address indexed voter, VoteType support, uint256 weight);
-    /// @notice SHE-205. `weight` of `voter`'s ballot was withdrawn because
-    ///         their live voting weight fell below what stands in the tally —
-    ///         shares they carried were redeemed or transferred away, or a
-    ///         delegation moved off them — while the vote was open. A ballot
-    ///         cannot outlive the weight behind it.
+    /// @notice SHE-205. `weight` units were REMOVED from `voter`'s ballot
+    ///         because their live voting weight fell below what stood in the
+    ///         tally — shares they carried were redeemed or transferred away,
+    ///         or a delegation moved off them — while the vote was open. A
+    ///         ballot cannot outlive the weight behind it.
+    /// @dev    `weight` is the DELTA cut in this movement, not the ballot's
+    ///         resulting standing weight. Indexers reconstruct the standing
+    ///         figure as `VoteCast.weight - sum(withdrawn) + sum(restored)`.
     event VoteWithdrawnOnExit(uint256 indexed proposalId, address indexed voter, uint256 weight);
-    /// @notice SHE-205. `weight` of `voter`'s previously withdrawn ballot was
-    ///         restored because their live voting weight came back. The ballot
-    ///         is recomputed against live votes, capped at what was cast, so a
-    ///         round trip leaves it exactly where it started.
+    /// @notice SHE-205. `weight` units were ADDED BACK to `voter`'s previously
+    ///         withdrawn ballot because their live voting weight returned. The
+    ///         ballot is recomputed against live votes, capped at what was
+    ///         cast, so a round trip inside the window leaves it where it
+    ///         started.
+    /// @dev    `weight` is the DELTA restored in this movement, not the
+    ///         ballot's resulting standing weight.
     event VoteRestoredOnReturn(uint256 indexed proposalId, address indexed voter, uint256 weight);
 
     event ProposalExecuted(uint256 indexed proposalId, address indexed vault, uint256 capitalSnapshot);

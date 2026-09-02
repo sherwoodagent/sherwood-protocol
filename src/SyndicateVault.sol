@@ -86,6 +86,32 @@ contract SyndicateVault is
     ///      per-vault `maxPerformanceFeeBps` of 20%.
     uint256 public constant MAX_AGENT_FEE_BPS = FeeConstants.MAX_PERFORMANCE_FEE_BPS;
 
+    /// @notice SHE-205. Gas handed to the governor for each voting report
+    ///         (`notifyShareExit`, `notifyVotingWeightMoved`), and the amount
+    ///         the caller must be able to fund before the vault will run the
+    ///         share movement at all.
+    /// @dev    A fixed GRANT rather than "whatever is left", because whatever
+    ///         is left is attacker-chosen. EIP-150 lets a caller retain 1/64
+    ///         of its gas and forward the rest, so at a call site with almost
+    ///         no trailing work -- `delegate()` -- a transaction could be capped
+    ///         where the vault finished and the governor starved: the move
+    ///         landed, the ballot behind it stood, and 29% of the book forced
+    ///         a veto against a 40% bar. Granting a constant and REVERTING when
+    ///         the caller cannot fund it turns that into a failed transaction.
+    ///         The governor's work per report is bounded and attacker-
+    ///         independent (a handful of SLOADs, one `getVotes`, two SSTOREs);
+    ///         `test_she205_reportGasGrantCoversAColdRecompute` pins the grant
+    ///         at >= 2x a cold recompute. Unused gas is returned, so the grant
+    ///         is a floor on the transaction's gas limit, not a cost.
+    uint256 public constant GOVERNANCE_REPORT_GAS = 200_000;
+
+    /// @dev SHE-205. Transient cache for the governor address, so a share
+    ///      movement that fires several reports pays the factory round-trip
+    ///      once. Set once per vault at creation (`SyndicateFactory`
+    ///      `_governorOf`), so a per-transaction cache can never be stale.
+    ///      Slot: `keccak256("sherwood.vault.governorCache") - 1`.
+    bytes32 private constant GOVERNOR_CACHE_TSLOT = 0x3d666d22fecad437fb3fcdb6d4d99cadd645515732500b6579243e4b695e2d31;
+
     /// @notice Cap on the owner-set idle-liquidity floor (50%).
     uint256 private constant MAX_MIN_BUFFER_BPS = 5_000;
 
@@ -1520,13 +1546,38 @@ contract SyndicateVault is
         // `redeem` and are reported here. A reader relaxing that gate would
         // open the gap; this comment is the warning.
         //
-        // BEST-EFFORT, NOT A GATE. A raw call whose result is ignored: this
-        // runs inside every share burn, so a governor that cannot answer
-        // must not be able to brick LP flow. The degraded outcome -- a
-        // governor with `vote`'s live-weight cap but neither report -- is an
-        // UNNETTED denominator with CAPPED ballots: strictly harder to veto
-        // than pre-fix, never a stuck vault. Only reachable behind a beacon
-        // implementation that has `vote` but not these hooks.
+        // Nor a "cancelled then redeemed" case, which would subtract the same
+        // shares once through `queueVotes` and again here. A redeem request
+        // is tagged with the ACTIVE proposal that locked redemptions, and
+        // `VaultWithdrawalQueue.cancel` refuses once that proposal's settle
+        // price is stamped. An Executed proposal has no exit but
+        // `settleProposal`, which stamps before `_decOpen` lets the next
+        // proposal exist -- so by the time any later vote is open, every
+        // request from the previous one is stamped and uncancellable. The
+        // two gates (redeem-only-while-active, cancel-only-before-stamp)
+        // together are what make "netted exactly once" true.
+        //
+        // THE DEPOSIT LOCK IS LOAD-BEARING TOO. Ballots recompute against
+        // live weight from ANY source, and mints are not reported to the
+        // denominator. If a deposit could land mid-vote, `vote -> redeem ->
+        // re-deposit` would restore a ballot against an already-shrunk
+        // denominator: a solo 29% veto with capital intact. That is blocked
+        // only because both mint entrypoints are shut for the whole window
+        // (`depositsLocked()` from Draft onward). Relaxing the deposit lock
+        // during a vote re-opens SHE-205; treat it like the `requestRedeem`
+        // gate above.
+        //
+        // The same seam admits RENTED weight: a voter who has fully exited
+        // gets their ballot back if another holder later delegates to them.
+        // Not a break -- that coalition holds 29% + 29% = 58% of the book,
+        // worse than the 40% an honest coalition needs -- but it is where
+        // the restore direction ends, and it matters the day shares are
+        // rentable from a passive market.
+        //
+        // GAS-FLOORED, NOT BEST-EFFORT: see `_reportToGovernor` for why a
+        // report that could be starved is a report that can be skipped on
+        // purpose, and for the exact degraded outcome when the governor
+        // itself cannot answer.
         if (to == address(0) && from != address(0) && from != _withdrawalQueue && value != 0) {
             _reportToGovernor(abi.encodeWithSignature("notifyShareExit(uint256)", value));
         }
@@ -1569,9 +1620,21 @@ contract SyndicateVault is
     ///      good, since `_hasVoted` blocks a re-vote. The queue never votes
     ///      and is skipped on either side.
     ///
-    ///      Best-effort for the same reason as the burn report in `_update`:
-    ///      this runs inside every transfer and every `delegate`, and a
-    ///      governor that cannot answer must not brick either.
+    ///      The restore is BOUNDED BY THE WINDOW. Weight that leaves inside
+    ///      the vote and returns only after `voteEnd` does not reopen the
+    ///      tally -- the governor stops listening there, for the same reason
+    ///      the denominator freezes there: a verdict that could still move
+    ///      after the window is a race between whoever calls
+    ///      `resolveProposalState`, and the attacker's version (vote, exit,
+    ///      re-acquire after `voteEnd` against the shrunk denominator) is
+    ///      exactly what the freeze forecloses. So "a round trip is a no-op"
+    ///      holds for round trips that complete inside the window;
+    ///      `test_she205_suspensionAtVoteEndIsNotRestored` pins the boundary.
+    ///
+    ///      Gas-floored, not best-effort: see `_reportToGovernor`. This is
+    ///      the call site with the least trailing work (`delegate()` does
+    ///      nothing after it), which is precisely where a best-effort report
+    ///      could be starved.
     function _moveDelegateVotes(address from, address to, uint256 amount) internal override {
         super._moveDelegateVotes(from, to, amount);
         if (from == to || amount == 0) return;
@@ -1584,16 +1647,75 @@ contract SyndicateVault is
         }
     }
 
-    /// @dev SHE-205. Raw, unchecked call to this vault's governor. The result
-    ///      is deliberately ignored: both reports run inside ERC20 hooks, and a
-    ///      revert here would brick share flow. A vault with no governor
-    ///      (pre-registration) has nothing to report to.
+    /// @dev SHE-205. Deliver one voting report to this vault's governor with a
+    ///      FIXED gas grant, or revert if the caller cannot fund it.
+    ///
+    ///      THE 63/64 RULE IS THE THREAT. A `CALL` forwards at most
+    ///      `gasleft - gasleft/64`, and the caller keeps the rest. Both
+    ///      reports run inside ERC20 hooks, so the "rest" is whatever the
+    ///      hook's caller still has to do -- and on `delegate()` that is three
+    ///      function epilogues. A transaction capped just above that let the
+    ///      delegation land while the governor ran out of gas mid-recompute:
+    ///      the report was best-effort, so nothing reverted, and a ballot
+    ///      stood behind weight that had left. From there the round-2 exploit
+    ///      replayed verbatim. The same shape reached the burn report
+    ///      (`notifyShareExit`) and the RESTORE side of a transfer, where
+    ///      starving it destroyed an honest LP's ballot for the window.
+    ///
+    ///      So: require that the caller can fund `GOVERNANCE_REPORT_GAS` in
+    ///      full under the 63/64 rule, then grant exactly that. Starvation
+    ///      becomes a revert of the whole share movement, which a well-formed
+    ///      transaction never hits (estimation sizes the limit) and a capped
+    ///      one cannot get past. The check runs BEFORE the factory lookup so
+    ///      the lookup cannot be starved either.
+    ///
+    ///      STILL NEVER A BRICK. The governor call itself is unchecked: a
+    ///      governor that reverts, or is missing, drops the report and LP
+    ///      flow continues. That degraded outcome -- capped ballots over an
+    ///      unnetted denominator -- is STRICTLY HARDER to veto than pre-fix
+    ///      only when the governor lacks the hooks entirely. A report that
+    ///      failed for any other reason on an otherwise working governor
+    ///      would be strictly easier, which is exactly why a fixed grant is
+    ///      used rather than "what is left": within the grant, the work is
+    ///      bounded and attacker-independent, so the only way to lose a
+    ///      report is a governor that cannot do its job at all.
+    ///
+    ///      The factory lookup is a raw staticcall, cached per transaction:
+    ///      it is a mapping getter set once at vault creation, and a factory
+    ///      that cannot answer must not brick share flow any more than a
+    ///      governor that cannot.
     function _reportToGovernor(bytes memory data) private {
-        address gov = ISyndicateFactory(_factory).governorOf(address(this));
+        uint256 g = gasleft();
+        uint256 fundable = g - g / 64;
+        if (fundable < GOVERNANCE_REPORT_GAS) revert GovernanceReportUnderfunded(fundable, GOVERNANCE_REPORT_GAS);
+
+        address gov = _cachedGovernor();
         if (gov == address(0)) return;
         // solhint-disable-next-line avoid-low-level-calls
-        (bool ok,) = gov.call(data);
+        (bool ok,) = gov.call{gas: GOVERNANCE_REPORT_GAS}(data);
         ok; // deliberately unchecked — see above
+    }
+
+    /// @dev SHE-205. The governor address, looked up through the factory once
+    ///      per transaction and held in transient storage. A raw staticcall so
+    ///      a factory that cannot answer reads as "no governor" rather than
+    ///      reverting the share movement; the gas floor in `_reportToGovernor`
+    ///      has already run, so this call cannot be starved into that branch.
+    function _cachedGovernor() private returns (address gov) {
+        bytes32 slot = GOVERNOR_CACHE_TSLOT;
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            gov := tload(slot)
+        }
+        if (gov != address(0)) return gov;
+        (bool ok, bytes memory ret) = _factory.staticcall(abi.encodeCall(ISyndicateFactory.governorOf, (address(this))));
+        if (!ok || ret.length != 32) return address(0);
+        gov = abi.decode(ret, (address));
+        if (gov == address(0)) return gov;
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            tstore(slot, gov)
+        }
     }
 
     /// @dev Use timestamp-based voting checkpoints instead of block numbers

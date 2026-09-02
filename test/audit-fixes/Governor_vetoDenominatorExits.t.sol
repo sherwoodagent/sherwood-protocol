@@ -726,6 +726,196 @@ contract GovernorVetoDenominatorExitsTest is Test {
         return _stateAfterVoting(pid) == ISyndicateGovernor.ProposalState.Rejected;
     }
 
+    // ── 7. ROUND-3 REVIEW — the reports cannot be starved ─────────────────
+    //
+    // Both reports were best-effort raw calls with no gas floor. Under
+    // EIP-150 a caller keeps 1/64 of its gas and forwards the rest, so a
+    // call site with almost no trailing work -- `delegate()` -- could be run
+    // at a gas cap where the vault finished and the governor starved. The
+    // move landed, the report did not, and the round-2 exploit came back:
+    // vote, `delegate(address(0))` at ~40k gas, transfer to a mule, redeem.
+    // The vault now requires enough gas to fund a fixed grant to the
+    // governor and reverts otherwise, so a starved report is a reverted
+    // transaction rather than a silent skip. The sweeps below pin that on
+    // every call site a report hangs off.
+
+    uint256 constant SWEEP_LO = 21_000;
+    uint256 constant SWEEP_HI = 400_000;
+    uint256 constant SWEEP_STEP = 250;
+
+    /// @notice `delegate(address(0))` at any gas cap either reverts or cuts
+    ///         the ballot. There is no cap at which the delegation lands and
+    ///         the ballot stands.
+    function test_she205_delegateCannotStarveTheBallotReport() public {
+        _deposit(lp1, 71_000e6);
+        _deposit(attacker, 29_000e6);
+        uint256 pid = _propose();
+        vm.prank(attacker);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        uint256 cast = governor.getProposal(pid).votesAgainst;
+        assertGt(cast, 0, "control: ballot cast");
+
+        uint256 landed;
+        for (uint256 cap = SWEEP_LO; cap <= SWEEP_HI; cap += SWEEP_STEP) {
+            uint256 snap = vm.snapshotState();
+            vm.prank(attacker);
+            (bool ok,) = address(vault).call{gas: cap}(abi.encodeCall(vault.delegate, (address(0))));
+            if (ok) {
+                landed++;
+                assertEq(vault.getVotes(attacker), 0, "control: the delegation landed");
+                assertEq(governor.getProposal(pid).votesAgainst, 0, "a landed delegation must have cut the ballot");
+            }
+            vm.revertToState(snap);
+        }
+        assertGt(landed, 0, "control: some cap let the delegation through");
+    }
+
+    /// @notice A gas-capped transfer that returns a voter's shares either
+    ///         reverts or restores the ballot. An allowance holder cannot pull
+    ///         and push back at a cap that leaves the LP with shares and no vote.
+    function test_she205_returnTransferCannotStarveTheRestore() public {
+        _deposit(lp1, 55_000e6);
+        _deposit(lp2, 45_000e6);
+        uint256 pid = _propose();
+        vm.prank(lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        uint256 cast = governor.getProposal(pid).votesAgainst;
+
+        uint256 bal = vault.balanceOf(lp2);
+        vm.prank(lp2);
+        vault.approve(helper, bal);
+        vm.prank(helper);
+        vault.transferFrom(lp2, helper, bal);
+        assertEq(governor.getProposal(pid).votesAgainst, 0, "control: the pull cut the ballot");
+
+        uint256 landed;
+        for (uint256 cap = SWEEP_LO; cap <= SWEEP_HI; cap += SWEEP_STEP) {
+            uint256 snap = vm.snapshotState();
+            vm.prank(helper);
+            (bool ok,) = address(vault).call{gas: cap}(abi.encodeCall(vault.transfer, (lp2, bal)));
+            if (ok) {
+                landed++;
+                assertEq(vault.balanceOf(lp2), bal, "control: the shares came back");
+                assertEq(governor.getProposal(pid).votesAgainst, cast, "a landed return must have restored the ballot");
+            }
+            vm.revertToState(snap);
+        }
+        assertGt(landed, 0, "control: some cap let the return through");
+    }
+
+    /// @notice A gas-capped `redeem` either reverts or nets the denominator.
+    ///         The burn report is held to the same floor as the ballot report,
+    ///         so the audited path cannot be re-opened by starving it.
+    function test_she205_redeemCannotStarveTheExitReport() public {
+        _deposit(lp1, 60_000e6);
+        _deposit(lp2, 40_000e6);
+        _deposit(attacker, 100_000e6);
+        uint256 pid = _propose();
+        vm.prank(lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        uint256 shares = vault.balanceOf(attacker);
+
+        uint256 landed;
+        for (uint256 cap = SWEEP_LO; cap <= SWEEP_HI; cap += SWEEP_STEP) {
+            uint256 snap = vm.snapshotState();
+            vm.prank(attacker);
+            (bool ok,) = address(vault).call{gas: cap}(abi.encodeCall(vault.redeem, (shares, attacker, attacker)));
+            if (ok) {
+                landed++;
+                assertEq(vault.balanceOf(attacker), 0, "control: the redeem landed");
+                assertEq(
+                    uint256(_stateAfterVoting(pid)),
+                    uint256(ISyndicateGovernor.ProposalState.Rejected),
+                    "a landed redeem must have netted the denominator"
+                );
+            }
+            vm.revertToState(snap);
+        }
+        assertGt(landed, 0, "control: some cap let the redeem through");
+    }
+
+    /// @notice The grant the vault hands each report is a hard ceiling, so
+    ///         the governor's work per report must sit well inside it or a
+    ///         fully funded call is starved by construction. Measured cold,
+    ///         on the most expensive shape (a ballot that changes).
+    function test_she205_reportGasGrantCoversAColdRecompute() public {
+        _deposit(lp1, 70_000e6);
+        _deposit(lp2, 30_000e6);
+        uint256 pid = _propose();
+        vm.prank(lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        uint256 bal = vault.balanceOf(lp2);
+
+        // Make lp2's live votes fall WITHOUT the report landing, so the
+        // measured call actually has a cut to record. The governor's hook is
+        // mocked to a no-op for the duration of the transfer.
+        vm.mockCall(address(governor), abi.encodeWithSelector(governor.notifyVotingWeightMoved.selector), "");
+        vm.prank(lp2);
+        vault.transfer(helper, bal);
+        vm.clearMockedCalls();
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
+        assertEq(governor.getProposal(pid).votesAgainst, bal, "control: the ballot is stale");
+
+        vm.cool(address(governor));
+        vm.cool(address(vault));
+        vm.prank(address(vault));
+        uint256 g0 = gasleft();
+        governor.notifyVotingWeightMoved(lp2);
+        uint256 used = g0 - gasleft();
+        emit log_named_uint("cold notifyVotingWeightMoved gas", used);
+        assertEq(governor.getProposal(pid).votesAgainst, 0, "control: the recompute ran");
+        assertLt(
+            used * 2, vault.GOVERNANCE_REPORT_GAS(), "the grant must leave at least 2x headroom over a cold recompute"
+        );
+
+        vm.cool(address(governor));
+        vm.cool(address(vault));
+        vm.prank(address(vault));
+        g0 = gasleft();
+        governor.notifyShareExit(1);
+        used = g0 - gasleft();
+        emit log_named_uint("cold notifyShareExit gas", used);
+        assertLt(
+            used * 2, vault.GOVERNANCE_REPORT_GAS(), "the grant must leave at least 2x headroom over a cold exit report"
+        );
+    }
+
+    /// @notice DOCUMENTED BOUNDARY. A ballot suspended inside the window and
+    ///         whose weight returns only after `voteEnd` is not restored.
+    /// @dev    Deliberate, and the same reason the denominator freezes there:
+    ///         a tally that moved after the window would make the verdict a
+    ///         race between `resolveProposalState` callers. The attacker
+    ///         version of this -- vote, exit, re-acquire weight after `voteEnd`
+    ///         against the already-shrunk denominator -- is exactly what the
+    ///         freeze forecloses. Cost falls on a holder whose shares are moved
+    ///         out by an allowance holder across the boundary; that holder can
+    ///         already be redeemed out by the same allowance.
+    function test_she205_suspensionAtVoteEndIsNotRestored() public {
+        _deposit(lp1, 55_000e6);
+        _deposit(lp2, 45_000e6);
+        uint256 pid = _propose();
+        vm.prank(lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+
+        uint256 bal = vault.balanceOf(lp2);
+        vm.prank(lp2);
+        vault.approve(helper, bal);
+        vm.prank(helper);
+        vault.transferFrom(lp2, helper, bal);
+        assertEq(governor.getProposal(pid).votesAgainst, 0, "control: suspended inside the window");
+
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        vm.prank(helper);
+        vault.transfer(lp2, bal);
+        assertEq(vault.balanceOf(lp2), bal, "control: the shares came back");
+        assertEq(governor.getProposal(pid).votesAgainst, 0, "a return after voteEnd does not reopen the tally");
+        assertTrue(
+            governor.getProposalState(pid) != ISyndicateGovernor.ProposalState.Rejected,
+            "the verdict is a pure function of the window"
+        );
+    }
+
     /// @dev Bounce the same shares between two attacker-controlled addresses
     ///      until `target` share-units have moved. Returns the transfer count so
     ///      a regression that makes this expensive is visible rather than silent.

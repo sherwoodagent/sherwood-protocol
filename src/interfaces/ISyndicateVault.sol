@@ -122,6 +122,13 @@ interface ISyndicateVault {
     ///         the tier system prices, so this is refused regardless of the
     ///         TierRegistry's presence or the `to` recipient.
     error DisallowedTransferFromSource(address target, address from);
+    /// @notice SHE-205. A share movement that must report to the governor was
+    ///         sent with too little gas to fund the report. Under EIP-150 the
+    ///         caller could otherwise choose a gas limit at which the movement
+    ///         lands and the report starves, leaving a ballot standing behind
+    ///         weight that has left. Re-send with a higher gas limit; see
+    ///         `SyndicateVault.GOVERNANCE_REPORT_GAS`.
+    error GovernanceReportUnderfunded(uint256 available, uint256 required);
 
     // ── Init Params ──
     struct InitParams {
