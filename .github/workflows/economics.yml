@@ -1,21 +1,14 @@
 name: Economics
 
-# SHE-182. Re-runs the protocol economics model on any PR that touches the
-# contracts, the deploy scripts, or the model itself, and posts the constant
-# diff when a Solidity change moved a number the economics depend on.
-#
-# ADVISORY, NOT BLOCKING. The job renders with `--allow-drift` and always
-# succeeds; drift shows up as a PR comment and inside the uploaded report, not
-# as a red check. A constant change is a decision for a human to make, not
-# something CI should veto — but it must never land unnoticed.
+# SHE-182. Re-runs the protocol economics model on demand and uploads the
+# report as a workflow artifact. Drift against constants.lock.json is printed
+# in the job log; it never blocks and never comments on a PR.
 
+# MANUAL ONLY. Run from the Actions tab (or `gh workflow run economics.yml`).
+# The report is uploaded as a workflow artifact visible to repo collaborators;
+# it is never posted to a PR. Keep it this way while the repo is public.
 on:
-  pull_request:
-    paths:
-      - "src/**"
-      - "script/**"
-      - "sim/economics/**"
-      - ".github/workflows/economics.yml"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,7 +16,6 @@ concurrency:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   economics:
@@ -59,48 +51,3 @@ jobs:
           name: economics-report
           path: sim/economics/out/
           if-no-files-found: warn
-
-      - name: Comment the constant diff on the PR
-        # Only when something actually drifted, and only for same-repo PRs —
-        # a fork PR's token cannot write comments, and failing there would turn
-        # an advisory job into noise.
-        if: >-
-          steps.drift.outputs.exit_code != '0' &&
-          github.event.pull_request.head.repo.full_name == github.repository
-        continue-on-error: true
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const diff = fs.readFileSync('drift.txt', 'utf8').trim();
-            const marker = '<!-- she-182-economics-drift -->';
-            const body = [
-              marker,
-              '### Protocol constant drift',
-              '',
-              'A constant the economics model reads no longer matches ' +
-              '`sim/economics/constants.lock.json`.',
-              '',
-              '```',
-              diff,
-              '```',
-              '',
-              'This is **advisory** — the check does not block. If the change is ' +
-              'intended, run `python3 sim/economics/extract_constants.py --write` and ' +
-              'commit the new lock in this PR, so the lock diff is the reviewable ' +
-              'record of the economics change. The re-run report is attached to this ' +
-              'workflow as the `economics-report` artifact.',
-            ].join('\n');
-
-            const { owner, repo } = context.repo;
-            const issue_number = context.payload.pull_request.number;
-            const existing = await github.paginate(
-              github.rest.issues.listComments, { owner, repo, issue_number });
-            const mine = existing.find(c => c.body && c.body.includes(marker));
-            if (mine) {
-              await github.rest.issues.updateComment(
-                { owner, repo, comment_id: mine.id, body });
-            } else {
-              await github.rest.issues.createComment(
-                { owner, repo, issue_number, body });
-            }
