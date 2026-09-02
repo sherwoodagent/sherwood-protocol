@@ -649,7 +649,7 @@ contract CoverageEndToEndTest is Test {
         _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
 
         // A challenge lands against the proposal g1 covered.
-        ledger.freezeCoverage(address(govA), pid);
+        ledger.freezeCoverage(address(govA), pid, block.timestamp + 30 days);
         assertTrue(ledger.hasFrozenCoverage(g1), "g1 is named by a frozen proposal");
 
         vm.prank(g1);
@@ -664,14 +664,24 @@ contract CoverageEndToEndTest is Test {
         vm.expectRevert(StakedWood.CoverageStillOpen.selector);
         swood.claimUnstakeGuardian();
 
-        // Once the challenge resolves, the exit opens on the same terms as before.
+        // Once the challenge resolves, the freeze gate opens. The unfreeze
+        // re-books the lock into the CURRENT bucket (SHE-213: one further
+        // challenge window from the unfreeze, the guarantee a fresh lock has),
+        // so `openExposure` gates the claim for that long and then the exit
+        // opens on the same terms as before.
         ledger.unfreezeCoverage(address(govA), pid);
         assertFalse(ledger.hasFrozenCoverage(g1), "nothing pins g1 any more");
+        assertGt(ledger.openExposure(g1), 0, "the unfrozen lock covers one more challenge window");
+        vm.prank(g1);
+        vm.expectRevert(StakedWood.CoverageStillOpen.selector);
+        swood.claimUnstakeGuardian();
 
+        vm.warp(vm.getBlockTimestamp() + EPOCH_LENGTH + ledger.challengeWindow() + 1);
+        assertEq(ledger.openExposure(g1), 0, "and then decays on the ordinary clock");
         uint256 balBefore = wood.balanceOf(g1);
         vm.prank(g1);
         swood.claimUnstakeGuardian();
-        assertGt(wood.balanceOf(g1), balBefore, "the gate is a condition, not a longer timer");
+        assertGt(wood.balanceOf(g1), balBefore, "the freeze gate is a condition; the bucket is the ordinary timer");
     }
 
     /// @notice The frozen-commitment count is per guardian and exact: a second
@@ -693,8 +703,8 @@ contract CoverageEndToEndTest is Test {
         _openReview(govB, pidB);
         _vote(govB, pidB, g1, IGuardianRegistry.GuardianVoteType.Approve);
 
-        ledger.freezeCoverage(address(govA), pidA);
-        ledger.freezeCoverage(address(govB), pidB);
+        ledger.freezeCoverage(address(govA), pidA, block.timestamp + 30 days);
+        ledger.freezeCoverage(address(govB), pidB, block.timestamp + 30 days);
         assertTrue(ledger.hasFrozenCoverage(g1));
 
         ledger.unfreezeCoverage(address(govA), pidA);

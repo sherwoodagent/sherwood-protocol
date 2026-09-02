@@ -113,7 +113,7 @@ abstract contract ExposureLedgerHandler is Properties {
 
     function _exposureLedger_freezeCoverage(address governor_, uint256 proposalId) internal {
         vm.prank(address(game));
-        ledger.freezeCoverage(governor_, proposalId);
+        ledger.freezeCoverage(governor_, proposalId, block.timestamp + 30 days);
     }
 
     function _exposureLedger_unfreezeCoverage(address governor_, uint256 proposalId) internal {

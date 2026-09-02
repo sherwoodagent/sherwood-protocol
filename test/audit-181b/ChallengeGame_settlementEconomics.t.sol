@@ -116,7 +116,7 @@ contract MockLedgerSE {
         }
     }
 
-    function freezeCoverage(address, uint256) external {}
+    function freezeCoverage(address, uint256, uint256) external {}
     function unfreezeCoverage(address, uint256) external {}
 
     function pinCoverageUntil(address governor, uint256 proposalId, uint256 deadline) external {

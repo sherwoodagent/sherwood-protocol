@@ -271,11 +271,23 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      base (`slashBpsFor`). Written once by `recordApproval`, erased only
     ///      by `_unwindApproval` (release or retire). Because it is one storage
     ///      slot rather than a booking family and a pledge family, the divergence
-    ///      class SHE-212 belonged to cannot be expressed. `epoch` is the bucket
-    ///      it was booked into, so the unwind can subtract from exactly the
-    ///      bucket the record added to.
+    ///      class SHE-212 belonged to cannot be expressed.
+    ///
+    ///      TWO EPOCHS, ONE SLOT. `epoch` is the bucket the lock CURRENTLY sits
+    ///      in — the one `_buckets` holds it under and the one `_unwindApproval`
+    ///      subtracts from. It is mutable: a freeze, an unfreeze or a pin moves
+    ///      the lock between buckets (`_rebucket`, SHE-213) so the wall-clock
+    ///      scan keeps counting it for exactly as long as it is live.
+    ///      `bookedEpoch` is the bucket `recordApproval` chose — the one
+    ///      containing `executeBy + strategyDuration` — and never changes; it is
+    ///      the floor an unfreeze returns the lock to, so no move can ever
+    ///      expire a lock before the settlement drain it backs can be
+    ///      challenged. `wood` is uint128: a lock is at most `kNumerator x
+    ///      stake` and sWOOD stake is uint128, and the store fails loudly rather
+    ///      than truncating (see `recordApproval`).
     struct LockRecord {
-        uint192 wood;
+        uint128 wood;
+        uint64 bookedEpoch;
         uint64 epoch;
     }
 
@@ -312,7 +324,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      after its epoch bucket ages out. A COUNT rather than a USD sum on
     ///      purpose — the claim gate's question is binary, and summing would
     ///      double-count against the live buckets and silently tighten the
-    ///      batching cap, which is a different control.
+    ///      batching cap, which is a different control: the batching cap keeps
+    ///      counting a frozen lock because the freeze MOVES it to a later
+    ///      bucket (`_rebucket`, SHE-213), not because anything is added here.
     mapping(address guardian => uint256) internal _frozenCommitments;
     /// @notice The latest instant through which a guardian's coverage is pinned
     ///         open, independent of whether any challenge naming them is
@@ -997,10 +1011,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 free = cap - open;
 
         uint256 lock = lockWood < free ? lockWood : free;
-        // Truncation in the uint192 store below would book a phantom (smaller)
+        // Truncation in the uint128 store below would book a phantom (smaller)
         // lock — fail loudly instead. Unreachable at any sane `kNumerator`
-        // (stake is uint128), kept as the belt to that brace.
-        if (lock > type(uint192).max) revert InvalidParameter();
+        // (stake is uint128 and WOOD supply is ~1e27), kept as the belt to that
+        // brace.
+        if (lock > type(uint128).max) revert InvalidParameter();
         // BOOK INTO THE BUCKET THAT OUTLIVES SETTLEMENT, not the one the vote
         // happened to land in. The commitment must survive until the drain it
         // backs can no longer be challenged:
@@ -1015,10 +1030,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         (uint256 epoch, bool withinHorizon) = _coverageEpochOrSkip(pv);
         if (!withinHorizon) return;
         _buckets[guardian][epoch] += lock;
-        // lock bounded to uint192 above; epoch = elapsed / epochLength cannot
-        // approach 2^64 on any realistic timescale.
+        // lock bounded to uint128 above; epoch = elapsed / epochLength cannot
+        // approach 2^64 on any realistic timescale. `bookedEpoch == epoch` at
+        // booking; only `epoch` moves afterwards (`_rebucket`).
         // forge-lint: disable-next-line(unsafe-typecast)
-        _locks[key][guardian] = LockRecord({wood: uint192(lock), epoch: uint64(epoch)});
+        _locks[key][guardian] = LockRecord({wood: uint128(lock), bookedEpoch: uint64(epoch), epoch: uint64(epoch)});
         // The ledger keeps its OWN approver list: the quorum reads this, never
         // the registry, so the ledger's registry pointer and the governor's can
         // never disagree about who covered a proposal.
@@ -1031,17 +1047,20 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @dev SHARED UNWIND, used by both `releaseApproval` and `retireApproval` so
     ///      the vote-change unwind and the post-window sweep cannot drift apart.
-    ///      Clears the lock, subtracts it from the bucket it was booked into, and
-    ///      swap-and-pops the guardian out of the approver list.
+    ///      Clears the lock, subtracts it from the bucket it CURRENTLY occupies,
+    ///      and swap-and-pops the guardian out of the approver list.
     ///
     ///      PRECONDITION, NOT ENFORCED HERE: callers must already hold `r` from
     ///      BEFORE this call, and freeze/pin/window checks are each caller's own
     ///      responsibility — the two gate on different conditions.
     function _unwindApproval(bytes32 key, address guardian, LockRecord memory r) internal {
         delete _locks[key][guardian];
-        // The bucket was credited with exactly `r.wood` at exactly `r.epoch`
-        // and nothing has moved either since — there is no second accumulator
-        // to keep in step, which is the point of a single lock.
+        // FROM THE CURRENT BUCKET, `r.epoch` — never a recomputed booking-time
+        // epoch and never `r.bookedEpoch`. `_rebucket` keeps `r.epoch` pointed
+        // at whichever bucket holds the wood right now; subtracting anywhere
+        // else would leave a phantom in the bucket the lock was moved to and
+        // underflow the one it left. There is still no second accumulator to
+        // keep in step: the lock is in exactly one bucket at every instant.
         _buckets[guardian][r.epoch] -= r.wood;
 
         // Swap-and-pop out of the approver list, so it stays bounded by the cohort
@@ -1188,11 +1207,34 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      so nothing can transit a listed guardian's figure through zero while
     ///      the challenge naming them is live. The old booking/pledge split
     ///      existed precisely because one of the two COULD (audit-181 finding A).
-    function freezeCoverage(address governor, uint256 proposalId) external onlyFreezer {
+    /// @dev THE FREEZE ALSO RE-BUCKETS THE LOCK (SHE-213). `hasFrozenCoverage`
+    ///      stops the accused WALKING OUT; it does nothing about the accused
+    ///      LOCKING AGAIN. `openExposure` is the same wall-clock scan, so once
+    ///      the lock's bucket aged out the guardian's free budget read as if the
+    ///      frozen lock did not exist and `recordApproval` admitted a new lock on
+    ///      top of one still fully slashable — one bond, two live locks. Each
+    ///      listed lock is moved to the bucket containing `liveUntil`, the latest
+    ///      instant this challenge can still be live (`filedAt +
+    ///      disputeTimeoutAtFiling`, pinned by the game at filing so the owner
+    ///      cannot move it afterwards). RAISE-ONLY: a lock already in a later
+    ///      bucket — one whose settlement lies past the dispute clock — stays
+    ///      put, because the bucket rule (the bucket contains `executeBy +
+    ///      strategyDuration`) is what holds the budget while the drain it backs
+    ///      can still be challenged, and a freeze must never shorten that.
+    ///      `liveUntil` is a PARAMETER rather than a read-back: the ledger makes
+    ///      no call into the freezer on this path, and the game has already
+    ///      pinned the value in the same transaction. Clamped to the horizon —
+    ///      see `_horizonClampedEpochOf`. Moves only when the flag flips, so a
+    ///      repeated freeze moves nothing; the game's refcount means a second
+    ///      concurrent filing never reaches here, and its dispute clock (later
+    ///      than the first's by at most the filing gap) is covered by the
+    ///      challenge-window slack past the first's bucket, not by a move.
+    function freezeCoverage(address governor, uint256 proposalId, uint256 liveUntil) external onlyFreezer {
         bytes32 key = _reviewKey(governor, proposalId);
         if (!_frozen[key]) {
             _frozen[key] = true;
             _frozenKeyCount++;
+            uint256 target = _horizonClampedEpochOf(liveUntil);
             address[] storage listed = _approversOf[key];
             for (uint256 i = 0; i < listed.length; i++) {
                 address g = listed[i];
@@ -1200,6 +1242,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
                 if (_frozenFor[key][g]) continue;
                 _frozenFor[key][g] = true;
                 _frozenCommitments[g]++;
+                _rebucketNoEarlier(key, g, target);
             }
         }
         emit CoverageFrozenSet(governor, proposalId, true);
@@ -1211,6 +1254,22 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      list moved. It cannot move while frozen in any case: `releaseApproval`
     ///      is the only path that shrinks it, and that is the path the freeze
     ///      blocks.
+    /// @dev RETURNS THE LOCK TO ORDINARY DECAY (SHE-213): to the LATEST of the
+    ///      current bucket, the bucket it was BOOKED into, and the bucket of any
+    ///      pin still standing on it. The challenge is over, so the lock should
+    ///      decay like one that was never frozen — and a never-frozen lock sits
+    ///      in the bucket containing `executeBy + strategyDuration`, which
+    ///      already outlives the ordinary re-filing deadline (`executedAt +
+    ///      strategyDuration + game.challengeWindow`; the game's window is
+    ///      bounded by this one). Never below that: a challenge can be filed and
+    ///      resolved BEFORE settlement, and moving the lock to the CURRENT bucket
+    ///      then would expire it before the settlement drain can be challenged —
+    ///      the pre-ADR `currentEpoch()` hole under another name. Never below the
+    ///      current bucket either: a lock unfrozen late (a timeout `_fail` is
+    ///      permissionless and can run any time after the clock) still covers one
+    ///      further `challengeWindow` from now, the guarantee a fresh lock has.
+    ///      Never below a live pin: `pinCoverageUntil` may have landed before
+    ///      this unfreeze and its deadline outlives the challenge by design.
     function unfreezeCoverage(address governor, uint256 proposalId) external onlyFreezer {
         bytes32 key = _reviewKey(governor, proposalId);
         if (_frozen[key]) {
@@ -1222,6 +1281,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
                 if (!_frozenFor[key][g]) continue;
                 _frozenFor[key][g] = false;
                 _frozenCommitments[g]--;
+                _rebucket(key, g, _restingEpochOf(key, g));
             }
         }
         emit CoverageFrozenSet(governor, proposalId, false);
@@ -1256,16 +1316,103 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      `_pinnedCoverageUntil[g]` is `hasFrozenCoverage`'s read,
     ///      `_pinnedUntil[key][g]` is `retireApproval`'s. Both are monotonic
     ///      raises from the SAME `deadline`, so they differ only in scope.
+    ///
+    ///      AND RE-BUCKETS THE LOCK TO `deadline` (SHE-213), raise-only, so the
+    ///      lock keeps counting against capacity for as long as the pin keeps it
+    ///      slashable. A pin has no unpin — it decays on the wall clock — which
+    ///      is exactly why the bucket mechanism, itself wall-clock, is the right
+    ///      enforcer: no release event to hook, nothing to forget. A shorter
+    ///      deadline moves nothing, matching the deadline's own monotonic raise.
+    ///      Clamped to the horizon — see `_horizonClampedEpochOf`.
     function pinCoverageUntil(address governor, uint256 proposalId, uint256 deadline) external onlyFreezer {
         bytes32 key = _reviewKey(governor, proposalId);
+        uint256 target = _horizonClampedEpochOf(deadline);
         address[] storage listed = _approversOf[key];
         for (uint256 i = 0; i < listed.length; i++) {
             address g = listed[i];
             if (_locks[key][g].wood == 0) continue;
             if (deadline > _pinnedCoverageUntil[g]) _pinnedCoverageUntil[g] = deadline;
             if (deadline > _pinnedUntil[key][g]) _pinnedUntil[key][g] = deadline;
+            _rebucketNoEarlier(key, g, target);
         }
         emit CoveragePinned(governor, proposalId, deadline);
+    }
+
+    // ── Re-bucketing (SHE-213) ──
+
+    /// @dev THE ONE MOVE. Subtract the lock from the bucket it sits in, add it
+    ///      to `target`, point the record at `target`. No-op on an equal epoch,
+    ///      so any sequence of freeze / unfreeze / pin composes: every call reads
+    ///      the CURRENT epoch off the record, and the lock is in exactly one
+    ///      bucket before and after. `openExposure` is untouched — it already
+    ///      answers "is this lock still live?" by bucket expiry, so moving the
+    ///      lock to the bucket matching its true liability end makes the
+    ///      existing scan give the right answer with no second accumulator on
+    ///      the capacity path. (A non-decaying accumulator was tried for SHE-212:
+    ///      it kept unfrozen, EXPIRED locks counted until someone retired them,
+    ///      which broke autonomous recycling.) Callers clamp `target` to the
+    ///      horizon (`_horizonClampedEpochOf`) so the scan can always see it.
+    ///
+    ///      THE ADVERSARY: a guardian under accusation, or whose lock is pinned
+    ///      pending re-challenge, whose lock is unretirable and exit-blocked but
+    ///      whose ORIGINAL bucket has aged out on the wall clock — so the scan
+    ///      reports the budget free and `recordApproval` lets it lock the same
+    ///      stake again while the first lock is still fully slashable.
+    function _rebucket(bytes32 key, address guardian, uint256 target) internal {
+        LockRecord storage r = _locks[key][guardian];
+        uint256 from = r.epoch;
+        if (target == from) return;
+        uint256 wood = r.wood;
+        _buckets[guardian][from] -= wood;
+        _buckets[guardian][target] += wood;
+        // `target` is an epoch index, bounded like `epoch` at booking.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        r.epoch = uint64(target);
+        emit ExposureRebucketed(guardian, key, wood, from, target);
+    }
+
+    /// @dev Raise-only: moves the lock to `target` only when that is later than
+    ///      the bucket it is in. Freeze and pin use it — neither may shorten a
+    ///      lock's life.
+    function _rebucketNoEarlier(bytes32 key, address guardian, uint256 target) internal {
+        if (target > _locks[key][guardian].epoch) _rebucket(key, guardian, target);
+    }
+
+    /// @dev Where an UNFROZEN lock belongs: the latest of the current bucket
+    ///      (one more `challengeWindow` from now), the bucket it was booked into
+    ///      (settlement can still be challenged), and the bucket of any pin still
+    ///      standing on this (key, guardian). See `unfreezeCoverage`.
+    function _restingEpochOf(bytes32 key, address guardian) internal view returns (uint256 e) {
+        e = currentEpoch();
+        uint256 booked = _locks[key][guardian].bookedEpoch;
+        if (booked > e) e = booked;
+        uint256 pinned = _horizonClampedEpochOf(_pinnedUntil[key][guardian]);
+        if (pinned > e) e = pinned;
+    }
+
+    /// @dev The epoch bucket containing instant `t`, clamped to the LAST bucket
+    ///      `openExposure` can see from now — the far end of its walk,
+    ///      `(elapsed + MAX_COVERAGE_HORIZON) / epochLength`. A re-bucket target
+    ///      past the horizon would land in a bucket the scan never reads,
+    ///      silently UN-counting the lock: the exact failure re-bucketing exists
+    ///      to prevent, arrived at from the other side.
+    ///
+    ///      DELIBERATELY NOT THE RULE AN INITIAL BOOKING FOLLOWS. `recordApproval`
+    ///      books NOTHING beyond the horizon: clamping there would under-cover a
+    ///      long strategy's tail and hide a mis-set duration ceiling, and the
+    ///      proposer can shorten the duration. Here the alternative to clamping
+    ///      is NOT MOVING, which leaves the lock in a bucket that expires earlier
+    ///      still — and nobody chose the value: `MAX_DISPUTE_TIMEOUT` equals
+    ///      `MAX_COVERAGE_HORIZON`, so a freeze at the game's ceiling lands
+    ///      exactly on the edge and the clamp only bites on a value the game
+    ///      itself would refuse. Residual: a target genuinely past the horizon
+    ///      stops counting at the horizon's edge rather than at its true end;
+    ///      exit stays blocked by `hasFrozenCoverage` throughout, and the
+    ///      unfreeze re-books anyway.
+    function _horizonClampedEpochOf(uint256 t) internal view returns (uint256) {
+        uint256 edge = (block.timestamp - epochGenesis + MAX_COVERAGE_HORIZON) / epochLength;
+        uint256 e = t <= epochGenesis ? 0 : (t - epochGenesis) / epochLength;
+        return e > edge ? edge : e;
     }
 
     /// @inheritdoc IExposureLedger
@@ -1644,8 +1791,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // covering settlement, which is in the future at vote time, so a
         // backward-only sum would miss every live commitment and report a
         // guardian's budget as free while it is fully pledged.
-        // `MAX_COVERAGE_HORIZON` bounds the span and `_coverageEpoch` refuses to
-        // book beyond it, so the two keep this loop fixed-width.
+        // `MAX_COVERAGE_HORIZON` bounds the span, `_coverageEpoch` refuses to
+        // book beyond it and `_rebucket` clamps a move to it, so the three keep
+        // this loop fixed-width and every live lock inside it.
         uint256 to = (elapsed + MAX_COVERAGE_HORIZON) / epochLength;
         for (uint256 e = from; e <= to; e++) {
             total += _buckets[guardian][e];
