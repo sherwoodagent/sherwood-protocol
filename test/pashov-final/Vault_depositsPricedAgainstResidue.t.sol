@@ -914,4 +914,67 @@ contract PashovFinalDepositResiduePricingTest is VaultInstantLiquidityTest {
         _settleWithPid(PID + 1, address(honest));
         assertTrue(vault.depositsLocked(), "the gate never re-armed for the next strategy");
     }
+
+    // ── M3 (review of #298): the spent episode is observable ──
+
+    /// @notice THE SPENT EPISODE IS NOW VISIBLE FROM OUTSIDE — as state, through
+    ///         `unvaluedEpisodeSpent`, and as a log, through
+    ///         `UnvaluedMarkRefused` on the refusal itself.
+    ///
+    /// @dev    WHY THIS MATTERS. `_refreshUnvalued`'s burned-label branch
+    ///         returned in SILENCE: no state change, no event. From outside, a
+    ///         label the vault has stopped gating on is indistinguishable from a
+    ///         label with nothing to gate on, and the trade `_unvaluedBurned`
+    ///         documents — deposits keep flowing against a NAV that structurally
+    ///         cannot include the unvaluable leg — became untraceable the moment
+    ///         it was taken.
+    ///
+    ///         AND THE EPISODE CAN BE SPENT DELIBERATELY. Nothing requires a
+    ///         mark to be large or long-lived: a one-wei residue marked and
+    ///         cleared in consecutive calls burns the label just as a full
+    ///         seven-day episode does, because `_bumpUnvalued` burns on EVERY
+    ///         drop. That is the shape this test walks.
+    ///
+    ///         No storage was added for either read — `unvaluedEpisodeSpent`
+    ///         exposes the existing `_unvaluedBurned` mapping, and
+    ///         `script/check-layout-goldens.sh` proves the layout is unchanged.
+    function test_spentEpisodeIsObservableAsStateAndAsAnEvent() public {
+        StubDeliveryStrategy cycler = new StubDeliveryStrategy();
+        cycler.setHolding(true);
+        cycler.setUnvalued(true);
+        // Tracked across the clear, for the reason
+        // `test_truthfullyClearedLabelCannotReArmTheLock` documents.
+        cycler.setResidue(1_000e6);
+        _settleWith(address(cycler));
+
+        assertFalse(vault.unvaluedEpisodeSpent(address(cycler)), "a live mark has not spent the episode yet");
+        assertTrue(vault.depositsLocked(), "precondition: the mark shuts the gate");
+
+        // THE CLEAR SPENDS IT. One transaction, no window elapsed — the
+        // deliberate burn, not just the lapsed one.
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        cycler.setUnvalued(false);
+        vault.collectResidue(address(cycler));
+        assertTrue(vault.unvaluedEpisodeSpent(address(cycler)), "the clear spent the label's one episode");
+        assertFalse(vault.depositsLocked(), "precondition: the episode ended");
+
+        // THE REFUSAL IS NOW AUDIBLE. Re-marking is ignored, as it must be, and
+        // it says so.
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        cycler.setUnvalued(true);
+        vm.expectEmit(true, false, false, false);
+        emit ISyndicateVault.UnvaluedMarkRefused(address(cycler));
+        vm.prank(makeAddr("griefer"));
+        vault.collectResidue(address(cycler));
+
+        // ...and the refusal really was a refusal: the gate stayed open and the
+        // burn is still set.
+        assertFalse(vault.depositsLocked(), "the refused re-mark must not shut the gate");
+        assertTrue(vault.unvaluedEpisodeSpent(address(cycler)), "the burn is permanent");
+
+        // NON-VACUITY: the view is per-strategy, not a vault-wide flag. A label
+        // that never marked reads false, and the event does not fire for it.
+        StubDeliveryStrategy untouched = new StubDeliveryStrategy();
+        assertFalse(vault.unvaluedEpisodeSpent(address(untouched)), "the spend is per-label, not vault-wide");
+    }
 }

@@ -65,6 +65,37 @@ interface IExposureLedger {
     ///         proof of coverage.
     error NoWoodPrice();
 
+    /// @notice `block.timestamp` is strictly behind `epochGenesis`, so no epoch
+    ///         figure can be derived and every epoch-indexed read is refused.
+    /// @dev    FAIL CLOSED, NOT FAIL OPEN. `epochGenesis` is stamped in the
+    ///         constructor, so this is unreachable on a live chain and reachable
+    ///         on every fork, vnet and test harness — and it happened. The
+    ///         tempting fix is to floor the subtraction at zero, and that is
+    ///         WRONG here: `openExposureUsd` walks buckets
+    ///         `[(elapsed - W)/L, (elapsed + MAX_COVERAGE_HORIZON)/L]`, and
+    ///         `_coverageEpoch` floors every booking at `currentEpoch()`. With
+    ///         `elapsed` clamped to 0 the walk is `[0, MAX_COVERAGE_HORIZON/L]`
+    ///         — at a 28-day epoch that is buckets 0..2 — so on any ledger older
+    ///         than 60 days every live booking sits STRICTLY ABOVE the clamped
+    ///         walk. The walk is not a superset of what is owed; it is disjoint
+    ///         from it, and the view answers zero with real coverage live.
+    ///
+    ///         That zero is not a cosmetic bad read. `StakedWood`'s
+    ///         `claimUnstakeGuardian` gates on `openExposureUsd(msg.sender) != 0`,
+    ///         so a guardian with live coverage whose ledger is older than 60
+    ///         days could request unstake, wait for the clock to fall behind
+    ///         genesis, and walk away with a bonded stake still underwriting
+    ///         open proposals. Reverting keeps that gate shut: the pre-fix 0x11
+    ///         panic at least failed closed, and this error is that same closed
+    ///         failure made explicit and decodable.
+    ///
+    ///         STRICTLY `<`. Exactly at genesis `elapsed == 0` is a legitimate
+    ///         value, not an underflow, and the ledger answers normally.
+    ///
+    ///         Off-chain readers detect this state with `clockBeforeGenesis()`
+    ///         rather than by catching a revert.
+    error ClockBeforeGenesis();
+
     // ── Events ──
     event WoodUsdPriceSet(uint256 oldPriceX8, uint256 newPriceX8);
     event WoodFeedSet(address indexed feed, uint256 maxDelay);
@@ -273,6 +304,18 @@ interface IExposureLedger {
     function coverageUsd(address asset, uint256 amount) external view returns (uint256);
     function proposerBondWood(address asset, uint256 requiredCoverage) external view returns (uint256);
     function currentEpoch() external view returns (uint256);
+
+    /// @notice Whether the chain clock is currently behind `epochGenesis`, i.e.
+    ///         whether every epoch-indexed read is presently refused with
+    ///         `ClockBeforeGenesis`.
+    /// @dev    THE NON-REVERTING PROBE. `currentEpoch` and `openExposureUsd`
+    ///         fail closed in this state (see `ClockBeforeGenesis`), which is
+    ///         correct for the solvency gate and useless for a UI: an indexer
+    ///         that only sees a revert cannot tell "clock behind genesis" from
+    ///         "node down". This answers that question without reverting, so a
+    ///         snapshot cycle can render `—` for exposure, keep going, and stay
+    ///         up for the twelve blocks a bad vnet clock lasts.
+    function clockBeforeGenesis() external view returns (bool);
 
     /// @notice The WOOD/USD price CAP, 8 decimals. NEVER SERVED AS A PRICE — it
     ///         only bounds whatever the market reports, and lowering it is the

@@ -230,6 +230,17 @@ interface ISyndicateVault {
     ///         nothing is marked. The strategy may never mark again — see the
     ///         implementation for why the prune and the burn are inseparable.
     function pruneUnvaluedMark(address strategy) external;
+    /// @notice Whether `strategy` has already spent its one unvalued episode and
+    ///         may therefore never mark again.
+    /// @dev    THE SPEND WAS OTHERWISE INVISIBLE. The burn is set on EVERY drop
+    ///         of a mark — a lapsed prune, a truthful clear, or the codeless
+    ///         force-clear — and a burned label's later re-mark is refused
+    ///         silently inside `_refreshUnvalued`. With no view and no event, a
+    ///         depositor could not tell "this strategy holds no unvaluable
+    ///         residue" from "this strategy holds unvaluable residue the vault
+    ///         has stopped gating on". Pair this with `UnvaluedMarkRefused` to
+    ///         see both the state and the moment it bit.
+    function unvaluedEpisodeSpent(address strategy) external view returns (bool);
     /// @notice Permissionless: drive a settled strategy's last-resort hatch,
     ///         handing the vault what the clone can neither convert nor push.
     /// @dev    Separate from `collectResidue` because the hatch forecloses a
@@ -388,6 +399,19 @@ interface ISyndicateVault {
     ///         strategy is in this state — the one residue shape a price cannot
     ///         express.
     event ResidueUnvalued(address indexed strategy, bool unvalued);
+    /// @notice A settled strategy reported unvaluable residue and the vault
+    ///         REFUSED to mark it, because this label already spent its one
+    ///         episode. Its residue is from here on priced at zero rather than
+    ///         gating deposits.
+    /// @dev    THE SILENT BRANCH, MADE AUDIBLE. `_refreshUnvalued` returns
+    ///         without a state change on a burned label's re-mark, so before
+    ///         this event the spend of an episode — including a deliberate one,
+    ///         a one-wei mark cleared immediately to burn the label — left no
+    ///         trace at all. Deposits keep flowing after this fires, which is
+    ///         the intended trade (see `_unvaluedBurned`), but it is a trade a
+    ///         depositor is entitled to observe. `unvaluedEpisodeSpent` reads
+    ///         the same fact as state.
+    event UnvaluedMarkRefused(address indexed strategy);
     /// @notice Part of an arrival was routed to the redeem cohort that exited at
     ///         `pid`'s stamp, rather than staying in the vault.
     /// @dev    `collectResidue` returns and `ResidueCleared` reports the GROSS
