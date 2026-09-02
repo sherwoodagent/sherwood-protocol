@@ -430,7 +430,17 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     // ── Views ──
 
+    /// @dev FLOORS AT ZERO BEFORE GENESIS rather than underflowing. On a live
+    ///      chain `block.timestamp < epochGenesis` cannot happen — genesis is
+    ///      stamped in the constructor — but a fork, a vnet or a test harness
+    ///      can put the clock behind it, and a 0.8 panic here takes down every
+    ///      caller at once (`openExposureUsd`, and through it
+    ///      `StakedWood.claimUnstakeGuardian` and the guardian indexer's whole
+    ///      snapshot cycle). Zero is also the correct answer, not merely a safe
+    ///      one: before genesis no epoch has begun. `_coverageEpoch` already
+    ///      guarded its own subtraction this way.
     function currentEpoch() public view returns (uint256) {
+        if (block.timestamp <= epochGenesis) return 0;
         return (block.timestamp - epochGenesis) / epochLength;
     }
 
@@ -2030,7 +2040,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      i.e. from = (elapsed - W) / L when elapsed > W. from <= cur always
     ///      (W > 0), so the loop is bounded by ceil(W/L) + 1 iterations.
     function openExposureUsd(address guardian) public view returns (uint256 total) {
-        uint256 elapsed = block.timestamp - epochGenesis;
+        // Pre-genesis floors at zero instead of underflowing; see
+        // `currentEpoch`. Clamping `elapsed` rather than returning early keeps
+        // the walk a SUPERSET of what is owed — buckets [0, horizon/L] — which
+        // is the conservative direction for a solvency gate.
+        uint256 elapsed = block.timestamp <= epochGenesis ? 0 : block.timestamp - epochGenesis;
         uint256 from = elapsed > challengeWindow ? (elapsed - challengeWindow) / epochLength : 0;
         // Scans FORWARD as well as back. Approvals are booked into the bucket
         // covering settlement, which is in the future at vote time, so a
