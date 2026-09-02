@@ -69,6 +69,8 @@ the credit it bounds — a credit merged without its clamp is an extraction path
   `fee == 0` assertion failed against the fixture's high-water mark and would
   have been testing the fixture rather than the clamp.
 
+- [x] 5.11 Coverage job: `LaunchpadStrategy.sol` added to `foundry.toml`'s `[profile.coverage]` via-IR restriction list. That profile compiles with legacy codegen, no optimizer and no via_ir, where this change pushed the template past the EVM stack limit; eight files were already exempted for the same reason. **Cost, stated plainly:** a restricted file is dropped from the coverage report entirely -- neither the summary nor `lcov.info` -- so the template this change is about loses line/branch instrumentation. Its tests still run and still gate the job. Tracked for unwinding in #73 alongside the other eight.
+
 ## 6. Follow-through
 
 - [x] 6.1 Update `openspec/changes/launchpad-strategy/design.md` where it documents settlement leaving P&L understated, pointing at this change.

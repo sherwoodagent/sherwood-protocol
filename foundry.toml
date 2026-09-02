@@ -86,6 +86,16 @@ via_ir = true
 paths = "src/strategies/ConcentratedLiquidityStrategy.sol"
 via_ir = true
 
+# Added 2026-09-02 by the unpriced-cost-basis change (SHE-153). Confirmed
+# empirically, per the note above: with this entry removed, coverage codegen
+# fails `Stack too deep` (LValue.cpp:50) with no source location, and with it
+# present the build is clean. Removing a local and a `balanceOf` from `_settle`
+# was tried first and was NOT sufficient on its own -- it is kept because it is
+# a strict improvement, not because it fixed this.
+[[profile.coverage.compilation_restrictions]]
+paths = "src/strategies/LaunchpadStrategy.sol"
+via_ir = true
+
 # Profile used by the Medusa/Echidna harness under test/fizz/. The fuzzers compile
 # through crytic-compile, which shells out to this profile.
 #
