@@ -49,7 +49,7 @@ contract GuardianRegistryOutcomeTest is RegistryTestHarness {
 
     function _vote(uint256 i, IGuardianRegistry.GuardianVoteType side) internal {
         vm.prank(_guardian(i));
-        registry.voteOnProposal(address(governor), PID, side);
+        registry.voteOnProposal(address(governor), PID, side, type(uint256).max);
     }
 
     function _outcome(uint256 pid) internal view returns (uint8) {
@@ -170,7 +170,7 @@ contract GuardianRegistryOutcomeTest is RegistryTestHarness {
         // blockStakeWeight to 20_000e18 = 40% >= 30% is refused outright.
         vm.prank(_guardian(1));
         vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(reviewEnd);
 

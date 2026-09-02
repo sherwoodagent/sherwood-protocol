@@ -111,17 +111,22 @@ contract MockChallengeGameWindow {
 ///         pinCoverageUntil, retireApproval, hasFrozenCoverage,
 ///         setChallengeWindow, _feedPriceX8).
 ///
-/// @dev    FINDING A (`test_freezeCoverage_...`): `freezeCoverage` and
-///         `pinCoverageUntil` gated on the LIVE BOOKING
-///         (`_recorded[key][g].usd`), which the permissionless,
-///         deliberately-not-freeze-gated `settleCoverage` can rewrite to
-///         zero while the PLEDGE (`_reservedUsd`) and the `_approversOf`
-///         listing survive untouched. A guardian whose booking transited
+/// @dev    FINDING A (`test_freezeAndPin_reachAGuardianWhoseStakeCollapsed`):
+///         `freezeCoverage` and `pinCoverageUntil` gated on the LIVE BOOKING,
+///         which the permissionless, deliberately-not-freeze-gated
+///         `settleCoverage` could rewrite to zero while the PLEDGE and the
+///         `_approversOf` listing survived. A guardian whose booking transited
 ///         through zero was therefore never counted into
 ///         `_frozenCommitments`, so `hasFrozenCoverage` — the gate
 ///         `StakedWood.claimUnstakeGuardian` reads — came back clean while
 ///         the accusation naming them was still live. Fixed by gating both
-///         loops on the pledge instead.
+///         loops on the pledge. Declared coverage locks then collapsed booking
+///         and pledge into ONE lock and deleted `settleCoverage`, so the
+///         divergence can no longer be produced at all; what survives here is
+///         the property the fix was defending — a guardian whose STAKE has
+///         collapsed to nothing, with its lock still live, is still frozen,
+///         pinned and named by `slashBpsFor`, because every one of those reads
+///         the lock and none reads the stake.
 ///
 ///         FINDING B (`test_pinCoverageUntil_boundaryIsInclusiveOfDeadline`):
 ///         `ChallengeGame.file` refuses a filing only STRICTLY past its
@@ -209,130 +214,65 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
     // whose live booking transited through zero
     // ══════════════════════════════════════════════════════════════════
 
-    /// @notice A guardian whose bond evaporates gets its BOOKING settled down
-    ///         to exactly zero while its PLEDGE and `_approversOf` listing
-    ///         survive — an entirely ordinary, permissionless sequence
-    ///         (`settleCoverage` needs no privileged role). `freezeCoverage`
-    ///         must still count that guardian as frozen.
+    /// @notice A guardian whose bond evaporates entirely — unstaked, or
+    ///         slashed on an unrelated conviction — while its lock is still
+    ///         live must still be counted by `freezeCoverage`, raised by
+    ///         `pinCoverageUntil` and named by `slashBpsFor` (at the saturated
+    ///         rate: the lock exceeds a zero basis). All three read the LOCK,
+    ///         and nothing about the stake can move a lock.
     ///
-    ///         Fails against the pre-fix code (the booking-gated loop skips a
-    ///         zero booking, so `hasFrozenCoverage` reads `false`), passes
-    ///         against the fix.
-    function test_freezeCoverage_countsGuardianWhoseBookingWasSettledToZero() public {
+    ///         The original finding-A fixture reached the same end state
+    ///         through `settleCoverage` writing the booking to zero; that path
+    ///         no longer exists, and this is the surviving one.
+    function test_freezeAndPin_reachAGuardianWhoseStakeCollapsed() public {
         address g2 = makeAddr("g2");
         // 5,000e18 WOOD @ $2.00 = $10,000 slashable each — exactly the full
-        // $10,000 requirement, so each reserves its whole free budget.
+        // $10,000 requirement, so each locks its whole free budget.
         swood.setStake(guardian, 5_000e18);
         swood.setStake(g2, 5_000e18);
         mgov.set(_requiredCoverage6(10_000e18));
         mgov.setSchedule(block.timestamp + 1 days, 3 days);
 
         vm.startPrank(registry);
-        ledger.recordApproval(address(mgov), 1, guardian);
-        ledger.recordApproval(address(mgov), 1, g2);
+        ledger.recordApproval(address(mgov), 1, guardian, type(uint256).max);
+        ledger.recordApproval(address(mgov), 1, g2, type(uint256).max);
         vm.stopPrank();
 
-        (, uint256[] memory pledgedBefore) = ledger.pledgedOf(address(mgov), 1);
-        assertEq(pledgedBefore[0], 10_000e18, "guardian must pledge its full slashable bond");
+        (, uint256[] memory lockedBefore) = ledger.pledgedOf(address(mgov), 1);
+        assertEq(lockedBefore[0], 5_000e18, "guardian must lock its whole stake");
 
-        skip(31 days); // review shuts, settleCoverage's ReviewNotClosed gate opens
+        skip(31 days); // review shut; nothing about the lock changes
 
-        // The guardian's bond evaporates entirely -- unstaked, or slashed on
-        // an unrelated conviction -- while g2 stays fully solvent, so
-        // `_effectiveReservedTotal` stays nonzero and settleCoverage's
-        // per-approver loop actually runs (rather than early-returning
-        // without touching any booking).
+        // The guardian's bond evaporates entirely while g2 stays solvent.
         swood.setStake(guardian, 0);
-        ledger.settleCoverage(address(mgov), 1);
 
-        // Booking is now zero; pledge is untouched.
-        (address[] memory approvers, uint256[] memory booked) = ledger.approversOf(address(mgov), 1);
+        // The lock is untouched — there is no permissionless pass left that
+        // could write it down, and `coverageUsdOf` is what now reads zero.
+        (address[] memory approvers, uint256[] memory locked) = ledger.approversOf(address(mgov), 1);
         assertEq(approvers[0], guardian, "guardian must still be listed first");
-        assertEq(booked[0], 0, "settleCoverage must have written the booking down to exactly zero");
-        (, uint256[] memory pledgedAfter) = ledger.pledgedOf(address(mgov), 1);
-        assertEq(pledgedAfter[0], 10_000e18, "pledge must survive the booking write-down");
+        assertEq(locked[0], 5_000e18, "the lock survives the stake collapse");
+        assertEq(ledger.lockOf(address(mgov), 1, guardian), 5_000e18);
+        assertEq(ledger.coverageUsdOf(address(mgov), 1, guardian), 0, "what a conviction could recover is zero");
+
+        // slashBpsFor still NAMES the guardian, at the ceiling: pashov #13's
+        // concern (a permissionless write dropping a pledged guardian out of
+        // the slash set) has nothing left to write.
+        (address[] memory accused, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
+        assertEq(accused[0], guardian, "the guardian is still in the slash set");
+        assertEq(bps[0], 10_000, "a lock over a zero basis saturates; it does not vanish");
 
         vm.prank(freezer);
         ledger.freezeCoverage(address(mgov), 1);
-
-        assertTrue(ledger.hasFrozenCoverage(guardian), "guardian must be frozen despite a zero booking");
+        assertTrue(ledger.hasFrozenCoverage(guardian), "guardian must be frozen despite a zero stake");
         assertEq(ledger.frozenCoverageCount(), 1);
-    }
 
-    /// @notice PASHOV REVIEW FINDING #13: the LAST consumer still keyed on the
-    ///         booking was `slashBpsFor` — the one that decides WHO A
-    ///         CONVICTION SLASHES.
-    /// @dev    Issue #83 moved `TokenCourt._recordAccused` off the booking, and
-    ///         audit-181 findings A/C moved `freezeCoverage` and
-    ///         `pinCoverageUntil` (the tests either side of this one). This
-    ///         site was left behind, so the same permissionless, re-runnable,
-    ///         deliberately-not-freeze-gated `settleCoverage` those fixes
-    ///         defend against could still drop a guardian out of the slash set
-    ///         entirely. The rate is BINARY — `BPS_DENOMINATOR` or nothing — so
-    ///         one integer division floored to zero was the whole difference
-    ///         between losing 100% of a live stake and losing none of it.
-    ///
-    ///         Same fixture as the `freezeCoverage` test above, one assertion
-    ///         further along: booking zero, pledge intact, guardian still named
-    ///         at the ceiling.
-    function test_finding13_slashBpsForNamesGuardianWhoseBookingWasSettledToZero() public {
-        address g2 = makeAddr("g2");
-        swood.setStake(guardian, 5_000e18);
-        swood.setStake(g2, 5_000e18);
-        mgov.set(_requiredCoverage6(10_000e18));
-        mgov.setSchedule(block.timestamp + 1 days, 3 days);
-
-        vm.startPrank(registry);
-        ledger.recordApproval(address(mgov), 1, guardian);
-        ledger.recordApproval(address(mgov), 1, g2);
-        vm.stopPrank();
-
-        skip(31 days);
-
-        swood.setStake(guardian, 0);
-        ledger.settleCoverage(address(mgov), 1);
-
-        (, uint256[] memory booked) = ledger.approversOf(address(mgov), 1);
-        assertEq(booked[0], 0, "fixture: the live booking really is zero");
-        (, uint256[] memory pledged) = ledger.pledgedOf(address(mgov), 1);
-        assertEq(pledged[0], 10_000e18, "fixture: the pledge is untouched");
-
-        (address[] memory accused, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
-        assertEq(accused[0], guardian, "the guardian is still listed");
-        assertEq(
-            bps[0],
-            10_000,
-            "a zeroed BOOKING must not drop a pledged guardian out of the slash set: the predicate is the pledge"
-        );
-    }
-
-    /// @notice The `pinCoverageUntil` sibling of the same defect: a pin issued
-    ///         while the guardian's booking reads zero (but its pledge does
-    ///         not) must still raise the pin, not silently skip the guardian.
-    function test_pinCoverageUntil_pinsGuardianWhoseBookingWasSettledToZero() public {
-        address g2 = makeAddr("g2");
-        swood.setStake(guardian, 5_000e18);
-        swood.setStake(g2, 5_000e18);
-        mgov.set(_requiredCoverage6(10_000e18));
-        mgov.setSchedule(block.timestamp + 1 days, 3 days);
-
-        vm.startPrank(registry);
-        ledger.recordApproval(address(mgov), 1, guardian);
-        ledger.recordApproval(address(mgov), 1, g2);
-        vm.stopPrank();
-
-        skip(31 days);
-        swood.setStake(guardian, 0);
-        ledger.settleCoverage(address(mgov), 1);
-
-        (, uint256[] memory booked) = ledger.approversOf(address(mgov), 1);
-        assertEq(booked[0], 0, "precondition: guardian's booking must be zero");
-
-        uint256 deadline = block.timestamp + 1_000;
+        // And the pin sibling: raised, not skipped.
         vm.prank(freezer);
-        ledger.pinCoverageUntil(address(mgov), 1, deadline);
-
-        assertTrue(ledger.hasFrozenCoverage(guardian), "pin must have raised despite a zero booking");
+        ledger.unfreezeCoverage(address(mgov), 1);
+        assertFalse(ledger.hasFrozenCoverage(guardian), "control: unfrozen and unpinned reads clean");
+        vm.prank(freezer);
+        ledger.pinCoverageUntil(address(mgov), 1, block.timestamp + 1_000);
+        assertTrue(ledger.hasFrozenCoverage(guardian), "pin must have raised despite a zero stake");
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -356,7 +296,7 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
         mgov.setSchedule(block.timestamp + 1 days, 3 days);
 
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), p1, guardian);
+        ledger.recordApproval(address(mgov), p1, guardian, type(uint256).max);
 
         // Advance past the guardian's own bucket challenge-window expiry, so
         // the ONLY thing left gating `retireApproval` below is the pin.
@@ -405,12 +345,12 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
         mgov.set(_requiredCoverage6(1_000e18));
         mgov.setSchedule(block.timestamp + 1 days, 3 days);
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), p1, guardian);
+        ledger.recordApproval(address(mgov), p1, guardian, type(uint256).max);
 
         mgov.set(_requiredCoverage6(1_000e18));
         mgov.setSchedule(block.timestamp + 1 days, 3 days);
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), p2, guardian);
+        ledger.recordApproval(address(mgov), p2, guardian, type(uint256).max);
 
         uint256 expiry = ledger.epochGenesis() + ledger.epochLength() + ledger.challengeWindow();
         vm.warp(expiry + 1); // both P1 and P2's buckets are now provably dead

@@ -668,20 +668,32 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     }
 
     /// @notice GL-20 `SHOULD-HOLD` — the approver array holds exactly the
-    ///         guardians carrying a live pledge, with no duplicates.
-    /// @dev `_approversOf` is append-only while `_reservedUsd` is cleared on
-    ///      release, so the two can drift: a guardian appearing twice would
-    ///      double-count toward `requireApproveQuorum`, and one appearing with a
-    ///      zeroed pledge would inflate the cohort's apparent size. Both are
-    ///      quorum-inflation bugs, which is why membership and pledge are
-    ///      checked together rather than counting length alone.
+    ///         guardians carrying a live WOOD lock, with no duplicates, and
+    ///         `approversOf` / `pledgedOf` / `lockOf` all report that same lock.
+    /// @dev `_approversOf` is swap-and-popped by `_unwindApproval` while the lock
+    ///      is deleted alongside it, so the two can only drift through a bug: a
+    ///      guardian appearing twice would double-count toward
+    ///      `requireApproveQuorum`, and one listed with a zero lock would inflate
+    ///      the cohort's apparent size (and `recordApproval` never lists a
+    ///      zero declaration). Both are quorum-inflation bugs, which is why
+    ///      membership and lock are checked together rather than counting length
+    ///      alone. The two views read identical storage since `settleCoverage`
+    ///      went away (there is no longer a booking distinct from the pledge),
+    ///      so their agreement — and agreement with `lockOf` — is pinned here
+    ///      too: `ChallengeGame.file` and `TokenCourt` ask `pledgedOf`, the
+    ///      quorum asks the approver list, and they must never see different
+    ///      cohorts.
     function property_GL20_approverArrayMatchesPledges() public view returns (bool) {
         uint256 n = governor.proposalCount();
         for (uint256 pid = 1; pid <= n; pid++) {
-            (address[] memory approvers,) = ledger.approversOf(address(governor), pid);
-            (, uint256[] memory pledged) = ledger.pledgedOf(address(governor), pid);
+            (address[] memory approvers, uint256[] memory locked) = ledger.approversOf(address(governor), pid);
+            (address[] memory pledgers, uint256[] memory pledged) = ledger.pledgedOf(address(governor), pid);
+            if (pledgers.length != approvers.length || pledged.length != approvers.length) return false;
+            if (locked.length != approvers.length) return false;
             for (uint256 i; i < approvers.length; i++) {
-                if (pledged[i] == 0) return false;
+                if (locked[i] == 0) return false;
+                if (pledgers[i] != approvers[i] || pledged[i] != locked[i]) return false;
+                if (ledger.lockOf(address(governor), pid, approvers[i]) != locked[i]) return false;
                 for (uint256 j = i + 1; j < approvers.length; j++) {
                     if (approvers[i] == approvers[j]) return false;
                 }
@@ -718,100 +730,100 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         return s == IChallengeGame.Status.Filed || s == IChallengeGame.Status.Disputed;
     }
 
-    // ―――――― ExposureLedger shared-stake accumulators (x-ray I-5 / X-8) ――――――
+    // ―――――――――― ExposureLedger lock accounting (x-ray I-5 / X-8) ――――――――――
     // The mathematical core of the protocol's central economic claim: one
     // guardian bond backs many proposals at once, and the ledger's job is to
-    // stop the same stake being promised twice. Nothing on-chain asserts it.
+    // stop the same stake being promised twice. Under declared coverage locks
+    // the ledger keeps ONE figure per (proposal, guardian) — the WOOD lock —
+    // and the per-guardian epoch buckets `openExposure` sums. Nothing on-chain
+    // asserts that the two agree.
+
+    /// @dev Sum of `lockOf` over every proposal for `guardian` — the ledger's
+    ///      own per-key records, which persist until release or retirement.
+    function _sumLocks(address guardian) internal view returns (uint256 total) {
+        uint256 n = governor.proposalCount();
+        for (uint256 pid = 1; pid <= n; pid++) {
+            total += ledger.lockOf(address(governor), pid, guardian);
+        }
+    }
 
     /// @notice GL-12 `SHOULD-HOLD` — a guardian's live bucketed exposure never
-    ///         exceeds the sum of what the ledger recorded for them across
-    ///         every proposal.
+    ///         exceeds the sum of its live locks across every proposal.
     ///
     /// @dev `<=`, NOT `==`, and the asymmetry is the whole subtlety.
-    ///      `openExposureUsd` sums `_buckets[guardian][epoch]` over a WALL-CLOCK
-    ///      window — buckets age out once their challenge window elapses — while
-    ///      `approversOf` returns `_recorded[key][guardian]` for every key ever
-    ///      written. Expiry, `retireApproval` and `settleCoverage`'s re-book can
-    ///      each drop the live side below the historical sum, so equality is
-    ///      false for a reason that is correct behaviour.
+    ///      `openExposure` sums `_buckets[guardian][epoch]` over a WALL-CLOCK
+    ///      window — buckets age out once their challenge window elapses —
+    ///      while a lock record survives until `releaseApproval` or
+    ///      `retireApproval` clears it (and the sweep is only LEGAL once the
+    ///      bucket has expired). Expiry can therefore drop the live side below
+    ///      the lock sum, so equality is false for a reason that is correct
+    ///      behaviour; GL-52 pins the equality while nothing can have expired.
     ///
-    ///      `<=` still carries the real content: it fails if a booking is
-    ///      double-counted into the buckets, or if a bucket is credited without
-    ///      a matching record — the two ways this accumulator could overstate a
-    ///      guardian's free budget and let them over-promise their bond.
+    ///      `<=` still carries the real content: it fails if a lock is
+    ///      double-counted into the buckets, or if a bucket is credited
+    ///      without a matching lock — the two ways this accumulator could
+    ///      overstate a guardian's consumed budget.
     ///
     ///      Deliberately not written as `==` first and relaxed later: GL-09 and
     ///      GL-16 both shipped as equalities, both fired, and both turned out to
     ///      be defects in the property rather than the protocol. The direction
     ///      that can actually be violated is the one worth asserting.
-    function property_GL12_openExposureWithinRecordedSum() public view returns (bool) {
-        uint256 n = governor.proposalCount();
+    function property_GL12_openExposureWithinLockSum() public view returns (bool) {
         for (uint256 g; g < GUARDIAN_COUNT; g++) {
             address guardian = actors[g];
-            uint256 recorded;
-            for (uint256 pid = 1; pid <= n; pid++) {
-                (address[] memory approvers, uint256[] memory committed) = ledger.approversOf(address(governor), pid);
-                for (uint256 i; i < approvers.length; i++) {
-                    if (approvers[i] == guardian) recorded += committed[i];
-                }
-            }
-            if (ledger.openExposureUsd(guardian) > recorded) return false;
+            if (ledger.openExposure(guardian) > _sumLocks(guardian)) return false;
         }
         return true;
     }
 
-    /// @notice GL-13 `SHOULD-HOLD` — per (proposal, guardian), the pledged
-    ///         reservation is never below the recorded exposure booked against
-    ///         it.
+    /// @notice GL-52 `SHOULD-HOLD` — while no bucket can have expired, a
+    ///         guardian's bucketed exposure EQUALS the sum of its locks.
     ///
-    /// @dev I-5's second clause. `recordApproval` writes both sides equal
-    ///      (`_reservedUsd` and `_recorded.usd` both take `share`), and only
-    ///      `settleCoverage`'s re-book moves them apart — downward on the
-    ///      recorded side, rebooking approvals to actual need. The pledge is the
-    ///      standing promise and nothing but a release clears it, so recorded
-    ///      exposure exceeding its own pledge would mean the ledger is carrying
-    ///      liability the guardian never reserved.
-    ///
-    ///      PROPERTIES.md specifies this against `_livePledgedUsd`, which has no
-    ///      accessor and would need a ghost mirroring every mutation site. This
-    ///      is the same clause expressed through the two accessors that DO
-    ///      exist, so it is assertable today; the ghost-based aggregate remains
-    ///      open.
-    function property_GL13_pledgeCoversRecorded() public view returns (bool) {
-        uint256 n = governor.proposalCount();
-        for (uint256 pid = 1; pid <= n; pid++) {
-            (address[] memory approvers, uint256[] memory committed) = ledger.approversOf(address(governor), pid);
-            (, uint256[] memory pledged) = ledger.pledgedOf(address(governor), pid);
-            if (pledged.length != approvers.length) return false;
-            for (uint256 i; i < approvers.length; i++) {
-                if (pledged[i] < committed[i]) return false;
-            }
+    /// @dev The exact clause GL-12 relaxes. `openExposure` walks buckets from
+    ///      `(elapsed - challengeWindow) / epochLength` (0 while `elapsed <=
+    ///      challengeWindow`) forward through the coverage horizon, and
+    ///      `recordApproval` refuses to book beyond that horizon, so until the
+    ///      first challenge window has elapsed since genesis EVERY bucket ever
+    ///      written is inside the walk, `retireApproval` cannot yet have run
+    ///      (it gates on that same expiry), and the only writers are
+    ///      `recordApproval` (credits bucket and lock together) and
+    ///      `releaseApproval` (debits both together). Any drift between the two
+    ///      in that window is a bug in one of those two writers. Vacuous once
+    ///      the campaign's clock passes the window, where GL-12 carries on.
+    function property_GL52_openExposureEqualsLockSumBeforeAnyExpiry() public view returns (bool) {
+        if (block.timestamp - ledger.epochGenesis() > ledger.challengeWindow()) return true;
+        for (uint256 g; g < GUARDIAN_COUNT; g++) {
+            address guardian = actors[g];
+            if (ledger.openExposure(guardian) != _sumLocks(guardian)) return false;
         }
         return true;
     }
 
-    /// @notice GL-49 `EXPLORATORY` — x-ray X-8: a guardian's aggregate booked
-    ///         coverage never exceeds the stake that backs it,
-    ///         `kNumerator * slashableBondUsd`.
+    /// @notice GL-49 `EXPLORATORY` — x-ray X-8: a guardian's live locked
+    ///         exposure never exceeds the stake that backs it,
+    ///         `kNumerator * guardianStake`, in WOOD.
     ///
     /// @dev THE central economic claim, and x-ray flags it On-chain=**No** —
     ///      nothing asserts it anywhere. `recordApproval` maintains it going in:
-    ///      it books `share = min(free, need)` only while `open < capUsd`, so
-    ///      the sum cannot exceed the cap AT BOOKING TIME.
+    ///      it locks `min(declared, cap - open)` only while `open < cap`, so the
+    ///      sum cannot exceed the cap AT LOCKING TIME. No price is involved on
+    ///      either side any more — the old USD form of this property could be
+    ///      moved by a WOOD price fall or a haircut change; this one cannot.
     ///
     ///      EXPLORATORY because the bound is enforced only at that instant and
-    ///      the right-hand side moves afterwards. `slashableBondUsd` is a live
-    ///      read: a WOOD price fall, a haircut change, or a slash on another
-    ///      case all shrink the cap under commitments already booked against it.
-    ///      A violation is therefore not automatically a bug — it is the
-    ///      quantitative answer to "how far can a guardian's book drift past
-    ///      their collateral without any single call being wrong", which is
-    ///      exactly what the fuzzer should be asked and what E-1 rests on.
-    function property_GL49_bookedCoverageWithinSlashableStake() public view returns (bool) {
+    ///      the right-hand side still moves afterwards: a slash on another case
+    ///      shrinks the stake under locks already booked against it. At
+    ///      `kNumerator == 1` the ledger's containment claim is that a
+    ///      conviction on ONE proposal burns at most that proposal's lock, so
+    ///      the stake left is at least the sum of the other locks; a violation
+    ///      here is the quantitative answer to "how far can a guardian's book
+    ///      drift past its collateral without any single call being wrong" —
+    ///      the envelope floor (`minSlashBps`) is the one legal way it can.
+    function property_GL49_lockedExposureWithinStake() public view returns (bool) {
         uint256 k = ledger.kNumerator();
         for (uint256 g; g < GUARDIAN_COUNT; g++) {
             address guardian = actors[g];
-            if (ledger.openExposureUsd(guardian) > k * ledger.slashableBondUsd(guardian)) return false;
+            if (ledger.openExposure(guardian) > k * swood.guardianStake(guardian)) return false;
         }
         return true;
     }

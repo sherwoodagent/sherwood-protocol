@@ -2,10 +2,14 @@
 pragma solidity 0.8.28;
 
 /// @title IExposureLedger
-/// @notice Dollar-denominated aggregate exposure cap + covered-TVL cap +
-///         approve-quorum arithmetic. Singleton; consumed by GuardianRegistry
-///         (exposure recording at approve-vote time) and SyndicateGovernor
-///         (covered-TVL check at propose, approve-quorum check at execute).
+/// @notice WOOD-denominated guardian coverage locks + covered-TVL cap +
+///         approve-quorum arithmetic. A guardian DECLARES a WOOD amount on
+///         approve and the ledger locks `min(declared, k x stake - open)`; that
+///         one lock is the guardian's booking, pledge and slash base for the
+///         proposal. Singleton; consumed by GuardianRegistry (lock recording at
+///         approve-vote time), SyndicateGovernor (covered-TVL check at propose,
+///         approve-quorum check at execute) and ChallengeGame (slash rates and
+///         bond sizing).
 interface IExposureLedger {
     // ── Errors ──
     /// @notice Retained for ABI stability; no longer thrown. The exposure cap
@@ -21,12 +25,6 @@ interface IExposureLedger {
     ///         the epoch length, rather than silently under-covering the tail.
     error CoverageHorizonExceeded();
 
-    /// @notice `settleCoverage` called before the review window shut, while the
-    ///         approver set can still change.
-    error ReviewNotClosed();
-
-    /// @notice Emitted when reservations collapse to allocations for a proposal.
-    event CoverageSettled(bytes32 indexed reviewKey, uint256 reservedTotal, uint256 allocatedTotal);
     error InsufficientApproveCoverage();
     error NotGuardianRegistry();
     error FeedNotConfigured();
@@ -43,7 +41,7 @@ interface IExposureLedger {
     error CoveragePinnedActive();
 
     /// @notice `retireApproval` called before the booked epoch's challenge
-    ///         window has elapsed — the same expiry `openExposureUsd` itself
+    ///         window has elapsed — the same expiry `openExposure` itself
     ///         uses. Retire only what is provably past challengeability.
     error ChallengeWindowOpen();
 
@@ -57,12 +55,11 @@ interface IExposureLedger {
     ///         than meaning uncapped: an unset cap would admit an unbounded market
     ///         price and hand a ~$438k pool the valuation of every guardian bond.
     ///
-    ///         HALTING SEMANTICS. Every consumer lets this propagate except
-    ///         `recordApproval`, which catches it and books nothing — reverting
-    ///         there would let Block votes land while Approve votes failed,
-    ///         turning the review block-only. Execution, proposal creation and
-    ///         challenge filing all halt, which is correct: no price means no
-    ///         proof of coverage.
+    ///         HALTING SEMANTICS. Every consumer lets this propagate.
+    ///         `recordApproval` never reads it — the lock and the cap are WOOD —
+    ///         so the approve vote keeps landing through a WOOD outage. Execution,
+    ///         proposal creation, challenge filing and the fee-weight view all
+    ///         halt, which is correct: no price means no proof of coverage.
     error NoWoodPrice();
 
     // ── Events ──
@@ -71,16 +68,17 @@ interface IExposureLedger {
     event WoodTwapOracleSet(address indexed oldOracle, address indexed newOracle);
     event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event AssetFeedSet(address indexed asset, address feed, uint256 maxDelay, uint8 assetDecimals);
-    event ExposureRecorded(address indexed guardian, bytes32 indexed reviewKey, uint256 usd, uint256 epoch);
-    event ExposureReleased(address indexed guardian, bytes32 indexed reviewKey, uint256 usd, uint256 epoch);
-    /// @notice A dead commitment was swept by `retireApproval` (audit #181
-    ///         finding 11) — booked coverage that was past its challenge
-    ///         window, unfrozen, and unpinned, released from both
-    ///         shared-stake accumulators the same way `ExposureReleased`
-    ///         releases a vote-change unwind.
-    event ExposureRetired(
-        address indexed guardian, bytes32 indexed reviewKey, uint256 usd, uint256 reservedUsd, uint256 epoch
-    );
+    /// @notice `guardian` locked `wood` WOOD behind `reviewKey`, booked into
+    ///         epoch bucket `epoch`. `wood` is `min(declared, free budget)`.
+    event ExposureRecorded(address indexed guardian, bytes32 indexed reviewKey, uint256 wood, uint256 epoch);
+    /// @notice A vote-change unwind released `guardian`'s lock of `wood` from
+    ///         bucket `epoch`.
+    event ExposureReleased(address indexed guardian, bytes32 indexed reviewKey, uint256 wood, uint256 epoch);
+    /// @notice A dead lock was swept by `retireApproval` (audit #181 finding 11)
+    ///         — a lock past its challenge window, unfrozen, and unpinned,
+    ///         released from its bucket the same way `ExposureReleased` releases
+    ///         a vote-change unwind.
+    event ExposureRetired(address indexed guardian, bytes32 indexed reviewKey, uint256 wood, uint256 epoch);
     event ParameterChangeFinalized(bytes32 indexed paramKey, uint256 oldValue, uint256 newValue);
     event CoverageFreezerSet(address indexed oldFreezer, address indexed newFreezer);
     event CoverageFrozenSet(address indexed governor, uint256 indexed proposalId, bool frozen);
@@ -89,29 +87,36 @@ interface IExposureLedger {
     event CoveragePinned(address indexed governor, uint256 indexed proposalId, uint256 deadline);
 
     // ── Registry-only mutations ──
-    function recordApproval(address governor, uint256 proposalId, address guardian) external;
+    /// @notice Lock `min(lockWood, kNumerator x slashableStake(guardian) -
+    ///         openExposure(guardian))` WOOD behind (governor, proposalId) for
+    ///         `guardian`. Idempotent per (proposal, guardian). NEVER REVERTS on
+    ///         a booking failure: a zero `lockWood`, zero required coverage, an
+    ///         unpriceable vault asset, zero free budget, or settlement beyond the
+    ///         coverage horizon all lock nothing and return, so the approve vote
+    ///         still lands and any shortfall surfaces at the execute-time quorum.
+    ///         Reads NO WOOD price. There is no cohort cap: locks across a
+    ///         proposal's approvers may sum above its requirement, and nothing
+    ///         reduces a lock other than `releaseApproval`/`retireApproval`.
+    /// @param  lockWood The WOOD the guardian declares. Clamped, never rejected.
+    function recordApproval(address governor, uint256 proposalId, address guardian, uint256 lockWood) external;
     function releaseApproval(address governor, uint256 proposalId, address guardian) external;
 
-    /// @notice Permissionless sweep of a dead commitment: once a key's booked epoch
+    /// @notice Permissionless sweep of a dead lock: once a key's booked epoch
     ///         is past its challenge window, its coverage is not frozen, and
     ///         `guardian` is not within an active `pinCoverageUntil` deadline ON
     ///         THIS (governor, proposalId) PAIR SPECIFICALLY — a pin from an
     ///         unrelated proposal the same guardian also approved does not block
     ///         this sweep — anyone may retire it.
     /// @dev    WHY THIS EXISTS: `releaseApproval` has exactly one caller, gated on
-    ///         the review still being open, so a commitment that survives its own
-    ///         review has NO release path at all. The shared-stake denominators
-    ///         are otherwise monotone non-decreasing across a guardian's entire
-    ///         history of approvals, while `openExposureUsd` decays every
-    ///         challenge window — so left unswept, a guardian's share of its own
-    ///         bond decays as ~1/N in the number of proposals it has EVER
-    ///         approved, counting ones whose challenge window has long closed and
-    ///         which therefore carry no collectable liability.
+    ///         the review still being open, so a lock that survives its own
+    ///         review has NO release path at all. The BUDGET recycles on its own
+    ///         (`openExposure` decays every challenge window); what does not is
+    ///         the lock record and the approver listing, which the freeze/pin
+    ///         walks and every accused-set derivation read. Retiring bounds those
+    ///         by commitments that can still be collected on.
     ///
-    ///         PERMISSIONLESS AND SAFE TO SKIP: if nobody calls it a dead
-    ///         commitment keeps diluting the guardian's share (conservative —
-    ///         quorums get harder, never easier), and the preconditions themselves
-    ///         gate correctness.
+    ///         PERMISSIONLESS AND SAFE TO SKIP: the preconditions themselves gate
+    ///         correctness, and an unswept dead lock costs only list length.
     function retireApproval(address governor, uint256 proposalId, address guardian) external;
 
     // ── Governor-consumed checks (view) ──
@@ -171,105 +176,108 @@ interface IExposureLedger {
     function frozenCoverageCount() external view returns (uint256);
 
     // Views
-    /// @notice The covering approvers of a proposal and the USD each has BOOKED
-    ///         right now.
-    /// @dev    NOT A HISTORICAL SET. `releaseApproval` swap-and-pops the guardian
-    ///         out of the list, so a released commitment is DROPPED, not reported
-    ///         as a zero share. A zero here means something else: a booking
-    ///         `settleCoverage` wrote down to nothing, which it does for any
-    ///         approver whose own slashable bond has gone.
-    ///
-    ///         That makes this the wrong read for did-this-guardian-underwrite —
-    ///         `settleCoverage` is permissionless, re-runnable and un-gated on the
-    ///         freeze, so the number moves under a live challenge. Use `pledgedOf`
-    ///         for that question.
+    /// @notice The covering approvers of a proposal and the WOOD each has LOCKED
+    ///         behind it.
+    /// @dev    NOT A HISTORICAL SET. `releaseApproval`/`retireApproval`
+    ///         swap-and-pop the guardian out of the list, so a released lock is
+    ///         DROPPED, not reported as zero. Every listed guardian holds a
+    ///         non-zero lock, and that lock is the guardian's booking, pledge and
+    ///         slash base at once — there is no second number it could differ
+    ///         from. Identical to `pledgedOf`.
     function approversOf(address governor, uint256 proposalId)
         external
         view
-        returns (address[] memory approvers, uint256[] memory committedUsd);
+        returns (address[] memory approvers, uint256[] memory lockedWood);
 
-    /// @notice The covering approvers of a proposal and the USD each PLEDGED when
-    ///         it approved — the reservation `recordApproval` booked, before any
-    ///         settlement pass redistributed it.
-    /// @dev    The settle-immune half of the pair. `approversOf` reports the live
-    ///         booking, which `settleCoverage` rewrites in both directions without
-    ///         a freeze gate; this reports the pledge, which only `recordApproval`
-    ///         writes and only `releaseApproval` clears — and that reverts
-    ///         `CoverageFrozen` for the whole life of a challenge.
-    ///
-    ///         So this is the read that answers whether a guardian underwrote a
-    ///         proposal. `TokenCourt` derives its accused set from it: a guardian
-    ///         whose booking a later settlement zeroed still underwrote the drain
-    ///         and must still be barred from voting on its own case.
+    /// @notice The covering approvers of a proposal and the WOOD each PLEDGED —
+    ///         the same lock `approversOf` reports, under the name the
+    ///         "did this guardian underwrite it?" question asks for.
+    /// @dev    Historically the settle-immune half of a booking/pledge pair. With
+    ///         one lock per (proposal, guardian) the pair has collapsed; this
+    ///         selector survives because `ChallengeGame.file` and `TokenCourt`
+    ///         derive the accused set from it, and the lock is written once by
+    ///         `recordApproval` and erased only by `releaseApproval` (which reverts
+    ///         `CoverageFrozen` for the whole life of a challenge) or
+    ///         `retireApproval` (refused while frozen or pinned).
     function pledgedOf(address governor, uint256 proposalId)
         external
         view
-        returns (address[] memory approvers, uint256[] memory pledgedUsd);
+        returns (address[] memory approvers, uint256[] memory lockedWood);
+
+    /// @notice `guardian`'s WOOD lock behind (governor, proposalId); 0 when it
+    ///         holds none (never approved, released, or retired).
+    function lockOf(address governor, uint256 proposalId, address guardian) external view returns (uint256);
 
     /// @notice Per-approver slash rates for a proposal, in bps of each guardian's
     ///         own slashable stake, positionally aligned with the approver list.
-    /// @dev    Feeds `IStakedWood.slashVerdict` directly. PUNITIVE: every approver
-    ///         still holding a live commitment returns the full
-    ///         `BPS_DENOMINATOR`, which `_slashOne` then clamps into
-    ///         `[minSlashBps, maxSlashBps]`, so the severity ceiling is applied at
-    ///         one governance-controlled site rather than read twice. A guardian
-    ///         who booked nothing, or released by changing their vote, returns 0.
+    /// @dev    Feeds `IStakedWood.slashVerdict` directly. Each rate is the
+    ///         approver's LOCK for this proposal over its slash basis
+    ///         (`slashableStakeAt(g, executedAt)` once executed, live stake
+    ///         before), rounded UP so the burn never falls below the lock by
+    ///         truncation, saturating at 10_000 when the lock meets or exceeds the
+    ///         basis or the basis is zero. A guardian with a zero lock returns 0.
+    ///         `StakedWood` then clamps every non-zero rate into
+    ///         `[minSlashBps, maxSlashBps]`, so the burn is `min(lock, basis)`
+    ///         under the envelope and `minSlashBps` is the single deterrence
+    ///         floor a small declaration cannot get under.
     ///
-    ///         The rate is INDEPENDENT of the loss: it reads no required coverage,
-    ///         no allocation, and no price feed. That last point is a liveness
-    ///         property worth keeping — an allocation-priced rate made a
-    ///         conviction unpriceable during exactly the market stress a drain
-    ///         happens in.
+    ///         The rate reads NO price: lock and stake are both WOOD, so a
+    ///         conviction never waits on a feed — a liveness property worth
+    ///         keeping, since feed outages correlate with the market stress a
+    ///         drain happens in.
     function slashBpsFor(address governor, uint256 proposalId)
         external
         view
         returns (address[] memory approvers, uint256[] memory bps);
-    /// @notice What `guardian` actually carries on this proposal, after the
-    ///         pro-rata scale-back — as opposed to the deliberately over-sized
-    ///         amount `recordApproval` reserved.
-    /// @dev    Reservations are per-approver and each may run up to the full
-    ///         coverage, so the real split is computed at read time from whoever
-    ///         is still an approver. This is the number a conviction should slash
-    ///         against; the raw reservation would over-slash.
-    function allocatedUsd(address governor, uint256 proposalId, address guardian) external view returns (uint256);
 
-    /// @notice What a conviction on this proposal can ACTUALLY take, in USD-18 —
-    ///         the cohort's whole liability, not the sum of what it reserved.
-    /// @dev    Summing `approversOf` overstates this by a factor that GROWS WITH
-    ///         THE APPROVER COUNT, since `recordApproval` deliberately reserves up
-    ///         to the full coverage from every approver. Exposed as one number so
-    ///         callers outside the ledger need not re-derive the
-    ///         reservation/allocation distinction — sizing a challenger's bond off
-    ///         reservations would charge more to challenge a proposal the better
-    ///         covered it was. `min(needUsd, effectiveTotal)`: allocations sum to
-    ///         the need when the cohort can cover it, and are bounded by what the
-    ///         cohort can actually pay when it cannot.
+    /// @notice `slashBpsFor` at an explicit slash anchor instead of the
+    ///         proposal's `executedAt`. Each rate is the approver's LOCK over
+    ///         `slashableStakeAt(g, anchor)` (live stake when `anchor == 0`),
+    ///         rounded up, saturating at 10_000, 0 for a zero lock.
+    /// @dev    The review-path slash uses this: `GuardianRegistry.resolveReview`
+    ///         blocks BEFORE execution, so `executedAt` is zero and the basis
+    ///         `StakedWood.slashGuardians` burns against is the stake at review
+    ///         open. `anchor` is a RAW instant — sWOOD applies the same-block `-1`
+    ///         hardening itself, so a caller holding a pre-hardened stamp passes
+    ///         `stamp + 1`. Reverts `VerdictNotPast` (via sWOOD) on a future
+    ///         anchor.
+    function slashBpsForAt(address governor, uint256 proposalId, uint256 anchor)
+        external
+        view
+        returns (address[] memory approvers, uint256[] memory bps);
+
+    /// @notice What `guardian` underwrote on this proposal, in USD-18:
+    ///         `min(lock, slashable stake) x woodPriceX8()`. UNCAPPED at the
+    ///         proposal's need — a guardian who locked more risked more and earns
+    ///         fee in proportion. The fee-weight read behind
+    ///         `GuardianRegistry.getApproverCoverage`.
+    /// @dev    Reverts `NoWoodPrice` when WOOD cannot be priced; the registry
+    ///         catches that and reports `priced == false` so the caller retries
+    ///         rather than paying zero through an outage.
+    function coverageUsdOf(address governor, uint256 proposalId, address guardian) external view returns (uint256);
+
+    /// @notice What a conviction on this proposal can recover FOR THIS PROPOSAL,
+    ///         in USD-18: `min(needUsd, sum of min(lock_i, slashable stake_i) x
+    ///         woodPriceX8())`.
+    /// @dev    The cap at `needUsd` bounds BOND SIZING only: a cohort may lock
+    ///         more than the proposal needs, and on conviction every full lock
+    ///         still burns, but a challenger should not have to post a bond
+    ///         against over-subscription it cannot recover. Reverts on an
+    ///         unpriceable WOOD feed or a stale asset feed — sizing a bond off an
+    ///         unvouched price is the unsafe direction.
     function liabilityUsd(address governor, uint256 proposalId) external view returns (uint256);
 
-    /// @notice The UNSHARED counterpart of `liabilityUsd`: what a conviction on
-    ///         THIS proposal alone can take, ignoring pro-rata sharing with OTHER
-    ///         open proposals the same guardians back.
-    /// @dev    `liabilityUsd` is the right basis for pricing a conviction's actual
-    ///         recovery and is deliberately pro-rated, since a conviction can only
-    ///         ever take one real, shared bond. `ChallengeGame.file`'s
-    ///         anti-frivolous-filing bond is a different quantity: it prices what
-    ///         THIS FILING freezes for THIS accused cohort, and must not shrink
-    ///         merely because the same guardians are juggling other open
-    ///         commitments. `ChallengeGame.file` is the intended caller.
+    /// @notice Identical to `liabilityUsd`. With no cohort cap nothing is
+    ///         pro-rated across a guardian's other proposals, so there is no
+    ///         longer a distinct "unshared" basis; the selector is kept because
+    ///         `ChallengeGame.file` names it.
     function unsharedLiabilityUsd(address governor, uint256 proposalId) external view returns (uint256);
 
-    /// @notice Return each approver's over-reservation once the review has shut and
-    ///         the approver set is final. Permissionless; safe to skip.
-    /// @dev    Re-runnable, and a caller that prices money off a settled proposal
-    ///         should re-run it first: each pass re-derives the whole split from
-    ///         the pledges recorded at vote time, at the CURRENT price, so a pass
-    ///         taken while WOOD or the vault asset was depressed leaves a stale
-    ///         number the next pass corrects. No pass can book a guardian above
-    ///         its own pledge, in either direction.
-    function settleCoverage(address governor, uint256 proposalId) external;
-
     function slashableBondUsd(address guardian) external view returns (uint256);
-    function openExposureUsd(address guardian) external view returns (uint256);
+    /// @notice Sum, in WOOD, of `guardian`'s epoch buckets whose challenge window
+    ///         has not elapsed — the batching-cap denominator. Pure WOOD
+    ///         arithmetic; readable through any price outage.
+    function openExposure(address guardian) external view returns (uint256);
     function coverageUsd(address asset, uint256 amount) external view returns (uint256);
     function proposerBondWood(address asset, uint256 requiredCoverage) external view returns (uint256);
     function currentEpoch() external view returns (uint256);
@@ -321,6 +329,17 @@ interface IExposureLedger {
     function setAssetFeed(address asset, address feed, uint256 maxDelay) external;
     function setGuardianRegistry(address registry) external;
     function setChallengeWindow(uint256 newWindow) external;
+    /// @notice Set the exposure-cap multiplier `k`: a guardian may hold live
+    ///         locks totalling `k x slashableStake`, in WOOD. Rejects zero.
+    /// @dev    AT `k = 1` THE LEDGER GUARANTEES CONTAINMENT: `sum of live locks <=
+    ///         stake`, so burning one proposal's lock leaves at least the sum of
+    ///         every other lock still staked — a conviction on one proposal
+    ///         leaves every other proposal the guardian backs fully covered. ANY
+    ///         `k > 1` IS DELIBERATE LEVERAGE that trades exactly that property
+    ///         away: a conviction on one proposal may then leave the others
+    ///         under-covered by precisely the excess. The default is 1 because
+    ///         containment is a safety property, not a placeholder; raise it only
+    ///         as an informed governance decision.
     function setKNumerator(uint256 newK) external;
     function setCoveredTvlCapUsd(uint256 newCap) external;
     function setQuorumTierThreshold(uint8 newThreshold) external;

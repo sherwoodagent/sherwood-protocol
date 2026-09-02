@@ -186,7 +186,7 @@ prosecutor fee (default 5%, ≤ 20%) to the challenger, remainder burned.
 | `vote` | LPs with snapshot voting power |
 | `vetoProposal`, `emergencyCancel`, `unstick`, emergency settle | vault owner |
 | guardian `voteOnProposal` | active staked guardians |
-| `openReview`, `resolveReview`, `executeProposal`, `settleProposal` (post-duration), `resolveProposalState`, `reclaimProposerBond`, `settleCoverage` | **anyone** (permissionless keepers) |
+| `openReview`, `resolveReview`, `executeProposal`, `settleProposal` (post-duration), `resolveProposalState`, `reclaimProposerBond` | **anyone** (permissionless keepers) |
 | parameter setters | vault owner, frozen while a proposal is open |
 
 ## Failure modes

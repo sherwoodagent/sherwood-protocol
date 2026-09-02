@@ -218,13 +218,16 @@ contract GuardianHandler is Test {
 
         address[] memory approvers = new address[](1);
         approvers[0] = actors[bound(approverSeed, 0, actors.length - 1)];
+        // Per-approver rates (declared coverage locks): one approver, one rate.
+        uint256[] memory rates = new uint256[](1);
+        rates[0] = slashBps;
 
         vm.prank(address(registry));
         // Pass openedAt = now: the own-slash basis is the raw own-stake
         // checkpoint at openedAt (spec 2026-07-19 §5), so `now` sizes the
         // slash off the approver's current stake and keeps the own-stake
         // leg exercised. (openedAt=0 would find no checkpoint → own basis 0.)
-        try swood.slashGuardians(bytes32(uint256(pid)), block.timestamp, approvers, slashBps) {
+        try swood.slashGuardians(bytes32(uint256(pid)), block.timestamp, approvers, rates) {
             successfulSlashes += 1;
         } catch {}
     }
@@ -248,7 +251,7 @@ contract GuardianHandler is Test {
             ? IGuardianRegistry.GuardianVoteType.Approve
             : IGuardianRegistry.GuardianVoteType.Block;
         vm.prank(a);
-        try registry.voteOnProposal(address(governor), pid, s) {} catch {}
+        try registry.voteOnProposal(address(governor), pid, s, type(uint256).max) {} catch {}
     }
 
     function openReview(uint256 proposalSeed) external {

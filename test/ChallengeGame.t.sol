@@ -65,11 +65,12 @@ contract MockChallengeLedger {
 
     mapping(bytes32 reviewKey => address[]) internal _approvers;
     mapping(bytes32 reviewKey => mapping(address guardian => uint256)) internal _committed;
-    /// @dev The PLEDGE — the real ledger's `_reservedUsd`. `recordApproval`
-    ///      writes it equal to the live booking and only `releaseApproval`
-    ///      clears it; `settleCoverage` never touches it. Kept separate here so
-    ///      a test can drive the BOOKING to zero under a live challenge (the
-    ///      #83 chain) without pretending the guardian released.
+    /// @dev The PLEDGE. In the real ledger this and `_committed` are now ONE
+    ///      lock (declared coverage locks collapsed booking and pledge and
+    ///      deleted `settleCoverage`). The mock keeps them separate so the
+    ///      tests that pin WHICH selector `ChallengeGame` reads (`pledgedOf`,
+    ///      pashov #24) can still drive the two apart: a game that ever went
+    ///      back to `approversOf` would be caught here, not on chain.
     mapping(bytes32 reviewKey => mapping(address guardian => uint256)) internal _pledged;
     mapping(bytes32 reviewKey => bool) internal _frozen;
     mapping(address guardian => uint256) internal _slashableBondUsd;
@@ -120,11 +121,10 @@ contract MockChallengeLedger {
         }
     }
 
-    /// @dev A settlement pass on ONE approver: rewrites the LIVE BOOKING and
-    ///      leaves the pledge alone, exactly as `ExposureLedger._rebook` does.
-    ///      Driving it to zero is what a `settleCoverage` call does to a
-    ///      guardian whose own slashable bond was emptied by a concurrent
-    ///      conviction.
+    /// @dev Rewrites the mock's BOOKING only, leaving the pledge alone — the
+    ///      divergence the real ledger's since-deleted `settleCoverage` used to
+    ///      produce. Retained purely as the lever that proves the game reads
+    ///      `pledgedOf` (see `_pledged` above).
     function setCommittedOnly(address governor, uint256 proposalId, address guardian, uint256 usd) external {
         _committed[_key(governor, proposalId)][guardian] = usd;
     }
@@ -289,14 +289,21 @@ contract MockChallengeLedger {
         _unsharedLiabilitySet[k] = true;
     }
 
+    /// @dev Under declared coverage locks the real ledger returns
+    ///      `min(needUsd, sum of min(lock_i, basis_i) x price)` and `file()`
+    ///      trusts that figure outright (the game's own uncapped fallback is
+    ///      gone). The override therefore plays the NEED: a value below the
+    ///      cohort sum is what is takeable, a value above it is capped by the
+    ///      cohort exactly as the ledger caps it, so the test that pins "never
+    ///      inflated by the need" exercises the contract the game relies on.
     function unsharedLiabilityUsd(address governor, uint256 proposalId) external view returns (uint256) {
         bytes32 k = _key(governor, proposalId);
-        if (_unsharedLiabilitySet[k]) return _unsharedLiabilityUsd[k];
         address[] storage list = _approvers[k];
         uint256 total;
         for (uint256 i = 0; i < list.length; i++) {
             total += _committed[k][list[i]];
         }
+        if (_unsharedLiabilitySet[k] && _unsharedLiabilityUsd[k] < total) return _unsharedLiabilityUsd[k];
         return total;
     }
 
@@ -921,7 +928,10 @@ contract ChallengeGameTest is Test {
     function test_file_bondUsesReservationsWhenTheyAreTheSmallerFigure() public {
         _setCoverage(PROPOSAL, 6_000e18, 4_000e18); // reservations sum to $10,000
         // `file()` reads `unsharedLiabilityUsd`, not `liabilityUsd` — see the
-        // note on `test_file_bondIsSizedOnLiabilityNotReservations`.
+        // note on `test_file_bondIsSizedOnLiabilityNotReservations`. The cap at
+        // the cohort lives in the ledger now (declared coverage locks); the mock
+        // mirrors it, and this test pins that the game passes the capped figure
+        // through rather than re-deriving anything from the need.
         ledger.setUnsharedLiabilityUsd(address(gov), PROPOSAL, 25_000e18); // a larger need
         _execute(PROPOSAL);
 

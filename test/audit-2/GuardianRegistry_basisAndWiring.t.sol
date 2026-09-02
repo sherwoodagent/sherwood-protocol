@@ -96,7 +96,7 @@ contract GuardianRegistry_basisAndWiringTest is RegistryTestHarness {
 
         vm.prank(attacker);
         vm.expectRevert(IGuardianRegistry.NotActiveGuardian.selector);
-        registry.voteOnProposal(address(governor), 1, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), 1, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(voteEnd + REVIEW_PERIOD);
         bool blocked = registry.resolveReview(address(governor), 1);
@@ -124,7 +124,7 @@ contract GuardianRegistry_basisAndWiringTest is RegistryTestHarness {
             2, honestBlocker, IGuardianRegistry.GuardianVoteType.Block, 1_000_000e18
         );
         vm.prank(honestBlocker);
-        registry.voteOnProposal(address(governor), 2, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), 2, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(voteEnd + REVIEW_PERIOD);
         bool blocked = registry.resolveReview(address(governor), 2);

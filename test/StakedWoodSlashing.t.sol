@@ -74,7 +74,7 @@ contract StakedWoodSlashingTest is Test {
         approvers[0] = alice;
         vm.prank(alice);
         vm.expectRevert(StakedWood.NotRegistry.selector);
-        swood.slashGuardians(bytes32(uint256(1)), 0, approvers, 5000);
+        swood.slashGuardians(bytes32(uint256(1)), 0, approvers, _uniformBps(approvers, 5000));
     }
 
     function test_slashGuardians_ownStake() public {
@@ -99,7 +99,7 @@ contract StakedWoodSlashingTest is Test {
         vm.expectEmit(true, true, true, true, address(swood));
         emit GuardianSlashed(bytes32(uint256(1)), alice, 5_000e18, 0);
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(bytes32(uint256(1)), maturedAt, approvers, 2500);
+        uint256 total = swood.slashGuardians(bytes32(uint256(1)), maturedAt, approvers, _uniformBps(approvers, 2500));
         uint256 slashedAt = vm.getBlockTimestamp();
 
         assertEq(total, 5_000e18, "returned total");
@@ -128,7 +128,7 @@ contract StakedWoodSlashingTest is Test {
 
         address[] memory approvers = new address[](0);
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(bytes32(uint256(1)), 0, approvers, 5000);
+        uint256 total = swood.slashGuardians(bytes32(uint256(1)), 0, approvers, _uniformBps(approvers, 5000));
 
         assertEq(total, 0, "empty array returns 0");
         assertEq(wood.balanceOf(BURN_ADDRESS), burnBefore, "nothing burned");
@@ -160,7 +160,7 @@ contract StakedWoodSlashingTest is Test {
 
         // First slash at 25%: 12k * 2500 / 10000 = 3k → live drops to 9k.
         vm.prank(registry);
-        swood.slashGuardians(bytes32(uint256(1)), openedAt, approvers, 2500);
+        swood.slashGuardians(bytes32(uint256(1)), openedAt, approvers, _uniformBps(approvers, 2500));
         assertEq(swood.guardianStake(alice), 9_000e18, "live after first slash");
 
         // Second slash, same openedAt: checkpoint reads 12k but live is 9k.
@@ -169,7 +169,7 @@ contract StakedWoodSlashingTest is Test {
         vm.expectEmit(true, true, true, true, address(swood));
         emit GuardianSlashed(bytes32(uint256(2)), alice, 2_250e18, 0);
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(bytes32(uint256(2)), openedAt, approvers, 2500);
+        uint256 total = swood.slashGuardians(bytes32(uint256(2)), openedAt, approvers, _uniformBps(approvers, 2500));
 
         // 12k * 2500 / 10000 = 3k would over-slash; clamp caps at 2.25k.
         assertEq(total, 2_250e18, "slash sized from live stake, not snapshot");
@@ -235,7 +235,7 @@ contract StakedWoodSlashingTest is Test {
         vm.expectEmit(false, false, false, true, address(s));
         emit PendingBurnRecorded(5_000e18);
         vm.prank(registry);
-        uint256 total = s.slashGuardians(bytes32(uint256(1)), openedAt, approvers, 2500);
+        uint256 total = s.slashGuardians(bytes32(uint256(1)), openedAt, approvers, _uniformBps(approvers, 2500));
 
         assertEq(total, 5_000e18, "slash accounting still applied");
         assertEq(s.guardianStake(alice), 15_000e18, "own stake reduced despite failed burn");
@@ -267,7 +267,7 @@ contract StakedWoodSlashingTest is Test {
         vm.expectEmit(false, false, false, true, address(s));
         emit PendingBurnRecorded(5_000e18);
         vm.prank(registry);
-        uint256 total = s.slashGuardians(bytes32(uint256(1)), openedAt, approvers, 2500);
+        uint256 total = s.slashGuardians(bytes32(uint256(1)), openedAt, approvers, _uniformBps(approvers, 2500));
 
         assertEq(total, 5_000e18, "slash accounting still applied");
         assertEq(s.guardianStake(alice), 15_000e18, "own stake reduced despite reverting burn");
@@ -295,7 +295,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = alice;
         vm.prank(registry);
-        s.slashGuardians(bytes32(uint256(1)), openedAt, approvers, 2500);
+        s.slashGuardians(bytes32(uint256(1)), openedAt, approvers, _uniformBps(approvers, 2500));
         assertEq(s.pendingBurn(), 5_000e18, "queued before recovery");
 
         // Token recovers; flushBurn is permissionless.
@@ -444,7 +444,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = bob;
         vm.prank(registry);
-        uint256 total = swood.slashGuardians(bytes32(uint256(1)), openedAt, approvers, 1000);
+        uint256 total = swood.slashGuardians(bytes32(uint256(1)), openedAt, approvers, _uniformBps(approvers, 1000));
 
         // ownSlash = mulDiv(min(snap 10k, live 20k), 1000, 10_000) = 1k.
         // Live-based sizing would have given 2k (over-slash by 1k).
@@ -468,7 +468,7 @@ contract StakedWoodSlashingTest is Test {
         approvers[0] = alice;
         vm.prank(registry);
         // openedAt = 0: no checkpoint at/before 0 → own basis 0 → no-op.
-        uint256 total = swood.slashGuardians(bytes32(uint256(1)), 0, approvers, 2500);
+        uint256 total = swood.slashGuardians(bytes32(uint256(1)), 0, approvers, _uniformBps(approvers, 2500));
 
         assertEq(total, 0, "no own basis at openedAt=0 -> no-op");
         assertEq(swood.guardianStake(alice), 20_000e18, "own stake untouched");
@@ -484,7 +484,7 @@ contract StakedWoodSlashingTest is Test {
         address[] memory approvers = new address[](1);
         approvers[0] = guardian;
         vm.prank(registry);
-        total = swood.slashGuardians(bytes32(uint256(0x5EED)), openedAt, approvers, bps);
+        total = swood.slashGuardians(bytes32(uint256(0x5EED)), openedAt, approvers, _uniformBps(approvers, bps));
     }
 
     /// @notice Slash liability is the RAW own-stake checkpoint at openedAt,
@@ -498,5 +498,16 @@ contract StakedWoodSlashingTest is Test {
         assertEq(swood.getPastVotes(alice, openedAt), 2_500e18, "aged vote weight = 25% floor");
         _slash(alice, openedAt, 5000);
         assertEq(swood.guardianStake(alice), 5_000e18, "50% of RAW 10k, not of aged 2.5k");
+    }
+
+    /// @dev Declared coverage locks made `slashGuardians` take a PER-APPROVER
+    ///      rate array (each approver's lock over its basis, scaled by the
+    ///      review severity in the registry). Every case in this file slashes a
+    ///      cohort at one uniform rate, so this builds that array.
+    function _uniformBps(address[] memory approvers, uint256 bps) internal pure returns (uint256[] memory rates) {
+        rates = new uint256[](approvers.length);
+        for (uint256 i = 0; i < approvers.length; i++) {
+            rates[i] = bps;
+        }
     }
 }

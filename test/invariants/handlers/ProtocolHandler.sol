@@ -144,7 +144,7 @@ contract ProtocolHandler is Test {
         bool isPaused = registry.paused();
         if (isPaused) pausedCallAttempts += 1;
         vm.prank(g);
-        try registry.voteOnProposal(address(governor), 1, s) {}
+        try registry.voteOnProposal(address(governor), 1, s, type(uint256).max) {}
         catch {
             if (isPaused) pausedCallReverts += 1;
         }

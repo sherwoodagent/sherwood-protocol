@@ -117,8 +117,19 @@ contract MockLedgerForOracleTest {
     /// @dev Zero means "no override" at the `file()` call site — the raw
     ///      `approversOf` sum is used as-is, which keeps this mock's bond
     ///      arithmetic simple and predictable for the tests below.
-    function unsharedLiabilityUsd(address, uint256) external pure returns (uint256) {
-        return 0;
+    /// @dev Mirrors the real ledger under declared coverage locks: the cohort's
+    ///      locks at value, PRICED INSIDE — the real `unsharedLiabilityUsd`
+    ///      reads `woodPriceX8()` and reverts with it, which is the revert
+    ///      `ChallengeGame.file` maps to `WoodPriceUnset`. A mock that priced
+    ///      nothing here would let the bare `woodPriceX8()` read in `file` leak
+    ///      the raw error instead, and prove nothing about that mapping.
+    function unsharedLiabilityUsd(address governor, uint256 proposalId) external view returns (uint256 total) {
+        if (revertOnWoodPriceX8) revert MockNoWoodPrice();
+        bytes32 k = _key(governor, proposalId);
+        address[] storage list = _approvers[k];
+        for (uint256 i = 0; i < list.length; i++) {
+            total += _committed[k][list[i]];
+        }
     }
 
     function freezeCoverage(address governor, uint256 proposalId) external {
@@ -312,36 +323,39 @@ contract ChallengeGame_courtAndOracleTest is Test {
 
     // ── Finding #12a ──
 
-    /// @notice `file()` must still succeed when `woodPriceX8()` reverts, by
-    ///         falling back to the governance cap `woodUsdPriceX8()`.
-    /// @dev    FAILS AGAINST THE PRE-FIX CODE: `file()` used to read
-    ///         `exposureLedger.woodPriceX8()` unguarded, so a revert there
-    ///         (exactly what the real `ExposureLedger.woodPriceX8` does on
-    ///         `NoWoodPrice`) propagated straight through and reverted the
-    ///         whole filing.
-    function test_file_succeedsWhenWoodPriceX8Reverts() public {
+    /// @notice Declared coverage locks: a WOOD price the ledger cannot compose
+    ///         makes filing WAIT. The pre-lock game fell back to the governance
+    ///         cap (`woodUsdPriceX8`) and sized the bond off an uncapped
+    ///         reservation sum; that fallback is gone, because the only thing a
+    ///         fallback could do on a stale feed is make the bond LARGER than
+    ///         what a conviction can recover. The cap being set — and above
+    ///         market — is the control: it must not be consulted.
+    function test_file_revertsWoodPriceUnset_whenWoodPriceX8Reverts() public {
         ledger.setRevertOnWoodPriceX8(true);
         uint256 capX8 = 2e8; // $2.00 cap, deliberately above the $1.00 market used elsewhere in this file
         ledger.setWoodUsdPriceX8(capX8);
 
         address challenger = address(0xC4A11E7);
-        uint256 expectedBond = _expectedBondWood(capX8);
-        _fund(challenger, expectedBond);
+        _fund(challenger, _expectedBondWood(capX8));
 
+        vm.prank(challenger);
+        vm.expectRevert(IChallengeGame.WoodPriceUnset.selector);
+        game.file(
+            address(governor), PROPOSAL_ID, IChallengeGame.Predicate.OutOfAdapterOutflow, address(0), bytes4(0), "ev"
+        );
+
+        // Non-vacuity: the same filing goes through once the price composes.
+        ledger.setRevertOnWoodPriceX8(false);
+        _fund(challenger, _expectedBondWood(PRICE_X8));
         vm.prank(challenger);
         uint256 id = game.file(
             address(governor), PROPOSAL_ID, IChallengeGame.Predicate.OutOfAdapterOutflow, address(0), bytes4(0), "ev"
         );
-
-        IChallengeGame.Challenge memory c = game.challengeOf(id);
-        assertEq(uint8(c.status), uint8(IChallengeGame.Status.Filed), "filing must succeed despite the revert");
-        assertEq(c.bondWood, expectedBond, "bond must be priced off the governance cap fallback");
+        assertEq(game.challengeOf(id).bondWood, _expectedBondWood(PRICE_X8), "priced off the composed price only");
     }
 
-    /// @notice The zero-cap guard is live again on the fallback branch: with
-    ///         `woodPriceX8()` reverting AND the cap unset, `file()` must
-    ///         still revert `WoodPriceUnset` rather than pricing a bond of
-    ///         zero (or dividing by zero).
+    /// @notice Same revert with the governance cap at zero: the cap is not a
+    ///         fallback in either state, so the selector does not change.
     function test_file_revertsWoodPriceUnset_whenFallbackCapAlsoZero() public {
         ledger.setRevertOnWoodPriceX8(true);
         ledger.setWoodUsdPriceX8(0);

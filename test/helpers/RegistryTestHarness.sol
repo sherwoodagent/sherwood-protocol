@@ -7,6 +7,7 @@ import {StakedWood} from "../../src/StakedWood.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockGovernorMinimal} from "../mocks/MockGovernorMinimal.sol";
+import {MockLedgerFullLocks} from "../mocks/MockLedgerFullLocks.sol";
 
 /// @notice Shared test harness for the post-split `GuardianRegistry` +
 ///         `StakedWood` (sWOOD) pair. After the sWOOD staking split the
@@ -76,6 +77,23 @@ abstract contract RegistryTestHarness is Test {
         // actually bonded (see GuardianRegistry.t.sol), or the slash silently
         // targets an address with no stake and no-ops.
         registry.addGovernor(address(governor), HARNESS_VAULT_SENTINEL);
+    }
+
+    /// @dev The whole-stake ledger stand-in, once `_wireFullLockLedger` ran.
+    MockLedgerFullLocks internal fullLockLedger;
+
+    /// @dev Declared coverage locks: `GuardianRegistry._reviewSlashRates`
+    ///      multiplies each approver's LOCK RATE (from the wired ledger) by the
+    ///      review severity, and with NO ledger wired every rate is zero — a
+    ///      blocked review then burns nothing. Suites that pin severity
+    ///      arithmetic on real `StakedWood` balances call this from `setUp` to
+    ///      wire a ledger under which every approver has locked its whole
+    ///      stake (rate 10_000), which is exactly the pre-lock slash shape.
+    function _wireFullLockLedger() internal {
+        fullLockLedger = new MockLedgerFullLocks();
+        fullLockLedger.setGuardianRegistry(address(registry));
+        vm.prank(regOwner);
+        registry.setExposureLedger(address(fullLockLedger));
     }
 
     /// @dev Pushes a proposal's review window into the registry AS the mock

@@ -221,10 +221,10 @@ contract GovernorCoverageGatesTest is Test {
         // deliberately. Feed staleness itself is covered in ExposureLedger.t.sol.
         ledger.setAssetFeed(address(usdg), address(feed), 365 days);
         ledger.setCoveredTvlCapUsd(10_000_000e18); // $10M — generous
-        // The ledger books commitments itself and the quorum reads its OWN
+        // The ledger holds the locks itself and the quorum reads its OWN
         // approver list, so this slot is only the record/release authorization.
-        // Nothing is committed by default — the cold-start case the quorum must
-        // fail closed on; `_seatApprovers` books real commitments.
+        // Nothing is locked by default — the cold-start case the quorum must
+        // fail closed on; `_seatApprovers` locks real commitments.
         ledger.setGuardianRegistry(ledgerRegistry);
         vm.stopPrank();
 
@@ -625,16 +625,22 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 
-    /// @dev Stake each guardian and book a REAL commitment against `pid`
-    ///      through the ledger's registry-only entrypoint. The quorum sums the
-    ///      ledger's own committed shares, so coverage has to be booked, not
-    ///      merely asserted by a mock approver list. At $0.05/WOOD, 20,000 WOOD
-    ///      == $1,000 of slashable bond.
+    /// @dev Stake each guardian and lock a REAL commitment against `pid`
+    ///      through the ledger's registry-only entrypoint. The quorum sums
+    ///      `min(lock, slashable stake) x price` over the ledger's OWN approver
+    ///      list, so coverage has to be locked, not merely asserted by a mock
+    ///      approver list. Each guardian declares `type(uint256).max`, which
+    ///      the ledger clamps to its whole free budget (`kNumerator x stake -
+    ///      openExposure`, k = 1 here), so the lock equals the stake and the
+    ///      coverage each guardian raises is exactly its stake at the price:
+    ///      at $0.05/WOOD, 20,000 WOOD == $1,000. The stake figure is therefore
+    ///      still the single knob every test below reasons about.
     function _seatApprovers(uint256 pid, address[] memory gs, uint256 ownStakeEach) internal {
         for (uint256 i = 0; i < gs.length; i++) {
             swood.setStake(gs[i], ownStakeEach);
             vm.prank(address(ledgerRegistry));
-            ledger.recordApproval(address(governor), pid, gs[i]);
+            ledger.recordApproval(address(governor), pid, gs[i], type(uint256).max);
+            assertEq(ledger.lockOf(address(governor), pid, gs[i]), ownStakeEach, "fixture: lock == whole stake");
         }
     }
 

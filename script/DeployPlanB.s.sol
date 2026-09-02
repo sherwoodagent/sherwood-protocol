@@ -11,6 +11,7 @@ import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 interface ISwoodCooldown {
     function coolDownPeriod() external view returns (uint256);
     function maxSlashBps() external view returns (uint256);
+    function minSlashBps() external view returns (uint256);
     function exposureLedger() external view returns (address);
     /// @dev `onlyOwner` on sWOOD. This script CALLS it (see the wiring block)
     ///      rather than only asserting it: the ledger the pointer has to name
@@ -60,9 +61,16 @@ interface IProtocolConfigAdmin {
  *      printed remedy was not an action any operator could take. Pre-flight 3
  *      replaces it and is strictly stronger. Kept named here so the numbering
  *      below is not read as a gap; see the body for the full argument.
- * @dev PRE-FLIGHT 1b (review N9): `maxSlashBps == 10_000`. The ledger books at
- *      100% of allocation, so any lower ceiling makes recovery a strict
- *      shortfall against it.
+ * @dev PRE-FLIGHT 1b (review N9, re-based for declared locks): `maxSlashBps ==
+ *      10_000`. A guardian's lock may equal their entire live stake and the
+ *      slash is that lock as bps of the stake basis, so a ceiling below 100%
+ *      clips the burn beneath the lock — a strict recovery shortfall.
+ * @dev PRE-FLIGHT 1c (declared-coverage-locks): `minSlashBps != 0`. Under
+ *      declared locks it is the SINGLE deterrence floor — the least any
+ *      convicted approver loses as a fraction of everything they hold, whatever
+ *      they declared. Zero would let a token lock buy a token penalty. The
+ *      launch value is a governance decision in the runbook; this only refuses
+ *      zero.
  * @dev PRE-FLIGHT 4 (ADR 2026-07-27): `quorumTierThreshold == 0` — a covering
  *      approve quorum is required at EVERY tier. The `maxEnvelopeTier <= 1`
  *      half this was once paired with was dropped (owner decision 2026-07-31);
@@ -477,21 +485,21 @@ contract DeployPlanB is ScriptBase {
         //     Only `initialize` could reach 42, i.e. only a fresh sWOOD.
         //   - The property it approximated (an approver cannot exit from under
         //     a pending challenge) is now enforced exactly by the exit gate on
-        //     `claimUnstakeGuardian`, which reads `openExposureUsd` directly.
+        //     `claimUnstakeGuardian`, which reads `openExposure` directly.
         //
         // Pre-flight 3 below replaces it, and is strictly stronger: it checks
         // the mechanism is WIRED rather than that a proxy for it is large
         // enough.
         uint256 coolDown = ISwoodCooldown(swood).coolDownPeriod();
 
-        // ── Pre-flight 1b: the slash ceiling must not clip the allocation ──
-        // The ledger books liability at 100% of a guardian's allocation, and
-        // after the n1 fix `allocation == live slashable bond` is the DESIGNED
-        // outcome whenever a co-approver's bond collapses, not a corner case.
-        // With delegation deferred there is no surplus to absorb a clipped
-        // ceiling, so any `maxSlashBps` below 10_000 makes recovery a strict
-        // shortfall against the allocation and breaks §2's inequality by
-        // construction.
+        // ── Pre-flight 1b: the slash ceiling must not clip the lock ──
+        // Under declared locks a guardian's lock may equal their entire live
+        // stake (the cap is `kNumerator × stake`, and k defaults to 1), and a
+        // conviction burns that lock expressed as bps of the stake basis. A
+        // ceiling below 100% therefore clips the burn beneath the lock — a
+        // strict recovery shortfall for every fully-locked guardian, by
+        // construction. The adversary is a deployment that quietly
+        // under-collateralises exactly the guardians who committed the most.
         //
         // Every shipped config already seats 10_000 (`Deploy.s.sol`'s
         // DEFAULT_MAX_SLASH_BPS and both testnet scripts). This asserts the
@@ -499,8 +507,22 @@ contract DeployPlanB is ScriptBase {
         // could lower it silently (review N9).
         require(
             ISwoodCooldown(swood).maxSlashBps() == 10_000,
-            "PRE-FLIGHT: sWOOD maxSlashBps != 10000 -- the ledger books at 100% of allocation, "
-            "so a lower ceiling makes recovery a strict shortfall."
+            "PRE-FLIGHT: sWOOD maxSlashBps != 10000 -- a lock may equal the whole stake and must "
+            "burn in full; a lower ceiling clips the burn beneath the lock."
+        );
+
+        // ── Pre-flight 1c: the deterrence floor must be armed ──
+        // With slashing proportional to the lock, `minSlashBps` is the SINGLE
+        // floor on what a convicted approver loses — a bond-wide fraction a
+        // guardian cannot declare their way under. At zero, a token lock buys a
+        // token penalty and approving a drain for a bribe is a positive-EV
+        // trade. The adversary is a colluding guardian sizing their own
+        // punishment. The launch VALUE is a governance decision recorded in the
+        // runbook; this refuses only the one value that disarms the floor.
+        require(
+            ISwoodCooldown(swood).minSlashBps() != 0,
+            "PRE-FLIGHT: sWOOD minSlashBps == 0 -- it is the single deterrence floor under declared "
+            "locks; set it by governance before deploying the ledger."
         );
 
         // ── Pre-flight 2: a zero covered-TVL cap bricks all proposing ──
@@ -796,7 +818,7 @@ contract DeployPlanB is ScriptBase {
         // remedy produced: an operator who deployed a ledger by hand to satisfy
         // the check got a SECOND ledger from this script, with the registry and
         // the factory booking into the new one while sWOOD read the old. Every
-        // guardian then shows `openExposureUsd == 0` and walks out carrying live
+        // guardian then shows `openExposure == 0` and walks out carrying live
         // exposure — the exact failure the check exists to prevent, reached by
         // following its own instructions.
         //

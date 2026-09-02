@@ -249,16 +249,18 @@ abstract contract ChallengeGameHandler is Properties {
     ///      `TokenCourt._recordAccused`. That landed AFTER this helper did, so
     ///      the two silently diverged.
     ///
-    ///      The divergence is one-directional and quiet, which is why it is
-    ///      worth a comment rather than just a fix. GL-13 pins
-    ///      `pledged >= recorded`, so a booking-based check can only ever be
-    ///      too STRICT: it skips proposals `file` would accept, never picks one
-    ///      `file` would reject. The failure mode is therefore lost
-    ///      reachability, not a reverting handler — the composite quietly stops
-    ///      finding targets and adjudication coverage decays, with nothing
-    ///      failing to point at it. `settleCoverage` is permissionless,
-    ///      re-runnable and not freeze-gated, and rebooking recorded down to
-    ///      zero while the pledge stands is exactly the state that triggers it.
+    ///      The divergence was one-directional and quiet, which is why it is
+    ///      worth a comment rather than just a fix. The booking never exceeded
+    ///      the pledge, so a booking-based check could only ever be too STRICT:
+    ///      it skipped proposals `file` would accept, never picked one `file`
+    ///      would reject. The failure mode was therefore lost reachability, not
+    ///      a reverting handler — the composite quietly stopped finding targets
+    ///      and adjudication coverage decayed, with nothing failing to point at
+    ///      it. Declared coverage locks collapsed booking and pledge into ONE
+    ///      lock (`approversOf` and `pledgedOf` now read the same storage — GL-20
+    ///      pins their agreement) and deleted `settleCoverage`, so the drift can
+    ///      no longer arise; this helper keeps reading the gate's own selector
+    ///      so a future re-split cannot re-open it silently.
     ///
     ///      ALSO MODELS THE TWO GATES THE COMPOSITE ITSELF MANUFACTURES, which
     ///      are the same drift in the OPPOSITE and worse direction. A predictor

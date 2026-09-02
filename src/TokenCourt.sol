@@ -664,26 +664,26 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
         return participationFloorBps * base / BPS_DENOMINATOR;
     }
 
-    /// @dev THE PREDICATE IS THE PLEDGE, NOT THE LIVE BOOKING. `_reservedUsd`
-    ///      (read here via `pledgedOf`) is written only by `recordApproval` and
-    ///      erased only by `releaseApproval`, which a filed challenge blocks.
-    ///      `_recorded.usd` (via `approversOf`) is rewritten in both directions
-    ///      by the permissionless `settleCoverage`. Filtering on the booking
-    ///      put the accused set inside a stranger's reach: a guardian convicted
-    ///      on a concurrent challenge lands at zero stake, so the next
-    ///      `settleCoverage` books it at zero, it drops out of this loop, and
-    ///      it walks past `vote`'s `AccusedCannotVote` bar — while its ballot
-    ///      still weighs the full pre-slash amount, since checkpoints are
-    ///      append-only and the snapshot predates the slash.
-    /// @dev A released approver is still excluded: `releaseApproval` zeroes the
-    ///      pledge and swap-and-pops the guardian out of `_approversOf`. The
+    /// @dev THE PREDICATE IS THE LOCK, read via `pledgedOf`. The ledger holds
+    ///      one WOOD lock per (proposal, guardian), written only by
+    ///      `recordApproval` and erased only by `releaseApproval` (which a filed
+    ///      challenge blocks with `CoverageFrozen`) or `retireApproval` (refused
+    ///      while frozen or pinned). There is no longer a separately-movable
+    ///      booking: the old `settleCoverage` could rewrite one in both
+    ///      directions while a challenge was live, which put the accused set
+    ///      inside a stranger's reach — a guardian convicted on a concurrent
+    ///      challenge could be booked down to zero by anyone, drop out of this
+    ///      loop, and walk past `vote`'s `AccusedCannotVote` bar with a ballot
+    ///      still weighing the full pre-slash amount. That mechanism is deleted;
+    ///      the accused set is now derived from a figure only the accused's own
+    ///      pre-filing vote change could ever have moved.
+    /// @dev A released approver is still excluded: `releaseApproval` clears the
+    ///      lock and swap-and-pops the guardian out of `_approversOf`. The
     ///      zero-check below is the belt to that brace.
-    /// @dev The bar is wider than the slash, by construction. `slashBpsFor`
-    ///      still filters on the live booking, but containment holds in the
-    ///      direction that matters — `_recorded.usd != 0` implies
-    ///      `_reservedUsd != 0` — so everyone a conviction can take stake from
-    ///      is barred here. The converse gap costs nothing: a zero booking
-    ///      means there was never anything to collect.
+    /// @dev The bar and the slash read the SAME number: `slashBpsFor` rates
+    ///      every listed guardian off this same lock, so everyone a conviction
+    ///      can take stake from is barred here and nobody barred here is
+    ///      un-slashable.
     /// @dev The ledger arrives as a PARAMETER, already resolved by `refer`, so
     ///      the address the accused set is derived from and the address the
     ///      case advertises are one value by construction. It comes from the

@@ -156,8 +156,11 @@ abstract contract StakedWoodHandler is Properties {
         address[] memory approvers = new address[](1);
         approvers[0] = toGuardian(guardianSeed);
         bytes32 reviewKey = keccak256(abi.encode("fizz-review", guardianSeed % 4));
+        // Per-approver rates (declared coverage locks): one approver, one rate.
+        uint256[] memory rates = new uint256[](1);
+        rates[0] = slashBps;
         vm.prank(address(registry));
-        swood.slashGuardians(reviewKey, block.timestamp - 1, approvers, slashBps);
+        swood.slashGuardians(reviewKey, block.timestamp - 1, approvers, rates);
     }
 
     /// @dev Authorized-slasher-gated (the challenge game).

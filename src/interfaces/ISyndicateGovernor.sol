@@ -641,19 +641,6 @@ interface ISyndicateGovernor {
     ///         `NoBond` revert from the escrow.
     event ProposerBondForfeitureAcknowledged(uint256 indexed proposalId, uint256 amount);
 
-    /// @notice The governor's best-effort self-trigger of the exposure ledger's
-    ///         `settleCoverage` reverted — at settlement finalization or after a
-    ///         bond reclaim. Mirrors the house best-effort pattern: a bare catch,
-    ///         both identifying fields indexed, no revert-data payload, and the
-    ///         terminal path is never bricked by it.
-    /// @dev    A caller who dials gas to starve this trigger achieves only the
-    ///         pre-change status quo — the cohort's reservations stay over-booked,
-    ///         the conservative direction — visibly and permissionlessly
-    ///         repairably, since anyone may re-call the external
-    ///         `ExposureLedger.settleCoverage`. `ledger` names the collaborator to
-    ///         retry against.
-    event CoverageSettleFailed(uint256 indexed proposalId, address indexed ledger);
-
     /// @notice Emitted in `_distributeFees` when `guardianFeeBps > 0`. The guardian
     ///         fee is carved from gross PnL and transferred to `recipient`. This is
     ///         the off-chain Merkl bot's sole attribution signal — it swaps the
