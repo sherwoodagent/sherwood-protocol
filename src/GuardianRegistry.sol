@@ -38,14 +38,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     uint256 internal constant BPS_DENOMINATOR = 10_000;
     /// @notice 7-day epoch — anchors the `refundSlash` per-epoch cap window.
     uint256 public constant EPOCH_DURATION = 7 days;
-    /// @notice Upper bound on approvers per proposal. Load-bearing: `resolveReview`
-    ///         iterates the approver list to slash, and `SlashGasCeiling.t.sol`
-    ///         pins the gas that bound buys. There is deliberately NO blocker
-    ///         counterpart (SHE-207): the block tally is the scalar
-    ///         `Review.blockStakeWeight`, nothing on-chain iterates blockers, and
-    ///         a fixed slot count was a censorship surface — 100 dust guardians
-    ///         could fill it and keep honest Block votes from ever reaching
-    ///         quorum. Squatting the APPROVER side is SHE-240.
+    /// @notice Bounds the slash loop in `resolveReview` (`SlashGasCeiling.t.sol`). No blocker
+    ///         counterpart: the block tally is a scalar and a fixed slot count was a
+    ///         censorship surface (SHE-207). Approver-side squatting: SHE-240.
     uint256 public constant MAX_APPROVERS_PER_PROPOSAL = 100;
     uint256 public constant LATE_VOTE_LOCKOUT_BPS = 1000;
 
@@ -191,14 +186,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      own raw own-stake checkpoint at `openedAt`.
     mapping(bytes32 => mapping(address => uint128)) internal _voteStake;
     mapping(bytes32 => address[]) internal _approvers;
-    /// @dev RETIRED (SHE-207). Was the per-review blocker list; never read or
-    ///      written any more. The slot is kept, not deleted, because this
-    ///      contract is UUPS-upgraded with a frozen, append-only layout
-    ///      (`script/guardian-registry-layout.golden.json`): dropping it would
-    ///      shift `_approverIndex` and everything below by one word.
+    /// @dev Retired blocker list (SHE-207); slot kept for the UUPS append-only layout.
+    // slither-disable-next-line unused-state
     mapping(bytes32 => address[]) internal __retiredBlockers;
     mapping(bytes32 => mapping(address => uint256)) internal _approverIndex;
-    /// @dev RETIRED (SHE-207) — see `__retiredBlockers`.
+    /// @dev Retired (SHE-207); see `__retiredBlockers`.
+    // slither-disable-next-line unused-state
     mapping(bytes32 => mapping(address => uint256)) internal __retiredBlockerIndex;
 
     struct EmergencyReview {
@@ -1079,7 +1072,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (!r.opened) {
             r.resolved = true;
             r.blocked = false;
-            emit ReviewResolved(proposalId, false, 0);
+            emit ReviewResolved(msg.sender, proposalId, false, 0);
             return;
         }
         // Once block quorum is reached, the proposer can't dodge approver
@@ -1087,7 +1080,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (_isBlocked(r)) revert ReviewNotOpen();
         r.resolved = true;
         r.blocked = false;
-        emit ReviewResolved(proposalId, false, 0);
+        emit ReviewResolved(msg.sender, proposalId, false, 0);
     }
 
     // Permissionless
@@ -1189,7 +1182,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (r.resolved) return r.blocked; // idempotent
         if (!r.opened) {
             r.resolved = true;
-            emit ReviewResolved(proposalId, false, 0);
+            emit ReviewResolved(governor, proposalId, false, 0);
             return false;
         }
         // Block-quorum decision: own stake at review open vs the at-open
@@ -1213,13 +1206,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // below were sized from.
             (address[] memory approvers, uint256[] memory bpsPer) = _reviewSlashRates(key, governor, proposalId, r);
             swood.slashGuardians(key, uint256(r.openedAt), approvers, bpsPer);
-            // Blocker attribution is NOT emitted here (SHE-207): the per-blocker
-            // loop needed a bounded list, and the bound was the censorship
-            // surface. Off-chain: join `GuardianVoteCast` / `GuardianVoteChanged`
-            // (both carry `governor`) with this `ReviewResolved(blocked=true)`.
+            // No per-blocker emit (SHE-207): attribution is an off-chain join of the
+            // vote events with `ReviewResolved`; every one of them carries `governor`.
         }
 
-        emit ReviewResolved(proposalId, blocked_, 0);
+        emit ReviewResolved(governor, proposalId, blocked_, 0);
         return blocked_;
     }
 
@@ -1493,7 +1484,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         _emergencyBlockVotes[eKey][round][msg.sender] = true;
         er.blockStakeWeight += weight;
 
-        emit EmergencyBlockVoteCast(proposalId, msg.sender, weight);
+        emit EmergencyBlockVoteCast(governor, proposalId, msg.sender, weight);
     }
 
     // ── Slash appeal ──

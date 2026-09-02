@@ -351,8 +351,8 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         // pre-skip `voteEnd`) and would now already be in the past, so
         // reusing it here would revert `ReviewNotOpen` instead of exercising
         // the cap. Register a fresh proposal id whose window starts NOW —
-        // same pattern `test_voteOnProposal_blockerCapHitEmitsEventAndReverts`
-        // below already uses — so the vote window still covers the matured cohort.
+        // same pattern `test_voteOnProposal_hundredDustBlockersCannotCensorAnHonestBlock`
+        // below uses — so the vote window still covers the matured cohort.
         uint256 capPid = 43;
         vm.warp(vm.getBlockTimestamp() + 1);
         _registerReview(capPid, vm.getBlockTimestamp(), vm.getBlockTimestamp() + REVIEW_PERIOD);
@@ -700,7 +700,7 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
         // Post-split: the registry no longer computes the slash, so
         // `slashedAmount` is always 0 in `ReviewResolved`.
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.ReviewResolved(PROPOSAL_ID, false, 0);
+        emit IGuardianRegistry.ReviewResolved(address(governor), PROPOSAL_ID, false, 0);
         bool blocked = registry.resolveReview(address(governor), PROPOSAL_ID);
         assertFalse(blocked);
         assertEq(wood.balanceOf(BURN_ADDRESS), 0);
@@ -720,7 +720,7 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
 
         vm.warp(reviewEnd);
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.ReviewResolved(PROPOSAL_ID, false, 0);
+        emit IGuardianRegistry.ReviewResolved(address(governor), PROPOSAL_ID, false, 0);
         bool blocked = registry.resolveReview(address(governor), PROPOSAL_ID);
 
         assertFalse(blocked);
@@ -753,7 +753,7 @@ contract GuardianRegistryResolveTest is RegistryTestHarness {
         // Post-split: `ReviewResolved.slashedAmount` is 0 — sWOOD computes and
         // burns the slash; the registry just records the blocked flag.
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.ReviewResolved(PROPOSAL_ID, true, 0);
+        emit IGuardianRegistry.ReviewResolved(address(governor), PROPOSAL_ID, true, 0);
         bool blocked = registry.resolveReview(address(governor), PROPOSAL_ID);
 
         assertTrue(blocked);
@@ -1040,7 +1040,7 @@ contract GuardianRegistryEmergencyTest is RegistryTestHarness {
         _openEmergency();
 
         vm.expectEmit(true, true, false, true);
-        emit IGuardianRegistry.EmergencyBlockVoteCast(PROPOSAL_ID, _guardian(0), 10_000e18);
+        emit IGuardianRegistry.EmergencyBlockVoteCast(address(governor), PROPOSAL_ID, _guardian(0), 10_000e18);
         vm.prank(_guardian(0));
         registry.voteBlockEmergencySettle(address(governor), PROPOSAL_ID);
     }

@@ -21,7 +21,7 @@ The guardian review's verdict on a proposal — cleared, blocked, or cohort-too-
 _Avoid_: review resolution, review result
 
 **Economic commit**:
-The irreversible side effects of a blocked review — slashing approvers and emitting blocker attribution. Idempotent and permissionless; distinct from merely reading the review outcome.
+The irreversible side effect of a blocked review — slashing approvers (blocker attribution is derived off-chain from the vote events). Idempotent and permissionless; distinct from merely reading the review outcome.
 _Avoid_: resolution, settlement (that word belongs to proposals)
 
 **Review registration**:

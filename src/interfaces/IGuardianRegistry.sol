@@ -69,13 +69,9 @@ interface IGuardianRegistry {
     /// @notice Governor pushed a proposal's review window at propose time.
     event ReviewRegistered(address indexed governor, uint256 indexed proposalId, uint64 voteEnd, uint64 reviewEnd);
     event ReviewOpened(uint256 indexed proposalId, uint128 totalStakeAtOpen);
-    /// @notice A guardian's first vote on a review. `governor` is part of the
-    ///         event (SHE-207): per-vault governors all number proposals from 1,
-    ///         so `proposalId` alone does not identify the review. Blocker
-    ///         attribution is derived OFF-CHAIN from this event and
-    ///         `GuardianVoteChanged`, joined with `ReviewResolved(blocked=true)`
-    ///         — there is no on-chain blocker list any more, so nothing bounds
-    ///         how many guardians may Block.
+    /// @notice First vote on a review. `governor` disambiguates: per-vault governors
+    ///         all number proposals from 1. Blocker attribution is an off-chain join
+    ///         of this, `GuardianVoteChanged` and `ReviewResolved(blocked=true)` (SHE-207).
     event GuardianVoteCast(
         address indexed governor,
         uint256 indexed proposalId,
@@ -83,8 +79,7 @@ interface IGuardianRegistry {
         GuardianVoteType support,
         uint128 weight
     );
-    /// @notice A guardian flipped sides before the late-vote lockout. The
-    ///         weight is the one stamped by the matching `GuardianVoteCast`.
+    /// @notice Side flip before the late-vote lockout; weight is the one from `GuardianVoteCast`.
     event GuardianVoteChanged(
         address indexed governor,
         uint256 indexed proposalId,
@@ -93,10 +88,12 @@ interface IGuardianRegistry {
         GuardianVoteType to
     );
     event ApproverCapReached(uint256 indexed proposalId);
-    event ReviewResolved(uint256 indexed proposalId, bool blocked, uint256 slashedAmount);
+    event ReviewResolved(address indexed governor, uint256 indexed proposalId, bool blocked, uint256 slashedAmount);
     event EmergencyReviewOpened(uint256 indexed proposalId, bytes32 callsHash, uint64 reviewEnd);
     event EmergencyReviewCancelled(uint256 indexed proposalId);
-    event EmergencyBlockVoteCast(uint256 indexed proposalId, address indexed guardian, uint128 weight);
+    event EmergencyBlockVoteCast(
+        address indexed governor, uint256 indexed proposalId, address indexed guardian, uint128 weight
+    );
     event EmergencyReviewResolved(uint256 indexed proposalId, bool blocked, uint256 slashedAmount);
     event Paused(address indexed by);
     event Unpaused(address indexed by, bool deadman);
