@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {stdStorage, StdStorage} from "forge-std/StdStorage.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -710,6 +711,130 @@ contract LaunchpadStrategyTest is Test {
         assertEq(amt0, ASSET_IN, "nothing held back: the fee is not the asset");
         assertEq(launchAdapter.lastQuoteIn(), ASSET_IN - fee, "quoteIn excludes the fee");
         assertEq(quote.balanceOf(address(launchAdapter)), ASSET_IN, "venue pulled quoteIn AND the fee");
+    }
+
+    // ── the fee-swap overshoot: an exact-INPUT swap cannot hit an exact output ──
+
+    /// @dev DEFECT A, the regression. `_acquireFeeToken` sizes an exact-INPUT
+    ///      swap from a forward quote and adds `settleSlippageBps` of headroom,
+    ///      so it ALWAYS buys more fee token than the venue pulls. When the fee
+    ///      token is neither the vault asset nor the launch quote, that
+    ///      overshoot used to rest on the clone FOREVER: `sweep()` moves only
+    ///      `asset`, `launchToken` and the quote, `undeliveredValue()` counts
+    ///      vault-asset only, and `hasUnvaluedResidue()` counts launch-token and
+    ///      quote only — so it was unrecoverable AND undeclared.
+    ///
+    ///      Measured on the Robinhood fork: clone 0x6Cb8…511C bought
+    ///      515,002,662,640,967 wei of WETH for a 500,000,000,000,000 wei fee
+    ///      and 15,002,662,640,967 wei survived two `collectResidue` calls.
+    ///
+    ///      Asserted as an EXACT figure, not "small": at a 1:1 rate the
+    ///      overshoot is `fee * settleSlippageBps / BPS` to the wei.
+    function test_execute_feeInThirdToken_overshootIsDeliveredToTheVault() public {
+        RecordingSwapAdapter rec = _recorder();
+        uint256 fee = 1e18;
+        launchAdapter.setNativeFee(address(feeToken), fee);
+
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.swapAdapter = address(rec);
+        p.minQuoteOut = 0;
+        LaunchpadStrategy s = _clone(p);
+
+        // What the sizing formula buys at a 1:1 rate, to the wei.
+        uint256 bought = (fee * (10_000 + p.settleSlippageBps)) / 10_000;
+        uint256 overshoot = bought - fee;
+        assertGt(overshoot, 0, "the fixture must actually overshoot, or it proves nothing");
+
+        uint256 vaultBefore = feeToken.balanceOf(address(vault));
+        _execute(s);
+
+        assertEq(feeToken.balanceOf(address(launchAdapter)), fee, "the venue pulled exactly its fee");
+        assertEq(feeToken.balanceOf(address(s)), 0, "NOTHING is stranded on the clone, not even transiently");
+        assertEq(
+            feeToken.balanceOf(address(vault)) - vaultBefore, overshoot, "the exact overshoot reached the vault in kind"
+        );
+    }
+
+    /// @dev The same overshoot, announced. A silent delivery is only half the
+    ///      fix: the vault warehouses this token unpriced, so the arrival has to
+    ///      be readable off-chain.
+    function test_execute_feeInThirdToken_overshootIsAnnounced() public {
+        RecordingSwapAdapter rec = _recorder();
+        uint256 fee = 2e18;
+        launchAdapter.setNativeFee(address(feeToken), fee);
+
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.swapAdapter = address(rec);
+        p.minQuoteOut = 0;
+        LaunchpadStrategy s = _clone(p);
+
+        uint256 overshoot = (fee * (10_000 + p.settleSlippageBps)) / 10_000 - fee;
+
+        governor.setProposal(block.timestamp, DURATION);
+        vault.approveToken(address(asset), address(s), ASSET_IN);
+        vm.expectEmit(true, true, false, true, address(s));
+        emit LaunchpadStrategy.FeeTokenResidueDelivered(address(feeToken), address(vault), overshoot);
+        vault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
+    }
+
+    /// @dev THE FEE TOKEN IS THE QUOTE — unchanged. There is no second swap, so
+    ///      there is no overshoot, and the residual push must NOT fire: the
+    ///      quote is the launch's own lane, declared by `hasUnvaluedResidue()`
+    ///      and converted at settlement. Hijacking it to the vault here would
+    ///      move settlement's job into execute.
+    function test_execute_feeInQuoteToken_noResidualPushFires() public {
+        RecordingSwapAdapter rec = _recorder();
+        uint256 fee = 10e18;
+        launchAdapter.setNativeFee(address(quote), fee);
+
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.swapAdapter = address(rec);
+        p.minQuoteOut = 0;
+        LaunchpadStrategy s = _clone(p);
+
+        governor.setProposal(block.timestamp, DURATION);
+        vault.approveToken(address(asset), address(s), ASSET_IN);
+        vm.recordLogs();
+        vault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
+
+        assertEq(_residueDeliveries(vm.getRecordedLogs()), 0, "the quote lane is never the residual lane");
+        assertEq(rec.swapCalls(), 1, "still one swap");
+        assertEq(launchAdapter.lastQuoteIn(), ASSET_IN - fee, "quoteIn still excludes the fee");
+        assertEq(quote.balanceOf(address(launchAdapter)), ASSET_IN, "the venue still pulled quoteIn AND the fee");
+        assertEq(quote.balanceOf(address(vault)), 0, "no quote was pushed to the vault at execute");
+    }
+
+    /// @dev THE FEE TOKEN IS THE VAULT ASSET — unchanged. The hold-back means
+    ///      no fee swap and therefore no overshoot at all; anything left is
+    ///      asset, which `_pushAllToVault(asset)` already returns, so the
+    ///      residual push must not fire a second, redundant transfer.
+    function test_execute_feeInVaultAsset_noResidualPushFires() public {
+        RecordingSwapAdapter rec = _recorder();
+        uint256 fee = 5e18;
+        launchAdapter.setNativeFee(address(asset), fee);
+
+        LaunchpadStrategy.InitParams memory p = _params();
+        p.swapAdapter = address(rec);
+        p.minQuoteOut = 0;
+        LaunchpadStrategy s = _clone(p);
+
+        governor.setProposal(block.timestamp, DURATION);
+        vault.approveToken(address(asset), address(s), ASSET_IN);
+        vm.recordLogs();
+        vault.callStrategy(address(s), abi.encodeWithSignature("execute()"));
+
+        assertEq(_residueDeliveries(vm.getRecordedLogs()), 0, "the asset lane is never the residual lane");
+        assertEq(rec.swapCalls(), 1, "the pair is still crossed exactly once");
+        assertEq(asset.balanceOf(address(s)), 0, "no asset stranded");
+        assertEq(asset.balanceOf(address(launchAdapter)), fee, "the venue still got its fee in the asset");
+    }
+
+    /// @dev Counts `FeeTokenResidueDelivered` logs in a recorded trace.
+    function _residueDeliveries(Vm.Log[] memory logs) internal pure returns (uint256 n) {
+        bytes32 topic = LaunchpadStrategy.FeeTokenResidueDelivered.selector;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics.length != 0 && logs[i].topics[0] == topic) ++n;
+        }
     }
 
     /// @dev The zero-fee path is untouched by the reordering: one swap, the

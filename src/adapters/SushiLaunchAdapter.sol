@@ -57,6 +57,37 @@ contract SushiLaunchAdapter is ILaunchAdapter {
     ///         safe one. Nothing here is the launch's money.
     event NativeSweepSkipped(address indexed to, uint256 amount);
 
+    /// @notice A TOLERATED VENUE CALL DID NOT GO THROUGH. Emitted where a
+    ///         failed venue leg is otherwise INVISIBLE — `collectFees` reports
+    ///         `(0, 0)`, which is also what an honest "nothing accrued" looks
+    ///         like.
+    ///
+    /// @dev    Observed on Robinhood 4663: driven under `cast send`'s ESTIMATED
+    ///         gas limit, `collectFees` returned status 1, moved nothing and
+    ///         logged NOTHING AT ALL (224,428 gas); the identical call with
+    ///         `--gas-limit 3000000` moved 8.391340 USDG (227,388 gas). EIP-150
+    ///         forwards only 63/64 of the available gas, so the child can run
+    ///         out while the parent succeeds — and a raw `call` cannot tell
+    ///         that from a venue refusing service. Tolerating the failure is
+    ///         right: a settlement path must not be hostage to a venue call.
+    ///         Making it silent was not, and this is the only fix that does not
+    ///         change the return contract.
+    ///
+    ///         Deliberately the SAME SIGNATURE as `StonkLaunchAdapter`'s event,
+    ///         so one keeper subscription covers both venues. `reason` is
+    ///         indexed: a starved child reverts with NO returndata
+    ///         (`0x00000000`) and is therefore a different topic from any error
+    ///         the venue names.
+    ///
+    /// @param  leg        Which venue call failed.
+    /// @param  reason     The revert selector, or `0x00000000` for a revert
+    ///                    with no returndata.
+    /// @param  launchRef  The launch the call was made for — here, the token.
+    /// @param  gasStarved The child consumed essentially all the gas the 63/64
+    ///                    rule forwarded it. A heuristic, and the closest an
+    ///                    EVM caller can get to observing a child's OOG.
+    event VenueCallFailed(bytes32 indexed leg, bytes4 indexed reason, bytes32 launchRef, bool gasStarved);
+
     /// @notice The constructor's launchpad is not a contract, or exposes no
     ///         readable `WETH()`. Fail at deploy rather than at the first
     ///         launch, where a mis-wired singleton would already hold funds.
@@ -288,10 +319,17 @@ contract SushiLaunchAdapter is ILaunchAdapter {
         // Raw call: a venue revert must not propagate (see above). Not
         // `try/catch` — the venue's return tuple is unused, only the deltas are
         // trusted, so there is nothing to decode on the success path either.
+        uint256 gasBefore = gasleft();
+        // solhint-disable-next-line avoid-low-level-calls
         (bool distributed,) = address(launchpad).call(abi.encodeCall(ISushiLaunchpad.distributeFees, (token)));
         // A failed call reverted its own state, so nothing moved: `(0, 0)` is
-        // the honest report, not a swallowed error.
-        if (!distributed) return (0, 0);
+        // the honest report. It is no longer a SILENT one — see
+        // `VenueCallFailed` for the 4663 trace that made "the venue refused"
+        // and "there was nothing to collect" the same observation.
+        if (!distributed) {
+            emit VenueCallFailed("distributeFees", _revertSelector(), launchRef, gasleft() <= gasBefore / 63);
+            return (0, 0);
+        }
 
         uint256 quoteAfter = _balanceOf(quoteToken, creator);
         uint256 tokenAfter = _balanceOf(token, creator);
@@ -425,6 +463,25 @@ contract SushiLaunchAdapter is ILaunchAdapter {
         (bool ok, bytes memory ret) = target.staticcall(abi.encodeCall(ISushiLaunchpad.launchFee, ()));
         if (!ok || ret.length < 32) return 0;
         return abi.decode(ret, (uint256));
+    }
+
+    /// @dev The revert selector of the call that JUST returned, read straight
+    ///      out of the returndata buffer.
+    ///
+    ///      NEVER COPIES THE WHOLE RETURNDATA. `(bool ok,) = target.call(...)`
+    ///      deliberately omits the bytes variable so Solidity skips
+    ///      `RETURNDATACOPY` entirely; binding one here to read four bytes
+    ///      would hand a hostile or merely verbose venue a returndata bomb on a
+    ///      path whose entire contract is that it must not revert. Four bytes,
+    ///      into scratch, or `0x00000000` when the callee returned less —
+    ///      which is exactly what a child that ran out of gas returns.
+    function _revertSelector() private pure returns (bytes4 sel) {
+        assembly ("memory-safe") {
+            if gt(returndatasize(), 3) {
+                returndatacopy(0, 0, 4)
+                sel := and(mload(0), 0xffffffff00000000000000000000000000000000000000000000000000000000)
+            }
+        }
     }
 
     /// @dev Non-reverting balance read, so `collectFees` cannot be turned into

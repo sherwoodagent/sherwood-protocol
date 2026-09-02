@@ -242,12 +242,51 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///         to call in any phase. A refused leg reverted its own state, so
     ///         nothing moved and anyone may retry it forever.
     event VenueLegSkipped(bytes32 indexed leg);
+
+    /// @notice A TOLERATED VENUE CALL DID NOT GO THROUGH. Emitted where a
+    ///         failed venue leg is otherwise INVISIBLE — the return value is
+    ///         `(0, 0)`, which is also what an honest "nothing accrued" looks
+    ///         like.
+    ///
+    /// @dev    Observed on Robinhood 4663: driven under `cast send`'s ESTIMATED
+    ///         gas limit, `collectFees` returned status 1, moved nothing and
+    ///         logged nothing (224,428 gas); the identical call with
+    ///         `--gas-limit 3000000` moved 8.391340 USDG (227,388 gas). EIP-150
+    ///         forwards only 63/64 of the available gas, so the child can run
+    ///         out while the parent survives — and a raw `call` cannot tell
+    ///         that from a refusal. Tolerating the failure is right: a
+    ///         settlement path must not be hostage to a venue call. Making it
+    ///         SILENT was not.
+    ///
+    ///         `reason` IS INDEXED ON PURPOSE. On this venue the pad pays the
+    ///         creator at trade time and only accrues on a failed push, so
+    ///         `flushCreatorQuote` refuses on essentially every call and a bare
+    ///         "the leg was skipped" event carries no signal at all. Filtering
+    ///         by topic separates the venue's ordinary refusal (its own error
+    ///         selector) from a starved child (`0x00000000` — a revert with NO
+    ///         returndata, which is what running out of gas looks like).
+    ///
+    /// @param  leg        Which venue call failed.
+    /// @param  reason     The revert selector, or `0x00000000` for a revert
+    ///                    with no returndata.
+    /// @param  launchRef  The ref this adapter answers for — the clone.
+    /// @param  gasStarved The child consumed essentially all the gas the 63/64
+    ///                    rule forwarded it. A heuristic, and the closest an
+    ///                    EVM caller can get to observing a child's OOG.
+    event VenueCallFailed(bytes32 indexed leg, bytes4 indexed reason, bytes32 launchRef, bool gasStarved);
     /// @notice Creator fees swept out of the clone to its `feeRecipient`.
     /// @dev ONE DESTINATION, ALWAYS. This used to carry both the owner and a
     ///      resolved destination so the two lanes of `cloneCollectFees` were
     ///      distinguishable on-chain; there is only one lane now, so the
     ///      recipient is the whole story and the clone that emitted it names
     ///      the launch.
+    ///
+    ///      ALSO EMITTED FROM `executeLaunch`, and deliberately the same event.
+    ///      The pad pays its creator at trade time, so a dev buy pushes fee
+    ///      income into the clone before `cloneCollectFees` has ever run; that
+    ///      income is forwarded on the spot rather than netted against the
+    ///      budget (see `executeLaunch`). It is the same stream reaching the
+    ///      same address, so an indexer should see one fee lane and not two.
     event FeesCollected(address indexed recipient, uint256 quoteOut, uint256 tokenOut);
     /// @notice The owner pulled the venue's zero-trades recovery lever.
     event LaunchAborted(address indexed owner, uint256 returned);
@@ -655,6 +694,15 @@ contract StonkLaunchAdapter is ILaunchAdapter {
     ///      `p.quoteIn` was forwarded here by the implementation before this
     ///      call, because the owner could not approve an address that did not
     ///      exist yet.
+    ///
+    ///      THE QUOTE LEAVES BY TWO DOORS, and conflating them is what made
+    ///      `quoteSpent` wrong. The pad pushes the creator's fee share back
+    ///      into this clone INSIDE the dev buy, so the balance resting here
+    ///      afterwards is fee INCOME, not budget the venue declined to spend.
+    ///      Fee income goes to the `feeRecipient`; anything that was already
+    ///      resting here goes to the owner; and `quoteSpent` is `p.quoteIn`,
+    ///      which is what the venue consumed. See the split at the end of this
+    ///      function for the live trace and the one stated assumption.
     function executeLaunch(LaunchParams calldata p)
         external
         returns (address token, uint256 id, uint256 reserveHeld, uint256 quoteSpent)
@@ -705,6 +753,11 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         padContract.arm(id, armAmount);
         IERC20(token).forceApprove(address(padContract), 0);
 
+        // Everything resting here that is NOT this launch's budget, measured
+        // before the pad can touch it — see the split below.
+        uint256 unrelated = IERC20(p.quoteToken).balanceOf(address(this));
+        unrelated = unrelated > p.quoteIn ? unrelated - p.quoteIn : 0;
+
         if (p.quoteIn != 0) {
             IERC20(p.quoteToken).forceApprove(address(padContract), p.quoteIn);
             // Delivered to the OWNER, not here: a curve dev buy that lands
@@ -717,11 +770,52 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         // Reserve AND dev buy, measured where the invariant says they must be.
         reserveHeld = IERC20(token).balanceOf(owner_) - ownerBefore;
 
-        // Unspent quote belongs to the owner it was pulled from. Normally zero:
-        // the pad consumes the buy in full.
-        uint256 leftover = IERC20(p.quoteToken).balanceOf(address(this));
-        if (leftover != 0) IERC20(p.quoteToken).safeTransfer(owner_, leftover);
-        quoteSpent = leftover >= p.quoteIn ? 0 : p.quoteIn - leftover;
+        // ── the quote split: FEE INCOME IS NOT UNSPENT QUOTE ──
+        //
+        // THE PAD PAYS ITS CREATOR AT TRADE TIME, PUSHING THE CREATOR'S SHARE
+        // BACK INTO THIS CLONE INSIDE THE VERY `buy` ABOVE. This clone IS the
+        // creator (it must be — `arm` and `abort` are creator-only levers the
+        // fund needs), so after the buy the balance here is
+        //
+        //     unrelated + creatorFee
+        //
+        // and NOT "quote the pad declined to spend". Netting the two — the
+        // shape `quoteSpent = quoteIn - balanceOf(this)` had — reports fee
+        // INCOME as budget the launch never used. Traced live in cycle B:
+        // 1,200.000000 USDG in, 19.800000 USDG of creator fee pushed back
+        // mid-call, `quoteSpent` reported as 1,180.200000 — short by exactly
+        // the fee. `ILaunchAdapter.LaunchResult.quoteSpent` is "Quote actually
+        // consumed", and the pad consumes the buy in full or reverts, so the
+        // honest figure is `p.quoteIn` (and 0 when there was no buy).
+        //
+        // THE TWO PORTIONS GO TO DIFFERENT PLACES, and that is the point:
+        //   - anything that was already resting here belongs to the OWNER it
+        //     was pulled from, exactly as before;
+        //   - the creator fee belongs to the `feeRecipient` the launch named,
+        //     which is the fund's VAULT. Routing it to the owner would push a
+        //     fee into strategy custody at execute time — the one lane
+        //     `feeRecipient` exists to close — and it would arrive unannounced.
+        //     It is delivered here rather than left for the permissionless
+        //     `cloneCollectFees()` so that no keeper has to run for a fund to
+        //     be paid what it already earned.
+        //
+        // STATED ASSUMPTION. A pad that consumed only PART of the buy would be
+        // indistinguishable from one that paid a fee, and this splits in favour
+        // of the fee. `StonkSafeLaunchpadV2.buy` pulls `quoteIn` in full or
+        // reverts, so that case does not arise; if it ever did, the misrouted
+        // amount would reach the fund's own vault rather than its strategy —
+        // wrong lane, no loss.
+        quoteSpent = p.quoteIn;
+
+        uint256 resting = IERC20(p.quoteToken).balanceOf(address(this));
+        uint256 feeIncome = resting > unrelated ? resting - unrelated : 0;
+        uint256 ownerShare = resting - feeIncome;
+        if (ownerShare != 0) IERC20(p.quoteToken).safeTransfer(owner_, ownerShare);
+        if (feeIncome != 0) {
+            address recipient = feeRecipient;
+            IERC20(p.quoteToken).safeTransfer(recipient, feeIncome);
+            emit FeesCollected(recipient, feeIncome, 0);
+        }
 
         uint256 dust = IERC20(token).balanceOf(address(this));
         if (dust != 0) revert DustRemains(token, dust);
@@ -893,9 +987,19 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         uint256 quoteBefore = _balanceOf(quoteAsset, recipient);
         uint256 tokenBefore = _balanceOf(token, recipient);
 
+        uint256 gasBefore = gasleft();
         // solhint-disable-next-line avoid-low-level-calls
         (bool flushed,) = padAddress.call(abi.encodeCall(IStonkSafeLaunchpadV2.flushCreatorQuote, (launchId)));
-        if (!flushed) emit VenueLegSkipped("flushCreatorQuote");
+        // Announced, not merely tolerated. `VenueLegSkipped` used to carry this
+        // and carried no signal: it fired on EVERY call, because this pad pays
+        // the creator at trade time and `flushCreatorQuote` therefore has
+        // nothing to flush. `VenueCallFailed` indexes the revert selector, so
+        // an out-of-gas child (`0x00000000`) is a different topic from the
+        // venue's ordinary refusal and cannot be drowned by it. The `(0, 0)`
+        // return contract below is unchanged.
+        if (!flushed) {
+            emit VenueCallFailed("flushCreatorQuote", _revertSelector(), _selfRef(), gasleft() <= gasBefore / 63);
+        }
 
         _forward(quoteAsset, recipient);
         if (token != quoteAsset) _forward(token, recipient);
@@ -1055,6 +1159,32 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         (bool ok, bytes memory ret) = padAddress.staticcall(abi.encodeCall(IStonkSafeLaunchpadV2.launchFeeWei, ()));
         if (!ok || ret.length < 32) return 0;
         return abi.decode(ret, (uint256));
+    }
+
+    /// @dev The revert selector of the call that JUST returned, read straight
+    ///      out of the returndata buffer.
+    ///
+    ///      NEVER COPIES THE WHOLE RETURNDATA. `(bool ok,) = target.call(...)`
+    ///      deliberately omits the bytes variable so Solidity skips
+    ///      `RETURNDATACOPY` entirely; binding one here to read four bytes
+    ///      would hand a hostile or merely verbose venue a returndata bomb on a
+    ///      path whose entire contract is that it must not revert. Four bytes,
+    ///      into scratch, or `0x00000000` when the callee returned less —
+    ///      which is exactly what a child that ran out of gas returns.
+    function _revertSelector() private pure returns (bytes4 sel) {
+        assembly ("memory-safe") {
+            if gt(returndatasize(), 3) {
+                returndatacopy(0, 0, 4)
+                sel := and(mload(0), 0xffffffff00000000000000000000000000000000000000000000000000000000)
+            }
+        }
+    }
+
+    /// @dev This clone's own `launchRef`, which IS its address. The widening
+    ///      cast is lossless by construction.
+    function _selfRef() private view returns (bytes32) {
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return bytes32(uint256(uint160(address(this))));
     }
 
     /// @dev Non-reverting balance read, so `cloneCollectFees` cannot be turned

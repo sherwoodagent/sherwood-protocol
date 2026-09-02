@@ -19,8 +19,12 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///           - `arm` is creator-only and PULLS the loaded supply, so a launch
 ///             that withheld a reserve arms strictly less than it minted;
 ///           - `buy` delivers to `recipient` — never to `msg.sender` — bumps
-///             `buyCount`, and accrues the creator's 16.5% as
-///             `creatorQuoteOwed`;
+///             `buyCount`, and PUSHES the creator's 16.5% to the creator inside
+///             that same call, accruing it as `creatorQuoteOwed` only when the
+///             push fails. This is the live 4663 behaviour and it is
+///             load-bearing: a clone's own fee income lands mid-`buy`, where a
+///             naive `quoteSpent = quoteIn - balanceOf(this)` counts fee INCOME
+///             as unspent quote;
 ///           - `flushCreatorQuote` is permissionless and pays THE CREATOR, so a
 ///             clone must forward afterwards;
 ///           - `abort` is creator-only and barred once `buyCount != 0`;
@@ -32,7 +36,9 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///
 ///         Test knobs (`setGraduatable`, `setStale`, `setRate`,
 ///         `setLaunchFeeWei`) drive the adapter's edges; the real pad derives
-///         all four from its curve and its oracle.
+///         all four from its curve and its oracle. `setFlushReverts` and
+///         `setFlushBurnsGas` stage the two ways a tolerated venue call can
+///         fail — a refusal, and an out-of-gas child frame.
 contract MockStonkPad {
     /// @notice Live values on every pad (2026-08-28).
     uint16 public constant CREATOR_FEE_BPS = 1650;
@@ -49,6 +55,12 @@ contract MockStonkPad {
     bool public graduatable;
     /// @notice The stock lanes' weekend oracle gap.
     bool public stale;
+    /// @notice Make `flushCreatorQuote` REFUSE, the way a paused pad does.
+    bool public flushReverts;
+    /// @notice Make `flushCreatorQuote` BURN EVERY UNIT OF GAS it is forwarded
+    ///         and return no data — the EIP-150 63/64 shape that made a failed
+    ///         venue call indistinguishable from "nothing accrued" on 4663.
+    bool public flushBurnsGas;
 
     uint256 public nextId = 1;
     mapping(uint256 id => IStonkSafeLaunchpadV2.Launch launch) internal _launches;
@@ -71,6 +83,7 @@ contract MockStonkPad {
     error InsufficientOutput();
     error WindowClosed();
     error InsufficientLaunchFee();
+    error FlushRefused();
 
     constructor(address quote_) {
         quote = quote_;
@@ -92,6 +105,14 @@ contract MockStonkPad {
 
     function setStale(bool value) external {
         stale = value;
+    }
+
+    function setFlushReverts(bool value) external {
+        flushReverts = value;
+    }
+
+    function setFlushBurnsGas(bool value) external {
+        flushBurnsGas = value;
     }
 
     // ── venue surface ──
@@ -210,7 +231,18 @@ contract MockStonkPad {
         l.realQuote += quoteIn;
         l.buyCount += 1;
         boughtOf[id][recipient] += tokensOut;
-        creatorQuoteOwed[id] += (quoteIn * CREATOR_FEE_BPS) / 10_000;
+
+        // THE CREATOR IS PAID AT TRADE TIME, PUSHED INSIDE THE BUY — the live
+        // 4663 behaviour, and the reason a clone sees its own fee income land
+        // mid-`buy` rather than as an accrual it flushes later. Only a FAILED
+        // push accrues, which is why `flushCreatorQuote` has nothing to do on
+        // a healthy launch.
+        uint256 creatorFee = (quoteIn * CREATOR_FEE_BPS) / 10_000;
+        if (creatorFee != 0) {
+            // solhint-disable-next-line avoid-low-level-calls
+            (bool paid,) = quote.call(abi.encodeCall(IERC20.transfer, (l.creator, creatorFee)));
+            if (!paid) creatorQuoteOwed[id] += creatorFee;
+        }
         IERC20(l.token).transfer(recipient, tokensOut);
     }
 
@@ -247,6 +279,15 @@ contract MockStonkPad {
     /// @dev Permissionless, and it pays the CREATOR — which on a cloned adapter
     ///      is the clone, never the strategy and never the caller.
     function flushCreatorQuote(uint256 id) external {
+        // `INVALID` consumes every unit of gas the caller forwarded and returns
+        // no data — the exact signature of a child frame that ran out of gas
+        // under the 63/64 rule, which a raw `call` cannot tell from a revert.
+        if (flushBurnsGas) {
+            assembly ("memory-safe") {
+                invalid()
+            }
+        }
+        if (flushReverts) revert FlushRefused();
         IStonkSafeLaunchpadV2.Launch storage l = _load(id);
         uint256 owed = creatorQuoteOwed[id];
         if (owed == 0) return;
