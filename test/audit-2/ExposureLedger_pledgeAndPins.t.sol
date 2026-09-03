@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
 import {MockWoodTwapOracle} from "test/mocks/MockWoodTwapOracle.sol";
+import {MockCoverageFreezer} from "test/mocks/MockCoverageFreezer.sol";
 
 /// @dev Minimal sWOOD stub. Every proposal in this file stays UNEXECUTED
 ///      (`executedAt` never set away from its 0 default), so every
@@ -176,7 +177,9 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
     address internal owner = makeAddr("owner");
     address internal guardian = makeAddr("guardian");
     address internal registry = makeAddr("registry"); // deliberately codeless
-    address internal freezer = makeAddr("freezer");
+    // SHE-214: a freezer must answer `challengeWindow()` to wire; a low window so
+    // no test that lowers the ledger's window trips the game-side floor.
+    address internal freezer = address(new MockCoverageFreezer(1 days));
 
     uint256 internal constant MARKET_X8 = 2e8; // $2.00/WOOD
     uint256 internal constant CAP_X8 = 4e8; // 2x above market, non-binding
@@ -401,14 +404,15 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
     ///         shrink below succeeds), passes against the fix.
     function test_setChallengeWindow_cannotShrinkBelowTheWiredGameWindow() public {
         MockChallengeGameWindow game = new MockChallengeGameWindow(20 days);
-        vm.prank(owner);
-        ledger.setCoverageFreezer(address(game));
 
         // Bump the ledger's window above the game's first, isolating the
-        // SHRINK direction finding D is about.
+        // SHRINK direction finding D is about. Before wiring: since SHE-214
+        // `setCoverageFreezer` refuses a game whose window exceeds the ledger's.
         vm.prank(owner);
         ledger.setChallengeWindow(25 days);
         assertEq(ledger.challengeWindow(), 25 days);
+        vm.prank(owner);
+        ledger.setCoverageFreezer(address(game));
 
         // Shrinking below the game's own 20d window must revert.
         vm.prank(owner);

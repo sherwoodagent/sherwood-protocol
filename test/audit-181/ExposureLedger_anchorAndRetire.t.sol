@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
 import {MockWoodTwapOracle} from "test/mocks/MockWoodTwapOracle.sol";
+import {MockCoverageFreezer} from "test/mocks/MockCoverageFreezer.sol";
 
 /// @dev Minimal sWOOD stub, but UNLIKE `test/ExposureLedger.t.sol`'s
 ///      `MockSwood`, this one mirrors `StakedWood.slashableStakeAt`'s ACTUAL
@@ -160,7 +161,9 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
     address internal owner = makeAddr("owner");
     address internal guardian = makeAddr("guardian");
     address internal registry = makeAddr("registry");
-    address internal freezer = makeAddr("freezer");
+    // SHE-214: a freezer must answer `challengeWindow()` to wire; a low window so
+    // no test that lowers the ledger's window trips the game-side floor.
+    address internal freezer = address(new MockCoverageFreezer(1 days));
 
     // $2.00 market, cap 2x above (non-binding) — matches finding 4's own
     // worked example (guardian at $2.00/WOOD, price falls to $1.00).

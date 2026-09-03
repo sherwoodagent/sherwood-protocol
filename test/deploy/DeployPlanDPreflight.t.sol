@@ -11,6 +11,7 @@ import {StakedWood} from "../../src/StakedWood.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockWoodTwapOracle} from "../mocks/MockWoodTwapOracle.sol";
+import {MockCoverageFreezer} from "../mocks/MockCoverageFreezer.sol";
 
 /// @dev See `DeployTokenCourtPreflight.t.sol`'s copy of this contract for the
 ///      full explanation: `vm.startBroadcast` runs the script's calls as
@@ -188,8 +189,10 @@ contract DeployPlanDPreflightTest is Test {
     ///      `setCoverageFreezer` outright, and a script that clobbered instead
     ///      of refusing would have left no way back.
     function test_preflight_bites_whenCoverageFreezerIsAlreadyHeld() public {
+        // Hoisted: a call in argument position would consume the prank.
+        address stub = address(new MockCoverageFreezer(ledger.challengeWindow()));
         vm.prank(DEFAULT_SENDER);
-        ledger.setCoverageFreezer(address(0xDEAD));
+        ledger.setCoverageFreezer(stub);
         _runExpecting("PRE-FLIGHT: ExposureLedger.coverageFreezer already set.");
     }
 

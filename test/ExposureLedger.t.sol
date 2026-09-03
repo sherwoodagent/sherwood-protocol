@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
+import {MockCoverageFreezer} from "test/mocks/MockCoverageFreezer.sol";
 import {
     MockWoodTwapOracle,
     DirtyFlagWoodTwapOracle,
@@ -244,7 +245,9 @@ contract ExposureLedgerTest is Test {
     address internal owner = makeAddr("owner");
     address internal guardian = makeAddr("guardian");
     address internal registry = makeAddr("registry");
-    address internal freezer = makeAddr("freezer");
+    // SHE-214: a freezer must answer `challengeWindow()` to wire; a low window so
+    // no test that lowers the ledger's window trips the game-side floor.
+    address internal freezer = address(new MockCoverageFreezer(1 days));
     MockGovernorForLedger internal mgov;
     address internal usdgAsset;
 
