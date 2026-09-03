@@ -807,18 +807,25 @@ contract StonkLaunchAdapter is ILaunchAdapter {
         // wrong lane, no loss.
         quoteSpent = p.quoteIn;
 
-        uint256 resting = IERC20(p.quoteToken).balanceOf(address(this));
-        uint256 feeIncome = resting > unrelated ? resting - unrelated : 0;
-        uint256 ownerShare = resting - feeIncome;
-        if (ownerShare != 0) IERC20(p.quoteToken).safeTransfer(owner_, ownerShare);
-        if (feeIncome != 0) {
-            address recipient = feeRecipient;
-            IERC20(p.quoteToken).safeTransfer(recipient, feeIncome);
-            emit FeesCollected(recipient, feeIncome, 0);
-        }
+        _splitRestingQuote(p.quoteToken, owner_, unrelated);
 
         uint256 dust = IERC20(token).balanceOf(address(this));
         if (dust != 0) revert DustRemains(token, dust);
+    }
+
+    /// @dev The split described at the end of `executeLaunch`, lifted out of it
+    ///      so its four locals do not sit on that function's stack — legacy
+    ///      codegen overflows there. Behaviour is unchanged.
+    function _splitRestingQuote(address quoteToken, address owner_, uint256 unrelated) private {
+        uint256 resting = IERC20(quoteToken).balanceOf(address(this));
+        uint256 feeIncome = resting > unrelated ? resting - unrelated : 0;
+        uint256 ownerShare = resting - feeIncome;
+        if (ownerShare != 0) IERC20(quoteToken).safeTransfer(owner_, ownerShare);
+        if (feeIncome != 0) {
+            address recipient = feeRecipient;
+            IERC20(quoteToken).safeTransfer(recipient, feeIncome);
+            emit FeesCollected(recipient, feeIncome, 0);
+        }
     }
 
     /// @notice This clone's lifecycle position.
