@@ -846,9 +846,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         CounterBondPool storage pool = _pools[poolKey];
         if (pool.completedAt == 0 && bondWood > pool.target) pool.target = bondWood;
 
-        // Refcounted: only the first live challenge freezes, only the last one
-        // to terminate unfreezes.
-        if (_liveCount[key]++ == 0) exposureLedger.freezeCoverage(governor, proposalId);
+        // Refcounted for the UNFREEZE only: the last live challenge to terminate
+        // releases it. The ledger hears about EVERY filing, because `liveUntil`
+        // (this challenge's worst-case end) can outlive the first freeze's
+        // bucket by up to `strategyDuration + challengeWindow` (SHE-213).
+        _liveCount[key]++;
+        exposureLedger.freezeCoverage(governor, proposalId, block.timestamp + disputeTimeout);
 
         wood.safeTransferFrom(msg.sender, address(this), bondWood);
         emit ChallengeFiled(challengeId, governor, proposalId, msg.sender, predicate, bondWood, evidenceURI);

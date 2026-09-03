@@ -92,7 +92,7 @@ contract GuardianRegistry_quorumDenominatorTest is RegistryTestHarness {
         // (1_000_000e18), never the attacker-inflated live total
         // (2_100_000e18). `ReviewOpened` carries `totalStakeAtOpen` directly.
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.ReviewOpened(PROPOSAL_ID, 1_000_000e18);
+        emit IGuardianRegistry.ReviewOpened(address(governor), PROPOSAL_ID, 1_000_000e18);
         registry.openReview(address(governor), PROPOSAL_ID);
 
         // Honest cohort casts its genuine 40% block vote.
@@ -103,7 +103,7 @@ contract GuardianRegistry_quorumDenominatorTest is RegistryTestHarness {
 
         vm.warp(voteEnd + REVIEW_PERIOD);
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.ReviewResolved(PROPOSAL_ID, true, 0);
+        emit IGuardianRegistry.ReviewResolved(address(governor), PROPOSAL_ID, true, 0);
         bool blocked = registry.resolveReview(address(governor), PROPOSAL_ID);
         assertTrue(
             blocked, "honest 40% block-side must clear a 20% quorum measured against the honest-only 1_000_000e18 base"
@@ -176,7 +176,7 @@ contract GuardianRegistry_quorumDenominatorTest is RegistryTestHarness {
         // again. Asserted via the emitted event: a stale `AlreadyVoted`
         // revert (the pre-fix bug) means this event never fires.
         vm.expectEmit(true, true, false, true);
-        emit IGuardianRegistry.EmergencyBlockVoteCast(PROPOSAL_ID, honestBlocker, 10_000e18);
+        emit IGuardianRegistry.EmergencyBlockVoteCast(address(governor), PROPOSAL_ID, honestBlocker, 10_000e18);
         vm.prank(honestBlocker);
         registry.voteBlockEmergencySettle(address(governor), PROPOSAL_ID);
     }

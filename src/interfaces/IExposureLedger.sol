@@ -79,6 +79,10 @@ interface IExposureLedger {
     ///         released from its bucket the same way `ExposureReleased` releases
     ///         a vote-change unwind.
     event ExposureRetired(address indexed guardian, bytes32 indexed reviewKey, uint256 wood, uint256 epoch);
+    /// @notice A freeze, unfreeze or pin moved `guardian`'s lock between buckets (SHE-213).
+    event ExposureRebucketed(
+        address indexed guardian, bytes32 indexed reviewKey, uint256 wood, uint256 fromEpoch, uint256 toEpoch
+    );
     event ParameterChangeFinalized(bytes32 indexed paramKey, uint256 oldValue, uint256 newValue);
     event CoverageFreezerSet(address indexed oldFreezer, address indexed newFreezer);
     event CoverageFrozenSet(address indexed governor, uint256 indexed proposalId, bool frozen);
@@ -138,7 +142,12 @@ interface IExposureLedger {
         returns (uint256 coverageRaisedUsd, uint256 requiredCoverageUsd);
 
     // ── Coverage freeze (challenge game) ──
-    function freezeCoverage(address governor, uint256 proposalId) external;
+    /// @notice Freeze one proposal's coverage while a challenge is live and
+    ///         re-bucket each approver's lock (raise-only) to the bucket
+    ///         containing `liveUntil` (SHE-213).
+    /// @param  liveUntil The challenge's worst-case end, `filedAt + disputeTimeout`.
+    function freezeCoverage(address governor, uint256 proposalId, uint256 liveUntil) external;
+    /// @notice Release the freeze; each lock returns to max(current, booked, pinned) bucket.
     function unfreezeCoverage(address governor, uint256 proposalId) external;
     function isCoverageFrozen(address governor, uint256 proposalId) external view returns (bool);
     /// @notice Whether ANY frozen proposal names this guardian as a covering
@@ -158,6 +167,7 @@ interface IExposureLedger {
     ///         instead — a pin issued against one stale proposal must not block
     ///         sweeping a guardian's OTHER commitments. Only ever RAISES either
     ///         value; each decays on its own, so no unpin call exists or is needed.
+    ///         Also re-buckets each lock to `deadline`, raise-only (SHE-213).
     function pinCoverageUntil(address governor, uint256 proposalId, uint256 deadline) external;
     /// @dev Zero is legal and deliberate — the UNWIRE switch, closing the freeze
     ///      surface when the challenge game is replaced: with no freezer wired

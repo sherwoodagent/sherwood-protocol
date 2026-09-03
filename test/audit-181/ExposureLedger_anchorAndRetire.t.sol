@@ -374,7 +374,7 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
         ledger.recordApproval(address(mgov), p1, guardian, type(uint256).max);
 
         vm.prank(freezer);
-        ledger.freezeCoverage(address(mgov), p1);
+        ledger.freezeCoverage(address(mgov), p1, block.timestamp + 30 days);
 
         uint256 expiry = ledger.epochGenesis() + ledger.epochLength() + ledger.challengeWindow();
         vm.warp(expiry + 1);
