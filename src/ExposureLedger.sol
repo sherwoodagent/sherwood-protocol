@@ -1228,9 +1228,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      booked bucket and any live pin (`_restingEpochOf`). Not the current
     ///      bucket: a new filing is legal only until `max(executedAt +
     ///      strategyDuration + game.challengeWindow, challengeableUntil)`; the
-    ///      first lives inside the booked bucket, the second always arrives with
-    ///      a pin. A current-bucket floor would hold an acquitted guardian's
-    ///      capacity and exit for up to `epochLength + challengeWindow`.
+    ///      first lives inside the booked bucket WHEN `game.challengeWindow <=
+    ///      challengeWindow` (enforced at wiring by #297's `setCoverageFreezer`
+    ///      mirror, SHE-214; a game window above the ledger's leaves up to the
+    ///      difference filable-but-uncounted after an acquittal), the second
+    ///      always arrives with a pin. A current-bucket floor would hold an
+    ///      acquitted guardian's capacity and exit for up to `epochLength +
+    ///      challengeWindow`.
     function unfreezeCoverage(address governor, uint256 proposalId) external onlyFreezer {
         bytes32 key = _reviewKey(governor, proposalId);
         if (_frozen[key]) {

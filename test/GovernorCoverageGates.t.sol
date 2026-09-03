@@ -1411,6 +1411,12 @@ contract GovernorCoverageGatesTest is Test {
     ///         EOA registry cannot answer.
     function test_reclaimBond_gameWindowAboveTheLedgers_waitsForTheGame() public {
         uint256 pid = _executeThenSettle();
+        // INVERSION FIXTURE: a game window ABOVE the ledger's. #297 (SHE-214)
+        // makes `setCoverageFreezer` refuse this at wiring, so once it lands
+        // this fixture fails there by design — rebuild the divergence from the
+        // ledger side. Until then it is also the one configuration in which an
+        // acquittal leaves a lock filable-but-uncounted for `game.W - ledger.W`
+        // (SHE-213 `unfreezeCoverage` natspec).
         uint256 gameWindow = ledger.challengeWindow() + 7 days;
         MockFilingDeadline stubGame = new MockFilingDeadline(gameWindow);
         vm.prank(ledgerOwner);
