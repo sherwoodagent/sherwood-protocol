@@ -9,32 +9,13 @@ import {MockGovernorMinimal} from "../mocks/MockGovernorMinimal.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 
 /// @title StakedWood_she215OwnerBondLive
-/// @notice SHE-215 (audit High), sWOOD half — the predicate the governor's new
-///         propose/execute gate reads.
-///
-///         `claimUnstakeOwner`'s natspec has always promised that after a claim
-///         "the vault then enters grace-period state and new proposals cannot
-///         be created until the slot is re-funded". Nothing enforced it and no
-///         `gracePeriod` state, timer or gate existed anywhere in `src/` — the
-///         string was the only occurrence. `ownerBondLive` is that state, made
-///         real and readable; `SyndicateGovernor` is where it now bites (see
-///         `Governor_she215OwnerBondGate.t.sol`).
-///
-/// @dev    The predicate is `owner != address(0) && unstakeRequestedAt == 0`.
-///         Both clauses are pinned below, as is the ONE state that must stay
-///         permissive: a vault created under the documented
-///         `minOwnerStake == 0` open-onboarding sentinel holds a bound slot
-///         with a real owner and a zero amount, and must keep its proposal
-///         lane. Keying the predicate on `stakedAmount` instead would have
-///         bricked every such vault at birth.
+/// @notice SHE-215, sWOOD half: pins `ownerBondLive`, its two clauses, and
+///         `cancelUnstakeOwner` (design: `openspec/changes/owner-bond-proposal-gate`).
 contract StakedWoodShe215OwnerBondLiveTest is Test {
     StakedWood internal swood;
     ERC20Mock internal wood;
     MockGovernorMinimal internal gov;
-    /// @dev A real registry, deployed only to read the passthrough the governor
-    ///      actually calls — the governor holds a registry handle, not an sWOOD
-    ///      one. `registry` (the pranked slasher below) stays a plain address so
-    ///      `slashOwnerBond` can be driven directly.
+    /// @notice A real registry, deployed only for the passthrough the governor calls.
     GuardianRegistry internal guardianRegistry;
 
     address internal owner = address(0xA11CE);
@@ -88,12 +69,7 @@ contract StakedWoodShe215OwnerBondLiveTest is Test {
         wood.approve(address(swood), type(uint256).max);
     }
 
-    /// @notice THE ROUTE THE GOVERNOR ACTUALLY TAKES. `SyndicateGovernor` holds
-    ///         a `IGuardianRegistry` handle, not an sWOOD one, so the gate reads
-    ///         this passthrough — the same route `GovernorEmergency` uses for
-    ///         `ownerStake`. Asserted across a state CHANGE, not once: a
-    ///         passthrough hard-wired to `true` would satisfy a single
-    ///         assertion and quietly disable the gate everywhere.
+    /// @notice The registry passthrough tracks the sWOOD predicate across a state change.
     function test_registryPassthrough_tracksTheSwoodPredicate() public {
         assertFalse(guardianRegistry.ownerBondLive(vault), "unbound");
         _bind();
@@ -118,23 +94,15 @@ contract StakedWoodShe215OwnerBondLiveTest is Test {
     // The predicate
     // =====================================================================
 
-    /// @notice A freshly bound slot is live. The baseline every other case
-    ///         below moves away from.
+    /// @notice A freshly bound slot is live.
     function test_ownerBondLive_trueForAFreshlyBoundSlot() public {
         assertFalse(swood.ownerBondLive(vault), "unbound: no slot, no lane");
         _bind();
         assertTrue(swood.ownerBondLive(vault), "bound and not exiting");
     }
 
-    /// @notice CLAUSE TWO. The lane closes at the REQUEST, not at the claim.
-    ///         A bond inside its exit cooldown is already committed to leaving
-    ///         and is not collateral behind anything; leaving the whole
-    ///         cooldown open was what let the exploit be staged at leisure.
-    ///
-    /// @dev    MUTATION-CHECKED: dropping the `unstakeRequestedAt == 0` clause
-    ///         leaves this assertion failing and hands the owner the entire
-    ///         cooldown as a window in which to propose against a bond they
-    ///         have already declared they are withdrawing.
+    /// @notice Clause two: the lane closes at the request, not at the claim.
+    /// @dev    MUTATION-CHECKED: dropping the `unstakeRequestedAt == 0` clause fails here.
     function test_ownerBondLive_falseWhileTheUnstakeRequestIsPending() public {
         _bind();
 
@@ -145,9 +113,7 @@ contract StakedWoodShe215OwnerBondLiveTest is Test {
         assertEq(swood.ownerStake(vault), BOND, "the WOOD is still escrowed; amount alone cannot see this");
     }
 
-    /// @notice CLAUSE ONE, THE FINDING ITSELF. `claimUnstakeOwner` deletes the
-    ///         record, so the promised grace period is now a state the governor
-    ///         can read rather than a sentence in a comment.
+    /// @notice Clause one: a claimed bond deletes the record, so the slot is not live.
     function test_ownerBondLive_falseAfterTheBondIsClaimed() public {
         _bind();
 
@@ -161,10 +127,7 @@ contract StakedWoodShe215OwnerBondLiveTest is Test {
         assertFalse(swood.ownerBondLive(vault), "the grace period the natspec promised");
     }
 
-    /// @notice CLAUSE ONE, THE OTHER EMPTYING ROUTE. `slashOwnerBond` also
-    ///         `delete`s the record, so a slashed vault sits in the same
-    ///         grace-period state — which is the right answer: the deterrent
-    ///         behind the lane has been burned.
+    /// @notice Clause one, the other emptying route: `slashOwnerBond` also deletes the record.
     function test_ownerBondLive_falseAfterTheBondIsSlashed() public {
         _bind();
 
@@ -174,16 +137,8 @@ contract StakedWoodShe215OwnerBondLiveTest is Test {
         assertFalse(swood.ownerBondLive(vault), "a burned bond is not a live bond");
     }
 
-    /// @notice THE STATE THAT MUST STAY PERMISSIVE. Under the documented
-    ///         `minOwnerStake == 0` open-onboarding sentinel, `bindOwnerStake`
-    ///         records a real owner against a ZERO amount. That vault never
-    ///         posted a bond and was never asked to, so its proposal lane must
-    ///         stay open — this is why the predicate tests `owner`, not
-    ///         `stakedAmount`.
-    ///
-    /// @dev    MUTATION-CHECKED: rewriting the first clause as
-    ///         `s.stakedAmount != 0` fails here, and would brick the proposal
-    ///         lane of every zero-bond vault from the moment it is created.
+    /// @notice A `minOwnerStake == 0` onboarding vault keeps its lane on a zero-amount slot.
+    /// @dev    MUTATION-CHECKED: rewriting the first clause as `s.stakedAmount != 0` fails here.
     function test_ownerBondLive_trueForAZeroBondOnboardingVault() public {
         address poorCreator = address(0xDEAD0);
 
@@ -201,11 +156,7 @@ contract StakedWoodShe215OwnerBondLiveTest is Test {
     // cancelUnstakeOwner — the way back
     // =====================================================================
 
-    /// @notice THE REVERSIBILITY THE GATE NEEDS. Without a cancel, a single
-    ///         exploratory `requestUnstakeOwner` would shut a live vault's
-    ///         proposal lane for the whole cooldown with no way back short of
-    ///         claiming the bond and running a two-transaction `rotateOwner`.
-    ///         Mirrors `cancelUnstakeGuardian`.
+    /// @notice `cancelUnstakeOwner` restores the live bond and reopens the lane.
     function test_cancelUnstakeOwner_restoresTheLiveBond() public {
         _bind();
 
@@ -222,11 +173,7 @@ contract StakedWoodShe215OwnerBondLiveTest is Test {
         assertEq(swood.ownerStake(vault), BOND, "and the bond never moved");
     }
 
-    /// @notice A CANCEL RESTARTS THE COOLDOWN, it does not preserve credit for
-    ///         time already served. Pins that `cooldownAtRequest` is cleared
-    ///         alongside the stamp: a cancel-and-re-request must buy the full
-    ///         wait again, or the owner could park a request, cancel it to
-    ///         reopen the lane, and re-request with the cooldown nearly spent.
+    /// @notice A cancel restarts the cooldown; it keeps no credit for time already served.
     function test_cancelUnstakeOwner_thenRequestAgainRestartsTheCooldown() public {
         _bind();
 
@@ -239,10 +186,8 @@ contract StakedWoodShe215OwnerBondLiveTest is Test {
         vm.prank(alice);
         swood.requestUnstakeOwner(vault);
 
-        // `vm.getBlockTimestamp()`, not `block.timestamp`: the executing frame
-        // caches the latter, so a second warp built on it would land back where
-        // the first one did. One second short of a FULL fresh cooldown, not of
-        // the original one.
+        // `vm.getBlockTimestamp()`, not `block.timestamp`: the frame caches the
+        // latter, so a second warp built on it would land where the first did.
         vm.warp(vm.getBlockTimestamp() + COOLDOWN - 1);
         vm.prank(alice);
         vm.expectRevert(StakedWood.CooldownNotElapsed.selector);
@@ -254,9 +199,7 @@ contract StakedWoodShe215OwnerBondLiveTest is Test {
         assertFalse(swood.ownerBondLive(vault));
     }
 
-    /// @notice Only the recorded owner may cancel, and only against a request
-    ///         that exists. Same two gates `requestUnstakeOwner` applies, in
-    ///         the same order.
+    /// @notice Only the recorded owner may cancel, and only against a request that exists.
     function test_cancelUnstakeOwner_revertsForAStrangerAndForNoRequest() public {
         _bind();
 
@@ -272,10 +215,7 @@ contract StakedWoodShe215OwnerBondLiveTest is Test {
         swood.cancelUnstakeOwner(vault);
     }
 
-    /// @notice A SLASHED SLOT CANNOT BE CANCELLED BACK TO LIFE. `slashOwnerBond`
-    ///         deletes the record, so there is no owner to match and nothing to
-    ///         restore — the owner-path analogue of `cancelUnstakeGuardian`'s
-    ///         ghost-guardian refusal, reached one field earlier.
+    /// @notice A slashed slot cannot be cancelled back to life.
     function test_cancelUnstakeOwner_cannotResurrectASlashedSlot() public {
         _bind();
 

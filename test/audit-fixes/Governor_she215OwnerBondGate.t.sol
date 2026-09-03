@@ -16,33 +16,9 @@ import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title Governor_she215OwnerBondGate
-/// @notice SHE-215 (audit High), governor half — the enforcement the
-///         `claimUnstakeOwner` natspec had always claimed and never had.
-///
-///         `StakedWood.claimUnstakeOwner` documented that after a claim "the
-///         vault then enters grace-period state and new proposals cannot be
-///         created until the slot is re-funded". `grep gracePeriod src/`
-///         returned that comment and nothing else: `_propose` gated on the
-///         vault address, `isAgent`, and the open-proposal lock, and read no
-///         owner bond at all; `executeProposal` gated on Approved, the active
-///         proposal and the cooldown, and read no owner bond either. The only
-///         enforcers in the repo were `GovernorEmergency` and
-///         `SyndicateFactory.rotateOwner`.
-///
-///         `isAgent` is `_agents[a].active` and is independent of the owner's
-///         stake, so an owner who is ALSO a registered agent could request
-///         their unstake in a quiet gap (`requestUnstakeOwner` only refuses
-///         while a proposal is open), sit out the cooldown, claim the bond
-///         (`claimUnstakeOwner`'s re-check only refuses while a proposal is
-///         open), and then propose AND execute a capital-moving strategy on a
-///         vault with nothing slashable behind it.
-///
-/// @dev    The predicate itself — bind / request / cancel / claim / slash — is
-///         pinned against a real `StakedWood` in
-///         `StakedWood_she215OwnerBondLive.t.sol`, including the registry
-///         passthrough. This suite drives the governor against
-///         `MockRegistryMinimal`, whose `setOwnerBondLive` stands in for those
-///         sWOOD transitions, so the two halves are pinned independently.
+/// @notice SHE-215, governor half: pins the `ownerBondLive` gate on both the
+///         propose and execute legs (design:
+///         `openspec/changes/owner-bond-proposal-gate`).
 contract GovernorShe215OwnerBondGateTest is Test {
     SyndicateGovernor internal governor;
     ProtocolConfig internal protocolConfig;
@@ -91,10 +67,8 @@ contract GovernorShe215OwnerBondGateTest is Test {
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
-        // THE EXPLOIT'S PRECONDITION, IN ONE LINE: the vault owner is also a
-        // registered agent. `isAgent` is independent of the owner bond, so
-        // nothing about claiming the bond ever revoked this.
-        // Minted OUTSIDE the prank: an argument-position external call would
+        // The exploit's precondition: the vault owner is also a registered agent.
+        // Minted OUTSIDE the prank — an argument-position external call would
         // consume the one-shot prank before `registerAgent` is reached.
         uint256 agentNftId = agentRegistry.mint(agent);
         vm.prank(owner);
@@ -190,24 +164,14 @@ contract GovernorShe215OwnerBondGateTest is Test {
     // propose
     // =====================================================================
 
-    /// @notice THE CONTROL. Nothing about this fix narrows the ordinary lane:
-    ///         a bonded vault proposes exactly as before.
+    /// @notice The control: a bonded vault proposes exactly as before.
     function test_propose_succeedsWhileTheOwnerBondIsLive() public {
         uint256 proposalId = _propose();
         assertGt(proposalId, 0, "a bonded vault still proposes");
     }
 
-    /// @notice THE FINDING, PROPOSE LEG. With the owner's exit in flight — or
-    ///         the bond already claimed or slashed, all three of which
-    ///         `ownerBondLive` reports identically — `propose` must fail
-    ///         CLOSED with a named error rather than mint a proposal against
-    ///         collateral that is leaving or gone.
-    ///
-    /// @dev    MUTATION-CHECKED: deleting the `ownerBondLive` gate from
-    ///         `_propose` makes this call succeed and returns the finding in
-    ///         full — an unbonded vault opening a capital-moving proposal, with
-    ///         only `GovernorEmergency`'s bond gate left anywhere in the
-    ///         protocol.
+    /// @notice The finding, propose leg: an unbonded vault fails closed with a named error.
+    /// @dev    MUTATION-CHECKED: deleting the gate from `_propose` makes this call succeed.
     function test_propose_revertsWhenTheOwnerBondIsNotLive() public {
         guardianRegistry.setOwnerBondLive(false);
 
@@ -230,11 +194,7 @@ contract GovernorShe215OwnerBondGateTest is Test {
         );
     }
 
-    /// @notice THE GRACE PERIOD ENDS WHEN THE SLOT IS RE-FUNDED — the second
-    ///         half of the sentence the natspec always carried. Restoring the
-    ///         bond (`cancelUnstakeOwner` on a request still in flight, or
-    ///         `rotateOwner` -> `transferOwnerStakeSlot` on a claimed one)
-    ///         reopens the lane. The gate is a state check, not a latch.
+    /// @notice Re-funding the slot reopens the lane: the gate is a state check, not a latch.
     function test_propose_reopensOnceTheBondIsRestored() public {
         guardianRegistry.setOwnerBondLive(false);
         guardianRegistry.setOwnerBondLive(true);
@@ -247,18 +207,8 @@ contract GovernorShe215OwnerBondGateTest is Test {
     // executeProposal
     // =====================================================================
 
-    /// @notice THE FINDING, EXECUTE LEG — and the reason the propose gate is
-    ///         not sufficient on its own. `requestUnstakeOwner` refuses only
-    ///         while a proposal is open, but the vote and the review period sit
-    ///         between propose and execute, so an owner can start their exit
-    ///         before the proposal that is about to move capital even exists
-    ///         and clear the cooldown while it is still being voted on.
-    ///         Re-asserting at the point of use is what closes the class.
-    ///
-    /// @dev    MUTATION-CHECKED: deleting the gate from `executeProposal`
-    ///         leaves this execution succeeding — capital deployed by a batch
-    ///         with no owner bond behind it, which is exactly the state the
-    ///         emergency lane refuses to enter.
+    /// @notice The finding, execute leg: a bond that leaves after approval stops execution.
+    /// @dev    MUTATION-CHECKED: deleting the gate from `executeProposal` lets this succeed.
     function test_executeProposal_revertsWhenTheBondLeavesAfterApproval() public {
         uint256 proposalId = _propose();
         _approve(proposalId);
@@ -270,9 +220,7 @@ contract GovernorShe215OwnerBondGateTest is Test {
         governor.executeProposal(proposalId);
     }
 
-    /// @notice THE CONTROL FOR THE EXECUTE LEG: the same proposal executes
-    ///         normally while the bond stays live, so the revert above is
-    ///         attributable to the bond and to nothing else in the path.
+    /// @notice The control for the execute leg: the same proposal executes with a live bond.
     function test_executeProposal_succeedsWhileTheOwnerBondIsLive() public {
         uint256 proposalId = _propose();
         _approve(proposalId);
@@ -281,10 +229,7 @@ contract GovernorShe215OwnerBondGateTest is Test {
         assertEq(governor.getActiveProposal(), proposalId, "executed with a live bond");
     }
 
-    /// @notice AND IT RECOVERS. A proposal blocked by a departing bond is not
-    ///         bricked: re-funding the slot inside the execution window lets it
-    ///         through, so an owner who reverses course does not strand an
-    ///         approved proposal.
+    /// @notice A proposal blocked by a departing bond is not bricked: it recovers in window.
     function test_executeProposal_recoversWhenTheBondIsRestoredInWindow() public {
         uint256 proposalId = _propose();
         _approve(proposalId);

@@ -161,9 +161,7 @@ interface IStakedWood {
 
     /// @notice True iff `vault`'s owner-stake slot is bound and not exiting —
     ///         `owner != address(0) && unstakeRequestedAt == 0`. The predicate
-    ///         `SyndicateGovernor.propose` / `executeProposal` gate on
-    ///         (SHE-215); see `StakedWood.ownerBondLive` for why it is
-    ///         existence-and-not-exiting rather than `>= requiredOwnerBond`.
+    ///         `SyndicateGovernor.propose` / `executeProposal` gate on (SHE-215).
     function ownerBondLive(address vault) external view returns (bool);
 
     function totalGuardianStake() external view returns (uint256);

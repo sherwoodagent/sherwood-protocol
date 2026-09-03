@@ -206,27 +206,9 @@ contract MockStakedWood is IStakedWood {
         return _ownerStake[vault];
     }
 
-    /// @dev A CONSTANT, not a settable slot — deliberately, and unlike every
-    ///      other read on this mock (SHE-215 review of #300). `IStakedWood`
-    ///      declares the member so it cannot simply be dropped, but the
-    ///      settable `_ownerBondNotLive` / `setOwnerBondLive` pair it first
-    ///      shipped with had zero callers and no way to acquire one: the gate
-    ///      lives in `SyndicateGovernor`, which reads
-    ///      `IGuardianRegistry.ownerBondLive`, so this function is reachable
-    ///      only with the mock sitting behind a REAL `GuardianRegistry` — and
-    ///      nothing in the suite does that. Every fixture here builds the mock
-    ///      standalone for TokenCourt/ChallengeGame work; the fixtures that are
-    ///      about the gate use `MockRegistryMinimal.setOwnerBondLive` instead.
-    ///      A knob no test can turn models nothing and reads as coverage that
-    ///      does not exist.
-    ///
-    ///      `true` is the right constant for the same reason it is the right
-    ///      default there: the real `StakedWood` reads
-    ///      `owner != address(0) && unstakeRequestedAt == 0`, true for every
-    ///      normally created vault including a zero-amount
-    ///      `minOwnerStake == 0` one, so "live" is the state an unconfigured
-    ///      fixture is modelling. Restore the setter the day a fixture actually
-    ///      wires this mock into a real registry.
+    /// @dev A constant, not a settable slot: `IStakedWood` declares the member but
+    ///      no fixture puts this mock behind a real `GuardianRegistry`, so a setter
+    ///      would have no reachable caller. Restore it when one does (SHE-215).
     function ownerBondLive(address) external pure returns (bool) {
         return true;
     }
@@ -281,12 +263,8 @@ contract MockStakedWood is IStakedWood {
         }
     }
 
-    /// @dev Models the FUNDING half of the real `slashOwnerBond` only. The real
-    ///      one `delete`s the record, so the slot also stops being live — but
-    ///      `ownerBondLive` here is a constant with no reachable reader (see its
-    ///      doc), so mirroring that half would be writing state nothing can
-    ///      observe. Whoever first wires this mock behind a real
-    ///      `GuardianRegistry` has to restore both together.
+    /// @dev Models the funding half of `slashOwnerBond` only; the real one also
+    ///      deletes the record, which `ownerBondLive` here cannot observe.
     function slashOwnerBond(address vault) external {
         slashOwnerBondCallCount++;
         lastSlashedVault = vault;

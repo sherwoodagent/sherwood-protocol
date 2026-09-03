@@ -194,15 +194,9 @@ contract MockRegistryMinimal is IGuardianRegistry {
         revert NotImplemented();
     }
 
-    /// @dev A DELIBERATE PERMISSIVE DEFAULT, unlike the reverting stubs around
-    ///      it (SHE-215). `SyndicateGovernor.propose` and `executeProposal` now
-    ///      read this on EVERY call, so a `NotImplemented` here would fail
-    ///      every governor fixture in the repo on a question none of them is
-    ///      about. `true` — "the vault is bonded and not exiting" — reproduces
-    ///      exactly the pre-gate behaviour those fixtures were written against,
-    ///      and it is a state the real `StakedWood` produces for any normally
-    ///      created vault, including the `minOwnerStake == 0` one. Tests that
-    ///      are about the gate flip it with `setOwnerBondLive`.
+    /// @dev Permissive by default, unlike the reverting stubs around it: the
+    ///      governor reads this on every propose and execute, so `NotImplemented`
+    ///      would fail every governor fixture (SHE-215).
     bool internal _ownerBondLive = true;
 
     function setOwnerBondLive(bool live) external {
