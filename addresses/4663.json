@@ -29,6 +29,49 @@
     "UniswapV3NonfungiblePositionManager": {
       "address": "0x73991a25c818bf1f1128deaab1492d45638de0d3",
       "verification": "24384 bytes of code; name() == \"Uniswap V3 Positions NFT-V1\", symbol() == \"UNI-V3-POS\", factory() == UniswapV3Factory above, WETH9() == WETH below. Discovered from the owner topic of a Mint log on the USDG/WETH 0.01% pool rather than from a published address list."
+    },
+    "SushiLaunchpadV1": {
+      "address": "0x104F1Ab42674565EC3DF0BFEbCcC4186f72fA7ED",
+      "verification": "Verified source on robinhoodchain.blockscout.com as SushiLaunchpad (solc v0.8.36); 2366 TokenLaunched events. Identity, not presence: WETH() == WETH below, v3Factory() == SushiV3Factory below, positionManager() == SushiV3NonfungiblePositionManager below. Live params read 2026-08-28: launchFee() == 5e14 wei, protocolReserveBps() == 300, defaultSushiFeeBps() == 3000, owner() == 0x6fA4080b70eed82Cf48570DDE705026905a64657. quoteTokenPriceFeed(WOOD) == address(0) at that date -- WOOD-paired launches revert UnsupportedQuoteToken until the venue owner registers a WOOD/USD aggregator."
+    },
+    "SushiV3Factory": {
+      "address": "0xE51960f1B45f1C9FB6D166E6a884F866fC70433B",
+      "verification": "feeAmountTickSpacing(10000) == 200 (the 1% tier the launchpad mints into). Round-trip closed: getPool(WOOD, WETH, 3000) == WoodWethSushiV3Pool below, whose own factory() returns this address. Distinct from UniswapV3Factory above -- the two venues do NOT share a factory on this chain."
+    },
+    "SushiV3NonfungiblePositionManager": {
+      "address": "0x51d0e5188afe12d502e29D982d20C190e7816107",
+      "verification": "name() == \"SushiSwap V3 Positions NFT-V1\", symbol() == \"SUSHI-V3-POS\", factory() == SushiV3Factory above, WETH9() == WETH below. Holds every launchpad LP position -- the launch creator never custodies one."
+    },
+    "WoodWethSushiV3Pool": {
+      "address": "0xF6831AaF374B353757F0dE6B3DD2a74697671C69",
+      "verification": "fee() == 3000, factory() == SushiV3Factory above, liquidity() == 2.128e22 read 2026-08-28. The live WOOD/WETH venue behind the SHARE/WOOD pairing; also the only on-chain WOOD price source, and thin enough (~$437k) that the protocol admits its TWAP only under the min() ceiling in WoodTwapOracle."
+    },
+    "StonkSafeLaunchpadV2Pads": {
+      "v2_mint_launch": {
+        "WETH": "0xFCd61B25BbF3AbD6cf0070D6328E351cc30EEC9f",
+        "STONK": "0x8f6782c5Aa37804d08a9b7bf3984Ff3245Fd6cD4",
+        "USDG": "0xd4F20033586977A2511f4A2DB4aF7C79a340D70a",
+        "GME": "0x4B9Dcd6CCFAeF0f6D23065Dd78E79d5E20ec8cFD",
+        "NVDA": "0xEe96d955d5634813374ecE4C74F2C0ff71B1F9FB",
+        "AAPL": "0xB0453A81Cbf963903409FFF18AD92941e1c7a864",
+        "SPCX": "0x0c3b4EDED41696eFF0ed70841f132B519d81c947",
+        "USO": "0xDb3C81C841ff88db6cDFbDDB0eE049D162A6053B"
+      },
+      "v3_external_token": {
+        "WETH": "0x5BCEefBa6fDf437A7388aDC5c9056c827baca3B3",
+        "STONK": "0x406fd0B957bb8cF1dd57C78540D009578e971131",
+        "USDG": "0xF0A06Ac7BBb0cc3049B68c257c3ee27CcEA40eeA",
+        "GME": "0x5b21F8a5Ef81586627B4725844aD447325d0992B",
+        "NVDA": "0xDf03953DCA8dB733345278A0c5fd2E81fa2A9B54",
+        "AAPL": "0xc522DfaE0D1a140257702392B665183a6De7657f",
+        "SPCX": "0xd82da1D8ef59959b170b59147283Ab1F2F1Ca86A",
+        "USO": "0x644b19512052A1b6d38d7B16C6c3Fb1d3F7270D2"
+      },
+      "verification": "Verified source StonkSafeLaunchpadV2 (solc v0.8.24) on robinhoodchain.blockscout.com; one pad per quote lane, all 16 sharing one ABI. Every address above was confirmed on-chain on 2026-08-28 by reading quote() and matching it to the lane it is filed under -- the check that caught a transcription slip in the USDG V2 address. Live launch counts then: V2 WETH 199, STONK 62, GME 35, SPCX 10, AAPL 9, USDG 8, NVDA 4, USO 2; V3 WETH 1 and the rest 0 (fresh, so launchCount is NOT a usable identity signal for the V3 pads). Live params on every pad: launchFeeWei() == 0, creatorFeeBps() == 1650, protocolFeeBps() == 1650, lpFeeBps() == 5000. There is NO WOOD lane and no permissionless way to add one -- a StonkBrokers launch pairs against WETH, STONKBROKER, USDG or a stock token."
+    },
+    "SafeLaunchLensV2": {
+      "address": "0x25b5Df581f4b2Ed450203f375ad8A28b17F115B3",
+      "verification": "Verified source SafeLaunchLensV2 (solc v0.8.24); 13007 bytes of code. All reads take the pad as their first argument. priceWei(WETH_V2_PAD, 1) answered 39847682795 on 2026-08-28, i.e. it prices a real launch on a real pad. Curve math MUST be read through this lens rather than reimplemented -- the tax schedule changes every minute."
     }
   },
   "tokens": {
