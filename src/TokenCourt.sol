@@ -522,7 +522,12 @@ contract TokenCourt is Ownable2Step, ITokenCourt {
             // game was re-pointed while the challenge is still rulable, and
             // swallowing it would close the case with the verdict undelivered,
             // which re-wiring cannot fix because `refer` reverts
-            // `AlreadyReferred`. It is transient, so it bubbles.
+            // `AlreadyReferred`. It is transient, so it bubbles. So does
+            // `WindowClosed` (SHE-246): a finalize that lands at or after the
+            // challenge's `filedAt + disputeTimeoutAtFiling` finds `rule` shut;
+            // `refer`'s `InsufficientClock` gate makes that a late caller, not
+            // an honest one, and once anyone `resolve`s the stale challenge the
+            // retry closes this case through `WrongStatus`.
             bytes4 sel = reason.length >= 4 ? bytes4(reason) : bytes4(0);
             if (sel != IChallengeGame.WrongStatus.selector) {
                 assembly ("memory-safe") {

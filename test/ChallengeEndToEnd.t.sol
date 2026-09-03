@@ -1442,4 +1442,161 @@ contract ChallengeEndToEndTest is Test {
     function test_constants_disputeTimeoutCeilingFitsTheCoverageHorizon() public view {
         assertLe(game.MAX_DISPUTE_TIMEOUT(), ledger.MAX_COVERAGE_HORIZON(), "MAX_DISPUTE_TIMEOUT must fit the horizon");
     }
+
+    // ── SHE-246: a challenge is unrulable past its dispute deadline ──
+
+    /// @notice THE LEDGER'S `liveUntil` IS THE END OF SLASHABILITY. Reviewer
+    ///         sequence on #299: freeze on day 20, `liveUntil` day 50, nobody
+    ///         resolves, day 70. The lock has aged out of `openExposure` (the
+    ///         bucket containing `liveUntil` expired), the key is still frozen,
+    ///         and the ONLY thing `resolve` may now do is unwind - never slash.
+    function test_staleUnbackedFiling_cannotSettlePastTheDisputeDeadline() public {
+        uint256 pid = _proposeApproveExecuteWithDuration(30 days);
+        uint256 executedAt = gov.getProposal(pid).executedAt;
+
+        vm.warp(executedAt + 20 days);
+        uint256 cid = _file(challenger, pid, "ipfs://stale");
+        uint256 liveUntil = vm.getBlockTimestamp() + game.disputeTimeout();
+        uint256 stakeBefore = swood.guardianStake(g1);
+        uint256 challengerBefore = wood.balanceOf(challenger);
+        uint256 bond = game.challengeOf(cid).bondWood;
+
+        // Past the deadline AND past the bucket's wall-clock expiry.
+        uint256 expiry = _bucketExpiry(_epochOf(liveUntil));
+        vm.warp((expiry > liveUntil ? expiry : liveUntil) + 1);
+        assertTrue(ledger.isCoverageFrozen(address(gov), pid), "fixture: still frozen, nobody resolved");
+        assertTrue(ledger.hasFrozenCoverage(g1), "fixture: exit still blocked");
+        assertEq(ledger.openExposure(g1), 0, "the lock aged out at liveUntil - correct iff nothing can slash it");
+
+        game.resolve(cid);
+        assertEq(
+            uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Inconclusive), "a stale filing unwinds"
+        );
+        assertEq(swood.guardianStake(g1), stakeBefore, "nothing slashed past the deadline");
+        assertFalse(ledger.isCoverageFrozen(address(gov), pid), "unfrozen");
+        // A non-verdict re-arms the re-challenge window and pins the ledger
+        // through it: exit stays blocked and the lock is COUNTED again for
+        // exactly as long as a fresh filing is legal, then both clear.
+        uint256 rearmedUntil = game.challengeableUntil(_reviewKey(pid));
+        assertEq(rearmedUntil, vm.getBlockTimestamp() + game.challengeWindow(), "re-armed one window from now");
+        assertTrue(ledger.hasFrozenCoverage(g1), "pinned through the re-armed window");
+        assertEq(ledger.openExposure(g1), G1_STAKE, "re-counted while re-challengeable");
+        vm.warp(rearmedUntil + 1);
+        assertFalse(ledger.hasFrozenCoverage(g1), "exit unblocked once the window shuts");
+        uint256 burned = (bond * game.challengeOf(cid).inconclusiveBurnBpsAtFiling) / 10_000;
+        assertGt(burned, 0, "fixture: the free-freeze price is non-zero");
+        assertEq(wood.balanceOf(challenger), challengerBefore + bond - burned, "bond back net of the round burn");
+    }
+
+    /// @notice `rule` is open one second before the deadline and shut from the
+    ///         deadline on - the same instant `resolve`'s non-slashing branch
+    ///         opens, so no instant is both rulable and unwindable.
+    function test_rule_convictsAtDeadlineMinusOne() public {
+        (uint256 cid, address stubCourt) = _fileAndDisputeWithStubCourt();
+        IChallengeGame.Challenge memory c = game.challengeOf(cid);
+        vm.warp(c.filedAt + c.disputeTimeoutAtFiling - 1);
+        vm.prank(stubCourt);
+        game.rule(cid, IChallengeGame.Verdict.Guilty);
+        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "ruled in time");
+        assertEq(swood.guardianStake(g1), 0, "slashed");
+    }
+
+    function test_rule_revertsFromTheDeadlineOn_andResolveUnwinds() public {
+        (uint256 cid, address stubCourt) = _fileAndDisputeWithStubCourt();
+        IChallengeGame.Challenge memory c = game.challengeOf(cid);
+        uint256 stakeBefore = swood.guardianStake(g1);
+
+        vm.warp(c.filedAt + c.disputeTimeoutAtFiling);
+        vm.prank(stubCourt);
+        vm.expectRevert(IChallengeGame.WindowClosed.selector);
+        game.rule(cid, IChallengeGame.Verdict.Guilty);
+
+        vm.warp(c.filedAt + c.disputeTimeoutAtFiling + 1);
+        vm.prank(stubCourt);
+        vm.expectRevert(IChallengeGame.WindowClosed.selector);
+        game.rule(cid, IChallengeGame.Verdict.Guilty);
+
+        // The clock's own exit: a court WAS pinned, so the timeout is `_fail`.
+        game.resolve(cid);
+        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Failed), "timed out");
+        assertEq(swood.guardianStake(g1), stakeBefore, "never slashed");
+        assertFalse(ledger.isCoverageFrozen(address(gov), pid_), "unfrozen");
+    }
+
+    /// @notice CONCURRENT FILINGS: the deadline is per filing, and the key is
+    ///         slashable until the LATEST live filing's deadline. The earlier
+    ///         filing going stale neither unfreezes the key nor shortens the
+    ///         later one's window, and the ledger keeps counting the lock until
+    ///         that later `liveUntil` - which is what #299's raise-only freeze
+    ///         booked.
+    function test_twoFilings_keyStaysSlashableUntilTheLaterDeadline() public {
+        uint256 pid = _proposeApproveExecuteWithDuration(30 days);
+        uint256 executedAt = gov.getProposal(pid).executedAt;
+
+        vm.warp(executedAt + 1);
+        uint256 cid1 = _file(challenger, pid, "ipfs://c1");
+        uint256 deadline1 = vm.getBlockTimestamp() + game.disputeTimeout();
+
+        vm.warp(executedAt + 20 days);
+        address challenger2 = makeAddr("challenger2");
+        wood.mint(challenger2, _challengerBond() * 2);
+        vm.prank(challenger2);
+        wood.approve(address(game), type(uint256).max);
+        uint256 cid2 = _file(challenger2, pid, "ipfs://c2");
+        uint256 deadline2 = vm.getBlockTimestamp() + game.disputeTimeout();
+
+        // Between the two deadlines: 1 is stale, 2 is live.
+        vm.warp(deadline1 + 5 days);
+        assertLt(vm.getBlockTimestamp(), deadline2, "fixture: inside the second window");
+        game.resolve(cid1);
+        assertEq(uint256(game.challengeOf(cid1).status), uint256(IChallengeGame.Status.Inconclusive), "1 unwound");
+        assertEq(swood.guardianStake(g1), G1_STAKE, "the stale filing slashed nothing");
+        assertTrue(ledger.isCoverageFrozen(address(gov), pid), "still frozen by 2");
+        assertEq(ledger.openExposure(g1), G1_STAKE, "still counted until the later liveUntil");
+
+        game.resolve(cid2);
+        assertEq(uint256(game.challengeOf(cid2).status), uint256(IChallengeGame.Status.Settled), "2 convicts");
+        assertEq(swood.guardianStake(g1), 0, "slashed through the later filing");
+    }
+
+    function test_twoFilings_nothingSlashesPastTheLaterDeadline() public {
+        uint256 pid = _proposeApproveExecuteWithDuration(30 days);
+        uint256 executedAt = gov.getProposal(pid).executedAt;
+
+        vm.warp(executedAt + 1);
+        uint256 cid1 = _file(challenger, pid, "ipfs://c1");
+        vm.warp(executedAt + 20 days);
+        address challenger2 = makeAddr("challenger2");
+        wood.mint(challenger2, _challengerBond() * 2);
+        vm.prank(challenger2);
+        wood.approve(address(game), type(uint256).max);
+        uint256 cid2 = _file(challenger2, pid, "ipfs://c2");
+        uint256 deadline2 = vm.getBlockTimestamp() + game.disputeTimeout();
+
+        vm.warp(deadline2);
+        game.resolve(cid2);
+        game.resolve(cid1);
+        assertEq(uint256(game.challengeOf(cid1).status), uint256(IChallengeGame.Status.Inconclusive));
+        assertEq(uint256(game.challengeOf(cid2).status), uint256(IChallengeGame.Status.Inconclusive));
+        assertEq(swood.guardianStake(g1), G1_STAKE, "no path slashes past the last deadline");
+        assertFalse(ledger.isCoverageFrozen(address(gov), pid), "fully released");
+    }
+
+    uint256 internal pid_;
+
+    /// @dev A court is wired BEFORE filing so `courtAtFiling` pins non-zero and
+    ///      `rule` is reachable; g1 completes the pool inside `autoSlashDelay`.
+    function _fileAndDisputeWithStubCourt() internal returns (uint256 cid, address stubCourt) {
+        pid_ = _proposeApproveExecute();
+        uint256 executedAt = gov.getProposal(pid_).executedAt;
+        stubCourt = address(new StubInconclusiveCourt());
+        vm.prank(owner);
+        game.setCourt(stubCourt);
+        vm.warp(executedAt + 1);
+        cid = _file(challenger, pid_, "ipfs://disputed");
+        vm.warp(executedAt + 2 days);
+        vm.prank(g1);
+        game.dispute(cid, type(uint256).max);
+        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Disputed), "fixture: backed");
+    }
 }

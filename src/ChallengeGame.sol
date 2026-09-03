@@ -300,6 +300,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         delay, and always strictly greater than it - a timeout at or
     ///         below the slash clock would let a contested challenge fail before
     ///         the slash it was raised against was ever due.
+    /// @notice ALSO THE HARD END OF SLASHABILITY (SHE-246). `filedAt +
+    ///         disputeTimeoutAtFiling` is the instant from which no path can
+    ///         convict on that filing: `rule` reverts `WindowClosed` and
+    ///         `resolve` only unwinds. It is the same value `file` books on the
+    ///         ledger as `liveUntil`, so the lock the ledger counts against
+    ///         guardian capacity ages out exactly when the filing stops being
+    ///         able to slash it.
     /// @dev    Deliberately generous relative to `autoSlashDelay`: guardians
     ///         carry the vigilance burden, so the escalation they buy with a
     ///         counter-bond must be worth more than the window they lost.
@@ -1105,6 +1112,21 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      pinned it routes to `_fail`, which also re-arms the re-challenge
     ///      window - a court WAS pinned, yet nothing adjudicated the merits. Only
     ///      `rule`'s genuine `NotGuilty` entry does not re-arm.
+    /// @dev THE SILENCE BRANCH HAS A HARD END (SHE-246). An un-backed filing is
+    ///      convictable only inside `[filedAt + autoSlashDelay, filedAt +
+    ///      disputeTimeout)`. From the deadline on it is STALE: `_settle` is
+    ///      unreachable and the call routes to `_refundAll` instead. Nobody
+    ///      called the permissionless settle for the whole of that window, so
+    ///      nothing was adjudicated; the accused could not have stopped the
+    ///      settle, so the accused is not the one who let it lapse; and the
+    ///      shape is exactly the "free freeze" `_refundAll`'s escalating burn
+    ///      already prices - the filing froze coverage for the full dispute
+    ///      clock and delivered no verdict. Without this end the ledger had no
+    ///      instant to book `liveUntil` against, and a lock could leave
+    ///      `openExposure` while still slashable (design.md, frozen-lock
+    ///      rebucketing). `_fail` is deliberately NOT the stale exit: it forfeits
+    ///      the bond to pool funders pro rata, and an un-backed pool bought no
+    ///      defence to be paid for.
     function resolve(uint256 challengeId) external {
         Challenge storage c = _challenges[challengeId];
         // `Filed` is the only stored live status now - `Disputed` is derived
@@ -1114,7 +1136,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         bytes32 poolKey = _poolOf[challengeId];
         if (!_poolBacked(c, _pools[poolKey])) {
             if (block.timestamp < c.filedAt + c.autoSlashDelayAtFiling) revert DelayNotElapsed();
-            _settle(challengeId, c, poolKey);
+            if (block.timestamp >= c.filedAt + c.disputeTimeoutAtFiling) {
+                // Stale: past the hard end. Unwind, never convict.
+                _refundAll(challengeId, c, poolKey);
+            } else {
+                _settle(challengeId, c, poolKey);
+            }
         } else {
             if (block.timestamp < c.filedAt + c.disputeTimeoutAtFiling) revert DelayNotElapsed();
             if (c.courtAtFiling == address(0)) {
@@ -1141,6 +1168,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @dev Ruling beats the timeout: all three branches are terminal and
     ///      `resolve` acts only on `Filed`/`Disputed`, so the clock can never
     ///      overwrite a verdict already handed down.
+    /// @dev AND THE TIMEOUT BEATS A LATE RULING (SHE-246). From `filedAt +
+    ///      disputeTimeoutAtFiling` on, `rule` reverts `WindowClosed` whatever
+    ///      the verdict: the filing is stale and only `resolve`'s non-verdict
+    ///      exits remain, so the deadline the ledger books as `liveUntil` is
+    ///      the true end of slashability. `TokenCourt.refer` already refuses a
+    ///      case whose vote plus `FINALIZE_BUFFER` would not fit inside this
+    ///      deadline (`InsufficientClock`), so an honest `finalize` always
+    ///      lands before it; one that arrives late bubbles this revert (the
+    ///      court swallows only `WrongStatus`), leaves the case intact, and
+    ///      closes it once `resolve` has made the challenge terminal.
     /// @dev CEI is inherited from `_settle`/`_fail`/`_refundAll`; the event is
     ///      emitted first so the log reads verdict-then-consequence.
     function rule(uint256 challengeId, Verdict verdict) external {
@@ -1164,6 +1201,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         bytes32 poolKey = _poolOf[challengeId];
         if (c.status != Status.Filed || !_poolBacked(c, _pools[poolKey])) revert WrongStatus();
         if (c.courtAtFiling == address(0)) revert NotCourt();
+        // Hard deadline - see the natspec. Checked AFTER the status/court gates
+        // so a terminal challenge still reports `WrongStatus` to the court.
+        if (block.timestamp >= c.filedAt + c.disputeTimeoutAtFiling) revert WindowClosed();
         emit ChallengeRuled(challengeId, verdict);
         if (verdict == Verdict.Guilty) {
             _settle(challengeId, c, poolKey);
@@ -1626,6 +1666,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      missed its participation floor, so neither side was found right or
     ///      wrong: nothing is slashed, nothing is forfeited, and the counter-bond
     ///      pool simply comes back.
+    ///
+    ///      THREE ENTRIES, one shape: a court's `Inconclusive` ruling, the
+    ///      Disputed timeout with no court pinned, and (SHE-246) a STALE
+    ///      un-backed filing - `resolve` at or after `filedAt +
+    ///      disputeTimeoutAtFiling` on a challenge nobody settled inside its
+    ///      window. The pool may then be part-funded rather than complete;
+    ///      `_releasePoolIfLast` hands whatever was raised back to its funders.
     ///
     ///      The challenger's bond is not returned whole: an unpriced challenge is
     ///      a free freeze. This contract cannot tell an honest challenger whose

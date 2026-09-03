@@ -2380,11 +2380,18 @@ contract ChallengeGameTest is Test {
             }
         }
 
-        // Past BOTH deadlines, so every challenge is resolvable whichever state
-        // it is in and the order is genuinely free. `rule` itself checks only
-        // `status == Disputed`, never the clock, so warping this far forecloses
-        // nothing for the rule() path exercised below.
-        vm.warp(vm.getBlockTimestamp() + game.disputeTimeout());
+        // All three were filed at the same instant, so they share one hard
+        // deadline (SHE-246): `rule` is open only BEFORE it, and `resolve` on a
+        // DISPUTED challenge only FROM it. Start one second before it, where
+        // every `rule` path is still open and an undisputed `resolve` settles;
+        // the first disputed challenge routed to `resolve` warps to the
+        // deadline, after which every remaining disputed one must also take
+        // `resolve` (a late `rule` reverts `WindowClosed`) and an undisputed
+        // one takes the stale `_refundAll` path - so the custody invariant now
+        // covers that fourth accounting shape as well.
+        uint256 deadline = vm.getBlockTimestamp() + game.disputeTimeout();
+        vm.warp(deadline - 1);
+        bool pastDeadline;
 
         // All six orderings of {0,1,2}.
         uint256 seed = orderSeed % 6;
@@ -2400,13 +2407,17 @@ contract ChallengeGameTest is Test {
             // apiece. Only meaningful for a DISPUTED challenge — `rule` demands
             // `Disputed`, so an undisputed (`Filed`) one always takes `resolve`.
             uint256 choice = (uint256(verdictSeed) >> (2 * idx)) & 0x3;
-            if (disputed[idx] && choice != 0) {
+            if (disputed[idx] && choice != 0 && !pastDeadline) {
                 IChallengeGame.Verdict v = choice == 1
                     ? IChallengeGame.Verdict.Guilty
                     : choice == 2 ? IChallengeGame.Verdict.NotGuilty : IChallengeGame.Verdict.Inconclusive;
                 vm.prank(court);
                 game.rule(ids[idx], v);
             } else {
+                if (disputed[idx] && !pastDeadline) {
+                    vm.warp(deadline);
+                    pastDeadline = true;
+                }
                 game.resolve(ids[idx]);
             }
             _assertLiveBondsBacked();
