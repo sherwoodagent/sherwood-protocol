@@ -382,16 +382,10 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
         vm.expectRevert(IExposureLedger.CoverageFrozen.selector);
         ledger.retireApproval(address(mgov), p1, guardian);
 
-        // Unfreezing clears the freeze block — but it re-books the lock into
-        // the CURRENT bucket (SHE-213: one further challenge window from the
-        // unfreeze), so the sweep waits for that bucket to age out too.
+        // Unfreezing clears the block; the sweep then succeeds.
         vm.prank(freezer);
         ledger.unfreezeCoverage(address(mgov), p1);
-        vm.expectRevert(IExposureLedger.ChallengeWindowOpen.selector);
         ledger.retireApproval(address(mgov), p1, guardian);
-        vm.warp(ledger.epochGenesis() + 2 * ledger.epochLength() + ledger.challengeWindow() + 1);
-        ledger.retireApproval(address(mgov), p1, guardian);
-        assertEq(ledger.lockOf(address(mgov), p1, guardian), 0, "swept once the re-booked bucket aged out");
     }
 
     /// @notice `retireApproval` must revert while the guardian's booked epoch

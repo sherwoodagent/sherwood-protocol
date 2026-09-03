@@ -1035,17 +1035,35 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposure(guardian), 0, "and released after it");
     }
 
-    /// @notice REPEATED FREEZE MOVES NOTHING. The second call, even with a
-    ///         later `liveUntil`, only re-emits: the flag did not flip.
-    function test_freezeCoverage_repeatDoesNotMoveTheLockAgain() public {
+    /// @notice A REPEATED FREEZE RAISES THE TARGET, NEVER LOWERS IT. The game
+    ///         calls `freezeCoverage` on EVERY filing; a second concurrent
+    ///         filing's later dispute clock must move the lock later (or SHE-213
+    ///         re-opens one filing later), while an earlier or equal `liveUntil`
+    ///         moves nothing. The flag and counters flip once either way.
+    function test_freezeCoverage_repeatRaisesTheTargetAndNeverLowersIt() public {
         _lockIntoEpoch0();
         uint256 genesis = ledger.epochGenesis();
         vm.startPrank(freezer);
-        ledger.freezeCoverage(address(mgov), 1, genesis + 50 days);
-        ledger.freezeCoverage(address(mgov), 1, genesis + 100 days);
+        ledger.freezeCoverage(address(mgov), 1, genesis + 50 days); // epoch 1
+        assertEq(_bucket(1), 100_000e18);
+        ledger.freezeCoverage(address(mgov), 1, genesis + 30 days); // earlier: no move
+        assertEq(_bucket(1), 100_000e18, "an earlier repeat moves nothing");
+        vm.warp(genesis + 44 days); // a second filing near the end of the first's clock
+        ledger.freezeCoverage(address(mgov), 1, genesis + 74 days); // epoch 2 (horizon edge from day 44 is epoch 3)
         vm.stopPrank();
-        assertEq(_bucket(1), 100_000e18, "still where the first freeze put it");
-        assertEq(_bucket(3), 0, "the repeat's later target was ignored");
+        assertEq(_bucket(1), 0, "left the first target's bucket");
+        assertEq(_bucket(2), 100_000e18, "the later repeat RAISED the bucket");
+        assertTrue(ledger.isCoverageFrozen(address(mgov), 1));
+        assertEq(ledger.frozenCoverageCount(), 1, "the flag flipped once");
+
+        // Day 71: the first target's bucket (1) aged out on day 70; the second
+        // clock runs to day 74. Frozen, slashable, and still COUNTED.
+        vm.warp(genesis + 71 days);
+        assertTrue(ledger.hasFrozenCoverage(guardian));
+        assertEq(ledger.openExposure(guardian), 100_000e18, "counted through the second filing's clock");
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 2, guardian, LOCK_ALL);
+        assertEq(ledger.lockOf(address(mgov), 2, guardian), 0, "no budget is free");
     }
 
     /// @notice FREEZE IS RAISE-ONLY. A lock booked into a bucket LATER than the
@@ -1129,26 +1147,29 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposure(guardian), 0, "released on the booked bucket's own clock");
     }
 
-    /// @notice A LATE UNFREEZE STILL COVERS ONE CHALLENGE WINDOW FROM NOW. The
-    ///         timeout `_fail` is permissionless and may run long after the
-    ///         clock; the lock is re-booked into the current bucket rather than
-    ///         left in one that already expired.
-    function test_unfreezeCoverage_lateUnfreezeReBooksIntoTheCurrentBucket() public {
+    /// @notice A LATE UNFREEZE DOES NOT HOLD A DEAD LOCK. After an acquittal
+    ///         (no pin) past the ordinary filing deadline, nothing can slash the
+    ///         lock, so it goes back to its BOOKED bucket — already expired —
+    ///         and frees the guardian's capacity and exit at once. Flooring at
+    ///         the current bucket would have held both for up to
+    ///         `epochLength + challengeWindow` for no protective reason.
+    function test_unfreezeCoverage_lateUnfreezeReturnsToTheBookedBucketAndFreesADeadLock() public {
         _lockIntoEpoch0();
         uint256 genesis = ledger.epochGenesis();
         vm.warp(genesis + 20 days);
         vm.prank(freezer);
-        ledger.freezeCoverage(address(mgov), 1, genesis + 50 days); // epoch 1, counts to day 70
+        ledger.freezeCoverage(address(mgov), 1, genesis + 50 days); // epoch 1
 
-        vm.warp(genesis + 100 days); // epoch 3
-        assertEq(ledger.openExposure(guardian), 0, "the dispute clock ran out on day 50; nothing to count");
+        vm.warp(genesis + 100 days); // epoch 3; the booked bucket 0 expired on day 42
+        vm.expectEmit(true, true, false, true, address(ledger));
+        emit IExposureLedger.ExposureRebucketed(guardian, _key1(), 100_000e18, 1, 0);
         vm.prank(freezer);
         ledger.unfreezeCoverage(address(mgov), 1);
-        assertEq(_bucket(3), 100_000e18, "re-booked into the current bucket");
-        vm.warp(genesis + 126 days - 1);
-        assertEq(ledger.openExposure(guardian), 100_000e18, "one further challenge window from the unfreeze");
-        vm.warp(genesis + 126 days);
-        assertEq(ledger.openExposure(guardian), 0);
+        assertEq(_bucket(0), 100_000e18, "back in the booked bucket");
+        assertEq(_bucket(3), 0, "NOT held in the current bucket");
+        assertEq(ledger.openExposure(guardian), 0, "a dead lock frees the moment the freeze lifts");
+        ledger.retireApproval(address(mgov), 1, guardian);
+        assertEq(ledger.lockOf(address(mgov), 1, guardian), 0, "and retires at once");
     }
 
     /// @notice UNFREEZE NEVER DROPS BENEATH A STANDING PIN. A pin issued while
@@ -1241,8 +1262,9 @@ contract ExposureLedgerTest is Test {
 
         vm.warp(genesis + 30 days); // current epoch 1
         vm.prank(freezer);
-        ledger.unfreezeCoverage(address(mgov), 1); // max(cur 1, booked 0) = 1: stays
-        assertEq(_bucket(1), 100_000e18, "one bucket after unfreeze");
+        ledger.unfreezeCoverage(address(mgov), 1); // back to the booked bucket 0 (no pin)
+        assertEq(_bucket(0), 100_000e18, "one bucket after unfreeze: the booked one");
+        assertEq(_bucket(1), 0);
 
         vm.prank(freezer);
         ledger.pinCoverageUntil(address(mgov), 1, genesis + 90 days); // -> epoch 3
@@ -2206,13 +2228,13 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposure(guardian), 180_000e18, "k = 2 admits a lock above the stake");
     }
 
-    function test_recordApproval_uint192OverflowGuardReverts() public {
+    function test_recordApproval_uint128OverflowGuardReverts() public {
         _wireRecording();
-        // The lock is min(declared, free budget), so BOTH must exceed uint192
-        // to reach the guard: an absurd stake (1e60 WOOD, unreachable with a
-        // uint128 `stakedAmount` on the real sWOOD) and a whole-budget
-        // declaration. free == 1e60 > type(uint192).max (~6.28e57).
-        swood.setStake(guardian, 1e60);
+        // The lock is min(declared, free budget), so BOTH must exceed uint128
+        // to reach the guard: an absurd stake (unreachable with a uint128
+        // `stakedAmount` on the real sWOOD) and a whole-budget declaration.
+        // Exactly one above the ceiling, so the guard is the `>` it claims.
+        swood.setStake(guardian, uint256(type(uint128).max) + 1);
         mgov.set(1_000e6);
         vm.prank(registry);
         vm.expectRevert(IExposureLedger.InvalidParameter.selector);
