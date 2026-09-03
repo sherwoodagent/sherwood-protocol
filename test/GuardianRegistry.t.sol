@@ -97,7 +97,7 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
         _registerReview(PROPOSAL_ID, ve, ve + REVIEW_PERIOD);
 
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.ReviewOpened(PROPOSAL_ID, 50_000e18);
+        emit IGuardianRegistry.ReviewOpened(address(governor), PROPOSAL_ID, 50_000e18);
         registry.openReview(address(governor), PROPOSAL_ID);
 
         assertEq(swood.totalGuardianStake(), 50_000e18);
@@ -115,7 +115,7 @@ contract GuardianRegistryOpenReviewTest is RegistryTestHarness {
         _registerReview(PROPOSAL_ID, ve, ve + REVIEW_PERIOD);
 
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.ReviewOpened(PROPOSAL_ID, 30_000e18);
+        emit IGuardianRegistry.ReviewOpened(address(governor), PROPOSAL_ID, 30_000e18);
         registry.openReview(address(governor), PROPOSAL_ID);
     }
 
@@ -366,7 +366,7 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         }
 
         vm.expectEmit(true, false, false, false);
-        emit IGuardianRegistry.ApproverCapReached(capPid);
+        emit IGuardianRegistry.ApproverCapReached(address(governor), capPid);
         vm.prank(last);
         vm.expectRevert(IGuardianRegistry.NewSideFull.selector);
         registry.voteOnProposal(

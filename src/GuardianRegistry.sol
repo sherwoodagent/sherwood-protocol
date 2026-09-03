@@ -774,7 +774,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             _voteStake[key][msg.sender] = weight;
 
             if (support == GuardianVoteType.Approve) {
-                _pushApprover(key, proposalId, msg.sender);
+                _pushApprover(key, governor, proposalId, msg.sender);
                 r.approveStakeWeight += weight;
             } else {
                 // No list, no cap: a blocker is only its weight in the tally.
@@ -816,7 +816,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
                 // Block -> Approve.
                 if (_approvers[key].length >= MAX_APPROVERS_PER_PROPOSAL) revert NewSideFull();
                 r.blockStakeWeight -= weight;
-                _pushApprover(key, proposalId, msg.sender); // cap pre-checked above -- must succeed
+                _pushApprover(key, governor, proposalId, msg.sender); // cap pre-checked above -- must succeed
                 r.approveStakeWeight += weight;
             }
             _votes[key][msg.sender] = support;
@@ -839,9 +839,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     }
 
     // ── Internal vote helpers (all take composite bytes32 key) ──
-    function _pushApprover(bytes32 key, uint256 proposalId, address g) private {
+    function _pushApprover(bytes32 key, address governor, uint256 proposalId, address g) private {
         if (_approvers[key].length >= MAX_APPROVERS_PER_PROPOSAL) {
-            emit ApproverCapReached(proposalId);
+            emit ApproverCapReached(governor, proposalId);
             revert NewSideFull();
         }
         _approvers[key].push(g);
@@ -1157,7 +1157,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // should be sized off the stake a guardian actually held when the
         // review they are being judged for was running.
         r.openedAt = uint64(block.timestamp - 1);
-        emit ReviewOpened(proposalId, totalAtOpen);
+        emit ReviewOpened(governor, proposalId, totalAtOpen);
     }
 
     /// @inheritdoc IGuardianRegistry

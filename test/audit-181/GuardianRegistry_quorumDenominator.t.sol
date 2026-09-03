@@ -92,7 +92,7 @@ contract GuardianRegistry_quorumDenominatorTest is RegistryTestHarness {
         // (1_000_000e18), never the attacker-inflated live total
         // (2_100_000e18). `ReviewOpened` carries `totalStakeAtOpen` directly.
         vm.expectEmit(true, false, false, true);
-        emit IGuardianRegistry.ReviewOpened(PROPOSAL_ID, 1_000_000e18);
+        emit IGuardianRegistry.ReviewOpened(address(governor), PROPOSAL_ID, 1_000_000e18);
         registry.openReview(address(governor), PROPOSAL_ID);
 
         // Honest cohort casts its genuine 40% block vote.

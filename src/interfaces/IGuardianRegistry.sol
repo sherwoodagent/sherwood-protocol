@@ -68,7 +68,7 @@ interface IGuardianRegistry {
     event GovernorAdded(address indexed governor);
     /// @notice Governor pushed a proposal's review window at propose time.
     event ReviewRegistered(address indexed governor, uint256 indexed proposalId, uint64 voteEnd, uint64 reviewEnd);
-    event ReviewOpened(uint256 indexed proposalId, uint128 totalStakeAtOpen);
+    event ReviewOpened(address indexed governor, uint256 indexed proposalId, uint128 totalStakeAtOpen);
     /// @notice First vote on a review. `governor` disambiguates: per-vault governors
     ///         all number proposals from 1. Blocker attribution is an off-chain join
     ///         of this, `GuardianVoteChanged` and `ReviewResolved(blocked=true)` (SHE-207).
@@ -87,7 +87,7 @@ interface IGuardianRegistry {
         GuardianVoteType from,
         GuardianVoteType to
     );
-    event ApproverCapReached(uint256 indexed proposalId);
+    event ApproverCapReached(address indexed governor, uint256 indexed proposalId);
     event ReviewResolved(address indexed governor, uint256 indexed proposalId, bool blocked, uint256 slashedAmount);
     event EmergencyReviewOpened(uint256 indexed proposalId, bytes32 callsHash, uint64 reviewEnd);
     event EmergencyReviewCancelled(uint256 indexed proposalId);
