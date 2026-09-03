@@ -194,6 +194,19 @@ contract MockRegistryMinimal is IGuardianRegistry {
         revert NotImplemented();
     }
 
+    /// @dev Permissive by default, unlike the reverting stubs around it: the
+    ///      governor reads this on every propose and execute, so `NotImplemented`
+    ///      would fail every governor fixture (SHE-215).
+    bool internal _ownerBondLive = true;
+
+    function setOwnerBondLive(bool live) external {
+        _ownerBondLive = live;
+    }
+
+    function ownerBondLive(address) external view returns (bool) {
+        return _ownerBondLive;
+    }
+
     function minOwnerStake() external pure returns (uint256) {
         revert NotImplemented();
     }

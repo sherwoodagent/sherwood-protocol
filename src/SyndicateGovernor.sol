@@ -597,6 +597,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ) private returns (uint256 proposalId) {
         if (vault != GovernorParameters.vault) revert VaultNotRegistered();
         if (!ISyndicateVault(vault).isAgent(msg.sender)) revert NotRegisteredAgent();
+        // SHE-215: no live owner bond, no proposal lane.
+        // (`openspec/changes/owner-bond-proposal-gate`)
+        if (!IGuardianRegistry(_guardianRegistry).ownerBondLive(vault)) revert OwnerBondNotLive();
         // Blocks new proposals when the vault still has a non-terminal
         // lifecycle bound to it (Pending / GuardianReview / Approved / Executed).
         // Draft co-proposals do not count toward openProposalCount and are
@@ -708,8 +711,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
         bool isCollaborative = coProposers.length > 0;
 
-        // Review period defaults to zero when registry isn't wired; state machine
-        // still works (voteEnd == reviewEnd → immediate transition to Approved).
         uint256 reviewPeriod_ = IGuardianRegistry(_guardianRegistry).reviewPeriod();
 
         // Sequential storage writes instead of struct literal to avoid Yul
@@ -953,6 +954,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
         address vault = proposal.vault;
         if (_activeProposal != 0) revert StrategyAlreadyActive();
+        // SHE-215: re-checked at execute — the bond can be slashed between
+        // propose and execute (`slashOwnerBond` has no open-proposal gate).
+        // (`openspec/changes/owner-bond-proposal-gate`)
+        if (!IGuardianRegistry(_guardianRegistry).ownerBondLive(vault)) revert OwnerBondNotLive();
         // Cooldown check (skip if no prior settlement)
         uint256 lastSettled = _lastSettledAt;
         if (lastSettled != 0 && block.timestamp < lastSettled + _params.cooldownPeriod) {

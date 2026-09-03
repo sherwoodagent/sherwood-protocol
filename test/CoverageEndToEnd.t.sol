@@ -194,6 +194,8 @@ contract CoverageEndToEndTest is Test {
         (govB, vaultB) = _deploySyndicate();
         registry.addGovernor(address(govA), address(vaultA)); // test contract IS the registry factory
         registry.addGovernor(address(govB), address(vaultB));
+        _bondVaultOwner(address(vaultA));
+        _bondVaultOwner(address(vaultB));
 
         // Each vault resolves its governor through the factory (this contract).
         vm.mockCall(
@@ -1301,5 +1303,22 @@ contract CoverageEndToEndTest is Test {
             stakeNow - (stakeNow * 5_000) / 10_000,
             "the raise applies to reviews opened afterwards"
         );
+    }
+
+    /// @dev SHE-215: `SyndicateGovernor.propose` / `executeProposal` now refuse
+    ///      a vault whose owner-stake slot is unbound, claimed, slashed, or
+    ///      exiting. `SyndicateFactory.createSyndicate` ALWAYS binds that slot,
+    ///      so a hand-built syndicate that skips it models a vault the real
+    ///      factory cannot produce. Binding here restores the fixture to a
+    ///      state the protocol can actually reach.
+    function _bondVaultOwner(address vault_) internal {
+        uint256 bond = swood.minOwnerStake();
+        wood.mint(owner, bond);
+        vm.startPrank(owner);
+        wood.approve(address(swood), bond);
+        swood.prepareOwnerStake(bond);
+        vm.stopPrank();
+        // The test contract is sWOOD's factory.
+        swood.bindOwnerStake(owner, vault_);
     }
 }

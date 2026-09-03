@@ -445,6 +445,11 @@ interface ISyndicateGovernor {
     /// @notice `setTier2CallCapBps` called with 0 or a value above 10_000.
     error InvalidTier2CallCapBps();
 
+    /// @notice The vault's owner-stake slot is unbound, exiting, claimed or
+    ///         slashed, so nothing is slashable behind the proposal lane.
+    ///         Refused by `propose` and by `executeProposal` (SHE-215).
+    error OwnerBondNotLive();
+
     // ── Guardian-review emergency settle errors ──
     error OwnerBondInsufficient();
     error EmergencySettleBlocked();

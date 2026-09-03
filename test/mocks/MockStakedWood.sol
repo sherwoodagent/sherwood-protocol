@@ -206,6 +206,13 @@ contract MockStakedWood is IStakedWood {
         return _ownerStake[vault];
     }
 
+    /// @dev A constant, not a settable slot: `IStakedWood` declares the member but
+    ///      no fixture puts this mock behind a real `GuardianRegistry`, so a setter
+    ///      would have no reachable caller. Restore it when one does (SHE-215).
+    function ownerBondLive(address) external pure returns (bool) {
+        return true;
+    }
+
     /// @dev Anchor-aware slash basis (issue #35). DEFAULTS to live
     ///      `guardianStake`, same pattern as `getPastStake`'s default: most
     ///      fixtures do not care about the anchor distinction, so an
@@ -256,6 +263,8 @@ contract MockStakedWood is IStakedWood {
         }
     }
 
+    /// @dev Models the funding half of `slashOwnerBond` only; the real one also
+    ///      deletes the record, which `ownerBondLive` here cannot observe.
     function slashOwnerBond(address vault) external {
         slashOwnerBondCallCount++;
         lastSlashedVault = vault;

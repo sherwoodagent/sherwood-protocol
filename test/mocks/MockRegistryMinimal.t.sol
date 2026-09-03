@@ -41,6 +41,18 @@ contract MockRegistryMinimalTest is Test {
         assertEq(mock.lastCancelledProposalId(), 42);
     }
 
+    /// @notice `ownerBondLive` defaults to live, and the setter moves off it both ways.
+    function test_liveSurface_ownerBondLiveDefaultsToLive() public {
+        assertTrue(mock.ownerBondLive(address(this)), "the permissive default the governor fixtures rely on");
+        assertTrue(mock.ownerBondLive(address(0xBEEF)), "the default is per-mock, not per-vault");
+
+        mock.setOwnerBondLive(false);
+        assertFalse(mock.ownerBondLive(address(this)), "setOwnerBondLive(false) must model the closed lane");
+
+        mock.setOwnerBondLive(true);
+        assertTrue(mock.ownerBondLive(address(this)), "and it must be reversible");
+    }
+
     function test_stubbedFunction_revertsNotImplemented() public {
         vm.expectRevert(MockRegistryMinimal.NotImplemented.selector);
         mock.voteOnProposal(address(this), 1, IGuardianRegistry.GuardianVoteType.Approve, 0);

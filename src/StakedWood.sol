@@ -175,6 +175,9 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @notice Emitted when a vault owner claims their bond after cooldown elapsed.
     event OwnerUnstakeClaimed(address indexed vault, address indexed owner, uint256 amount);
 
+    /// @notice Emitted when a vault owner cancels a pending bond unstake request.
+    event OwnerUnstakeCancelled(address indexed vault, address indexed owner);
+
     /// @notice Emitted when the factory re-points a vault's owner-stake slot.
     event OwnerStakeSlotTransferred(address indexed vault, address indexed oldOwner, address indexed newOwner);
 
@@ -1071,10 +1074,26 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         emit OwnerUnstakeRequested(vault, block.timestamp);
     }
 
+    /// @notice Cancel a pending owner-bond unstake request.
+    /// @dev Reverses `requestUnstakeOwner` so the propose gate is not a one-way
+    ///      door for the whole cooldown. A slashed slot is deleted and cannot be
+    ///      cancelled back (SHE-215; see `openspec/changes/owner-bond-proposal-gate`).
+    /// @dev nonReentrant omitted — no external calls, no value movement.
+    function cancelUnstakeOwner(address vault) external {
+        OwnerStake storage s = _ownerStakes[vault];
+        if (s.owner != msg.sender || s.stakedAmount == 0) revert NoActiveStake();
+        if (s.unstakeRequestedAt == 0) revert UnstakeNotRequested();
+
+        s.unstakeRequestedAt = 0;
+        s.cooldownAtRequest = 0;
+
+        emit OwnerUnstakeCancelled(vault, msg.sender);
+    }
+
     /// @notice Claim a vault owner's bond after the cooldown has elapsed.
     /// @dev Releases WOOD to the recorded owner and deletes `_ownerStakes[vault]`
-    ///      entirely — the vault then enters grace-period state and new proposals
-    ///      cannot be created until the slot is re-funded.
+    ///      entirely — `ownerBondLive` then reads false and the propose/execute
+    ///      lane stays shut until the slot is re-funded (SHE-215).
     /// @dev RE-FUNDING THE SLOT: `bindOwnerStake` is reachable only from
     ///      `createSyndicate`, i.e. once per vault at birth. The single route back
     ///      to a funded slot on a LIVE vault is `rotateOwner` ->
@@ -1185,6 +1204,15 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @notice A vault's bound owner stake.
     function ownerStake(address v) external view returns (uint256) {
         return _ownerStakes[v].stakedAmount;
+    }
+
+    /// @notice True iff `v`'s owner-stake slot is bound and not exiting.
+    /// @dev Live = a bound owner with no exit requested. Keyed on the owner, not
+    ///      the amount: the `minOwnerStake == 0` sentinel binds a zero-amount slot
+    ///      (SHE-215; `openspec/changes/owner-bond-proposal-gate`).
+    function ownerBondLive(address v) external view returns (bool) {
+        OwnerStake storage s = _ownerStakes[v];
+        return s.owner != address(0) && s.unstakeRequestedAt == 0;
     }
 
     /// @notice A prospective owner's escrowed prepared stake amount.

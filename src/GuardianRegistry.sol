@@ -602,6 +602,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     }
 
     /// @inheritdoc IGuardianRegistry
+    function ownerBondLive(address vault) external view returns (bool) {
+        return swood.ownerBondLive(vault);
+    }
+
+    /// @inheritdoc IGuardianRegistry
     /// @dev Reads the CREATION FLOOR directly, not `requiredOwnerBond`.
     ///
     ///      This used to pass `address(0)` to `requiredOwnerBond` on the

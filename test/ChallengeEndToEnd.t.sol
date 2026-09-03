@@ -245,6 +245,7 @@ contract ChallengeEndToEndTest is Test {
         //    the vault resolves its governor through `governorOf`.
         _deploySyndicate();
         registry.addGovernor(address(gov), address(vault));
+        _bondVaultOwner(address(vault));
         vm.mockCall(
             address(this), abi.encodeWithSignature("governorOf(address)", address(vault)), abi.encode(address(gov))
         );
@@ -1326,6 +1327,23 @@ contract ChallengeEndToEndTest is Test {
         assertEq(ledger.coverageUsdOf(address(gov), qid, g1), 750e18, "Q's coverage from g1 is unchanged");
         assertEq(ledger.liabilityUsd(address(gov), qid), COVERAGE_USD, "Q remains fully covered");
         assertFalse(ledger.isCoverageFrozen(address(gov), qid), "and was never frozen by P's challenge");
+    }
+
+    /// @dev SHE-215: `SyndicateGovernor.propose` / `executeProposal` now refuse
+    ///      a vault whose owner-stake slot is unbound, claimed, slashed, or
+    ///      exiting. `SyndicateFactory.createSyndicate` ALWAYS binds that slot,
+    ///      so a hand-built syndicate that skips it models a vault the real
+    ///      factory cannot produce. Binding here restores the fixture to a
+    ///      state the protocol can actually reach.
+    function _bondVaultOwner(address vault_) internal {
+        uint256 bond = swood.minOwnerStake();
+        wood.mint(owner, bond);
+        vm.startPrank(owner);
+        wood.approve(address(swood), bond);
+        swood.prepareOwnerStake(bond);
+        vm.stopPrank();
+        // The test contract is sWOOD's factory.
+        swood.bindOwnerStake(owner, vault_);
     }
 
     // ── SHE-213: every filing re-buckets the approvers' locks ──

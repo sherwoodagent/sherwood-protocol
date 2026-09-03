@@ -158,6 +158,12 @@ interface IStakedWood {
     function isActiveGuardian(address guardian) external view returns (bool);
     function guardianStake(address guardian) external view returns (uint256);
     function ownerStake(address vault) external view returns (uint256);
+
+    /// @notice True iff `vault`'s owner-stake slot is bound and not exiting —
+    ///         `owner != address(0) && unstakeRequestedAt == 0`. The predicate
+    ///         `SyndicateGovernor.propose` / `executeProposal` gate on (SHE-215).
+    function ownerBondLive(address vault) external view returns (bool);
+
     function totalGuardianStake() external view returns (uint256);
     function preparedStakeOf(address owner) external view returns (uint256);
     function canCreateVault(address owner) external view returns (bool);

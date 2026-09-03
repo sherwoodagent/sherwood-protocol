@@ -348,6 +348,17 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
 
         _asFactory(address(registry), abi.encodeCall(GuardianRegistry.addGovernor, (address(governor), address(vault))));
 
+        // SHE-215: `propose` / `executeProposal` refuse a vault whose
+        // owner-stake slot is unbound, claimed, slashed, or exiting. The real
+        // `SyndicateFactory.createSyndicate` always binds that slot, so this
+        // hand-built syndicate must too or the entire proposal surface is
+        // trivially unreachable for the fuzzer. `admin` (this harness) is the
+        // vault owner; `bindOwnerStake` is factory-gated like the calls above.
+        wood.deal(address(this), MIN_OWNER_STAKE);
+        wood.approve(address(swood), MIN_OWNER_STAKE);
+        swood.prepareOwnerStake(MIN_OWNER_STAKE);
+        _asFactory(address(swood), abi.encodeCall(StakedWood.bindOwnerStake, (address(this), address(vault))));
+
         // Async LP lane. `setWithdrawalQueue` is factory-gated and set-once
         // (G-17, I-28).
         queue = new VaultWithdrawalQueue(address(vault));
