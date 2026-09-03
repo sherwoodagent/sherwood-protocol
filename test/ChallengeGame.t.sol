@@ -2236,6 +2236,39 @@ contract ChallengeGameTest is Test {
         game.setAutoSlashDelay(25 days); // 25d + 5d voteWindow + 1d buffer = 31d > 30d disputeTimeout
     }
 
+    /// @notice SHE-246: the dispute timeout is now the hard end of
+    ///         slashability, so the settle window `[autoSlashDelay,
+    ///         disputeTimeout)` gets a floor that holds WITHOUT a court wired -
+    ///         the referral invariant is vacuous then, and it was the only
+    ///         right-edge bound. Exactly at the floor passes; one second under
+    ///         reverts.
+    function test_settleWindowFloor_disputeTimeoutAtTheFloorPasses_oneSecondUnderReverts() public {
+        uint256 floor = game.MIN_SETTLE_WINDOW();
+        assertEq(floor, 1 days);
+        uint256 delay = game.autoSlashDelay();
+        vm.startPrank(owner);
+        game.setCourt(address(0));
+        vm.expectRevert(IChallengeGame.InvalidParameter.selector);
+        game.setDisputeTimeout(delay + floor - 1);
+        game.setDisputeTimeout(delay + floor);
+        vm.stopPrank();
+        assertEq(game.disputeTimeout(), delay + floor);
+    }
+
+    /// @notice The reverse order: raising `autoSlashDelay` into the floored
+    ///         window reverts the same way, and exactly at the floor passes.
+    function test_settleWindowFloor_autoSlashDelayRaisingIntoTheWindowReverts() public {
+        uint256 floor = game.MIN_SETTLE_WINDOW();
+        uint256 timeout = game.disputeTimeout();
+        vm.startPrank(owner);
+        game.setCourt(address(0));
+        vm.expectRevert(IChallengeGame.InvalidParameter.selector);
+        game.setAutoSlashDelay(timeout - floor + 1);
+        game.setAutoSlashDelay(timeout - floor);
+        vm.stopPrank();
+        assertEq(game.autoSlashDelay(), timeout - floor);
+    }
+
     /// @notice The invariant is VACUOUS with no court wired — there is no
     ///         referral to fit, so neither setter has anything to check against.
     function test_setDisputeTimeout_vacuousWithNoCourtWired() public {

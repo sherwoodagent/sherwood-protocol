@@ -107,14 +107,27 @@ abstract contract ChallengeGameHandler is Properties {
     ///      point is to perturb E-4's economics, not to re-test the bounds.
     function challengeGame_secondary(uint8 selector, uint256 arg0) public {
         selector = uint8(selector % 8);
-        if (selector == 0) _challengeGame_setAutoSlashDelay(clampBetween(arg0, 1 hours, game.disputeTimeout() - 1));
-        else if (selector == 1) _challengeGame_setChallengerBondBps(clampBetween(arg0, 1, 10_000));
-        else if (selector == 2) _challengeGame_setDisputeTimeout(clampBetween(arg0, game.autoSlashDelay() + 1, 90 days));
-        else if (selector == 3) _challengeGame_setFilingsPaused(arg0 % 2 == 0);
-        else if (selector == 4) _challengeGame_setForfeitBurnBps(clampBetween(arg0, 0, 10_000));
-        else if (selector == 5) _challengeGame_setInconclusiveBurnBps(clampBetween(arg0, 0, 10_000));
-        else if (selector == 6) _challengeGame_setProsecutorFeeBps(clampBetween(arg0, 0, 2_000));
-        else _challengeGame_setSettleBurnBps(clampBetween(arg0, 0, 10_000));
+        if (selector == 0) {
+            _challengeGame_setAutoSlashDelay(
+                clampBetween(arg0, 1 hours, game.disputeTimeout() - game.MIN_SETTLE_WINDOW())
+            );
+        } else if (selector == 1) {
+            _challengeGame_setChallengerBondBps(clampBetween(arg0, 1, 10_000));
+        } else if (selector == 2) {
+            _challengeGame_setDisputeTimeout(
+                clampBetween(arg0, game.autoSlashDelay() + game.MIN_SETTLE_WINDOW(), 90 days)
+            );
+        } else if (selector == 3) {
+            _challengeGame_setFilingsPaused(arg0 % 2 == 0);
+        } else if (selector == 4) {
+            _challengeGame_setForfeitBurnBps(clampBetween(arg0, 0, 10_000));
+        } else if (selector == 5) {
+            _challengeGame_setInconclusiveBurnBps(clampBetween(arg0, 0, 10_000));
+        } else if (selector == 6) {
+            _challengeGame_setProsecutorFeeBps(clampBetween(arg0, 0, 2_000));
+        } else {
+            _challengeGame_setSettleBurnBps(clampBetween(arg0, 0, 10_000));
+        }
     }
 
     // ―――――――――――――――――――― Lifecycle composite ――――――――――――――――――――

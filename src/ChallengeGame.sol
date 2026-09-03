@@ -97,6 +97,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      the far side can seat a configuration this contract would refuse.
     uint256 public constant MIN_REFERRAL_SLACK = 1 hours;
 
+    /// @notice Floor on the SETTLE WINDOW `[autoSlashDelay, disputeTimeout)` -
+    ///         the time a permissionless `resolve` has to convict an undisputed
+    ///         filing before the hard deadline makes it stale (SHE-246). With
+    ///         no court wired `_requireWindowFits` is vacuous, so without this
+    ///         floor the owner could set `disputeTimeout = autoSlashDelay + 1`
+    ///         and make every LATER un-backed filing effectively unconvictable.
+    ///         That is a new owner power - before the deadline existed the
+    ///         window had no right edge - so it is bounded here, in BOTH
+    ///         setters, regardless of court wiring. One day is the same order
+    ///         as `FINALIZE_BUFFER`: it survives a chain halt or a keeper
+    ///         outage, and a challenger who cannot call `resolve` within a day
+    ///         of the silence verdict was not going to. With a court wired the
+    ///         referral invariant (`voteWindow + FINALIZE_BUFFER +
+    ///         MIN_REFERRAL_SLACK`) already implies a wider window.
+    uint256 public constant MIN_SETTLE_WINDOW = 1 days;
+
     /// @dev THE GAS FLOOR for a permissionless `resolve`, sized per approver
     ///      plus a base because the slash loop runs first and a flat floor would
     ///      let a large batch consume it before the work that needs protecting.
@@ -304,9 +320,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         disputeTimeoutAtFiling` is the instant from which no path can
     ///         convict on that filing: `rule` reverts `WindowClosed` and
     ///         `resolve` only unwinds. It is the same value `file` books on the
-    ///         ledger as `liveUntil`, so the lock the ledger counts against
-    ///         guardian capacity ages out exactly when the filing stops being
-    ///         able to slash it.
+    ///         ledger as `liveUntil`, so the ledger keeps counting the lock
+    ///         against guardian capacity at least until the filing stops being
+    ///         able to slash it (it ages out of the scan no earlier than the
+    ///         end of the bucket containing `liveUntil` plus the ledger's
+    ///         `challengeWindow` - never before the deadline).
     /// @dev    Deliberately generous relative to `autoSlashDelay`: guardians
     ///         carry the vigilance burden, so the escalation they buy with a
     ///         counter-bond must be worth more than the window they lost.
@@ -2151,25 +2169,32 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         }
     }
 
-    /// @dev Bounded [`MIN_AUTO_SLASH_DELAY`, `disputeTimeout`). Both clocks run
-    ///      from `filedAt`, so a delay at or above the dispute timeout would let
-    ///      a contested challenge time out before the slash it was raised against
-    ///      came due, and the accused would have bought its escalation for
-    ///      nothing. The last check is the cross-contract one, which additionally
-    ///      needs the court's own clocks.
+    /// @dev Bounded [`MIN_AUTO_SLASH_DELAY`, `disputeTimeout - MIN_SETTLE_WINDOW`].
+    ///      Both clocks run from `filedAt`, so a delay at or above the dispute
+    ///      timeout would let a contested challenge time out before the slash it
+    ///      was raised against came due, and the accused would have bought its
+    ///      escalation for nothing; and since the timeout is now also the hard
+    ///      end of slashability, the settle window between the two keeps
+    ///      `MIN_SETTLE_WINDOW` whether or not a court is wired. The last check
+    ///      is the cross-contract one, which additionally needs the court's own
+    ///      clocks.
     function setAutoSlashDelay(uint256 newDelay) external onlyOwner {
-        if (newDelay < MIN_AUTO_SLASH_DELAY || newDelay >= disputeTimeout) revert InvalidParameter();
+        if (newDelay < MIN_AUTO_SLASH_DELAY || newDelay + MIN_SETTLE_WINDOW > disputeTimeout) {
+            revert InvalidParameter();
+        }
         _requireWindowFits(court, newDelay, disputeTimeout);
         emit AutoSlashDelaySet(autoSlashDelay, newDelay);
         autoSlashDelay = newDelay;
     }
 
-    /// @dev Bounded (`autoSlashDelay`, `MAX_DISPUTE_TIMEOUT`] - the same
-    ///      cross-parameter invariant from the other side, plus a ceiling on how
-    ///      long a filing may pin a guardian's coverage. Last check is the
-    ///      cross-contract one, as in `setAutoSlashDelay`.
+    /// @dev Bounded [`autoSlashDelay + MIN_SETTLE_WINDOW`, `MAX_DISPUTE_TIMEOUT`]
+    ///      - the same cross-parameter invariant from the other side, plus a
+    ///      ceiling on how long a filing may pin a guardian's coverage. Last
+    ///      check is the cross-contract one, as in `setAutoSlashDelay`.
     function setDisputeTimeout(uint256 newTimeout) external onlyOwner {
-        if (newTimeout <= autoSlashDelay || newTimeout > MAX_DISPUTE_TIMEOUT) revert InvalidParameter();
+        if (newTimeout < autoSlashDelay + MIN_SETTLE_WINDOW || newTimeout > MAX_DISPUTE_TIMEOUT) {
+            revert InvalidParameter();
+        }
         _requireWindowFits(court, autoSlashDelay, newTimeout);
         emit DisputeTimeoutSet(disputeTimeout, newTimeout);
         disputeTimeout = newTimeout;
