@@ -121,7 +121,7 @@ contract GuardianRegistry_basisAndWiringTest is RegistryTestHarness {
 
         vm.expectEmit(true, true, false, true);
         emit IGuardianRegistry.GuardianVoteCast(
-            2, honestBlocker, IGuardianRegistry.GuardianVoteType.Block, 1_000_000e18
+            address(governor), 2, honestBlocker, IGuardianRegistry.GuardianVoteType.Block, 1_000_000e18
         );
         vm.prank(honestBlocker);
         registry.voteOnProposal(address(governor), 2, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);

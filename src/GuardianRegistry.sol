@@ -36,14 +36,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
 
     // ── Constants ──
     uint256 internal constant BPS_DENOMINATOR = 10_000;
-    /// @notice 7-day epoch — anchors the `_emitBlockerAttribution` epoch index
-    ///         and the `refundSlash` per-epoch cap window.
+    /// @notice 7-day epoch — anchors the `refundSlash` per-epoch cap window.
     uint256 public constant EPOCH_DURATION = 7 days;
+    /// @notice Bounds the slash loop in `resolveReview` (`SlashGasCeiling.t.sol`). No blocker
+    ///         counterpart: the block tally is a scalar and a fixed slot count was a
+    ///         censorship surface (SHE-207). Approver-side squatting: SHE-240.
     uint256 public constant MAX_APPROVERS_PER_PROPOSAL = 100;
-    /// @notice Upper bound on blockers per proposal. Caps the O(n)
-    ///         `BlockerAttributed` emit loop in `_emitBlockerAttribution` so
-    ///         `resolveReview` cannot be gas-DoS'd.
-    uint256 public constant MAX_BLOCKERS_PER_PROPOSAL = 100;
     uint256 public constant LATE_VOTE_LOCKOUT_BPS = 1000;
 
     /// @dev Mirrors `GovernorParameters.MAX_EXECUTION_WINDOW` and the ledger's
@@ -188,9 +186,13 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      own raw own-stake checkpoint at `openedAt`.
     mapping(bytes32 => mapping(address => uint128)) internal _voteStake;
     mapping(bytes32 => address[]) internal _approvers;
-    mapping(bytes32 => address[]) internal _blockers;
+    /// @dev Retired blocker list (SHE-207); slot kept for the UUPS append-only layout.
+    // slither-disable-next-line unused-state
+    mapping(bytes32 => address[]) internal __retiredBlockers;
     mapping(bytes32 => mapping(address => uint256)) internal _approverIndex;
-    mapping(bytes32 => mapping(address => uint256)) internal _blockerIndex;
+    /// @dev Retired (SHE-207); see `__retiredBlockers`.
+    // slither-disable-next-line unused-state
+    mapping(bytes32 => mapping(address => uint256)) internal __retiredBlockerIndex;
 
     struct EmergencyReview {
         bytes32 callsHash;
@@ -249,8 +251,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      returned on `finalizeEmergency`, cleared on cancel/finalize.
     mapping(bytes32 => BatchExecutorLib.Call[]) internal _emergencyCalls;
 
-    // Epoch accounting. `epochGenesis` anchors the `_emitBlockerAttribution`
-    // epoch index and the `refundSlash` per-epoch cap window.
+    // Epoch accounting. `epochGenesis` anchors the `refundSlash` per-epoch
+    // cap window.
     uint256 public epochGenesis;
 
     // Pause state
@@ -705,8 +707,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      called and `voteEnd <= now < reviewEnd`. Snapshots the caller's vote
     ///      weight at `r.openedAt`, growth-gated via `_growthGatedVoteWeight` so a
     ///      voter's own numerator weight cannot outrun the denominator's dilution
-    ///      defense, and adds it to the chosen side's tally. Approvers and
-    ///      Blockers are each capped. Block votes carry no proposed severity: the
+    ///      defense, and adds it to the chosen side's tally. Approvers are capped
+    ///      (the slash loop iterates them); Blockers are NOT — the block tally is
+    ///      a scalar and a fixed blocker slot count was a censorship surface
+    ///      (SHE-207). Block votes carry no proposed severity: the
     ///      slash severity is a deterministic function of block-side decisiveness
     ///      computed at `resolveReview` (see `_severityBps`).
     /// @dev `lockWood` IS THE APPROVER'S DECLARATION — the WOOD it puts behind
@@ -770,15 +774,15 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             _voteStake[key][msg.sender] = weight;
 
             if (support == GuardianVoteType.Approve) {
-                _pushApprover(key, proposalId, msg.sender);
+                _pushApprover(key, governor, proposalId, msg.sender);
                 r.approveStakeWeight += weight;
             } else {
-                _pushBlocker(key, proposalId, msg.sender);
+                // No list, no cap: a blocker is only its weight in the tally.
                 r.blockStakeWeight += weight;
             }
             _votes[key][msg.sender] = support;
             // CEI: the external ledger call runs AFTER every state write above
-            // (`_votes`, tallies, approver/blocker push) so a re-entrant
+            // (`_votes`, tallies, approver push) so a re-entrant
             // voteOnProposal observes committed state — do NOT move any state
             // write below this hook. Same discipline as resolveReview.
             if (support == GuardianVoteType.Approve && address(exposureLedger) != address(0)) {
@@ -788,7 +792,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
                 // at the execute-time quorum.
                 exposureLedger.recordApproval(governor, proposalId, msg.sender, lockWood);
             }
-            emit GuardianVoteCast(proposalId, msg.sender, support, weight);
+            emit GuardianVoteCast(governor, proposalId, msg.sender, support, weight);
         } else {
             // Vote-change: must be before the late lockout window.
             uint256 reviewWindowDuration = uint256(r.reviewEnd) - uint256(r.voteEnd);
@@ -802,20 +806,17 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
 
             uint128 weight = _voteStake[key][msg.sender]; // preserved snapshot
             // LOAD-BEARING INVARIANT: the new-side cap is checked inline BEFORE
-            // any `_remove*` / `_push*` call.
+            // any `_remove*` / `_push*` call. Only the Approve side has one.
             if (existing == GuardianVoteType.Approve) {
-                // Approve -> Block (blockers are capped).
-                if (_blockers[key].length >= MAX_BLOCKERS_PER_PROPOSAL) revert NewSideFull();
+                // Approve -> Block: blockers are uncapped (SHE-207), nothing to check.
                 _removeApprover(key, msg.sender);
                 r.approveStakeWeight -= weight;
-                _pushBlocker(key, proposalId, msg.sender); // cap pre-checked above -- must succeed
                 r.blockStakeWeight += weight;
             } else {
                 // Block -> Approve.
                 if (_approvers[key].length >= MAX_APPROVERS_PER_PROPOSAL) revert NewSideFull();
-                _removeBlocker(key, msg.sender);
                 r.blockStakeWeight -= weight;
-                _pushApprover(key, proposalId, msg.sender); // cap pre-checked above -- must succeed
+                _pushApprover(key, governor, proposalId, msg.sender); // cap pre-checked above -- must succeed
                 r.approveStakeWeight += weight;
             }
             _votes[key][msg.sender] = support;
@@ -833,30 +834,18 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
                     exposureLedger.recordApproval(governor, proposalId, msg.sender, lockWood);
                 }
             }
-            emit GuardianVoteChanged(proposalId, msg.sender, existing, support);
+            emit GuardianVoteChanged(governor, proposalId, msg.sender, existing, support);
         }
     }
 
     // ── Internal vote helpers (all take composite bytes32 key) ──
-    function _pushApprover(bytes32 key, uint256 proposalId, address g) private {
+    function _pushApprover(bytes32 key, address governor, uint256 proposalId, address g) private {
         if (_approvers[key].length >= MAX_APPROVERS_PER_PROPOSAL) {
-            emit ApproverCapReached(proposalId);
+            emit ApproverCapReached(governor, proposalId);
             revert NewSideFull();
         }
         _approvers[key].push(g);
         _approverIndex[key][g] = _approvers[key].length; // 1-indexed
-    }
-
-    function _pushBlocker(bytes32 key, uint256 proposalId, address g) private {
-        // Cap parallels MAX_APPROVERS_PER_PROPOSAL so the
-        // `BlockerAttributed` emit loop in `_emitBlockerAttribution` is
-        // O(MAX_BLOCKERS_PER_PROPOSAL) — bounded gas at `resolveReview`.
-        if (_blockers[key].length >= MAX_BLOCKERS_PER_PROPOSAL) {
-            emit BlockerCapReached(proposalId);
-            revert NewSideFull();
-        }
-        _blockers[key].push(g);
-        _blockerIndex[key][g] = _blockers[key].length; // 1-indexed
     }
 
     /// @dev Swap-and-pop removal of `g` from `_approvers[key]`, keeping
@@ -872,20 +861,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         }
         arr.pop();
         delete _approverIndex[key][g];
-    }
-
-    /// @dev Mirror of `_removeApprover` for blockers.
-    function _removeBlocker(bytes32 key, address g) private {
-        uint256 idx1 = _blockerIndex[key][g];
-        uint256 idx = idx1 - 1;
-        address[] storage arr = _blockers[key];
-        address last = arr[arr.length - 1];
-        if (last != g) {
-            arr[idx] = last;
-            _blockerIndex[key][last] = idx1;
-        }
-        arr.pop();
-        delete _blockerIndex[key][g];
     }
 
     // ── Governor-only (emergency) ──
@@ -1097,7 +1072,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (!r.opened) {
             r.resolved = true;
             r.blocked = false;
-            emit ReviewResolved(proposalId, false, 0);
+            emit ReviewResolved(msg.sender, proposalId, false, 0);
             return;
         }
         // Once block quorum is reached, the proposer can't dodge approver
@@ -1105,7 +1080,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (_isBlocked(r)) revert ReviewNotOpen();
         r.resolved = true;
         r.blocked = false;
-        emit ReviewResolved(proposalId, false, 0);
+        emit ReviewResolved(msg.sender, proposalId, false, 0);
     }
 
     // Permissionless
@@ -1182,7 +1157,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // should be sized off the stake a guardian actually held when the
         // review they are being judged for was running.
         r.openedAt = uint64(block.timestamp - 1);
-        emit ReviewOpened(proposalId, totalAtOpen);
+        emit ReviewOpened(governor, proposalId, totalAtOpen);
     }
 
     /// @inheritdoc IGuardianRegistry
@@ -1207,7 +1182,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (r.resolved) return r.blocked; // idempotent
         if (!r.opened) {
             r.resolved = true;
-            emit ReviewResolved(proposalId, false, 0);
+            emit ReviewResolved(governor, proposalId, false, 0);
             return false;
         }
         // Block-quorum decision: own stake at review open vs the at-open
@@ -1231,10 +1206,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // below were sized from.
             (address[] memory approvers, uint256[] memory bpsPer) = _reviewSlashRates(key, governor, proposalId, r);
             swood.slashGuardians(key, uint256(r.openedAt), approvers, bpsPer);
-            _emitBlockerAttribution(key, governor, proposalId);
+            // No per-blocker emit (SHE-207): attribution is an off-chain join of the
+            // vote events with `ReviewResolved`; every one of them carries `governor`.
         }
 
-        emit ReviewResolved(proposalId, blocked_, 0);
+        emit ReviewResolved(governor, proposalId, blocked_, 0);
         return blocked_;
     }
 
@@ -1406,22 +1382,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         return lo + (hi - lo) * (t * t / 1e18) / 1e18;
     }
 
-    /// @dev Emits `BlockerAttributed(governor, proposalId, epochId, blocker, weight)`
-    ///      for each blocker so Merkl's off-chain bot can build the epoch WOOD
-    ///      campaign's Merkle roots. `governor` disambiguates the (governor,
-    ///      proposalId) review since per-vault governors all number from 1.
-    function _emitBlockerAttribution(bytes32 key, address governor, uint256 proposalId) private {
-        uint256 epochId = (block.timestamp - epochGenesis) / EPOCH_DURATION;
-        address[] storage blockers = _blockers[key];
-        uint256 n = blockers.length;
-        for (uint256 i = 0; i < n; i++) {
-            address b = blockers[i];
-            uint256 w = _voteStake[key][b];
-            if (w == 0) continue;
-            emit BlockerAttributed(governor, proposalId, epochId, b, w);
-        }
-    }
-
     /// @notice Governor finalizes an emergency review after the review window.
     function finalizeEmergency(uint256 proposalId)
         external
@@ -1524,7 +1484,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         _emergencyBlockVotes[eKey][round][msg.sender] = true;
         er.blockStakeWeight += weight;
 
-        emit EmergencyBlockVoteCast(proposalId, msg.sender, weight);
+        emit EmergencyBlockVoteCast(governor, proposalId, msg.sender, weight);
     }
 
     // ── Slash appeal ──

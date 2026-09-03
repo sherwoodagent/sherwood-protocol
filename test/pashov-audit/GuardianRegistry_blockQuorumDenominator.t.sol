@@ -405,7 +405,9 @@ contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
         // `_growthGatedVoteWeight` clamps them back to the 40_000e18 they held
         // 30 days ago — the top-up bought exactly nothing.
         vm.expectEmit(true, true, false, true);
-        emit IGuardianRegistry.GuardianVoteCast(4, attacker, IGuardianRegistry.GuardianVoteType.Block, 40_000e18);
+        emit IGuardianRegistry.GuardianVoteCast(
+            address(governor), 4, attacker, IGuardianRegistry.GuardianVoteType.Block, 40_000e18
+        );
         vm.prank(attacker);
         registry.voteOnProposal(address(governor), 4, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 

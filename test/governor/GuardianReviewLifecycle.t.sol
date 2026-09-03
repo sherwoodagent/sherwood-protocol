@@ -703,9 +703,9 @@ contract GuardianReviewLifecycleTest is Test {
         uint256 expectedBurn = 3 * ((GUARDIAN_STAKE * 1074) / 10_000); // 3 × 2_148e18
         assertEq(burnAfter - burnBefore, expectedBurn, "burn == 3 * (20_000e18 * 1074/10_000)");
 
-        // V1.5: blocker epoch attribution is emitted as `BlockerAttributed` and
-        // attributed off-chain via Merkl. Event inspection is covered in
-        // Phase 3 dedicated tests.
+        // Blocker attribution is derived off-chain from `GuardianVoteCast` /
+        // `GuardianVoteChanged` joined with `ReviewResolved` (SHE-207); there
+        // is no on-chain blocker list or per-blocker emit any more.
     }
 
     /// @notice Vote-change path: first-vote stake snapshot is preserved when a
@@ -746,8 +746,8 @@ contract GuardianReviewLifecycleTest is Test {
         // keep their stake).
         assertEq(swood.guardianStake(g1), GUARDIAN_STAKE, "g1 not slashed - ended as blocker");
 
-        // V1.5: blocker attribution emitted via BlockerAttributed event, not
-        // queryable on-chain. See Phase 3 event-inspection tests.
+        // Blocker attribution is off-chain (SHE-207): `GuardianVoteCast` /
+        // `GuardianVoteChanged` joined with `ReviewResolved`. Not queryable on-chain.
     }
 
     /// @notice No keeper ever calls `openReview`. After `reviewEnd`, anyone calls

@@ -565,7 +565,7 @@ Entry points restricted by a modifier or an internal `msg.sender` check.
 
 | Contract | Function | Restriction | State Modified |
 |----------|----------|-------------|----------------|
-| GuardianRegistry | `voteOnProposal()` | `StakedWood.isActiveGuardian(msg.sender)`, `whenNotPaused` | `_votes`, `_voteStake`, `r.approveStakeWeight` / `blockStakeWeight`, `_approvers` / `_blockers`; calls `ExposureLedger.recordApproval` / `releaseApproval` |
+| GuardianRegistry | `voteOnProposal()` | `StakedWood.isActiveGuardian(msg.sender)`, `whenNotPaused` | `_votes`, `_voteStake`, `r.approveStakeWeight` / `blockStakeWeight`, `_approvers` (blockers keep no list, SHE-207); calls `ExposureLedger.recordApproval` / `releaseApproval` |
 | GuardianRegistry | `voteBlockEmergencySettle()` | `isActiveGuardian`, `whenNotPaused` | `_emergencyBlockVotes`, `er.blockStakeWeight` |
 | StakedWood | `requestUnstakeGuardian()`, `cancelUnstakeGuardian()` | self-scoped to `_guardians[msg.sender]` | `g.unstakeRequestedAt`, `g.cooldownAtRequest`, `g.stakedAt`, `totalGuardianStake`, checkpoints |
 | StakedWood | `approveOwnerStakeBinding()`, `revokeOwnerStakeBinding()` | self-scoped consent write | `approvedBindVault[msg.sender]` |
