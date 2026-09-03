@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
+import {MockCoverageFreezer} from "test/mocks/MockCoverageFreezer.sol";
 import {
     MockWoodTwapOracle,
     DirtyFlagWoodTwapOracle,
@@ -257,7 +258,9 @@ contract ExposureLedgerTest is Test {
     address internal owner = makeAddr("owner");
     address internal guardian = makeAddr("guardian");
     address internal registry = makeAddr("registry");
-    address internal freezer = makeAddr("freezer");
+    // SHE-214: a freezer must answer `challengeWindow()` to wire; a low window so
+    // no test that lowers the ledger's window trips the game-side floor.
+    address internal freezer = address(new MockCoverageFreezer(1 days));
     MockGovernorForLedger internal mgov;
     address internal usdgAsset;
 
@@ -692,19 +695,23 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.coverageFreezer(), address(under));
     }
 
-    /// @notice FAIL CLOSED AT WIRING. A code-bearing freezer that cannot
-    ///         answer `challengeWindow()` is not the game: refuse it rather
-    ///         than wire it with no bound. A codeless pointer cannot file, so
-    ///         there is no filing deadline to desync from — still admitted.
+    /// @notice FAIL CLOSED AT WIRING. A freezer that cannot answer
+    ///         `challengeWindow()` is not the game: refuse it rather than wire
+    ///         it with no bound. Codeless included (SHE-214): the governor's
+    ///         reclaim gate makes a typed call on the wired freezer, so a
+    ///         codeless one would brick bond reclaim, and a pre-committed
+    ///         address could gain code later with no check firing.
     function test_setCoverageFreezer_refusesACodeBearingFreezerThatCannotAnswer() public {
         address deaf = address(new MockDeafFreezer());
         vm.prank(owner);
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        vm.expectRevert(IExposureLedger.CoverageFreezerUnreadable.selector);
         ledger.setCoverageFreezer(deaf);
 
+        address eoa = makeAddr("codelessFreezer");
         vm.prank(owner);
-        ledger.setCoverageFreezer(freezer); // EOA
-        assertEq(ledger.coverageFreezer(), freezer);
+        vm.expectRevert(IExposureLedger.CoverageFreezerUnreadable.selector);
+        ledger.setCoverageFreezer(eoa);
+        assertEq(ledger.coverageFreezer(), address(0));
     }
 
     /// @notice THE ORDERING THE OLD FLOOR HAPPENED TO CAP. Pre-SHE-231 the
@@ -732,25 +739,28 @@ contract ExposureLedgerTest is Test {
     }
 
     /// @notice The bound in `setChallengeWindow` used to be `try/catch {}`:
-    ///         a freezer that stopped answering silently dropped it. Now the
-    ///         read fails closed, and the escape is the ordinary rotation.
+    ///         a freezer that stopped answering silently dropped it. Now a
+    ///         LOWERING fails closed (a raise never reads the game — it cannot
+    ///         violate the bound), and the escape is the ordinary rotation.
     function test_setChallengeWindow_failsClosedWhenTheWiredFreezerStopsAnswering() public {
         MockGameWindow game = new MockGameWindow(1 days);
         vm.startPrank(owner);
         ledger.setCoverageFreezer(address(game));
-        ledger.setChallengeWindow(15 days); // answering: bound checked, passes
-        assertEq(ledger.challengeWindow(), 15 days);
+        ledger.setChallengeWindow(10 days); // answering: bound checked, passes
+        assertEq(ledger.challengeWindow(), 10 days);
 
         game.setMute(true);
-        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        ledger.setChallengeWindow(16 days);
+        ledger.setChallengeWindow(16 days); // a raise does not consult the game
+        assertEq(ledger.challengeWindow(), 16 days);
+        vm.expectRevert(IExposureLedger.CoverageFreezerUnreadable.selector);
+        ledger.setChallengeWindow(15 days);
 
         // Not a brick: nothing is frozen, so the slot rotates and the bound
         // is simply absent again.
         ledger.setCoverageFreezer(address(0));
-        ledger.setChallengeWindow(16 days);
+        ledger.setChallengeWindow(15 days);
         vm.stopPrank();
-        assertEq(ledger.challengeWindow(), 16 days);
+        assertEq(ledger.challengeWindow(), 15 days);
     }
 
     /// @notice ADR 2026-07-26 — THE SETTLEMENT-COVERAGE BUG.
