@@ -28,13 +28,13 @@ exclude_lints = ["screaming-snake-case-immutable", "mixed-case-variable"]
 # here only documents that — forge would do it regardless, and plain optimizer /
 # optimizer_runs / via_ir keys in this profile are ignored by the coverage command.
 #
-# Unoptimized legacy codegen then blows the EVM stack in the eight largest
+# Unoptimized legacy codegen then blows the EVM stack in the nine largest
 # contracts. The escape hatch that does survive forge's override is per-file
-# compilation restrictions: those eight compile in a second solc group that keeps
+# compilation restrictions: those nine compile in a second solc group that keeps
 # via_ir + the optimizer, while every other file stays on the legacy pipeline and
 # reports accurate coverage.
 #
-# What this costs: the eight restricted files are absent from the report entirely
+# What this costs: the nine restricted files are absent from the report entirely
 # (forge drops via_ir units rather than mis-mapping them) — they show up in neither
 # the summary nor lcov.info. Their TESTS still run and still gate the job; only the
 # line/branch instrumentation is missing. The alternative was no coverage signal at
@@ -99,7 +99,7 @@ via_ir = true
 # Profile used by the Medusa/Echidna harness under test/fizz/. The fuzzers compile
 # through crytic-compile, which shells out to this profile.
 #
-# via_ir stays on for the same reason [profile.coverage] has to special-case eight
+# via_ir stays on for the same reason [profile.coverage] has to special-case nine
 # files: the harness links against the largest contracts, and legacy codegen blows
 # the stack on them. Unlike coverage, nothing here overrides via_ir, so one setting
 # covers the whole project.

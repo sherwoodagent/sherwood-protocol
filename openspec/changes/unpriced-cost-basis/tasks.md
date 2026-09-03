@@ -74,4 +74,4 @@ the credit it bounds — a credit merged without its clamp is an extraction path
 ## 6. Follow-through
 
 - [x] 6.1 Update `openspec/changes/launchpad-strategy/design.md` where it documents settlement leaving P&L understated, pointing at this change.
-- [ ] 6.2 Note in the PR description that this fixes a `ConcentratedLiquidityStrategy` defect that predates the launchpad work, so reviewers do not read the CL diff as scope creep.
+- [x] 6.2 Note in the PR description that this fixes a `ConcentratedLiquidityStrategy` defect that predates the launchpad work, so reviewers do not read the CL diff as scope creep.
