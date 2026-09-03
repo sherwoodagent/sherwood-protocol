@@ -1486,6 +1486,82 @@ contract ChallengeEndToEndTest is Test {
         uint256 burned = (bond * game.challengeOf(cid).inconclusiveBurnBpsAtFiling) / 10_000;
         assertGt(burned, 0, "fixture: the free-freeze price is non-zero");
         assertEq(wood.balanceOf(challenger), challengerBefore + bond - burned, "bond back net of the round burn");
+
+        // Capacity is not over-committed: once the pinned bucket has aged out
+        // too, a fresh approval by the same guardian lands at full size.
+        vm.warp(_bucketExpiry(_epochOf(rearmedUntil)) + 1);
+        assertEq(ledger.openExposure(g1), 0, "nothing left counted");
+        vm.prank(agent);
+        gov.settleProposal(pid);
+        gov.resolveProposalState(pid);
+        uint256 pid2 = _proposeApproveExecuteWithDuration(30 days);
+        assertEq(ledger.lockOf(address(gov), pid2, g1), G1_STAKE, "a fresh lock lands at full size");
+        assertEq(ledger.openExposure(g1), G1_STAKE, "and is the only thing counted");
+    }
+
+    /// @notice THE DEADLINE READS THE PINNED TIMEOUT, NOT THE LIVE ONE. An
+    ///         owner raising `disputeTimeout` after a filing must not extend
+    ///         that filing's slashability past the `liveUntil` it booked on the
+    ///         ledger - that would be SHE-246 reopened by a setter. The filing
+    ///         is placed so `liveUntil` is the LAST second of its bucket: the
+    ///         bucket then ages out `challengeWindow` after the deadline, well
+    ///         inside the raised clock, so the ledger boundary and the stale
+    ///         `resolve` are checked in one run under both clocks.
+    function test_deadlineReadsThePinnedTimeout_unbackedResolveUnwindsAndTheLedgerIsUnmoved() public {
+        uint256 pid = _proposeApproveExecuteWithDuration(30 days);
+        uint256 executedAt = gov.getProposal(pid).executedAt;
+        uint256 oldTimeout = game.disputeTimeout();
+        uint256 e = _epochOf(executedAt + 1 + oldTimeout);
+        uint256 fileAt = ledger.epochGenesis() + (e + 1) * EPOCH_LENGTH - 1 - oldTimeout;
+        assertGe(fileAt, executedAt + 1, "fixture: filed after execution");
+        vm.warp(fileAt);
+        uint256 cid = _file(challenger, pid, "ipfs://pinned");
+        assertEq(game.challengeOf(cid).disputeTimeoutAtFiling, oldTimeout, "fixture: pinned the old clock");
+
+        // Hoisted: a call in argument position would consume the prank.
+        uint256 maxTimeout = game.MAX_DISPUTE_TIMEOUT();
+        vm.prank(owner);
+        game.setDisputeTimeout(maxTimeout);
+        uint256 liveDeadline = fileAt + game.disputeTimeout();
+        uint256 boundary = _bucketExpiry(e) + 1;
+        assertGt(liveDeadline, boundary, "fixture: the live clock outlives the booked bucket");
+
+        vm.warp(boundary);
+        assertTrue(ledger.isCoverageFrozen(address(gov), pid), "still frozen, nobody resolved");
+        assertEq(ledger.openExposure(g1), 0, "the raise moved nothing: the lock aged out at the booked liveUntil");
+
+        game.resolve(cid);
+        assertEq(
+            uint256(game.challengeOf(cid).status),
+            uint256(IChallengeGame.Status.Inconclusive),
+            "stale on the PINNED clock"
+        );
+        assertEq(swood.guardianStake(g1), G1_STAKE, "the live clock convicts nothing");
+    }
+
+    function test_deadlineReadsThePinnedTimeout_ruleRevertsAtTheOldDeadlineAfterARaise() public {
+        (uint256 cid, address stubCourt) = _fileAndDisputeWithStubCourt();
+        IChallengeGame.Challenge memory c = game.challengeOf(cid);
+        uint256 oldDeadline = c.filedAt + c.disputeTimeoutAtFiling;
+
+        // Hoisted: a call in argument position would consume the prank.
+        uint256 maxTimeout = game.MAX_DISPUTE_TIMEOUT();
+        vm.prank(owner);
+        game.setDisputeTimeout(maxTimeout);
+        assertGt(c.filedAt + game.disputeTimeout(), oldDeadline, "fixture: raised");
+
+        vm.warp(oldDeadline);
+        vm.prank(stubCourt);
+        vm.expectRevert(IChallengeGame.WindowClosed.selector);
+        game.rule(cid, IChallengeGame.Verdict.Guilty);
+
+        game.resolve(cid);
+        assertEq(
+            uint256(game.challengeOf(cid).status),
+            uint256(IChallengeGame.Status.Failed),
+            "timed out on the pinned clock"
+        );
+        assertEq(swood.guardianStake(g1), G1_STAKE, "never slashed");
     }
 
     /// @notice `rule` is open one second before the deadline and shut from the
