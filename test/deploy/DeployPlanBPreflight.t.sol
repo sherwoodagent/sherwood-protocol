@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {DeployPlanB} from "../../script/DeployPlanB.s.sol";
 import {ExposureLedger} from "../../src/ExposureLedger.sol";
+import {IExposureLedger} from "../../src/interfaces/IExposureLedger.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
@@ -709,29 +710,48 @@ contract DeployPlanBPreflightTest is Test {
     }
 
     /// @dev The shipped value, asserted on the DEPLOYED state and pinned to the
-    ///      script's own constant so the two cannot drift. 7,000 is a 30%
-    ///      allowance; 5,000 (the ledger floor) was rejected as too costly to
-    ///      guardian return on equity.
+    ///      script's own constant so the two cannot drift. 5,000 is a 50%
+    ///      allowance. It was once rejected as too costly to guardian return on
+    ///      equity, but that was under full-coverage reservation; with declared
+    ///      locks (SHE-227) guardian ROE is 1.6-4.2%/yr at 0.50, and the haircut
+    ///      is the only buffer between the WOOD price at approval and at verdict
+    ///      (SHE-182 launch configuration).
     function test_deploy_seatsTheShippedHaircut() public {
-        assertEq(script.DEFAULT_WOOD_HAIRCUT_BPS(), 7_000, "the shipped haircut is 7,000 -- a 30% allowance");
+        assertEq(script.DEFAULT_WOOD_HAIRCUT_BPS(), 5_000, "the shipped haircut is 5,000 -- a 50% allowance");
 
         _run();
 
         ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
-        assertEq(ledger.woodHaircutBps(), 7_000, "the haircut must be seated by the script, not left at 10,000");
+        assertEq(ledger.woodHaircutBps(), 5_000, "the haircut must be seated by the script, not left at 10,000");
 
         // It is a real discount on a real valuation, not a stored number: the
-        // composed price is 70% of what the market source reports.
-        assertEq(ledger.woodPriceX8(), (WOOD_MARKET_X8 * 7_000) / 10_000, "the allowance reaches the price");
+        // composed price is 50% of what the market source reports.
+        assertEq(ledger.woodPriceX8(), (WOOD_MARKET_X8 * 5_000) / 10_000, "the allowance reaches the price");
     }
 
     /// @dev An operator override is honoured, and the floor still binds. The
     ///      ledger's own setter rejects anything under 5,000 mid-broadcast, so
     ///      this proves the script does not quietly widen the range.
+    /// @dev The override here is ABOVE the default, so it does not reach the
+    ///      floor branch — `test_deploy_refusesAHaircutBelowTheLedgerFloor`
+    ///      does, and that is the boundary that matters now.
     function test_deploy_honoursAHaircutOverrideAndRespectsTheFloor() public {
         bookHaircutBps = 6_000;
         _run();
         assertEq(ExposureLedger(swood.exposureLedger()).woodHaircutBps(), 6_000, "an override must be seated");
+    }
+
+    /// @notice ONE BPS BELOW THE SHIPPED DEFAULT. `DEFAULT_WOOD_HAIRCUT_BPS`
+    ///         now EQUALS the ledger's `MIN_WOOD_HAIRCUT_BPS` (both 5,000), so
+    ///         the default sits exactly on the revert boundary and there is no
+    ///         margin left to test with. This pins the boundary itself: the
+    ///         refusal comes from the ledger's own setter, as `InvalidParameter`
+    ///         raised mid-broadcast, which is precisely why the script mirrors
+    ///         the floor and asserts it after the broadcast as well.
+    function test_deploy_refusesAHaircutBelowTheLedgerFloor() public {
+        bookHaircutBps = 4_999;
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        _run();
     }
 
     // ─────────────── pre-flight 10: the ledger owner (issue #89) ───────────────

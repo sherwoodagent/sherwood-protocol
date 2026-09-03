@@ -1,0 +1,17 @@
+{
+  "name": "fee-ladder",
+  "title": "Fee ladder",
+  "ticket": "SHE-18",
+  "question": "Which fee rate is actually the depositor's lever?",
+  "note": "The management-capped variant (100/2000) is not a proposal in any ticket. It is here to test the finding that the MANAGEMENT rate, not the performance rate, is what the depositor should care about: management accrues on asset-seconds for every day a proposal is open, win or lose, so a fund deployed most of the year pays it in full. Note also that the '#330 reading' is a judgement call -- two of the three #330 constants no longer exist post-audit -- and that it is pinned to the LITERAL 500/1500 of the ticket, not to the live caps. The fee pair in every label below is re-rendered from the resolved fees, so a label cannot outlive a constant it names.",
+  "cells": [
+    {"label": "current 200/2000", "overrides": {"stage": "growth", "fee_set": "current", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "#330 reading 500/1500", "overrides": {"stage": "growth", "fee_set": "she330_caps", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "post-audit ceilings 300/2500", "overrides": {"stage": "growth", "fee_set": "worst_stack", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "management-capped 100/2000", "overrides": {"stage": "growth", "fee_set": "mgmt_capped", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "mature @ current 200/2000", "overrides": {"stage": "mature", "fee_set": "current", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "mature @ #330 500/1500", "overrides": {"stage": "mature", "fee_set": "she330_caps", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "mature @ ceilings 300/2500", "overrides": {"stage": "mature", "fee_set": "worst_stack", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "mature @ mgmt-capped 100/2000", "overrides": {"stage": "mature", "fee_set": "mgmt_capped", "tvl": 10000000.0, "wood_price": 0.05}}
+  ]
+}

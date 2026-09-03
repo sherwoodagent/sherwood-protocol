@@ -1,0 +1,20 @@
+{
+  "name": "launch-plan",
+  "title": "Launch plan: stacking the recommended changes",
+  "ticket": "SHE-182 / SHE-227",
+  "question": "Starting from the protocol as it ships today, what does each recommended change buy, and what does the launch configuration underwrite at spot and at the tokenomics anchor?",
+  "note": "Cells stack in order: (0) today as scripted -- full reservation, 0.70 haircut, nothing certified, WOOD at the spot-derived price; (1) SHE-227 declared locks (reservation_mode shared, assumes sherwood-protocol#293 lands); (2) the 0.50 haircut now seated in DeployPlanB; (3) the three launch adapters certified at 50 bps so only 20% of notional stays uncertified; (4) the same at the $0.05 tokenomics anchor. Then the growth and mature profiles under the launch configuration. Bootstrap = 3 approvers, $250k funds, 6 proposals/yr; growth = 5 approvers, $1M funds, 12/yr.",
+  "cells": [
+    {"label": "0 today as scripted (full, 0.70, 100% tier-2, spot)", "overrides": {"stage": "bootstrap", "reservation_mode": "full", "wood_haircut_bps": 7000, "tier2_share": 1.0, "tvl": 1000000.0, "wood_price": 0.00627821}},
+    {"label": "1 + declared locks (SHE-227)", "overrides": {"stage": "bootstrap", "reservation_mode": "shared", "wood_haircut_bps": 7000, "tier2_share": 1.0, "tvl": 1000000.0, "wood_price": 0.00627821}},
+    {"label": "2 + haircut 0.50 (DeployPlanB)", "overrides": {"stage": "bootstrap", "reservation_mode": "shared", "tier2_share": 1.0, "tvl": 1000000.0, "wood_price": 0.00627821}},
+    {"label": "3 + launch adapters certified (20% tier-2)", "overrides": {"stage": "bootstrap", "reservation_mode": "shared", "tier2_share": 0.2, "tvl": 1000000.0, "wood_price": 0.00627821}},
+    {"label": "4 launch config @ $0.05", "overrides": {"stage": "bootstrap", "reservation_mode": "shared", "tier2_share": 0.2, "tvl": 1000000.0, "wood_price": 0.05}},
+    {"label": "5 growth under launch config @ spot", "overrides": {"stage": "growth", "reservation_mode": "shared", "tier2_share": 0.2, "tvl": 10000000.0, "wood_price": 0.00627821}},
+    {"label": "6 growth under launch config @ $0.05", "overrides": {"stage": "growth", "reservation_mode": "shared", "tier2_share": 0.2, "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "7 growth, 3 approvers @ $0.05", "overrides": {"stage": "growth", "reservation_mode": "shared", "tier2_share": 0.2, "approvers_per_proposal": 3, "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "8 mature under launch config @ $0.05", "overrides": {"stage": "mature", "reservation_mode": "shared", "tvl": 100000000.0, "wood_price": 0.05}},
+    {"label": "9 mature at NEW fee ceilings 300/2500", "overrides": {"stage": "mature", "reservation_mode": "shared", "mgmt_bps": 300, "perf_bps": 2500, "tvl": 100000000.0, "wood_price": 0.05}},
+    {"label": "10 mature at OLD fee ceilings 500/3000", "overrides": {"stage": "mature", "reservation_mode": "shared", "mgmt_bps": 500, "perf_bps": 3000, "tvl": 100000000.0, "wood_price": 0.05}}
+  ]
+}

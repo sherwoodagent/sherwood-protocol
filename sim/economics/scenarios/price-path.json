@@ -1,0 +1,17 @@
+{
+  "name": "price-path",
+  "title": "Moving WOOD price",
+  "ticket": null,
+  "question": "What does a year on a moving WOOD price do to the lockup?",
+  "note": "WOOD demand is USD-denominated, so the WOOD quantity is exactly inversely proportional to price. The reported lockup is the 12-month mean; binding TVL uses the WORST (lowest-price) month, because that is the month the constraint actually binds in. A re-rating relieves the constraint slowly and a crash tightens it immediately.",
+  "cells": [
+    {"label": "flat @ spot $0.00628",
+     "overrides": {"stage": "growth", "tvl": 10000000.0, "wood_price": 0.00627821}},
+    {"label": "re-rate $0.0063 -> $0.05 over 12 months",
+     "overrides": {"stage": "growth", "tvl": 10000000.0, "wood_price": 0.0063,
+                   "wood_price_path": [[0, 0.0063], [11, 0.05]]}},
+    {"label": "crash $0.05 -> $0.01 over 12 months",
+     "overrides": {"stage": "growth", "tvl": 10000000.0, "wood_price": 0.05,
+                   "wood_price_path": [[0, 0.05], [11, 0.01]]}}
+  ]
+}

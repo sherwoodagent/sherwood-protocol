@@ -1,0 +1,18 @@
+{
+  "name": "reference-cells",
+  "title": "Reference cells",
+  "ticket": "SHE-182",
+  "question": "The standing grid: three lifecycle stages at three TVLs.",
+  "note": "Stage profiles (fund size, cadence, proposal size, tier-2 share, approvers, return, win rate) are MODELLING ASSUMPTIONS invented for this simulation -- they are in assumptions.json and are the first thing to argue about. The ratios (fee as % of gross, stake per $1 of coverage) are far more robust than the absolute dollars, which scale linearly in TVL anyway.",
+  "cells": [
+    {"label": "bootstrap @ $1M", "overrides": {"stage": "bootstrap", "tvl": 1000000.0, "wood_price": 0.05}},
+    {"label": "bootstrap @ $10M", "overrides": {"stage": "bootstrap", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "bootstrap @ $100M", "overrides": {"stage": "bootstrap", "tvl": 100000000.0, "wood_price": 0.05}},
+    {"label": "growth @ $1M", "overrides": {"stage": "growth", "tvl": 1000000.0, "wood_price": 0.05}},
+    {"label": "growth @ $10M", "overrides": {"stage": "growth", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "growth @ $100M", "overrides": {"stage": "growth", "tvl": 100000000.0, "wood_price": 0.05}},
+    {"label": "mature @ $1M", "overrides": {"stage": "mature", "tvl": 1000000.0, "wood_price": 0.05}},
+    {"label": "mature @ $10M", "overrides": {"stage": "mature", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "mature @ $100M", "overrides": {"stage": "mature", "tvl": 100000000.0, "wood_price": 0.05}}
+  ]
+}

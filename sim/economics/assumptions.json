@@ -1,0 +1,116 @@
+{
+  "_comment": "ASSUMPTIONS, NOT CODE FACTS. Everything in this file is either a doc figure with no on-chain source, or a modelling profile the simulation invents. Nothing here is extracted from Solidity and nothing here is covered by the drift check. Argue with this file first.",
+
+  "doc_assumptions": {
+    "wood_total_supply": {
+      "value": 500000000.0,
+      "unit": "WOOD",
+      "source": "sherwood/docs/tokenomics-wood.md:553",
+      "kind": "doc",
+      "note": "The production WOOD token is in neither repo. The repo holds three mutually inconsistent supply numbers (500M / 100M fixture / 1B retired). Every %-of-supply figure inherits this."
+    },
+    "wood_effective_float_m12": {
+      "value": 230000000.0,
+      "unit": "WOOD",
+      "source": "sherwood/docs/tokenomics-wood.md:596",
+      "kind": "doc",
+      "note": "Midpoint of the 210-250M M12 effective-float range. Every %-of-float and every binding-TVL figure inherits this."
+    },
+    "wood_price_tokenomics_anchor": {
+      "value": 0.05,
+      "unit": "USD",
+      "source": "sherwood/docs/tokenomics-wood.md:453",
+      "kind": "doc",
+      "note": "The buyback table's price anchor. Not a market price."
+    },
+    "wood_price_stretch_anchors": {
+      "value": [0.2, 1.0],
+      "unit": "USD",
+      "source": "none",
+      "kind": "extrapolation",
+      "note": "No repo source at all. They exist only to show that every WOOD quantity is exactly inversely proportional to price."
+    },
+    "certified_bound_bps": {
+      "value": 50,
+      "unit": "bps of notional",
+      "source": "docs/papers/guardian-network-economic-security.md:152",
+      "kind": "doc",
+      "note": "The protocol's own worked example for a certified tier-0/1 adapter. Real bounds are per-adapter in [1, 9999] (TierRegistry.sol:496) and NO deploy script issues any certification -- at launch everything is tier 2 at full notional."
+    },
+    "flywheel_threshold_frac_of_float": {
+      "value": 0.25,
+      "unit": "fraction",
+      "source": "none",
+      "kind": "modelling",
+      "note": "The share of effective float at which required lockup is called 'binding'. Arbitrary; the report also shows 10% and 50%."
+    }
+  },
+
+  "stage_profiles": {
+    "_comment": "Invented. Fund size, cadence, proposal size, tier-2 share, approvers, gross return and win rate come from nowhere in the repo. The RATIOS the model reports (fee as % of gross, stake per $1 of coverage) are far more robust than the absolute dollars.",
+    "bootstrap": {
+      "avg_fund_size": 250000.0,
+      "proposals_per_fund_year": 6,
+      "proposal_frac_of_fund": 0.5,
+      "strategy_duration_days": 14,
+      "approvers_per_proposal": 3,
+      "tier2_share": 1.0,
+      "gross_return_annual": 0.08,
+      "frac_profitable": 0.55,
+      "loss_ratio": 0.6,
+      "challenge_rate": 0.05
+    },
+    "growth": {
+      "avg_fund_size": 1000000.0,
+      "proposals_per_fund_year": 12,
+      "proposal_frac_of_fund": 0.4,
+      "strategy_duration_days": 14,
+      "approvers_per_proposal": 5,
+      "tier2_share": 0.4,
+      "gross_return_annual": 0.12,
+      "frac_profitable": 0.6,
+      "loss_ratio": 0.6,
+      "challenge_rate": 0.02
+    },
+    "mature": {
+      "avg_fund_size": 5000000.0,
+      "proposals_per_fund_year": 24,
+      "proposal_frac_of_fund": 0.3,
+      "strategy_duration_days": 21,
+      "approvers_per_proposal": 7,
+      "tier2_share": 0.15,
+      "gross_return_annual": 0.15,
+      "frac_profitable": 0.65,
+      "loss_ratio": 0.6,
+      "challenge_rate": 0.01
+    }
+  },
+
+  "fee_sets": {
+    "_comment": "mgmt_bps / perf_bps only. The splits always come from ProtocolConfig.sol via the extractor. A 'label' here is the NAME of the set and carries no numbers: constants.resolve_fee_set appends the resolved mgmt/perf pair, so a label can never outlive a constant it names.",
+    "current": {
+      "label": "Current deployed defaults",
+      "mgmt_bps": "MANAGEMENT_FEE_BPS_DEPLOYED",
+      "perf_bps": "DEFAULT_AGENT_FEE_BPS",
+      "note": "Both sides read from the extracted constants, so this set moves if the source moves."
+    },
+    "she330_caps": {
+      "label": "#330 reading (fixed history)",
+      "mgmt_bps": 500,
+      "perf_bps": 1500,
+      "note": "LITERALS ON PURPOSE. #330's targets are a historical position, not a live parameter: they must not track a constant this repo later moved, or the cell stops answering its own question. What actually happened to the two caps since: management stood at 500 and is lowered to 300 in the launch configuration (SHE-182 / SHE-18); performance was RAISED to 3000 post-audit and is lowered to 2500 in the same change. Two of the three #330 constants no longer exist post-audit, so '#330 targets' is read here as rate ceilings under the current two-number model."
+    },
+    "worst_stack": {
+      "label": "Post-audit ceilings (MAX caps)",
+      "mgmt_bps": "MAX_MANAGEMENT_FEE_BPS",
+      "perf_bps": "MAX_PERFORMANCE_FEE_BPS",
+      "note": "Every rate at its live hard ceiling, read from the source at run time. This is the unambiguous SHE-18 fee-stacking case, and the rendered label carries whatever the ceilings currently are."
+    },
+    "mgmt_capped": {
+      "label": "Management-capped",
+      "mgmt_bps": 100,
+      "perf_bps": "DEFAULT_AGENT_FEE_BPS",
+      "note": "Not a proposal in any ticket. It exists to test the finding that the MANAGEMENT rate, not the performance rate, is the depositor's real lever once a fund is deployed most of the year."
+    }
+  }
+}

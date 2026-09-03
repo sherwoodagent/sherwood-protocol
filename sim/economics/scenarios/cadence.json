@@ -1,0 +1,15 @@
+{
+  "name": "cadence",
+  "title": "Proposal cadence",
+  "ticket": null,
+  "question": "How much of the fee load is set by how often a fund trades, rather than by the rates?",
+  "note": "Management fee accrues only while a proposal is open, so cadence x duration is what turns a rate into a bill. 24 x 21 days is 138% of the year, capped at 100%: such a fund pays the full headline management rate. Note that script/Deploy.s.sol ships MAX_STRATEGY_DAYS at 14, below the factory's 30-day ceiling, so the 21-day cells assume that deploy-time parameter is raised.",
+  "cells": [
+    {"label": "6/yr x 14d", "overrides": {"stage": "growth", "proposals_per_fund_year": 6, "strategy_duration_days": 14, "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "12/yr x 14d", "overrides": {"stage": "growth", "proposals_per_fund_year": 12, "strategy_duration_days": 14, "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "24/yr x 14d", "overrides": {"stage": "growth", "proposals_per_fund_year": 24, "strategy_duration_days": 14, "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "6/yr x 21d", "overrides": {"stage": "growth", "proposals_per_fund_year": 6, "strategy_duration_days": 21, "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "12/yr x 21d", "overrides": {"stage": "growth", "proposals_per_fund_year": 12, "strategy_duration_days": 21, "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "24/yr x 21d", "overrides": {"stage": "growth", "proposals_per_fund_year": 24, "strategy_duration_days": 21, "tvl": 10000000.0, "wood_price": 0.05}}
+  ]
+}

@@ -10,14 +10,14 @@ pragma solidity 0.8.28;
 ///         from a hand-edited literal. Referenced as compile-time constants,
 ///         so this adds no runtime bytecode.
 library FeeConstants {
-    /// @notice Hard ceiling on the agent performance fee, in basis points (30%).
+    /// @notice Hard ceiling on the agent performance fee, in basis points (25%).
     /// @dev This is the outer bound governance can ever reach, not the headline
     ///      rate. Three limits stack below it: this constant, the per-vault
     ///      `maxPerformanceFeeBps` (factory default
     ///      `DEFAULT_MAX_PERFORMANCE_FEE_BPS`), and the vault's own
     ///      `agentFeeBps`. High enough that the 20% headline of the two-number
-    ///      fee model is reachable without making 30% the default.
-    uint256 internal constant MAX_PERFORMANCE_FEE_BPS = 3000;
+    ///      fee model is reachable without making the ceiling the default.
+    uint256 internal constant MAX_PERFORMANCE_FEE_BPS = 2500;
 
     /// @notice Per-vault performance-fee ceiling a newly created vault starts
     ///         with, in basis points (20%) — the advertised headline rate.

@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {Create3Factory} from "../../script/utils/Create3Factory.sol";
+import {DeploySherwood} from "../../script/Deploy.s.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
@@ -33,6 +34,17 @@ contract DeployScriptTest is Test {
     bytes32 constant SALT_FACTORY_PROXY = keccak256("sherwood.deploy.factory-proxy.2");
     bytes32 constant SALT_REGISTRY_IMPL = keccak256("sherwood.deploy.guardian-registry-impl.1");
     bytes32 constant SALT_REGISTRY_PROXY = keccak256("sherwood.deploy.guardian-registry-proxy.1");
+
+    /// @notice `Deploy.s.sol` MIRRORS `SyndicateFactory.MAX_MANAGEMENT_FEE_BPS`
+    ///         so its pre-flight `require` can refuse an over-cap `MANAGEMENT_FEE`
+    ///         BEFORE `vm.startBroadcast()` — the factory's own check lives in
+    ///         `initialize`, which runs mid-ceremony. A mirror can drift; this is
+    ///         what stops it. (SHE-182 / SHE-18 lowered the cap from 500 to 300.)
+    function test_managementFeeMirrorMatchesTheFactoryConstant() public {
+        uint256 mirrored = new DeploySherwood().MAX_MANAGEMENT_FEE_BPS();
+        assertEq(mirrored, new SyndicateFactory().MAX_MANAGEMENT_FEE_BPS(), "the mirror has drifted");
+        assertEq(mirrored, 300, "the management ceiling is 3%/yr");
+    }
 
     function test_predictedFactoryAddressMatchesRealDeploy() public {
         address deployer = address(this);

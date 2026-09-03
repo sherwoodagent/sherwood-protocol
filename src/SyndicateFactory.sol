@@ -173,8 +173,10 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         Paginated reads above this cap silently clamp to `MAX_PAGE_LIMIT`.
     uint256 public constant MAX_PAGE_LIMIT = 100;
 
-    /// @notice Maximum management fee a vault owner may charge (5% of post-strategy net).
-    uint256 public constant MAX_MANAGEMENT_FEE_BPS = 500;
+    /// @notice Maximum management fee a vault owner may charge (3%/yr on deployed assets;
+    ///         lowered from 5% in the launch configuration, SHE-182 / SHE-18).
+    /// @dev 3%/yr is the DESIGNED cap: `openspec/changes/archive/2026-07-24-fee-mechanism/design.md:212`.
+    uint256 public constant MAX_MANAGEMENT_FEE_BPS = 300;
 
     /// @notice Adapter-selector tier registry (guardian economic-security model).
     ///         Optional — `address(0)` means governors created by this factory
@@ -501,7 +503,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///      owner-instant setters. All values sit within `GovernorParameters`
     ///      bounds so the governor's validation at `initialize` accepts them.
     /// @dev `maxPerformanceFeeBps` starts at the advertised headline (20%), not at
-    ///      the protocol ceiling (30%): the settle-time clamp resolves an
+    ///      the protocol ceiling (25%): the settle-time clamp resolves an
     ///      over-ceiling rate silently, so a permissive default would fail open and
     ///      let an owner quietly charge above the headline. Named constant, not a
     ///      literal, so it cannot drift from `FeeConstants`.

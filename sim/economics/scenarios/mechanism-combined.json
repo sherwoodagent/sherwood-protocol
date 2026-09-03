@@ -1,0 +1,17 @@
+{
+  "name": "mechanism-combined",
+  "title": "Both mechanism fixes together",
+  "ticket": "SHE-227 + SHE-232",
+  "question": "Do the two fixes interact, or are they independent?",
+  "note": "They act on different quantities -- SHE-227 on the coverage BUDGET during review, SHE-232 on the SLASH after a conviction -- so the four cells below should show clean separability: reservation_mode moves WOOD locked and binding TVL and nothing else, slash_mode moves the fraud waterfall and nothing else.",
+  "cells": [
+    {"label": "today (full + whole)",
+     "overrides": {"stage": "growth", "reservation_mode": "full", "slash_mode": "whole", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "SHE-227 only (shared + whole)",
+     "overrides": {"stage": "growth", "reservation_mode": "shared", "slash_mode": "whole", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "SHE-232 only (full + allocated)",
+     "overrides": {"stage": "growth", "reservation_mode": "full", "slash_mode": "allocated", "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "both (shared + allocated)",
+     "overrides": {"stage": "growth", "reservation_mode": "shared", "slash_mode": "allocated", "tvl": 10000000.0, "wood_price": 0.05}}
+  ]
+}

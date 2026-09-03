@@ -41,7 +41,7 @@ import {ScriptBase} from "./ScriptBase.sol";
  *                         use on mainnet.
  *     ENS_REGISTRAR     — L2 Registrar address (default: 0x0 = no ENS)
  *     AGENT_REGISTRY    — ERC-8004 Identity Registry (default: 0x0 = no identity)
- *     MANAGEMENT_FEE    — Management fee in bps (default: 50 = 0.5%)
+ *     MANAGEMENT_FEE    — Management fee in bps (default: 200 = 2%)
  *     PROTOCOL_FEE      — Protocol fee in bps (default: 100 = 1%, max 1%)
  *     MAX_STRATEGY_DAYS — Max strategy duration in days (default: 14). NOTE (#421):
  *                         per-vault governors initialize from the factory's
@@ -97,6 +97,13 @@ contract DeploySherwood is ScriptBase {
     uint256 constant DEFAULT_SLASH_APPEAL_SEED = 1_000_000e18;
     uint256 constant DEFAULT_EPOCH_ZERO_SEED = 10_000e18;
     uint256 constant DEFAULT_MIN_SLASH_BPS = 1000; // 10%
+    /// @notice Mirror of `SyndicateFactory.MAX_MANAGEMENT_FEE_BPS` (3%/yr). Public
+    ///         so `DeployScript.t.sol` can pin the two together.
+    /// @dev    Mirrored rather than read because the refusal must happen BEFORE the
+    ///         broadcast: the factory enforces the same bound in `initialize`, which
+    ///         runs mid-ceremony, after the executor, vault impl and registry exist.
+    ///         Keep in step with the factory; `DeployScript.t.sol` asserts they agree.
+    uint256 public constant MAX_MANAGEMENT_FEE_BPS = 300;
     // The own-stake severity ceiling may be a full 100% — own stake is a
     // plain integer with no share math to brick.
     uint256 constant DEFAULT_MAX_SLASH_BPS = 10_000; // 100%
@@ -143,6 +150,15 @@ contract DeploySherwood is ScriptBase {
             epochZeroSeed: vm.envOr("EPOCH_ZERO_SEED", DEFAULT_EPOCH_ZERO_SEED)
         });
         require(cfg.woodToken != address(0), "WOOD_TOKEN not set (env or chains.json)");
+
+        // PRE-FLIGHT: `MANAGEMENT_FEE` is unbounded here and the factory rejects an
+        // over-cap value inside `initialize`, mid-broadcast. SHE-182 lowered the cap
+        // from 500 to 300, so a runbook or `.env` still carrying the old 5% is the
+        // expected way to hit this. Refuse now, while nothing has been deployed.
+        require(
+            cfg.managementFeeBps <= MAX_MANAGEMENT_FEE_BPS,
+            "PRE-FLIGHT: MANAGEMENT_FEE above MAX_MANAGEMENT_FEE_BPS (300)"
+        );
 
         // Multisig handoff is mandatory in prod.
         bool skipHandoff = vm.envOr("SKIP_MULTISIG_HANDOFF", false);

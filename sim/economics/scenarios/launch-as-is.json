@@ -1,0 +1,19 @@
+{
+  "name": "launch-as-is",
+  "title": "Launch as it actually ships",
+  "ticket": null,
+  "question": "What does the protocol look like on day one, with nothing certified?",
+  "note": "No deploy script issues any adapter certification (script/Deploy.s.sol:303 and script/DeployPlanB.s.sol:1047 only print the runbook), so every call is tier 2 at full notional. This is the launch reality, not a pessimistic case. Run at the derived spot price and at the tokenomics anchor.",
+  "cells": [
+    {
+      "label": "growth profile, 100% tier-2, WOOD @ spot $0.00628",
+      "overrides": {"stage": "growth", "tier2_share": 1.0, "approvers_per_proposal": 5,
+                    "fee_set": "current", "tvl": 10000000.0, "wood_price": 0.00627821}
+    },
+    {
+      "label": "growth profile, 100% tier-2, WOOD @ $0.05",
+      "overrides": {"stage": "growth", "tier2_share": 1.0, "approvers_per_proposal": 5,
+                    "fee_set": "current", "tvl": 10000000.0, "wood_price": 0.05}
+    }
+  ]
+}

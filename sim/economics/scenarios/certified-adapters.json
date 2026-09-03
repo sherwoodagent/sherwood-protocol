@@ -1,0 +1,17 @@
+{
+  "name": "certified-adapters",
+  "title": "Adapter certification",
+  "ticket": null,
+  "question": "How much capacity does certifying adapters buy?",
+  "note": "Certified tier-0/1 calls are bounded at 50 bps of notional instead of the full 10000, a 200:1 coverage reduction. The 50 bps figure is an ASSUMPTION taken from the protocol's own worked example (docs/papers/guardian-network-economic-security.md:152); real bounds are per-adapter in [1, 9999].",
+  "cells": [
+    {"label": "100% tier-2 (nothing certified)",
+     "overrides": {"stage": "growth", "tier2_share": 1.0, "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "40% tier-2 (growth baseline)",
+     "overrides": {"stage": "growth", "tier2_share": 0.4, "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "10% tier-2",
+     "overrides": {"stage": "growth", "tier2_share": 0.1, "tvl": 10000000.0, "wood_price": 0.05}},
+    {"label": "0% tier-2 (everything certified @ 50 bps)",
+     "overrides": {"stage": "growth", "tier2_share": 0.0, "tvl": 10000000.0, "wood_price": 0.05}}
+  ]
+}

@@ -257,7 +257,7 @@ interface ISyndicateVault {
     function agentFeeBps() external view returns (uint256);
     /// @notice Set the agent performance fee (owner only). Capped at
     ///         `MAX_AGENT_FEE_BPS`, which aliases
-    ///         `FeeConstants.MAX_PERFORMANCE_FEE_BPS` (3000 = 30%). Reverts with
+    ///         `FeeConstants.MAX_PERFORMANCE_FEE_BPS` (2500 = 25%). Reverts with
     ///         `AgentFeeTooHigh` above.
     function setAgentFeeBps(uint256 bps) external;
     /// @notice Idle-liquidity floor in basis points of the pre-batch float.
