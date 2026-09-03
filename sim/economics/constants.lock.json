@@ -88,7 +88,7 @@
     },
     "MANAGEMENT_FEE_BPS_DEPLOYED": {
       "file": "script/Deploy.s.sol",
-      "line": 137,
+      "line": 144,
       "note": "The management rate a mainnet deploy actually ships with (env-overridable).",
       "raw": "200",
       "value": 200
@@ -102,7 +102,7 @@
     },
     "MAX_MANAGEMENT_FEE_BPS": {
       "file": "src/SyndicateFactory.sol",
-      "line": 177,
+      "line": 179,
       "note": "Hard ceiling on the management fee (5%/yr).",
       "raw": "300",
       "value": 300
@@ -116,21 +116,21 @@
     },
     "MAX_SLASH_BPS": {
       "file": "script/Deploy.s.sol",
-      "line": 102,
+      "line": 109,
       "note": "Upper clamp on any slash. 100% as deployed.",
       "raw": "10_000",
       "value": 10000
     },
     "MAX_STRATEGY_DAYS_DEPLOYED": {
       "file": "script/Deploy.s.sol",
-      "line": 138,
+      "line": 145,
       "note": "Deploy-time strategy-duration ceiling in DAYS. Lower than the factory's 30d.",
       "raw": "14",
       "value": 14
     },
     "MAX_STRATEGY_DURATION_DAYS": {
       "file": "src/SyndicateFactory.sol",
-      "line": 518,
+      "line": 520,
       "note": "Governor-parameter ceiling on a single strategy. Note Deploy.s.sol ships MAX_STRATEGY_DAYS at 14, which binds first.",
       "raw": "30",
       "value": 30
@@ -221,7 +221,7 @@
     },
     "PLANB_REQUIRED_MAX_SLASH_BPS": {
       "file": "script/DeployPlanB.s.sol",
-      "line": 501,
+      "line": 509,
       "note": "Plan B pre-flight HARD-REQUIRES this maxSlashBps. It is why the slash is 100%.",
       "raw": "10_000",
       "value": 10000
@@ -256,7 +256,7 @@
     },
     "WOOD_HAIRCUT_BPS": {
       "file": "script/DeployPlanB.s.sol",
-      "line": 287,
+      "line": 295,
       "note": "The haircut a Plan B deploy applies to the WOOD price when pricing stake. The model uses this, NOT the ledger default.",
       "raw": "5_000",
       "value": 5000
