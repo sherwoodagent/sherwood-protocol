@@ -695,19 +695,27 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.coverageFreezer(), address(under));
     }
 
-    /// @notice FAIL CLOSED AT WIRING. A freezer that cannot answer
+    /// @notice FAIL CLOSED AT WIRING. A code-bearing freezer that cannot answer
     ///         `challengeWindow()` is not the game: refuse it rather than wire
-    ///         it with no bound. Codeless included (SHE-214): the governor's
-    ///         reclaim gate makes a typed call on the wired freezer, so a
-    ///         codeless one would brick bond reclaim, and a pre-committed
-    ///         address could gain code later with no check firing.
+    ///         it with no bound. Pins the `!ok` branch of
+    ///         `_requireWindowCoversFreezer`.
     function test_setCoverageFreezer_refusesACodeBearingFreezerThatCannotAnswer() public {
         address deaf = address(new MockDeafFreezer());
         vm.prank(owner);
         vm.expectRevert(IExposureLedger.CoverageFreezerUnreadable.selector);
         ledger.setCoverageFreezer(deaf);
+        assertEq(ledger.coverageFreezer(), address(0));
+    }
 
+    /// @notice FAIL CLOSED AT WIRING, codeless too (SHE-214). The governor's
+    ///         reclaim gate makes a typed `challengeWindow()` call on the wired
+    ///         freezer, so a codeless one would brick bond reclaim, and a
+    ///         pre-committed address could gain code later with no check
+    ///         firing. Pins the `code.length == 0` branch of
+    ///         `_requireWindowCoversFreezer`.
+    function test_setCoverageFreezer_refusesACodelessFreezer() public {
         address eoa = makeAddr("codelessFreezer");
+        assertEq(eoa.code.length, 0, "precondition");
         vm.prank(owner);
         vm.expectRevert(IExposureLedger.CoverageFreezerUnreadable.selector);
         ledger.setCoverageFreezer(eoa);
