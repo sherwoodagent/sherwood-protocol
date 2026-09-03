@@ -315,7 +315,7 @@ to turn a set of bps into a dollar figure. Anything here is arguable; nothing he
     literally. The sim interprets them as *rate ceilings under the current two-number model*:
     mgmt 500 bps, perf 1500 bps, splits unchanged. A different reading — e.g. mapping "protocol
     10→1 %" onto `perfSplit.protocolBps` — would give different protocol revenue. The `worst_stack`
-    set (500 / 3000, the actual post-audit ceilings) is the unambiguous one.
+    set (300 / 2500, the actual post-audit ceilings) is the unambiguous one.
 
 11. **Off-chain guardian distribution is ignored.** The guardian fee is a single transfer to
     `guardiansFeeRecipient`; the per-guardian split happens off-chain via a weekly Merkl WOOD buyback

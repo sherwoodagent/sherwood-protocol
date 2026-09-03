@@ -46,6 +46,34 @@ contract DeployScriptTest is Test {
         assertEq(mirrored, 300, "the management ceiling is 3%/yr");
     }
 
+    /// @notice Pins the `run()` PRE-FLIGHT itself, not just the mirrored constant:
+    ///         an over-cap `MANAGEMENT_FEE` must be refused by the script, before
+    ///         the broadcast, so it never reaches `initialize` mid-ceremony.
+    /// @dev The control (`MANAGEMENT_FEE == MAX`) reverts on the LATER
+    ///      `OWNER_MULTISIG` guard — a different reason proves the pre-flight
+    ///      passed rather than that `run()` reverts for any input. `vm.setEnv`
+    ///      writes the shared process environment, so every var is restored.
+    function test_run_refusesAnOverCapManagementFee() public {
+        DeploySherwood s = new DeploySherwood();
+        ERC20Mock wood = new ERC20Mock("WOOD", "WOOD", 18);
+        vm.setEnv("WOOD_TOKEN", vm.toString(address(wood)));
+        vm.setEnv("SKIP_MULTISIG_HANDOFF", "false");
+        vm.setEnv("OWNER_MULTISIG", "0x0000000000000000000000000000000000000000");
+
+        vm.setEnv("MANAGEMENT_FEE", "301");
+        vm.expectRevert(bytes("PRE-FLIGHT: MANAGEMENT_FEE above MAX_MANAGEMENT_FEE_BPS (300)"));
+        s.run();
+
+        // Control: the ceiling itself is accepted (inclusive `<=`), so `run()`
+        // proceeds to the next guard.
+        vm.setEnv("MANAGEMENT_FEE", "300");
+        vm.expectRevert(bytes("OWNER_MULTISIG required (or set SKIP_MULTISIG_HANDOFF=true)"));
+        s.run();
+
+        vm.setEnv("MANAGEMENT_FEE", "200");
+        vm.setEnv("WOOD_TOKEN", "0x0000000000000000000000000000000000000000");
+    }
+
     function test_predictedFactoryAddressMatchesRealDeploy() public {
         address deployer = address(this);
         ERC20Mock wood = new ERC20Mock("WOOD", "WOOD", 18);

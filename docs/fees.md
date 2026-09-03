@@ -24,8 +24,8 @@ below the high-water mark while review workload is unchanged. See
   `SyndicateFactory.managementFeeBps` (`src/SyndicateFactory.sol:342`). There is no
   per-vault setter — changing the factory value only affects *new* vaults.
 - **Bounds:** 0 → `MAX_MANAGEMENT_FEE_BPS = 300` bps (3%/yr), enforced at vault
-  `initialize` (`src/SyndicateFactory.sol:276`) and at the factory setter
-  (`src/SyndicateFactory.sol:536`). Deploy scripts seed 200 bps (2%/yr).
+  `initialize` (`src/SyndicateFactory.sol:309`) and at the factory setter
+  (`src/SyndicateFactory.sol:593`). Deploy scripts seed 200 bps (2%/yr).
 - **Sticky per vault:** `_managementFeeBps` is written once at `initialize`
   (`src/SyndicateVault.sol:270`) and the vault exposes only a getter
   (`:955`) — there is no per-vault setter, and `SyndicateFactory.setManagementFeeBps`
@@ -151,9 +151,9 @@ Collaborative proposals sub-split the **agent slice** of both fees
 
 | Parameter | Units | Default | Min | Max | Enforced at |
 |---|---|---|---|---|---|
-| `managementFeeBps` | bps/yr | 200 | 0 | 300 | `SyndicateFactory.sol:276`, `:536` |
-| `agentFeeBps` | bps | 2 000 | 0 | 3 000 | `SyndicateVault.sol:1131` |
-| `maxPerformanceFeeBps` (per-vault cap) | bps | 2 000 | 0 | 3 000 | `GovernorParameters.sol:346` |
+| `managementFeeBps` | bps/yr | 200 | 0 | 300 | `SyndicateFactory.sol:309`, `:593` |
+| `agentFeeBps` | bps | 2 000 | 0 | 2 500 | `SyndicateVault.sol:1131` |
+| `maxPerformanceFeeBps` (per-vault cap) | bps | 2 000 | 0 | 2 500 | `GovernorParameters.sol:346` |
 | Mgmt split legs | bps | 6000/2000/2000 | 0/leg | sum == 10 000 | `ProtocolConfig.sol:92` |
 | Perf split legs | bps | 5000/1500/2500/1000 | 0/leg | sum == 10 000 | `ProtocolConfig.sol:103` |
 | Co-proposer `splitBps` | bps | per-proposal | 100 | 9 000 total | `SyndicateGovernor.sol:1498` |
