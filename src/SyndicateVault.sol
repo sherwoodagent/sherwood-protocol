@@ -1534,6 +1534,28 @@ contract SyndicateVault is
         internal
         override(ERC20Upgradeable, ERC20VotesUpgradeable)
     {
+        // HIGH-WATER MARK RESET, PRE-STATE HALF — A MINT INTO AN EMPTY POOL
+        // (SHE-206). The post-state check below cannot see the state it was
+        // written to catch when the pool empties through the ASYNC lane: the
+        // instant `_pricingSupply()` reaches zero is `stampSettlement` on the
+        // queue, which moves no ERC20 value and therefore never reaches this
+        // hook at all. By the time a mint does arrive, the post-state supply is
+        // nonzero again and the stale mark survives into the new epoch.
+        //
+        // Reading the PRE-state of a mint catches exactly that: `from ==
+        // address(0)` with nothing live to price is a fund being re-seeded,
+        // whatever emptied it and whenever. `_initHighWaterMarkIfUnset` — which
+        // both mint entrypoints call immediately after — then seeds the mark at
+        // the re-seeding depositor's own entry price.
+        //
+        // MINTS ONLY, deliberately. A burn or transfer cannot turn an empty
+        // pricing supply into a live one, so the pre-state is never the
+        // deciding read for them and this would be a wasted `_pricingSupply()`
+        // staticcall on every transfer.
+        if (from == address(0) && _pricingSupply() == 0) {
+            _highWaterPricePerShare = 0;
+        }
+
         super._update(from, to, value);
 
         // HIGH-WATER MARK RESET ON FULL DRAIN.
@@ -1556,7 +1578,22 @@ contract SyndicateVault is
         // the fund as freshly created. A mint in the SAME call as the draining
         // burn is impossible for a single ERC20 `_update`; sequential
         // burn-then-mint across two calls is exactly the case this closes.
-        if (totalSupply() == 0) {
+        //
+        // KEYED ON `_pricingSupply()`, NOT `totalSupply()` (SHE-206). Every
+        // pricing path in this contract divides by `_pricingSupply()`, and
+        // `aboveHighWaterMark` multiplies by it — so a guard reading the raw
+        // supply is measuring a different fund from the one the fee is charged
+        // against. The two disagree for the whole window between
+        // `stampSettlement` and the last `claim`, where the stamped queue
+        // shares are still in `totalSupply()` but are no longer a claim on the
+        // pool. "Every remaining share is a stamped queue share" IS a fully
+        // drained fund by the only measure the price uses.
+        //
+        // SAFE AGAINST THE CLAIM BURN BY ORDERING: `VaultWithdrawalQueue.claim`
+        // decrements `_stampedUnclaimedShares` BEFORE calling `settleRedeem`,
+        // so both legs of this subtraction have moved by the time this read
+        // runs and it can never under-count by the burn.
+        if (_pricingSupply() == 0) {
             _highWaterPricePerShare = 0;
         }
 
@@ -3011,7 +3048,17 @@ contract SyndicateVault is
     ///      is what makes the recovery free. Called at settlement only; a partial
     ///      exit must NOT ratchet, or the holders who stayed would start measuring
     ///      from a peak the fund never banked.
+    /// @dev NOTHING TO RATCHET AGAINST AN EMPTY PRICING SUPPLY (SHE-206). With
+    ///      `_pricingSupply() == 0` — every remaining share stamped to the
+    ///      queue — `pricePerShare()` divides residual assets by the virtual
+    ///      offset alone and returns an arbitrarily large number that describes
+    ///      no holder's position. Banking it as the peak writes a mark no
+    ///      future fund can clear. Returning early leaves the previous peak
+    ///      standing, which is what a settlement with no live equity should do;
+    ///      the reset/seed pair in `_update` re-establishes the mark at the
+    ///      next depositor's own entry price.
     function ratchetHighWaterMark() external onlyGovernor {
+        if (_pricingSupply() == 0) return;
         uint256 pps = pricePerShare();
         if (pps > _highWaterPricePerShare) {
             _highWaterPricePerShare = pps;
@@ -3022,8 +3069,17 @@ contract SyndicateVault is
     /// @dev Seed the mark at the fund's first deposit so the first proposal's
     ///      gains above it are chargeable. Before any shares exist the price is
     ///      meaningless, so this cannot be done at `initialize`.
+    /// @dev GATED ON `_pricingSupply()`, NOT `totalSupply()` (SHE-206) — the
+    ///      same supply the price this seeds is taken against, and the same one
+    ///      the reset in `_update` now reads. The two MUST move together: with
+    ///      the reset keyed on the pricing supply and the seed left on the raw
+    ///      one, a fund re-seeded out of an all-stamped state would have its
+    ///      mark zeroed and then refused a re-seed (`totalSupply()` never
+    ///      returned to zero, so from this gate's point of view the mark was
+    ///      never unset), leaving it at 0 forever and reading every later
+    ///      dollar as chargeable — the opposite error, not the same one.
     function _initHighWaterMarkIfUnset() private {
-        if (_highWaterPricePerShare == 0 && totalSupply() != 0) {
+        if (_highWaterPricePerShare == 0 && _pricingSupply() != 0) {
             uint256 pps = pricePerShare();
             _highWaterPricePerShare = pps;
             emit HighWaterMarkUpdated(pps);
