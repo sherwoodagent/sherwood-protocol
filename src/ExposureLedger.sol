@@ -846,24 +846,25 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      path, and every accused approver would be permanently barred from
     ///      `claimUnstakeGuardian`. Zero is still legal as the unwire switch; the
     ///      only reachable order is to drain live challenges first.
-    /// @dev THE WINDOW BOUND IS MIRRORED HERE. `setChallengeWindow` refuses a
-    ///      ledger window below the wired game's, but that check only sees the
-    ///      freezer wired at the instant it runs. Without the same bound on
-    ///      THIS setter the sequence `setCoverageFreezer(0)` → shrink → re-wire
-    ///      reaches `game.challengeWindow > ledger.challengeWindow` with no
-    ///      check ever firing, and so does wiring a game whose window is
-    ///      already above the ledger's. In that state `retireApproval`'s gate
-    ///      (keyed off the ledger's window) opens BEFORE `ChallengeGame.file`'s
-    ///      deadline (keyed off the game's) closes: a sweep empties
-    ///      `_approversOf` while the proposal is still filable, the proposal is
-    ///      permanently unchallengeable, and `openExposureUsd` reads zero so
-    ///      the guardian can also `claimUnstakeGuardian`. The floor this
-    ///      contract used to carry (`reviewPeriod + 7 days`) capped that
-    ///      desync at `W_game - 7d6h` by accident; with the floor gone this
-    ///      mirror is the only thing bounding it (SHE-231 review, finding 2).
+    /// @dev MIRRORS THE WINDOW FLOOR ON THE INCOMING GAME (SHE-214). The ledger
+    ///      must keep coverage slashable at least as long as the game admits a
+    ///      filing: `retireApproval`'s sweep opens at
+    ///      `bucketEnd + ledger.challengeWindow` while `ChallengeGame.file`
+    ///      closes at `executedAt + strategyDuration + game.challengeWindow`,
+    ///      so `game.challengeWindow <= ledger.challengeWindow` is the
+    ///      invariant. The game checks it at construction and in its two
+    ///      setters; `setChallengeWindow` re-checks it when THIS window moves;
+    ///      this setter was the fourth corner. Without it the three-step
+    ///      `setCoverageFreezer(0)` -> `setChallengeWindow(small)` ->
+    ///      `setCoverageFreezer(game)` walked through every other check
+    ///      (`DeployPlanD` wires the freezer LAST, so the unwired state is
+    ///      ordinary), and once seated nothing detected the inversion: a sweep
+    ///      empties `_approversOf` while the proposal is still filable, the
+    ///      proposal is permanently unchallengeable, and open exposure reads
+    ///      zero so the guardian can also `claimUnstakeGuardian`.
     ///
-    ///      ANY non-zero freezer MUST answer `challengeWindow()` (SHE-214, the
-    ///      shape this bound shares with `setChallengeWindow` via
+    ///      ANY non-zero freezer MUST answer `challengeWindow()` (the shape this
+    ///      bound shares with `setChallengeWindow` via
     ///      `_requireWindowCoversFreezer`): a freezer that cannot is not the
     ///      game and is refused with `CoverageFreezerUnreadable`. A codeless
     ///      pointer is refused too, not carved out: it cannot file today, but a
@@ -873,17 +874,25 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      typed `challengeWindow()` call on whatever is wired, which reverts
     ///      on a codeless address and would brick bond reclaim for every
     ///      settled proposal. Zero remains the unwire switch and is never read.
-    ///      The ledger's own design record for setter floors,
-    ///      `openspec/changes/archive/2026-08-03-enforce-floor-invariant-in-setters/design.md`
-    ///      D3 (wired but unreadable fails closed; unwired skips) and D4
-    ///      (guarding only one of two composing setters is a bypass), prescribes
-    ///      exactly this shape.
     ///
-    ///      `SyndicateGovernor.reclaimProposerBond`'s `max` over both deadlines
-    ///      stays as defence in depth for the bond — including against a
-    ///      non-canonical freezer that changes its answer after wiring; it never
-    ///      covered the approver sweep, which is why the bound has to live at
-    ///      the setters.
+    ///      HISTORY. This check landed in #220, was reverted in 88872ed citing
+    ///      "design.md D2", and is restored here. D2 there is the proposer-bond
+    ///      reclaim design (`reclaimProposerBond`'s gate is a `max` of both
+    ///      deadlines), which makes the BOND robust to a divergence — it says
+    ///      nothing about the ledger having to ACCEPT one, and it does not
+    ///      reach the approver sweep this invariant protects. The ledger's own
+    ///      design record for setter floors is
+    ///      `openspec/changes/archive/2026-08-03-enforce-floor-invariant-in-setters/design.md`:
+    ///      D3 (wired but unreadable fails closed; unwired skips) and D4
+    ///      (guarding only one of two composing setters is a bypass) prescribe
+    ///      exactly this shape. The fixture that broke
+    ///      (`test_reclaimBond_gameWindowAboveTheLedgers_waitsForTheGame`) now
+    ///      raises the stub game's window AFTER wiring — a route the real game
+    ///      cannot take (its window is a plain storage variable and the
+    ///      contract is not upgradeable), and `reclaimProposerBond`'s `max`
+    ///      gate stays as defence in depth for the bond if a non-canonical
+    ///      freezer ever does; it never covered the approver sweep, which is
+    ///      why the bound has to live at the setters.
     function setCoverageFreezer(address freezer) external onlyOwner {
         if (_frozenKeyCount != 0) revert CoverageFrozen();
         _requireWindowCoversFreezer(freezer, challengeWindow);
