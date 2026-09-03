@@ -76,7 +76,7 @@ contract SyndicateVault is
     ///         `removeAgent` frees a slot.
     uint256 public constant MAX_AGENTS_PER_VAULT = 32;
 
-    /// @notice Hard cap on the vault-owner-set agent performance fee (30%), equal
+    /// @notice Hard cap on the vault-owner-set agent performance fee (25%), equal
     ///         to the protocol ceiling on the governor's `maxPerformanceFeeBps`.
     ///         The governor additionally clamps the realized fee to its own,
     ///         lower, configured value at settlement, so a stored value above the

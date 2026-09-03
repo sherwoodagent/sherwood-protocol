@@ -10,7 +10,7 @@ pragma solidity 0.8.28;
 ///         from a hand-edited literal. Referenced as compile-time constants,
 ///         so this adds no runtime bytecode.
 library FeeConstants {
-    /// @notice Hard ceiling on the agent performance fee, in basis points (30%).
+    /// @notice Hard ceiling on the agent performance fee, in basis points (25%).
     /// @dev This is the outer bound governance can ever reach, not the headline
     ///      rate. Three limits stack below it: this constant, the per-vault
     ///      `maxPerformanceFeeBps` (factory default

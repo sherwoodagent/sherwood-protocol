@@ -173,7 +173,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         Paginated reads above this cap silently clamp to `MAX_PAGE_LIMIT`.
     uint256 public constant MAX_PAGE_LIMIT = 100;
 
-    /// @notice Maximum management fee a vault owner may charge (5% of post-strategy net).
+    /// @notice Maximum management fee a vault owner may charge (3%/yr on deployed assets;
+    ///         lowered from 5% in the launch configuration, SHE-182 / SHE-18).
     uint256 public constant MAX_MANAGEMENT_FEE_BPS = 300;
 
     /// @notice Adapter-selector tier registry (guardian economic-security model).

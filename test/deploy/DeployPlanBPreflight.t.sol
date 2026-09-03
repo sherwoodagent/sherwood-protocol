@@ -724,7 +724,7 @@ contract DeployPlanBPreflightTest is Test {
         assertEq(ledger.woodHaircutBps(), 5_000, "the haircut must be seated by the script, not left at 10,000");
 
         // It is a real discount on a real valuation, not a stored number: the
-        // composed price is 70% of what the market source reports.
+        // composed price is 50% of what the market source reports.
         assertEq(ledger.woodPriceX8(), (WOOD_MARKET_X8 * 5_000) / 10_000, "the allowance reaches the price");
     }
 

@@ -42,7 +42,7 @@ abstract contract GovernorParameters is ProposalLifecycle {
     uint256 public constant MAX_EXECUTION_WINDOW = 7 days;
     uint256 public constant MIN_VETO_THRESHOLD_BPS = 2000; // 20%
     uint256 public constant MAX_VETO_THRESHOLD_BPS = 8000; // 80%
-    uint256 public constant MAX_PERFORMANCE_FEE_CAP = FeeConstants.MAX_PERFORMANCE_FEE_BPS; // 30%
+    uint256 public constant MAX_PERFORMANCE_FEE_CAP = FeeConstants.MAX_PERFORMANCE_FEE_BPS; // 25%
     uint256 public constant ABSOLUTE_MIN_STRATEGY_DURATION = 1 hours;
     // Strategies are short-lived by design: the proposer can self-settle 1h after execute
     // (MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE); a non-proposer settle waits the full

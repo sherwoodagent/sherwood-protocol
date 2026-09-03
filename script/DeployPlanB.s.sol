@@ -96,7 +96,7 @@ interface IProtocolConfigAdmin {
  *      ledger's floor. The ledger DEFAULTS to 10,000 — no haircut — and its own
  *      setter accepts that value, so nothing else refuses the one configuration
  *      with zero allowance against the accepted overstatements. This script
- *      SEATS the haircut (7,000) rather than merely checking it. See the block.
+ *      SEATS the haircut (5,000) rather than merely checking it. See the block.
  * @dev PRE-FLIGHT 8 (design revision 2, 2026-08-02): POST-broadcast, the WOOD
  *      price CAP must be non-zero AND the composed `woodPriceX8()` must resolve
  *      to a non-zero price. The cap is no longer a fallback price — it only
@@ -262,7 +262,7 @@ contract DeployPlanB is ScriptBase {
     ///         unset. Public so the pre-flight tests assert against the SAME
     ///         value an unset environment produces.
     ///
-    /// @dev    WHY 7,000, i.e. a 30% discount on every bond valuation. The
+    /// @dev    WHY 5,000, i.e. a 50% discount on every bond valuation. The
     ///         ledger ships this parameter at 10,000 — no haircut — and that
     ///         default leaves ZERO allowance against the two overstatements
     ///         this design deliberately ACCEPTS rather than eliminates:
@@ -276,9 +276,13 @@ contract DeployPlanB is ScriptBase {
     ///
     ///         Both OVERSTATE bond value — the dangerous direction — and the
     ///         haircut is the compensating control for both. 5,000 (the ledger's
-    ///         floor) was REJECTED as too costly to guardian return on equity, a
-    ///         recurring concern in review. 7,000 is the accepted balance: a 30%
-    ///         allowance bought at 30% of every guardian's headline bond value.
+    ///         floor) was once rejected as too costly to guardian return on
+    ///         equity, but that was under full-coverage reservation. With
+    ///         declared locks (SHE-227) the haircut is the ONLY buffer between
+    ///         the WOOD price at approval and at verdict, 4–6 weeks later: at
+    ///         7,000 the cohort's burn equals the loot after a 30% WOOD drop, at
+    ///         5,000 after a 50% drop, and guardian ROE stays at 1.6–4.2%/yr
+    ///         (SHE-182 launch configuration, `sim/economics` launch-plan).
     ///
     ///         Seated here rather than left to a follow-up transaction for the
     ///         same reason the duration ceiling is: a parameter an operator is
@@ -959,7 +963,7 @@ contract DeployPlanB is ScriptBase {
             "ZERO allowance for the two overstatements this design accepts: the oracle's stale "
             "ETH/USD leg (an ETH drawdown inside the ~10.7h heartbeat reads WOOD/USD high by roughly "
             "the ETH move, no attacker needed) and the crash lag of up to twapWindow + maxTwapAge. "
-            "Set WOOD_HAIRCUT_BPS -- 7000 is the shipped value and absorbs a 30% overstatement."
+            "Set WOOD_HAIRCUT_BPS -- 5000 is the shipped value and absorbs a 50% overstatement."
         );
         require(
             ledger.woodHaircutBps() >= MIN_WOOD_HAIRCUT_BPS,
