@@ -156,6 +156,13 @@ shrink or grow it.
   settlement, and never held past the last legal filing. Release and retirement unwind from the bucket the
   lock currently occupies. `openExposure` is unchanged and there is no second
   accumulator; the scan simply sees the lock where its liability actually ends.
+  That end is HARD (SHE-246): from `filedAt + disputeTimeoutAtFiling` on, a
+  filing can no longer convict — `rule` reverts `WindowClosed` and `resolve` on
+  a still-undisputed filing unwinds it (`Inconclusive`, bond back net of the
+  round burn) instead of settling — so a filing nobody resolves stops being
+  slashable exactly when its bucket stops counting. With concurrent filings the
+  key is slashable until the latest live filing's deadline, which is what the
+  raise-only freeze booked.
   Residual: a move target past the 60-day horizon is clamped to the horizon's
   edge (a bucket outside the scan would un-count the lock), so a challenge at
   the game's 60-day ceiling stops counting at the edge rather than its true
@@ -358,7 +365,12 @@ the verdict. No panel, no appeal.
   guilty → `Guilty`; tie or majority not-guilty → `NotGuilty` (fails safe).
 - Referral is only accepted if a full vote + finalize buffer fits before the
   challenge's pinned `disputeTimeout` (`InsufficientClock`) — a case that exists is
-  always one that can finish.
+  always one that can finish. The deadline is hard on the game side too
+  (SHE-246): a `finalize` that only lands at or after
+  `filedAt + disputeTimeoutAtFiling` finds `rule` shut (`WindowClosed` bubbles;
+  the case stays in `Voting`), the challenge times out to the accused through
+  `resolve`, and the case then closes as already-terminal with the verdict
+  recorded but undelivered.
 - Cross-contract invariant, enforced at the setters on both sides plus
   per-referral:
   `autoSlashDelay + voteWindow + FINALIZE_BUFFER + MIN_REFERRAL_SLACK ≤ disputeTimeout`

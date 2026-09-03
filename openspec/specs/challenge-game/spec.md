@@ -105,18 +105,26 @@ The contribution that brings the pool to exactly the bond SHALL flip the status 
 - **THEN** the dispute itself still lands (status `Disputed`, transfer cleared) and `AutoReferFailed` is emitted; anyone may retry `refer` directly
 
 ### Requirement: Silence is the verdict — permissionless timeout resolution
-`resolve(challengeId)` SHALL be permissionless and choose nothing: from `Filed` at or after `filedAt + autoSlashDelayAtFiling` it SHALL settle the challenge (the silence IS the adjudication); from `Disputed` at or after `filedAt + disputeTimeoutAtFiling` it SHALL fail the challenge in favour of the accused (the fail-safe when no ruling arrived). Before the respective clock it SHALL revert `DelayNotElapsed`; from any terminal status, `WrongStatus`.
+`resolve(challengeId)` SHALL be permissionless and choose nothing: from `Filed` at or after `filedAt + autoSlashDelayAtFiling` and before `filedAt + disputeTimeoutAtFiling` it SHALL settle the challenge (the silence IS the adjudication); from `Filed` at or after `filedAt + disputeTimeoutAtFiling` (a STALE filing nobody settled inside its window) it SHALL unwind the challenge through the `Inconclusive` path — nothing slashed, the freeze released, the bond returned net of the round's inconclusive burn, any part-funded pool released to its funders; from `Disputed` at or after `filedAt + disputeTimeoutAtFiling` it SHALL fail the challenge in favour of the accused (the fail-safe when no ruling arrived). Before the respective clock it SHALL revert `DelayNotElapsed`; from any terminal status, `WrongStatus`. `filedAt + disputeTimeoutAtFiling` is therefore the HARD END OF SLASHABILITY for a filing: it is the same value `file` books on the ledger as `liveUntil`, and no path may convict on that filing from that instant on.
 
 #### Scenario: Undisputed challenge auto-settles
-- **WHEN** a challenge is still `Filed` and `autoSlashDelayAtFiling` has elapsed since filing
+- **WHEN** a challenge is still `Filed` and `autoSlashDelayAtFiling` has elapsed since filing, and `disputeTimeoutAtFiling` has not
 - **THEN** any caller's `resolve` executes the conviction path (slash, demotion, bond handling) and the challenge becomes `Settled`
+
+#### Scenario: Stale undisputed challenge unwinds instead of settling
+- **WHEN** a challenge is still `Filed` and `disputeTimeoutAtFiling` has elapsed since filing with nobody having settled it
+- **THEN** any caller's `resolve` makes the challenge `Inconclusive`: no slash, coverage unfrozen, bond returned net of the inconclusive burn, the re-challenge window re-armed and pinned
+
+#### Scenario: Slashability ends exactly at the ledger's liveUntil
+- **WHEN** the latest live filing on a key has reached `filedAt + disputeTimeoutAtFiling` and nobody has resolved it
+- **THEN** the key MAY still read as frozen (`hasFrozenCoverage`) until someone resolves, but neither `resolve` nor `rule` can slash it, so the ledger's lock ageing out of `openExposure` at that instant is correct; with two concurrent filings the key stays slashable until the LATER filing's deadline and the earlier one going stale neither unfreezes it nor shortens that window
 
 #### Scenario: Unruled dispute times out to the accused
 - **WHEN** a challenge is `Disputed` and `disputeTimeoutAtFiling` has elapsed since filing with no ruling
 - **THEN** any caller's `resolve` fails the challenge: the accused side wins, the challenger's bond forfeits
 
 ### Requirement: Court ruling — three verdicts, ruling beats timeout
-`rule(challengeId, verdict)` SHALL be callable only by the wired `court` (otherwise `NotCourt`; the zero-address court makes `rule` unreachable by construction) and only on a `Disputed` challenge (otherwise `WrongStatus`). The court supplies ONLY the verdict enum — there is no severity argument. `Guilty` SHALL take the identical settle path an undisputed challenge takes; `NotGuilty` SHALL take the identical fail path the timeout takes; `Inconclusive` (deliberately the enum's zero value, so a defaulted verdict lands on the harmless unwind) SHALL unwind both sides. `ChallengeRuled` SHALL be emitted before the consequent accounting. All three outcomes are terminal, and `resolve` acts only on `Filed`/`Disputed`, so a ruling can never be overwritten by the clock — a guilty approver cannot dispute and run out `disputeTimeout` once a court is wired.
+`rule(challengeId, verdict)` SHALL be callable only by the wired `court` (otherwise `NotCourt`; the zero-address court makes `rule` unreachable by construction) and only on a `Disputed` challenge (otherwise `WrongStatus`). The court supplies ONLY the verdict enum — there is no severity argument. `Guilty` SHALL take the identical settle path an undisputed challenge takes; `NotGuilty` SHALL take the identical fail path the timeout takes; `Inconclusive` (deliberately the enum's zero value, so a defaulted verdict lands on the harmless unwind) SHALL unwind both sides. `ChallengeRuled` SHALL be emitted before the consequent accounting. All three outcomes are terminal, and `resolve` acts only on `Filed`/`Disputed`, so a ruling can never be overwritten by the clock — a guilty approver cannot dispute and run out `disputeTimeout` once a court is wired. The clock in turn beats a LATE ruling: at or after `filedAt + disputeTimeoutAtFiling`, `rule` SHALL revert `WindowClosed` for every verdict, checked after the status and court gates so a terminal challenge still reports `WrongStatus`. `TokenCourt.refer` already refuses a case whose vote plus `FINALIZE_BUFFER` would not fit inside that deadline, so an honest `finalize` always lands before it; a late `finalize` bubbles `WindowClosed` (the court swallows only `WrongStatus`), leaves the case in `Voting`, and closes through `WrongStatus` once `resolve` has timed the challenge out.
 
 #### Scenario: Non-court caller refused
 - **WHEN** any address other than `court` calls `rule`
@@ -125,6 +133,10 @@ The contribution that brings the pool to exactly the bond SHALL flip the status 
 #### Scenario: Ruling pre-empts the timeout
 - **WHEN** the court rules `Guilty` before `disputeTimeoutAtFiling` elapses
 - **THEN** the conviction executes and a later `resolve` reverts `WrongStatus`
+
+#### Scenario: Late ruling refused
+- **WHEN** the court calls `rule` with any verdict at or after `filedAt + disputeTimeoutAtFiling` on a still-live `Disputed` challenge
+- **THEN** the call reverts `WindowClosed`, nothing is slashed, and `resolve` remains the only exit (failing the challenge to the accused, or unwinding it when no court was pinned)
 
 ### Requirement: Settle path — conviction, slash into escrow, per-path bond handling
 `_settle` (reached from the silence timeout or a `Guilty` ruling) SHALL fail closed with `ZeroAddress` if `stakedWood` is unwired (recoverable: wiring the slasher makes every stuck challenge resolvable). It SHALL mark the status `Settled`, release this challenge's freeze hold, and — unless the proposal was already convicted by a concurrent challenge, in which case it SHALL emit `VerdictAlreadyCollected` and slash nothing — set the convicted flag and execute the slash via `IStakedWood.slashVerdict` using the ledger's per-approver rates (`slashBpsFor`, filtered to non-zero entries so released approvers are not named in the conviction) and the pinned `executedAt` as basis. It SHALL also pass a `contestors` array, positionally aligned with the approvers, flagging every approver that funded the counter-bond — sWOOD caps the conviction bounty at their summed slash, so the scan MUST be complete rather than stopping at the first match. Bond handling SHALL differ by entry: on the ESCALATED entry (`Guilty` ruling) the challenger receives its bond whole plus the entire forfeited pool, with no burn; on the SILENCE entry, `settleBurnBpsAtFiling` of the bond is burned to `0x…dEaD` (`ChallengerBondBurned`), the remainder returns to the challenger, and any part-funded pool is booked for pull-refund to its contributors. `ChallengeSettled(challengeId, slashedWood)` SHALL be emitted, where `slashedWood` is what was actually BURNED (net of any conviction bounty).
