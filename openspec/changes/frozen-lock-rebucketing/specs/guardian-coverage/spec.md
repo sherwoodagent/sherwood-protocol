@@ -22,15 +22,23 @@
 ## ADDED Requirements
 
 ### Requirement: Frozen and pinned locks are re-bucketed to their true liability end
-The ledger SHALL keep each lock in the epoch bucket that matches how long the lock is actually live, moving it when a freeze, an unfreeze, or a pin changes that answer, so that the existing bucket scan counts it for exactly that long without any second accumulator or any additional read on the capacity path. On freeze, each listed approver's lock SHALL move to the bucket containing the challenge's pinned worst-case end (`filedAt + disputeTimeoutAtFiling`). On unfreeze, each lock SHALL move to the bucket containing the current time, so ordinary decay resumes and the lock still covers one further `challengeWindow`. A move SHALL update the lock's recorded epoch, and release and retirement SHALL unwind the lock from that recorded (current) epoch — never from a recomputed booking-time epoch — so a moved lock leaves neither a phantom in its new bucket nor a negative in its old one. A re-bucket target beyond the coverage horizon SHALL be clamped to the horizon's edge, because a bucket outside the bounded scan is invisible to it — the exact un-counting this requirement exists to prevent. Moving a lock to the bucket it already occupies SHALL be a no-op. The adversary throughout is a guardian who has been accused, or whose lock is pinned, and who uses the wall-clock expiry of the original bucket to have that lock stop counting while it remains slashable.
+The ledger SHALL keep each lock in the epoch bucket that matches how long the lock is actually live, moving it when a freeze, an unfreeze, or a pin changes that answer, so that the existing bucket scan counts it for exactly that long without any second accumulator or any additional read on the capacity path. On freeze, each listed approver's lock SHALL move to the bucket containing the challenge's pinned worst-case end (`filedAt + disputeTimeoutAtFiling`, passed by the freezer), never earlier than the bucket it occupies. On unfreeze, each lock SHALL move to the LATEST of the bucket containing the current time, the bucket it was booked into, and the bucket of any standing pin on it — so ordinary decay resumes, the lock still covers one further `challengeWindow`, and a challenge resolved before settlement can never leave the settlement drain uncovered. A move SHALL update the lock's recorded epoch, and release and retirement SHALL unwind the lock from that recorded (current) epoch — never from a recomputed booking-time epoch — so a moved lock leaves neither a phantom in its new bucket nor a negative in its old one. A re-bucket target beyond the coverage horizon SHALL be clamped to the horizon's edge, because a bucket outside the bounded scan is invisible to it — the exact un-counting this requirement exists to prevent. Moving a lock to the bucket it already occupies SHALL be a no-op. The adversary throughout is a guardian who has been accused, or whose lock is pinned, and who uses the wall-clock expiry of the original bucket to have that lock stop counting while it remains slashable.
 
 #### Scenario: Freeze extends the lock to the challenge's worst-case end
 - **WHEN** a challenge is filed against a proposal whose approvers' locks sit in a bucket that expires before `filedAt + disputeTimeoutAtFiling`
 - **THEN** each lock is moved to the bucket containing that end, and `openExposure` for each approver is unchanged at the moment of the move
 
 #### Scenario: Unfreeze resumes ordinary decay
-- **WHEN** the challenge terminates and coverage is unfrozen
+- **WHEN** the challenge terminates and coverage is unfrozen after the lock's booked bucket has become the current one or has passed
 - **THEN** each lock is moved to the bucket containing the current time, so it expires at that bucket's end plus `challengeWindow` — the same guarantee a freshly booked lock has
+
+#### Scenario: Unfreeze before settlement keeps the settlement bucket
+- **WHEN** a challenge is filed and resolved before the proposal settles, while the lock's booked bucket is still ahead of the current one
+- **THEN** the unfreeze returns the lock to its booked bucket, not the current one, so the budget stays held until the settlement drain can no longer be challenged
+
+#### Scenario: Freeze never moves a lock earlier
+- **WHEN** a challenge's worst-case end falls in a bucket earlier than the one the lock already occupies
+- **THEN** the lock stays where it is
 
 #### Scenario: Retire after a move unwinds the right bucket
 - **WHEN** a lock has been re-bucketed by a freeze and later unfrozen, and its retirement window has elapsed

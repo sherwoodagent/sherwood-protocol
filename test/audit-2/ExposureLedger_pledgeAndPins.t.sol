@@ -262,7 +262,7 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
         assertEq(bps[0], 10_000, "a lock over a zero basis saturates; it does not vanish");
 
         vm.prank(freezer);
-        ledger.freezeCoverage(address(mgov), 1);
+        ledger.freezeCoverage(address(mgov), 1, block.timestamp + 30 days);
         assertTrue(ledger.hasFrozenCoverage(guardian), "guardian must be frozen despite a zero stake");
         assertEq(ledger.frozenCoverageCount(), 1);
 
@@ -299,7 +299,10 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
         ledger.recordApproval(address(mgov), p1, guardian, type(uint256).max);
 
         // Advance past the guardian's own bucket challenge-window expiry, so
-        // the ONLY thing left gating `retireApproval` below is the pin.
+        // the pin is the thing gating `retireApproval` below. (Since SHE-213
+        // the pin ALSO moves the lock into the bucket containing `deadline`,
+        // so that bucket's own expiry gates the sweep after the pin decays —
+        // asserted separately at the end.)
         uint256 expiry = ledger.epochGenesis() + ledger.epochLength() + ledger.challengeWindow();
         vm.warp(expiry + 1);
 
@@ -316,6 +319,11 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
         // One instant past the deadline: the pin has decayed on both reads.
         vm.warp(deadline + 1);
         assertFalse(ledger.hasFrozenCoverage(guardian), "must read unfrozen the instant after the deadline");
+        // The PIN no longer gates; the bucket the pin moved the lock into does
+        // (it counts until its end plus the challenge window).
+        vm.expectRevert(IExposureLedger.ChallengeWindowOpen.selector);
+        ledger.retireApproval(address(mgov), p1, guardian);
+        vm.warp(ledger.epochGenesis() + 2 * ledger.epochLength() + ledger.challengeWindow() + 1);
         ledger.retireApproval(address(mgov), p1, guardian); // must now succeed
 
         (address[] memory approvers,) = ledger.pledgedOf(address(mgov), p1);

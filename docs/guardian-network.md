@@ -145,6 +145,21 @@ shrink or grow it.
   or inflate a guardian's capacity, and an approve vote never depends on a price.
   Budget recycles when a bucket ages past `bucketEnd + challengeWindow`, or
   earlier on release or retirement.
+- **Frozen and pinned locks keep counting (SHE-213).** A challenge freezes a lock
+  and an `Inconclusive` round pins it, and both keep it slashable past its
+  bucket's wall-clock expiry — so the freeze and the pin *move* the lock
+  (`_rebucket`) into the bucket containing the challenge's pinned worst-case end
+  (`filedAt + disputeTimeoutAtFiling`, sent on EVERY filing so a later
+  concurrent challenge extends it) or the pin deadline, raise-only. The
+  unfreeze returns it to ordinary decay: the later of the bucket it was booked
+  into and any standing pin — never earlier than the bucket covering
+  settlement, and never held past the last legal filing. Release and retirement unwind from the bucket the
+  lock currently occupies. `openExposure` is unchanged and there is no second
+  accumulator; the scan simply sees the lock where its liability actually ends.
+  Residual: a move target past the 60-day horizon is clamped to the horizon's
+  edge (a bucket outside the scan would un-count the lock), so a challenge at
+  the game's 60-day ceiling stops counting at the edge rather than its true
+  end; `hasFrozenCoverage` still blocks exit throughout.
 - **`k = 1` contains a conviction.** At the default `kNumerator = 1`,
   `Σ locks ≤ stake`, so burning proposal A's lock leaves
   `stake − lock_A ≥ Σ other locks`: every other proposal the guardian backs stays

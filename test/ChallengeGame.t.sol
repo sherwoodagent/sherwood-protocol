@@ -213,7 +213,7 @@ contract MockChallengeLedger {
         coverageFreezer = freezer;
     }
 
-    function freezeCoverage(address governor, uint256 proposalId) external {
+    function freezeCoverage(address governor, uint256 proposalId, uint256) external {
         _frozen[_key(governor, proposalId)] = true;
     }
 

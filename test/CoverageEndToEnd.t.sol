@@ -649,7 +649,7 @@ contract CoverageEndToEndTest is Test {
         _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
 
         // A challenge lands against the proposal g1 covered.
-        ledger.freezeCoverage(address(govA), pid);
+        ledger.freezeCoverage(address(govA), pid, block.timestamp + 30 days);
         assertTrue(ledger.hasFrozenCoverage(g1), "g1 is named by a frozen proposal");
 
         vm.prank(g1);
@@ -693,8 +693,8 @@ contract CoverageEndToEndTest is Test {
         _openReview(govB, pidB);
         _vote(govB, pidB, g1, IGuardianRegistry.GuardianVoteType.Approve);
 
-        ledger.freezeCoverage(address(govA), pidA);
-        ledger.freezeCoverage(address(govB), pidB);
+        ledger.freezeCoverage(address(govA), pidA, block.timestamp + 30 days);
+        ledger.freezeCoverage(address(govB), pidB, block.timestamp + 30 days);
         assertTrue(ledger.hasFrozenCoverage(g1));
 
         ledger.unfreezeCoverage(address(govA), pidA);

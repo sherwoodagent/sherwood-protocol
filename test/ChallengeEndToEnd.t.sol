@@ -1327,4 +1327,101 @@ contract ChallengeEndToEndTest is Test {
         assertEq(ledger.liabilityUsd(address(gov), qid), COVERAGE_USD, "Q remains fully covered");
         assertFalse(ledger.isCoverageFrozen(address(gov), qid), "and was never frozen by P's challenge");
     }
+
+    // ── SHE-213: every filing re-buckets the approvers' locks ──
+
+    /// @dev propose(`duration`) -> review -> g1 approves -> execute, without
+    ///      the 7-day-arc assertions `_proposeApproveExecute` makes.
+    function _proposeApproveExecuteWithDuration(uint256 duration) internal returns (uint256 pid) {
+        ISyndicateGovernor.RiskEnvelope memory env =
+            ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000});
+        vm.prank(agent);
+        pid = gov.propose(
+            address(vault),
+            address(0),
+            "ipfs://she-213",
+            duration,
+            env,
+            _execCalls(),
+            GovEnvelope.defaultCaps(MAX_CAPITAL, _execCalls().length),
+            _settleCalls(),
+            GovEnvelope.defaultCaps(MAX_CAPITAL, _settleCalls().length),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+        vm.warp(gov.getProposal(pid).voteEnd + 1);
+        registry.openReview(address(gov), pid);
+        vm.prank(g1);
+        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+        vm.warp(gov.getProposal(pid).reviewEnd + 1);
+        gov.executeProposal(pid);
+    }
+
+    function _epochOf(uint256 t) internal view returns (uint256) {
+        return (t - ledger.epochGenesis()) / EPOCH_LENGTH;
+    }
+
+    /// @dev The instant bucket `epoch` stops counting in `openExposure`.
+    function _bucketExpiry(uint256 epoch) internal view returns (uint256) {
+        return ledger.epochGenesis() + (epoch + 1) * EPOCH_LENGTH + ledger.challengeWindow();
+    }
+
+    function _file(address who, uint256 pid, string memory uri) internal returns (uint256 cid) {
+        vm.prank(who);
+        cid = game.file(
+            address(gov),
+            pid,
+            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            address(adapter),
+            adapter.poke.selector,
+            uri
+        );
+    }
+
+    /// @notice THE SECOND FILING REACHES THE LEDGER. A executes on day ~1 with
+    ///         a 30-day strategy (filing deadline day ~45). Challenge 1 is filed
+    ///         at execution: its worst-case end falls in bucket 1, which stops
+    ///         counting on day 70. Challenge 2 is filed at the inclusive
+    ///         deadline; its dispute clock runs to day ~76. On day 71 g1 is
+    ///         frozen and slashable through challenge 2 — and, because the game
+    ///         freezes the ledger on EVERY filing and the ledger re-buckets
+    ///         raise-only on every call, still COUNTED. Under first-filing-only
+    ///         freezing `openExposure` read zero here and g1 could re-lock.
+    function test_secondFiling_keepsTheLockCountedPastTheFirstFreezesBucket() public {
+        uint256 pid = _proposeApproveExecuteWithDuration(30 days);
+        uint256 executedAt = gov.getProposal(pid).executedAt;
+        assertEq(ledger.openExposure(g1), G1_STAKE, "locked");
+
+        // Challenge 1 at execution.
+        _file(challenger, pid, "ipfs://c1");
+        uint256 firstEpoch = _epochOf(vm.getBlockTimestamp() + game.disputeTimeout());
+
+        // Challenge 2, from a second challenger, at the inclusive filing deadline.
+        vm.warp(executedAt + 30 days + game.challengeWindow());
+        address challenger2 = makeAddr("challenger2");
+        wood.mint(challenger2, _challengerBond() * 2);
+        vm.prank(challenger2);
+        wood.approve(address(game), type(uint256).max);
+        uint256 cid2 = _file(challenger2, pid, "ipfs://c2");
+        uint256 secondLiveUntil = vm.getBlockTimestamp() + game.disputeTimeout();
+        // Non-vacuity: the second clock must outlive the first target's bucket.
+        assertGt(secondLiveUntil, _bucketExpiry(firstEpoch), "fixture: second clock outlives the first bucket");
+
+        // The instant after the first target's bucket has aged out.
+        vm.warp(_bucketExpiry(firstEpoch) + 1);
+        assertEq(
+            uint256(game.challengeOf(cid2).status), uint256(IChallengeGame.Status.Filed), "challenge 2 is still live"
+        );
+        assertTrue(ledger.isCoverageFrozen(address(gov), pid), "still frozen");
+        assertTrue(ledger.hasFrozenCoverage(g1), "g1 still exit-blocked");
+        assertEq(ledger.openExposure(g1), G1_STAKE, "frozen and slashable means COUNTED");
+    }
+
+    /// @notice The horizon clamp in `ExposureLedger._horizonClampedEpochOf`
+    ///         "only bites on a value the game itself would refuse" iff the
+    ///         game's dispute-timeout ceiling fits inside the ledger's coverage
+    ///         horizon. Pinned here so a later raise of `MAX_DISPUTE_TIMEOUT`
+    ///         cannot silently turn the clamp into an early expiry.
+    function test_constants_disputeTimeoutCeilingFitsTheCoverageHorizon() public view {
+        assertLe(game.MAX_DISPUTE_TIMEOUT(), ledger.MAX_COVERAGE_HORIZON(), "MAX_DISPUTE_TIMEOUT must fit the horizon");
+    }
 }

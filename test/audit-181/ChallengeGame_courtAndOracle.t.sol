@@ -132,7 +132,7 @@ contract MockLedgerForOracleTest {
         }
     }
 
-    function freezeCoverage(address governor, uint256 proposalId) external {
+    function freezeCoverage(address governor, uint256 proposalId, uint256) external {
         freezeCalls[_key(governor, proposalId)]++;
     }
 
