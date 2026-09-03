@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
 import {MockWoodTwapOracle} from "test/mocks/MockWoodTwapOracle.sol";
+import {MockCoverageFreezer} from "test/mocks/MockCoverageFreezer.sol";
 
 /// @dev Minimal sWOOD stub. Every proposal in this file stays UNEXECUTED
 ///      (`executedAt` never set away from its 0 default), so every
@@ -174,7 +175,9 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
     address internal owner = makeAddr("owner");
     address internal guardian = makeAddr("guardian");
     address internal registry = makeAddr("registry"); // deliberately codeless
-    address internal freezer = makeAddr("freezer");
+    // SHE-214: a freezer must answer `challengeWindow()` to wire; a low window so
+    // no test that lowers the ledger's window trips the game-side floor.
+    address internal freezer = address(new MockCoverageFreezer(1 days));
 
     uint256 internal constant MARKET_X8 = 2e8; // $2.00/WOOD
     uint256 internal constant CAP_X8 = 4e8; // 2x above market, non-binding
