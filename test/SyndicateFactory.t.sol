@@ -182,7 +182,7 @@ contract SyndicateFactoryTest is Test {
     }
 
     /// @notice A freshly created vault's governor starts at the advertised 20%
-    ///         headline, not at the 30% protocol ceiling. The settle-time clamp
+    ///         headline, not at the 25% protocol ceiling. The settle-time clamp
     ///         resolves an over-ceiling rate silently, so a permissive default
     ///         would let an owner quietly charge above the headline; this must
     ///         fail closed instead. Leaving it at the old 1500 would be the
@@ -200,6 +200,64 @@ contract SyndicateFactoryTest is Test {
         );
         assertEq(perVaultCeiling, 2000, "the headline is 20%");
         assertLt(perVaultCeiling, FeeConstants.MAX_PERFORMANCE_FEE_BPS, "the default must sit below the ceiling");
+    }
+
+    // ==================== The management-fee ceiling (SHE-182 / SHE-18) ====================
+    //
+    // Reverting `MAX_MANAGEMENT_FEE_BPS` from 300 to 500 left `test/fees/*`,
+    // `test/deploy/*` and this file entirely green (review of #294): no test
+    // referenced the constant, and neither enforcement site had a revert test at
+    // any value. These four are the pins. The performance ceiling has its own in
+    // `test/fees/FeeConstantsCap.t.sol`; this one lives on the factory, not in
+    // `FeeConstants`, so it is pinned where it is declared.
+
+    /// @notice 3%/yr, lowered from 5% in the launch configuration. This is the
+    ///         depositor's real lever: management accrues on asset-seconds for
+    ///         every day a proposal is open, win or lose.
+    function test_managementFeeCeilingIsThreePercent() public view {
+        assertEq(factory.MAX_MANAGEMENT_FEE_BPS(), 300, "the protocol management ceiling is 3%/yr");
+    }
+
+    /// @dev 301, not 501: one bps over the NEW ceiling is what makes this bite
+    ///      when someone reverts the constant to 500.
+    function test_setManagementFeeBps_revertsOneBpsAboveTheCeiling() public {
+        vm.prank(owner);
+        vm.expectRevert(SyndicateFactory.ManagementFeeTooHigh.selector);
+        factory.setManagementFeeBps(301);
+    }
+
+    /// @dev The bound is inclusive — the ceiling itself is a legal rate, so the
+    ///      test above is pinning the boundary and not merely the direction.
+    function test_setManagementFeeBps_acceptsTheCeilingItself() public {
+        vm.prank(owner);
+        factory.setManagementFeeBps(300);
+        assertEq(factory.managementFeeBps(), 300, "the ceiling itself must be settable");
+    }
+
+    /// @notice The other enforcement site. An `.env` or runbook still carrying
+    ///         the old 5% reaches this check mid-broadcast, after the executor,
+    ///         vault impl and registry are already deployed — which is why
+    ///         `Deploy.s.sol` now refuses the same value at pre-flight.
+    function test_initialize_revertsOnAManagementFeeAboveTheCeiling() public {
+        SyndicateFactory impl = new SyndicateFactory();
+        bytes memory init = abi.encodeCall(
+            SyndicateFactory.initialize,
+            (SyndicateFactory.InitParams({
+                    owner: owner,
+                    executorImpl: address(executorLib),
+                    vaultImpl: address(vaultImpl),
+                    ensRegistrar: address(ensRegistrar),
+                    agentRegistry: address(agentRegistry),
+                    beacon: governorAddr,
+                    protocolConfig: governorAddr,
+                    managementFeeBps: 301,
+                    guardianRegistry: guardianRegistryAddr,
+                    tierRegistry: address(tierRegistryFixture)
+                }))
+        );
+
+        vm.expectRevert(SyndicateFactory.ManagementFeeTooHigh.selector);
+        new ERC1967Proxy(address(impl), init);
     }
 
     /// @notice F4 — a reverting registrar `available()` view must NOT brick

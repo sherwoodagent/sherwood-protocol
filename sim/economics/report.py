@@ -13,6 +13,7 @@ import datetime
 import json
 import math
 import os
+import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(HERE, "out")
@@ -75,6 +76,21 @@ def esc(s):
 # ---------------------------------------------------------------------------
 # table shapes shared by both renderers
 # ---------------------------------------------------------------------------
+
+_TRAILING_FEE_PAIR = re.compile(r"\s+\d{1,5}\s*/\s*\d{1,5}\s*$")
+
+
+def cell_label(row):
+    """The row label, with any fee pair in it RE-RENDERED from the resolved
+    fees. A scenario file that writes "post-audit ceilings 500/3000" into a
+    label keeps saying 500/3000 after the constants it names have moved, and
+    the report then prints the new economics under the old heading (review of
+    #294). A label that names no fee pair is returned untouched."""
+    base = _TRAILING_FEE_PAIR.sub("", row["label"])
+    if base == row["label"]:
+        return base
+    return "%s %d/%d" % (base, row["mgmt_bps"], row["perf_bps"])
+
 
 HEADLINE_HEADERS = ["scenario", "ticket", "cells", "depositor share of gross",
                     "guardian pool %TVL", "WOOD locked (%float)",
@@ -139,7 +155,7 @@ def cell_rows(sc):
     rows = []
     for r in sc["rows"]:
         rows.append([
-            r["label"], r["stage"], "%d/%d" % (r["mgmt_bps"], r["perf_bps"]),
+            cell_label(r), r["stage"], "%d/%d" % (r["mgmt_bps"], r["perf_bps"]),
             price(r["wood_price"]),
             usd(r["gross_return_usd"]), usd(r["mgmt_fee_usd"]), usd(r["perf_fee_usd"]),
             usd(r["depositor_net_usd"]), pct(r["depositor_share_of_gross_pct"]),
@@ -164,7 +180,7 @@ def wood_leg_rows(sc):
     for r in sc["rows"]:
         w = r["wood"]
         rows.append([
-            r["label"], usd(w["open_coverage_usd"]), wood(w["proposer_bond_wood"]),
+            cell_label(r), usd(w["open_coverage_usd"]), wood(w["proposer_bond_wood"]),
             wood(w["guardian_stake_wood"]), wood(w["challenge_bond_wood"]),
             wood(w["owner_bond_wood"]), wood(w["total_wood_locked"]),
             usd(w["total_usd_locked"]), "yes" if w["stake_floor_binds"] else "",
@@ -182,7 +198,7 @@ def fraud_rows(sc):
     for r in sc["rows"]:
         w = r["worked_slashed"]
         rows.append([
-            r["label"], r["slash_mode"], usd(w["coverage_usd"]),
+            cell_label(r), r["slash_mode"], usd(w["coverage_usd"]),
             wood(w["slashed_wood"]), wood(w["total_burned_wood"]),
             usd(w["total_burned_usd"]), wood(w["paid_to_challenger_wood"]),
             usd(w["paid_to_depositor_usd"]),
@@ -748,7 +764,7 @@ def render_html(payload):
     pick = by_bind[:6] + by_bind[-6:]
     a("<figure>")
     a(log_bar_chart("Binding TVL at 25% of effective float",
-                    ["%s / %s" % (r["scenario"], r["label"]) for r in pick],
+                    ["%s / %s" % (r["scenario"], cell_label(r)) for r in pick],
                     [r["binding_tvl_25pct_float"] for r in pick]))
     a("<figcaption>Six tightest and six loosest cells in the whole run, log scale. "
       "The spread is nearly four orders of magnitude and almost all of it is adapter "

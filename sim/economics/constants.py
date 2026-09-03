@@ -135,6 +135,11 @@ def resolve_fee_set(name, proto, assumptions):
 
     Fee-set entries may name a protocol constant instead of a literal, so a
     change in FeeConstants.sol propagates into the scenarios automatically.
+
+    The LABEL IS RENDERED, never stored: `assumptions.json` holds the name of
+    the set and this function appends the resolved pair. A stored "500/3000"
+    on a set that reads `MAX_*_FEE_BPS` survives the constant it names and
+    then prints the new economics under the old heading (review of #294).
     """
     if name not in assumptions.fee_sets:
         raise KeyError("unknown fee set %r; known: %s"
@@ -150,4 +155,5 @@ def resolve_fee_set(name, proto, assumptions):
             return int(getattr(proto, x))
         return int(x)
 
-    return val(spec["mgmt_bps"]), val(spec["perf_bps"]), spec["label"], spec["note"]
+    mgmt, perf = val(spec["mgmt_bps"]), val(spec["perf_bps"])
+    return mgmt, perf, "%s %d/%d" % (spec["label"], mgmt, perf), spec["note"]

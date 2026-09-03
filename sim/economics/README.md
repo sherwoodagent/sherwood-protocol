@@ -150,7 +150,7 @@ The scenario library as it stands:
 | `allocated-slash` | SHE-232 | Whole-stake vs allocated slash. |
 | `mechanism-combined` | SHE-227 + SHE-232 | Both fixes, alone and together. |
 | `approver-ladder` | SHE-227 | 3 / 5 / 7 / 10 approvers. |
-| `fee-ladder` | SHE-18 | 200/2000, 500/1500, 500/3000, 100/2000 at growth and mature. |
+| `fee-ladder` | SHE-18 | 200/2000, 500/1500, 300/2500, 100/2000 at growth and mature. |
 | `cadence` | — | 6 / 12 / 24 proposals per fund-year at 14 and 21 days. |
 | `price-path` | — | Flat spot, a re-rate to $0.05, and a crash to $0.01. |
 | `reference-cells` | SHE-182 | bootstrap / growth / mature at $1M / $10M / $100M. |
@@ -198,7 +198,7 @@ hidden:
    resolves the symbol against the other extracted constants rather than assuming
    10 000. If a third file introduces a different `BPS_DENOMINATOR`, that resolution
    becomes ambiguous. (The value matters: the ledger's own default is **no haircut** —
-   only `DeployPlanB` overwrites it to 7 000, and the model uses the Plan B value.)
+   only `DeployPlanB` overwrites it to 5 000, and the model uses the Plan B value.)
 
 The `MGMT_SPLIT_*` / `PERF_SPLIT_*` patterns also lean on struct-literal field order via a
 non-greedy `[^}]*?` scan inside the brace. That survives field reordering and whitespace,

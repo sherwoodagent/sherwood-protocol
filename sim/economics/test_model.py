@@ -22,9 +22,10 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import extract_constants as xc  # noqa: E402
+import report  # noqa: E402
 import scenarios as scen  # noqa: E402
 import sensitivity  # noqa: E402
-from constants import load  # noqa: E402
+from constants import load, resolve_fee_set  # noqa: E402
 from model import (Params, binding_tvl, cohort_multiplier, run_cell,  # noqa: E402
                    wood_demand, worked_proposal)
 
@@ -40,6 +41,10 @@ def params(**overrides):
 # they keep testing the MECHANICS when a deploy parameter is deliberately moved.
 DOSSIER = dict(wood_haircut_bps=7000)
 DOSSIER_WORST_STACK = dict(mgmt_bps=500, perf_bps=3000)
+# The same stack under the launch configuration (SHE-182 / SHE-18). Literals,
+# for the same reason the dossier pair is: this pins the economics the fee
+# change was made to buy, so it must not move when a ceiling moves again.
+LAUNCH_WORST_STACK = dict(mgmt_bps=300, perf_bps=2500)
 
 
 def dossier_params(**overrides):
@@ -135,11 +140,74 @@ class ResultsSectionA(unittest.TestCase):
                                     **DOSSIER_WORST_STACK))
         self.assertAlmostEqual(c["depositor_share_of_gross_pct"], 39.5, places=1)
 
+    def test_mature_launch_stack_leaves_55_4_pct(self):
+        """The same cell at the launch ceilings -- the figure the fee change is
+        made for. Sibling of the 39.5% dossier pin above: that one keeps
+        testing the OLD economics on purpose, so without this one the number
+        that justifies 300/2500 is asserted nowhere."""
+        c = run_cell(dossier_params(stage="mature", tvl=1_000_000.0, wood_price=0.05,
+                                    **LAUNCH_WORST_STACK))
+        self.assertAlmostEqual(c["depositor_share_of_gross_pct"], 55.4, places=1)
+
     def test_fees_and_depositor_exhaust_the_gross(self):
         c = run_cell(params(stage="growth", tvl=1_000_000.0, wood_price=0.05))
         legs = c["agent_usd"] + c["guardian_usd"] + c["protocol_usd"] + c["owner_usd"]
         self.assertAlmostEqual(legs + c["depositor_net_usd"], c["gross_return_usd"],
                                places=6)
+
+
+class FeeSetLabels(unittest.TestCase):
+    """Review of #294: the report printed 55.4% under a "500/3000" heading,
+    because the label was a stored string and the fees under it were resolved
+    from the live constants. Every label that names a fee pair must render it
+    from the resolved values."""
+
+    def test_symbol_resolved_label_carries_the_resolved_numbers(self):
+        mgmt, perf, label, _ = resolve_fee_set("worst_stack", PROTO, ASSUMPTIONS)
+        # the set reads both ceilings from Solidity, so this is the label that
+        # went stale when they moved
+        self.assertEqual(mgmt, PROTO.MAX_MANAGEMENT_FEE_BPS)
+        self.assertEqual(perf, PROTO.MAX_PERFORMANCE_FEE_BPS)
+        self.assertIn("%d/%d" % (mgmt, perf), label)
+        self.assertTrue(label.endswith("%d/%d" % (mgmt, perf)), label)
+
+    def test_every_fee_set_label_ends_in_its_own_resolved_pair(self):
+        for name in sorted(ASSUMPTIONS.fee_sets):
+            mgmt, perf, label, _ = resolve_fee_set(name, PROTO, ASSUMPTIONS)
+            self.assertTrue(label.endswith("%d/%d" % (mgmt, perf)),
+                            "%s: %r does not end in its resolved fees" % (name, label))
+
+    def test_she330_is_pinned_to_history_not_to_the_live_caps(self):
+        """#330's targets are a historical position. They must not track a
+        constant this repo later moved, or the cell stops answering its own
+        question."""
+        mgmt, perf, label, _ = resolve_fee_set("she330_caps", PROTO, ASSUMPTIONS)
+        self.assertEqual((mgmt, perf), (500, 1500))
+        self.assertIn("500/1500", label)
+        spec = ASSUMPTIONS.fee_sets["she330_caps"]
+        self.assertIsInstance(spec["mgmt_bps"], int)
+        self.assertIsInstance(spec["perf_bps"], int)
+
+    def test_report_row_label_rerenders_a_stale_fee_pair(self):
+        stale = {"label": "post-audit ceilings 500/3000", "mgmt_bps": 300, "perf_bps": 2500}
+        self.assertEqual(report.cell_label(stale), "post-audit ceilings 300/2500")
+
+    def test_report_row_label_leaves_a_label_without_fees_alone(self):
+        row = {"label": "growth, 5 approvers", "mgmt_bps": 300, "perf_bps": 2500}
+        self.assertEqual(report.cell_label(row), "growth, 5 approvers")
+
+    def test_no_rendered_row_label_contradicts_its_own_fees(self):
+        """The end-to-end version: run every scenario and check each rendered
+        row label against the columns printed beside it."""
+        for sc in scen.run_all(PROTO, ASSUMPTIONS):
+            for row in sc["rows"]:
+                label = report.cell_label(row)
+                pair = "%d/%d" % (row["mgmt_bps"], row["perf_bps"])
+                for token in label.replace(",", " ").split():
+                    if token.count("/") == 1 and token.replace("/", "").isdigit():
+                        self.assertEqual(token, pair,
+                                         "%s / %s: label says %s, fees are %s"
+                                         % (sc["name"], label, token, pair))
 
 
 class BindingTvl(unittest.TestCase):

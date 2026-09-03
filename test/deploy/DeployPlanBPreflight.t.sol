@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {DeployPlanB} from "../../script/DeployPlanB.s.sol";
 import {ExposureLedger} from "../../src/ExposureLedger.sol";
+import {IExposureLedger} from "../../src/interfaces/IExposureLedger.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
@@ -731,10 +732,26 @@ contract DeployPlanBPreflightTest is Test {
     /// @dev An operator override is honoured, and the floor still binds. The
     ///      ledger's own setter rejects anything under 5,000 mid-broadcast, so
     ///      this proves the script does not quietly widen the range.
+    /// @dev The override here is ABOVE the default, so it does not reach the
+    ///      floor branch — `test_deploy_refusesAHaircutBelowTheLedgerFloor`
+    ///      does, and that is the boundary that matters now.
     function test_deploy_honoursAHaircutOverrideAndRespectsTheFloor() public {
         bookHaircutBps = 6_000;
         _run();
         assertEq(ExposureLedger(swood.exposureLedger()).woodHaircutBps(), 6_000, "an override must be seated");
+    }
+
+    /// @notice ONE BPS BELOW THE SHIPPED DEFAULT. `DEFAULT_WOOD_HAIRCUT_BPS`
+    ///         now EQUALS the ledger's `MIN_WOOD_HAIRCUT_BPS` (both 5,000), so
+    ///         the default sits exactly on the revert boundary and there is no
+    ///         margin left to test with. This pins the boundary itself: the
+    ///         refusal comes from the ledger's own setter, as `InvalidParameter`
+    ///         raised mid-broadcast, which is precisely why the script mirrors
+    ///         the floor and asserts it after the broadcast as well.
+    function test_deploy_refusesAHaircutBelowTheLedgerFloor() public {
+        bookHaircutBps = 4_999;
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        _run();
     }
 
     // ─────────────── pre-flight 10: the ledger owner (issue #89) ───────────────

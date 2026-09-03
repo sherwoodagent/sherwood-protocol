@@ -288,6 +288,10 @@ contract DeployPlanB is ScriptBase {
     ///         same reason the duration ceiling is: a parameter an operator is
     ///         merely TOLD to set afterwards is a parameter that ships at its
     ///         default, and this default is the one with no margin in it.
+    ///
+    ///         DEFAULT == FLOOR IS DELIBERATE: 5,000 is also the ledger's
+    ///         `MIN_WOOD_HAIRCUT_BPS`, so any raise of that floor must move this
+    ///         constant in the same change (4,999 is pinned as a revert in test).
     uint256 public constant DEFAULT_WOOD_HAIRCUT_BPS = 5_000;
 
     /// @notice Mirror of `ExposureLedger.MIN_WOOD_HAIRCUT_BPS`, which is
