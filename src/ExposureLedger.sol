@@ -63,7 +63,9 @@ interface IRegistryApproversMinimal {
 ///      `coverageFreezer` IS the game address. The game enforces
 ///      `game.challengeWindow <= ledger.challengeWindow()` at construction and
 ///      in two setters, but none of those re-fire when the LEDGER's window
-///      moves — `setChallengeWindow` reads this to close that gap.
+///      moves or when the ledger is pointed at a different game —
+///      `setChallengeWindow` and `setCoverageFreezer` both read this, through
+///      `_requireWindowCoversFreezer`, to close those two gaps (SHE-214).
 interface IChallengeGameWindowMinimal {
     function challengeWindow() external view returns (uint256);
 }
@@ -695,15 +697,20 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      coverage early); growing it re-counts buckets that had already expired
     ///      (conservative). Change it between epochs or at low open exposure.
     ///
-    ///      TWO LOWER BOUNDS, BOTH TOLERANT READS OF AN EXTERNAL POINTER. Reading
-    ///      a pointer STRICTLY here while `setGuardianRegistry` admits it
-    ///      TOLERANTLY is a contradiction: a registry the tolerant setter admitted
-    ///      (codeless, or reverting on `reviewPeriod()`) would then make this
-    ///      function revert in THIS frame on every subsequent call, permanently
-    ///      bricking it rather than merely declining to floor it. Liveness of a
-    ///      governance setter must not depend on a foreign contract answering a
-    ///      view call, so both bounds use the same `code.length` + try/catch
-    ///      shape: an unanswerable pointer means no floor from that side.
+    ///      TWO LOWER BOUNDS: ONE TOLERANT (the registry), ONE STRICT (the game).
+    ///      The registry bound is a tolerant `code.length` + try/catch read,
+    ///      because `setGuardianRegistry` admits the pointer TOLERANTLY (codeless,
+    ///      or reverting on `reviewPeriod()`) and reading it strictly here would
+    ///      brick this setter on a pointer the other setter let in. The game
+    ///      bound is the opposite shape, on purpose: `setCoverageFreezer` admits
+    ///      a freezer only if it answers `challengeWindow()` and fits under this
+    ///      window (SHE-214), so a wired freezer that cannot answer is a fault,
+    ///      and this is a security floor — it fails CLOSED
+    ///      (`CoverageFreezerUnreadable`) rather than declining to floor. It is
+    ///      read only when LOWERING: a raise preserves `game.W <= ledger.W` by
+    ///      construction, so the safe direction never depends on the game
+    ///      answering, and the unwire switch reopens the other direction once
+    ///      nothing is frozen.
     function setChallengeWindow(uint256 newWindow) external onlyOwner {
         // Zero would free coverage instantly. The upper bound is whatever keeps
         // `openExposure`'s walk inside `MAX_SCAN_BUCKETS`.
@@ -736,12 +743,19 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // security floor, and a wired game that cannot answer is refused rather
         // than declining to floor: `setCoverageFreezer` mirrors the same check on
         // the incoming address, so any wired freezer answered once and an
-        // unreadable one is a fault, not an ordering mistake. Liveness survives
-        // because the unwire switch (`setCoverageFreezer(0)`) has no window check.
-        // The lowering order the pair permits is game first, then ledger —
-        // `ChallengeGame.setChallengeWindow` floors under the LIVE ledger window,
-        // this floors over the LIVE game window, so the reverse order reverts here.
-        _requireWindowCoversFreezer(coverageFreezer, newWindow);
+        // unreadable one is a fault, not an ordering mistake.
+        //
+        // LOWERING ONLY. Every wiring corner guards `game.W <= ledger.W`, so the
+        // stored pair satisfies it, and `newWindow >= challengeWindow` keeps it
+        // without consulting the game. Skipping the read on a raise is what keeps
+        // this setter live in the safe direction when a wired freezer has gone
+        // mute AND a freeze is live (`setCoverageFreezer(0)` reverts
+        // `CoverageFrozen` then, so the unwire hatch is shut until the freeze
+        // clears). The lowering order the pair permits is game first, then
+        // ledger — `ChallengeGame.setChallengeWindow` floors under the LIVE
+        // ledger window, this floors over the LIVE game window, so the reverse
+        // order reverts here.
+        if (newWindow < challengeWindow) _requireWindowCoversFreezer(coverageFreezer, newWindow);
         emit ParameterChangeFinalized(PARAM_CHALLENGE_WINDOW, challengeWindow, newWindow);
         challengeWindow = newWindow;
     }
@@ -772,10 +786,17 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      reclaim design (`reclaimProposerBond`'s gate is a `max` of both
     ///      deadlines), which makes the BOND robust to a divergence — it says
     ///      nothing about the ledger having to ACCEPT one, and it does not
-    ///      reach the approver sweep this invariant protects. The fixture that
-    ///      broke (`test_reclaimBond_gameWindowAboveTheLedgers_waitsForTheGame`)
-    ///      now raises the stub game's window AFTER wiring, which is the only
-    ///      route to that state that a real game cannot take either.
+    ///      reach the approver sweep this invariant protects. The ledger's own
+    ///      design record for setter floors is
+    ///      `openspec/changes/archive/2026-08-03-enforce-floor-invariant-in-setters/design.md`:
+    ///      D3 (wired but unreadable fails closed; unwired skips) and D4
+    ///      (guarding only one of two composing setters is a bypass) prescribe
+    ///      exactly this shape. The fixture that broke
+    ///      (`test_reclaimBond_gameWindowAboveTheLedgers_waitsForTheGame`) now
+    ///      raises the stub game's window AFTER wiring — a route the real game
+    ///      cannot take (its window is a plain storage variable and the
+    ///      contract is not upgradeable), and `reclaimProposerBond`'s `max`
+    ///      gate is the defence if a non-canonical freezer ever does.
     ///
     ///      Same strict shape as `setChallengeWindow`'s bound: zero skips (the
     ///      unwire switch), anything else must answer `challengeWindow()`.
@@ -1678,15 +1699,17 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      window) and `setCoverageFreezer` (candidate freezer, stored window).
     ///      Zero is the unwire switch and skips. Otherwise a raw staticcall in
     ///      `_feedPriceX8`'s shape — `code.length` first (a typed call to an EOA
-    ///      reverts in THIS frame), short returndata rejected before decoding —
-    ///      and, being a security gate, it FAILS CLOSED: an unreadable game
-    ///      reverts `CoverageFreezerUnreadable` rather than declining to floor.
+    ///      reverts in THIS frame), returndata checked to be exactly one word
+    ///      before decoding (a bare `fallback` answers `ok` with no data; a
+    ///      different function shape answers with more) — and, being a security
+    ///      gate, it FAILS CLOSED: an unreadable game reverts
+    ///      `CoverageFreezerUnreadable` rather than declining to floor.
     function _requireWindowCoversFreezer(address freezer, uint256 ledgerWindow) internal view {
         if (freezer == address(0)) return;
         if (freezer.code.length == 0) revert CoverageFreezerUnreadable();
         (bool ok, bytes memory ret) =
             freezer.staticcall(abi.encodeCall(IChallengeGameWindowMinimal.challengeWindow, ()));
-        if (!ok || ret.length < 32) revert CoverageFreezerUnreadable();
+        if (!ok || ret.length != 32) revert CoverageFreezerUnreadable();
         if (ledgerWindow < abi.decode(ret, (uint256))) revert InvalidParameter();
     }
 

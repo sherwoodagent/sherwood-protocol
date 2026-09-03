@@ -7,9 +7,27 @@ import {IChallengeGame} from "../../src/interfaces/IChallengeGame.sol";
 import {ChallengeGame} from "../../src/ChallengeGame.sol";
 import {MockCoverageFreezer} from "../mocks/MockCoverageFreezer.sol";
 
-/// @dev Has code, but not the selector — a slot rotated to something that is
-///      not a game.
+/// @dev Has code, but not the selector and no fallback — the call REVERTS
+///      (`ok == false`): a slot rotated to something that is not a game.
 contract MuteFreezer {}
+
+/// @dev Answers `ok` with EMPTY returndata — a bare fallback swallowing the
+///      selector. Exercises the `ret.length != 32` branch from below.
+contract ShortAnswerFreezer {
+    fallback() external {}
+}
+
+/// @dev Answers `ok` with TWO words — some other function shape behind the
+///      selector. Exercises the `ret.length != 32` branch from above.
+contract LongAnswerFreezer {
+    fallback() external {
+        assembly {
+            mstore(0, 1)
+            mstore(32, 2)
+            return(0, 64)
+        }
+    }
+}
 
 /// @title ExposureLedger — SHE-214, the window floor mirrored into setCoverageFreezer
 /// @notice THE BYPASS, AS FILED. `game.challengeWindow <= ledger.challengeWindow`
@@ -113,13 +131,39 @@ contract ExposureLedgerShe214FreezerWindowMirrorTest is ExposureLedgerTest {
         ledger.setCoverageFreezer(eoa);
     }
 
-    /// @notice FAIL CLOSED: code without the selector (empty returndata on a
-    ///         missing function) is refused the same way.
+    /// @notice FAIL CLOSED: code without the selector and without a fallback
+    ///         reverts on the call (`ok == false`) and is refused the same way.
     function test_she214_muteFreezer_failsClosed() public {
         address mute = address(new MuteFreezer());
         vm.prank(owner);
         vm.expectRevert(IExposureLedger.CoverageFreezerUnreadable.selector);
         ledger.setCoverageFreezer(mute);
+    }
+
+    /// @notice FAIL CLOSED: a successful call that returns NO data (a bare
+    ///         fallback) is not an answer. Pins the `ret.length != 32` guard
+    ///         from below — dropping it would decode garbage.
+    function test_she214_shortReturndataFreezer_failsClosed() public {
+        address short_ = address(new ShortAnswerFreezer());
+        (bool ok, bytes memory ret) = short_.staticcall(abi.encodeWithSignature("challengeWindow()"));
+        assertTrue(ok, "precondition: the call succeeds");
+        assertEq(ret.length, 0, "precondition: with no data");
+        vm.prank(owner);
+        vm.expectRevert(IExposureLedger.CoverageFreezerUnreadable.selector);
+        ledger.setCoverageFreezer(short_);
+    }
+
+    /// @notice FAIL CLOSED: a successful call that returns MORE than one word
+    ///         is some other function, not `challengeWindow()`. Pins the guard
+    ///         from above (`== 32`, not `>= 32`).
+    function test_she214_longReturndataFreezer_failsClosed() public {
+        address long_ = address(new LongAnswerFreezer());
+        (bool ok, bytes memory ret) = long_.staticcall(abi.encodeWithSignature("challengeWindow()"));
+        assertTrue(ok, "precondition: the call succeeds");
+        assertEq(ret.length, 64, "precondition: with two words");
+        vm.prank(owner);
+        vm.expectRevert(IExposureLedger.CoverageFreezerUnreadable.selector);
+        ledger.setCoverageFreezer(long_);
     }
 
     /// @notice FAIL CLOSED: a freezer whose `challengeWindow()` reverts.
@@ -132,8 +176,8 @@ contract ExposureLedgerShe214FreezerWindowMirrorTest is ExposureLedgerTest {
     }
 
     /// @notice The sibling bound in `setChallengeWindow` is strict too. A
-    ///         freezer that answered at wiring and stopped afterwards (an
-    ///         upgraded or broken game) blocks the window setter — and the
+    ///         freezer that answered at wiring and stopped afterwards (a
+    ///         non-canonical or broken game) blocks a LOWERING — and the
     ///         unwire switch reopens it, so nothing is bricked.
     function test_she214_setChallengeWindow_unreadableWiredFreezer_failsClosedButIsRecoverable() public {
         MockCoverageFreezer game = _game(W);
@@ -142,13 +186,42 @@ contract ExposureLedgerShe214FreezerWindowMirrorTest is ExposureLedgerTest {
         game.setMuted(true);
 
         vm.expectRevert(IExposureLedger.CoverageFreezerUnreadable.selector);
-        ledger.setChallengeWindow(W + 1 days);
+        ledger.setChallengeWindow(W - 1 days);
         assertEq(ledger.challengeWindow(), W, "the refused change must not have taken effect");
 
         ledger.setCoverageFreezer(address(0));
+        ledger.setChallengeWindow(W - 1 days);
+        vm.stopPrank();
+        assertEq(ledger.challengeWindow(), W - 1 days);
+    }
+
+    /// @notice A RAISE never consults the game: it preserves `game.W <=
+    ///         ledger.W` by construction. This is what keeps the setter live in
+    ///         the safe direction when the unwire hatch is shut — a mute wired
+    ///         freezer AND a live freeze (`setCoverageFreezer(0)` reverts
+    ///         `CoverageFrozen`). Lowering stays strict throughout.
+    function test_she214_setChallengeWindow_raiseSkipsAMuteFreezerEvenUnderALiveFreeze() public {
+        MockCoverageFreezer game = _game(W);
+        vm.prank(owner);
+        ledger.setCoverageFreezer(address(game));
+        vm.prank(address(game));
+        ledger.freezeCoverage(makeAddr("anyGovernor"), 1);
+        game.setMuted(true);
+
+        vm.startPrank(owner);
+        // The hatch is shut...
+        vm.expectRevert(IExposureLedger.CoverageFrozen.selector);
+        ledger.setCoverageFreezer(address(0));
+        // ...lowering is refused (strict)...
+        vm.expectRevert(IExposureLedger.CoverageFreezerUnreadable.selector);
+        ledger.setChallengeWindow(W - 1 days);
+        // ...and raising goes through without reading the game.
+        ledger.setChallengeWindow(W + 1 days);
+        assertEq(ledger.challengeWindow(), W + 1 days);
+        // Equal is a non-lowering too.
         ledger.setChallengeWindow(W + 1 days);
         vm.stopPrank();
-        assertEq(ledger.challengeWindow(), W + 1 days);
+        assertEq(ledger.coverageFreezer(), address(game), "still wired; nothing was unwound to get here");
     }
 
     /// @notice `setChallengeWindow` still refuses to shrink under the wired
