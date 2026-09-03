@@ -252,21 +252,32 @@ abstract contract StakedWoodHandler is Properties {
 
     // ── Secondary: owner-slot lifecycle, acted as the BOUND OWNER ──
     //
-    // `Base.setup()` binds the slot to `address(this)`, so every call below
-    // runs unpranked: this contract IS the vault owner, and `requestUnstakeOwner`
-    // / `cancelUnstakeOwner` / `prepareOwnerStake` all key on `msg.sender`.
-    // Pranking as `admin` would be equivalent today (`admin == address(this)`)
-    // but would silently stop working if the harness ever rebinds elsewhere.
+    // `Base.setup()` binds the slot to `address(this)`, so this contract IS the
+    // vault owner, and `requestUnstakeOwner` / `cancelUnstakeOwner` /
+    // `prepareOwnerStake` all key on `msg.sender`. Pranking as `admin` would be
+    // equivalent today (`admin == address(this)`) but would silently stop
+    // working if the harness ever rebinds elsewhere.
+    //
+    // EXPLICITLY PRANKED AS `address(this)` RATHER THAN LEFT UNPRANKED. Running
+    // bare would be identical only if no prank were in force — but an `asActor`
+    // frame whose body reverts never reaches its `vm.stopPrank()`, so a later
+    // draw can inherit that actor as `msg.sender` and turn every call here into
+    // a silent no-op against a slot the actor does not own. Setting the prank
+    // explicitly overrides anything leaked and pins the sender to the owner.
 
     /// @dev Reverts while the vault has an open or active proposal, which is
     ///      the gate `requestUnstakeOwner` documents — reverting simply drops
     ///      the call from the sequence, so this is safe to draw at any time.
     function _stakedWood_requestUnstakeOwnerAsOwner(address vault_) internal {
+        vm.startPrank(address(this));
         swood.requestUnstakeOwner(vault_);
+        vm.stopPrank();
     }
 
     function _stakedWood_cancelUnstakeOwnerAsOwner(address vault_) internal {
+        vm.startPrank(address(this));
         swood.cancelUnstakeOwner(vault_);
+        vm.stopPrank();
     }
 
     /// @dev Re-fund an EMPTIED owner-stake slot through the same factory-gated
@@ -284,6 +295,12 @@ abstract contract StakedWoodHandler is Properties {
     function _stakedWood_rebindOwnerStake() internal {
         if (swood.ownerStake(address(vault)) != 0) return;
 
+        // Same explicit prank as the two above: `prepareOwnerStake` escrows
+        // against `msg.sender`, and a leaked prank would park the escrow on an
+        // actor and leave `bindOwnerStake` reverting forever. `_asFactory` is
+        // unaffected either way — it hops through `fizzFactory`, so the callee
+        // sees the factory as its sender, not whoever this frame pranks.
+        vm.startPrank(address(this));
         if (!swood.canCreateVault(address(this))) {
             uint256 min = swood.minOwnerStake();
             wood.deal(address(this), min);
@@ -291,6 +308,7 @@ abstract contract StakedWoodHandler is Properties {
             swood.prepareOwnerStake(min);
         }
         _asFactory(address(swood), abi.encodeCall(StakedWood.bindOwnerStake, (address(this), address(vault))));
+        vm.stopPrank();
     }
 
     // ── Secondary: owner-gated params ──

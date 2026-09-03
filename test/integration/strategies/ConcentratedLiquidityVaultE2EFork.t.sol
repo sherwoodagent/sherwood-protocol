@@ -126,7 +126,52 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         super.setUp();
         // `super.setUp()` skips (and leaves `vault` unset) when there is no RPC.
         if (address(vault) == address(0)) return;
+        // `this.` ON PURPOSE, and it is what makes this file compile from cold.
+        // See `wireVenue`.
+        this.wireVenue();
+    }
 
+    /// @dev The rest of `setUp`, BEHIND AN EXTERNAL SELF-CALL. Same statements,
+    ///      same order, same storage — `this.wireVenue()` runs at this address,
+    ///      so the `vm.startPrank(deployer)` block below still pranks from here
+    ///      and `new UniswapSwapAdapter(...)` / `new ConcentratedLiquidityStrategy()`
+    ///      still deploy from this contract's nonce sequence, at the same
+    ///      addresses. Nothing is pranked or `expectRevert`-armed across the
+    ///      call, so the extra frame is not observable.
+    ///
+    ///      WHY IT IS NOT JUST TIDYING. `forge clean && forge build` at b350eaa:
+    ///        Yul exception:Cannot swap Variable expr_5 with Variable _37:
+    ///        too deep in the stack by 1 slots in
+    ///        [ expr_5 size _1 expr expr_1 var_instance size cleaned_9 cleaned_8
+    ///          _1 memPtr_14 expr_mpos_11 expr_mpos_7 expr_mpos_9 expr_mpos_4
+    ///          size expr_mpos_10 _37 ]
+    ///        --> test/integration/strategies/ConcentratedLiquidityVaultE2EFork.t.sol:83:41
+    ///      Ignore the reported line. `83:41` is the `POSITION_MANAGER` literal,
+    ///      and solc reuses that location as the ambient one for ~2,400 IR
+    ///      statements in this contract — it identifies nothing. The FRAME is the
+    ///      evidence: `cleaned_8`/`cleaned_9` plus a string's memory positions is
+    ///      an `assertEq(address,address,string)`, of which this body has three,
+    ///      and `expr_5` is the hoisted `POSITION_MANAGER` constant, live from the
+    ///      identity assertions all the way down to `setCounterpartyAllowed`.
+    ///      Splitting the body off shortens that live range to one frame.
+    ///
+    ///      WHY `external` AND NOT `internal`. The three splits further down
+    ///      (`_routeData`, `_rerangePolicy`, `_initParams`) and the base harness's
+    ///      `_initializeClone` all keep pointers out of a frame the same way, but
+    ///      the inliner may undo an internal split and at this size it does: two
+    ///      internal reshapes were tried here and produced a byte-for-byte
+    ///      identical stack. An external call is the one boundary it cannot cross.
+    ///
+    ///      AND IT IS NOT A LOCAL PROPERTY OF THIS FILE. This same contract, byte
+    ///      for byte, compiles clean in a cut-down project holding only its own
+    ///      import closure: Yul variable names carry global AST ids, so the set of
+    ///      sources compiled ALONGSIDE it moves the optimizer's decisions. That is
+    ///      how the base built clean and this head did not with this file
+    ///      untouched, why a warm incremental build hides it entirely (the cached
+    ///      artifact is reused and the scheduler never re-runs), and why the check
+    ///      is `forge clean && forge build` on the whole tree rather than `--skip`
+    ///      or a compilation restriction.
+    function wireVenue() external {
         // ── Venue identity, not code presence ──
         assertEq(
             keccak256(bytes(INonfungiblePositionManager(POSITION_MANAGER).symbol())),
@@ -309,8 +354,37 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         calls[0] = BatchExecutorLib.Call({target: strategy, data: abi.encodeWithSignature("settle()"), value: 0});
     }
 
+    /// @dev THE SECOND HALF OF THE `wireVenue` FIX — see its natspec for the
+    ///      failure, the evidence and why an external boundary is the only kind
+    ///      that holds. These two are the same device applied to the other end of
+    ///      the contract: they pull the `InitParams` encode and the
+    ///      `Clones.clone` + `initialize(address,address,bytes)` pair out of every
+    ///      frame that inlines `_deploy`.
+    ///
+    ///      BOTH HALVES ARE REQUIRED; NEITHER IS REDUNDANT. Measured, each by a
+    ///      full `forge clean && forge build`: this pair alone still failed, and
+    ///      the `wireVenue` split alone still failed (with the original frame,
+    ///      unchanged). Only the two together build clean. That is what a
+    ///      one-slot overflow spread across a whole contract's inlining budget
+    ///      looks like — do not drop either half because it "looks unnecessary"
+    ///      without re-running the cold build.
+    ///
+    ///      Behaviour is unchanged. `initDataFor` is a `view` self-staticcall over
+    ///      this contract's own storage; `cloneAndInitFor` is a self-call, so
+    ///      `msg.sender` inside it is `address(this)` exactly as it was inline and
+    ///      the `vm.prank(deployer)` in `_cloneAndInit` still applies. Every
+    ///      `_deploy` call site is the first statement of a test body, with no
+    ///      prank in force and no `expectRevert` armed.
+    function initDataFor(uint256 twapDeviationBps) external view returns (bytes memory) {
+        return _initData(twapDeviationBps);
+    }
+
+    function cloneAndInitFor(bytes calldata data) external returns (address) {
+        return _cloneAndInit(template, data);
+    }
+
     function _deploy(uint256 twapDeviationBps) internal returns (address strategy, uint256 proposalId) {
-        strategy = _cloneAndInit(template, _initData(twapDeviationBps));
+        strategy = this.cloneAndInitFor(this.initDataFor(twapDeviationBps));
         proposalId = _proposeVoteExecute(_execCalls(strategy), _settleCalls(strategy), PERF_FEE_BPS, STRATEGY_DURATION);
     }
 

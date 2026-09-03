@@ -975,17 +975,22 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_activeProposal != 0) revert StrategyAlreadyActive();
         // RE-ASSERTED AT THE POINT OF USE, not only at the point of admission
         // (SHE-215). `propose` refuses an unbonded vault, but the bond that
-        // matters is the one live WHEN CAPITAL MOVES: the vote and the review
-        // period sit between the two, and `requestUnstakeOwner` only refuses
-        // while `openProposalCount() != 0`, so nothing stops an owner starting
-        // their exit before the proposal that is about to execute even exists.
-        // Checking here closes the class rather than the instance, exactly as
-        // `GovernorEmergency.finalizeEmergencySettle` re-asserts its own bond
+        // matters is the one live WHEN CAPITAL MOVES, and the vote plus the
+        // review period sit between the two.
+        //
+        // The reachable route between those two points is `slashOwnerBond`: the
+        // registry can empty an owner-stake slot at any time, including while a
+        // proposal it never saw is mid-flight. The owner's OWN exit is not that
+        // route — `requestUnstakeOwner` refuses while `openProposalCount() != 0`
+        // (Draft onward) or a proposal is active, and once a request is in
+        // `propose` refuses too, so an owner cannot walk a proposal up to this
+        // gate. Checking here closes the class rather than the instance, exactly
+        // as `GovernorEmergency.finalizeEmergencySettle` re-asserts its own bond
         // gate and says so.
         //
         // The dual of `claimUnstakeOwner`'s claim-time `openProposalCount()`
         // re-check: that one stops the bond leaving while a proposal is open,
-        // this one stops a proposal executing while the bond is leaving. Both
+        // this one stops a proposal executing once the bond is gone. Both
         // exist because a gate that fires once can be walked around by changing
         // the state it measured.
         if (!IGuardianRegistry(_guardianRegistry).ownerBondLive(vault)) revert OwnerBondNotLive();
