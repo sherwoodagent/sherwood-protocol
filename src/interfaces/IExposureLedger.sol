@@ -36,11 +36,11 @@ interface IExposureLedger {
 
     /// @notice A non-zero `coverageFreezer` (the challenge game) that cannot
     ///         answer `challengeWindow()` — codeless, reverting, or returning
-    ///         short data. Raised by `setCoverageFreezer` on the incoming
-    ///         address and by `setChallengeWindow` on the wired one (SHE-214):
-    ///         the window floor is a security gate, so an unreadable game is
-    ///         refused rather than waved through. Recoverable by unwiring
-    ///         (`setCoverageFreezer(address(0))`).
+    ///         anything but one word. Raised by `setCoverageFreezer` on the
+    ///         incoming address and by `setChallengeWindow` on the wired one
+    ///         when lowering (SHE-214): the window floor is a security gate, so
+    ///         an unreadable game is refused rather than waved through.
+    ///         Recoverable by unwiring (`setCoverageFreezer(address(0))`).
     error CoverageFreezerUnreadable();
 
     /// @notice `retireApproval` called on a guardian still within an active
