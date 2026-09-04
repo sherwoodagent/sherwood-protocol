@@ -67,21 +67,21 @@
     },
     "K_NUMERATOR": {
       "file": "src/ExposureLedger.sol",
-      "line": 181,
+      "line": 174,
       "note": "USD of coverage bookable per USD of haircut-priced stake.",
       "raw": "1",
       "value": 1
     },
     "LEDGER_CHALLENGE_WINDOW_DAYS": {
       "file": "src/ExposureLedger.sol",
-      "line": 179,
+      "line": 172,
       "note": "Post-epoch challenge window held by the ledger.",
       "raw": "14",
       "value": 14
     },
     "LEDGER_DEFAULT_WOOD_HAIRCUT_BPS": {
       "file": "src/ExposureLedger.sol",
-      "line": 238,
+      "line": 231,
       "note": "The ledger's OWN default haircut. Written symbolically as BPS_DENOMINATOR, i.e. NO haircut. Only DeployPlanB overwrites it.",
       "raw": "BPS_DENOMINATOR",
       "value": 10000
@@ -103,7 +103,7 @@
     "MAX_MANAGEMENT_FEE_BPS": {
       "file": "src/SyndicateFactory.sol",
       "line": 179,
-      "note": "Hard ceiling on the management fee (5%/yr).",
+      "note": "Hard ceiling on the management fee (3%/yr).",
       "raw": "300",
       "value": 300
     },
@@ -228,7 +228,7 @@
     },
     "PROPOSER_BOND_BPS": {
       "file": "src/ExposureLedger.sol",
-      "line": 197,
+      "line": 190,
       "note": "Proposer bond as bps of USD coverage (1%).",
       "raw": "100",
       "value": 100

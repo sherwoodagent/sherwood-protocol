@@ -10,6 +10,7 @@ The dollar figures pinned here come from the SHE-182 manual simulation and its
 changed or a protocol constant did -- both are things a reviewer must see.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -198,7 +199,31 @@ class FeeSetLabels(unittest.TestCase):
 
     def test_no_rendered_row_label_contradicts_its_own_fees(self):
         """The end-to-end version: run every scenario and check each rendered
-        row label against the columns printed beside it."""
+        row label against the columns printed beside it.
+
+        The committed scenarios all agree with their own fees today, so they
+        alone cannot tell re-render from passthrough. The synthetic scenario
+        below carries a label that disagrees on purpose, and is what makes
+        this test fail if `cell_label` stops re-rendering (review of #294)."""
+        stale = {
+            "name": "stale-label-fixture",
+            "title": "a scenario whose stored label names the OLD ceilings",
+            "cells": [{"label": "mature at ceilings 500/3000",
+                       "overrides": {"stage": "mature", "mgmt_bps": 300,
+                                     "perf_bps": 2500}}],
+        }
+        tmp = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(tmp, "stale-label-fixture.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump(stale, fh)
+            sc = scen.run_all(PROTO, ASSUMPTIONS, directory=tmp)[0]
+        finally:
+            shutil.rmtree(tmp)
+        rendered = report.cell_label(sc["rows"][0])
+        self.assertEqual(rendered, "mature at ceilings 300/2500")
+        self.assertNotIn("500/3000", rendered)
+
         for sc in scen.run_all(PROTO, ASSUMPTIONS):
             for row in sc["rows"]:
                 label = report.cell_label(row)

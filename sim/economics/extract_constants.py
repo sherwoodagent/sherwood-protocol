@@ -212,7 +212,7 @@ SPECS = [
     # --- src/SyndicateFactory.sol ---------------------------------------------
     dict(name="MAX_MANAGEMENT_FEE_BPS", file="src/SyndicateFactory.sol",
          pattern=r"constant\s+MAX_MANAGEMENT_FEE_BPS\s*=\s*([\d_]+)\s*;",
-         conv=_as_int, note="Hard ceiling on the management fee (5%/yr)."),
+         conv=_as_int, note="Hard ceiling on the management fee (3%/yr)."),
     dict(name="MAX_STRATEGY_DURATION_DAYS", file="src/SyndicateFactory.sol",
          pattern=r"maxStrategyDuration:\s*([\d_]+)\s*days",
          conv=_as_days,

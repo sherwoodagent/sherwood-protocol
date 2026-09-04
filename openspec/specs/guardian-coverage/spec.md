@@ -286,7 +286,7 @@ Guardian compensation SHALL be coverage-weighted, not stake-weighted. At settlem
 - **THEN** `GuardianFeeAccrued` is not emitted, so the off-chain distributor cannot double-pay when the escrow is later claimed
 
 ### Requirement: Protocol fee ceiling constants
-The protocol-wide performance-fee constants SHALL live in a single library (`src/FeeConstants.sol`): the hard agent performance-fee ceiling `MAX_PERFORMANCE_FEE_BPS = 3000` (30%) shared by governor and vault caps, the governor's shipped default cap `DEFAULT_MAX_PERFORMANCE_FEE_BPS = 2000` (20%), and the default agent fee `DEFAULT_AGENT_FEE_BPS = 2000` (20%) used as the vault getter's fallback. The default agent fee SHALL equal `DEFAULT_MAX_PERFORMANCE_FEE_BPS`, so an unset vault charges exactly the headline rate and only an explicit governor parameter change goes above it; the hard ceiling sits above both so that change has somewhere to go.
+The protocol-wide performance-fee constants SHALL live in a single library (`src/FeeConstants.sol`): the hard agent performance-fee ceiling `MAX_PERFORMANCE_FEE_BPS = 2500` (25%) shared by governor and vault caps, the governor's shipped default cap `DEFAULT_MAX_PERFORMANCE_FEE_BPS = 2000` (20%), and the default agent fee `DEFAULT_AGENT_FEE_BPS = 2000` (20%) used as the vault getter's fallback. The default agent fee SHALL equal `DEFAULT_MAX_PERFORMANCE_FEE_BPS`, so an unset vault charges exactly the headline rate and only an explicit governor parameter change goes above it; the hard ceiling sits above both so that change has somewhere to go.
 
 #### Scenario: Shared ceiling
 - **WHEN** either the governor's `maxPerformanceFeeBps` cap or the vault's agent-fee cap is enforced

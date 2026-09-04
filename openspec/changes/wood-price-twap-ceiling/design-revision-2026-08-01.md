@@ -179,6 +179,13 @@ it is a different problem (structural unavailability) and a different fix.
 
 ### The haircut ships at 7,000 (owner decision, 2026-08-02)
 
+> **SUPERSEDED by SHE-182.** The shipped value is now **5,000** —
+> `DeployPlanB.s.sol:295` — and the "why not 5,000" argument below was answered
+> on the revenue side rather than by weakening the allowance. This section is
+> kept as the record of the 2026-08-02 decision; the live requirement is
+> `openspec/specs/deployment-docs/spec.md`, "The WOOD price carries two accepted
+> overstatements".
+
 A **30% allowance**, and `DeployPlanB` SEATS it inside its broadcast rather than
 leaving it to a follow-up transaction. The ledger's default is 10,000 — no
 haircut — and its own setter accepts that as a legal value, so the
