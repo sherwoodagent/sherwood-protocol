@@ -21,17 +21,17 @@ below the high-water mark while review workload is unchanged. See
 ## Management fee
 
 - **Rate source:** `vault.managementFeeBps()`, stamped once at vault creation from
-  `SyndicateFactory.managementFeeBps` (`src/SyndicateFactory.sol:342`). There is no
+  `SyndicateFactory.managementFeeBps` (`src/SyndicateFactory.sol:374`). There is no
   per-vault setter — changing the factory value only affects *new* vaults.
-- **Bounds:** 0 → `MAX_MANAGEMENT_FEE_BPS = 300` bps (3%/yr), enforced at vault
-  `initialize` (`src/SyndicateFactory.sol:309`) and at the factory setter
+- **Bounds:** 0 → `MAX_MANAGEMENT_FEE_BPS = 300` bps (3%/yr), enforced at
+  `SyndicateFactory.initialize` (`src/SyndicateFactory.sol:309`) and at the factory setter
   (`src/SyndicateFactory.sol:593`). Deploy scripts seed 200 bps (2%/yr).
 - **Sticky per vault:** `_managementFeeBps` is written once at `initialize`
-  (`src/SyndicateVault.sol:270`) and the vault exposes only a getter
-  (`:955`) — there is no per-vault setter, and `SyndicateFactory.setManagementFeeBps`
+  (`src/SyndicateVault.sol:601`) and the vault exposes only a getter
+  (`:1467`) — there is no per-vault setter, and `SyndicateFactory.setManagementFeeBps`
   reaches new vaults only. A fund created under the wrong rate keeps it forever.
 - **Accrual:** the vault integrates *asset-seconds* — a running sum of
-  `fund assets × elapsed time` (`src/SyndicateVault.sol:1554`). The clock only runs
+  `fund assets × elapsed time` (`src/SyndicateVault.sol:2686`). The clock only runs
   while a strategy is deployed: `startManagementAccrual()` starts it at
   `executeProposal` and `consumeManagementAccrual()` stops and zeroes it at
   settlement. **Idle capital between proposals accrues nothing.**
@@ -152,10 +152,10 @@ Collaborative proposals sub-split the **agent slice** of both fees
 | Parameter | Units | Default | Min | Max | Enforced at |
 |---|---|---|---|---|---|
 | `managementFeeBps` | bps/yr | 200 | 0 | 300 | `SyndicateFactory.sol:309`, `:593` |
-| `agentFeeBps` | bps | 2 000 | 0 | 2 500 | `SyndicateVault.sol:1131` |
-| `maxPerformanceFeeBps` (per-vault cap) | bps | 2 000 | 0 | 2 500 | `GovernorParameters.sol:346` |
-| Mgmt split legs | bps | 6000/2000/2000 | 0/leg | sum == 10 000 | `ProtocolConfig.sol:92` |
-| Perf split legs | bps | 5000/1500/2500/1000 | 0/leg | sum == 10 000 | `ProtocolConfig.sol:103` |
+| `agentFeeBps` | bps | 2 000 | 0 | 2 500 | `SyndicateVault.sol:1482` |
+| `maxPerformanceFeeBps` (per-vault cap) | bps | 2 000 | 0 | 2 500 | `GovernorParameters.sol:345` |
+| Mgmt split legs | bps | 6000/2000/2000 | 0/leg | sum == 10 000 | `ProtocolConfig.sol:101` |
+| Perf split legs | bps | 5000/1500/2500/1000 | 0/leg | sum == 10 000 | `ProtocolConfig.sol:112` |
 | Co-proposer `splitBps` | bps | per-proposal | 100 | 9 000 total | `SyndicateGovernor.sol:1498` |
 | `creationFee` | absolute | 0 | — | unbounded | `SyndicateFactory.sol:503` |
 | `minBufferBps` | bps | 0 | 0 | 5 000 | `SyndicateVault.sol:1140` |

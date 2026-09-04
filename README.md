@@ -95,7 +95,7 @@ Independent of the syndicate machinery — team/contributor token grants.
 
   | Fee | Base | Rate source | Ceiling | Charged | Split |
   |---|---|---|---|---|---|
-  | Management | fund assets × time deployed | `vault.managementFeeBps()`, seeded from `factory.managementFeeBps` | `MAX_MANAGEMENT_FEE_BPS` = 3%/yr (deploy scripts seed 2%) | **every** settlement — profit, flat or loss | agent 60 / protocol 20 / guardian 20 |
+  | Management | fund assets × time deployed | `vault.managementFeeBps()`, seeded from `factory.managementFeeBps` | `MAX_MANAGEMENT_FEE_BPS` = 3%/yr (Deploy.s.sol seeds 2%, testnet 0.5%) | **every** settlement — profit, flat or loss | agent 60 / protocol 20 / guardian 20 |
   | Performance | value above the fund's previous **peak** price per share | `vault.agentFeeBps()` (default 20%), clamped at propose to the governor's `maxPerformanceFeeBps` | per-vault cap defaults to 20%; hard protocol ceiling 25% | profitable settlements only | agent 50 / protocol 15 / guardian 25 / owner 10 |
 
   Each fee is one division of one base, not a waterfall — no recipient's share is

@@ -51,8 +51,8 @@ contract DeployScriptTest is Test {
     ///         the broadcast, so it never reaches `initialize` mid-ceremony.
     /// @dev The control (`MANAGEMENT_FEE == MAX`) reverts on the LATER
     ///      `OWNER_MULTISIG` guard — a different reason proves the pre-flight
-    ///      passed rather than that `run()` reverts for any input. `vm.setEnv`
-    ///      writes the shared process environment, so every var is restored.
+    ///      passed rather than that `run()` reverts for any input. `vm.setEnv` is
+    ///      process-global: `MANAGEMENT_FEE` and `WOOD_TOKEN` are restored at the end.
     function test_run_refusesAnOverCapManagementFee() public {
         DeploySherwood s = new DeploySherwood();
         ERC20Mock wood = new ERC20Mock("WOOD", "WOOD", 18);
