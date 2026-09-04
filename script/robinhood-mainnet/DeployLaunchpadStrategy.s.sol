@@ -6,14 +6,16 @@ import {ScriptBase} from "../ScriptBase.sol";
 import {LaunchpadStrategy} from "../../src/strategies/LaunchpadStrategy.sol";
 import {SushiLaunchAdapter} from "../../src/adapters/SushiLaunchAdapter.sol";
 import {StonkLaunchAdapter} from "../../src/adapters/StonkLaunchAdapter.sol";
+import {PonsLaunchAdapter} from "../../src/adapters/PonsLaunchAdapter.sol";
 import {ISushiLaunchpad} from "../../src/vendor/sushi/ISushiLaunchpad.sol";
+import {IPonsLaunchFactory, IPonsLaunchLocker} from "../../src/vendor/pons/IPonsLaunch.sol";
 import {IStonkSafeLaunchpadV2} from "../../src/vendor/stonkbrokers/IStonkSafeLaunchpadV2.sol";
 import {ITierRegistry} from "../../src/interfaces/ITierRegistry.sol";
 
 /**
- * @notice Deploy the LaunchpadStrategy template with BOTH launch adapters —
- *         SushiLaunchAdapter and StonkLaunchAdapter — to Robinhood Chain
- *         mainnet (chain 4663).
+ * @notice Deploy the LaunchpadStrategy template with ALL THREE launch
+ *         adapters — SushiLaunchAdapter, StonkLaunchAdapter and
+ *         PonsLaunchAdapter — to Robinhood Chain mainnet (chain 4663).
  *
  *   MAINNET-ONLY BY CONSTRUCTION. Both venues exist on 4663 and nowhere else —
  *   `cast code` against the testnet (46630) Sushi address returns empty — so
@@ -21,11 +23,19 @@ import {ITierRegistry} from "../../src/interfaces/ITierRegistry.sol";
  *   template whose every clone would revert at init. Fork rehearsal happens on
  *   a 4663 fork via ROBINHOOD_FORK_CHAIN_ID.
  *
- *   WHY BOTH ADAPTERS IN ONE SCRIPT: they are two implementations of one
+ *   WHY EVERY ADAPTER IN ONE SCRIPT: they are implementations of one
  *   interface serving one template, and an agent picks between them per
  *   proposal. Deploying them apart would let the template ship with only one
- *   venue certified, which reads to an agent as "the other pair is broken"
+ *   venue certified, which reads to an agent as "the other pairs are broken"
  *   rather than "not yet approved".
+ *
+ *   THE PONS ADAPTER IS OPTIONAL HERE, and deliberately so. It deploys only
+ *   when `chains/{id}.json` carries `PONS_LAUNCH_FACTORY_V2` and
+ *   `PONS_LAUNCH_LOCKER_V2`; a book without them skips it with a printed note
+ *   rather than aborting a ceremony whose other two venues are ready. Note
+ *   also that the Pons venue is CLOSED on 4663 today — `launchEnabled()` is
+ *   false and the whitelist is empty — so a deployed Pons adapter is INERT
+ *   until Pons acts. The runbook prints exactly what to ask them for.
  *
  *   Prerequisites:
  *     - Core stack deployed (Deploy.s.sol) and StrategyFactory deployed.
@@ -35,8 +45,8 @@ import {ITierRegistry} from "../../src/interfaces/ITierRegistry.sol";
  *       addresses and their identity evidence live in addresses/4663.json.
  *
  *   Post-deploy, the REGISTRY OWNER must, and the runbook below prints it:
- *     - `setAdapterAllowed` + tier certification for BOTH adapters (Gate A +
- *       Gate B, docs/adapter-onboarding-checklist.md).
+ *     - `setAdapterAllowed` + tier certification for EVERY adapter this run
+ *       deployed (Gate A + Gate B, docs/adapter-onboarding-checklist.md).
  *     - `StrategyFactory.setTemplateApproval(LAUNCHPAD_TEMPLATE, true)`.
  *
  *   NO COUNTERPARTY ALLOWANCES ARE NEEDED for these venues, and that is a real
@@ -70,6 +80,21 @@ contract DeployLaunchpadStrategy is ScriptBase {
         address weth = _readAddress("WETH");
         _assertIsSushiLaunchpad(launchpad, weth);
 
+        // TOLERANT reads: the Pons keys are newer than this script's other
+        // dependencies, and a book that predates them must skip the third
+        // adapter rather than abort a ceremony whose two ready venues would
+        // otherwise ship. `_assertIsPonsFactory` is what makes the skip safe to
+        // be tolerant about — anything PRESENT is verified in full.
+        address ponsFactory = _optionalAddress("PONS_LAUNCH_FACTORY_V2");
+        address ponsLocker = _optionalAddress("PONS_LAUNCH_LOCKER_V2");
+        if (ponsFactory == address(0) || ponsLocker == address(0)) {
+            console.log("PONS_LAUNCH_FACTORY_V2 / PONS_LAUNCH_LOCKER_V2 absent - SKIPPING PonsLaunchAdapter.");
+            console.log("  Seed both keys in chains/%s.json and re-run to deploy it.", vm.toString(block.chainid));
+            ponsFactory = address(0);
+        } else {
+            _assertIsPonsFactory(ponsFactory, ponsLocker, weth);
+        }
+
         vm.startBroadcast();
         address deployer = msg.sender;
         console.log("Deployer:", deployer);
@@ -78,6 +103,7 @@ contract DeployLaunchpadStrategy is ScriptBase {
         SushiLaunchAdapter adapter = new SushiLaunchAdapter(launchpad);
         (address[] memory quotes, address[] memory pads) = _stonkLaneSet();
         StonkLaunchAdapter stonkAdapter = new StonkLaunchAdapter(quotes, pads, _readAddress("SAFE_LAUNCH_LENS_V2"));
+        address ponsAdapter = ponsFactory == address(0) ? address(0) : address(new PonsLaunchAdapter(ponsFactory, weth));
         LaunchpadStrategy template = new LaunchpadStrategy();
 
         vm.stopBroadcast();
@@ -88,14 +114,18 @@ contract DeployLaunchpadStrategy is ScriptBase {
 
         _patchAddress("SUSHI_LAUNCH_ADAPTER", address(adapter));
         _patchAddress("STONK_LAUNCH_ADAPTER", address(stonkAdapter));
+        if (ponsAdapter != address(0)) _patchAddress("PONS_LAUNCH_ADAPTER", ponsAdapter);
         _patchAddress("LAUNCHPAD_TEMPLATE", address(template));
         console.log("SushiLaunchAdapter:   ", address(adapter));
         console.log("StonkLaunchAdapter:   ", address(stonkAdapter));
+        console.log("PonsLaunchAdapter:    ", ponsAdapter);
         console.log("LaunchpadStrategy:    ", address(template));
         console.log("StonkLaunchAdapter padSetHash:");
         console.logBytes32(stonkAdapter.padSetHash());
 
-        _printRegistryRunbook(address(adapter), address(stonkAdapter), launchpad, address(template));
+        _printRegistryRunbook(
+            address(adapter), address(stonkAdapter), ponsAdapter, launchpad, ponsFactory, address(template)
+        );
     }
 
     /// @dev The eight V2 (mint-launch) lanes, read from the address book.
@@ -199,6 +229,45 @@ contract DeployLaunchpadStrategy is ScriptBase {
         require(pad.quoteTokenPriceFeed(weth) != address(0), "launchpad has no WETH quote feed");
     }
 
+    /// @dev IDENTITY, NOT PRESENCE, for the Pons venue — the same hazard
+    ///      `_assertIsSushiLaunchpad` exists for, answered with the graph this
+    ///      venue makes available. Pons is TWO contracts that name each other,
+    ///      so the round trip is cheap to check and hard to fake: the factory
+    ///      must name the book's locker, and that locker must name the factory
+    ///      back. A squatter would have to reproduce both halves.
+    ///
+    ///      THE CONFIG CHECK IS NOT DECORATION. `PonsLaunchAdapter`'s
+    ///      constructor refuses a WETH that is not the `pairToken` of some
+    ///      ENABLED launch config, so a venue with no live WETH pairing makes
+    ///      the deploy revert with a constructor error instead of a sentence.
+    ///      Asserting it here turns that into a legible failure, and also
+    ///      catches the case that matters operationally: a venue that has
+    ///      disabled the only pairing the template can use.
+    function _assertIsPonsFactory(address ponsFactory, address ponsLocker, address weth) internal view {
+        require(ponsFactory.code.length != 0, "PONS_LAUNCH_FACTORY_V2 holds no code");
+        require(ponsLocker.code.length != 0, "PONS_LAUNCH_LOCKER_V2 holds no code");
+
+        // READ THE FIRST HOP DEFENSIVELY, so the squatter case produces a
+        // SENTENCE rather than a panic. A codeful-but-unrelated address has no
+        // `locker()`, and a typed call there aborts on an ABI-decode panic with
+        // no reason string. Every later hop is typed, because by then the
+        // target has answered one Pons-shaped question correctly.
+        (bool ok, bytes memory ret) = ponsFactory.staticcall(abi.encodeCall(IPonsLaunchFactory.locker, ()));
+        require(ok && ret.length == 32, "PONS_LAUNCH_FACTORY_V2 does not answer locker() - not a Pons factory");
+        require(abi.decode(ret, (address)) == ponsLocker, "factory locker() disagrees with PONS_LAUNCH_LOCKER_V2");
+        require(
+            IPonsLaunchLocker(ponsLocker).factory() == ponsFactory,
+            "locker factory() disagrees with PONS_LAUNCH_FACTORY_V2"
+        );
+
+        IPonsLaunchFactory pons = IPonsLaunchFactory(ponsFactory);
+        require(pons.launchConfigCount() != 0, "Pons factory has no launch configs");
+        require(pons.dexConfigCount() != 0, "Pons factory has no dex configs");
+        IPonsLaunchFactory.LaunchConfig memory config = pons.getLaunchConfig(0);
+        require(config.pairToken == weth, "Pons launch config 0 does not pair against WETH");
+        require(config.enabled, "Pons launch config 0 is disabled");
+    }
+
     /// @dev Printed, not executed: these are REGISTRY-OWNER actions and the
     ///      deployer is not the owner on mainnet. `DeployConcentratedLiquidity
     ///      Strategy` asserts its counterparty precondition instead, because
@@ -210,10 +279,14 @@ contract DeployLaunchpadStrategy is ScriptBase {
     ///      address the script itself is minting is impossible, so the runbook
     ///      is the honest form and the post-deploy reads below are how it is
     ///      verified.
-    function _printRegistryRunbook(address adapter, address stonkAdapter, address launchpad, address template)
-        internal
-        view
-    {
+    function _printRegistryRunbook(
+        address adapter,
+        address stonkAdapter,
+        address ponsAdapter,
+        address launchpad,
+        address ponsFactory,
+        address template
+    ) internal view {
         // TOLERANT read: this script can legitimately run on a fork whose book
         // predates the core deploy, and a mandatory read would revert the whole
         // ceremony over a runbook printout.
@@ -224,7 +297,18 @@ contract DeployLaunchpadStrategy is ScriptBase {
         console.log("2. Tier certification for that adapter (Gate A)       ", adapter);
         console.log("3. TierRegistry.setAdapterAllowed(stonkAdapter, true) ", stonkAdapter);
         console.log("4. Tier certification for that adapter (Gate A)       ", stonkAdapter);
-        console.log("5. StrategyFactory.setTemplateApproval(template, true)", template);
+        if (ponsAdapter != address(0)) {
+            console.log("5. TierRegistry.setAdapterAllowed(ponsAdapter, true) ", ponsAdapter);
+            console.log("6. Tier certification for that adapter (Gate A)      ", ponsAdapter);
+        }
+        // Numbered around the optional block above, so a skipped Pons deploy
+        // does not leave a gap an operator reads as a missing step.
+        console.log(
+            ponsAdapter == address(0)
+                ? "5. StrategyFactory.setTemplateApproval(template, true)"
+                : "7. StrategyFactory.setTemplateApproval(template, true)",
+            template
+        );
         console.log("");
         console.log("NO counterparty allowances are needed for these venues. Each adapter");
         console.log("pins its venue in IMMUTABLES the codehash gate already covers, unlike a");
@@ -240,6 +324,12 @@ contract DeployLaunchpadStrategy is ScriptBase {
             console.log(
                 "tierRegistry.isAdapterAllowed(stonkAdapter):", ITierRegistry(registry).isAdapterAllowed(stonkAdapter)
             );
+            if (ponsAdapter != address(0)) {
+                console.log(
+                    "tierRegistry.isAdapterAllowed(ponsAdapter): ",
+                    ITierRegistry(registry).isAdapterAllowed(ponsAdapter)
+                );
+            }
         } else {
             console.log("TIER_REGISTRY unset in the address book - verify the two reads by hand");
         }
@@ -249,5 +339,25 @@ contract DeployLaunchpadStrategy is ScriptBase {
         console.log("      Sushi owner registers a WOOD/USD aggregator; every other");
         console.log("      supported lane (WETH, USDG, stock tokens) works meanwhile,");
         console.log("      and the adapter needs no change when that feed lands.");
+
+        if (ponsAdapter == address(0)) return;
+        console.log("");
+        console.log("***********************************************************************");
+        console.log("*  ACTION REQUIRED AT PONS - THE PONS ADAPTER IS INERT UNTIL THEY ACT  *");
+        console.log("***********************************************************************");
+        console.log("PonsLaunchFactory.launchEnabled() is FALSE and the whitelist is empty,");
+        console.log("so EVERY launch through this adapter reverts NotWhitelisted() at the");
+        console.log("venue. Registry certification does NOT lift this - only Pons can.");
+        console.log("");
+        console.log("Give Pons THIS address to whitelist:");
+        console.log("  PonsLaunchAdapter:", ponsAdapter);
+        console.log("Either of these un-blocks it, from the Pons factory OWNER:");
+        console.log("  setWhitelistedLauncher(<adapter above>, true)   <-- preferred, scoped");
+        console.log("  setLaunchEnabled(true)                          <-- opens it publicly");
+        console.log("Verify with:");
+        console.log("  cast call <factory> 'whitelistedLaunchers(address)(bool)' <adapter>");
+        console.log("The whitelist is PER-ADDRESS, which is why this adapter is a singleton:");
+        console.log("a per-launch clone would need a new Pons approval for every fund.");
+        console.log("Re-run the certification only after the whitelist read returns true.");
     }
 }

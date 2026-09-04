@@ -72,6 +72,14 @@
     "SafeLaunchLensV2": {
       "address": "0x25b5Df581f4b2Ed450203f375ad8A28b17F115B3",
       "verification": "Verified source SafeLaunchLensV2 (solc v0.8.24); 13007 bytes of code. All reads take the pad as their first argument. priceWei(WETH_V2_PAD, 1) answered 39847682795 on 2026-08-28, i.e. it prices a real launch on a real pad. Curve math MUST be read through this lens rather than reimplemented -- the tax schedule changes every minute."
+    },
+    "PonsLaunchFactoryV2": {
+      "address": "0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB",
+      "verification": "Verified source PonsLaunchFactory (solc v0.8.30) on robinhoodchain.blockscout.com; ~266k transactions. Identity round-trip closes: factory.locker() == PonsLaunchLockerV2 below, whose own factory() returns this address. Live state read 2026-08-31: launchFee() == 5e14 wei native, launchConfigCount() == 1, dexConfigCount() == 1, owner == 0x263ed295dAFaE1d9AAdD6E56c4B6F9f38eE019Dd. Launch config 0 = {pairToken: WETH, graduationThreshold: 4.2e18, initialTick: -204200, supply: 1e27, maxWalletBps: 500, maxTxBps: 550, restrictionBlocks: 2, enabled: true}. Dex config 0 = 'uniswap v3' on the CHAIN'S CANONICAL UniV3 (factory 0x1f7d7550..., positionManager 0x73991a25..., router 0xCaf681a6... -- the same entries already in this book), 1% pool fee, tickSpacing 200. NOT USABLE YET: launchToken reverts NotWhitelisted unless launchEnabled (reads FALSE) or whitelistedLaunchers[caller]; the v1/legacy factory 0x0c37a24F5D23A486FA692d1500881d698B1F77a4 carries the IDENTICAL gate and the same owner, so it is no escape. Two facts that shaped our adapter: the factory hardcodes amountOutMinimum == 0 on the dev-buy router call, so it enforces NO slippage floor and the integrator's own check is the only guarantee; and getLaunchedToken returns a zero-filled struct with exists == false for an unknown token rather than reverting (the opposite of Sushi's launchInfo), while graduationStatus is the reverting one."
+    },
+    "PonsLaunchLockerV2": {
+      "address": "0x736D76699C26D0d966744cAe304C000d471f7F35",
+      "verification": "Verified source PonsLaunchLocker (solc v0.8.30). factory() == PonsLaunchFactoryV2 above. Holds every launch's LP position, locked -- the creator never custodies one. Two access facts the adapter design rests on: setFeeRedirect(token, wallet) authorises launched.deployer OR the factory, so the launching adapter can re-point fees after the launch; collectFees(token) authorises owner, deployer, the current recipient, or an allowlisted feeCollector, pays the current feeRedirects[token], and reverts NoFeesToCollect() when nothing has accrued. Live 2026-08-31: protocolFeeShare() == 30 and protocolFeeRecipient() == the owner, and collectFees RETURNS THE GROSS while paying the recipient the net -- an integrator reporting the return tuple would overstate the fund's take by exactly Pons's 30% cut."
     }
   },
   "tokens": {

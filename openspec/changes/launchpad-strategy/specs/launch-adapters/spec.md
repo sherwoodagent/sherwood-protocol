@@ -64,6 +64,35 @@ Fee destination: `launch` SHALL `transferCreator(token, p.feeRecipient)` in the 
 - **WHEN** `launch(p)` is called with `p.quoteToken = WOOD` while `quoteTokenPriceFeed(WOOD) == 0`
 - **THEN** the adapter reverts before moving funds, with an error naming the unsupported quote
 
+### Requirement: PonsLaunchAdapter (stateless singleton, gated venue)
+
+`src/adapters/PonsLaunchAdapter.sol` SHALL front `PonsLaunchFactory` v2 (`0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB`) and its locker (`0x736D76699C26D0d966744cAe304C000d471f7F35`). It SHALL be a SINGLETON, and that is forced rather than chosen: the venue admits launchers by ADDRESS (`whitelistedLaunchers`), so per-launch clones could never each be admitted.
+
+`feeWallet` at this venue decides TWO things — `initialBuyRecipient = feeWallet == 0 ? msg.sender : feeWallet`, and the locker's fee redirect. The template needs them split, so `launch` SHALL set `feeWallet` to the CALLING STRATEGY, so the dev buy that is the reserve lands where holders can claim it, and SHALL then immediately call `locker.setFeeRedirect(token, p.feeRecipient)` in the same transaction, which the locker permits because it authorises `launched.deployer`. The adapter SHALL expose no caller-reachable path to `setFeeRedirect` thereafter: it remains `deployer` forever and therefore retains the theoretical power to re-point any launch's fees, and the custody invariant holds only because that power is unexercisable in fact.
+
+The dev buy is funded in NATIVE here (`initialBuyAmount = msg.value - launchFee`), so the adapter SHALL unwrap `launchFee + quoteIn` of the WETH it pulls, not merely the fee. `quoteSupported` SHALL be CONFIG-gated — true only where some ENABLED launch config pairs against the quote — unlike Sushi's feed registry; only the WETH config is live today, which is a venue configuration rather than a protocol limit. `collectFees` SHALL drive `locker.collectFees`, tolerate its `NoFeesToCollect()` as `(0, 0)`, and report deltas on the current redirect target.
+
+**THE VENUE ENFORCES NO SLIPPAGE FLOOR OF ITS OWN.** The factory hardcodes `amountOutMinimum: 0` into the router call, which inverts the Sushi arrangement — there the venue's own floor fires first and the adapter's check is belt-and-braces. Here the adapter's post-launch balance check is the ONLY thing standing between a proposal's `minTokensOut` and an arbitrarily sandwiched dev buy, so it SHALL check `p.minTokensOut` strictly, with the `reserveAmount` assertion behind it.
+
+`venueData` SHALL carry `{uint256 launchConfigId, uint256 dexId, bytes32 salt}`, each validated before any transfer (in range, enabled, `pairToken == p.quoteToken`, router set). Pinning the ids instead would freeze the adapter at one configuration and force a redeploy plus re-certification the moment Pons adds a pairing.
+
+The salt SHALL be namespaced per caller — `keccak256(abi.encode(msg.sender, salt))`. Adversary, and it is specific to a SINGLETON on this venue: the token address is CREATE2-derived from the metadata and the deployer, and for a shared adapter the deployer is one constant, so two funds choosing the same name, symbol and salt would collide and the second launch would fail. Namespacing gives every strategy its own salt space and makes squatting another fund's launch impossible.
+
+`quoteSupported` SHALL apply TWO gates of different kinds, documented apart so the constraint is not misattributed: the VENUE's, that some enabled config pairs against the quote; and THIS ADAPTER's, that the quote is the wrapped native, because the venue funds the dev buy from `msg.value` and a non-wrapped-native pairing cannot be funded by us at all.
+
+The venue is CLOSED today: `launchToken` reverts `NotWhitelisted` unless `launchEnabled` (false) or the caller is whitelisted, and the v1 factory carries the identical gate under the same owner. The adapter is therefore deployable but INERT until Pons flips the flag or admits our address, and the deploy runbook SHALL say so with the address to hand them. The ONLY approval that gates a Pons proposal on our side is the adapter's own `setAdapterAllowed` plus certification; no counterparty allowance is required, for the same reason as the other two venues — this adapter pins its factory and locker in immutables the codehash gate already covers. The remaining gate is entirely the venue's: the Pons-side whitelist, which no action of ours can substitute for.
+
+#### Scenario: Reserve and fees reach different destinations
+- **WHEN** `launch(p)` completes
+- **THEN** the launch tokens bought are held by the calling strategy, and the locker's fee redirect for that token is `p.feeRecipient`
+
+#### Scenario: The gate is real
+- **WHEN** the adapter is not whitelisted and `launchEnabled` is false
+- **THEN** `launch` reverts at the venue and no funds have moved
+
+#### Scenario: Fees cannot be re-pointed after launch
+- **WHEN** any caller tries to make the adapter change a launch's fee redirect after `launch` returned
+- **THEN** no such entry point exists
 ### Requirement: A failed venue payout is distinguishable from an empty one
 
 `collectFees` tolerates a failing venue call by contract, but SHALL NOT make that failure invisible. Implementations SHALL emit a distinct event when the inner venue call fails, carrying the revert selector and a gas-starvation indication, while still returning `(0, 0)`.
