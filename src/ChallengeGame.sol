@@ -97,6 +97,22 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      the far side can seat a configuration this contract would refuse.
     uint256 public constant MIN_REFERRAL_SLACK = 1 hours;
 
+    /// @notice Floor on the SETTLE WINDOW `[autoSlashDelay, disputeTimeout)` -
+    ///         the time a permissionless `resolve` has to convict an undisputed
+    ///         filing before the hard deadline makes it stale (SHE-246). With
+    ///         no court wired `_requireWindowFits` is vacuous, so without this
+    ///         floor the owner could set `disputeTimeout = autoSlashDelay + 1`
+    ///         and make every LATER un-backed filing effectively unconvictable.
+    ///         That is a new owner power - before the deadline existed the
+    ///         window had no right edge - so it is bounded here, in BOTH
+    ///         setters, regardless of court wiring. One day is the same order
+    ///         as `FINALIZE_BUFFER`: it survives a chain halt or a keeper
+    ///         outage, and a challenger who cannot call `resolve` within a day
+    ///         of the silence verdict was not going to. With a court wired the
+    ///         referral invariant (`voteWindow + FINALIZE_BUFFER +
+    ///         MIN_REFERRAL_SLACK`) already implies a wider window.
+    uint256 public constant MIN_SETTLE_WINDOW = 1 days;
+
     /// @dev THE GAS FLOOR for a permissionless `resolve`, sized per approver
     ///      plus a base because the slash loop runs first and a flat floor would
     ///      let a large batch consume it before the work that needs protecting.
@@ -300,6 +316,15 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         delay, and always strictly greater than it - a timeout at or
     ///         below the slash clock would let a contested challenge fail before
     ///         the slash it was raised against was ever due.
+    /// @notice ALSO THE HARD END OF SLASHABILITY (SHE-246). `filedAt +
+    ///         disputeTimeoutAtFiling` is the instant from which no path can
+    ///         convict on that filing: `rule` reverts `WindowClosed` and
+    ///         `resolve` only unwinds. It is the same value `file` books on the
+    ///         ledger as `liveUntil`, so the ledger keeps counting the lock
+    ///         against guardian capacity at least until the filing stops being
+    ///         able to slash it (it ages out of the scan no earlier than the
+    ///         end of the bucket containing `liveUntil` plus the ledger's
+    ///         `challengeWindow` - never before the deadline).
     /// @dev    Deliberately generous relative to `autoSlashDelay`: guardians
     ///         carry the vigilance burden, so the escalation they buy with a
     ///         counter-bond must be worth more than the window they lost.
@@ -1105,6 +1130,21 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      pinned it routes to `_fail`, which also re-arms the re-challenge
     ///      window - a court WAS pinned, yet nothing adjudicated the merits. Only
     ///      `rule`'s genuine `NotGuilty` entry does not re-arm.
+    /// @dev THE SILENCE BRANCH HAS A HARD END (SHE-246). An un-backed filing is
+    ///      convictable only inside `[filedAt + autoSlashDelay, filedAt +
+    ///      disputeTimeout)`. From the deadline on it is STALE: `_settle` is
+    ///      unreachable and the call routes to `_refundAll` instead. Nobody
+    ///      called the permissionless settle for the whole of that window, so
+    ///      nothing was adjudicated; the accused could not have stopped the
+    ///      settle, so the accused is not the one who let it lapse; and the
+    ///      shape is exactly the "free freeze" `_refundAll`'s escalating burn
+    ///      already prices - the filing froze coverage for the full dispute
+    ///      clock and delivered no verdict. Without this end the ledger had no
+    ///      instant to book `liveUntil` against, and a lock could leave
+    ///      `openExposure` while still slashable (design.md, frozen-lock
+    ///      rebucketing). `_fail` is deliberately NOT the stale exit: it forfeits
+    ///      the bond to pool funders pro rata, and an un-backed pool bought no
+    ///      defence to be paid for.
     function resolve(uint256 challengeId) external {
         Challenge storage c = _challenges[challengeId];
         // `Filed` is the only stored live status now - `Disputed` is derived
@@ -1114,7 +1154,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         bytes32 poolKey = _poolOf[challengeId];
         if (!_poolBacked(c, _pools[poolKey])) {
             if (block.timestamp < c.filedAt + c.autoSlashDelayAtFiling) revert DelayNotElapsed();
-            _settle(challengeId, c, poolKey);
+            if (block.timestamp >= c.filedAt + c.disputeTimeoutAtFiling) {
+                // Stale: past the hard end. Unwind, never convict.
+                _refundAll(challengeId, c, poolKey);
+            } else {
+                _settle(challengeId, c, poolKey);
+            }
         } else {
             if (block.timestamp < c.filedAt + c.disputeTimeoutAtFiling) revert DelayNotElapsed();
             if (c.courtAtFiling == address(0)) {
@@ -1141,6 +1186,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @dev Ruling beats the timeout: all three branches are terminal and
     ///      `resolve` acts only on `Filed`/`Disputed`, so the clock can never
     ///      overwrite a verdict already handed down.
+    /// @dev AND THE TIMEOUT BEATS A LATE RULING (SHE-246). From `filedAt +
+    ///      disputeTimeoutAtFiling` on, `rule` reverts `WindowClosed` whatever
+    ///      the verdict: the filing is stale and only `resolve`'s non-verdict
+    ///      exits remain, so the deadline the ledger books as `liveUntil` is
+    ///      the true end of slashability. `TokenCourt.refer` already refuses a
+    ///      case whose vote plus `FINALIZE_BUFFER` would not fit inside this
+    ///      deadline (`InsufficientClock`), so an honest `finalize` always
+    ///      lands before it; one that arrives late bubbles this revert (the
+    ///      court swallows only `WrongStatus`), leaves the case intact, and
+    ///      closes it once `resolve` has made the challenge terminal.
     /// @dev CEI is inherited from `_settle`/`_fail`/`_refundAll`; the event is
     ///      emitted first so the log reads verdict-then-consequence.
     function rule(uint256 challengeId, Verdict verdict) external {
@@ -1164,6 +1219,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         bytes32 poolKey = _poolOf[challengeId];
         if (c.status != Status.Filed || !_poolBacked(c, _pools[poolKey])) revert WrongStatus();
         if (c.courtAtFiling == address(0)) revert NotCourt();
+        // Hard deadline - see the natspec. Checked AFTER the status/court gates
+        // so a terminal challenge still reports `WrongStatus` to the court.
+        if (block.timestamp >= c.filedAt + c.disputeTimeoutAtFiling) revert WindowClosed();
         emit ChallengeRuled(challengeId, verdict);
         if (verdict == Verdict.Guilty) {
             _settle(challengeId, c, poolKey);
@@ -1626,6 +1684,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      missed its participation floor, so neither side was found right or
     ///      wrong: nothing is slashed, nothing is forfeited, and the counter-bond
     ///      pool simply comes back.
+    ///
+    ///      THREE ENTRIES, one shape: a court's `Inconclusive` ruling, the
+    ///      Disputed timeout with no court pinned, and (SHE-246) a STALE
+    ///      un-backed filing - `resolve` at or after `filedAt +
+    ///      disputeTimeoutAtFiling` on a challenge nobody settled inside its
+    ///      window. The pool may then be part-funded rather than complete;
+    ///      `_releasePoolIfLast` hands whatever was raised back to its funders.
     ///
     ///      The challenger's bond is not returned whole: an unpriced challenge is
     ///      a free freeze. This contract cannot tell an honest challenger whose
@@ -2104,25 +2169,32 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         }
     }
 
-    /// @dev Bounded [`MIN_AUTO_SLASH_DELAY`, `disputeTimeout`). Both clocks run
-    ///      from `filedAt`, so a delay at or above the dispute timeout would let
-    ///      a contested challenge time out before the slash it was raised against
-    ///      came due, and the accused would have bought its escalation for
-    ///      nothing. The last check is the cross-contract one, which additionally
-    ///      needs the court's own clocks.
+    /// @dev Bounded [`MIN_AUTO_SLASH_DELAY`, `disputeTimeout - MIN_SETTLE_WINDOW`].
+    ///      Both clocks run from `filedAt`, so a delay at or above the dispute
+    ///      timeout would let a contested challenge time out before the slash it
+    ///      was raised against came due, and the accused would have bought its
+    ///      escalation for nothing; and since the timeout is now also the hard
+    ///      end of slashability, the settle window between the two keeps
+    ///      `MIN_SETTLE_WINDOW` whether or not a court is wired. The last check
+    ///      is the cross-contract one, which additionally needs the court's own
+    ///      clocks.
     function setAutoSlashDelay(uint256 newDelay) external onlyOwner {
-        if (newDelay < MIN_AUTO_SLASH_DELAY || newDelay >= disputeTimeout) revert InvalidParameter();
+        if (newDelay < MIN_AUTO_SLASH_DELAY || newDelay + MIN_SETTLE_WINDOW > disputeTimeout) {
+            revert InvalidParameter();
+        }
         _requireWindowFits(court, newDelay, disputeTimeout);
         emit AutoSlashDelaySet(autoSlashDelay, newDelay);
         autoSlashDelay = newDelay;
     }
 
-    /// @dev Bounded (`autoSlashDelay`, `MAX_DISPUTE_TIMEOUT`] - the same
-    ///      cross-parameter invariant from the other side, plus a ceiling on how
-    ///      long a filing may pin a guardian's coverage. Last check is the
-    ///      cross-contract one, as in `setAutoSlashDelay`.
+    /// @dev Bounded [`autoSlashDelay + MIN_SETTLE_WINDOW`, `MAX_DISPUTE_TIMEOUT`]
+    ///      - the same cross-parameter invariant from the other side, plus a
+    ///      ceiling on how long a filing may pin a guardian's coverage. Last
+    ///      check is the cross-contract one, as in `setAutoSlashDelay`.
     function setDisputeTimeout(uint256 newTimeout) external onlyOwner {
-        if (newTimeout <= autoSlashDelay || newTimeout > MAX_DISPUTE_TIMEOUT) revert InvalidParameter();
+        if (newTimeout < autoSlashDelay + MIN_SETTLE_WINDOW || newTimeout > MAX_DISPUTE_TIMEOUT) {
+            revert InvalidParameter();
+        }
         _requireWindowFits(court, autoSlashDelay, newTimeout);
         emit DisputeTimeoutSet(disputeTimeout, newTimeout);
         disputeTimeout = newTimeout;

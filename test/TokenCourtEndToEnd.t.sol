@@ -1361,4 +1361,49 @@ contract TokenCourtEndToEndTest is Test {
         // The test contract is sWOOD's factory.
         swood.bindOwnerStake(owner, vault_);
     }
+
+    /// @notice SHE-246: A LATE `finalize` CANNOT CONVICT. `refer` guarantees an
+    ///         honest finalize fits before `filedAt + disputeTimeoutAtFiling`;
+    ///         one that arrives at or after it finds `rule` shut (`WindowClosed`
+    ///         bubbles - the case is left intact, nothing swallowed), and the
+    ///         challenge's own clock then times it out to the accused. The case
+    ///         closes afterwards through the swallowed `WrongStatus`, verdict
+    ///         recorded but undelivered - bookkeeping, not a slash.
+    function test_arc_lateFinalize_cannotConvictPastTheDisputeDeadline() public {
+        uint256 pid = _proposeApproveExecute();
+        uint256 stakeBefore = swood.guardianStake(g1);
+
+        vm.prank(challenger);
+        uint256 cid = game.file(
+            address(gov),
+            pid,
+            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            address(adapter),
+            adapter.poke.selector,
+            "ipfs://evidence/late"
+        );
+        _disputeFull(cid);
+        uint256 caseId = court.caseOfChallenge(address(game), cid);
+        assertTrue(caseId != 0, "fixture: referred");
+        vm.prank(g2);
+        court.vote(caseId, true); // a guilty majority that will never land
+
+        IChallengeGame.Challenge memory c = game.challengeOf(cid);
+        uint256 deadline = c.filedAt + c.disputeTimeoutAtFiling;
+        ITokenCourt.Case memory k = court.caseOf(caseId);
+        assertLe(k.referredAt + k.voteWindowAtReferral, deadline, "fixture: the vote closed before the deadline");
+
+        vm.warp(deadline);
+        vm.expectRevert(IChallengeGame.WindowClosed.selector);
+        court.finalize(caseId);
+        assertEq(uint256(court.caseOf(caseId).phase), uint256(ITokenCourt.Phase.Voting), "case left intact");
+
+        game.resolve(cid);
+        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Failed), "timed out");
+        assertEq(swood.guardianStake(g1), stakeBefore, "the late verdict never slashed");
+
+        court.finalize(caseId); // `WrongStatus` swallowed: bookkeeping only
+        assertEq(uint256(court.caseOf(caseId).phase), uint256(ITokenCourt.Phase.Resolved), "case closed");
+        assertEq(swood.guardianStake(g1), stakeBefore, "still not slashed");
+    }
 }

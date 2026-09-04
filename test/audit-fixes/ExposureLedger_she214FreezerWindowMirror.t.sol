@@ -205,7 +205,7 @@ contract ExposureLedgerShe214FreezerWindowMirrorTest is ExposureLedgerTest {
         vm.prank(owner);
         ledger.setCoverageFreezer(address(game));
         vm.prank(address(game));
-        ledger.freezeCoverage(makeAddr("anyGovernor"), 1);
+        ledger.freezeCoverage(makeAddr("anyGovernor"), 1, block.timestamp + 30 days);
         game.setMuted(true);
 
         vm.startPrank(owner);
