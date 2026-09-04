@@ -22,7 +22,8 @@ below the high-water mark while review workload is unchanged. See
 
 - **Rate source:** `vault.managementFeeBps()`, stamped once at vault creation from
   `SyndicateFactory.managementFeeBps` (`src/SyndicateFactory.sol:136`) and stamped
-  into the vault's init params at `:374`. There is no per-vault setter — changing the factory value only affects *new* vaults.
+  into the vault's init params at `:374`. There is no per-vault setter — changing
+  the factory value only affects *new* vaults.
 - **Bounds:** 0 → `MAX_MANAGEMENT_FEE_BPS = 300` bps (3%/yr), enforced at
   `SyndicateFactory.initialize` (`src/SyndicateFactory.sol:288`, check at `:309`) and
   at the factory setter (`src/SyndicateFactory.sol:593`). The vault-side write is a

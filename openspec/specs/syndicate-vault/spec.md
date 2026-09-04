@@ -307,7 +307,7 @@ The vault SHALL expose an initialization-time `managementFeeBps` and an owner-se
 
 #### Scenario: Default agent fee
 - **WHEN** the owner has never called `setAgentFeeBps`
-- **THEN** `agentFeeBps()` returns 500
+- **THEN** `agentFeeBps()` returns 2000
 
 #### Scenario: Explicit zero survives
 - **WHEN** the owner sets the agent fee to 0
