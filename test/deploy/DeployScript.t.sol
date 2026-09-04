@@ -46,13 +46,12 @@ contract DeployScriptTest is Test {
         assertEq(mirrored, 300, "the management ceiling is 3%/yr");
     }
 
-    /// @notice Pins the `run()` PRE-FLIGHT itself, not just the mirrored constant:
-    ///         an over-cap `MANAGEMENT_FEE` must be refused by the script, before
-    ///         the broadcast, so it never reaches `initialize` mid-ceremony.
+    /// @notice Pins the `run()` PRE-FLIGHT itself, not the mirrored constant: an
+    ///         over-cap `MANAGEMENT_FEE` must be refused before the broadcast, so
+    ///         it never reaches `initialize` mid-ceremony.
     /// @dev The control (`MANAGEMENT_FEE == MAX`) reverts on the LATER
     ///      `OWNER_MULTISIG` guard — a different reason proves the pre-flight
-    ///      passed rather than that `run()` reverts for any input. `vm.setEnv`
-    ///      writes the shared process environment, so every var is restored.
+    ///      passed. `vm.setEnv` is process-global, so all four vars are restored.
     function test_run_refusesAnOverCapManagementFee() public {
         DeploySherwood s = new DeploySherwood();
         ERC20Mock wood = new ERC20Mock("WOOD", "WOOD", 18);
@@ -70,8 +69,12 @@ contract DeployScriptTest is Test {
         vm.expectRevert(bytes("OWNER_MULTISIG required (or set SKIP_MULTISIG_HANDOFF=true)"));
         s.run();
 
+        // Restore every var this test wrote to the `vm.envOr` default the script
+        // would see with it unset — not just the two the first draft reset.
         vm.setEnv("MANAGEMENT_FEE", "200");
         vm.setEnv("WOOD_TOKEN", "0x0000000000000000000000000000000000000000");
+        vm.setEnv("SKIP_MULTISIG_HANDOFF", "false");
+        vm.setEnv("OWNER_MULTISIG", "0x0000000000000000000000000000000000000000");
     }
 
     function test_predictedFactoryAddressMatchesRealDeploy() public {
