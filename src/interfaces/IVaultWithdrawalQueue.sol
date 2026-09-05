@@ -112,7 +112,6 @@ interface IVaultWithdrawalQueue {
     // could not release. The settle stamp is computed from float alone, so a
     // redeemer claiming against it leaves their share of that residue behind and
     // it accrues to the LPs who stayed — no attacker, no loss to the protocol, a
-    // transfer between LPs (finding #3, fairness half).
     //
     // The stamp stays the SENIOR floor: fully backed, always payable, unchanged.
     // What follows is a JUNIOR claim on real assets as they actually arrive,

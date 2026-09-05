@@ -6,7 +6,6 @@ interface ITierRegistry {
     /// @notice May RECEIVE vault funds through a governor batch — the spender /
     ///         recipient axis (`_guardBatchCalls` PART 2b). The STRONG grant.
     /// @dev    No longer answers "may be named as a batch callee": that is
-    ///         `isCallableTarget`, split out per pashov finding #14 so a
     ///         demotion can revoke the right to be PAID without revoking the
     ///         vault's ability to RECLAIM from the address already holding its
     ///         capital.
@@ -27,11 +26,5 @@ interface ITierRegistry {
     /// @notice The code class `target` currently belongs to — non-zero iff its
     ///         codehash is the ERC-1167 clone of a certified template whose own
     ///         code has not drifted. `bytes32(0)` for everything else.
-    /// @dev    Read by `SyndicateVault._requireRecipientVaultBinding` (SHE-209):
-    ///         a class member must name the paying vault as its `vault()`.
-    ///         Deliberately the SAME `_classOf` the `isAdapterAllowed` class
-    ///         fallback uses, so `classOf(x) != 0` is exactly "the class path is
-    ///         what can admit `x`". A registry stand-in with no class concept
-    ///         returns `bytes32(0)`.
     function classOf(address target) external view returns (bytes32);
 }

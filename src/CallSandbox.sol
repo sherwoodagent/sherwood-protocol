@@ -217,43 +217,6 @@ contract CallSandbox is ICallSandbox {
         emit SandboxRun(_vault, n, IERC20(_asset).balanceOf(address(this)));
     }
 
-    /// @dev THE ACCOUNTING DENYLIST, resolved live because every one of these
-    ///      addresses can be re-pointed after this clone was minted.
-    ///
-    ///      The adversary here is NOT fund theft — the funded balance already
-    ///      bounds that, and it is the whole point of the sandbox. It is
-    ///      protocol accounting: a sandbox holding vault capital could deposit it
-    ///      back to mint shares while an open proposal has deposits locked, or
-    ///      touch the queue's stamp and reserve counters, corrupting figures
-    ///      other guards assume only the vault itself can move.
-    ///
-    ///      DEFENCE IN DEPTH, NOT THE LOAD-BEARING GUARD — do not build on it as
-    ///      though it were. It screens STORED TARGETS ONLY, and a payload reaches
-    ///      any of these addresses anyway by naming a proposer-deployed forwarder
-    ///      that calls on to them; screening one hop cannot be made complete.
-    ///      What actually holds is upstream and unaffected by indirection:
-    ///      `SyndicateVault.runSandbox` is `nonReentrant`, so no route back into
-    ///      the vault survives while a run is in flight, and every function on
-    ///      the contracts below is gated to its own privileged caller. This list
-    ///      catches the direct, obvious shape cheaply; it is not a boundary.
-    ///
-    ///      TWO CLASSES, AND THE DIFFERENCE IS DELIBERATE.
-    ///
-    ///      REQUIRED (vault, queue, governor): resolvable directly from the
-    ///      vault, and the exact surface the funded cap does NOT bound. An
-    ///      unreadable hop here reverts — failing closed is safe because the
-    ///      failure is recoverable (the proposal expires with the capital never
-    ///      having left) while the thing it prevents is not.
-    ///
-    ///      BEST-EFFORT (tier registry, exposure ledger, sWOOD, WOOD): reached
-    ///      through a chain of getters that a legitimately unwired deployment
-    ///      may not answer. An unresolvable hop leaves that address undenied,
-    ///      and that is acceptable on a specific argument rather than a shrug:
-    ///      every function on those contracts is gated to its own privileged
-    ///      caller (owner, governor, or the staker acting for themselves), so a
-    ///      sandbox reaching them acts only as itself, holding no stake and no
-    ///      standing. Denying them is belt-and-braces; failing closed on a
-    ///      four-hop chain would trade a real liveness risk for it.
     function _assertNoDeniedTargets() private view {
         address vault_ = _vault;
         address queue = IVaultMinimal(vault_).withdrawalQueue();
@@ -323,7 +286,6 @@ contract CallSandbox is ICallSandbox {
     ///      standing and no owner action — including in the state that wedges an
     ///      ordinary strategy, where a demotion has cleared the allowlist and
     ///      every batch-routed settlement path reverts `DisallowedBatchCallee`
-    ///      (pashov finding #15). A sandbox holds no registry entry, so there is
     ///      nothing to demote and nothing to wedge.
     function sweep() external onlyVault returns (uint256 assets) {
         address vault_ = _vault;
@@ -337,30 +299,6 @@ contract CallSandbox is ICallSandbox {
             emit SandboxSwept(assets);
         }
 
-        // THEN THE DECLARED TOKENS, OR THE DEPOSIT LOCK IS PERMANENT. This is
-        // not tidiness: `hasUnvaluedResidue()` reports true while any declared
-        // non-asset token sits here, `SyndicateVault.depositsLocked()` shuts the
-        // mint side on exactly that flag, and `collectResidue` clears it only by
-        // re-reading the same probe. Without this leg the flag can never go
-        // false — nothing else can move a token out of a sandbox whose `run` is
-        // one-shot and already spent — so any registered agent could brick
-        // deposits forever by declaring a token its payload leaves behind. The
-        // vault's own `depositsLocked` natspec calls exactly that trade (a
-        // permanent, unrecoverable brick) worse than the suppression it guards.
-        //
-        // BEST-EFFORT, PER TOKEN, ON A FAIRLY DIVIDED BUDGET. The list is
-        // proposer-authored: a token that reverts, returns nothing, or burns gas
-        // must not take down the sweep and re-brick the exit it is the only
-        // escape from. `_fairShare` is what makes "its own leg" true — a FIXED
-        // ceiling alone does not, because 16 entries at the old 150,000-gas
-        // probe ceiling is 2.4M against the 1,500,000 `SyndicateVault.collectResidue`
-        // lends this call. Measured before the fix: 16 gas-burning declared
-        // tokens consumed the entire 1.5M and the ASSET TRANSFER ABOVE was
-        // reverted with it, recovering nothing.
-        //
-        // Tokens land in the VAULT, where `totalAssets()` does not count them —
-        // so this recovers custody without ever pricing an unvalued asset into a
-        // mint, which is the distinction the whole residue design rests on.
         uint256 n = _declaredTokens.length;
         for (uint256 i = 0; i < n; i++) {
             address t = _declaredTokens[i];
@@ -405,21 +343,6 @@ contract CallSandbox is ICallSandbox {
         }
     }
 
-    /// @dev This iteration's slice of the gas still in hand, with `remaining`
-    ///      tokens left to visit (this one included).
-    ///
-    ///      THE POINT IS THE DIVISION, NOT THE CEILING. A per-entry ceiling
-    ///      bounds one call; it does not bound a LOOP, because n entries at the
-    ///      ceiling exceed whatever the caller lent. Dividing what is actually
-    ///      left means a hostile entry can consume its own slice and no more —
-    ///      every token behind it still gets a turn, and the function always
-    ///      returns rather than reverting the caller out of gas.
-    ///
-    ///      The `+ 1` reserves a slice for the work after the loop (the return,
-    ///      and in `sweep` nothing else), so the LAST entry cannot take
-    ///      everything either. Scales both ways: given a generous budget the
-    ///      slices exceed the ceilings and the ceilings bind, which is the
-    ///      ordinary case.
     function _fairShare(uint256 remaining) private view returns (uint256) {
         return gasleft() / (remaining + 1);
     }

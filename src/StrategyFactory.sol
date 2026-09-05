@@ -46,7 +46,6 @@ interface IVaultMembership {
 ///         whether or not this factory produced it (a bare `Clones.clone` +
 ///         permissionless `initialize` bound to the paying vault is
 ///         indistinguishable from a factory clone to every on-chain check,
-///         SHE-209 / PR #284 finding 1). Consequently:
 ///
 ///           - `setTemplateApproval(t, false)` stops NEW clones through this
 ///             factory only. To stop a template's clones from being FUNDED,

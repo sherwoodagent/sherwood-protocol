@@ -42,7 +42,6 @@ interface IChallengeGame {
     }
 
     /// @notice Challenge lifecycle. There is deliberately no `Proven` state:
-    ///         nothing is proven on-chain, so a challenge is only ever live
     ///         (`Filed`/`Disputed`) or terminal
     ///         (`Failed`/`Settled`/`Inconclusive`). `Inconclusive` is a terminal
     ///         NON-VERDICT, reachable only from `Disputed`.
@@ -84,8 +83,6 @@ interface IChallengeGame {
     ///        every contributor. There is deliberately no single `disputer` field:
     ///        the defence is bought collectively.
     ///
-    ///        SHARED ACROSS EVERY CHALLENGE ON THE PROPOSAL (pashov 2026-08
-    ///        finding #10): the pool is keyed per review key, not per challenge,
     ///        so two concurrent challenges report the SAME figure here and one
     ///        funding answers both. `challengeOf` synthesises it from the pool
     ///        while the challenge is live, and the value is pinned into storage

@@ -453,89 +453,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         address vaultAsset = IERC4626(vault()).asset();
 
-        // (0) GOVERNANCE BINDING — must run BEFORE any of the checks below,
-        //     because every one of them resolves through an address the
-        //     proposer chose. `getPool` asks a factory which pool it created;
-        //     `market(id).lastUpdate` asks a Morpho whether a market exists;
-        //     `_isWrapperOf` asks a token what it wraps. Bind the address first
-        //     and each of those is a question put to something the protocol
-        //     vouched for; bind nothing and each is self-consistent by
-        //     construction. Finding #4 was that exact failure — the pool's
-        //     provenance was settled by comparing two values the proposer
-        //     supplied — so `uniswapFactory` is bound here too.
-        //
-        //     The vault's batch guard cannot substitute. `_guardBatchCalls`
-        //     PART 2a checks the CLONE is an allowlisted callee; the approvals
-        //     that actually move money — `forceApprove(collateralToken)` in
-        //     `_postCollateral`, `forceApprove(swapAdapter)` in
-        //     `_rebalanceToTarget` — are issued INSIDE this contract, one hop
-        //     past anything the governor batch names.
-        //
-        //     FAIL CLOSED on an unresolvable registry, matching
-        //     `PortfolioStrategy._initialize`. Binding time is the cheap place
-        //     to refuse: it costs a re-proposal, where discovering it at
-        //     execute costs the deployed capital. No hop is proposer input, so
-        //     the proposer cannot steer the walk into the skip.
-        //
-        //     TWO AXES, BECAUSE THEY ARE TWO QUESTIONS. `isAdapterAllowed` is
-        //     the predicate `SyndicateVault._guardBatchCalls` uses to decide
-        //     which addresses a governor batch may call directly, approve as a
-        //     spender, and transfer to — and `setAdapterAllowed`'s own contract
-        //     says exotic-asset contracts, naming LP-position NFTs, MUST NOT be
-        //     listed on it. A Uniswap position manager is exactly one, so
-        //     binding everything through that axis would have made running this
-        //     template require the entry the axis forbids, and would have
-        //     widened the batch guard for Morpho and the position manager as a
-        //     side effect of a decision about a strategy.
-        //
-        //     CORRECTION (PR #217 review). An earlier version of this note said
-        //     the swap adapter is "the one address here that receives
-        //     `forceApprove` of this strategy's balances". THAT IS FALSE and
-        //     nothing should be reasoned from it: `_postCollateral` approves the
-        //     collateral token and then Morpho, `_mintPosition` approves the
-        //     position manager on both legs, and `_repayAndWithdraw` approves
-        //     Morpho again. ALL FOUR bound addresses receive approvals of clone
-        //     balances. The split is not "who touches funds".
-        //
-        //     THE ACTUAL LINE IS WHOSE CALLDATA. Every `isAdapterAllowed` read
-        //     in `SyndicateVault` sits inside `_guardBatchCalls`, iterating the
-        //     governor batch's own `calls[]` — it answers "may a PROPOSER-
-        //     AUTHORED batch name this address as a callee, an approve spender
-        //     or a transfer recipient". Nothing in the vault gates what a
-        //     strategy clone does with capital already delegated to it; that is
-        //     governed by the template's own code, which is itself certified
-        //     and allowlisted before any batch can reach it.
-        //
-        //     So `isCounterpartyAllowed` grants "a certified template may bind
-        //     and approve this address from inside its own reviewed code path",
-        //     and withholds "arbitrary batch calldata may name it". Those are
-        //     different capabilities over different calldata, which is what
-        //     makes the weaker grant meaningful — not any claim that a
-        //     counterparty never sees funds.
-        //
-        //     The swap adapter stays on the strong axis anyway, for a reason
-        //     that survives the correction: `PortfolioStrategy` binds its own
-        //     adapter through `isAdapterAllowed`, and a swap adapter is exactly
-        //     the kind of address a batch legitimately names. Keeping the two
-        //     templates asking the same question of the same role is worth more
-        //     than the one entry it costs. Adapter standing implies counterparty
-        //     standing, so a registry configured before this axis existed keeps
-        //     working unchanged.
-        //
-        //     THE VAULT ASSET IS EXEMPT, mirroring `_guardBatchCalls`' own
-        //     `target != asset_` carve-out. `collateralToken == vaultAsset` is
-        //     an explicitly supported configuration (see check (2) and
-        //     `_collateralValue`), and the vault's own guard treats its asset as
-        //     needing no allowlist entry — so requiring one here would refuse a
-        //     legitimate market on a registry that is configured exactly right.
-        //     The exemption is safe on its own terms: the address is read from
-        //     the vault, not from `p`, so a proposer cannot name it into the
-        //     skip. `swapAdapter`, `positionManager` and `morpho` get no such
-        //     exemption; they are never the asset.
-        //     NOT ALL OF THEM ARE BOUND HERE. `otherToken` is a counterparty by
-        //     the same rule as the rest, but its address is not known until the
-        //     pool has been proven and read, so it is bound at the end of check
-        //     (1). `registry` is hoisted out of this block for that.
         address registry = _resolveTierRegistry();
         if (registry == address(0)) revert TierRegistryUnresolved();
         {
@@ -556,52 +473,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             }
         }
 
-        // (1) The pool is the one the FACTORY created for its own key, and one
-        //     of its two tokens is the vault asset. Provenance comes first:
-        //     without it every other read below is attacker-chosen, because a
-        //     contract can answer all of these selectors.
-        //
-        //     THE FACTORY IS ASKED, NOT THE POOL (pashov 2026-08 finding #4).
-        //     This check used to read `pool_.factory() != p.uniswapFactory`,
-        //     which established nothing — both operands came from the same
-        //     proposer, and `p.uniswapFactory` was otherwise unused, so an
-        //     impostor answering the whole `IUniswapV3Pool` surface simply
-        //     named itself a factory and passed. Binding `p.uniswapFactory` to
-        //     the registry, which (0) now does, is necessary but NOT sufficient
-        //     on its own: an impostor is equally free to report the genuine
-        //     factory's address, and the comparison still succeeds. The
-        //     direction is what was wrong. Only the factory can say which pool
-        //     is canonical for a key, and no contract can make the real factory
-        //     point at it.
-        //
-        //     An earlier note here argued against `getPool` on the grounds that
-        //     self-reporting "cannot be forged by a third party deploying a
-        //     real pool for a fake token pair". THAT REASONING DOES NOT HOLD
-        //     and nothing should be built on it: a genuinely factory-created
-        //     pool over a worthless second token reports the real factory too,
-        //     so it clears both formulations identically. The two differ only
-        //     on the impostor, which self-reporting admits and this rejects.
-        //     What that note was reaching for is a real gap, and provenance is
-        //     genuinely not the control for it: a proposer may create a real
-        //     pool of the vault asset against a token it controls, and every
-        //     provenance check passes because every one of them is true. That
-        //     is closed SEPARATELY, by binding `otherToken` below — do not read
-        //     THIS check as covering it.
-        //
-        //     `p.pool` is non-zero (checked above) and the read is length-
-        //     checked, so a factory that cannot answer — no code, revert, short
-        //     return — resolves to `address(0)`, fails the comparison, and
-        //     reverts with THIS contract's error rather than undecodably inside
-        //     a typed call.
-        //
-        //     BOTH SIDES GET THAT TREATMENT. The pool is read with TYPED calls
-        //     (`token0`/`token1`/`fee`) before the factory is asked, because
-        //     they only build the lookup key — but a typed call to an address
-        //     with no code reverts in THIS frame with empty returndata, which is
-        //     indistinguishable from a bug in the guard. So codelessness is
-        //     rejected here, up front, with the same error the provenance
-        //     comparison raises: an address that cannot be asked what pair it
-        //     trades was never a pool the factory created.
         if (p.pool.code.length == 0) revert PoolNotFromFactory();
         IUniswapV3Pool pool_ = IUniswapV3Pool(p.pool);
 
@@ -621,30 +492,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             revert PoolAssetMismatch();
         }
 
-        //     THE VOLATILE LEG IS A COUNTERPARTY (pashov 2026-08, the gap named
-        //     in the provenance note above). Provenance proves where the pool
-        //     came from; it says nothing about what the pool TRADES. Without
-        //     this, a proposer deploys a worthless ERC-20, creates a genuine
-        //     `(vaultAsset, junk)` pool through the real factory, initialises
-        //     it at a price of their choosing, and every check above passes on
-        //     the merits. `_rebalanceToTarget` then buys that token with vault
-        //     asset, and BOTH slippage floors are derived from that same
-        //     attacker-priced venue — the anchor from the pool's own `slot0`,
-        //     the quote from the only venue that quotes the pair — so they
-        //     agree with each other and with nothing real.
-        //
-        //     It belongs on this axis by the rule the axis already states:
-        //     every address this contract approves or calls with vault funds.
-        //     `_mintPosition` force-approves it to the position manager,
-        //     `_rebalanceToTarget` and `_convertOtherToAsset` approve it to the
-        //     swap adapter, and `rerange()`'s own natspec already calls it "any
-        //     ERC-20 for which a real pool exists, so a transfer hook is a live
-        //     possibility". It was the one such address left unbound.
-        //
-        //     NO VAULT-ASSET EXEMPTION IS NEEDED, unlike `collateralToken`:
-        //     `otherToken` is by construction the token that is NOT the vault
-        //     asset — the branch above assigns it from whichever side failed to
-        //     match — so the carve-out could never apply.
         _requireAllowedCounterparty(registry, otherToken);
 
         // (2) The market exists and lends the vault asset.
@@ -721,17 +568,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         settleDeadline = p.settleDeadline;
     }
 
-    /// @dev Adapter-quote-driven floor, mirroring `PortfolioStrategy._quoteMinOut`.
-    ///      An adapter whose `quote()` returns 0 or reverts cannot guarantee
-    ///      slippage at all, so there is nothing to degrade TO — the caller
-    ///      decides whether that is fatal.
-    ///
-    ///      NOT SANDWICH PROTECTION ON ITS OWN, and it must not be described as
-    ///      such: the quote is taken in the same transaction, through the same
-    ///      `swapExtraData` route, as the swap it bounds, so a searcher who
-    ///      moves that venue first gets a quote at the moved price and a floor
-    ///      derived from it. `_poolAnchoredMinOut` is the answer to that; every
-    ///      call site takes the MAX of the two.
     function _quoteMinOut(address tokenIn, address tokenOut, uint256 amountIn, uint256 slippageBps)
         private
         returns (uint256)
@@ -744,54 +580,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         }
     }
 
-    /// @dev Floor derived from the CONFIGURED POOL's own price, independent of
-    ///      whatever venue `swapExtraData` routes through.
-    ///
-    ///      THE GAP THIS CLOSES (pashov 2026-08 finding #4). `swapExtraData` is
-    ///      stored verbatim at `_initialize` and nothing ties it to `pool`: the
-    ///      adapter may route a different fee tier, a V4 pool, or a multi-hop
-    ///      path. `_requireSpotNearTwap` reads `pool.slot0()` — the LP venue —
-    ///      so it never observed the venue the swap actually crossed, and
-    ///      `_quoteMinOut` took both of its operands from that unobserved
-    ///      venue. Every swap floor in this contract therefore moved with the
-    ///      attacker, on a `rerange()` that is permissionless by design.
-    ///
-    ///      WHY sqrtPriceX96 AND NOT THE TWAP TICK. Converting a tick to a
-    ///      price needs `TickMath.getSqrtRatioAtTick`, which this contract
-    ///      deliberately does not vendor (see `_derivedRange`). `slot0()`
-    ///      already returns `sqrtPriceX96` directly. So the anchor is a pool
-    ///      price reached without new price math.
-    ///
-    ///      SPOT, AND THEREFORE ONLY AS SAFE AS ITS CALLER'S TWAP CHECK. The
-    ///      minting sites (`_execute`, `rerange`) have already asserted spot
-    ///      against the TWAP via `_requireSpotNearTwap()` and reverted
-    ///      otherwise, so for them this is a TWAP-verified price. `_settle` and
-    ///      `sweep` assert nothing, so `_trySwapToAsset` gates the call on
-    ///      `_spotNearTwap()` itself — see the note there on why an unverified
-    ///      spot used as a floor is a denial lever rather than a guard. Do NOT
-    ///      add a call site without deciding which of the two it is.
-    ///
-    ///      NETTED OF THE POOL FEE. The value derived here is the pool's MID
-    ///      price; `_quoteMinOut`'s operand is an adapter quote, which already
-    ///      has the venue's fee and price impact taken out of it. Applying the
-    ///      same `slippageBps` to both would silently redefine what that budget
-    ///      has to cover — on the mid it would have to absorb the fee before it
-    ///      absorbs any slippage at all, so a 0.3% tier would eat 30 bps of it
-    ///      and a 1% tier 100, and every configuration sized against the old
-    ///      quote-only floor would start reverting at `_rebalanceToTarget`
-    ///      (which, unlike settle, does NOT degrade). Subtracting `pool.fee()`
-    ///      first keeps `slippageBps` meaning the same thing it did before.
-    ///      The routed venue may charge differently, so this is the configured
-    ///      pool's fee as a proxy, not a claim about the route.
-    ///
-    ///      `price(token1 per token0) = sqrtPriceX96^2 / 2^192`, split into two
-    ///      `mulDiv`s by 2^96 so the intermediate never overflows.
-    ///      Decimals need no handling: `sqrtPriceX96` encodes the ratio of RAW
-    ///      token amounts, so both legs' scales are already baked in.
-    ///
-    ///      Returns 0 when the pool price is unreadable or the result rounds to
-    ///      nothing — the caller then falls back to the quote floor alone,
-    ///      which is the pre-existing behaviour rather than a new brick.
     function _poolAnchoredMinOut(address tokenIn, uint256 amountIn, uint256 slippageBps)
         private
         view
@@ -831,26 +619,11 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         if (anchored > minOut) minOut = anchored;
     }
 
-    /// @dev The deadline settlement stamps onto its position calls.
-    ///      EXTEND-ONLY, NEVER EXPIRING. A tunable that could resolve to a past
-    ///      timestamp would let the proposer brick `settle()` — the vault's only
-    ///      exit — by setting it once and walking away, which is precisely the
-    ///      settlement veto the deliverable-maximum design exists to remove.
-    ///      Taking the max means the field can only ever widen the window a
-    ///      later-landing settlement batch is accepted in.
     function _deadline() private view returns (uint256) {
         uint256 d = settleDeadline;
         return d > block.timestamp ? d : block.timestamp;
     }
 
-    /// @dev Probe for "is `token` an ERC-4626 whose underlying is `underlying`".
-    ///      Raw staticcall with an explicit `ret.length` check, per the repo's
-    ///      oracle-read discipline: a high-level call here would revert in THIS
-    ///      frame with no data when `token` is a plain ERC-20 with no `asset()`,
-    ///      which is a legitimate configuration this function must be able to
-    ///      answer "no" to rather than abort on.
-    ///      FAILS CLOSED: anything that does not cleanly decode to `underlying`
-    ///      is treated as not-a-wrapper, and the caller reverts.
     function _isWrapperOf(address token, address underlying) private view returns (bool) {
         if (token.code.length == 0) return false;
         (bool ok, bytes memory ret) = token.staticcall(abi.encodeCall(IERC4626.asset, ()));
@@ -860,50 +633,12 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     // ── Governance-allowlist binding (see check (0) in `_initialize`) ──
 
-    /// @dev Reverts unless `adapter` carries ADAPTER standing in `registry` —
-    ///      the strong grant, which additionally licenses appearing in
-    ///      proposer-authored governor-batch calldata.
-    ///
-    ///      For the swap adapter only, and NOT because it is the only address
-    ///      here that receives approvals — every bound address does; see the
-    ///      correction in check (0). It is because `PortfolioStrategy` binds the
-    ///      same role through the same predicate, and keeping two templates
-    ///      asking one question of one role is worth the extra registry entry.
-    ///
-    ///      Mirrors `PortfolioStrategy._requireAllowedAdapter`, but takes the registry
-    ///      as an argument since `_initialize` binds several counterparties and
-    ///      re-walking `vault() -> governor() -> tierRegistry()` per address
-    ///      would be redundant staticcall pairs.
     function _requireAllowedAdapter(address registry, address adapter) private view {
         if (!_readAllowed(registry, abi.encodeCall(ITierBindingPath.isAdapterAllowed, (adapter)))) {
             revert CounterpartyNotAllowed(adapter, registry);
         }
     }
 
-    /// @dev Reverts unless `counterparty` carries COUNTERPARTY standing — the
-    ///      weak grant: a CERTIFIED TEMPLATE may bind and approve this address
-    ///      from inside its own reviewed code path, and proposer-authored batch
-    ///      calldata may NOT name it as a callee, approve spender or transfer
-    ///      recipient.
-    ///
-    ///      READ THAT BOUNDARY PRECISELY, because the obvious reading is wrong.
-    ///      It is not "this address never receives funds" — `_postCollateral`,
-    ///      `_mintPosition` and `_repayAndWithdraw` all `forceApprove` addresses
-    ///      bound through here. It is that the approving code is fixed at
-    ///      certification time rather than written by the proposer per proposal.
-    ///      Every `isAdapterAllowed` read in `SyndicateVault` sits inside
-    ///      `_guardBatchCalls` iterating `calls[]`; none of them gates what a
-    ///      clone does with capital already delegated to it.
-    ///
-    ///      This is the predicate the lending market, the position manager and
-    ///      the collateral token bind through. Binding them on the adapter axis
-    ///      instead would force an owner to make an entry that axis explicitly
-    ///      forbids — `setAdapterAllowed` says exotic-asset contracts, naming
-    ///      LP-position NFTs, MUST NOT be listed there, and a Uniswap position
-    ///      manager is one — and would widen the vault's batch guard for Morpho
-    ///      and the position manager as a side effect of a strategy decision.
-    ///      `isCounterpartyAllowed` is implied by adapter standing, so a
-    ///      registry already configured the old way keeps working unchanged.
     function _requireAllowedCounterparty(address registry, address counterparty) private view {
         if (!_readAllowed(registry, abi.encodeCall(ITierBindingPath.isCounterpartyAllowed, (counterparty)))) {
             revert CounterpartyNotAllowed(counterparty, registry);
@@ -920,35 +655,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         registry = _readAddress(governor_, abi.encodeCall(ITierBindingPath.tierRegistry, ()));
     }
 
-    /// @dev RE-CERTIFY AT EVERY FUND-MOVING ENTRYPOINT, not just at init.
-    ///      `_initialize` was the only place this template consulted the tier
-    ///      registry, so a counterparty revoked AFTERWARDS still received
-    ///      `forceApprove` of this clone's whole balance — and revocation needs
-    ///      no governance action at all: `TierRegistry.poke` and
-    ///      `demoteByChallenge` are both permissionless, and the owner's
-    ///      `setAdapterAllowed(x, false)` is one call. Both sibling templates
-    ///      already do this and spell out why —
-    ///      `MorphoSupplyStrategy._execute`'s `_requireAllowedMorpho` ("a
-    ///      singleton demoted between clone-init and execute ... would still
-    ///      receive `forceApprove` of the whole supply, one hop outside the
-    ///      vault's batch gate") and `PortfolioStrategy`'s
-    ///      `_requireAllowedAdapter` at `_execute`/`rebalance`/`rebalanceDelta`.
-    ///      This template was the one left on a point-in-time check, and it is
-    ///      the one where the exposure is largest: `_rebalanceToTarget` discards
-    ///      the swap's return value entirely and takes `minOut` enforcement from
-    ///      inside the adapter, so a revoked adapter can take `toSwap` and
-    ///      deliver nothing with no local check firing.
-    ///
-    ///      The vault's batch guard cannot substitute, as `_initialize`'s own
-    ///      note already records: the approvals that move money are issued
-    ///      INSIDE this contract, one hop past anything the governor batch names.
-    ///
-    ///      SCOPED TO THE ENTRY PATHS ON PURPOSE. `_settle`, `sweep` and
-    ///      `releaseUnconvertible` stay unguarded under the existing
-    ///      capital-hostage rationale: blocking an EXIT because a counterparty
-    ///      was demoted strands the very funds the demotion is meant to protect.
-    ///      Unresolved registry → skip, matching `_requireAllowedAdapter`'s own
-    ///      shape; resolved-but-unvouched → revert.
     function _requireCounterpartiesStillAllowed() private view {
         address registry = _resolveTierRegistry();
         if (registry == address(0)) return;
@@ -962,32 +668,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         _requireAllowedCounterparty(registry, otherToken);
         address coll = _marketParams.collateralToken;
         if (coll != asset) _requireAllowedCounterparty(registry, coll);
-        // `uniswapFactory` is DELIBERATELY ABSENT, and the asymmetry with
-        // `otherToken` above is the reason to say so. Every address re-checked
-        // here keeps receiving vault funds or approvals for the clone's whole
-        // life. The factory receives neither: it is asked one question, once, at
-        // init — "did you create this pool?" — and the answer is a fact about
-        // the past that a later demotion cannot retract. Re-checking it would
-        // let a demotion freeze `execute()` and the permissionless `rerange()`
-        // over a pool whose provenance is still exactly as established, which is
-        // the capital-hostage failure the exit paths are ungated to avoid.
     }
 
-    /// @dev Staticcall-safe boolean read, shared by both allowlist axes.
-    ///      Unreadable → `false`, so a registry that cannot answer has not
-    ///      vouched.
-    ///
-    ///      The word is read directly rather than via `abi.decode(ret, (bool))`:
-    ///      decoding a bool REVERTS on any word that is not 0 or 1, and that
-    ///      revert would land in this frame with nothing to catch it — turning
-    ///      the documented "unreadable means not vouched for" into "unreadable
-    ///      bricks `_initialize` undecodably", which is the exact failure this
-    ///      whole helper is written in raw-staticcall form to avoid. Non-zero is
-    ///      true, matching how the EVM itself reads a boolean return.
-    ///
-    ///      Takes encoded calldata rather than a selector-plus-address so the
-    ///      two axes cannot diverge in their failure handling: there is exactly
-    ///      one place that decides what an unanswerable registry means.
     function _readAllowed(address registry, bytes memory data) private view returns (bool) {
         if (registry.code.length == 0) return false;
         (bool ok, bytes memory ret) = registry.staticcall(data);
@@ -1015,27 +697,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         return address(uint160(word));
     }
 
-    /// @dev The collateral's worth in vault-asset units, READ FROM THE CHAIN.
-    ///
-    ///      This is the denominator of the LLTV-buffer gate, which the constant
-    ///      above calls the only on-chain control over liquidation before
-    ///      settlement. A denominator taken from init data is not a control at
-    ///      all: a proposer who overstates it drives the computed LTV toward
-    ///      zero and clears any buffer unconditionally. So it is derived, and
-    ///      `InitParams` no longer carries a field for it.
-    ///
-    ///      Direct case: the market takes the vault asset, so the value IS the
-    ///      amount. Wrapper case: `previewRedeem(previewDeposit(amount))` is the
-    ///      round trip this strategy will actually perform — deposit at execute,
-    ///      redeem at settle — priced by the wrapper itself, in vault-asset
-    ///      units, with no oracle. It reads slightly BELOW `amount` whenever the
-    ///      wrapper charges a round-trip fee, which is the conservative
-    ///      direction for a gate on leverage.
-    ///
-    ///      Both previews are typed calls, and reverting is correct: the caller
-    ///      has already proven this token answers `asset()` as an ERC-4626, and
-    ///      an init failure only fails the PROPOSAL, which is recoverable.
-    ///      Fails closed on a zero value so the division below cannot panic.
     function _collateralValueOf(address collateralToken, address vaultAsset, uint256 amount)
         private
         view
@@ -1056,19 +717,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     function _requireValidBounds(InitParams memory p) private pure {
         if (p.twapWindow < MIN_TWAP_WINDOW) revert InvalidBound();
         if (p.maxTwapDeviationBps == 0 || p.maxTwapDeviationBps > MAX_TWAP_DEVIATION_BPS) revert InvalidBound();
-        // ZERO IS THE STRICTEST SETTING, NOT THE LOOSEST (pashov 2026-08
-        // finding #16). It reads as a safe default and is the one value that
-        // cannot work: this field is the floor for the `_rebalanceToTarget`
-        // swap that runs at the top of `_mintPosition`, and `_quoteMinOut`
-        // computes `expected * (BPS_DENOMINATOR - slippageBps)`. Zero puts the
-        // floor exactly ON the quote, which is read before the swap moves the
-        // pool, so no honest fill clears it. `_execute` reverts and the
-        // proposal expires at `executeBy` with the bond still locked.
-        //
-        // It ALSO used to brick the mint itself, via a per-leg floor derived
-        // from the offered amounts; finding #9 removed that floor, and this
-        // rejection is load-bearing independently of it. Same bar as
-        // `settleSlippageBps` below, and for the same reason.
         if (p.mintSlippageBps == 0 || p.mintSlippageBps > MAX_SLIPPAGE_BPS) revert InvalidBound();
         // ZERO IS NOT A LEGAL INIT VALUE, because `_updateParams` reads zero as
         // "keep current" and is otherwise a one-way ratchet. A clone
@@ -1083,44 +731,12 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     function _requireValidRerangePolicy(RerangePolicy memory r, int24 spacing, int24 lower, int24 upper) private pure {
         // A half-width below one tick spacing cannot snap to a non-empty range.
         if (r.halfWidthTicks < spacing) revert InvalidRerangePolicy();
-        // THE RERANGE BAND MAY NOT BE NARROWER THAN THE APPROVED ONE (pashov
-        // 2026-08 finding #17, structural half).
-        //
-        // `_execute` enforces `MAX_POOL_SHARE_BPS` on the liquidity it actually
-        // mints; `rerange` re-mints through the same `_mintPosition` and cannot
-        // re-check it without introducing a permanent brick (see the block in
-        // `rerange`). So the cap is preserved HERE instead, at bind time, where
-        // refusing costs a re-proposal rather than stranding a live position.
-        //
-        // For fixed token amounts, liquidity scales inversely with band width:
-        // `L ≈ amount / (sqrt(Pu) - sqrt(Pl))`. A rerange band at least as wide
-        // as the initial one therefore mints at most the liquidity the initial
-        // mint did, and that figure already cleared the cap at `_execute`. This
-        // closes the structural case the finding turns on — a wide initial
-        // range plus `halfWidthTicks == tickSpacing`, which passed every check
-        // and then concentrated the same notional into a single spacing.
-        //
-        // What it does NOT close, stated so the gap is not mistaken for
-        // covered: venue depth FALLING between execute and rerange breaches the
-        // cap with an unchanged band, and no bind-time rule can see that. That
-        // residual needs the runtime check, which needs the zero-liquidity
-        // brick solved first.
         if (uint256(int256(r.halfWidthTicks)) * 2 < uint256(int256(upper - lower))) {
             revert InvalidRerangePolicy();
         }
         if (r.halfWidthTicks > MAX_HALF_WIDTH_TICKS) revert InvalidRerangePolicy();
         if (r.triggerBps == 0 || r.triggerBps > BPS_DENOMINATOR) revert InvalidRerangePolicy();
         if (r.maxReranges > MAX_RERANGE_LIMIT) revert InvalidRerangePolicy();
-        // ZERO IS A PERMANENT SELF-BRICK (pashov 2026-08 finding #16).
-        // `_quoteMinOut` computes `expected * (BPS_DENOMINATOR - slippageBps) /
-        // BPS_DENOMINATOR`, so zero puts the floor exactly ON the quote — and
-        // the quote is read BEFORE the swap moves the pool, so no honest fill
-        // clears it. Every `rerange()` then reverts for this clone's whole
-        // life: `_updateParams` reaches only `settleSlippageBps` and
-        // `settleDeadline` and is a one-way ratchet, so this field can never be
-        // corrected. The position sits frozen in its initial band for up to
-        // `ABSOLUTE_MAX_STRATEGY_DURATION`, earning no fees while the borrow
-        // accrues. Refusing the input costs a re-proposal instead.
         if (r.slippageBps == 0 || r.slippageBps > MAX_SLIPPAGE_BPS) revert InvalidRerangePolicy();
         if (r.swapFractionBps > BPS_DENOMINATOR) revert InvalidRerangePolicy();
     }
@@ -1137,37 +753,12 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     // ── Price guards ──
 
-    /// @notice The pool's arithmetic-mean tick over `twapWindow`.
-    /// @dev    FAILS CLOSED, deliberately, and unlike `PortfolioStrategy`'s
-    ///         `_tryPushFeedPrice`. This read IS the security boundary against
-    ///         minting into a manipulated tick, and its failure is recoverable
-    ///         (redeploy the clone, propose again) while the loss it prevents is
-    ///         not. A pool whose observation ring cannot serve the window
-    ///         reverts here rather than degrading to spot — degrading to spot
-    ///         would compare spot against itself and pass unconditionally,
-    ///         which is worse than no guard because it looks like one.
-    ///
-    ///         Raw staticcall rather than a typed call so an `observe` that
-    ///         reverts (upstream `OLD`) is distinguishable from one that returns
-    ///         malformed data, and neither reaches `abi.decode` unchecked.
     function _twapTick() private view returns (int24) {
         (int24 tick, bool ok) = _tryTwapTick();
         if (!ok) revert TwapUnavailable();
         return tick;
     }
 
-    /// @dev The read itself, reporting availability instead of reverting.
-    ///      Exists for `_spotNearTwap`, which asks the same question on a path
-    ///      that must not revert (see there). `_twapTick` is the fail-closed
-    ///      wrapper and remains the only form the minting paths use — the
-    ///      difference is which caller is allowed to survive an unavailable
-    ///      TWAP, never how the TWAP itself is computed.
-    ///
-    ///      The `ret.length` floor bounds `abi.decode` to payloads that can at
-    ///      least carry two dynamic-array heads; beyond that the decode assumes
-    ///      well-formed ABI, which `pool` earns by being factory-verified at
-    ///      `_initialize`. What this path defends against is a manipulated
-    ///      PRICE, not a hostile pool ABI.
     function _tryTwapTick() private view returns (int24, bool) {
         // Cardinality 1 means the ring holds only the current observation:
         // there is no history to average, so `observe` would answer with spot.
@@ -1194,15 +785,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         return (avg, true);
     }
 
-    /// @dev `_requireSpotNearTwap` as a QUESTION rather than an assertion: true
-    ///      only when the TWAP is readable AND spot sits inside
-    ///      `maxTwapDeviationBps` of it. Same tick-space comparison, same
-    ///      first-order bps↔tick mapping, same permissive-erring direction.
-    ///
-    ///      Exists because `_trySwapToAsset` needs to know whether the pool
-    ///      price is trustworthy WITHOUT that question being able to revert the
-    ///      vault's exit. An unreadable TWAP answers false, so the pool anchor
-    ///      is simply not applied — never a settlement veto.
     function _spotNearTwap() private view returns (bool) {
         (int24 twap, bool ok) = _tryTwapTick();
         if (!ok) return false;
@@ -1219,25 +801,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         if (!_withinTwapBound(spot, twap)) revert SpotOutsideTwapBound();
     }
 
-    /// @dev THE comparison, in one place. `_requireSpotNearTwap` asserts it and
-    ///      `_spotNearTwap` asks it; holding the arithmetic in two copies would
-    ///      let the assertion and the question drift apart, and they must answer
-    ///      identically — the settle path's decision to swap at all is only
-    ///      sound while it means exactly what the minting paths enforce.
-    ///
-    ///      Compared in TICK space, not price space: a tick is a log of price,
-    ///      so a bound on tick distance is a bound on the RATIO of the two
-    ///      prices, which is what "deviation" means here. Doing it in price
-    ///      space would need the exp this contract deliberately does not carry.
-    ///
-    ///      One tick is a factor of 1.0001, i.e. ~1 bps, so a bound expressed in
-    ///      bps maps onto ticks one-for-one. The mapping is a FIRST-ORDER
-    ///      approximation and drifts as the bound grows: at the
-    ///      `MAX_TWAP_DEVIATION_BPS` ceiling of 1_000, `1.0001^1000 = 1.1052`,
-    ///      so the check actually admits ~10.5% rather than exactly 10%. It errs
-    ///      PERMISSIVE, never strict, which is why the ceiling is the real
-    ///      control and this conversion is not asked to be exact (design
-    ///      Decision 2).
     function _withinTwapBound(int24 spot, int24 twap) private view returns (bool) {
         int24 diff = spot > twap ? spot - twap : twap - spot;
         // `diff` is non-negative by construction above, so the cast cannot wrap.
@@ -1294,42 +857,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         morpho.supplyCollateral(_marketParams, posted, address(this), "");
     }
 
-    /// @dev Converts `swapFraction` of `assetAmount` into the other token, then
-    ///      mints one position over `[lower, upper]`.
-    ///
-    ///      THE SPLIT IS THE AGENT'S NUMBER, NOT A DERIVED ONE. Sizing the two
-    ///      legs of a range exactly needs `sqrtRatioAtTick` for both bounds; the
-    ///      design rejects carrying that math on-chain, and the agent has
-    ///      already computed the ratio precisely off-chain.
-    ///
-    ///      A WRONG SPLIT NOW UNDER-DEPLOYS RATHER THAN REVERTING (pashov
-    ///      2026-08 finding #9). This note used to claim the mint floor bounded
-    ///      it; that floor measured the unconsumed remainder, not the price, and
-    ///      reverted on ordinary drift — see the block at the mint itself.
-    ///      Nothing recomputes the split on-chain, so what a bad ratio costs is
-    ///      a smaller position plus an idle remainder the settlement returns,
-    ///      not a stranded proposal. The size actually opened is emitted in
-    ///      `PositionOpened`.
-    /// @dev Move the held balances to `targetOtherBps` of TOTAL value in the
-    ///      other token, swapping only the difference in whichever direction it
-    ///      is needed.
-    ///
-    ///      MEASURES WHAT IS HELD, RATHER THAN ASSUMING IT IS ALL VAULT ASSET.
-    ///      This is the difference between a rerange that preserves the position
-    ///      and one that decays it. At execute the clone holds only the borrowed
-    ///      vault asset, so "swap `targetOtherBps` of the asset" and "move to
-    ///      `targetOtherBps` of total" coincide. At RERANGE they do not: the
-    ///      close returns BOTH legs, so swapping a further fraction of the asset
-    ///      side ratchets the position further into `otherToken` every single
-    ///      time. The ratio drifts, the mint consumes less of the offered
-    ///      balances, and liquidity falls on every rerange even when the swap
-    ///      itself is free — a permissionless caller could then bleed the
-    ///      position through the drift alone, which is exactly the griefing the
-    ///      rerange cap is supposed to bound. Valuing the held `otherToken`
-    ///      through the adapter and swapping only the delta removes the drift at
-    ///      its source rather than capping its consequences.
-    ///
-    ///      Fails closed on an unavailable quote, like the mint it feeds.
     function _rebalanceToTarget(uint256 targetOtherBps, uint256 slippageBps) private {
         uint256 assetBal = IERC20(asset).balanceOf(address(this));
         uint256 otherBal = IERC20(otherToken).balanceOf(address(this));
@@ -1359,16 +886,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             // it was offered.
             IERC20(asset).forceApprove(address(swapAdapter), 0);
         } else {
-            // NOTHING HELD MEANS NOTHING TO SELL, and it must be answered BEFORE
-            // the division below rather than by the `toSwap == 0` guard after
-            // it. `otherValue` stays 0 whenever `otherBal` is 0 (the quote is
-            // skipped), and this branch is still reached in that state because
-            // `targetOtherValue > otherValue` is `0 > 0` — false. The single-
-            // sided LP configuration `_requireValidBounds` accepts
-            // (`swapFractionBps == 0`) lands here on its very first mint, so
-            // without this the whole of `execute()` panics 0x12 with the
-            // proposer's bond already locked, and permissionless `rerange()`
-            // panics the same way on a position holding only the vault asset.
             if (otherValue == 0) return;
             uint256 excessValue = otherValue - targetOtherValue; // asset units
             // Convert the excess back into `otherToken` units proportionally —
@@ -1397,37 +914,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         (uint256 amount0Desired, uint256 amount1Desired) = assetIsToken0 ? (assetBal, otherBal) : (otherBal, assetBal);
 
-        // NO PER-LEG FLOOR ON THE MINT (pashov 2026-08 finding #9).
-        //
-        // `amountXMin` bounded the wrong quantity. Uniswap's parameter exists to
-        // bound PRICE MOVEMENT between quote and execution; deriving it from
-        // `amountXDesired` — the clone's whole balance — bounded the UNCONSUMED
-        // REMAINDER instead, and a leftover is the routine outcome, as the
-        // comment below this call already says. Spot drifting inside the band
-        // between propose and execute leaves one leg barely touched, the floor
-        // on that leg becomes unreachable, and `_execute` reverts until the
-        // proposal expires at `executeBy` with the proposer bond locked. No
-        // attacker required; ordinary price movement is enough.
-        //
-        // WHAT GUARDS THE PRICE INSTEAD, one call up the stack: `_execute`
-        // asserts `_requireSpotNearTwap()` immediately before this, and
-        // `rerange` re-asserts it on its own path. That is the check that
-        // actually bounds a manipulated pool, and it does it on the pool's own
-        // price rather than on a leftover. A mint is also not a swap: the
-        // tokens move into a position THIS CONTRACT owns, so a skewed price
-        // costs composition, not principal.
-        //
-        // THE CONCESSION, STATED. This used to be what rejected a badly-chosen
-        // `swapFractionBps` (see the note on `_execute`'s helper below, now
-        // corrected). It no longer does: a wrong split under-deploys and leaves
-        // the remainder idle on the clone rather than reverting. That is the
-        // deliberate direction — the remainder is recoverable at settle, while a
-        // revert strands the entire proposal — and it is unavoidable, because a
-        // leftover from an honest drift and a leftover from a wrong split are
-        // the SAME observable. Any rule that rejects the second rejects the
-        // first, which is the defect. `PositionOpened` emits the liquidity
-        // actually minted, so an under-deployed proposal is visible off-chain
-        // without a new event.
         INonfungiblePositionManager.MintParams memory mp = INonfungiblePositionManager.MintParams({
             token0: assetIsToken0 ? asset : otherToken,
             token1: assetIsToken0 ? otherToken : asset,
@@ -1463,14 +949,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         return _derivedRange(_twapTick());
     }
 
-    /// @dev Widened to `int256` before the clamp. A band that is legitimate in
-    ///      the middle of the domain still runs past `MIN_TICK`/`MAX_TICK` when
-    ///      the TWAP sits near an extreme, and `center ± half` in `int24` would
-    ///      REVERT on overflow there — bricking `rerange()` permanently for a
-    ///      policy that init accepted. Clamping to the domain keeps the position
-    ///      re-centerable at every tick the pool can reach; the init-time
-    ///      `MAX_HALF_WIDTH_TICKS` ceiling is what stops the clamp from being
-    ///      reached by a band nobody meant to approve.
     function _derivedRange(int24 center) private view returns (int24 newLower, int24 newUpper) {
         int24 spacing = tickSpacing;
         int256 half = int256(_rerange.halfWidthTicks);
@@ -1561,42 +1039,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         (uint256 tid, uint128 liquidityAfter) =
             _mintPosition(newLower, newUpper, _rerange.swapFractionBps, _rerange.slippageBps);
 
-        // PASHOV 2026-08 FINDING #17 IS REAL AND IS NOT FIXED HERE. `_execute`
-        // ends with `_requireWithinPoolShare` on the actually-minted liquidity;
-        // this path re-mints through the same `_mintPosition` and does not, so
-        // a wide initial range plus a `halfWidthTicks` of one tick spacing
-        // clears init and execute and then concentrates the same notional far
-        // above `MAX_POOL_SHARE_BPS`. Depth falling between execute and rerange
-        // breaches it on its own.
-        //
-        // The obvious enforcement — `_requireWithinPoolShare(snapshot,
-        // liquidityAfter)` right here — was written, tested, reviewed and
-        // WITHDRAWN. It reverts, and both of its revert paths are permanent:
-        //
-        //   1. The breach it names as its motivating case is STRUCTURAL, not
-        //      transient. `_requireValidRerangePolicy` accepts
-        //      `halfWidthTicks == tickSpacing` and nothing couples that policy
-        //      to `MAX_POOL_SHARE_BPS`, so the same notability in the same one
-        //      spacing produces the same over-cap L on EVERY attempt. The clone
-        //      is then dead on arrival: every `rerange()` reverts for the whole
-        //      proposal lifetime, the position sits out of range earning no
-        //      fees, and the Morpho borrow keeps accruing against it.
-        //   2. `_requireWithinPoolShare` treats `poolLiquidity == 0` as
-        //      unsatisfiable. On a live pool `_closePosition`'s
-        //      `decreaseLiquidity` removes this position from
-        //      `pool.liquidity()`, so a strategy that is the only in-range LP
-        //      reads zero after the close and is bricked. `MockUniswapV3Pool`
-        //      exposes `liquidity` as a plain settable field that
-        //      `decreaseLiquidity` never touches, so NO test against these
-        //      mocks can reach that branch — it is not merely uncovered, it is
-        //      structurally untestable here.
-        //
-        // Trading an over-cap position for a permanently frozen one is not a
-        // fix. The enforcement this needs is at BIND time — reject a rerange
-        // policy that cannot satisfy the cap — which requires coupling
-        // `halfWidthTicks` to `MAX_POOL_SHARE_BPS` through liquidity math this
-        // template deliberately does not carry, plus a fork test for (2).
-        // Left open rather than closed badly.
         tokenId = tid;
         tickLower = newLower;
         tickUpper = newUpper;
@@ -1666,23 +1108,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     // ── Settle ──
 
-    /// @dev ORDER IS LOAD-BEARING: unwind → collect → convert → repay →
-    ///      withdraw collateral → push. Adversary: an ordering that withdraws
-    ///      collateral first, leaving an outstanding borrow collateralized by
-    ///      nothing and the position exposed to liquidation during its own
-    ///      settlement. Morpho enforces the same thing from its side, so a
-    ///      wrong order here reverts rather than mis-settling — but reverting
-    ///      IS the failure this contract is built to avoid.
-    ///
-    ///      DELIVERABLE-MAXIMUM, NOT ALL-OR-REVERT (the `MorphoSupplyStrategy`
-    ///      argument, applied unchanged). Reverting on any shortfall hands
-    ///      whoever can create that shortfall a veto over the vault's whole
-    ///      settlement path, freezing redemptions vault-wide for as long as they
-    ///      sustain it. So settle takes what it can, emits loudly, and leaves
-    ///      the residue recoverable through `sweep()`. The residue costs THIS
-    ///      proposal, because the governor measures PnL from realized float —
-    ///      deliberate: a proposer who parks the vault in a venue that cannot
-    ///      pay out at settlement should wear the mark.
     function _settle() internal override nonReentrant {
         _tryUnwindPosition();
 
@@ -1720,18 +1145,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         try this.unwindPosition() {} catch {}
     }
 
-    /// @dev Converts the whole `otherToken` balance back to the vault asset.
-    ///      Fee income accrues in BOTH tokens, so this is what brings the
-    ///      non-vault-asset half of the fees into the amount the vault receives.
-    ///      Reuses the proposer's configured adapter rather than opening a
-    ///      second swap path.
-    /// @dev DEGRADES, unlike the mint-side swap. The asymmetry is deliberate and
-    ///      is the same argument as the deliverable-maximum repay below: settle
-    ///      is the vault's only exit, so anything that can revert here is a veto
-    ///      over vault-wide redemption. An adapter that cannot quote leaves the
-    ///      `otherToken` unconverted and the residue recoverable by `sweep()`,
-    ///      which costs this proposal — strictly better than freezing the vault.
-    ///      The swap is NEVER attempted without a floor; it is skipped instead.
     function _trySwapToAsset(uint256 slippageBps) private {
         uint256 bal = IERC20(otherToken).balanceOf(address(this));
         if (bal == 0) return;
@@ -1743,39 +1156,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         } catch {
             return;
         }
-        // The exit leg was the one swap with NO anchor at all: unlike `_execute`
-        // and `rerange`, `_settle`/`sweep` never call `_requireSpotNearTwap`, so
-        // this floor was purely the routed venue quoting itself. Raise it to the
-        // configured pool's own price when that is higher.
-        //
-        // AN UNVERIFIED POOL MEANS NO SWAP, NOT A CHEAPER SWAP. This is the one
-        // place the anchor's safety is not inherited from its caller:
-        // `_execute`/`rerange` assert spot against the TWAP and revert
-        // otherwise, so for them a pushed pool never reaches the floor at all.
-        // `_settle`/`sweep` assert nothing, which leaves exactly two options for
-        // a pool whose spot is outside `maxTwapDeviationBps` — and only one of
-        // them is safe:
-        //
-        //   SKIP THE ANCHOR and swap on the quote floor alone. Rejected. It
-        //   hands the attacker who pushed the pool the ORIGINAL finding back:
-        //   with the anchor off, `minOut` is the routed venue quoting itself,
-        //   so the same actor moves both and the skim clears. Measured, not
-        //   argued: a venue paying half the pool price converted the entire
-        //   position with the pool pushed 23,000 ticks off its TWAP.
-        //
-        //   SKIP THE SWAP. Taken. It is what this function already does for
-        //   every other unusable floor — "the swap is NEVER attempted without a
-        //   floor; it is skipped instead" — and the residue is recoverable by
-        //   the permissionless `sweep()`, so the cost of a pushed pool is delay,
-        //   not loss.
-        //
-        // The denial that buys is bounded and self-defeating: holding spot
-        // outside the bound costs the attacker capital every block, while the
-        // TWAP walks toward spot over `twapWindow`, so the deviation they are
-        // paying to maintain closes underneath them. `sweep()` and
-        // `settleProposal` are both retryable by anyone at any later honest
-        // moment. Trading a bounded, unprofitable delay for a profitable,
-        // unbounded skim is the wrong direction on the vault's exit.
         if (!_spotNearTwap()) return;
         uint256 anchored = _poolAnchoredMinOut(otherToken, bal, slippageBps);
         if (anchored > minOut) minOut = anchored;
@@ -1833,22 +1213,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             if (outstanding == 0) {
                 _tryWithdrawCollateral(collateral);
             } else {
-                // PASHOV FINDING #8. Gating the withdrawal on `outstanding == 0`
-                // is strictly stronger than the rule Morpho enforces
-                // (`LTV <= LLTV`), so a position that came back a few units
-                // short of its accrued interest kept its ENTIRE collateral
-                // locked behind trivial residual debt — traced in
-                // `CLStrategy_partialCollateralRecovery.t.sol`: ~412 of debt
-                // stranding 100,000 of collateral, a ~243x disproportion, from
-                // an ordinary interest-outran-fees outcome with no attacker.
-                //
-                // It is also unrecoverable once it happens: the partial repay
-                // above leaves this clone's asset balance at zero, so `sweep()`
-                // never re-enters the repay branch and the withdrawal stays
-                // gated forever. Only a third party volunteering to repay
-                // someone else's dust would unblock it.
-                //
-                // So take the health-preserving maximum instead of nothing.
                 uint256 freeable = _withdrawableWhileHealthy(collateral);
                 if (freeable != 0) _tryWithdrawCollateral(uint128(freeable));
             }
@@ -1880,59 +1244,12 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         }
     }
 
-    /// @dev Approves, calls, then retires the allowance whatever happened. The
-    ///      approval is the amount HELD rather than the amount computed: the
-    ///      computed figure comes from a local mirror of Morpho's share math, so
-    ///      approving exactly it makes settlement depend on that mirror agreeing
-    ///      to the wei. It is already known that `held` covers the call.
-    ///      Returns whether the repay landed; callers deliberately ignore it,
-    ///      because the authoritative answer is the position re-read afterwards.
     function _tryRepay(uint256 approveAmount, bytes memory callData) private returns (bool ok) {
         IERC20(asset).forceApprove(address(morpho), approveAmount);
         (ok,) = address(morpho).call(callData);
         IERC20(asset).forceApprove(address(morpho), 0);
     }
 
-    /// @dev The collateral this position can release while still satisfying
-    ///      Morpho's own health rule against the debt that is STILL OUTSTANDING
-    ///      (pashov finding #8). Morpho requires
-    ///        collateral * price / ORACLE_PRICE_SCALE * lltv / WAD  >=  borrowed
-    ///      so the collateral that must STAY is the smallest value satisfying it,
-    ///      rounded UP at every step, and everything above that is freeable.
-    ///
-    ///      KEEPS `MIN_LLTV_BUFFER_BPS` OF HEADROOM rather than unwinding to the
-    ///      liquidation threshold exactly. Landing on the bar would leave the
-    ///      residual position one interest-accrual block away from liquidation,
-    ///      which trades the bug for a worse one; the same buffer the entry-side
-    ///      LTV gate enforces is the natural bar to reuse.
-    ///
-    ///      THE ORACLE READ IS RAW AND GUARDED, matching this file's standing
-    ///      treatment of proposer-supplied `MarketParams` members (`accrueInterest`
-    ///      above, `_tryRedeemWrapper`, `_feedPriceX8` in `ExposureLedger`): the
-    ///      oracle address is part of the proposer's market declaration, so a
-    ///      typed call would hand whoever controls it a settlement veto — a
-    ///      revert in this frame with no returndata to catch. DECISION ON
-    ///      FAILURE: return 0, i.e. degrade to the pre-fix behaviour of leaving
-    ///      the collateral for `sweep()`. This is a liveness path, so it fails
-    ///      to the OLD outcome, never to a withdrawal sized off an unread price.
-    ///
-    ///      NOT GATED ON THE `accrued` FLAG, unlike the shares-mode repay in the
-    ///      caller — and that asymmetry is deliberate, not an oversight. Both
-    ///      read the same `totalBorrowAssets`, which is STALE when
-    ///      `accrueInterest` failed, and a stale read understates `owed` and so
-    ///      oversizes the result here. It cannot land, though: Morpho re-accrues
-    ///      INSIDE `withdrawCollateral` before its health check, so the same
-    ///      reverting IRM that left these totals stale also reverts the
-    ///      withdrawal, `_tryWithdrawCollateral` swallows it, and the outcome is
-    ///      the pre-fix one. Shares-mode repay needs the gate because a stale
-    ///      `owed` there makes Morpho pull MORE than expected; there is no
-    ///      matching hazard on this side.
-    ///
-    ///      A COROLLARY WORTH PINNING: `MIN_LLTV_BUFFER_BPS` above therefore
-    ///      does exactly the one job its own paragraph claims. It is NOT also
-    ///      absorbing un-accrued interest, because no withdrawal ever lands with
-    ///      un-accrued interest outstanding. Do not shrink it on the theory that
-    ///      it is carrying slack for this case.
     function _withdrawableWhileHealthy(uint128 collateral) private view returns (uint256) {
         MarketParams memory mp = _marketParams;
         uint128 borrowShares = morpho.position(marketId, address(this)).borrowShares;
@@ -1971,22 +1288,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             .call(abi.encodeCall(IMorpho.withdrawCollateral, (_marketParams, amount, address(this), address(this))));
     }
 
-    /// @dev Redeem the ERC-4626 collateral wrapper back into the vault asset.
-    ///      GUARDED, and that guard is the point. This is the one call on the
-    ///      settlement path that a third party routinely controls: the wrappers
-    ///      this template is built for (spUSDG and its class) gate redemption
-    ///      behind pauses, caps, queues and underlying liquidity, none of which
-    ///      this proposal can influence. A typed call here would let whoever
-    ///      operates the wrapper freeze the vault's ONLY exit by pausing their
-    ///      own product — a settlement veto handed to an unrelated third party,
-    ///      which is exactly what the deliverable-maximum design exists to
-    ///      remove. On failure the shares stay on the clone and `sweep()`
-    ///      retries; `_repayAndWithdraw` reports them as `collateralRemaining`
-    ///      in the meantime.
-    ///
-    ///      `maxRedeem` is honoured rather than assumed: a wrapper that will
-    ///      serve part of the balance should serve that part now instead of
-    ///      failing whole and deferring everything to `sweep()`.
     function _tryRedeemWrapper() private returns (bool ok) {
         address collateralToken = _marketParams.collateralToken;
         if (collateralToken == asset) return true;
@@ -2072,21 +1373,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      a pool will quote right now is the manipulable part; value the vault
     ///      is not counting is the part that matters here.
     function hasUndeliveredValue() public view override returns (bool) {
-        // `Settled` ONLY, and that is a deliberate reversal. Answering for
-        // `Executed` too was tried, to cover a clone left holding everything by
-        // `finalizeEmergencySettle`. It WEDGES the vault: `sweep()` is itself
-        // `Settled`-gated, so such a clone reports residue forever, cannot be
-        // swept, and deposits shut permanently with no permissionless way out —
-        // and a proposer can reach it cheaply by omitting `settle()` from a
-        // `maxDrawdownBps == 10_000` batch. A permanent DoS is worse than the
-        // fail-open it was closing, and it would have falsified
-        // `depositsLocked`'s "NOBODY IS WEDGED" doctrine.
-        //
-        // Closing the emergency-path gap needs `sweep()` reachable for a
-        // terminal-but-`Executed` clone first — either by relaxing its gate or
-        // by a permissionless `forceSettle()`. Tracked with the NAV work in
-        // issue #233 / `docs/nav-residue-design.md`. Until then this stays
-        // narrow.
         if (_state != State.Settled) return false;
         if (tokenId != 0) return true;
         if (IERC20(asset).balanceOf(address(this)) > RESIDUE_DUST) return true;
@@ -2145,7 +1431,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         Position memory pos = morpho.position(marketId, address(this));
         // SAME FLOOR AS THE BOOL. Without it a 1-wei donated collateral gives
         // `hasUndeliveredValue() == false` while this returns non-zero — the
-        // bool/amount divergence that was finding #1. Free to close now; it
         // would not be obvious once #233 wires a consumer.
         if (pos.collateral <= RESIDUE_DUST) return v;
         uint256 owed;
@@ -2170,7 +1455,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      balance, plus Morpho collateral net of debt ONLY when the collateral
     ///      token IS the vault asset. Everything else needs a price this
     ///      template refuses to consult, because the venue quoting it is one the
-    ///      proposal can trade — the lever finding #3 was exploited through.
     ///
     ///      So this reports the residue shapes that figure omits, and the vault
     ///      refuses to mint at all while any of them is outstanding. Under a
@@ -2247,25 +1531,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         _trySwapToAsset(settleSlippageBps);
 
-        // REPAY BEFORE EXPORTING, in the position `sweep()` has it — after the
-        // swap, before the push. `_repayAndWithdraw` funds the repayment from
-        // this clone's OWN asset balance, and the push below sends every wei of
-        // that balance to the vault. Exporting first therefore does not merely
-        // skip the repayment, it REMOVES the resource the repayment needs: a
-        // later `sweep()` reads `held == 0`, takes neither repay branch, and the
-        // collateral stays behind debt that can no longer be cleared. This
-        // function is `onlyVault`, but the property that matters survives that:
-        // `SyndicateVault.releaseUnconvertible(strategy)` is ungated, so ANY
-        // party still drives this path — they drive it AS the vault. That makes
-        // the sequence front-runnable for gas by a party paid to do it; the
-        // adversary and the vault-wide cost are traced in
-        // `test/pashov-final/CLStrategy_releaseRepaysFirst.t.sol` (finding #10).
-        //
-        // Nothing is foreclosed by running it here: `_repayAndWithdraw` ends
-        // with an unconditional `_tryRedeemWrapper()`, so collateral it pulls
-        // out of Morpho gets a redemption attempt in this same call and leaves
-        // as `asset` below. The raw pushes further down still fire only on a
-        // genuine redemption failure.
         (uint256 debtRemaining, uint256 collateralRemaining) = _repayAndWithdraw();
 
         // Deliver whatever the conversion DID produce before releasing the rest.
@@ -2278,52 +1543,16 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             emit ResidualSwept(assets);
         }
 
-        // THE COLLATERAL WRAPPER TOO — not just `otherToken`. This hatch was
-        // built for the LP-fee-sized `otherToken` residue and omitted the ERC-4626
-        // collateral shares, which are the proposal's ENTIRE principal. Those
-        // shares are only ever disposed of by `_tryRedeemWrapper`, and this
-        // template's own note concedes the wrappers it targets "gate redemption
-        // behind pauses, caps, queues and underlying liquidity, none of which
-        // this proposal can influence" — so a wrapper that stops redeeming for
-        // good stranded the whole principal on a clone that carries no rescue
-        // surface, while `SyndicateVault.rescueERC20` can only reach tokens the
-        // VAULT holds. The argument this function already makes for itself
-        // applies verbatim and with far larger stakes: the vault is the strictly
-        // better custodian, because it has an owner-gated rescue and this clone
-        // has none.
         address coll = _marketParams.collateralToken;
         if (coll != asset) {
             uint256 collBal = IERC20(coll).balanceOf(address(this));
             if (collBal != 0) {
                 _pushAllToVault(coll);
                 emit UnconvertibleReleased(coll, collBal);
-                // HANDED OFF, NOT STRANDED — so it must not be reported as
-                // outstanding below. `_repayAndWithdraw` counts loose wrapper
-                // shares into `collateralRemaining` alongside what Morpho still
-                // holds, which is right for `sweep()` (the shares stay on the
-                // clone there) and wrong here, where this push just delivered
-                // them. `collBal` IS that loose component: it was measured after
-                // `_repayAndWithdraw` and nothing between the two touches `coll`
-                // (the `asset` push above is a different token inside this
-                // branch). Saturating anyway — an underflow here would revert
-                // the hatch of last resort over an accounting nicety.
                 collateralRemaining = collBal >= collateralRemaining ? 0 : collateralRemaining - collBal;
             }
         }
 
-        // REPORTED AFTER THE HAND-OFF, unlike `sweep()`, and for the reason the
-        // two differ: `sweep()` only ever delivers `asset`, so what it measured
-        // is still stranded when it emits. This path also exports the collateral
-        // itself, so emitting on the pre-push figure would report value that
-        // reached the vault in this very call as missing — the monitoring signal
-        // would fire on the hatch WORKING. What is left after this line is the
-        // genuine strand: debt this clone could not clear, and collateral still
-        // posted to Morpho.
-        //
-        // Loud on the SAME terms `sweep()` is otherwise: a release that repays
-        // only part of the debt is indistinguishable off-chain from one that
-        // cleared everything, and this path is the one an attacker drives, so
-        // the partial outcome is the one monitoring most needs to see.
         if (debtRemaining != 0 || collateralRemaining != 0) {
             emit SettlementIncomplete(debtRemaining, collateralRemaining);
         }
@@ -2336,62 +1565,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     // ── Tunables ──
 
-    /// @notice Decode: (uint256 settleSlippageBps, uint256 settleDeadline)
-    /// @dev    ONLY risk-reducing parameters. The pool, the market, the sizes,
-    ///         the active range and EVERY rerange-policy field are immutable
-    ///         after initialization, and there is deliberately no encoding by
-    ///         which this function can reach them.
-    ///
-    ///         Adversary: a proposer who, having had a position approved by
-    ///         voters and guardians, mutates it after approval into a materially
-    ///         different position the review never covered — including by
-    ///         re-centering the band repeatedly until it sits somewhere the
-    ///         review would not have approved. That is why the range is not
-    ///         settable here even though `rerange()` changes it: `rerange()`
-    ///         cannot be steered, and this could be.
-    ///         RISK-REDUCING IS ENFORCED, NOT ASSERTED. The ceiling alone is not
-    ///         that claim: it lets a proposal reviewed at a tight settlement band
-    ///         be widened all the way to `MAX_SLIPPAGE_BPS` after approval, and
-    ///         `settleProposal` is proposer-callable an hour after execute — so
-    ///         the same address that widened the band is the one that then
-    ///         settles through it, into a sandwich it controls, with nobody
-    ///         reviewing the change. `settleSlippageBps` is therefore
-    ///         TIGHTEN-ONLY, mirroring `PortfolioStrategy._updateParams`, which
-    ///         names the identical adversary.
-    ///
-    ///         NO FLOOR, deliberately, and this is where it departs from
-    ///         `PortfolioStrategy`'s `MIN_SLIPPAGE_BPS`. There an over-tight
-    ///         value is irreversible AND bricks `rebalanceDelta`. Here the only
-    ///         consumer is `_trySwapToAsset`, which DEGRADES: a floor nothing
-    ///         can fill skips the conversion and leaves the residue to `sweep()`
-    ///         and `releaseUnconvertible()`. Self-inflicted and recoverable does
-    ///         not need to be a rejected input.
-    ///
-    ///         `settleDeadline` needs no such rule: `_deadline()` returns
-    ///         `max(settleDeadline, block.timestamp)`, so the field can never
-    ///         resolve to the past and lowering it only narrows how late a
-    ///         settlement batch may land — the risk-reducing direction already.
     function _updateParams(bytes calldata data) internal override {
         (uint256 slippageBps, uint256 deadline) = abi.decode(data, (uint256, uint256));
-        // ZERO KEEPS THE CURRENT BAND — it does not set a zero one.
-        //
-        // `PortfolioStrategy._updateParams` documents this repo's convention as
-        // "Pass empty arrays / 0 to keep current values", and without the
-        // sentinel the tighten-only ratchet below turns that convention into a
-        // one-way trap: a proposer shortening only the deadline writes
-        // `abi.encode(0, newDeadline)`, pins `settleSlippageBps` at 0 for the
-        // clone's lifetime, and every later call reverts `ImmutableParam`
-        // unless it also passes 0. `_trySwapToAsset` then computes
-        // `minOut = expected * (10_000 - 0) / 10_000 == expected`, a
-        // zero-tolerance floor no real fill clears, so the volatile leg stops
-        // converting at settlement and is left to `sweep()` every time.
-        //
-        // The sibling's answer to the same hazard is `MIN_SLIPPAGE_BPS`, which
-        // makes a too-low value a REJECTED input rather than a permanent
-        // self-brick. A keep-sentinel is the better fit here because this
-        // template's consumer degrades rather than reverts, so there is no
-        // value worth rejecting outright — only one worth not writing by
-        // accident.
         if (slippageBps != 0) {
             // Ceiling first, so an out-of-range value keeps answering
             // `InvalidBound` rather than being absorbed by the ratchet below.

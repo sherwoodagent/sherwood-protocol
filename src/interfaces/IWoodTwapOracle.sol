@@ -7,7 +7,6 @@ pragma solidity 0.8.28;
 ///
 /// @dev    THE TWAP IS NEVER AN UNBOUNDED PRICE. `ExposureLedger` admits this
 ///         number only under `min(source, woodUsdPriceX8)`, and the pool behind
-///         it is ~$437k deep (design.md, measured 2026-08-01). Promoting it to
 ///         an unbounded price source would make that pool the valuation basis
 ///         for every guardian bond in the protocol. Any consumer added later
 ///         must preserve that constraint.

@@ -71,7 +71,6 @@ interface IGuardianRegistry {
     event ReviewOpened(address indexed governor, uint256 indexed proposalId, uint128 totalStakeAtOpen);
     /// @notice First vote on a review. `governor` disambiguates: per-vault governors
     ///         all number proposals from 1. Blocker attribution is an off-chain join
-    ///         of this, `GuardianVoteChanged` and `ReviewResolved(blocked=true)` (SHE-207).
     event GuardianVoteCast(
         address indexed governor,
         uint256 indexed proposalId,
@@ -247,7 +246,6 @@ interface IGuardianRegistry {
 
     /// @notice True iff `vault`'s owner-stake slot is bound and not exiting.
     ///         Passthrough to sWOOD — the route `SyndicateGovernor` already has
-    ///         for `ownerStake` (SHE-215).
     function ownerBondLive(address vault) external view returns (bool);
 
     /// @notice The minimum WOOD a vault owner must bond. Passthrough to sWOOD.

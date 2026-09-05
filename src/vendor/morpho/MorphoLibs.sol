@@ -113,30 +113,6 @@ library MorphoBalancesLib {
     using SharesMathLib for uint256;
     using SafeCastLib for uint256;
 
-    /// @notice Market totals as they would stand after accruing pending
-    ///         interest at `block.timestamp`.
-    /// @dev    Faithful to the singleton: interest = totalBorrowAssets *
-    ///         taylor(borrowRateView * elapsed), added to BOTH supply and
-    ///         borrow totals; a nonzero fee additionally mints fee shares
-    ///         (diluting the fee out of suppliers' share price exactly as the
-    ///         singleton does).
-    ///
-    ///         Accrual is accumulated INTO THE `Market` MEMORY STRUCT, whose
-    ///         totals are uint128, and narrowed through `toUint128` — upstream's
-    ///         exact arithmetic. The bound is load-bearing, not decoration: it
-    ///         is the invariant that this view can never report a total the
-    ///         singleton's own storage could not hold. Accumulating in uint256
-    ///         locals instead would let a projection past uint128 return a
-    ///         silently inflated, `ok = true` valuation that `withdrawTo` /
-    ///         `_settle` could never deliver, where upstream reverts. Reverting
-    ///         is the safe direction here: `MorphoSupplyAdapter.value` catches
-    ///         it into `(0, false)` and the vault degrades to Lane B.
-    ///
-    ///         Adversary: a market whose IRM (Morpho governance gates IRM
-    ///         enablement, so this is narrow) or whose unaccrued age drives
-    ///         `totalBorrowAssets * taylor(rate * elapsed)` past uint128 while
-    ///         staying inside uint256 — the only band where the two
-    ///         formulations disagree.
     function expectedMarketBalances(IMorpho morpho, MarketParams memory marketParams)
         internal
         view

@@ -36,7 +36,6 @@ import {IVotes} from "@openzeppelin/contracts/governance/utils/IVotes.sol";
  */
 contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializable {
     /// @notice Ceiling applied to `maxDrawdownBps` when deriving the SETTLE-PRICE
-    ///         floor (pashov finding #2). Not a bound on the strategy's declared
     ///         loss — that stays whatever voters approved, up to 10_000.
     /// @dev    Why a cap rather than rejecting `maxDrawdownBps == 10_000` at
     ///         propose: rejecting it would make the P&L envelope answer for the
@@ -91,14 +90,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @notice Proposal ID -> voter -> bool
     mapping(uint256 => mapping(address => bool)) private _hasVoted;
 
-    /// @notice SHE-205. A cast ballot, retained so that the vote can follow the
-    ///         voting weight behind it. `cast` is the weight counted at `vote`;
-    ///         `weight` is what currently stands in the tally, always
-    ///         `min(cast, live votes of the voter)` after the last movement.
-    /// @dev    Two figures rather than a running decrement because the standing
-    ///         weight is RECOMPUTED, never accumulated: weight that leaves and
-    ///         returns restores the ballot, and no sequence of moves can push it
-    ///         above what was cast.
     struct Ballot {
         VoteType support;
         uint256 weight;
@@ -199,13 +190,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      goalposts for co-proposers who already approved.
     mapping(uint256 proposalId => uint256 packedTiming) private _draftTimingSnap;
 
-    /// @notice Tier registry. MANDATORY at `initialize` (pashov finding #1) —
-    ///         a governor cannot be born unwired. Re-pointed post-init via
-    ///         `setTierRegistry` (factory-only, like `setProtocolConfig`),
-    ///         which also refuses zero and codeless.
-    /// @dev Governors deployed BEFORE this became an init param can still read
-    ///      zero here; `SyndicateVault._guardBatchCalls` fails closed on that,
-    ///      and `SyndicateFactory.pushWiring` is the rescue.
     address internal _tierRegistry;
 
     /// @notice Exposure ledger. Optional: address(0) skips the covered-TVL
@@ -221,7 +205,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @notice Proposal ID -> per-call gross-outflow caps for the EXECUTE
     ///         (opening) calls, one entry per `_executeCalls[id]` entry,
     ///         denominated in the vault asset. Stored immutably at propose
-    ///         (issue #43); coverage is priced from these, and they are
     ///         forwarded to `executeGovernorBatch` unchanged at execute.
     mapping(uint256 => uint256[]) private _executeCallCaps;
 
@@ -240,7 +223,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     mapping(uint256 => uint256[]) private _effectiveSettlementCallCaps;
 
     /// @notice Outstanding escrowed fee liability per `(vault, token)` — the
-    ///         aggregate `_unclaimedFees` never had (pashov review finding #3).
     /// @dev `_unclaimedFees` is keyed per RECIPIENT with no total, so the vault
     ///      holding the escrowed assets could not see that it owed them and
     ///      `totalAssets()` counted them as LP equity. Appended before `__gap`,
@@ -248,7 +230,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     mapping(address vault => mapping(address token => uint256)) private _escrowedFees;
 
     /// @notice Proposal ID -> the vault's price per share at EXECUTE, captured
-    ///         before the batch deploys any capital (pashov finding #2).
     /// @dev THE ANCHOR THE SETTLE-PRICE FLOOR IS MEASURED AGAINST, and the
     ///      reason it cannot be faked. Taken while the vault still physically
     ///      holds the capital, so it is a real ratio (~par) rather than the
@@ -289,60 +270,15 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      collectable — which is the honest failure mode.
     mapping(uint256 => address[]) private _sandboxTokens;
 
-    /// @notice SHE-205. The proposal whose voting-window exits `_voteExitShares`
-    ///         belongs to. Tagged rather than cleared so the counter never has
-    ///         to be reset on a separate write.
     uint256 private _voteExitPid;
 
-    /// @notice SHE-205. Shares that left the vault during `_voteExitPid`'s
-    ///         voting window, netted out of the veto denominator.
-    ///
-    /// @dev    The veto bar is a fraction of a supply SNAPSHOT, but redemptions
-    ///         stay open for the whole vote (they shut only at EXECUTE, via
-    ///         `getActiveProposal`, while deposits shut at Draft via
-    ///         `openProposalCount`). A depositor arriving one block before
-    ///         `propose` is therefore counted in the denominator and can be gone
-    ///         before settlement — raising the bar without casting a vote.
-    ///         Netting their exit back out is what removes the inflation.
-    ///
-    ///         FROZEN AT `voteEnd`, deliberately. Pricing the bar against LIVE
-    ///         supply instead would make the verdict move after the vote closed:
-    ///         `_computeState` is a true view and `resolveProposalState` is
-    ///         permissionless, so the outcome would become an MEV race —
-    ///         withdraw, resolve, redeposit in one transaction. Counting only
-    ///         while `block.timestamp <= voteEnd` makes the verdict a pure
-    ///         function of the window.
     uint256 private _voteExitShares;
 
-    /// @notice SHE-205. Per-proposal ballot record, keyed by the VOTER: the
-    ///         direction they chose, the weight they cast, and the weight still
-    ///         standing behind it.
-    ///
-    /// @dev    Needed because netting exits out of the denominator WITHOUT also
-    ///         rescinding the departing holder's ballot trades this bug for its
-    ///         mirror. A voter could cast Against, then withdraw to shrink the
-    ///         very denominator their ballot is measured against: at a 40% bar,
-    ///         a 30% holder voting then exiting clears `0.4 x (S - e)`, so 30%
-    ///         beats a 40% bar.
-    ///
-    ///         THE DENOMINATOR AND THE BALLOT ANSWER DIFFERENT QUESTIONS. The
-    ///         denominator is a SUPPLY figure and moves only on burns. The
-    ///         ballot is a claim on VOTING WEIGHT and must move whenever the
-    ///         voter's weight does -- by burn, by transfer, or by a delegation
-    ///         change -- or the two decouple: vote, hand the shares to a second
-    ///         address, redeem there. Keyed on the burner, the ballot survived
-    ///         that and 29% of the book forced a veto against a 40% bar with
-    ///         all of its capital returned. The vault therefore reports every
-    ///         drop in an address's live votes, and the ballot is recomputed as
-    ///         `min(cast, getVotes(voter))`. Together the two halves leave the
-    ///         effective bar at 40% of supply however the attacker splits
-    ///         between voting, moving and exiting.
     mapping(uint256 => mapping(address => Ballot)) private _ballots;
 
     /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31)
     ///      for the three mappings above, then 1 more for `_escrowedFees`, then
     ///      1 more for `_ppsSnapshots`, then 3 more for the sandbox payload
-    ///      (26 -> 23), then 3 more for the SHE-205 exit accounting
     ///      (23 -> 20) — append-only. See
     ///      `script/syndicate-governor-layout.golden.json`.
     uint256[20] private __gap;
@@ -359,14 +295,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _disableInitializers();
     }
 
-    /// @param tierRegistry_ MANDATORY (pashov finding #1). Wiring the registry
-    ///        here rather than in a follow-up `setTierRegistry` is what makes
-    ///        the registry-less governor unreachable: `_guardBatchCalls` drops
-    ///        the whole callee/spender allowlist when it resolves none, so a
-    ///        governor that could exist unwired for even one block could hand a
-    ///        vault `asset.approve(attacker, max)` past every meter. Codeless
-    ///        subsumes zero — an EOA would pass a zero-check and then revert the
-    ///        guard's typed `isCallableTarget` call, bricking the vault instead.
     function initialize(
         address vault_,
         address guardianRegistry_,
@@ -411,13 +339,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         return _settlementCallCaps[id];
     }
 
-    /// @dev The COVERAGE-SCALED settlement caps — what `settleProposal` and
-    ///      `unstick` both meter against. Populated on EVERY execute path, so it
-    ///      is never empty for a proposal in `Executed`, the only state `unstick`
-    ///      accepts. Split from `_getSettlementCallCaps` rather than replacing it:
-    ///      the raw propose-time array is still the record of what was voted on,
-    ///      and conflating the two let the sizing be enforced on one replay path
-    ///      and not the other.
     function _getEffectiveSettlementCallCaps(uint256 id) internal view override returns (uint256[] storage) {
         return _effectiveSettlementCallCaps[id];
     }
@@ -490,26 +411,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // locked and the review period spent, with no path to fix it.
         if (sandbox.calls.length > MAX_SANDBOX_CALLS) revert TooManyCalls();
         if (sandbox.declaredTokens.length > MAX_SANDBOX_TOKENS) revert TooManySandboxTokens();
-        // MIRRORS `CallSandbox.init`'S ZERO-TARGET REFUSAL, for the same reason
-        // the declared-token dedup below mirrors its duplicate check: a rule
-        // enforced only at execute kills a proposal that already cleared the
-        // vote and the review period, with the bond locked and no way to amend.
-        //
-        // AND THIS ONE ALSO PROPS UP A SENTINEL. `CallSandbox._denyIfNamed`
-        // treats `address(0)` as "the probe did not resolve" and returns
-        // early, so a zero target would be an entry the accounting denylist
-        // cannot screen. Its natspec argues that is safe BECAUSE `init` rejects
-        // zero targets — an invariant better held at both ends than at one.
         for (uint256 i = 0; i < sandbox.calls.length; i++) {
             if (sandbox.calls[i].target == address(0)) revert ZeroSandboxTarget(i);
         }
-        // MIRRORS `CallSandbox.init`'S OWN REFUSAL, and must. Every rule `init`
-        // enforces has to be enforced HERE too, or the payload that breaks it
-        // clears the vote and the whole review period and then reverts at
-        // execute with the proposer's bond locked and no way to amend — the
-        // same reason the call-count bound is checked against the sandbox's
-        // figure rather than the batch's. Pinned by
-        // `test_propose_duplicateDeclaredTokenRejectedAtProposeNotExecute`.
         for (uint256 i = 0; i < sandbox.declaredTokens.length; i++) {
             for (uint256 j = 0; j < i; j++) {
                 if (sandbox.declaredTokens[i] == sandbox.declaredTokens[j]) {
@@ -518,14 +422,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             }
         }
         if (sandbox.funding == 0) revert ZeroSandboxFunding();
-        // REFUSE HERE, NOT AT EXECUTE. A vault created before its factory had a
-        // sandbox implementation has none and can never be given one — the
-        // vault's setter is factory-only and set-once. Without this check such a
-        // proposal would pass the vote, spend the whole review period, lock the
-        // proposer's bond, and only then revert `SandboxNotConfigured` at
-        // execute, with no way to fix it and the bond reclaimable only after the
-        // proposal expires. Read live off the vault rather than mirrored here:
-        // the vault is the only authority on what it will actually clone.
         if (ISyndicateVault(vault).sandboxImplementation() == address(0)) {
             revert SandboxNotAvailable(vault);
         }
@@ -538,16 +434,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             revert SandboxFundingExceedsMaxCapital(sandbox.funding, envelope.maxCapital);
         }
 
-        // WRITTEN BEFORE THE PROPOSAL EXISTS, AGAINST THE ID IT IS ABOUT TO MINT.
-        // `_snapshotTierAndGate` — which runs deep inside `_propose`, prices
-        // required coverage and locks the proposer bond — reads the funding back
-        // out of storage by proposal id. Writing the payload afterwards would
-        // price it at zero: a state read that some later call in the same
-        // transaction establishes reads as unset, and a helper that degrades to
-        // zero makes that silent. Nothing can interleave between this write and
-        // the mint (`_propose` starts with view checks and a call to the vault's
-        // own `isAgent`), and if the ids ever diverge the whole transaction
-        // reverts rather than leaving a payload attached to the wrong proposal.
         uint256 expectedId = _proposalCount + 1;
         _storeSandbox(expectedId, sandbox);
 
@@ -597,7 +483,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ) private returns (uint256 proposalId) {
         if (vault != GovernorParameters.vault) revert VaultNotRegistered();
         if (!ISyndicateVault(vault).isAgent(msg.sender)) revert NotRegisteredAgent();
-        // SHE-215: no live owner bond, no proposal lane.
         // (`openspec/changes/owner-bond-proposal-gate`)
         if (!IGuardianRegistry(_guardianRegistry).ownerBondLive(vault)) revert OwnerBondNotLive();
         // Blocks new proposals when the vault still has a non-terminal
@@ -605,60 +490,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Draft co-proposals do not count toward openProposalCount and are
         // independently gated at their Draft -> Pending transition.
         if (_openProposalCount != 0) revert VaultHasOpenProposal();
-        // BIND THE DECLARED STRATEGY TO ITS CALLER (pashov review finding #8).
-        // `StrategyFactory.cloneAndInit` enforces `proposer == msg.sender` so
-        // `_proposer` is "a known authorized address", and
-        // `BaseStrategy.execute()` treats `strategyOf(activePid) ==
-        // address(this)` as the security boundary — issue #150's fix, "this
-        // check IS the security boundary here". But the governor never
-        // preserved the binding those two ends assume: `p.strategy` was
-        // written verbatim from calldata, so the equality held BY
-        // CONSTRUCTION for whoever declared the clone, not for whoever owns
-        // it. `IStrategy.proposer()` had zero call sites in `src/`, and
-        // `StrategyFactory` records the governor-side check as "deferred".
-        //
-        // Unbound, any registered agent could name a rival's pre-deployed,
-        // governance-allowlisted clone as its own proposal's strategy and
-        // drive it Pending -> Executed. The ratchet is one-way, so the rightful
-        // proposer's own later proposal then reverts `AlreadyExecuted` forever:
-        // recovery needs a redeploy plus a fresh `setAdapterAllowed` and, if
-        // tier-certified, a new `proposeCertification` + `certifyDelay`.
-        // `address(0)` stays legal — a proposal need not name a strategy.
-        // Only a CONTRACT can be bricked, so only a contract is checked. A
-        // codeless `strategy` is a label and nothing more — `BaseStrategy`'s
-        // ratchet needs code to flip, `executeCalls` needs code to call — and
-        // `propose` has always accepted one (see
-        // `test_propose_eoaStrategySucceedsAtPropose`). Raw staticcall rather
-        // than a typed call for the same reason as everywhere else in this
-        // repo: a contract that does not answer `proposer()` would otherwise
-        // revert here with no data. It fails CLOSED — something with code that
-        // cannot identify its own proposer must not be declared as one.
-        // ENFORCED ONLY WHERE THERE IS SOMETHING TO PROTECT. The attack this
-        // closes needs a `BaseStrategy` clone: `execute()`'s guard is
-        // `strategyOf(activePid) == address(this)`, and what gets stolen is
-        // that clone's one-way Pending -> Executed ratchet. An address that
-        // does not answer `proposer()` has no such ratchet — it is a plain
-        // adapter pointer or an EOA label, both long-standing legitimate uses
-        // of this field (`test_propose_eoaStrategySucceedsAtPropose`,
-        // `test_vault_activeStrategyAdapter_*`) — so there is nothing for this
-        // guard to defend and refusing it would break callers for no gain.
-        //
-        // When the address DOES answer, the binding is mandatory: that is
-        // exactly the clone case, and `StrategyFactory.cloneAndInit` already
-        // pinned `_proposer` to whoever cloned it. Raw staticcall throughout,
-        // so "does not answer" is a decodable state rather than an
-        // uncatchable revert in this frame.
         if (strategy != address(0) && strategy.code.length != 0) {
             (bool okP, bytes memory pRet) = strategy.staticcall(abi.encodeCall(IStrategy.proposer, ()));
             address declaredProposer = (okP && pRet.length == 32) ? abi.decode(pRet, (address)) : address(0);
             if (declaredProposer != address(0)) {
-                // A ZERO PROPOSER IS NOT A VICTIM. `StrategyFactory.cloneAndInit`
-                // always writes `_proposer = msg.sender`, so every live clone
-                // carries a non-zero one; zero means the strategy was never
-                // initialized and therefore has no ratchet anyone could steal
-                // and no owner anyone could grief. Templates read zero too, and
-                // they set `_initialized` in their constructor so they can never
-                // become live.
                 if (declaredProposer != msg.sender) revert StrategyProposerMismatch();
                 (bool okV, bytes memory vRet) = strategy.staticcall(abi.encodeCall(IStrategy.vault, ()));
                 if (okV && vRet.length == 32 && abi.decode(vRet, (address)) != vault) {
@@ -679,7 +514,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             revert TooManyCalls();
         }
         // Reject any call in either array whose target the vault's
-        // privileged-batch-target predicate flags (issue #118). Runs here,
         // bounded by the TooManyCalls cap above, before any state write or
         // state-changing external call (lockBond).
         _rejectPrivilegedTargets(vault, executeCalls, settlementCalls);
@@ -698,13 +532,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
         proposalId = ++_proposalCount;
 
-        // Per-call capital declarations: validate AND store in ONE early call so
-        // the caps calldata refs die immediately after, instead of staying live
-        // across the rest of this function (Yul stack-too-deep mitigation). A
-        // revert here rolls back the `_proposalCount` increment alongside
-        // everything else. Never folded into `_rejectPrivilegedTargets`'
-        // staticcall-probe loop: different subject, different failure mode — this
-        // never degrades open.
         _validateAndStoreBatch(
             proposalId, executeCalls, executeCallCaps, settlementCalls, settlementCallCaps, envelope.maxCapital
         );
@@ -777,32 +604,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_commitState(proposal) != ProposalState.Pending) revert NotWithinVotingPeriod();
         if (_hasVoted[proposalId][msg.sender]) revert AlreadyVoted();
 
-        // Vote weight from ERC20Votes checkpoint at proposal creation, CAPPED BY
-        // WHAT THE VOTER STILL CARRIES.
-        //
-        // SHE-205: the snapshot read alone is order-dependent in a way the exit
-        // netting cannot see. `notifyVotingWeightMoved` recomputes a ballot that
-        // already exists, so vote-then-exit is covered -- but exit-then-vote arrives at
-        // an empty `_ballots` slot, returns early, and leaves the holder free to
-        // cast full snapshot weight against a denominator their own exit just
-        // shrank. That inverts the fix: 28.6% of the book could force a veto
-        // with its capital already withdrawn.
-        //
-        // `getVotes` rather than `balanceOf` is deliberate. This vault
-        // auto-delegates on receipt but leaves an explicit delegation alone, so
-        // a delegatee legitimately votes weight it does not hold and a balance
-        // comparison would zero them. Current votes track the delegation graph,
-        // so an exit by the underlying holder lowers the delegatee's cap too.
-        //
-        // The cap only ever reduces: a holder who ACQUIRED shares after the
-        // snapshot still votes the snapshot figure.
         uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, proposal.snapshotTimestamp);
         uint256 liveWeight = IVotes(proposal.vault).getVotes(msg.sender);
         if (liveWeight < weight) weight = liveWeight;
         if (weight == 0) revert NoVotingPower();
 
         _hasVoted[proposalId][msg.sender] = true;
-        // SHE-205: retain the ballot so `notifyVotingWeightMoved` can follow it
         // if the voter's weight later moves. What is stored is the CAPPED
         // weight -- the snapshot figure less anything already gone -- so the
         // recompute below can never restore weight the voter did not carry
@@ -820,46 +627,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         emit VoteCast(proposalId, msg.sender, support, weight);
     }
 
-    /// @notice SHE-205. The vault reports that `shares` were BURNED — redeemed
-    ///         out of the vault — while a vote is open. Those shares stop
-    ///         counting toward the veto denominator. The denominator is a
-    ///         supply figure, so only a burn moves it; transfers and delegation
-    ///         changes are reported through `notifyVotingWeightMoved` instead,
-    ///         which touches ballots and never the denominator.
-    ///
-    /// @dev    VAULT-ONLY, and silent rather than reverting on every other
-    ///         condition. This runs inside the vault's ERC20 `_update`, so a
-    ///         revert here would brick every share burn; each early return is
-    ///         a state in which there is simply nothing to record.
-    ///
-    ///         Only `Pending` and only up to `voteEnd`: see `_voteExitShares`
-    ///         for why the counter must stop there rather than track live
-    ///         supply.
-    ///
-    ///         The vault never reports the withdrawal queue's own burns, which
-    ///         would otherwise be subtracted twice — escrowed queue shares are
-    ///         already netted out of the denominator via the queue's
-    ///         checkpointed voting weight.
-    ///
-    ///         The burner's ballot is NOT handled here. Burning shares lowers
-    ///         the live votes of whoever they were delegated to, and the vault
-    ///         reports that drop separately (from the OZ delegate-votes hook,
-    ///         which fires inside the same `_update`), so the ballot is
-    ///         recomputed for the right voter whether or not the burner is the
-    ///         one who voted.
     function notifyShareExit(uint256 shares) external {
         if (msg.sender != GovernorParameters.vault) return;
         if (shares == 0) return;
         (uint256 pid,) = _openVote();
         if (pid == 0) return;
 
-        // TAG, DON'T CLEAR. Retagging to a NEW pid silently zeroes
-        // `_exitedDuringVote(oldPid)`, which would retroactively restore the
-        // pre-fix denominator for a verdict already read. That is unreachable
-        // only because a proposal is committed to storage before its successor
-        // can exist: `ProposalLifecycle._decOpen` drops `_openProposalCount` on
-        // a committing terminal transition, and `propose` requires that count to
-        // be zero. This ordering is load-bearing -- keep the two in step.
         if (_voteExitPid != pid) {
             _voteExitPid = pid;
             _voteExitShares = 0;
@@ -867,34 +640,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _voteExitShares += shares;
     }
 
-    /// @notice SHE-205. The vault reports that `voter`'s live voting weight
-    ///         just MOVED — shares they carry were transferred or burned, shares
-    ///         arrived, or a delegation moved onto or off them. Any ballot
-    ///         `voter` cast on the open proposal is brought back in step with
-    ///         the weight they now hold: the standing weight becomes
-    ///         `min(cast, getVotes(voter))`.
-    ///
-    /// @dev    RECOMPUTED, NOT DECREMENTED. The tally moves by the difference
-    ///         between what stood before and what stands now, in either
-    ///         direction, so weight that leaves and comes back restores the
-    ///         ballot and a round trip is a no-op. The ceiling is what was
-    ///         cast, so no sequence of moves can grow a ballot.
-    ///
-    ///         KEYED ON THE VOTER, NOT THE HOLDER. The vault resolves the
-    ///         address whose votes dropped -- `delegates(from)` for a transfer
-    ///         or burn, the OLD delegatee for a delegation change -- and that
-    ///         is the only address that can have voted this weight. Keying on
-    ///         the burning account instead let a voter hand their shares to a
-    ///         second address and redeem there: denominator down, ballot
-    ///         intact, 29% forcing a veto against a 40% bar.
-    ///
-    ///         The vault reports both sides of every move, so a rise is seen
-    ///         as promptly as a drop. `test_she205_ballotFollowsTheWeightOutAndBack`
-    ///         pins the restore.
-    ///
-    ///         VAULT-ONLY and silent on every other condition, for the same
-    ///         reason as `notifyShareExit`: this runs inside every share
-    ///         transfer and every delegation.
     function notifyVotingWeightMoved(address voter) external {
         if (msg.sender != GovernorParameters.vault) return;
         (uint256 pid, StrategyProposal storage p) = _openVote();
@@ -925,22 +670,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
     }
 
-    /// @dev SHE-205. The proposal currently taking votes, or `(0, _)` if
-    ///      none. Exactly one top-level proposal is open at a time, so the
-    ///      monotonic counter names it — the same identification
-    ///      `SyndicateVault._openProposalPid` relies on. Bounded by `voteEnd`
-    ///      rather than by state alone because `state` is only committed on
-    ///      the next `_commitState`; a proposal past its window but not yet
-    ///      resolved still reads `Pending`.
     function _openVote() internal view returns (uint256 pid, StrategyProposal storage p) {
         pid = _proposalCount;
         p = _proposals[pid];
         if (p.id == 0 || p.state != ProposalState.Pending || block.timestamp > p.voteEnd) pid = 0;
     }
 
-    /// @dev SHE-205. Surfaces the exit counter to `_computeState`, which lives
-    ///      in the base contract. The storage sits here, in the most-derived
-    ///      contract, so the base's layout is untouched.
     function _exitedDuringVote(uint256 proposalId) internal view override returns (uint256) {
         return _voteExitPid == proposalId ? _voteExitShares : 0;
     }
@@ -954,7 +689,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
         address vault = proposal.vault;
         if (_activeProposal != 0) revert StrategyAlreadyActive();
-        // SHE-215: re-checked at execute — the bond can be slashed between
         // propose and execute (`slashOwnerBond` has no open-proposal gate).
         // (`openspec/changes/owner-bond-proposal-gate`)
         if (!IGuardianRegistry(_guardianRegistry).ownerBondLive(vault)) revert OwnerBondNotLive();
@@ -968,31 +702,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         address asset = IERC4626(vault).asset();
         uint256 balanceBefore = IERC20(asset).balanceOf(vault);
         _capitalSnapshots[proposalId] = balanceBefore;
-        // Anchor for the settle-price floor (pashov finding #2). MUST be read
-        // HERE, before the execute batch deploys capital: `totalAssets()` counts
-        // only the vault's idle balance, so a reading taken after deployment
-        // would be ~0 and the floor derived from it would be vacuous — the exact
-        // failure being fixed. Typed call: `pricePerShare()` is on
-        // `ISyndicateVault` and every governor path already calls this vault.
-        // STORED OFFSET BY ONE so `0` unambiguously means "no anchor recorded"
-        // and can never mean "recorded as zero". `pricePerShare()` floors to 0
-        // whenever `totalAssets()` reads 0 against a large supply — a state
-        // `SyndicateVault` itself documents as reachable ("an escrow exceeding
-        // the float pins `totalAssets()` to 0") — and without the offset that
-        // would silently and totally disable this gate for the proposal.
         _ppsSnapshots[proposalId] = ISyndicateVault(vault).pricePerShare() + 1;
 
         // Update state BEFORE external call (CEI pattern)
         _activeProposal = proposalId;
         _transition(proposal, ProposalState.Executed);
-        // INVARIANT: THIS STAMP MUST PRECEDE THE `requireApproveQuorum` GATE
-        // BELOW, IN THE SAME TRANSACTION. The gate reads each approver's LIVE
-        // `slashableBondUsd`, which is sound ONLY because every sWOOD stake
-        // mutation checkpoints at `block.timestamp`, so the checkpoint at
-        // `executedAt` equals the live stake the gate just read — the gate and
-        // the eventual verdict slash (anchored at this same `executedAt`) then
-        // provably value the same WOOD. Move the gate out of this transaction, or
-        // ahead of this line, and that equality becomes an accident of ordering.
         proposal.executedAt = block.timestamp;
         // Start the management-fee clock. Must follow `_activeProposal` so the
         // vault's `totalAssets()` reads live NAV through the now-active lane, and
@@ -1008,21 +722,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // and the vault batch below (single SLOAD-loop; cold path, no stack risk).
         BatchExecutorLib.Call[] memory calls = _loadCalls(_executeCalls, proposalId);
 
-        // Fail-safe on stale certification. A proposal priced at tier 0/1 whose
-        // adapter demoted since propose is under-covered — block execution rather
-        // than run a possibly-unbounded batch against a bounded-tier coverage
-        // price. Tier alone misses a same-tier re-certification with a higher
-        // `extractableBoundBps`, so also revert when the re-resolved coverage
-        // exceeds the propose-time snapshot.
-        //
-        // PRICE THE SAME QUANTITY PROPOSE PRICED. `_snapshotTierAndGate` adds
-        // the sandbox funding to the stored `requiredCoverage`; comparing a
-        // batch-only live figure against that sum leaves the coverage guard
-        // slack by exactly the funding, so a mid-review re-certification that
-        // raises the batch's coverage by less than the funding executes
-        // undetected. Adding the funding here removes that slack. The tier
-        // needs no matching adjustment: a sandbox proposal is pinned at tier 2,
-        // and 2 is the maximum, so `TierRegressed` cannot fire for it.
         uint256 sandboxFunding = _sandboxFunding[proposalId];
         (uint8 liveTier, uint256 liveCoverage) = _resolveTierAndCoverage(
             calls,
@@ -1035,72 +734,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (liveTier > proposal.envelopeTier) revert TierRegressed();
         if (liveCoverage + sandboxFunding > proposal.requiredCoverage) revert CoverageRegressed();
 
-        // Fail-safe sibling to the two regression checks above. The propose-time
-        // ceiling check alone is NOT sufficient: it prices `maxCapital` against
-        // `totalAssets()` at PROPOSE, and nothing stops the proposer inflating
-        // that denominator with its own deposit right before proposing, then
-        // withdrawing it during the vote. The two capital locks read different
-        // counters — `depositsLocked()` rises at PROPOSE, `redemptionsLocked()`
-        // only at EXECUTE — so the proposer's own capital is free to leave in the
-        // gap, shrinking the float the ceiling was computed against while
-        // `maxCapital` stays pinned at its inflated value. Re-running the
-        // identical ratio against LIVE totals immediately before dispatch closes
-        // the window. Distinct revert so the two are never conflated off-chain.
         if (proposal.maxCapital > _capitalCeiling()) revert MaxCapitalCeilingRegressed();
 
-        // A coverage-consuming proposal at or above the tier threshold cannot
-        // execute without a bond-encumbered approve quorum: silence alone does
-        // not pass it, so an identified, stake-backed approver is always on the
-        // hook. A revert here leaves the proposal Approved — it expires at
-        // `executeBy` unless covering approvals arrive, so suppressing the cohort
-        // blocks execution without forcing cancellation.
-        //
-        // RUNS AFTER `proposal.executedAt = block.timestamp`, IN THE SAME
-        // TRANSACTION — load-bearing (see the stamp's own note). This gate's live
-        // read is what makes it sound to leave every OTHER post-execution ledger
-        // read anchored at `executedAt` instead: the two are provably equal at
-        // this one instant. Hoisted into `_deriveAndStoreEffectiveCapital` (an
-        // INTERNAL call, so the same-transaction reach is unaffected) purely for
-        // this function's Yul stack budget.
-        //
-        // That helper also derives `effectiveMaxCapital` from the gate's
-        // raised-vs-required figures — `maxCapital` unchanged when the gate does
-        // not run — and scales the stored per-call caps by the same factor,
-        // persisting the scaled settlement caps for `settleProposal`.
         uint256[] memory scaledExecuteCaps =
             _deriveAndStoreEffectiveCapital(proposalId, proposal, _exposureLedger, asset);
 
-        // Execute the opening calls via the vault. The effective capital caps the
-        // batch's net asset outflow (batch-level); the coverage-scaled per-call
-        // caps additionally bound each call's own gross outflow
-        // (BatchExecutorLib-level) — two distinct accounting layers, both
-        // mandatory on this path.
-        // Dispatch the sandbox BEFORE the execute batch, and hand the batch what
-        // is left of the envelope.
-        //
-        // ORDER IS LOAD-BEARING, NOT STYLISTIC. The vault prices its tier-2
-        // ceiling off `totalAssets()`, which during the Executed window counts
-        // only idle float — after the batch has deployed capital that reads near
-        // zero, so a sandbox dispatched afterwards would be measured against a
-        // ceiling of ~0 and revert for every non-trivial funding. Run here, the
-        // ceiling is measured against the same float the proposal was priced
-        // against.
-        //
-        // SUBTRACTING THE FUNDING IS WHAT STOPS THE ENVELOPE BEING SPENT TWICE.
-        // `effectiveMaxCapital` is the vault's net-outflow meter for the batch;
-        // without the subtraction a proposal could fund a sandbox to its full
-        // envelope and then deploy that same envelope again through the batch.
-        // The subtraction cannot underflow: `proposeWithSandbox` bounds funding
-        // by `maxCapital`, and the scaling below is monotone in it.
         uint256 batchCapital = proposal.effectiveMaxCapital;
         if (sandboxFunding != 0) {
-            // Scaled by the SAME raised-over-required ratio the effective
-            // capital and the per-call caps already carry, expressed as
-            // `effective/max` rather than re-reading the quorum figures: the two
-            // are the same ratio by construction (`effective = max *
-            // raised / required`), and taking it this way keeps the quorum reads
-            // in one place. The extra floor can only round the funding DOWN,
-            // which under-funds rather than over-funds — the safe direction.
             uint256 maxCapital = proposal.maxCapital;
             uint256 scaledFunding =
                 batchCapital == maxCapital ? sandboxFunding : (sandboxFunding * batchCapital) / maxCapital;
@@ -1133,14 +773,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             revert StrategyDurationNotElapsed();
         }
 
-        // Run the pre-committed settlement calls under the SAME effective capital
-        // cap execution ran under — reused from storage, NEVER recomputed, so a
-        // coverage drop between execute and settle cannot cap the unwind below
-        // the size legitimately deployed at execution. An honest unwind is
-        // net-INFLOW, so any finite cap passes it trivially; the cap only binds a
-        // malicious proposer who parked extraction in `settlementCalls` to
-        // self-settle and drain uncapped. The persisted per-call caps
-        // additionally bound each settlement call's own gross outflow.
         ISyndicateVault(proposal.vault)
             .executeGovernorBatch(
                 _loadCalls(_settlementCalls, proposalId),
@@ -1148,51 +780,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
                 proposal.effectiveMaxCapital
             );
 
-        // THE SETTLE PRICE MAY NOT BE STAMPED AGAINST AN UNREALIZED UNWIND.
-        // `_finishSettlement` calls `vault.onProposalSettled`, which freezes
-        // `num = totalAssets() + 1` as the price EVERY queued deposit and redeem
-        // for this proposal is later paid at — and settlement is
-        // deliverable-maximum at the strategy layer, not all-or-revert
-        // (`MorphoSupplyStrategy` and `ConcentratedLiquidityStrategy` both emit
-        // `SettlementIncomplete` and continue). `MorphoSupplyStrategy` further
-        // caps delivery at Morpho's own idle balance, which is exactly what a
-        // fee-free `flashLoan` removes for one callback frame.
-        //
-        // So without this gate an unprivileged caller settles from inside a
-        // flash-loan callback, the strategy delivers ~0, and the stamp becomes
-        // `num == 1`: queued depositors mint against a near-zero price (traced:
-        // 1e29 shares against a 1e18 supply) and queued redeemers burn for zero
-        // assets, with `cancel` already closed by `AlreadySettled`.
-        //
-        // `maxDrawdownBps` is the envelope voters and guardians actually
-        // approved, and until now it was validated at propose and never read
-        // again. Enforcing it here is what makes it load-bearing.
-        //
-        // MEASURED AS AN ABSOLUTE DROP AGAINST THE CAPITAL THE ENVELOPE COVERS,
-        // not as a percentage of the whole fund. `maxDrawdownBps` is declared —
-        // and validated at propose, and documented on `InvalidDrawdown` — as a
-        // share of COMMITTED capital, so the allowance is
-        // `effectiveMaxCapital * bps` (the coverage-scaled figure `execute` and
-        // the settlement batch above are both bounded by), never
-        // `vaultBalance * bps`. Scaling off the vault balance would let a
-        // proposal committing 10% of the fund lose ten times its own declared
-        // envelope before this trips.
-        //
-        // Both sides are the vault's RAW asset balance, `_capitalSnapshots`'
-        // own unit (the same measure `_finishSettlement` computes `pnl` in), so
-        // the comparison reduces to `balanceBefore - balanceNow <= allowance`.
-        // Any balance component that is constant across the window — the queue
-        // reserve, an untouched fee escrow — therefore cancels exactly instead
-        // of scaling the bar. The one component that is NOT constant is the fee
-        // escrow, and `claimUnclaimedFees` is gated on the active proposal for
-        // precisely that reason; see the note there.
-        //
-        // SCOPED TO THIS PATH ON PURPOSE. `unstick` and `finalizeEmergencySettle`
-        // route through `_finishSettlementHook` and stay ungated: they are the
-        // owner-multisig escape hatch for a genuine loss that exceeds the
-        // envelope, and gating them would wedge exactly the position that most
-        // needs to exit. A proposal that trips this gate is not stuck — it is
-        // redirected to the path where a human looks at it.
         {
             uint256 basis = _capitalSnapshots[proposalId];
             uint256 allowance = (proposal.effectiveMaxCapital * proposal.maxDrawdownBps) / BPS_DENOMINATOR;
@@ -1207,71 +794,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             }
         }
 
-        // SECOND, INDEPENDENT GATE — the settle PRICE (pashov finding #2).
-        //
-        // The capital floor above is identically true when a proposal declares
-        // `maxDrawdownBps == 10_000`: `allowance` then equals `basis`, so
-        // `basis > allowance` is false and the whole branch is SKIPPED. That is
-        // defensible for the strategy's own P&L — voters may accept a total
-        // loss — but the waiver reaches a party the envelope never spoke for.
-        // `_finishSettlement` -> `onProposalSettled` freezes
-        // `num = totalAssets() + 1` as the price EVERY queued deposit and redeem
-        // is paid at, and a permissionless caller picks the block.
-        //
-        // Proven on a live Robinhood fork: settle from inside a `flashLoan` that
-        // empties Morpho's idle balance so `_deliverableNow` returns 0, and the
-        // stamp lands at `num == 1` — a queued 1 USDG deposit minted 99.99% of a
-        // 20,000 USDG vault's supply.
-        //
-        // So the stamp gets its OWN bound, and the declared drawdown is CAPPED
-        // on the way in. A proposal may still declare a total loss; the price it
-        // may freeze is bounded regardless. A settlement under this floor is not
-        // stuck — it is redirected to `finalizeEmergencySettle`, where an owner
-        // bond and guardian review stand behind it.
         _requireSettlePriceAboveFloorHook(proposalId, proposal, false);
 
         _finishSettlement(proposalId, proposal);
     }
 
-    /// @dev Shared by `settleProposal` and `unstick` (pashov findings #2, #12).
-    ///      `unstick` replays the SAME stored batch under the SAME caps, so
-    ///      leaving it ungated closed the front door and left the side door
-    ///      open — the attack there needs no 100% declaration at all.
-    ///
-    ///      DELIBERATELY LOOSER THAN THE CAPITAL FLOOR. Capping the declared
-    ///      drawdown at `MAX_STAMP_DRAWDOWN_BPS` leaves a 100% proposal a floor
-    ///      of 10% of the execute-time price, so ordinary and even severe losses
-    ///      still settle and `unstick` remains the escape hatch it was added to
-    ///      be. Only a near-zero stamp — the shape a flash-loaned settle
-    ///      manufactures, and the shape that mints unbounded shares to a queued
-    ///      depositor — is refused.
-    ///
-    ///      `finalizeEmergencySettle` stays exempt, and the accurate statement
-    ///      of what that costs is: AN ATTACKING VAULT OWNER MUST NOW WAIT OUT A
-    ///      GUARDIAN REVIEW, not "the stamp is bounded on every path". The bond
-    ///      is slashed only if guardians actively BLOCK (`finalizeEmergency` ->
-    ///      `GuardianRegistry._resolveEmergency`), and guardians review the
-    ///      submitted CALLDATA, not the block the owner later finalizes in — so
-    ///      an owner may post a bond, submit the honest replay calls, let the
-    ///      review lapse unblocked, and finalize from inside a flash-loan frame
-    ///      with no slash. The exemption is still the right call: gating it
-    ///      would leave a genuinely illiquid position with NO exit at all, and
-    ///      the vault stays frozen meanwhile. What the exemption buys the
-    ///      protocol is time and visibility, not arithmetic.
-    ///
-    ///      MEASURES A SLIGHTLY DIFFERENT NUMBER THAN THE ONE STAMPED. This
-    ///      runs before `_finishSettlement`, which charges the management fee
-    ///      and then the performance fee — both of which leave the vault (or
-    ///      land in `_escrowedFees`, which `totalAssets()` also subtracts)
-    ///      BEFORE `onProposalSettled` freezes `num = totalAssets() + 1`. So
-    ///      the stamped price is strictly at or below the price approved here,
-    ///      by the size of the fees. The gap is bounded and cannot be inflated
-    ///      into a near-zero stamp: the management base is ~0 for the deployed
-    ///      window and the performance leg is zero on a loss, which is the only
-    ///      case where this floor binds at all. Checked pre-fee deliberately —
-    ///      moving it after `_chargePerformanceFee` would make a fee charge
-    ///      able to REVERT an otherwise-valid settlement, converting a fee
-    ///      rounding edge into a stuck vault.
     function _requireSettlePriceAboveFloorHook(uint256 proposalId, StrategyProposal storage proposal, bool rescuePath)
         internal
         view
@@ -1286,18 +813,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (anchor == 0) return;
         uint256 ppsAtExecute = anchor - 1;
 
-        // TWO BARS, because the two callers mean different things.
-        //
-        // `settleProposal` (rescuePath == false) is the ordinary, permissionless
-        // exit, so it is held to the DECLARED envelope — capped, so a 100%
-        // declaration cannot waive it to nothing.
-        //
-        // `unstick` (rescuePath == true) exists precisely to settle a proposal
-        // the declared envelope refused. Holding it to that same envelope would
-        // delete its purpose, so it gets only the absolute backstop: refuse a
-        // near-zero stamp, allow everything above it. A genuine loss past the
-        // backstop is not stuck either — it routes to `finalizeEmergencySettle`,
-        // which carries an owner bond and a guardian review.
         uint256 declared = rescuePath ? MAX_STAMP_DRAWDOWN_BPS : proposal.maxDrawdownBps;
         if (declared > MAX_STAMP_DRAWDOWN_BPS) declared = MAX_STAMP_DRAWDOWN_BPS;
         uint256 ppsFloor = (ppsAtExecute * (BPS_DENOMINATOR - declared)) / BPS_DENOMINATOR;
@@ -1452,13 +967,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         uint256 bond = proposal.proposerBondWood;
         if (bond == 0) revert NoBondToReclaim();
         address escrow = proposal.proposerBondEscrow;
-        // Forfeiture acknowledge: the governor still records a bond, but a
-        // conviction already made `forfeitBond` delete the escrow's record for
-        // this key. `amount == 0` here is exact — the only two record-deleting
-        // exits are this reclaim's own release (which zeroes `proposerBondWood`
-        // in the same transaction) and forfeiture. Handled before the window
-        // gates: a forfeited bond has nothing left to wait out, and gate 3 could
-        // otherwise revert for a bond that no longer exists.
         (, uint256 held) = IProposerBondEscrow(escrow).bondOf(address(this), proposalId);
         if (held == 0) {
             proposal.proposerBondWood = 0;
@@ -1471,7 +979,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // it has nothing at stake in.
         uint256 executedAt = proposal.executedAt;
         if (executedAt != 0) {
-            // Pinned at propose time (issue #116): a factory re-point of the
             // live `_exposureLedger` slot after this proposal locked its bond
             // must not change which ledger these gates read. Zero pin means a
             // pre-upgrade proposal that recorded no ledger — fall back to the
@@ -1483,13 +990,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // strand the bond permanently — rotating the pinned ledger's own
             // `coverageFreezer` makes it reclaimable again.
             if (ledger == address(0)) revert ExposureLedgerUnset();
-            // `+ strategyDuration`. Risk does not end when the strategy executes;
-            // it ends when its term is over AND the window on top of it has run
-            // out. Anchoring at `executedAt + challengeWindow` alone released the
-            // bond up to 30 days BEFORE `ChallengeGame.file` stops admitting —
-            // and the proposer bond is precisely what a successful challenge is
-            // paid out of. Read off `proposal` in the same load as `executedAt`,
-            // matching how `file` pins it off its own snapshot.
             uint256 strategyDuration = proposal.strategyDuration;
             if (block.timestamp < executedAt + strategyDuration + IExposureLedger(ledger).challengeWindow()) {
                 revert ChallengeWindowOpen();
@@ -1583,14 +1083,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // vetoThresholdBps reads live by design — the owner trust model
             // covers a mid-Draft shift.
             proposal.vetoThresholdBps = _params.vetoThresholdBps;
-            // The Draft already incremented `_openProposalCount` at propose time —
-            // do NOT re-increment here. Push the review window to the registry so
-            // it can resolve the guardian review without calling back. Guarded on
-            // `reviewEnd > voteEnd`: with `reviewPeriod == 0` the window collapses
-            // and the registry would revert `InvalidReviewWindow`.
-            // LOAD-BEARING: this predicate must stay identical to the one
-            // `_afterVote` tests. A proposal that gets past it there without
-            // having been registered here auto-approves with no guardian review.
             if (proposal.reviewEnd > proposal.voteEnd) {
                 IGuardianRegistry(_guardianRegistry).registerReview(proposalId, proposal.voteEnd, proposal.reviewEnd);
             }
@@ -1805,7 +1297,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     /// @dev Narrow proposal tuple returned by `getProposalView`. Memory-only
     ///      — this struct is never stored, so appending `executedAt` is an
-    ///      ABI extension with no storage-layout effect (issue #35).
     struct ProposalViewLite {
         uint256 voteEnd;
         uint256 reviewEnd;
@@ -1854,35 +1345,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         return (IERC4626(GovernorParameters.vault).totalAssets() * maxCapitalBps()) / BPS_DENOMINATOR;
     }
 
-    /// @dev Propose-time half of the maxCapital ceiling. Without it, a proposer
-    ///      declares `maxCapital = uint256.max` and the net-outflow cap never
-    ///      binds. Hoisted out of `propose` to stay under Yul's stack budget, and
-    ///      reads the vault from storage for the same reason.
-    ///
-    ///      NOT sufficient on its own: this prices `maxCapital` against
-    ///      `totalAssets()` at PROPOSE, and the vault's two capital locks read
-    ///      different counters — deposits blocked from `openProposalCount() != 0`
-    ///      (set here), redemptions only from `getActiveProposal() != 0` (set at
-    ///      execute). A proposer can inflate `totalAssets()` with its own deposit
-    ///      immediately before proposing, pass this gate, then withdraw during the
-    ///      vote. `executeProposal` re-runs the same ratio against live totals
-    ///      immediately before dispatch to close that window.
     function _checkMaxCapitalCeiling(uint256 maxCapital) private view {
         if (maxCapital > _capitalCeiling()) revert MaxCapitalExceedsCeiling();
     }
 
-    /// @dev Propose-time half of the privileged-target fix: rejects any target in
-    ///      EITHER call array that the vault's own privileged-batch-target
-    ///      predicate flags (the vault itself, or its bound withdrawal queue) —
-    ///      the SAME predicate `_guardBatchCalls` enforces at execute/settle time,
-    ///      single-sourced on the vault so this cannot drift from it. Denylist
-    ///      half ONLY: the registry-gated selector half depends on mutable, even
-    ///      codehash-sensitive state and would prove nothing about settle time.
-    ///
-    ///      Consumed via staticcall as a capability probe: a failed or malformed
-    ///      call (a vault that predates this view) degrades OPEN — propose must
-    ///      never brick on a fail-early check. `executeGovernorBatch`'s guard
-    ///      remains the authoritative enforcement on every batch path regardless.
     function _rejectPrivilegedTargets(
         address vault_,
         BatchExecutorLib.Call[] calldata executeCalls_,
@@ -1914,24 +1380,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
     }
 
-    /// @dev Propose-time cap-array validation AND storage of BOTH the calls and
-    ///      the caps, combined into ONE call. Combined deliberately: `propose`'s
-    ///      Yul stack budget is at the edge, and folding `_storeCalls` in here
-    ///      means all four array params are referenced only within this one early
-    ///      call instead of staying live across the rest of `propose`'s body.
-    ///      Checks, in order:
-    ///        1. Each cap array's length equals its call array's length — every
-    ///           call must declare exactly one cap.
-    ///        2. `sum(executeCallCaps) <= maxCapital` AND
-    ///           `sum(settlementCallCaps) <= maxCapital`, evaluated PER BATCH and
-    ///           never combined — the two batches run in separate transactions,
-    ///           each independently bounded by the vault's net-outflow meter, so
-    ///           requiring the combined sum under `maxCapital` would halve every
-    ///           proposal's settlement budget for no safety gain.
-    ///      Overflow is a non-issue: `cap_i <= maxCapital <= totalAssets()` and
-    ///      each array is bounded by `MAX_CALLS_PER_PROPOSAL`. A revert here still
-    ///      rolls back the `_proposalCount` bump, so validating after storing
-    ///      nothing yet is safe.
     function _validateAndStoreBatch(
         uint256 proposalId,
         BatchExecutorLib.Call[] calldata executeCalls,
@@ -1959,14 +1407,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _storeCaps(_settlementCallCaps, proposalId, settlementCallCaps);
     }
 
-    /// @dev Resolves and stores the proposal's tier and required coverage, then
-    ///      runs the propose-time gates: the maxCapital ceiling, the ledger's
-    ///      covered-TVL cap, and the risk-scaled proposer bond (which PULLS WOOD
-    ///      from the proposer — a state-changing external call, see the CEI note
-    ///      at the `lockBond` site). Hoisted out of `propose` for Yul's stack
-    ///      budget; reads `p.maxCapital`/`p.id` from storage rather than taking
-    ///      them as arguments, since the call site must stay exactly
-    ///      `(p, _loadCalls(...))`-shaped.
     function _snapshotTierAndGate(StrategyProposal storage p, BatchExecutorLib.Call[] memory execCalls) private {
         // Envelope ceiling check. Lives here (not in propose's validation
         // block) purely for the same stack-budget reason — an extra call
@@ -1985,44 +1425,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             p.maxCapital,
             true
         );
-        // A SANDBOX IS PRICED AT FULL NOTIONAL AND IS ALWAYS TIER 2. Read from
-        // storage, written by `proposeWithSandbox` before this call — see the
-        // ordering note at that write.
-        //
-        // The funding is the payload's structural maximum loss, and unlike a
-        // batch call there is no certified bound that could reduce it: the
-        // targets are uncertified by design, which is the whole point of the
-        // mechanism. So the charge is the entire funded amount, added to
-        // whatever the batches already cost. Forcing tier 2 is not cosmetic —
-        // `_deriveAndStoreEffectiveCapital` only demands the bond-encumbered
-        // approve quorum at or above `quorumTierThreshold`, so a payload that
-        // rode along at tier 0 would be arbitrary calldata reaching an
-        // arbitrary target with no identified underwriter on the hook.
         uint256 sandboxFunding = _sandboxFunding[p.id];
         if (sandboxFunding != 0) {
             tier_ = 2;
             coverage_ += sandboxFunding;
         }
         p.envelopeTier = tier_;
-        // ZERO COVERAGE IS SPECIFIED, NOT A HOLE — see design.md D2, pinned by
-        // `PerCallCapitalDeclarations.test_allZeroCaps_pricesZeroCoverage_meterStillBlocksOutflow`
-        // and `GovernorCoverageGates.test_execute_zeroRequiredCoverage_passesOptimistically`.
-        // An all-zero-cap batch prices to zero coverage regardless of tier, and
-        // the protection is the PER-CALL METER at execute time, not a coverage
-        // floor: `cap_i == 0` makes `BatchExecutorLib` revert `CallCapExceeded`
-        // on any outflow at all, which is strictly stronger than any coverage
-        // requirement. A floor here would refuse the declaration that buys the
-        // tightest possible spend limit.
-        //
-        // A guard was briefly added here on the reading that zero coverage also
-        // switches off the approve quorum, the proposer bond and the challenge
-        // freeze. It does — but the residual that argument is really about is
-        // that `BatchExecutorLib` meters only vault-asset BALANCE, so a call
-        // whose capability is an AUTHORIZATION rather than a transfer moves zero
-        // and meters zero honestly. That is a metering-SCOPE question about what
-        // the meter can see, and it belongs where the meter is defined; pricing
-        // is the wrong lever for it and refusing at propose broke three
-        // specified behaviours.
         p.requiredCoverage = coverage_;
         // Skipped when unwired — the pre-ledger safe default matches the
         // tierRegistry pattern.
@@ -2030,14 +1438,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (ledger != address(0)) {
             address asset = IERC4626(GovernorParameters.vault).asset();
             IExposureLedger(ledger).requireWithinCoveredTvlCap(asset, coverage_);
-            // Fails on the PROPOSER, not on the cohort: a duration whose
-            // settlement outruns the ledger's booking horizon would leave every
-            // approve vote unable to book, turning the review block-only.
-            //
-            // `p.executeBy` is still zero on the collaborative path, so compute
-            // the worst-case deadline instead: a Draft may idle for
-            // `collaborationWindow` before activating, then run voting, review
-            // and execution.
             uint256 deadline = p.executeBy;
             if (deadline == 0) {
                 ISyndicateGovernor.GovernorParams memory gp = _params;
@@ -2049,16 +1449,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             if (escrow != address(0)) {
                 uint256 bondWood = IExposureLedger(ledger).proposerBondWood(asset, coverage_);
                 if (bondWood != 0) {
-                    // FAIL CLOSED ON A MISMATCHED PAIR, before any state write.
-                    // `_bondEscrow` and `_exposureLedger` are independently
-                    // factory-settable with no on-chain pairing guarantee, and
-                    // ledger rotation routinely outpaces escrow rotation in
-                    // ordinary operation. Locking a bond into an escrow whose own
-                    // immutable `exposureLedger` differs from `ledger` would pin
-                    // it against a ledger whose live game the escrow never
-                    // recognises as the authorized convictor — `forfeitBond`
-                    // would revert forever and a convicted proposer would keep
-                    // the bond.
                     if (IProposerBondEscrow(escrow).exposureLedger() != ledger) {
                         revert LedgerEscrowMismatch();
                     }
@@ -2081,22 +1471,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
     }
 
-    /// @dev Proposal tier = max tier across EXECUTE and SETTLEMENT calls
-    ///      (batch-wide: every consumer of the aggregate tier wants the
-    ///      fail-closed max). Coverage is
-    ///      the SUM of per-call contributions across BOTH execute and settlement
-    ///      calls: `coverage = sum(cap_i * boundBps_i) / 10_000`, where
-    ///      `boundBps_i` is the certified bound for tier-0/1 calls and 10_000
-    ///      (full notional) for tier-2 or uncertified ones. Monotonic in every cap
-    ///      and every bound — the property the regression guard and the
-    ///      proportional scaling both lean on.
-    ///
-    ///      With no registry wired every proposal is tier 2 / full notional, so
-    ///      the pre-registry safe default is not made cheaper by per-call caps.
-    ///      `memory` params (not calldata) so this can be reused on
-    ///      storage-loaded calls at execute time. `checkCeiling` gates the
-    ///      per-call tier-2 ceiling — true at propose, false at execute, where
-    ///      post-propose tier drift is the regression guards' job.
     function _resolveTierAndCoverage(
         BatchExecutorLib.Call[] memory execCalls,
         uint256[] memory execCaps,
@@ -2113,7 +1487,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         (uint8 execTier, uint256 execCoverage) = _scanCalls(registry, execCalls, execCaps, checkCeiling, tier2Ceiling);
         (uint8 settleTier, uint256 settleCoverage) =
             _scanCalls(registry, settleCalls, settleCaps, checkCeiling, tier2Ceiling);
-        // Tier is the MAX across BOTH legs, not execute alone (SHE-210). The
         // approve-quorum gate and `TierRegressed` both key off this tier; taking
         // execTier only let a proposer park an uncertified tier-2 extraction in
         // `settlementCalls` under a low-tier execute leg, so it skipped the
@@ -2244,21 +1617,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         }
     }
 
-    /// @dev Derives, stores and emits the coverage-proportional effective capital
-    ///      at execute, and scales the stored per-call caps by the same factor,
-    ///      persisting the scaled settlement caps for `settleProposal` to reuse
-    ///      verbatim. Hoisted out of `executeProposal` for Yul's stack budget. An
-    ///      INTERNAL call, so the same-transaction invariant on the
-    ///      `requireApproveQuorum` gate is unaffected by the function boundary.
-    ///
-    ///      `effectiveMaxCapital = maxCapital` when the gate does not run (no
-    ///      ledger wired, zero `requiredCoverage`, or tier below the quorum
-    ///      threshold) or when raised coverage is at or above required; otherwise
-    ///      `floor(maxCapital * coverageRaisedUsd / requiredCoverageUsd)`, which
-    ///      can floor to zero on dust coverage — a zero net-outflow cap,
-    ///      fail-closed and accepted. `requireApproveQuorum` already reverts on a
-    ///      raised aggregate of exactly zero, so the division never sees a zero
-    ///      denominator on the scaling branch.
     function _deriveAndStoreEffectiveCapital(
         uint256 proposalId,
         StrategyProposal storage proposal,
@@ -2297,13 +1655,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _storeCapsMemory(_effectiveSettlementCallCaps, proposalId, settlementCaps);
     }
 
-    /// @dev Scales each cap by `raised/required` (floor, matching `coverageUsd`'s
-    ///      own discipline) and defensively re-asserts the scaled sum against
-    ///      `bound`. Term-wise floors cannot mathematically exceed `bound` given
-    ///      the propose-time invariant `sum(caps) <= maxCapital`, so the re-assert
-    ///      is belt-and-braces: on a hypothetical violation the LARGEST scaled cap
-    ///      absorbs the dust-sized excess deterministically. A cap that floors to
-    ///      zero stays zero (fail-closed).
     function _scaleCaps(uint256[] memory caps, uint256 raised, uint256 required, uint256 bound)
         private
         pure
@@ -2418,16 +1769,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     // `stateOf` (the ONE pure resolver — a TRUE view that never lags
     // determinable reality).
 
-    /// @dev Finalize a settled proposal: compute P&L, distribute fees, clear
-    ///      counters. Invoked by both happy-path `settleProposal` and the
-    ///      emergency settle lifecycle.
-    ///
-    ///      PnL is measured purely against `IERC20(asset).balanceOf(vault)`. Any
-    ///      non-asset balance the strategy still holds at settlement (mTokens, LP
-    ///      NFTs, reward tokens, perp margin) counts as a LOSS of the
-    ///      corresponding asset balance it started with. Strategies MUST fully
-    ///      unwind non-asset positions before this runs; if one cannot, wait past
-    ///      `strategyDuration` and drive the emergency-settle path.
     function _finishSettlement(uint256 proposalId, StrategyProposal storage proposal)
         internal
         returns (int256 pnl, uint256 agentFee)
@@ -2442,15 +1783,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         uint256 balanceAdjusted = IERC20(asset).balanceOf(vault);
         pnl = int256(balanceAdjusted) - int256(snapshot);
 
-        // Two-number fee model. Ordering is load-bearing: management fee first (it
-        // lowers assets and therefore price per share), then the high-water-mark
-        // comparison, then performance. Reversing any pair would charge
-        // performance on assets the management fee already took, or ratchet the
-        // mark past value the fund never banked.
-        //
-        // The management fee is charged on EVERY settlement — profit, flat or
-        // loss. It funds the parties doing continuous work in months when there is
-        // no profit to share.
         uint256 totalFee = _chargeManagementFee(proposalId, vault, asset, proposal.proposer);
 
         // No strategy self-report can exempt a proposal from the performance leg:
@@ -2468,18 +1800,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // the vault has no withdrawal queue.
         ISyndicateVault(vault).onProposalSettled(proposalId);
 
-        // Release the locks LAST, after every external call above (CEI).
-        // `_activeProposal` backs the vault's `redemptionsLocked()` and
-        // `_openProposalCount` backs `depositsLocked()` — clearing either before
-        // the fee transfers or the `onProposalSettled` stamp would open a window
-        // where a callback-bearing fee recipient could deposit or redeem against a
-        // NAV that is pre-fee and pre-stamp, shifting `totalSupply()` before the
-        // settle price lands and diluting this proposal's queued redeemers.
-        // `nonReentrant` does NOT cover this: it guards re-entry into this
-        // governor, not calls into the vault or its withdrawal queue. Open
-        // emergency reviews are NOT auto-cancelled here — they resolve naturally
-        // at `reviewEnd`, so an owner who opened an adversarial emergency cannot
-        // dodge slash by racing a settle.
         _activeProposal = 0;
         _transition(proposal, ProposalState.Settled);
         delete _capitalSnapshots[proposalId];
@@ -2493,17 +1813,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         emit ProposalSettled(proposalId, vault, pnl, totalFee, block.timestamp - proposal.executedAt);
     }
 
-    /// @dev Snapshot every fee rate, recipient and split in force at propose time
-    ///      so settlement pays what voters actually approved rather than a
-    ///      post-vote governance change. Extracted from `propose` rather than
-    ///      inlined: `propose` sits at the Yul stack-depth limit and the reads
-    ///      below need more slots than remain.
-    ///
-    ///      The splits are deliberately NOT validated here. `ProtocolConfig` is
-    ///      born valid and rejects an invalid write, so a zero-sum split is
-    ///      unreachable for a real config; reverting would only ever fire against
-    ///      a mock, and would turn a fee-accounting problem into a
-    ///      settlement-liveness one. The charge functions skip a zero-sum split.
     function _snapshotFeeConfig(StrategyProposal storage p) private {
         IProtocolConfig cfg = IProtocolConfig(protocolConfig);
         p.snapshotProtocolFeeRecipient = cfg.protocolFeeRecipient();
@@ -2521,38 +1830,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         return fee;
     }
 
-    /// @dev Charge the always-on management fee and divide it three ways.
-    ///      Extracted to avoid stack-too-deep.
-    ///
-    ///      THE FEE MAP — two depositor-facing numbers, everyone else paid out of
-    ///      internal splits. The two fees are independent and each is ONE division
-    ///      of ONE base; no recipient's share is reduced by another's.
-    ///
-    ///        1. managementFee = assetSeconds * managementFeeBps / (10_000 * 365d)
-    ///             base: fund assets integrated over the proposal's life, from the
-    ///             vault's accrual accumulator
-    ///             charged: on EVERY settlement — profit, flat, or loss
-    ///             source: vault.managementFeeBps(), read LIVE and safely so —
-    ///             written only at vault `initialize`, with no setter
-    ///             split: prop.snapshotMgmtSplit -> agent / protocol / guardian
-    ///
-    ///        2. performanceFee = aboveHighWaterMark * perfFeeBps
-    ///             base: value above the fund's previous PEAK price per share,
-    ///             read AFTER the management fee, which lowers it
-    ///             charged: only when the fund is above its mark
-    ///             source: vault.agentFeeBps() (offset-by-one sentinel)
-    ///             caps: vault-side `MAX_PERFORMANCE_FEE_BPS` at set, clamped
-    ///             AGAIN here to the governor's live `maxPerformanceFeeBps`
-    ///             snapshot: propose time -> prop.performanceFeeBps
-    ///             split: prop.snapshotPerfSplit -> agent / protocol / guardian /
-    ///             owner, then the high-water mark ratchets to the post-fee price
-    ///
-    ///      The agent's slice of BOTH fees flows through `_distributeAgentFee`, so
-    ///      co-proposer splits apply to management as well as carry. Guardian
-    ///      delivery is a WOOD airdrop via Merkl, attributed by the
-    ///      `GuardianFeeAccrued` event. Any recipient transfer that reverts
-    ///      escrows in `_unclaimedFees` so settlement never bricks.
-    /// @return mgmtFee The whole management fee charged.
     function _chargeManagementFee(uint256 proposalId, address vault, address asset, address proposer)
         internal
         returns (uint256 mgmtFee)
@@ -2606,15 +1883,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         emit ManagementFeeCharged(proposalId, asset, mgmtFee, assetSeconds);
     }
 
-    /// @dev Charge the performance fee on value above the high-water mark and
-    ///      divide it four ways in ONE split. Each recipient's share is computed
-    ///      from the full fee, never from what another recipient left behind.
-    ///
-    ///      Must run AFTER the management fee: that fee lowers the vault's assets
-    ///      and therefore its price per share, so reading the above-mark base
-    ///      first would charge performance on assets already taken.
-    /// @return agentFee The agent's slice, reported for the settle event.
-    /// @return perfFee  The whole fee charged.
     function _chargePerformanceFee(uint256 proposalId, address vault, address asset, address proposer)
         internal
         returns (uint256 agentFee, uint256 perfFee)
@@ -2676,22 +1944,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         ISyndicateVault(vault).ratchetHighWaterMark();
     }
 
-    /// @dev Distribute the agent fee to co-proposers (if any) and the lead
-    ///      proposer. Extracted to avoid stack-too-deep.
-    /// @dev Assumes a non-fee-on-transfer asset: `distributed += share` is booked
-    ///      at the requested amount, not the received amount, so the lead's
-    ///      rounding remainder is computed against the requested total. An FOT
-    ///      asset would double-count the burn.
-    /// @dev The split is agreed and validated at PROPOSE time, against each
-    ///      co-proposer's THEN-live agent status, and settle honours that recorded
-    ///      split rather than re-resolving against a possibly-mutated LIVE status.
-    ///      A co-proposer removed after propose still does not get paid, but its
-    ///      earned share is FORFEITED back to the vault rather than folded into
-    ///      the lead's remainder: folding it in would let an owner who has seated
-    ///      itself as lead strip co-proposers right before settle to redirect
-    ///      their entitlement to itself. The lead's own share is therefore always
-    ///      exactly its propose-time split, independent of which co-proposers are
-    ///      still active at settle.
     function _distributeAgentFee(uint256 proposalId, address vault, address asset, address proposer, uint256 agentFee)
         internal
     {
@@ -2746,33 +1998,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         try ISyndicateVault(vault).transferPerformanceFee(asset, recipient, amount) {
             return true;
         } catch {
-            // ESCROW ONLY WHAT THE VAULT CAN BACK. The catch cannot see WHY the
-            // transfer failed, and the two reasons want opposite treatment. A
-            // blacklisted recipient means the money IS here and the full amount
-            // must be held for them. `AmountExceedsBalance` means the vault does
-            // NOT have it — and escrowing the full amount then books a liability
-            // that is unbacked by construction, with three compounding effects:
-            // `_escrowedFees` feeds the vault's `_escrowedFeeLiability()`, which
-            // `totalAssets()` subtracts, so an oversized escrow pins
-            // `totalAssets()` to 0 — zeroing every LP's conversion AND stamping
-            // the settle price at `num == 1` for this proposal's whole queued
-            // flow, with `cancel` already closed by `AlreadySettled`; and
-            // `claimUnclaimedFees` re-requests the SAME full amount, so it fails
-            // the same comparison permanently, while `rescueERC20` refuses the
-            // vault asset. Traced: a 1,000,000 USDC float at the 500bps cap over
-            // 30d charges 4,109 USDC of management fee; if the strategy returns
-            // 1,000 USDC the escrow books 3,288 against a real balance of 179.
-            //
-            // A fee is charged against assets under management and cannot exceed
-            // them. Capping here forfeits the unbacked remainder — bounded, and
-            // computed off a base that no longer exists — instead of minting a
-            // permanent claim on money that was never there.
-            //
-            // RAW STATICCALL, DEGRADING TO THE FULL AMOUNT. Same doctrine as the
-            // vault's own `_escrowedFeeLiability()`: a vault that cannot answer
-            // reproduces exactly the pre-existing behaviour rather than getting a
-            // stricter one invented for it, so this cannot regress an integration
-            // that works today.
             uint256 escrowAmount = amount;
             (bool okCap, bytes memory capRet) = vault.staticcall(abi.encodeCall(ISyndicateVault.spendableFee, (asset)));
             if (okCap && capRet.length == 32) {
@@ -2788,7 +2013,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             _unclaimedFees[_unclaimedKey(vault, recipient, asset)] += amount;
             // Mirror into the per-(vault, token) aggregate so the vault can
             // net this liability out of `totalAssets()` — see `_escrowedFees`
-            // (pashov review finding #3). Both writes stay in lockstep: this
             // one and the matching decrement in `claimUnclaimedFees` are the
             // only places either mapping moves on the escrow path.
             _escrowedFees[vault][asset] += amount;
@@ -2862,32 +2086,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     }
 
     /// @inheritdoc ISyndicateGovernor
-    /// @dev ZERO AND CODELESS BOTH REFUSED (pashov finding #1). This slot used
-    ///      to accept zero on the premise that un-wiring "resolves everything at
-    ///      tier 2 / full notional — the safe default". That is a PRICING
-    ///      default; what a missing registry removes is a CAPABILITY gate:
-    ///      `SyndicateVault._guardBatchCalls` resolves through this slot and,
-    ///      finding none, RETURNS — dropping the callee allowlist, the
-    ///      spender/recipient gate and the `UnrecognizedAssetSelector` branch,
-    ///      after which `asset.approve(attacker, max)` moves zero balance past
-    ///      every meter and licenses an unbounded pull later. A codeless address
-    ///      instead reverts the guard's typed call and bricks the vault. Only
-    ///      removal is refused — re-pointing to a different registry is legal.
-    ///
-    ///      The factory's own `setTierRegistry` still accepts zero: there it is
-    ///      a kill switch on NEW syndicates and cannot reach an existing
-    ///      governor. A pre-fix governor that IS registry-less is recovered with
-    ///      `SyndicateFactory.pushWiring(governor)`.
-    ///
-    ///      This is a RE-POINT, not the wiring point: `initialize` now takes the
-    ///      registry, so every governor this factory deploys is born wired.
-    ///
-    ///      Now-unreachable consequence, kept as rationale: zeroing this would
-    ///      dead-end `PortfolioStrategy._initialize`'s
-    ///      `vault() → governor() → tierRegistry()` walk, reverting
-    ///      `TierRegistryUnresolved` for every new clone while existing clones
-    ///      kept running — rebalance/settle degrade open by design so an
-    ///      un-wiring can never strand capital in a live strategy.
     function setTierRegistry(address newRegistry) external onlyFactory {
         if (newRegistry.code.length == 0) revert TierRegistryNotWired();
         emit TierRegistrySet(_tierRegistry, newRegistry);

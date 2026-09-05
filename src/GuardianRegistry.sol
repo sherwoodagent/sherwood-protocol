@@ -40,7 +40,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     uint256 public constant EPOCH_DURATION = 7 days;
     /// @notice Bounds the slash loop in `resolveReview` (`SlashGasCeiling.t.sol`). No blocker
     ///         counterpart: the block tally is a scalar and a fixed slot count was a
-    ///         censorship surface (SHE-207). Approver-side squatting: SHE-240.
     uint256 public constant MAX_APPROVERS_PER_PROPOSAL = 100;
     uint256 public constant LATE_VOTE_LOCKOUT_BPS = 1000;
 
@@ -114,7 +113,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         uint64 reviewEnd;
         /// @dev Snapshot of the sWOOD slash-severity envelope at `openReview`,
         ///      for exactly the reason `blockQuorumBpsAtOpen` above is
-        ///      snapshotted (pashov review finding #11). Only half of the
         ///      mid-review-immutability defence was in place: the THRESHOLD a
         ///      review is judged against was frozen at open, but the PENALTY
         ///      that decision carries was still read live from
@@ -144,14 +142,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         uint16 minSlashBpsAtOpen;
         uint16 maxSlashBpsAtOpen;
         /// @dev Value of `pauseShiftTotal` when this review's clock was registered
-        ///      (pashov review finding #7). `_effNow` subtracts only the pause
         ///      time accumulated SINCE this instant, so a review gets back
         ///      exactly the span its own window lost and no more — a review
         ///      registered after a pause ended is unaffected by it.
         uint64 clockShiftAtRegister;
         /// @dev The instant BOTH sides of the block-quorum comparison are
         ///      measured at: `block.timestamp - 1` as of `registerReview`,
-        ///      i.e. propose time (pashov 2026-08 finding #1).
         ///
         ///      The numerator (`_growthGatedVoteWeight`) used to be read at
         ///      `openedAt` while the denominator was
@@ -186,12 +182,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      own raw own-stake checkpoint at `openedAt`.
     mapping(bytes32 => mapping(address => uint128)) internal _voteStake;
     mapping(bytes32 => address[]) internal _approvers;
-    /// @dev Retired blocker list (SHE-207); slot kept for the UUPS append-only layout.
-    // slither-disable-next-line unused-state
     mapping(bytes32 => address[]) internal __retiredBlockers;
     mapping(bytes32 => mapping(address => uint256)) internal _approverIndex;
-    /// @dev Retired (SHE-207); see `__retiredBlockers`.
-    // slither-disable-next-line unused-state
     mapping(bytes32 => mapping(address => uint256)) internal __retiredBlockerIndex;
 
     struct EmergencyReview {
@@ -228,7 +220,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         ///      entries read it as the default zero and no packed layout moves.
         uint256 round;
         /// @dev Value of `pauseShiftTotal` when this emergency's clock started
-        ///      (pashov review finding #7). Same device as
         ///      `Review.clockShiftAtRegister`: `voteBlockEmergencySettle` is
         ///      `whenNotPaused` while `er.reviewEnd` ran on wall clock, so a
         ///      pause spanning the window left `blockStakeWeight` at zero and
@@ -295,7 +286,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     IExposureLedger public exposureLedger;
 
     /// @notice Total seconds this registry has spent paused, accumulated at
-    ///         each `unpause` (pashov review finding #7). Review deadlines are
     ///         compared against `_effNow`, which subtracts the share of this
     ///         that accrued while a given review's clock was already running —
     ///         so a pause DEFERS review windows instead of consuming them.
@@ -424,32 +414,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         r.voteEnd = uint64(voteEnd);
         // forge-lint: disable-next-line(unsafe-typecast)
         r.reviewEnd = uint64(reviewEnd);
-        // Baseline for `_effNow` — see `Review.clockShiftAtRegister` and the
-        // block in `unpause` (pashov review finding #7). Captured here, not at
-        // `openReview`, because the window this review is judged against is
-        // defined here: a pause landing between propose and open would
-        // otherwise eat into `[voteEnd, reviewEnd)` uncredited.
-        //
-        // INCLUDE THE PAUSE IN PROGRESS (pashov 2026-08 finding #21).
-        // `registerReview` is the only review-clock writer without
-        // `whenNotPaused` — `openReview`, `openEmergency`, `voteOnProposal` and
-        // `resolveReview` all carry it — so it is the one that can land MID
-        // pause. `pauseShiftTotal` is only advanced by `unpause`, so reading it
-        // bare during a pause snapshots the PRE-pause figure; `unpause` then
-        // adds the entire outage, and `_effNow` credits this review with all of
-        // it rather than with the part that actually overlapped its own clock.
-        // A pause from T to T+10h with a `propose` at T+9h gave that review 10h
-        // of credit for 1h of lost window.
-        //
-        // That over-credit is not cosmetic: it widens the span in which the
-        // governor's wall-clock `reviewEnd` has passed while the registry's
-        // effective clock has not — the window behind the terminal-Expired race
-        // and the cancel/resolve deadlock this contract has already had to fix.
-        //
-        // Adding `whenNotPaused` here was the other option and was REJECTED: it
-        // would make `SyndicateGovernor.propose` revert for the duration of any
-        // registry pause, since propose is what pushes this window. Stamping the
-        // in-progress span costs nothing and changes no liveness.
         r.clockShiftAtRegister =
             paused ? pauseShiftTotal + uint64(block.timestamp - uint256(pausedAt)) : pauseShiftTotal;
         // Freeze the block-quorum basis at propose time — see `Review.snapshotAt`.
@@ -471,38 +435,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         return (r.voteEnd, r.reviewEnd);
     }
 
-    /// @dev The instant a review's WINDOW is judged against: wall clock less
-    ///      the registry downtime that accrued after this review's clock
-    ///      started (pashov review finding #7). Every writer into a review
-    ///      window is `whenNotPaused`, so without this a pause spanning
-    ///      `[voteEnd, reviewEnd)` silently consumed the whole window and both
-    ///      resolution readers scored the resulting emptiness as `Cleared` —
-    ///      approving a proposal no guardian could have opened or voted on.
-    ///
-    ///      Deliberately NOT used for `openedAt`, which must stay a real
-    ///      timestamp because sWOOD checkpoint lookups are keyed on it, nor for
-    ///      the `DEADMAN_UNPAUSE_DELAY` check, whose entire purpose is to
-    ///      measure real elapsed pause time.
-    ///      COUNTS THE PAUSE IN PROGRESS, not only completed ones.
-    ///      `pauseShiftTotal` is advanced solely by `unpause`, so reading it
-    ///      bare treats an ongoing outage as zero downtime and lets the
-    ///      effective clock keep ticking through a pause that is, by
-    ///      construction, time nobody could act in.
-    ///
-    ///      It is also a SAFETY requirement, not just a correctness one, since
-    ///      `registerReview` began stamping the in-progress span into
-    ///      `clockShiftAtRegister` (finding #21): that write makes
-    ///      `clockShiftAtStart > pauseShiftTotal` for the remainder of the
-    ///      pause, and the checked subtraction below then panics `0x11`. Two
-    ///      readers reach it mid-pause — `outcomeOf`, a view that
-    ///      `ProposalLifecycle._afterVote` calls, and `cancelReview`, which
-    ///      carries no `whenNotPaused` and which `SyndicateGovernor
-    ///      .cancelProposal` calls UNWRAPPED. `_closeReviewIfRegistered`'s bare
-    ///      `try` would swallow the panic, leaving a live slashable review on a
-    ///      terminal proposal: exactly the harm finding #6 exists to close.
-    ///
-    ///      Adding the live span restores `clockShiftAtStart <= total` as an
-    ///      invariant, because both sides now include it.
     function _effNow(uint64 clockShiftAtStart) private view returns (uint256) {
         uint256 total = uint256(pauseShiftTotal) + (paused ? block.timestamp - uint256(pausedAt) : 0);
         return block.timestamp - (total - uint256(clockShiftAtStart));
@@ -520,68 +452,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      BEFORE this; it evaluates only the at-open quorum comparison.
     function _isBlocked(Review storage r) private view returns (bool) {
         uint256 denom = uint256(r.totalStakeAtOpen);
-        // A ZERO DENOMINATOR IS VACUOUSLY BLOCKED, so guard it explicitly:
-        // `0 * 10_000 >= q * 0` is `0 >= 0` = TRUE, which would resolve a
-        // review Blocked with no guardian participation at all and slash every
-        // approver. `_resolveEmergency` and `cancelEmergency` guard their own
-        // comparisons the same way, and `cancelReview`'s natspec names this
-        // vacuous-`0 >= 0` hazard by name.
-        //
-        // LOAD-BEARING NOW, not defence in depth. The `cohortTooSmall` waiver
-        // used to keep this path away from the predicate whenever the staked
-        // total was under a floor, which incidentally covered the zero case.
-        // That waiver is gone — a thin cohort now decides its own reviews — so
-        // this is the only thing standing between an empty electorate and an
-        // automatic Blocked. Zero guardians is the one case that must still
-        // fail OPEN: there is nobody to have reviewed.
         if (denom == 0) return false;
         return uint256(r.blockStakeWeight) * 10_000 >= uint256(r.blockQuorumBpsAtOpen) * denom;
     }
 
-    /// @dev GROWTH-GATED MIN on a voter's OWN weight at review open, mirroring
-    ///      `TokenCourt.vote`'s clamp. Adding the lookback-min to the block-quorum
-    ///      DENOMINATOR while leaving this numerator raw meant fresh stake
-    ///      discounted out of the denominator still counted in FULL on the
-    ///      numerator — turning a mathematically impossible block (an attacker's
-    ///      own stake counted symmetrically on both sides can never flip the
-    ///      quorum comparison) into a cheap one reachable with ~1 second of stake
-    ///      age.
-    ///
-    ///      Gate on RAW stake growth, strict `>`; clamp the finished
-    ///      `getPastVotes` reading — byte-for-byte `TokenCourt.vote`'s
-    ///      construction. The `getPastTotalVotes(lookbackTs) != 0` guard skips the
-    ///      clamp during bootstrap, mirroring `_lookbackMinTotalVotes`'s own
-    ///      fallback: with no history at all, every early guardian's raw stake
-    ///      trivially grew from zero and would otherwise be clamped to zero.
-    ///
-    ///      Shared by `voteOnProposal`'s first-vote branch and
-    ///      `voteBlockEmergencySettle`. The vote-CHANGE branch does not call this:
-    ///      it reuses the snapshot already clamped when the first vote was cast.
     function _growthGatedVoteWeight(IStakedWood sw, address voter, uint256 openedAt) private view returns (uint256) {
-        // RAW STAKE, MATCHING THE DENOMINATOR'S OWN BASIS (pashov review
-        // finding #12). This weight is the block-quorum NUMERATOR, and the
-        // denominator it is compared against — `r.totalStakeAtOpen`, via
-        // `_lookbackMinTotalVotes` — is RAW stake frozen at open.
-        // `getPastVotes` is not: it applies `StakedWood._ageFactorBps`, a
-        // function of the LIVE `ageFloorBps` / `maturationPeriod` slots. Two
-        // consequences, both bad:
-        //
-        //   - The comparison was systematically mis-scaled. A young cohort at
-        //     the shipped 2500 bps age floor contributes a quarter of its raw
-        //     stake to the numerator while the denominator counts all of it,
-        //     so a 3000 bps block quorum could be unreachable even with every
-        //     guardian blocking — the veto failing OPEN with no attacker.
-        //   - `setAgeFloorBps` / `setMaturationPeriod` carry no open-review
-        //     guard, so the owner could re-weight every not-yet-cast vote
-        //     mid-review against a frozen denominator and flip a decided
-        //     outcome — the exact mid-review mutability `blockQuorumBpsAtOpen`
-        //     exists to prevent, reintroduced through the other operand. The
-        //     same helper backs `voteBlockEmergencySettle`, where flipping the
-        //     result decides whether a vault owner's entire bond is burned.
-        //
-        // The growth gate below is unchanged in shape and still compares each
-        // voter against its own `FLOOR_LOOKBACK` history; only the measure is
-        // now the same one the denominator uses.
         uint256 weight = sw.getPastStake(voter, openedAt);
         uint256 lookbackTs = openedAt > FLOOR_LOOKBACK ? openedAt - FLOOR_LOOKBACK : 0;
         if (
@@ -612,7 +487,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      This used to pass `address(0)` to `requiredOwnerBond` on the
     ///      reasoning that a zero vault has zero TVL so the scaled figure
     ///      collapses to the bare floor. That stopped being true when
-    ///      `requiredOwnerBond` gained a `MIN_OWNER_BOND_FLOOR` (finding #22):
     ///      under the open-onboarding sentinel (`minOwnerStake == 0`) it now
     ///      returns the floor, so this view — the ABI-facing question "what
     ///      bond does creating a vault require?" — would answer with a nonzero
@@ -715,7 +589,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      defense, and adds it to the chosen side's tally. Approvers are capped
     ///      (the slash loop iterates them); Blockers are NOT — the block tally is
     ///      a scalar and a fixed blocker slot count was a censorship surface
-    ///      (SHE-207). Block votes carry no proposed severity: the
     ///      slash severity is a deterministic function of block-side decisiveness
     ///      computed at `resolveReview` (see `_severityBps`).
     /// @dev `lockWood` IS THE APPROVER'S DECLARATION — the WOOD it puts behind
@@ -744,8 +617,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // future edit to either guard cannot silently arm the other.
         if (r.resolved) revert ReviewNotOpen();
 
-        // Pause-adjusted on both bounds — see `_effNow` (pashov review
-        // finding #7). This is the writer whose `whenNotPaused` gate made the
         // window consumable in the first place.
         uint256 nowEff = _effNow(r.clockShiftAtRegister);
         if (r.voteEnd == 0 || nowEff < r.voteEnd || nowEff >= r.reviewEnd) revert ReviewNotOpen();
@@ -760,19 +631,11 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             uint256 reviewWindowDuration = uint256(r.reviewEnd) - uint256(r.voteEnd);
             uint256 lockoutStart = r.reviewEnd - (reviewWindowDuration * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
             // Pause-adjusted like every other bound measured against
-            // `r.reviewEnd` — see `_effNow` (pashov review finding #7). On wall
             // clock a pause would eat the whole votable stretch and leave only
             // the locked-out tail, which is the same window-consumption defect
             // one step further in.
             if (_effNow(r.clockShiftAtRegister) >= lockoutStart) revert VoteChangeLockedOut();
 
-            // First vote — snapshot own weight AT `r.openedAt`, growth-gated
-            // to match the block-quorum denominator's own lookback-min
-            // (finding A; see `_growthGatedVoteWeight`).
-            // Read at `r.snapshotAt`, NOT `r.openedAt`: the denominator this
-            // weight is compared against is frozen at that same propose-time
-            // instant (see `Review.snapshotAt`). `openedAt` stays the basis
-            // sWOOD sizes slashes from.
             uint256 weight256 = _growthGatedVoteWeight(swood, msg.sender, uint256(r.snapshotAt));
             if (weight256 == 0) revert NotActiveGuardian(); // no votable weight at open time
             uint128 weight = uint128(weight256);
@@ -803,7 +666,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             uint256 reviewWindowDuration = uint256(r.reviewEnd) - uint256(r.voteEnd);
             uint256 lockoutStart = r.reviewEnd - (reviewWindowDuration * LATE_VOTE_LOCKOUT_BPS) / BPS_DENOMINATOR;
             // Pause-adjusted like every other bound measured against
-            // `r.reviewEnd` — see `_effNow` (pashov review finding #7). On wall
             // clock a pause would eat the whole votable stretch and leave only
             // the locked-out tail, which is the same window-consumption defect
             // one step further in.
@@ -813,7 +675,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // LOAD-BEARING INVARIANT: the new-side cap is checked inline BEFORE
             // any `_remove*` / `_push*` call. Only the Approve side has one.
             if (existing == GuardianVoteType.Approve) {
-                // Approve -> Block: blockers are uncapped (SHE-207), nothing to check.
                 _removeApprover(key, msg.sender);
                 r.approveStakeWeight -= weight;
                 r.blockStakeWeight += weight;
@@ -872,16 +733,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @inheritdoc IGuardianRegistry
     /// @notice Governor opens an emergency review, storing the call array and
     ///         its pre-commitment hash.
-    /// @dev `whenNotPaused` MIRRORS `openReview` (pashov review finding #7).
-    ///      This was the only sibling `open*` without the gate, so an emergency
-    ///      could be opened while paused and its whole review window expire
-    ///      before `voteBlockEmergencySettle` — itself `whenNotPaused` — was
-    ///      ever callable. `_resolveEmergency` then read `blockStakeWeight == 0`
-    ///      as "not blocked", skipping `slashOwnerBond` and handing back an
-    ///      owner-chosen call batch that `executeGovernorBatch` runs with an
-    ///      empty caps array. Belt and braces with `clockShiftAtOpen` below:
-    ///      this stops the window from STARTING during a pause, that one gives
-    ///      back time lost to a pause which begins after it opened.
     function openEmergency(uint256 proposalId, bytes32 callsHash, BatchExecutorLib.Call[] calldata calls)
         external
         onlyGovernor
@@ -893,56 +744,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         bytes32 eKey = _reviewKey(msg.sender, proposalId);
         EmergencyReview storage er = _emergencyReviews[eKey];
         if (er.reviewEnd > 0 && _effNow(er.clockShiftAtOpen) < er.reviewEnd) revert EmergencyAlreadyOpen();
-        // COMMIT THE PRIOR ROUND BEFORE OVERWRITING IT. The guard above asks
-        // only "is a window still running?", never "was the last one settled?" —
-        // and those are different facts, because the ONLY path that commits a
-        // Blocked verdict (`resolveEmergencyReview` -> `_resolveEmergency`, and
-        // its `slashOwnerBond`) is itself gated on `_effNow >= er.reviewEnd`.
-        // Both predicates therefore flip at the SAME instant, leaving the entire
-        // deterrent as a same-block race whose timestamp the owner knows in
-        // advance: re-calling `emergencySettleWithCalls` at exactly `reviewEnd`
-        // resets `blockStakeWeight` to 0, clears `resolved`, and bumps `round`
-        // (voiding every block vote, since `_emergencyBlockVotes` is round-keyed)
-        // — so the owner never pays the bond and can retry the uncapped
-        // owner-calldata path indefinitely, forcing guardians to re-win the race
-        // and re-cast every vote each round.
-        //
-        // The other route out of a review, `cancelEmergency`, already imposes a
-        // full `reviewPeriod` cooldown for exactly this reason. Resolving in
-        // place is the narrower fix: it settles the verdict the elapsed window
-        // already earned, then lets the re-open proceed on a clean record.
-        // Cheap in the common case — a first open leaves `callsHash` zero, and a
-        // round already resolved short-circuits.
-        //
-        // IN SERIES WITH THE CALLER'S BOND GATE (2026-08 sweep finding #11).
-        // That finding moved `emergencySettleWithCalls`'s owner-bond check to
-        // AFTER this call, and the two now form one mechanism against a
-        // re-open that would void a blocked verdict:
-        //
-        //   this resolve computes `blocked` -> `slashOwnerBond` empties the
-        //   slot -> the caller's gate reads zero and REVERTS the whole
-        //   transaction, re-open and slash together.
-        //
-        // Neither half works alone. Delete this line and the bond survives the
-        // re-open, the gate passes, and the owner voids the votes exactly as
-        // before — measured, not argued: removing it turns
-        // `test_emergencySettleWithCalls_cannotReopenOnABondTheSameCallBurns`
-        // and its sibling red. Those two tests pin THIS call as much as they
-        // pin the gate.
-        //
-        // Note what does NOT depend on it: `er.round++` below retires
-        // prior-round votes on its own, so vote hygiene across a re-open is the
-        // round bump's job, not this resolve's.
         if (er.callsHash != bytes32(0) && !er.resolved) _resolveEmergency(eKey, proposalId, er);
-        // Denominator read at `t-1`, the same checkpoint anchor the numerator
-        // uses (`voteBlockEmergencySettle` reads its weight at `er.openedAt`),
-        // so a flash (de)stake in this block cannot move one side without the
-        // other.
-        //
-        // No lookback-min here, matching `openReview` — see the note there. The
-        // emergency flow has no propose step, so THIS call is where its
-        // electorate is fixed, and it is the owner who initiates it rather than
-        // an attacker choosing the moment.
         IStakedWood sw = swood;
         uint256 ts1 = block.timestamp - 1;
         uint256 gs = sw.getPastTotalVotes(ts1);
@@ -951,7 +753,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         er.callsHash = callsHash;
         er.reviewEnd = uint64(block.timestamp + reviewPeriod);
         // Baseline for `_effNow` — see `EmergencyReview.clockShiftAtOpen`
-        // (pashov review finding #7). Set wherever this clock is (re)started.
         er.clockShiftAtOpen = pauseShiftTotal;
         er.totalStakeAtOpen = uint128(gs);
         er.blockStakeWeight = 0;
@@ -1011,14 +812,12 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // Repurpose `reviewEnd` post-cancel to encode the cooldown deadline.
         er.reviewEnd = uint64(block.timestamp + reviewPeriod);
         // Baseline for `_effNow` — see `EmergencyReview.clockShiftAtOpen`
-        // (pashov review finding #7). Set wherever this clock is (re)started.
         er.clockShiftAtOpen = pauseShiftTotal;
         er.callsHash = bytes32(0);
         unchecked {
             er.nonce++; // legacy counter only, see struct @dev
             // Bump the round too so any block votes cast this round go
             // stale — a future `openEmergency` on this key mints a new,
-            // never-before-used round (finding #25).
             er.round++;
         }
         delete _emergencyCalls[eKey];
@@ -1040,32 +839,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         bytes32 key = _reviewKey(msg.sender, proposalId);
         Review storage r = _reviews[key];
         if (r.resolved) return; // idempotent
-        // Reject after the review window has closed: the proposer has had the
-        // entire window to bail out; permitting cancel after `reviewEnd` would
-        // let the proposer race a pending `resolveReview` slash.
-        //
-        // MEASURED ON THE PAUSE-ADJUSTED CLOCK (pashov 2026-08 finding #6).
-        // This was the last reader of `reviewEnd` still on the wall clock:
-        // `openReview`, `voteOnProposal`, `resolveReview`, `outcomeOf` and the
-        // declared mirror `cancelEmergency` all use `_effNow`. In the deferred
-        // span `[reviewEnd, reviewEnd + pauseShiftTotal)` that split left the
-        // review neither cancellable (wall clock says too late) nor resolvable
-        // (effective clock says too early), while `voteOnProposal` kept
-        // ACCEPTING block votes — so the proposer lost their exit while the
-        // votes that slash their approvers kept accumulating.
-        //
-        // Two concrete consequences, both closed by this one line:
-        //   - `SyndicateGovernor.cancelProposal`'s GuardianReview branch calls
-        //     `cancelReview` UNWRAPPED, so the whole cancel reverted.
-        //   - `ProposalLifecycle._closeReviewIfRegistered` calls it inside a
-        //     bare `try`, so the failure was SILENT: the review stayed open on
-        //     a proposal that had already gone terminal, and a later
-        //     `resolveReview` still slashed its approvers — precisely the harm
-        //     that cleanup exists to prevent.
-        //
-        // The stated rationale above is unchanged in intent: the proposer still
-        // gets exactly one review window and still cannot race a pending
-        // slash. It is now the same window everyone else is measuring.
         uint256 ve = r.reviewEnd;
         if (ve > 0 && _effNow(r.clockShiftAtRegister) >= ve) revert ReviewNotOpen();
         // A never-opened review has nothing to block, and `_isBlocked` must not
@@ -1105,35 +878,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (r.opened || r.resolved) return; // idempotent
 
         uint256 ve = r.voteEnd;
-        // Pause-adjusted — see `_effNow` (pashov review finding #7).
         if (ve == 0 || _effNow(r.clockShiftAtRegister) < ve) revert ReviewNotOpen();
 
         IStakedWood sw = swood;
-        // BOTH SIDES OF THE QUORUM COMPARISON ARE READ AT `r.snapshotAt`, the
-        // propose-time instant — see `Review.snapshotAt` and the numerator read
-        // in `voteOnProposal`. Same date on both sides is the whole point: the
-        // lookback-min this replaced left the denominator up to
-        // `FLOOR_LOOKBACK` staler than the numerator, which is pashov 2026-08
-        // finding #1.
-        //
-        // ACCEPTED IN EXCHANGE, and stated so it is not mistaken for an
-        // oversight: the denominator is now a plain current total at that
-        // instant, so stake parked just before the proposal counts in full.
-        // `stakeAsGuardian` has no cap and no allowlist, and a guardian who
-        // only ever parks and never votes is never slashed, so dilution — a
-        // third party raising the absolute weight an honest cohort must clear
-        // — costs capital and nothing else. The lookback-min did NOT close
-        // that; it priced it at `FLOOR_LOOKBACK` of held capital, and
-        // `test_dilution_aPatientDiluterBeatsTheLookbackMinToo` pins that a
-        // diluter who parks before the window beats it anyway. This trades a
-        // 30-day dilution price for closing a permanent over-weighting hole.
-        // Closing BOTH needs a total of stake continuously present for
-        // `FLOOR_LOOKBACK` — the aggregate counterpart of
-        // `_growthGatedVoteWeight` — which is new sWOOD accounting.
-        //
-        // Propose time, not open time, because `openReview` is permissionless:
-        // reading at open lets the attacker choose the instant the electorate
-        // is measured.
         uint128 totalAtOpen = uint128(sw.getPastTotalVotes(uint256(r.snapshotAt)));
         uint256 combinedAtOpen = uint256(totalAtOpen);
         r.opened = true;
@@ -1142,18 +889,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // threshold after voters have cast.
         // forge-lint: disable-next-line(unsafe-typecast)
         r.blockQuorumBpsAtOpen = uint16(blockQuorumBps);
-        // Snapshot the slash-severity envelope for the same reason and at the
-        // same instant (pashov review finding #11) — see `Review`. Freezing
-        // the threshold but not the penalty left the owner able to rewrite
-        // what a decided review COSTS at resolve time.
-        //
-        // STORED PLUS ONE, so "unset" and "set to zero" are distinguishable
-        // (PR #195 re-review). Both sWOOD getters are bps bounded by 10_000 at
-        // their setters, so `+ 1` tops out at 10_001 and still fits `uint16`
-        // — and 0 in either field now means, unambiguously, that this review
-        // predates the field. See `_severityBps` for why the previous
-        // `lo == 0 && hi == 0` sentinel was not safe.
-        // forge-lint: disable-next-line(unsafe-typecast)
         r.minSlashBpsAtOpen = uint16(swood.minSlashBps() + 1);
         // forge-lint: disable-next-line(unsafe-typecast)
         r.maxSlashBpsAtOpen = uint16(swood.maxSlashBps() + 1);
@@ -1179,7 +914,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (!_authorizedGovernors.contains(governor)) revert UnauthorizedGovernor();
         bytes32 key = _reviewKey(governor, proposalId);
         Review storage r = _reviews[key];
-        // Pause-adjusted — see `_effNow` (pashov review finding #7). Holding
         // resolution back for the deferred span is the whole point: resolving
         // on wall clock is what let a paused-out review commit as `Cleared`.
         if (r.reviewEnd == 0 || _effNow(r.clockShiftAtRegister) < r.reviewEnd) revert ReviewNotReadyForResolve();
@@ -1200,18 +934,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         r.blocked = blocked_;
 
         if (blocked_) {
-            // Slash every approver — each for ITS LOCK, scaled by severity, never
-            // for a fraction of its whole bond (design D3: both slash paths burn
-            // the lock). Severity is DETERMINISTIC — a quadratic ramp of
-            // block-side decisiveness from the at-open block quorum to
-            // `SUPERMAJORITY_BPS`, computed by `_severityBps`; it is not voted,
-            // and it multiplies the lock-derived rate rather than replacing it.
-            // Pass `r.openedAt` so sWOOD sizes each slash off the approver's raw
-            // own-stake checkpoint at review open — the same basis the rates
-            // below were sized from.
             (address[] memory approvers, uint256[] memory bpsPer) = _reviewSlashRates(key, governor, proposalId, r);
             swood.slashGuardians(key, uint256(r.openedAt), approvers, bpsPer);
-            // No per-blocker emit (SHE-207): attribution is an off-chain join of the
             // vote events with `ReviewResolved`; every one of them carries `governor`.
         }
 
@@ -1219,75 +943,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         return blocked_;
     }
 
-    /// @dev THE REVIEW-PATH SLASH RATES. For each approver the ledger holds a
-    ///      lock for on this proposal:
-    ///
-    ///          lockBps_i = 0                               lock_i == 0
-    ///                    = 10_000                          basis_i == 0 || lock_i >= basis_i
-    ///                    = ceil(lock_i x 10_000 / basis_i) otherwise
-    ///          bps_i     = ceil(lockBps_i x severityBps / 10_000)
-    ///          bps_i     = min(max(bps_i, loAtOpen), hiAtOpen)      if bps_i != 0
-    ///
-    ///      where `basis_i` is `swood.slashableStakeAt(g, review open)` — the
-    ///      checkpoint `StakedWood._slashOne` will multiply — `severityBps` is
-    ///      `_severityBps(r)`, and `[loAtOpen, hiAtOpen]` is the slash envelope
-    ///      SNAPSHOTTED AT REVIEW OPEN (`_envelopeAtOpen`, the same values
-    ///      `_severityBps` ramps between). `lockBps` comes from
-    ///      `ExposureLedger.slashBpsForAt`, the SAME formula the verdict path's
-    ///      `slashBpsFor` uses, so the two paths cannot drift; this function
-    ///      contributes the severity multiplier and the at-open envelope, nothing
-    ///      else. sWOOD applies NO live bound afterwards (only a constant
-    ///      saturation at 10_000): a live ceiling would let the owner zero
-    ///      `maxSlashBps` mid-review and nullify the burn, the mirror of #11.
-    ///
-    ///      THE ENVELOPE IS THE AT-OPEN ONE, NOT THE LIVE ONE (pashov review
-    ///      finding #11). The adversary here is the OWNER: with the floor read
-    ///      from sWOOD's live `minSlashBps` at resolve, an owner who disliked a
-    ///      specific cohort could wait for the review to decide against them and
-    ///      then raise `minSlashBps` in the same block, punishing exactly those
-    ///      approvers beyond the terms they voted under — and lower it back
-    ///      afterwards, so no other review ever saw the change. Flooring against
-    ///      `Review.minSlashBpsAtOpen` makes the penalty a function of the rules
-    ///      in force when the approvers committed, and only of those. sWOOD keeps
-    ///      its live MAX as a cap because a ceiling lowered after the fact can
-    ///      only protect guardians; it deliberately applies NO live floor.
-    ///
-    ///      THE ADVERSARY is a guardian who backed a bad proposal with a small
-    ///      lock while holding a large bond. Under the previous uniform-severity
-    ///      call it lost `severity` of EVERYTHING it held, which punished the
-    ///      well-capitalised more than the reckless and left every other proposal
-    ///      it backed under-covered (cross-proposal contagion). Now it loses at
-    ///      most its lock, scaled by how decisively the review condemned the
-    ///      proposal — and never less than `minSlashBps` of the bond, because the
-    ///      envelope floor is applied downstream to every non-zero rate. A
-    ///      1-wei declaration therefore buys neither quorum weight nor a token
-    ///      penalty. A non-zero lock at a non-zero severity always rounds UP to
-    ///      at least 1 bps, so the floor can bind on it; the ONLY ways to owe 0
-    ///      are to hold no lock (released by a vote change, or an approval that
-    ///      locked nothing) or a zero severity, which was already a zero burn
-    ///      under the old uniform call.
-    ///
-    ///      ANCHOR. `r.openedAt` is stored ALREADY `-1`-hardened (`open block - 1`),
-    ///      and `slashGuardians` hands it to `_slashOne` verbatim. The ledger's
-    ///      `slashBpsForAt` goes through `swood.slashableStakeAt`, which applies
-    ///      its own `-1` to a RAW instant — so this passes `openedAt + 1`, the raw
-    ///      open instant, and both lookups land on the same checkpoint. Passing
-    ///      `openedAt` itself would size the rate off `open block - 2`: a stake
-    ///      checkpoint landing exactly at `open block - 1` would then be in the
-    ///      burn basis but not the rate denominator, over-shooting the lock.
-    ///      `openedAt + 1 <= block.timestamp` at resolve, so sWOOD's
-    ///      `VerdictNotPast` guard never fires.
-    ///
-    ///      UNWIRED LEDGER. If `exposureLedger` is zero no lock was ever
-    ///      recorded — `voteOnProposal` had nowhere to write it — so no approver
-    ///      holds any liability. The fallback returns the registry's own vote-side
-    ///      `_approvers[key]` with all-zero rates, which `slashGuardians` skips
-    ///      entirely: nothing locked, nothing burned. This is the ONLY fallback;
-    ///      a wired ledger that reverts propagates, because a slash that silently
-    ///      burned nothing on a broken read would be the escape hatch this path
-    ///      exists to close. When wired, the ledger's set is used rather than
-    ///      `_approvers[key]`: the ledger drops released locks from its list while
-    ///      the vote set keeps the voter, and the lock set is the liability set.
     function _reviewSlashRates(bytes32 key, address governor, uint256 proposalId, Review storage r)
         private
         view
@@ -1320,33 +975,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         }
     }
 
-    /// @dev The slash envelope `[lo, hi]` a review is judged under — the values
-    ///      `openReview` snapshotted, shared by `_severityBps` (which ramps between
-    ///      them) and `_reviewSlashRates` (which clamps to them), so the two can
-    ///      never read different envelopes for one review.
-    ///
-    ///      MIGRATION GUARD (PR #195 review, item 5). `minSlashBpsAtOpen` /
-    ///      `maxSlashBpsAtOpen` are APPENDED fields, so every review already
-    ///      `opened` when this upgrade lands reads them as 0 — and a zero
-    ///      envelope collapses every branch of the ramp to 0, which makes
-    ///      `_slashOne`'s `ownSlash` zero and skips the burn entirely. That is
-    ///      precisely the outcome the snapshot exists to prevent, handed for free
-    ///      to every in-flight review at the moment of the upgrade. Falling back
-    ///      to the live reads restores the pre-upgrade behaviour for exactly those
-    ///      reviews, which is strictly better than granting them immunity.
-    ///
-    ///      THE SENTINEL IS THE OFFSET, NOT THE VALUE (PR #195 re-review). The
-    ///      first cut of this guard keyed on `lo == 0 && hi == 0` read straight
-    ///      off the live getters, and that is a LEGAL CONFIGURATION, not just an
-    ///      unset field: `setMinSlashBps(0)` only checks `v > maxSlashBps`, and
-    ///      `setMaxSlashBps(0)` only checks `v < minSlashBps`, so `0/0` is
-    ///      reachable and reads back as "predates the field". An owner who opened
-    ///      a review while the live envelope was 0/0 would hit this fallback at
-    ///      resolve time and get the LIVE slots back — so raising `maxSlashBps`
-    ///      to 10_000 between open and resolve would take every approver's whole
-    ///      stake, which is exactly the mid-review mutability finding #11 closes.
-    ///      `openReview` therefore stores each bound PLUS ONE, making 0
-    ///      unreachable for any genuine snapshot and the sentinel unambiguous.
     function _envelopeAtOpen(Review storage r) private view returns (uint256 lo, uint256 hi) {
         if (r.minSlashBpsAtOpen == 0 || r.maxSlashBpsAtOpen == 0) {
             lo = swood.minSlashBps();
@@ -1357,20 +985,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         }
     }
 
-    /// @dev Deterministic slash severity from block-side decisiveness: the winning
-    ///      side of a review must not choose the losers' penalty. Quadratic ramp
-    ///      from the at-open block quorum (floor — a scraped quorum is a genuinely
-    ///      contested call) to `SUPERMAJORITY_BPS` (ceiling — overwhelming
-    ///      condemnation). Approvers cannot lower it and blockers gain nothing by
-    ///      inflating it, since slashed WOOD burns and blocker rewards are
-    ///      epoch-level. Only called when the block quorum was reached, so
-    ///      `bBps >= qBps` up to rounding; the other branch floors defensively.
-    /// @dev READS THE AT-OPEN ENVELOPE, NOT THE LIVE SLOTS (pashov review
-    ///      finding #11). See `Review.minSlashBpsAtOpen` for why a live read
-    ///      here let the owner nullify or maximise an already-decided review in
-    ///      the same transaction that committed it.
     function _severityBps(Review storage r) private view returns (uint256) {
-        // At-open envelope with the PR #195 migration guard — see `_envelopeAtOpen`.
         (uint256 lo, uint256 hi) = _envelopeAtOpen(r);
         uint256 denom = uint256(r.totalStakeAtOpen);
         if (denom == 0) return lo; // defensive: a reached quorum implies denom > 0
@@ -1537,43 +1152,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (deadman && block.timestamp < uint256(pausedAt) + DEADMAN_UNPAUSE_DELAY) {
             revert NotPausedOrDeadmanNotElapsed();
         }
-        // A PAUSE DEFERS REVIEW CLOCKS, IT DOES NOT CONSUME THEM (pashov
-        // review finding #7). Review windows are wall-clock, but every writer
-        // into them — `openReview`, `voteOnProposal`,
-        // `voteBlockEmergencySettle` — is `whenNotPaused`. A pause spanning
-        // `[voteEnd, reviewEnd)` therefore left `r.opened == false` with no
-        // guardian able to change that, and BOTH readers treat that emptiness
-        // as a clean bill of health rather than an undetermined one:
-        // `resolveReview` short-circuits `if (!r.opened) { resolved = true;
-        // return false; }` and `outcomeOf` returns `Cleared`. The proposal
-        // then executed with a guardian review that structurally could not
-        // happen — the veto failing OPEN, and needing no malice at all, since
-        // an ordinary incident pause does it.
-        //
-        // Accumulating the paused span here and subtracting it in `_effNow`
-        // gives every review whose clock was already running the time back,
-        // while reviews registered later start from the new baseline and are
-        // unaffected.
-        //
-        // ACCEPTED TRADEOFF: THIS TURNS A FAIL-OPEN INTO A GRIEFABLE
-        // FAIL-CLOSED (PR #195 review, item 7). `resolveReview` now requires
-        // `_effNow >= r.reviewEnd`, so each pause/unpause cycle pushes every
-        // in-flight review's resolution further out, and nothing stops the
-        // owner re-pausing the moment `DEADMAN_UNPAUSE_DELAY` lets a stranger
-        // unpause. An owner can therefore defer guardian resolution
-        // indefinitely — including past a proposal's own wall-clock
-        // `executeBy`, since that deadline lives on the governor and is NOT
-        // pause-adjusted, so the proposal expires rather than executing.
-        //
-        // Deliberate, on two grounds. The failure direction is now REFUSAL
-        // rather than an unearned `Cleared` — a deferred review approves
-        // nothing, whereas the old behaviour executed proposals no guardian
-        // could vote on. And the lever is already held: this owner can pause
-        // indefinitely regardless, which halts `voteOnProposal`,
-        // `resolveReview` and `openReview` outright. The registry's whole
-        // pause design sits under the trusted-owner doctrine; this adds no
-        // capability, only a longer tail on one that exists.
-        // `test_finding7_repeatedPauseCyclesCompound` pins the compounding.
         pauseShiftTotal += uint64(block.timestamp - uint256(pausedAt));
         paused = false;
         pausedAt = 0;
@@ -1685,8 +1263,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (r.resolved) {
             return r.blocked ? ReviewOutcome.Blocked : ReviewOutcome.Cleared;
         }
-        // Pause-adjusted, matching `resolveReview` — see `_effNow` (pashov
-        // review finding #7). `ProposalLifecycle._afterVote` reads this, so
         // reporting `Cleared` on wall clock here would approve the proposal
         // even while `resolveReview` still considers the window open.
         if (r.reviewEnd == 0 || _effNow(r.clockShiftAtRegister) < r.reviewEnd) {

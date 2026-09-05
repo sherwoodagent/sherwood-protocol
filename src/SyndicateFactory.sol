@@ -38,9 +38,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     using EnumerableSet for EnumerableSet.UintSet;
 
     // ── Errors ──
-    /// @notice No real tier registry where one is mandatory (pashov finding #1):
-    ///         a governor without one is permanently registry-less, and
-    ///         `SyndicateVault._guardBatchCalls` degrades OPEN.
     error TierRegistryNotWired();
     error InvalidExecutorImpl();
     /// @notice `setSandboxImpl` was given a codeless address. See the setter.
@@ -126,7 +123,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     mapping(address vault => address governor) private _governorOf;
 
     /// @dev Deprecated. Formerly the protocol PriceRouter for Lane A live-NAV
-    ///      pricing, now retired (issue #54). Slot 7 stays occupied — same
     ///      slot, same type — because the factory is deployed and its layout
     ///      is golden-pinned (`script/syndicate-factory-layout.golden.json`);
     ///      only the label changes, which the EVM never sees.
@@ -253,10 +249,8 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         tierRegistry / exposureLedger / bondEscrow into an existing governor.
     event WiringPushed(address indexed governor);
     /// @notice Emitted by `setExecutorImpl` — the shared `BatchExecutorLib`
-    ///         new syndicates are wired to at `createSyndicate` (issue #43).
     event ExecutorImplUpdated(address oldImpl, address newImpl);
     /// @notice Emitted when `pushExecutor` re-points an existing vault at the
-    ///         factory's current `executorImpl` (issue #43).
     event ExecutorPushed(address indexed vault, address indexed executorImpl);
     event GovernorDeployed(address indexed vault, address indexed governor);
     event BeaconUpdated(address indexed oldBeacon, address indexed newBeacon);
@@ -273,8 +267,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         address protocolConfig;
         uint256 managementFeeBps;
         address guardianRegistry;
-        /// @dev MANDATORY (pashov finding #1) — here rather than in a follow-up
-        ///      `setTierRegistry` so a live-but-unwired factory cannot exist.
         address tierRegistry;
     }
 
@@ -330,7 +322,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         if (bytes(config.symbol).length == 0) revert InvalidSyndicateConfig();
         if (bytes(config.subdomain).length == 0) revert InvalidSyndicateConfig();
         if (bytes(config.metadataURI).length == 0) revert InvalidSyndicateConfig();
-        // Registry-less vaults are born unguarded (finding #1 — rationale at
         // the governor init site below). `initialize` requires one, so this only
         // fires after an owner zeroed the slot as a kill switch. Reads factory
         // storage only, so it belongs with the pre-flight rejects.
@@ -390,30 +381,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
             ISyndicateVault(vault).setSandboxImplementation(sandboxImpl);
         }
 
-        // Deploy the per-vault governor as a BeaconProxy. The governor's
-        // `onlyVaultOwner` resolves the owner live from the vault, and the vault
-        // resolves its governor back through `factory.governorOf(vault)` (read
-        // from `_governorOf` below) — so recording the mapping here is what wires
-        // the vault ↔ governor link (no separate vault setter needed).
-        // `addGovernor` authorizes the new governor on the shared registry.
-        // The tier registry goes in the INIT CALL, not a follow-up
-        // `setTierRegistry` (pashov finding #1). This used to skip the push when
-        // the factory's own pointer was unset, on the premise that the governor
-        // "keeps its safe tier-2 default". That is a PRICING default; what a
-        // missing registry removes is a CAPABILITY gate.
-        // `SyndicateVault._guardBatchCalls` resolving no registry used to RETURN,
-        // dropping the callee allowlist, the spender/recipient gate and the
-        // `UnrecognizedAssetSelector` branch on the way out — after which one
-        // batch instruction, `asset.approve(attacker, max)`, moves ZERO balance,
-        // so the net-outflow meter, the per-call cap and `requiredCoverage` all
-        // read zero, and the vault is drained in a LATER transaction no meter
-        // watches. A vault created in that window stayed registry-less
-        // permanently, so the window was inherited, not transient.
-        //
-        // Three layers now, cheapest first: mandatory `InitParams.tierRegistry`
-        // on this factory, the pre-flight reject at the top of this function,
-        // and the governor's own `initialize` refusing a codeless registry —
-        // after which the guard itself fails closed rather than open.
         bytes memory govInitData = abi.encodeCall(
             ISyndicateGovernor.initialize,
             (vault, guardianRegistry, protocolConfig, address(this), tierRegistry, _defaultGovernorParams())
@@ -437,19 +404,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         // roll back the whole creation tx — atomic.
         sw.bindOwnerStake(msg.sender, vault);
 
-        // Register the ENS subname — the vault is both address record and NFT
-        // owner. An external registrar revert (a mempool front-runner claiming the
-        // label, or a paused registrar) must NOT undo the fee transfer, vault and
-        // queue deploy, and stake bind already done: the syndicate is fully
-        // operational without ENS, and an operator can `register` later via the
-        // registrar directly. So `createSyndicate` never reverts for an ENS
-        // failure.
-        //
-        // Pre-check `available()` so a genuine label-taken front-run is
-        // distinguished in telemetry from an unexpected registrar fault, and the
-        // doomed `register` call is skipped. Non-front-run reverts are
-        // deliberately not bubbled either: a paused or misconfigured registrar
-        // would then brick ALL vault creation.
         if (address(ensRegistrar) != address(0)) {
             // The `available()` view is itself an external call into a
             // possibly-paused / misconfigured / non-conforming registrar. It
@@ -496,15 +450,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         emit SyndicateCreated(syndicateId, vault, msg.sender, config.metadataURI, config.subdomain);
     }
 
-    /// @dev Default governance parameters stamped onto each new per-vault governor
-    ///      at deploy. Vault owners tune them post-creation via the governor's
-    ///      owner-instant setters. All values sit within `GovernorParameters`
-    ///      bounds so the governor's validation at `initialize` accepts them.
-    /// @dev `maxPerformanceFeeBps` starts at the advertised headline (20%), not at
-    ///      the protocol ceiling (30%): the settle-time clamp resolves an
-    ///      over-ceiling rate silently, so a permissive default would fail open and
-    ///      let an owner quietly charge above the headline. Named constant, not a
-    ///      literal, so it cannot drift from `FeeConstants`.
     function _defaultGovernorParams() private pure returns (ISyndicateGovernor.GovernorParams memory) {
         return ISyndicateGovernor.GovernorParams({
             votingPeriod: 24 hours,
@@ -559,7 +504,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     }
 
     /// @notice Update the shared `BatchExecutorLib` new syndicates are wired to
-    ///         at `createSyndicate` (issue #43, design.md D5 migration
     ///         primitive #1). Existing vaults are untouched — re-point them
     ///         individually via `pushExecutor`.
     function setExecutorImpl(address newExecutorImpl) external onlyOwner {
@@ -674,8 +618,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         Only affects governors created AFTER this call; existing ones are
     ///         rewired via `pushWiring(governor)`.
     /// @dev `address(0)` is legal HERE and nowhere else, and no longer means
-    ///      "later governors keep the safe tier-2 default" — since pashov
-    ///      finding #1 `createSyndicate` reverts while this is unset, so it is a
     ///      fail-CLOSED kill switch on new syndicates that cannot un-wire an
     ///      existing governor. Codeless is refused: an EOA passes every
     ///      zero-check, then reverts the batch guard's typed `isCallableTarget`

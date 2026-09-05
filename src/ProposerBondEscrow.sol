@@ -185,13 +185,6 @@ contract ProposerBondEscrow is IProposerBondEscrow {
         if (msg.sender != ILedgerFreezerMinimal(exposureLedger).coverageFreezer()) {
             revert NotAuthorizedConvictor();
         }
-        // NOT TRUSTED FROM THE CALLER, for the same reason sWOOD re-checks the
-        // rates it is handed: the convictor is a replaceable role, and this
-        // contract is the one that actually moves the WOOD. Bounding the rate
-        // here is what keeps "a compromised convictor can divert AT MOST
-        // `MAX_PROSECUTOR_FEE_BPS` of any one bond" true no matter what the
-        // game does. Reverts rather than clamping — a caller-chosen payee must
-        // never be laundered into a smaller-but-still-caller-chosen one.
         if (feeBps > MAX_PROSECUTOR_FEE_BPS) revert FeeBpsTooHigh();
         bytes32 key = _key(governor, proposalId);
         Bond memory b = _bonds[key];
@@ -203,18 +196,6 @@ contract ProposerBondEscrow is IProposerBondEscrow {
         // still-live bond.
         delete _bonds[key];
 
-        // THE PROSECUTOR'S FEE, AND WHY IT COMES FROM HERE. Catching a bad
-        // proposal has to pay someone, and this is the only pot a prosecutor
-        // cannot fund for itself: to self-deal you must BE the proposer, and then
-        // you are paying yourself a fraction of a bond you forfeit in full. That
-        // makes the fee sybil-proof by construction, with no role predicate to
-        // game.
-        //
-        // Deliberately NOT taken from the guardians' slash: that pot IS fundable
-        // by a prosecutor willing to stake and approve the proposal it is about to
-        // accuse, which is why a slash-funded fee needed an approver-role
-        // predicate — and that predicate was controlled by the accused, who could
-        // zero the fee by funding their defence from an unrelated address.
         uint256 fee;
         if (feeTo != address(0) && feeBps != 0 && b.amount != 0) {
             fee = (b.amount * feeBps) / 10_000;

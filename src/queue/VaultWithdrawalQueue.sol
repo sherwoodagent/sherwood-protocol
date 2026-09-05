@@ -14,7 +14,6 @@ interface IRequestableVault {
     /// @notice True while a mint must not happen — an open proposal. The
     ///         deposit claim below refuses on this, the same predicate the
     ///         instant path uses. A residue no longer locks: it is PRICED via
-    ///         `previewDeposit` instead (finding #3).
     function depositsLocked() external view returns (bool);
     /// @notice Live assets-to-shares for a MINT, at the current price and
     ///         INCLUDING value settled strategies still owe the vault. The
@@ -85,7 +84,6 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     // from float alone, so a redeemer claiming against it leaves their share of
     // that residue behind, and it accrues to the LPs who stayed. No attacker, no
     // loss to the protocol — a transfer between LPs, and the fairness half of
-    // finding #3.
     //
     // PAID IN TWO PARTS, AND NOTHING IS EVER VALUED. The stamp above is the
     // SENIOR floor: fully backed, always payable, unchanged. What follows is the
@@ -209,16 +207,6 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     function stampSettlement(uint256 pid, uint256 num, uint256 den) external onlyVault {
         SettlePrice storage sp = _settlePrice[pid];
         if (sp.stamped) revert AlreadySettled();
-        // MONOTONIC BY ASSERTION, NOT BY ASSUMPTION. Both surviving exits key
-        // off `_lastStampedPid` as a high-water mark and are exact complements
-        // of each other — `claim` needs `_lastStampedPid >= r.pid`, `cancel`
-        // needs its negation — so a LOWER pid stamped after a higher one would
-        // make an already-claimable deposit unclaimable AND reopen its cancel
-        // exit, which is precisely the costless straddle pashov #10 closed. That
-        // ordering follows today from the governor's single-open-proposal
-        // invariant, i.e. from another contract; nothing here enforced it, and a
-        // cross-contract invariant that two local branches silently depend on is
-        // the kind that survives until it doesn't.
         if (pid < _lastStampedPid) revert StampOutOfOrder();
         sp.num = num;
         sp.den = den;
@@ -233,7 +221,6 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             // a claim on the pool and became a claim for `reservedForPid` fixed
             // assets; pricing must lose the shares at the same instant it loses
             // the assets, or the gap between the two is exactly the mispricing
-            // window issue #92 describes.
             _stampedUnclaimedShares += redeemShares;
             // FROZEN HERE, for the junior leg. `_pidRedeemShares` above is
             // decremented as each redeemer takes their floor, so it cannot be
@@ -260,36 +247,11 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     ///      frozen price at all (it is converted live below), so no stamp is
     ///      relevant to it. `depositsLocked()` is the whole gate: no open
     ///      proposal, and no settled strategy still holding a residue. The
-    ///      second arm is finding #3 — see the pricing block in the deposit
     ///      branch for why the gate and the live read are both required.
     function claim(uint256 requestId) external nonReentrant returns (uint256 outAmount) {
         Request storage r = _req(requestId);
         if (r.claimed) revert AlreadyClaimed();
         if (r.cancelled) revert AlreadyCancelled();
-        // GATE ON THE PRICE THIS CLAIM ACTUALLY USES, not blindly on the request's
-        // own tagged pid.
-        //
-        // Redeem claims price against their OWN pid's stamp: `requestRedeem` only
-        // opens while the proposal it tags is already Executed, and every Executed
-        // proposal reaches Settled through a path that stamps, so `r.pid` is
-        // always eventually stamped for a redeem.
-        //
-        // Deposit claims price against `_lastStampedPid` instead, and
-        // `requestDeposit` opens on `openProposalCount() != 0` — Draft AND
-        // Pending, not just Executed. A proposal can leave Draft/Pending WITHOUT
-        // ever settling, so `_settlePrice[r.pid]` can be permanently unstamped for
-        // a deposit tagged to one of those, and gating on `r.pid` there reverted
-        // forever with no recovery for a pay-on-behalf deposit. Gating on
-        // `_lastStampedPid` unlocks the claim at the NEXT real settlement —
-        // exactly the price it is charged at below.
-        //
-        // AT OR AFTER THIS REQUEST, not merely "some stamp exists". Because
-        // `stampSettlement` writes `sp.stamped` BEFORE `_lastStampedPid`,
-        // `_settlePrice[_lastStampedPid].stamped` is true by construction from
-        // the first settlement onward — on its own it is the constant `true`,
-        // not a gate. `_lastStampedPid >= r.pid` asks the real question, and
-        // makes this the exact complement of `cancel`'s gate: before that
-        // instant only cancel is open, after it only claim is.
         bool isRedeem = r.kind == RequestKind.Redeem;
         SettlePrice memory sp;
         if (isRedeem) {
@@ -297,21 +259,6 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             if (!sp.stamped) revert NotSettled();
             if (IRequestableVault(vault).redemptionsLocked()) revert VaultLocked();
         } else {
-            // DEPOSITS GATE ON THE VAULT'S OWN MINT PREDICATE, NOT ON A STAMP
-            // (finding #3, the attack half). A queued deposit no longer prices
-            // against a frozen number, so there is nothing to wait for and no
-            // stamp to require — what it needs is an instant at which minting is
-            // honest, which is exactly what `depositsLocked()` answers: no open
-            // proposal and no residue that cannot be
-            // valued (a valuable one is charged for by `previewDeposit` below,
-            // not blocked). That predicate subsumes `redemptionsLocked()` (an active proposal
-            // implies a nonzero open count), so it is the only gate here.
-            //
-            // This also retires the `_lastStampedPid >= r.pid` requirement,
-            // which was never about safety: a deposit tagged to a proposal that
-            // left Draft/Pending WITHOUT settling could never satisfy it and
-            // reverted forever. Such a request now claims at the next clean
-            // instant like any other.
             if (IRequestableVault(vault).depositsLocked()) revert VaultLocked();
         }
 
@@ -323,13 +270,6 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             // assets = shares * num / den (matches ERC-4626 convertToAssets at settle)
             outAmount = Math.mulDiv(amount, sp.num, sp.den);
             _pendingShares -= amount;
-            // Release reserve against the proposal's stamped aggregate, not the
-            // per-request payout, so the claim that empties the proposal's shares
-            // frees the whole remainder (incl. the floor(Σ)−Σfloor rounding dust).
-            // Otherwise that dust accumulates across proposals until
-            // `reservedAssets` exceeds the vault float that backs the true
-            // claimable, over-restricting flows and eventually bricking
-            // `executeGovernorBatch`.
             uint256 remainingShares = _pidRedeemShares[r.pid] - amount;
             _pidRedeemShares[r.pid] = remainingShares;
             uint256 release;
@@ -350,34 +290,6 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
             _stampedUnclaimedShares = stamped > amount ? stamped - amount : 0;
             IRequestableVault(vault).settleRedeem(amount, outAmount, r.owner);
         } else {
-            // PRICED LIVE, NOT AT ANY STAMP (finding #3, the attack half).
-            //
-            // A stamp is a frozen REALIZED figure taken at settlement, and
-            // `totalAssets()` counts only float — so a settlement that left a
-            // residue on the strategy stamps a price BELOW what the vault owns.
-            // Minting against that number is the skim: claim cheap, then call
-            // the permissionless `sweep()` and own a slice of the residue the
-            // incumbents paid for. An attacker can induce it rather than wait
-            // for it (a fee-free flash loan empties the market's idle balance
-            // for one callback frame, forcing under-delivery on demand).
-            //
-            // Two changes close it together, and neither suffices alone. The
-            // gate above admits the claim only at an instant the vault can
-            // price honestly; this live read then charges for what it is worth
-            // AT THAT INSTANT — float PLUS what settled strategies still owe,
-            // which a frozen stamp is blind to either way.
-            //
-            // The escrowed assets never entered the strategy (they sit in this
-            // contract, off-vault, uncounted in `totalAssets`), so the honest
-            // price is the one prevailing when they actually join the pool.
-            // Computed BEFORE the push so the deposit does not dilute its own
-            // price. Redeem keeps its stamp deliberately: those shares left the
-            // supply at that settlement and the reserve is denominated against
-            // that same price.
-            //
-            // Retires the perpetual look-back call the old frozen pricing
-            // created — with no frozen number there is nothing to look back at,
-            // which is why `cancel` can now stay open for deposits.
             outAmount = IRequestableVault(vault).previewDeposit(amount);
             if (outAmount == 0) revert ZeroShares();
             _pendingDepositAssets -= amount;
@@ -398,30 +310,6 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         if (msg.sender != r.owner) revert NotQueueOwner();
         if (r.claimed) revert AlreadyClaimed();
         if (r.cancelled) revert AlreadyCancelled();
-        // DEPOSIT CANCEL IS UNCONDITIONALLY OPEN, and that is a CONSEQUENCE of
-        // the live pricing in `claim`, not a relaxation of pashov #10.
-        //
-        // #10 was a costless straddle: `claim` paid a deposit at a FROZEN
-        // price, so holding the request was a perpetual look-back call — claim
-        // when the stale number mints more, cancel when it does not, with the
-        // upside funded by the incumbents. The fix then was to shut cancel
-        // exactly when claim opened, keying both gates to `_lastStampedPid`.
-        //
-        // A deposit now converts LIVE at claim time (see the pricing block in
-        // `claim`). There is no stale number to exercise against: claiming
-        // always mints at the price prevailing in that instant, so the option
-        // is worth zero and the straddle has no payoff to straddle. Cancel is
-        // then just "I changed my mind", which is what it was always for — and
-        // it must stay open, because the deposit gate can still hold a claim
-        // shut (an open proposal, or a residue no template can value) and a
-        // depositor must never be wedged between a closed claim and a closed
-        // cancel.
-        //
-        // Redeem keeps `r.pid`: those shares left the supply at that settlement
-        // and `_pidReserved` is denominated against that same frozen price, so
-        // its own stamp is the correct and only meaningful gate — and unlike a
-        // deposit, a redeem IS paid from a stamp, so the look-back logic still
-        // applies to it.
         bool priceFixed = r.kind == RequestKind.Redeem && _settlePrice[r.pid].stamped;
         if (priceFixed) revert AlreadySettled();
 
@@ -489,15 +377,6 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
         emit RemainderClaimed(requestId, r.owner, owed);
     }
 
-    /// @dev A request's cumulative slice of everything that has arrived for its
-    ///      cohort. ONE formula, shared by the view and the mutator so they
-    ///      cannot drift — a view that quotes more than the payer will pay is
-    ///      the kind of divergence nobody notices until someone integrates
-    ///      against it.
-    ///
-    ///      Rounds DOWN, and the denominator is the cohort FROZEN at the stamp,
-    ///      so the entitlements of a pid's requests sum to at most what arrived
-    ///      for it.
     function _entitlementOf(Request storage r) private view returns (uint256) {
         uint256 cohort = _pidCohortShares[r.pid];
         if (cohort == 0) return 0;

@@ -87,7 +87,6 @@ interface IStrategyDelivery {
     ///         OWN BLIND SPOTS. That figure is deliberately partial and biased
     ///         low, because valuing the excluded legs would mean consulting a
     ///         price an attacker can move inside the settlement transaction —
-    ///         exactly what finding #3 exploited. Under-reporting was harmless
     ///         while a boolean lock covered every residue shape; it is NOT
     ///         harmless now that the figure sets the price a mint pays, because
     ///         "biased low" is then precisely the skim.
