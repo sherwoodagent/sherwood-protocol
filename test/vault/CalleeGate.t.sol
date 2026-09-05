@@ -285,7 +285,7 @@ contract CalleeGateTest is Test {
     ///         de-allowlists the whole address — and that is unchanged here.
     ///         What changed is the AXIS: revoking the right to be paid must not
     ///         revoke the vault's ability to reclaim. An owner who does want to
-    ///         sever callability entirely still has `setAdapterAllowed(x, false)`,
+    ///         sever callability entirely still has `setCallable(x, false)`,
     ///         pinned by `test_explicitOwnerRevocationClosesCalleeStandingToo`
     ///         in `test/pashov-final/Registry_demoteKeepsCalleeStanding.t.sol`.
     function test_demotionSeveresFundsPathButNotCallability() public {
