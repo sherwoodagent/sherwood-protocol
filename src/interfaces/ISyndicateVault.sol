@@ -87,7 +87,6 @@ interface ISyndicateVault {
     ///         does not equal `address(this)`, or is unreadable. Class
     ///         membership proves the recipient's CODE is a certified template's
     ///         clone, but `initialize` is unpermissioned, so the clone's
-    ///         fund-destination (`_vault`) can be attacker-set (SHE-209). Every
     ///         class member is bound to this vault, INCLUDING one the owner also
     ///         granted per-address via `setAdapterAllowed`; only non-members
     ///         (`classOf == 0`: routers, Permit2, plain tokens) are exempt.
@@ -107,8 +106,6 @@ interface ISyndicateVault {
     /// @notice The calling governor resolved no TierRegistry — no `tierRegistry()`
     ///         getter, or one returning `address(0)`. The batch guard's callee
     ///         allowlist and spender/recipient gate cannot be evaluated without
-    ///         it, so the batch is REFUSED rather than run unguarded (pashov
-    ///         finding #1). Unreachable for governors this factory deploys;
     ///         `SyndicateFactory.pushWiring(governor)` rescues a pre-fix one.
     error TierRegistryUnresolved();
     /// @notice A governor-batch call carries a guarded value-moving selector but
@@ -133,12 +130,6 @@ interface ISyndicateVault {
     ///         the tier system prices, so this is refused regardless of the
     ///         TierRegistry's presence or the `to` recipient.
     error DisallowedTransferFromSource(address target, address from);
-    /// @notice SHE-205. A share movement that must report to the governor was
-    ///         sent with too little gas to fund the report. Under EIP-150 the
-    ///         caller could otherwise choose a gas limit at which the movement
-    ///         lands and the report starves, leaving a ballot standing behind
-    ///         weight that has left. Re-send with a higher gas limit; see
-    ///         `SyndicateVault.GOVERNANCE_REPORT_GAS`.
     error GovernanceReportUnderfunded(uint256 available, uint256 required);
 
     // ── Init Params ──
@@ -188,7 +179,6 @@ interface ISyndicateVault {
     function isPrivilegedBatchTarget(address target) external view returns (bool);
     /// @notice Run a governor-approved batch of calls, metering each call's
     ///         gross outflow of `asset()` against its declared `callCaps[i]`
-    ///         (issue #43) and the whole batch's net outflow against
     ///         `maxNetOutflow`. `callCaps.length == 0` skips per-call
     ///         metering (the emergency-rescue escape valve); a non-empty
     ///         array whose length differs from `calls` reverts inside the
@@ -230,7 +220,6 @@ interface ISyndicateVault {
     /// @notice True while a mint must not happen: an open proposal, or a settled
     ///         strategy holding residue no template can express in vault-asset
     ///         units. A residue that CAN be valued does not lock — it is priced
-    ///         into `depositNav()` instead (finding #3). Both the instant path
     ///         and the queue's deposit claim refuse on this one predicate.
     function depositsLocked() external view returns (bool);
     /// @notice Assets the vault is worth for pricing a MINT: idle float plus the

@@ -12,7 +12,6 @@ pragma solidity 0.8.28;
  *
  *   This contract has NO state and NO access control. The calling vault must
  *   enforce allowlists BEFORE delegatecalling here; per-call capital
- *   declarations (issue #43) are enforced HERE, inside the metered
  *   `executeBatch(calls, asset, caps)` overload — gross per-call outflow vs.
  *   its declared `caps[i]`, fail-closed, breach reverts the whole batch with
  *   `CallCapExceeded`. An empty `caps` array is the deliberate unmetered
@@ -61,7 +60,6 @@ contract BatchExecutorLib {
 
     /**
      * @notice Execute a batch of calls atomically, metering each call's gross
-     *         outflow of `asset` against its declared cap (issue #43).
      * @dev Called via delegatecall from vault, so `address(this)` == vault and
      *      the balance read below is the vault's own balance of `asset`. The
      *      SAME asset the vault's own batch-level meter uses — passed in by

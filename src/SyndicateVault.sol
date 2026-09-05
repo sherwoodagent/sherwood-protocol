@@ -86,30 +86,8 @@ contract SyndicateVault is
     ///      per-vault `maxPerformanceFeeBps` of 20%.
     uint256 public constant MAX_AGENT_FEE_BPS = FeeConstants.MAX_PERFORMANCE_FEE_BPS;
 
-    /// @notice SHE-205. Gas handed to the governor for each voting report
-    ///         (`notifyShareExit`, `notifyVotingWeightMoved`), and the amount
-    ///         the caller must be able to fund before the vault will run the
-    ///         share movement at all.
-    /// @dev    A fixed GRANT rather than "whatever is left", because whatever
-    ///         is left is attacker-chosen. EIP-150 lets a caller retain 1/64
-    ///         of its gas and forward the rest, so at a call site with almost
-    ///         no trailing work -- `delegate()` -- a transaction could be capped
-    ///         where the vault finished and the governor starved: the move
-    ///         landed, the ballot behind it stood, and 29% of the book forced
-    ///         a veto against a 40% bar. Granting a constant and REVERTING when
-    ///         the caller cannot fund it turns that into a failed transaction.
-    ///         The governor's work per report is bounded and attacker-
-    ///         independent (a handful of SLOADs, one `getVotes`, two SSTOREs);
-    ///         `test_she205_reportGasGrantCoversAColdRecompute` pins the grant
-    ///         at >= 2x a cold recompute. Unused gas is returned, so the grant
-    ///         is a floor on the transaction's gas limit, not a cost.
     uint256 public constant GOVERNANCE_REPORT_GAS = 200_000;
 
-    /// @dev SHE-205. Transient cache for the governor address, so a share
-    ///      movement that fires several reports pays the factory round-trip
-    ///      once. Set once per vault at creation (`SyndicateFactory`
-    ///      `_governorOf`), so a per-transaction cache can never be stale.
-    ///      Slot: `keccak256("sherwood.vault.governorCache") - 1`.
     bytes32 private constant GOVERNOR_CACHE_TSLOT = 0x3d666d22fecad437fb3fcdb6d4d99cadd645515732500b6579243e4b695e2d31;
 
     /// @notice Cap on the owner-set idle-liquidity floor (50%).
@@ -405,7 +383,6 @@ contract SyndicateVault is
     ///         `_residueTotal` prices MINTS, and after a cohort is owed part of
     ///         a residue only the remainder will ever reach the pool a new
     ///         depositor is buying into. Pricing the gross figure would charge
-    ///         them for value routed to somebody else — finding #3's shape
     ///         flipped, an over-charged depositor instead of an under-paid
     ///         redeemer.
     ///
@@ -445,7 +422,6 @@ contract SyndicateVault is
     ///         stops blocking mints, so a depositor could enter against a NAV
     ///         missing it. Bounded mispricing beats an unliftable lock, which is
     ///         this contract's stated doctrine everywhere else, and it is the
-    ///         "timeout backstop" issue #233 already points at.
     ///
     ///         EARLIEST MARK WINS. One slot rather than per-strategy expiry: the
     ///         count is almost always 0 or 1, and an attacker who can mark once
@@ -783,17 +759,6 @@ contract SyndicateVault is
         return IProposalStatus(_getGovernor()).getActiveProposal();
     }
 
-    /// @dev Proposal id to tag a queued `requestDeposit` with. `_activePid()`
-    ///      reads 0 until EXECUTE, but `requestDeposit` opens as soon as ANY
-    ///      non-terminal proposal exists, which is earlier. Exactly one top-level
-    ///      proposal is ever open on this vault at a time, so the governor's
-    ///      monotonic `proposalCount()` already names that open proposal in the
-    ///      gap; from EXECUTE onward the two agree.
-    /// @dev Deliberately a low-level staticcall, same reasoning as
-    ///      `_pricingSupply()`: `proposalCount()` is selector-stable but is not
-    ///      declared on `IProposalStatus`, which is intentionally narrowed. A
-    ///      missing selector degrades to pid 0 rather than reverting, so a
-    ///      nonstandard governor can never brick `requestDeposit`.
     function _openProposalPid() private view returns (uint256) {
         address gov = _getGovernor();
         uint256 active = IProposalStatus(gov).getActiveProposal();
@@ -818,7 +783,6 @@ contract SyndicateVault is
         _guardBatchCalls(calls);
         uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
         // The lib's unmetered 1-arg `executeBatch(Call[])` overload was
-        // deleted in issue #43 §5 — the metered 3-arg signature is the only
         // one left, so `abi.encodeCall` resolves it unambiguously again.
         (bool success, bytes memory returnData) =
             _executorImpl.delegatecall(abi.encodeCall(BatchExecutorLib.executeBatch, (calls, asset(), callCaps)));
@@ -836,28 +800,6 @@ contract SyndicateVault is
         // later proposal cannot strand them. Settle batches return float and
         // pass trivially; an execute batch that over-deploys reverts here.
         uint256 balanceAfter = IERC20(asset()).balanceOf(address(this));
-        // Custody-level net-outflow ceiling. Inflow batches (settle) pass
-        // trivially; the governor passes the proposal's maxCapital on execute,
-        // settlement and emergency paths, and honest unwinds are net-inflow, so
-        // the finite cap never binds them.
-        //
-        // This is a COARSE custody cap — it meters the vault's own `asset()`
-        // balance delta, so capital deployed INTO an allowlisted adapter counts as
-        // outflow the same as an extraction. What it GUARANTEES holds only
-        // TOGETHER with `_guardBatchCalls`: the meter bounds the `asset()` a
-        // single batch moves out of custody, and the guard closes the
-        // balance-invisible exfiltration routes — the callee gate (any target that
-        // is neither `asset()` nor allowlisted is refused) plus the retained
-        // selector checks beneath it. The precise extractable bound is the tier
-        // system's per-call coverage.
-        //
-        // TWO LAYERS, finest to coarsest:
-        //   1. `BatchExecutorLib.executeBatch`'s per-call meter: each call's gross
-        //      outflow against its proposer-declared `caps[i]`.
-        //   2. This function's `netOutflow` check: a batch-wide backstop against
-        //      `maxCapital`. When caps cover every moving call, layer 1 is
-        //      strictly tighter, so layer 2 only binds when caps are empty (the
-        //      emergency-rescue escape valve) or sum right up to `maxCapital`.
         uint256 netOutflow = balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;
         if (netOutflow > maxNetOutflow) revert MaxNetOutflowExceeded(netOutflow, maxNetOutflow);
         uint256 reserve = reservedQueueAssets();
@@ -906,13 +848,6 @@ contract SyndicateVault is
         if (impl == address(0)) revert SandboxNotConfigured();
         if (_proposalSandbox[pid] != address(0)) revert SandboxAlreadyMinted(pid);
 
-        // THE CEILING IS READ LIVE, not captured at propose. A ceiling tightened
-        // between propose and execute must bind, and this is the only read that
-        // can see it. Typed call on `msg.sender`, which `onlyGovernor` has
-        // already established IS the governor: fail closed, because a governor
-        // that cannot price its own tier-2 bound must not be funding arbitrary
-        // calldata. The failure is recoverable (the proposal expires with the
-        // capital never having left); what it prevents is not.
         uint256 ceiling = (totalAssets() * ISyndicateGovernor(msg.sender).tier2CallCapBps()) / 10_000;
         if (funding > ceiling) revert SandboxFundingExceedsCeiling(funding, ceiling);
 
@@ -965,155 +900,7 @@ contract SyndicateVault is
         emit ExecutorImplSet(old, newImpl);
     }
 
-    /// @dev Two-part batch gate: a privileged-TARGET denylist (Part 1, always
-    ///      runs), then the value-moving-SELECTOR allowlist (Part 2,
-    ///      registry-dependent). The two are independent — do not collapse them,
-    ///      and do not move Part 1 below Part 2's registry lookup.
-    ///
-    ///      PART 1: PRIVILEGED-TARGET DENYLIST. Selector-guarding is not enough,
-    ///      because this adversary needs no value-moving selector at all. The
-    ///      batch runs via delegatecall, so every sub-call reaches its target
-    ///      carrying `msg.sender == vault` — exactly what the withdrawal queue's
-    ///      `onlyVault` gate checks. `queue.queueRedeem(attacker, victimShares,
-    ///      pid)` therefore clears that gate and mints the attacker a claim on
-    ///      shares the queue already escrows for someone else, while every other
-    ///      guard reads it as harmless: the queue's entrypoints move ZERO vault
-    ///      `asset()` in-tx (the value leaves later via `queue.claim`), so the
-    ///      net-outflow meter, the queue-reserve floor and the buffer floor all
-    ///      see nothing, and coverage prices an uncertified target at tier 2 — a
-    ///      price a 1-wei proposal buys. Blocked as a target CLASS rather than a
-    ///      selector list, so the next privileged queue function is covered by
-    ///      default. UNCONDITIONAL, above Part 2's registry staticcall and both of
-    ///      its degrade-open returns: a queue steal is not priced, it is theft.
-    ///      SCOPE is exactly two addresses — the vault and its bound queue — not a
-    ///      target allowlist; adapters' own `onlyVault` entrypoints stay open.
-    ///
-    ///      PART 1b: transferFrom SOURCE GUARD (LP-ALLOWANCE CONFISCATION). Same
-    ///      loop, same unconditional posture, different adversary:
-    ///      `asset.transferFrom(victim, vault, victimBal)` spends
-    ///      `allowance[victim][vault]` — the very allowance every LP grants to
-    ///      deposit, which UIs routinely set to `type(uint256).max`. Every other
-    ///      meter is blind: net-outflow reads 0 because the vault's OWN balance
-    ///      rises, coverage prices the target against the vault's own maxCapital
-    ///      rather than a third party's wallet, and Part 2's
-    ///      `to == vault -> continue` exemption passes it outright. `from`
-    ///      (calldata bytes 4:36) is decoded here and MUST equal the vault itself.
-    ///
-    ///      `isAdapterAllowed` is DELIBERATELY NOT CONSULTED as a source
-    ///      allowlist: it encodes DESTINATION consent, not permission to spend an
-    ///      address's allowances to the vault. No honest batch pulls FROM a
-    ///      non-vault address — capital deploys via `approve(adapter)` plus the
-    ///      adapter pulling in its own code, and returns are pushes.
-    ///      `from == address(this)` stays permitted: it is semantically
-    ///      `transfer(x, amt)`, and `x` remains destination-guarded by Part 2.
-    ///
-    ///      PART 2a: THE CALLEE GATE (outer boundary). Runs on every call, before
-    ///      any selector is examined, and refuses any callee that is neither
-    ///      `asset()` nor TierRegistry-allowlisted — closing the
-    ///      unenumerable-selector class that repeated rounds of selector
-    ///      enumeration kept failing to cover.
-    ///
-    ///      PART 2b: VALUE-MOVING-SELECTOR ALLOWLIST (inner boundary). The
-    ///      net-outflow meter only sees the vault's own `asset()` balance delta,
-    ///      so `token.approve(attacker, max)` meters zero while the attacker
-    ///      drains via `transferFrom` in a later tx. Gating the spender/recipient
-    ///      of the guarded selectors bounds ERC20 exfiltration over the
-    ///      now-finite set of allowlisted callees: for approve /
-    ///      increaseAllowance / transfer the guarded address is arg 1 (bytes
-    ///      4:36); for transferFrom (legacy and Permit2) and DSToken `move` it is
-    ///      `to`, arg 2 (bytes 36:68); for Permit2 `approve` it is `spender`, ALSO
-    ///      arg 2, since Permit2's extra leading `token` arg shifts it one slot
-    ///      right of legacy `approve`. The address must be the vault itself (with
-    ///      the `asset()` exception below) or a TierRegistry-allowlisted adapter.
-    ///      Runs on every governor batch, settlement included.
-    ///
-    ///      SELF-TRANSFER FAST-PATH SCOPED TO `asset()`: `recipient ==
-    ///      address(this) -> continue` would otherwise skip the registry check for
-    ///      ANY token whose destination decodes to the vault, not only the one
-    ///      token the outer balance-diff meter independently verifies — letting a
-    ///      non-standard token execute arbitrary logic under
-    ///      `transferFrom(vault, vault, amount)` with zero verification anywhere.
-    ///      The fast-path therefore additionally requires
-    ///      `calls[i].target == asset()`.
-    ///
-    ///      RESIDUALS. (a) Exotic assets — ERC721 `setApprovalForAll`, ERC1155,
-    ///      LP-position NFTs — are refused as callees by default under PART 2a,
-    ///      closing the whole class including standards never enumerated here. If
-    ///      one is ever allowlisted anyway its non-ERC20 selectors pass this
-    ///      switch unexamined, so the operator invariant is: exotic-asset
-    ///      contracts MUST NOT be allowlisted as batch callees. (b) Coverage is
-    ///      PER-SELECTOR, NOT PER-ROUTER — do not read Permit2/DSToken/ERC1363 as
-    ///      guarded routers; only the enumerated selectors are, within the set of
-    ///      callees PART 2a admits. ERC-777 `operatorSend` and any other
-    ///      unenumerated router shape still pass unexamined on an allowlisted
-    ///      target. (c) Both parts trust calldata pattern-matching over verified
-    ///      balance movement for every token except `asset()`. (d) The
-    ///      self-transfer fast-path is structurally unreachable for
-    ///      Permit2-routed selectors, since a Permit2 call's target is the Permit2
-    ///      singleton — this fails CLOSED, so it is a possible over-restriction,
-    ///      not a fund-safety gap.
-    ///
-    ///      UNSET REGISTRY — FAILS CLOSED (pashov finding #1). With no registry
-    ///      wired (or a governor predating the getter), PART 2 cannot run. This
-    ///      used to RETURN, dropping the callee allowlist, the spender/recipient
-    ///      gate and the `UnrecognizedAssetSelector` branch — not a pricing-only
-    ///      degradation and not "by design": `asset.approve(attacker, max)` moves
-    ///      zero balance, so every meter reads zero, and licenses an unbounded
-    ///      pull in a LATER transaction. It now reverts
-    ///      `TierRegistryUnresolved`, matching `PortfolioStrategy`,
-    ///      `MorphoSupplyStrategy` and `ConcentratedLiquidityStrategy`, which
-    ///      already fail closed on the same walk.
-    ///
-    ///      LIVENESS COST, ACCEPTED: a governor that IS registry-less has its
-    ///      batches — `settleProposal` / `unstick` / every exit — reverting until
-    ///      the factory owner calls `pushWiring(governor)`. That state is
-    ///      unreachable for anything this factory deploys (mandatory
-    ///      `SyndicateFactory.InitParams.tierRegistry`, mandatory
-    ///      `SyndicateGovernor.initialize` arg, and `setTierRegistry` refusing
-    ///      zero and codeless), so only governors predating those checks can hit
-    ///      it, and for them a one-call rewire is preferable to running the
-    ///      allowlist-free window the finding describes.
-    ///
-    ///      PART 1 IS NOT AFFECTED: it needs no registry and sits above the
-    ///      resolve. Pinned by `test_targetGate_bitesEvenWithNoTierRegistryWired`
-    ///      and `test_targetGate_bitesEvenWhenGovernorHasNoTierGetter`, so
-    ///      relocating Part 1 below the resolve converts a privileged-callee
-    ///      rejection into the registry error and fails a test.
     function _guardBatchCalls(BatchExecutorLib.Call[] calldata calls) private view {
-        // PRIVILEGED-CALLEE GATE, ahead of everything else.
-        //
-        // The batch runs under delegatecall, so every call carries
-        // `msg.sender == vault`. For the QUEUE that is decisive: its `onlyVault`
-        // gate is satisfied by a batch that merely names it as a target.
-        //
-        // For the VAULT the reason is different, and worth stating precisely so
-        // nobody re-permits it on a wrong premise. `msg.sender == vault` does NOT
-        // open this contract's self-gated functions — `settleRedeem`/
-        // `settleDeposit` require the queue, and it satisfies neither `onlyOwner`,
-        // `onlyGovernor` nor the factory gate. The exposure is the PERMISSIONLESS
-        // surface instead, chiefly `requestDeposit`: a batch naming the vault can
-        // escrow the vault's own float into the queue while directing the
-        // resulting deposit claim to an attacker. That one IS metered — the float
-        // genuinely leaves — so blocking the vault is defense-in-depth rather than
-        // a second live hole; it removes the standing dependency on no
-        // permissionless entrypoint ever becoming dangerous to call as ourselves.
-        //
-        // No other meter catches the queue case. `queue.queueRedeem(attacker,
-        // victimShares, pid)` mints a redeem claim against shares another owner
-        // escrowed while moving ZERO `asset()`, the value leaves in a LATER
-        // transaction via `queue.claim` which nothing meters, and coverage prices
-        // an uncertified target at tier 2 — a 1-wei proposal any single approver
-        // clears.
-        //
-        // BEFORE THE REGISTRY LOOKUP, DELIBERATELY. The selector guard below
-        // returns early for a governor with no registry, and that exemption is a
-        // documented default for PRICING a call — not for refusing a capability.
-        //
-        // A TARGET CLASS, NOT A SELECTOR LIST: enumerating today's privileged
-        // functions would leave the next one unprotected, and nothing a batch
-        // legitimately does names these two addresses. `stampSettlement` shows why
-        // breadth matters — it is one-shot per pid, so one batch can pre-burn the
-        // settlement slot of proposals that have not happened yet.
         for (uint256 i = 0; i < calls.length; i++) {
             address target = calls[i].target;
             if (_isPrivilegedBatchTarget(target)) {
@@ -1171,24 +958,6 @@ contract SyndicateVault is
 
         address asset_ = asset();
         for (uint256 i = 0; i < calls.length; i++) {
-            // ── PART 2a: target-based callee gate (issue #166, Option B) ──
-            // Runs on EVERY call — before the short-calldata continue below, so
-            // empty-calldata and native-`value` calls are gated too. asset() is
-            // the sole exemption (design.md Decision 2); everything else must be
-            // an allowlisted, codehash-current adapter.
-            //
-            // READS THE CALLEE AXIS (`isCallableTarget`), NOT `isAdapterAllowed`
-            // (pashov finding #14). The two used to be one registry bit, so a
-            // demotion — reachable permissionlessly, since `ChallengeGame.file`
-            // only needs the pair to appear in the executed proposal's calldata,
-            // and every execute batch names `(clone, execute.selector)` — revoked
-            // the vault's ability to CALL the very clone holding its capital.
-            // `settleProposal`, `unstick` and `finalizeEmergencySettle` all
-            // reverted here, the proposal pinned in `Executed`, and every LP exit
-            // shut. The recipient/spender checks in PART 2b still read
-            // `isAdapterAllowed`, so a demoted clone remains reclaimable but
-            // unfundable. No lifecycle state is grandfathered: this stays one
-            // unconditional rule, evaluated per call, exactly as before.
             address target = calls[i].target;
             if (target != asset_ && !ITierRegistry(registry).isCallableTarget(target)) {
                 revert DisallowedBatchCallee(target);
@@ -1254,27 +1023,6 @@ contract SyndicateVault is
                 }
                 continue;
             } else {
-                // UNRECOGNIZED SELECTOR ON THE ONE EXEMPT TARGET.
-                //
-                // PART 2a lets `asset()` through without an allowlist check, on
-                // the premise that the outer `netOutflow` meter independently
-                // verifies it via a balance diff. A balance diff sees VALUE
-                // MOVEMENT; it does not see an AUTHORIZATION grant. ERC-777
-                // `authorizeOperator` — and any allowance-delegation shape not
-                // enumerated above — moves zero balance in-batch and licenses an
-                // unbounded pull in a LATER transaction, after every meter here
-                // has passed. Nothing downstream catches it either: declared at
-                // cap 0, `requiredCoverage` prices to 0, so no guardian books
-                // coverage, no proposer bond is locked, and `ChallengeGame.file`
-                // reverts on the empty approver set — the proposal is
-                // unchallengeable.
-                //
-                // Scoped deliberately to `asset()`: every other target already
-                // cleared PART 2a's allowlist, and the terminal `continue` is
-                // load-bearing for them, since ordinary batch calls carry
-                // selectors this switch should not enumerate. The standard ERC-20
-                // READS are carved out: a closed, enumerable set that grants
-                // nothing and that batches legitimately call on `asset()`.
                 if (target == asset_ && !_isBenignAssetRead(sel)) {
                     revert UnrecognizedAssetSelector(sel);
                 }
@@ -1294,55 +1042,11 @@ contract SyndicateVault is
         }
     }
 
-    /// @dev SHE-209 vault-binding for the code-class allowlist path.
-    ///
-    ///      `TierRegistry.isAdapterAllowed` admits a recipient either by an
-    ///      explicit owner grant OR by the CODE-CLASS fallback: any address
-    ///      whose codehash is the ERC-1167 clone of a certified template. The
-    ///      class fallback proves the recipient's CODE is byte-identical to a
-    ///      vetted template, but a clone's fund destination lives in STORAGE
-    ///      (`_vault`), set by an UNPERMISSIONED `initialize`. So anyone can
-    ///      `Clones.clone(template)`, `initialize(_vault = attacker)`, and the
-    ///      rogue clone passes `isAdapterAllowed` (and is priced at the
-    ///      template's cheap certified tier); the strategy's `_pushAllToVault`
-    ///      then ships the batch's funds to the attacker.
-    ///
-    ///      Bind every CLASS MEMBER to THIS vault: a recipient with
-    ///      `classOf != 0` must name this vault as its own
-    ///      (`vault() == address(this)`). This is the one provenance codehash
-    ///      cannot supply. The exemption is "not a class member", NOT
-    ///      "explicitly granted": routers, Permit2 and plain tokens are exempt
-    ///      because they are not clones of a certified template, while a clone
-    ///      of a certified template is bound even when the owner ALSO granted
-    ///      it per-address via `setAdapterAllowed` (the intended per-clone
-    ///      pattern, `script/Deploy.s.sol`). That tightening is deliberate: an
-    ///      explicit grant vets the address, and the binding then pins that the
-    ///      address still pays THIS vault — the two checks are independent.
-    ///
-    ///      `classOf` is a TYPED call. The typed `isAdapterAllowed` on the line
-    ///      above already proved the registry is live and answering, and
-    ///      `classOf` does a strict subset of that call's work (both read
-    ///      `_classOf`), so a registry that cannot answer it is a misconfigured
-    ///      registry, not a "registry with no class concept" — and an
-    ///      out-of-gas child is indistinguishable from either by a raw probe.
-    ///      Fail CLOSED by letting the revert bubble (Carlos, PR #284 finding 2).
-    ///
-    ///      `vault()` is a raw, length-checked probe read via `_readVaultOf`:
-    ///      unreadable, short, dirty-upper-bits or mismatched on a CONFIRMED
-    ///      class member → revert `AdapterVaultMismatch`. Fail CLOSED: a class
-    ///      member that cannot prove it belongs to this vault must not be paid.
     function _requireRecipientVaultBinding(address registry, address recipient) private view {
         if (ITierRegistry(registry).classOf(recipient) == bytes32(0)) return;
         if (_readVaultOf(recipient) != address(this)) revert AdapterVaultMismatch(recipient);
     }
 
-    /// @dev Staticcall-safe `vault()` read, mirroring
-    ///      `PortfolioStrategy._readAddress`: revert, short return, or dirty
-    ///      upper bits all resolve to `address(0)`, which the caller treats as
-    ///      a mismatch. Masks instead of `abi.decode`, which reverts with EMPTY
-    ///      returndata on a dirty word — same refusal, worse diagnostics
-    ///      (Carlos, PR #284 finding 5). `recipient` is a confirmed class
-    ///      member here, so it always has code; no `code.length` pre-check.
     function _readVaultOf(address recipient) private view returns (address) {
         (bool ok, bytes memory ret) = recipient.staticcall(abi.encodeWithSignature("vault()"));
         if (!ok || ret.length < 32) return address(0);
@@ -1354,13 +1058,6 @@ contract SyndicateVault is
         return address(uint160(word));
     }
 
-    /// @dev The standard ERC-20 view selectors, which a governor batch may
-    ///      legitimately call on `asset()` and which cannot grant, move or
-    ///      delegate anything. An explicit carve-out from the
-    ///      unrecognized-selector rejection above, so that rejection stays pointed
-    ///      at state-changing selectors on the one target that skips PART 2a.
-    ///      Deliberately excludes `approve`/`transfer`/`transferFrom` and their
-    ///      siblings, which are gated on their spender/recipient above.
     function _isBenignAssetRead(bytes4 sel) private pure returns (bool) {
         return sel == 0x70a08231 // balanceOf(address)
             || sel == 0x313ce567 // decimals()
@@ -1393,31 +1090,6 @@ contract SyndicateVault is
         if (asset_ != asset()) revert InvalidAsset();
         if (to == address(0)) revert ZeroAddress();
         uint256 spendable = IERC20(asset_).balanceOf(address(this));
-        // BOTH LIABILITIES, not just the queue's (pashov 2026-08 finding #23).
-        // `totalAssets()` already treats the vault as owing
-        // `reservedQueueAssets() + _escrowedFeeLiability()`; this guard counted
-        // only the first, so a later settlement's fee could spend float already
-        // booked as an earlier recipient's escrow — after which THEIR
-        // `claimUnclaimedFees` reverts `AmountExceedsBalance` with no recovery
-        // path, since `_payFee`'s escrow-on-failure is one-shot per settlement.
-        //
-        // THE CLAIM PATH EXEMPTS ITSELF, STRUCTURALLY — there is no special
-        // case here and there must not be one. `claimUnclaimedFees` decrements
-        // `_escrowedFees[vault][token]` BEFORE calling this
-        // (`SyndicateGovernor.claimUnclaimedFees`), so by the time this runs the
-        // liability no longer includes the amount being claimed and the
-        // subtraction below leaves exactly enough. Reordering that decrement to
-        // after the transfer would brick every escrowed claim.
-        //
-        // The LP paths (`_availableFloat`, `_withdraw`) deliberately do NOT
-        // subtract escrow: `totalAssets()` nets it already, so an LP's share
-        // entitlement is reduced by it rather than reserved against it, and
-        // double-counting there would refuse withdrawals no liability requires.
-        //
-        // `_escrowedFeeLiability()` degrades to 0 on an unreadable governor.
-        // Stated as a decision: that is the LIVENESS direction on a path whose
-        // own failure mode is a lost fee, and it reproduces exactly the
-        // pre-existing behaviour rather than inventing a stricter one.
         uint256 reserve = reservedQueueAssets() + _escrowedFeeLiability();
         spendable = spendable > reserve ? spendable - reserve : 0;
         if (amount > spendable) revert AmountExceedsBalance();
@@ -1478,13 +1150,6 @@ contract SyndicateVault is
         return _activeStrategy();
     }
 
-    /// @dev Reads the active proposal's strategy through the governor's scalar
-    ///      `strategyOf` getter. Returns `address(0)` when no proposal is active
-    ///      OR when the active proposal opted out. Still wrapped in try/catch: an
-    ///      `address` return says nothing about EXISTENCE, and the vault (UUPS)
-    ///      and governor (beacon) upgrade on independent paths, so a vault impl
-    ///      calling `strategyOf` can go live before the governor beacon carries
-    ///      it. The only consumer is an off-chain-facing view.
     function _activeStrategy() internal view returns (address) {
         address gov = _getGovernor();
         if (gov == address(0)) return address(0);
@@ -1534,206 +1199,25 @@ contract SyndicateVault is
         internal
         override(ERC20Upgradeable, ERC20VotesUpgradeable)
     {
-        // HIGH-WATER MARK RESET, PRE-STATE HALF — A MINT INTO AN EMPTY POOL
-        // (SHE-206). The post-state check below cannot see the state it was
-        // written to catch when the pool empties through the ASYNC lane: the
-        // instant `_pricingSupply()` reaches zero is `stampSettlement` on the
-        // queue, which moves no ERC20 value and therefore never reaches this
-        // hook at all. By the time a mint does arrive, the post-state supply is
-        // nonzero again and the stale mark survives into the new epoch.
-        //
-        // Reading the PRE-state of a mint catches exactly that: `from ==
-        // address(0)` with nothing live to price is a fund being re-seeded,
-        // whatever emptied it and whenever. `_initHighWaterMarkIfUnset` — which
-        // both mint entrypoints call immediately after — then seeds the mark at
-        // the re-seeding depositor's own entry price.
-        //
-        // MINTS ONLY, deliberately. A burn or transfer cannot turn an empty
-        // pricing supply into a live one, so the pre-state is never the
-        // deciding read for them and this would be a wasted `_pricingSupply()`
-        // staticcall on every transfer.
         if (from == address(0) && _pricingSupply() == 0) {
             _highWaterPricePerShare = 0;
         }
 
         super._update(from, to, value);
 
-        // HIGH-WATER MARK RESET ON FULL DRAIN.
-        //
-        // `_highWaterPricePerShare` is seeded once, at the first mint, and
-        // otherwise only ever advances. It was NEVER reset when `totalSupply()`
-        // returns to zero, while the ERC-4626 share/asset SCALE is independently
-        // re-derived from `(residualAssets + 1)` on the very next deposit. The
-        // result: a re-seeding deposit's price-per-share can land at
-        // `(residualAssets + 1)x` the STALE mark, and `aboveHighWaterMark` then
-        // reads almost the entire new principal as performance-fee base on a
-        // zero-P&L re-seed — charged against brand-new capital that never earned a
-        // cent. Reaching `totalSupply() == 0 && totalAssets() > 0` is not exotic:
-        // redeem-flooring dust, the queue's deliberate dust release,
-        // `_unclaimedFees` escrow, or a bare ERC20 donation all leave residual
-        // assets behind an empty share supply.
-        //
-        // Zeroing here, on EVERY burn/mint/transfer that empties supply (this hook
-        // is the single OZ chokepoint for all of them), makes the next mint treat
-        // the fund as freshly created. A mint in the SAME call as the draining
-        // burn is impossible for a single ERC20 `_update`; sequential
-        // burn-then-mint across two calls is exactly the case this closes.
-        //
-        // KEYED ON `_pricingSupply()`, NOT `totalSupply()` (SHE-206). Every
-        // pricing path in this contract divides by `_pricingSupply()`, and
-        // `aboveHighWaterMark` multiplies by it — so a guard reading the raw
-        // supply is measuring a different fund from the one the fee is charged
-        // against. The two disagree for the whole window between
-        // `stampSettlement` and the last `claim`, where the stamped queue
-        // shares are still in `totalSupply()` but are no longer a claim on the
-        // pool. "Every remaining share is a stamped queue share" IS a fully
-        // drained fund by the only measure the price uses.
-        //
-        // SAFE AGAINST THE CLAIM BURN BY ORDERING: `VaultWithdrawalQueue.claim`
-        // decrements `_stampedUnclaimedShares` BEFORE calling `settleRedeem`,
-        // so both legs of this subtraction have moved by the time this read
-        // runs and it can never under-count by the burn.
         if (_pricingSupply() == 0) {
             _highWaterPricePerShare = 0;
         }
 
-        // SHE-205: REPORT SHARES LEAVING SUPPLY WHILE A VOTE IS OPEN.
-        //
-        // The LP veto bar is a fraction of a supply SNAPSHOT, but this vault
-        // shuts deposits and redemptions on DIFFERENT predicates: deposits from
-        // `openProposalCount() != 0` (Draft onward), redemptions only from
-        // `getActiveProposal() != 0` (EXECUTE onward). For the whole vote,
-        // money cannot come in but can leave — so a depositor who arrives one
-        // block before `propose` is counted in the denominator and can exit
-        // before settlement, lifting the bar without ever casting a vote. The
-        // governor nets these shares back out.
-        //
-        // MINTS ARE NOT REPORTED (`from == 0`) and need not be: deposits are
-        // already shut for the entire window, so supply can only fall.
-        //
-        // BURNS ONLY (`to == address(0)`), NOT EVERY OUTBOUND MOVE. The veto
-        // denominator is a SUPPLY figure, and only a burn changes supply. A
-        // holder-to-holder transfer leaves the electorate exactly as large as
-        // it was, so reporting one here would net out shares that never left.
-        //
-        // Reporting gross outbound movement instead is unbounded: plain
-        // `transfer` is not gated during a proposal, so a holder of dust could
-        // bounce the same shares between two addresses they control and drive
-        // the netted denominator anywhere they liked -- to `0`, where the veto
-        // check is skipped and a 100%-Against book is ignored, or to `1`, where
-        // the threshold rounds to `0` and every proposal is Rejected with
-        // nobody voting. Both were reachable for the cost of gas. Keying on the
-        // burn makes the counter monotonic in something an attacker must
-        // actually spend: their own capital, bounded by what they hold.
-        //
-        // THE BALLOT IS NOT HANDLED HERE. A ballot is a claim on VOTING
-        // WEIGHT, not on supply, and it must follow the weight through every
-        // kind of move -- burn, transfer, delegation change -- or a voter can
-        // hand their shares to a second address and redeem there with the
-        // ballot intact. That report lives in `_moveDelegateVotes` below, the
-        // one OZ hook every one of those paths runs through.
-        //
-        // THE QUEUE IS SKIPPED. Escrowed redeem shares are already netted out
-        // of the denominator via the queue's checkpointed voting weight, and a
-        // queued claim burning them mid-vote would otherwise subtract the same
-        // shares twice. There is no "queued during the window" case to worry
-        // about: `requestRedeem` requires `redemptionsLocked()`, which is
-        // `getActiveProposal() != 0` -- EXECUTE onward -- and no proposal can be
-        // Pending while another is active (`propose` needs
-        // `_openProposalCount == 0`). Shares are either in the queue at the
-        // snapshot and netted through `queueVotes`, or they burn through
-        // `redeem` and are reported here. A reader relaxing that gate would
-        // open the gap; this comment is the warning.
-        //
-        // Nor a "cancelled then redeemed" case, which would subtract the same
-        // shares once through `queueVotes` and again here. A redeem request
-        // is tagged with the ACTIVE proposal that locked redemptions, and
-        // `VaultWithdrawalQueue.cancel` refuses once that proposal's settle
-        // price is stamped. An Executed proposal has no exit but
-        // `settleProposal`, which stamps before `_decOpen` lets the next
-        // proposal exist -- so by the time any later vote is open, every
-        // request from the previous one is stamped and uncancellable. The
-        // two gates (redeem-only-while-active, cancel-only-before-stamp)
-        // together are what make "netted exactly once" true.
-        //
-        // THE DEPOSIT LOCK IS LOAD-BEARING TOO. Ballots recompute against
-        // live weight from ANY source, and mints are not reported to the
-        // denominator. If a deposit could land mid-vote, `vote -> redeem ->
-        // re-deposit` would restore a ballot against an already-shrunk
-        // denominator: a solo 29% veto with capital intact. That is blocked
-        // only because both mint entrypoints are shut for the whole window
-        // (`depositsLocked()` from Draft onward). Relaxing the deposit lock
-        // during a vote re-opens SHE-205; treat it like the `requestRedeem`
-        // gate above.
-        //
-        // The same seam admits RENTED weight: a voter who has fully exited
-        // gets their ballot back if another holder later delegates to them.
-        // Not a break -- that coalition holds 29% + 29% = 58% of the book,
-        // worse than the 40% an honest coalition needs -- but it is where
-        // the restore direction ends, and it matters the day shares are
-        // rentable from a passive market.
-        //
-        // GAS-FLOORED, NOT BEST-EFFORT: see `_reportToGovernor` for why a
-        // report that could be starved is a report that can be skipped on
-        // purpose, and for the exact degraded outcome when the governor
-        // itself cannot answer.
         if (to == address(0) && from != address(0) && from != _withdrawalQueue && value != 0) {
             _reportToGovernor(abi.encodeWithSignature("notifyShareExit(uint256)", value));
         }
 
-        // AUTO-DELEGATE ON EVERY RECEIPT. Runs AFTER `super._update` so the
-        // recipient's post-receipt balance is what checkpoints. Holders that
-        // explicitly delegated away keep their choice.
-        //
-        // The behaviour is kept because `getPastVotes == balance` is what makes
-        // this vault's OWN governance readable: a holder who never calls
-        // `delegate` still carries weight, which every snapshot-based read here
-        // assumes. Removing it would silently zero the voting weight of every
-        // non-delegating holder.
-        //
-        // The heal is permissionless and needs no action from the holder: it also
-        // runs on a zero-value transfer, so anyone can arm a stranded undelegated
-        // holder by sending it 0 shares.
         if (to != address(0) && delegates(to) == address(0)) {
             _delegate(to, to);
         }
     }
 
-    /// @dev SHE-205: REPORT A DROP IN LIVE VOTING WEIGHT WHILE A VOTE IS OPEN.
-    ///
-    ///      This is the single OZ chokepoint through which voting units move:
-    ///      `_transferVotingUnits` (every transfer and burn) resolves both
-    ///      sides through `delegates()` and lands here, and `_delegate` (every
-    ///      delegation change) lands here with the old and new delegatee. So
-    ///      `from` is exactly the address whose `getVotes` just fell, which is
-    ///      the only address that could have cast a ballot with that weight.
-    ///      The governor recomputes that ballot as `min(cast, getVotes(from))`
-    ///      -- see `SyndicateGovernor.notifyVotingWeightMoved`.
-    ///
-    ///      Reported AFTER `super` so the governor reads the post-move
-    ///      checkpoint. BOTH sides are reported: the losing side so a ballot
-    ///      is cut the moment its weight leaves, the gaining side so a ballot
-    ///      cut earlier is restored when the weight comes back. Without the
-    ///      second, an honest voter's round trip -- or a spender pulling on an
-    ///      allowance and returning the shares -- would delete the ballot for
-    ///      good, since `_hasVoted` blocks a re-vote. The queue never votes
-    ///      and is skipped on either side.
-    ///
-    ///      The restore is BOUNDED BY THE WINDOW. Weight that leaves inside
-    ///      the vote and returns only after `voteEnd` does not reopen the
-    ///      tally -- the governor stops listening there, for the same reason
-    ///      the denominator freezes there: a verdict that could still move
-    ///      after the window is a race between whoever calls
-    ///      `resolveProposalState`, and the attacker's version (vote, exit,
-    ///      re-acquire after `voteEnd` against the shrunk denominator) is
-    ///      exactly what the freeze forecloses. So "a round trip is a no-op"
-    ///      holds for round trips that complete inside the window;
-    ///      `test_she205_suspensionAtVoteEndIsNotRestored` pins the boundary.
-    ///
-    ///      Gas-floored, not best-effort: see `_reportToGovernor`. This is
-    ///      the call site with the least trailing work (`delegate()` does
-    ///      nothing after it), which is precisely where a best-effort report
-    ///      could be starved.
     function _moveDelegateVotes(address from, address to, uint256 amount) internal override {
         super._moveDelegateVotes(from, to, amount);
         if (from == to || amount == 0) return;
@@ -1746,43 +1230,6 @@ contract SyndicateVault is
         }
     }
 
-    /// @dev SHE-205. Deliver one voting report to this vault's governor with a
-    ///      FIXED gas grant, or revert if the caller cannot fund it.
-    ///
-    ///      THE 63/64 RULE IS THE THREAT. A `CALL` forwards at most
-    ///      `gasleft - gasleft/64`, and the caller keeps the rest. Both
-    ///      reports run inside ERC20 hooks, so the "rest" is whatever the
-    ///      hook's caller still has to do -- and on `delegate()` that is three
-    ///      function epilogues. A transaction capped just above that let the
-    ///      delegation land while the governor ran out of gas mid-recompute:
-    ///      the report was best-effort, so nothing reverted, and a ballot
-    ///      stood behind weight that had left. From there the round-2 exploit
-    ///      replayed verbatim. The same shape reached the burn report
-    ///      (`notifyShareExit`) and the RESTORE side of a transfer, where
-    ///      starving it destroyed an honest LP's ballot for the window.
-    ///
-    ///      So: require that the caller can fund `GOVERNANCE_REPORT_GAS` in
-    ///      full under the 63/64 rule, then grant exactly that. Starvation
-    ///      becomes a revert of the whole share movement, which a well-formed
-    ///      transaction never hits (estimation sizes the limit) and a capped
-    ///      one cannot get past. The check runs BEFORE the factory lookup so
-    ///      the lookup cannot be starved either.
-    ///
-    ///      STILL NEVER A BRICK. The governor call itself is unchecked: a
-    ///      governor that reverts, or is missing, drops the report and LP
-    ///      flow continues. That degraded outcome -- capped ballots over an
-    ///      unnetted denominator -- is STRICTLY HARDER to veto than pre-fix
-    ///      only when the governor lacks the hooks entirely. A report that
-    ///      failed for any other reason on an otherwise working governor
-    ///      would be strictly easier, which is exactly why a fixed grant is
-    ///      used rather than "what is left": within the grant, the work is
-    ///      bounded and attacker-independent, so the only way to lose a
-    ///      report is a governor that cannot do its job at all.
-    ///
-    ///      The factory lookup is a raw staticcall, cached per transaction:
-    ///      it is a mapping getter set once at vault creation, and a factory
-    ///      that cannot answer must not brick share flow any more than a
-    ///      governor that cannot.
     function _reportToGovernor(bytes memory data) private {
         uint256 g = gasleft();
         uint256 fundable = g - g / 64;
@@ -1795,11 +1242,6 @@ contract SyndicateVault is
         ok; // deliberately unchecked — see above
     }
 
-    /// @dev SHE-205. The governor address, looked up through the factory once
-    ///      per transaction and held in transient storage. A raw staticcall so
-    ///      a factory that cannot answer reads as "no governor" rather than
-    ///      reverting the share movement; the gas floor in `_reportToGovernor`
-    ///      has already run, so this call cannot be starved into that branch.
     function _cachedGovernor() private returns (address gov) {
         bytes32 slot = GOVERNOR_CACHE_TSLOT;
         // solhint-disable-next-line no-inline-assembly
@@ -1891,7 +1333,6 @@ contract SyndicateVault is
     ///      This closes the MINT side only. Queued redeemers stamped in the same
     ///      `onProposalSettled` call are still priced at the float-only figure
     ///      and remain underpaid by the residue — that is the FAIRNESS half of
-    ///      finding #3 (issue #233), deliberately not closed here; see
     ///      `docs/nav-residue-design.md`. This PR closes the ATTACK half.
     /// @notice Public because the withdrawal queue reads it: a queued deposit
     ///         claim mints at the live price and must be refused on exactly the
@@ -1947,7 +1388,6 @@ contract SyndicateVault is
     ///         gate — `hasUndeliveredValue` stays true while `own` exceeds the
     ///         dust floor even when `deliverable` is zero. That is a real,
     ///         accepted liveness cost of the lock and the reason the round
-    ///         ledger's timeout/guardian backstop exists (issue #233); it is
     ///         deliberately not improvised here.
     function collectResidue(address strategy) external nonReentrant returns (uint256 collected) {
         return _recoverResidueVia(strategy, _SEL_SWEEP);
@@ -2040,14 +1480,6 @@ contract SyndicateVault is
     ///      here.
     function _recoverResidueVia(address strategy, bytes4 selector) private returns (uint256 collected) {
         uint256 known = _residueAmount[strategy];
-        // RECOVER FIRST, ASK ABOUT THE BOOKS AFTER. This used to return early
-        // when nothing was recorded, which was safe only while `sweep()` was
-        // itself permissionless — a strategy holding assets the vault never
-        // recorded (an unreadable probe, a zero cap) could still be emptied by
-        // calling it directly. Now that the templates' recovery entry points are
-        // vault-only, that escape route runs through here, so an early return
-        // would strand those assets permanently. The call below is a no-op
-        // against an address with nothing to give, including an EOA.
         bool tracked = known != 0 || _residueUnvalued[strategy];
 
         uint256 before = IERC20(asset()).balanceOf(address(this));
@@ -2057,14 +1489,6 @@ contract SyndicateVault is
         collected = IERC20(asset()).balanceOf(address(this)) - before;
         _payCohortShare(strategy, collected);
 
-        // Nothing on the books to reconcile. Anything that DID arrive has
-        // already been through `_payCohortShare` above, which is the whole
-        // reason that runs before the bookkeeping rather than after it — and
-        // it is a real split precisely when this strategy has a settlement
-        // behind it, i.e. `_residuePid` survives an amount that went to zero.
-        // For an address that never settled the pid is 0, `_cohortFractionOf`
-        // declines, and the arrival belongs to the stayers in full; there is
-        // no cohort to owe.
         if (!tracked) return collected;
 
         // A CODELESS STRATEGY OWES NOTHING. It can hold nothing and answer
@@ -2110,38 +1534,6 @@ contract SyndicateVault is
         value = abi.decode(ret, (uint256));
     }
 
-    /// @dev Record `strategy` as still owing, if it says so. Called at
-    ///      settlement, once, for the strategy that just settled.
-    ///      Idempotent on the count: a strategy already in the set is not
-    ///      double-counted, which matters because the same clone could in
-    ///      principle be named by two proposals.
-    ///
-    ///      MARKS ONLY ON A DEFINITE, READABLE "YES". An unreadable probe leaves
-    ///      the strategy unmarked — deposits stay OPEN — and that direction is
-    ///      forced, not preferred.
-    ///
-    ///      Marking fail-closed was tried and is UNSAFE, because the mark would
-    ///      be unremovable: `collectResidue` can only clear on a definite
-    ///      readable zero, so an address that can never answer is marked once
-    ///      and never cleared, and `depositsLocked()` returns true for the rest
-    ///      of the vault's life with no permissionless exit. That is reachable
-    ///      by any registered agent, not theoretical: `SyndicateGovernor.propose`
-    ///      stores `strategy` unvalidated and explicitly skips its own probe for
-    ///      codeless addresses (see the `strategy.code.length != 0` guard there
-    ///      and `test_propose_eoaStrategySucceedsAtPropose`), nothing ever calls
-    ///      the field, and a staticcall to a codeless address succeeds with
-    ///      empty returndata — so an EOA label settles normally and then bricks
-    ///      every deposit path, instant and queued, permanently.
-    ///
-    ///      A PERMANENT DoS IS WORSE THAN THE SUPPRESSION IT GUARDS, which is
-    ///      the same trade `_PROBE_GAS` already documents and the same doctrine
-    ///      `IStrategyDelivery.hasUndeliveredValue` and both templates state. A
-    ///      proposer who degrades the probe suppresses a MITIGATION — the
-    ///      recoverable direction — and the answer to that is a measured gas
-    ///      bound, not a lock nobody can lift. The codeless short-circuit below
-    ///      is the same treatment `address(0)` gets and the same rule
-    ///      `propose` applies: a guard that only makes sense for a CONTRACT must
-    ///      establish there is one first.
     function _recordResidue(address strategy, uint256 pid, uint256 cap) private {
         if (strategy == address(0) || strategy.code.length == 0) return;
 
@@ -2157,19 +1549,6 @@ contract SyndicateVault is
         _residueCap[strategy] = cap;
 
         uint256 known = _residueAmount[strategy];
-        // FIRST COHORT KEEPS THE CLAIM. Re-pointing this at a later proposal
-        // while the strategy still owes for an earlier one would route the older
-        // cohort's arrivals to the newer cohort — real money, misallocated
-        // between two sets of exited LPs.
-        //
-        // That is unreachable today, but only because of an invariant in ANOTHER
-        // contract: `BaseStrategy.execute` requires `State.Pending`, so a settled
-        // clone cannot be executed again, cannot reach Settled again, and so
-        // never returns here. This repo has been bitten before by a local branch
-        // silently depending on a cross-contract invariant (see
-        // `VaultWithdrawalQueue`'s stamp-monotonicity note), so the guard is made
-        // local rather than argued. A second cohort simply goes unrecorded,
-        // which leaves it exactly where it is today: paid the float-only floor.
         if (known == 0) _residuePid[strategy] = pid;
         if (outstanding == known) return;
         // ONLY THE STAYERS' PART PRICES A MINT — see `_residueNet`.
@@ -2190,19 +1569,6 @@ contract SyndicateVault is
         _residueAmount[strategy] = outstanding;
     }
 
-    /// @dev The exiting cohort's fraction of `pid`, frozen by the queue at its
-    ///      stamp. `(0, 0)` means "no cohort, or cannot be read", and every
-    ///      caller treats that as the whole amount belonging to the pool.
-    ///
-    ///      RAW STATICCALL, DEGRADING TO ZERO. The queue is not a proxy and can
-    ///      never gain a selector, so a vault paired with a queue deployed
-    ///      before this function existed would revert on a typed call — and this
-    ///      sits on `collectResidue`, which is the ONLY exit from the
-    ///      unvaluable-residue deposit lock. A typed call there turns an
-    ///      incoherent pairing into bricked deposits; degrading skips the junior
-    ///      leg instead, leaving redeemers exactly where they are today. Same
-    ///      doctrine as `_pricingSupply` and `ExposureLedger._feedPriceX8`: fail
-    ///      OPEN on a liveness path.
     function _cohortFractionOf(uint256 pid) private view returns (uint256 shares, uint256 den) {
         address q = _withdrawalQueue;
         if (q == address(0) || pid == 0) return (0, 0);
@@ -2223,32 +1589,6 @@ contract SyndicateVault is
         return amount - Math.mulDiv(amount, shares, den);
     }
 
-    /// @dev Hand the exiting cohort their share of an arrival, and leave the
-    ///      rest where it landed.
-    ///
-    ///      THE FAIRNESS HALF OF FINDING #3. The settle stamp is computed from
-    ///      float alone, so a redeemer claiming against it is paid as though the
-    ///      residue were worth zero — and when it later comes home it lifts the
-    ///      price for whoever STAYED. The money is not lost; it goes to the
-    ///      wrong people. This pays it to the right ones.
-    ///
-    ///      SPLIT BY THE COHORT'S FRACTION AT THE STAMP, `shares / den`, both
-    ///      frozen by the queue when it stamped. If the exiting cohort held 30%
-    ///      of the vault at that instant, they are owed 30% of everything that
-    ///      arrives afterwards for that proposal. Rounds DOWN, so the cohort is
-    ///      never handed more than arrived and the dust stays with the stayers.
-    ///
-    ///      REAL ASSETS ONLY — `arrival` is a measured balance delta, never an
-    ///      estimate, so nothing here can pay out against value that has not
-    ///      turned up. That is what makes the junior leg unable to strand
-    ///      anyone: with no arrival there is simply nothing to split, and the
-    ///      redeemer keeps the floor they were already paid.
-    ///
-    ///      CUSTODIED BY THE QUEUE, not reserved here. Assets sent there leave
-    ///      `totalAssets()`, so they stop lifting the stayers' price the instant
-    ///      they are earmarked — which is correct, they are not the stayers' —
-    ///      and the junior leg never touches `reservedQueueAssets()`, the figure
-    ///      that gates instant exits and the next proposal's float.
     function _payCohortShare(address strategy, uint256 arrival) private {
         if (arrival == 0) return;
         address q = _withdrawalQueue;
@@ -2268,16 +1608,6 @@ contract SyndicateVault is
         emit CohortShareRouted(strategy, pid, cohortShare);
     }
 
-    /// @dev The tighter of the two bounds the governor already keeps on how much
-    ///      a proposal could have moved out: the vault's whole float before the
-    ///      batch (`getCapitalSnapshot`) and the coverage-scaled ceiling the
-    ///      batch was actually held to (`getEffectiveMaxCapital`). The ceiling is
-    ///      the real bound — the snapshot admits a self-report of up to the
-    ///      entire vault — so a hostile clone cannot impose an entry tax larger
-    ///      than the capital its proposal was permitted to touch.
-    ///
-    ///      Either read failing yields zero, which records nothing: unreadable
-    ///      means not recorded here as everywhere else on this path.
     function _residueBound(uint256 proposalId) private view returns (uint256) {
         (bool okC, bytes memory retC) =
             msg.sender.staticcall(abi.encodeCall(IProposalStatus.getCapitalSnapshot, (proposalId)));
@@ -2318,34 +1648,12 @@ contract SyndicateVault is
         emit ResidueUnvalued(strategy, now_);
     }
 
-    /// @dev The ONLY place `_unvaluedCount` and EITHER clock move, so neither
-    ///      deadline can drift from the marks it governs.
-    ///
-    ///      THE EPISODE CLOCK, `_unvaluedSince`, is dated from the FIRST mark
-    ///      (0 -> 1) and cleared on the last (1 -> 0): the window
-    ///      `depositsLocked` honours is therefore the whole episode, not a fresh
-    ///      grace period per strategy. Per-strategy deposit deadlines would let
-    ///      a sequence of hostile labels hold the gate shut indefinitely, which
-    ///      is the exact failure `_unvaluedSince` exists to rule out.
-    ///
-    ///      THE PER-STRATEGY CLOCK, `_unvaluedMarkedAt`, is dated from THIS
-    ///      label's own mark and cleared when it drops, because the only thing
-    ///      that reads it — `pruneUnvaluedMark` — burns one strategy forever.
-    ///      Sharing the episode clock with the burn is what let one label's
-    ///      expiry spend another's window; see `_unvaluedMarkedAt`.
     function _bumpUnvalued(address strategy, bool marked) private {
         if (marked) {
             if (_unvaluedCount == 0) _unvaluedSince = block.timestamp;
             _unvaluedMarkedAt[strategy] = block.timestamp;
             _unvaluedCount += 1;
         } else {
-            // HYGIENE, NOT BEHAVIOUR, and stated as such because a test that
-            // claimed otherwise was vacuous. Nothing can observe this reset:
-            // `_markStartOf` is read only by `pruneUnvaluedMark`, which returns
-            // early unless a mark is standing, and every mark re-stamps in the
-            // arm above. It is kept so a stale timestamp cannot become load
-            // bearing for a future reader — if one ever does read it outside a
-            // live mark, that reader needs a test, since this line has none.
             _unvaluedMarkedAt[strategy] = 0;
             _unvaluedCount -= 1;
             if (_unvaluedCount == 0) _unvaluedSince = 0;
@@ -2390,7 +1698,6 @@ contract SyndicateVault is
     ///      same breath — see `_pricingSupply`. Subtracting assets without their
     ///      shares would understate the price as badly as double-counting them
     ///      would overstate it.
-    ///      THE QUEUE RESERVE IS NOT THE ONLY LIABILITY (pashov review finding
     ///      #3). A fee whose transfer failed is escrowed by
     ///      `SyndicateGovernor._payFee` and LEFT HERE — owed exactly like a
     ///      queue reserve, but previously counted as LP equity, so redeemers in
@@ -2403,21 +1710,6 @@ contract SyndicateVault is
         return gross > owed ? gross - owed : 0;
     }
 
-    /// @dev Escrowed fee liability this vault owes, read from its governor.
-    ///      Low-level staticcall degrading to zero on any failure, matching
-    ///      `_openProposalPid` and `_pricingSupply`: `totalAssets()` sits on
-    ///      every pricing path in this contract, so a governor predating
-    ///      `outstandingEscrow` — or any nonstandard implementation — must not
-    ///      brick deposits, redemptions and settlement. Degrading to zero
-    ///      reproduces exactly the previous behaviour, never anything worse.
-    /// @dev COST, measured (PR #195 review, minor 4): ~5,535 gas the first time
-    ///      the governor is touched in a transaction (cold account access) and
-    ///      ~896 gas on every subsequent `totalAssets()` in that same
-    ///      transaction, once the address is warm. Since `totalAssets()` sits
-    ///      on the deposit / redeem / preview / settle paths, the realistic
-    ///      per-transaction cost is one cold hit plus warm repeats — the
-    ///      governor is already touched by most of those flows for other
-    ///      reasons, so in practice this is usually the warm figure.
     function _escrowedFeeLiability() private view returns (uint256) {
         address gov = _getGovernor();
         if (gov == address(0)) return 0;
@@ -2426,26 +1718,6 @@ contract SyndicateVault is
         return (ok && ret.length == 32) ? abi.decode(ret, (uint256)) : 0;
     }
 
-    /// @dev The supply a price is actually taken against: circulating shares LESS
-    ///      the escrowed redeem shares whose settle price is already stamped.
-    ///      Those shares are still in `totalSupply()` — the vault burns them at
-    ///      `claim`, not at the stamp — but they are no longer a claim on the pool.
-    ///
-    ///      PAIRED WITH `totalAssets`, INSEPARABLY: both legs of the same claim
-    ///      leave together, so a `claim` moves neither the price nor anyone else's
-    ///      position. PRE-STAMP ESCROW STAYS IN — a queued-but-unsettled redeem
-    ///      has no frozen price yet and still floats with the pool, which is why
-    ///      this reads `stampedUnclaimedShares()` rather than `pendingShares()`.
-    ///      FLOORED AT ZERO defensively; the counter is a subset of the balance
-    ///      the queue holds, so the branch is unreachable today.
-    ///
-    ///      Deliberately a low-level staticcall rather than a typed call:
-    ///      `VaultWithdrawalQueue` is not a proxy, so a queue deployed before this
-    ///      function existed can never gain the selector. A typed call would
-    ///      revert for that legacy pairing, and this sits on the conversion path,
-    ///      so the revert would brick every deposit, withdraw, preview and fee
-    ///      calc. A missing selector degrades to 0 instead; full remediation for
-    ///      an existing syndicate requires redeploying the vault/queue pair.
     function _pricingSupply() internal view returns (uint256) {
         address q = _withdrawalQueue;
         uint256 supply = totalSupply();
@@ -2516,15 +1788,6 @@ contract SyndicateVault is
         nonReentrant
     {
         if (depositsLocked()) revert DepositsLocked();
-        // NEVER TAKE ASSETS FOR ZERO SHARES. `previewDeposit` floors, so a
-        // large enough denominator rounds a real deposit down to nothing and
-        // `super._deposit` would transfer the assets and mint none — a silent
-        // total loss for the depositor. The queue's claim path has always had
-        // this guard; the instant path did not.
-        //
-        // Scoped to `assets != 0` so a zero-asset deposit stays the harmless
-        // no-op ERC-4626 allows: nothing in, nothing out, nobody worse off. The
-        // loss this guards is assets-in-shares-out, not zero-in-zero-out.
         if (shares == 0 && assets != 0) revert ZeroShares();
         _requireApprovedDepositor(receiver);
         super._deposit(caller, receiver, assets, shares);
@@ -2621,14 +1884,6 @@ contract SyndicateVault is
         if (msg.sender != owner_) {
             _spendAllowance(owner_, msg.sender, shares);
         }
-        // Move shares into queue custody. `_update` auto-delegates the queue to
-        // itself, so custody shares keep checkpointed voting weight AT THE QUEUE —
-        // now merely consistent rather than load-bearing, since nothing is
-        // apportioned and the queue has no governance surface. For proposals
-        // already open at request time, the voter's checkpoint at
-        // `snapshotTimestamp` is frozen with the pre-transfer weight, so vote
-        // power is preserved for in-flight proposals; queued shares forfeit voting
-        // power for any proposal opened after escrow.
         uint256 pid = _activePid();
         _transfer(owner_, q, shares);
         requestId = IVaultWithdrawalQueue(q).queueRedeem(owner_, shares, pid);
@@ -2733,24 +1988,7 @@ contract SyndicateVault is
     ///      `stampSettlement` increments the queue's counter only AFTER receiving
     ///      `num`/`den`, so the read here excludes only PRIOR stamps.
     function onProposalSettled(uint256 proposalId) external onlyGovernor {
-        // Pin the settling strategy BEFORE anything can return early — this is
-        // the last moment the governor still names it, and `depositsLocked`
-        // needs it to ask whether a residue is still in flight. Read from the
-        // caller (the governor), which is `onlyGovernor`-authenticated, via a
-        // length-checked staticcall: a governor that cannot answer leaves the
-        // pin at zero, which `depositsLocked` reads as nothing outstanding —
-        // the pre-existing behaviour, not a stricter one.
         (bool okS, bytes memory retS) = msg.sender.staticcall(abi.encodeCall(IProposalStatus.strategyOf, (proposalId)));
-        // NOT SWEPT HERE, AND THAT IS MEASURED RATHER THAN ASSUMED. An earlier
-        // plan called for a best-effort `sweep()` of the settling strategy at
-        // this point, to clear the residue before the stamp. It recovers
-        // nothing: `MorphoSupplyStrategy.sweep()` computes `_deliverableNow()`
-        // exactly as `_settle()` just did, and `_settle` has already withdrawn
-        // that maximum in this same transaction — the market's idle balance is
-        // drained by that withdraw, so a second call in the same frame resolves
-        // `deliverable == 0`. The residue of the proposal being settled is
-        // recoverable only in a LATER transaction, once the market refills,
-        // which is what `collectResidue` is for.
         address strat = (okS && retS.length == 32) ? abi.decode(retS, (address)) : address(0);
         uint256 bound = _residueBound(proposalId);
 
@@ -2763,84 +2001,11 @@ contract SyndicateVault is
             _recordResidue(_proposalSandbox[proposalId], proposalId, bound);
             return;
         }
-        // THE STAMP COUNTS UNDELIVERED VALUE; `totalAssets()` DELIBERATELY DOES
-        // NOT. `totalAssets()` is the LIVE figure every conversion reads, and
-        // teaching it to count strategy-held value would price the vault against
-        // an unrealized, strategy-influenced NAV — the exact lever the frozen
-        // settle price exists to remove (see `VaultWithdrawalQueue`'s header).
-        //
-        // At THIS point the position is already unwound, so what the strategy
-        // still holds is realized-but-undelivered value: a receivable, not a
-        // mark to market. Excluding it stamped a price below what the vault
-        // actually owned, and a queued depositor claiming at that frozen number
-        // minted against the shortfall — then swept it in. Freezing the price is
-        // what made it unfixable after the fact: a third party sweeping first
-        // did not repair the stamp, and the attacker carried no directional
-        // risk, since no residue simply meant a fair-price deposit.
-        //
-        // Degrades to 0 on any failure, i.e. to the pre-fix stamp, never to a
-        // higher one — an over-count is the only direction that could mint
-        // against value that never arrives.
-        // STAMPED FROM FLOAT ALONE, DELIBERATELY — the residue correction was
-        // attempted here and REVERTED, because it cannot be made safe at this
-        // site. `stampSettlement` derives the queue reserve as
-        // `mulDiv(redeemShares, num, den)`, and `_availableFloat` is
-        // `balanceOf - reserve`. Raising `num` therefore reserves assets the
-        // vault does not hold: instant `maxWithdraw`/`maxRedeem` floor to zero
-        // for EVERY LP, and a queued `claim` reverts outright if the residue
-        // never frees.
-        //
-        // Capping `num` does NOT fix that. The reserve scales with
-        // `redeemShares / den`, a ratio this call does not control, so no bound
-        // on `num` alone keeps the reserve payable — a 90%-queued vault still
-        // over-reserves by ~1.8x at the cap. The float-only stamp is
-        // under-priced but ALWAYS PAYABLE, and payable is the property the
-        // queue's solvency rests on.
-        //
-        // WHAT IS STILL OPEN HERE IS THE REDEEMER, NOT THE DEPOSITOR. The
-        // queued-DEPOSIT mispricing is closed, but not from this site: a mint no
-        // longer reads any stamp at all, it converts live against
-        // `depositNav()`, which counts what settled strategies still owe. A
-        // queued REDEEMER is still paid from this float-only stamp, so they
-        // leave their share of the residue behind and it accrues to the LPs who
-        // stayed. That is a fairness gap, not an attack — no adversary, no loss
-        // to the protocol, a transfer between LPs — and closing it means paying
-        // them a floor now plus a share of arrivals later, NOT correcting this
-        // number. See `docs/nav-residue-design.md` and issue #233; do not
-        // re-derive it here.
-        //
-        // NOTE the skip-stamp-plus-`restamp(pid)` shape is NOT the plan: it does
-        // not survive the queue. `claim` requires `_lastStampedPid >= r.pid`, so
-        // skipping strands every queued request for that pid including
-        // redeemers; `stampSettlement` reverts `StampOutOfOrder` once a later
-        // proposal settles, which would strand them permanently; and
-        // restamping a stamped pid needs `_reservedAssets` and
-        // `_stampedUnclaimedShares` unwound first. Strictly worse than the
-        // mispricing.
         uint256 num = totalAssets() + 1;
         uint256 den = _pricingSupply() + 10 ** _decimalsOffset();
         IVaultWithdrawalQueue(q).stampSettlement(proposalId, num, den);
 
-        // RECORDED AFTER THE STAMP, DELIBERATELY. `_recordResidue` nets out the
-        // exiting cohort's share of the residue so a mint is priced only for
-        // what will actually reach the pool -- and that fraction does not exist
-        // until the `stampSettlement` above freezes it. Recording first read a
-        // cohort of zero and quietly priced the gross figure, over-charging
-        // every depositor in the settle-to-arrival window.
-        //
-        // Safe in this order: the stamp reads `totalAssets()` and
-        // `_pricingSupply()`, neither of which the residue record touches, so
-        // moving the record later cannot move the price it stamped at.
         _recordResidue(strat, proposalId, bound);
-        // THE SANDBOX IS A SECOND HOLDER OF THIS PROPOSAL'S VALUE, and it must
-        // reach the same machinery or the vault would price mints against float
-        // alone while a sandbox still held assets — finding #3's shape
-        // reintroduced through a new path. Recording it here also keys it to
-        // THIS pid, so a late arrival is split with the cohort that exited at
-        // this settlement rather than accruing entirely to the stayers.
-        //
-        // Bounded by the same proposal envelope: the sandbox's funding was
-        // carved from it, so `bound` is a true ceiling on what it can owe.
         _recordResidue(_proposalSandbox[proposalId], proposalId, bound);
     }
 
@@ -2874,12 +2039,10 @@ contract SyndicateVault is
     ///      failure is the AdaptiveCurveIrm's own view cost drifting past this
     ///      cap over time — silently, since a suppressed report means the
     ///      residue is never recorded and deposits are priced residue-free
-    ///      (finding #3, for that proposal). Pinned by
     ///      `test_residueProbes_surviveAGasGriefingIrm` on both templates.
     ///
     ///      The round number below still needs a measured worst-case bound
     ///      across the shipped templates, tracked with the rest of the residue
-    ///      work in issue #233.
     uint256 private constant _PROBE_GAS = 150_000;
 
     /// @dev Gas ceiling for the `sweep()` call inside `collectResidue`. Unlike
@@ -2905,20 +2068,6 @@ contract SyndicateVault is
 
     // ==================== MANAGEMENT-FEE ACCRUAL ====================
 
-    /// @dev Close off the elapsed interval at the base that applied during it,
-    ///      then restamp the base from live fund assets. Called on every
-    ///      mid-proposal event that can move the base and once more at settlement.
-    ///      Proposal execute opens the accrual rather than closing an interval, so
-    ///      it stamps the base directly through `startManagementAccrual`.
-    ///
-    ///      Restamping from `totalAssets()` rather than applying a per-event delta
-    ///      is deliberate: the base is read from truth, so it stays correct for
-    ///      any caller regardless of whether that caller can express its own
-    ///      effect as an asset delta.
-    ///
-    ///      The `_mgmtLastUpdate == 0` early return is load-bearing twice: it is
-    ///      the no-live-proposal-no-fee rule, and it keeps `totalAssets()` off the
-    ///      ordinary deposit path entirely.
     function _accrueManagementFee() private {
         uint256 last = _mgmtLastUpdate;
         if (last == 0) return;
@@ -2930,14 +2079,6 @@ contract SyndicateVault is
         _stampMgmtBase();
     }
 
-    /// @dev Restamp the accrual base from live fund assets, falling back to idle
-    ///      float if the valuation is unavailable. A fee accrual must never be the
-    ///      reason `executeProposal` or a settlement reverts, so the try/catch
-    ///      degrades the BASE rather than the transaction — the fund is valued at
-    ///      its raw float for that interval and the fee comes out conservative,
-    ///      never inflated. Kept as the backstop should `totalAssets()` ever grow
-    ///      an external dependency again. Routed through an external self-call
-    ///      because `try` cannot wrap an internal one.
     function _stampMgmtBase() private {
         uint256 base;
         try this.totalAssets() returns (uint256 a) {
@@ -2988,26 +2129,6 @@ contract SyndicateVault is
 
     // ==================== HIGH-WATER MARK ====================
 
-    /// @notice AT LEAST one whole share, in this vault's OWN decimals — never a
-    ///         smaller, arbitrary `1e18`. Share decimals are
-    ///         `2 * assetDecimals` here, so a literal `1e18` is one whole share
-    ///         only at `assetDecimals == 9`; at 18 it was `1e-18` of a share, and
-    ///         `convertToAssets` of that quantized to whole-integer steps of
-    ///         `pps`, so `aboveHighWaterMark` read a fund up 99% as sitting AT the
-    ///         mark and charged zero performance fee.
-    /// @dev    `max(1e18, 10 ** decimals())`, NOT bare `10 ** decimals()`. Always
-    ///         converting against exactly one share is wrong for LOW-decimal
-    ///         assets: at `assetDecimals == 6`, `10 ** decimals() = 1e12`, a
-    ///         SMALLER unit than `1e18`. `convertToAssets` floors, and the
-    ///         absolute floor error in `pps` is bounded by <1 unit of this
-    ///         constant, so a smaller unit means that same error represents more
-    ///         real value once multiplied back out by `totalSupply()` — measured
-    ///         at ~$1 of drift on a $200,000 fee base for a 6-decimal asset. The
-    ///         `max` floors at exactly `1e18` for every `assetDecimals <= 9`, so
-    ///         those vaults keep identical numerics; only `assetDecimals > 9`
-    ///         switches to the larger, decimals-scaled unit.
-    /// @dev    Computed, not cached: `decimals()` reads only pinned state, so this
-    ///         costs one `EXP` and one comparison, not an external call.
     function _pricePerShareUnit() private view returns (uint256) {
         uint256 wholeShare = 10 ** decimals();
         return wholeShare > 1e18 ? wholeShare : 1e18;
@@ -3048,15 +2169,6 @@ contract SyndicateVault is
     ///      is what makes the recovery free. Called at settlement only; a partial
     ///      exit must NOT ratchet, or the holders who stayed would start measuring
     ///      from a peak the fund never banked.
-    /// @dev NOTHING TO RATCHET AGAINST AN EMPTY PRICING SUPPLY (SHE-206). With
-    ///      `_pricingSupply() == 0` — every remaining share stamped to the
-    ///      queue — `pricePerShare()` divides residual assets by the virtual
-    ///      offset alone and returns an arbitrarily large number that describes
-    ///      no holder's position. Banking it as the peak writes a mark no
-    ///      future fund can clear. Returning early leaves the previous peak
-    ///      standing, which is what a settlement with no live equity should do;
-    ///      the reset/seed pair in `_update` re-establishes the mark at the
-    ///      next depositor's own entry price.
     function ratchetHighWaterMark() external onlyGovernor {
         if (_pricingSupply() == 0) return;
         uint256 pps = pricePerShare();
@@ -3066,18 +2178,6 @@ contract SyndicateVault is
         }
     }
 
-    /// @dev Seed the mark at the fund's first deposit so the first proposal's
-    ///      gains above it are chargeable. Before any shares exist the price is
-    ///      meaningless, so this cannot be done at `initialize`.
-    /// @dev GATED ON `_pricingSupply()`, NOT `totalSupply()` (SHE-206) — the
-    ///      same supply the price this seeds is taken against, and the same one
-    ///      the reset in `_update` now reads. The two MUST move together: with
-    ///      the reset keyed on the pricing supply and the seed left on the raw
-    ///      one, a fund re-seeded out of an all-stamped state would have its
-    ///      mark zeroed and then refused a re-seed (`totalSupply()` never
-    ///      returned to zero, so from this gate's point of view the mark was
-    ///      never unset), leaving it at 0 forever and reading every later
-    ///      dollar as chargeable — the opposite error, not the same one.
     function _initHighWaterMarkIfUnset() private {
         if (_highWaterPricePerShare == 0 && _pricingSupply() != 0) {
             uint256 pps = pricePerShare();

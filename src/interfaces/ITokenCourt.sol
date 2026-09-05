@@ -98,8 +98,8 @@ interface ITokenCourt {
         Phase phase;
         IChallengeGame.Verdict verdict;
         uint256 finalizedAt;
-        address challenger; // pinned Challenge.challenger, written once in refer (finding #7)
-        uint256 accusedWeightAtLookback; // raw getPastStake sum at snapshotTs - FLOOR_LOOKBACK, same accused set as accusedWeight (finding #6)
+        address challenger;
+        uint256 accusedWeightAtLookback;
         /// @dev The proposer whose bond this verdict destroys or returns, read
         ///      once in `refer` from the challenge's pinned `proposerBondEscrow`
         ///      and barred by `vote`. Zero when the proposal locked no bond —
@@ -236,7 +236,6 @@ interface ITokenCourt {
     ///         sums into `guiltyVotes`/`notGuiltyVotes`. May be a
     ///         growth-gated min against the caller's aged weight
     ///         `FLOOR_LOOKBACK` before `snapshotTs` rather than the bare
-    ///         snapshot read — see `vote`'s natspec (issue #82).
     event VoteCast(uint256 indexed caseId, address indexed voter, bool guilty, uint256 weight);
     /// @notice A case resolved. `floor` is logged alongside the tally so an
     ///         `Inconclusive` verdict is explainable from the log alone —

@@ -18,7 +18,6 @@ interface IGovernorBinding {
 
 /// @notice The vault's live agent set, consulted by `onlyProposer` so that a
 ///         de-registered agent loses its standing on already-deployed clones
-///         (pashov review finding #9). Declared locally for the same reason
 ///         `IGovernorBinding` is: to generate the selector, not to type the
 ///         vault.
 interface IAgentSet {
@@ -60,20 +59,6 @@ abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
 
     /// @notice `execute()` was reached by a batch other than the one belonging
     ///         to the proposal that declared this clone as its strategy.
-    /// @dev The clone-ratchet bypass (issue #150): `executeGovernorBatch`
-    ///      delegatecalls through `BatchExecutorLib`, so every sub-call of
-    ///      every proposal's batch reaches its target with
-    ///      `msg.sender == vault` (src/SyndicateVault.sol:504-505). `onlyVault`
-    ///      alone can't distinguish "this clone's own proposal" from "any
-    ///      other proposal on the same vault" — a registered agent could get
-    ///      any proposal executed and target an unrelated, pre-deployed
-    ///      clone's `execute()` from its batch, flipping the one-shot
-    ///      `Pending → Executed` ratchet and permanently bricking that
-    ///      clone's own later legitimate proposal (`AlreadyExecuted` forever).
-    ///      Fail-closed by design (no capability probe, no try/catch): this
-    ///      check IS the security boundary here, unlike #118's propose-time
-    ///      check, which degrades open behind a second, authoritative layer.
-    ///      See design.md of `fix-strategy-clone-ratchet`, Decision 2.
     error NotActiveProposalStrategy();
 
     // ── State ──
@@ -100,35 +85,6 @@ abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
         _initialized = true;
     }
 
-    /// @dev RE-CHECKED LIVE, NOT JUST AGAINST THE PIN (pashov review finding
-    ///      #9). `_proposer` is written once at `initialize` and never
-    ///      revisited, while `SyndicateVault.removeAgent` — the owner's
-    ///      revocation lever — only deletes `_agents[a]` and reaches no
-    ///      already-deployed clone. A de-registered agent therefore kept
-    ///      unbounded `updateParams` / `rebalance` / `rebalanceDelta` authority
-    ///      over deployed capital for the rest of `strategyDuration` (30 days
-    ///      by factory default, up to `ABSOLUTE_MAX_STRATEGY_DURATION`), and
-    ///      the owner's only alternatives were demoting the shared swap adapter
-    ///      or price feed — whose blast radius is every strategy on the
-    ///      protocol — or waiting for a permissionless settle.
-    ///
-    ///      `PortfolioStrategy.rebalance` already re-checks the swap ADAPTER
-    ///      and the price SOURCES live on every call; this closes the same gap
-    ///      for the CALLER, which was the one input still trusted from init.
-    ///      Failing closed strands nothing: `settle()` is `onlyVault` and never
-    ///      consults this modifier, so the exit path is unaffected.
-    ///      RAW STATICCALL, NOT A HIGH-LEVEL CALL — same doctrine as
-    ///      `SyndicateVault._openProposalPid` / `_pricingSupply` and
-    ///      `ExposureLedger._feedPriceX8`. A typed call into a vault that does
-    ///      not answer `isAgent` reverts in THIS frame with no data, which
-    ///      turns a missing selector into an undecodable failure of every
-    ///      proposer-gated path rather than a stated one. Decoding the answer
-    ///      explicitly keeps the failure branch a DECISION: a vault that says
-    ///      `false`, and a vault that cannot answer at all, both fail closed
-    ///      here with a named error — closed rather than open because the
-    ///      whole point is that revocation must bite, and blocking a
-    ///      rebalance strands nothing (`settle()` is `onlyVault` and never
-    ///      consults this modifier).
     modifier onlyProposer() {
         if (msg.sender != _proposer) revert NotProposer();
         (bool ok, bytes memory ret) = _vault.staticcall(abi.encodeCall(IAgentSet.isAgent, (_proposer)));

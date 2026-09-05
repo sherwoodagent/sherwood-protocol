@@ -333,8 +333,6 @@ interface ISyndicateGovernor {
     /// @notice Revert if `envelope.maxDrawdownBps > 10_000` at propose — a
     ///         drawdown declaration cannot exceed 100% of committed capital.
     error InvalidDrawdown();
-    /// @notice `setTierRegistry` was handed zero or a codeless address (pashov
-    ///         finding #1). Un-wiring re-opens `SyndicateVault._guardBatchCalls`
     ///         (it degrades OPEN with no registry); a codeless address bricks
     ///         the guard's typed call. Re-pointing to a real registry is legal.
     error TierRegistryNotWired();
@@ -356,7 +354,6 @@ interface ISyndicateGovernor {
     ///                  whole fund.
     error SettlementBelowDrawdownFloor(uint256 realized, uint256 floor);
     /// @notice The settle PRICE fell below the floor anchored at execute
-    ///         (pashov finding #2). Distinct from `SettlementBelowDrawdownFloor`,
     ///         which bounds the strategy's absolute capital loss: this one
     ///         bounds what may be FROZEN as the price every queued deposit and
     ///         redeem is paid at. Two different questions, two separate gates —
@@ -428,10 +425,8 @@ interface ISyndicateGovernor {
     error SandboxNotAvailable(address vault);
     /// @notice Revert if `executeCallCaps.length != executeCalls.length` or
     ///         `settlementCallCaps.length != settlementCalls.length` at
-    ///         propose (issue #43). Every call must declare exactly one cap.
     error CallCapsLengthMismatch();
     /// @notice Revert if `Σ executeCallCaps` or `Σ settlementCallCaps`
-    ///         exceeds `envelope.maxCapital`, evaluated PER BATCH (issue #43)
     ///         — the two batches run in separate transactions, each
     ///         independently bounded by the vault's `maxCapital` net-outflow
     ///         meter, so a batch whose own sum is within `maxCapital` passes
@@ -447,7 +442,6 @@ interface ISyndicateGovernor {
 
     /// @notice The vault's owner-stake slot is unbound, exiting, claimed or
     ///         slashed, so nothing is slashable behind the proposal lane.
-    ///         Refused by `propose` and by `executeProposal` (SHE-215).
     error OwnerBondNotLive();
 
     // ── Guardian-review emergency settle errors ──
@@ -531,28 +525,12 @@ interface ISyndicateGovernor {
     event PerformanceFeeCharged(uint256 indexed proposalId, address indexed asset, uint256 amount, uint256 aboveMark);
 
     event VoteCast(uint256 indexed proposalId, address indexed voter, VoteType support, uint256 weight);
-    /// @notice SHE-205. `weight` units were REMOVED from `voter`'s ballot
-    ///         because their live voting weight fell below what stood in the
-    ///         tally — shares they carried were redeemed or transferred away,
-    ///         or a delegation moved off them — while the vote was open. A
-    ///         ballot cannot outlive the weight behind it.
-    /// @dev    `weight` is the DELTA cut in this movement, not the ballot's
-    ///         resulting standing weight. Indexers reconstruct the standing
-    ///         figure as `VoteCast.weight - sum(withdrawn) + sum(restored)`.
     event VoteWithdrawnOnExit(uint256 indexed proposalId, address indexed voter, uint256 weight);
-    /// @notice SHE-205. `weight` units were ADDED BACK to `voter`'s previously
-    ///         withdrawn ballot because their live voting weight returned. The
-    ///         ballot is recomputed against live votes, capped at what was
-    ///         cast, so a round trip inside the window leaves it where it
-    ///         started.
-    /// @dev    `weight` is the DELTA restored in this movement, not the
-    ///         ballot's resulting standing weight.
     event VoteRestoredOnReturn(uint256 indexed proposalId, address indexed voter, uint256 weight);
 
     event ProposalExecuted(uint256 indexed proposalId, address indexed vault, uint256 capitalSnapshot);
 
     /// @notice The coverage-proportional effective capital derived at
-    ///         execute (issue #27). `coverageRaisedUsd`/`requiredCoverageUsd`
     ///         are both zero when the approve-quorum gate did not run (no
     ///         ledger wired, zero `requiredCoverage`, or tier below the
     ///         quorum threshold) — `effectiveMaxCapital` equals
@@ -799,7 +777,6 @@ interface ISyndicateGovernor {
     ///         default when never set).
     function maxCapitalBps() external view returns (uint256);
     /// @notice Set the per-call tier-2 (uncertified) capital-cap ceiling, in
-    ///         bps of the vault's `totalAssets()` at propose time (issue #43).
     ///         Bounds: 1..10_000.
     function setTier2CallCapBps(uint256 newTier2CallCapBps) external;
     /// @notice Effective per-call tier-2 ceiling in bps of TVL (10_000 = no
@@ -843,9 +820,6 @@ interface ISyndicateGovernor {
     // ── Init ──
     /// @notice Initialize a freshly deployed per-vault governor proxy.
     ///         Called once by the factory inside the `BeaconProxy` constructor.
-    /// @param tierRegistry_ MANDATORY, must hold code (pashov finding #1). The
-    ///        registry is wired HERE, not in a follow-up `setTierRegistry`, so
-    ///        no governor ever exists with the batch guard's allowlist absent.
     function initialize(
         address vault_,
         address guardianRegistry_,
@@ -865,9 +839,7 @@ interface ISyndicateGovernor {
     function getExecuteCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory);
     function getSettlementCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory);
     /// @notice The per-call gross-outflow caps declared at propose time
-    ///         (issue #43), immutable for the proposal's lifetime. Positional
     ///         against `getExecuteCalls`/`getSettlementCalls` — the interface
-    ///         issue #27's proportional sizing will consume (design.md D7).
     function getCallCaps(uint256 proposalId)
         external
         view
@@ -887,7 +859,6 @@ interface ISyndicateGovernor {
     function getCapitalSnapshot(uint256 proposalId) external view returns (uint256);
 
     /// @notice Ceiling applied to `maxDrawdownBps` when deriving the settle-PRICE
-    ///         floor (pashov finding #2). Declared here so an interface-only
     ///         consumer can read the cap that gates it without binding to the
     ///         concrete governor.
     function MAX_STAMP_DRAWDOWN_BPS() external view returns (uint256);
@@ -911,7 +882,6 @@ interface ISyndicateGovernor {
     function getRiskEnvelope(uint256 proposalId) external view returns (uint256 maxCapital, uint16 maxDrawdownBps);
 
     /// @notice The coverage-proportional effective capital stored at execute
-    ///         (issue #27) — 0 before execution, `maxCapital` on ungated
     ///         paths, otherwise the coverage-scaled ceiling. `getRiskEnvelope`
     ///         keeps returning the DECLARED `maxCapital`; this returns what
     ///         the proposal actually ran (or will run) at.
@@ -962,7 +932,6 @@ interface ISyndicateGovernor {
     /// @notice Total escrowed fee liability against `vault` in `token`, summed
     ///         over every recipient — the aggregate `unclaimedFees` never had.
     /// @dev    Read by `SyndicateVault.totalAssets()` so escrowed fees stop
-    ///         counting as LP equity (pashov review finding #3). The assets
     ///         sit in the vault but are owed to fee recipients, so a vault that
     ///         cannot see this figure prices its shares above its real equity
     ///         and lets redeemers take the difference.

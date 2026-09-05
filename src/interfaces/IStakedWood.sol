@@ -65,7 +65,6 @@ interface IStakedWood {
     function claimUnstakeOwner(address vault) external;
 
     /// @notice Consent to having your prepared owner stake bound to `vault` by
-    ///         the factory's owner-rotation flow (issue #98). Callable only by
     ///         the prospective owner themselves; one approved vault per
     ///         address, overwritten on re-approval, consumed by the bind.
     function approveOwnerStakeBinding(address vault) external;
@@ -115,7 +114,6 @@ interface IStakedWood {
     /// @notice The WOOD a verdict slash anchored at `anchor` could recover
     ///         from `guardian`'s own stake right now: `min(max(liability at
     ///         anchor, votableStake at anchor), liveStake)`. Byte-for-byte the basis
-    ///         `_slashOne` sizes its per-approver take from (issue #35) — a
     ///         guardian who tops up its stake after `anchor` is not counted.
     ///         Reverts `VerdictNotPast` on a future `anchor`.
     function slashableStakeAt(address guardian, uint256 anchor) external view returns (uint256);
@@ -161,7 +159,6 @@ interface IStakedWood {
 
     /// @notice True iff `vault`'s owner-stake slot is bound and not exiting —
     ///         `owner != address(0) && unstakeRequestedAt == 0`. The predicate
-    ///         `SyndicateGovernor.propose` / `executeProposal` gate on (SHE-215).
     function ownerBondLive(address vault) external view returns (bool);
 
     function totalGuardianStake() external view returns (uint256);
