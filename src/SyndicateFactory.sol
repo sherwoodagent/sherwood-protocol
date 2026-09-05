@@ -48,8 +48,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     error NotAgentOwner();
     /// @notice `rotateOwner` restricted to vault owner / creator.
     error NotVaultOwnerOrCreator();
-    /// @notice New registry doesn't recognize this factory.
-    error RegistryFactoryMismatch();
     error SubdomainTooShort();
     error SubdomainTaken();
     error NotCreator();
@@ -240,7 +238,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         already landed; off-chain can retry by calling the registrar
     ///         directly.
     event EnsRegistrationFailed(address indexed vault, string subdomain);
-    event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event TierRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event ExposureLedgerSet(address indexed oldLedger, address indexed newLedger);
     event SandboxImplSet(address indexed oldImpl, address indexed newImpl);
@@ -586,30 +583,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         address gov = _governorOf[vault];
         if (gov == address(0)) revert VaultNotDeployed();
         ISyndicateGovernor(gov).forceSetParams(params);
-    }
-
-    /// @notice Re-point the factory at a new guardian registry. The governor and
-    ///         factory MUST share the same registry; flip both in the same multisig
-    ///         batch.
-    /// @dev Validates that the new registry's `factory()` view reports this
-    ///      contract — otherwise the two are misaligned and the owner-stake binds
-    ///      revert `NotFactory`. Strict: any view-call failure also reverts.
-    function setGuardianRegistry(address newRegistry) external onlyOwner {
-        if (newRegistry == address(0)) revert InvalidGuardianRegistry();
-        // Require the new registry to either advertise this factory
-        // (alignment) or return address(0) (stateless beta stub). Any other
-        // non-zero value is a misconfig — fail fast at swap time instead of
-        // letting bindOwnerStake / transferOwnerStakeSlot revert silently later.
-        try IGuardianRegistry(newRegistry).factory() returns (address registryFactory) {
-            if (registryFactory != address(0) && registryFactory != address(this)) {
-                revert RegistryFactoryMismatch();
-            }
-        } catch {
-            revert RegistryFactoryMismatch();
-        }
-        address old = guardianRegistry;
-        guardianRegistry = newRegistry;
-        emit GuardianRegistrySet(old, newRegistry);
     }
 
     /// @notice RE-POINT the adapter-selector tier registry pushed into governors
