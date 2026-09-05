@@ -52,9 +52,8 @@ interface IExposureLedger {
     ///         uses. Retire only what is provably past challengeability.
     error ChallengeWindowOpen();
 
-    /// @notice No source could price WOOD: the Chainlink WOOD feed is unwired or
-    ///         degraded AND the TWAP oracle is unwired or unavailable — or the
-    ///         price CAP `woodUsdPriceX8` is zero.
+    /// @notice No source could price WOOD: the WOOD/USD feed is unwired or
+    ///         degraded, or the price CAP `woodUsdPriceX8` is zero.
     /// @dev    THE CAP IS NEVER SERVED AS A PRICE, so there is no branch in which
     ///         a hand-maintained scalar becomes the valuation. That is what makes
     ///         its staleness tolerable, and it is why no-market-data has to be a
@@ -72,7 +71,6 @@ interface IExposureLedger {
     // ── Events ──
     event WoodUsdPriceSet(uint256 oldPriceX8, uint256 newPriceX8);
     event WoodFeedSet(address indexed feed, uint256 maxDelay);
-    event WoodTwapOracleSet(address indexed oldOracle, address indexed newOracle);
     event GuardianRegistrySet(address indexed oldRegistry, address indexed newRegistry);
     event AssetFeedSet(address indexed asset, address feed, uint256 maxDelay, uint8 assetDecimals);
     /// @notice `guardian` locked `wood` WOOD behind `reviewKey`, booked into
@@ -304,23 +302,7 @@ interface IExposureLedger {
     ///         source inert. Zero means `NoWoodPrice`, not uncapped.
     function woodUsdPriceX8() external view returns (uint256);
     function woodPriceX8() external view returns (uint256);
-
-    /// @notice The WOOD price, which source produced it, and whether the cap is
-    ///         currently binding — so monitoring can observe both degraded paths
-    ///         without an event.
-    /// @param  price       `_haircut(min(market, cap))`, floored at 1.
-    /// @param  fromFeed    True when a Chainlink WOOD feed priced it; false means
-    ///                     the TWAP oracle did. There is no third source: with
-    ///                     neither available this view REVERTS `NoWoodPrice`.
-    /// @param  capBinding  True when the manual cap — not the market — is setting
-    ///                     every bond's value. Sustained `true` is the alarm that
-    ///                     the cap has drifted BELOW market and the market source
-    ///                     has gone inert.
-    function woodPriceDetail() external view returns (uint256 price, bool fromFeed, bool capBinding);
     function woodHaircutBps() external view returns (uint256);
-
-    /// @notice The wired `IWoodTwapOracle`, or `address(0)` when unwired.
-    function woodTwapOracle() external view returns (address);
     function epochLength() external view returns (uint256);
     function challengeWindow() external view returns (uint256);
     function kNumerator() external view returns (uint256);
@@ -331,14 +313,6 @@ interface IExposureLedger {
     // ── Owner setters ──
     function setWoodUsdPrice(uint256 newPriceX8) external;
     function setWoodFeed(address feed, uint256 maxDelay) external;
-
-    /// @notice Wire (or unwire, with `address(0)`) the WOOD/WETH TWAP oracle.
-    /// @dev    Wiring VALIDATES the oracle's pair before trusting it, so an empty
-    ///         or wrong-token pool cannot be adopted by address alone. Unwiring is
-    ///         legal but is NOT a safe resting state: with no Chainlink WOOD feed
-    ///         on chain 4663 it leaves the ledger with no price source at all.
-    ///         Unwire only to rotate onto a replacement.
-    function setWoodTwapOracle(address oracle) external;
     function setWoodHaircutBps(uint256 newBps) external;
     function setAssetFeed(address asset, address feed, uint256 maxDelay) external;
     function setGuardianRegistry(address registry) external;

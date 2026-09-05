@@ -33,7 +33,6 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
-import {MockWoodTwapOracle} from "../mocks/MockWoodTwapOracle.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Base contract with state variables and setup functions.
@@ -210,7 +209,7 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
 
     MockAgentRegistry internal agentRegistry;
     MockAggregatorV3 internal assetFeed;
-    MockWoodTwapOracle internal woodTwap;
+    MockAggregatorV3 internal woodFeed;
     FizzFactory internal fizzFactory;
     FizzAdapter internal adapter;
 
@@ -244,7 +243,7 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         // WOOD at $0.05 from the market source, with the governance cap set
         // ABOVE it at $0.10 so `min(oracle, governance)` resolves to the
         // oracle — the configuration production ships (see X-7).
-        woodTwap = new MockWoodTwapOracle(0.05e8);
+        woodFeed = new MockAggregatorV3(8, 0.05e8);
     }
 
     function _deployStakingAndRegistry() internal {
@@ -416,7 +415,9 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         // current relative to the warps above.
         ledger = new ExposureLedger(address(this), address(swood), EPOCH_LENGTH);
         ledger.setWoodUsdPrice(0.1e8);
-        ledger.setWoodTwapOracle(address(woodTwap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         ledger.setAssetFeed(address(asset), address(assetFeed), 365 days);
         ledger.setCoveredTvlCapUsd(10_000_000e18);
         ledger.setGuardianRegistry(address(registry));

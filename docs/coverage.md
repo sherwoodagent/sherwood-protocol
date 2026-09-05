@@ -115,6 +115,14 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   guardian holds. `maxSlashBps` must be 100% so a guardian who locked their
   whole stake can be burned for all of it (`DeployPlanB` pre-flights both). A
   zero lock owes 0 bps and is skipped.
+- **WOOD is priced by one feed, capped by governance.** `woodPriceX8()` reads a
+  single `AggregatorV3`-shaped WOOD/USD feed, takes `min(feed, woodUsdPriceX8)`
+  — the cap is never served as a price — and applies `woodHaircutBps`. On chain
+  4663 that feed is `WoodPoolFeed`: the lower of the Uniswap and Sushiswap
+  WOOD/WETH pools' TWAPs over a window of at least 24h, converted through
+  ETH/USD, with the idle tail extrapolated at most 5 minutes and each pool held
+  to a WETH depth floor. A stale or shallow reading yields no price at all —
+  `NoWoodPrice` — rather than a wrong one.
 - **Cohort liability is the lock sum, capped at need.**
   `liabilityUsd(governor, proposalId)` returns
   `min(needUsd, Σ min(lock_i, live stake_i) × woodPriceX8())`;

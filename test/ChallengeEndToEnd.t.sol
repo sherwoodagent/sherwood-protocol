@@ -22,7 +22,7 @@ import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
-import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
+import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
@@ -268,13 +268,15 @@ contract ChallengeEndToEndTest is Test {
         ledger = new ExposureLedger(ledgerOwner, address(swood), EPOCH_LENGTH);
         feed = new ChallengeE2EFeed(1e8, 8); // $1.00, 8-dec
         // Design revision 2: `woodUsdPriceX8` is a CAP, never a price. WOOD is
-        // valued from the TWAP oracle at $0.05, with the cap 2x ABOVE it and
+        // valued from the WOOD/USD feed at $0.05, with the cap 2x ABOVE it and
         // therefore NOT binding — the configuration production ships. Every
         // dollar figure in this suite is unchanged; only the reason it holds is.
-        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(0.05e8);
+        MockAggregatorV3 woodFeed = new MockAggregatorV3(8, 0.05e8);
         vm.startPrank(ledgerOwner);
         ledger.setWoodUsdPrice(0.1e8);
-        ledger.setWoodTwapOracle(address(woodTwap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         // Generous staleness bound: the §3.3a quorum re-reads this feed at
         // EXECUTE time, a full voting + review window after propose.
         ledger.setAssetFeed(address(usdg), address(feed), 365 days);
