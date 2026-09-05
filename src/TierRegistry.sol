@@ -656,9 +656,21 @@ contract TierRegistry is Ownable2Step {
     ///         `ChallengeGame`'s bare catch and a won challenge produced only an
     ///         `AdapterDemotionFailed` event. The anti-grief guard is unchanged
     ///         in substance — an uncertified selector is still rejected.
+    ///
+    ///         A pending certification is cancelled ahead of that guard, and
+    ///         cancelling one satisfies the call on its own.
     function demoteByChallenge(address target, bytes4 selector) external {
         if (msg.sender != authorizedDemoter) revert NotAuthorizedDemoter();
-        if (!_isCertifiedFor(target, selector)) revert NotCertified();
+        bytes32 k = key(target, selector);
+        bool cancelled = _pending[k].readyAt != 0;
+        if (cancelled) {
+            delete _pending[k];
+            emit CertificationCancelled(target, selector);
+        }
+        if (!_isCertifiedFor(target, selector)) {
+            if (cancelled) return;
+            revert NotCertified();
+        }
         _demote(target, selector);
     }
 
@@ -1259,9 +1271,18 @@ contract TierRegistry is Ownable2Step {
 
     /// @notice Demote a class for `selector` on a challenge conviction.
     ///         Restricted to `authorizedDemoter`, mirroring `demoteByChallenge`.
+    ///         Cancels a pending class certification ahead of the
+    ///         `ClassNotCertified` guard, on the same terms.
     function demoteClassByChallenge(address template, bytes4 selector) external {
         if (msg.sender != authorizedDemoter) revert NotAuthorizedDemoter();
-        if (_classConfigs[classKey(cloneCodehashOf(template), selector)].certifiedCodehash == bytes32(0)) {
+        bytes32 k = classKey(cloneCodehashOf(template), selector);
+        bool cancelled = _classPending[k].readyAt != 0;
+        if (cancelled) {
+            delete _classPending[k];
+            emit ClassCertificationCancelled(template, selector);
+        }
+        if (_classConfigs[k].certifiedCodehash == bytes32(0)) {
+            if (cancelled) return;
             revert ClassNotCertified();
         }
         _demoteClass(template, selector);
