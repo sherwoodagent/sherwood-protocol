@@ -10,7 +10,7 @@ on:
   # bought silence. (Found 2026-08-01: PRs #75/#78/#80 each ran zero checks.)
   pull_request:
   push:
-    branches: [main]
+    branches: [main, audit-fixes-integration]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
