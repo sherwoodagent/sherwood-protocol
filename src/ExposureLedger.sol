@@ -165,7 +165,6 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     bytes32 public constant PARAM_CHALLENGE_WINDOW = keccak256("challengeWindow");
     bytes32 public constant PARAM_K_NUMERATOR = keccak256("kNumerator");
     bytes32 public constant PARAM_COVERED_TVL_CAP = keccak256("coveredTvlCapUsd");
-    bytes32 public constant PARAM_QUORUM_TIER_THRESHOLD = keccak256("quorumTierThreshold");
     bytes32 public constant PARAM_PROPOSER_BOND_BPS = keccak256("proposerBondBps");
 
     ISwoodMinimal public immutable swood;
@@ -196,15 +195,6 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         cap unset = NOTHING can be proposed through a wired governor —
     ///         fail-closed until governance seeds it.
     uint256 public coveredTvlCapUsd;
-    /// @notice Minimum envelopeTier at which the approve quorum is fail-closed.
-    ///         Launch value 0: every tier.
-    /// @dev    Coverage sizing is per-tier, so a closed-loop adapter that can leak
-    ///         1% requires 1% of coverage. Zero makes the guardian layer mandatory
-    ///         at every tier rather than advisory below the threshold.
-    ///         `requiredCoverage == 0` still passes optimistically at every tier —
-    ///         that carve-out lives at the governor call site: a proposal that can
-    ///         extract nothing has nothing to underwrite.
-    uint8 public quorumTierThreshold = 0;
     /// @notice Proposer bond as bps of USD coverage (spec §3.9/§5). Default 1%.
     uint256 public proposerBondBps = 100;
 
@@ -619,12 +609,6 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     function setCoveredTvlCapUsd(uint256 newCap) external onlyOwner {
         emit ParameterChangeFinalized(PARAM_COVERED_TVL_CAP, coveredTvlCapUsd, newCap);
         coveredTvlCapUsd = newCap;
-    }
-
-    function setQuorumTierThreshold(uint8 newThreshold) external onlyOwner {
-        if (newThreshold > 3) revert InvalidParameter(); // 3 = quorum disabled for all tiers
-        emit ParameterChangeFinalized(PARAM_QUORUM_TIER_THRESHOLD, quorumTierThreshold, newThreshold);
-        quorumTierThreshold = newThreshold;
     }
 
     function setProposerBondBps(uint256 newBps) external onlyOwner {

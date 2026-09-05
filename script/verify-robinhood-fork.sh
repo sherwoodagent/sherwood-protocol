@@ -91,7 +91,6 @@ check "swood.exposureLedger (exit gate armed)" "$(call "$SWOOD" 'exposureLedger(
 check "factory.exposureLedger"        "$(call "$FACTORY" 'exposureLedger()(address)')"   "$LEDGER"
 check "factory.bondEscrow"            "$(call "$FACTORY" 'bondEscrow()(address)')"       "$ESCROW"
 check "registry.exposureLedger"       "$(call "$REGISTRY" 'exposureLedger()(address)')"  "$LEDGER"
-check "ledger.quorumTierThreshold == 0" "$(call "$LEDGER" 'quorumTierThreshold()(uint256)')" "0"
 check "ledger.challengeWindow == 14d" "$(call "$LEDGER" 'challengeWindow()(uint256)')"   "1209600"
 check "ledger.woodHaircutBps == 7000" "$(call "$LEDGER" 'woodHaircutBps()(uint256)')"    "7000"
 # Delegation is deferred to v2 and the `StakedWoodDelegation` base was REMOVED

@@ -15,6 +15,7 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 contract MockChallengeGovernor {
     mapping(uint256 proposalId => ISyndicateGovernor.StrategyProposal) internal _proposals;
     mapping(uint256 proposalId => BatchExecutorLib.Call[]) internal _calls;
+    mapping(uint256 proposalId => BatchExecutorLib.Call[]) internal _settlementCalls;
 
     /// @dev Stands in for "the proposal did touch the adapter the filing
     ///      names", which is the usual case; `setExecuteCall` overrides it per
@@ -35,6 +36,17 @@ contract MockChallengeGovernor {
     function setExecuteCall(uint256 proposalId, address target, bytes4 selector) external {
         delete _calls[proposalId];
         _calls[proposalId].push(BatchExecutorLib.Call({target: target, data: abi.encodePacked(selector), value: 0}));
+    }
+
+    function setSettlementCall(uint256 proposalId, address target, bytes4 selector) external {
+        delete _settlementCalls[proposalId];
+        _settlementCalls[proposalId].push(
+            BatchExecutorLib.Call({target: target, data: abi.encodePacked(selector), value: 0})
+        );
+    }
+
+    function getSettlementCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory) {
+        return _settlementCalls[proposalId];
     }
 
     function getProposal(uint256 proposalId) external view returns (ISyndicateGovernor.StrategyProposal memory) {
@@ -2099,6 +2111,41 @@ contract ChallengeGameTest is Test {
         vm.stopPrank();
         assertGt(id, 0);
         assertEq(tiers.demoteCount(), 0, "nothing demoted by a filing alone");
+    }
+
+    /// @notice A settlement-leg adapter is part of the proposal too: the caps
+    ///         and the coverage price it, so a filing may name it.
+    function test_file_acceptsAnAdapterOnlyTheSettlementLegCalls() public {
+        address settlementAdapter = address(0x5E77);
+        bytes4 settlementSelector = bytes4(0x11223344);
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
+        _execute(PROPOSAL);
+        gov.setExecuteCall(PROPOSAL, ADAPTER, SELECTOR);
+        gov.setSettlementCall(PROPOSAL, settlementAdapter, settlementSelector);
+
+        vm.startPrank(challenger);
+        // In neither leg: still refused.
+        vm.expectRevert(IChallengeGame.AdapterNotInProposal.selector);
+        game.file(
+            address(gov),
+            PROPOSAL,
+            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            settlementAdapter,
+            bytes4(0xdeadbeef),
+            EVIDENCE
+        );
+        // Present only in the settlement leg: accepted.
+        uint256 id = game.file(
+            address(gov),
+            PROPOSAL,
+            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            settlementAdapter,
+            settlementSelector,
+            EVIDENCE
+        );
+        vm.stopPrank();
+        assertGt(id, 0);
+        assertEq(game.challengeOf(id).adapterTarget, settlementAdapter);
     }
 
     /// @notice A filing that accuses NO adapter is still legal — predicates 2, 3

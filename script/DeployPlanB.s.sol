@@ -71,10 +71,6 @@ interface IProtocolConfigAdmin {
  *      they declared. Zero would let a token lock buy a token penalty. The
  *      launch value is a governance decision in the runbook; this only refuses
  *      zero.
- * @dev PRE-FLIGHT 4 (ADR 2026-07-27): `quorumTierThreshold == 0` — a covering
- *      approve quorum is required at EVERY tier. The `maxEnvelopeTier <= 1`
- *      half this was once paired with was dropped (owner decision 2026-07-31);
- *      see the block itself.
  * @dev PRE-FLIGHT 2: a zero `coveredTvlCapUsd` is fail-closed — the moment the
  *      ledger is wired into a governor, NOTHING can be proposed. Refuse to
  *      deploy into that state rather than brick proposing.
@@ -765,10 +761,6 @@ contract DeployPlanB is ScriptBase {
         ledger.setAssetFeed(usdg, usdgFeed, feedMaxDelay);
         ledger.setGuardianRegistry(registry);
         ledger.setCoveredTvlCapUsd(coveredTvlCapUsd);
-        // quorumTierThreshold stays at its default, which ADR 2026-07-27 moved
-        // to 0 (every tier fail-closed). Asserted in pre-flight 4 rather than
-        // re-set here, so a ledger whose default ever drifts is caught instead
-        // of silently corrected.
 
         IGuardianRegistry(registry).setExposureLedger(address(ledger));
         ISyndicateFactory(factory).setExposureLedger(address(ledger));
@@ -832,27 +824,6 @@ contract DeployPlanB is ScriptBase {
             "PRE-FLIGHT: sWOOD exposureLedger != the ledger just deployed -- the unstake gate is "
             "open, or reads a ledger holding none of this deployment's bookings. This script wires "
             "it inside the broadcast; if it did not land, re-run from the sWOOD owner."
-        );
-
-        // ── Pre-flight 4 (POST-wiring): coverage is enforced at every tier ──
-        // ADR 2026-07-27 originally paired this with a `maxEnvelopeTier <= 1`
-        // ceiling that refused tier-2 exposure outright. THAT HALF WAS DROPPED
-        // (owner decision 2026-07-31): tier-2 guardian ROE is to be closed with
-        // off-chain team token incentives rather than by refusing the tier, so
-        // tier 2 remains admissible on-chain and there is no ceiling to assert.
-        //
-        // What remains is the half that was never a policy choice. Coverage
-        // SIZING was already correct at every tier; only ENFORCEMENT was gated,
-        // and at the old default of 2 it ran at tier 2 alone — so a tier-0/1
-        // proposal could execute with NO covering approver at all, its
-        // correctly-sized coverage never checked. Threshold 0 closes that.
-        //
-        // Asserted after the broadcast, the only point where the value is
-        // readable in the form the protocol will actually run with.
-        require(
-            ledger.quorumTierThreshold() == 0,
-            "PRE-FLIGHT: ExposureLedger.quorumTierThreshold != 0 -- a covering approve quorum is "
-            "required at EVERY tier. Call setQuorumTierThreshold(0), then re-run."
         );
 
         // ── Pre-flight 6 (POST-broadcast): the ceiling actually landed ──

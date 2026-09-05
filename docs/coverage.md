@@ -154,11 +154,9 @@ runs when:
 
 ```
 gated = ledger != 0 && requiredCoverage != 0
-     && envelopeTier >= quorumTierThreshold
 ```
 
-Launch `quorumTierThreshold` is 0 (every tier). When the gate does not run,
-`effectiveMaxCapital = maxCapital`. When it does:
+When the gate does not run, `effectiveMaxCapital = maxCapital`. When it does:
 
 ```
 (coverageRaisedUsd, requiredCoverageUsd) =

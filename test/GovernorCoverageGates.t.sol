@@ -1016,24 +1016,17 @@ contract GovernorCoverageGatesTest is Test {
         governor.executeProposal(pid);
     }
 
-    /// @notice Below the tier threshold, optimistic passage is preserved — the
-    ///         lane the §3.10 ROE gate depends on (spec §4 gate 2). Threshold 3
-    ///         puts every tier below it, which is the same branch a tier-0/1
-    ///         proposal takes at the launch threshold of 2.
-    function test_execute_tierBelowThreshold_skipsQuorum() public {
+    /// @notice No envelope tier buys a proposal out of the approve quorum. The
+    ///         highest tier, carrying non-zero `requiredCoverage` and no
+    ///         covering approver, is refused at execute.
+    function test_execute_highestTierWithCoverageAndNoApprovers_stillRequiresTheQuorum() public {
         uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
-        vm.prank(ledgerOwner);
-        ledger.setQuorumTierThreshold(3); // no tier qualifies
-        _toApproved(pid);
+        assertEq(governor.getProposalTier(pid), 2, "the highest envelope tier");
+        assertGt(governor.getRequiredCoverage(pid), 0);
 
-        // issue #27: the gate not running means NOTHING measured coverage, so
-        // nothing scales — `effectiveMaxCapital` is stored equal to the
-        // declared `maxCapital`, and the event reports zero USD figures.
-        vm.expectEmit(true, false, false, true, address(governor));
-        emit ISyndicateGovernor.EffectiveMaxCapitalSet(pid, 1_000e6, 1_000e6, 0, 0);
-        governor.executeProposal(pid); // zero approvers, still executes
-        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
-        assertEq(governor.getEffectiveMaxCapital(pid), 1_000e6, "ungated path stores the declared maxCapital");
+        _toApproved(pid);
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        governor.executeProposal(pid);
     }
 
     /// @notice OPERATIONAL COUPLING, pinned deliberately: the quorum re-reads
@@ -1056,7 +1049,7 @@ contract GovernorCoverageGatesTest is Test {
         governor.executeProposal(pid);
     }
 
-    // ── ADR 2026-07-27: quorumTierThreshold == 0 (coverage required at EVERY tier) ──
+    // ── Coverage required at EVERY tier ──
 
     /// @dev Wires a TierRegistry and certifies BOTH the execute and settlement
     ///      calls at `tier` with `bound` bps, so the proposal resolves to that
@@ -1083,12 +1076,6 @@ contract GovernorCoverageGatesTest is Test {
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         reg.certify(address(targetToken), targetToken.approve.selector);
         reg.certify(address(usdg), usdg.approve.selector);
-    }
-
-    /// @notice The launch default is 0 — every tier fail-closed. The §3.10 ROE
-    ///         gate that held this at 2 is resolved (ADR 2026-07-27).
-    function test_quorumTierThresholdDefaultsToZero() public view {
-        assertEq(ledger.quorumTierThreshold(), 0);
     }
 
     /// @notice THE enforcement gap this ADR closes. A tier-0 proposal carrying
@@ -1145,6 +1132,8 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(governor.getRequiredCoverage(pid), 0);
 
         _toApproved(pid);
+        vm.expectEmit(true, false, false, true, address(governor));
+        emit ISyndicateGovernor.EffectiveMaxCapitalSet(pid, 1, 1, 0, 0);
         governor.executeProposal(pid); // no approvers, still executes
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
         // issue #27: zero `requiredCoverage` skips the gate, so nothing scales.

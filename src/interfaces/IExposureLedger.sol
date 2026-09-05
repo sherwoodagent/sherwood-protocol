@@ -307,7 +307,6 @@ interface IExposureLedger {
     function challengeWindow() external view returns (uint256);
     function kNumerator() external view returns (uint256);
     function coveredTvlCapUsd() external view returns (uint256);
-    function quorumTierThreshold() external view returns (uint8);
     function proposerBondBps() external view returns (uint256);
 
     // ── Owner setters ──
@@ -330,6 +329,5 @@ interface IExposureLedger {
     ///         as an informed governance decision.
     function setKNumerator(uint256 newK) external;
     function setCoveredTvlCapUsd(uint256 newCap) external;
-    function setQuorumTierThreshold(uint8 newThreshold) external;
     function setProposerBondBps(uint256 newBps) external;
 }

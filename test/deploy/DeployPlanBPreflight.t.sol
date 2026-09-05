@@ -326,18 +326,6 @@ contract DeployPlanBPreflightTest is Test {
         assertEq(factory.exposureLedger(), ledger, "the three pointers must agree");
     }
 
-    /// @dev PRE-FLIGHT 4 passes at the shipped default. Kept as a live check
-    ///      rather than a comment: if `ExposureLedger`'s default ever drifts
-    ///      off 0, every Plan B deploy starts refusing and this names why.
-    function test_deploy_defaultQuorumTierThresholdPasses() public {
-        _run();
-        assertEq(
-            ExposureLedger(swood.exposureLedger()).quorumTierThreshold(),
-            0,
-            "default must be 0 or pre-flight 4 refuses every deploy"
-        );
-    }
-
     // ──────────────────────── the pre-flights bite ────────────────────────
 
     /// @dev PRE-FLIGHT 2b: the broadcaster must own sWOOD, or it cannot make

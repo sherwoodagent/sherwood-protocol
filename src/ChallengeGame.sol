@@ -772,22 +772,32 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     }
 
     /// @dev The membership test behind `AdapterNotInProposal`. Matches on
-    ///      `(target, selector)` across the proposal's stored execute calls. A
-    ///      call with fewer than 4 bytes of calldata carries no selector and
-    ///      can only match a filing that names one it cannot have, so it is
-    ///      skipped rather than treated as a wildcard.
+    ///      `(target, selector)` across BOTH committed legs — the execute calls
+    ///      and the settlement calls — because coverage prices both. A call with
+    ///      fewer than 4 bytes of calldata carries no selector and can only
+    ///      match a filing that names one it cannot have, so it is skipped
+    ///      rather than treated as a wildcard.
     function _requireAdapterInProposal(address governor, uint256 proposalId, address target, bytes4 selector)
         private
         view
     {
-        BatchExecutorLib.Call[] memory calls = ISyndicateGovernor(governor).getExecuteCalls(proposalId);
+        if (_callsContain(ISyndicateGovernor(governor).getExecuteCalls(proposalId), target, selector)) return;
+        if (_callsContain(ISyndicateGovernor(governor).getSettlementCalls(proposalId), target, selector)) return;
+        revert AdapterNotInProposal();
+    }
+
+    function _callsContain(BatchExecutorLib.Call[] memory calls, address target, bytes4 selector)
+        private
+        pure
+        returns (bool)
+    {
         for (uint256 i = 0; i < calls.length; i++) {
             if (calls[i].target != target) continue;
             bytes memory data = calls[i].data;
             if (data.length < 4) continue;
-            if (bytes4(data) == selector) return;
+            if (bytes4(data) == selector) return true;
         }
-        revert AdapterNotInProposal();
+        return false;
     }
 
     /// @dev Per-challenger slot key. Namespaced under the review key so two
