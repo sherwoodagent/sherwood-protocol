@@ -180,6 +180,11 @@ interface IChallengeGame {
         ///      `resolve` routes that case to `_refundAll` — a non-verdict, not an
         ///      acquittal. Appended last for tuple-position stability.
         address courtAtFiling;
+        /// @dev WOOD paid into THIS challenge's own defence, when the shared pool
+        ///      completed before it was filed. Appended for tuple stability.
+        uint256 defenceWeight;
+        /// @dev When that own defence reached the pool's target; zero means never.
+        uint256 defendedAt;
     }
 
     // ── Errors ──
@@ -307,10 +312,9 @@ interface IChallengeGame {
     /// @dev `challengeId` IS THE CHALLENGE THE COMPLETING CONTRIBUTION WAS PAID
     ///      THROUGH, not the only one it disputes. The pool is per proposal, so
     ///      every live challenge on that review key whose own silence window
-    ///      still contains this instant becomes `Disputed` in the same call, and
-    ///      any filed afterwards is adopted by it. An indexer must re-read
-    ///      `challengeOf(...).status` for the siblings rather than assume one
-    ///      event means one challenge.
+    ///      still contains this instant becomes `Disputed` in the same call. An
+    ///      indexer must re-read `challengeOf(...).status` for the siblings
+    ///      rather than assume one event means one challenge.
     event ChallengeDisputed(uint256 indexed challengeId, uint256 counterBondWood);
     /// @notice A conviction destroyed the proposal's counter-bond pool. Emitted
     ///         once per pool, by whichever challenge convicted first.
