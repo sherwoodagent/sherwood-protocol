@@ -235,9 +235,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     /// @dev Set of authorized governor addresses. Added by `addGovernor`
     ///      (factory-only).
     EnumerableSet.AddressSet private _authorizedGovernors;
-    /// @dev Unused internally; `SyndicateFactory.setGuardianRegistry` reads
-    ///      this getter as a misconfig check, and it is part of the deployed
-    ///      proxy storage layout. Do not remove.
+    /// @dev Unused internally; part of the deployed proxy storage layout. Do not remove.
     address public factory;
 
     /// @notice The StakedWood (sWOOD) contract — sole WOOD custodian. The
