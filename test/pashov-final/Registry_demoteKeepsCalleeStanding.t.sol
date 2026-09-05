@@ -12,6 +12,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @notice Stand-in for a strategy clone that currently custodies vault
 ///         capital. `settle()` is the call the vault MUST still be able to make
@@ -145,6 +146,25 @@ contract RegistryDemoteKeepsCalleeStandingTest is Test {
         assertEq(usdc.balanceOf(address(vault)), vaultBefore + 5_000e6, "capital returned to vault");
     }
 
+    /// @notice An owner delisting is the same axis decision as a conviction:
+    ///         it revokes the right to be PAID, and must leave the committed
+    ///         settle batch able to reclaim the capital the clone already
+    ///         holds.
+    function test_ownerDelistedStrategyRemainsCallableSoCapitalCanBeRecovered() public {
+        vm.prank(address(vault));
+        usdc.transfer(address(strategy), 5_000e6);
+
+        tierRegistry.setAdapterAllowed(address(strategy), false);
+        assertFalse(tierRegistry.isAdapterAllowed(address(strategy)), "delisting revokes value-receiving standing");
+        assertTrue(tierRegistry.isCallableTarget(address(strategy)), "the callee gate still answers true");
+
+        uint256 vaultBefore = usdc.balanceOf(address(vault));
+        _runBatch(_one(address(strategy), abi.encodeWithSignature("settle()")));
+
+        assertEq(usdc.balanceOf(address(strategy)), 0, "capital recovered from the delisted clone");
+        assertEq(usdc.balanceOf(address(vault)), vaultBefore + 5_000e6, "capital returned to vault");
+    }
+
     /// @notice The other half of the split, and the reason this cannot be fixed
     ///         by simply not clearing the bit: a demoted clone must still be
     ///         refused as a RECIPIENT of vault funds. That is what demotion is
@@ -164,14 +184,83 @@ contract RegistryDemoteKeepsCalleeStandingTest is Test {
         _runBatch(_one(address(usdc), abi.encodeCall(IERC20.transfer, (address(strategy), 1_000e6))));
     }
 
-    /// @notice An EXPLICIT owner revocation is a different act from a demotion
-    ///         and must still close both axes — otherwise the split becomes a
-    ///         way to keep calling an address governance has fully delisted.
+    /// @notice An EXPLICIT `setCallable(a, false)` is a different act from a
+    ///         demotion and must close the callee axis — otherwise the split
+    ///         becomes a way to keep calling an address governance has fully
+    ///         delisted.
     function test_explicitOwnerRevocationClosesCalleeStandingToo() public {
         tierRegistry.setAdapterAllowed(address(strategy), false);
+        tierRegistry.setCallable(address(strategy), false);
 
+        assertFalse(tierRegistry.isCallableTarget(address(strategy)), "the callee gate refuses");
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchCallee.selector, address(strategy)));
         _runBatch(_one(address(strategy), abi.encodeWithSignature("settle()")));
+    }
+
+    function test_setCallableIsOnlyOwner() public {
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        tierRegistry.setCallable(address(strategy), false);
+
+        assertTrue(tierRegistry.isCallableTarget(address(strategy)), "a non-owner cannot close the callee axis");
+
+        tierRegistry.setCallable(address(strategy), false);
+        tierRegistry.setAdapterAllowed(address(strategy), true);
+        assertTrue(tierRegistry.isCallableTarget(address(strategy)), "a full re-grant re-opens the callee axis");
+    }
+
+    /// @notice The class-axis twin of
+    ///         `test_ownerDelistedStrategyRemainsCallableSoCapitalCanBeRecovered`,
+    ///         at whole-template blast radius: withdrawing a class's right to
+    ///         be PAID must leave every clone of it reclaimable.
+    function test_classDelistedCloneRemainsCallableSoCapitalCanBeRecovered() public {
+        address clone = _certifiedClassClone();
+        vm.prank(address(vault));
+        usdc.transfer(clone, 5_000e6);
+
+        tierRegistry.setClassAllowed(address(strategy), false);
+        assertFalse(tierRegistry.isAdapterAllowed(clone), "class delisting revokes value-receiving standing");
+        assertTrue(tierRegistry.isCallableTarget(clone), "the callee gate still answers true");
+
+        uint256 vaultBefore = usdc.balanceOf(address(vault));
+        _runBatch(_one(clone, abi.encodeWithSignature("settle()")));
+
+        assertEq(usdc.balanceOf(clone), 0, "capital recovered from the delisted clone");
+        assertEq(usdc.balanceOf(address(vault)), vaultBefore + 5_000e6, "capital returned to vault");
+    }
+
+    /// @notice And the class-level switch is the lever that does close it.
+    function test_setClassCallableClosesTheClassCalleeAxis() public {
+        address clone = _certifiedClassClone();
+
+        tierRegistry.setClassCallable(address(strategy), false);
+
+        assertFalse(tierRegistry.isCallableTarget(clone), "the class callee axis is closed");
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchCallee.selector, clone));
+        _runBatch(_one(clone, abi.encodeWithSignature("settle()")));
+    }
+
+    function test_setClassCallableIsOnlyOwner() public {
+        address clone = _certifiedClassClone();
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        tierRegistry.setClassCallable(address(strategy), false);
+
+        assertTrue(tierRegistry.isCallableTarget(clone), "a non-owner cannot close the class callee axis");
+    }
+
+    /// @dev The fixture the class-path tests share: an ERC-1167 clone of a
+    ///      certified, allowlisted template, with no address entry of its own.
+    function _certifiedClassClone() private returns (address clone) {
+        clone = Clones.clone(address(strategy));
+        tierRegistry.proposeClassCertification(
+            address(strategy), EXECUTE_SELECTOR, 1, 500, address(0), address(strategy).codehash
+        );
+        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay() + 1);
+        tierRegistry.certifyClass(address(strategy), EXECUTE_SELECTOR);
+        tierRegistry.setClassAllowed(address(strategy), true);
+        assertTrue(tierRegistry.isCallableTarget(clone), "precondition: reachable via the class path");
     }
 
     /// @notice THE CLASS-PATH VERSION OF THE TEST ABOVE, and the one that
@@ -188,7 +277,8 @@ contract RegistryDemoteKeepsCalleeStandingTest is Test {
     ///         the only per-member denial lever an owner has over a class
     ///         member, permanently, and anyone may permissionlessly deploy an
     ///         ERC-1167 clone of a certified template to become one. Hence the
-    ///         dedicated `_calleeRevoked` flag, which `_demote` never writes.
+    ///         dedicated `_calleeRevoked` flag, which `_demote` never writes
+    ///         and only `setCallable` moves.
     function test_explicitOwnerRevocationClosesCalleeStandingForAClassMember() public {
         // A real class member: an ERC-1167 clone of a certified template, with
         // no address entry of its own.
@@ -202,9 +292,10 @@ contract RegistryDemoteKeepsCalleeStandingTest is Test {
 
         assertTrue(tierRegistry.isCallableTarget(clone), "precondition: reachable via the class path");
 
-        // The owner delists this specific member. It has no address entry, so
-        // this must bite through the class fallback or it bites nothing.
-        tierRegistry.setAdapterAllowed(clone, false);
+        // The owner closes the callee axis for this specific member. It has no
+        // address entry, so this must bite through the class fallback or it
+        // bites nothing.
+        tierRegistry.setCallable(clone, false);
 
         assertFalse(tierRegistry.isCallableTarget(clone), "explicit revocation must close the class path too");
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchCallee.selector, clone));
