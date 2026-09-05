@@ -505,6 +505,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      below, not the record.
     mapping(bytes32 poolKey => mapping(address contributor => uint256)) internal _contributed;
 
+    /// @dev The round's raised total immediately after this contributor's latest payment.
+    mapping(bytes32 poolKey => mapping(address contributor => uint256)) internal _contributedMark;
+
     /// @dev Has this contributor already taken its STAKE back out of a
     ///      `Released` pool? One flag per pool, not per challenge, because the
     ///      stake comes back exactly once however many challenges shared it.
@@ -514,6 +517,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      forfeited bond? Per challenge, because each failed challenge on a
     ///      shared pool forfeits its own bond into the same split.
     mapping(uint256 challengeId => mapping(address contributor => bool)) internal _forfeitClaimed;
+
+    /// @dev The round's failed challenges, append-only; scanned by a later payment into the same pool.
+    mapping(bytes32 poolKey => uint256[]) internal _failedInRound;
 
     /// @dev Which pool round a proposal is on. Bumped when a pool resolves, so
     ///      the next round after an `Inconclusive` unwind starts empty instead
@@ -742,7 +748,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // collapsing the pool funder's risk to zero and turning every dispute
             // into a guaranteed forfeit funded by the challenger. `resolve` reads
             // this pin, not the live `court`.
-            courtAtFiling: court
+            courtAtFiling: court,
+            defenceWeight: 0,
+            defendedAt: 0
         });
         _lastChallenge[key] = challengeId;
         _liveByChallenger[challengerKey] = challengeId;
@@ -799,8 +807,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     }
 
     function _poolBacked(Challenge storage c, CounterBondPool storage p) private view returns (bool) {
+        if (c.defendedAt != 0) return true;
         uint256 completedAt = p.completedAt;
-        return completedAt != 0 && completedAt < c.filedAt + c.autoSlashDelayAtFiling;
+        return completedAt != 0 && completedAt >= c.filedAt && completedAt < c.filedAt + c.autoSlashDelayAtFiling;
     }
 
     // ── Dispute ──
@@ -857,50 +866,88 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // is what would let a conviction be answered after the fact - see
         // `_burnPool`.
         if (p.outcome != PoolOutcome.Open) revert WrongStatus();
-        // Already complete: this challenge, and every other live one on the key,
-        // is disputed already. The pre-fix code expressed the same refusal as a
-        // stored `Disputed` status.
-        if (p.completedAt != 0) revert WrongStatus();
+        // A completed pool answers only what it was raised against; a challenge
+        // it does not answer buys its OWN defence at the same target.
+        bool own = p.completedAt != 0;
+        if (own && _poolBacked(c, p)) revert WrongStatus();
         // The window this challenge received, not whatever governance
         // currently prefers.
         if (block.timestamp >= c.filedAt + c.autoSlashDelayAtFiling) revert WindowClosed();
 
         // Open to anyone - see the function natspec.
         uint256 target = p.target;
-        uint256 pool = p.weight;
-        // An incomplete pool guarantees `pool < target`, so the shortfall is
+        // An incomplete defence guarantees `raised < target`, so the shortfall is
         // never zero and a clamped contribution is never zero either.
-        uint256 shortfall = target - pool;
+        uint256 raised = own ? c.defenceWeight : p.weight;
+        uint256 shortfall = target - raised;
         uint256 amount = amountWood < shortfall ? amountWood : shortfall;
         if (amount == 0) revert NothingToContribute();
 
+        raised += amount;
+        uint256 pool = p.weight + amount;
+        p.weight = pool;
+        bool complete = raised == target;
+        if (own) {
+            c.defenceWeight = raised;
+            if (complete) c.defendedAt = block.timestamp;
+        } else if (complete) {
+            // Recorded, not fanned out: every live challenge on this key whose
+            // own silence window still contains this instant becomes disputed by
+            // derivation. See `_poolBacked` for why that is not a loop.
+            p.completedAt = block.timestamp;
+        }
+        _bookContribution(challengeId, c.courtAtFiling, poolKey, amount, pool, complete);
+    }
+
+    /// @dev The tail every counter-bond payment shares: the contributor record,
+    ///      custody, and - on the payment that completes a defence - the dispute
+    ///      event and the best-effort referral. Kept as one code path so burn,
+    ///      release and forfeit accounting cannot diverge between the two.
+    function _bookContribution(
+        uint256 challengeId,
+        address courtAtFiling,
+        bytes32 poolKey,
+        uint256 amount,
+        uint256 pool,
+        bool complete
+    ) private {
+        // The mark below is the round total after the LATEST payment, so writing it
+        // carries the payer past the total an earlier failure was split by. What that
+        // failure already owes it is settled here, at the old mark, before the new one.
+        uint256 held = _contributed[poolKey][msg.sender];
+        if (held != 0) {
+            uint256 settled;
+            uint256[] storage failed = _failedInRound[poolKey];
+            for (uint256 i; i < failed.length; ++i) {
+                uint256 id = failed[i];
+                uint256 share = _forfeitShare(id, poolKey, msg.sender, held);
+                if (share == 0) continue;
+                settled += share;
+                emit ContributionClaimed(id, msg.sender, share);
+            }
+            if (settled != 0) {
+                unclaimedWood -= settled;
+                wood.safeTransfer(msg.sender, settled);
+            }
+        }
+
         // First payment appends; a top-up finds its existing entry. Keeping the
         // list duplicate-free makes the failure-path split a single pass.
-        if (_contributed[poolKey][msg.sender] == 0) _contributors[poolKey].push(msg.sender);
+        if (held == 0) _contributors[poolKey].push(msg.sender);
         _contributed[poolKey][msg.sender] += amount;
-
-        pool += amount;
-        p.weight = pool;
+        _contributedMark[poolKey][msg.sender] = pool;
         bondedWood += amount;
-
-        bool complete = pool == target;
-        // Recorded, not fanned out: every live challenge on this key whose own
-        // silence window still contains this instant becomes disputed by
-        // derivation. See `_poolBacked` for why that is not a loop.
-        if (complete) p.completedAt = block.timestamp;
 
         wood.safeTransferFrom(msg.sender, address(this), amount);
         emit CounterBondContributed(challengeId, msg.sender, amount, pool);
-        if (complete) emit ChallengeDisputed(challengeId, pool);
+        if (!complete) return;
+        emit ChallengeDisputed(challengeId, pool);
 
-        // Best-effort, deliberately unguarded - see the function natspec.
-        if (complete) {
-            address courtAddr = c.courtAtFiling;
-            if (courtAddr != address(0) && court != address(0)) {
-                try ITokenCourt(courtAddr).refer(challengeId) {}
-                catch {
-                    emit AutoReferFailed(challengeId);
-                }
+        // Best-effort, deliberately unguarded - see `dispute`'s natspec.
+        if (courtAtFiling != address(0) && court != address(0)) {
+            try ITokenCourt(courtAtFiling).refer(challengeId) {}
+            catch {
+                emit AutoReferFailed(challengeId);
             }
         }
     }
@@ -1168,6 +1215,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         uint256 payout = bond - burnAmount;
 
         c.forfeitPayoutWood = payout;
+        // Only while the round can still take a payment: `_releasePoolIfLast`
+        // below closes it and bumps the key, so nothing would ever scan this.
+        if (_liveCount[rk] != 0) _failedInRound[poolKey].push(challengeId);
         unclaimedWood += payout;
         _releasePoolIfLast(rk, poolKey, challengeId);
 
@@ -1336,6 +1386,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///
     ///      Reported as zero while the named challenge is live, so this view and
     ///      `claimContribution`'s `ChallengeNotTerminal` gate never disagree.
+    ///      A contribution made after a challenge failed earns no share of that
+    ///      forfeit; a further payment by a funder that ALREADY earned one
+    ///      collects it first, so the share is paid out rather than dropped.
     function claimableContribution(uint256 challengeId, address contributor) public view returns (uint256 owed) {
         Challenge storage c = _challenges[challengeId];
         Status status = c.status;
@@ -1349,11 +1402,31 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
         CounterBondPool storage p = _pools[poolKey];
         if (p.outcome == PoolOutcome.Released && !_stakeClaimed[poolKey][contributor]) owed = contributed;
-        if (status == Status.Failed && !_forfeitClaimed[challengeId][contributor]) {
-            uint256 payout = c.forfeitPayoutWood;
-            uint256 weight = p.weight;
-            if (payout != 0 && weight != 0) owed += (payout * contributed) / weight;
-        }
+        owed += _forfeitOwed(challengeId, poolKey, contributor, contributed);
+    }
+
+    /// @dev The forfeit split owed for one failed challenge: eligibility rule and pro-rata cut, stated once.
+    function _forfeitOwed(uint256 challengeId, bytes32 poolKey, address contributor, uint256 contributed)
+        private
+        view
+        returns (uint256)
+    {
+        Challenge storage c = _challenges[challengeId];
+        if (c.status != Status.Failed || _forfeitClaimed[challengeId][contributor]) return 0;
+        uint256 payout = c.forfeitPayoutWood;
+        uint256 weight = c.counterBondWood;
+        if (payout == 0 || weight == 0 || _contributedMark[poolKey][contributor] > weight) return 0;
+        return (payout * contributed) / weight;
+    }
+
+    /// @dev The forfeit leg of a claim, shared by `claimContribution` and the settle a later payment makes for itself.
+    /// @dev Leaves the `unclaimedWood` decrement and the transfer to the caller, which owes both legs together.
+    function _forfeitShare(uint256 challengeId, bytes32 poolKey, address contributor, uint256 contributed)
+        private
+        returns (uint256 share)
+    {
+        share = _forfeitOwed(challengeId, poolKey, contributor, contributed);
+        if (share != 0) _forfeitClaimed[challengeId][contributor] = true;
     }
 
     /// @inheritdoc IChallengeGame
@@ -1377,14 +1450,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             _stakeClaimed[poolKey][msg.sender] = true;
             amount = contributed;
         }
-        if (status == Status.Failed && !_forfeitClaimed[challengeId][msg.sender]) {
-            uint256 payout = c.forfeitPayoutWood;
-            uint256 weight = p.weight;
-            if (payout != 0 && weight != 0) {
-                _forfeitClaimed[challengeId][msg.sender] = true;
-                amount += (payout * contributed) / weight;
-            }
-        }
+        amount += _forfeitShare(challengeId, poolKey, msg.sender, contributed);
         if (amount == 0) revert NothingToClaim();
 
         unclaimedWood -= amount;
