@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {console} from "forge-std/Script.sol";
 import {ScriptBase} from "./ScriptBase.sol";
 import {StrategyFactory} from "../src/StrategyFactory.sol";
+import {TierRegistry} from "../src/TierRegistry.sol";
 
 /// @title  DeployStrategyFactory
 /// @notice #387 phase: deploy the keyless-clone StrategyFactory and approve the
@@ -48,8 +49,20 @@ contract DeployStrategyFactory is ScriptBase {
         }
         require(approved > 0, "no templates found in chains.json - run DeployTemplates first");
 
+        // TierRegistry class membership requires this factory's provenance
+        // record, so an unwired registry resolves NO class at all. The registry
+        // may already have been handed to the multisig by the core deploy, in
+        // which case this is a runbook item rather than a broadcast call.
+        address tierRegistry = _tryParseAddress(json, "TIER_REGISTRY");
+        bool wired = tierRegistry != address(0) && TierRegistry(tierRegistry).owner() == deployer;
+        if (wired) TierRegistry(tierRegistry).setStrategyFactory(address(sf));
+
         if (!skipHandoff) sf.transferOwnership(ownerMultisig);
         vm.stopBroadcast();
+
+        if (!wired) {
+            console.log("RUNBOOK: TierRegistry.setStrategyFactory(this) is REQUIRED - no class resolves until it runs");
+        }
 
         console.log("StrategyFactory:", address(sf));
         console.log("Templates approved:", approved);

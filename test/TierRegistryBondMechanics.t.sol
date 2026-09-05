@@ -334,4 +334,71 @@ contract TierRegistryBondMechanicsTest is Test {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         assertEq(logs.length, 1, "certify with a disabled bond must emit only TierCertified, never SubmitterBondLocked");
     }
+
+    // ── Class bonds across an epoch re-point ──
+
+    /// @dev Class analogue of `_certifyNow`: propose as owner, warp past the
+    ///      pinned `readyAt`, execute as the pinned submitter.
+    function _certifyClassNow(address template_, bytes4 selector_, address submitter_) internal {
+        vm.prank(owner);
+        reg.proposeClassCertification(template_, selector_, 1, 500, submitter_, template_.codehash);
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        if (submitter_ != address(0)) {
+            vm.prank(submitter_);
+        }
+        reg.certifyClass(template_, selector_);
+    }
+
+    /// @notice The normal class-bond path: demote, wait out the release delay,
+    ///         claim. Unchanged by the orphan rule below.
+    function test_classDemote_startsReleaseTimelock_claimAfterDelay() public {
+        (ERC20Mock wood, address submitter) = _bondSetup();
+        bytes4 sel = bytes4(0xc1c1c1c1);
+        _certifyClassNow(target, sel, submitter);
+        assertEq(reg.totalBondedWood(), 10_000e18, "bond locked at certification");
+
+        vm.prank(owner);
+        reg.demoteClass(target, sel);
+        vm.expectRevert(TierRegistry.BondNotReleasable.selector);
+        reg.claimClassSubmitterBond(target, sel);
+
+        vm.warp(vm.getBlockTimestamp() + 14 days + 1);
+        reg.claimClassSubmitterBond(target, sel);
+        assertEq(wood.balanceOf(submitter), 100_000e18, "submitter made whole");
+        assertEq(reg.totalBondedWood(), 0, "and the ledger follows the payout");
+    }
+
+    /// @notice A re-point orphans the class configs certified against the old
+    ///         template code. The bond behind an orphaned selector warrants
+    ///         nothing any more: it is claimable at once, and once claimed the
+    ///         selector can be certified again against the new code.
+    function test_classBond_orphanedByRepointIsClaimableAndTheSelectorRecertifies() public {
+        (ERC20Mock wood, address submitter) = _bondSetup();
+        bytes4 selA = bytes4(0xaaaaaaaa);
+        bytes4 selB = bytes4(0xbbbbbbbb);
+
+        _certifyClassNow(target, selA, submitter);
+        (uint8 tA,) = reg.classTierOf(target, selA);
+        assertEq(tA, 1, "precondition: A certified against the old template code");
+
+        // The template's code moves and a sibling selector is certified
+        // against it: A's config is orphaned, so nothing can demote it.
+        vm.etch(target, hex"600160005260206000f3");
+        _certifyClassNow(target, selB, submitter);
+        (uint8 tA2,) = reg.classTierOf(target, selA);
+        assertEq(tA2, 2, "A no longer resolves");
+        assertEq(reg.totalBondedWood(), 20_000e18, "both bonds are still on the books");
+        assertEq(wood.balanceOf(submitter), 80_000e18);
+
+        reg.claimClassSubmitterBond(target, selA);
+        assertEq(wood.balanceOf(submitter), 90_000e18, "the orphaned bond is paid back");
+        assertEq(reg.totalBondedWood(), 10_000e18, "leaving only B's bond");
+        assertEq(reg.classBondOf(target, selA).amount, 0, "and the record is gone");
+
+        _certifyClassNow(target, selA, submitter);
+        (uint8 tA3,) = reg.classTierOf(target, selA);
+        assertEq(tA3, 1, "A certifies again against the new code");
+        assertEq(reg.totalBondedWood(), 20_000e18, "under a fresh bond");
+        assertEq(wood.balanceOf(submitter), 80_000e18);
+    }
 }

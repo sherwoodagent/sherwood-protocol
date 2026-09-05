@@ -2,7 +2,6 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
-import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
@@ -14,11 +13,33 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockStrategy} from "../mocks/MockStrategy.sol";
+import {StrategyFactory, IVaultMembership} from "../../src/StrategyFactory.sol";
+
+/// @dev Minimal SyndicateFactory stand-in returning a non-zero
+///      `vaultToSyndicate(vault)` so `StrategyFactory._authClone` passes.
+contract _MockSyndicateRegistry {
+    function vaultToSyndicate(address) external pure returns (uint256) {
+        return 1;
+    }
+}
+
+/// @dev A second registered vault, under the attacker's control.
+contract _AttackerVault {
+    address public owner;
+
+    constructor(address owner_) {
+        owner = owner_;
+    }
+
+    function isAgent(address) external pure returns (bool) {
+        return false;
+    }
+}
 
 /// @title Vault_she209RealRegistryBinding
 /// @notice SHE-209 against the REAL `TierRegistry`, the REAL certification
-///         ceremony, and a REAL permissionless `Clones.clone` of a real
-///         `BaseStrategy` template — never a hand-written registry mock.
+///         ceremony, the REAL `StrategyFactory`, and a real `BaseStrategy`
+///         template — never a hand-written registry mock.
 ///
 ///         The sibling suite (`Vault_she209ClassVaultBinding`) proves the
 ///         vault-side logic against a mock whose `classOf` is set by hand, so
@@ -39,6 +60,8 @@ contract VaultShe209RealRegistryBindingTest is Test {
     MockAgentRegistry agentRegistry;
     TierRegistry registry;
     MockStrategy template;
+    StrategyFactory factory;
+    _AttackerVault attackerVault;
 
     address owner = makeAddr("owner");
     address registryOwner = makeAddr("registryOwner");
@@ -63,6 +86,9 @@ contract VaultShe209RealRegistryBindingTest is Test {
         agentRegistry = new MockAgentRegistry();
         registry = new TierRegistry(registryOwner);
         template = new MockStrategy();
+        factory = new StrategyFactory(address(new _MockSyndicateRegistry()), address(this));
+        factory.setTemplateApproval(address(template), true);
+        attackerVault = new _AttackerVault(attacker);
 
         SyndicateVault impl = new SyndicateVault();
         bytes memory initData = abi.encodeCall(
@@ -92,6 +118,7 @@ contract VaultShe209RealRegistryBindingTest is Test {
         // class. After this, every ERC-1167 clone of `template` is a class
         // member and `isAdapterAllowed` admits it via the class fallback.
         vm.startPrank(registryOwner);
+        registry.setStrategyFactory(address(factory));
         registry.proposeClassCertification(address(template), SEL, 1, 500, address(0), address(template).codehash);
         vm.warp(vm.getBlockTimestamp() + registry.certifyDelay());
         registry.certifyClass(address(template), SEL);
@@ -103,13 +130,14 @@ contract VaultShe209RealRegistryBindingTest is Test {
         usdc.mint(address(vault), 1_000e6);
     }
 
-    /// @dev A bare `Clones.clone` — never through `StrategyFactory` — with the
-    ///      unpermissioned `initialize` binding it to `vault_`.
+    /// @dev A real factory clone bound to `vault_`, minted by `vault_`'s own
+    ///      owner. Class membership requires factory provenance, so the vault
+    ///      the clone PAYS is the only thing separating these two cases.
     function _rogueClone(address vault_) internal returns (address clone) {
-        clone = Clones.clone(address(template));
         bytes memory data = abi.encode(address(usdc), address(0), uint256(0), uint256(0), false);
-        vm.prank(attacker);
-        MockStrategy(clone).initialize(vault_, attacker, data);
+        address caller = IVaultMembership(vault_).owner();
+        vm.prank(caller);
+        clone = factory.cloneAndInit(address(template), vault_, caller, data);
     }
 
     function _transferBatch(address recipient) internal view returns (BatchExecutorLib.Call[] memory calls) {
@@ -132,14 +160,14 @@ contract VaultShe209RealRegistryBindingTest is Test {
     ///         permissionless clone purely by class, and the vault refuses it
     ///         because its `vault()` is the attacker.
     function test_she209_realRegistry_rogueCloneRecipient_reverts() public {
-        address rogue = _rogueClone(attacker);
+        address rogue = _rogueClone(address(attackerVault));
 
         // The registry-layer hole is intact, as intended: class admission and
         // a non-zero class report agree — pinning the equivalence the vault
         // guard relies on.
         assertTrue(registry.isAdapterAllowed(rogue), "real registry admits the rogue clone by class");
         assertEq(registry.classOf(rogue), registry.cloneCodehashOf(address(template)), "classOf is the clone class");
-        assertEq(MockStrategy(rogue).vault(), attacker, "rogue clone pays the attacker");
+        assertEq(MockStrategy(rogue).vault(), address(attackerVault), "rogue clone pays the attacker");
 
         vm.prank(MOCK_GOVERNOR);
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.AdapterVaultMismatch.selector, rogue));
@@ -180,7 +208,7 @@ contract VaultShe209RealRegistryBindingTest is Test {
     /// @notice PERMIT2 BATCH SITE. The per-element loop at the Permit2
     ///         `transferFrom(AllowanceTransferDetails[])` site binds too.
     function test_she209_realRegistry_permit2BatchRecipient_reverts() public {
-        address rogue = _rogueClone(attacker);
+        address rogue = _rogueClone(address(attackerVault));
 
         vm.prank(MOCK_GOVERNOR);
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.AdapterVaultMismatch.selector, rogue));
@@ -203,7 +231,7 @@ contract VaultShe209RealRegistryBindingTest is Test {
     ///         class member, and the binding still fires. The exemption is
     ///         "non-member", not "explicitly granted".
     function test_she209_realRegistry_explicitGrantOnRogueClassMember_stillBound() public {
-        address rogue = _rogueClone(attacker);
+        address rogue = _rogueClone(address(attackerVault));
         vm.prank(registryOwner);
         registry.setAdapterAllowed(rogue, true);
         assertTrue(registry.isAdapterAllowed(rogue), "address path admits it");

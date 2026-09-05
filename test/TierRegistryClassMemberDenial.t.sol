@@ -72,6 +72,8 @@ contract TierRegistryClassMemberDenialTest is Test {
         registry = new TierRegistry(owner);
         syndicateRegistry = new _MockSyndicateRegistry();
         factory = new StrategyFactory(address(syndicateRegistry), address(this));
+        vm.prank(owner);
+        registry.setStrategyFactory(address(factory));
         template = new MockStrategy();
         factory.setTemplateApproval(address(template), true);
         usdc = new ERC20Mock("USDC", "USDC", 6);

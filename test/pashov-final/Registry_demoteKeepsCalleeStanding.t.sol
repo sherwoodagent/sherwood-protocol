@@ -11,7 +11,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+import {StrategyFactory} from "../../src/StrategyFactory.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @notice Stand-in for a strategy clone that currently custodies vault
@@ -30,6 +30,19 @@ contract HoldingStrategyStub {
     function settle() external {
         uint256 bal = asset.balanceOf(address(this));
         if (bal != 0) asset.transfer(vault, bal);
+    }
+
+    /// @dev `asset` and `vault` are immutables baked into this template's
+    ///      runtime code, so a clone delegatecalling here already reads them.
+    ///      This exists only so `StrategyFactory.cloneAndInit` completes.
+    function initialize(address, address, bytes calldata) external {}
+}
+
+/// @dev Minimal SyndicateFactory stand-in so `StrategyFactory._authClone`
+///      accepts the vault under test as a registered vault.
+contract _MockSyndicateRegistry {
+    function vaultToSyndicate(address) external pure returns (uint256) {
+        return 1;
     }
 }
 
@@ -58,6 +71,7 @@ contract RegistryDemoteKeepsCalleeStandingTest is Test {
     MockProposalStatus governor;
     TierRegistry tierRegistry;
     HoldingStrategyStub strategy;
+    StrategyFactory strategyFactory;
 
     address owner = makeAddr("owner");
     address alice = makeAddr("alice");
@@ -93,6 +107,9 @@ contract RegistryDemoteKeepsCalleeStandingTest is Test {
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
 
         strategy = new HoldingStrategyStub(address(usdc), address(vault));
+        strategyFactory = new StrategyFactory(address(new _MockSyndicateRegistry()), address(this));
+        strategyFactory.setTemplateApproval(address(strategy), true);
+        tierRegistry.setStrategyFactory(address(strategyFactory));
         tierRegistry.setAdapterAllowed(address(strategy), true);
         tierRegistry.setAuthorizedDemoter(address(this));
 
@@ -101,6 +118,13 @@ contract RegistryDemoteKeepsCalleeStandingTest is Test {
         usdc.approve(address(vault), type(uint256).max);
         vault.deposit(10_000e6, alice);
         vm.stopPrank();
+    }
+
+    /// @dev A class member: an ERC-1167 clone the factory deployed from
+    ///      `strategy`, with no address entry of its own.
+    function _factoryClone() internal returns (address clone) {
+        vm.prank(owner);
+        clone = strategyFactory.cloneAndInit(address(strategy), address(vault), owner, "");
     }
 
     function _one(address target, bytes memory data) internal pure returns (BatchExecutorLib.Call[] memory calls) {
@@ -253,7 +277,7 @@ contract RegistryDemoteKeepsCalleeStandingTest is Test {
     /// @dev The fixture the class-path tests share: an ERC-1167 clone of a
     ///      certified, allowlisted template, with no address entry of its own.
     function _certifiedClassClone() private returns (address clone) {
-        clone = Clones.clone(address(strategy));
+        clone = _factoryClone();
         tierRegistry.proposeClassCertification(
             address(strategy), EXECUTE_SELECTOR, 1, 500, address(0), address(strategy).codehash
         );
@@ -282,7 +306,7 @@ contract RegistryDemoteKeepsCalleeStandingTest is Test {
     function test_explicitOwnerRevocationClosesCalleeStandingForAClassMember() public {
         // A real class member: an ERC-1167 clone of a certified template, with
         // no address entry of its own.
-        address clone = Clones.clone(address(strategy));
+        address clone = _factoryClone();
         tierRegistry.proposeClassCertification(
             address(strategy), EXECUTE_SELECTOR, 1, 500, address(0), address(strategy).codehash
         );
@@ -305,7 +329,7 @@ contract RegistryDemoteKeepsCalleeStandingTest is Test {
     /// @notice The other half: a DEMOTED class member must STAY callable, or
     ///         the new flag has simply re-created the bug it was added to fix.
     function test_demotedClassMemberRemainsCallable() public {
-        address clone = Clones.clone(address(strategy));
+        address clone = _factoryClone();
         tierRegistry.proposeClassCertification(
             address(strategy), EXECUTE_SELECTOR, 1, 500, address(0), address(strategy).codehash
         );
