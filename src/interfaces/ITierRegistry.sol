@@ -26,6 +26,7 @@ interface ITierRegistry {
     function isCounterpartyAllowed(address counterparty) external view returns (bool);
     /// @notice The code class `target` currently belongs to — non-zero iff its
     ///         codehash is the ERC-1167 clone of a certified template whose own
-    ///         code has not drifted. `bytes32(0)` for everything else.
+    ///         code has not drifted AND `StrategyFactory` minted it from that
+    ///         template. `bytes32(0)` for everything else.
     function classOf(address target) external view returns (bytes32);
 }
