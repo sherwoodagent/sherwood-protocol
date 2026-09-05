@@ -194,7 +194,7 @@ contract DeployPlanD is ScriptBase {
             priceX8 != 0,
             "PRE-FLIGHT: ExposureLedger.woodPriceX8 is 0 (fail-closed: no challenge could be filed). "
             "Either the price CAP woodUsdPriceX8 is unset, or no market source is wired under it -- "
-            "chain 4663 has no Chainlink WOOD/USD feed, so the ledger needs setWoodTwapOracle."
+            "the ledger needs setWoodFeed pointed at a live WOOD/USD feed."
         );
 
         // ── Pre-flight 4: a covering approve quorum at EVERY tier ──

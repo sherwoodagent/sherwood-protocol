@@ -146,11 +146,6 @@ else
 fi
 
 echo; echo "── WOOD price source ──"
-check "ledger.woodTwapOracle (none on a fork)" "$(call "$LEDGER" 'woodTwapOracle()(address)')" "$ZERO"
-FROMFEED=$(cast call "$LEDGER" 'woodPriceDetail()(uint256,bool,bool)' --rpc-url "$RPC" 2>/dev/null | sed -n '2p')
-check "price attributed to the feed"  "$FROMFEED"                                        "true"
-CAPBIND=$(cast call "$LEDGER" 'woodPriceDetail()(uint256,bool,bool)' --rpc-url "$RPC" 2>/dev/null | sed -n '3p')
-check "cap NOT binding (seeded above market)" "$CAPBIND"                                 "false"
 check "fork feed decimals == 8"       "$(call "$WFEED" 'decimals()(uint8)')"             "8"
 
 echo

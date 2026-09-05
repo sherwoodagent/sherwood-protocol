@@ -10,7 +10,7 @@ import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
-import {MockWoodTwapOracle} from "../mocks/MockWoodTwapOracle.sol";
+import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
 import {MockCoverageFreezer} from "../mocks/MockCoverageFreezer.sol";
 
 /// @dev See `DeployTokenCourtPreflight.t.sol`'s copy of this contract for the
@@ -96,10 +96,12 @@ contract DeployPlanDPreflightTest is Test {
         // leaves a live market source behind. Without one the ledger cannot
         // price WOOD at all and pre-flight 3 refuses — which is the state
         // `test_preflight_bites_whenTheLedgerIsUnpriced` provokes deliberately.
-        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(WOOD_MARKET_X8);
+        MockAggregatorV3 woodFeed = new MockAggregatorV3(8, int256(WOOD_MARKET_X8));
         vm.startPrank(DEFAULT_SENDER);
         ledger.setWoodUsdPrice(WOOD_PRICE_CAP_X8);
-        ledger.setWoodTwapOracle(address(woodTwap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         swood.setExposureLedger(address(ledger));
         vm.stopPrank();
 

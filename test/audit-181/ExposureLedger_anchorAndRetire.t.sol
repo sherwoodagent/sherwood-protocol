@@ -4,7 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
-import {MockWoodTwapOracle} from "test/mocks/MockWoodTwapOracle.sol";
+import {MockAggregatorV3} from "test/mocks/MockAggregatorV3.sol";
 import {MockCoverageFreezer} from "test/mocks/MockCoverageFreezer.sol";
 
 /// @dev Minimal sWOOD stub, but UNLIKE `test/ExposureLedger.t.sol`'s
@@ -154,7 +154,7 @@ contract MockGovernorForLedger {
 contract ExposureLedgerAnchorAndRetireTest is Test {
     ExposureLedger internal ledger;
     MockSwoodAnchored internal swood;
-    MockWoodTwapOracle internal twap;
+    MockAggregatorV3 internal woodFeed;
     MockGovernorForLedger internal mgov;
     address internal usdgAsset;
 
@@ -173,7 +173,7 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
     function setUp() public {
         swood = new MockSwoodAnchored();
         ledger = new ExposureLedger(owner, address(swood), 28 days);
-        twap = new MockWoodTwapOracle(MARKET_X8);
+        woodFeed = new MockAggregatorV3(8, int256(MARKET_X8));
 
         usdgAsset = makeAddr("usdgAsset");
         vm.mockCall(usdgAsset, abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
@@ -183,7 +183,9 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
 
         vm.startPrank(owner);
         ledger.setWoodUsdPrice(CAP_X8);
-        ledger.setWoodTwapOracle(address(twap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         ledger.setAssetFeed(usdgAsset, address(feed), 365 days);
         ledger.setGuardianRegistry(registry);
         ledger.setCoverageFreezer(freezer);
@@ -240,7 +242,7 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
         assertEq(ledger.coverageUsdOf(address(mgov), proposalId, guardian), needUsd, "worth the full requirement");
 
         // WOOD crashes to $1.00 ...
-        twap.setPrice(1e8);
+        woodFeed.setAnswer(1e8);
         // ... and in the SAME block, the guardian tops up its stake. No time
         // passes between the crash, the top-up, and the gate check below —
         // this is the exact same-block sequence the finding describes.
@@ -281,7 +283,7 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
         // the same-block crash-and-top-up sequence.
         vm.warp(vm.getBlockTimestamp() + 1);
 
-        twap.setPrice(1e8);
+        woodFeed.setAnswer(1e8);
         swood.setStake(guardian, 1_000_000e18);
 
         // Sized to the anchored, pre-top-up value: must pass.
