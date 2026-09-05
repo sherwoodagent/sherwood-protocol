@@ -5,7 +5,7 @@ pragma solidity 0.8.28;
 /// @notice The accumulator half of `UniswapV2Pair`, reproduced exactly.
 ///
 /// @dev    `_update` IS COPIED VERBATIM, and that is the point of this mock
-///         rather than a stub returning a canned TWAP. `WoodTwapOracle`'s
+///         rather than a stub returning a canned TWAP. `WoodPoolFeed`'s
 ///         correctness is entirely a claim about this arithmetic — UQ112x112
 ///         encoding, accumulation at the OLD reserves for the elapsed span,
 ///         wrapping `uint32` timestamps, unchecked `uint256` accumulators — so a

@@ -20,7 +20,7 @@ import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
-import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
+import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
@@ -104,6 +104,7 @@ contract CoverageEndToEndTest is Test {
     StakedWood public swood;
     GuardianRegistry public registry;
     ExposureLedger public ledger;
+    MockAggregatorV3 public woodFeed;
     MockFeed public feed;
     ProposerBondEscrow public escrow;
     TierRegistry public tierRegistry; // deployed; wired only by the tier-1 test
@@ -238,13 +239,15 @@ contract CoverageEndToEndTest is Test {
         ledger = new ExposureLedger(ledgerOwner, address(swood), EPOCH_LENGTH);
         feed = new MockFeed(1e8, 8); // $1.00, 8-dec
         // Design revision 2: `woodUsdPriceX8` is a CAP, never a price. WOOD is
-        // valued from the TWAP oracle at $0.05, with the cap 2x ABOVE it and
+        // valued from the WOOD/USD feed at $0.05, with the cap 2x ABOVE it and
         // therefore NOT binding — the configuration production ships. Every
         // dollar figure in this suite is unchanged; only the reason it holds is.
-        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(0.05e8);
+        woodFeed = new MockAggregatorV3(8, 0.05e8);
         vm.startPrank(ledgerOwner);
         ledger.setWoodUsdPrice(0.1e8);
-        ledger.setWoodTwapOracle(address(woodTwap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         // Generous staleness bound: the §3.3a quorum re-reads this feed at
         // EXECUTE time, a full voting + review window after propose. A tight
         // `maxDelay` would make every execution die `StalePrice` regardless of
@@ -926,7 +929,7 @@ contract CoverageEndToEndTest is Test {
 
         // WOOD crashes 2.5x: $0.05 -> $0.02. g1's live bond falls from $1,500
         // to $600 -- below its $1,000 reservation.
-        MockWoodTwapOracle(ledger.woodTwapOracle()).setPrice(0.02e8);
+        woodFeed.setAnswer(0.02e8);
         assertEq(ledger.slashableBondUsd(g1), 600e18, "live bond crashed with the price");
         uint256 liabilityAfterCrash = ledger.liabilityUsd(address(govA), pid);
         assertEq(liabilityAfterCrash, 600e18, "filing-bond basis drops with the price");

@@ -12,8 +12,9 @@ interface ITierRegistry {
     function isAdapterAllowed(address adapter) external view returns (bool);
     /// @notice May be named as a CALLEE in a governor batch (`_guardBatchCalls`
     ///         PART 2a). Implied by `isAdapterAllowed` at grant time and
-    ///         deliberately OUTLIVING it through a demotion — see
-    ///         `TierRegistry.isCallableTarget`. Confers no right to receive value.
+    ///         deliberately OUTLIVING it through a demotion or an owner
+    ///         delisting — see `TierRegistry.isCallableTarget`. Confers no right
+    ///         to receive value.
     function isCallableTarget(address target) external view returns (bool);
     /// @notice May be bound by a certified strategy template as a lending
     ///         market, position manager or collateral token — and approved by
@@ -25,6 +26,7 @@ interface ITierRegistry {
     function isCounterpartyAllowed(address counterparty) external view returns (bool);
     /// @notice The code class `target` currently belongs to — non-zero iff its
     ///         codehash is the ERC-1167 clone of a certified template whose own
-    ///         code has not drifted. `bytes32(0)` for everything else.
+    ///         code has not drifted AND `StrategyFactory` minted it from that
+    ///         template. `bytes32(0)` for everything else.
     function classOf(address target) external view returns (bytes32);
 }

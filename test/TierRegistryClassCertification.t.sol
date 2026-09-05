@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 import {StrategyFactory} from "../src/StrategyFactory.sol";
 import {MockStrategy} from "./mocks/MockStrategy.sol";
@@ -54,6 +55,8 @@ contract TierRegistryClassCertificationTest is Test {
         registry = new TierRegistry(owner);
         syndicateRegistry = new _MockSyndicateRegistry();
         factory = new StrategyFactory(address(syndicateRegistry), address(this));
+        vm.prank(owner);
+        registry.setStrategyFactory(address(factory));
         template = new MockStrategy();
         factory.setTemplateApproval(address(template), true);
         usdc = new ERC20Mock("USDC", "USDC", 6);
@@ -146,11 +149,15 @@ contract TierRegistryClassCertificationTest is Test {
 
     /// @dev Two-step certify: propose, warp past `certifyDelay`, execute.
     ///      No bond is configured, so execution is permissionless.
-    function _certifyClass(address tmpl) internal {
+    function _certifyClassFor(address tmpl, bytes4 sel) internal {
         vm.prank(owner);
-        registry.proposeClassCertification(tmpl, SEL, TIER_1, BOUND, address(0), tmpl.codehash);
+        registry.proposeClassCertification(tmpl, sel, TIER_1, BOUND, address(0), tmpl.codehash);
         vm.warp(block.timestamp + registry.certifyDelay() + 1);
-        registry.certifyClass(tmpl, SEL);
+        registry.certifyClass(tmpl, sel);
+    }
+
+    function _certifyClass(address tmpl) internal {
+        _certifyClassFor(tmpl, SEL);
     }
 
     function _certifyAndAllowClass(address tmpl) internal {
@@ -294,17 +301,167 @@ contract TierRegistryClassCertificationTest is Test {
 
     // ── 5.5 Clone created outside the factory ──
 
-    /// @notice A deliberate loosening, pinned so it reads as intended rather
-    ///         than as an oversight: membership is proven from bytecode, so
-    ///         `StrategyFactory._authClone` is not enforced for it. Analyzed as
-    ///         granting no capability — the clone is inert until a proposal
-    ///         names it, and that proposal still faces vote and guardian review.
-    function test_classMembership_cloneMadeOutsideFactoryIsMember() public {
+    /// @notice A byte-identical `Clones.clone` the factory never deployed is
+    ///         refused on every axis. Bytecode alone is not the proof:
+    ///         membership also requires the factory to name the same template.
+    function test_classMembership_cloneMadeOutsideFactoryIsNotAMember() public {
         _certifyAndAllowClass(address(template));
         address rogue = Clones.clone(address(template));
-        (uint8 tier,) = registry.tierOf(rogue, SEL);
-        assertEq(tier, TIER_1, "bytecode is the proof, not provenance");
-        assertTrue(registry.isAdapterAllowed(rogue));
+        address minted = _cloneViaFactory();
+        assertEq(rogue.codehash, minted.codehash, "byte-identical to a factory clone");
+
+        (uint8 tier, uint16 bound) = registry.tierOf(rogue, SEL);
+        assertEq(tier, 2, "no provenance, no class tier");
+        assertEq(bound, 10_000);
+        assertFalse(registry.isAdapterAllowed(rogue), "refused as a funds recipient");
+        assertFalse(registry.isCallableTarget(rogue), "refused as a batch callee");
+        assertEq(registry.classOf(rogue), bytes32(0), "belongs to no class");
+
+        (uint8 mTier,) = registry.tierOf(minted, SEL);
+        assertEq(mTier, TIER_1, "control: the factory's own clone is a member");
+        assertTrue(registry.isAdapterAllowed(minted));
+    }
+
+    /// @notice A clone the factory DID deploy whose bytecode is later moved
+    ///         away from the anchor codehash is not a member either — the
+    ///         provenance record is a second condition, never a replacement.
+    function test_classMembership_factoryCloneWithDriftedBytecodeIsNotAMember() public {
+        _certifyAndAllowClass(address(template));
+        address clone = _cloneViaFactory();
+        assertEq(registry.classOf(clone), registry.cloneCodehashOf(address(template)), "precondition: a member");
+
+        vm.etch(clone, hex"600160005260206000f3");
+
+        assertEq(registry.classOf(clone), bytes32(0), "drifted bytecode leaves the class");
+        (uint8 tier,) = registry.tierOf(clone, SEL);
+        assertEq(tier, 2);
+        assertFalse(registry.isAdapterAllowed(clone));
+        assertEq(factory.cloneTemplate(clone), address(template), "even though provenance still says so");
+    }
+
+    // ── 5.5b The factory pointer ──
+
+    function test_setStrategyFactory_onlyOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        registry.setStrategyFactory(address(factory));
+    }
+
+    function test_setStrategyFactory_rejectsZero() public {
+        vm.prank(owner);
+        vm.expectRevert(TierRegistry.InvalidStrategyFactory.selector);
+        registry.setStrategyFactory(address(0));
+    }
+
+    /// @notice Every class read STATICCALLs the factory, so an EOA there would
+    ///         revert `tierOf`, `isAdapterAllowed` and `isCallableTarget` for
+    ///         every target — settlement included.
+    function test_setStrategyFactory_rejectsAnEoa() public {
+        address eoa = makeAddr("notAFactory");
+        vm.prank(owner);
+        vm.expectRevert(TierRegistry.InvalidStrategyFactory.selector);
+        registry.setStrategyFactory(eoa);
+    }
+
+    /// @notice Fail closed: a registry with no factory wired resolves no class
+    ///         at all, however complete the certification ceremony was.
+    function test_classOf_isZeroWhileTheFactoryIsUnset() public {
+        TierRegistry fresh = new TierRegistry(owner);
+        assertEq(fresh.strategyFactory(), address(0), "precondition: unset");
+
+        vm.startPrank(owner);
+        fresh.proposeClassCertification(address(template), SEL, TIER_1, BOUND, address(0), address(template).codehash);
+        vm.warp(block.timestamp + fresh.certifyDelay() + 1);
+        vm.stopPrank();
+        fresh.certifyClass(address(template), SEL);
+        vm.prank(owner);
+        fresh.setClassAllowed(address(template), true);
+
+        address clone = _cloneViaFactory();
+        assertEq(fresh.classOf(clone), bytes32(0), "no factory, no class");
+        (uint8 tier,) = fresh.tierOf(clone, SEL);
+        assertEq(tier, 2);
+        assertFalse(fresh.isAdapterAllowed(clone));
+        assertFalse(fresh.isCallableTarget(clone));
+    }
+
+    // ── 5.5c Re-pointing the class at new template code ──
+
+    /// @notice Certifications are keyed to the template codehash they were
+    ///         reviewed against. Re-certifying ONE selector against new
+    ///         template code must not revive the selectors certified against
+    ///         the old code, nor the class's funds and callee bits.
+    function test_recertifyingAgainstNewTemplateCodeOrphansTheOldCertifications() public {
+        bytes4 selB = bytes4(keccak256("settle()"));
+        bytes4 selC = bytes4(keccak256("unwind()"));
+
+        _certifyClassFor(address(template), SEL);
+        _certifyClassFor(address(template), selB);
+        vm.prank(owner);
+        registry.setClassAllowed(address(template), true);
+        address clone = _cloneViaFactory();
+
+        (uint8 tA,) = registry.tierOf(clone, SEL);
+        (uint8 tB,) = registry.tierOf(clone, selB);
+        assertEq(tA, TIER_1, "precondition: A certified");
+        assertEq(tB, TIER_1, "precondition: B certified");
+        assertTrue(registry.isAdapterAllowed(clone), "precondition: class allowed");
+
+        // The template's code moves; the clone's own codehash does not.
+        vm.etch(address(template), hex"600160005260206000f3");
+        _certifyClassFor(address(template), selC);
+
+        (uint8 tA2,) = registry.tierOf(clone, SEL);
+        (uint8 tB2,) = registry.tierOf(clone, selB);
+        (uint8 tC,) = registry.tierOf(clone, selC);
+        assertEq(tA2, 2, "A was certified against the old template code");
+        assertEq(tB2, 2, "and so was B");
+        assertEq(tC, TIER_1, "only the selector reviewed against the new code is served");
+        assertFalse(registry.isAdapterAllowed(clone), "the funds bit does not survive the re-point");
+        assertTrue(registry.isCallableTarget(clone), "but the callee bit does: the vault must still settle");
+        assertFalse(registry.isClassAllowed(address(template)), "and the class reports itself unallowed");
+
+        vm.prank(owner);
+        registry.setClassAllowed(address(template), true);
+        assertTrue(registry.isAdapterAllowed(clone), "an explicit owner grant reopens it against the new code");
+        (uint8 tA3,) = registry.tierOf(clone, SEL);
+        assertEq(tA3, 2, "and still does not revive A");
+    }
+
+    /// @notice A re-point closes the funds axis for the whole class, but the
+    ///         clones minted under the old code may still hold vault capital.
+    ///         The callee axis therefore survives it, exactly as it survives a
+    ///         demotion — the vault must be able to call in and reclaim.
+    function test_repointedClassMemberRemainsCallable() public {
+        _certifyAndAllowClass(address(template));
+        address clone = _cloneViaFactory();
+        assertTrue(registry.isCallableTarget(clone), "precondition: reachable");
+        assertTrue(registry.isAdapterAllowed(clone), "precondition: fundable");
+
+        vm.etch(address(template), hex"600160005260206000f3");
+        _certifyClassFor(address(template), bytes4(keccak256("unwind()")));
+
+        assertTrue(registry.isCallableTarget(clone), "the settlement path stays open across a re-point");
+        assertFalse(registry.isAdapterAllowed(clone), "while the funds path closes");
+    }
+
+    /// @notice Re-certifying against UNCHANGED template code is not a re-point:
+    ///         sibling selectors keep resolving.
+    function test_recertifyingAgainstUnchangedTemplateCodeKeepsSiblingSelectors() public {
+        bytes4 selB = bytes4(keccak256("settle()"));
+        _certifyClassFor(address(template), SEL);
+        _certifyClassFor(address(template), selB);
+        vm.prank(owner);
+        registry.setClassAllowed(address(template), true);
+        address clone = _cloneViaFactory();
+
+        vm.prank(owner);
+        registry.demoteClass(address(template), selB);
+        _certifyClassFor(address(template), selB);
+
+        (uint8 tA,) = registry.tierOf(clone, SEL);
+        (uint8 tB,) = registry.tierOf(clone, selB);
+        assertEq(tA, TIER_1, "A is untouched by B's re-certification");
+        assertEq(tB, TIER_1, "and B is restored");
     }
 
     // ── 5.6 Immutable-args clone: the quiet-failure mode ──

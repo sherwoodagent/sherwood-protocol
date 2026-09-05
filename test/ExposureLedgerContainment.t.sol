@@ -6,7 +6,6 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {StakedWood} from "src/StakedWood.sol";
 import {ERC20Mock} from "test/mocks/ERC20Mock.sol";
-import {MockWoodTwapOracle} from "test/mocks/MockWoodTwapOracle.sol";
 import {MockFeed, MockGovernorForLedger, MockVaultForLedger} from "test/ExposureLedger.t.sol";
 
 /// @title ExposureLedgerContainment
@@ -32,7 +31,7 @@ contract ExposureLedgerContainmentTest is Test {
     ERC20Mock internal wood;
     StakedWood internal swood;
     ExposureLedger internal ledger;
-    MockWoodTwapOracle internal twap;
+    MockFeed internal marketFeed;
     MockGovernorForLedger internal govA;
     MockGovernorForLedger internal govB;
 
@@ -79,7 +78,7 @@ contract ExposureLedgerContainmentTest is Test {
         vm.stopPrank();
 
         ledger = new ExposureLedger(owner, address(swood), 28 days);
-        twap = new MockWoodTwapOracle(MARKET_X8);
+        marketFeed = new MockFeed(int256(MARKET_X8), 8);
         usdgAsset = makeAddr("usdgAsset");
         vm.mockCall(usdgAsset, abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
         MockFeed feed = new MockFeed(1e8, 8);
@@ -87,7 +86,7 @@ contract ExposureLedgerContainmentTest is Test {
         govB = new MockGovernorForLedger(address(new MockVaultForLedger(usdgAsset)));
         vm.startPrank(owner);
         ledger.setWoodUsdPrice(CAP_X8);
-        ledger.setWoodTwapOracle(address(twap));
+        ledger.setWoodFeed(address(marketFeed), 365 days);
         ledger.setAssetFeed(usdgAsset, address(feed), 365 days);
         ledger.setGuardianRegistry(registry);
         vm.stopPrank();

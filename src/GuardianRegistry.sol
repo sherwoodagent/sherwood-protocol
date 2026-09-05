@@ -54,21 +54,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     uint256 public constant MAX_REFUND_PER_EPOCH_BPS = 2000;
     uint256 public constant DEADMAN_UNPAUSE_DELAY = 7 days;
     uint256 public constant MAX_CALLS_PER_PROPOSAL = 64;
-    /// @notice How far BEFORE the review-open instant (`ts1`) the block-quorum
-    ///         denominator's electorate base is cross-checked. The base fed to
-    ///         `openReview`/`openEmergency` is the SMALLER of the electorate at
-    ///         `ts1` and the electorate this long before it, so stake younger
-    ///         than this cannot inflate the denominator a block vote is measured
-    ///         against.
-    /// @dev Mirrors `TokenCourt.FLOOR_LOOKBACK` and `_participationFloor`'s
-    ///      lookback-min construction, including its bootstrap fallback — read
-    ///      that function first if touching this. Without the floor,
-    ///      `stakeAsGuardian` has no cap or allowlist gate, so anyone can park
-    ///      fresh, never-voting stake just before a review opens and raise the
-    ///      absolute weight an honest cohort must clear to block a proposal. A
-    ///      `constant`, since an owner-tunable lookback could be shrunk to zero
-    ///      immediately before the attack it exists to close.
-    uint256 public constant FLOOR_LOOKBACK = 30 days;
 
     // ── Parameter keys (used as event topic discriminators) ──
     bytes32 public constant PARAM_REVIEW_PERIOD = keccak256("reviewPeriod");
@@ -147,27 +132,15 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         ///      registered after a pause ended is unaffected by it.
         uint64 clockShiftAtRegister;
         /// @dev The instant BOTH sides of the block-quorum comparison are
-        ///      measured at: `block.timestamp - 1` as of `registerReview`,
-        ///
-        ///      The numerator (`_growthGatedVoteWeight`) used to be read at
-        ///      `openedAt` while the denominator was
-        ///      `min(total(openedAt), total(openedAt - FLOOR_LOOKBACK))`. Those
-        ///      are different dates, and that mismatch WAS the finding: a
-        ///      guardian who held still while the cohort grew kept their old
-        ///      share of an old electorate. 40k of a 60k cohort blocked alone
-        ///      30 days later against a live 600k cohort — 6.67% of the real
-        ///      electorate — and drove severity to near `maxSlashBps` against
-        ///      every honest approver.
+        ///      measured at: `block.timestamp - 1` as of `registerReview`.
         ///
         ///      Deliberately NOT `openedAt`: that field is passed to
         ///      `swood.slashGuardians` to size each slash, so moving it would
         ///      silently change slash amounts. Two instants, two jobs.
         ///
         ///      Propose time rather than open time because `openReview` is
-        ///      permissionless — the attacker picks when it fires — and because
-        ///      the LP vote already freezes its own electorate at propose via
-        ///      `StrategyProposal.snapshotTimestamp`. Same instant, same
-        ///      convention.
+        ///      permissionless, and because the LP vote already freezes its own
+        ///      electorate at propose via `StrategyProposal.snapshotTimestamp`.
         ///
         ///      Appended at the END of the struct, so no field above moves.
         uint64 snapshotAt;
@@ -456,19 +429,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         return uint256(r.blockStakeWeight) * 10_000 >= uint256(r.blockQuorumBpsAtOpen) * denom;
     }
 
-    function _growthGatedVoteWeight(IStakedWood sw, address voter, uint256 openedAt) private view returns (uint256) {
-        uint256 weight = sw.getPastStake(voter, openedAt);
-        uint256 lookbackTs = openedAt > FLOOR_LOOKBACK ? openedAt - FLOOR_LOOKBACK : 0;
-        if (
-            sw.getPastStake(voter, openedAt) > sw.getPastStake(voter, lookbackTs)
-                && sw.getPastTotalVotes(lookbackTs) != 0
-        ) {
-            uint256 weightThen = sw.getPastStake(voter, lookbackTs);
-            if (weightThen < weight) weight = weightThen;
-        }
-        return weight;
-    }
-
     // ── sWOOD passthrough views (lets GovernorEmergency read the owner bond via the registry) ──
 
     /// @inheritdoc IGuardianRegistry
@@ -583,10 +543,9 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
 
     /// @inheritdoc IGuardianRegistry
     /// @dev First-vote path OR vote-change. Requires `openReview` to have been
-    ///      called and `voteEnd <= now < reviewEnd`. Snapshots the caller's vote
-    ///      weight at `r.openedAt`, growth-gated via `_growthGatedVoteWeight` so a
-    ///      voter's own numerator weight cannot outrun the denominator's dilution
-    ///      defense, and adds it to the chosen side's tally. Approvers are capped
+    ///      called and `voteEnd <= now < reviewEnd`. Snapshots the caller's raw
+    ///      stake at `r.snapshotAt` — the same instant the denominator is read
+    ///      at — and adds it to the chosen side's tally. Approvers are capped
     ///      (the slash loop iterates them); Blockers are NOT — the block tally is
     ///      a scalar and a fixed blocker slot count was a censorship surface
     ///      slash severity is a deterministic function of block-side decisiveness
@@ -636,7 +595,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // one step further in.
             if (_effNow(r.clockShiftAtRegister) >= lockoutStart) revert VoteChangeLockedOut();
 
-            uint256 weight256 = _growthGatedVoteWeight(swood, msg.sender, uint256(r.snapshotAt));
+            uint256 weight256 = swood.getPastStake(msg.sender, uint256(r.snapshotAt));
             if (weight256 == 0) revert NotActiveGuardian(); // no votable weight at open time
             uint128 weight = uint128(weight256);
             _voteStake[key][msg.sender] = weight;
@@ -1078,10 +1037,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
 
     /// @inheritdoc IGuardianRegistry
     /// @dev Active-guardian-only, block-only side, one vote per guardian. Weight
-    ///      is read at `er.openedAt` and growth-gated via
-    ///      `_growthGatedVoteWeight`: the emergency block-quorum denominator is
-    ///      already the lookback-min, so a voter's own weight must be capped the
-    ///      same way or fresh stake escapes on the numerator side only.
+    ///      is the caller's raw stake at `er.openedAt`, the same instant the
+    ///      emergency block-quorum denominator is read at.
     function voteBlockEmergencySettle(address governor, uint256 proposalId) external whenNotPaused {
         if (!_authorizedGovernors.contains(governor)) revert UnauthorizedGovernor();
         bytes32 eKey = _reviewKey(governor, proposalId);
@@ -1098,7 +1055,7 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         uint256 round = er.round;
         if (_emergencyBlockVotes[eKey][round][msg.sender]) revert AlreadyVoted();
 
-        uint256 weight256 = _growthGatedVoteWeight(swood, msg.sender, uint256(er.openedAt));
+        uint256 weight256 = swood.getPastStake(msg.sender, uint256(er.openedAt));
         if (weight256 == 0) revert NotActiveGuardian(); // no votable weight at open time
         uint128 weight = uint128(weight256);
         _emergencyBlockVotes[eKey][round][msg.sender] = true;

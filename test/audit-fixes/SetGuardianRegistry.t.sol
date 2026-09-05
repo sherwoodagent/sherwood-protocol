@@ -13,10 +13,9 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
-/// @title SetGuardianRegistry — owner-only registry repointing
-/// @notice Lets the protocol upgrade from a stub registry
-///         to the real `GuardianRegistry` once WOOD is live without redeploying
-///         the governor + factory proxies.
+/// @title SetGuardianRegistry — the guardian registry pointer is not settable
+/// @notice Both the governor and the factory bind their registry at
+///         `initialize` and expose no setter for it.
 contract SetGuardianRegistryTest is Test {
     SyndicateGovernor governor;
     SyndicateFactory factory;
@@ -24,7 +23,6 @@ contract SetGuardianRegistryTest is Test {
     MockRegistryMinimal replacementRegistry;
 
     address owner = makeAddr("owner");
-    address attacker = makeAddr("attacker");
 
     function setUp() public {
         initialRegistry = new MockRegistryMinimal();
@@ -83,62 +81,19 @@ contract SetGuardianRegistryTest is Test {
         // governor.setFactory removed in per-vault design — factory set at initialize time
     }
 
-    /// @notice PR #351 review #1: `governor.setGuardianRegistry` was REMOVED.
-    ///         Repointing mid-proposal silently auto-Approved any blocked
-    ///         review (the new registry's `!r.opened` branch in
-    ///         `resolveReview` returned `blocked=false`, discarding every
-    ///         Block vote AND the approver slash). Same hazard class as V-H2
-    ///         (which removed the factory's `setGovernor`). The legitimate
-    ///         beta-stub → real-registry migration path is a governor UUPS
-    ///         upgrade that writes the new address in its initializer, not a
-    ///         setter. The factory's `setGuardianRegistry` is preserved (it
-    ///         only gates new vault creation + `rotateOwner`, not in-flight
-    ///         reviews, and Sherlock #28 added a factory-alignment check).
-    function test_governor_setGuardianRegistry_doesNotExist() public {
-        // The governor proxy has no `setGuardianRegistry(address)` selector.
+    /// @notice Neither proxy exposes `setGuardianRegistry(address)`: the
+    ///         pointer each one binds at `initialize` is the pointer it keeps.
+    function test_setGuardianRegistry_isAbsentFromGovernorAndFactory() public {
         bytes memory data = abi.encodeWithSignature("setGuardianRegistry(address)", address(replacementRegistry));
+
         vm.prank(owner);
-        (bool ok,) = address(governor).call(data);
-        assertFalse(ok, "setGuardianRegistry MUST be absent (PR #351 review #1)");
-        assertEq(governor.guardianRegistry(), address(initialRegistry), "registry slot unchanged");
-    }
+        (bool govOk,) = address(governor).call(data);
+        assertFalse(govOk, "governor must expose no registry setter");
+        assertEq(governor.guardianRegistry(), address(initialRegistry), "governor registry slot moved");
 
-    function test_factory_setGuardianRegistry_succeedsForOwner() public {
-        assertEq(factory.guardianRegistry(), address(initialRegistry));
         vm.prank(owner);
-        vm.expectEmit(true, true, false, false);
-        emit SyndicateFactory.GuardianRegistrySet(address(initialRegistry), address(replacementRegistry));
-        factory.setGuardianRegistry(address(replacementRegistry));
-        assertEq(factory.guardianRegistry(), address(replacementRegistry));
-    }
-
-    function test_factory_setGuardianRegistry_revertsForAttacker() public {
-        vm.prank(attacker);
-        vm.expectRevert();
-        factory.setGuardianRegistry(address(replacementRegistry));
-    }
-
-    function test_factory_setGuardianRegistry_revertsOnZero() public {
-        vm.prank(owner);
-        vm.expectRevert(SyndicateFactory.InvalidGuardianRegistry.selector);
-        factory.setGuardianRegistry(address(0));
-    }
-
-    /// @notice Sherlock run #1 finding #28 — new registry whose `factory()`
-    ///         returns a different address (misconfig) reverts at swap time
-    ///         instead of bricking subsequent bindOwnerStake calls.
-    function test_factory_setGuardianRegistry_revertsOnFactoryMismatch() public {
-        // Deploy a contract that pretends to be a registry but reports a
-        // different factory address.
-        _BadRegistry bad = new _BadRegistry();
-        vm.prank(owner);
-        vm.expectRevert(SyndicateFactory.RegistryFactoryMismatch.selector);
-        factory.setGuardianRegistry(address(bad));
-    }
-}
-
-contract _BadRegistry {
-    function factory() external pure returns (address) {
-        return address(0xBAD); // not the test factory
+        (bool factoryOk,) = address(factory).call(data);
+        assertFalse(factoryOk, "factory must expose no registry setter");
+        assertEq(factory.guardianRegistry(), address(initialRegistry), "factory registry slot moved");
     }
 }

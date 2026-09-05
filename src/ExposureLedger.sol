@@ -3,7 +3,6 @@ pragma solidity 0.8.28;
 
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
-import {IWoodTwapOracle} from "./interfaces/IWoodTwapOracle.sol";
 
 /// @dev Narrow sWOOD read surface (own stake, cooldown). Mirrors the
 ///      IGovernorMinimal pattern in GuardianRegistry — the ledger does not
@@ -100,7 +99,6 @@ interface IChallengeGameWindowMinimal {
  *         resolves:
  *
  *             sourceX8 = feed fresh ? min(feedX8, woodUsdPriceX8)
- *                      : twap fresh ? min(twapX8, woodUsdPriceX8)
  *                      :              revert NoWoodPrice
  *             price    = haircut(sourceX8), floored at 1
  *
@@ -160,8 +158,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      feed. Real Chainlink aggregators report 8 or 18; the bound stays far
     ///      below 78, where `10 ** feedDecimals` overflows `uint256` and panics
     ///      (0x11) inside `_feedPriceX8`'s and `coverageUsd`'s normalization —
-    ///      taking the whole price path down instead of falling through to the
-    ///      TWAP. Bounding at WRITE time closes it for every reader in one place.
+    ///      taking the whole price path down. Bounding at WRITE time closes it
+    ///      for every reader in one place.
     uint8 internal constant MAX_FEED_DECIMALS = 18;
 
     bytes32 public constant PARAM_CHALLENGE_WINDOW = keccak256("challengeWindow");
@@ -210,21 +208,12 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @notice Proposer bond as bps of USD coverage (spec §3.9/§5). Default 1%.
     uint256 public proposerBondBps = 100;
 
-    /// @notice Chainlink WOOD/USD feed. Once wired it is the PREFERRED market
-    ///         source; the TWAP oracle serves only while it is unset or degraded.
-    ///         Still capped by `woodUsdPriceX8` like every source.
+    /// @notice The WOOD/USD feed, `AggregatorV3`-shaped. The ONLY market source,
+    ///         and still capped by `woodUsdPriceX8`.
     /// @dev    Reuses the same `AssetFeed` shape and staleness handling as the
-    ///         vault-asset feeds. Expected to stay UNSET on chain 4663 — there is
-    ///         no WOOD/USD aggregator there — which is why the TWAP oracle is not
-    ///         an optional extra but the live source.
+    ///         vault-asset feeds. On chain 4663 it is a `WoodPoolFeed`, which
+    ///         derives WOOD/USD from the two WOOD/WETH pools.
     AssetFeed internal _woodFeed;
-
-    /// @notice The WOOD/WETH TWAP oracle (`IWoodTwapOracle`), or zero.
-    /// @dev    Not `immutable` and not a constructor argument: the ledger is
-    ///         deployed before the oracle has a completed averaging window, and
-    ///         a bad oracle must be rotatable without redeploying the ledger.
-    ///         Every read of it is defensive — see `_twapPriceX8`.
-    address public woodTwapOracle;
 
     /// @notice Haircut applied to whichever market source won, in bps.
     ///
@@ -237,13 +226,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         this design ACCEPTS rather than eliminates, and once a price has
     ///         cleared the cap it is the only thing standing under either.
     ///
-    ///           1. NON-CONTEMPORANEOUS LEGS in `WoodTwapOracle`. The WOOD/ETH
+    ///           1. NON-CONTEMPORANEOUS LEGS in a pool-derived feed. The WOOD/ETH
     ///              average is near-real-time; the ETH/USD answer may be up to one
     ///              heartbeat old (~10.7h on 4663, while healthy). During an ETH
     ///              drawdown inside that heartbeat the product reads HIGH by
     ///              roughly the ETH move, with no attacker capital involved.
-    ///           2. RESIDUAL CRASH LAG of up to `twapWindow + maxTwapAge`,
-    ///              inherent to averaging.
+    ///           2. RESIDUAL CRASH LAG of up to the averaging window, inherent
+    ///              to averaging.
     ///
     ///         Both OVERSTATE bond value — the dangerous direction. AT THE 10_000
     ///         DEFAULT THAT ALLOWANCE IS ZERO; 5_000 (the floor) absorbs a 50%
@@ -402,33 +391,17 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         REVERTS `NoWoodPrice` when no source can price WOOD. See
     ///         `IExposureLedger.NoWoodPrice` for why that is fail-safe.
     function woodPriceX8() public view returns (uint256) {
-        (uint256 price,,) = _woodPrice();
-        return price;
-    }
-
-    /// @inheritdoc IExposureLedger
-    /// @dev Exists because both degraded states are otherwise invisible: there is
-    ///      no event on either, and `woodUsdPriceX8` carries no `updatedAt`, so
-    ///      TWAP-healthy and cap-has-drifted-under-market-for-a-month read
-    ///      identically from outside.
-    function woodPriceDetail() external view returns (uint256 price, bool fromFeed, bool capBinding) {
         return _woodPrice();
     }
 
-    function _woodPrice() internal view returns (uint256 price, bool fromFeed, bool capBinding) {
+    function _woodPrice() internal view returns (uint256 price) {
         uint256 cap = woodUsdPriceX8;
         if (cap == 0) revert NoWoodPrice();
 
-        uint256 marketX8;
-        (marketX8, fromFeed) = _feedPriceX8();
-        if (!fromFeed) {
-            bool twapOk;
-            (marketX8, twapOk) = _twapPriceX8();
-            if (!twapOk) revert NoWoodPrice();
-        }
+        (uint256 marketX8, bool ok) = _feedPriceX8();
+        if (!ok) revert NoWoodPrice();
 
-        capBinding = cap < marketX8;
-        uint256 sourceX8 = capBinding ? cap : marketX8;
+        uint256 sourceX8 = cap < marketX8 ? cap : marketX8;
         price = _haircut(sourceX8);
         // FLOOR AT 1. `_haircut` truncates, so a source below 2 wei-X8 at the
         // 5,000 bps floor resolves to exactly zero — and zero is not very cheap
@@ -445,7 +418,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         (bool success, bytes memory ret) = feed.staticcall(abi.encodeCall(IAggregatorMinimal.latestRoundData, ()));
         // latestRoundData returns (uint80, int256, uint256, uint256, uint80):
         // 5 words, 160 bytes. Short/absent data is rejected before any decode
-        // is attempted, exactly as `_twapPriceX8` rejects `ret.length < 64`.
+        // is attempted.
         if (!success || ret.length < 160) return (0, false);
         (, int256 answer,, uint256 updatedAt,) = abi.decode(ret, (uint256, int256, uint256, uint256, uint256));
         if (answer <= 0) return (0, false);
@@ -460,16 +433,6 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // A source that truncated to zero is reported UNAVAILABLE, not a
         // healthy zero price — see the dev-note above.
         return (priceX8, priceX8 != 0);
-    }
-
-    function _twapPriceX8() internal view returns (uint256 priceX8, bool ok) {
-        address oracle = woodTwapOracle;
-        if (oracle == address(0) || oracle.code.length == 0) return (0, false);
-        (bool success, bytes memory ret) = oracle.staticcall(abi.encodeCall(IWoodTwapOracle.consult, ()));
-        if (!success || ret.length < 64) return (0, false);
-        (uint256 twapX8, uint256 flag) = abi.decode(ret, (uint256, uint256));
-        if (flag != 1 || twapX8 == 0) return (0, false);
-        return (twapX8, true);
     }
 
     /// @dev THE HAIRCUT APPLIES TO WHATEVER SOURCE WON, and to the cap when the
@@ -522,9 +485,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @notice Wire (or UNWIRE) the Chainlink WOOD/USD feed.
     ///
     /// @dev    ZERO IS THE UNWIRE SWITCH and it is load-bearing: it is the
-    ///         governance path back from a bad aggregator. Unwiring is safe ONLY
-    ///         WHILE A TWAP ORACLE IS WIRED — with neither wired there is no
-    ///         market data and every price read reverts `NoWoodPrice`.
+    ///         governance path back from a bad aggregator. It is NOT a resting
+    ///         state: with no feed wired there is no market data at all and every
+    ///         price read reverts `NoWoodPrice`.
     ///
     ///         UNWIRING MUST BE SPELLED `setWoodFeed(address(0), 0)`. `maxDelay`
     ///         is REQUIRED to be zero rather than merely ignored, so a mis-typed
@@ -554,35 +517,6 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
             feedDecimals: feedDecimals
         });
         emit WoodFeedSet(feed, maxDelay);
-    }
-
-    /// @inheritdoc IExposureLedger
-    ///
-    /// @dev THE PAIR IS VALIDATED BEFORE IT IS TRUSTED. Four WOOD/WETH Uniswap V3
-    ///      pools exist on chain 4663 and all four are initialised-but-never-
-    ///      traded shells: `getPool` returns a non-zero address, so a pool-exists
-    ///      check passes and the price read comes back garbage. `validatePair()`
-    ///      re-checks the token ordering, both reserves and the accumulator, and
-    ///      wiring is refused unless it answers a clean `true`.
-    ///
-    ///      PROBED, NOT CALLED TYPED, and the answer decoded as a `uint256`:
-    ///      `abi.decode` into a `bool` reverts on any word that is not 0 or 1, so
-    ///      a malformed answer would become an undecodable revert instead of the
-    ///      refusal it should be. `code.length` FIRST — the extcodesize guard on a
-    ///      high-level call to a codeless address reverts in this frame, which no
-    ///      `try` can catch.
-    ///
-    ///      UNWIRING TO ZERO IS ACCEPTED and validates nothing. It is not a safe
-    ///      resting state on 4663.
-    function setWoodTwapOracle(address oracle) external onlyOwner {
-        if (oracle != address(0)) {
-            if (oracle.code.length == 0) revert InvalidParameter();
-            (bool success, bytes memory ret) = oracle.staticcall(abi.encodeCall(IWoodTwapOracle.validatePair, ()));
-            if (!success || ret.length < 32) revert InvalidParameter();
-            if (abi.decode(ret, (uint256)) != 1) revert InvalidParameter();
-        }
-        emit WoodTwapOracleSet(woodTwapOracle, oracle);
-        woodTwapOracle = oracle;
     }
 
     /// @dev BOUNDED, BUT NOT RATE-LIMITED. The

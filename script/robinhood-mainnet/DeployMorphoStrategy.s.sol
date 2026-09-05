@@ -65,7 +65,7 @@ contract DeployMorphoStrategy is ScriptBase {
     ///         never touch `vm.setEnv` — that writes one shared mutable process
     ///         global which forge does not roll back between tests and which
     ///         every parallel suite races. Same split, and the same reason, as
-    ///         `DeployWoodTwapOracle`.
+    ///         `DeployWoodPoolFeed`.
     function run() external {
         // Accept Robinhood mainnet (4663) OR a Tenderly-fork chain id via
         // ROBINHOOD_FORK_CHAIN_ID so the byte-same phase runs against the fork.

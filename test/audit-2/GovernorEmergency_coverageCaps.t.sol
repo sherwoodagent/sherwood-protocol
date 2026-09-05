@@ -17,7 +17,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
-import {MockWoodTwapOracle} from "../mocks/MockWoodTwapOracle.sol";
+import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
@@ -110,14 +110,16 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
         agentRegistry = new MockAgentRegistry();
         guardianRegistryMock = new MockRegistryMinimal();
 
-        // ── Ledger: $0.05 WOOD (via TWAP), $1.00 USDG feed, generous cap.
+        // ── Ledger: $0.05 WOOD (via the feed), $1.00 USDG feed, generous cap.
         swood = new Audit2_MockSwood();
         ledger = new ExposureLedger(ledgerOwner, address(swood), 28 days);
         feed = new Audit2_MockFeed(1e8, 8); // $1.00, 8-dec
-        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(0.05e8);
+        MockAggregatorV3 woodFeed = new MockAggregatorV3(8, 0.05e8);
         vm.startPrank(ledgerOwner);
-        ledger.setWoodUsdPrice(0.1e8); // cap only, not binding (TWAP $0.05 is used)
-        ledger.setWoodTwapOracle(address(woodTwap));
+        ledger.setWoodUsdPrice(0.1e8); // cap only, not binding (the feed's $0.05 is used)
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         ledger.setAssetFeed(address(usdg), address(feed), 365 days);
         ledger.setCoveredTvlCapUsd(10_000_000e18);
         ledger.setGuardianRegistry(ledgerRegistry);

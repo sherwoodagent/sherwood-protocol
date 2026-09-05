@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IStrategyFactory} from "./interfaces/IStrategyFactory.sol";
 
 /**
  * @title TierRegistry
@@ -150,24 +151,21 @@ contract TierRegistry is Ownable2Step {
     ///      needs its own slot. `_classAllowDenied` cannot serve: `_demote`
     ///      writes it too, so honouring it in `isCallableTarget` would re-close
     ///      the axis for exactly the demoted class-certified clones this split
-    ///      exists to rescue. But ignoring it outright left
-    ///      `setAdapterAllowed(a, false)` with NO effect on the callee axis for
-    ///      a class member — such a clone has no address entry, so
-    ///      `_calleeAllowed` is already false and clearing it bites nothing,
-    ///      and the class fallback then re-allowed it forever. Since anyone can
-    ///      permissionlessly deploy an ERC-1167 clone of a certified template
-    ///      to become a class member, that was a strict widening.
+    ///      exists to rescue. It is also the only flag that reaches a class
+    ///      member, which has no address entry for a cleared `_calleeAllowed`
+    ///      to bite — and anyone may permissionlessly deploy an ERC-1167 clone
+    ///      of a certified template to become one.
     ///
-    ///      Set ONLY by `setAdapterAllowed(a, false)`; cleared by
-    ///      `setAdapterAllowed(a, true)`; `_demote` never touches it. That is
-    ///      the whole distinction: a conviction says "you may not be PAID
-    ///      again", an owner delisting says "the vault has no further business
-    ///      with you at all".
+    ///      Set ONLY by `setCallable(a, false)`; cleared by `setCallable(a,
+    ///      true)` and by a full re-grant. Neither `_demote` nor
+    ///      `setAdapterAllowed(a, false)` touches it: both say "you may not be
+    ///      PAID again", never "the vault has no further business with you".
     mapping(address adapter => bool) private _calleeRevoked;
 
     /// @dev The CLASS half of the callee axis, mirroring `_calleeAllowed` on the
     ///      address half. Set by `setClassAllowed(t, true)`, cleared only by
-    ///      `setClassAllowed(t, false)`; `_demoteClass` never touches it.
+    ///      `setClassCallable(t, false)`; neither `_demoteClass` nor
+    ///      `setClassAllowed(t, false)` touches it.
     ///
     ///      Without this the split did nothing for the case it most needed to
     ///      cover. A per-proposal strategy clone has NO address entry — class
@@ -176,7 +174,11 @@ contract TierRegistry is Ownable2Step {
     ///      and the vault again could not reach the clone holding its capital.
     ///      The address-entry version of the test passed regardless, which is
     ///      why this went unnoticed until a class-clone test was written.
-    mapping(bytes32 classCodehash => bool) private _classCalleeAllowed;
+    ///
+    ///      Keyed by the plain clone codehash, NOT the epoch fingerprint: a
+    ///      re-point takes funds standing, never the vault's reach into clones
+    ///      already holding its capital.
+    mapping(bytes32 cloneCodehash => bool) private _classCalleeAllowed;
 
     /// @dev Grant-time codehash snapshot for the allowlist axis. The adversary: an
     ///      allowlisted adapter whose bytecode is swapped at the same address, or
@@ -269,9 +271,10 @@ contract TierRegistry is Ownable2Step {
     ///             363d3d373d3d3d363d73 <template:20> 5af43d82803e903d91602b57fd5bf3
     ///
     ///         The implementation address is baked into the bytecode, so every
-    ///         clone of one template is byte-identical and a matching codehash
-    ///         is self-verifying proof of "clone of `template`" — no factory
-    ///         record and no proposer-supplied claim (design.md Decision 1).
+    ///         clone of one template is byte-identical, so a matching codehash
+    ///         narrows a target to "clone of `template`" — one of the three
+    ///         conditions `_classOf` requires, alongside the anchored template
+    ///         codehash and the factory's own provenance record.
     ///
     ///         PURE, and deliberately so: it derives what a clone WOULD hash to,
     ///         never reads chain state. Membership is decided by the caller
@@ -327,11 +330,11 @@ contract TierRegistry is Ownable2Step {
         // A demotion against THIS address stops here: the class must not undo
         // what an owner or a challenge conviction just revoked.
         if (_classTierDenied[k]) return (TIER_ARBITRARY, FULL_NOTIONAL_BPS);
-        // Class fallback. `_classOf` returns 0 unless the target is a live
-        // ERC-1167 clone of a certified template whose own code is unchanged.
+        // Class fallback. `_classOf` returns 0 unless the target is a
+        // factory-minted clone of a certified template whose code is unchanged.
         bytes32 cch = _classOf(target);
         if (cch != bytes32(0)) {
-            TierConfig storage cc = _classConfigs[classKey(cch, selector)];
+            TierConfig storage cc = _classConfigs[_classCfgKey(cch, selector)];
             if (cc.certifiedCodehash != bytes32(0)) return (cc.tier, cc.extractableBoundBps);
         }
         return (TIER_ARBITRARY, FULL_NOTIONAL_BPS);
@@ -354,6 +357,7 @@ contract TierRegistry is Ownable2Step {
     event CertifyDelaySet(uint256 delay);
     event TierDemoted(address indexed target, bytes4 indexed selector);
     event AdapterAllowedSet(address indexed adapter, bool allowed);
+    event CalleeAllowedSet(address indexed target, bool callable);
     /// @notice The counterparty axis moved for `counterparty`. Distinct from
     ///         `AdapterAllowedSet` so an indexer can tell "may be bound by a
     ///         strategy" from "may receive vault funds through a batch".
@@ -658,9 +662,24 @@ contract TierRegistry is Ownable2Step {
     ///         `ChallengeGame`'s bare catch and a won challenge produced only an
     ///         `AdapterDemotionFailed` event. The anti-grief guard is unchanged
     ///         in substance — an uncertified selector is still rejected.
+    ///
+    ///         A PENDING CERTIFICATION IS CANCELLED AHEAD OF THAT GUARD, and
+    ///         cancelling one satisfies the call on its own: a demotion taken
+    ///         before the verdict lands leaves the key uncertified, so the
+    ///         guard would otherwise revert and roll the cancellation back,
+    ///         letting the re-proposal ripen through the conviction.
     function demoteByChallenge(address target, bytes4 selector) external {
         if (msg.sender != authorizedDemoter) revert NotAuthorizedDemoter();
-        if (!_isCertifiedFor(target, selector)) revert NotCertified();
+        bytes32 k = key(target, selector);
+        bool cancelled = _pending[k].readyAt != 0;
+        if (cancelled) {
+            delete _pending[k];
+            emit CertificationCancelled(target, selector);
+        }
+        if (!_isCertifiedFor(target, selector)) {
+            if (cancelled) return;
+            revert NotCertified();
+        }
         _demote(target, selector);
     }
 
@@ -745,9 +764,9 @@ contract TierRegistry is Ownable2Step {
     }
 
     /// @notice Allow or disallow `adapter` as the spender/recipient of value-moving
-    ///         ERC20 calls inside governor batches, AND as a batch callee at all —
-    ///         a target that fails this check cannot be named in a governor batch
-    ///         regardless of selector or calldata. Exotic-asset contracts
+    ///         ERC20 calls inside governor batches. `true` opens the callee axis
+    ///         with it; `false` closes this axis only and leaves `setCallable`
+    ///         the switch for "never call this again". Exotic-asset contracts
     ///         (ERC-721/1155/777, LP-position NFTs) MUST NOT be allowlisted here
     ///         as batch callees; batches should reach such positions through
     ///         allowlisted adapters instead.
@@ -774,16 +793,9 @@ contract TierRegistry is Ownable2Step {
     ///         for the address path.
     function setAdapterAllowed(address adapter, bool allowed) external onlyOwner {
         _adapterAllowed[adapter] = allowed;
-        // Explicit revocation closes the callee axis for CLASS members too, who
-        // have no address entry for the line below to clear.
-        _calleeRevoked[adapter] = !allowed;
-        // BOTH axes move together on an EXPLICIT owner decision. Only `_demote`
-        // splits them (see `_calleeAllowed`): an owner delisting an address
-        // means "the vault has no further business with you at all", while a
-        // conviction means "you may not be paid again" and must still leave the
-        // vault able to reclaim what you already hold.
-        _calleeAllowed[adapter] = allowed;
         if (allowed) {
+            _calleeRevoked[adapter] = false;
+            _calleeAllowed[adapter] = true;
             _adapterAllowedCodehash[adapter] = _effectiveCodehash(adapter);
             if (_classAllowDenied[adapter]) {
                 delete _classAllowDenied[adapter];
@@ -796,10 +808,17 @@ contract TierRegistry is Ownable2Step {
         emit AdapterAllowedSet(adapter, allowed);
     }
 
+    /// @notice Open or close the callee axis for `target` — a POST-SETTLEMENT
+    ///         action, taken once the vault holds nothing there. `onlyOwner`.
+    function setCallable(address target, bool callable) external onlyOwner {
+        _calleeRevoked[target] = !callable;
+        emit CalleeAllowedSet(target, callable);
+    }
+
     /// @notice True when `adapter` may receive approvals/transfers of vault funds
-    ///         through a governor batch, AND whether it may be named as a batch
-    ///         callee at all — the two roles are deliberately the collapsed same
-    ///         predicate.
+    ///         through a governor batch. Whether it may be named as a batch
+    ///         callee at all is the separate `isCallableTarget` predicate, which
+    ///         a demotion or an owner delisting deliberately leaves open.
     /// @dev    Fail-safe self-heal is LAZY, mirroring `tierOf`: true only when the
     ///         allowlist flag is set AND the adapter's live effective codehash
     ///         still matches the grant-time snapshot — no state write in the hot
@@ -831,7 +850,7 @@ contract TierRegistry is Ownable2Step {
         }
         if (_classAllowDenied[adapter]) return false;
         bytes32 cch = _classOf(adapter);
-        return cch != bytes32(0) && _classAllowed[cch];
+        return cch != bytes32(0) && _classAllowed[_classFp(cch)];
     }
 
     /// @notice May the vault CALL `target` inside a governor batch? This is the
@@ -839,10 +858,11 @@ contract TierRegistry is Ownable2Step {
     ///         ONLY one it asks — a `true` here confers no right to receive
     ///         value, which PART 2b gates separately on `isAdapterAllowed`.
     function isCallableTarget(address target) public view returns (bool) {
-        // Explicit owner delisting closes this axis outright, including via the
-        // class path below. `_demote` never sets this flag, so a CONVICTED
-        // clone stays reachable for the settlement batch that reclaims the
-        // vault's capital — which is the entire point of the split.
+        // An explicit `setCallable(target, false)` closes this axis outright,
+        // including via the class path below. Neither `_demote` nor
+        // `setAdapterAllowed(target, false)` sets this flag, so a CONVICTED or
+        // delisted clone stays reachable for the settlement batch that reclaims
+        // the vault's capital — which is the entire point of the split.
         if (_calleeRevoked[target]) return false;
         if (_calleeAllowed[target] && _effectiveCodehash(target) == _adapterAllowedCodehash[target]) {
             return true;
@@ -955,7 +975,7 @@ contract TierRegistry is Ownable2Step {
     ///      shared by the tier and allowlist axes.
     mapping(bytes32 cloneCodehash => ClassAnchor) private _classAnchors;
 
-    /// @dev `classKey(cloneCodehash, selector)` => tier config. A SEPARATE
+    /// @dev `_classCfgKey(cloneCodehash, selector)` => tier config. A SEPARATE
     ///      mapping from `_configs`, so an address entry can never be written
     ///      or demoted through a class entry point or vice versa — namespace
     ///      isolation is structural here, not merely improbable.
@@ -966,9 +986,32 @@ contract TierRegistry is Ownable2Step {
 
     /// @dev class fingerprint => allowlist flag. The class analogue of
     ///      `_adapterAllowed`. No separate codehash snapshot is needed: the
-    ///      anchor's two-level check already proves the code is current, and
-    ///      the class key IS a codehash.
-    mapping(bytes32 cloneCodehash => bool) private _classAllowed;
+    ///      anchor's two-level check already proves the code is current.
+    mapping(bytes32 classFingerprint => bool) private _classAllowed;
+
+    /// @dev A selector certified against one template codehash is never served
+    ///      for another.
+    mapping(bytes32 cloneCodehash => uint64 epoch) private _classEpoch;
+
+    /// @dev `classKey(cloneCodehash, selector)` => the class epoch its bond was
+    ///      locked at. A bond behind an epoch the class has since left warrants
+    ///      an orphaned config and is releasable at once.
+    mapping(bytes32 classConfigKey => uint64 epoch) private _classBondEpoch;
+
+    /// @notice The StrategyFactory whose clone provenance gates class
+    ///         membership. Zero resolves no class at all.
+    address public strategyFactory;
+
+    /// @dev Class fingerprint at the CURRENT epoch. The funds bit and the tier
+    ///      configs are keyed by it, so a re-point orphans them in O(1).
+    function _classFp(bytes32 cch) private view returns (bytes32) {
+        return keccak256(abi.encodePacked(cch, _classEpoch[cch]));
+    }
+
+    /// @dev Class tier-config key at the current epoch.
+    function _classCfgKey(bytes32 cch, bytes4 selector) private view returns (bytes32) {
+        return keccak256(abi.encodePacked(_classFp(cch), selector));
+    }
 
     // ── PER-MEMBER DENIAL (the class fallback's off switch) ──
     //
@@ -1034,11 +1077,12 @@ contract TierRegistry is Ownable2Step {
         if (_configs[key(target, selector)].certifiedCodehash != bytes32(0)) return true;
         bytes32 cch = _classOf(target);
         if (cch == bytes32(0)) return false;
-        return _classConfigs[classKey(cch, selector)].certifiedCodehash != bytes32(0);
+        return _classConfigs[_classCfgKey(cch, selector)].certifiedCodehash != bytes32(0);
     }
 
     error ClassNotCertified();
     error NoPendingClassCertification();
+    error InvalidStrategyFactory();
     /// @notice The certified template's live codehash no longer matches the
     ///         snapshot taken at certification.
     error TemplateCodehashChanged();
@@ -1065,6 +1109,16 @@ contract TierRegistry is Ownable2Step {
     event ClassCertificationCancelled(address indexed template, bytes4 indexed selector);
     event ClassDemoted(address indexed template, bytes4 indexed selector, bytes32 indexed cloneCodehash);
     event ClassAllowedSet(address indexed template, bytes32 indexed cloneCodehash, bool allowed);
+    event ClassCalleeAllowedSet(address indexed template, bytes32 indexed cloneCodehash, bool callable);
+    event StrategyFactorySet(address indexed factory);
+
+    /// @notice Point class membership at the StrategyFactory that mints clones.
+    ///         Must be a contract — every class read staticcalls it. `onlyOwner`.
+    function setStrategyFactory(address factory) external onlyOwner {
+        if (factory.code.length == 0) revert InvalidStrategyFactory();
+        strategyFactory = factory;
+        emit StrategyFactorySet(factory);
+    }
 
     function _classOf(address target) private view returns (bytes32) {
         bytes32 ch = target.codehash;
@@ -1073,6 +1127,8 @@ contract TierRegistry is Ownable2Step {
         address t = a.template;
         if (t == address(0)) return bytes32(0);
         if (t.codehash != a.templateCodehash) return bytes32(0);
+        address f = strategyFactory;
+        if (f == address(0) || IStrategyFactory(f).cloneTemplate(target) != t) return bytes32(0);
         return ch;
     }
 
@@ -1099,9 +1155,9 @@ contract TierRegistry is Ownable2Step {
     ///         What the owner must check and this cannot: that `template` binds
     ///         every init-supplied external address and is not itself a proxy.
     ///
-    ///         every clone of `template` as a batch recipient, including clones
-    ///         minted outside `StrategyFactory` and initialized permissionlessly.
-    ///         `SyndicateVault` binds each member to the paying vault
+    ///         A class certification admits every clone `StrategyFactory`
+    ///         minted from `template` as a batch recipient, whoever asked the
+    ///         factory for it. `SyndicateVault` binds each member to the vault
     ///         (`vault() == vault`), which neutralizes a hostile clone ONLY IF
     ///         the template derives its fund destination and its counterparty
     ///         allowlist from `vault()` and exposes no payout / recipient /
@@ -1168,15 +1224,18 @@ contract TierRegistry is Ownable2Step {
             revert BondActive();
         }
         delete _classPending[k];
+        bytes32 anchored = _classAnchors[cch].templateCodehash;
+        if (anchored != bytes32(0) && anchored != p.templateCodehash) ++_classEpoch[cch];
         if (p.bondAmount != 0) {
             _bonds[k] =
                 SubmitterBond({submitter: p.submitter, amount: p.bondAmount, releasableAt: 0, token: p.bondToken});
+            _classBondEpoch[k] = _classEpoch[cch];
             totalBondedWood += p.bondAmount;
             p.bondToken.safeTransferFrom(p.submitter, address(this), p.bondAmount);
             emit SubmitterBondLocked(template, selector, p.submitter, p.bondAmount);
         }
         _classAnchors[cch] = ClassAnchor({template: p.template, templateCodehash: p.templateCodehash});
-        _classConfigs[k] =
+        _classConfigs[_classCfgKey(cch, selector)] =
             TierConfig({tier: p.tier, extractableBoundBps: p.extractableBoundBps, certifiedCodehash: cch});
         emit ClassCertified(template, selector, cch, p.tier, p.extractableBoundBps, p.templateCodehash);
     }
@@ -1202,7 +1261,7 @@ contract TierRegistry is Ownable2Step {
     /// @notice Effective tier for a class's `selector`, ignoring membership.
     ///         `(2, 10_000)` when the class carries no certification.
     function classTierOf(address template, bytes4 selector) external view returns (uint8, uint16) {
-        TierConfig storage c = _classConfigs[classKey(cloneCodehashOf(template), selector)];
+        TierConfig storage c = _classConfigs[_classCfgKey(cloneCodehashOf(template), selector)];
         if (c.certifiedCodehash == bytes32(0)) return (TIER_ARBITRARY, FULL_NOTIONAL_BPS);
         return (c.tier, c.extractableBoundBps);
     }
@@ -1222,22 +1281,33 @@ contract TierRegistry is Ownable2Step {
     function setClassAllowed(address template, bool allowed) external onlyOwner {
         bytes32 cch = cloneCodehashOf(template);
         if (allowed && _classAnchors[cch].template == address(0)) revert ClassNotCertified();
-        _classAllowed[cch] = allowed;
-        // Callee axis moves with the owner's EXPLICIT decision, and only with
-        // it — `_demoteClass` deliberately leaves `_classCalleeAllowed` set so a
-        // convicted class stays reclaimable while becoming unfundable.
-        _classCalleeAllowed[cch] = allowed;
+        bytes32 fp = _classFp(cch);
+        _classAllowed[fp] = allowed;
+        // The callee axis opens with a grant and never closes with a delisting,
+        // mirroring `_demoteClass` and the address path: a class that may no
+        // longer be PAID stays reclaimable. `setClassCallable` closes it.
+        if (allowed) _classCalleeAllowed[cch] = true;
         emit ClassAllowedSet(template, cch, allowed);
+    }
+
+    /// @notice Open or close the callee axis for every clone of `template` — a
+    ///         POST-SETTLEMENT action, taken once the vault holds nothing in any
+    ///         of them. `onlyOwner`.
+    function setClassCallable(address template, bool callable) external onlyOwner {
+        bytes32 cch = cloneCodehashOf(template);
+        if (callable && _classAnchors[cch].template == address(0)) revert ClassNotCertified();
+        _classCalleeAllowed[cch] = callable;
+        emit ClassCalleeAllowedSet(template, cch, callable);
     }
 
     /// @notice Whether every clone of `template` is currently allowlisted.
     function isClassAllowed(address template) external view returns (bool) {
-        return _classAllowed[cloneCodehashOf(template)];
+        return _classAllowed[_classFp(cloneCodehashOf(template))];
     }
 
     /// @notice Demote a class for `selector`. `onlyOwner`. Instant.
     function demoteClass(address template, bytes4 selector) external onlyOwner {
-        if (_classConfigs[classKey(cloneCodehashOf(template), selector)].certifiedCodehash == bytes32(0)) {
+        if (_classConfigs[_classCfgKey(cloneCodehashOf(template), selector)].certifiedCodehash == bytes32(0)) {
             revert ClassNotCertified();
         }
         _demoteClass(template, selector);
@@ -1245,9 +1315,19 @@ contract TierRegistry is Ownable2Step {
 
     /// @notice Demote a class for `selector` on a challenge conviction.
     ///         Restricted to `authorizedDemoter`, mirroring `demoteByChallenge`.
+    ///         Cancels a pending class certification ahead of the
+    ///         `ClassNotCertified` guard, on the same terms.
     function demoteClassByChallenge(address template, bytes4 selector) external {
         if (msg.sender != authorizedDemoter) revert NotAuthorizedDemoter();
-        if (_classConfigs[classKey(cloneCodehashOf(template), selector)].certifiedCodehash == bytes32(0)) {
+        bytes32 cch = cloneCodehashOf(template);
+        bytes32 k = classKey(cch, selector);
+        bool cancelled = _classPending[k].readyAt != 0;
+        if (cancelled) {
+            delete _classPending[k];
+            emit ClassCertificationCancelled(template, selector);
+        }
+        if (_classConfigs[_classCfgKey(cch, selector)].certifiedCodehash == bytes32(0)) {
+            if (cancelled) return;
             revert ClassNotCertified();
         }
         _demoteClass(template, selector);
@@ -1260,7 +1340,7 @@ contract TierRegistry is Ownable2Step {
     ///         cannot change for an already-deployed address, level 2 can.
     function pokeClass(address template, bytes4 selector) external {
         bytes32 cch = cloneCodehashOf(template);
-        if (_classConfigs[classKey(cch, selector)].certifiedCodehash == bytes32(0)) revert ClassNotCertified();
+        if (_classConfigs[_classCfgKey(cch, selector)].certifiedCodehash == bytes32(0)) revert ClassNotCertified();
         if (template.codehash == _classAnchors[cch].templateCodehash) revert CodehashMatches();
         _demoteClass(template, selector);
     }
@@ -1268,7 +1348,7 @@ contract TierRegistry is Ownable2Step {
     function _demoteClass(address template, bytes4 selector) private {
         bytes32 cch = cloneCodehashOf(template);
         bytes32 k = classKey(cch, selector);
-        delete _classConfigs[k];
+        delete _classConfigs[_classCfgKey(cch, selector)];
         if (_classPending[k].readyAt != 0) {
             delete _classPending[k];
             emit ClassCertificationCancelled(template, selector);
@@ -1279,21 +1359,26 @@ contract TierRegistry is Ownable2Step {
             b.releasableAt = releasableAt;
             emit SubmitterBondReleaseStarted(template, selector, b.submitter, releasableAt);
         }
-        if (_classAllowed[cch]) {
-            delete _classAllowed[cch];
+        bytes32 fp = _classFp(cch);
+        if (_classAllowed[fp]) {
+            delete _classAllowed[fp];
             emit ClassAllowedSet(template, cch, false);
         }
         emit ClassDemoted(template, selector, cch);
     }
 
-    /// @notice Release a demoted class bond to its submitter. Permissionless,
-    ///         same model as `claimSubmitterBond` on the address path.
+    /// @notice Release a demoted or epoch-orphaned class bond to its submitter.
+    ///         Permissionless, same model as `claimSubmitterBond` on the
+    ///         address path.
     function claimClassSubmitterBond(address template, bytes4 selector) external {
-        bytes32 k = classKey(cloneCodehashOf(template), selector);
+        bytes32 cch = cloneCodehashOf(template);
+        bytes32 k = classKey(cch, selector);
         SubmitterBond memory b = _bonds[k];
         if (b.amount == 0) revert NotCertified();
-        if (b.releasableAt == 0 || block.timestamp < b.releasableAt) revert BondNotReleasable();
+        bool orphaned = _classBondEpoch[k] != _classEpoch[cch];
+        if (!orphaned && (b.releasableAt == 0 || block.timestamp < b.releasableAt)) revert BondNotReleasable();
         delete _bonds[k];
+        delete _classBondEpoch[k];
         totalBondedWood -= b.amount;
         b.token.safeTransfer(b.submitter, b.amount);
         emit SubmitterBondClaimed(template, selector, b.submitter, b.amount);

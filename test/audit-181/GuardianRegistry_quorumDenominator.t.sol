@@ -8,14 +8,15 @@ import {RegistryTestHarness} from "../helpers/RegistryTestHarness.sol";
 /// @notice Regression tests for audit issue #181:
 ///
 ///         FINDING #8 (HIGH) — `openReview` (and `openEmergency`) read the
-///         block-quorum DENOMINATOR as a bare `sw.getPastTotalVotes(ts1)`
-///         with no lookback floor. `StakedWood.stakeAsGuardian` has no
-///         cap/allowlist gate, so an attacker can park a large, never-voting
-///         stake immediately before `openReview` to inflate the denominator
-///         and push the absolute vote weight an honest cohort must clear to
-///         block a proposal out of reach. The fix takes the lookback-min
-///         `TokenCourt._participationFloor` already uses (`FLOOR_LOOKBACK`),
-///         so stake younger than 30 days cannot move the denominator.
+///         block-quorum DENOMINATOR at the OPEN instant, which `openReview`
+///         does not control — it is permissionless. `StakedWood.stakeAsGuardian`
+///         has no cap/allowlist gate, so an attacker could park a large,
+///         never-voting stake immediately before it and push the absolute vote
+///         weight an honest cohort must clear to block a proposal out of reach.
+///         The review denominator is now stamped at propose time
+///         (`Review.snapshotAt`, `registerReview`'s block minus one), the same
+///         instant every vote's numerator is read at; the emergency path reads
+///         both sides at its own open instant.
 ///
 ///         FINDING #25 (confidence 72) — `EmergencyReview.nonce` is a
 ///         `uint8` bumped unchecked at BOTH `openEmergency` and
@@ -36,6 +37,7 @@ contract GuardianRegistry_quorumDenominatorTest is RegistryTestHarness {
     address internal honestBlocker = address(0xB10C4);
     address internal honestSilent = address(0x51E17);
     address internal attacker = address(0xA77AC4);
+    address internal freshBlocker = address(0xF9E54);
 
     function setUp() public {
         _deployRegistryAndSwood(REVIEW_PERIOD, BLOCK_QUORUM_BPS);
@@ -43,36 +45,22 @@ contract GuardianRegistry_quorumDenominatorTest is RegistryTestHarness {
 
     // ── Finding #8 ──
 
-    /// @notice A fresh, never-voting stake parked immediately before
-    ///         `openReview` must NOT raise the block-quorum denominator: the
-    ///         honest cohort's genuine 40% block vote must still clear a 20%
-    ///         quorum measured against the honest-only base, not against a
-    ///         base inflated by an attacker's same-block stake.
+    /// @notice A stake parked after the propose-time snapshot must NOT raise
+    ///         the block-quorum denominator: the honest cohort's genuine 40%
+    ///         block vote must still clear a 20% quorum measured against the
+    ///         honest-only base.
     ///
     ///         Numbers mirror the audit finding: honest cohort E =
     ///         1_000_000e18 (400_000e18 blocker + 600_000e18 silent),
     ///         blockQuorumBps = 2000. Baseline (no attack):
     ///           400_000e18 * 10_000 = 4e9 >= 2000 * 1_000_000e18 = 2e9  -> BLOCKED
-    ///         Attack (pre-fix): attacker stakes 1_100_000e18 just before
-    ///         `openReview`, inflating the live total to 2_100_000e18:
+    ///         With the attacker's 1_100_000e18 in the denominator:
     ///           400_000e18 * 10_000 = 4e9  <  2000 * 2_100_000e18 = 4.2e9 -> NOT BLOCKED
-    ///         Fixed code takes `min(total(ts1), total(ts1 - 30 days))`. The
-    ///         attacker's stake is younger than 30 days at `ts1`, so the
-    ///         lookback read excludes it and the denominator stays at the
-    ///         honest-only 1_000_000e18 — restoring the baseline BLOCKED
-    ///         outcome. Against the OLD (unfixed) code, this test fails
-    ///         because `ReviewOpened` fires with `totalStakeAtOpen ==
-    ///         2_100_000e18` (not `1_000_000e18`) and `resolveReview` returns
-    ///         `false` (not `true`).
     function test_openReview_freshStakeCannotInflateBlockQuorumDenominator() public {
         // Honest cohort stakes now.
         _stakeGuardian(honestBlocker, 400_000e18, 1);
         _stakeGuardian(honestSilent, 600_000e18, 2);
 
-        // Mature the honest cohort past BOTH `maturationPeriod` (so their
-        // block vote weight reads at full par) and `FLOOR_LOOKBACK` (so the
-        // lookback-min read at `ts1 - 30 days` still sees their full stake) —
-        // both are 30 days in this harness, so a 31-day warp clears both.
         vm.warp(vm.getBlockTimestamp() + 31 days);
 
         uint256 voteEnd = vm.getBlockTimestamp();
@@ -88,9 +76,9 @@ contract GuardianRegistry_quorumDenominatorTest is RegistryTestHarness {
         // just-written checkpoints (honest AND attacker).
         vm.warp(vm.getBlockTimestamp() + 1);
 
-        // The at-open denominator must be the honest-only lookback-min
-        // (1_000_000e18), never the attacker-inflated live total
-        // (2_100_000e18). `ReviewOpened` carries `totalStakeAtOpen` directly.
+        // The denominator must be the honest-only 1_000_000e18 at the propose
+        // snapshot, never the attacker-inflated 2_100_000e18. `ReviewOpened`
+        // carries `totalStakeAtOpen` directly.
         vm.expectEmit(true, false, false, true);
         emit IGuardianRegistry.ReviewOpened(address(governor), PROPOSAL_ID, 1_000_000e18);
         registry.openReview(address(governor), PROPOSAL_ID);
@@ -107,6 +95,45 @@ contract GuardianRegistry_quorumDenominatorTest is RegistryTestHarness {
         bool blocked = registry.resolveReview(address(governor), PROPOSAL_ID);
         assertTrue(
             blocked, "honest 40% block-side must clear a 20% quorum measured against the honest-only 1_000_000e18 base"
+        );
+    }
+
+    /// @notice Stake present at the quorum snapshot must count for the same
+    ///         amount on both sides of the block-quorum comparison. A guardian
+    ///         whose whole position was opened after the previous cohort is
+    ///         80_000e18 of a 100_000e18 electorate: it is in the denominator
+    ///         `openReview` stamps, so it must be in the numerator its own vote
+    ///         carries, and 8000 bps must clear the 2000 bps quorum.
+    function test_freshGuardianStakeCountsEquallyOnBothSides() public {
+        _stakeGuardian(honestSilent, 20_000e18, 1);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
+
+        _stakeGuardian(freshBlocker, 80_000e18, 2);
+        // The snapshot is `registerReview`'s block minus one, so let the stake
+        // checkpoint age one second into it.
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        uint256 voteEnd = vm.getBlockTimestamp();
+        _registerReview(PROPOSAL_ID, voteEnd, voteEnd + REVIEW_PERIOD);
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        vm.expectEmit(true, false, false, true);
+        emit IGuardianRegistry.ReviewOpened(address(governor), PROPOSAL_ID, 100_000e18);
+        registry.openReview(address(governor), PROPOSAL_ID);
+
+        vm.expectEmit(true, true, false, true);
+        emit IGuardianRegistry.GuardianVoteCast(
+            address(governor), PROPOSAL_ID, freshBlocker, IGuardianRegistry.GuardianVoteType.Block, 80_000e18
+        );
+        vm.prank(freshBlocker);
+        registry.voteOnProposal(
+            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max
+        );
+
+        vm.warp(voteEnd + REVIEW_PERIOD);
+        assertTrue(
+            registry.resolveReview(address(governor), PROPOSAL_ID),
+            "80% of the electorate the denominator counts must clear a 20% quorum"
         );
     }
 

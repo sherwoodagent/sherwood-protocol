@@ -4,7 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
-import {MockWoodTwapOracle} from "test/mocks/MockWoodTwapOracle.sol";
+import {MockAggregatorV3} from "test/mocks/MockAggregatorV3.sol";
 import {MockCoverageFreezer} from "test/mocks/MockCoverageFreezer.sol";
 
 /// @dev Minimal sWOOD stub. Every proposal in this file stays UNEXECUTED
@@ -170,7 +170,7 @@ contract MockChallengeGameWindow {
 contract ExposureLedgerPledgeAndPinsTest is Test {
     ExposureLedger internal ledger;
     MockSwood internal swood;
-    MockWoodTwapOracle internal twap;
+    MockAggregatorV3 internal woodFeed;
     MockGovernorForLedger internal mgov;
     address internal usdgAsset;
 
@@ -187,7 +187,7 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
     function setUp() public {
         swood = new MockSwood();
         ledger = new ExposureLedger(owner, address(swood), 28 days);
-        twap = new MockWoodTwapOracle(MARKET_X8);
+        woodFeed = new MockAggregatorV3(8, int256(MARKET_X8));
 
         usdgAsset = makeAddr("usdgAsset");
         vm.mockCall(usdgAsset, abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
@@ -197,7 +197,9 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
 
         vm.startPrank(owner);
         ledger.setWoodUsdPrice(CAP_X8);
-        ledger.setWoodTwapOracle(address(twap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         ledger.setAssetFeed(usdgAsset, address(assetFeed), 365 days);
         ledger.setGuardianRegistry(registry);
         ledger.setCoverageFreezer(freezer);
@@ -453,22 +455,16 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
 
     /// @notice A Chainlink WOOD feed with a small positive answer at 18
     ///         decimals normalises to exactly zero wei-X8
-    ///         (`(1 * 1e8) / 1e18 == 0`). The ledger must fall through to the
-    ///         TWAP rather than silently resolving `woodPriceX8()` to zero.
-    ///
-    ///         Fails against the pre-fix code (`_feedPriceX8` returns
-    ///         `(0, true)`, `fromFeed` reads `true`, the TWAP fallback is
-    ///         skipped entirely, and `woodPriceX8()` resolves to 0), passes
-    ///         against the fix.
-    function test_feedPriceX8_truncatingToZeroFallsThroughToTwap() public {
-        MockAssetFeed woodFeed = new MockAssetFeed(1, 18); // answer=1, 18-dec feed
+    ///         (`(1 * 1e8) / 1e18 == 0`). The ledger must report that source
+    ///         UNAVAILABLE rather than silently resolving `woodPriceX8()` to
+    ///         zero, which would value every bond at nothing while every call
+    ///         still succeeded.
+    function test_feedPriceX8_truncatingToZeroIsUnavailableNotAZeroPrice() public {
+        MockAssetFeed truncating = new MockAssetFeed(1, 18); // answer=1, 18-dec feed
         vm.prank(owner);
-        ledger.setWoodFeed(address(woodFeed), 365 days);
+        ledger.setWoodFeed(address(truncating), 365 days);
 
-        (uint256 price, bool fromFeed, bool capBinding) = ledger.woodPriceDetail();
-        assertFalse(fromFeed, "a source that truncates to zero must not count as a healthy feed answer");
-        assertFalse(capBinding, "the cap (2x market) must not be binding");
-        assertEq(price, MARKET_X8, "price must fall through to the healthy TWAP, not resolve to zero");
-        assertGt(ledger.woodPriceX8(), 0, "woodPriceX8 must not silently resolve to zero");
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.woodPriceX8();
     }
 }
