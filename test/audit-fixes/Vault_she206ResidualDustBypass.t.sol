@@ -1,123 +1,84 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
+import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
+import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
 import {VaultWithdrawalQueue} from "../../src/queue/VaultWithdrawalQueue.sol";
+import {IVaultWithdrawalQueue} from "../../src/interfaces/IVaultWithdrawalQueue.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title Vault_she206ResidualDustBypass
+/// @notice SHE-206 residual (SHE-257). One share-wei held back from an async
+///         exit keeps `_pricingSupply()` at 1, so the `== 0` reset guards of
+///         `Vault_she206HwmPricingSupply.t.sol` never fire and the stale mark
+///         reads a zero-P&L re-seeding deposit as almost entirely "profit".
 ///
-/// @notice KNOWN-OPEN SHE-206 — the remainder the pricing-supply fix does NOT
-///         close. Every test here PASSES, and each one asserts a phantom
-///         performance-fee base that the vault charges TODAY, on this branch,
-///         with `Vault_she206HwmPricingSupply.t.sol`'s fix in place.
+/// @dev    The vault view `aboveHighWaterMark()` still says so — the mark is
+///         not repaired. What is closed is the CHARGE: `_chargePerformanceFee`
+///         clamps its base to the proposal's realized P&L, so every settlement
+///         below charges the constants, which are now 0.
 ///
-///         These are pins, not regressions. They exist so the residual has a
-///         number attached to it in the repo rather than only in a review
-///         comment, and so a real fix has to flip them ON PURPOSE — a green
-///         suite must not be readable as "SHE-206 is closed".
-///
-/// @dev    WHY THE FIX DOES NOT REACH THIS. The sibling file moves the reset,
-///         the seed and the ratchet from `totalSupply()` onto
-///         `_pricingSupply()`, and every one of those guards tests
-///         `_pricingSupply() == 0`. But the pathology is not "the pricing
-///         supply is empty" — it is "the pricing supply is negligible next to
-///         the virtual offset". `pricePerShare()` divides by
-///         `_pricingSupply() + 10 ** _decimalsOffset()`, so ONE share-wei of
-///         live supply is worth nothing at all against a `1e12` offset while
-///         being infinitely far from the `== 0` the guards ask about. The
-///         exact arithmetic that made the original finding a High is still
-///         there; only the trigger moved, from "hold zero shares back" to
-///         "hold one wei back".
-///
-///         WHAT IT COSTS. Alice takes a completely ordinary async exit and
-///         keeps a single share-wei — or, in the third test, sends that wei to
-///         `0xdEaD` so nobody can ever undo it. Bob's next 10,000 USDC deposit,
-///         with zero P&L anywhere in the sequence, is charged 9,999.990001 USDC
-///         of performance-fee base: 99.9999% of his own principal. With no
-///         donation at all the stamp's own rounding dust (one wei of
-///         `totalAssets`) still yields 4,999.994999. Both figures are
-///         byte-identical to the ones the base commit produces, which is the
-///         cleanest statement of the residual: for this attack the fix changed
-///         nothing except the price of entry, which is one wei.
-///
-///         Still no privileged position, and now permanent: `_pricingSupply()`
-///         can never return to 0 while that wei exists, so the reset is
-///         disabled for the vault's whole life, not just one epoch.
-///
-/// @dev    DIRECTION OF A REAL FIX — and why the obvious one is not it.
-///         Widening the guards to `_pricingSupply() < 10 ** _decimalsOffset()`
-///         is NOT sufficient. It buys nothing at the boundary: at exactly one
-///         unit share the price per share is still unbounded above, because
-///         `totalAssets` is not bounded below by anything the vault controls —
-///         a bare ERC20 transfer can set it to any value it likes, which is the
-///         donation amplifier the ticket already lists as secondary. A
-///         threshold only moves the wei count an attacker has to hold; it does
-///         not remove the division that makes the mark meaningless. It also
-///         introduces its own failure: a real fund whose live supply is
-///         legitimately below the offset would have its mark silently reset.
-///
-///         The principled fix is the ticket's "secondary" item: INTERNAL ASSET
-///         ACCOUNTING. Once `totalAssets()` tracks deposits and settlements
-///         rather than `balanceOf(this)`, the numerator stops being
-///         attacker-controlled and the price per share stops being able to
-///         exceed the mark by an arbitrary factor on zero P&L — which is the
-///         actual invariant, and the one a supply threshold never gets to. That
-///         is not a two-day change, so SHE-206 stays OPEN with this file as its
-///         standing evidence.
-///
-/// @dev    PROVENANCE: reproduced from the adversarial review of PR #300. The
-///         three scenarios and the three figures are the reviewer's; the
-///         assertions are added here so they run in CI instead of being read
-///         once and forgotten.
+///         Real governor, real queue: the clamp lives in the governor, so a
+///         mocked one cannot witness it.
 contract VaultShe206ResidualDustBypassTest is Test {
+    SyndicateGovernor internal governor;
     SyndicateVault internal vault;
     VaultWithdrawalQueue internal queue;
     BatchExecutorLib internal executorLib;
-    ERC20Mock internal usdc;
+    ProtocolConfig internal protocolConfig;
+    MockRegistryMinimal internal guardianRegistry;
     MockAgentRegistry internal agentRegistry;
+    ERC20Mock internal usdc;
 
     address internal owner = makeAddr("owner");
+    address internal agent = makeAddr("agent");
     address internal alice = makeAddr("alice");
     address internal bob = makeAddr("bob");
     address internal donor = makeAddr("donor");
-    address internal constant MOCK_GOVERNOR = address(0xF00D);
-
-    /// @dev The burn address the third scenario parks the dust at, to show the
-    ///      bypass survives its own author walking away from it.
+    address internal sink = makeAddr("sink");
     address internal constant DEAD = address(0xdEaD);
 
+    uint256 internal constant VOTING_PERIOD = 1 days;
+    uint256 internal constant COOLDOWN_PERIOD = 1 days;
+    uint256 internal constant STRATEGY_DURATION = 7 days;
+    uint256 internal constant SELF_SETTLE_FLOOR = 1 hours;
+    uint256 internal constant PERF_FEE_BPS = 1500;
+
     uint256 internal constant EPOCH1 = 1_000e6;
-    /// @dev The re-seeding deposit that gets charged. 10,000 USDC.
+    /// @dev The re-seeding deposit that used to get charged. 10,000 USDC.
     uint256 internal constant EPOCH2 = 10_000e6;
     /// @dev One whole USDC of residue behind the near-empty pricing supply.
     uint256 internal constant RESIDUE = 1e6;
 
-    // KNOWN-OPEN SHE-206 — the three figures below are what the vault charges
-    // on this branch. They are NOT targets; a real fix drives all three to 0
-    // and must update this file deliberately when it does.
-
-    /// @dev `d·r/(r+1)` with one share-wei of live supply and one whole USDC of
-    ///      residue: 9,999.990001 USDC of fee base on a 10,000 USDC zero-P&L
-    ///      deposit.
-    uint256 internal constant RESIDUAL_FEE_BASE_WITH_DONATION = 9_999_990_001;
-    /// @dev The same bypass with NO donation whatsoever — the one wei of
-    ///      `totalAssets` the settlement stamp leaves behind is enough on its
-    ///      own: 4,999.994999 USDC.
-    uint256 internal constant RESIDUAL_FEE_BASE_NO_DONATION = 4_999_994_999;
+    /// @dev Pre-SHE-257 these read 9_999_990_001 and 4_999_994_999: the base
+    ///      the settlement charged on a zero-P&L 10,000 USDC deposit, with and
+    ///      without a donation. The clamp drives both to 0.
+    uint256 internal constant RESIDUAL_FEE_BASE_WITH_DONATION = 0;
+    uint256 internal constant RESIDUAL_FEE_BASE_NO_DONATION = 0;
 
     function setUp() public {
+        protocolConfig = new ProtocolConfig(owner);
+        vm.prank(owner);
+        protocolConfig.setProtocolFeeRecipient(owner);
+
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
+        guardianRegistry = new MockRegistryMinimal();
+        uint256 agentNftId = agentRegistry.mint(agent);
 
-        SyndicateVault impl = new SyndicateVault();
-        bytes memory initData = abi.encodeCall(
+        SyndicateVault vaultImpl = new SyndicateVault();
+        bytes memory vaultInit = abi.encodeCall(
             SyndicateVault.initialize,
             (ISyndicateVault.InitParams({
                     asset: address(usdc),
@@ -130,16 +91,43 @@ contract VaultShe206ResidualDustBypassTest is Test {
                     managementFeeBps: 0
                 }))
         );
-        vault = SyndicateVault(payable(address(new ERC1967Proxy(address(impl), initData))));
+        vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
 
-        // Test contract acts as factory; queue is deployed and bound by it.
+        // Test contract is the vault's factory: binds the queue, answers `governorOf`.
         queue = new VaultWithdrawalQueue(address(vault));
         vault.setWithdrawalQueue(address(queue));
 
-        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), abi.encode(uint256(0)));
+        vm.startPrank(owner);
+        vault.registerAgent(agentNftId, agent);
+        vault.setAgentFeeBps(PERF_FEE_BPS);
+        vm.stopPrank();
+
+        SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
+        bytes memory govInit = abi.encodeCall(
+            SyndicateGovernor.initialize,
+            (
+                address(vault),
+                address(guardianRegistry),
+                address(protocolConfig),
+                address(this),
+                address(deployTierRegistry(address(this))),
+                ISyndicateGovernor.GovernorParams({
+                    votingPeriod: VOTING_PERIOD,
+                    executionWindow: 1 days,
+                    vetoThresholdBps: 4000,
+                    maxPerformanceFeeBps: PERF_FEE_BPS,
+                    cooldownPeriod: COOLDOWN_PERIOD,
+                    collaborationWindow: 48 hours,
+                    maxCoProposers: 5,
+                    minStrategyDuration: 1 hours,
+                    maxStrategyDuration: 30 days
+                })
+            )
+        );
+        governor = SyndicateGovernor(address(new ERC1967Proxy(address(govImpl), govInit)));
+
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
 
         usdc.mint(alice, 100_000e6);
         usdc.mint(bob, 100_000e6);
@@ -148,157 +136,278 @@ contract VaultShe206ResidualDustBypassTest is Test {
         usdc.approve(address(vault), type(uint256).max);
         vm.prank(bob);
         usdc.approve(address(vault), type(uint256).max);
+        vm.warp(vm.getBlockTimestamp() + 1);
     }
 
-    function _setProposalActive(bool active) internal {
-        vm.mockCall(
-            MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(active ? uint256(1) : uint256(0))
+    // ── lifecycle helpers ──
+
+    function _benignCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
+        calls = new BatchExecutorLib.Call[](1);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.balanceOf, (address(vault))), value: 0
+        });
+    }
+
+    /// @dev Propose, have `voter` approve, and execute. Hoists every staticcall
+    ///      ahead of the one-shot pranks.
+    function _proposeAndExecute(address voter) internal returns (uint256 pid) {
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
+        BatchExecutorLib.Call[] memory calls = _benignCalls();
+        uint256[] memory caps = GovEnvelope.defaultCaps(env.maxCapital, calls.length);
+        vm.warp(vm.getBlockTimestamp() + 1); // vote weight snapshots before propose
+        vm.prank(agent);
+        pid = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://p",
+            STRATEGY_DURATION,
+            env,
+            calls,
+            caps,
+            calls,
+            caps,
+            new ISyndicateGovernor.CoProposer[](0)
         );
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(voter);
+        governor.vote(pid, ISyndicateGovernor.VoteType.For);
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(pid);
+        vm.warp(vm.getBlockTimestamp() + SELF_SETTLE_FLOOR + 1);
     }
 
-    /// @dev The governor settling proposal 1 — the call that stamps the frozen
-    ///      price into the queue and takes the pricing supply down to its dust.
-    function _settle() internal {
-        _setProposalActive(false);
-        vm.prank(MOCK_GOVERNOR);
-        vault.onProposalSettled(1);
+    /// @dev Settle `pid` and return the performance-fee base the governor
+    ///      charged (0 when no `PerformanceFeeCharged` was emitted).
+    function _settleAndChargedBase(uint256 pid) internal returns (uint256 base) {
+        vm.recordLogs();
+        vm.prank(agent);
+        governor.settleProposal(pid);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == ISyndicateGovernor.PerformanceFeeCharged.selector) {
+                (, base) = abi.decode(logs[i].data, (uint256, uint256));
+            }
+        }
     }
 
-    /// @dev `totalSupply()` less the queue's stamped-but-unclaimed shares — the
-    ///      quantity `SyndicateVault._pricingSupply()` computes and every guard
-    ///      SHE-206 touched compares against zero.
     function _pricingSupply() internal view returns (uint256) {
         uint256 supply = vault.totalSupply();
         uint256 stamped = queue.stampedUnclaimedShares();
         return supply > stamped ? supply - stamped : 0;
     }
 
-    /// @dev Epoch 1: alice deposits and exits through the async queue, holding
-    ///      back exactly ONE share-wei. That wei is the whole exploit.
-    /// @return mark1 the epoch-1 mark, which must survive the settlement.
-    function _asyncExitKeepingOneWei() internal returns (uint256 mark1) {
+    /// @dev Epoch 1: alice deposits, a proposal runs flat, and she exits through
+    ///      the queue holding back exactly one share-wei (or burns it first).
+    /// @return mark1 the epoch-1 mark, which survives the settlement.
+    function _asyncExitKeepingOneWei(bool burnIt) internal returns (uint256 mark1) {
         vm.prank(alice);
         uint256 shares = vault.deposit(EPOCH1, alice);
         mark1 = vault.highWaterPricePerShare();
         assertGt(mark1, 0, "sanity: mark seeded on the first deposit");
 
-        _setProposalActive(true);
-        vm.startPrank(alice);
-        vault.approve(address(queue), shares - 1);
+        if (burnIt) {
+            vm.prank(alice);
+            vault.transfer(DEAD, 1);
+        }
+        uint256 pid = _proposeAndExecute(alice);
+        vm.prank(alice);
         vault.requestRedeem(shares - 1, alice);
-        vm.stopPrank();
+        assertEq(_settleAndChargedBase(pid), 0, "sanity: a flat epoch charges nothing");
 
-        _settle();
-
-        // The state the fix's guards are looking for, missed by one wei. The
-        // sibling file's `test_hwm_asyncFullExitThenReseedDepositChargesNoPerformanceFee`
-        // is the SAME sequence with this value at 0, and there the fee base is
-        // 0 — so this line is the entire difference between the two outcomes.
         assertEq(_pricingSupply(), 1, "one share-wei of live pricing supply is what defeats the `== 0` guards");
         assertEq(vault.highWaterPricePerShare(), mark1, "so no reset fires and the stale epoch-1 mark stands");
+        vm.warp(vm.getBlockTimestamp() + COOLDOWN_PERIOD + 1);
     }
 
-    // =====================================================================
-    // KNOWN-OPEN SHE-206 — residual bypass, asserted as current behaviour
-    // =====================================================================
-
-    /// @notice KNOWN-OPEN SHE-206. One share-wei withheld from an ordinary
-    ///         async exit re-opens the original finding at full magnitude:
-    ///         9,999.990001 USDC of performance-fee base charged against a
-    ///         10,000 USDC deposit that has earned nothing.
-    ///
-    /// @dev Byte-identical to the figure the pre-fix base commit produces. The
-    ///      fee base being nonzero is the finding; the exact equality is what
-    ///      makes it a pin, since a partial mitigation that merely shrank the
-    ///      number would otherwise slip through as "fixed".
-    function test_review_residualOneWeiOfPricingSupplyKeepsTheExploit() public {
-        uint256 mark1 = _asyncExitKeepingOneWei();
-
-        // Residual assets behind the near-empty pricing supply. A bare transfer
-        // is simply the source with the fewest moving parts; redeem flooring
-        // and the queue's dust release reach the same state.
-        vm.prank(donor);
-        usdc.transfer(address(vault), RESIDUE);
-
-        // Epoch 2. Bob's money has been in the vault for zero seconds.
+    /// @dev Bob re-seeds the fund with zero P&L anywhere in the sequence.
+    function _bobReseeds() internal {
         vm.prank(bob);
         vault.deposit(EPOCH2, bob);
+    }
 
-        assertGt(vault.aboveHighWaterMark(), 0, "KNOWN-OPEN: zero P&L is still charged a performance-fee base");
-        assertEq(
-            vault.aboveHighWaterMark(),
-            RESIDUAL_FEE_BASE_WITH_DONATION,
-            "KNOWN-OPEN SHE-206: 9,999.990001 USDC of a 10,000 USDC deposit, unchanged from the base commit"
-        );
+    // ── the three residual scenarios, charged base now 0 ──
+
+    /// @notice One share-wei withheld plus one USDC of residue: the view still
+    ///         reads ~9,999.99 USDC above the mark, the settlement charges 0.
+    function test_perfBaseNeverExceedsRealizedPnl_oneWeiWithDonation() public {
+        uint256 mark1 = _asyncExitKeepingOneWei(false);
+        vm.prank(donor);
+        usdc.transfer(address(vault), RESIDUE);
+        _bobReseeds();
+        assertGt(vault.aboveHighWaterMark(), EPOCH2 * 99 / 100, "the stale mark still reads bob's principal as profit");
         assertEq(vault.highWaterPricePerShare(), mark1, "the stale mark is what the deposit is measured against");
+
+        uint256 pid = _proposeAndExecute(bob);
+        uint256 before = usdc.balanceOf(address(vault));
+        assertEq(_settleAndChargedBase(pid), RESIDUAL_FEE_BASE_WITH_DONATION, "zero P&L charges no base");
+        assertEq(usdc.balanceOf(address(vault)), before, "not a wei of bob's principal left as fee");
     }
 
-    /// @notice KNOWN-OPEN SHE-206. The same bypass with NO donation at all.
-    ///
-    /// @dev The point of this one is that the residue does not have to be
-    ///      supplied. `stampSettlement`'s own rounding leaves a single wei of
-    ///      `totalAssets` behind a one-wei pricing supply, and that alone puts
-    ///      the price per share two orders of magnitude above the mark — half
-    ///      of bob's principal, 4,999.994999 USDC, on zero P&L. So the attack
-    ///      needs no capital beyond the share-wei: there is nothing to fund and
-    ///      nothing to donate.
-    function test_review_residualOneWeiNoDonation() public {
-        _asyncExitKeepingOneWei();
+    /// @notice The same bypass with no donation: the stamp's own rounding wei
+    ///         is enough for the view (~4,999.99 USDC), and still charges 0.
+    function test_perfBaseNeverExceedsRealizedPnl_oneWeiNoDonation() public {
+        _asyncExitKeepingOneWei(false);
         assertEq(vault.totalAssets(), 1, "the stamp's own rounding dust, nothing added");
+        _bobReseeds();
+        assertGt(vault.aboveHighWaterMark(), EPOCH2 * 49 / 100, "the dust alone inflates the view");
 
-        vm.prank(bob);
-        vault.deposit(EPOCH2, bob);
-
-        assertGt(vault.aboveHighWaterMark(), 0, "KNOWN-OPEN: the dust alone is enough");
-        assertEq(
-            vault.aboveHighWaterMark(),
-            RESIDUAL_FEE_BASE_NO_DONATION,
-            "KNOWN-OPEN SHE-206: 4,999.994999 USDC on a zero-P&L 10,000 USDC deposit, with no donation"
-        );
+        uint256 pid = _proposeAndExecute(bob);
+        uint256 before = usdc.balanceOf(address(vault));
+        assertEq(_settleAndChargedBase(pid), RESIDUAL_FEE_BASE_NO_DONATION, "zero P&L charges no base");
+        assertEq(usdc.balanceOf(address(vault)), before, "not a wei of bob's principal left as fee");
     }
 
-    /// @notice KNOWN-OPEN SHE-206. The share-wei can be burned, which makes the
-    ///         bypass PERMANENT and unattributable.
-    ///
-    /// @dev The distinguishing claim, and the reason this is not just a
-    ///      restatement of the first test: alice does not have to keep custody
-    ///      of anything. She sends one share-wei to `0xdEaD` before exiting in
-    ///      full. `_pricingSupply()` can now never return to 0 for the lifetime
-    ///      of the vault — nobody holds the position that would have to be
-    ///      redeemed — so the reset is disabled forever, for every future
-    ///      epoch, by a transfer that costs one wei and leaves no live
-    ///      counterparty. Same fee base as holding it: 9,999.990001 USDC.
-    function test_review_oneWeiToDeadAddressPermanentlyDisablesTheReset() public {
-        vm.prank(alice);
-        uint256 shares = vault.deposit(EPOCH1, alice);
-        uint256 mark1 = vault.highWaterPricePerShare();
-
-        vm.prank(alice);
-        vault.transfer(DEAD, 1);
-
-        _setProposalActive(true);
-        vm.startPrank(alice);
-        vault.approve(address(queue), shares - 1);
-        vault.requestRedeem(shares - 1, alice);
-        vm.stopPrank();
-        _settle();
-
-        assertEq(vault.balanceOf(alice), 0, "alice is fully out; she holds nothing");
+    /// @notice The share-wei burned to `0xdEaD`: the reset is disabled for the
+    ///         vault's whole life, and every zero-P&L epoch still charges 0.
+    function test_perfBaseNeverExceedsRealizedPnl_oneWeiBurnedToDead() public {
+        uint256 mark1 = _asyncExitKeepingOneWei(true);
+        assertEq(vault.balanceOf(alice), 0, "alice is fully out");
         assertEq(vault.balanceOf(DEAD), 1, "the wei that keeps the pricing supply alive is unreachable");
-        assertEq(_pricingSupply(), 1, "and it can never be redeemed, so this can never return to 0");
-
         vm.prank(donor);
         usdc.transfer(address(vault), RESIDUE);
-
-        vm.prank(bob);
-        vault.deposit(EPOCH2, bob);
-
-        assertGt(vault.aboveHighWaterMark(), 0, "KNOWN-OPEN: permanently, for every future epoch");
-        assertEq(
-            vault.aboveHighWaterMark(),
-            RESIDUAL_FEE_BASE_WITH_DONATION,
-            "KNOWN-OPEN SHE-206: burning the dust costs the attacker nothing and changes nothing"
-        );
+        _bobReseeds();
+        assertGt(vault.aboveHighWaterMark(), EPOCH2 * 99 / 100, "permanently inflated view");
         assertEq(vault.highWaterPricePerShare(), mark1, "the epoch-1 mark outlives everyone who held under it");
+
+        uint256 pid = _proposeAndExecute(bob);
+        uint256 before = usdc.balanceOf(address(vault));
+        assertEq(_settleAndChargedBase(pid), RESIDUAL_FEE_BASE_WITH_DONATION, "zero P&L charges no base");
+        assertEq(usdc.balanceOf(address(vault)), before, "not a wei of bob's principal left as fee");
+    }
+
+    /// @notice A LOSS under the inflated view charges nothing either: the clamp
+    ///         floors the base at zero rather than casting `pnl` to uint.
+    function test_perfBaseNeverExceedsRealizedPnl_lossUnderAStaleMarkChargesNothing() public {
+        _asyncExitKeepingOneWei(false);
+        vm.prank(donor);
+        usdc.transfer(address(vault), RESIDUE);
+        _bobReseeds();
+
+        uint256 pid = _proposeAndExecute(bob);
+        vm.prank(address(vault));
+        usdc.transfer(sink, 1e6);
+        assertGt(vault.aboveHighWaterMark(), 0, "sanity: the view is still above the mark after the loss");
+        uint256 before = usdc.balanceOf(address(vault));
+        assertEq(_settleAndChargedBase(pid), 0, "a loss charges no base");
+        assertEq(usdc.balanceOf(address(vault)), before, "nothing left the vault at settlement");
+    }
+
+    // ── the invariant ──
+
+    /// @notice The charged base is exactly `min(aboveHighWaterMark(), pnl)`:
+    ///         with the view inflated far past a real gain, the base is the gain.
+    function test_performanceFeeBaseNeverExceedsTheProposalsRealizedPnl() public {
+        _asyncExitKeepingOneWei(false);
+        vm.prank(donor);
+        usdc.transfer(address(vault), RESIDUE);
+        _bobReseeds();
+
+        uint256 pid = _proposeAndExecute(bob);
+        uint256 gain = 500e6;
+        usdc.mint(address(vault), gain);
+        uint256 view_ = vault.aboveHighWaterMark();
+        assertGt(view_, gain, "sanity: the view claims far more than the proposal earned");
+
+        uint256 before = usdc.balanceOf(address(vault));
+        uint256 base = _settleAndChargedBase(pid);
+        assertEq(base, gain, "the base is the proposal's realized P&L, not the view");
+        assertEq(before - usdc.balanceOf(address(vault)), gain * PERF_FEE_BPS / 10_000, "the fee is 15% of the gain");
+    }
+
+    /// @notice The same equality on a fuzzed gain: `base == min(view, pnl)`.
+    function testFuzz_performanceFeeBaseIsMinOfViewAndRealizedPnl(uint256 gain) public {
+        // Floor of 7: below it the 15% fee rounds to zero and no event carries a base.
+        gain = bound(gain, 7, 50_000e6);
+        _asyncExitKeepingOneWei(false);
+        _bobReseeds();
+
+        uint256 pid = _proposeAndExecute(bob);
+        usdc.mint(address(vault), gain);
+        uint256 view_ = vault.aboveHighWaterMark();
+
+        uint256 base = _settleAndChargedBase(pid);
+        assertEq(base, view_ < gain ? view_ : gain, "base == min(aboveHighWaterMark, pnl)");
+    }
+
+    /// @notice A donation that lands between two settlements lifts the view
+    ///         above the mark but is not the next proposal's P&L: charged 0.
+    function test_donationBetweenSettlementsIsNeverChargedAsPerformanceFee() public {
+        vm.prank(alice);
+        vault.deposit(EPOCH1, alice);
+        assertEq(_settleAndChargedBase(_proposeAndExecute(alice)), 0, "sanity: a flat epoch charges nothing");
+        vm.warp(vm.getBlockTimestamp() + COOLDOWN_PERIOD + 1);
+
+        uint256 donation = 100e6;
+        vm.prank(donor);
+        usdc.transfer(address(vault), donation);
+        assertApproxEqRel(vault.aboveHighWaterMark(), donation, 1e12, "sanity: the whole donation sits above the mark");
+
+        uint256 pid = _proposeAndExecute(alice);
+        uint256 before = usdc.balanceOf(address(vault));
+        assertEq(_settleAndChargedBase(pid), 0, "zero P&L on the proposal: no base");
+        assertEq(usdc.balanceOf(address(vault)), before, "the donation stays with the holders");
+    }
+
+    // ── supply immobility, the premise the clamp is exact on ──
+
+    /// @notice `totalSupply()` and `_pricingSupply()` cannot move between execute
+    ///         and the fee read: every mint/burn path is shut, and the fee is
+    ///         read before the settlement stamp moves the pricing supply.
+    function test_shareSupplyIsConstantBetweenExecuteAndSettle() public {
+        vm.prank(alice);
+        uint256 aliceShares = vault.deposit(EPOCH1, alice);
+
+        // Epoch 1 leaves a stamped-but-unclaimed redeem behind.
+        uint256 pid1 = _proposeAndExecute(alice);
+        vm.prank(alice);
+        vault.requestRedeem(aliceShares / 2, alice);
+        _settleAndChargedBase(pid1);
+        vm.warp(vm.getBlockTimestamp() + COOLDOWN_PERIOD + 1);
+        _bobReseeds();
+
+        uint256 pid2 = _proposeAndExecute(alice);
+        uint256 supplyAtExecute = vault.totalSupply();
+        uint256 pricingAtExecute = _pricingSupply();
+
+        // Instant lanes: shut.
+        vm.startPrank(bob);
+        vm.expectRevert();
+        vault.deposit(1e6, bob);
+        vm.expectRevert();
+        vault.mint(1e6, bob);
+        vm.expectRevert();
+        vault.redeem(1e6, bob, bob);
+        vm.expectRevert();
+        vault.withdraw(1e6, bob, bob);
+        vm.stopPrank();
+
+        // A prior epoch's stamped redeem: cannot claim (burn) mid-proposal.
+        vm.prank(alice);
+        vm.expectRevert(IVaultWithdrawalQueue.VaultLocked.selector);
+        queue.claim(1);
+
+        // Queue requests move custody, not supply; a deposit claim cannot mint.
+        vm.startPrank(bob);
+        uint256 depReq = vault.requestDeposit(1e6, bob);
+        vm.expectRevert(IVaultWithdrawalQueue.VaultLocked.selector);
+        queue.claim(depReq);
+        uint256 redReq = vault.requestRedeem(1e6, bob);
+        queue.cancel(redReq);
+        uint256 escrowed = 2e6;
+        vault.requestRedeem(escrowed, bob);
+        vm.stopPrank();
+        usdc.mint(address(vault), 300e6);
+
+        assertEq(vault.totalSupply(), supplyAtExecute, "no mint or burn between execute and settle");
+        assertEq(_pricingSupply(), pricingAtExecute, "no stamp between execute and settle");
+
+        // The fee is read at the execute-time pricing supply, before the stamp.
+        uint256 viewBeforeSettle = vault.aboveHighWaterMark();
+        assertLt(viewBeforeSettle, 300e6, "sanity: the view sits below the gain, so it is the unclamped base");
+        assertEq(_settleAndChargedBase(pid2), viewBeforeSettle, "base read at the pre-stamp pricing supply");
+        assertEq(vault.totalSupply(), supplyAtExecute, "settlement itself mints and burns nothing");
+        assertEq(
+            _pricingSupply(), pricingAtExecute - escrowed, "only the stamp, after the fee, moves the pricing supply"
+        );
     }
 }

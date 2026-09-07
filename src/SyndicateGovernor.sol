@@ -1791,7 +1791,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // self-manage. Every proposal is charged the same way.
         {
             uint256 perfFee;
-            (agentFee, perfFee) = _chargePerformanceFee(proposalId, vault, asset, proposal.proposer);
+            (agentFee, perfFee) = _chargePerformanceFee(proposalId, vault, asset, proposal.proposer, pnl);
             totalFee += perfFee;
         }
 
@@ -1883,7 +1883,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         emit ManagementFeeCharged(proposalId, asset, mgmtFee, assetSeconds);
     }
 
-    function _chargePerformanceFee(uint256 proposalId, address vault, address asset, address proposer)
+    function _chargePerformanceFee(uint256 proposalId, address vault, address asset, address proposer, int256 pnl)
         internal
         returns (uint256 agentFee, uint256 perfFee)
     {
@@ -1893,6 +1893,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // proposal's own starting balance — a fund that fell and recovered has
         // already paid for this ground.
         uint256 base = ISyndicateVault(vault).aboveHighWaterMark();
+        // Never more than this proposal earned: share supply is frozen between
+        // execute and settle, so `pnl` and the mark's base share a unit, and a
+        // stale mark cannot charge principal or a donation as performance.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 earned = pnl > 0 ? uint256(pnl) : 0;
+        if (base > earned) base = earned;
 
         if (base > 0) {
             // Snapshotted at propose so it matches what voters approved, then
