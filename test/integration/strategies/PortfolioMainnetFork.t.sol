@@ -56,21 +56,11 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
         extraData[0] = abi.encodePacked(uint8(0), abi.encode(FEE_500));
         uint8[] memory priceDecimals = new uint8[](1);
         priceDecimals[0] = 8; // Chainlink push feed decimals
-        bytes32[] memory feedIds = new bytes32[](1);
-        feedIds[0] = bytes32(uint256(uint160(CHAINLINK_ETH_USD_FEED))); // push-mode encoding
+        address[] memory feeds = new address[](1);
+        feeds[0] = CHAINLINK_ETH_USD_FEED;
 
-        return abi.encode(
-            USDG,
-            swapAdapter,
-            address(0), // push mode (no Data Streams verifier)
-            tokens,
-            weights,
-            totalAmt,
-            MAX_SLIPPAGE_BPS,
-            extraData,
-            priceDecimals,
-            feedIds
-        );
+        return
+            abi.encode(USDG, swapAdapter, tokens, weights, totalAmt, MAX_SLIPPAGE_BPS, extraData, priceDecimals, feeds);
     }
 
     function _buildExecCalls(address strategy, uint256 amount)
@@ -128,9 +118,8 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
 
         // Single 100% WETH slot already at target → no swaps, but this exercises
         // the push-feed price path (ETH/USD) end-to-end without reverting.
-        bytes[] memory reports = new bytes[](1);
         vm.prank(agent);
-        PortfolioStrategy(strategy).rebalanceDelta(reports);
+        PortfolioStrategy(strategy).rebalanceDelta();
         assertGt(IERC20(WETH).balanceOf(strategy), 0, "still holds WETH post-rebalance");
         vm.clearMockedCalls();
 
@@ -178,22 +167,14 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
         uint8[] memory priceDecimals = new uint8[](2);
         priceDecimals[0] = 8;
         priceDecimals[1] = 8;
-        bytes32[] memory feedIds = new bytes32[](2);
-        feedIds[0] = bytes32(uint256(uint160(CHAINLINK_ETH_USD_FEED)));
-        feedIds[1] = bytes32(uint256(uint160(CHAINLINK_TSLA_USD_FEED)));
+        address[] memory feeds = new address[](2);
+        feeds[0] = CHAINLINK_ETH_USD_FEED;
+        feeds[1] = CHAINLINK_TSLA_USD_FEED;
 
-        return abi.encode(
-            USDG,
-            swapAdapter,
-            address(0), // push mode
-            tokens,
-            weights,
-            totalAmt,
-            MIXED_SLIPPAGE_BPS,
-            extraData,
-            priceDecimals,
-            feedIds
-        );
+        return
+            abi.encode(
+                USDG, swapAdapter, tokens, weights, totalAmt, MIXED_SLIPPAGE_BPS, extraData, priceDecimals, feeds
+            );
     }
 
     function test_portfolio_mixedBasket_v3AndV4() public {
@@ -233,9 +214,8 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
 
         // Both legs already at their 50% target → rebalanceDelta exercises both
         // push-feed price paths (v3 + v4 kinds) without reverting.
-        bytes[] memory reports = new bytes[](2);
         vm.prank(agent);
-        PortfolioStrategy(strategy).rebalanceDelta(reports);
+        PortfolioStrategy(strategy).rebalanceDelta();
         assertGt(IERC20(WETH).balanceOf(strategy), 0, "still holds WETH post-rebalance");
         assertGt(IERC20(TSLA).balanceOf(strategy), 0, "still holds TSLA post-rebalance");
         vm.clearMockedCalls();
@@ -285,22 +265,14 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
         uint8[] memory priceDecimals = new uint8[](2);
         priceDecimals[0] = 8;
         priceDecimals[1] = 8;
-        bytes32[] memory feedIds = new bytes32[](2);
-        feedIds[0] = bytes32(uint256(uint160(CHAINLINK_ETH_USD_FEED)));
-        feedIds[1] = bytes32(uint256(uint160(CHAINLINK_TSLA_USD_FEED)));
+        address[] memory feeds = new address[](2);
+        feeds[0] = CHAINLINK_ETH_USD_FEED;
+        feeds[1] = CHAINLINK_TSLA_USD_FEED;
 
-        return abi.encode(
-            USDG,
-            swapAdapter,
-            address(0),
-            tokens,
-            weights,
-            totalAmt,
-            MIXED_SLIPPAGE_BPS,
-            extraData,
-            priceDecimals,
-            feedIds
-        );
+        return
+            abi.encode(
+                USDG, swapAdapter, tokens, weights, totalAmt, MIXED_SLIPPAGE_BPS, extraData, priceDecimals, feeds
+            );
     }
 
     function test_portfolio_mixedBasket_tslaViaMode3Native() public {
@@ -336,10 +308,8 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
             abi.encodeWithSelector(AggregatorV3Interface.latestRoundData.selector),
             abi.encode(uint80(1), tslaAnswer, vm.getBlockTimestamp(), vm.getBlockTimestamp(), uint80(1))
         );
-
-        bytes[] memory reports = new bytes[](2);
         vm.prank(agent);
-        PortfolioStrategy(strategy).rebalanceDelta(reports);
+        PortfolioStrategy(strategy).rebalanceDelta();
         assertGt(IERC20(WETH).balanceOf(strategy), 0, "still holds WETH post-rebalance");
         assertGt(IERC20(TSLA).balanceOf(strategy), 0, "still holds TSLA post-rebalance");
         vm.clearMockedCalls();
@@ -378,72 +348,15 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
         console2.log("Live ETH/USD updatedAt:", updatedAt);
 
         vm.warp(updatedAt + 26 hours + 1);
-
-        bytes[] memory reports = new bytes[](1);
         vm.prank(agent);
         vm.expectRevert(PortfolioStrategy.StalePrice.selector);
-        PortfolioStrategy(strategy).rebalanceDelta(reports);
+        PortfolioStrategy(strategy).rebalanceDelta();
     }
 
-    // ── Per-slot packed max age (Fix A) — a 96h-packed slot survives a 48h
-    //    staleness gap that kills the 26h default ──
-
-    /// @dev 100% WETH basket whose ETH/USD slot packs a per-slot max age. Age 0
-    ///      → default 26h; nonzero overrides it.
-    function _deployWethBasketAged(uint256 ageSeconds) internal returns (address strategy, uint256 proposalId) {
-        address[] memory tokens = new address[](1);
-        tokens[0] = WETH;
-        uint256[] memory weights = new uint256[](1);
-        weights[0] = 10_000;
-        bytes[] memory extraData = new bytes[](1);
-        extraData[0] = abi.encodePacked(uint8(0), abi.encode(FEE_500));
-        uint8[] memory priceDecimals = new uint8[](1);
-        priceDecimals[0] = 8;
-        bytes32[] memory feedIds = new bytes32[](1);
-        feedIds[0] = bytes32((ageSeconds << 160) | uint256(uint160(CHAINLINK_ETH_USD_FEED)));
-
-        bytes memory initData = abi.encode(
-            USDG,
-            swapAdapter,
-            address(0),
-            tokens,
-            weights,
-            TOTAL_AMOUNT,
-            MAX_SLIPPAGE_BPS,
-            extraData,
-            priceDecimals,
-            feedIds
-        );
-        strategy = _cloneAndInit(template, initData);
-        proposalId = _proposeVoteExecute(
-            _buildExecCalls(strategy, TOTAL_AMOUNT), _buildSettleCalls(strategy), PERF_FEE_BPS, STRATEGY_DURATION
-        );
-    }
-
-    function test_portfolio_packedAge_survives48hGap() public {
-        (address strategy,) = _deployWethBasketAged(96 hours);
-
-        // Stamp the ETH/USD feed's updatedAt 48h behind the current clock — past
-        // the 26h default but within the packed 96h age. rebalanceDelta prices
-        // it without reverting.
-        (, int256 ethAnswer,,,) = AggregatorV3Interface(CHAINLINK_ETH_USD_FEED).latestRoundData();
-        uint256 staleAt = vm.getBlockTimestamp() - 48 hours;
-        vm.mockCall(
-            CHAINLINK_ETH_USD_FEED,
-            abi.encodeWithSelector(AggregatorV3Interface.latestRoundData.selector),
-            abi.encode(uint80(1), ethAnswer, staleAt, staleAt, uint80(1))
-        );
-
-        bytes[] memory reports = new bytes[](1);
-        vm.prank(agent);
-        PortfolioStrategy(strategy).rebalanceDelta(reports);
-        assertGt(IERC20(WETH).balanceOf(strategy), 0, "WETH priced via packed 96h age");
-        vm.clearMockedCalls();
-    }
+    // ── A 48h feed gap reverts every priced path at the flat 26h max age ──
 
     function test_portfolio_defaultAge_reverts48hGap() public {
-        // Same 48h gap, but a default-age (0 → 26h) slot reverts StalePrice.
-        (address strategy,) = _deployWethBasketAged(0);
+        (address strategy,) = _deployWethBasket();
 
         (, int256 ethAnswer,,,) = AggregatorV3Interface(CHAINLINK_ETH_USD_FEED).latestRoundData();
         uint256 staleAt = vm.getBlockTimestamp() - 48 hours;
@@ -452,11 +365,9 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
             abi.encodeWithSelector(AggregatorV3Interface.latestRoundData.selector),
             abi.encode(uint80(1), ethAnswer, staleAt, staleAt, uint80(1))
         );
-
-        bytes[] memory reports = new bytes[](1);
         vm.prank(agent);
         vm.expectRevert(PortfolioStrategy.StalePrice.selector);
-        PortfolioStrategy(strategy).rebalanceDelta(reports);
+        PortfolioStrategy(strategy).rebalanceDelta();
         vm.clearMockedCalls();
     }
 

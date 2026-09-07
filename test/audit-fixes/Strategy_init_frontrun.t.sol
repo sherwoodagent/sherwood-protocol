@@ -72,19 +72,10 @@ contract StrategyInitFrontrunTest is Test {
         extra[0] = "";
         uint8[] memory priceDecs = new uint8[](1);
         priceDecs[0] = 18;
-        bytes32[] memory feedIds = new bytes32[](1);
-        feedIds[0] = keccak256("test.feed.tokenA");
+        address[] memory feeds = new address[](1);
+        feeds[0] = makeAddr("feedA");
         bytes memory initData = abi.encode(
-            stubToken,
-            makeAddr("adapter"),
-            address(0),
-            tokens,
-            weights,
-            uint256(1e6),
-            uint256(100),
-            extra,
-            priceDecs,
-            feedIds
+            stubToken, makeAddr("adapter"), tokens, weights, uint256(1e6), uint256(100), extra, priceDecs, feeds
         );
 
         vm.prank(attacker);
@@ -108,22 +99,11 @@ contract StrategyInitFrontrunTest is Test {
         extra[0] = "";
         uint8[] memory priceDecs = new uint8[](1);
         priceDecs[0] = 18;
-        // chainlinkVerifier == address(0) selects push-feed mode, so the feedId
-        // must encode an AggregatorV3 whose live decimals() matches priceDecs.
-        // Reuse the mocked tokenA address (decimals() = 18).
-        bytes32[] memory feedIds = new bytes32[](1);
-        feedIds[0] = bytes32(uint256(uint160(tokenA)));
+        // The feed's live decimals() must match priceDecs; reuse the mocked tokenA (18).
+        address[] memory feeds = new address[](1);
+        feeds[0] = tokenA;
         bytes memory initData = abi.encode(
-            stubToken,
-            makeAddr("adapter"),
-            address(0),
-            tokens,
-            weights,
-            uint256(1e6),
-            uint256(100),
-            extra,
-            priceDecs,
-            feedIds
+            stubToken, makeAddr("adapter"), tokens, weights, uint256(1e6), uint256(100), extra, priceDecs, feeds
         );
 
         // `PortfolioStrategy._initialize` is fail-closed on registry

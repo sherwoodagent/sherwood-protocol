@@ -202,20 +202,11 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         extra[0] = "";
         uint8[] memory priceDecs = new uint8[](1);
         priceDecs[0] = 18;
-        bytes32[] memory feedIds = new bytes32[](1);
-        feedIds[0] = bytes32(uint256(uint160(address(tsla))));
+        address[] memory feeds = new address[](1);
+        feeds[0] = address(tsla);
 
         return abi.encode(
-            address(weth),
-            address(adapter),
-            address(0), // push mode
-            tokens,
-            weights,
-            TOTAL_AMOUNT,
-            maxSlippageBps_,
-            extra,
-            priceDecs,
-            feedIds
+            address(weth), address(adapter), tokens, weights, TOTAL_AMOUNT, maxSlippageBps_, extra, priceDecs, feeds
         );
     }
 
@@ -236,20 +227,11 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         extra[0] = "";
         uint8[] memory priceDecs = new uint8[](1);
         priceDecs[0] = 18;
-        bytes32[] memory feedIds = new bytes32[](1);
-        feedIds[0] = bytes32(uint256(uint160(feed)));
+        address[] memory feeds = new address[](1);
+        feeds[0] = feed;
 
         return abi.encode(
-            address(weth),
-            address(adapter),
-            address(0), // push mode
-            tokens,
-            weights,
-            TOTAL_AMOUNT,
-            maxSlippageBps_,
-            extra,
-            priceDecs,
-            feedIds
+            address(weth), address(adapter), tokens, weights, TOTAL_AMOUNT, maxSlippageBps_, extra, priceDecs, feeds
         );
     }
 
@@ -534,7 +516,8 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         // floor, not the allowlist; the entries below just get it past init.
         MockTierRegistry registry = new MockTierRegistry();
         registry.setAllowed(address(adapter), true);
-        registry.setAllowed(address(tsla), true);
+        AllowlistMockAggregator feed = new AllowlistMockAggregator(18, int256(1e18), block.timestamp);
+        registry.setAllowed(address(feed), true);
         MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
         MockVaultWithGovernor vaultStub = new MockVaultWithGovernor(address(governor));
         weth.mint(address(vaultStub), TOTAL_AMOUNT);
@@ -545,7 +528,7 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         adapter.setRate(address(weth), address(tsla), 1e18);
         adapter.setRate(address(tsla), address(weth), 1e18);
 
-        strategy.initialize(address(vaultStub), proposer, _initData(strategy.MIN_SLIPPAGE_BPS()));
+        strategy.initialize(address(vaultStub), proposer, _initDataWithFeed(strategy.MIN_SLIPPAGE_BPS(), address(feed)));
         vm.prank(address(vaultStub));
         strategy.execute();
 
@@ -648,16 +631,11 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
 
         registry.setAllowed(address(adapter), false);
 
-        // The revert fires before any report is consumed (the re-check runs
-        // ahead of `_verifyPrice`), so an empty push-mode report is fine.
-        bytes[] memory reports = new bytes[](1);
-        reports[0] = "";
-
         vm.prank(proposer);
         vm.expectRevert(
             abi.encodeWithSelector(PortfolioStrategy.AdapterNotAllowed.selector, address(adapter), address(registry))
         );
-        strategy.rebalanceDelta(reports);
+        strategy.rebalanceDelta();
     }
 
     /// @dev Regression guard: a resolved, still-allowlisted adapter must not
@@ -676,11 +654,8 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
     function test_allowlistedAdapter_rebalanceDelta_stillSucceeds() public {
         (PortfolioStrategy strategy,,,) = _initAndExecuteWithResolvedRegistryAndAggregator(SLIPPAGE_100);
 
-        bytes[] memory reports = new bytes[](1);
-        reports[0] = "";
-
         vm.prank(proposer);
-        strategy.rebalanceDelta(reports);
+        strategy.rebalanceDelta();
         assertEq(
             uint256(strategy.state()), uint256(BaseStrategy.State.Executed), "rebalanceDelta does not change state"
         );
@@ -708,7 +683,8 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         // adapter, and `tsla` doubling as its own push feed.
         MockTierRegistry registry = new MockTierRegistry();
         registry.setAllowed(address(adapter), true);
-        registry.setAllowed(address(tsla), true);
+        AllowlistMockAggregator feed = new AllowlistMockAggregator(18, int256(1e18), block.timestamp);
+        registry.setAllowed(address(feed), true);
         MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
         MockVaultWithGovernor vaultStub = new MockVaultWithGovernor(address(governor));
         weth.mint(address(vaultStub), TOTAL_AMOUNT);
@@ -719,7 +695,7 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         adapter.setRate(address(weth), address(tsla), 1e18);
         adapter.setRate(address(tsla), address(weth), 1e18);
 
-        strategy.initialize(address(vaultStub), proposer, _initData(initSlippageBps));
+        strategy.initialize(address(vaultStub), proposer, _initDataWithFeed(initSlippageBps, address(feed)));
         vm.prank(address(vaultStub));
         strategy.execute();
     }
