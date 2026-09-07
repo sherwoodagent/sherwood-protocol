@@ -337,20 +337,6 @@ contract ConcentratedLiquidityStrategyLifecycleTest is CLFixture {
         strategy.execute();
     }
 
-    /// @dev `unwindPosition` is external ONLY so `_settle` can `try/catch` it as
-    ///      a unit. It moves the position and clears `tokenId`, so anything but
-    ///      a self-call must be refused.
-    function test_unwindPosition_onlySelfReverts() public {
-        _execute();
-        vm.prank(keeper);
-        vm.expectRevert(ConcentratedLiquidityStrategy.NotSelf.selector);
-        strategy.unwindPosition();
-
-        vm.prank(proposer);
-        vm.expectRevert(ConcentratedLiquidityStrategy.NotSelf.selector);
-        strategy.unwindPosition();
-    }
-
     function test_execute_twiceReverts() public {
         _execute();
         vm.prank(address(vaultStub));
@@ -1014,65 +1000,46 @@ contract ConcentratedLiquidityStrategyPoolAnchoredFloorTest is CLFixture {
         assertEq(uint256(s.state()), uint256(BaseStrategy.State.Executed), "the fee haircut must not be double-counted");
     }
 
-    // ── The exit leg: the anchor must not become a settlement veto ──
+    // ── The exit leg: the anchor holds, and settle reverts rather than degrading ──
 
-    /// @dev THE REGRESSION THE GATE MUST NOT BREAK. Pool honest, routed venue
-    ///      short: the anchor holds and the skim is refused, leaving the residue
-    ///      for `sweep()`. If gating the anchor on `_spotNearTwap()` had
-    ///      disabled it on this path, this converts and the finding is back.
+    /// @dev Pool honest, routed venue short: the anchor holds and the swap is refused,
+    ///      which reverts the settlement (a swallowed failure would settle short of debt).
     function test_settle_shortRoutedVenueIsRefusedWhileSpotIsTwapVerified() public {
         _execute();
         // Half of what the pool says the token is worth.
         adapter.setRate(address(nvda), address(usdg), (100 * 1e18 / 1e12) / 2);
-        _settle();
-        assertGt(
-            nvda.balanceOf(address(strategy)), 0, "the halved venue must not clear while the pool price is verified"
-        );
+        vm.prank(address(vaultStub));
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
+        strategy.settle();
     }
 
-    /// @dev THE FIX, and the correction to its first attempt. `_settle`/`sweep`
-    ///      assert nothing about spot — unlike `_execute`/`rerange`, which
-    ///      revert `SpotOutsideTwapBound` first — so the anchor's safety is not
-    ///      inherited here and a pushed pool has to be handled explicitly.
-    ///
-    ///      SKIPPING THE ANCHOR IS THE WRONG HANDLING, which is what this pins.
-    ///      With the anchor off, `minOut` falls back to the routed venue quoting
-    ///      itself, so the same actor who pushed the pool also moves the venue
-    ///      and the original finding clears — measured at a full conversion of
-    ///      the position through a venue paying half the pool price. Skipping
-    ///      the SWAP instead costs delay rather than principal.
-    function test_settle_pushedPoolMustNotHandTheSkimBack() public {
+    /// @dev D8: a pushed pool is not handled by skipping the anchor (which would hand the
+    ///      skim back through the venue quoting itself) nor by skipping the swap — settle
+    ///      reverts `SpotOutsideTwapBound` and is retried when the pool is honest.
+    function test_settle_pushedPoolRevertsRatherThanHandingTheSkimBack() public {
         _execute();
         pool.setTicks(23_000, 0);
         adapter.setRate(address(nvda), address(usdg), (100 * 1e18 / 1e12) / 2);
-        _settle();
-        assertGt(
-            nvda.balanceOf(address(strategy)),
-            0,
-            "an unverified pool must skip the swap, not swap on the venue's own quote"
-        );
+        vm.prank(address(vaultStub));
+        vm.expectRevert(ConcentratedLiquidityStrategy.SpotOutsideTwapBound.selector);
+        strategy.settle();
     }
 
-    /// @dev And the delay is only that. The residue a pushed pool leaves is
-    ///      recoverable by the permissionless `sweep()` at any later honest
-    ///      moment, with no owner involvement — which is what makes trading the
-    ///      skim for a skipped swap the right way round. Holding spot outside
-    ///      the bound costs the attacker every block while the TWAP walks toward
-    ///      spot, so the deviation they are paying for closes underneath them.
-    function test_settle_pushedPoolResidueIsRecoveredBySweep() public {
+    /// @dev And the delay is only that: once the pool returns to itself the identical
+    ///      call converts everything and settles.
+    function test_settle_succeedsOnceThePoolIsHonestAgain() public {
         _execute();
         pool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96 / 3);
         pool.setTicks(23_000, 0);
+        vm.prank(address(vaultStub));
+        vm.expectRevert(ConcentratedLiquidityStrategy.SpotOutsideTwapBound.selector);
+        strategy.settle();
 
-        _settle();
-        assertGt(nvda.balanceOf(address(strategy)), 0, "precondition: the pushed pool left a residue");
-
-        // The pool returns to itself; anyone may retry.
         pool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96);
         pool.setTicks(0, 0);
-        vm.prank(address(vaultStub));
-        strategy.sweep();
+        _settle();
 
-        assertEq(nvda.balanceOf(address(strategy)), 0, "sweep must recover the residue once the pool is honest");
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
+        assertEq(nvda.balanceOf(address(strategy)), 0, "volatile leg left on the clone");
     }
 }

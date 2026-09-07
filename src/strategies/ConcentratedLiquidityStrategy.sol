@@ -3,7 +3,6 @@ pragma solidity 0.8.28;
 
 import {BaseStrategy} from "./BaseStrategy.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
-import {IStrategyDelivery} from "../interfaces/IStrategyDelivery.sol";
 import {ISwapAdapter} from "../interfaces/ISwapAdapter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
@@ -11,7 +10,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {IMorpho, Id, MarketParams, Market, Position} from "../vendor/morpho/IMorpho.sol";
-import {MarketParamsLib, MorphoBalancesLib} from "../vendor/morpho/MorphoLibs.sol";
+import {MarketParamsLib, SharesMathLib} from "../vendor/morpho/MorphoLibs.sol";
 import {IUniswapV3Pool} from "../vendor/uniswap/IUniswapV3Pool.sol";
 import {IUniswapV3Factory} from "../vendor/uniswap/IUniswapV3Factory.sol";
 import {INonfungiblePositionManager} from "../vendor/uniswap/INonfungiblePositionManager.sol";
@@ -31,20 +30,6 @@ interface ITierBindingPath {
     function isCounterpartyAllowed(address counterparty) external view returns (bool);
 }
 
-/// @notice Morpho Blue's oracle surface: the collateral price quoted in
-///         loan-token units, scaled by `ORACLE_PRICE_SCALE`.
-/// @dev    Declared locally for the same reason as `ITierBindingPath`, and read
-///         the same way — a length-checked raw staticcall. The oracle address
-///         is a member of the proposer-supplied `MarketParams`, so a typed call
-///         would let whoever controls it revert this frame undecodably and veto
-///         settlement. Exists to generate a selector, not to type the response.
-interface IMorphoOracle {
-    function price() external view returns (uint256);
-}
-
-/// @dev Morpho Blue's fixed oracle price scale (`1e36`).
-uint256 constant ORACLE_PRICE_SCALE = 1e36;
-
 /**
  * @title ConcentratedLiquidityStrategy
  * @notice Deploys vault capital as a market-making position: concentrated
@@ -61,7 +46,7 @@ uint256 constant ORACLE_PRICE_SCALE = 1e36;
  *            touches the borrow or the collateral.
  *   Settle:  decrease to zero → collect → convert the other token back →
  *            repay → withdraw collateral → push everything to the vault.
- *            Deliverable-maximum, never all-or-revert (see `_settle`).
+ *            All-or-revert: every step is typed, a failed settlement is retried.
  *
  *   Batch calls from governor:
  *     Execute: [asset.approve(strategy, assetAmount), strategy.execute()]
@@ -80,7 +65,7 @@ uint256 constant ORACLE_PRICE_SCALE = 1e36;
 contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
     using MarketParamsLib for MarketParams;
-    using MorphoBalancesLib for IMorpho;
+    using SharesMathLib for uint256;
 
     // ── Constants ──
 
@@ -268,20 +253,12 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         — including loosening a bound in the risk-INCREASING direction,
     ///         which is the same thing by another route.
     error ImmutableParam();
-    /// @notice `sweep()` is the post-settlement recovery path only.
-    error NotSettled();
-    /// @notice `unwindPosition()` is an internal step exposed only so the
-    ///         settlement path can `try/catch` it; nobody else may call it.
-    error NotSelf();
-    /// @notice The configured adapter could not quote a leg this contract is
-    ///         about to swap. Adversary: the absence of a floor. This contract
-    ///         carries no price oracle of its own, so the adapter's quote is the
-    ///         ONLY source a minimum-output can be derived from — swapping with
-    ///         a zero floor would be a free sandwich for whoever is watching the
-    ///         mempool. Reverting is correct at execute and at rerange; at
-    ///         SETTLE it would hand a griefer a veto, which is why `_settle`
-    ///         routes its conversion through `_trySwapToAsset` instead.
+    /// @notice The configured adapter could not quote a leg this contract is about to
+    ///         swap. The adapter's quote is one of the two floor sources; no floor, no swap.
     error QuoteUnavailable();
+    /// @notice Settlement proceeds cannot cover the Morpho debt; the position stays as it
+    ///         is and settlement is retried (or exited under guardian review).
+    error ProceedsBelowDebt(uint256 held, uint256 owed);
 
     // ── Events ──
 
@@ -307,19 +284,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         uint128 liquidityBefore,
         uint128 liquidityAfter
     );
-
-    /// @notice Settlement could not clear the whole position in one call.
-    ///         Loud on purpose: the governor measures PnL from the vault's
-    ///         realized float, so the residue books as a LOSS on this proposal
-    ///         and is later returned untaxed by `sweep()`.
-    event SettlementIncomplete(uint256 debtRemaining, uint256 collateralRemaining);
-
-    event ResidualSwept(uint256 assets);
-
-    /// @notice A residue left the clone WITHOUT being converted to the vault
-    ///         asset. Distinct from `ResidualSwept` on purpose: this is not
-    ///         proceeds, it is an unpriced token the vault owner must deal with.
-    event UnconvertibleReleased(address indexed token, uint256 amount);
 
     // ── Types ──
 
@@ -785,16 +749,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         return (avg, true);
     }
 
-    function _spotNearTwap() private view returns (bool) {
-        (int24 twap, bool ok) = _tryTwapTick();
-        if (!ok) return false;
-        (, int24 spot,,,,,) = pool.slot0();
-        return _withinTwapBound(spot, twap);
-    }
-
-    /// @dev Reverts unless spot sits within `maxTwapDeviationBps` of the TWAP.
-    ///      Shares `_withinTwapBound` with `_spotNearTwap` — see there for the
-    ///      tick-space reasoning and the first-order bps↔tick mapping.
+    /// @dev Reverts unless spot sits within `maxTwapDeviationBps` of the TWAP,
+    ///      and when the TWAP itself cannot be read (`_twapTick`).
     function _requireSpotNearTwap() private view returns (int24 twap) {
         twap = _twapTick();
         (, int24 spot,,,,,) = pool.slot0();
@@ -1108,459 +1064,59 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     // ── Settle ──
 
+    /// @dev All-or-revert: the clone holds nothing afterwards, or nothing changes.
     function _settle() internal override nonReentrant {
-        _tryUnwindPosition();
-
-        _trySwapToAsset(settleSlippageBps);
-
-        (uint256 debtRemaining, uint256 collateralRemaining) = _repayAndWithdraw();
-        if (debtRemaining != 0 || collateralRemaining != 0) {
-            emit SettlementIncomplete(debtRemaining, collateralRemaining);
+        if (tokenId != 0) {
+            _closePosition(tokenId);
+            tokenId = 0;
         }
-
+        _swapToAsset(settleSlippageBps);
+        _repayAndWithdraw();
         _pushAllToVault(asset);
     }
 
-    /// @notice Unwind the live position. Callable only by this contract.
-    /// @dev    External ONLY so `_settle` can wrap it in `try/catch` as a unit.
-    ///         The four position-manager calls behind it are typed, and a typed
-    ///         call that reverts takes the whole settlement with it — which is
-    ///         the vault-wide redemption veto this design exists to remove. A
-    ///         self-call is the cheapest way to make the entire unwind atomic
-    ///         AND recoverable: on failure the inner state changes roll back,
-    ///         `tokenId` survives, and `sweep()` retries the identical call.
-    ///         Guarding the four calls individually would instead leave the
-    ///         position half-closed with no record of how far it got.
-    function unwindPosition() external {
-        if (msg.sender != address(this)) revert NotSelf();
-        _closePosition(tokenId);
-        tokenId = 0;
-    }
-
-    /// @dev `catch` is empty on purpose: the position stays held, the residue is
-    ///      reported by the `SettlementIncomplete` emitted downstream, and
-    ///      `sweep()` is the retry.
-    function _tryUnwindPosition() private {
-        if (tokenId == 0) return;
-        try this.unwindPosition() {} catch {}
-    }
-
-    function _trySwapToAsset(uint256 slippageBps) private {
+    /// @dev Spot is TWAP-verified first (D8), so the pool-anchored half of the floor is trusted
+    ///      only inside the deviation bound; the floor is then `max(quote, pool-anchored)`.
+    function _swapToAsset(uint256 slippageBps) private {
         uint256 bal = IERC20(otherToken).balanceOf(address(this));
         if (bal == 0) return;
 
-        uint256 minOut;
-        try swapAdapter.quote(otherToken, asset, bal, swapExtraData) returns (uint256 expected) {
-            if (expected == 0) return;
-            minOut = (expected * (BPS_DENOMINATOR - slippageBps)) / BPS_DENOMINATOR;
-        } catch {
-            return;
-        }
-        if (!_spotNearTwap()) return;
-        uint256 anchored = _poolAnchoredMinOut(otherToken, bal, slippageBps);
-        if (anchored > minOut) minOut = anchored;
+        _requireSpotNearTwap();
+        uint256 minOut = _floorFor(otherToken, asset, bal, slippageBps);
 
         IERC20(otherToken).forceApprove(address(swapAdapter), bal);
-        // The swap itself is also allowed to fail: a quote that stood a moment
-        // ago can be gone by the time the swap lands, and that must not revert
-        // settlement either.
-        (bool swapped,) = address(swapAdapter)
-            .call(abi.encodeCall(ISwapAdapter.swap, (otherToken, asset, bal, minOut, swapExtraData)));
-        // Retire the allowance either way: on failure it must not stand, and on
-        // success an adapter that took less than offered must not keep the rest.
+        swapAdapter.swap(otherToken, asset, bal, minOut, swapExtraData);
         IERC20(otherToken).forceApprove(address(swapAdapter), 0);
-        if (!swapped) return; // residue stays converted-nothing; `sweep()` retries
     }
 
-    /// @dev Repays by SHARES when the position can afford the whole debt, and by
-    ///      ASSETS only when taking the deliverable maximum. Shares-mode is what
-    ///      clears the debt EXACTLY — a single dust share left behind blocks
-    ///      `withdrawCollateral` entirely, which would turn a full settlement
-    ///      into a stranded one.
-    function _repayAndWithdraw() private returns (uint256 debtRemaining, uint256 collateralRemaining) {
-        // GUARDED: `accrueInterest` calls the market's IRM, and the IRM address
-        // is part of the proposer-supplied `MarketParams`. A reverting IRM would
-        // otherwise be a settlement veto handed to the proposer.
-        (bool accrued,) = address(morpho).call(abi.encodeCall(IMorpho.accrueInterest, (_marketParams)));
-
-        uint128 borrowShares = morpho.position(marketId, address(this)).borrowShares;
-
-        if (borrowShares != 0) {
-            Market memory m = morpho.market(marketId);
-            uint256 owed = _sharesToAssetsUp(borrowShares, m.totalBorrowAssets, m.totalBorrowShares);
-            uint256 held = IERC20(asset).balanceOf(address(this));
-
-            if (accrued && held >= owed) {
-                // Shares-mode is what clears the debt EXACTLY — a single dust
-                // share left behind blocks `withdrawCollateral` entirely. It is
-                // only trustworthy on FRESH totals, which is why it is gated on
-                // the accrual above having landed: against stale totals the
-                // mirrored `owed` understates what Morpho will actually pull.
-                _tryRepay(held, abi.encodeCall(IMorpho.repay, (_marketParams, 0, borrowShares, address(this), "")));
-            } else if (held != 0) {
-                // Deliverable maximum. Capped at `owed` because repaying more
-                // assets than the position owes underflows Morpho's share math.
-                uint256 amount = held < owed ? held : owed;
-                if (amount != 0) {
-                    _tryRepay(amount, abi.encodeCall(IMorpho.repay, (_marketParams, amount, 0, address(this), "")));
-                }
-            }
-        }
-
-        uint128 collateral = morpho.position(marketId, address(this)).collateral;
-        uint128 outstanding = morpho.position(marketId, address(this)).borrowShares;
-        if (collateral != 0) {
-            if (outstanding == 0) {
-                _tryWithdrawCollateral(collateral);
-            } else {
-                uint256 freeable = _withdrawableWhileHealthy(collateral);
-                if (freeable != 0) _tryWithdrawCollateral(uint128(freeable));
-            }
-        }
-
-        // Retried UNCONDITIONALLY, not only under the branch above. A previous
-        // call can have pulled the shares out of Morpho and then failed to
-        // redeem them; Morpho's collateral is zero at that point, so gating the
-        // retry on it would strand the shares on this clone forever.
-        _tryRedeemWrapper();
-
-        // Re-read rather than reasoning from the branch taken: a partial repay
-        // that rounded, or a capped withdrawal, must be reported as it actually
-        // landed and not as it was intended.
-        borrowShares = morpho.position(marketId, address(this)).borrowShares;
-        collateral = morpho.position(marketId, address(this)).collateral;
-        if (borrowShares != 0) {
-            Market memory m2 = morpho.market(marketId);
-            debtRemaining = _sharesToAssetsUp(borrowShares, m2.totalBorrowAssets, m2.totalBorrowShares);
-        }
-        // Counts wrapper shares still sitting on the clone, not just what Morpho
-        // still holds — both are collateral this settlement failed to deliver,
-        // in the same units, and reporting only the first would call a stranded
-        // settlement complete.
-        collateralRemaining = collateral;
-        address collateralToken = _marketParams.collateralToken;
-        if (collateralToken != asset) {
-            collateralRemaining += IERC20(collateralToken).balanceOf(address(this));
-        }
-    }
-
-    function _tryRepay(uint256 approveAmount, bytes memory callData) private returns (bool ok) {
-        IERC20(asset).forceApprove(address(morpho), approveAmount);
-        (ok,) = address(morpho).call(callData);
-        IERC20(asset).forceApprove(address(morpho), 0);
-    }
-
-    function _withdrawableWhileHealthy(uint128 collateral) private view returns (uint256) {
-        MarketParams memory mp = _marketParams;
-        uint128 borrowShares = morpho.position(marketId, address(this)).borrowShares;
-        if (borrowShares == 0 || mp.lltv == 0) return 0;
-
-        address oracle = mp.oracle;
-        if (oracle.code.length == 0) return 0;
-        (bool ok, bytes memory ret) = oracle.staticcall(abi.encodeWithSelector(IMorphoOracle.price.selector));
-        if (!ok || ret.length < 32) return 0;
-        uint256 price = abi.decode(ret, (uint256));
-        if (price == 0) return 0;
-
-        Market memory m = morpho.market(marketId);
-        uint256 owed = _sharesToAssetsUp(borrowShares, m.totalBorrowAssets, m.totalBorrowShares);
-
-        // Effective LTV ceiling, held `MIN_LLTV_BUFFER_BPS` under the market's.
-        uint256 bufferWad = (MIN_LLTV_BUFFER_BPS * 1e18) / BPS_DENOMINATOR;
-        if (mp.lltv <= bufferWad) return 0;
-        uint256 effLltv = mp.lltv - bufferWad;
-
-        // required = ceil(ceil(owed * ORACLE_PRICE_SCALE / price) * WAD / effLltv)
-        // Split so the intermediate never needs 1e36 * 1e18 at once.
-        uint256 required = Math.mulDiv(owed, ORACLE_PRICE_SCALE, price, Math.Rounding.Ceil);
-        required = Math.mulDiv(required, 1e18, effLltv, Math.Rounding.Ceil);
-
-        if (required >= collateral) return 0;
-        return collateral - required;
-    }
-
-    /// @dev Degrades rather than reverting. A collateral withdrawal can fail for
-    ///      reasons outside this proposal's control; taking the shortfall as an
-    ///      incomplete settlement keeps the vault's redemption path open, and
-    ///      `sweep()` recovers it once the condition clears.
-    function _tryWithdrawCollateral(uint128 amount) private returns (bool ok) {
-        (ok,) = address(morpho)
-            .call(abi.encodeCall(IMorpho.withdrawCollateral, (_marketParams, amount, address(this), address(this))));
-    }
-
-    function _tryRedeemWrapper() private returns (bool ok) {
-        address collateralToken = _marketParams.collateralToken;
-        if (collateralToken == asset) return true;
-
-        uint256 shares = IERC20(collateralToken).balanceOf(address(this));
-        if (shares == 0) return true;
-
-        (bool maxOk, bytes memory maxRet) =
-            collateralToken.staticcall(abi.encodeCall(IERC4626.maxRedeem, (address(this))));
-        if (maxOk && maxRet.length == 32) {
-            uint256 redeemable = abi.decode(maxRet, (uint256));
-            if (redeemable < shares) shares = redeemable;
-        }
-        if (shares == 0) return false;
-
-        (ok,) = collateralToken.call(abi.encodeCall(IERC4626.redeem, (shares, address(this), address(this))));
-    }
-
-    function _sharesToAssetsUp(uint256 shares, uint256 totalAssets, uint256 totalShares)
-        private
-        pure
-        returns (uint256)
-    {
-        // Mirrors `SharesMathLib.toAssetsUp` including the virtual offsets, so a
-        // value computed here and one computed by the singleton agree exactly.
-        uint256 tA = totalAssets + 1;
-        uint256 tS = totalShares + 1e6;
-        return (shares * tA + (tS - 1)) / tS;
-    }
-
-    /// @notice Recover a residue left behind by an incomplete settlement.
-    /// @dev    VAULT-ONLY, THOUGH THE VALUE ONLY EVER MOVES THE RIGHT WAY. This
-    ///         was permissionless on the reasoning that a one-directional push
-    ///         needs no gate. The push is fine; the ACCOUNTING is what breaks —
-    ///         `SyndicateVault.collectResidue` measures the arrival as a balance
-    ///         delta and pays the exited redeem cohort their frozen share of it,
-    ///         and a delta only measures everything if it is the only door.
-    ///         Called directly, the cohort is credited nothing and the arrival
-    ///         lifts the stayers' price instead, unrepairably. See the twin note
-    ///         on `MorphoSupplyStrategy.sweep`. The permissionless entry point
-    ///         is `collectResidue`, which calls this.
-    ///
-    ///         Post-settlement only. Idempotent and safe to call with nothing to
-    ///         move.
-    ///         RETRIES EVERY STEP `_settle` CAN FAIL AT, in the same order. The
-    ///         set of residues this can recover must not be narrower than the
-    ///         set `_settle` can create, or the "recoverable later" claim above
-    ///         is false for whichever step was left out — so the position
-    ///         unwind is retried here too, not just the repay and the withdraw.
-    function sweep() external onlyVault nonReentrant returns (uint256 assets) {
-        if (_state != State.Settled) revert NotSettled();
-
-        _tryUnwindPosition();
-        _trySwapToAsset(settleSlippageBps);
-
-        (uint256 debtRemaining, uint256 collateralRemaining) = _repayAndWithdraw();
-        if (debtRemaining != 0 || collateralRemaining != 0) {
-            // Loud on the same terms `_settle` is: a sweep that recovers only
-            // part of the residue must not read as a completed recovery.
-            emit SettlementIncomplete(debtRemaining, collateralRemaining);
-        }
-
-        assets = IERC20(asset).balanceOf(address(this));
-        if (assets != 0) {
-            _pushAllToVault(asset);
-            emit ResidualSwept(assets);
-        }
-    }
-
-    /// @inheritdoc IStrategyDelivery
-    /// @dev True while a settled proposal still has value on this clone that a
-    ///      `sweep()` or `releaseUnconvertible()` would move. The vault reads it
-    ///      to keep deposits shut over that window, since `totalAssets()` prices
-    ///      anything held here at zero.
-    ///
-    ///      Covers every leg this template can strand, which is more than the
-    ///      Morpho case: an open LP position, the ERC-4626 collateral wrapper,
-    ///      the `otherToken` side, and plain idle `asset`. `_settle` reports the
-    ///      first two through `SettlementIncomplete`; the last two are what
-    ///      `sweep`/`releaseUnconvertible` exist to return.
-    ///
-    ///      Reads BALANCES, not deliverability. Whether a wrapper will redeem or
-    ///      a pool will quote right now is the manipulable part; value the vault
-    ///      is not counting is the part that matters here.
-    function hasUndeliveredValue() public view override returns (bool) {
-        if (_state != State.Settled) return false;
-        if (tokenId != 0) return true;
-        if (IERC20(asset).balanceOf(address(this)) > RESIDUE_DUST) return true;
-        if (IERC20(otherToken).balanceOf(address(this)) > RESIDUE_DUST) return true;
-        // THE MORPHO POSITION, which is the residue this template most often
-        // strands: `_repayAndWithdraw` defines `collateralRemaining` as exactly
-        // this, `_tryWithdrawCollateral` degrades rather than reverting, and
-        // collateral cannot leave while debt remains. The canonical strand — LP
-        // burned, loose balances pushed, collateral stuck behind residual debt —
-        // answered false without this and reopened deposits.
+    /// @dev Repays by SHARES on freshly accrued totals, which is what clears the debt
+    ///      exactly; a dust share left behind would block `withdrawCollateral`.
+    function _repayAndWithdraw() private {
+        morpho.accrueInterest(_marketParams);
         Position memory pos = morpho.position(marketId, address(this));
-        // Dust-floored for the same reason: `supplyCollateral` also takes
-        // `onBehalf` and needs no authorization. The floor is on COLLATERAL and
-        // the `borrowShares` clause is gone deliberately: debt with zero
-        // collateral is not a reachable steady state, because Morpho's bad-debt
-        // realization zeroes both sides together. So the collateral floor
-        // subsumes it rather than merely ignoring it.
-        if (pos.collateral > RESIDUE_DUST) return true;
-        address coll = _marketParams.collateralToken;
-        if (coll != asset && IERC20(coll).balanceOf(address(this)) > RESIDUE_DUST) return true;
-        return false;
-    }
 
-    /// @inheritdoc IStrategyDelivery
-    /// @dev DELIBERATELY PARTIAL, AND BIASED LOW. Reports only what this
-    ///      template can value in vault-asset units WITHOUT consulting a price
-    ///      an attacker could move inside the settlement transaction: the idle
-    ///      vault-asset balance, plus the Morpho collateral net of debt when the
-    ///      collateral token IS the vault asset (the fee-free 1:1 wrapper case
-    ///      this template is built for).
-    ///
-    ///      NOT counted: a live LP position (`tokenId != 0`), the volatile leg,
-    ///      and a collateral token that is not the vault asset. Valuing those
-    ///      needs a pool or oracle read, and a stamp that trusts one is exactly
-    ///      the unrealized, strategy-influenced NAV the frozen-price design
-    ///      exists to avoid — the same lever findings #2/#3 pull.
-    ///
-    ///      UNDER-REPORTING IS NO LONGER SAFE ON ITS OWN, and that changed
-    ///      under this function rather than inside it. While the vault only
-    ///      needed a boolean, omitting a leg cost nothing: the lock covered
-    ///      every residue shape and the price stayed float-only. The vault now
-    ///      prices MINTS against this figure, so an omission is exactly the
-    ///      finding-#3 skim — a depositor mints against a price missing the LP
-    ///      leg, sweeps it in, and takes the difference from the incumbents.
-    ///
-    ///      What keeps the narrowing safe is `hasUnvaluedResidue()` below, which
-    ///      declares every shape this omits. The vault refuses to mint at all
-    ///      while any of them is outstanding, so the partial figure is only ever
-    ///      used when it is also COMPLETE.
-    function undeliveredValue() public view override returns (uint256) {
-        if (_state != State.Settled) return 0;
-        uint256 v = IERC20(asset).balanceOf(address(this));
-        if (_marketParams.collateralToken != asset) return v;
-
-        // ONE read of the struct, not two.
-        Position memory pos = morpho.position(marketId, address(this));
-        // SAME FLOOR AS THE BOOL. Without it a 1-wei donated collateral gives
-        // `hasUndeliveredValue() == false` while this returns non-zero — the
-        // would not be obvious once #233 wires a consumer.
-        if (pos.collateral <= RESIDUE_DUST) return v;
-        uint256 owed;
         if (pos.borrowShares != 0) {
-            // ACCRUED totals, not raw. A raw `morpho.market` read excludes
-            // interest since `lastUpdate`, which understates `owed` and pushes
-            // `collateral - owed` HIGH — the one direction this stamp must
-            // never err in. The same-tx accrual in `_repayAndWithdraw` is a
-            // guarded call allowed to fail, so it is not a guarantee.
-            (,, uint256 totalBorrowAssets, uint256 totalBorrowShares) = morpho.expectedMarketBalances(_marketParams);
-            owed = _sharesToAssetsUp(pos.borrowShares, totalBorrowAssets, totalBorrowShares);
+            Market memory m = morpho.market(marketId);
+            uint256 owed = uint256(pos.borrowShares).toAssetsUp(m.totalBorrowAssets, m.totalBorrowShares);
+            uint256 held = IERC20(asset).balanceOf(address(this));
+            if (held < owed) revert ProceedsBelowDebt(held, owed);
+
+            IERC20(asset).forceApprove(address(morpho), owed);
+            morpho.repay(_marketParams, 0, pos.borrowShares, address(this), "");
+            IERC20(asset).forceApprove(address(morpho), 0);
         }
-        // Net equity only, and never negative: an underwater position
-        // contributes nothing rather than subtracting from the stamp.
-        if (uint256(pos.collateral) > owed) v += uint256(pos.collateral) - owed;
-        return v;
+
+        if (pos.collateral != 0) {
+            morpho.withdrawCollateral(_marketParams, pos.collateral, address(this), address(this));
+        }
+        _redeemWrapper();
     }
 
-    /// @inheritdoc IStrategyDelivery
-    /// @dev THE EXACT COMPLEMENT OF WHAT `undeliveredValue()` ABOVE CAN PRICE.
-    ///      That figure is deliberately partial: it reports the idle vault-asset
-    ///      balance, plus Morpho collateral net of debt ONLY when the collateral
-    ///      token IS the vault asset. Everything else needs a price this
-    ///      template refuses to consult, because the venue quoting it is one the
-    ///
-    ///      So this reports the residue shapes that figure omits, and the vault
-    ///      refuses to mint at all while any of them is outstanding. Under a
-    ///      boolean lock the omission was harmless (the lock covered every
-    ///      shape); once the figure sets the price a mint pays, an omission IS
-    ///      the skim — a depositor mints against a price missing the LP leg,
-    ///      sweeps it in, and takes the difference from the incumbents.
-    ///
-    ///      Every shape here is unwindable by the permissionless `sweep()`:
-    ///      burning an LP position always returns its tokens, there is no
-    ///      illiquid market to wait on, and `releaseUnconvertible` hands off
-    ///      whatever cannot be swapped. So this cannot wedge the vault the way
-    ///      an unclearable Morpho supply could.
-    function hasUnvaluedResidue() public view override returns (bool) {
-        if (_state != State.Settled) return false;
-        // A live LP position — valuing it means reading the pool.
-        if (tokenId != 0) return true;
-        // The volatile leg, which is by construction not the vault asset.
-        if (IERC20(otherToken).balanceOf(address(this)) > RESIDUE_DUST) return true;
-        address coll = _marketParams.collateralToken;
-        if (coll != asset) {
-            // Loose collateral, and collateral still posted to Morpho — both in
-            // a token `undeliveredValue()` bails out on rather than converting.
-            if (IERC20(coll).balanceOf(address(this)) > RESIDUE_DUST) return true;
-            if (morpho.position(marketId, address(this)).collateral > RESIDUE_DUST) return true;
-        }
-        return false;
-    }
-
-    /// @notice Hand an `otherToken` residue this clone cannot convert to the
-    ///         vault, unconverted.
-    /// @dev    THE ESCAPE HATCH OF LAST RESORT, deliberately NOT folded into
-    ///         `sweep()`. `sweep()` retries the conversion and can be called
-    ///         forever, so a transient adapter outage needs no escape — and
-    ///         pushing on every sweep would FORECLOSE the conversion, moving the
-    ///         residue somewhere this contract can no longer sell it. The case
-    ///         this exists for is the other one: an adapter that will never
-    ///         quote this pair again, where `sweep()` alone leaves the residue
-    ///         on the clone permanently, because nothing on this contract can
-    ///         move a token that is neither the vault asset nor swappable.
-    ///
-    ///         The vault is the strictly better custodian for that: it carries
-    ///         an owner-gated `rescueERC20`, and this clone carries nothing.
-    ///
-    ///         VAULT-ONLY, LIKE `sweep()`, AND FOR THE SAME ACCOUNTING REASON.
-    ///         The conversion below is attempted before the release, so this
-    ///         function can push VAULT ASSET home — which makes it a second door
-    ///         onto the balance delta `SyndicateVault._payCohortShare` splits,
-    ///         and a delta only measures everything if it is the only door.
-    ///         Called directly, the exited redeem cohort is credited nothing and
-    ///         the arrival lifts the stayers' price instead, unrepairably: the
-    ///         delta is spent, so a later vault-side call measures zero. The
-    ///         permissionless entry point is `SyndicateVault
-    ///         .releaseUnconvertible(strategy)`, which calls this — so the
-    ///         capital-hostage property is unchanged, anyone may still trigger
-    ///         it at any time.
-    ///
-    ///         The conversion is attempted first every time — so the worst a
-    ///         caller can do is release during an outage that would have
-    ///         cleared. That trades a recoverable inconvenience (the owner sells
-    ///         it manually) against an unrecoverable loss, which is the right
-    ///         direction.
-    ///
-    ///         NOT counted as swept proceeds: the governor prices this proposal
-    ///         from the vault's realized float in the VAULT ASSET, and this is
-    ///         not that. It books as a loss here and is recovered off-path.
-    function releaseUnconvertible() external onlyVault nonReentrant returns (uint256 released) {
-        if (_state != State.Settled) revert NotSettled();
-
-        // Retry the wrapper first: redemption may have reopened since settle,
-        // and unwrapped collateral leaves as `asset` below, which is strictly
-        // better for the vault than receiving the shares.
-        _tryRedeemWrapper();
-
-        _trySwapToAsset(settleSlippageBps);
-
-        (uint256 debtRemaining, uint256 collateralRemaining) = _repayAndWithdraw();
-
-        // Deliver whatever the conversion DID produce before releasing the rest.
-        // Skipping this would leave converted proceeds sitting on the clone —
-        // the one outcome this path must never produce, since it exists to get
-        // value off the clone.
-        uint256 assets = IERC20(asset).balanceOf(address(this));
-        if (assets != 0) {
-            _pushAllToVault(asset);
-            emit ResidualSwept(assets);
-        }
-
-        address coll = _marketParams.collateralToken;
-        if (coll != asset) {
-            uint256 collBal = IERC20(coll).balanceOf(address(this));
-            if (collBal != 0) {
-                _pushAllToVault(coll);
-                emit UnconvertibleReleased(coll, collBal);
-                collateralRemaining = collBal >= collateralRemaining ? 0 : collateralRemaining - collBal;
-            }
-        }
-
-        if (debtRemaining != 0 || collateralRemaining != 0) {
-            emit SettlementIncomplete(debtRemaining, collateralRemaining);
-        }
-
-        released = IERC20(otherToken).balanceOf(address(this));
-        if (released == 0) return 0;
-        _pushAllToVault(otherToken);
-        emit UnconvertibleReleased(otherToken, released);
+    function _redeemWrapper() private {
+        address collateralToken = _marketParams.collateralToken;
+        if (collateralToken == asset) return;
+        uint256 shares = IERC20(collateralToken).balanceOf(address(this));
+        if (shares != 0) IERC4626(collateralToken).redeem(shares, address(this), address(this));
     }
 
     // ── Tunables ──

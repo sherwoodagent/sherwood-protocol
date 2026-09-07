@@ -205,74 +205,83 @@ contract MorphoSupplyStrategyTest is MorphoSupplyFixture {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// #18b — settlement cannot be held hostage by market utilization
+// Settlement is all-or-revert: the market pays in full or settle reverts
 // ═══════════════════════════════════════════════════════════════════════
 
 contract MorphoSupplySettlementTest is MorphoSupplyFixture {
     /// @dev Borrow all but `leave` of the market so a full-position withdraw
-    ///      cannot be paid out, and do NOT repay: utilization stays pinned,
-    ///      which is exactly the hostage state.
+    ///      cannot be paid out, and do NOT repay.
     function _pinUtilization(uint256 leave) internal {
         mockMorpho.simulateBorrow(mp, SUPPLY - leave, borrower);
     }
 
-    /// @notice Settlement takes what the market can deliver instead of
-    ///         reverting. Adversary: a borrower pinning utilization to freeze
-    ///         the whole vault — `redemptionsLocked()` would stay true, instant
-    ///         exits shut and the queue unable to settle, for as long as they
-    ///         hold the position.
-    function test_settle_atPinnedUtilization_deliversMaximum_ratherThanReverting() public {
+    /// @notice A market that cannot pay the whole position reverts settle; nothing is
+    ///         delivered partially and the position is untouched.
+    function test_settle_atPinnedUtilization_revertsRatherThanDeliveringPartially() public {
         _approveAndExecute();
         _pinUtilization(10_000e6); // only 10k of the 100k is withdrawable
+        uint256 sharesBefore = mockMorpho.position(marketId, address(strategy)).supplyShares;
 
-        uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
         vm.prank(address(vaultStub));
-        strategy.settle(); // must NOT revert
+        vm.expectRevert("MockMorpho: insufficient liquidity");
+        strategy.settle();
 
-        assertEq(usdg.balanceOf(address(vaultStub)) - vaultBefore, 10_000e6, "delivered what the market could pay");
-        assertGt(
-            mockMorpho.position(marketId, address(strategy)).supplyShares, 0, "residue stays supplied, not destroyed"
-        );
+        assertEq(usdg.balanceOf(address(vaultStub)), 0, "delivered partially");
+        assertEq(mockMorpho.position(marketId, address(strategy)).supplyShares, sharesBefore, "position touched");
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed), "state advanced");
     }
 
-    /// @notice The residue is recoverable: once utilization recedes, anyone can
-    ///         sweep it back to the vault.
-    function test_sweep_returnsTheResidueOnceLiquidityReturns() public {
+    /// @notice A flash loan that empties Morpho's idle balance while the totals still
+    ///         say the position is withdrawable: the transfer fails and settle reverts,
+    ///         instead of the old clamp-to-idle-balance delivering the drained residue.
+    function test_settle_revertsRatherThanDeliveringPartially_whenMorphoIsFlashDrained() public {
+        _approveAndExecute();
+        uint256 idle = usdg.balanceOf(address(mockMorpho));
+        assertEq(idle, SUPPLY, "precondition: the market holds the whole supply idle");
+
+        // Model the flash-loan frame: the tokens leave, the accounting does not.
+        vm.prank(address(mockMorpho));
+        usdg.transfer(borrower, idle - 10_000e6);
+
+        vm.prank(address(vaultStub));
+        vm.expectRevert();
+        strategy.settle();
+
+        assertEq(usdg.balanceOf(address(vaultStub)), 0, "delivered the drained remainder");
+        assertGt(mockMorpho.position(marketId, address(strategy)).supplyShares, 0, "position burned");
+
+        // The frame ends, the balance is back, and the identical call delivers everything.
+        vm.prank(borrower);
+        usdg.transfer(address(mockMorpho), idle - 10_000e6);
+        vm.prank(address(vaultStub));
+        strategy.settle();
+        assertEq(usdg.balanceOf(address(vaultStub)), SUPPLY, "full delivery on retry");
+        assertEq(mockMorpho.position(marketId, address(strategy)).supplyShares, 0, "position fully unwound");
+    }
+
+    /// @notice A failed settle is simply retried once utilization recedes.
+    function test_settle_succeedsOnRetryOnceLiquidityReturns() public {
         _approveAndExecute();
         _pinUtilization(10_000e6);
         vm.prank(address(vaultStub));
+        vm.expectRevert("MockMorpho: insufficient liquidity");
         strategy.settle();
 
-        // Borrower repays; the market can now pay the rest.
         usdg.mint(borrower, SUPPLY);
         vm.startPrank(borrower);
         usdg.approve(address(mockMorpho), type(uint256).max);
         mockMorpho.simulateRepayAll(mp);
         vm.stopPrank();
 
-        uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
-        // Vault-only since the cohort-accounting fix: `collectResidue` measures
-        // the arrival as a balance delta, so a direct call would land outside
-        // that measurement and starve the exited redeem cohort.
         vm.prank(address(vaultStub));
-        uint256 swept = strategy.sweep();
-        assertGt(swept, 0, "residue recovered");
-        assertEq(usdg.balanceOf(address(vaultStub)) - vaultBefore, swept, "and lands in the vault");
+        strategy.settle();
+        assertGe(usdg.balanceOf(address(vaultStub)), SUPPLY, "principal (plus interest) delivered");
         assertEq(mockMorpho.position(marketId, address(strategy)).supplyShares, 0, "position fully unwound");
-    }
-
-    /// @notice `sweep` is a post-settlement recovery path only — before
-    ///         settlement the position is unwound by `settle`.
-    function test_sweep_revertsBeforeSettlement() public {
-        _approveAndExecute();
-        vm.prank(address(vaultStub));
-        vm.expectRevert(MorphoSupplyStrategy.NotSettled.selector);
-        strategy.sweep();
+        assertEq(usdg.balanceOf(address(strategy)), 0, "nothing left on the clone");
     }
 
     /// @notice No regression on the liquid path: a market that can pay in full
-    ///         still settles by SHARES, so accrued interest comes out with no
-    ///         dust stranded.
+    ///         settles by SHARES, so accrued interest comes out with no dust stranded.
     function test_settle_whenFullyLiquid_unwindsCompletelyWithInterest() public {
         _approveAndExecute();
         _borrowWarpRepay(50_000e6, 30 days); // leaves interest on the supply side
@@ -283,68 +292,5 @@ contract MorphoSupplySettlementTest is MorphoSupplyFixture {
 
         assertGt(usdg.balanceOf(address(vaultStub)) - vaultBefore, SUPPLY, "principal plus accrued interest");
         assertEq(mockMorpho.position(marketId, address(strategy)).supplyShares, 0, "nothing left behind");
-    }
-
-    // ── the residue probes must not route through the proposer's IRM ──
-
-    /// @notice FINDING #3, SUPPRESSED THROUGH THE IRM. `_initialize` binds
-    ///         neither `mp.irm` nor the registry against it, and the vault reads
-    ///         the residue probes under a gas cap. An accruing read routes
-    ///         through `IIrm.borrowRateView`, so an IRM whose view burns past
-    ///         that cap makes the probe fail — and a failed probe means the
-    ///         residue is never recorded, deposits are priced as if there were
-    ///         none, and the skim is back.
-    ///
-    ///         `sweep()` calls the same market with FULL gas and still works,
-    ///         which is what made the asymmetry reachable: suppress the price,
-    ///         keep the recovery.
-    ///
-    ///         Both probes are computed from raw stored totals, so there is no
-    ///         external call for a hostile IRM to enter through.
-    function test_residueProbes_surviveAGasGriefingIrm() public {
-        _approveAndExecute();
-        _pinUtilization(10_000e6);
-        vm.prank(address(vaultStub));
-        strategy.settle();
-
-        // Interest must be pending, or there is nothing for the IRM to be asked
-        // about and the griefing branch is never reached.
-        vm.warp(vm.getBlockTimestamp() + 30 days);
-        irm.setGasToBurn(10_000_000);
-
-        // Read under the same 150k cap the vault applies. Pre-fix these OOG'd.
-        (bool okAmount, bytes memory amountRet) =
-            address(strategy).staticcall{gas: 150_000}(abi.encodeWithSignature("undeliveredValue()"));
-        assertTrue(okAmount, "amount probe must not depend on the proposer's IRM");
-        assertGt(abi.decode(amountRet, (uint256)), 0, "and must report the residue");
-
-        (bool okBool,) = address(strategy).staticcall{gas: 150_000}(abi.encodeWithSignature("hasUndeliveredValue()"));
-        assertTrue(okBool, "the bool probe must be equally immune");
-    }
-
-    /// @notice The raw basis is stale-LOW by the interest accrued since
-    ///         `lastUpdate`, never high — the bounded direction. It under-prices
-    ///         a deposit by at most that interest, where the suppression it
-    ///         replaces omitted the entire residue.
-    function test_undeliveredValue_isStaleLowNotHigh() public {
-        _approveAndExecute();
-        _pinUtilization(10_000e6);
-        vm.prank(address(vaultStub));
-        strategy.settle();
-
-        uint256 atSettle = strategy.undeliveredValue();
-        vm.warp(vm.getBlockTimestamp() + 30 days);
-
-        // Accrual is not projected, so the figure does not move until the market
-        // itself accrues — under-reporting by exactly the pending interest, and
-        // never over-reporting, which is the direction that would let a deposit
-        // be priced against value that never arrives.
-        assertEq(strategy.undeliveredValue(), atSettle, "raw totals, no projection");
-
-        // Once the market itself accrues, the figure catches up — the staleness
-        // is a lag, not a permanent under-count, and it only ever resolves
-        // upward.
-        mockMorpho.accrueInterest(mp);
-        assertGe(strategy.undeliveredValue(), atSettle, "resolves upward once accrued, never downward");
     }
 }

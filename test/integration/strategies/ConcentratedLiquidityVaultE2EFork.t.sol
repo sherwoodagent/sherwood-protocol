@@ -29,7 +29,7 @@ import {INonfungiblePositionManager} from "../../../src/vendor/uniswap/INonfungi
  *         same template through a `ForkVaultStub`, so nothing there exercises
  *         `_pullFromVault`/`_pushAllToVault` against a vault that prices shares,
  *         the governor's propose→vote→review→execute→settle envelope, or the
- *         `hasUndeliveredValue()` deposit lock. That is the gap this file
+ *         all-or-revert settle against live venues. That is the gap this file
  *         closes. It leaves the stub suite alone.
  *
  *  ── Venue, measured on chain (Tenderly archive vnet of 4663, head block
@@ -466,69 +466,6 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         return avg;
     }
 
-    /// @dev `collectResidue` behind a helper purely to keep the caller's stack
-    ///      shallow — this suite's lifecycle tests are already at the via-IR
-    ///      limit, and inlining the call there trips "stack too deep".
-    ///      Permissionless, and since `sweep()` became vault-only it is the only
-    ///      door to a residue recovery.
-    function _collectResidue(address strategy) internal returns (uint256) {
-        return vault.collectResidue(strategy);
-    }
-
-    /// @dev Same shape, same reason, for the last-resort hatch: `sweep()` and
-    ///      `releaseUnconvertible()` are both vault-only now, and both have a
-    ///      permissionless vault-side door that measures what arrives.
-    ///      Returns the WETH the hatch handed over — the vault's own return
-    ///      value counts VAULT ASSET, which is a different thing here — and
-    ///      pranks internally so the caller keeps one local, not four.
-    ///
-    ///      MEASURES THE CEILING WHILE IT IS HERE. Both recovery paths now run
-    ///      under `SyndicateVault._SWEEP_GAS` (1,500,000), where before they
-    ///      could be called directly with unbounded gas — so the cap binds the
-    ///      heavy path for the first time, and it has never been measured
-    ///      against live Morpho / Uniswap / ERC-4626 rather than mocks. It has
-    ///      to be measured HERE: the unit-level pin in
-    ///      `ConcentratedLiquidityStrategySettle.t.sol` bounds the template's
-    ///      own logic against stubbed vendors, which is a floor, not the bound.
-    ///
-    ///      AND AN OVERRUN IS SILENT WITHOUT THE SECOND ASSERT. The vault
-    ///      ignores the sub-call's result, so a hatch that exhausts the cap does
-    ///      not revert — it recovers nothing, stays counted, and holds the
-    ///      deposit gate. Gas-under-ceiling alone would therefore pass on
-    ///      exactly the failure being guarded, since a call that OOG'd at the
-    ///      cap also "fits". Pairing it with a recovery that actually landed is
-    ///      what makes the check non-vacuous.
-    ///
-    ///      THREE LOCALS, DELIBERATELY. This suite sits at the via-IR stack
-    ///      limit (see the note on `_collectResidue`); a fourth here fails the
-    ///      whole file to compile, which is why the assertion lives in its own
-    ///      frame below rather than inline.
-    function _releaseUnconvertible(address strategy, address caller) internal returns (uint256 releasedWeth) {
-        uint256 wethBefore = IERC20(WETH).balanceOf(strategy);
-        uint256 gasBefore = gasleft();
-        vm.prank(caller);
-        vault.releaseUnconvertible(strategy);
-        _assertFitsSweepCap(gasBefore);
-        return wethBefore - IERC20(WETH).balanceOf(strategy);
-    }
-
-    /// @dev Reads `gasleft()` one frame down, so the figure carries this call's
-    ///      own overhead. That biases it slightly HIGH, which is the safe
-    ///      direction for a ceiling check — it can report a near-miss that is
-    ///      really a pass, never a pass that is really an overrun.
-    function _assertFitsSweepCap(uint256 gasBefore) internal {
-        uint256 gasUsed = gasBefore - gasleft();
-        emit log_named_uint("releaseUnconvertible gas (fork, whole vault call)", gasUsed);
-        assertLt(gasUsed, SWEEP_GAS_CEILING, "the hatch no longer fits the vault's forwarding cap");
-    }
-
-    /// @dev Mirrors `SyndicateVault._SWEEP_GAS`, which is private and cannot be
-    ///      read from here. Quoted by name in that constant's own natspec as the
-    ///      thing that measures it, so lowering one without the other is caught
-    ///      by review rather than silently going stale in the permissive
-    ///      direction.
-    uint256 internal constant SWEEP_GAS_CEILING = 1_500_000;
-
     function _tickGap() internal view returns (uint256) {
         (, int24 spot,,,,,) = pool.slot0();
         int24 twap = _twapTick();
@@ -707,9 +644,6 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         _assertNoDust(strategy, tokens);
         assertEq(_morphoPosition(strategy).borrowShares, 0, "debt not fully repaid");
         assertEq(_morphoPosition(strategy).collateral, 0, "collateral not fully withdrawn");
-        assertFalse(
-            ConcentratedLiquidityStrategy(strategy).hasUndeliveredValue(), "residue reported after a clean settlement"
-        );
 
         // ── Conservation: what the vault received matches what the position
         //    could deliver, within the pool fee + impact the exit swap pays.
@@ -734,219 +668,80 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
 
     /// @notice Price moves GENUINELY (spot and TWAP together) far below the
     ///         band, so the position is entirely on the volatile side at
-    ///         settlement.
-    /// @dev    The POSITION unwind must still complete — NFT burned, both legs
-    ///         collected, the volatile leg converted through a TWAP-verified
-    ///         floor, nothing left on the clone. The MORPHO leg cannot: the LP
-    ///         notional is exactly the borrow, so an adverse move leaves the
-    ///         position short of its own debt by construction, and the template
-    ///         is deliberately deliverable-maximum rather than all-or-revert
-    ///         there. What this pins is that the shortfall is accounted for
-    ///         rather than lost: delivered + still-stranded == deliverable.
-    function test_cl_settleOutOfRange_completeUnwind() public {
+    ///         settlement and short of its own debt by construction (the LP
+    ///         notional is exactly the borrow).
+    /// @dev    All-or-revert: settle reverts `ProceedsBelowDebt` and leaves the
+    ///         position, the debt and the collateral exactly as they were. The
+    ///         exit for a position that can never cover its debt is
+    ///         `emergencySettleWithCalls` under guardian review.
+    function test_cl_settleOutOfRange_revertsWhenProceedsCannotCoverDebt() public {
         _requireFork();
 
         (address strategy, uint256 proposalId) = _deploy(1_000);
         uint256 tid = ConcentratedLiquidityStrategy(strategy).tokenId();
-        (int24 lower, int24 upper) = _bandOf(tid);
-        uint128 collateralPosted = _morphoPosition(strategy).collateral;
+        (int24 lower,) = _bandOf(tid);
+        Position memory before = _morphoPosition(strategy);
 
         // Drive spot ~2000 ticks (~18%) below the band. token0 = WETH, so a
         // band entirely above spot holds WETH only.
         int24 achieved = _pushTicks(-2_000);
-        console2.log("band lower:", int256(lower));
-        console2.log("band upper:", int256(upper));
         console2.log("spot after push:", int256(achieved));
         assertLt(achieved, lower, "push did not take spot out of the band");
 
         // The move is REAL, not a same-block manipulation: warp two TWAP windows
-        // so the observation ring reports the new level and `_spotNearTwap()`
-        // is true again. Without this the settle path deliberately refuses to
-        // convert — that case is `test_cl_residue_manipulatedSpot_*` below.
+        // so the observation ring reports the new level and the settle swap is
+        // allowed. The manipulated case is `test_cl_settle_manipulatedSpot_reverts`.
         vm.warp(vm.getBlockTimestamp() + 2 * TWAP_WINDOW + STRATEGY_DURATION);
-        console2.log("spot/TWAP gap at settle (ticks):", _tickGap());
         assertLe(_tickGap(), 1_000, "TWAP did not converge on the new level");
 
         uint256 deliverable = _deliverableUsdg(strategy);
         console2.log("deliverable at settle (USDG):", deliverable);
+        // Net equity below the posted collateral means the LP legs are worth less than the debt.
+        assertLt(
+            deliverable, COLLATERAL, "an 18% adverse move left the position able to cover its debt - premise broken"
+        );
 
         uint256 vaultPreSettle = IERC20(USDG).balanceOf(address(vault));
+        vm.expectPartialRevert(ConcentratedLiquidityStrategy.ProceedsBelowDebt.selector);
         governor.settleProposal(proposalId);
-        uint256 delivered = IERC20(USDG).balanceOf(address(vault)) - vaultPreSettle;
-        console2.log("delivered to vault (USDG):", delivered);
 
-        // ── The POSITION unwind is complete, and the volatile leg WAS converted ──
-        assertEq(ConcentratedLiquidityStrategy(strategy).tokenId(), 0, "tokenId not cleared");
-        _assertPositionBurned(tid);
-        address[] memory tokens = new address[](3);
-        tokens[0] = USDG;
-        tokens[1] = WETH;
-        tokens[2] = mp.collateralToken;
-        // Zero WETH is the load-bearing half: spot re-converged on the TWAP, so
-        // `_trySwapToAsset` was allowed to sell. Contrast
-        // `test_cl_residue_manipulatedSpot_*`, where the same price level
-        // reached by manipulation leaves the whole leg unconverted.
-        _assertNoDust(strategy, tokens);
-
-        // ── Deliverable maximum, NOT all-or-revert ──
-        Position memory pos = _morphoPosition(strategy);
-        console2.log("residual debt shares:", uint256(pos.borrowShares));
-        console2.log("collateral posted:", uint256(collateralPosted));
-        console2.log("collateral remaining:", uint256(pos.collateral));
-        assertGt(pos.borrowShares, 0, "an 18% adverse move left no residual debt - premise broken");
-        // PASHOV FINDING #8, on a live market: residual debt must not strand the
-        // WHOLE collateral. Before that fix this figure was `collateralPosted`.
-        assertLt(uint256(pos.collateral), uint256(collateralPosted), "health-preserving partial withdrawal never ran");
-        assertTrue(ConcentratedLiquidityStrategy(strategy).hasUndeliveredValue(), "stranded collateral not reported");
-
-        // ── Conservation across an INCOMPLETE settlement: what reached the
-        //    vault plus what is still stranded equals what the position was
-        //    worth, inside the exit swap's fee + impact. A settlement that lost
-        //    the volatile leg, or that filled it below the pool-anchored floor,
-        //    breaks this. ──
-        uint256 residualNet = IERC4626(mp.collateralToken).convertToAssets(uint256(pos.collateral));
-        {
-            (,, uint256 tba, uint256 tbs) = IMorpho(MORPHO).expectedMarketBalances(mp);
-            uint256 debt = SharesMathLib.toAssetsUp(uint256(pos.borrowShares), tba, tbs);
-            residualNet = residualNet > debt ? residualNet - debt : 0;
-        }
-        console2.log("still stranded, net of debt (USDG):", residualNet);
-        assertGe(delivered + residualNet, (deliverable * 9_900) / 10_000, "value vanished across the settlement");
-        assertLe(delivered + residualNet, (deliverable * 10_010) / 10_000, "settlement accounted for more than existed");
-
-        // Divergence loss is REAL and must be visible: the position bought WETH
-        // all the way down through its band. A settlement that silently returned
-        // the principal would mean the LP leg was never marked.
-        assertLt(delivered, COLLATERAL + BORROW, "no divergence loss after an 18% adverse move");
+        assertEq(IERC20(USDG).balanceOf(address(vault)), vaultPreSettle, "a failed settle delivered something");
+        assertEq(ConcentratedLiquidityStrategy(strategy).tokenId(), tid, "tokenId cleared by a failed settle");
+        assertGt(_liquidityOf(tid), 0, "position unwound by a failed settle");
+        Position memory after_ = _morphoPosition(strategy);
+        assertEq(after_.borrowShares, before.borrowShares, "debt moved");
+        assertEq(after_.collateral, before.collateral, "collateral moved");
     }
 
-    // ==================== 3. UNPRICEABLE RESIDUE / releaseUnconvertible ====================
+    // ==================== 3. MANIPULATED SPOT: SETTLE REVERTS (D8) ====================
 
-    /// @notice Settle with spot pushed outside the TWAP bound: `_trySwapToAsset`
-    ///         refuses to convert at a manipulated price, so the clone keeps the
-    ///         whole volatile leg and the debt goes unpaid.
-    /// @dev    Three things are pinned here:
-    ///           1. the vault FAILS CLOSED — `hasUndeliveredValue()` is true and
-    ///              instant deposits revert `DepositsLocked`, while
-    ///              `undeliveredValue()` under-reports (it prices only idle
-    ///              vault asset, never the volatile leg or the wrapper), so no
-    ///              stamp can ever count value that has not arrived;
-    ///           2. `releaseUnconvertible()` hands the residue to the vault
-    ///              without anyone minting against it in between — the released
-    ///              WETH is NOT the vault asset, so `totalAssets()` does not move;
-    ///           3. SUSPECTED BUG, see the block at the end.
-    function test_cl_residue_manipulatedSpot_failsClosedAndReleases() public {
+    /// @notice Settle with spot pushed outside the TWAP bound in the same block:
+    ///         the swap is refused, settle reverts `SpotOutsideTwapBound`, and
+    ///         nothing on the clone or in Morpho moves. The volatile leg is never
+    ///         sold into the manipulated pool.
+    function test_cl_settle_manipulatedSpot_reverts() public {
         _requireFork();
 
         (address strategy, uint256 proposalId) = _deploy(1_000);
         uint256 tid = ConcentratedLiquidityStrategy(strategy).tokenId();
+        Position memory before = _morphoPosition(strategy);
 
         vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION);
 
-        // Same-block manipulation: push spot far below the band and settle
-        // immediately, so the TWAP still reports the pre-push level.
         _pushTicks(-2_000);
         uint256 gap = _tickGap();
         console2.log("spot/TWAP gap at settle (ticks):", gap);
         assertGt(gap, 1_000, "spot is not outside the configured TWAP bound");
 
+        vm.expectPartialRevert(ConcentratedLiquidityStrategy.SpotOutsideTwapBound.selector);
         governor.settleProposal(proposalId);
 
-        // ── 1. The volatile leg was NOT sold into the manipulated pool ──
-        uint256 wethResidue = IERC20(WETH).balanceOf(strategy);
-        console2.log("WETH residue on the clone (wei):", wethResidue);
-        assertGt(wethResidue, 0, "settle converted the volatile leg at a manipulated price");
-        assertEq(ConcentratedLiquidityStrategy(strategy).tokenId(), 0, "position not unwound");
-        _assertPositionBurned(tid);
-
-        ConcentratedLiquidityStrategy s = ConcentratedLiquidityStrategy(strategy);
-        assertTrue(s.hasUndeliveredValue(), "residue not reported");
-        // Under-reports on purpose: only idle vault asset is priced. The WETH
-        // leg and the Morpho collateral are worth far more than this figure.
-        assertEq(s.undeliveredValue(), IERC20(USDG).balanceOf(strategy), "undeliveredValue priced more than idle asset");
-        assertLt(s.undeliveredValue(), _wethInUsdg(wethResidue), "undeliveredValue did not under-report the residue");
-
-        // ── The vault refuses to mint against it ──
-        _dealUSDG(outsider, 1_000e6);
-        vm.startPrank(outsider);
-        IERC20(USDG).approve(address(vault), 1_000e6);
-        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
-        vault.deposit(1_000e6, outsider);
-        vm.stopPrank();
-
-        // ── 2. The escape hatch hands the residue over, uncounted ──
-        uint256 vaultWethBefore = IERC20(WETH).balanceOf(address(vault));
-        uint256 totalAssetsBefore = vault.totalAssets();
-        uint256 supplyBefore = vault.totalSupply();
-
-        // Permissionless by design, and still is — but through the vault, so
-        // any VAULT ASSET the hatch converts on its way is measured and split
-        // with the exited cohort. The clone-side function is vault-only.
-        uint256 released = _releaseUnconvertible(strategy, outsider);
-
-        assertEq(released, wethResidue, "released amount does not match the residue");
-        assertEq(IERC20(WETH).balanceOf(strategy), 0, "residue still on the clone");
-        assertEq(
-            IERC20(WETH).balanceOf(address(vault)),
-            vaultWethBefore + released,
-            "released residue did not reach the vault"
-        );
-        // The release mints nothing and prices nothing: WETH is not the vault
-        // asset, so `totalAssets()` is untouched and no share was created
-        // against unpriced value.
-        assertEq(vault.totalAssets(), totalAssetsBefore, "totalAssets moved on an unpriced token");
-        assertEq(vault.totalSupply(), supplyBefore, "shares minted against unpriced value");
-
-        // ── 3. SUSPECTED BUG: the release FORECLOSES the only permissionless
-        //    recovery, and the vault stays deposit-locked forever.
-        //
-        //    `_repayAndWithdraw` could not repay (the clone held no vault asset
-        //    at settle, only WETH), so the debt survives and the collateral is
-        //    pinned behind it — `_withdrawableWhileHealthy` frees only the slice
-        //    above the LLTV buffer. `hasUndeliveredValue()` keys on that
-        //    collateral, so deposits stay shut.
-        //
-        //    `SyndicateVault._depositsLocked` justifies locking with "NOBODY IS
-        //    WEDGED BY THIS. `sweep()` is permissionless and untaxed, so the
-        //    very depositor this refuses can call it and then deposit at the
-        //    correct price." That claim does not survive this path:
-        //    `releaseUnconvertible()` is equally permissionless and has just
-        //    moved the only asset `sweep()` could have converted into the repay,
-        //    so every later sweep — even once the pool is honest again —
-        //    recovers nothing and the lock never clears without the vault owner
-        //    manually rescuing the WETH and sending it back to the clone.
-        //    `releaseUnconvertible`'s own natspec anticipates the foreclosure
-        //    ("pushing on every sweep would FORECLOSE the conversion") but
-        //    prices it as "the owner sells it manually", not as an indefinite
-        //    vault-wide deposit lock any passer-by can trigger for the price of
-        //    one manipulated block.
-        Position memory pos = _morphoPosition(strategy);
-        console2.log("residual debt shares:", uint256(pos.borrowShares));
-        console2.log("stranded collateral (spUSDG):", uint256(pos.collateral));
-        assertGt(pos.borrowShares, 0, "no residual debt - scenario did not reproduce");
-        assertGt(pos.collateral, 0, "no stranded collateral - scenario did not reproduce");
-        assertTrue(s.hasUndeliveredValue(), "collateral stranded behind debt is not reported");
-
-        // Let the pool become honest again — the TWAP walks to spot — and give
-        // the permissionless recovery every chance.
-        vm.warp(vm.getBlockTimestamp() + 2 * TWAP_WINDOW);
-        assertLe(_tickGap(), 1_000, "TWAP did not converge - sweep would be refused for the right reason");
-        // `sweep()` is vault-only now; `collectResidue` is the permissionless
-        // door and drives it, so this still tests "anyone can recover".
-        uint256 recovered = _collectResidue(address(s));
-        console2.log("sweep recovered (USDG):", recovered);
-        // Not exactly zero: wrapper yield since settlement nudges
-        // `_withdrawableWhileHealthy` up by a few wei of USDG. The point is the
-        // ORDER OF MAGNITUDE — a residue worth thousands of USDG was released
-        // away, and the permissionless retry can now recover cents.
-        assertLt(recovered, _wethInUsdg(released) / 100, "sweep still recovers the residue after a release");
-        assertTrue(s.hasUndeliveredValue(), "vault unlocked without the residue ever being delivered");
-
-        vm.startPrank(outsider);
-        IERC20(USDG).approve(address(vault), 1_000e6);
-        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
-        vault.deposit(1_000e6, outsider);
-        vm.stopPrank();
+        assertEq(IERC20(WETH).balanceOf(strategy), 0, "volatile leg left on the clone");
+        assertEq(ConcentratedLiquidityStrategy(strategy).tokenId(), tid, "position unwound by a failed settle");
+        assertGt(_liquidityOf(tid), 0, "liquidity removed by a failed settle");
+        Position memory after_ = _morphoPosition(strategy);
+        assertEq(after_.borrowShares, before.borrowShares, "debt moved");
+        assertEq(after_.collateral, before.collateral, "collateral moved");
     }
 
     // ==================== 4. THE TWAP GUARD, AGAINST LIVE OBSERVATIONS ====================
