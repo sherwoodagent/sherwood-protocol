@@ -5,6 +5,7 @@ import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {IVotes} from "@openzeppelin/contracts/governance/utils/IVotes.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title ProposalLifecycle
 /// @notice Abstract base owning the proposal lifecycle (propose -> vote ->
@@ -74,7 +75,12 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             // threshold collapses to 0 and every proposal auto-rejects.
             // Reads the vetoThresholdBps snapshot taken at Draft -> Pending,
             // not a live param, so mid-vote finalizes don't move the bar.
+            // min(snapshot, live): a redeem ordered ahead of propose in its block is in the snapshot
+            // but gone from supply, and supply cannot move while the proposal is open. The queue
+            // term stays at the snapshot: a post-snapshot requestRedeem still votes with snapshot weight.
             uint256 pastTotalSupply = IVotes(p.vault).getPastTotalSupply(p.snapshotTimestamp);
+            uint256 nowTotalSupply = IERC20(p.vault).totalSupply();
+            if (nowTotalSupply < pastTotalSupply) pastTotalSupply = nowTotalSupply;
             address queue = ISyndicateVault(p.vault).withdrawalQueue();
             uint256 queueVotes = queue == address(0) ? 0 : IVotes(p.vault).getPastVotes(queue, p.snapshotTimestamp);
             uint256 liveSupply = pastTotalSupply > queueVotes ? pastTotalSupply - queueVotes : 0;

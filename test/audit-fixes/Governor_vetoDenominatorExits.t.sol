@@ -173,6 +173,54 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(uint256(_resolveWithAgainst(80_000e6 - 1)), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 
+    /// @notice A redeem ordered ahead of propose in its block is in the snapshot but gone from
+    ///         supply; the bar is min(snapshot, live), so 100% of the live supply Against rejects.
+    function test_sameBlockPreProposeRedeemCannotInflateTheVetoBar() public {
+        _deposit(lp1, 100_000e6);
+        _deposit(attacker, 200_000e6); // block N-1; the fixture then warps to block N
+        uint256 lp1Shares = vault.balanceOf(lp1);
+        uint256 attackerShares = vault.balanceOf(attacker);
+        vm.prank(attacker);
+        vault.redeem(attackerShares, attacker, attacker); // block N, ahead of propose
+        uint256 pid = _propose();
+        uint256 snapshot = vault.getPastTotalSupply(governor.getProposal(pid).snapshotTimestamp);
+        assertEq(snapshot, lp1Shares + attackerShares, "attacker's shares are in the snapshot");
+        assertEq(vault.totalSupply(), lp1Shares, "and gone from the live supply");
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Rejected));
+    }
+
+    /// @notice Control: with nothing leaving in the propose block the bar is the snapshot supply
+    ///         and 39% Against does not reach the 40% bar. Live > snapshot cannot occur: deposits
+    ///         are locked from propose to settle, so the min can only ever lower the bar to the truth.
+    function test_vetoBarIsTheSnapshotSupplyWhenNothingLeftInTheProposeBlock() public {
+        _deposit(lp1, 39_000e6);
+        _deposit(lp2, 61_000e6);
+        uint256 pid = _propose();
+        assertEq(vault.totalSupply(), vault.getPastTotalSupply(governor.getProposal(pid).snapshotTimestamp));
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    /// @notice The queue term is read at the snapshot: a holder who queues a redeem after the
+    ///         snapshot still votes with snapshot weight, so the bar must not shrink by his shares.
+    ///         250k supply, bar 100k; 90k queued and voted Against is short of the bar.
+    function test_queuedRedeemAfterTheSnapshotDoesNotShrinkTheVetoBar() public {
+        _deposit(lp1, 160_000e6);
+        _deposit(attacker, 90_000e6);
+        uint256 pid = _propose();
+        vm.startPrank(attacker);
+        vault.requestRedeem(vault.balanceOf(attacker), attacker);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        vm.stopPrank();
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
     function _resolveWithAgainst(uint256 againstAssets) internal returns (ISyndicateGovernor.ProposalState) {
         _deposit(lp1, againstAssets);
         _deposit(lp2, 120_000e6 - againstAssets);
