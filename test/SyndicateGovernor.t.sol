@@ -18,6 +18,11 @@ import {IVaultWithdrawalQueue} from "../src/interfaces/IVaultWithdrawalQueue.sol
 import {MockStrategyAdapter} from "./mocks/MockStrategyAdapter.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
+import {MockMorpho, MockIrm} from "./mocks/MockMorpho.sol";
+import {MorphoSupplyStrategy} from "../src/strategies/MorphoSupplyStrategy.sol";
+import {MarketParams} from "../src/vendor/morpho/IMorpho.sol";
 
 contract SyndicateGovernorTest is Test {
     SyndicateGovernor public governor;
@@ -592,19 +597,14 @@ contract SyndicateGovernorTest is Test {
     }
 
     /// @dev Propose with a REAL drawdown envelope. Every other helper in this
-    ///      file goes through `GovEnvelope.permissive`, which declares
-    ///      `maxDrawdownBps = 10_000` — a 100% loss is inside the envelope, so
-    ///      the settle-time floor never binds. These tests need it to bind.
+    ///      file goes through `GovEnvelope.permissive` (`maxDrawdownBps = 10_000`).
     function _createAndExecuteProposalWithDrawdown(uint16 maxDrawdownBps) internal returns (uint256 proposalId) {
         // `totalAssets()` is read HERE, outside the callee, so the staticcall
         // cannot consume the one-shot prank armed for `propose` inside it.
         return _createAndExecuteProposalWithEnvelope(vault.totalAssets(), maxDrawdownBps);
     }
 
-    /// @dev As above, but with `maxCapital` decoupled from the ceiling. The
-    ///      drawdown floor scales off `effectiveMaxCapital`, so a proposal that
-    ///      commits only PART of the float is the case that separates "dd% of
-    ///      the envelope" from "dd% of the whole fund".
+    /// @dev As above, but with `maxCapital` decoupled from the ceiling.
     function _createAndExecuteProposalWithEnvelope(uint256 maxCapital, uint16 maxDrawdownBps)
         internal
         returns (uint256 proposalId)
@@ -634,86 +634,19 @@ contract SyndicateGovernorTest is Test {
         vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
     }
 
-    /// @notice Pashov 2026-08 finding #1 — `settleProposal` must not freeze the
-    ///         Lane B settle price against an unrealized unwind.
-    /// @dev    `onProposalSettled` stamps `num = totalAssets() + 1` as the price
-    ///         EVERY queued deposit and redeem for this proposal is later paid
-    ///         at, and settlement is deliverable-maximum at the strategy layer
-    ///         rather than all-or-revert. `MorphoSupplyStrategy` additionally
-    ///         caps delivery at Morpho's idle balance — exactly what a fee-free
-    ///         `flashLoan` removes for one callback frame — so an unprivileged
-    ///         caller could settle a strategy that delivered ~0 and stamp
-    ///         `num == 1`, minting near-unbounded shares to a queued depositor
-    ///         and burning queued redeemers for zero.
-    ///
-    ///         The shortfall is modelled directly on the vault balance here:
-    ///         what the gate reads is the realized balance, and how it got low
-    ///         (flash loan, genuine loss, a strategy that simply did not
-    ///         deliver) is not something the governor can or should distinguish.
-    function test_pashovFinding1_settleBelowDrawdownFloor_reverts() public {
-        uint256 pid = _createAndExecuteProposalWithDrawdown(2_000); // 20%
-        uint256 basis = governor.getCapitalSnapshot(pid);
-        assertEq(basis, 100_000e6, "snapshot is the pre-execute vault balance");
-        // Read the COVERAGE-SCALED capital, not the propose-time declaration:
-        // the floor scales off exactly the figure `executeProposal` and the
-        // settlement batch are bounded by. This proposal commits the whole
-        // float, so the two coincide — the fraction case is the sibling test.
+    /// @notice SHE-256 deleted the capital drawdown floor: a balance below the
+    ///         declared capital envelope but above the PRICE floor settles. A
+    ///         20% envelope on half the float separates the two (old capital
+    ///         floor 90% of basis, price floor 80% of pps).
+    function test_settleBelowTheDeclaredCapitalEnvelopeSettles() public {
+        uint256 basis = vault.totalAssets();
+        uint256 pid = _createAndExecuteProposalWithEnvelope(basis / 2, 2_000);
         uint256 committed = governor.getProposal(pid).effectiveMaxCapital;
-        uint256 floor = basis - (committed * 2_000) / 10_000;
+        uint256 oldCapitalFloor = basis - (committed * 2_000) / 10_000;
+        uint256 priceFloorAssets = (basis * 8_000) / 10_000;
+        assertGt(oldCapitalFloor, priceFloorAssets, "the two floors must separate");
 
-        // The unwind delivers one unit less than the approved envelope allows.
-        deal(address(usdc), address(vault), floor - 1);
-        vm.prank(agent);
-        vm.expectRevert(
-            abi.encodeWithSelector(ISyndicateGovernor.SettlementBelowDrawdownFloor.selector, floor - 1, floor)
-        );
-        governor.settleProposal(pid);
-
-        // Still Executed — the stamp never landed, so no queued claim was
-        // priced against the incomplete unwind.
-        assertEq(
-            uint256(governor.getProposal(pid).state),
-            uint256(ISyndicateGovernor.ProposalState.Executed),
-            "a refused settle must not advance the proposal"
-        );
-
-        // Exactly at the floor it settles: the gate is the declared envelope,
-        // not a demand that the strategy be profitable.
-        deal(address(usdc), address(vault), floor);
-        vm.prank(agent);
-        governor.settleProposal(pid);
-        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
-    }
-
-    /// @notice The CAPITAL gate must not bind a proposal whose voters accepted a
-    ///         total loss (`maxDrawdownBps == 10_000`) — that is the envelope
-    ///         working as declared, and it stays true.
-    ///
-    /// @dev    REWRITTEN FOR pashov FINDING #2, and the change of expectation is
-    ///         the point. This previously settled at a balance of ZERO and
-    ///         asserted that as correct, on the reasoning that a declared total
-    ///         loss should not be second-guessed. That reasoning holds for the
-    ///         STRATEGY's P&L and does not hold for the SETTLE PRICE: the same
-    ///         waiver let `onProposalSettled` freeze `num == 1` as the price
-    ///         every queued deposit and redeem is paid at, which a fork PoC
-    ///         turned into 1 USDG -> 20,001 USDG. Queued LPs never voted on that
-    ///         envelope.
-    ///
-    ///         So the two gates are now separate and this pins BOTH halves: the
-    ///         capital floor still does not bind (a 90%-loss settlement that
-    ///         would have tripped a declared-20% envelope goes through), while
-    ///         the price floor refuses the near-zero stamp the old version
-    ///         accepted. `GovEnvelope.permissive` is still unaffected — it
-    ///         settles at or near par, far above the 10% backstop.
-    function test_pashovFinding1_fullDrawdownEnvelope_capitalFloorStillDoesNotBind() public {
-        uint256 pid = _createAndExecuteProposalWithDrawdown(10_000);
-
-        // An 80% loss: far past any declared envelope the capital floor would
-        // enforce, and still settleable because the voters accepted total loss.
-        // Deliberately NOT 10_000e6 — that is exactly the price floor, so the
-        // test would pass by ~9 wei of pps and flip red on any rounding change,
-        // while reading as if it exercised only the capital gate.
-        deal(address(usdc), address(vault), 20_000e6);
+        deal(address(usdc), address(vault), oldCapitalFloor - 1);
         vm.prank(agent);
         governor.settleProposal(pid);
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
@@ -721,9 +654,7 @@ contract SyndicateGovernorTest is Test {
 
     // ── pashov finding #2 — the settle PRICE needs its own floor ──
 
-    /// @notice THE FINDING. `maxDrawdownBps == 10_000` makes the capital floor
-    ///         above identically true (`basis > basis` is false, so the branch
-    ///         is skipped entirely), and that waiver reaches a party the
+    /// @notice THE FINDING. A total-loss declaration reaches a party the
     ///         envelope never spoke for: `onProposalSettled` freezes
     ///         `num = totalAssets() + 1` as the price EVERY queued deposit and
     ///         redeem is paid at.
@@ -776,8 +707,7 @@ contract SyndicateGovernorTest is Test {
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
     }
 
-    /// @notice The price floor's BOUNDARY, mirroring the capital floor's own
-    ///         at-the-floor / one-below pair. Without this the only price-floor
+    /// @notice The price floor's BOUNDARY. Without this the only price-floor
     ///         evidence is a near-zero stamp, which says nothing about where the
     ///         line actually sits.
     function test_pashovFinding2_priceFloorBoundary() public {
@@ -798,10 +728,7 @@ contract SyndicateGovernorTest is Test {
     ///         caps and skipped the floor entirely, so the attack above needs no
     ///         100% declaration at all: the owner queues a deposit, waits out
     ///         the term, and calls `unstick` inside the flash loan.
-    /// @dev    Deliberately looser than the capital floor, so the escape hatch
-    ///         `test_pashovFinding1_unstickRecoversAProposalTheFloorRefused`
-    ///         depends on stays open for ORDINARY losses — only a near-zero
-    ///         stamp is refused.
+    /// @dev    Only a near-zero stamp is refused; ordinary losses still unstick.
     function test_pashovFinding12_unstickCannotStampANearZeroPrice() public {
         uint256 pid = _createAndExecuteProposalWithDrawdown(10_000);
         // `unstick` gates on the FULL `strategyDuration`, not the proposer's
@@ -823,55 +750,12 @@ contract SyndicateGovernorTest is Test {
         );
     }
 
-    /// @notice The floor is a share of the CAPITAL THE ENVELOPE COVERS, never a
-    ///         share of the whole fund.
-    /// @dev    `maxDrawdownBps` is declared, validated and documented as a share
-    ///         of committed capital (see `InvalidDrawdown`). Scaling the floor
-    ///         off the vault balance instead would let a proposal committing a
-    ///         fraction of the float lose a multiple of its own declaration
-    ///         before the gate trips — here a 50% commitment with a 20% envelope
-    ///         would have been allowed a 20,000 USDC drop against the 10,000
-    ///         USDC it actually declared.
-    ///
-    ///         This is the discriminating case: the sibling test above commits
-    ///         the WHOLE float, where the two formulas coincide exactly.
-    function test_pashovFinding1_floorScalesWithTheEnvelopeNotTheWholeFund() public {
-        uint256 half = vault.totalAssets() / 2;
-        uint256 pid = _createAndExecuteProposalWithEnvelope(half, 2_000); // 20% of half
-
-        uint256 basis = governor.getCapitalSnapshot(pid);
-        uint256 committed = governor.getProposal(pid).effectiveMaxCapital;
-        assertLt(committed, basis, "the proposal must commit only part of the float");
-
-        uint256 floor = basis - (committed * 2_000) / 10_000;
-        uint256 wholeFundFloor = basis - (basis * 2_000) / 10_000;
-        assertGt(floor, wholeFundFloor, "the envelope-scaled floor must bind first");
-
-        // Inside the whole-fund floor but outside the declared envelope: this is
-        // exactly the band the pre-fix formula let through.
-        deal(address(usdc), address(vault), floor - 1);
-        vm.prank(agent);
-        vm.expectRevert(
-            abi.encodeWithSelector(ISyndicateGovernor.SettlementBelowDrawdownFloor.selector, floor - 1, floor)
-        );
-        governor.settleProposal(pid);
-
-        deal(address(usdc), address(vault), floor);
-        vm.prank(agent);
-        governor.settleProposal(pid);
-        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
-    }
-
     /// @notice An escrowed fee may not leave the vault while a strategy is live.
     /// @dev    `claimUnclaimedFees` -> `vault.transferPerformanceFee` was the one
     ///         asset outflow between execute and settle that is neither the
     ///         strategy nor gated on `redemptionsLocked()`. Both consumers of the
     ///         vault's asset balance difference read that outflow as a strategy
-    ///         loss: it understates `_finishSettlement`'s `pnl`, and it can push
-    ///         a profitable unwind under the drawdown floor — which leaves the
-    ///         proposal Executed, `_activeProposal` set, and therefore the whole
-    ///         vault (redemptions, queue claims, future proposals) locked until
-    ///         the owner multisig runs `unstick`.
+    ///         loss, understating `_finishSettlement`'s `pnl`.
     ///
     ///         The gate is unconditional, ahead of the zero-amount early return,
     ///         so the invariant is "no escrow moves during a live strategy" and
@@ -892,38 +776,86 @@ contract SyndicateGovernorTest is Test {
         governor.claimUnclaimedFees(address(vault), address(usdc));
     }
 
-    /// @notice The documented escape hatch actually works on the new failure.
-    /// @dev    The drawdown gate is scoped to `settleProposal` on the grounds
-    ///         that a proposal it refuses is "redirected to the path where a
-    ///         human looks at it", never stuck. That claim is only worth what
-    ///         it is tested at: `unstick` replays the same voted settlement
-    ///         batch under the same effective caps, is ungated on the drawdown
-    ///         floor, and must clear a proposal the floor just rejected.
-    function test_pashovFinding1_unstickRecoversAProposalTheFloorRefused() public {
-        uint256 pid = _createAndExecuteProposalWithDrawdown(2_000);
-        uint256 basis = governor.getCapitalSnapshot(pid);
-        uint256 committed = governor.getProposal(pid).effectiveMaxCapital;
-        uint256 floor = basis - (committed * 2_000) / 10_000;
+    /// @notice A settle driven from inside a flash loan that empties Morpho's
+    ///         idle balance cannot freeze a depressed price: the strategy is
+    ///         all-or-revert (SHE-255) so nothing is delivered partially, and a
+    ///         strategy that delivers nothing still meets the price floor. The
+    ///         honest retry after the frame settles at par.
+    function test_flashLoanedSettleRevertsInsteadOfFreezingADepressedPrice() public {
+        MockIrm irm = new MockIrm();
+        MockMorpho morpho = new MockMorpho();
+        MarketParams memory mp = MarketParams({
+            loanToken: address(usdc),
+            collateralToken: makeAddr("collateral"),
+            oracle: makeAddr("oracle"),
+            irm: address(irm),
+            lltv: 0.86e18
+        });
+        morpho.createMarket(mp);
+        uint256 supply = permissiveEnv.maxCapital;
+        MorphoSupplyStrategy strat = MorphoSupplyStrategy(Clones.clone(address(new MorphoSupplyStrategy())));
+        strat.initialize(address(vault), agent, abi.encode(address(morpho), mp, supply));
 
-        // A genuine loss beyond the envelope — the case the gate is meant to
-        // stop from stamping a Lane B price, and the case a human must resolve.
-        deal(address(usdc), address(vault), floor / 2);
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(strat), supply)), value: 0
+        });
+        execCalls[1] =
+            BatchExecutorLib.Call({target: address(strat), data: abi.encodeCall(strat.execute, ()), value: 0});
+        uint256[] memory execCaps = new uint256[](2);
+        execCaps[1] = supply;
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] =
+            BatchExecutorLib.Call({target: address(strat), data: abi.encodeCall(strat.settle, ()), value: 0});
+
         vm.prank(agent);
-        vm.expectRevert(
-            abi.encodeWithSelector(ISyndicateGovernor.SettlementBelowDrawdownFloor.selector, floor / 2, floor)
+        uint256 pid = governor.propose(
+            address(vault),
+            address(strat),
+            "ipfs://flash",
+            7 days,
+            permissiveEnv,
+            execCalls,
+            execCaps,
+            settleCalls,
+            new uint256[](1),
+            _emptyCoProposers()
         );
-        governor.settleProposal(pid);
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.For);
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(pid);
+        assertEq(usdc.balanceOf(address(morpho)), supply, "precondition: the market holds the whole supply idle");
+        uint256 ppsAtExecute = vault.pricePerShare();
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
 
-        // `unstick` needs the full declared duration, not the proposer's
-        // self-settle head start.
-        vm.warp(governor.getProposal(pid).executedAt + 7 days);
-        vm.prank(vault.owner());
-        governor.unstick(pid);
-        assertEq(
-            uint256(governor.getProposal(pid).state),
-            uint256(ISyndicateGovernor.ProposalState.Settled),
-            "the owner escape hatch must clear a proposal the floor refused"
-        );
+        // Frame 1: the flash loan takes the tokens, the accounting stays. The
+        // strategy cannot deliver in full, so it reverts; nothing is stamped.
+        address flashBorrower = makeAddr("flashBorrower");
+        vm.prank(address(morpho));
+        usdc.transfer(flashBorrower, supply - 1_000e6);
+        vm.expectPartialRevert(IERC20Errors.ERC20InsufficientBalance.selector);
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+
+        // Frame 2: a strategy that delivers NOTHING (the pre-SHE-255 clamp
+        // shape) is stopped by the price floor alone.
+        vm.mockCall(address(strat), abi.encodeCall(strat.settle, ()), "");
+        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
+        governor.settleProposal(pid);
+        vm.clearMockedCalls(); // also drops setUp's `governorOf` mock; re-arm it
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+
+        // The frame ends and the honest retry settles at par.
+        vm.prank(flashBorrower);
+        usdc.transfer(address(morpho), supply - 1_000e6);
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertGe(vault.pricePerShare() + 2, ppsAtExecute, "settled below par after a full delivery");
     }
 
     // Legacy `emergencySettle(uint256, Call[])` is a revert stub as of Task 24.

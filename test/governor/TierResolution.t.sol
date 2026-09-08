@@ -15,7 +15,6 @@ import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
-import {unwireTierRegistry} from "../helpers/TierRegistryUnwire.sol";
 
 /// @notice Task 5 — propose-time tier resolution (spec 2026-07-22 §3.2). The
 ///         proposal's tier is the MAX tier across its execute calls (resolved
@@ -255,30 +254,6 @@ contract TierResolutionTest is Test {
         // settle: 1_000e6 (default cap, 1 uncertified call) * 10_000/10_000 = 1_000e6
         // total = 502.5e6 + 1_000e6 = 1_502_500_000
         assertEq(governor.getRequiredCoverage(pid), 1_502_500_000);
-    }
-
-    /// @notice Registry unset (address(0)) → everything defaults to tier 2 /
-    ///         full notional, even for calls a registry would have certified.
-    /// @dev    Reaches the state with `vm.store` (see `unwireTierRegistry`): the
-    ///         registry is a mandatory `initialize` argument since pashov
-    ///         finding #1, so only a governor deployed BEFORE that fix is
-    ///         registry-less — which is exactly the population this branch
-    ///         exists for. Note the pricing here (`MAX_CAPITAL`, flat) differs
-    ///         from the wired uncertified case
-    ///         (`test_shortCalldataResolvesAsUncertifiedTier2`, `2 *
-    ///         MAX_CAPITAL`): the flat default prices the ENVELOPE once, the
-    ///         wired path prices each declared cap.
-    function test_zeroTierRegistryAddressDefaultsAllToTier2() public {
-        unwireTierRegistry(address(governor));
-        // Deliberately NOT wired; certification alone must not matter.
-        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
-
-        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
-        calls[0] = _certifiedCall();
-        uint256 pid = _propose(calls);
-
-        assertEq(governor.getProposalTier(pid), 2);
-        assertEq(governor.getRequiredCoverage(pid), MAX_CAPITAL);
     }
 
     /// @notice Calldata shorter than 4 bytes cannot carry a selector — it

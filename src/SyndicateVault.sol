@@ -211,22 +211,8 @@ contract SyndicateVault is
     uint256 private _agentFeeBpsPlusOne;
 
     /// @notice Idle-liquidity floor (bps of pre-batch float) enforced against
-    ///         governor batches. 0 = off. Packed with `minHoldingPeriod`.
+    ///         governor batches. 0 = off.
     uint16 public minBufferBps;
-
-    /// @notice Seconds an account must hold after a deposit before instant
-    ///         exit (anti flash-arb, GLP-cooldown pattern). Lane B is exempt.
-    /// @dev Not yet exposed via ISyndicateVault; kept non-public to stay under
-    ///      the EIP-170 runtime size limit. Storage slot/type reserved for
-    ///      future instant-exit logic.
-    uint32 internal minHoldingPeriod;
-
-    /// @notice Timestamp of each account's most recent instant deposit
-    ///         (receiver-side). Gates instant exit via `minHoldingPeriod`.
-    /// @dev Not yet exposed via ISyndicateVault; kept non-public to stay under
-    ///      the EIP-170 runtime size limit. Storage slot/type reserved for
-    ///      future instant-exit logic.
-    mapping(address => uint40) internal lastDepositAt;
 
     // ── Two-number fee model (management + performance) ──
 
@@ -1015,7 +1001,7 @@ contract SyndicateVault is
                 _Permit2BatchDetail[] memory details = abi.decode(data[4:], (_Permit2BatchDetail[]));
                 for (uint256 j = 0; j < details.length; j++) {
                     address to = details[j].to;
-                    if (to == address(this) && calls[i].target == asset_) continue;
+                    if (to == address(this)) continue;
                     if (!ITierRegistry(registry).isAdapterAllowed(to)) {
                         revert DisallowedTransferTarget(calls[i].target, sel, to);
                     }
@@ -1028,13 +1014,9 @@ contract SyndicateVault is
                 }
                 continue;
             }
-            // Self-transfer fast-path is scoped to asset() ONLY: it is the
-            // one token the outer `netOutflow` meter in `executeGovernorBatch`
-            // independently verifies via a balance diff. Any other token
-            // whose destination decodes to the vault still routes through the
-            // TierRegistry check below — see the "SELF-TRANSFER FAST-PATH
-            // SCOPED TO asset()" note above.
-            if (recipient == address(this) && calls[i].target == asset_) continue;
+            // Value landing on the vault itself needs no allowlist entry: the
+            // callee gate (PART 2a) already vetted who is being called.
+            if (recipient == address(this)) continue;
             if (!ITierRegistry(registry).isAdapterAllowed(recipient)) {
                 revert DisallowedTransferTarget(calls[i].target, sel, recipient);
             }
@@ -1762,19 +1744,33 @@ contract SyndicateVault is
         return Math.mulDiv(shares, depositNav() + 1, _pricingSupply() + 10 ** _decimalsOffset(), Math.Rounding.Ceil);
     }
 
-    /// @dev Returns 0 when `paused()` so the EIP-4626 IMP-1 invariant holds
-    ///      (`deposit(maxDeposit(x), x)` MUST NOT revert when the action is
-    ///      disabled). Active-proposal / whitelist cases stay reported
-    ///      as `type(uint256).max` here (adding those checks busts EIP-170 and
-    ///      under-reports valid Lane A deposit flows); frontends poll
-    ///      the per-vault governor's `getActiveProposal()` + `isApprovedDepositor` directly.
-    function maxDeposit(address) public view override returns (uint256) {
-        if (paused()) return 0;
+    /// @dev 0 whenever `deposit(_, receiver)` would revert: paused, deposits
+    ///      locked, or `receiver` not whitelisted in closed mode (EIP-4626).
+    function maxDeposit(address receiver) public view override returns (uint256) {
+        if (paused() || depositsLocked()) return 0;
+        if (!_openDeposits && !_approvedDepositors.contains(receiver)) return 0;
         return type(uint256).max;
     }
 
     function maxMint(address receiver) public view override returns (uint256) {
         return maxDeposit(receiver);
+    }
+
+    /// @dev OZ's `deposit`/`mint` compare against `maxDeposit` first; re-check
+    ///      here so a refused deposit keeps its named error.
+    function deposit(uint256 assets, address receiver) public override returns (uint256) {
+        _requireDepositOpen(receiver);
+        return super.deposit(assets, receiver);
+    }
+
+    function mint(uint256 shares, address receiver) public override returns (uint256) {
+        _requireDepositOpen(receiver);
+        return super.mint(shares, receiver);
+    }
+
+    function _requireDepositOpen(address receiver) private view {
+        if (depositsLocked()) revert DepositsLocked();
+        _requireApprovedDepositor(receiver);
     }
 
     /// @dev Instant deposit is allowed only outside an open proposal. During an

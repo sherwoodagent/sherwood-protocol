@@ -322,10 +322,6 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
         if (bytes(config.symbol).length == 0) revert InvalidSyndicateConfig();
         if (bytes(config.subdomain).length == 0) revert InvalidSyndicateConfig();
         if (bytes(config.metadataURI).length == 0) revert InvalidSyndicateConfig();
-        // the governor init site below). `initialize` requires one, so this only
-        // fires after an owner zeroed the slot as a kill switch. Reads factory
-        // storage only, so it belongs with the pre-flight rejects.
-        if (tierRegistry == address(0)) revert TierRegistryNotWired();
 
         // Gate on prepared owner stake before any side effects. Owner bonds
         // live on sWOOD; the registry exposes its sWOOD handle so the factory
@@ -617,13 +613,11 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         from `InitParams`, so this is a migration step, not a deploy one.
     ///         Only affects governors created AFTER this call; existing ones are
     ///         rewired via `pushWiring(governor)`.
-    /// @dev `address(0)` is legal HERE and nowhere else, and no longer means
-    ///      fail-CLOSED kill switch on new syndicates that cannot un-wire an
-    ///      existing governor. Codeless is refused: an EOA passes every
-    ///      zero-check, then reverts the batch guard's typed `isCallableTarget`
-    ///      call and bricks every vault it reaches. Cf. `setExecutorImpl`.
+    /// @dev Zero and codeless are both refused: an EOA passes every zero-check,
+    ///      then reverts the batch guard's typed `isCallableTarget` call and
+    ///      bricks every vault it reaches. Cf. `setExecutorImpl`.
     function setTierRegistry(address newRegistry) external onlyOwner {
-        if (newRegistry != address(0) && newRegistry.code.length == 0) revert TierRegistryNotWired();
+        if (newRegistry.code.length == 0) revert TierRegistryNotWired();
         address old = tierRegistry;
         tierRegistry = newRegistry;
         emit TierRegistrySet(old, newRegistry);
@@ -697,7 +691,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     /// @param governor A per-vault governor proxy deployed by this factory.
     function pushWiring(address governor) external onlyOwner {
         if (!_isFactoryGovernor(governor)) revert NotFactoryGovernor();
-        if (tierRegistry != address(0)) ISyndicateGovernor(governor).setTierRegistry(tierRegistry);
+        ISyndicateGovernor(governor).setTierRegistry(tierRegistry);
         if (exposureLedger != address(0)) ISyndicateGovernor(governor).setExposureLedger(exposureLedger);
         if (bondEscrow != address(0)) ISyndicateGovernor(governor).setBondEscrow(bondEscrow);
         emit WiringPushed(governor);

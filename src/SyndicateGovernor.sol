@@ -780,20 +780,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
                 proposal.effectiveMaxCapital
             );
 
-        {
-            uint256 basis = _capitalSnapshots[proposalId];
-            uint256 allowance = (proposal.effectiveMaxCapital * proposal.maxDrawdownBps) / BPS_DENOMINATOR;
-            // `allowance >= basis` covers the declared-total-loss envelope
-            // (`maxDrawdownBps == 10_000` on a proposal committing the whole
-            // float): the floor is zero, so any realized balance settles. That
-            // is the envelope working as declared, not a hole.
-            if (basis > allowance) {
-                uint256 floor = basis - allowance;
-                uint256 realized = IERC20(IERC4626(proposal.vault).asset()).balanceOf(proposal.vault);
-                if (realized < floor) revert SettlementBelowDrawdownFloor(realized, floor);
-            }
-        }
-
         _requireSettlePriceAboveFloorHook(proposalId, proposal, false);
 
         _finishSettlement(proposalId, proposal);
@@ -1480,7 +1466,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         bool checkCeiling
     ) private view returns (uint8 tier, uint256 coverage) {
         address registry = _tierRegistry;
-        if (registry == address(0)) return (2, maxCapital);
         uint256 tier2Ceiling = checkCeiling
             ? (IERC4626(GovernorParameters.vault).totalAssets() * tier2CallCapBps()) / BPS_DENOMINATOR
             : type(uint256).max;
@@ -1803,10 +1788,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _activeProposal = 0;
         _transition(proposal, ProposalState.Settled);
         delete _capitalSnapshots[proposalId];
-        // Symmetric with the capital snapshot above: both are read only on the
-        // way INTO settlement (the two floors), never after it, and `Settled`
-        // is terminal — no path re-enters `_finishSettlement` for this id — so
-        // clearing recovers the refund without weakening either gate.
+        // Read only on the way INTO settlement and `Settled` is terminal, so
+        // clearing recovers the refund without weakening the price floor.
         delete _ppsSnapshots[proposalId];
         _decOpen();
 
@@ -2041,12 +2024,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      transfers) or gated on `redemptionsLocked()` (instant redeem, queue
     ///      `claim`/`settleRedeem`, the `rescue*` helpers). An escrowed fee
     ///      leaving mid-strategy is indistinguishable from a strategy loss to
-    ///      both asset-balance-differencing consumers: it understates
-    ///      `_finishSettlement`'s `pnl`, and — since the drawdown floor —
-    ///      it can revert an otherwise-profitable `settleProposal` outright,
-    ///      which leaves `_activeProposal` set and therefore keeps redemptions,
-    ///      queue claims and every future proposal locked until the owner
-    ///      multisig runs `unstick`.
+    ///      `_finishSettlement`'s `pnl`, which understates it.
     ///
     ///      Costs the recipient nothing but a wait. The escrow only exists
     ///      because a transfer already failed once, it accrues no deadline, and

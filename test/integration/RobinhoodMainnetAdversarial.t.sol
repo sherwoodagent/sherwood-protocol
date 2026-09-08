@@ -209,7 +209,7 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
     // ==================== local lifecycle helpers ====================
     //
     // The base harness's `_proposeVoteExecute` hardcodes `GovEnvelope.permissive`
-    // (maxDrawdownBps = 10_000, i.e. the capital-floor gate is a no-op). Several
+    // (maxDrawdownBps = 10_000). Several
     // cases here need a REAL drawdown declaration, a defeated vote, or a review
     // that never approves — so the envelope stages are split out locally rather
     // than by editing the shared base.
@@ -432,15 +432,14 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
 
     // ==================== 2. SETTLEMENT FAILURE ====================
 
-    /// @notice Settlement that under-delivers past the declared drawdown must
-    ///         REVERT with the specific floor error, must not wedge the vault,
-    ///         and once the shortfall is repaired the proposal must settle
-    ///         exactly once — a second settle is refused.
-    function test_settleUnderDelivering_revertsAtFloor_thenSettlesExactlyOnce() public {
+    /// @notice A near-total under-delivery is refused on the PRICE floor (the
+    ///         capital floor is gone, SHE-256), must not wedge the vault, and
+    ///         once the shortfall is repaired the proposal settles exactly once.
+    function test_settleUnderDelivering_revertsAtPriceFloor_thenSettlesExactlyOnce() public {
         _requireFork();
         _allow(sink);
         uint256 vaultBefore = _usdg(address(vault));
-        uint256 loss = vaultBefore / 2; // 50% out the door; declared max 10%
+        uint256 loss = (vaultBefore * 95) / 100; // 95% out the door; the price floor is 10%
 
         BatchExecutorLib.Call[] memory execCalls = _single(
             BatchExecutorLib.Call({target: USDG, data: abi.encodeCall(IERC20.transfer, (sink, loss)), value: 0})
@@ -456,14 +455,7 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
 
         vm.warp(vm.getBlockTimestamp() + DURATION + 1);
 
-        // basis = pre-exec balance, allowance = maxCapital * 10%, so the floor is
-        // 90% of the pre-exec balance and a 50% loss is far below it.
-        uint256 floorAssets = vaultBefore - (vaultBefore * 1000) / 10_000;
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                ISyndicateGovernor.SettlementBelowDrawdownFloor.selector, vaultBefore - loss, floorAssets
-            )
-        );
+        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
         governor.settleProposal(pid);
 
         // NOT WEDGED: the proposal is still Executed, LPs can still queue an
