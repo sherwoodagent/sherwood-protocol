@@ -333,26 +333,10 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         address last = address(uint160(0x100000 + cap));
         _stakeGuardian(last, 10_000e18, 999);
 
-        // audit-181-second finding A: `_growthGatedVoteWeight` clamps a
-        // voter's own numerator weight to what they held `FLOOR_LOOKBACK`
-        // before `openedAt` whenever their raw stake grew over that window
-        // (mirrors `TokenCourt.vote`, issue #82). A guardian staked only
-        // seconds before `openReview` had ZERO stake at the lookback
-        // instant, so the clamp zeroes their vote weight and
-        // `voteOnProposal` reverts `NotActiveGuardian()` on a 0-weight
-        // first vote. Age the new cohort past `FLOOR_LOOKBACK` (same 30d as
-        // this harness's `maturationPeriod`, so this also brings them to
-        // par) so their stake already existed at the lookback checkpoint
-        // and the clamp is a no-op, matching the un-gated pre-remediation
-        // behaviour this test exercises (the cap, not the clamp).
-        skip(registry.FLOOR_LOOKBACK());
-
-        // PROPOSAL_ID's window was fixed in `setUp` (24h after the ORIGINAL
-        // pre-skip `voteEnd`) and would now already be in the past, so
-        // reusing it here would revert `ReviewNotOpen` instead of exercising
-        // the cap. Register a fresh proposal id whose window starts NOW —
-        // same pattern `test_voteOnProposal_hundredDustBlockersCannotCensorAnHonestBlock`
-        // below uses — so the vote window still covers the matured cohort.
+        // PROPOSAL_ID's window was fixed in `setUp`, so register a fresh
+        // proposal id whose window starts NOW — same pattern
+        // `test_voteOnProposal_hundredDustBlockersCannotCensorAnHonestBlock`
+        // below uses — and the vote window covers this cohort.
         uint256 capPid = 43;
         vm.warp(vm.getBlockTimestamp() + 1);
         _registerReview(capPid, vm.getBlockTimestamp(), vm.getBlockTimestamp() + REVIEW_PERIOD);
@@ -399,10 +383,6 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         }
         address whale = address(uint160(0x300000 + squat));
         _stakeGuardian(whale, 3_000_000e18, 999);
-
-        // Age the cohort past `FLOOR_LOOKBACK` so `_growthGatedVoteWeight`
-        // does not clamp any first vote to zero (see the approver-cap test above).
-        skip(registry.FLOOR_LOOKBACK());
 
         vm.warp(vm.getBlockTimestamp() + 1);
         uint256 newPid = 42;

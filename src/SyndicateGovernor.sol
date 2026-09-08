@@ -1630,8 +1630,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // extract nothing needs no covering signer. Reachable — an all-zero-cap
         // proposal legitimately prices to zero, and the per-call meter enforces
         // exactly that declaration.
-        bool gated = ledger != address(0) && proposal.requiredCoverage != 0
-            && proposal.envelopeTier >= IExposureLedger(ledger).quorumTierThreshold();
+        bool gated = ledger != address(0) && proposal.requiredCoverage != 0;
         if (gated) {
             (coverageRaisedUsd, requiredCoverageUsd) = IExposureLedger(ledger)
                 .requireApproveQuorum(address(this), proposalId, asset, proposal.requiredCoverage);

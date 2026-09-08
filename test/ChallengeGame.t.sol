@@ -15,6 +15,7 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 contract MockChallengeGovernor {
     mapping(uint256 proposalId => ISyndicateGovernor.StrategyProposal) internal _proposals;
     mapping(uint256 proposalId => BatchExecutorLib.Call[]) internal _calls;
+    mapping(uint256 proposalId => BatchExecutorLib.Call[]) internal _settlementCalls;
 
     /// @dev Stands in for "the proposal did touch the adapter the filing
     ///      names", which is the usual case; `setExecuteCall` overrides it per
@@ -35,6 +36,17 @@ contract MockChallengeGovernor {
     function setExecuteCall(uint256 proposalId, address target, bytes4 selector) external {
         delete _calls[proposalId];
         _calls[proposalId].push(BatchExecutorLib.Call({target: target, data: abi.encodePacked(selector), value: 0}));
+    }
+
+    function setSettlementCall(uint256 proposalId, address target, bytes4 selector) external {
+        delete _settlementCalls[proposalId];
+        _settlementCalls[proposalId].push(
+            BatchExecutorLib.Call({target: target, data: abi.encodePacked(selector), value: 0})
+        );
+    }
+
+    function getSettlementCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory) {
+        return _settlementCalls[proposalId];
     }
 
     function getProposal(uint256 proposalId) external view returns (ISyndicateGovernor.StrategyProposal memory) {
@@ -771,17 +783,14 @@ contract ChallengeGameTest is Test {
         );
         assertEq(game.liveChallengeCountOf(address(gov), PROPOSAL), 2);
 
-        // ONE POOL PER PROPOSAL (pashov 2026-08 finding #10): the squat's pool
-        // is the proposal's pool, so the honest filing is ADOPTED by it and is
-        // `Disputed` the moment it lands, without the accused paying a second
-        // counter-bond. That is the deliberate consequence of pricing the
-        // defence per proposal rather than per challenge — the cohort answers
-        // one accusation's worth however many accusations are open — and the
-        // route left to a conviction is the court, not the silence clock.
+        // ONE POOL PER PROPOSAL, but a pool answers only the accusations that
+        // were already open when it completed. The squat's counter-bond was
+        // raised against the squat; this filing lands afterwards and is
+        // undefended until the cohort pays for its own window.
         assertEq(
             uint8(game.challengeOf(honest).status),
-            uint8(IChallengeGame.Status.Disputed),
-            "the standing pool disputes the new filing too"
+            uint8(IChallengeGame.Status.Filed),
+            "a filing that lands after the pool completed is not adopted by it"
         );
 
         // The squat times out to the accused, as designed — and takes nothing
@@ -796,25 +805,25 @@ contract ChallengeGameTest is Test {
         (uint256 poolStillHeld,,,,) = game.counterBondPoolOf(honest);
         assertGt(poolStillHeld, 0, "the shared pool survives the squat's own resolution");
 
-        // And the honest challenge still convicts — through the court now
-        // rather than through silence.
-        vm.prank(court);
-        game.rule(honest, IChallengeGame.Verdict.Guilty);
+        // And the honest challenge still convicts — through the silence clock,
+        // which the squat's counter-bond never stopped for it.
+        game.resolve(honest);
+        assertEq(uint8(game.challengeOf(honest).status), uint8(IChallengeGame.Status.Settled));
         assertEq(swood.callCount(), 1, "the squat delayed the verdict; it did not prevent it");
         assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "last one out unfreezes");
         (uint256 poolAfter,,,, bool poolBurned) = game.counterBondPoolOf(honest);
-        assertEq(poolAfter, 0, "and the conviction burned the pool the squat funded");
-        assertTrue(poolBurned);
+        assertEq(poolAfter, 0, "the pool leaves live accounting with the last challenge");
+        assertFalse(poolBurned, "released, not burned -- it never defended the challenge that convicted");
 
-        // The funder keeps only what the squat's own failure won it — the
-        // forfeited challenger bond — and never gets the staked pool back,
-        // because the conviction burned it.
+        // The cohort gets back the counter-bond that bought it nothing, plus
+        // the bond its own squat forfeited to it net of that path's burn: the
+        // squat cost it the two burn slices and delayed the verdict.
         IChallengeGame.Challenge memory sq = game.challengeOf(squat);
         uint256 forfeitPayout = sq.bondWood - (sq.bondWood * sq.forfeitBurnBpsAtFiling) / 10_000;
         assertEq(
             game.claimableContribution(squat, guardianA),
-            forfeitPayout,
-            "the squat's forfeited bond only, never the staked pool"
+            forfeitPayout + poolStillHeld,
+            "the squat's forfeited bond, plus the counter-bond that defended only the squat"
         );
     }
 
@@ -2102,6 +2111,41 @@ contract ChallengeGameTest is Test {
         vm.stopPrank();
         assertGt(id, 0);
         assertEq(tiers.demoteCount(), 0, "nothing demoted by a filing alone");
+    }
+
+    /// @notice A settlement-leg adapter is part of the proposal too: the caps
+    ///         and the coverage price it, so a filing may name it.
+    function test_file_acceptsAnAdapterOnlyTheSettlementLegCalls() public {
+        address settlementAdapter = address(0x5E77);
+        bytes4 settlementSelector = bytes4(0x11223344);
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
+        _execute(PROPOSAL);
+        gov.setExecuteCall(PROPOSAL, ADAPTER, SELECTOR);
+        gov.setSettlementCall(PROPOSAL, settlementAdapter, settlementSelector);
+
+        vm.startPrank(challenger);
+        // In neither leg: still refused.
+        vm.expectRevert(IChallengeGame.AdapterNotInProposal.selector);
+        game.file(
+            address(gov),
+            PROPOSAL,
+            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            settlementAdapter,
+            bytes4(0xdeadbeef),
+            EVIDENCE
+        );
+        // Present only in the settlement leg: accepted.
+        uint256 id = game.file(
+            address(gov),
+            PROPOSAL,
+            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            settlementAdapter,
+            settlementSelector,
+            EVIDENCE
+        );
+        vm.stopPrank();
+        assertGt(id, 0);
+        assertEq(game.challengeOf(id).adapterTarget, settlementAdapter);
     }
 
     /// @notice A filing that accuses NO adapter is still legal — predicates 2, 3
@@ -4760,6 +4804,445 @@ contract ChallengeGameTest is Test {
         assertEq(game.bondedWood(), 0, "nothing left accounted");
         assertEq(game.unclaimedWood(), 0);
         assertEq(wood.balanceOf(address(game)), 0, "nothing stranded");
+        _assertLiveBondsBacked();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // The counter-bond pool defends only the challenges that were already live
+    // when it completed
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice A COMPLETED POOL IS NOT A STANDING SHIELD. The accused self-file
+    ///         a decoy from a fresh address and fund the one per-proposal pool
+    ///         through it. Every later filing used to be born `Disputed` off
+    ///         that single payment: no silence conviction was reachable, and a
+    ///         filing nobody referred forfeited its bond at the timeout to the
+    ///         pool's funders — the accused. A filing that lands after the pool
+    ///         completed is now unbacked, so silence still convicts and the
+    ///         honest bond goes back to the challenger.
+    function test_selfFiledDecoyProvidesNoShield() public {
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
+        _execute(PROPOSAL);
+        vm.warp(vm.getBlockTimestamp() + 3 days);
+
+        address decoyFiler = makeAddr("selfFiledDecoy");
+        _fund(decoyFiler);
+        vm.prank(decoyFiler);
+        uint256 decoy =
+            game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.RogueAllowance, ADAPTER, SELECTOR, EVIDENCE);
+
+        (, uint256 target,,,) = game.counterBondPoolOf(decoy);
+        uint256 funderBefore = wood.balanceOf(guardianA);
+        _completePool(decoy);
+        (,,, uint256 completedAt,) = game.counterBondPoolOf(decoy);
+        assertEq(completedAt, vm.getBlockTimestamp(), "fixture: the decoy's pool is complete");
+        assertEq(funderBefore - wood.balanceOf(guardianA), target, "and the cohort paid exactly one bond for it");
+
+        // The honest filing lands a day AFTER the pool completed.
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 honest = _fileStandardFrom(challenger, PROPOSAL);
+
+        assertEq(
+            uint8(game.challengeOf(honest).status),
+            uint8(IChallengeGame.Status.Filed),
+            "a filing made after the pool completed is undefended"
+        );
+        assertEq(
+            uint8(game.challengeOf(decoy).status),
+            uint8(IChallengeGame.Status.Disputed),
+            "while the challenge the pool was raised against keeps its defence"
+        );
+
+        uint256 bond = game.challengeOf(honest).bondWood;
+        uint256 challengerBefore = wood.balanceOf(challenger);
+        uint256 burnBefore = wood.balanceOf(game.BURN_ADDRESS());
+
+        vm.warp(_filedAt(honest) + game.autoSlashDelay());
+        game.resolve(honest);
+
+        uint256 slice = (bond * game.settleBurnBps()) / 10_000;
+        assertEq(uint8(game.challengeOf(honest).status), uint8(IChallengeGame.Status.Settled));
+        assertEq(swood.callCount(), 1, "the silence IS still the verdict");
+        assertEq(
+            wood.balanceOf(challenger) - challengerBefore, bond - slice, "the honest bond comes back to the challenger"
+        );
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()) - burnBefore, slice, "and only its settle slice is destroyed");
+        assertEq(
+            game.claimableContribution(honest, guardianA), 0, "the pool's funder is owed nothing out of the honest bond"
+        );
+        assertEq(wood.balanceOf(guardianA), funderBefore - target, "and is still out exactly the pool it paid for");
+        assertEq(
+            uint8(game.poolOutcomeOf(decoy)),
+            uint8(IChallengeGame.PoolOutcome.Open),
+            "the decoy's own pool is untouched"
+        );
+    }
+
+    /// @notice AND THE NEXT ROUND STARTS UNDEFENDED. Once the last live
+    ///         challenge terminates, the pool closes and the round moves on, so
+    ///         a fresh filing inherits nothing: it is `Filed` against an empty
+    ///         pool until a counter-bond is posted inside its own window. The
+    ///         previous round's funder is paid out of the round it actually
+    ///         contributed to, which the move does not disturb.
+    function test_freshFilingAfterTheLastLiveChallengeIsUndefended() public {
+        uint256 first = _fileStandard(PROPOSAL);
+        (, uint256 target,,,) = game.counterBondPoolOf(first);
+        uint256 funderBefore = wood.balanceOf(guardianA);
+        _completePool(first);
+        assertEq(uint8(game.challengeOf(first).status), uint8(IChallengeGame.Status.Disputed));
+
+        vm.prank(court);
+        game.rule(first, IChallengeGame.Verdict.Inconclusive);
+        assertEq(
+            uint8(game.poolOutcomeOf(first)),
+            uint8(IChallengeGame.PoolOutcome.Released),
+            "the last live challenge closed the pool"
+        );
+
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 second = _fileStandardFrom(challenger, PROPOSAL);
+
+        (uint256 poolWood, uint256 secondTarget, uint256 raised, uint256 completedAt,) = game.counterBondPoolOf(second);
+        assertEq(
+            uint8(game.challengeOf(second).status),
+            uint8(IChallengeGame.Status.Filed),
+            "a fresh filing needs a fresh defence"
+        );
+        assertEq(poolWood, 0, "nothing carried over from the completed round");
+        assertEq(raised, 0);
+        assertEq(completedAt, 0);
+        assertEq(secondTarget, game.challengeOf(second).bondWood, "and the bar is one bond again");
+
+        // The old round's contributor is still whole: the claim is keyed to the
+        // round it paid into, not to whichever round is current.
+        assertEq(game.claimableContribution(first, guardianA), target, "the previous round's stake is still claimable");
+        vm.prank(guardianA);
+        game.claimContribution(first);
+        assertEq(wood.balanceOf(guardianA), funderBefore, "and it comes back in full, exactly once");
+
+        // A counter-bond posted for THIS challenge's window is what defends it.
+        _completePool(second);
+        assertEq(
+            uint8(game.challengeOf(second).status),
+            uint8(IChallengeGame.Status.Disputed),
+            "defended only once its own counter-bond is posted"
+        );
+        assertEq(game.claimableContribution(first, guardianA), 0, "the retired claim is not re-opened by the new round");
+    }
+
+    /// @notice AND IT IS NOT UNDEFENDABLE. A completed pool answers only the
+    ///         accusations that were already open, but a challenge filed
+    ///         afterwards can still buy a defence: one more bond into the same
+    ///         round, and that challenge alone is disputed. Without it, a second
+    ///         filing landing just after a legitimate counter-bond would convict
+    ///         an innocent cohort by silence for the price of one bond, with no
+    ///         answer available to them at all.
+    function test_challengeFiledAfterPoolCompletedCanBeDefendedByItsOwnCounterBond() public {
+        uint256 a = _fileStandard(PROPOSAL);
+        (, uint256 target,,,) = game.counterBondPoolOf(a);
+        _completePool(a);
+        assertEq(uint8(game.challengeOf(a).status), uint8(IChallengeGame.Status.Disputed), "fixture: A is pool-backed");
+
+        address laterFiler = makeAddr("laterFiler");
+        _fund(laterFiler);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 b = _fileStandardFrom(laterFiler, PROPOSAL);
+        assertEq(
+            uint8(game.challengeOf(b).status),
+            uint8(IChallengeGame.Status.Filed),
+            "B is born unbacked by the completed pool"
+        );
+
+        // A already answered by the shared completion takes no second payment.
+        vm.prank(guardianB);
+        vm.expectRevert(IChallengeGame.WrongStatus.selector);
+        game.dispute(a, target);
+
+        uint256 funderBefore = wood.balanceOf(guardianB);
+        vm.prank(guardianB);
+        game.dispute(b, type(uint256).max);
+
+        assertEq(
+            uint8(game.challengeOf(b).status), uint8(IChallengeGame.Status.Disputed), "B's own counter-bond defends B"
+        );
+
+        // And once B has bought its own defence it refuses one too.
+        vm.prank(guardianB);
+        vm.expectRevert(IChallengeGame.WrongStatus.selector);
+        game.dispute(b, target);
+        assertEq(funderBefore - wood.balanceOf(guardianB), target, "at the price one pooled defence costs");
+        assertEq(game.challengeOf(b).defendedAt, vm.getBlockTimestamp(), "the instant is pinned on B itself");
+        assertEq(game.challengeOf(b).defenceWeight, target, "and so is what B's own defence cost");
+        assertEq(uint8(game.challengeOf(a).status), uint8(IChallengeGame.Status.Disputed), "A keeps its own defence");
+        assertEq(game.challengeOf(a).defendedAt, 0, "while A is backed by the shared completion, not its own bond");
+
+        // The payment is booked into the round exactly like a pooled one.
+        assertEq(game.counterBondContributionOf(b, guardianB), target, "recorded as a contribution of the round");
+        address[] memory funders = game.counterBondContributors(b);
+        assertEq(funders.length, 2, "both defences sit in one contributor list");
+        assertEq(funders[0], guardianA);
+        assertEq(funders[1], guardianB);
+        (uint256 poolWood,, uint256 raised,,) = game.counterBondPoolOf(b);
+        assertEq(raised, 2 * target, "the round holds both defences");
+        assertEq(poolWood, raised, "and still holds them");
+        _assertLiveBondsBacked();
+
+        // Silence cannot convict a defended challenge: B now waits for the court.
+        vm.warp(_filedAt(b) + game.autoSlashDelay());
+        vm.expectRevert(IChallengeGame.DelayNotElapsed.selector);
+        game.resolve(b);
+        assertEq(swood.callCount(), 0, "no silence verdict against the cohort");
+    }
+
+    /// @notice A PART-PAID OWN DEFENCE IS NOT A DEFENCE, on the same terms the
+    ///         pooled path already sets: below the target the silence clock
+    ///         keeps running, and the top-up that reaches it is the one that
+    ///         stops it.
+    function test_partialOwnDefenceDoesNotBackTheLaterFilingUntilItIsComplete() public {
+        uint256 a = _fileStandard(PROPOSAL);
+        (, uint256 target,,,) = game.counterBondPoolOf(a);
+        _completePool(a);
+
+        address laterFiler = makeAddr("laterFiler");
+        _fund(laterFiler);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 b = _fileStandardFrom(laterFiler, PROPOSAL);
+
+        uint256 part = target / 3;
+        vm.prank(guardianB);
+        game.dispute(b, part);
+        assertEq(
+            uint8(game.challengeOf(b).status), uint8(IChallengeGame.Status.Filed), "a third of the bar is not a defence"
+        );
+        assertEq(game.challengeOf(b).defendedAt, 0, "nothing is pinned until the bar is reached");
+        assertEq(game.challengeOf(b).defenceWeight, part, "only what has been paid so far");
+        (,, uint256 raised,,) = game.counterBondPoolOf(b);
+        assertEq(raised, target + part, "though the WOOD is in the round");
+
+        // Left there, the silence still convicts.
+        uint256 snap = vm.snapshotState();
+        vm.warp(_filedAt(b) + game.autoSlashDelay());
+        vm.prank(guardianB);
+        vm.expectRevert(IChallengeGame.WindowClosed.selector);
+        game.dispute(b, type(uint256).max);
+        game.resolve(b);
+        assertEq(
+            uint8(game.challengeOf(b).status),
+            uint8(IChallengeGame.Status.Settled),
+            "silence convicts an under-funded defence"
+        );
+        assertEq(swood.callCount(), 1, "the silence IS the verdict");
+        vm.revertToState(snap);
+
+        // Topped up inside B's own window, it becomes a defence.
+        vm.warp(_filedAt(b) + game.autoSlashDelay() - 1);
+        vm.prank(guardianB);
+        game.dispute(b, type(uint256).max);
+        assertEq(
+            uint8(game.challengeOf(b).status),
+            uint8(IChallengeGame.Status.Disputed),
+            "the top-up that reaches the bar defends it"
+        );
+        assertEq(game.counterBondContributionOf(b, guardianB), target, "two payments, one contribution of record");
+        assertEq(game.challengeOf(b).defendedAt, vm.getBlockTimestamp(), "pinned by the payment that completed it");
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice A FORFEIT IS SPLIT AS IT STOOD WHEN IT WAS BOOKED. The round's
+    ///         raised total no longer freezes at the shared completion — an
+    ///         own defence keeps growing it while other challenges are live —
+    ///         so a failed challenge's split has to read the total pinned onto
+    ///         it at the failure, not the live one. Otherwise a payment made
+    ///         after the fact both collects a share of a forfeit it never
+    ///         defended against and dilutes the defenders who did.
+    function test_contributionAfterAFailureEarnsNoShareOfItsForfeit() public {
+        uint256 a = _fileStandard(PROPOSAL);
+        (, uint256 target,,,) = game.counterBondPoolOf(a);
+        _completePool(a);
+
+        address filerB = makeAddr("forfeitFilerB");
+        address filerC = makeAddr("forfeitFilerC");
+        _fund(filerB);
+        _fund(filerC);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 b = _fileStandardFrom(filerB, PROPOSAL);
+        uint256 cid = _fileStandardFrom(filerC, PROPOSAL);
+
+        vm.prank(guardianB);
+        game.dispute(b, type(uint256).max);
+        (,, uint256 raised,,) = game.counterBondPoolOf(b);
+        assertEq(raised, 2 * target, "fixture: the shared defence plus B's own");
+
+        // The court clears B, forfeiting B's bond into the round.
+        vm.prank(court);
+        game.rule(b, IChallengeGame.Verdict.NotGuilty);
+        assertEq(uint8(game.challengeOf(b).status), uint8(IChallengeGame.Status.Failed));
+        uint256 payout = game.challengeOf(b).forfeitPayoutWood;
+        assertGt(payout, 0, "fixture: there is a forfeit to split");
+        uint256 shareA = game.claimableContribution(b, guardianA);
+        uint256 shareB = game.claimableContribution(b, guardianB);
+        assertEq(shareA, payout / 2, "the two defenders of record halve it");
+        assertEq(shareB, payout / 2);
+
+        // A defence bought for C AFTER B failed, taking the round to three bonds.
+        address latecomer = makeAddr("latecomerDefender");
+        _fund(latecomer);
+        vm.prank(latecomer);
+        game.dispute(cid, type(uint256).max);
+        (,, uint256 raisedAfter,,) = game.counterBondPoolOf(cid);
+        assertEq(raisedAfter, 3 * target, "fixture: the round grew after B failed");
+
+        assertEq(game.claimableContribution(b, latecomer), 0, "it shares nothing of a forfeit booked before it paid");
+        assertEq(game.claimableContribution(b, guardianA), shareA, "and dilutes neither defender of record");
+        assertEq(game.claimableContribution(b, guardianB), shareB);
+
+        vm.prank(latecomer);
+        vm.expectRevert(IChallengeGame.NothingToClaim.selector);
+        game.claimContribution(b);
+
+        uint256 balBefore = wood.balanceOf(guardianB);
+        vm.prank(guardianB);
+        game.claimContribution(b);
+        assertEq(wood.balanceOf(guardianB) - balBefore, shareB, "paid exactly the share pinned at the failure");
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice A DEFENDER'S EARNED SHARE SURVIVES ITS NEXT PAYMENT. The
+    ///         contributor's mark is the round total after its LATEST payment,
+    ///         so defending a further filing moves it past the total an earlier
+    ///         failure was split by. The payment settles what is already owed
+    ///         first, at the old mark, so the share is paid rather than lost —
+    ///         and the round's WOOD is not left with no function that can move
+    ///         it. Defending a new filing before an old verdict is collected is
+    ///         the ordinary order of events, not a mistake.
+    function test_topUpAfterASiblingFailedPaysTheEarnedShareRatherThanStrandingIt() public {
+        uint256 a = _fileStandard(PROPOSAL);
+        (, uint256 target,,,) = game.counterBondPoolOf(a);
+        _completePool(a);
+
+        address filerB = makeAddr("strandFilerB");
+        address filerC = makeAddr("strandFilerC");
+        _fund(filerB);
+        _fund(filerC);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 b = _fileStandardFrom(filerB, PROPOSAL);
+        uint256 cid = _fileStandardFrom(filerC, PROPOSAL);
+
+        vm.prank(guardianB);
+        game.dispute(b, type(uint256).max);
+
+        vm.prank(court);
+        game.rule(b, IChallengeGame.Verdict.NotGuilty);
+        uint256 payout = game.challengeOf(b).forfeitPayoutWood;
+        uint256 shareA = game.claimableContribution(b, guardianA);
+        assertEq(shareA, payout / 2, "fixture: A is a defender of record of the failed filing");
+        assertEq(game.unclaimedWood(), payout, "fixture: the whole forfeit is owed to the two of them");
+
+        // A defends the third filing before collecting. The unclaimed share is
+        // settled by that payment.
+        uint256 balBefore = wood.balanceOf(guardianA);
+        vm.prank(guardianA);
+        game.dispute(cid, type(uint256).max);
+        assertEq(
+            balBefore - wood.balanceOf(guardianA),
+            target - shareA,
+            "the new defence costs a bond less the share it settled"
+        );
+
+        // And it is settled ONCE: nothing more is owed on that failure.
+        assertEq(game.claimableContribution(b, guardianA), 0, "the share is collected, not owed twice");
+        vm.prank(guardianA);
+        vm.expectRevert(IChallengeGame.NothingToClaim.selector);
+        game.claimContribution(b);
+
+        // With both defenders of record paid, only floor-division dust remains.
+        vm.prank(guardianB);
+        game.claimContribution(b);
+        assertLe(game.unclaimedWood(), 2, "nothing is stranded but the dust of the split");
+        _assertLiveBondsBacked();
+    }
+
+    /// @notice A PAYMENT WITH NOTHING OWED TO IT IS JUST A CONTRIBUTION: no
+    ///         failed sibling on the round means the settle pass finds nothing
+    ///         and the round's WOOD is untouched by it.
+    function test_topUpWithNoFailedSiblingBooksTheContributionAlone() public {
+        uint256 a = _fileStandard(PROPOSAL);
+        (, uint256 target,,,) = game.counterBondPoolOf(a);
+        uint256 part = target / 3;
+        vm.prank(guardianA);
+        game.dispute(a, part);
+
+        uint256 balBefore = wood.balanceOf(guardianA);
+        vm.prank(guardianA);
+        game.dispute(a, type(uint256).max);
+        assertEq(balBefore - wood.balanceOf(guardianA), target - part, "the top-up pays the shortfall and nothing else");
+        assertEq(game.unclaimedWood(), 0, "and nothing was settled out of the round");
+    }
+
+    /// @notice TWO FAILURES ON ONE ROUND SETTLE TOGETHER, EACH AT ITS OWN
+    ///         DENOMINATOR. A funder that paid once and then watched two
+    ///         siblings fail is owed a share of each, split by the round total
+    ///         AT THAT failure - not by the total the round has reached since.
+    ///         Its next payment collects both in one pass, and the flags that
+    ///         pass sets are what stop either being paid a second time.
+    function test_twoFailedSiblingsSettleAtTheirOwnDenominatorsOnTheNextPayment() public {
+        uint256 a = _fileStandard(PROPOSAL);
+        (, uint256 target,,,) = game.counterBondPoolOf(a);
+        _completePool(a); // A defends the round for T.
+
+        address filerX = makeAddr("twoFailFilerX");
+        address filerY = makeAddr("twoFailFilerY");
+        address filerZ = makeAddr("twoFailFilerZ");
+        _fund(filerX);
+        _fund(filerY);
+        _fund(filerZ);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 x = _fileStandardFrom(filerX, PROPOSAL);
+        uint256 y = _fileStandardFrom(filerY, PROPOSAL);
+        uint256 z = _fileStandardFrom(filerZ, PROPOSAL);
+
+        // X is own-defended by B for T, then fails against a round total of 2T.
+        vm.prank(guardianB);
+        game.dispute(x, type(uint256).max);
+        vm.prank(court);
+        game.rule(x, IChallengeGame.Verdict.NotGuilty);
+        uint256 payoutX = game.challengeOf(x).forfeitPayoutWood;
+        assertEq(game.challengeOf(x).counterBondWood, 2 * target, "fixture: X is split by the round total at X");
+
+        // Y is own-defended by B for T - which settles B's X share on the way
+        // in - and then fails against a round total of 3T.
+        uint256 balB = wood.balanceOf(guardianB);
+        vm.prank(guardianB);
+        game.dispute(y, type(uint256).max);
+        assertEq(balB - wood.balanceOf(guardianB), target - payoutX / 2, "B's defence of Y settles B's X share");
+        vm.prank(court);
+        game.rule(y, IChallengeGame.Verdict.NotGuilty);
+        uint256 payoutY = game.challengeOf(y).forfeitPayoutWood;
+        assertEq(game.challengeOf(y).counterBondWood, 3 * target, "fixture: Y is split by the round total at Y");
+
+        // A never topped up, so it holds T against both denominators. Its
+        // defence of the fourth filing collects both shares at once.
+        uint256 owedA = (payoutX * target) / (2 * target) + (payoutY * target) / (3 * target);
+        uint256 balA = wood.balanceOf(guardianA);
+        vm.prank(guardianA);
+        game.dispute(z, type(uint256).max);
+        assertEq(balA - wood.balanceOf(guardianA), target - owedA, "A's defence of Z settles both of A's shares");
+        assertEq(game.claimableContribution(x, guardianA), 0, "A's X share is collected, not owed twice");
+        assertEq(game.claimableContribution(y, guardianA), 0, "A's Y share is collected, not owed twice");
+
+        // B holds 2T of the round by the time Y fails, so its Y cut is two
+        // thirds - and its X cut is already paid, so X owes it nothing.
+        uint256 balB2 = wood.balanceOf(guardianB);
+        vm.prank(guardianB);
+        game.claimContribution(y);
+        assertEq(
+            wood.balanceOf(guardianB) - balB2, (payoutY * 2 * target) / (3 * target), "B's Y cut is its 2T of the 3T"
+        );
+        vm.prank(guardianB);
+        vm.expectRevert(IChallengeGame.NothingToClaim.selector);
+        game.claimContribution(x);
+
+        assertLe(game.unclaimedWood(), 3, "both forfeits are fully distributed, but for the dust of the two splits");
         _assertLiveBondsBacked();
     }
 }

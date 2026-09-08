@@ -40,12 +40,10 @@ interface IVaultMembership {
 ///
 ///         `template` is gated by an owner-managed allowlist: an unlisted
 ///         template reverts here, so this factory never clones an
-///         attacker-controlled contract. It is NOT the only chokepoint on what
-///         a vault may pay, though: `TierRegistry`'s code-class fallback admits
-///         ANY ERC-1167 clone of a class-allowed template as a batch recipient,
-///         whether or not this factory produced it (a bare `Clones.clone` +
-///         permissionless `initialize` bound to the paying vault is
-///         indistinguishable from a factory clone to every on-chain check,
+///         attacker-controlled contract. `cloneTemplate` records which template
+///         each clone came from, and `TierRegistry._classOf` requires that
+///         record to name the class's anchored template, so a clone this
+///         factory did not produce is not a class member.
 ///
 ///           - `setTemplateApproval(t, false)` stops NEW clones through this
 ///             factory only. To stop a template's clones from being FUNDED,
@@ -70,6 +68,10 @@ contract StrategyFactory is Ownable {
     ///         adds the canonical templates (Aerodrome / Moonwell / Portfolio
     ///         / HL Grid / HL Perp / WstETH / Mamo) at deploy.
     mapping(address template => bool approved) public approvedTemplate;
+
+    /// @notice Template `clone` was deployed from; `address(0)` when this
+    ///         factory did not deploy it.
+    mapping(address clone => address template) public cloneTemplate;
 
     error Unauthorized();
     error VaultNotRegistered();
@@ -144,6 +146,7 @@ contract StrategyFactory is Ownable {
         _authTemplate(template);
         if (proposer != msg.sender) revert ProposerMustBeSender();
         clone = Clones.clone(template);
+        cloneTemplate[clone] = template;
         IStrategy(clone).initialize(vault, proposer, data);
         emit StrategyCloned(template, vault, clone);
     }
@@ -173,6 +176,7 @@ contract StrategyFactory is Ownable {
         _authTemplate(template);
         if (proposer != msg.sender) revert ProposerMustBeSender();
         clone = Clones.cloneDeterministic(template, keccak256(abi.encode(vault, salt)));
+        cloneTemplate[clone] = template;
         IStrategy(clone).initialize(vault, proposer, data);
         emit StrategyCloned(template, vault, clone);
     }

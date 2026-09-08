@@ -46,7 +46,7 @@ abstract contract ExposureLedgerHandler is Properties {
         uint256 count = governor.proposalCount();
         uint256 proposalId = count == 0 ? 0 : clampBetween(arg0, 1, count);
 
-        selector = uint8(selector % 12);
+        selector = uint8(selector % 11);
         if (selector == 0) {
             if (count == 0) return;
             _exposureLedger_freezeCoverage(address(governor), proposalId);
@@ -78,8 +78,6 @@ abstract contract ExposureLedgerHandler is Properties {
         } else if (selector == 8) {
             _exposureLedger_setProposerBondBps(clampBetween(arg1, 0, 10_000));
         } else if (selector == 9) {
-            _exposureLedger_setQuorumTierThreshold(uint8(arg1 % 3));
-        } else if (selector == 10) {
             // I-7: bounded [MIN_WOOD_HAIRCUT_BPS, 10000].
             _exposureLedger_setWoodHaircutBps(clampBetween(arg1, 5_000, 10_000));
         } else {
@@ -142,10 +140,6 @@ abstract contract ExposureLedgerHandler is Properties {
 
     function _exposureLedger_setProposerBondBps(uint256 newBps) internal asAdmin {
         ledger.setProposerBondBps(newBps);
-    }
-
-    function _exposureLedger_setQuorumTierThreshold(uint8 newThreshold) internal asAdmin {
-        ledger.setQuorumTierThreshold(newThreshold);
     }
 
     function _exposureLedger_setWoodHaircutBps(uint256 newBps) internal asAdmin {

@@ -4,7 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
-import {MockWoodTwapOracle} from "test/mocks/MockWoodTwapOracle.sol";
+import {MockAggregatorV3} from "test/mocks/MockAggregatorV3.sol";
 
 /// @dev Minimal sWOOD stub exposing exactly the reads the ledger consumes.
 ///      Live-basis only (`slashableStakeAt` mirrors live stake) — none of
@@ -61,8 +61,8 @@ contract HighDecimalsFeed {
 ///      normally, within bound) whose `latestRoundData()` returns too few
 ///      words to decode — ONE word (32 bytes) where the tuple `(uint80,
 ///      int256, uint256, uint256, uint80)` needs five (160 bytes). Mirrors
-///      `test/mocks/MockWoodTwapOracle.sol`'s `ShortReturnWoodTwapOracle`
-///      exactly, for the identical reason: a typed `try ... returns (...)`
+///      the ledger's own defensive read, for the same reason: a typed
+///      `try ... returns (...)`
 ///      does not route a return-data decode failure through `catch` — it is
 ///      an uncaught, full revert of the transaction (Solidity's own
 ///      documented limitation) — so a defensive reader must reject the
@@ -166,7 +166,7 @@ contract MockGovernorForLedger {
 ///         data reverted uncatchably. Fixed by bounding `feedDecimals` at
 ///         write time (`MAX_FEED_DECIMALS`, both setters) and by rewriting
 ///         `_feedPriceX8` to a raw staticcall with an explicit length check
-///         before decoding — the exact pattern `_twapPriceX8` already used.
+///         before decoding.
 ///
 ///         FINDING 23 (`test_recordApproval_...`): `recordApproval` (and the
 ///         since-deleted `settleCoverage`) used to write the equivalent of `try this.coverageUsd(IVaultAssetMinimal(pv.vault)
@@ -184,7 +184,7 @@ contract MockGovernorForLedger {
 contract ExposureLedgerPriceAndScopeTest is Test {
     ExposureLedger internal ledger;
     MockSwood internal swood;
-    MockWoodTwapOracle internal twap;
+    MockAggregatorV3 internal woodFeed;
     MockGovernorForLedger internal mgov;
     MockVaultForLedger internal vault;
     address internal usdgAsset;
@@ -200,7 +200,7 @@ contract ExposureLedgerPriceAndScopeTest is Test {
     function setUp() public {
         swood = new MockSwood();
         ledger = new ExposureLedger(owner, address(swood), 28 days);
-        twap = new MockWoodTwapOracle(MARKET_X8);
+        woodFeed = new MockAggregatorV3(8, int256(MARKET_X8));
 
         usdgAsset = makeAddr("usdgAsset");
         vm.mockCall(usdgAsset, abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
@@ -210,7 +210,9 @@ contract ExposureLedgerPriceAndScopeTest is Test {
 
         vm.startPrank(owner);
         ledger.setWoodUsdPrice(CAP_X8);
-        ledger.setWoodTwapOracle(address(twap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         ledger.setAssetFeed(usdgAsset, address(assetFeed), 365 days);
         ledger.setGuardianRegistry(registry);
         vm.stopPrank();
@@ -265,25 +267,22 @@ contract ExposureLedgerPriceAndScopeTest is Test {
     }
 
     /// @notice A wired-but-malformed WOOD feed (too little `latestRoundData`
-    ///         return data to decode) must make `woodPriceX8` fall through to
-    ///         the TWAP, not revert the whole read.
+    ///         return data to decode) must resolve to the ledger's own
+    ///         `NoWoodPrice`, not to an undecodable revert bubbled out of the
+    ///         decoder.
     ///
-    ///         Fails against the pre-fix code: the typed
-    ///         `try IAggregatorMinimal(feed).latestRoundData() returns (...)`
-    ///         does not catch a return-data ABI-decode failure (an
-    ///         uncatchable, full revert per Solidity's own documented
-    ///         behaviour), so `woodPriceX8()` reverts outright and this test
-    ///         fails on the unexpected revert. Passes against the fix, which
-    ///         rejects the short return by length BEFORE attempting to decode.
-    function test_woodPriceX8_fallsThroughToTwap_onShortReturnFeedData() public {
+    ///         The typed `try IAggregatorMinimal(feed).latestRoundData()
+    ///         returns (...)` does not catch a return-data ABI-decode failure
+    ///         (an uncatchable, full revert per Solidity's own documented
+    ///         behaviour), so the read must reject the short return by LENGTH
+    ///         before attempting to decode it.
+    function test_woodPriceX8_isNoWoodPrice_onShortReturnFeedData() public {
         ShortReturnAggregator badFeed = new ShortReturnAggregator();
         vm.prank(owner);
         ledger.setWoodFeed(address(badFeed), 1 days); // decimals() == 8, within bound: wires cleanly
 
-        assertEq(ledger.woodPriceX8(), MARKET_X8, "must fall through to the TWAP, not revert");
-
-        (, bool fromFeed,) = ledger.woodPriceDetail();
-        assertFalse(fromFeed, "malformed feed data must not be reported as the live source");
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.woodPriceX8();
     }
 
     // ══════════════════════════════════════════════════════════════════

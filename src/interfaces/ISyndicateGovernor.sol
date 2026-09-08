@@ -789,10 +789,8 @@ interface ISyndicateGovernor {
     function setTierRegistry(address newRegistry) external;
     /// @notice Wire the exposure ledger. Factory-only. `address(0)` un-wires: the
     ///         covered-TVL cap, the proposer bond gate AND the approve quorum are
-    ///         then skipped. The quorum is load-bearing whenever
-    ///         `quorumTierThreshold == 0` applies it at every tier, so a governor
-    ///         created while the factory's ledger is unset carries no coverage gate
-    ///         at all until `pushWiring` reaches it.
+    ///         then skipped, so a governor created while the factory's ledger is
+    ///         unset carries no coverage gate at all until `pushWiring` reaches it.
     /// @dev Precondition: seed the ledger's asset feed and covered-TVL cap BEFORE
     ///      wiring it. The gates fail closed, so a wired ledger with an unpriceable
     ///      vault asset or a zero cap halts all proposal creation for this vault.

@@ -4,24 +4,17 @@ pragma solidity 0.8.28;
 import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {ExposureLedger} from "../../src/ExposureLedger.sol";
-import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {RegistryTestHarness} from "../helpers/RegistryTestHarness.sol";
 
 /// @notice Regression tests for the SECOND audit-181 pass on `GuardianRegistry`
 ///         (findings A, B, C + the `initialize` blockQuorumBps gap).
 ///
-///         FINDING A (the worst defect the FIRST remediation produced): it
-///         added `_lookbackMinTotalVotes` to the block-quorum DENOMINATOR
-///         (`Review.totalStakeAtOpen` / `EmergencyReview.totalStakeAtOpen`)
-///         but left the voter's own NUMERATOR weight (`voteOnProposal`'s
-///         first-vote branch, `voteBlockEmergencySettle`) reading raw
-///         `getPastVotes` with no matching clamp. An attacker's fresh stake
-///         was therefore discounted OUT of the denominator but counted IN
-///         FULL on the numerator — turning a mathematically impossible block
-///         (own stake symmetric on both sides can never flip the inequality)
-///         into a cheap one. The fix mirrors `TokenCourt.vote`'s
-///         growth-gated min (issue #82) via `_growthGatedVoteWeight`.
+///         FINDING A: the block-quorum numerator and denominator must be the
+///         same measure at the same instant, or stake that is discounted out
+///         of one side while counting in full on the other turns a
+///         mathematically impossible block into a cheap one. Both sides now
+///         read raw stake at `Review.snapshotAt` / `EmergencyReview.openedAt`.
 ///
 ///         FINDING B: `cohortTooSmall` was computed from the 30-day
 ///         lookback-min instead of the LIVE electorate, making it a free,
@@ -66,22 +59,10 @@ contract GuardianRegistry_basisAndWiringTest is RegistryTestHarness {
     ///         Attacker parks 1.2E (1_200_000e18) in the SAME block as
     ///         `openReview` and tries to cast the sole Block vote.
     ///
-    ///         Pre-fix (numerator raw, denominator lookback-min-of-E): the
-    ///         attacker's vote alone would land at full 1_200_000e18 weight
-    ///         against a lookback-min denominator of ~1_000_000e18 —
-    ///         `1_200_000e18 * 10_000 >= 2000 * 1_000_000e18` is TRUE, so a
-    ///         lone attacker with fresh capital blocks a proposal the honest
-    ///         cohort never voted on at all.
-    ///
-    ///         Fixed: the attacker's raw stake GREW across `FLOOR_LOOKBACK`
-    ///         (0 -> 1_200_000e18) while the global total at the lookback
-    ///         instant is nonzero (the honest cohort), so
-    ///         `_growthGatedVoteWeight` clamps their weight to
-    ///         `getPastVotes(attacker, ts1 - FLOOR_LOOKBACK) == 0` (they held
-    ///         nothing back then). `voteOnProposal` then reverts
-    ///         `NotActiveGuardian` on the zero-weight guard — the attacker
-    ///         cannot cast a vote that counts for anything, and the review
-    ///         resolves NOT blocked with zero block-side weight.
+    ///         The stake lands after `registerReview`'s snapshot instant, so it
+    ///         is in neither the denominator nor the attacker's own numerator:
+    ///         `voteOnProposal` reverts `NotActiveGuardian` on the zero-weight
+    ///         guard and the review resolves NOT blocked.
     function test_voteOnProposal_freshStakeAttackerCannotContributeToBlockNumerator() public {
         _stakeGuardian(honestSilent, 1_000_000e18, 1);
         vm.warp(vm.getBlockTimestamp() + 31 days);
@@ -103,12 +84,8 @@ contract GuardianRegistry_basisAndWiringTest is RegistryTestHarness {
         assertFalse(blocked, "a lone attacker's fresh stake must not be able to block a proposal by itself");
     }
 
-    /// @notice Sanity companion to the test above: a genuinely MATURE
-    ///         guardian (staked long before `FLOOR_LOOKBACK`, no top-up) must
-    ///         NOT be clamped — the fix must not degrade ordinary voting.
-    ///         `getPastStake` at `openedAt` and at `openedAt - FLOOR_LOOKBACK`
-    ///         are identical (no growth), so `_growthGatedVoteWeight` returns
-    ///         the raw, un-clamped `getPastVotes` reading.
+    /// @notice Sanity companion to the test above: a guardian whose stake was
+    ///         present at the snapshot instant votes its full raw weight.
     function test_voteOnProposal_matureGuardianWeightIsNotClamped() public {
         _stakeGuardian(honestBlocker, 1_000_000e18, 1);
         vm.warp(vm.getBlockTimestamp() + 31 days);
@@ -129,27 +106,6 @@ contract GuardianRegistry_basisAndWiringTest is RegistryTestHarness {
         vm.warp(voteEnd + REVIEW_PERIOD);
         bool blocked = registry.resolveReview(address(governor), 2);
         assertTrue(blocked, "a mature guardian's full, un-clamped weight must still be able to block");
-    }
-
-    /// @notice Mirror of the numerator-clamp test on the emergency path
-    ///         (`voteBlockEmergencySettle`) — finding A names BOTH functions
-    ///         explicitly, and they must not diverge (Failure Mode 1: fixing
-    ///         the named path while leaving its sibling raw).
-    function test_voteBlockEmergencySettle_freshStakeAttackerCannotContributeToBlockNumerator() public {
-        _stakeGuardian(honestSilent, 1_000_000e18, 1);
-        vm.warp(vm.getBlockTimestamp() + 31 days);
-
-        _stakeGuardian(attacker, 1_200_000e18, 2);
-        vm.warp(vm.getBlockTimestamp() + 1);
-
-        BatchExecutorLib.Call[] memory emptyCalls = new BatchExecutorLib.Call[](0);
-        bytes32 emptyHash = keccak256(abi.encode(emptyCalls));
-        vm.prank(address(governor));
-        registry.openEmergency(3, emptyHash, emptyCalls);
-
-        vm.prank(attacker);
-        vm.expectRevert(IGuardianRegistry.NotActiveGuardian.selector);
-        registry.voteBlockEmergencySettle(address(governor), 3);
     }
 
     // ══════════════════════════ FINDING B ══════════════════════════

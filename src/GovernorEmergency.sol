@@ -87,7 +87,7 @@ abstract contract GovernorEmergency is ProposalLifecycle {
 
         IGuardianRegistry reg = IGuardianRegistry(_guardianRegistry);
 
-        // OPENED FIRST, THEN BONDED — the order is the fix, see below.
+        // The bond is read after openEmergency so a blocked round resolves and slashes first.
         bytes32 h = keccak256(abi.encode(calls));
         reg.openEmergency(proposalId, h, calls);
 

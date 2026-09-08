@@ -661,6 +661,66 @@ contract TierRegistryCertificationTimelockTest is Test {
         assertTrue(reg.pendingCertificationOf(target, SEL).readyAt != 0, "unrelated key's pending survives");
     }
 
+    /// @notice A demotion taken BEFORE the verdict lands leaves the key
+    ///         uncertified, so `_demote` never runs for it and a re-proposed
+    ///         certification would otherwise ripen straight through the
+    ///         conviction. The conviction must cancel it.
+    function test_demoteByChallenge_cancelsAPendingRecertificationAfterAPreDemotion() public {
+        address demoter = makeAddr("demoter");
+        vm.startPrank(owner);
+        reg.setAuthorizedDemoter(demoter);
+        reg.proposeCertification(target, SEL, 1, 500, address(0), target.codehash);
+        vm.stopPrank();
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        reg.certify(target, SEL);
+
+        vm.startPrank(owner);
+        reg.demote(target, SEL);
+        reg.proposeCertification(target, SEL, 1, 500, address(0), target.codehash);
+        vm.stopPrank();
+        assertTrue(reg.pendingCertificationOf(target, SEL).readyAt != 0, "recertification is pending");
+
+        vm.expectEmit(true, true, false, true);
+        emit TierRegistry.CertificationCancelled(target, SEL);
+        vm.prank(demoter);
+        reg.demoteByChallenge(target, SEL);
+
+        assertEq(reg.pendingCertificationOf(target, SEL).readyAt, 0, "the conviction cancels the recertification");
+
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        vm.expectRevert(TierRegistry.NoPendingCertification.selector);
+        reg.certify(target, SEL);
+    }
+
+    /// @notice The class twin of the case above: a pre-demoted class with a
+    ///         re-proposed certification must lose it to the conviction.
+    function test_demoteClassByChallenge_cancelsAPendingRecertificationAfterAPreDemotion() public {
+        address demoter = makeAddr("demoter");
+        vm.startPrank(owner);
+        reg.setAuthorizedDemoter(demoter);
+        reg.proposeClassCertification(target, SEL, 1, 500, address(0), target.codehash);
+        vm.stopPrank();
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        reg.certifyClass(target, SEL);
+
+        vm.startPrank(owner);
+        reg.demoteClass(target, SEL);
+        reg.proposeClassCertification(target, SEL, 1, 500, address(0), target.codehash);
+        vm.stopPrank();
+        assertTrue(reg.pendingClassCertificationOf(target, SEL).readyAt != 0, "recertification is pending");
+
+        vm.expectEmit(true, true, false, true);
+        emit TierRegistry.ClassCertificationCancelled(target, SEL);
+        vm.prank(demoter);
+        reg.demoteClassByChallenge(target, SEL);
+
+        assertEq(reg.pendingClassCertificationOf(target, SEL).readyAt, 0, "the conviction cancels the recertification");
+
+        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
+        vm.expectRevert(TierRegistry.NoPendingClassCertification.selector);
+        reg.certifyClass(target, SEL);
+    }
+
     /// @notice Finding #3 [85]: once a bond is pinned, only the pinned
     ///         `submitter` may trigger `certify` — a third party must not be
     ///         able to pull the bond off the submitter's standing allowance
