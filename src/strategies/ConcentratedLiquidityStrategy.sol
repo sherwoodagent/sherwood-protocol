@@ -259,6 +259,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @notice Settlement proceeds cannot cover the Morpho debt; the position stays as it
     ///         is and settlement is retried (or exited under guardian review).
     error ProceedsBelowDebt(uint256 held, uint256 owed);
+    /// @notice Settle left `amount` of `token` on the clone (clamping wrapper, partial-pull adapter).
+    error StrategyHoldsTokens(address token, uint256 amount);
+    /// @notice Settle left a Morpho position open.
+    error MorphoPositionOpen(uint256 borrowShares, uint256 collateral);
 
     // ── Events ──
 
@@ -1073,6 +1077,23 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         _swapToAsset(settleSlippageBps);
         _repayAndWithdraw();
         _pushAllToVault(asset);
+        _requireHoldsNothing();
+    }
+
+    /// @dev Re-read after the pushes: a wrapper whose `redeem` clamps or an adapter that pulls
+    ///      part of `amountIn` would otherwise strand value behind `Settled`, which no path can reach.
+    function _requireHoldsNothing() private view {
+        _requireZeroBalance(asset);
+        _requireZeroBalance(otherToken);
+        address collateralToken = _marketParams.collateralToken;
+        if (collateralToken != asset) _requireZeroBalance(collateralToken);
+        Position memory pos = morpho.position(marketId, address(this));
+        if (pos.borrowShares != 0 || pos.collateral != 0) revert MorphoPositionOpen(pos.borrowShares, pos.collateral);
+    }
+
+    function _requireZeroBalance(address token) private view {
+        uint256 held = IERC20(token).balanceOf(address(this));
+        if (held != 0) revert StrategyHoldsTokens(token, held);
     }
 
     /// @dev Spot is TWAP-verified first (D8), so the pool-anchored half of the floor is trusted

@@ -23,11 +23,19 @@ contract MockSwapAdapter is ISwapAdapter {
 
     uint256 public constant RATE_PRECISION = 1e18;
 
+    /// @notice Fraction of `amountIn` actually pulled, in bps. An adapter that pays the full
+    ///         quote while pulling less leaves the remainder on the caller.
+    uint256 public pullBps = 10_000;
+
     error RateNotSet();
     error SlippageExceeded();
 
     function setRate(address tokenIn, address tokenOut, uint256 rate) external {
         rates[_pairKey(tokenIn, tokenOut)] = rate;
+    }
+
+    function setPullBps(uint256 bps) external {
+        pullBps = bps;
     }
 
     /// @inheritdoc ISwapAdapter
@@ -48,7 +56,7 @@ contract MockSwapAdapter is ISwapAdapter {
         amountOut = (amountIn * rate) / RATE_PRECISION;
         if (amountOut < amountOutMin) revert SlippageExceeded();
 
-        IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
+        IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), (amountIn * pullBps) / 10_000);
         IERC20(tokenOut).safeTransfer(msg.sender, amountOut);
     }
 

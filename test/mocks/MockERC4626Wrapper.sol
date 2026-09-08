@@ -36,6 +36,10 @@ contract MockERC4626Wrapper is ERC4626 {
     /// @notice Ceiling on shares redeemable in one call. Defaults to unlimited.
     uint256 public redeemCap = type(uint256).max;
 
+    /// @notice When set, `redeem` above `redeemCap` silently serves `redeemCap` shares
+    ///         (non-OZ semantics) instead of reverting `ERC4626ExceededMaxRedeem`.
+    bool public redeemClamps;
+
     constructor(IERC20 asset_, string memory name_, string memory symbol_) ERC20(name_, symbol_) ERC4626(asset_) {}
 
     function setExitFeeBps(uint256 bps) external {
@@ -50,6 +54,10 @@ contract MockERC4626Wrapper is ERC4626 {
         redeemCap = cap;
     }
 
+    function setRedeemClamps(bool clamps) external {
+        redeemClamps = clamps;
+    }
+
     function previewRedeem(uint256 shares) public view override returns (uint256) {
         return (super.previewRedeem(shares) * (10_000 - exitFeeBps)) / 10_000;
     }
@@ -61,6 +69,7 @@ contract MockERC4626Wrapper is ERC4626 {
 
     function redeem(uint256 shares, address receiver, address owner) public override returns (uint256) {
         require(!redeemPaused, "MockERC4626Wrapper: redeem paused");
+        if (redeemClamps && shares > redeemCap) shares = redeemCap;
         return super.redeem(shares, receiver, owner);
     }
 }

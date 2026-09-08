@@ -205,6 +205,57 @@ contract ConcentratedLiquidityStrategyAllOrRevertTest is SettleFixture {
         strategy.settle();
     }
 
+    /// @notice A wrapper whose `redeem` silently clamps to a cap leaves shares on the clone;
+    ///         settle reverts rather than committing `Settled` over them.
+    function test_settle_revertsWhenTheWrapperRedeemClamps() public {
+        _execute();
+        uint256 tid = strategy.tokenId();
+        (uint128 d, uint128 c) = (_debtShares(), _collateral());
+        _accrueFees(1_000e6, 0);
+        spUsdg.setRedeemCap(1_000e6);
+        spUsdg.setRedeemClamps(true);
+
+        vm.prank(address(vaultStub));
+        vm.expectPartialRevert(ConcentratedLiquidityStrategy.StrategyHoldsTokens.selector);
+        strategy.settle();
+
+        _assertUntouched(tid, d, c);
+        assertEq(spUsdg.balanceOf(address(strategy)), 0, "wrapper shares stranded on the clone");
+    }
+
+    /// @notice An adapter that pays the full quote but pulls only half of `amountIn` leaves the
+    ///         volatile leg on the clone; settle reverts rather than committing `Settled` over it.
+    function test_settle_revertsWhenTheAdapterLeavesTheVolatileLegBehind() public {
+        _execute();
+        uint256 tid = strategy.tokenId();
+        (uint128 d, uint128 c) = (_debtShares(), _collateral());
+        _accrueFees(1_000e6, 100e18);
+        adapter.setPullBps(5_000);
+
+        vm.prank(address(vaultStub));
+        vm.expectPartialRevert(ConcentratedLiquidityStrategy.StrategyHoldsTokens.selector);
+        strategy.settle();
+
+        _assertUntouched(tid, d, c);
+        assertEq(nvda.balanceOf(address(strategy)), 0, "volatile leg stranded on the clone");
+    }
+
+    /// @notice Control: with honest counterparties the check is inert and every checked
+    ///         balance and the Morpho position are zero after settle.
+    function test_settle_honestPathLeavesEveryCheckedBalanceAtZero() public {
+        _execute();
+        _accrueFees(1_000e6, 100e18);
+        _settle();
+
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
+        assertEq(usdg.balanceOf(address(strategy)), 0, "asset");
+        assertEq(nvda.balanceOf(address(strategy)), 0, "volatile leg");
+        assertEq(spUsdg.balanceOf(address(strategy)), 0, "wrapper shares");
+        assertEq(_debtShares(), 0, "debt");
+        assertEq(_collateral(), 0, "collateral");
+        assertEq(strategy.tokenId(), 0, "position");
+    }
+
     /// @notice `accrueInterest` is typed: a reverting IRM reverts settle.
     function test_settle_revertsOnRevertingIrm() public {
         _execute();
