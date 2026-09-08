@@ -200,10 +200,8 @@ contract PerCallCapitalDeclarationsTest is Test {
     ///         `settlementCalls`, under a certified tier-0 execute leg, must
     ///         still price the proposal at tier 2. Pre-fix `tier = execTier`
     ///         discarded the settlement leg's tier, so the proposal recorded
-    ///         tier 0 and skipped the bond-encumbered approve quorum
-    ///         (`envelopeTier >= quorumTierThreshold`) while coverage — always
-    ///         summed over both legs — priced the extraction. Now tier is the
-    ///         MAX across both legs.
+    ///         tier 0 while coverage — always summed over both legs — priced the
+    ///         extraction. Now tier is the MAX across both legs.
     function test_she210_settlementLegLiftsProposalTier() public {
         _wireTierRegistry();
         // Execute leg: certified tier-0.

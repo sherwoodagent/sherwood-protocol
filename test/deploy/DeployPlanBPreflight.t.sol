@@ -16,7 +16,6 @@ import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
-import {MockWoodTwapOracle} from "../mocks/MockWoodTwapOracle.sol";
 
 /// @dev THE ONLY WAY TO RUN A SCRIPT AS ITS OWN BROADCASTER FROM A TEST.
 ///      `vm.startBroadcast()` executes the script's calls as forge's
@@ -188,11 +187,6 @@ contract DeployPlanBPreflightTest is Test {
     // value an UNSET `MAX_STRATEGY_DURATION` produces in `run()`. See
     // `test_deploy_seatsTheProtocolDurationCeiling`.
     uint256 internal bookMaxStrategyDuration;
-    /// @dev The live WOOD price source. Under design revision 2 the deployed
-    ///      ledger CANNOT price a bond without one — `woodUsdPriceX8` is a cap,
-    ///      never a price — so a book with a zero here is a book pre-flight 8
-    ///      refuses. Seeded in `setUp`; a test that wants the refusal clears it.
-    address internal bookTwapOracle;
     /// @dev The price CAP the next run should seed. A test that wants
     ///      pre-flight 8's first assert zeroes it.
     uint256 internal bookCapPriceX8 = WOOD_PRICE_CAP_X8;
@@ -206,9 +200,10 @@ contract DeployPlanBPreflightTest is Test {
     ///      against the refusing branch and `test_preflight10_bites_*` keeps
     ///      meaning what it meant. Only the bypass test raises it.
     bool internal bookAllowEoaLedgerOwner;
-    /// @dev The optional Chainlink-shaped WOOD/USD feed. ZERO by default: the
-    ///      mainnet posture is TWAP-only, because chain 4663 publishes no such
-    ///      aggregator. Only the fork-shaped tests set it.
+    /// @dev THE live WOOD price source. The deployed ledger CANNOT price a bond
+    ///      without one — `woodUsdPriceX8` is a cap, never a price — so a book
+    ///      with a zero here is a book pre-flight 8 refuses. Seeded in `setUp`;
+    ///      a test that wants the refusal clears it.
     address internal bookWoodUsdFeed;
     /// @dev Its staleness bound. Paired with the field above — pre-flight 12
     ///      refuses one without the other.
@@ -218,7 +213,8 @@ contract DeployPlanBPreflightTest is Test {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
         usdg = new ERC20Mock("USDG", "USDG", 6);
         usdgFeed = new MockAggregatorV3(8, 1e8);
-        bookTwapOracle = address(new MockWoodTwapOracle(WOOD_MARKET_X8));
+        bookWoodUsdFeed = address(new MockAggregatorV3(8, int256(WOOD_MARKET_X8)));
+        bookWoodFeedMaxDelay = 365 days;
 
         StakedWood swoodImpl = new StakedWood();
         bytes memory swoodInit = abi.encodeCall(
@@ -328,18 +324,6 @@ contract DeployPlanBPreflightTest is Test {
         assertTrue(ledger != address(stale), "sWOOD must not be left on the stale ledger");
         assertEq(address(registry.exposureLedger()), ledger, "the three pointers must agree");
         assertEq(factory.exposureLedger(), ledger, "the three pointers must agree");
-    }
-
-    /// @dev PRE-FLIGHT 4 passes at the shipped default. Kept as a live check
-    ///      rather than a comment: if `ExposureLedger`'s default ever drifts
-    ///      off 0, every Plan B deploy starts refusing and this names why.
-    function test_deploy_defaultQuorumTierThresholdPasses() public {
-        _run();
-        assertEq(
-            ExposureLedger(swood.exposureLedger()).quorumTierThreshold(),
-            0,
-            "default must be 0 or pre-flight 4 refuses every deploy"
-        );
     }
 
     // ──────────────────────── the pre-flights bite ────────────────────────
@@ -606,31 +590,31 @@ contract DeployPlanBPreflightTest is Test {
     /// @dev (b) The CAP is set but nothing prices under it. This is the shape a
     ///      cap-only check would MISS: `woodUsdPriceX8 != 0` proves the ceiling
     ///      is configured and says nothing about whether anything is priced
-    ///      beneath it. Chain 4663 has no Chainlink WOOD/USD feed, so with no
-    ///      oracle wired the ledger has no source at all.
+    ///      beneath it. The feed is the ledger's only source, so with none wired
+    ///      it has no source at all.
     function test_preflight_bites_whenNoWoodPriceSourceIsWired() public {
-        bookTwapOracle = address(0);
-        _runExpecting("PRE-FLIGHT: ExposureLedger.woodPriceX8() does not resolve");
+        bookWoodUsdFeed = address(0);
+        bookWoodFeedMaxDelay = 0;
+        _runExpecting("PRE-FLIGHT: WOOD_USD_FEED is unset");
     }
 
-    /// @dev (c) The oracle is wired but has no completed averaging window yet —
-    ///      the operationally likely mistake, since `WoodTwapOracle` needs at
-    ///      least `twapWindow` of keeper activity before `consult()` answers.
-    ///      Refused, which is what forces the deploy-and-prime-first ordering.
-    function test_preflight_bites_whenTheOracleHasNoCompletedWindowYet() public {
-        MockWoodTwapOracle(bookTwapOracle).setAvailable(false);
+    /// @dev (c) The feed is wired but is not answering — a `WoodPoolFeed` with
+    ///      no completed window yet is exactly this shape, and it is the
+    ///      operationally likely mistake. Refused, which is what forces the
+    ///      deploy-and-prime-first ordering.
+    function test_preflight_bites_whenTheFeedIsNotAnswering() public {
+        MockAggregatorV3(bookWoodUsdFeed).setAnswer(0);
         _runExpecting("PRE-FLIGHT: ExposureLedger.woodPriceX8() does not resolve");
     }
 
     /// @dev The passing shape, asserted on the DEPLOYED state rather than on
-    ///      the book: the oracle landed, the cap landed, and the composed price
-    ///      is the MARKET — proving the cap was seeded above it and is not
-    ///      binding, which is the configuration production ships.
-    function test_deploy_wiresTheOracleAndPricesOffTheMarket() public {
+    ///      the book: the cap landed and the composed price is the MARKET —
+    ///      proving the cap was seeded above it and is not binding, which is the
+    ///      configuration production ships.
+    function test_deploy_wiresTheFeedAndPricesOffTheMarket() public {
         _run();
 
         ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
-        assertEq(ledger.woodTwapOracle(), bookTwapOracle, "the oracle must be wired by the script");
         assertEq(ledger.woodUsdPriceX8(), WOOD_PRICE_CAP_X8, "the cap must land");
         // Market-priced, THEN discounted by the seated allowance. The cap sits
         // above the market and so plays no part in the number.
@@ -639,8 +623,6 @@ contract DeployPlanBPreflightTest is Test {
             (WOOD_MARKET_X8 * DeployPlanB(script).DEFAULT_WOOD_HAIRCUT_BPS()) / 10_000,
             "priced off the market, with the cap above it and the haircut applied"
         );
-        (,, bool capBinding) = ledger.woodPriceDetail();
-        assertFalse(capBinding, "a cap seeded BELOW market would bind and make the oracle inert");
     }
 
     // ── PRE-FLIGHT 12: the WOOD/USD feed and its delay move together ───────
@@ -674,34 +656,30 @@ contract DeployPlanBPreflightTest is Test {
         _runExpecting("PRE-FLIGHT: WOOD_USD_FEED holds no code");
     }
 
-    /// @dev THE FORK SHAPE, and the reason the knob exists. With no TWAP oracle
-    ///      the ledger has no source a vnet can prime — but a Chainlink-shaped
-    ///      feed prices it fine, and pre-flight 8 passes on that alone. This is
-    ///      the configuration the Robinhood fork ceremony actually runs.
-    function test_deploy_pricesOffTheFeed_whenNoOracleCanBePrimed() public {
-        bookTwapOracle = address(0);
-        bookWoodUsdFeed = address(new MockAggregatorV3(8, int256(WOOD_MARKET_X8)));
-        bookWoodFeedMaxDelay = 1 hours;
-
-        _run();
-
-        ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
-        assertEq(ledger.woodTwapOracle(), address(0), "no oracle is wired on the fork shape");
-        assertEq(
-            ledger.woodPriceX8(),
-            (WOOD_MARKET_X8 * DeployPlanB(script).DEFAULT_WOOD_HAIRCUT_BPS()) / 10_000,
-            "the feed alone must carry the composed price, haircut applied"
-        );
-        (, bool fromFeed,) = ledger.woodPriceDetail();
-        assertTrue(fromFeed, "the composed price must be attributed to the feed");
+    /// @dev A pool feed republishes `updatedAt` only when a snapshot ROLLS, at
+    ///      most once per averaging window. A `maxDelay` that does not clear the
+    ///      window plus the keeper's cadence therefore halts every price read
+    ///      BETWEEN rolls — the protocol stops for up to a window, and reads as
+    ///      a stale feed rather than as the mis-set bound it is. Seeded exactly
+    ///      at the boundary, which is the value an operator would pick.
+    function test_preflight12_bites_whenTheDelayDoesNotClearThePoolFeedsWindow() public {
+        bookWoodUsdFeed = address(new MockWindowedFeed(8, int256(WOOD_MARKET_X8), 24 hours));
+        bookWoodFeedMaxDelay = 24 hours + 2 hours;
+        _runExpecting("PRE-FLIGHT: WOOD_FEED_MAX_DELAY must EXCEED the feed's averaging window plus the");
     }
 
-    /// @dev Both sources wired: the FEED wins and the oracle stays the fallback.
-    ///      Asserted because the two are seeded by separate env keys and an
-    ///      operator who wires both should know which one is being served.
-    function test_deploy_prefersTheFeed_whenBothSourcesAreWired() public {
-        // Deliberately different from `WOOD_MARKET_X8` so the assertion can tell
-        // the two sources apart rather than passing on a coincidence.
+    /// @dev The paired passing case, so the bound is pinned from both sides
+    ///      rather than only proven to fire eventually.
+    function test_preflight12_passes_whenTheDelayClearsTheWindowAndTheCadence() public {
+        bookWoodUsdFeed = address(new MockWindowedFeed(8, int256(WOOD_MARKET_X8), 24 hours));
+        bookWoodFeedMaxDelay = 24 hours + 2 hours + 1;
+        _run();
+    }
+
+    /// @dev The book's feed is what the deployed ledger prices off, whatever it
+    ///      is. Seeded deliberately away from `WOOD_MARKET_X8` so the assertion
+    ///      reads the wired feed rather than passing on a coincidence.
+    function test_deploy_pricesOffWhicheverFeedTheBookNames() public {
         uint256 feedPriceX8 = WOOD_MARKET_X8 / 2;
         bookWoodUsdFeed = address(new MockAggregatorV3(8, int256(feedPriceX8)));
         bookWoodFeedMaxDelay = 1 hours;
@@ -709,25 +687,11 @@ contract DeployPlanBPreflightTest is Test {
         _run();
 
         ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
-        assertEq(ledger.woodTwapOracle(), bookTwapOracle, "the oracle stays wired as the fallback");
         assertEq(
             ledger.woodPriceX8(),
             (feedPriceX8 * DeployPlanB(script).DEFAULT_WOOD_HAIRCUT_BPS()) / 10_000,
-            "the feed is the preferred source when both are present"
+            "the composed price must come from the feed the book named"
         );
-    }
-
-    /// @dev The mainnet posture is unchanged by the new keys: leave both unset
-    ///      and no feed is wired at all. This is what proves the addition is
-    ///      inert for the ceremony that does not opt into it.
-    function test_deploy_wiresNoFeed_whenTheKeysAreUnset() public {
-        _run();
-
-        // `_woodFeed` is internal, so the observable proof that none was wired
-        // is the attribution on the composed price: it comes from the oracle.
-        ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
-        (, bool fromFeed,) = ledger.woodPriceDetail();
-        assertFalse(fromFeed, "an unset WOOD_USD_FEED must leave the ledger TWAP-only");
     }
 
     // ── PRE-FLIGHT 9: a real haircut allowance must exist ──────────────────
@@ -935,7 +899,6 @@ contract DeployPlanBPreflightTest is Test {
         book.coveredTvlCapUsd = bookCap;
         book.protocolConfig = address(protocolConfig);
         book.maxStrategyDuration = bookMaxStrategyDuration;
-        book.woodTwapOracle = bookTwapOracle;
         book.woodUsdFeed = bookWoodUsdFeed;
         book.woodFeedMaxDelay = bookWoodFeedMaxDelay;
         book.allowEoaLedgerOwner = bookAllowEoaLedgerOwner;
@@ -962,5 +925,15 @@ contract DeployPlanBPreflightTest is Test {
             head[i] = r[i];
         }
         require(keccak256(head) == keccak256(p), reason);
+    }
+}
+
+/// @dev What a `WoodPoolFeed` looks like to pre-flight 12's probe: an ordinary
+///      aggregator that also reports the window its `updatedAt` advances on.
+contract MockWindowedFeed is MockAggregatorV3 {
+    uint256 public immutable window;
+
+    constructor(uint8 decimals_, int256 answer_, uint256 window_) MockAggregatorV3(decimals_, answer_) {
+        window = window_;
     }
 }

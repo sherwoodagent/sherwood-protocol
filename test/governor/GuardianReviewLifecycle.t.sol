@@ -624,14 +624,6 @@ contract GuardianReviewLifecycleTest is Test {
 
         // Age-weighted voting: mature the freshly staked blockers to par so
         // their block votes carry full weight against the raw denominator.
-        //
-        // 31 days, not 30, and the extra day is load-bearing. Vote weight is
-        // now read at the PROPOSE-time snapshot rather than at review-open, so
-        // the growth gate's `snapshot - FLOOR_LOOKBACK` lookback lands a
-        // voting period earlier than it used to. At exactly 30 days that
-        // lookback falls just BEFORE these guardians staked, so the gate reads
-        // their stake as having grown from zero and clamps them to zero —
-        // `NotActiveGuardian`. That is the gate working, not a regression.
         skip(31 days);
 
         uint256 pid = _propose();

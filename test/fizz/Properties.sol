@@ -156,8 +156,12 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     ///              different statement and is pinned separately by GL-01. This
     ///              one is about whether the counter is right, not whether the
     ///              tokens are there.
-    ///           3. The pool never exceeds its target — `dispute` clamps the
-    ///              overshoot rather than refunding it.
+    ///           3. Neither defence exceeds the target — `dispute` clamps the
+    ///              overshoot rather than refunding it. The SHARED defence is
+    ///              bounded until it completes, and a challenge the completion
+    ///              does not answer is bounded by its OWN `defenceWeight`; the
+    ///              round's raised total is their sum, so it is not itself
+    ///              bounded by one target.
     ///
     ///         The pre-fix version compared a per-challenge contributor sum
     ///         against `challengeOf(id).counterBondWood`. That comparison went
@@ -175,14 +179,16 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
             IChallengeGame.Challenge memory c = game.challengeOf(id);
             if (c.status != IChallengeGame.Status.Filed && c.status != IChallengeGame.Status.Disputed) continue;
 
-            (uint256 poolWood, uint256 targetWood, uint256 raisedWood,,) = game.counterBondPoolOf(id);
+            (uint256 poolWood, uint256 targetWood, uint256 raisedWood, uint256 completedAt,) =
+                game.counterBondPoolOf(id);
             address[] memory contributors = game.counterBondContributors(id);
             uint256 sum;
             for (uint256 j; j < contributors.length; j++) {
                 sum += game.counterBondContributionOf(id, contributors[j]);
             }
             if (sum != raisedWood) return false;
-            if (raisedWood > targetWood) return false;
+            if (completedAt == 0 && raisedWood > targetWood) return false;
+            if (c.defenceWeight > targetWood) return false;
 
             // THE LEDGER SIDE. Every live challenge's own bond counts once;
             // each PROPOSAL's pool counts once however many challenges share

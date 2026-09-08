@@ -20,7 +20,7 @@ import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
-import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
+import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
 
@@ -104,6 +104,7 @@ contract CoverageEndToEndTest is Test {
     StakedWood public swood;
     GuardianRegistry public registry;
     ExposureLedger public ledger;
+    MockAggregatorV3 public woodFeed;
     MockFeed public feed;
     ProposerBondEscrow public escrow;
     TierRegistry public tierRegistry; // deployed; wired only by the tier-1 test
@@ -238,13 +239,15 @@ contract CoverageEndToEndTest is Test {
         ledger = new ExposureLedger(ledgerOwner, address(swood), EPOCH_LENGTH);
         feed = new MockFeed(1e8, 8); // $1.00, 8-dec
         // Design revision 2: `woodUsdPriceX8` is a CAP, never a price. WOOD is
-        // valued from the TWAP oracle at $0.05, with the cap 2x ABOVE it and
+        // valued from the WOOD/USD feed at $0.05, with the cap 2x ABOVE it and
         // therefore NOT binding — the configuration production ships. Every
         // dollar figure in this suite is unchanged; only the reason it holds is.
-        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(0.05e8);
+        woodFeed = new MockAggregatorV3(8, 0.05e8);
         vm.startPrank(ledgerOwner);
         ledger.setWoodUsdPrice(0.1e8);
-        ledger.setWoodTwapOracle(address(woodTwap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         // Generous staleness bound: the §3.3a quorum re-reads this feed at
         // EXECUTE time, a full voting + review window after propose. A tight
         // `maxDelay` would make every execution die `StalePrice` regardless of
@@ -926,7 +929,7 @@ contract CoverageEndToEndTest is Test {
 
         // WOOD crashes 2.5x: $0.05 -> $0.02. g1's live bond falls from $1,500
         // to $600 -- below its $1,000 reservation.
-        MockWoodTwapOracle(ledger.woodTwapOracle()).setPrice(0.02e8);
+        woodFeed.setAnswer(0.02e8);
         assertEq(ledger.slashableBondUsd(g1), 600e18, "live bond crashed with the price");
         uint256 liabilityAfterCrash = ledger.liabilityUsd(address(govA), pid);
         assertEq(liabilityAfterCrash, 600e18, "filing-bond basis drops with the price");
@@ -1028,7 +1031,6 @@ contract CoverageEndToEndTest is Test {
         uint256 agentBalBefore = wood.balanceOf(agentA);
         uint256 pid = _propose(govA, address(vaultA), agentA);
         assertEq(govA.getProposal(pid).envelopeTier, 2, "tier 2 => quorum applies");
-        assertGe(govA.getProposal(pid).envelopeTier, ledger.quorumTierThreshold());
 
         // Cohort collapses: three of four guardians exit, leaving 20k of votable
         // stake — under the registry's 50k floor.
@@ -1160,21 +1162,11 @@ contract CoverageEndToEndTest is Test {
         );
     }
 
-    /// @notice ADR 2026-07-27 REVERSED this test's original conclusion, and the
-    ///         reversal is the whole point of the ADR. It used to assert that a
-    ///         tier-1 proposal executes with ZERO approvers — the optimistic
-    ///         lane below `quorumTierThreshold`, which the §4 gate-2 argument
-    ///         leaned on. The ROE validation resolved that gate the other way:
-    ///         the threshold is now 0, tier 1 is no longer below it, and the
-    ///         quorum IS consulted.
-    ///
-    ///         Coverage SIZING is unchanged and still bounded (asserted in the
-    ///         helper) — sizing was never the gap. ENFORCEMENT was: this exact
-    ///         shape, a bounded-tier proposal with no covering approver, is what
-    ///         used to execute unbacked.
+    /// @notice A bounded-tier proposal is fail-closed too: coverage SIZING is
+    ///         bounded per tier (asserted in the helper), but ENFORCEMENT is not
+    ///         tiered — a tier-1 proposal with no covering approver is refused.
     function test_boundedTierNowRequiresCoverage() public {
         uint256 pid = _proposeBoundedTier1();
-        assertEq(ledger.quorumTierThreshold(), 0, "ADR 2026-07-27: every tier fail-closed");
 
         // Review runs with a healthy cohort and NOBODY approves.
         _openReview(govA, pid);
@@ -1187,27 +1179,6 @@ contract CoverageEndToEndTest is Test {
         govA.executeProposal(pid);
         assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Approved), "stays Approved, unexecuted");
         assertEq(adapter.pokes(), 0, "the batch never ran");
-    }
-
-    /// @notice The optimistic lane still EXISTS as a mechanism — it is simply no
-    ///         longer reachable at the launch threshold. Raising the threshold
-    ///         back above the proposal's tier restores it, which is what proves
-    ///         the `>=` comparison is doing the work rather than the tier alone.
-    ///         Kept so a future re-admission (v2, per the ADR) has a live test of
-    ///         the knob rather than a re-derivation.
-    function test_boundedTierExecutesOptimisticallyWhenThresholdRaised() public {
-        uint256 pid = _proposeBoundedTier1();
-        vm.prank(ledgerOwner);
-        ledger.setQuorumTierThreshold(2); // the pre-ADR launch value
-
-        _openReview(govA, pid);
-        _pastReview(govA, pid);
-        (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pid);
-        assertEq(approvers.length, 0, "zero approvers");
-
-        govA.executeProposal(pid);
-        assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Executed), "bounded lane still executes");
-        assertEq(adapter.pokes(), 1, "the batch really ran");
     }
 
     // ── 6. Declared coverage locks on the REVIEW path ─────────────────────

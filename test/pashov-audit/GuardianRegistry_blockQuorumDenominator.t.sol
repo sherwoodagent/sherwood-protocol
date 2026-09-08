@@ -3,60 +3,27 @@ pragma solidity 0.8.28;
 
 import {RegistryTestHarness} from "../helpers/RegistryTestHarness.sol";
 import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
+import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 
 /// @title GuardianRegistry_blockQuorumDenominatorTest
-/// @notice CHARACTERIZATION SUITE for pashov 2026-08 finding #1 — the
-///         block-quorum denominator (`Review.totalStakeAtOpen`, written from
-///         `_lookbackMinTotalVotes`'s `minTotal`).
+/// @notice The block-quorum comparison (`blockStakeWeight * 10_000 >=
+///         blockQuorumBps * totalStakeAtOpen`) reads its numerator and its
+///         denominator from the same raw stake instant: `snapshotAt` on the
+///         review path, `openedAt` on the emergency path. This suite pins what
+///         that single instant buys and what it does not.
 ///
-///         THIS SUITE FIXES NOTHING. It exists because finding #1 has no local
-///         fix, and the next reader needs the two opposing attacks pinned as
-///         executable fixtures rather than as prose, so that a future "obvious"
-///         patch cannot be shipped without watching the other attack turn green.
-///         Same posture the repo already took on the sibling construction in
-///         `TokenCourt._participationFloor` (see `test/audit-2/
-///         TokenCourt_floorCollapse.t.sol` and the in-source block there).
+///         Buys: stake that lands after the instant is in neither read, so
+///         nobody can move the comparison by staking once a review is in
+///         flight, and no voter is ever measured against an electorate they
+///         are not themselves counted in.
 ///
-///         THE TWO ATTACKS, both against `_isBlocked`
-///         (`blockStakeWeight * 10_000 >= blockQuorumBps * denom`):
-///
-///           OVER-WEIGHTING (finding #1). A SMALL denominator makes a block
-///           cheap. `minTotal` is up to `FLOOR_LOOKBACK` stale, so a guardian
-///           whose own stake never moved votes full weight against a
-///           30-day-old electorate. `test_overWeighting_*` reproduces the
-///           audit's own numbers.
-///
-///           DILUTION (what `minTotal` was introduced to close). A LARGE
-///           denominator makes a block impossible. `stakeAsGuardian` has no
-///           cap and no allowlist, so anyone can park never-voting stake and
-///           raise the absolute weight an honest cohort must clear.
-///           `test_dilution_*` reproduces it.
-///
-///         WHY NO FUNCTION OF THE AGGREGATE TRACE SEPARATES THEM. Both attacks
-///         turn on stake younger than `FLOOR_LOOKBACK`. Any denominator rule
-///         computable here is a function of `getPastTotalVotes` readings, and
-///         in that trace honest young stake and attacker-planted young stake
-///         are THE SAME OBJECT — an attacker can reproduce any growth curve by
-///         paying the matching holding time. So every rule counts young stake
-///         at some weight k in [0, 1]:
-///
-///           k = 0  -> `minTotal`, today's rule: dilution closed, over-weighting open.
-///           k = 1  -> the live total: over-weighting closed, dilution open.
-///           0<k<1  -> `max(minTotal, k * totalNow)`: BOTH bounded, NEITHER closed.
-///
-///         `test_algebra_*` pins that "scale each voter's numerator by
-///         minTotal/totalNow and keep comparing against minTotal" is not a
-///         third option — it is bit-for-bit the k = 1 rule.
-///         `test_blend_*` pins that the k in between really does interpolate:
-///         the smallest k that defeats the over-weighting fixture also hands
-///         the dilution fixture to the attacker.
-///
-///         The only construction that separates the two is a denominator built
-///         from per-voter `min(stake(now), stake(now - FLOOR_LOOKBACK))` summed
-///         over the WHOLE electorate. That is not derivable from the aggregate
-///         checkpoints `StakedWood` publishes and cannot be iterated on-chain;
-///         it would need new `StakedWood` accounting (a checkpointed total of
-///         stake continuously present for at least `FLOOR_LOOKBACK`).
+///         Does not buy: a defence against dilution by stake parked BEFORE the
+///         instant. `stakeAsGuardian` has no cap and no allowlist, and a
+///         diluter that never votes takes no slash risk, so a large enough
+///         position held across the snapshot lowers every honest guardian's
+///         share. That is priced, not closed, and
+///         `test_dilution_stakeParkedBeforeTheSnapshotDilutesTheVeto` keeps the
+///         cost visible.
 contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
     uint256 internal constant REVIEW_PERIOD = 24 hours;
     /// @dev The audit's own quorum: 30%.
@@ -84,38 +51,22 @@ contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
         registry.openReview(address(governor), pid);
     }
 
-    /// @dev The two aggregate readings `_lookbackMinTotalVotes` is built from,
-    ///      taken at the same `ts1` a review opened at. Every candidate rule in
-    ///      this suite is evaluated from exactly these two numbers, which is
-    ///      the point: they are all the information the contract has.
-    function _totalsAt(uint256 openedAt) internal view returns (uint256 totalNow, uint256 minTotal) {
-        totalNow = swood.getPastTotalVotes(openedAt);
-        uint256 lookbackTs = openedAt > registry.FLOOR_LOOKBACK() ? openedAt - registry.FLOOR_LOOKBACK() : 0;
-        uint256 earlier = swood.getPastTotalVotes(lookbackTs);
-        minTotal = (earlier != 0 && earlier < totalNow) ? earlier : totalNow;
-    }
-
-    /// @dev `_isBlocked` against an arbitrary denominator — the candidate-rule
-    ///      evaluator. Mirrors the production predicate exactly, including the
-    ///      `>=` edge and the bps scaling.
+    /// @dev `_isBlocked` against an arbitrary denominator, so a fixture can pin
+    ///      the counterfactual outcome as well as the real one. Mirrors the
+    ///      production predicate exactly, including the `>=` edge.
     function _wouldBlock(uint256 blockWeight, uint256 denom) internal pure returns (bool) {
         return blockWeight * 10_000 >= Q * denom;
     }
 
-    // ═══════════════════ ATTACK 1 — OVER-WEIGHTING (finding #1) ═══════════════════
+    // ═══════════════════ A STALE SHARE BUYS NOTHING ═══════════════════
 
-    /// @notice THE FINDING, with the audit's numbers. `attacker` holds
-    ///         40_000e18 of a 60_000e18 cohort at t0 and never touches it. By
-    ///         t0 + `FLOOR_LOOKBACK` the honest side has grown the electorate
-    ///         to 600_000e18, so the attacker is 6.67% of the LIVE cohort.
-    ///
-    ///         `openReview` still pins `totalStakeAtOpen = min(600k, 60k) =
-    ///         60k`, and `_growthGatedVoteWeight` does not clamp the attacker
-    ///         (their own raw stake did not grow), so a single voter clears a
-    ///         30% quorum on their own — and the same stale denominator drives
-    ///         `_severityBps` to the top of the slash envelope, wiping the
-    ///         honest approver.
-    function test_overWeighting_staticWhaleBlocksAloneAndMaxesSeverity() public {
+    /// @notice `attacker` holds 40_000e18 of a 60_000e18 cohort and never
+    ///         touches it; a month later the honest side has taken the
+    ///         electorate to 600_000e18, so the attacker is 667 bps of it.
+    ///         Measured at the snapshot instant that is what they are, and a
+    ///         lone 667 bps vote does not reach a 3000 bps quorum — so there is
+    ///         no block, no severity, and no slash against the honest approver.
+    function test_staticWhaleCannotBlockAloneOnAStaleShare() public {
         _stakeGuardian(attacker, 40_000e18, 1);
         _stakeGuardian(honestOld, 20_000e18, 2);
         // t0 electorate: 60_000e18.
@@ -126,21 +77,16 @@ contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
         //
         // ONE SECOND, AND IT IS LOAD-BEARING. The quorum basis is stamped at
         // `registerReview` time MINUS ONE, so a cohort that staked in the very
-        // same block as the proposal is invisible to it — that `- 1` is the
-        // flash-stake defence. Without this warp the fixture would still see
-        // the 60_000e18 pre-growth total and would prove nothing about the fix.
-        // Real timelines have weeks here, not one second.
+        // same block as the proposal is invisible to it. Without this warp the
+        // fixture would still see the 60_000e18 pre-growth total.
         vm.warp(vm.getBlockTimestamp() + 1);
 
+        uint256 totalNow = swood.getPastTotalVotes(vm.getBlockTimestamp() - 1);
+        assertEq(totalNow, 600_000e18, "live electorate at the snapshot instant");
         uint256 reviewEnd = _registerAndOpen(1);
-        uint256 openedAt = vm.getBlockTimestamp() - 1;
 
-        (uint256 totalNow, uint256 minTotal) = _totalsAt(openedAt);
-        assertEq(totalNow, 600_000e18, "live electorate at ts1");
-        assertEq(minTotal, 60_000e18, "the 30-day-old electorate, no longer the denominator");
-
-        // The honest approver is an OLD guardian, so it is not itself clamped —
-        // this is a real approver taking real slash risk, not a strawman.
+        // The honest approver is an OLD guardian taking real slash risk, not a
+        // strawman.
         vm.prank(honestOld);
         registry.voteOnProposal(address(governor), 1, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
 
@@ -148,66 +94,43 @@ contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
         registry.voteOnProposal(address(governor), 1, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(reviewEnd);
-        // THE FIX. Both sides of the comparison are now read at the same
-        // propose-time instant, so the attacker is measured as what it is —
-        // 40_000e18 of a 600_000e18 electorate, 667 bps against a 3_000 bps
-        // quorum. Pre-fix this returned TRUE: the numerator was current while
-        // the denominator was the 60_000e18 electorate of 30 days earlier.
         assertFalse(
             registry.resolveReview(address(governor), 1),
             "a 6.67% holder must not block alone once both sides share an instant"
         );
-
-        // The second half of the finding closes with the first. The stale
-        // denominator also drove `_severityBps`: pre-fix, bBps was
-        // 40_000e18 * 10_000 / 60_000e18 = 6666 under integer division — one
-        // bps under `SUPERMAJORITY_BPS` (6667), so the audit's "reads 6,667"
-        // was off by one, but the quadratic ramp at t = 3666/3667 landed within
-        // a handful of bps of `maxSlashBps` and wiped the honest approver
-        // anyway.
-        //
-        // Now there is no block, so there is no slash at all: the approver who
-        // took real risk on an honest approval keeps every token.
         assertEq(
             swood.guardianStake(honestOld), 20_000e18, "no block means no slash -- the honest approver is untouched"
         );
-
-        // THE COUNTERFACTUAL that makes this a finding rather than a design
-        // choice: measured against the electorate that actually exists, the
-        // attacker is nowhere near quorum.
         assertFalse(
             _wouldBlock(40_000e18, totalNow), "against the LIVE electorate the same vote is 667 bps, far under quorum"
         );
-        assertTrue(_wouldBlock(40_000e18, minTotal), "against the stale electorate it is 6666 bps, over quorum");
+        assertTrue(
+            _wouldBlock(40_000e18, 60_000e18),
+            "against the month-old electorate it would have been 6666 bps, over quorum"
+        );
     }
 
-    // ═════════════════ ATTACK 2 — DILUTION (what minTotal closes) ═════════════════
+    // ═════════════════════════ DILUTION, PRICED ═════════════════════════
 
-    /// @notice The attack `minTotal` exists to defeat, and it is not
-    ///         hypothetical: `stakeAsGuardian` has no cap and no allowlist, and
-    ///         a diluter never votes, so it takes no slash risk at all.
-    ///
-    ///         Honest electorate 600_000e18, matured. An honest blocker holds
-    ///         200_000e18 — 33.3%, comfortably over the 30% quorum. The diluter
-    ///         parks 1_400_000e18 one block before `openReview`, taking the live
-    ///         electorate to 2_000_000e18 and the honest blocker to 10%.
-    ///
-    ///         Today the veto survives, because fresh stake cannot lower the
-    ///         `ts1 - FLOOR_LOOKBACK` reading. Against a live denominator it
-    ///         does not.
-    function test_dilution_freshParkedStakeCannotKillTheVetoToday() public {
+    /// @notice Honest electorate 600_000e18, of which an honest blocker holds
+    ///         200_000e18 — 3333 bps, over the 3000 bps quorum. A diluter parks
+    ///         1_400_000e18 in the same block the review is registered in.
+    ///         Because the snapshot is that block minus one, the parked stake
+    ///         is in neither the denominator nor anybody's numerator, and the
+    ///         veto survives.
+    function test_dilution_stakeParkedAfterTheSnapshotCannotKillTheVeto() public {
         _stakeGuardian(honestOld, 200_000e18, 1); // the blocker
         _stakeGuardian(honestNew, 400_000e18, 2); // silent honest cohort
 
         vm.warp(vm.getBlockTimestamp() + 31 days);
         _stakeGuardian(diluter, 1_400_000e18, 3);
 
+        assertEq(
+            swood.getPastTotalVotes(vm.getBlockTimestamp() - 1),
+            600_000e18,
+            "the diluter staked after the snapshot instant"
+        );
         uint256 reviewEnd = _registerAndOpen(2);
-        uint256 openedAt = vm.getBlockTimestamp() - 1;
-
-        (uint256 totalNow, uint256 minTotal) = _totalsAt(openedAt);
-        assertEq(totalNow, 2_000_000e18, "diluted live electorate");
-        assertEq(minTotal, 600_000e18, "the lookback read is untouched by two-block-old stake");
 
         vm.prank(honestOld);
         registry.voteOnProposal(address(governor), 2, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
@@ -215,38 +138,30 @@ contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
         vm.warp(reviewEnd);
         assertTrue(
             registry.resolveReview(address(governor), 2),
-            "today's rule: a genuine 33% honest blocker still vetoes through a 3.3x dilution"
+            "a genuine 33% honest blocker still vetoes through a 3.3x park"
         );
-
-        // THE COUNTERFACTUAL, and the exact reason finding #1 has no local fix:
-        // the rule that would have defeated attack 1 hands attack 2 to the
-        // diluter.
         assertFalse(
-            _wouldBlock(200_000e18, totalNow),
-            "against the LIVE electorate the honest blocker falls to 1000 bps and the veto dies"
+            _wouldBlock(200_000e18, 2_000_000e18),
+            "had the park counted, the honest blocker would have fallen to 1000 bps"
         );
-        assertTrue(_wouldBlock(200_000e18, minTotal), "against the lookback-min it is 3333 bps and the veto holds");
     }
 
-    /// @notice The diluter's cost, pinned. `minTotal` does not DEFEAT dilution,
-    ///         it PRICES it at `FLOOR_LOOKBACK` of held capital: stake older
-    ///         than the lookback is present in both reads, so a patient diluter
-    ///         beats the current rule too. Anyone re-deriving the tradeoff needs
-    ///         this number, because it is what a candidate rule has to beat.
-    function test_dilution_aPatientDiluterBeatsTheLookbackMinToo() public {
+    /// @notice The diluter's cost, pinned. A position held across the snapshot
+    ///         instant IS in the denominator, so dilution is priced in held
+    ///         capital rather than defeated. Anyone re-deriving the tradeoff
+    ///         needs this number, because it is what a candidate rule has to
+    ///         beat.
+    function test_dilution_stakeParkedBeforeTheSnapshotDilutesTheVeto() public {
         _stakeGuardian(honestOld, 200_000e18, 1);
         _stakeGuardian(honestNew, 400_000e18, 2);
-        // The diluter parks BEFORE the lookback window instead of inside it.
         _stakeGuardian(diluter, 1_400_000e18, 3);
 
         vm.warp(vm.getBlockTimestamp() + 31 days);
 
+        assertEq(
+            swood.getPastTotalVotes(vm.getBlockTimestamp() - 1), 2_000_000e18, "the parked stake is at the snapshot"
+        );
         uint256 reviewEnd = _registerAndOpen(3);
-        uint256 openedAt = vm.getBlockTimestamp() - 1;
-
-        (uint256 totalNow, uint256 minTotal) = _totalsAt(openedAt);
-        assertEq(totalNow, 2_000_000e18, "live electorate");
-        assertEq(minTotal, 2_000_000e18, "31-day-old parked stake is in BOTH reads -- the min buys nothing");
 
         vm.prank(honestOld);
         registry.voteOnProposal(address(governor), 3, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
@@ -254,116 +169,97 @@ contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
         vm.warp(reviewEnd);
         assertFalse(
             registry.resolveReview(address(governor), 3),
-            "a diluter willing to hold for FLOOR_LOOKBACK kills the veto under the CURRENT rule"
+            "a diluter that holds across the snapshot takes the honest blocker to 1000 bps"
         );
     }
 
-    // ═══════════════ THE ALGEBRA — scaling the numerator is not a third option ═══════════════
+    // ═══════════════ EMERGENCY PATH — one instant, both sides ═══════════════
 
-    /// @notice "Scale each voter's weight by `minTotal / totalNow` and keep
-    ///         comparing against `minTotal`" is proposed every time this finding
-    ///         is re-derived. It is the LIVE-DENOMINATOR rule wearing a hat:
-    ///
-    ///           (w * minTotal / totalNow) * 10_000 >= Q * minTotal
-    ///             <=> w * 10_000 / totalNow        >= Q
-    ///             <=> w * 10_000                   >= Q * totalNow
-    ///
-    ///         Pinned over BOTH fixtures' numbers, including the rounding the
-    ///         integer division introduces, so the identity is checked as code
-    ///         and not as algebra in a comment.
-    function test_algebra_scaledNumeratorAgainstMinTotalIsTheLiveDenominatorRule() public pure {
-        // Parallel arrays rather than a nested literal: the over-weighting
-        // fixture, the dilution fixture, an at-the-edge case with no staleness,
-        // and a dust case chosen to be the worst available for the rounding the
-        // scaling division introduces.
-        uint256[4] memory weights = [uint256(40_000e18), 200_000e18, 30_000e18, 1e18];
-        uint256[4] memory totalsNow = [uint256(600_000e18), 2_000_000e18, 100_000e18, 3e18];
-        uint256[4] memory minTotals = [uint256(60_000e18), 600_000e18, 100_000e18, 2e18];
+    /// @notice `openEmergency` stamps both sides of the emergency block quorum
+    ///         at `block.timestamp - 1`, so a vault owner who stakes as a
+    ///         guardian in that same block is in neither read and changes
+    ///         nothing. The blocker holds 60_000e18 of the 80_000e18 electorate
+    ///         that instant carries — 7500 bps against a 3000 bps quorum — and
+    ///         the emergency is blocked; had the owner's 200_000e18 landed in
+    ///         the denominator alone, the same vote would fall to 2142 bps.
+    function test_sameBlockOwnerStakeCannotChangeEmergencyBlockQuorum() public {
+        _stakeGuardian(honestOld, 20_000e18, 1);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
 
-        for (uint256 i = 0; i < weights.length; i++) {
-            uint256 w = weights[i];
-            uint256 totalNow = totalsNow[i];
-            uint256 minTotal = minTotals[i];
+        _stakeGuardian(honestNew, 60_000e18, 2);
+        vm.warp(vm.getBlockTimestamp() + 1);
 
-            uint256 scaled = w * minTotal / totalNow;
-            bool scaledAgainstMin = scaled * 10_000 >= Q * minTotal;
-            bool rawAgainstLive = w * 10_000 >= Q * totalNow;
+        BatchExecutorLib.Call[] memory emptyCalls = new BatchExecutorLib.Call[](0);
+        bytes32 emptyHash = keccak256(abi.encode(emptyCalls));
 
-            assertEq(
-                scaledAgainstMin,
-                rawAgainstLive,
-                "scaling the numerator is the live-denominator rule, not a third option"
-            );
-        }
+        // Same block as the open: the vault owner's guardian stake lands after
+        // the `block.timestamp - 1` instant both sides are read at.
+        _stakeGuardian(diluter, 200_000e18, 3);
+        vm.prank(address(governor));
+        registry.openEmergency(5, emptyHash, emptyCalls);
+
+        vm.expectEmit(true, true, false, true);
+        emit IGuardianRegistry.EmergencyBlockVoteCast(address(governor), 5, honestNew, 60_000e18);
+        vm.prank(honestNew);
+        registry.voteBlockEmergencySettle(address(governor), 5);
+
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
+        vm.prank(address(governor));
+        (bool blocked,) = registry.finalizeEmergency(5);
+        assertTrue(blocked, "a 75% blocker must veto whatever the owner stakes in the opening block");
+        assertFalse(_wouldBlock(60_000e18, 280_000e18), "had the owner's stake counted, the vote would be 2142 bps");
     }
 
-    // ═══════════════ THE BLEND — bounds both, defeats neither ═══════════════
+    /// @notice The unfavourable half of that same instant. An attacker who
+    ///         stakes one second BEFORE `openEmergency` is inside the
+    ///         `block.timestamp - 1` read, so their position counts in the
+    ///         numerator exactly as it does in the denominator: any
+    ///         X >= Q * E / (10_000 - Q) reaches the block quorum alone. Here
+    ///         E is the 70_000e18 honest cohort and Q is 3000 bps, so
+    ///         30_000e18 lands on the `>=` edge and vetoes the round with no
+    ///         honest guardian voting at all. Symmetry is what makes that
+    ///         stake votable, and this is its price.
+    function test_stakeParkedOneSecondBeforeOpenEmergencyCountsTowardTheBlockQuorum() public {
+        _stakeGuardian(honestOld, 20_000e18, 1);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
+        _stakeGuardian(honestNew, 50_000e18, 2);
 
-    /// @notice `denom = max(minTotal, k * totalNow)` is the only genuinely
-    ///         different shape available from the two readings, and it does
-    ///         exactly what the k-interpolation says: the smallest k that
-    ///         defeats the over-weighting fixture is already large enough to
-    ///         hand the dilution fixture to the attacker.
-    ///
-    ///         Over-weighting fixture: attacker 40_000e18, totalNow 600_000e18,
-    ///         minTotal 60_000e18. Defeated once `Q * k * totalNow > 40_000e18`,
-    ///         i.e. `k > 2222` bps.
-    ///
-    ///         Dilution fixture: honest blocker 200_000e18, totalNow
-    ///         2_000_000e18, minTotal 600_000e18. Survives only while
-    ///         `Q * k * totalNow <= 200_000e18`, i.e. `k <= 3333` bps.
-    ///
-    ///         The two constraints overlap in [2223, 3333] bps ONLY for these
-    ///         two specific fixtures. That window is an artifact of the numbers
-    ///         chosen, not a safe setting: it closes entirely as soon as either
-    ///         attacker scales their position, which the loop below pins by
-    ///         re-running the dilution fixture with a diluter twice as large.
-    function test_blend_noKDefeatsBothOnceEitherAttackerScales() public pure {
-        uint256[6] memory ks = [uint256(0), 1000, 2500, 5000, 7500, 10_000];
+        // One second before the open, not in it: the attacker's stake is inside
+        // the `block.timestamp - 1` instant both sides are read at.
+        _stakeGuardian(attacker, 30_000e18, 3);
+        vm.warp(vm.getBlockTimestamp() + 1);
+        assertEq(
+            swood.getPastTotalVotes(vm.getBlockTimestamp() - 1),
+            100_000e18,
+            "the parked stake is inside the denominator too"
+        );
 
-        for (uint256 i = 0; i < ks.length; i++) {
-            uint256 k = ks[i];
+        BatchExecutorLib.Call[] memory emptyCalls = new BatchExecutorLib.Call[](0);
+        bytes32 emptyHash = keccak256(abi.encode(emptyCalls));
 
-            // Over-weighting fixture.
-            uint256 denomA = _blend(60_000e18, 600_000e18, k);
-            bool attackerBlocks = _wouldBlock(40_000e18, denomA);
+        vm.prank(address(governor));
+        registry.openEmergency(6, emptyHash, emptyCalls);
 
-            // Dilution fixture, with the diluter at 2x the size used in
-            // `test_dilution_freshParkedStakeCannotKillTheVetoToday`
-            // (live electorate 3_400_000e18 instead of 2_000_000e18). Nothing
-            // stops them: `stakeAsGuardian` has no cap.
-            uint256 denomB = _blend(600_000e18, 3_400_000e18, k);
-            bool honestStillVetoes = _wouldBlock(200_000e18, denomB);
+        vm.expectEmit(true, true, false, true);
+        emit IGuardianRegistry.EmergencyBlockVoteCast(address(governor), 6, attacker, 30_000e18);
+        vm.prank(attacker);
+        registry.voteBlockEmergencySettle(address(governor), 6);
 
-            assertFalse(
-                !attackerBlocks && honestStillVetoes,
-                "no k both denies the static whale and preserves the honest veto once the diluter scales"
-            );
-        }
-    }
-
-    /// @notice The blend's endpoints are the two rules it interpolates — pinned
-    ///         so the sweep above cannot be read as testing something exotic.
-    function test_blend_endpointsAreTheTwoKnownRules() public pure {
-        assertEq(_blend(60_000e18, 600_000e18, 0), 60_000e18, "k = 0 is today's lookback-min rule");
-        assertEq(_blend(60_000e18, 600_000e18, 10_000), 600_000e18, "k = 10_000 is the live-total rule");
-    }
-
-    function _blend(uint256 minTotal, uint256 totalNow, uint256 kBps) internal pure returns (uint256) {
-        uint256 scaled = totalNow * kBps / 10_000;
-        return scaled > minTotal ? scaled : minTotal;
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD);
+        vm.prank(address(governor));
+        (bool blocked,) = registry.finalizeEmergency(6);
+        assertTrue(blocked, "3E/7 parked one second early vetoes the emergency alone");
     }
 
     // ═══════════════ BASIS CHECK — numerator and denominator agree ═══════════════
 
-    /// @notice Finding #1's premise depends on the numerator and the
-    ///         denominator being the SAME measure. They are: `getPastStake`
-    ///         (the numerator, via `_growthGatedVoteWeight`) and
-    ///         `getPastTotalVotes` (the denominator) are both RAW, while
-    ///         `getPastVotes` alone applies `_ageFactorBps`. Pinned here
-    ///         because a future change that swaps the numerator back to
-    ///         `getPastVotes` would silently re-scale every comparison in this
-    ///         file, and the age factor reads LIVE owner-tunable slots.
+    /// @notice The comparison depends on the numerator and the denominator
+    ///         being the SAME measure. They are: `getPastStake` (the numerator)
+    ///         and `getPastTotalVotes` (the denominator) are both RAW, while
+    ///         `getPastVotes` alone applies `_ageFactorBps`. Pinned because a
+    ///         future change that swaps the numerator to `getPastVotes` would
+    ///         silently re-scale every comparison in this file, and the age
+    ///         factor reads LIVE owner-tunable slots.
     function test_basis_stakeAndTotalAreRawWhileVotesIsAgeWeighted() public {
         assertEq(swood.ageFloorBps(), 2500, "fixture precondition: a young position is discounted to 25%");
 
@@ -380,40 +276,5 @@ contract GuardianRegistry_blockQuorumDenominatorTest is RegistryTestHarness {
         vm.warp(vm.getBlockTimestamp() + 30 days);
         uint256 matured = vm.getBlockTimestamp() - 1;
         assertEq(swood.getPastVotes(honestOld, matured), 100_000e18, "at par the two bases coincide");
-    }
-
-    /// @notice The growth gate is what makes the over-weighting attack a
-    ///         STATIC-stake attack rather than a fresh-capital one, so it is
-    ///         pinned alongside the fixtures: the attacker's discount comes
-    ///         from holding still, and topping up would COST them weight.
-    function test_growthGate_toppingUpCostsTheAttackerWeightRatherThanBuyingIt() public {
-        _stakeGuardian(attacker, 40_000e18, 1);
-        _stakeGuardian(honestOld, 20_000e18, 2);
-
-        vm.warp(vm.getBlockTimestamp() + 30 days);
-        _stakeGuardian(honestNew, 540_000e18, 3);
-        // The attacker tops up, chasing a bigger numerator (`stakeAsGuardian`
-        // is the top-up path; the `agentId` argument is ignored on a top-up).
-        _stakeGuardian(attacker, 500_000e18, 1);
-
-        uint256 reviewEnd = _registerAndOpen(4);
-
-        vm.prank(honestOld);
-        registry.voteOnProposal(address(governor), 4, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
-
-        // The top-up made the attacker's RAW stake grow across the lookback, so
-        // `_growthGatedVoteWeight` clamps them back to the 40_000e18 they held
-        // 30 days ago — the top-up bought exactly nothing.
-        vm.expectEmit(true, true, false, true);
-        emit IGuardianRegistry.GuardianVoteCast(
-            address(governor), 4, attacker, IGuardianRegistry.GuardianVoteType.Block, 40_000e18
-        );
-        vm.prank(attacker);
-        registry.voteOnProposal(address(governor), 4, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
-
-        vm.warp(reviewEnd);
-        assertTrue(
-            registry.resolveReview(address(governor), 4), "still blocked -- on the OLD 40_000e18, not the top-up"
-        );
     }
 }

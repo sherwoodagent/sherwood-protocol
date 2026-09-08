@@ -93,16 +93,11 @@ contract GuardianRegistry_severityPauseAndBasisTest is RegistryTestHarness {
 
     /// @dev The numerator came from `getPastVotes`, which applies
     ///      `StakedWood._ageFactorBps`; the denominator (`r.totalStakeAtOpen`)
-    ///      is RAW stake. A guardian old enough to clear the growth gate but
-    ///      younger than `maturationPeriod` therefore contributed a FRACTION of
-    ///      its stake to a comparison whose other side counted all of it — so a
-    ///      cohort genuinely holding 40% of the electorate could fail a 30%
-    ///      block quorum. The veto failing OPEN, with no attacker involved.
-    ///
-    ///      The regime needs `maturationPeriod > FLOOR_LOOKBACK` (30 days), so
-    ///      the owner widens it here — a legal, routine retune. At the shipped
-    ///      30-day default the two windows coincide and the defect is inert,
-    ///      which is exactly why it survived.
+    ///      is RAW stake. A guardian younger than `maturationPeriod` therefore
+    ///      contributed a FRACTION of its stake to a comparison whose other
+    ///      side counted all of it — so a cohort genuinely holding 40% of the
+    ///      electorate could fail a 30% block quorum. The veto failing OPEN,
+    ///      with no attacker involved.
     function test_finding12_blockQuorumTalliesRawStake_notAgedWeight() public {
         vm.prank(regOwner);
         swood.setMaturationPeriod(90 days);
@@ -110,10 +105,8 @@ contract GuardianRegistry_severityPauseAndBasisTest is RegistryTestHarness {
         _stakeGuardian(approver1, 30_000e18, 1);
         _stakeGuardian(blocker1, 20_000e18, 2); // 40% raw of the 50_000e18 cohort
 
-        // 31 days: past FLOOR_LOOKBACK, so the lookback read sees the same flat
-        // stake and the growth gate cannot fire (`S > S` is false) — this test
-        // is about the age factor, not the gate. Still far short of the 90-day
-        // maturation, so the factor is a genuine discount (~5083 bps).
+        // 31 days: far short of the 90-day maturation, so the age factor is a
+        // genuine discount (~5083 bps).
         skip(31 days);
         vm.warp(vm.getBlockTimestamp() + 1);
 

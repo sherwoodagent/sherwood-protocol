@@ -32,6 +32,21 @@ abstract contract ChallengeGameHandler is Properties {
         game.setProsecutorFeeBps(clampBetween(bps, 0, game.MAX_PROSECUTOR_FEE_BPS()));
     }
 
+    /// @dev What a contribution can still buy for this challenge. The pool is
+    ///      keyed per PROPOSAL, so the headroom is the pool's own target/raised
+    ///      until it completes; after that the pool answers only what it was
+    ///      raised against, and a `Filed` challenge it does not answer buys its
+    ///      own defence up to the same target.
+    function _counterBondHeadroom(uint256 challengeId) internal view returns (uint256) {
+        (, uint256 target, uint256 raised, uint256 completedAt,) = game.counterBondPoolOf(challengeId);
+        if (completedAt != 0) {
+            IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
+            if (c.status != IChallengeGame.Status.Filed) return 0;
+            raised = c.defenceWeight;
+        }
+        return target > raised ? target - raised : 0;
+    }
+
     // ――――――――――――――――――――――――― Clamped ――――――――――――――――――――――――――
 
     /// @dev `challengeId` is 1-indexed and `challengeCount` is the high-water
@@ -54,12 +69,7 @@ abstract contract ChallengeGameHandler is Properties {
         // reverts in the transfer rather than in the game.
         uint256 bal = wood.balanceOf(actor);
         if (bal == 0) return;
-        IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
-        // The pool is keyed per PROPOSAL now (pashov 2026-08 finding #10), so
-        // the remaining headroom comes from the pool's own target/raised rather
-        // than from this challenge's stale per-challenge field.
-        (, uint256 target, uint256 raised,,) = game.counterBondPoolOf(challengeId);
-        uint256 remaining = target > raised ? target - raised : 0;
+        uint256 remaining = _counterBondHeadroom(challengeId);
         if (remaining == 0) return;
         amountWood = clampBetween(amountWood, 1, remaining < bal ? remaining : bal);
 
@@ -74,12 +84,7 @@ abstract contract ChallengeGameHandler is Properties {
         if (count == 0) return;
         challengeId = clampBetween(challengeId, 1, count);
 
-        IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
-        // The pool is keyed per PROPOSAL now (pashov 2026-08 finding #10), so
-        // the remaining headroom comes from the pool's own target/raised rather
-        // than from this challenge's stale per-challenge field.
-        (, uint256 target, uint256 raised,,) = game.counterBondPoolOf(challengeId);
-        uint256 remaining = target > raised ? target - raised : 0;
+        uint256 remaining = _counterBondHeadroom(challengeId);
         if (remaining == 0 || wood.balanceOf(actor) < remaining) return;
 
         challengeGame_dispute(challengeId, remaining);
@@ -197,12 +202,7 @@ abstract contract ChallengeGameHandler is Properties {
         // Fund the counter-bond to exactly its target. `Disputed` requires
         // `counterBondWood == bondWood`; a short pool leaves the challenge in
         // Filed and `refer` reverts, so partial funding is not enough.
-        IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
-        // The pool is keyed per PROPOSAL now (pashov 2026-08 finding #10), so
-        // the remaining headroom comes from the pool's own target/raised rather
-        // than from this challenge's stale per-challenge field.
-        (, uint256 target, uint256 raised,,) = game.counterBondPoolOf(challengeId);
-        uint256 remaining = target > raised ? target - raised : 0;
+        uint256 remaining = _counterBondHeadroom(challengeId);
         for (uint256 i; i < actors.length && remaining != 0; i++) {
             address d = _nonGuardian(i);
             if (d == challenger) continue;

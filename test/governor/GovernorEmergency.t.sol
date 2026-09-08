@@ -451,7 +451,7 @@ contract GovernorEmergencyTest is Test {
     ///      and round 2 went live with zero slashable collateral — one free
     ///      unbonded run at owner-authored calldata, which
     ///      `finalizeEmergencySettle` executes with EMPTY per-call caps.
-    function test_emergencySettleWithCalls_cannotReopenOnABondTheSameCallBurns() public {
+    function test_blockedEmergencyRoundCannotBeReplacedByAnUnbondedOne() public {
         uint256 pid = _createExecutedProposal(7 days);
         vm.warp(vm.getBlockTimestamp() + 7 days);
 

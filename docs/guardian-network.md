@@ -114,8 +114,8 @@ it. Full detail: [coverage.md](coverage.md).
   the shortfall case: it **scales** capital via
   `_deriveAndStoreEffectiveCapital` (`SyndicateGovernor.sol:1563`) —
   `effectiveMaxCapital = floor(maxCapital * coverageRaisedUsd / requiredCoverageUsd)` —
-  and the same ratio scales every per-call cap. `quorumTierThreshold = 0`
-  (`ExposureLedger.sol:209`) applies the gate to every tier. An empty or
+  and the same ratio scales every per-call cap. The gate applies at every
+  tier. An empty or
   zero book is "no underwriter on the hook," not a shortfall; the proposal stays
   `Approved` until `executeBy`. Guardian daemons that treat any shortfall as
   disqualifying are wrong.
@@ -281,9 +281,9 @@ payload for the whole review period. Guardians underwrite this call set.
 A sandbox is priced at **full funding** and forced to **tier 2** inside
 `_snapshotTierAndGate` (`SyndicateGovernor.sol:1747`, sandbox term `:1778-1782`):
 `coverage_ += sandboxFunding`. There is no certified bound that could reduce it.
-That force is not cosmetic: the approve quorum only applies at or above
-`quorumTierThreshold`, so a payload that rode along at tier 0 would be arbitrary
-calldata with no identified underwriter on the hook.
+That force is not cosmetic: it is what prices the payload at full notional, so
+a payload that rode along at tier 0 would be arbitrary calldata carrying a
+coverage figure far below what it can move.
 
 `executeProposal` dispatches the sandbox **before** the execute batch. Coverage
 scaling uses the same `effective / max` ratio as `effectiveMaxCapital`

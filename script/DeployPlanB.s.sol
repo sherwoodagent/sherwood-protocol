@@ -45,7 +45,7 @@ interface IProtocolConfigAdmin {
  *         book via env vars (from chains/<chainid>.json). Order:
  *           1. pre-flights (see below) — fail BEFORE anything is deployed
  *           2. deploy ExposureLedger (epochLength 28d) + ProposerBondEscrow
- *           3. seed ledger params (WOOD price cap, haircut, TWAP oracle, asset feed, caps, registry link)
+ *           3. seed ledger params (WOOD price cap, haircut, WOOD feed, asset feed, caps, registry link)
  *           4. registry.setExposureLedger   (owner op — REQUIRES the UUPS-upgraded impl)
  *           5. factory.setExposureLedger / setBondEscrow (new syndicates)
  *           6. swood.setExposureLedger      (owner op — arms the unstake gate)
@@ -71,10 +71,6 @@ interface IProtocolConfigAdmin {
  *      they declared. Zero would let a token lock buy a token penalty. The
  *      launch value is a governance decision in the runbook; this only refuses
  *      zero.
- * @dev PRE-FLIGHT 4 (ADR 2026-07-27): `quorumTierThreshold == 0` — a covering
- *      approve quorum is required at EVERY tier. The `maxEnvelopeTier <= 1`
- *      half this was once paired with was dropped (owner decision 2026-07-31);
- *      see the block itself.
  * @dev PRE-FLIGHT 2: a zero `coveredTvlCapUsd` is fail-closed — the moment the
  *      ledger is wired into a governor, NOTHING can be proposed. Refuse to
  *      deploy into that state rather than brick proposing.
@@ -175,7 +171,7 @@ interface IProtocolConfigAdmin {
  *                                 price, it only bounds how far a manipulated
  *                                 market source may be trusted upward. Set
  *                                 BELOW market it binds permanently, pins every
- *                                 bond at the cap and makes the TWAP inert.
+ *                                 bond at the cap and makes the market source inert.
  *                                 A cap at M x market caps manipulation at M x;
  *                                 1.25-2x market is the intended band, reviewed
  *                                 monthly. Non-zero (pre-flight 8).
@@ -183,32 +179,26 @@ interface IProtocolConfigAdmin {
  *                                 to DEFAULT_WOOD_HAIRCUT_BPS (7,000 = a 30%
  *                                 discount) when unset. This is the ALLOWANCE
  *                                 against the two overstatements the design
- *                                 accepts — the oracle's stale ETH/USD leg and
+ *                                 accepts — the feed's stale ETH/USD leg and
  *                                 the residual crash lag. The ledger DEFAULTS to
  *                                 10,000, which is no haircut and no allowance;
  *                                 pre-flight 9 refuses that. 5,000 is the floor
  *                                 and was rejected as too costly to guardian ROE.
- *     WOOD_TWAP_ORACLE          — deployed WoodTwapOracle, the live WOOD price
- *                                 source. OPTIONAL as a key, REQUIRED in
- *                                 practice: chain 4663 has no Chainlink
- *                                 WOOD/USD feed, so without it every price read
- *                                 reverts NoWoodPrice. It must already have a
- *                                 COMPLETED averaging window when this runs —
- *                                 deploy it and run the keeper for at least
- *                                 `twapWindow` first (pre-flight 8).
- *     WOOD_USD_FEED             — OPTIONAL Chainlink-shaped WOOD/USD aggregator.
- *                                 The PREFERRED market source when set; the TWAP
- *                                 oracle stays the fallback on all four degraded
- *                                 shapes. Chain 4663 has no such feed, so the
- *                                 mainnet ceremony leaves this unset. The FORK
- *                                 sets it, and must: a vnet cannot prime a TWAP
- *                                 oracle at all (the WOOD/WETH pair stops trading
- *                                 at the fork point, so `update()` no-ops forever
- *                                 across the growing idle span), which leaves a
- *                                 feed as the only source that can satisfy
- *                                 pre-flight 8 there.
+ *     WOOD_USD_FEED             — the AggregatorV3-shaped WOOD/USD feed: the
+ *                                 `WoodPoolFeed` from DeployWoodPoolFeed on 4663,
+ *                                 or any plain aggregator. The ledger's ONLY
+ *                                 market source, so pre-flight 8 requires it and
+ *                                 requires it to be ANSWERING — on a real chain
+ *                                 that means a full window of keeper activity
+ *                                 first. On a FORK the pools stop trading at the
+ *                                 fork point and can never be snapshot, so point
+ *                                 this at a plain aggregator instead.
  *     WOOD_FEED_MAX_DELAY       — staleness bound for WOOD_USD_FEED, seconds.
- *                                 Set together with it or not at all (pre-flight 12).
+ *                                 Set together with it or not at all, and for a
+ *                                 pool feed it must EXCEED that feed's averaging
+ *                                 window plus KEEPER_CADENCE_SLACK: `updatedAt`
+ *                                 advances only when a snapshot rolls, at most
+ *                                 once per window (pre-flight 12).
  *     COVERED_TVL_CAP_USD18     — per-vault covered-TVL ceiling, USD-18. Non-zero.
  *     PROTOCOL_CONFIG           — ProtocolConfig to seat the duration ceiling on
  *                                 (`Deploy.s.sol` already writes this key into
@@ -275,12 +265,12 @@ contract DeployPlanB is ScriptBase {
     ///         default leaves ZERO allowance against the two overstatements
     ///         this design deliberately ACCEPTS rather than eliminates:
     ///
-    ///           - the oracle's two legs are not contemporaneous, so an ETH
+    ///           - the feed's two legs are not contemporaneous, so an ETH
     ///             drawdown inside the ~10.7h ETH/USD heartbeat makes WOOD/USD
     ///             read high by roughly the ETH move, with no attacker capital
     ///             involved (design revision, finding 4);
-    ///           - the residual crash lag of up to `twapWindow + maxTwapAge`,
-    ///             inherent to averaging.
+    ///           - the residual crash lag of up to `window + maxDelay`, inherent
+    ///             to averaging behind a staleness bound.
     ///
     ///         Both OVERSTATE bond value — the dangerous direction — and the
     ///         haircut is the compensating control for both. 5,000 (the ledger's
@@ -301,6 +291,12 @@ contract DeployPlanB is ScriptBase {
     ///         enforces the same floor, so this catches a DRIFTED mirror rather
     ///         than a bad env value.
     uint256 internal constant MIN_WOOD_HAIRCUT_BPS = 5_000;
+
+    /// @notice The keeper cadence `WOOD_FEED_MAX_DELAY` must clear on top of a
+    ///         pool feed's averaging window (pre-flight 12).
+    /// @dev    Keep in step with `DeployWoodPoolFeed.KEEPER_CADENCE`, which is
+    ///         what the feed's printed runbook tells the operator to run at.
+    uint256 internal constant KEEPER_CADENCE_SLACK = 2 hours;
 
     /// @notice The policy value for `SyndicateGovernor.tier2CallCapBps` (issue
     ///         #43, design.md D2): 200 bps (2% of TVL) — the issue's own
@@ -364,24 +360,12 @@ contract DeployPlanB is ScriptBase {
         uint256 coveredTvlCapUsd;
         address protocolConfig;
         uint256 maxStrategyDuration; // protocol-wide ceiling. Non-zero.
-        /// @dev The `WoodTwapOracle` this ledger prices against, or zero to
-        ///      wire none. Zero only works if a Chainlink WOOD/USD feed is
-        ///      wired by hand before pre-flight 8's composed-price assert runs —
-        ///      and chain 4663 has no such feed, so in practice this is required.
-        address woodTwapOracle;
-        /// @dev A Chainlink-shaped WOOD/USD aggregator, or zero to wire none.
-        ///      The PREFERRED market source when set — `_woodPrice` reads it
-        ///      first and only falls back to the TWAP oracle on the four
-        ///      degraded shapes (unset, non-positive answer, stale, reverting).
-        ///      Still capped by `woodPriceCapX8` either way.
-        ///
-        ///      Wired here rather than left as a manual follow-up for the same
-        ///      reason the TWAP pointer is: pre-flight 8 demands a composed
-        ///      price, and the only two ways to supply one are this and the
-        ///      oracle. It is what makes the FORK ceremony runnable at all — a
-        ///      vnet cannot prime a TWAP oracle, because the WOOD/WETH pair
-        ///      stops trading at the fork point and `update()` then no-ops
-        ///      forever across the growing idle span.
+        /// @dev The `AggregatorV3`-shaped WOOD/USD feed this ledger prices
+        ///      against — a `WoodPoolFeed` on 4663, a plain aggregator anywhere
+        ///      one exists. Zero wires none, which pre-flight 8 then refuses:
+        ///      it is the ONLY market source, so without it every price read
+        ///      reverts NoWoodPrice. On a real chain it must already have a
+        ///      COMPLETED window when this runs.
         address woodUsdFeed;
         /// @dev Staleness bound for `woodUsdFeed`, seconds. Must be non-zero
         ///      when the feed is set and zero when it is not — `setWoodFeed`
@@ -426,16 +410,10 @@ contract DeployPlanB is ScriptBase {
         // different one sets the key; one who wants NO ceiling cannot express
         // that here at all (pre-flight 6).
         book.maxStrategyDuration = vm.envOr("MAX_STRATEGY_DURATION", DEFAULT_MAX_STRATEGY_DURATION);
-        // `envOr` with a zero default: a chain that somehow HAS a Chainlink
-        // WOOD/USD feed does not need this, and pre-flight 8 is what actually
-        // refuses a ledger with no live price source — so the requirement is
-        // expressed once, as a property of the deployed state, rather than
-        // twice as an env precondition too.
-        book.woodTwapOracle = vm.envOr("WOOD_TWAP_ORACLE", address(0));
-        // `envOr` with a zero default: chain 4663 has no Chainlink WOOD/USD
-        // aggregator, so the mainnet ceremony leaves both keys unset and prices
-        // off the TWAP oracle alone. The fork sets them, because it is the only
-        // source it can actually serve.
+        // `envOr` with a zero default: pre-flight 8 is what actually refuses a
+        // ledger with no live price source, so the requirement is expressed once,
+        // as a property of the deployed state, rather than twice as an env
+        // precondition too.
         book.woodUsdFeed = vm.envOr("WOOD_USD_FEED", address(0));
         book.woodFeedMaxDelay = vm.envOr("WOOD_FEED_MAX_DELAY", uint256(0));
         // `envOr` false: the mainnet ceremony needs no new key and keeps the
@@ -712,6 +690,22 @@ contract DeployPlanB is ScriptBase {
             book.woodUsdFeed == address(0) || book.woodUsdFeed.code.length != 0,
             "PRE-FLIGHT: WOOD_USD_FEED holds no code"
         );
+        // A `WoodPoolFeed` republishes `updatedAt` only when a snapshot ROLLS,
+        // which is at most once per averaging window — extra keeper calls in
+        // between are no-ops. A `maxDelay` at or below the window therefore
+        // halts every price read between rolls, for up to a whole window, and
+        // reads as a stale feed rather than as a mis-set bound. Probed rather
+        // than called typed because `WOOD_USD_FEED` may be a plain aggregator,
+        // which has no window and needs no such margin.
+        (bool hasWindow, bytes memory windowRet) = book.woodUsdFeed.staticcall(abi.encodeWithSignature("window()"));
+        if (hasWindow && windowRet.length == 32) {
+            require(
+                book.woodFeedMaxDelay > abi.decode(windowRet, (uint256)) + KEEPER_CADENCE_SLACK,
+                "PRE-FLIGHT: WOOD_FEED_MAX_DELAY must EXCEED the feed's averaging window plus the "
+                "keeper cadence (2h). The feed's updatedAt advances at most once per window, so a "
+                "tighter bound halts proposing and executing between rolls for up to a whole window."
+            );
+        }
 
         console.log("sWOOD coolDownPeriod (s): %s", coolDown);
         console.log("deployer / ledger owner:  %s", deployer);
@@ -750,18 +744,10 @@ contract DeployPlanB is ScriptBase {
         // 1-day lock on the haircut, including against a mid-crash tightening.
         ledger.setWoodHaircutBps(book.woodHaircutBps);
         // THE MARKET SOURCE. Wired inside the broadcast rather than left as a
-        // manual follow-up for the same reason the duration ceiling is: chain
-        // 4663 has no Chainlink WOOD/USD aggregator, so a ledger that ships
-        // without this has NO price source at all and every price read reverts
-        // `NoWoodPrice` — proposing and executing are dead on arrival. An
-        // operator merely TOLD to wire it afterwards is an operator who ships
-        // the broken state. Pre-flight 8 below proves it landed and works.
-        if (book.woodTwapOracle != address(0)) {
-            ledger.setWoodTwapOracle(book.woodTwapOracle);
-        }
-        // THE OTHER MARKET SOURCE, and the PREFERRED one when both are wired.
-        // Same broadcast, same reasoning: pre-flight 8 proves a composed price
-        // exists, and on a fork this is the only source that can produce one.
+        // manual follow-up for the same reason the duration ceiling is: it is the
+        // ledger's ONLY price source, so a ledger that ships without it reverts
+        // `NoWoodPrice` on every read — proposing and executing are dead on
+        // arrival. Pre-flight 8 below proves it landed and works.
         if (book.woodUsdFeed != address(0)) {
             ledger.setWoodFeed(book.woodUsdFeed, book.woodFeedMaxDelay);
         }
@@ -775,10 +761,6 @@ contract DeployPlanB is ScriptBase {
         ledger.setAssetFeed(usdg, usdgFeed, feedMaxDelay);
         ledger.setGuardianRegistry(registry);
         ledger.setCoveredTvlCapUsd(coveredTvlCapUsd);
-        // quorumTierThreshold stays at its default, which ADR 2026-07-27 moved
-        // to 0 (every tier fail-closed). Asserted in pre-flight 4 rather than
-        // re-set here, so a ledger whose default ever drifts is caught instead
-        // of silently corrected.
 
         IGuardianRegistry(registry).setExposureLedger(address(ledger));
         ISyndicateFactory(factory).setExposureLedger(address(ledger));
@@ -842,27 +824,6 @@ contract DeployPlanB is ScriptBase {
             "PRE-FLIGHT: sWOOD exposureLedger != the ledger just deployed -- the unstake gate is "
             "open, or reads a ledger holding none of this deployment's bookings. This script wires "
             "it inside the broadcast; if it did not land, re-run from the sWOOD owner."
-        );
-
-        // ── Pre-flight 4 (POST-wiring): coverage is enforced at every tier ──
-        // ADR 2026-07-27 originally paired this with a `maxEnvelopeTier <= 1`
-        // ceiling that refused tier-2 exposure outright. THAT HALF WAS DROPPED
-        // (owner decision 2026-07-31): tier-2 guardian ROE is to be closed with
-        // off-chain team token incentives rather than by refusing the tier, so
-        // tier 2 remains admissible on-chain and there is no ceiling to assert.
-        //
-        // What remains is the half that was never a policy choice. Coverage
-        // SIZING was already correct at every tier; only ENFORCEMENT was gated,
-        // and at the old default of 2 it ran at tier 2 alone — so a tier-0/1
-        // proposal could execute with NO covering approver at all, its
-        // correctly-sized coverage never checked. Threshold 0 closes that.
-        //
-        // Asserted after the broadcast, the only point where the value is
-        // readable in the form the protocol will actually run with.
-        require(
-            ledger.quorumTierThreshold() == 0,
-            "PRE-FLIGHT: ExposureLedger.quorumTierThreshold != 0 -- a covering approve quorum is "
-            "required at EVERY tier. Call setQuorumTierThreshold(0), then re-run."
         );
 
         // ── Pre-flight 6 (POST-broadcast): the ceiling actually landed ──
@@ -936,40 +897,43 @@ contract DeployPlanB is ScriptBase {
             "price -- a cap below market binds permanently and makes the market source inert)."
         );
         //
-        // (b) THE COMPOSED PRICE MUST RESOLVE. `woodUsdPriceX8 != 0` alone
+        // (b) THE FEED MUST BE WIRED AND ANSWERING. `woodUsdPriceX8 != 0` alone
         //     proves only that the CEILING is configured; it says nothing about
         //     whether anything is priced under it. This calls the figure the
-        //     protocol actually divides by, which fails on all three shapes
-        //     that matter: no oracle wired, an oracle with no completed
-        //     averaging window yet, and an oracle whose ETH/USD leg is
-        //     unusable. That middle case is the operationally important one —
-        //     `WoodTwapOracle` needs at least `twapWindow` of keeper activity
-        //     BEFORE this script runs, so the ordering is deploy-and-prime the
-        //     oracle first, Plan B second.
+        //     protocol actually divides by, which fails on every shape that
+        //     matters: no feed wired, a `WoodPoolFeed` with no completed window
+        //     yet, a pool below its depth floor, and a stale reading. The window
+        //     case is the operationally important one — the feed needs a full
+        //     window of keeper activity BEFORE this script runs, so the ordering
+        //     is deploy-and-prime the feed first, Plan B second.
         //
         //     Probed rather than called typed: `woodPriceX8()` REVERTS rather
         //     than returning zero when no source can price WOOD, and a bare
         //     revert here would surface as an opaque script failure instead of
         //     the instruction below.
+        require(
+            book.woodUsdFeed != address(0),
+            "PRE-FLIGHT: WOOD_USD_FEED is unset. The ledger has exactly one market source, so "
+            "without it every price read reverts NoWoodPrice and nothing can be proposed, executed "
+            "or challenged. Deploy script/DeployWoodPoolFeed.s.sol and prime it first."
+        );
         (bool priced, bytes memory priceRet) = address(ledger).staticcall(abi.encodeWithSignature("woodPriceX8()"));
         require(
             priced && priceRet.length >= 32 && abi.decode(priceRet, (uint256)) != 0,
-            "PRE-FLIGHT: ExposureLedger.woodPriceX8() does not resolve to a non-zero price. There is "
-            "no live WOOD price source: either WOOD_TWAP_ORACLE is unset, or the oracle has no "
-            "completed averaging window yet (deploy it and run the keeper for at least twapWindow "
-            "BEFORE this script), or its ETH/USD leg is stale. Chain 4663 has no Chainlink WOOD/USD "
-            "feed, so without the TWAP oracle nothing can be proposed or executed."
+            "PRE-FLIGHT: ExposureLedger.woodPriceX8() does not resolve to a non-zero price. The wired "
+            "WOOD_USD_FEED is not answering: a WoodPoolFeed with no completed window yet (run the "
+            "keeper for a full window BEFORE this script), a pool below MIN_WETH_RESERVE, a stale "
+            "ETH/USD leg, or a reading older than WOOD_FEED_MAX_DELAY."
         );
 
         // ── Pre-flight 9 (POST-broadcast): a real allowance must exist ──
         //
         // `woodHaircutBps` is the compensating control for the two
-        // overstatements this design ACCEPTS rather than eliminates — the
-        // oracle's non-contemporaneous legs (an ETH drawdown inside the ~10.7h
-        // ETH/USD heartbeat reads WOOD/USD high by roughly the ETH move, with
-        // no attacker capital involved) and the residual crash lag of up to
-        // `twapWindow + maxTwapAge`. Both overstate bond value, which is the
-        // dangerous direction.
+        // overstatements this design ACCEPTS rather than eliminates — the feed's
+        // non-contemporaneous legs (an ETH drawdown inside the ~10.7h ETH/USD
+        // heartbeat reads WOOD/USD high by roughly the ETH move, with no attacker
+        // capital involved) and the residual crash lag of up to
+        // `window + maxDelay`. Both overstate bond value, the dangerous direction.
         //
         // THE LEDGER'S OWN SETTER CANNOT CATCH THIS. It accepts the full
         // `[5_000, 10_000]` range, and 10_000 — its DEFAULT — is a legal value
@@ -978,9 +942,9 @@ contract DeployPlanB is ScriptBase {
         require(
             ledger.woodHaircutBps() < 10_000,
             "PRE-FLIGHT: ExposureLedger.woodHaircutBps is 10000 -- that is NO haircut, which leaves "
-            "ZERO allowance for the two overstatements this design accepts: the oracle's stale "
+            "ZERO allowance for the two overstatements this design accepts: the feed's stale "
             "ETH/USD leg (an ETH drawdown inside the ~10.7h heartbeat reads WOOD/USD high by roughly "
-            "the ETH move, no attacker needed) and the crash lag of up to twapWindow + maxTwapAge. "
+            "the ETH move, no attacker needed) and the crash lag of up to window + maxDelay. "
             "Set WOOD_HAIRCUT_BPS -- 7000 is the shipped value and absorbs a 30% overstatement."
         );
         require(
@@ -1047,7 +1011,6 @@ contract DeployPlanB is ScriptBase {
         console.log("ExposureLedger:     %s", address(ledger));
         console.log("ProposerBondEscrow: %s", address(escrow));
         console.log("ledger owner:       %s (must carry the Zodiac delay module)", ledger.owner());
-        console.log("WoodTwapOracle:     %s", ledger.woodTwapOracle());
         console.log("WOOD/USD feed:      %s (delay %s s)", book.woodUsdFeed, book.woodFeedMaxDelay);
         console.log("WOOD price cap (X8): %s", ledger.woodUsdPriceX8());
         console.log("WOOD haircut (bps):  %s", ledger.woodHaircutBps());

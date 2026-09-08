@@ -9,9 +9,11 @@ import {BatchExecutorLib} from "src/BatchExecutorLib.sol";
 import {ERC20Mock} from "test/mocks/ERC20Mock.sol";
 
 /// @dev Minimal governor stub — `file()` only reads `executedAt`/`vault` off
-///      `getProposal`, and `getExecuteCalls` is never invoked by these tests
+///      `getProposal`, and neither call list is invoked by these tests
 ///      because every filing here names no adapter (`adapterTarget ==
-///      address(0)` skips `_requireAdapterInProposal` entirely).
+///      address(0)` skips `_requireAdapterInProposal` entirely). Both are
+///      implemented anyway: a filing that DID name an adapter must reach
+///      `AdapterNotInProposal`, not a missing-selector revert.
 contract MockGovernorForOracleTest {
     mapping(uint256 => ISyndicateGovernor.StrategyProposal) internal _proposals;
 
@@ -25,6 +27,10 @@ contract MockGovernorForOracleTest {
     }
 
     function getExecuteCalls(uint256) external pure returns (BatchExecutorLib.Call[] memory) {
+        return new BatchExecutorLib.Call[](0);
+    }
+
+    function getSettlementCalls(uint256) external pure returns (BatchExecutorLib.Call[] memory) {
         return new BatchExecutorLib.Call[](0);
     }
 }

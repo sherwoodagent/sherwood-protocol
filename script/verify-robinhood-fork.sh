@@ -91,7 +91,6 @@ check "swood.exposureLedger (exit gate armed)" "$(call "$SWOOD" 'exposureLedger(
 check "factory.exposureLedger"        "$(call "$FACTORY" 'exposureLedger()(address)')"   "$LEDGER"
 check "factory.bondEscrow"            "$(call "$FACTORY" 'bondEscrow()(address)')"       "$ESCROW"
 check "registry.exposureLedger"       "$(call "$REGISTRY" 'exposureLedger()(address)')"  "$LEDGER"
-check "ledger.quorumTierThreshold == 0" "$(call "$LEDGER" 'quorumTierThreshold()(uint256)')" "0"
 check "ledger.challengeWindow == 14d" "$(call "$LEDGER" 'challengeWindow()(uint256)')"   "1209600"
 check "ledger.woodHaircutBps == 7000" "$(call "$LEDGER" 'woodHaircutBps()(uint256)')"    "7000"
 # Delegation is deferred to v2 and the `StakedWoodDelegation` base was REMOVED
@@ -146,11 +145,6 @@ else
 fi
 
 echo; echo "── WOOD price source ──"
-check "ledger.woodTwapOracle (none on a fork)" "$(call "$LEDGER" 'woodTwapOracle()(address)')" "$ZERO"
-FROMFEED=$(cast call "$LEDGER" 'woodPriceDetail()(uint256,bool,bool)' --rpc-url "$RPC" 2>/dev/null | sed -n '2p')
-check "price attributed to the feed"  "$FROMFEED"                                        "true"
-CAPBIND=$(cast call "$LEDGER" 'woodPriceDetail()(uint256,bool,bool)' --rpc-url "$RPC" 2>/dev/null | sed -n '3p')
-check "cap NOT binding (seeded above market)" "$CAPBIND"                                 "false"
 check "fork feed decimals == 8"       "$(call "$WFEED" 'decimals()(uint8)')"             "8"
 
 echo
