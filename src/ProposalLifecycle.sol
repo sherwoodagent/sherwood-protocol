@@ -75,6 +75,7 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             // Votable set at the snapshot = supply minus the queue (queued shares keep snapshot weight).
             // Cap it at totalSupply(): a redeem ordered ahead of propose shrinks live supply but not
             // the snapshot. Cap AFTER the queue subtraction, or a claim in the propose block is removed twice.
+            // Never undercounts; overcounts by at most the queue's balance at the snapshot (exact fix: SHE-282).
             uint256 pastTotalSupply = IVotes(p.vault).getPastTotalSupply(p.snapshotTimestamp);
             address queue = ISyndicateVault(p.vault).withdrawalQueue();
             uint256 queueVotes = queue == address(0) ? 0 : IVotes(p.vault).getPastVotes(queue, p.snapshotTimestamp);
