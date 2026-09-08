@@ -1,0 +1,5 @@
+{
+  "name": "Sherwood Protocol",
+  "user": "ubuntu",
+  "install": "./.cursor/install.sh"
+}
