@@ -105,7 +105,7 @@ jobs:
 
       # `forge coverage` disables the optimizer and via_ir project-wide to keep
       # source maps accurate, and unoptimized legacy codegen blows the stack in
-      # this repo's eight largest contracts. `[profile.coverage]` works around
+      # this repo's nine largest contracts. `[profile.coverage]` works around
       # that with per-file `compilation_restrictions` that keep exactly those
       # eight on the IR pipeline; see the comment block in foundry.toml for the
       # list, the reproduce command, and what the workaround costs. Same

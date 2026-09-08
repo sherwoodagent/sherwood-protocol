@@ -1342,10 +1342,12 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         uint256 posted = 0;
         if (levered()) {
             _pullFromVault(asset, collateralAmount);
+            _recordDeployed(collateralAmount);
             posted = _postCollateral(collateralAmount);
             morpho.borrow(_marketParams, borrowAmount, 0, address(this), address(this));
         } else {
             _pullFromVault(asset, lpAmount);
+            _recordDeployed(lpAmount);
         }
 
         (uint256 tid, uint128 liquidity) = _mintPosition(tickLower, tickUpper, swapFractionBps, mintSlippageBps);
@@ -1778,7 +1780,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             emit SettlementIncomplete(debtRemaining, collateralRemaining);
         }
 
-        _pushAllToVault(asset);
+        _recordReturned(_pushAllToVault(asset));
     }
 
     /// @notice Unwind the live position. Callable only by this contract.
@@ -2277,6 +2279,34 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     }
 
     /// @inheritdoc IStrategyDelivery
+    /// @dev THE COMPANION TO `hasUnvaluedResidue()` BELOW, which this template
+    ///      overrides to `true` for a live LP position and for the volatile leg.
+    ///      A CL clone that settles without fully unwinding — the position could
+    ///      not be closed, or the volatile leg could not be sold — would
+    ///      otherwise have its whole contribution reported as a loss and would
+    ///      trip the settlement drawdown gates, despite the position still
+    ///      belonging to the fund. This predates the launchpad work; the two
+    ///      templates share one defect because they share one cause.
+    ///
+    ///      Derived from the flow ledger: contributed vault asset less what
+    ///      unwinding actually handed back, so it falls to zero on the ordinary
+    ///      path where the position closes and its proceeds are delivered.
+    function unpricedCostBasis() public view override returns (uint256) {
+        return _flowCostBasis();
+    }
+
+    /// @inheritdoc IStrategyDelivery
+    /// @dev ALWAYS TRUE. A settle that cannot fully unwind leaves a live LP
+    ///      position or an unsold volatile leg — both unpriceable here, both
+    ///      already reported by `hasUnvaluedResidue()`. Declaring it
+    ///      unconditionally costs a clean unwind nothing (it reports a zero
+    ///      basis and settles with no credit) and is what lets an incomplete
+    ///      unwind settle honestly instead of as a total loss.
+    function expectsUnpricedResidue() public pure override returns (bool) {
+        return true;
+    }
+
+    /// @inheritdoc IStrategyDelivery
     /// @dev THE EXACT COMPLEMENT OF WHAT `undeliveredValue()` ABOVE CAN PRICE.
     ///      That figure is deliberately partial: it reports the idle vault-asset
     ///      balance, plus Morpho collateral net of debt ONLY when the collateral
@@ -2390,6 +2420,11 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         // value off the clone.
         uint256 assets = IERC20(asset).balanceOf(address(this));
         if (assets != 0) {
+            // NOT fed into the flow ledger, matching the sweep path on every
+            // other template: the cost basis is consumed at settlement, this
+            // runs after it, and this path is held to a gas ceiling that an
+            // extra store measurably eats into (`test_recoveryPathsKeep
+            // MeaningfulHeadroom` catches it).
             _pushAllToVault(asset);
             emit ResidualSwept(assets);
         }

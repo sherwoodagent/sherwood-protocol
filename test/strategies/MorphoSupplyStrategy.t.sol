@@ -202,6 +202,20 @@ contract MorphoSupplyStrategyTest is MorphoSupplyFixture {
         vm.expectRevert(MorphoSupplyStrategy.NoTunableParams.selector);
         strategy.updateParams("");
     }
+
+    /// @notice A template that round-trips into the vault asset declares no
+    ///         conversion and reports no basis.
+    /// @dev    THE COUPLING, from the other side. `hasUnvaluedResidue()`,
+    ///         `expectsUnpricedResidue()` and `unpricedCostBasis()` describe one
+    ///         design decision, and this template made the opposite one to the
+    ///         launch and CL templates: it holds the vault asset, which is
+    ///         priced, so it is owed no credit and asks for none. Asserted so a
+    ///         future edit cannot make it claim one by accident.
+    function test_unpricedCostBasis_nonConvertingTemplateClaimsNothing() public view {
+        assertFalse(strategy.expectsUnpricedResidue(), "supplying the vault asset converts nothing");
+        assertEq(strategy.unpricedCostBasis(), 0, "and so has no cost basis to report");
+        assertFalse(strategy.hasUnvaluedResidue(), "nothing here is unpriceable");
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

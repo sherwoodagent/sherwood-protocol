@@ -88,6 +88,14 @@ abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
     State internal _state;
     bool private _initialized;
 
+    /// @dev Vault-asset flow ledger backing `_flowCostBasis()`. Deliberately
+    ///      RECORDED rather than derived from balances: see
+    ///      `IStrategyDelivery.unpricedCostBasis`. Only the VAULT ASSET is
+    ///      counted — a template's other legs are exactly the things it cannot
+    ///      price, and their movements are not capital entering or leaving.
+    uint256 internal _assetDeployed;
+    uint256 internal _assetReturned;
+
     /**
      * @notice Disables `initialize` on the template itself so an attacker
      *         can't front-run a clone deploy with their own init.
@@ -261,6 +269,27 @@ abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
         return false;
     }
 
+    /// @inheritdoc IStrategyDelivery
+    /// @dev Default 0, matching `hasUnvaluedResidue`'s default of false: a
+    ///      template that holds nothing it cannot value spent nothing acquiring
+    ///      it. A template that DOES override that predicate MUST override this
+    ///      too — the pair describes one fact, and a `true` with a zero basis
+    ///      tells settlement the deployment vanished rather than changed form,
+    ///      which is the exact misreport this view was added to end.
+    function unpricedCostBasis() public view virtual returns (uint256) {
+        return 0;
+    }
+
+    /// @inheritdoc IStrategyDelivery
+    /// @dev Default false: a template that round-trips into the vault asset
+    ///      converts nothing and needs no declaration. Override to `true`
+    ///      wherever `hasUnvaluedResidue()` is overridden — the three views
+    ///      describe one design decision, and settlement refuses a strategy
+    ///      that reports a basis this never announced.
+    function expectsUnpricedResidue() public view virtual returns (bool) {
+        return false;
+    }
+
     /// @dev Dust floor for the residue probes. Anyone may transfer 1 wei to a
     ///      long-settled clone, and `hasUndeliveredValue()` keying on `!= 0`
     ///      turned that into an indefinite deposit DoS: `sweep()` clears it,
@@ -286,9 +315,48 @@ abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
     }
 
     /// @notice Push entire balance of a token back to the vault
-    function _pushAllToVault(address token) internal {
-        uint256 bal = IERC20(token).balanceOf(address(this));
+    /// @dev Returns the amount pushed so callers can feed the flow ledger.
+    ///      Callers that ignore the return value are unaffected.
+    function _pushAllToVault(address token) internal returns (uint256 bal) {
+        bal = IERC20(token).balanceOf(address(this));
         if (bal > 0) IERC20(token).safeTransfer(_vault, bal);
+    }
+
+    /// @dev Record vault asset taken from the vault for deployment.
+    function _recordDeployed(uint256 amount) internal {
+        _assetDeployed += amount;
+    }
+
+    /// @dev Record vault asset handed back to the vault.
+    function _recordReturned(uint256 amount) internal {
+        _assetReturned += amount;
+    }
+
+    /// @notice Cost basis derived from this strategy's own vault-asset flows:
+    ///         what it took from the vault, less what it gave back.
+    ///
+    /// @dev    THE SHARED IMPLEMENTATION of `unpricedCostBasis()` for templates
+    ///         that deliberately settle holding inventory they decline to price.
+    ///         What a strategy took and did not return is, by definition, what
+    ///         it spent on whatever it is still holding — no price is consulted
+    ///         to reach that figure, which is the point: it is a COST, not a
+    ///         valuation.
+    ///
+    ///         Settled-only, because before settlement the strategy is still
+    ///         working and the difference is capital in flight rather than
+    ///         capital converted. Reads no balances, so inventory moving off the
+    ///         clone — `sweep()` handing it to the vault, which does not price
+    ///         it either — cannot collapse the figure and resurrect the false
+    ///         loss it exists to prevent.
+    ///
+    ///         Deliberately NOT updated by `sweep()`: the figure is consumed at
+    ///         settlement, and the sweep path runs under a hard gas cap sized
+    ///         for exactly three balance reads and three transfers.
+    function _flowCostBasis() internal view returns (uint256) {
+        if (_state != State.Settled) return 0;
+        uint256 out_ = _assetDeployed;
+        uint256 back = _assetReturned;
+        return out_ > back ? out_ - back : 0;
     }
 
     // ── Abstract hooks for concrete strategies ──

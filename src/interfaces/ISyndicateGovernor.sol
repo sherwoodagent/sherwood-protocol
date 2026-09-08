@@ -115,6 +115,26 @@ interface ISyndicateGovernor {
         ///         the TierRegistry at propose time. 2 whenever no registry
         ///         is wired — the safe default.
         uint8 envelopeTier;
+        /// @notice Snapshot, taken at propose time, of the strategy template's
+        ///         own `IStrategyDelivery.expectsUnpricedResidue()` — whether
+        ///         this proposal is expected to settle holding inventory the
+        ///         strategy declines to price. False when no strategy is named
+        ///         or the address does not answer.
+        ///
+        ///         DELIBERATELY NOT A PROPOSER INPUT. Read from the certified
+        ///         template so it cannot be asserted to buy drawdown relief a
+        ///         strategy has not earned, and snapshotted here so a guardian
+        ///         reviewing the proposal sees the intent before execution
+        ///         rather than at settlement.
+        /// @dev    PACKED, NOT APPENDED, and deliberately: `maxDrawdownBps`
+        ///         (`uint16`) and `envelopeTier` (`uint8`) use 3 bytes of their
+        ///         slot, so this `bool` takes a free byte in that same slot and
+        ///         shifts no later member's offset. The append-only rule above
+        ///         exists to protect the mapping layout of an already-upgraded
+        ///         beacon governor; occupying padding in an existing slot
+        ///         preserves that layout exactly, which the storage-layout
+        ///         assertion in the test suite pins.
+        bool expectsUnpricedResidue;
         /// @notice Extractable-value figure the aggregate exposure cap consumes:
         ///         the SUM of per-call contributions across execute AND settlement
         ///         calls, `sum(cap_i * boundBps_i) / 10_000`, where `cap_i` is that
@@ -333,6 +353,18 @@ interface ISyndicateGovernor {
     /// @notice Revert if `envelope.maxDrawdownBps > 10_000` at propose — a
     ///         drawdown declaration cannot exceed 100% of committed capital.
     error InvalidDrawdown();
+
+    /// @notice A settling strategy reported a nonzero unpriced cost basis on a
+    ///         proposal that never declared it would convert capital.
+    /// @dev    The strategy is the source of truth for the AMOUNT and the
+    ///         proposal for the INTENT; this is the case where they disagree.
+    ///         Refusing here keeps the guarantee that a guardian reviewing a
+    ///         proposal cannot be surprised by a conversion at settlement.
+    ///         Scoped to the ordinary permissionless settle path — the
+    ///         owner-gated rescue and emergency paths still finish, since
+    ///         wedging the position that most needs to exit is the one outcome
+    ///         worse than a late declaration.
+    error UndeclaredUnpricedResidue(uint256 reported);
     /// @notice `setTierRegistry` was handed zero or a codeless address (pashov
     ///         finding #1). Un-wiring re-opens `SyndicateVault._guardBatchCalls`
     ///         (it degrades OPEN with no registry); a codeless address bricks
@@ -552,6 +584,21 @@ interface ISyndicateGovernor {
     event ProposalVetoed(uint256 indexed proposalId, address indexed vetoedBy);
 
     event EmergencySettled(uint256 indexed proposalId, address indexed vault, int256 pnl, uint256 customCallCount);
+
+    /// @notice Emitted at settlement when vault capital was converted into
+    ///         inventory the strategy declines to price, carrying the clamped
+    ///         cost basis credited to P&L and to the drawdown gates.
+    ///
+    /// @dev    A COMPANION, NOT A FIELD ON `ProposalSettled`. Appending to that
+    ///         event would break every consumer decoding it, and the figure is
+    ///         absent from the overwhelming majority of settlements. Consumers
+    ///         SHOULD render this as capital deployed into an unpriced position
+    ///         rather than as profit or loss: `ProposalSettled.pnl` is now
+    ///         credited by this amount, so a clean conversion reports
+    ///         approximately zero rather than its whole deployment as a loss.
+    ///
+    ///         NOT A VALUATION of the inventory. It is what the fund PAID.
+    event UnpricedConversion(uint256 indexed proposalId, address indexed vault, uint256 costBasis);
 
     // There is no setter for the guardian registry. The slot is write-only
     // at `initialize`; migration happens through a governor UUPS upgrade.
@@ -900,6 +947,12 @@ interface ISyndicateGovernor {
     ///         Unambiguous here: `maxCapital == 0` is rejected at propose, so a
     ///         zero `maxCapital` reliably means "no such proposal".
     function getRiskEnvelope(uint256 proposalId) external view returns (uint256 maxCapital, uint16 maxDrawdownBps);
+
+    /// @notice Whether this proposal declared at propose time that it expects to
+    ///         settle holding unpriced inventory.
+    /// @dev    Separate view rather than a third `getRiskEnvelope` return value,
+    ///         so existing callers destructuring that tuple keep compiling.
+    function expectsUnpricedResidue(uint256 proposalId) external view returns (bool);
 
     /// @notice The coverage-proportional effective capital stored at execute
     ///         (issue #27) — 0 before execution, `maxCapital` on ungated

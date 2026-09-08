@@ -273,6 +273,47 @@ contract ConcentratedLiquidityStrategyPartialSettleTest is SettleFixture {
         }
         return false;
     }
+
+    // ── Unpriced cost basis ──
+
+    /// @notice This template announces that it may settle holding value it
+    ///         cannot price.
+    /// @dev    Unconditional, and cheap to be so: a clean unwind reports a zero
+    ///         basis and is credited nothing (see below). Declaring it only
+    ///         sometimes would mean predicting at PROPOSE time whether an unwind
+    ///         will succeed, which is not knowable then.
+    function test_unpricedCostBasis_templateDeclaresConversion() public view {
+        assertTrue(strategy.expectsUnpricedResidue(), "a CL clone can settle holding a live position");
+    }
+
+    /// @notice A clean unwind earns no credit.
+    /// @dev    The declaration above costs the ordinary path nothing: everything
+    ///         taken from the vault came back, so there is no cost basis to
+    ///         report and settlement measures P&L exactly as it always did.
+    function test_unpricedCostBasis_cleanUnwindReportsNothing() public {
+        _execute();
+        _settle();
+        assertEq(strategy.unpricedCostBasis(), 0, "nothing is still held, so nothing was converted");
+    }
+
+    /// @notice A position that could not be unwound is not a loss.
+    /// @dev    THE CL HALF OF THE DEFECT, which predates the launchpad work. An
+    ///         unwind that fails leaves the position with the fund, and
+    ///         settlement previously reported the entire contribution as lost —
+    ///         understating P&L and consuming the proposal's drawdown envelope
+    ///         for value that never left.
+    function test_unpricedCostBasis_livePositionIsNotALoss() public {
+        _execute();
+        uint256 tid = strategy.tokenId();
+        // Credit fees the position manager was never funded for, so the collect
+        // inside the unwind reverts and the position survives settlement.
+        posm.accrueFees(tid, uint128(1_000_000e6), 0);
+        _settle();
+
+        assertEq(strategy.tokenId(), tid, "precondition: the position is still open");
+        assertTrue(strategy.hasUnvaluedResidue(), "and the template says it cannot price it");
+        assertGt(strategy.unpricedCostBasis(), 0, "what it cost is reported, so it reads as converted");
+    }
 }
 
 /// @notice The last-resort release path for a residue that can never be
