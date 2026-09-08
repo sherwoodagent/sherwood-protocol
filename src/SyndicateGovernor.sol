@@ -90,12 +90,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @notice Proposal ID -> voter -> bool
     mapping(uint256 => mapping(address => bool)) private _hasVoted;
 
-    struct Ballot {
-        VoteType support;
-        uint256 weight;
-        uint256 cast;
-    }
-
     /// @notice Proposal ID -> vault balance at execution time
     mapping(uint256 => uint256) private _capitalSnapshots;
 
@@ -270,18 +264,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      collectable — which is the honest failure mode.
     mapping(uint256 => address[]) private _sandboxTokens;
 
-    uint256 private _voteExitPid;
-
-    uint256 private _voteExitShares;
-
-    mapping(uint256 => mapping(address => Ballot)) private _ballots;
-
     /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31)
     ///      for the three mappings above, then 1 more for `_escrowedFees`, then
     ///      1 more for `_ppsSnapshots`, then 3 more for the sandbox payload
-    ///      (23 -> 20) — append-only. See
+    ///      (23) — append-only. See
     ///      `script/syndicate-governor-layout.golden.json`.
-    uint256[20] private __gap;
+    uint256[23] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -542,7 +530,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
         // Sequential storage writes instead of struct literal to avoid Yul
         // stack-too-deep under the coverage config (optimizer/viaIR off).
-        // votesFor / votesAgainst / votesAbstain / executedAt default to 0.
+        // votesAgainst / executedAt default to 0.
         StrategyProposal storage p = _proposals[proposalId];
         p.id = proposalId;
         p.proposer = msg.sender;
@@ -604,80 +592,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_commitState(proposal) != ProposalState.Pending) revert NotWithinVotingPeriod();
         if (_hasVoted[proposalId][msg.sender]) revert AlreadyVoted();
 
+        // Snapshot weight is final: no share can leave the vault while the
+        // proposal is open (`SyndicateVault.redemptionsLocked`), so no live cap.
         uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, proposal.snapshotTimestamp);
-        uint256 liveWeight = IVotes(proposal.vault).getVotes(msg.sender);
-        if (liveWeight < weight) weight = liveWeight;
         if (weight == 0) revert NoVotingPower();
 
         _hasVoted[proposalId][msg.sender] = true;
-        // if the voter's weight later moves. What is stored is the CAPPED
-        // weight -- the snapshot figure less anything already gone -- so the
-        // recompute below can never restore weight the voter did not carry
-        // when they voted.
-        _ballots[proposalId][msg.sender] = Ballot({support: support, weight: weight, cast: weight});
-
-        if (support == VoteType.For) {
-            proposal.votesFor += weight;
-        } else if (support == VoteType.Against) {
-            proposal.votesAgainst += weight;
-        } else {
-            proposal.votesAbstain += weight;
-        }
+        // Approval is optimistic: only Against votes are tallied, for the veto.
+        if (support == VoteType.Against) proposal.votesAgainst += weight;
 
         emit VoteCast(proposalId, msg.sender, support, weight);
-    }
-
-    function notifyShareExit(uint256 shares) external {
-        if (msg.sender != GovernorParameters.vault) return;
-        if (shares == 0) return;
-        (uint256 pid,) = _openVote();
-        if (pid == 0) return;
-
-        if (_voteExitPid != pid) {
-            _voteExitPid = pid;
-            _voteExitShares = 0;
-        }
-        _voteExitShares += shares;
-    }
-
-    function notifyVotingWeightMoved(address voter) external {
-        if (msg.sender != GovernorParameters.vault) return;
-        (uint256 pid, StrategyProposal storage p) = _openVote();
-        if (pid == 0) return;
-
-        Ballot storage b = _ballots[pid][voter];
-        uint256 cast = b.cast;
-        if (cast == 0) return;
-
-        uint256 live = IVotes(p.vault).getVotes(voter);
-        uint256 want = live < cast ? live : cast;
-        uint256 have = b.weight;
-        if (want == have) return;
-        b.weight = want;
-
-        if (want < have) {
-            uint256 cut = have - want;
-            if (b.support == VoteType.For) p.votesFor -= cut;
-            else if (b.support == VoteType.Against) p.votesAgainst -= cut;
-            else p.votesAbstain -= cut;
-            emit VoteWithdrawnOnExit(pid, voter, cut);
-        } else {
-            uint256 back = want - have;
-            if (b.support == VoteType.For) p.votesFor += back;
-            else if (b.support == VoteType.Against) p.votesAgainst += back;
-            else p.votesAbstain += back;
-            emit VoteRestoredOnReturn(pid, voter, back);
-        }
-    }
-
-    function _openVote() internal view returns (uint256 pid, StrategyProposal storage p) {
-        pid = _proposalCount;
-        p = _proposals[pid];
-        if (p.id == 0 || p.state != ProposalState.Pending || block.timestamp > p.voteEnd) pid = 0;
-    }
-
-    function _exitedDuringVote(uint256 proposalId) internal view override returns (uint256) {
-        return _voteExitPid == proposalId ? _voteExitShares : 0;
     }
 
     /// @inheritdoc ISyndicateGovernor

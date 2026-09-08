@@ -86,10 +86,6 @@ contract SyndicateVault is
     ///      per-vault `maxPerformanceFeeBps` of 20%.
     uint256 public constant MAX_AGENT_FEE_BPS = FeeConstants.MAX_PERFORMANCE_FEE_BPS;
 
-    uint256 public constant GOVERNANCE_REPORT_GAS = 200_000;
-
-    bytes32 private constant GOVERNOR_CACHE_TSLOT = 0x3d666d22fecad437fb3fcdb6d4d99cadd645515732500b6579243e4b695e2d31;
-
     /// @notice Cap on the owner-set idle-liquidity floor (50%).
     uint256 private constant MAX_MIN_BUFFER_BPS = 5_000;
 
@@ -737,14 +733,8 @@ contract SyndicateVault is
         return ISyndicateFactory(_factory).governorOf(address(this));
     }
 
-    /// @dev Active proposal id binding this vault, read through the governor (0
-    ///      when none active). Shared body for the Lane-A lock + async request
-    ///      paths. Distinct from `redemptionsLocked` / `_activeStrategy`, which
-    ///      additionally guard a zero governor — those keep their own reads.
-    function _activePid() private view returns (uint256) {
-        return IProposalStatus(_getGovernor()).getActiveProposal();
-    }
-
+    /// @dev Id of the proposal currently binding the vault: the executing one, else
+    ///      the latest (open from propose). Tags every queued request.
     function _openProposalPid() private view returns (uint256) {
         address gov = _getGovernor();
         uint256 active = IProposalStatus(gov).getActiveProposal();
@@ -1114,13 +1104,13 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev Fail-closed on missing governor: if the factory is misconfigured
-    ///      and `governor() == address(0)`, deposits / withdrawals / rescues
-    ///      must NOT silently unlock. Revert instead.
+    /// @dev True from propose to settle: no share is minted or burned while a
+    ///      proposal is open, so the veto denominator cannot move (SHE-205).
+    ///      Fail-closed on a missing governor.
     function redemptionsLocked() public view returns (bool) {
         address gov = _getGovernor();
         if (gov == address(0)) revert GovernorNotSet();
-        return IProposalStatus(gov).getActiveProposal() != 0;
+        return IProposalStatus(gov).openProposalCount() != 0;
     }
 
     /// @inheritdoc ISyndicateVault
@@ -1191,53 +1181,8 @@ contract SyndicateVault is
             _highWaterPricePerShare = 0;
         }
 
-        if (to == address(0) && from != address(0) && from != _withdrawalQueue && value != 0) {
-            _reportToGovernor(abi.encodeWithSignature("notifyShareExit(uint256)", value));
-        }
-
         if (to != address(0) && delegates(to) == address(0)) {
             _delegate(to, to);
-        }
-    }
-
-    function _moveDelegateVotes(address from, address to, uint256 amount) internal override {
-        super._moveDelegateVotes(from, to, amount);
-        if (from == to || amount == 0) return;
-        address q = _withdrawalQueue;
-        if (from != address(0) && from != q) {
-            _reportToGovernor(abi.encodeWithSignature("notifyVotingWeightMoved(address)", from));
-        }
-        if (to != address(0) && to != q) {
-            _reportToGovernor(abi.encodeWithSignature("notifyVotingWeightMoved(address)", to));
-        }
-    }
-
-    function _reportToGovernor(bytes memory data) private {
-        uint256 g = gasleft();
-        uint256 fundable = g - g / 64;
-        if (fundable < GOVERNANCE_REPORT_GAS) revert GovernanceReportUnderfunded(fundable, GOVERNANCE_REPORT_GAS);
-
-        address gov = _cachedGovernor();
-        if (gov == address(0)) return;
-        // solhint-disable-next-line avoid-low-level-calls
-        (bool ok,) = gov.call{gas: GOVERNANCE_REPORT_GAS}(data);
-        ok; // deliberately unchecked — see above
-    }
-
-    function _cachedGovernor() private returns (address gov) {
-        bytes32 slot = GOVERNOR_CACHE_TSLOT;
-        // solhint-disable-next-line no-inline-assembly
-        assembly ("memory-safe") {
-            gov := tload(slot)
-        }
-        if (gov != address(0)) return gov;
-        (bool ok, bytes memory ret) = _factory.staticcall(abi.encodeCall(ISyndicateFactory.governorOf, (address(this))));
-        if (!ok || ret.length != 32) return address(0);
-        gov = abi.decode(ret, (address));
-        if (gov == address(0)) return gov;
-        // solhint-disable-next-line no-inline-assembly
-        assembly ("memory-safe") {
-            tstore(slot, gov)
         }
     }
 
@@ -1321,7 +1266,7 @@ contract SyndicateVault is
     ///         same predicate as an instant one, or the gate has a hole the
     ///         width of the async path.
     function depositsLocked() public view returns (bool) {
-        if (IProposalStatus(_getGovernor()).openProposalCount() != 0) return true;
+        if (redemptionsLocked()) return true;
         // The ONLY residue that still blocks rather than prices: value no
         // template can express in vault-asset units without an oracle. See
         // `_unvaluedCount`.
@@ -1880,7 +1825,7 @@ contract SyndicateVault is
         if (msg.sender != owner_) {
             _spendAllowance(owner_, msg.sender, shares);
         }
-        uint256 pid = _activePid();
+        uint256 pid = _openProposalPid();
         _transfer(owner_, q, shares);
         requestId = IVaultWithdrawalQueue(q).queueRedeem(owner_, shares, pid);
         emit RedeemRequested(requestId, owner_, shares);
@@ -1891,14 +1836,8 @@ contract SyndicateVault is
     ///         Escrows `assets` in the queue (off-vault, so they never inflate
     ///         `totalAssets` nor get swept into the strategy) and records a claim
     ///         that mints shares at the realized settle price.
-    /// @dev Gated on `openProposalCount() != 0` — the SAME predicate the instant
-    ///      path closes on — not `redemptionsLocked()`, which is true only from
-    ///      EXECUTE onward. Those two diverge for the whole
-    ///      Pending/GuardianReview/Approved window: instant deposit is already
-    ///      closed there, so gating on `redemptionsLocked()` left NO path to
-    ///      deposit at all for that window. `openProposalCount()` covers exactly
-    ///      the window instant deposit is closed for, so exactly one path is
-    ///      always open.
+    /// @dev Gated on `openProposalCount() != 0`, the predicate instant deposit
+    ///      closes on, so exactly one deposit path is always open.
     /// @return requestId Always > 0 (the queue uses index 0 as a sentinel).
     function requestDeposit(uint256 assets, address receiver)
         external
@@ -1911,9 +1850,6 @@ contract SyndicateVault is
         if (IProposalStatus(_getGovernor()).openProposalCount() == 0) revert NoOpenProposal();
         if (assets == 0) revert ZeroAssets();
         _requireApprovedDepositor(receiver);
-        // Tag with the currently open proposal's id (see `_openProposalPid`) —
-        // NOT `_activePid()`, which is still 0 for any request placed before
-        // EXECUTE.
         uint256 pid = _openProposalPid();
         // Escrow assets in the queue (off-vault custody — never counted in
         // totalAssets, never swept into the strategy).

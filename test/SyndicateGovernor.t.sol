@@ -440,6 +440,10 @@ contract SyndicateGovernorTest is Test {
 
     function test_vote() public {
         uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        uint256 lp1Weight = vault.balanceOf(lp1);
+        // For votes are not tallied (approval is optimistic); the event carries the weight.
+        vm.expectEmit(true, true, false, true);
+        emit ISyndicateGovernor.VoteCast(proposalId, lp1, ISyndicateGovernor.VoteType.For, lp1Weight);
         vm.prank(lp1);
         governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
         vm.prank(lp2);
@@ -450,7 +454,6 @@ contract SyndicateGovernorTest is Test {
         assertFalse(governor.hasVoted(proposalId, random));
 
         ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
-        assertEq(p.votesFor, vault.balanceOf(lp1));
         assertEq(p.votesAgainst, vault.balanceOf(lp2));
     }
 

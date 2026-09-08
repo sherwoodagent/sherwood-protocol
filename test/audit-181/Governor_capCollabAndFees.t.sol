@@ -202,12 +202,12 @@ contract Governor_capCollabAndFeesTest is Test {
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
 
-        // Nothing blocks this: `redemptionsLocked()` only rises once
-        // `executeProposal` sets `_activeProposal`, which hasn't happened
-        // yet. An honest LP redeeming mid-vote shrinks totalAssets() below
-        // the value `maxCapital` was priced against at propose.
-        vm.prank(lp1);
-        vault.withdraw(5_000e6, lp1, lp1);
+        // Instant redeem is closed from propose (SHE-258), so model the float
+        // shrinking below the value `maxCapital` was priced against by moving
+        // asset out of the vault directly: the execute-time ceiling re-read is
+        // defence in depth against ANY shrink, whatever its cause.
+        vm.prank(address(vault));
+        usdc.transfer(address(0xdead), 5_000e6);
 
         assertEq(
             (vault.totalAssets() * governor.maxCapitalBps()) / 10_000,

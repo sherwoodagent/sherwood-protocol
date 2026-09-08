@@ -229,28 +229,10 @@
       "type": "t_mapping(t_uint256,t_array(t_address)dyn_storage)"
     },
     {
-      "label": "_voteExitPid",
+      "label": "__gap",
       "slot": "69",
       "offset": 0,
-      "type": "t_uint256"
-    },
-    {
-      "label": "_voteExitShares",
-      "slot": "70",
-      "offset": 0,
-      "type": "t_uint256"
-    },
-    {
-      "label": "_ballots",
-      "slot": "71",
-      "offset": 0,
-      "type": "t_mapping(t_uint256,t_mapping(t_address,t_struct(SyndicateGovernor.Ballot)_storage))"
-    },
-    {
-      "label": "__gap",
-      "slot": "72",
-      "offset": 0,
-      "type": "t_array(t_uint256)20_storage"
+      "type": "t_array(t_uint256)23_storage"
     }
   ],
   "types": {
@@ -448,154 +430,122 @@
         "type": "t_uint256"
       },
       {
-        "label": "votesFor",
+        "label": "votesAgainst",
         "slot": "7",
         "offset": 0,
         "type": "t_uint256"
       },
       {
-        "label": "votesAgainst",
+        "label": "snapshotTimestamp",
         "slot": "8",
         "offset": 0,
         "type": "t_uint256"
       },
       {
-        "label": "votesAbstain",
+        "label": "voteEnd",
         "slot": "9",
         "offset": 0,
         "type": "t_uint256"
       },
       {
-        "label": "snapshotTimestamp",
+        "label": "reviewEnd",
         "slot": "10",
         "offset": 0,
         "type": "t_uint256"
       },
       {
-        "label": "voteEnd",
+        "label": "executeBy",
         "slot": "11",
         "offset": 0,
         "type": "t_uint256"
       },
       {
-        "label": "reviewEnd",
+        "label": "executedAt",
         "slot": "12",
         "offset": 0,
         "type": "t_uint256"
       },
       {
-        "label": "executeBy",
-        "slot": "13",
-        "offset": 0,
-        "type": "t_uint256"
-      },
-      {
-        "label": "executedAt",
-        "slot": "14",
-        "offset": 0,
-        "type": "t_uint256"
-      },
-      {
         "label": "state",
-        "slot": "15",
+        "slot": "13",
         "offset": 0,
         "type": "t_enum(ProposalState)"
       },
       {
         "label": "vetoThresholdBps",
-        "slot": "16",
+        "slot": "14",
         "offset": 0,
         "type": "t_uint256"
       },
       {
         "label": "snapshotProtocolFeeRecipient",
-        "slot": "17",
+        "slot": "15",
         "offset": 0,
         "type": "t_address"
       },
       {
         "label": "snapshotGuardiansFeeRecipient",
-        "slot": "18",
+        "slot": "16",
         "offset": 0,
         "type": "t_address"
       },
       {
         "label": "maxCapital",
-        "slot": "19",
+        "slot": "17",
         "offset": 0,
         "type": "t_uint256"
       },
       {
         "label": "maxDrawdownBps",
-        "slot": "20",
+        "slot": "18",
         "offset": 0,
         "type": "t_uint16"
       },
       {
         "label": "envelopeTier",
-        "slot": "20",
+        "slot": "18",
         "offset": 2,
         "type": "t_uint8"
       },
       {
         "label": "requiredCoverage",
-        "slot": "21",
+        "slot": "19",
         "offset": 0,
         "type": "t_uint256"
       },
       {
         "label": "proposerBondWood",
-        "slot": "22",
+        "slot": "20",
         "offset": 0,
         "type": "t_uint256"
       },
       {
         "label": "proposerBondEscrow",
-        "slot": "23",
+        "slot": "21",
         "offset": 0,
         "type": "t_address"
       },
       {
         "label": "snapshotMgmtSplit",
-        "slot": "24",
+        "slot": "22",
         "offset": 0,
         "type": "t_struct(IProtocolConfig.MgmtSplit)_storage"
       },
       {
         "label": "snapshotPerfSplit",
-        "slot": "25",
+        "slot": "23",
         "offset": 0,
         "type": "t_struct(IProtocolConfig.PerfSplit)_storage"
       },
       {
         "label": "proposerBondLedger",
-        "slot": "26",
+        "slot": "24",
         "offset": 0,
         "type": "t_address"
       },
       {
         "label": "effectiveMaxCapital",
-        "slot": "27",
-        "offset": 0,
-        "type": "t_uint256"
-      }
-    ],
-    "t_struct(SyndicateGovernor.Ballot)_storage": [
-      {
-        "label": "support",
-        "slot": "0",
-        "offset": 0,
-        "type": "t_enum(VoteType)"
-      },
-      {
-        "label": "weight",
-        "slot": "1",
-        "offset": 0,
-        "type": "t_uint256"
-      },
-      {
-        "label": "cast",
-        "slot": "2",
+        "slot": "25",
         "offset": 0,
         "type": "t_uint256"
       }

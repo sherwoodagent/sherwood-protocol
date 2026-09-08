@@ -9,22 +9,18 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 
-/// @title Vault_redemptionLockSemantics — MS-H4 regression
-/// @notice Verifies the deposit-side lock now covers the full
+/// @title Vault_redemptionLockSemantics — MS-H4 / SHE-258 regression
+/// @notice Both the deposit-side and the redeem-side lock cover the full
 ///         Pending → GuardianReview → Approved → Executed window via
-///         `openProposalCount`, while withdrawals retain the legacy
-///         Executed-only lock (`getActiveProposal != 0`). The audit's
-///         late-deposit window — depositor enters during Pending, gets
-///         executed by the next `executeProposal` into a strategy they
-///         never voted on — is closed for all four pre-execute states.
+///         `openProposalCount`: no share is minted or burned while a proposal
+///         is open, so the audit's late-deposit window and SHE-205's
+///         exit-inflated veto bar are both closed for all four states.
 /// @dev Drives the vault directly with mocked governor reads. The two
 ///      governor selectors that matter:
-///        - `getActiveProposal(address)` = 0 outside Executed,
-///                                       != 0 during Executed.
-///        - `openProposalCount(address)` = 0 outside Pending..Executed,
-///                                        != 0 from Pending through Executed
-///                                        (incremented on Draft→Pending,
-///                                         decremented on terminal edges).
+///        - `getActiveProposal()` = 0 outside Executed, != 0 during Executed
+///          (drives `activeStrategyAdapter()` only).
+///        - `openProposalCount()` = 0 outside Pending..Executed, != 0 from
+///          Pending through Executed (drives BOTH locks).
 contract VaultRedemptionLockSemanticsTest is Test {
     SyndicateVault vault;
     BatchExecutorLib executorLib;
@@ -70,8 +66,8 @@ contract VaultRedemptionLockSemanticsTest is Test {
     }
 
     /// @dev Mocks the two governor view selectors used by the vault locks.
-    ///      `active` drives `redemptionsLocked()` (Executed); `openCount`
-    ///      drives the MS-H4 deposit lock (Pending..Executed). Optional
+    ///      `openCount` drives both locks (Pending..Executed); `active` only
+    ///      selects the strategy adapter for Executed. Optional
     ///      `strategy` parameter (defaults to address(0)) is the address the
     ///      vault will resolve as `activeStrategyAdapter()` via
     ///      `strategyOf(activePid)`.
@@ -149,25 +145,23 @@ contract VaultRedemptionLockSemanticsTest is Test {
     // ──────────────────────── MS-H4: withdraw lock asymmetry ────────────────────────
 
     /// @notice Withdrawals during Pending..Approved (no active proposal yet)
-    ///         MUST be allowed — the strategy hasn't started, the vault is
-    ///         float-only, and forcing LPs through async-redeem during voting
-    ///         would degrade UX without any safety benefit. Asymmetric with
-    ///         the deposit lock by design.
-    function test_withdraw_allowedDuringPending() public {
-        // Seed alice with shares while unlocked.
+    ///         MUST revert: a share that leaves mid-vote shrinks the supply the
+    ///         veto bar was snapshotted against (SHE-205). Symmetric with the
+    ///         deposit lock.
+    function test_withdraw_revertsDuringPending() public {
         _mockState({active: false, openCount: 0});
         vm.prank(alice);
         vault.deposit(1_000e6, alice);
         uint256 shares = vault.balanceOf(alice);
 
-        // Open proposal goes Pending — withdrawals stay open.
         _mockState({active: false, openCount: 1});
-        uint256 maxW = vault.maxWithdraw(alice);
-        assertGt(maxW, 0, "withdraw not blocked during Pending");
+        assertTrue(vault.redemptionsLocked(), "locked from propose");
+        assertEq(vault.maxWithdraw(alice), 0, "withdraw blocked during Pending");
+        assertEq(vault.maxRedeem(alice), 0, "redeem blocked during Pending");
 
         vm.prank(alice);
-        uint256 redeemed = vault.redeem(shares, alice, alice);
-        assertGt(redeemed, 0, "redeem succeeds during Pending");
+        vm.expectRevert();
+        vault.redeem(shares, alice, alice);
     }
 
     /// @notice Withdrawals during Executed MUST revert — instant exit is closed
@@ -186,17 +180,16 @@ contract VaultRedemptionLockSemanticsTest is Test {
 
     // ──────────────────────── Sanity: rescue lock unchanged ────────────────────────
 
-    /// @notice Rescue paths still gate on `redemptionsLocked()` (Executed
-    ///         only) — unchanged by MS-H4. During Pending they remain open.
-    ///         During Executed they revert.
-    function test_rescueERC20_unaffectedByPending() public {
+    /// @notice Rescue paths gate on `redemptionsLocked()`, which now rises at
+    ///         propose: blocked during Pending as well as Executed.
+    function test_rescueERC20_blockedDuringPending() public {
         ERC20Mock other = new ERC20Mock("Other", "OTH", 18);
         other.mint(address(vault), 100e18);
 
         _mockState({active: false, openCount: 1}); // Pending
         vm.prank(owner);
+        vm.expectRevert(ISyndicateVault.RedemptionsLocked.selector);
         vault.rescueERC20(address(other), owner, 100e18);
-        assertEq(other.balanceOf(owner), 100e18);
     }
 
     function test_rescueERC20_blockedDuringExecuted() public {

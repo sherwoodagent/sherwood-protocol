@@ -86,9 +86,8 @@ interface ISyndicateGovernor {
         ///         voters approved. Clamped to `maxPerformanceFeeBps` at settle.
         uint256 performanceFeeBps;
         uint256 strategyDuration;
-        uint256 votesFor;
+        /// @notice Against weight only: approval is optimistic, the tally exists for the veto.
         uint256 votesAgainst;
-        uint256 votesAbstain;
         uint256 snapshotTimestamp;
         uint256 voteEnd;
         uint256 reviewEnd; // guardian review window end; zero for collaborative drafts
@@ -254,11 +253,9 @@ interface ISyndicateGovernor {
     /// @notice Fail-safe sibling to `TierRegressed`/`CoverageRegressed`: revert at
     ///         execute if `proposal.maxCapital` now exceeds the LIVE
     ///         `totalAssets() * maxCapitalBps / 10_000` ceiling. The propose-time
-    ///         check alone is not sufficient: `depositsLocked()` rises at PROPOSE
-    ///         but `redemptionsLocked()` only at EXECUTE, so between the two a
-    ///         proposer can inflate `totalAssets()` with its own deposit to pass
-    ///         the propose-time ratio, then redeem that same deposit during the
-    ///         vote. Distinct from `MaxCapitalExceedsCeiling` so indexers can tell
+    ///         check alone is not sufficient: `totalAssets()` can still fall
+    ///         between propose and execute (fees, losses), so the ratio is
+    ///         re-read. Distinct from `MaxCapitalExceedsCeiling` so indexers can tell
     ///         a propose-time rejection from an execute-time regression.
     error MaxCapitalCeilingRegressed();
     error StrategyAlreadyActive();
@@ -504,8 +501,6 @@ interface ISyndicateGovernor {
     event PerformanceFeeCharged(uint256 indexed proposalId, address indexed asset, uint256 amount, uint256 aboveMark);
 
     event VoteCast(uint256 indexed proposalId, address indexed voter, VoteType support, uint256 weight);
-    event VoteWithdrawnOnExit(uint256 indexed proposalId, address indexed voter, uint256 weight);
-    event VoteRestoredOnReturn(uint256 indexed proposalId, address indexed voter, uint256 weight);
 
     event ProposalExecuted(uint256 indexed proposalId, address indexed vault, uint256 capitalSnapshot);
 

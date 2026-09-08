@@ -130,7 +130,6 @@ interface ISyndicateVault {
     ///         the tier system prices, so this is refused regardless of the
     ///         TierRegistry's presence or the `to` recipient.
     error DisallowedTransferFromSource(address target, address from);
-    error GovernanceReportUnderfunded(uint256 available, uint256 required);
 
     // ── Init Params ──
     struct InitParams {

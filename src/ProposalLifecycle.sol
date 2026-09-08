@@ -54,11 +54,6 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         return _openProposalCount;
     }
 
-    function _exitedDuringVote(uint256 proposalId) internal view virtual returns (uint256) {
-        proposalId; // silence unused-parameter warning in the default
-        return 0;
-    }
-
     function _computeState(StrategyProposal storage p)
         internal
         view
@@ -83,8 +78,6 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             address queue = ISyndicateVault(p.vault).withdrawalQueue();
             uint256 queueVotes = queue == address(0) ? 0 : IVotes(p.vault).getPastVotes(queue, p.snapshotTimestamp);
             uint256 liveSupply = pastTotalSupply > queueVotes ? pastTotalSupply - queueVotes : 0;
-            uint256 exited = _exitedDuringVote(p.id);
-            liveSupply = liveSupply > exited ? liveSupply - exited : 0;
             if (liveSupply > 0) {
                 uint256 vetoThreshold = (liveSupply * p.vetoThresholdBps) / BPS_DENOMINATOR;
                 // FLOOR AT ONE VOTE. Integer division sends the threshold to
