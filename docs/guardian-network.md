@@ -226,7 +226,7 @@ new-calldata escape hatch is gated.
 
 ## How guardians get paid
 
-The guardian network earns 10% of every management fee and 15% of every performance
+The guardian network earns 20% of every management fee and 25% of every performance
 fee (see [fees.md](fees.md)). Fees are delivered in the vault's asset to
 `guardiansFeeRecipient` and converted to WOOD off-chain via weekly Merkl buyback;
 `GuardianFeeAccrued` events provide per-guardian attribution weights. There are no
