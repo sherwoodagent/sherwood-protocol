@@ -69,21 +69,18 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         if (stored == ProposalState.Pending) {
             if (block.timestamp <= p.voteEnd) return (ProposalState.Pending, false);
 
-            // Voting ended — optimistic: approved unless AGAINST votes reach the
-            // veto threshold.
-            // Skip the veto check when liveSupply == 0, otherwise the
-            // threshold collapses to 0 and every proposal auto-rejects.
-            // Reads the vetoThresholdBps snapshot taken at Draft -> Pending,
-            // not a live param, so mid-vote finalizes don't move the bar.
-            // min(snapshot, live): a redeem ordered ahead of propose in its block is in the snapshot
-            // but gone from supply, and supply cannot move while the proposal is open. The queue
-            // term stays at the snapshot: a post-snapshot requestRedeem still votes with snapshot weight.
+            // Voting ended — optimistic: approved unless AGAINST votes reach the veto threshold.
+            // Skip the veto check when liveSupply == 0, else the bar collapses to 0 and everything auto-rejects.
+            // vetoThresholdBps is the Draft -> Pending snapshot, so mid-vote finalizes don't move the bar.
+            // Votable set at the snapshot = supply minus the queue (queued shares keep snapshot weight).
+            // Cap it at totalSupply(): a redeem ordered ahead of propose shrinks live supply but not
+            // the snapshot. Cap AFTER the queue subtraction, or a claim in the propose block is removed twice.
             uint256 pastTotalSupply = IVotes(p.vault).getPastTotalSupply(p.snapshotTimestamp);
-            uint256 nowTotalSupply = IERC20(p.vault).totalSupply();
-            if (nowTotalSupply < pastTotalSupply) pastTotalSupply = nowTotalSupply;
             address queue = ISyndicateVault(p.vault).withdrawalQueue();
             uint256 queueVotes = queue == address(0) ? 0 : IVotes(p.vault).getPastVotes(queue, p.snapshotTimestamp);
             uint256 liveSupply = pastTotalSupply > queueVotes ? pastTotalSupply - queueVotes : 0;
+            uint256 nowTotalSupply = IERC20(p.vault).totalSupply();
+            if (nowTotalSupply < liveSupply) liveSupply = nowTotalSupply;
             if (liveSupply > 0) {
                 uint256 vetoThreshold = (liveSupply * p.vetoThresholdBps) / BPS_DENOMINATOR;
                 // FLOOR AT ONE VOTE. Integer division sends the threshold to

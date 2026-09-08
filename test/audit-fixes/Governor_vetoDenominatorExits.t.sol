@@ -193,8 +193,8 @@ contract GovernorVetoDenominatorExitsTest is Test {
     }
 
     /// @notice Control: with nothing leaving in the propose block the bar is the snapshot supply
-    ///         and 39% Against does not reach the 40% bar. Live > snapshot cannot occur: deposits
-    ///         are locked from propose to settle, so the min can only ever lower the bar to the truth.
+    ///         and 39% Against does not reach the 40% bar. Live > snapshot is reachable only by a
+    ///         same-block deposit ahead of propose, and is harmless: the min then takes the snapshot.
     function test_vetoBarIsTheSnapshotSupplyWhenNothingLeftInTheProposeBlock() public {
         _deposit(lp1, 39_000e6);
         _deposit(lp2, 61_000e6);
@@ -219,6 +219,50 @@ contract GovernorVetoDenominatorExitsTest is Test {
         vm.stopPrank();
         _endVote();
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    /// @notice Queue a full redeem under pid0, settle it, and claim (burn) in the block of the next
+    ///         propose. The burned shares are gone from live supply AND still the queue's snapshot
+    ///         votes, so they must be removed once, not twice.
+    function _queueClaimThenPropose(address who) internal returns (uint256 pid1, uint256 burned) {
+        uint256 pid0 = _propose();
+        burned = vault.balanceOf(who);
+        vm.prank(who);
+        uint256 req = vault.requestRedeem(burned, who);
+        _endVote();
+        governor.executeProposal(pid0);
+        _settle(pid0);
+        vm.prank(who);
+        queue.claim(req); // same block as propose(pid1)
+        pid1 = _propose();
+        uint256 snap = governor.getProposal(pid1).snapshotTimestamp;
+        assertEq(vault.getPastTotalSupply(snap), vault.totalSupply() + burned, "snapshot still holds the burned shares");
+        assertEq(vault.getPastVotes(address(queue), snap), burned, "and the queue term counts them");
+    }
+
+    /// @notice 100k live vs 200k claimed: min-before-subtract gave liveSupply 0 and skipped the veto;
+    ///         the votable set is 100k, so 100% Against must reject.
+    function test_queuedSharesClaimedInTheProposeBlockAreNotSubtractedTwice_zeroBar() public {
+        _deposit(lp1, 100_000e6);
+        _deposit(attacker, 200_000e6);
+        (uint256 pid1,) = _queueClaimThenPropose(attacker);
+        vm.prank(lp1);
+        governor.vote(pid1, ISyndicateGovernor.VoteType.Against);
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Rejected));
+    }
+
+    /// @notice 75k/25k live vs 50k claimed: min-before-subtract halved the bar (40k -> 20k) and a
+    ///         25% Against rejected; the true bar is 40k, so it must approve.
+    function test_queuedSharesClaimedInTheProposeBlockAreNotSubtractedTwice_halvedBar() public {
+        _deposit(lp1, 75_000e6);
+        _deposit(lp2, 25_000e6);
+        _deposit(attacker, 50_000e6);
+        (uint256 pid1,) = _queueClaimThenPropose(attacker);
+        vm.prank(lp2);
+        governor.vote(pid1, ISyndicateGovernor.VoteType.Against);
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 
     function _resolveWithAgainst(uint256 againstAssets) internal returns (ISyndicateGovernor.ProposalState) {
