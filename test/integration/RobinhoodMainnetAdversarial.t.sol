@@ -453,10 +453,10 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
             BatchExecutorLib.Call({target: USDG, data: abi.encodeCall(IERC20.transfer, (sink, deployed)), value: 0})
         );
 
-        // --- Pending (voting open): deposits already shut, queue already open ---
+        // --- Pending (voting open): deposits and instant redeems shut from propose (SHE-258) ---
         uint256 pid = _propose(address(0), execCalls, _noop(), 10_000, DURATION);
         assertEq(governor.openProposalCount(), 1, "proposal did not bind the vault");
-        assertFalse(vault.redemptionsLocked(), "redemptions locked before execute");
+        assertTrue(vault.redemptionsLocked(), "redemptions not locked from propose");
 
         vm.startPrank(victim);
         IERC20(USDG).approve(address(vault), type(uint256).max);
