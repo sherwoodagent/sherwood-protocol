@@ -11,18 +11,16 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///         mints / burns / pays exactly what it's told.
 contract MockVault is ERC20("MV", "MV") {
     bool public locked;
-    /// @dev Stands in for the real vault's `depositsLocked()` — an open proposal
-    ///      OR a settled strategy still holding a residue. The queue's deposit
-    ///      claim gates on this (finding #3), so the tests drive it directly
-    ///      rather than modelling a strategy.
+    /// @dev Stands in for the real vault's `depositsLocked()` — an open
+    ///      proposal. The queue's deposit claim gates on this, so the tests
+    ///      drive it directly rather than modelling a proposal.
     bool public depositsLockedFlag;
     address public queue;
     IERC20 public immutable assetToken;
     address public lastRedeemTo;
     address public lastDepositTo;
     /// @dev Live assets->shares rate, settable so a test can move the price
-    ///      between request and claim — which is exactly what a swept-in residue
-    ///      does to the real vault. Defaults to 1:1.
+    ///      between request and claim, as a settlement does. Defaults to 1:1.
     uint256 public convertNum = 1;
     uint256 public convertDen = 1;
 
@@ -60,15 +58,13 @@ contract MockVault is ERC20("MV", "MV") {
 
     /// @dev Set the live price a deposit claim will convert at. `num/den` is
     ///      shares-per-asset: a HIGHER den (more assets backing each share)
-    ///      means a deposit mints FEWER shares, which is what a residue arriving
-    ///      into the pool does.
+    ///      means a deposit mints FEWER shares.
     function setConvertRate(uint256 num, uint256 den) external {
         convertNum = num;
         convertDen = den;
     }
 
-    /// @dev The queue's deposit claim prices through `previewDeposit`, which on
-    ///      the real vault includes value settled strategies still owe. Here it
+    /// @dev The queue's deposit claim prices through `previewDeposit`. Here it
     ///      is just the settable rate.
     function previewDeposit(uint256 assets) external view returns (uint256) {
         return (assets * convertNum) / convertDen;

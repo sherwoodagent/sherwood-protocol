@@ -22,7 +22,7 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {MockMorpho, MockIrm} from "./mocks/MockMorpho.sol";
 import {MorphoSupplyStrategy} from "../src/strategies/MorphoSupplyStrategy.sol";
-import {MarketParams} from "../src/vendor/morpho/IMorpho.sol";
+import {Id, MarketParams} from "../src/vendor/morpho/IMorpho.sol";
 
 contract SyndicateGovernorTest is Test {
     SyndicateGovernor public governor;
@@ -859,6 +859,90 @@ contract SyndicateGovernorTest is Test {
         governor.settleProposal(pid);
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
         assertGe(vault.pricePerShare() + 2, ppsAtExecute, "settled below par after a full delivery");
+    }
+
+    /// @notice A real template that cannot fully unwind reverts settle, and the
+    ///         vault records nothing: no assets move, the price is untouched and
+    ///         the proposal stays Executed until the market can pay in full.
+    function test_settleRevertsWhenTheStrategyCannotFullyUnwind() public {
+        MockIrm irm = new MockIrm();
+        MockMorpho morpho = new MockMorpho();
+        MarketParams memory mp = MarketParams({
+            loanToken: address(usdc),
+            collateralToken: makeAddr("collateral"),
+            oracle: makeAddr("oracle"),
+            irm: address(irm),
+            lltv: 0.86e18
+        });
+        Id marketId = morpho.createMarket(mp);
+        uint256 supply = permissiveEnv.maxCapital;
+        MorphoSupplyStrategy strat = MorphoSupplyStrategy(Clones.clone(address(new MorphoSupplyStrategy())));
+        strat.initialize(address(vault), agent, abi.encode(address(morpho), mp, supply));
+
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(strat), supply)), value: 0
+        });
+        execCalls[1] =
+            BatchExecutorLib.Call({target: address(strat), data: abi.encodeCall(strat.execute, ()), value: 0});
+        uint256[] memory execCaps = new uint256[](2);
+        execCaps[1] = supply;
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] =
+            BatchExecutorLib.Call({target: address(strat), data: abi.encodeCall(strat.settle, ()), value: 0});
+
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(strat),
+            "ipfs://illiquid",
+            7 days,
+            permissiveEnv,
+            execCalls,
+            execCaps,
+            settleCalls,
+            new uint256[](1),
+            _emptyCoProposers()
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.For);
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(pid);
+
+        // A borrower takes most of the market and does not repay: the position
+        // is intact on paper but cannot be withdrawn in full.
+        address borrower = makeAddr("borrower");
+        morpho.simulateBorrow(mp, supply - 1_000e6, borrower);
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+
+        uint256 vaultBefore = usdc.balanceOf(address(vault));
+        uint256 ppsBefore = vault.pricePerShare();
+        uint256 sharesBefore = morpho.position(marketId, address(strat)).supplyShares;
+        assertGt(sharesBefore, 0, "precondition: the strategy holds the position");
+
+        vm.expectRevert(bytes("MockMorpho: insufficient liquidity"));
+        governor.settleProposal(pid);
+
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+        assertEq(usdc.balanceOf(address(vault)), vaultBefore, "a refused settle moved assets");
+        assertEq(vault.pricePerShare(), ppsBefore, "a refused settle moved the price");
+        assertEq(morpho.position(marketId, address(strat)).supplyShares, sharesBefore, "the position was touched");
+        assertTrue(vault.redemptionsLocked(), "the proposal is still open");
+
+        // Control: once the market can pay in full, the identical call settles.
+        uint256 owed = supply - 1_000e6;
+        usdc.mint(borrower, owed);
+        vm.startPrank(borrower);
+        usdc.approve(address(morpho), type(uint256).max);
+        morpho.simulateRepayAll(mp);
+        vm.stopPrank();
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertEq(morpho.position(marketId, address(strat)).supplyShares, 0, "the position was not fully unwound");
+        assertFalse(vault.redemptionsLocked(), "settlement did not reopen the vault");
     }
 
     // Legacy `emergencySettle(uint256, Call[])` is a revert stub as of Task 24.

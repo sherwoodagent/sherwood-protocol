@@ -194,9 +194,8 @@ interface ISyndicateGovernor {
     /// @param calls          The call set, stored verbatim at propose and never
     ///                       mutable afterwards — it is what guardians underwrite.
     /// @param declaredTokens Non-asset tokens the payload may end up holding. What
-    ///                       is declared is reachable by the vault's residue
-    ///                       machinery; what is not is stranded in the sandbox and
-    ///                       never priced into a deposit.
+    ///                       is declared is pushed to the vault when the sandbox
+    ///                       runs; what is not is stranded there and never priced.
     struct SandboxPayload {
         uint256 funding;
         ICallSandbox.Call[] calls;

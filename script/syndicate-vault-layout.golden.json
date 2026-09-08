@@ -103,82 +103,22 @@
       "type": "t_uint256"
     },
     {
-      "label": "_residueAmount",
-      "slot": "16",
-      "offset": 0,
-      "type": "t_mapping(t_address,t_uint256)"
-    },
-    {
-      "label": "_residueTotal",
-      "slot": "17",
-      "offset": 0,
-      "type": "t_uint256"
-    },
-    {
-      "label": "_residueCap",
-      "slot": "18",
-      "offset": 0,
-      "type": "t_mapping(t_address,t_uint256)"
-    },
-    {
-      "label": "_residueUnvalued",
-      "slot": "19",
-      "offset": 0,
-      "type": "t_mapping(t_address,t_bool)"
-    },
-    {
-      "label": "_unvaluedCount",
-      "slot": "20",
-      "offset": 0,
-      "type": "t_uint256"
-    },
-    {
-      "label": "_residuePid",
-      "slot": "21",
-      "offset": 0,
-      "type": "t_mapping(t_address,t_uint256)"
-    },
-    {
-      "label": "_residueNet",
-      "slot": "22",
-      "offset": 0,
-      "type": "t_mapping(t_address,t_uint256)"
-    },
-    {
-      "label": "_unvaluedSince",
-      "slot": "23",
-      "offset": 0,
-      "type": "t_uint256"
-    },
-    {
-      "label": "_unvaluedBurned",
-      "slot": "24",
-      "offset": 0,
-      "type": "t_mapping(t_address,t_bool)"
-    },
-    {
-      "label": "_unvaluedMarkedAt",
-      "slot": "25",
-      "offset": 0,
-      "type": "t_mapping(t_address,t_uint256)"
-    },
-    {
       "label": "_sandboxImplementation",
-      "slot": "26",
+      "slot": "16",
       "offset": 0,
       "type": "t_address"
     },
     {
       "label": "_proposalSandbox",
-      "slot": "27",
+      "slot": "17",
       "offset": 0,
       "type": "t_mapping(t_uint256,t_address)"
     },
     {
       "label": "__gap",
-      "slot": "28",
+      "slot": "18",
       "offset": 0,
-      "type": "t_array(t_uint256)19_storage"
+      "type": "t_array(t_uint256)29_storage"
     }
   ],
   "types": {

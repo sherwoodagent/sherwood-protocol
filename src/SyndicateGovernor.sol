@@ -258,10 +258,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     mapping(uint256 => ICallSandbox.Call[]) private _sandboxCalls;
 
     /// @notice Proposal ID -> non-asset tokens the payload declares it may hold.
-    /// @dev Forwarded verbatim to `runSandbox`, where they become what the
-    ///      vault's residue probes can see. Undeclared leftovers are stranded in
-    ///      the sandbox by construction — never priced into a deposit, never
-    ///      collectable — which is the honest failure mode.
+    /// @dev Forwarded verbatim to `runSandbox`; the sandbox pushes each one home
+    ///      after its calls and reverts if any balance remains. Undeclared
+    ///      leftovers are stranded in the sandbox and never priced.
     mapping(uint256 => address[]) private _sandboxTokens;
 
     /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31)

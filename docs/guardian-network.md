@@ -293,10 +293,10 @@ clone, `init` (`CallSandbox.sol:165`), **push** funding (never approve-and-pull)
 then `run()` (`CallSandbox.sol:201`) — one-shot; any reverting call reverts the
 whole run.
 
-Residue: the clone implements `IStrategyDelivery` so `collectResidue` reaches it
-the same way it reaches a settled strategy. `sweep()` (`CallSandbox.sol:328`) is
-vault-only. A sandbox holds no registry entry, so there is nothing to demote
-and nothing to wedge.
+Residue: none. `run()` pushes the funded asset and every declared token back
+to the vault after the calls and reverts (`SandboxHoldsTokens`) if any balance
+remains, so a sandbox never holds value past execution. A sandbox holds no
+registry entry, so there is nothing to demote and nothing to wedge.
 
 Permissionless **targets**, not permissionless proposing: `registerAgent` stays
 `onlyOwner`; only a registered agent can call `proposeWithSandbox`.

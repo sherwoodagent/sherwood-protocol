@@ -25,10 +25,6 @@ interface ISyndicateVault {
     error NotGovernor();
     error RedemptionsLocked();
     error DepositsLocked();
-    /// @notice `pruneUnvaluedMark` called while the unvalued lock window is
-    ///         still running — deposits are genuinely shut, so there is nothing
-    ///         stale to drop yet.
-    error UnvaluedLockStillActive();
     error InvalidAgentAddress();
     error TransferFailed();
     error ZeroAddress();
@@ -46,9 +42,7 @@ interface ISyndicateVault {
     error SandboxImplementationAlreadySet();
     /// @notice No sandbox implementation is wired, so the sandbox path is absent.
     error SandboxNotConfigured();
-    /// @notice A sandbox already exists for this proposal. One per proposal —
-    ///         a second would orphan the first from `collectResidue` while it
-    ///         still held capital.
+    /// @notice A sandbox already exists for this proposal. One per proposal.
     error SandboxAlreadyMinted(uint256 pid);
     /// @notice Sandbox funding exceeded the live tier-2 per-call capital ceiling.
     error SandboxFundingExceedsCeiling(uint256 funding, uint256 ceiling);
@@ -216,34 +210,9 @@ interface ISyndicateVault {
     function spendableFee(address asset) external view returns (uint256);
     function governor() external view returns (address);
     function redemptionsLocked() external view returns (bool);
-    /// @notice True while a mint must not happen: an open proposal, or a settled
-    ///         strategy holding residue no template can express in vault-asset
-    ///         units. A residue that CAN be valued does not lock — it is priced
-    ///         and the queue's deposit claim refuse on this one predicate.
+    /// @notice Same predicate as `redemptionsLocked`; kept under both names for
+    ///         the queue and off-chain readers.
     function depositsLocked() external view returns (bool);
-    /// @notice Assets the vault is worth for pricing a MINT: idle float plus the
-    ///         value settled strategies still owe. Redemptions deliberately keep
-    ///         reading `totalAssets()` — see the implementation for why counting
-    ///         a receivable is safe on one side and not the other.
-    function depositNav() external view returns (uint256);
-    /// @notice Permissionless: sweep a settled strategy's residue back into the
-    ///         vault and refresh the figure deposits are priced against.
-    /// @return collected Vault-asset actually recovered by this call.
-    function collectResidue(address strategy) external returns (uint256 collected);
-    /// @notice Permissionless: drop an unvalued mark whose lock window already
-    ///         lapsed, so the deposit gate can arm again for the next one.
-    /// @dev    Reverts `UnvaluedLockStillActive` inside the window; a no-op when
-    ///         nothing is marked. The strategy may never mark again — see the
-    ///         implementation for why the prune and the burn are inseparable.
-    function pruneUnvaluedMark(address strategy) external;
-    /// @notice Permissionless: drive a settled strategy's last-resort hatch,
-    ///         handing the vault what the clone can neither convert nor push.
-    /// @dev    Separate from `collectResidue` because the hatch forecloses a
-    ///         conversion the routine sweep would retry. Routed through the
-    ///         vault so any vault-asset it produces is measured and split with
-    ///         the exited redeem cohort — the same reason `sweep()` is.
-    /// @return collected Vault-asset actually recovered by this call.
-    function releaseUnconvertible(address strategy) external returns (uint256 collected);
     function managementFeeBps() external view returns (uint256);
     /// @notice Vault-owner-set agent performance fee (basis points). Defaults
     ///         to `FeeConstants.DEFAULT_AGENT_FEE_BPS` (2000 = 20%) while unset.
@@ -367,26 +336,6 @@ interface ISyndicateVault {
 
     /// @notice The sandbox minted for `pid`, or zero if none.
     function sandboxOf(uint256 pid) external view returns (address);
-    /// @notice A settled strategy reported undelivered value; `outstanding` is
-    ///         the figure deposits are now priced against, on top of
-    ///         `totalAssets()`.
-    event ResidueOutstanding(address indexed strategy, uint256 outstanding);
-    /// @notice A settled strategy reported nothing outstanding and stopped
-    ///         being priced in. `collected` is what this call actually
-    ///         recovered, which may be zero if someone else swept first.
-    event ResidueCleared(address indexed strategy, uint256 collected);
-    /// @notice A settled strategy started or stopped holding residue it cannot
-    ///         value in vault-asset units. Deposits are refused while any
-    ///         strategy is in this state — the one residue shape a price cannot
-    ///         express.
-    event ResidueUnvalued(address indexed strategy, bool unvalued);
-    /// @notice Part of an arrival was routed to the redeem cohort that exited at
-    ///         `pid`'s stamp, rather than staying in the vault.
-    /// @dev    `collectResidue` returns and `ResidueCleared` reports the GROSS
-    ///         amount recovered from the strategy; this is the part that left
-    ///         again. Vault float gained `collected - assets`, so an indexer
-    ///         must net the two rather than summing `ResidueCleared` alone.
-    event CohortShareRouted(address indexed strategy, uint256 indexed pid, uint256 assets);
     event RedeemRequested(uint256 indexed requestId, address indexed owner, uint256 shares);
     event DepositRequested(uint256 indexed requestId, address indexed receiver, uint256 assets);
 }
