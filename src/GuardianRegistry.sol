@@ -550,8 +550,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     // ── Guardian review voting ──
 
     /// @inheritdoc IGuardianRegistry
-    /// @dev First-vote path OR vote-change. Requires `openReview` to have been
-    ///      called and `voteEnd <= now < reviewEnd`. Snapshots the caller's raw
+    /// @dev First-vote path OR vote-change. Opens a due-but-unopened review
+    ///      itself, then requires `voteEnd <= now < reviewEnd`. Snapshots the caller's raw
     ///      stake at `r.snapshotAt` — the same instant the denominator is read
     ///      at — and adds it to the chosen side's tally. Approvers are capped
     ///      (the slash loop iterates them); Blockers are NOT — the block tally is
@@ -576,17 +576,13 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
 
         bytes32 key = _reviewKey(governor, proposalId);
         Review storage r = _reviews[key];
-        if (!r.opened) revert ReviewNotOpen();
-        // Defence in depth alongside `openReview`'s resolved guard: a resolved
-        // review (cancelled, or already committed) accepts no further votes,
-        // so no approve weight can accrue on a proposal that carries no slash
-        // risk. Unreachable while `openReview` refuses to re-open — kept so a
-        // future edit to either guard cannot silently arm the other.
+        // A resolved review accepts no vote and is never re-opened.
         if (r.resolved) revert ReviewNotOpen();
 
         // window consumable in the first place.
         uint256 nowEff = _effNow(r.clockShiftAtRegister);
         if (r.voteEnd == 0 || nowEff < r.voteEnd || nowEff >= r.reviewEnd) revert ReviewNotOpen();
+        if (!r.opened) _openReview(r, governor, proposalId);
 
         if (!swood.isActiveGuardian(msg.sender)) revert NotActiveGuardian();
 
@@ -846,23 +842,22 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
 
         uint256 ve = r.voteEnd;
         if (ve == 0 || _effNow(r.clockShiftAtRegister) < ve) revert ReviewNotOpen();
+        _openReview(r, governor, proposalId);
+    }
 
-        IStakedWood sw = swood;
-        uint128 totalAtOpen = uint128(sw.getPastTotalVotes(uint256(r.snapshotAt)));
-        uint256 combinedAtOpen = uint256(totalAtOpen);
+    /// @dev Snapshots stake and the owner-settable thresholds at the open instant.
+    function _openReview(Review storage r, address governor, uint256 proposalId) private {
+        uint128 totalAtOpen = uint128(swood.getPastTotalVotes(uint256(r.snapshotAt)));
         r.opened = true;
         r.totalStakeAtOpen = totalAtOpen;
-        // Snapshot block-quorum at open so the owner can't shift the
-        // threshold after voters have cast.
         // forge-lint: disable-next-line(unsafe-typecast)
         r.blockQuorumBpsAtOpen = uint16(blockQuorumBps);
         r.minSlashBpsAtOpen = uint16(swood.minSlashBps() + 1);
         // forge-lint: disable-next-line(unsafe-typecast)
         r.maxSlashBpsAtOpen = uint16(swood.maxSlashBps() + 1);
-        // Still `t-1`: this is the basis sWOOD sizes slashes from, and it is
-        // deliberately the OPEN instant rather than `snapshotAt` — a slash
-        // should be sized off the stake a guardian actually held when the
-        // review they are being judged for was running.
+        // Still `t-1`: the basis sWOOD sizes slashes from, deliberately the
+        // OPEN instant rather than `snapshotAt` — a slash is sized off the
+        // stake a guardian held while the review it judges was running.
         r.openedAt = uint64(block.timestamp - 1);
         emit ReviewOpened(governor, proposalId, totalAtOpen);
     }
