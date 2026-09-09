@@ -1164,6 +1164,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @notice One persistent deleverage pass: repay what the clone holds, withdraw the collateral
     ///         that frees while Morpho stays healthy, redeem it to the asset. Repeat until the
     ///         clone holds the debt, then settle. Never touches the position or the volatile leg.
+    ///         Reverts NothingToDeleverage once covered, so a pre-committed batch of passes is one-shot.
     function deleverageStep() external onlyProposerOrVault nonReentrant {
         if (_state != State.Executed) revert NotExecuted();
         morpho.accrueInterest(_marketParams);

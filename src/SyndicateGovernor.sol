@@ -472,10 +472,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (!ISyndicateVault(vault).isAgent(msg.sender)) revert NotRegisteredAgent();
         // (`openspec/changes/owner-bond-proposal-gate`)
         if (!IGuardianRegistry(_guardianRegistry).ownerBondLive(vault)) revert OwnerBondNotLive();
-        // Blocks new proposals when the vault still has a non-terminal
-        // lifecycle bound to it (Pending / GuardianReview / Approved / Executed).
-        // Draft co-proposals do not count toward openProposalCount and are
-        // independently gated at their Draft -> Pending transition.
+        // Blocks new proposals while the vault has a non-terminal lifecycle bound to it
+        // (Draft / Pending / GuardianReview / Approved / Executed); Drafts count from creation.
         if (_openProposalCount != 0) revert VaultHasOpenProposal();
         // Cancel stamps the settle clock too, so cancel+propose cycling cannot keep redemptions locked.
         uint256 lastSettled = _lastSettledAt;
