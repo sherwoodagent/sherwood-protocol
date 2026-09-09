@@ -2835,4 +2835,13 @@ contract ExposureLedgerTest is Test {
         (, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
         assertEq(bps[0], 10_000, "and the rate saturates against the 50,000 basis");
     }
+
+    function test_currentEpochAndOpenExposureAreZeroBeforeGenesis() public {
+        // deploy a fresh ledger at a later timestamp, then rewind the clock behind its genesis
+        vm.warp(block.timestamp + 30 days);
+        ExposureLedger late = new ExposureLedger(owner, address(swood), 28 days);
+        vm.warp(late.epochGenesis() - 1);
+        assertEq(late.currentEpoch(), 0, "no epoch has begun");
+        assertEq(late.openExposure(address(0xBEEF)), 0, "nothing is open before genesis");
+    }
 }

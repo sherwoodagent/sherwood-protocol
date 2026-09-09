@@ -359,7 +359,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     // ── Views ──
 
     function currentEpoch() public view returns (uint256) {
-        return (block.timestamp - epochGenesis) / epochLength;
+        return block.timestamp <= epochGenesis ? 0 : (block.timestamp - epochGenesis) / epochLength;
     }
 
     /// @inheritdoc IExposureLedger
@@ -1417,7 +1417,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      i.e. from = (elapsed - W) / L when elapsed > W. from <= cur always
     ///      (W > 0), so the loop is bounded by ceil(W/L) + 1 iterations.
     function openExposure(address guardian) public view returns (uint256 total) {
-        uint256 elapsed = block.timestamp - epochGenesis;
+        uint256 elapsed = block.timestamp <= epochGenesis ? 0 : block.timestamp - epochGenesis;
         uint256 from = elapsed > challengeWindow ? (elapsed - challengeWindow) / epochLength : 0;
         // Scans FORWARD as well as back. Approvals are booked into the bucket
         // covering settlement, which is in the future at vote time, so a
