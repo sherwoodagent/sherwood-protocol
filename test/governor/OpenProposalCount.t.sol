@@ -419,6 +419,7 @@ contract OpenProposalCountTest is Test {
         vm.prank(owner);
         governor.vetoProposal(pidA);
         uint256 cooldownAfterVeto = governor.getCooldownEnd();
+        vm.warp(cooldownAfterVeto); // propose honours the cooldown the veto stamped
 
         // Same vault, fresh proposal, drive it to lazy Rejected via vote-veto.
         uint256 pidB = _propose();
@@ -525,6 +526,7 @@ contract OpenProposalCountTest is Test {
         vm.prank(agent);
         governor.cancelProposal(pid1);
         assertEq(governor.openProposalCount(), 0, "dec on cancel");
+        vm.warp(governor.getCooldownEnd()); // cancel stamps the settle cooldown propose honours
 
         // New proposal, settle through the full happy path.
         uint256 pid2 = _propose();
@@ -679,6 +681,7 @@ contract OpenProposalCountTest is Test {
 
         // Liveness regression: a fresh `propose` must succeed. Pre-fix this
         // reverted `VaultHasOpenProposal` because the counter stayed at 1.
+        vm.warp(governor.getCooldownEnd()); // the cancel stamped the settle cooldown propose honours
         vm.prank(agent);
         uint256 pid2 = governor.propose(
             address(vault),

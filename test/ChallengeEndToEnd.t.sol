@@ -1294,6 +1294,7 @@ contract ChallengeEndToEndTest is Test {
         vm.warp(executedAt + 1 hours + 1);
         vm.prank(agent);
         gov.settleProposal(pid);
+        vm.warp(gov.getCooldownEnd()); // propose honours the settle cooldown
 
         // ── Q: the unrelated proposal g1 also backs, with the OTHER half.
         uint256 qid = _propose();
@@ -1496,6 +1497,7 @@ contract ChallengeEndToEndTest is Test {
         vm.prank(agent);
         gov.settleProposal(pid);
         gov.resolveProposalState(pid);
+        vm.warp(gov.getCooldownEnd()); // propose honours the settle cooldown
         uint256 pid2 = _proposeApproveExecuteWithDuration(30 days);
         assertEq(ledger.lockOf(address(gov), pid2, g1), G1_STAKE, "a fresh lock lands at full size");
         assertEq(ledger.openExposure(g1), G1_STAKE, "and is the only thing counted");

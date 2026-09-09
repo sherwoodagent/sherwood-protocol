@@ -477,6 +477,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Draft co-proposals do not count toward openProposalCount and are
         // independently gated at their Draft -> Pending transition.
         if (_openProposalCount != 0) revert VaultHasOpenProposal();
+        // Cancel stamps the settle clock too, so cancel+propose cycling cannot keep redemptions locked.
+        uint256 lastSettled = _lastSettledAt;
+        if (lastSettled != 0 && block.timestamp < lastSettled + _params.cooldownPeriod) revert CooldownNotElapsed();
         if (strategy != address(0) && strategy.code.length != 0) {
             (bool okP, bytes memory pRet) = strategy.staticcall(abi.encodeCall(IStrategy.proposer, ()));
             address declaredProposer = (okP && pRet.length == 32) ? abi.decode(pRet, (address)) : address(0);
@@ -738,8 +741,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      no fees accrued. Cancel during GuardianReview drives the registry's
     ///      `cancelReview` so a stale `resolveReview` cannot still slash
     ///      approvers. `_lastSettledAt` is bumped on every cancel branch that
-    ///      decrements the open count, rate-limiting propose-cancel-propose-
-    ///      execute via the same cooldown that gates execute after a settle.
+    ///      decrements the open count, so the next propose waits out the same
+    ///      cooldown that gates execute after a settle.
     function cancelProposal(uint256 proposalId) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (msg.sender != proposal.proposer) revert NotProposer();

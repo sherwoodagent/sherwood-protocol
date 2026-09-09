@@ -611,7 +611,8 @@ contract ProposalLifecycleTest is Test {
         assertEq(emitted, 0, "Approved -> Expired must NOT re-run the review economic commit");
         assertEq(governor.openProposalCount(), 0, "expiry releases the vault binding");
 
-        // The vault is free again.
+        // The vault is free again once the settle cooldown the flush stamped has elapsed.
+        vm.warp(governor.getCooldownEnd());
         uint256 pid2 = _propose();
         assertGt(pid2, pid, "a fresh proposal id was minted");
         _assertState(pid2, ISyndicateGovernor.ProposalState.Pending, "the new proposal opens in Pending");
@@ -745,6 +746,7 @@ contract ProposalLifecycleTest is Test {
         vm.prank(agent);
         governor.cancelProposal(pid);
         assertEq(governor.openProposalCount(), 0, "cancel releases the binding");
+        vm.warp(governor.getCooldownEnd()); // cancel stamps the settle cooldown propose honours
 
         // ── Collaborative: NOT registered while Draft ──
         uint256 cpid = _proposeCollaborative();

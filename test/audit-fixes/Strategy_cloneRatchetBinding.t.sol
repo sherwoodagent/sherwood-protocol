@@ -585,6 +585,7 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
         // live maxCapital ceiling.
         env.maxCapital = vault.totalAssets();
 
+        vm.warp(governor.getCooldownEnd()); // propose honours the settle cooldown `unstick` stamped
         vm.prank(agent);
         uint256 pid2 = governor.propose(
             address(vault),

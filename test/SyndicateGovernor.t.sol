@@ -1412,32 +1412,35 @@ contract SyndicateGovernorTest is Test {
 
     // ==================== COOLDOWN BLOCKS RE-EXECUTION ====================
 
-    /// @dev Post G-M1: proposal 2 cannot be created while proposal 1 is still
-    ///      Executed (openProposalCount != 0). After settling proposal 1, the
-    ///      cooldown window opens on the vault. We pin the COOLDOWN path by
-    ///      creating+approving proposal 2 purely via propose + votes + warp
-    ///      past ONLY the voting window (not the cooldown), then showing
-    ///      `executeProposal` reverts `CooldownNotElapsed`.
-    function test_cooldown_blocksExecution() public {
-        // Execute proposal 1 then settle it. `_lastSettledAt[vault]` = now.
+    /// @dev After a settle the cooldown gates `propose` itself: a proposal cannot even
+    ///      open inside the window, so the execute-side check is never the first to fire.
+    function test_cooldown_blocksPropose() public {
         uint256 proposalId1 = _createAndExecuteProposal(1500, 7 days);
         vm.prank(agent);
         governor.settleProposal(proposalId1);
         uint256 settledAt = block.timestamp;
+        assertEq(governor.getCooldownEnd(), settledAt + COOLDOWN_PERIOD, "settle stamped the clock");
 
-        // Stretch cooldown to make it safely exceed voting window for this test.
-        vm.prank(owner);
-        governor.setCooldownPeriod(5 days);
-
-        // Propose 2 + drive to Approved. Uses `_createApprovedProposal` which
-        // warps past voting period but NOT past the 5-day cooldown.
-        uint256 proposalId2 = _createApprovedProposal(1500, 7 days);
-
-        // Cooldown has not elapsed — execute must revert.
-        assertGt(governor.getCooldownEnd(), block.timestamp, "still in cooldown");
-        assertLt(block.timestamp, settledAt + 5 days, "pre-cooldown sanity");
+        vm.warp(settledAt + COOLDOWN_PERIOD - 1);
+        permissiveEnv = GovEnvelope.permissive(address(vault));
+        vm.prank(agent);
         vm.expectRevert(ISyndicateGovernor.CooldownNotElapsed.selector);
-        governor.executeProposal(proposalId2);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+
+        vm.warp(settledAt + COOLDOWN_PERIOD);
+        uint256 proposalId2 = _createSimpleProposal(1500, 7 days);
+        assertGt(proposalId2, proposalId1, "opens at the cooldown boundary");
     }
 
     // ==================== DEPOSIT LOCK DURING ACTIVE PROPOSAL ====================

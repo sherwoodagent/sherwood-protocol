@@ -232,6 +232,7 @@ contract GovernorVetoDenominatorExitsTest is Test {
         _endVote();
         governor.executeProposal(pid0);
         _settle(pid0);
+        vm.warp(governor.getCooldownEnd()); // propose honours the settle cooldown
         vm.prank(who);
         queue.claim(req); // same block as propose(pid1)
         pid1 = _propose();
