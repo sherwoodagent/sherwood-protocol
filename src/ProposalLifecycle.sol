@@ -73,8 +73,8 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             // Skip the veto check when liveSupply == 0, else the bar collapses to 0 and everything auto-rejects.
             // vetoThresholdBps is the Draft -> Pending snapshot, so mid-vote finalizes don't move the bar.
             // Votable set at the snapshot = supply minus the queue (queued shares keep snapshot weight).
-            // Cap it at totalSupply(): a redeem ordered ahead of propose shrinks live supply but not
-            // the snapshot.
+            // Cap it at totalSupply(): bounds the inflation side only. A holder who redeemed ahead of
+            // propose in the same block keeps snapshot vote weight against this live-capped bar.
             uint256 pastTotalSupply = IVotes(p.vault).getPastTotalSupply(p.snapshotTimestamp);
             address queue = ISyndicateVault(p.vault).withdrawalQueue();
             uint256 queueVotes = queue == address(0) ? 0 : IVotes(p.vault).getPastVotes(queue, p.snapshotTimestamp);
