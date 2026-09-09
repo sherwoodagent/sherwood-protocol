@@ -510,6 +510,9 @@ contract OpenProposalCountTest is Test {
         vm.prank(owner);
         governor.emergencyCancel(pid);
         assertEq(governor.openProposalCount(), 0, "counter == 0 after emergencyCancel");
+        assertEq(
+            governor.getCooldownEnd(), vm.getBlockTimestamp() + COOLDOWN_PERIOD, "emergencyCancel stamped the cooldown"
+        );
 
         vm.prank(owner);
         swood.requestUnstakeOwner(address(vault));
@@ -629,6 +632,11 @@ contract OpenProposalCountTest is Test {
         vm.prank(agent);
         governor.rejectCollaboration(pid);
         assertEq(governor.openProposalCount(), 0, "decremented on rejectCollaboration");
+        assertEq(
+            governor.getCooldownEnd(),
+            vm.getBlockTimestamp() + COOLDOWN_PERIOD,
+            "rejectCollaboration stamped the cooldown"
+        );
     }
 
     /// @notice PR #324 review comment 4454151855 — owner-`emergencyCancel`
@@ -673,6 +681,11 @@ contract OpenProposalCountTest is Test {
 
         // R9 fix: counter must drop back to 0.
         assertEq(governor.openProposalCount(), 0, "R9: emergencyCancel decremented Draft");
+        assertEq(
+            governor.getCooldownEnd(),
+            vm.getBlockTimestamp() + COOLDOWN_PERIOD,
+            "emergencyCancel on a Draft stamped the cooldown"
+        );
         assertEq(
             uint256(governor.getProposalState(pid)),
             uint256(ISyndicateGovernor.ProposalState.Cancelled),
