@@ -480,9 +480,7 @@ contract SyndicateVault is
     function _openProposalPid() private view returns (uint256) {
         address gov = _getGovernor();
         uint256 active = IProposalStatus(gov).getActiveProposal();
-        if (active != 0) return active;
-        (bool ok, bytes memory ret) = gov.staticcall(abi.encodeWithSignature("proposalCount()"));
-        return (ok && ret.length == 32) ? abi.decode(ret, (uint256)) : 0;
+        return active != 0 ? active : IProposalStatus(gov).proposalCount();
     }
 
     /// @inheritdoc ISyndicateVault

@@ -18,6 +18,10 @@ contract MockGovernorNoTierGetterCG {
     function getActiveProposal() external pure returns (uint256) {
         return 0;
     }
+
+    function proposalCount() external pure returns (uint256) {
+        return 0;
+    }
 }
 
 /// @notice issue #166 — target-based batch callee gate (`_guardBatchCalls`

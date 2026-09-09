@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
+import {VaultWithdrawalQueue} from "../../src/queue/VaultWithdrawalQueue.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
@@ -201,5 +202,27 @@ contract VaultRedemptionLockSemanticsTest is Test {
         vm.prank(owner);
         vm.expectRevert(ISyndicateVault.RedemptionsLocked.selector);
         vault.rescueERC20(address(other), owner, 100e18);
+    }
+
+    /// @notice A governor that cannot report `proposalCount()` reverts `requestRedeem` outright:
+    ///         nothing is queued under a zero tag that no settlement would ever stamp.
+    function test_requestRedeemRevertsWhenTheGovernorCannotReportAProposalCount() public {
+        VaultWithdrawalQueue queue = new VaultWithdrawalQueue(address(vault));
+        vault.setWithdrawalQueue(address(queue));
+        vm.prank(alice);
+        vault.deposit(1_000e6, alice);
+        uint256 shares = vault.balanceOf(alice);
+        uint256 nextId = queue.nextRequestId();
+
+        _mockState({active: false, openCount: 1}); // Pending: the tag comes from proposalCount()
+        bytes memory reason = abi.encodeWithSelector(bytes4(keccak256("CountUnavailable()")));
+        vm.mockCallRevert(MOCK_GOVERNOR, abi.encodeWithSignature("proposalCount()"), reason);
+
+        vm.prank(alice);
+        vm.expectRevert(reason);
+        vault.requestRedeem(shares, alice);
+
+        assertEq(vault.balanceOf(alice), shares, "shares never left the holder");
+        assertEq(queue.nextRequestId(), nextId, "nothing queued");
     }
 }

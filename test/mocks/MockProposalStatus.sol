@@ -13,6 +13,7 @@ contract MockProposalStatus is IProposalStatus {
     uint256 public activePid;
     uint256 public openCount;
     address public strategy;
+    uint256 public proposalCount;
 
     /// @dev Mirrors `SyndicateGovernor.tierRegistry()` — the vault resolves the
     ///      TierRegistry through its governor for the callee and
@@ -33,6 +34,10 @@ contract MockProposalStatus is IProposalStatus {
 
     function setTierRegistry(address registry) external {
         tierRegistry = registry;
+    }
+
+    function setProposalCount(uint256 n) external {
+        proposalCount = n;
     }
 
     /// @dev One call drives the whole seam: pid=0 ⇒ unlocked; pid!=0 locks the

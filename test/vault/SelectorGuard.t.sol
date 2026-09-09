@@ -46,6 +46,10 @@ contract MockGovernorNoTierGetter {
     function getActiveProposal() external pure returns (uint256) {
         return 0;
     }
+
+    function proposalCount() external pure returns (uint256) {
+        return 0;
+    }
 }
 
 /// @notice Findings 1+7 — value-moving-selector allowlist gate. The net-outflow

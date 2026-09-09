@@ -260,8 +260,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     error ProceedsBelowDebt(uint256 held, uint256 owed);
     /// @notice Settle left `amount` of `token` on the clone.
     error StrategyHoldsTokens(address token, uint256 amount);
-    /// @notice Settle left a Morpho position open.
-    error MorphoPositionOpen(uint256 borrowShares, uint256 collateral);
 
     // ── Events ──
 
@@ -1080,8 +1078,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         _requireZeroBalance(otherToken);
         address collateralToken = _marketParams.collateralToken;
         if (collateralToken != asset) _requireZeroBalance(collateralToken);
-        Position memory pos = morpho.position(marketId, address(this));
-        if (pos.borrowShares != 0 || pos.collateral != 0) revert MorphoPositionOpen(pos.borrowShares, pos.collateral);
     }
 
     function _requireZeroBalance(address token) private view {
