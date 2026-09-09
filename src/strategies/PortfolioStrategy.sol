@@ -29,10 +29,9 @@ interface ITierBindingPath {
 
 /**
  * @title PortfolioStrategy
- * @notice Weighted basket of tokens bought on execute, sold on settle. Target weights and
- *         routes are fixed at init, so `rebalanceDelta` trades only price drift. Every swap
- *         floor is the slot's Chainlink push-feed price discounted by `maxSlippageBps`; a feed
- *         older than `MAX_PUSH_PRICE_AGE` reverts.
+ * @notice Weighted basket bought on execute, sold on settle. Weights and routes are fixed at
+ *         init, so `rebalanceDelta` trades only price drift. Every swap floors at the slot's
+ *         push-feed price less `maxSlippageBps`; a feed older than `MAX_PUSH_PRICE_AGE` reverts.
  *
  *   Batch calls from governor:
  *     Execute: [asset.approve(strategy, totalAmount), strategy.execute()]
@@ -213,8 +212,7 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
     // ── Update params ──
 
     /// @notice Update: (uint256[] newWeightsBps, uint256 newMaxSlippageBps, bytes[] newSwapExtraData)
-    /// @dev Only the tolerance is tunable, and only tighter: a re-targeted basket would let the
-    ///      proposer round-trip it at the floor through `rebalanceDelta`. Empty / 0 keeps current.
+    /// @dev Only the tolerance is tunable, and only tighter. Empty / 0 keeps current.
     function _updateParams(bytes calldata data) internal override {
         (uint256[] memory newWeightsBps, uint256 newMaxSlippageBps, bytes[] memory newSwapExtraData) =
             abi.decode(data, (uint256[], uint256, bytes[]));

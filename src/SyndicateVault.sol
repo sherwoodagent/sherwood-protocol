@@ -985,10 +985,8 @@ contract SyndicateVault is
     ///      same breath — see `_pricingSupply`. Subtracting assets without their
     ///      shares would understate the price as badly as double-counting them
     ///      would overstate it.
-    ///      #3). A fee whose transfer failed is escrowed by
-    ///      `SyndicateGovernor._payFee` and LEFT HERE — owed exactly like a
-    ///      queue reserve, but previously counted as LP equity, so redeemers in
-    ///      the post-settle window took a slice of the fee recipient's money.
+    ///      A fee whose transfer failed is escrowed by `SyndicateGovernor._payFee` and
+    ///      left here, owed exactly like a queue reserve.
     function totalAssets() public view override returns (uint256) {
         uint256 gross = IERC20(asset()).balanceOf(address(this));
         uint256 owed = reservedQueueAssets() + _escrowedFeeLiability();

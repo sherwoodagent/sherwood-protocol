@@ -45,10 +45,7 @@ interface ITierBindingPath {
  *            approved half-width centered on the current TWAP tick. Never
  *            touches the borrow or the collateral.
  *   Settle:  decrease to zero → collect → convert the other token back →
- *            repay → withdraw collateral → push everything to the vault. A
- *            negative-carry position first frees just enough collateral to
- *            cover the shortfall (`_deleverage`); a larger shortfall is unwound
- *            beforehand in persistent `deleverageStep` passes.
+ *            repay → withdraw collateral → push everything to the vault.
  *            All-or-revert: every step is typed, a failed settlement is retried.
  *
  *   Batch calls from governor:
@@ -579,8 +576,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         uint256 sp = uint256(sqrtPriceX96);
         uint256 expected;
-        // token0 -> token1 multiplies by the price; token1 -> token0 divides. A zero result
-        // means `amountIn` is worth under one unit of the out token: nothing to floor.
+        // token0 -> token1 multiplies by the price; token1 -> token0 divides.
         if (tokenIn == (assetIsToken0 ? asset : otherToken)) {
             expected = Math.mulDiv(Math.mulDiv(amountIn, sp, 1 << 96), sp, 1 << 96);
         } else {
@@ -1125,7 +1121,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     /// @dev Repays by SHARES on freshly accrued totals, which is what clears the debt
     ///      exactly; a dust share left behind would block `withdrawCollateral`.
-    ///      Negative carry (proceeds below the debt) takes one deleverage step first.
     function _repayAndWithdraw() private {
         morpho.accrueInterest(_marketParams);
         Position memory pos = morpho.position(marketId, address(this));
@@ -1164,7 +1159,6 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @notice One persistent deleverage pass: repay what the clone holds, withdraw the collateral
     ///         that frees while Morpho stays healthy, redeem it to the asset. Repeat until the
     ///         clone holds the debt, then settle. Never touches the position or the volatile leg.
-    ///         Reverts NothingToDeleverage once covered, so a pre-committed batch of passes is one-shot.
     function deleverageStep() external onlyProposerOrVault nonReentrant {
         if (_state != State.Executed) revert NotExecuted();
         morpho.accrueInterest(_marketParams);
