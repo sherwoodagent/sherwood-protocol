@@ -35,7 +35,7 @@ import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 ///           0  _guardianRegistry         15 vault
 ///           1  _proposals                16 protocolConfig
 ///           2  _openProposalCount        17 factory
-///           3  _lastSettledAt            18..26 _params (9 words)
+///           3  _cooldownEndsAt           18..26 _params (9 words)
 ///           4  collaborationDeadline     27 _bootstrapOwner
 ///           5..14 __lifecycleGap[10]     28 _maxCapitalBps (finding 3)
 ///                                        29..35 __paramsGap[7]

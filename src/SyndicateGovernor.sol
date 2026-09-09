@@ -96,7 +96,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @notice Currently executing proposal ID (0 if none)
     uint256 private _activeProposal;
 
-    // `_lastSettledAt` lives in ProposalLifecycle (stamped by `_decOpen`).
+    // `_cooldownEndsAt` lives in ProposalLifecycle (stamped by `_decOpen`).
 
     // ── Collaborative proposal storage ──
 
@@ -475,9 +475,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Blocks new proposals while the vault has a non-terminal lifecycle bound to it
         // (Draft / Pending / GuardianReview / Approved / Executed); Drafts count from creation.
         if (_openProposalCount != 0) revert VaultHasOpenProposal();
-        // Cancel stamps the settle clock too, so cancel+propose cycling cannot keep redemptions locked.
-        uint256 lastSettled = _lastSettledAt;
-        if (lastSettled != 0 && block.timestamp < lastSettled + _params.cooldownPeriod) revert CooldownNotElapsed();
+        // Cancel stamps the deadline too, so cancel+propose cycling cannot keep redemptions locked.
+        if (block.timestamp < _cooldownEndsAt) revert CooldownNotElapsed();
         if (strategy != address(0) && strategy.code.length != 0) {
             (bool okP, bytes memory pRet) = strategy.staticcall(abi.encodeCall(IStrategy.proposer, ()));
             address declaredProposer = (okP && pRet.length == 32) ? abi.decode(pRet, (address)) : address(0);
@@ -732,7 +731,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      execute is strictly less harmful, since no capital was deployed and
     ///      no fees accrued. Cancel during GuardianReview drives the registry's
     ///      `cancelReview` so a stale `resolveReview` cannot still slash
-    ///      approvers. `_lastSettledAt` is bumped on every cancel branch that
+    ///      approvers. `_cooldownEndsAt` is stamped on every cancel branch that
     ///      decrements the open count, so the next propose waits out the same
     ///      cooldown a settle imposes.
     function cancelProposal(uint256 proposalId) external nonReentrant {
@@ -797,7 +796,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     // `_decOpen()` and `openProposalCount()` are inherited from
     // ProposalLifecycle (single chokepoint: `_decOpen` decrements the counter
-    // AND stamps `_lastSettledAt` so the permissionless lazy terminal path via
+    // AND stamps `_cooldownEndsAt` so the permissionless lazy terminal path via
     // `resolveProposalState` can't dodge the settle cooldown).
 
     /// @inheritdoc ISyndicateGovernor
@@ -1098,7 +1097,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     /// @inheritdoc ISyndicateGovernor
     function getCooldownEnd() external view returns (uint256) {
-        return _lastSettledAt + _params.cooldownPeriod;
+        return _cooldownEndsAt;
     }
 
     /// @inheritdoc ISyndicateGovernor

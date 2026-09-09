@@ -107,7 +107,7 @@ After a passed vote the proposal SHALL sit in `GuardianReview` until `reviewEnd`
 `executeProposal` SHALL be permissionless but SHALL only run when the resolved state is `Approved` and no other proposal is actively executing. The settle cooldown is enforced at `propose` (below), and since `cooldownPeriod` is frozen while a proposal is open it cannot be the first gate to fail at execute. Before executing it SHALL: snapshot the vault's asset balance as the capital snapshot; mark the proposal `Executed` and set `executedAt` before any external call (CEI); re-resolve tier and coverage from the stored calls and revert with `TierRegressed` if the live tier exceeds the propose-time `envelopeTier`, or `CoverageRegressed` if the live coverage exceeds the propose-time `requiredCoverage`; and, when an exposure ledger is wired and `requiredCoverage != 0` and the tier is at or above the ledger's quorum tier threshold, require a bond-encumbered approve quorum via `requireApproveQuorum` (fail-closed: silence does not execute a coverage-consuming proposal). The opening batch SHALL run via the vault's `executeGovernorBatch` under the proposal's `maxCapital` net-outflow cap. All execute/settle/cancel entrypoints SHALL be protected by a shared reentrancy lock.
 
 #### Scenario: Cooldown between strategies
-- **WHEN** `propose` is called before `lastSettledAt + cooldownPeriod` has elapsed (nothing ever settled: no cooldown)
+- **WHEN** `propose` is called before the cooldown deadline stamped at the last terminal event (`terminalAt + cooldownPeriod` as of that event; nothing ever settled: no cooldown)
 - **THEN** the call SHALL revert with `CooldownNotElapsed`, giving depositors an exit window between strategies
 
 #### Scenario: Stale certification blocks execution

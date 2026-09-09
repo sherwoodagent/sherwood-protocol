@@ -115,11 +115,48 @@ contract GovernorProposeCooldownTest is Test {
         );
     }
 
-    /// @notice The first proposal is not gated: the settle clock is still zero.
+    /// @notice The first proposal is not gated: no deadline has been stamped yet.
     function test_firstProposalIgnoresTheZeroSettleClock() public {
         assertLt(vm.getBlockTimestamp(), COOLDOWN, "fixture must sit inside a would-be cooldown from t=0");
-        assertEq(governor.getCooldownEnd(), COOLDOWN, "clock unstamped");
+        assertEq(governor.getCooldownEnd(), 0, "deadline unstamped");
         assertEq(_propose(), 1);
+    }
+
+    /// @notice The deadline is stamped at the terminal event with the period in force then, so the
+    ///         owner cannot shorten an exit window the LPs are already inside.
+    function test_ownerCannotShrinkAnOpenExitWindowFromInsideIt() public {
+        uint256 pid = _propose();
+        _cancel(pid);
+        uint256 t = vm.getBlockTimestamp();
+        assertEq(governor.getCooldownEnd(), t + COOLDOWN, "deadline stamped at cancel");
+
+        vm.warp(t + 10 minutes);
+        vm.prank(owner);
+        governor.setCooldownPeriod(1 hours);
+        assertEq(governor.getCooldownEnd(), t + COOLDOWN, "the running deadline moved");
+
+        vm.warp(t + 1 hours);
+        _proposeRevertsCooldown();
+        assertGt(vault.maxRedeem(lp), 0, "exit closed early");
+
+        vm.warp(t + COOLDOWN);
+        assertEq(_propose(), pid + 1);
+    }
+
+    /// @notice A new period applies from the next terminal event onward.
+    function test_newCooldownAppliesFromTheNextTerminalEvent() public {
+        uint256 pid = _propose();
+        _cancel(pid);
+        vm.prank(owner);
+        governor.setCooldownPeriod(1 hours);
+        vm.warp(vm.getBlockTimestamp() + COOLDOWN);
+
+        pid = _propose();
+        _cancel(pid);
+        assertEq(governor.getCooldownEnd(), vm.getBlockTimestamp() + 1 hours, "new period not applied");
+
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        assertEq(_propose(), pid + 1);
     }
 
     function test_cancelThenProposeWithinCooldownReverts() public {

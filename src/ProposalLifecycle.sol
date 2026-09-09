@@ -27,7 +27,8 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
     address internal _guardianRegistry;
     mapping(uint256 => StrategyProposal) internal _proposals;
     uint256 internal _openProposalCount;
-    uint256 internal _lastSettledAt;
+    /// @dev Cooldown deadline stamped at the last terminal event; zero before the first.
+    uint256 internal _cooldownEndsAt;
     /// @notice Draft collaboration deadline per proposal.
     /// @dev Public: the getter's bytecode cost is immaterial under Robinhood's
     ///      98,304-byte limit, and `_computeState` reads this for the Draft ->
@@ -196,9 +197,12 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         try IGuardianRegistry(_guardianRegistry).cancelReview(p.id) {} catch {}
     }
 
-    /// @dev Release a vault binding and stamp the settlement clock.
+    /// @dev Release a vault binding and stamp the cooldown deadline with the period in force now,
+    ///      so a later `setCooldownPeriod` cannot move an open LP exit window.
     function _decOpen() internal {
         --_openProposalCount;
-        _lastSettledAt = block.timestamp;
+        _cooldownEndsAt = block.timestamp + _cooldownPeriod();
     }
+
+    function _cooldownPeriod() internal view virtual returns (uint256);
 }

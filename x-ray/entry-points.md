@@ -231,7 +231,7 @@ Entry points callable by any address with no effective access restriction. Sorte
 | Caller | Anyone (the proposer gets a shorter minimum wait, enforced in the body, not as a caller restriction) |
 | Parameters | `proposalId` (protocol-derived) |
 | Call chain | `→ SyndicateVault.executeGovernorBatch(settlementCalls) → _finishSettlement → SyndicateVault.consumeManagementAccrual()/aboveHighWaterMark()/transferPerformanceFee()/ratchetHighWaterMark()/onProposalSettled() → VaultWithdrawalQueue.stampSettlement()` |
-| State modified | `_activeProposal`, `_openProposalCount`, `_lastSettledAt`, `p.state`, `_capitalSnapshots` (deleted), `_unclaimedFees` (on transfer failure), vault fee/HWM state, queue settle price |
+| State modified | `_activeProposal`, `_openProposalCount`, `_cooldownEndsAt`, `p.state`, `_capitalSnapshots` (deleted), `_unclaimedFees` (on transfer failure), vault fee/HWM state, queue settle price |
 | Value flow | Tokens: Vault → protocol / guardian / agent(s) / owner fee recipients |
 | Reentrancy guard | yes |
 
@@ -399,7 +399,7 @@ Entry points callable by any address with no effective access restriction. Sorte
 | Caller | Anyone (documented as a permissionless state flush) |
 | Parameters | `proposalId` (protocol-derived) |
 | Call chain | `→ _commitState → GuardianRegistry.resolveReview()/cancelReview() → StakedWood.slashGuardians()` |
-| State modified | `p.state`, `_openProposalCount`, `_lastSettledAt`; registry review state; guardian stake on the slash path |
+| State modified | `p.state`, `_openProposalCount`, `_cooldownEndsAt`; registry review state; guardian stake on the slash path |
 | Value flow | None directly; the slash path burns guardian WOOD |
 | Reentrancy guard | yes |
 

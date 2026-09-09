@@ -252,6 +252,10 @@ abstract contract GovernorParameters is ProposalLifecycle {
         emit ParameterChangeFinalized(PARAM_MAX_STRATEGY_DURATION, old, newValue);
     }
 
+    function _cooldownPeriod() internal view override returns (uint256) {
+        return _params.cooldownPeriod;
+    }
+
     /// @inheritdoc ISyndicateGovernor
     function setCooldownPeriod(uint256 newValue) external onlyVaultOwner whenNoActiveProposal {
         _validateCooldownPeriod(newValue);

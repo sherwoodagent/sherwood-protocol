@@ -392,14 +392,14 @@ contract OpenProposalCountTest is Test {
         assertEq(governor.openProposalCount(), 0, "counter == 0 after flush");
 
         // PR #359 review #1: the lazy-resolution `_decOpen` MUST also bump
-        // `_lastSettledAt` so the settle cooldown gates the next propose.
+        // `_cooldownEndsAt` so the settle cooldown gates the next propose.
         // Pre-fix this branch decremented the counter WITHOUT the bump,
         // letting propose→resolve→propose skip the cooldown.
         // `getCooldownEnd == now + COOLDOWN_PERIOD` proves the bump landed.
         assertEq(
             governor.getCooldownEnd(),
             vm.getBlockTimestamp() + COOLDOWN_PERIOD,
-            "resolveProposalState must bump _lastSettledAt (PR #359 #1)"
+            "resolveProposalState must bump _cooldownEndsAt (PR #359 #1)"
         );
 
         // Owner can now rage-quit.
@@ -411,7 +411,7 @@ contract OpenProposalCountTest is Test {
     ///         (`resolveProposalState` → `_resolveState` → `_decOpen`) bumps
     ///         the settle cooldown identically to the explicit cancel/veto
     ///         paths. Pre-fix it was the lone `_decOpen` site without the
-    ///         `_lastSettledAt` write, so a guardian-blocked / expired
+    ///         `_cooldownEndsAt` write, so a guardian-blocked / expired
     ///         proposal left the cooldown un-armed.
     function test_resolveProposalState_armsCooldownLikeVeto() public {
         // Path A: explicit veto bumps the cooldown.

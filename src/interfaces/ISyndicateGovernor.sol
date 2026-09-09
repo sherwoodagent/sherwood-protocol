@@ -740,6 +740,7 @@ interface ISyndicateGovernor {
     function setMaxPerformanceFeeBps(uint256 newMaxPerformanceFeeBps) external;
     function setMinStrategyDuration(uint256 newMinStrategyDuration) external;
     function setMaxStrategyDuration(uint256 newMaxStrategyDuration) external;
+    /// @notice Applies from the next terminal event; an already-open LP exit window keeps its deadline.
     function setCooldownPeriod(uint256 newCooldownPeriod) external;
     function setCollaborationWindow(uint256 newCollaborationWindow) external;
     function setMaxCoProposers(uint256 newMaxCoProposers) external;
@@ -826,7 +827,8 @@ interface ISyndicateGovernor {
     ///      block rage-quit while any proposal binds the vault — the OR check is
     ///      belt-and-braces so stale-cache transitions cannot slip through.
     function openProposalCount() external view returns (uint256);
-    /// @notice When the LP exit window closes and the next propose is allowed.
+    /// @notice Deadline stamped at the last terminal event: when the LP exit window closes and the
+    ///         next propose is allowed. Zero before the first.
     function getCooldownEnd() external view returns (uint256);
     function getCapitalSnapshot(uint256 proposalId) external view returns (uint256);
 
