@@ -92,7 +92,7 @@ check "factory.exposureLedger"        "$(call "$FACTORY" 'exposureLedger()(addre
 check "factory.bondEscrow"            "$(call "$FACTORY" 'bondEscrow()(address)')"       "$ESCROW"
 check "registry.exposureLedger"       "$(call "$REGISTRY" 'exposureLedger()(address)')"  "$LEDGER"
 check "ledger.challengeWindow == 14d" "$(call "$LEDGER" 'challengeWindow()(uint256)')"   "1209600"
-check "ledger.woodHaircutBps == 7000" "$(call "$LEDGER" 'woodHaircutBps()(uint256)')"    "7000"
+check "ledger.woodHaircutBps == 5000" "$(call "$LEDGER" 'woodHaircutBps()(uint256)')"    "5000"
 # Delegation is deferred to v2 and the `StakedWoodDelegation` base was REMOVED
 # pre-mainnet, so the shipped sWOOD carries no such selector at all. An absent
 # selector is the passing state — code that does not exist cannot be enabled —

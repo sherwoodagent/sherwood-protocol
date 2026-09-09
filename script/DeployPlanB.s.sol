@@ -176,14 +176,14 @@ interface IProtocolConfigAdmin {
  *                                 1.25-2x market is the intended band, reviewed
  *                                 monthly. Non-zero (pre-flight 8).
  *     WOOD_HAIRCUT_BPS          — OPTIONAL bond-valuation haircut, bps. Defaults
- *                                 to DEFAULT_WOOD_HAIRCUT_BPS (7,000 = a 30%
- *                                 discount) when unset. This is the ALLOWANCE
+ *                                 to DEFAULT_WOOD_HAIRCUT_BPS (5,000 = the ledger
+ *                                 floor) when unset. This is the ALLOWANCE
  *                                 against the two overstatements the design
  *                                 accepts — the feed's stale ETH/USD leg and
  *                                 the residual crash lag. The ledger DEFAULTS to
  *                                 10,000, which is no haircut and no allowance;
- *                                 pre-flight 9 refuses that. 5,000 is the floor
- *                                 and was rejected as too costly to guardian ROE.
+ *                                 pre-flight 9 refuses that. The shipped default
+ *                                 sits ON the floor, so the two move together.
  *     WOOD_USD_FEED             — the AggregatorV3-shaped WOOD/USD feed: the
  *                                 `WoodPoolFeed` from DeployWoodPoolFeed on 4663,
  *                                 or any plain aggregator. The ledger's ONLY
@@ -273,16 +273,16 @@ contract DeployPlanB is ScriptBase {
     ///             to averaging behind a staleness bound.
     ///
     ///         Both OVERSTATE bond value — the dangerous direction — and the
-    ///         haircut is the compensating control for both. 5,000 (the ledger's
-    ///         floor) was REJECTED as too costly to guardian return on equity, a
-    ///         recurring concern in review. 7,000 is the accepted balance: a 30%
-    ///         allowance bought at 30% of every guardian's headline bond value.
+    ///         haircut is the compensating control for both. The default is the
+    ///         ledger's own floor, 5,000: a 50% allowance bought at 50% of every
+    ///         guardian's headline bond value, so no deploy can ship with less
+    ///         margin than the ledger itself will accept.
     ///
     ///         Seated here rather than left to a follow-up transaction for the
     ///         same reason the duration ceiling is: a parameter an operator is
     ///         merely TOLD to set afterwards is a parameter that ships at its
     ///         default, and this default is the one with no margin in it.
-    uint256 public constant DEFAULT_WOOD_HAIRCUT_BPS = 7_000;
+    uint256 public constant DEFAULT_WOOD_HAIRCUT_BPS = 5_000;
 
     /// @notice Mirror of `ExposureLedger.MIN_WOOD_HAIRCUT_BPS`, which is
     ///         `internal` and so cannot be read from here.

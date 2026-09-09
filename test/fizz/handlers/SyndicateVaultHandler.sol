@@ -111,7 +111,7 @@ abstract contract SyndicateVaultHandler is Properties {
         else if (selector == 4) _syndicateVault_pause();
         else if (selector == 5) _syndicateVault_unpause();
         else if (selector == 6) _syndicateVault_setOpenDeposits(arg0 % 2 == 0);
-        else if (selector == 7) _syndicateVault_setAgentFeeBps(clampBetween(arg0, 0, 3_000));
+        else if (selector == 7) _syndicateVault_setAgentFeeBps(clampBetween(arg0, 0, 2_500));
         else if (selector == 8) _syndicateVault_setMinBufferBps(uint16(clampBetween(arg0, 0, 10_000)));
         else if (selector == 9) _syndicateVault_registerAgent(arg0 % 1_000, toActor(arg1));
         else if (selector == 10) _syndicateVault_removeAgent(toActor(arg1));
