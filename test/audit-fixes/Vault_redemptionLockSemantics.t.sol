@@ -225,4 +225,24 @@ contract VaultRedemptionLockSemanticsTest is Test {
         assertEq(vault.balanceOf(alice), shares, "shares never left the holder");
         assertEq(queue.nextRequestId(), nextId, "nothing queued");
     }
+
+    /// @notice The deposit lane fails closed the same way: an unreadable `proposalCount()`
+    ///         reverts `requestDeposit` before any asset is escrowed.
+    function test_requestDepositRevertsWhenTheGovernorCannotReportAProposalCount() public {
+        VaultWithdrawalQueue queue = new VaultWithdrawalQueue(address(vault));
+        vault.setWithdrawalQueue(address(queue));
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        uint256 nextId = queue.nextRequestId();
+
+        _mockState({active: false, openCount: 1}); // Pending: the tag comes from proposalCount()
+        bytes memory reason = abi.encodeWithSelector(bytes4(keccak256("CountUnavailable()")));
+        vm.mockCallRevert(MOCK_GOVERNOR, abi.encodeWithSignature("proposalCount()"), reason);
+
+        vm.prank(alice);
+        vm.expectRevert(reason);
+        vault.requestDeposit(1_000e6, alice);
+
+        assertEq(usdc.balanceOf(alice), aliceBefore, "assets never left the depositor");
+        assertEq(queue.nextRequestId(), nextId, "nothing queued");
+    }
 }
