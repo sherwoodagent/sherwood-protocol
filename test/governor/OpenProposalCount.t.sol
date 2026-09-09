@@ -392,9 +392,9 @@ contract OpenProposalCountTest is Test {
         assertEq(governor.openProposalCount(), 0, "counter == 0 after flush");
 
         // PR #359 review #1: the lazy-resolution `_decOpen` MUST also bump
-        // `_lastSettledAt` so the settle cooldown gates the next execute.
+        // `_lastSettledAt` so the settle cooldown gates the next propose.
         // Pre-fix this branch decremented the counter WITHOUT the bump,
-        // letting propose→resolve→propose→execute skip the cooldown.
+        // letting propose→resolve→propose skip the cooldown.
         // `getCooldownEnd == now + COOLDOWN_PERIOD` proves the bump landed.
         assertEq(
             governor.getCooldownEnd(),

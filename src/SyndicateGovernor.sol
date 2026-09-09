@@ -617,11 +617,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // propose and execute (`slashOwnerBond` has no open-proposal gate).
         // (`openspec/changes/owner-bond-proposal-gate`)
         if (!IGuardianRegistry(_guardianRegistry).ownerBondLive(vault)) revert OwnerBondNotLive();
-        // Cooldown check (skip if no prior settlement)
-        uint256 lastSettled = _lastSettledAt;
-        if (lastSettled != 0 && block.timestamp < lastSettled + _params.cooldownPeriod) {
-            revert CooldownNotElapsed();
-        }
 
         // Snapshot vault balance before execution
         address asset = IERC4626(vault).asset();
@@ -741,7 +736,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      `cancelReview` so a stale `resolveReview` cannot still slash
     ///      approvers. `_lastSettledAt` is bumped on every cancel branch that
     ///      decrements the open count, so the next propose waits out the same
-    ///      cooldown that gates execute after a settle.
+    ///      cooldown a settle imposes.
     function cancelProposal(uint256 proposalId) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (msg.sender != proposal.proposer) revert NotProposer();

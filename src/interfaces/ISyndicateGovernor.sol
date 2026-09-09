@@ -24,9 +24,9 @@ interface ISyndicateGovernor {
     ///        GuardianReview → Approved        REGISTRY resolveReview: no block quorum
     ///        GuardianReview → Rejected        REGISTRY resolveReview: blocked
     ///        Approved       → Executed        executeProposal (anyone; gate is Approved
-    ///                                         state + no other active proposal + cooldown
-    ///                                         elapsed — no for-vote quorum exists in
-    ///                                         this optimistic model)
+    ///                                         state + no other active proposal — no
+    ///                                         for-vote quorum exists in this optimistic
+    ///                                         model; the settle cooldown gates propose)
     ///        Approved       → Expired         time (executeBy passes)
     ///        Executed       → Settled         settleProposal (proposer any time after
     ///                                         1h; anyone after strategyDuration) — or

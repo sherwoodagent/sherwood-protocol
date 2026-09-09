@@ -268,7 +268,7 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
     ///      `executeBy` deadline and flushes the lazy Expired transition, so
     ///      `openProposalCount` releases and a new proposal can be raised.
     ///      Also stamps `_lastSettledAt`, so callers must additionally clear
-    ///      `cooldownPeriod` before the NEXT proposal can `executeProposal`.
+    ///      `cooldownPeriod` before the NEXT proposal can be raised.
     function _expireAndRelease(uint256 proposalId) internal {
         vm.warp(vm.getBlockTimestamp() + EXECUTION_WINDOW + 1);
         governor.resolveProposalState(proposalId);
