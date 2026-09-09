@@ -411,6 +411,16 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         return block.timestamp - (total - uint256(clockShiftAtStart));
     }
 
+    /// @notice Pause-shift baseline stamped into the review at `registerReview`.
+    function reviewClockShift(address governor, uint256 proposalId) external view returns (uint64) {
+        return _reviews[_reviewKey(governor, proposalId)].clockShiftAtRegister;
+    }
+
+    /// @notice The effective "now" the review's window is judged against (paused time excluded).
+    function effectiveNowFor(address governor, uint256 proposalId) external view returns (uint256) {
+        return _effNow(_reviews[_reviewKey(governor, proposalId)].clockShiftAtRegister);
+    }
+
     /// @dev Composite key isolating per-(governor, proposalId) review state.
     ///      `abi.encode` pads both fields to 32 bytes — no (addr, id) collision.
     function _reviewKey(address gov, uint256 proposalId) private pure returns (bytes32) {

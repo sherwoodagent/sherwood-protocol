@@ -92,4 +92,24 @@ contract GuardianRegistryRegisterReviewTest is RegistryTestHarness {
         registry.addGovernor(gov2, vault2);
         assertEq(registry.vaultOf(gov2), vault2);
     }
+
+    function test_reviewClockShift_isTheShiftStampedAtRegister() public {
+        uint256 pid = 1;
+        _registerReview(pid, block.timestamp + 1 days, block.timestamp + 2 days);
+        assertEq(registry.reviewClockShift(address(governor), pid), registry.pauseShiftTotal(), "stamped at register");
+    }
+
+    function test_effectiveNowFor_isNowMinusTheShiftAccruedSinceRegister() public {
+        uint256 pid = 1;
+        _registerReview(pid, block.timestamp + 1 days, block.timestamp + 2 days);
+        uint256 before = registry.effectiveNowFor(address(governor), pid);
+        assertEq(before, block.timestamp, "no pause since register: effective now is now");
+        // pause for an hour, then unpause: the review's clock must not have advanced
+        vm.prank(regOwner);
+        registry.pause();
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(regOwner);
+        registry.unpause();
+        assertEq(registry.effectiveNowFor(address(governor), pid), before, "paused time does not count");
+    }
 }
