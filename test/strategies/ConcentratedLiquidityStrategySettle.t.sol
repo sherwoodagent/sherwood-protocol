@@ -134,14 +134,34 @@ contract ConcentratedLiquidityStrategyAllOrRevertTest is SettleFixture {
         _assertUntouched(tid, d, c);
     }
 
-    /// @notice An adapter that cannot quote the volatile leg reverts settle (no floor, no swap).
-    function test_settle_revertsOnUnquotableAdapter() public {
+    /// @notice Settle never asks the adapter for a quote: with `quote` reverting, the swap
+    ///         fills at the TWAP-anchored pool floor and the clone ends empty.
+    function test_settle_succeedsWhenTheAdapterCannotQuote() public {
         _execute();
         _accrueFees(0, 100e18);
-        adapter.setRate(address(nvda), address(usdg), 0);
+        adapter.setQuoteReverts(true);
+        uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
 
         vm.prank(address(vaultStub));
-        vm.expectRevert(ConcentratedLiquidityStrategy.QuoteUnavailable.selector);
+        strategy.settle();
+
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled), "settled");
+        assertGt(usdg.balanceOf(address(vaultStub)), vaultBefore, "proceeds delivered");
+        assertEq(nvda.balanceOf(address(strategy)), 0, "volatile leg converted");
+        assertEq(usdg.balanceOf(address(strategy)), 0, "clone holds nothing");
+        assertEq(_debtShares(), 0, "debt cleared");
+    }
+
+    /// @notice The pool anchor is the settle floor: an unquotable adapter filling below it
+    ///         still reverts settle.
+    function test_settle_stillRevertsWhenTheFillIsBelowThePoolAnchor() public {
+        _execute();
+        _accrueFees(0, 100e18);
+        adapter.setQuoteReverts(true);
+        adapter.setRate(address(nvda), address(usdg), (100 * 1e18 / 1e12) / 2);
+
+        vm.prank(address(vaultStub));
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
         strategy.settle();
     }
 

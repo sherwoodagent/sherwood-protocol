@@ -139,10 +139,8 @@ abstract contract CLFixture is Test {
         nvda.mint(address(adapter), 1_000_000e18);
         usdg.mint(address(adapter), 1_000_000e6);
 
-        // Seat a real pool price. `_poolAnchoredMinOut` treats 0 as unreadable
-        // and degrades to the quote floor alone, so leaving the mock's default
-        // would make the anchored floor inert in every test here rather than
-        // fail loudly. FAIR_SQRT_PRICE_X96 encodes exactly the adapter's rate,
+        // Seat a real pool price: `_poolAnchoredMinOut` reverts on the mock's
+        // default of 0. FAIR_SQRT_PRICE_X96 encodes exactly the adapter's rate,
         // so the two floors agree and the honest path is unaffected; the
         // manipulation tests move the ADAPTER away from it.
         pool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96);
@@ -935,35 +933,23 @@ contract ConcentratedLiquidityStrategyPoolAnchoredFloorTest is CLFixture {
         strategy.execute();
     }
 
-    /// @dev SELF-PROVING COUNTERPART to the test above, and the reason it is not
-    ///      vacuous. Same halved routed venue, but with the pool price
-    ///      unreadable the floor degrades to the quote alone — the pre-fix
-    ///      construction — and the identical skim CLEARS.
-    ///
-    ///      Two things are pinned at once: the manipulation test is actually
-    ///      exercising the new floor rather than some unrelated guard, and the
-    ///      degradation path is a real, deliberate residual (an unreadable pool
-    ///      price buys back the old exposure) rather than an accident.
-    function test_execute_quoteFloorAloneAdmitsTheSkim_provingTheAnchorIsLoadBearing() public {
-        pool.setSqrtPriceX96(0);
+    /// @dev Counterpart to the test above: seat the POOL at the same halved price and the
+    ///      identical fill clears, so the pool anchor is what rejected it, not another guard.
+    function test_execute_poolSeatedAtTheHalvedPriceAdmitsTheFill_provingTheAnchorIsLoadBearing() public {
+        // sqrt(0.5e10) ~= 70_710.68; rounding down keeps the anchor a hair under the fill.
+        pool.setSqrtPriceX96(uint160(70_710) * uint160(2 ** 96));
         adapter.setRate(address(usdg), address(nvda), (1e18 * 1e12 / 100) / 2);
         _execute();
-        assertEq(
-            uint256(strategy.state()),
-            uint256(BaseStrategy.State.Executed),
-            "without the pool anchor the halved venue clears -- this is the pre-fix behaviour"
-        );
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed), "pool and venue agree: clears");
     }
 
-    /// @dev The pool read degrades rather than bricks: an unreadable price
-    ///      (`sqrtPriceX96 == 0`) must fall back to the quote floor alone, which
-    ///      is the pre-existing behaviour, not a new revert. Pins that the
-    ///      degradation path is deliberate — and, read against the test above,
-    ///      pins that a zero price is what made this floor inert.
-    function test_execute_unreadablePoolPriceDegradesToQuoteFloor() public {
+    /// @dev An unreadable pool price (`sqrtPriceX96 == 0`) is no floor at all, so execute
+    ///      reverts rather than degrading to the quote alone.
+    function test_execute_revertsWhenThePoolPriceIsUnreadable() public {
         pool.setSqrtPriceX96(0);
-        _execute();
-        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed));
+        vm.prank(address(vaultStub));
+        vm.expectRevert(ConcentratedLiquidityStrategy.QuoteUnavailable.selector);
+        strategy.execute();
     }
 
     /// @dev The anchor is the pool's MID price, while `_quoteMinOut`'s operand

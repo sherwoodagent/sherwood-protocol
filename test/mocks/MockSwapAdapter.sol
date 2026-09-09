@@ -27,7 +27,11 @@ contract MockSwapAdapter is ISwapAdapter {
     ///         quote while pulling less leaves the remainder on the caller.
     uint256 public pullBps = 10_000;
 
+    /// @notice When set, `quote` reverts while `swap` still fills at the rate.
+    bool public quoteReverts;
+
     error RateNotSet();
+    error QuoteDisabled();
     error SlippageExceeded();
 
     function setRate(address tokenIn, address tokenOut, uint256 rate) external {
@@ -36,6 +40,10 @@ contract MockSwapAdapter is ISwapAdapter {
 
     function setPullBps(uint256 bps) external {
         pullBps = bps;
+    }
+
+    function setQuoteReverts(bool v) external {
+        quoteReverts = v;
     }
 
     /// @inheritdoc ISwapAdapter
@@ -72,6 +80,7 @@ contract MockSwapAdapter is ISwapAdapter {
         override
         returns (uint256 amountOut)
     {
+        if (quoteReverts) revert QuoteDisabled();
         uint256 rate = rates[_pairKey(tokenIn, tokenOut)];
         if (rate == 0) revert RateNotSet();
         amountOut = (amountIn * rate) / RATE_PRECISION;

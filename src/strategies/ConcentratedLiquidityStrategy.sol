@@ -253,8 +253,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         — including loosening a bound in the risk-INCREASING direction,
     ///         which is the same thing by another route.
     error ImmutableParam();
-    /// @notice The configured adapter could not quote a leg this contract is about to
-    ///         swap. The adapter's quote is one of the two floor sources; no floor, no swap.
+    /// @notice No floor could be derived: the adapter could not quote a leg (execute, rerange)
+    ///         or the pool reports no price. No floor, no swap.
     error QuoteUnavailable();
     /// @notice Settlement proceeds cannot cover the Morpho debt; the position stays as it
     ///         is and settlement is retried (or exited under guardian review).
@@ -554,30 +554,24 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         returns (uint256)
     {
         (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
-        if (sqrtPriceX96 == 0) return 0;
+        if (sqrtPriceX96 == 0) revert QuoteUnavailable();
 
         uint256 sp = uint256(sqrtPriceX96);
         uint256 expected;
-        // token0 -> token1 multiplies by the price; token1 -> token0 divides.
+        // token0 -> token1 multiplies by the price; token1 -> token0 divides. A zero result
+        // means `amountIn` is worth under one unit of the out token: nothing to floor.
         if (tokenIn == (assetIsToken0 ? asset : otherToken)) {
             expected = Math.mulDiv(Math.mulDiv(amountIn, sp, 1 << 96), sp, 1 << 96);
         } else {
             expected = Math.mulDiv(Math.mulDiv(amountIn, 1 << 96, sp), 1 << 96, sp);
         }
-        if (expected == 0) return 0;
-        // Fee first, slippage second — see the NatSpec. `pool.fee()` is in
-        // hundredths of a bip (1e6 = 100%), and Uniswap V3 caps it far below
-        // that, so the subtraction cannot underflow.
+        // Fee first, slippage second. `pool.fee()` is in hundredths of a bip (1e6 = 100%).
         expected = (expected * (FEE_DENOMINATOR - uint256(pool.fee()))) / FEE_DENOMINATOR;
-        if (expected == 0) return 0;
         return (expected * (BPS_DENOMINATOR - slippageBps)) / BPS_DENOMINATOR;
     }
 
-    /// @dev `max(quote floor, pool-anchored floor)`. The quote floor alone is
-    ///      defeated by moving the routed venue; the pool floor alone would be
-    ///      defeated by a routed venue that is legitimately cheaper than the LP
-    ///      pool. Taking the max means an attacker must beat BOTH, and a
-    ///      mis-scaled or unreadable pool read can only ever raise the bar.
+    /// @dev `max(quote floor, pool-anchored floor)` for execute and rerange: an attacker must
+    ///      beat both venues. Settle floors on the pool anchor alone (`_swapToAsset`).
     function _floorFor(address tokenIn, address tokenOut, uint256 amountIn, uint256 slippageBps)
         private
         returns (uint256 minOut)
@@ -1096,14 +1090,14 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         if (held != 0) revert StrategyHoldsTokens(token, held);
     }
 
-    /// @dev Spot is TWAP-verified first (D8), so the pool-anchored half of the floor is trusted
-    ///      only inside the deviation bound; the floor is then `max(quote, pool-anchored)`.
+    /// @dev Spot is TWAP-verified first, so the pool anchor is a trusted floor on its own. No
+    ///      adapter quote here: an adapter that stops quoting must not wedge the exit.
     function _swapToAsset(uint256 slippageBps) private {
         uint256 bal = IERC20(otherToken).balanceOf(address(this));
         if (bal == 0) return;
 
         _requireSpotNearTwap();
-        uint256 minOut = _floorFor(otherToken, asset, bal, slippageBps);
+        uint256 minOut = _poolAnchoredMinOut(otherToken, bal, slippageBps);
 
         IERC20(otherToken).forceApprove(address(swapAdapter), bal);
         swapAdapter.swap(otherToken, asset, bal, minOut, swapExtraData);
