@@ -631,58 +631,6 @@ contract PortfolioStrategyTest is Test {
         fresh.initialize(vault, proposer, initData);
     }
 
-    // ==================== REBALANCE (SIMPLE) ====================
-
-    function test_rebalance() public {
-        _executeStrategy();
-
-        // Verify initial allocations
-        PortfolioStrategy.TokenAllocation[] memory before = strategy.getAllocations();
-        assertEq(before[0].targetWeightBps, 4000);
-
-        // Change weights: TSLA 60%, AMZN 30%, NFLX 10%
-        uint256[] memory newWeights = new uint256[](3);
-        newWeights[0] = 6000;
-        newWeights[1] = 3000;
-        newWeights[2] = 1000;
-
-        vm.prank(proposer);
-        strategy.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
-
-        // Rebalance
-        vm.prank(proposer);
-        strategy.rebalance();
-
-        PortfolioStrategy.TokenAllocation[] memory after_ = strategy.getAllocations();
-
-        // After rebalance, all WETH recovered (10 WETH from sell) then re-bought at new weights
-        // TSLA: 60% of 10 WETH = 6 WETH * 100 = 600 TSLA
-        assertEq(after_[0].tokenAmount, 600e18);
-        assertEq(after_[0].investedAmount, 6e18);
-
-        // AMZN: 30% of 10 WETH = 3 WETH * 50 = 150 AMZN
-        assertEq(after_[1].tokenAmount, 150e18);
-        assertEq(after_[1].investedAmount, 3e18);
-
-        // NFLX: 10% of 10 WETH = 1 WETH * 200 = 200 NFLX
-        assertEq(after_[2].tokenAmount, 200e18);
-        assertEq(after_[2].investedAmount, 1e18);
-    }
-
-    function test_rebalance_onlyProposer() public {
-        _executeStrategy();
-
-        vm.prank(makeAddr("attacker"));
-        vm.expectRevert(BaseStrategy.NotProposer.selector);
-        strategy.rebalance();
-    }
-
-    function test_rebalance_notExecuted_reverts() public {
-        vm.prank(proposer);
-        vm.expectRevert(BaseStrategy.NotExecuted.selector);
-        strategy.rebalance();
-    }
-
     // ==================== REBALANCE DELTA ====================
 
     function test_rebalanceDelta() public {
@@ -738,7 +686,7 @@ contract PortfolioStrategyTest is Test {
 
         // 3. Rebalance
         vm.prank(proposer);
-        strategy.rebalance();
+        strategy.rebalanceDelta();
 
         // 4. Prices go up 10%
         adapter.setRate(address(tsla), address(weth), 0.011e18);
@@ -828,9 +776,9 @@ contract PortfolioStrategyTest is Test {
         assertEq(allocs[0].investedAmount, 5e18);
         assertEq(tsla.balanceOf(address(s)), 500e18);
 
-        // Rebalance (same weight, just sell/re-buy)
+        // Rebalance (same weight, no drift: delta swaps nothing)
         vm.prank(proposer);
-        s.rebalance();
+        s.rebalanceDelta();
 
         allocs = s.getAllocations();
         assertEq(allocs[0].tokenAmount, 500e18); // same — no price change
@@ -966,8 +914,8 @@ contract PortfolioStrategyTest is Test {
         assertEq(nflx.balanceOf(address(s)), 0);
     }
 
-    /// @notice Rebalance to zero weight — move a token from active to 0%, sell its position
-    function test_rebalance_zeroWeightRemoval() public {
+    /// @notice Delta rebalance to zero weight — move a token from active to 0%, sell its position
+    function test_rebalanceDelta_zeroWeightRemoval() public {
         _executeStrategy();
 
         // Initial: TSLA 40%, AMZN 35%, NFLX 25%
@@ -985,13 +933,12 @@ contract PortfolioStrategyTest is Test {
 
         // Rebalance — should sell NFLX and not re-buy
         vm.prank(proposer);
-        strategy.rebalance();
+        strategy.rebalanceDelta();
 
         PortfolioStrategy.TokenAllocation[] memory after_ = strategy.getAllocations();
 
-        // NFLX: 0 weight → sold, no re-buy
+        // NFLX: 0 weight → sold, no re-buy (the delta path tracks balances, not investedAmount)
         assertEq(after_[2].tokenAmount, 0);
-        assertEq(after_[2].investedAmount, 0);
         assertEq(nflx.balanceOf(address(strategy)), 0);
 
         // TSLA: 60% of recovered WETH
@@ -1017,7 +964,7 @@ contract PortfolioStrategyTest is Test {
         strategy.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
 
         vm.prank(proposer);
-        strategy.rebalance();
+        strategy.rebalanceDelta();
 
         // Settle — should succeed even with a zero-balance token
         uint256 vaultBefore = weth.balanceOf(vault);
@@ -1031,8 +978,8 @@ contract PortfolioStrategyTest is Test {
         assertEq(amzn.balanceOf(address(strategy)), 0);
     }
 
-    /// @notice Rebalance multiple times — weights can change between rebalances
-    function test_multipleRebalances() public {
+    /// @notice Delta rebalance multiple times — weights can change between rebalances
+    function test_multipleRebalanceDeltas() public {
         _executeStrategy();
 
         // First rebalance: 60/30/10
@@ -1043,7 +990,7 @@ contract PortfolioStrategyTest is Test {
         vm.prank(proposer);
         strategy.updateParams(abi.encode(w1, uint256(0), new bytes[](0)));
         vm.prank(proposer);
-        strategy.rebalance();
+        strategy.rebalanceDelta();
 
         PortfolioStrategy.TokenAllocation[] memory r1 = strategy.getAllocations();
         assertEq(r1[0].tokenAmount, 600e18); // 60% of 10 WETH * 100
@@ -1056,7 +1003,7 @@ contract PortfolioStrategyTest is Test {
         vm.prank(proposer);
         strategy.updateParams(abi.encode(w2, uint256(0), new bytes[](0)));
         vm.prank(proposer);
-        strategy.rebalance();
+        strategy.rebalanceDelta();
 
         PortfolioStrategy.TokenAllocation[] memory r2 = strategy.getAllocations();
         assertEq(r2[0].targetWeightBps, 3300);
@@ -1073,7 +1020,7 @@ contract PortfolioStrategyTest is Test {
         vm.prank(proposer);
         strategy.updateParams(abi.encode(w3, uint256(0), new bytes[](0)));
         vm.prank(proposer);
-        strategy.rebalance();
+        strategy.rebalanceDelta();
 
         PortfolioStrategy.TokenAllocation[] memory r3 = strategy.getAllocations();
         assertEq(r3[0].tokenAmount, 340e18); // 34% of 10 * 100
@@ -1088,49 +1035,8 @@ contract PortfolioStrategyTest is Test {
 
     // ==================== GAS BENCHMARKS ====================
 
-    /// @notice Gas cost comparison: sell-all/re-buy vs delta rebalance at 3 tokens
-    function test_gas_rebalance_3tokens() public {
-        _executeStrategy();
-
-        // Update weights for rebalance
-        uint256[] memory newWeights = new uint256[](3);
-        newWeights[0] = 6000;
-        newWeights[1] = 3000;
-        newWeights[2] = 1000;
-        vm.prank(proposer);
-        strategy.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
-
-        // Measure sell-all/re-buy gas
-        vm.prank(proposer);
-        uint256 gasBefore = gasleft();
-        strategy.rebalance();
-        uint256 gasSimple = gasBefore - gasleft();
-
-        // --- Setup fresh clone for delta comparison ---
-        address clone2 = Clones.clone(address(template));
-        PortfolioStrategy s2 = PortfolioStrategy(clone2);
-        _initStrategy(s2);
-
-        vm.prank(vault);
-        weth.approve(address(s2), TOTAL_AMOUNT);
-        vm.prank(vault);
-        s2.execute();
-
-        vm.prank(proposer);
-        s2.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
-
-        vm.prank(proposer);
-        uint256 gasBefore2 = gasleft();
-        s2.rebalanceDelta();
-        uint256 gasDelta = gasBefore2 - gasleft();
-
-        // Log gas costs (visible in forge test -vvv output)
-        emit log_named_uint("Gas: rebalance (sell-all/re-buy) 3 tokens", gasSimple);
-        emit log_named_uint("Gas: rebalanceDelta (Chainlink)   3 tokens", gasDelta);
-    }
-
-    /// @notice Gas cost at max basket size (20 tokens) — sell-all/re-buy
-    function test_gas_rebalance_20tokens() public {
+    /// @notice Gas cost at max basket size (20 tokens) — delta rebalance
+    function test_gas_rebalanceDelta_20tokens() public {
         address clone = Clones.clone(address(template));
         PortfolioStrategy s = PortfolioStrategy(clone);
 
@@ -1176,6 +1082,7 @@ contract PortfolioStrategyTest is Test {
         s.initialize(vault, proposer, initData);
 
         weth.mint(vault, 20e18);
+
         vm.prank(vault);
         weth.approve(address(s), 20e18);
         vm.prank(vault);
@@ -1184,34 +1091,25 @@ contract PortfolioStrategyTest is Test {
         vm.prank(proposer);
         s.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
 
-        // Measure gas
         vm.prank(proposer);
         uint256 gasBefore = gasleft();
-        s.rebalance();
-        uint256 gasUsed = gasBefore - gasleft();
-
-        emit log_named_uint("Gas: rebalance (sell-all/re-buy) 20 tokens", gasUsed);
-
-        // --- Delta rebalance for 20 tokens ---
-        address clone2 = Clones.clone(address(template));
-        PortfolioStrategy s2 = PortfolioStrategy(clone2);
-
-        s2.initialize(vault, proposer, initData);
-        weth.mint(vault, 20e18);
-        vm.prank(vault);
-        weth.approve(address(s2), 20e18);
-        vm.prank(vault);
-        s2.execute();
-
-        vm.prank(proposer);
-        s2.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
-
-        vm.prank(proposer);
-        uint256 gasBefore2 = gasleft();
-        s2.rebalanceDelta();
-        uint256 gasDelta = gasBefore2 - gasleft();
+        s.rebalanceDelta();
+        uint256 gasDelta = gasBefore - gasleft();
 
         emit log_named_uint("Gas: rebalanceDelta (Chainlink)   20 tokens", gasDelta);
+    }
+
+    /// @notice The sell-all/re-buy `rebalance()` is gone: its selector has no dispatch on a live clone.
+    function test_rebalanceIsGone_selectorReverts() public {
+        _executeStrategy();
+
+        vm.prank(proposer);
+        (bool ok,) = address(strategy).call(abi.encodeWithSignature("rebalance()"));
+        assertFalse(ok, "rebalance() must not dispatch");
+
+        vm.prank(proposer);
+        (bool okDelta,) = address(strategy).call(abi.encodeWithSignature("rebalanceDelta()"));
+        assertTrue(okDelta, "control: rebalanceDelta() still dispatches");
     }
 
     // ==================== HELPERS ====================

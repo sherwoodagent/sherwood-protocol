@@ -191,18 +191,18 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
     // Live proposer standing
     // ════════════════════════════════════════════════════════════════════
 
-    /// @notice A de-registered agent loses `rebalance` on an already-deployed clone.
+    /// @notice A de-registered agent loses `rebalanceDelta` on an already-deployed clone.
     function test_finding9_removedAgentLosesProposerRightsOnLiveClone() public {
         Rig memory r = _rig();
 
         vm.prank(proposer);
-        r.strategy.rebalance(); // still an agent: ordinary path works
+        r.strategy.rebalanceDelta(); // still an agent: ordinary path works
 
         r.vault.setAgent(proposer, false);
 
         vm.prank(proposer);
         vm.expectRevert(BaseStrategy.ProposerNoLongerAgent.selector);
-        r.strategy.rebalance();
+        r.strategy.rebalanceDelta();
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -234,20 +234,6 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         r.strategy.settle();
         assertEq(weth.balanceOf(address(r.vault)), vaultWethBefore + TOTAL_AMOUNT, "capital returned");
         assertEq(uint256(r.strategy.state()), uint256(BaseStrategy.State.Settled));
-    }
-
-    /// @notice `rebalance()`'s sell leg shares `_sellFloor` and reverts the same way.
-    function test_rebalance_sellLeg_revertsWhenFeedIsStale() public {
-        Rig memory r = _rig();
-
-        r.feed.setUpdatedAt(START - DEFAULT_MAX_AGE - 1 hours);
-        vm.warp(START + 1);
-
-        vm.prank(proposer);
-        vm.expectRevert(PortfolioStrategy.StalePrice.selector);
-        r.strategy.rebalance();
-
-        assertEq(uint256(r.strategy.state()), uint256(BaseStrategy.State.Executed));
     }
 
     /// @notice A codeless feed is a typed-call revert, never a quote-anchored fallback.
@@ -379,33 +365,9 @@ contract PortfolioStrategy_floorsAndOracleTest is Test {
         strategy.execute();
     }
 
-    /// @notice `rebalance()`'s re-buy leg gets the same floor as `_execute`'s buy leg.
-    function test_rebalance_reBuyLeg_revertsOnPoolManipulated() public {
-        Rig memory r = _rig();
-
-        r.adapter.setRate(address(weth), address(tsla), 0.01e18);
-
-        vm.prank(proposer);
-        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
-        r.strategy.rebalance();
-    }
-
     // ════════════════════════════════════════════════════════════════════
     // Price source re-validated live on every rebalance, never on settle
     // ════════════════════════════════════════════════════════════════════
-
-    function test_rebalance_revertsWhenPriceSourceRevokedPostExecute() public {
-        Rig memory r = _rig();
-        r.registry.setAllowed(address(r.feed), false);
-
-        vm.prank(proposer);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                PortfolioStrategy.PriceSourceNotAllowed.selector, address(r.feed), address(r.registry)
-            )
-        );
-        r.strategy.rebalance();
-    }
 
     function test_rebalanceDelta_revertsWhenPriceSourceRevokedPostExecute() public {
         Rig memory r = _rig();

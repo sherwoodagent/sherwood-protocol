@@ -93,14 +93,6 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
 
     // ── Events ──
     event WeightsUpdated(address[] tokens, uint256[] oldWeights, uint256[] newWeights);
-    event Rebalanced(
-        address[] tokens,
-        uint256[] oldWeights,
-        uint256[] newWeights,
-        uint256[] oldBalances,
-        uint256[] newBalances,
-        uint256 totalAssetValue
-    );
     event RebalancedDelta(
         address[] tokens,
         uint256[] oldWeights,
@@ -251,61 +243,6 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
     }
 
     // ── Rebalancing ──
-
-    /// @notice Sell every position, re-buy at the current target weights. Proposer-only, Executed only.
-    function rebalance() external onlyProposer nonReentrant {
-        if (_state != State.Executed) revert NotExecuted();
-        _requireAllowedAdapter(address(swapAdapter));
-        _requireAllowedPriceSources();
-
-        uint256 len = _allocations.length;
-
-        address[] memory tokens = new address[](len);
-        uint256[] memory oldWeights = new uint256[](len);
-        uint256[] memory newWeights = new uint256[](len);
-        uint256[] memory oldBalances = new uint256[](len);
-        for (uint256 i; i < len; ++i) {
-            tokens[i] = _allocations[i].token;
-            oldWeights[i] = _allocations[i].targetWeightBps;
-            newWeights[i] = _allocations[i].targetWeightBps;
-            oldBalances[i] = IERC20(_allocations[i].token).balanceOf(address(this));
-        }
-
-        for (uint256 i; i < len; ++i) {
-            TokenAllocation storage alloc = _allocations[i];
-            uint256 bal = IERC20(alloc.token).balanceOf(address(this));
-            if (bal == 0) continue;
-
-            IERC20(alloc.token).forceApprove(address(swapAdapter), bal);
-            uint256 minOut = _sellFloor(i, bal);
-            uint256 amountOut = swapAdapter.swap(alloc.token, asset, bal, minOut, _swapExtraData[i]);
-            if (amountOut == 0) revert SwapFailed();
-            alloc.tokenAmount = 0;
-            alloc.investedAmount = 0;
-        }
-
-        uint256 assetBalance = IERC20(asset).balanceOf(address(this));
-        for (uint256 i; i < len; ++i) {
-            TokenAllocation storage alloc = _allocations[i];
-            uint256 allocation = (assetBalance * alloc.targetWeightBps) / BPS_DENOMINATOR;
-            if (allocation == 0) continue;
-
-            IERC20(asset).forceApprove(address(swapAdapter), allocation);
-            uint256 minOut = _buyFloor(i, allocation);
-            uint256 amountOut = swapAdapter.swap(asset, alloc.token, allocation, minOut, _swapExtraData[i]);
-            if (amountOut == 0) revert SwapFailed();
-
-            alloc.tokenAmount = amountOut;
-            alloc.investedAmount = allocation;
-        }
-
-        uint256[] memory newBalances = new uint256[](len);
-        for (uint256 i; i < len; ++i) {
-            newBalances[i] = IERC20(_allocations[i].token).balanceOf(address(this));
-        }
-
-        emit Rebalanced(tokens, oldWeights, newWeights, oldBalances, newBalances, assetBalance);
-    }
 
     /// @dev Pre-rebalance snapshot, bundled so the legacy pipeline stays under the stack limit.
     struct DeltaSnapshot {
