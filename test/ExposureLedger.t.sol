@@ -26,6 +26,10 @@ contract ExposureLedgerHarness is ExposureLedger {
     function bucketOf(address guardian, uint256 epoch) external view returns (uint256) {
         return _buckets[guardian][epoch];
     }
+
+    function horizonClampedEpochOf(uint256 t) external view returns (uint256) {
+        return _horizonClampedEpochOf(t);
+    }
 }
 
 contract MockSwood {
@@ -2839,9 +2843,10 @@ contract ExposureLedgerTest is Test {
     function test_currentEpochAndOpenExposureAreZeroBeforeGenesis() public {
         // deploy a fresh ledger at a later timestamp, then rewind the clock behind its genesis
         vm.warp(block.timestamp + 30 days);
-        ExposureLedger late = new ExposureLedger(owner, address(swood), 28 days);
+        ExposureLedgerHarness late = new ExposureLedgerHarness(owner, address(swood), 28 days);
         vm.warp(late.epochGenesis() - 1);
         assertEq(late.currentEpoch(), 0, "no epoch has begun");
         assertEq(late.openExposure(address(0xBEEF)), 0, "nothing is open before genesis");
+        assertEq(late.horizonClampedEpochOf(0), 0, "horizon-clamped epoch is zero before genesis");
     }
 }
