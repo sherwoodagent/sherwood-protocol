@@ -331,6 +331,80 @@ contract PortfolioStrategy_stuckSettleEmergencyTest is Test {
         assertFalse(vault.redemptionsLocked());
     }
 
+    function _rescueCalls(address strategy) internal view returns (BatchExecutorLib.Call[] memory calls) {
+        calls = new BatchExecutorLib.Call[](2);
+        calls[0] = BatchExecutorLib.Call({
+            target: strategy, data: abi.encodeCall(BaseStrategy.rescueTo, (address(tsla))), value: 0
+        });
+        calls[1] = BatchExecutorLib.Call({
+            target: strategy, data: abi.encodeCall(BaseStrategy.rescueTo, (address(usdc))), value: 0
+        });
+    }
+
+    /// @notice A retired feed never comes back: a year on, every settle path still reverts.
+    ///         An emergency batch of `rescueTo` per basket token pulls the clone's tokens home
+    ///         without a price, `finalizeEmergencySettle` closes the proposal and both locks reopen.
+    function test_darkFeedForever_emergencyBatchRescuesTheBasketAndFinalises() public {
+        (PortfolioStrategy strategy, uint256 pid) = _executedBasket();
+
+        vm.warp(vm.getBlockTimestamp() + 365 days);
+
+        vm.expectRevert(PortfolioStrategy.StalePrice.selector);
+        governor.settleProposal(pid);
+        vm.prank(owner);
+        vm.expectRevert(PortfolioStrategy.StalePrice.selector);
+        governor.unstick(pid);
+        assertTrue(vault.redemptionsLocked(), "premise: locks shut while Executed");
+
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, _rescueCalls(address(strategy)));
+        vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
+        vm.prank(owner);
+        governor.finalizeEmergencySettle(pid);
+
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertEq(tsla.balanceOf(address(strategy)), 0, "basket left on the clone");
+        assertEq(usdc.balanceOf(address(strategy)), 0, "asset left on the clone");
+        assertEq(tsla.balanceOf(address(vault)), 500e18, "basket not delivered to the vault");
+        assertFalse(vault.redemptionsLocked(), "redemptions still locked");
+        assertFalse(vault.depositsLocked(), "deposits still locked");
+    }
+
+    function test_rescueTo_onlyVault() public {
+        (PortfolioStrategy strategy,) = _executedBasket();
+        vm.prank(owner);
+        vm.expectRevert(BaseStrategy.NotVault.selector);
+        strategy.rescueTo(address(tsla));
+        vm.prank(agent);
+        vm.expectRevert(BaseStrategy.NotVault.selector);
+        strategy.rescueTo(address(tsla));
+        assertEq(tsla.balanceOf(address(strategy)), 500e18, "moved without the vault");
+    }
+
+    /// @notice The batch guard admits `rescueTo` on the callee axis alone, exactly as it admits
+    ///         `settle()`: the selector names no recipient, so `isAdapterAllowed` is never
+    ///         consulted (denied here), and denying `isCallableTarget` on the clone refuses it.
+    function test_rescueTo_isReachableFromAnEmergencyBatch() public {
+        (PortfolioStrategy strategy,) = _executedBasket();
+        address tierRegistry = governor.tierRegistry();
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
+        calls[0] = _rescueCalls(address(strategy))[0];
+
+        vm.mockCall(
+            tierRegistry, abi.encodeCall(ITierRegistry.isAdapterAllowed, (address(strategy))), abi.encode(false)
+        );
+        vm.prank(address(governor));
+        vault.executeGovernorBatch(calls, new uint256[](0), 0);
+        assertEq(tsla.balanceOf(address(vault)), 500e18, "rescue did not land");
+
+        vm.mockCall(
+            tierRegistry, abi.encodeCall(ITierRegistry.isCallableTarget, (address(strategy))), abi.encode(false)
+        );
+        vm.prank(address(governor));
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchCallee.selector, address(strategy)));
+        vault.executeGovernorBatch(calls, new uint256[](0), 0);
+    }
+
     /// @notice Control: with a live feed the ordinary `settleProposal` clears at the same point.
     function test_settle_clearsWhenFeedIsLive() public {
         (PortfolioStrategy strategy, uint256 pid) = _executedBasket();

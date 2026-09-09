@@ -156,6 +156,13 @@ abstract contract BaseStrategy is IStrategy {
         _settle();
     }
 
+    /// @notice Emergency exit: push the clone's whole balance of `token` to the vault.
+    ///         No price read, no state change, any lifecycle state — reachable only
+    ///         through a vault batch, i.e. an owner-supplied emergency settle.
+    function rescueTo(address token) external onlyVault {
+        _pushAllToVault(token);
+    }
+
     /// @inheritdoc IStrategy
     function updateParams(bytes calldata data) external virtual onlyProposer {
         if (_state != State.Executed) revert NotExecuted();
