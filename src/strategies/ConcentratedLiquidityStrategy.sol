@@ -9,7 +9,7 @@ import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
-import {IMorpho, Id, MarketParams, Market, Position} from "../vendor/morpho/IMorpho.sol";
+import {IMorpho, IOracle, Id, MarketParams, Market, Position} from "../vendor/morpho/IMorpho.sol";
 import {MarketParamsLib, SharesMathLib} from "../vendor/morpho/MorphoLibs.sol";
 import {IUniswapV3Pool} from "../vendor/uniswap/IUniswapV3Pool.sol";
 import {IUniswapV3Factory} from "../vendor/uniswap/IUniswapV3Factory.sol";
@@ -47,7 +47,8 @@ interface ITierBindingPath {
  *   Settle:  decrease to zero → collect → convert the other token back →
  *            repay → withdraw collateral → push everything to the vault. A
  *            negative-carry position first frees just enough collateral to
- *            cover the shortfall (`_deleverage`).
+ *            cover the shortfall (`_deleverage`); a larger shortfall is unwound
+ *            beforehand in persistent `deleverageStep` passes.
  *            All-or-revert: every step is typed, a failed settlement is retried.
  *
  *   Batch calls from governor:
@@ -128,6 +129,12 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     /// @notice Hard ceiling on any configured slippage floor.
     uint256 public constant MAX_SLIPPAGE_BPS = 1_000;
+
+    /// @notice Morpho oracle scale: `price()` is loan units per collateral unit x 1e36.
+    uint256 public constant ORACLE_PRICE_SCALE = 1e36;
+
+    /// @notice Collateral `deleverageStep` keeps on top of what Morpho needs for the debt left open.
+    uint256 public constant DELEVERAGE_BUFFER_BPS = 10;
 
     /// @notice Hard ceiling on the configured spot-vs-TWAP deviation bound.
     uint256 public constant MAX_TWAP_DEVIATION_BPS = 1_000;
@@ -258,9 +265,14 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @notice No floor could be derived: the adapter could not quote a leg (execute, rerange)
     ///         or the pool reports no price. No floor, no swap.
     error QuoteUnavailable();
-    /// @notice Even after freeing collateral for the shortfall the proceeds cannot cover the
-    ///         Morpho debt; nothing moves and settle is retried.
+    /// @notice Even after the one in-settle deleverage step the proceeds cannot cover the Morpho
+    ///         debt; nothing moves. Run `deleverageStep` (or top the clone up), then retry.
     error ProceedsBelowDebt(uint256 held, uint256 owed);
+    /// @notice The clone already holds the debt: nothing to unwind.
+    error NothingToDeleverage();
+    /// @notice No collateral can leave Morpho without breaching health: the debt is at or past
+    ///         what the collateral supports. Only a top-up or liquidation moves it.
+    error CollateralNotFreeable(uint256 owed, uint256 collateral);
     /// @notice Settle left `amount` of `token` on the clone.
     error StrategyHoldsTokens(address token, uint256 amount);
 
@@ -275,6 +287,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         uint256 borrowed,
         uint256 collateral
     );
+
+    event DeleverageStep(uint256 repaid, uint256 withdrawn, uint256 owedAfter);
 
     event PositionReranged(
         uint256 indexed rerangeIndex,
@@ -391,6 +405,13 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///         "this block", which is the safe default; a proposer raises it
     ///         only to tolerate a settlement batch that may land later.
     uint256 public settleDeadline;
+
+    /// @dev The vault is admitted so an owner emergency batch can drive the unwind once the
+    ///      proposer is deregistered.
+    modifier onlyProposerOrVault() {
+        if (msg.sender != vault()) _requireProposer();
+        _;
+    }
 
     /// @inheritdoc IStrategy
     function name() external pure returns (string memory) {
@@ -1132,14 +1153,55 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     ///      then free the residual plus `settleSlippageBps` of collateral and redeem it. Never
     ///      relies on Morpho tolerating an unhealthy position.
     function _deleverage(uint256 held, uint256 owed, uint256 collateral) private {
-        uint256 want = ((owed - held) * (BPS_DENOMINATOR + settleSlippageBps)) / BPS_DENOMINATOR;
-        address collateralToken = _marketParams.collateralToken;
-        uint256 need = collateralToken == asset ? want : IERC4626(collateralToken).previewWithdraw(want);
+        uint256 need = _collateralFor(((owed - held) * (BPS_DENOMINATOR + settleSlippageBps)) / BPS_DENOMINATOR);
         if (need > collateral) revert ProceedsBelowDebt(held, owed);
 
         if (held != 0) _repay(held, 0);
         morpho.withdrawCollateral(_marketParams, need, address(this), address(this));
         _redeemWrapper();
+    }
+
+    /// @notice One persistent deleverage pass: repay what the clone holds, withdraw the collateral
+    ///         that frees while Morpho stays healthy, redeem it to the asset. Repeat until the
+    ///         clone holds the debt, then settle. Never touches the position or the volatile leg.
+    function deleverageStep() external onlyProposerOrVault nonReentrant {
+        if (_state != State.Executed) revert NotExecuted();
+        morpho.accrueInterest(_marketParams);
+        Position memory pos = morpho.position(marketId, address(this));
+        uint256 owed = _owedFor(pos.borrowShares);
+        uint256 held = IERC20(asset).balanceOf(address(this));
+        if (held >= owed) revert NothingToDeleverage();
+
+        if (held != 0) {
+            _repay(held, 0);
+            pos = morpho.position(marketId, address(this));
+            owed = _owedFor(pos.borrowShares);
+        }
+        uint256 freeable = _freeableCollateral(pos.collateral, owed);
+        if (freeable == 0) revert CollateralNotFreeable(owed, pos.collateral);
+        uint256 need = _collateralFor((owed * (BPS_DENOMINATOR + settleSlippageBps)) / BPS_DENOMINATOR);
+        uint256 withdrawn = need < freeable ? need : freeable;
+
+        morpho.withdrawCollateral(_marketParams, withdrawn, address(this), address(this));
+        _redeemWrapper();
+        emit DeleverageStep(held, withdrawn, owed);
+    }
+
+    /// @dev Collateral above what Morpho needs to hold `owed` healthy at the market oracle price,
+    ///      keeping `DELEVERAGE_BUFFER_BPS` on top. Every rounding goes against the withdrawal.
+    function _freeableCollateral(uint256 collateral, uint256 owed) private view returns (uint256) {
+        uint256 price = IOracle(_marketParams.oracle).price();
+        if (price == 0) revert CollateralValueUnavailable();
+        uint256 keep = Math.mulDiv(owed, 1e18, _marketParams.lltv, Math.Rounding.Ceil);
+        keep = Math.mulDiv(keep, ORACLE_PRICE_SCALE, price, Math.Rounding.Ceil);
+        keep = Math.mulDiv(keep, BPS_DENOMINATOR + DELEVERAGE_BUFFER_BPS, BPS_DENOMINATOR, Math.Rounding.Ceil);
+        return collateral > keep ? collateral - keep : 0;
+    }
+
+    /// @dev Collateral units that redeem to `assets` of the vault asset.
+    function _collateralFor(uint256 assets) private view returns (uint256) {
+        address collateralToken = _marketParams.collateralToken;
+        return collateralToken == asset ? assets : IERC4626(collateralToken).previewWithdraw(assets);
     }
 
     /// @dev `shares == 0` repays `assets` exactly (partial); else the share count, `assets` being

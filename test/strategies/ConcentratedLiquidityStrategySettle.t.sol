@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {Vm} from "forge-std/Vm.sol";
 import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 import {CLFixture} from "./ConcentratedLiquidityStrategy.t.sol";
+import {Market} from "../../src/vendor/morpho/IMorpho.sol";
+import {SharesMathLib} from "../../src/vendor/morpho/MorphoLibs.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 import {ConcentratedLiquidityStrategy} from "../../src/strategies/ConcentratedLiquidityStrategy.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
@@ -24,6 +27,30 @@ abstract contract SettleFixture is CLFixture {
 
     function _collateral() internal view returns (uint128) {
         return morpho.position(marketId, address(strategy)).collateral;
+    }
+
+    /// @dev Snapshot of everything a failed settle must leave alone.
+    function _assertUntouched(uint256 tid, uint128 debtBefore, uint128 collateralBefore) internal view {
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed), "state advanced");
+        assertEq(strategy.tokenId(), tid, "token id cleared");
+        assertFalse(posm.isBurned(tid), "position burned");
+        assertEq(_debtShares(), debtBefore, "debt moved");
+        assertEq(_collateral(), collateralBefore, "collateral moved");
+    }
+
+    /// @dev Accrued interest on the clone's debt, read after a storage-side accrual.
+    function _interest() internal returns (uint256) {
+        morpho.accrueInterest(mp);
+        return morpho.market(marketId).totalBorrowAssets - BORROW;
+    }
+
+    function _assertCloneEmptyAndUnwound() internal view {
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled), "not settled");
+        assertEq(_debtShares(), 0, "debt outstanding");
+        assertEq(_collateral(), 0, "collateral not withdrawn");
+        assertEq(usdg.balanceOf(address(strategy)), 0, "asset stranded");
+        assertEq(nvda.balanceOf(address(strategy)), 0, "volatile leg stranded");
+        assertEq(spUsdg.balanceOf(address(strategy)), 0, "wrapper shares stranded");
     }
 }
 
@@ -94,30 +121,6 @@ contract ConcentratedLiquidityStrategySettleTest is SettleFixture {
 /// @notice Settlement is all-or-revert: every leg that cannot complete reverts the
 ///         whole call, the clone's state is untouched, and the identical call is retried.
 contract ConcentratedLiquidityStrategyAllOrRevertTest is SettleFixture {
-    /// @dev Snapshot of everything a failed settle must leave alone.
-    function _assertUntouched(uint256 tid, uint128 debtBefore, uint128 collateralBefore) internal view {
-        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed), "state advanced");
-        assertEq(strategy.tokenId(), tid, "token id cleared");
-        assertFalse(posm.isBurned(tid), "position burned");
-        assertEq(_debtShares(), debtBefore, "debt moved");
-        assertEq(_collateral(), collateralBefore, "collateral moved");
-    }
-
-    /// @dev Accrued interest on the clone's debt, read after a storage-side accrual.
-    function _interest() internal returns (uint256) {
-        morpho.accrueInterest(mp);
-        return morpho.market(marketId).totalBorrowAssets - BORROW;
-    }
-
-    function _assertCloneEmptyAndUnwound() internal view {
-        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled), "not settled");
-        assertEq(_debtShares(), 0, "debt outstanding");
-        assertEq(_collateral(), 0, "collateral not withdrawn");
-        assertEq(usdg.balanceOf(address(strategy)), 0, "asset stranded");
-        assertEq(nvda.balanceOf(address(strategy)), 0, "volatile leg stranded");
-        assertEq(spUsdg.balanceOf(address(strategy)), 0, "wrapper shares stranded");
-    }
-
     /// @notice Negative carry: no fees, a month of interest. Settle frees the shortfall from the
     ///         collateral and completes; the vault gets its capital back minus the interest.
     function test_settle_negativeCarry_deleveragesAndSettles() public {
@@ -412,5 +415,184 @@ contract ConcentratedLiquidityStrategyAllOrRevertTest is SettleFixture {
         assertEq(nvda.balanceOf(address(strategy)), 0, "volatile leg stranded");
         assertEq(usdg.balanceOf(address(strategy)), 0, "asset stranded");
         assertGt(usdg.balanceOf(address(vaultStub)), vaultBefore, "vault did not receive the proceeds");
+    }
+}
+
+/// @notice `deleverageStep`: the persistent unwind for a shortfall the one in-settle step cannot
+///         free in a single health-checked withdrawal.
+contract ConcentratedLiquidityStrategyDeleverageStepTest is SettleFixture {
+    using SharesMathLib for uint256;
+
+    bytes32 constant STEP_SIG = keccak256("DeleverageStep(uint256,uint256,uint256)");
+
+    /// @dev Re-seat the clone at the tightest LTV init allows, converting `swapFractionBps` of the
+    ///      borrow into the volatile leg.
+    function _maxLtvStrategy(uint256 swapFractionBps) internal {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.borrowAmount = (COLLATERAL * (9_150 - strategy.MIN_LLTV_BUFFER_BPS())) / 10_000;
+        p.swapFractionBps = swapFractionBps;
+        strategy = _newStrategy(p);
+        status.set(1, 1, address(strategy));
+        vm.prank(address(vaultStub));
+        usdg.approve(address(strategy), type(uint256).max);
+    }
+
+    /// @dev NVDA to 1e-4 of fair, pool anchor and adapter agreeing; spot and TWAP ticks untouched.
+    function _loseTheVolatileLeg() internal {
+        adapter.setRate(address(nvda), address(usdg), (100 * 1e18 / 1e12) / 10_000);
+        pool.setSqrtPriceX96(uint160(1e7) * uint160(2 ** 96));
+    }
+
+    function _owed() internal returns (uint256) {
+        morpho.accrueInterest(mp);
+        Market memory m = morpho.market(marketId);
+        return uint256(_debtShares()).toAssetsUp(m.totalBorrowAssets, m.totalBorrowShares);
+    }
+
+    function _held() internal view returns (uint256) {
+        return usdg.balanceOf(address(strategy));
+    }
+
+    function _step() internal {
+        vm.prank(proposer);
+        strategy.deleverageStep();
+    }
+
+    /// @notice At max LTV with 90% of the borrow in a volatile leg that goes to ~0, settle cannot
+    ///         free the gap in one withdrawal. Repeated steps each shrink the debt under Morpho's
+    ///         health check until the clone holds it; settle then completes and the clone is empty.
+    function test_deleverageStep_convergesPastTheSingleStepCeiling() public {
+        _maxLtvStrategy(9_000);
+        uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
+        _execute();
+        _loseTheVolatileLeg();
+
+        vm.prank(address(vaultStub));
+        vm.expectRevert("MockMorpho: insufficient collateral");
+        strategy.settle();
+
+        uint256 steps;
+        while (_held() < _owed()) {
+            uint256 gapBefore = _owed() - _held();
+            _step();
+            ++steps;
+            assertLt(_owed() > _held() ? _owed() - _held() : 0, gapBefore, "step did not shrink the shortfall");
+            assertEq(morpho.healthChecks(), steps, "step withdrew without a health check");
+            assertLt(steps, 20, "did not converge");
+        }
+        assertGe(steps, 2, "premise: past the single-step ceiling");
+        emit log_named_uint("deleverage steps to hold the debt", steps);
+
+        _settle();
+
+        _assertCloneEmptyAndUnwound();
+        uint256 proceeds = usdg.balanceOf(address(vaultStub)) + COLLATERAL - vaultBefore;
+        assertGt(proceeds, 0, "nothing came back");
+        assertLt(proceeds, COLLATERAL / 2, "premise: the volatile leg was lost");
+    }
+
+    /// @notice Each step is health-checked by Morpho and none reverts: the withdrawal is capped at
+    ///         what keeps the position healthy, not sized to the gap.
+    function test_deleverageStep_neverLeavesMorphoUnhealthy() public {
+        _maxLtvStrategy(9_000);
+        _execute();
+        _loseTheVolatileLeg();
+        uint128 collateralBefore = _collateral();
+
+        _step();
+        _step();
+        _step();
+
+        assertEq(morpho.healthChecks(), 3, "every step ran with the debt open");
+        assertLt(_collateral(), collateralBefore, "no collateral freed");
+        assertGt(_debtShares(), 0, "premise: debt still open");
+    }
+
+    /// @notice The freed collateral lands as the vault asset: no wrapper shares stay on the clone,
+    ///         and the event carries the amounts.
+    function test_deleverageStep_leavesNoWrapperSharesOnTheClone() public {
+        _execute();
+        vm.warp(vm.getBlockTimestamp() + 30 days);
+        uint128 collateralBefore = _collateral();
+
+        vm.recordLogs();
+        _step();
+
+        assertEq(spUsdg.balanceOf(address(strategy)), 0, "wrapper shares left on the clone");
+        assertGt(_held(), 0, "nothing redeemed to the asset");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool seen;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(strategy) || logs[i].topics[0] != STEP_SIG) continue;
+            (uint256 repaid, uint256 withdrawn, uint256 owedAfter) =
+                abi.decode(logs[i].data, (uint256, uint256, uint256));
+            assertEq(repaid, 0, "nothing was held to repay");
+            assertEq(withdrawn, collateralBefore - _collateral(), "withdrawn");
+            assertEq(withdrawn, _held(), "par wrapper: redeemed 1:1");
+            assertEq(owedAfter, _owed(), "owed after");
+            seen = true;
+        }
+        assertTrue(seen, "DeleverageStep not emitted");
+    }
+
+    /// @notice The vault is admitted alongside the proposer; anyone else is refused.
+    function test_deleverageStep_onlyProposerOrVault() public {
+        _execute();
+        vm.warp(vm.getBlockTimestamp() + 30 days);
+
+        vm.prank(makeAddr("attacker"));
+        vm.expectRevert(BaseStrategy.NotProposer.selector);
+        strategy.deleverageStep();
+
+        vm.prank(address(vaultStub));
+        strategy.deleverageStep();
+        uint256 afterVault = _held();
+        assertGt(afterVault, 0, "vault-driven step freed nothing");
+
+        _step();
+        assertGe(_held(), _owed(), "proposer step did not finish the unwind");
+    }
+
+    /// @notice Once the clone holds the debt there is nothing to unwind; settle takes it from here.
+    function test_deleverageStep_revertsWhenNothingIsOwed() public {
+        _execute();
+        usdg.mint(address(strategy), BORROW * 2);
+
+        vm.prank(proposer);
+        vm.expectRevert(ConcentratedLiquidityStrategy.NothingToDeleverage.selector);
+        strategy.deleverageStep();
+    }
+
+    function test_deleverageStep_revertsBeforeExecute() public {
+        vm.prank(proposer);
+        vm.expectRevert(BaseStrategy.NotExecuted.selector);
+        strategy.deleverageStep();
+    }
+
+    function test_deleverageStep_revertsAfterSettle() public {
+        _execute();
+        _accrueFees(1_000e6, 0);
+        _settle();
+
+        vm.prank(proposer);
+        vm.expectRevert(BaseStrategy.NotExecuted.selector);
+        strategy.deleverageStep();
+    }
+
+    /// @notice A debt past what the collateral supports frees nothing: named revert, funds untouched.
+    function test_deleverageStep_revertsWhenTheCollateralCannotCoverTheDebt() public {
+        _execute();
+        uint256 tid = strategy.tokenId();
+        (uint128 d, uint128 c) = (_debtShares(), _collateral());
+        irm.setRate(uint256(10e18) / 365 days);
+        vm.warp(vm.getBlockTimestamp() + 365 days);
+        assertGt(_owed(), COLLATERAL, "premise: debt above the collateral");
+
+        vm.prank(proposer);
+        vm.expectPartialRevert(ConcentratedLiquidityStrategy.CollateralNotFreeable.selector);
+        strategy.deleverageStep();
+
+        _assertUntouched(tid, d, c);
+        assertEq(_held(), 0, "asset moved");
     }
 }
