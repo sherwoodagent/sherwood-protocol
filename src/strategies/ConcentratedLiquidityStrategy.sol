@@ -45,7 +45,9 @@ interface ITierBindingPath {
  *            approved half-width centered on the current TWAP tick. Never
  *            touches the borrow or the collateral.
  *   Settle:  decrease to zero → collect → convert the other token back →
- *            repay → withdraw collateral → push everything to the vault.
+ *            repay → withdraw collateral → push everything to the vault. A
+ *            negative-carry position first frees just enough collateral to
+ *            cover the shortfall (`_deleverage`).
  *            All-or-revert: every step is typed, a failed settlement is retried.
  *
  *   Batch calls from governor:
@@ -256,7 +258,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @notice No floor could be derived: the adapter could not quote a leg (execute, rerange)
     ///         or the pool reports no price. No floor, no swap.
     error QuoteUnavailable();
-    /// @notice Settlement proceeds cannot cover the Morpho debt; nothing moves and settle is retried.
+    /// @notice Even after freeing collateral for the shortfall the proceeds cannot cover the
+    ///         Morpho debt; nothing moves and settle is retried.
     error ProceedsBelowDebt(uint256 held, uint256 owed);
     /// @notice Settle left `amount` of `token` on the clone.
     error StrategyHoldsTokens(address token, uint256 amount);
@@ -1101,25 +1104,55 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
     /// @dev Repays by SHARES on freshly accrued totals, which is what clears the debt
     ///      exactly; a dust share left behind would block `withdrawCollateral`.
+    ///      Negative carry (proceeds below the debt) takes one deleverage step first.
     function _repayAndWithdraw() private {
         morpho.accrueInterest(_marketParams);
         Position memory pos = morpho.position(marketId, address(this));
 
         if (pos.borrowShares != 0) {
-            Market memory m = morpho.market(marketId);
-            uint256 owed = uint256(pos.borrowShares).toAssetsUp(m.totalBorrowAssets, m.totalBorrowShares);
+            uint256 owed = _owedFor(pos.borrowShares);
             uint256 held = IERC20(asset).balanceOf(address(this));
-            if (held < owed) revert ProceedsBelowDebt(held, owed);
-
-            IERC20(asset).forceApprove(address(morpho), owed);
-            morpho.repay(_marketParams, 0, pos.borrowShares, address(this), "");
-            IERC20(asset).forceApprove(address(morpho), 0);
+            if (held < owed) {
+                _deleverage(held, owed, pos.collateral);
+                pos = morpho.position(marketId, address(this));
+                owed = _owedFor(pos.borrowShares);
+                held = IERC20(asset).balanceOf(address(this));
+                if (held < owed) revert ProceedsBelowDebt(held, owed);
+            }
+            _repay(owed, pos.borrowShares);
         }
 
         if (pos.collateral != 0) {
             morpho.withdrawCollateral(_marketParams, pos.collateral, address(this), address(this));
         }
         _redeemWrapper();
+    }
+
+    /// @dev Repay what is held FIRST, so the withdrawal only has to keep the residual healthy;
+    ///      then free the residual plus `settleSlippageBps` of collateral and redeem it. Never
+    ///      relies on Morpho tolerating an unhealthy position.
+    function _deleverage(uint256 held, uint256 owed, uint256 collateral) private {
+        uint256 want = ((owed - held) * (BPS_DENOMINATOR + settleSlippageBps)) / BPS_DENOMINATOR;
+        address collateralToken = _marketParams.collateralToken;
+        uint256 need = collateralToken == asset ? want : IERC4626(collateralToken).previewWithdraw(want);
+        if (need > collateral) revert ProceedsBelowDebt(held, owed);
+
+        if (held != 0) _repay(held, 0);
+        morpho.withdrawCollateral(_marketParams, need, address(this), address(this));
+        _redeemWrapper();
+    }
+
+    /// @dev `shares == 0` repays `assets` exactly (partial); else the share count, `assets` being
+    ///      its rounded-up cost.
+    function _repay(uint256 assets, uint256 shares) private {
+        IERC20(asset).forceApprove(address(morpho), assets);
+        morpho.repay(_marketParams, shares == 0 ? assets : 0, shares, address(this), "");
+        IERC20(asset).forceApprove(address(morpho), 0);
+    }
+
+    function _owedFor(uint256 borrowShares) private view returns (uint256) {
+        Market memory m = morpho.market(marketId);
+        return borrowShares.toAssetsUp(m.totalBorrowAssets, m.totalBorrowShares);
     }
 
     function _redeemWrapper() private {

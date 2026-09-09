@@ -670,11 +670,11 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
     ///         band, so the position is entirely on the volatile side at
     ///         settlement and short of its own debt by construction (the LP
     ///         notional is exactly the borrow).
-    /// @dev    All-or-revert: settle reverts `ProceedsBelowDebt` and leaves the
-    ///         position, the debt and the collateral exactly as they were. The
-    ///         exit for a position that can never cover its debt is
-    ///         `emergencySettleWithCalls` under guardian review.
-    function test_cl_settleOutOfRange_revertsWhenProceedsCannotCoverDebt() public {
+    /// @dev    Negative carry by construction: settle repays the swap proceeds,
+    ///         frees the shortfall from the collateral in one step and completes
+    ///         at a loss; the clone ends empty and the vault takes less than the
+    ///         collateral back.
+    function test_cl_settleOutOfRange_deleveragesAndSettlesAtALoss() public {
         _requireFork();
 
         (address strategy, uint256 proposalId) = _deploy(1_000);
@@ -702,15 +702,18 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         );
 
         uint256 vaultPreSettle = IERC20(USDG).balanceOf(address(vault));
-        vm.expectPartialRevert(ConcentratedLiquidityStrategy.ProceedsBelowDebt.selector);
         governor.settleProposal(proposalId);
 
-        assertEq(IERC20(USDG).balanceOf(address(vault)), vaultPreSettle, "a failed settle delivered something");
-        assertEq(ConcentratedLiquidityStrategy(strategy).tokenId(), tid, "tokenId cleared by a failed settle");
-        assertGt(_liquidityOf(tid), 0, "position unwound by a failed settle");
+        uint256 delivered = IERC20(USDG).balanceOf(address(vault)) - vaultPreSettle;
+        console2.log("delivered at a loss (USDG):", delivered);
+        assertGt(delivered, 0, "nothing delivered");
+        assertLt(delivered, COLLATERAL, "a loss position returned its whole collateral");
+        assertEq(ConcentratedLiquidityStrategy(strategy).tokenId(), 0, "position kept");
         Position memory after_ = _morphoPosition(strategy);
-        assertEq(after_.borrowShares, before.borrowShares, "debt moved");
-        assertEq(after_.collateral, before.collateral, "collateral moved");
+        assertGt(before.borrowShares, 0, "premise: debt was open");
+        assertEq(after_.borrowShares, 0, "debt outstanding");
+        assertEq(after_.collateral, 0, "collateral left in Morpho");
+        assertEq(IERC20(USDG).balanceOf(strategy), 0, "asset stranded on the clone");
     }
 
     // ==================== 3. MANIPULATED SPOT: SETTLE REVERTS (D8) ====================

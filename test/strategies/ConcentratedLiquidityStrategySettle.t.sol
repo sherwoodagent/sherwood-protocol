@@ -103,20 +103,106 @@ contract ConcentratedLiquidityStrategyAllOrRevertTest is SettleFixture {
         assertEq(_collateral(), collateralBefore, "collateral moved");
     }
 
-    /// @notice Proceeds short of the debt: settle reverts with the typed shortfall
-    ///         rather than repaying what it can and stranding the collateral.
-    function test_settle_revertsWhenProceedsCannotCoverDebt() public {
+    /// @dev Accrued interest on the clone's debt, read after a storage-side accrual.
+    function _interest() internal returns (uint256) {
+        morpho.accrueInterest(mp);
+        return morpho.market(marketId).totalBorrowAssets - BORROW;
+    }
+
+    function _assertCloneEmptyAndUnwound() internal view {
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled), "not settled");
+        assertEq(_debtShares(), 0, "debt outstanding");
+        assertEq(_collateral(), 0, "collateral not withdrawn");
+        assertEq(usdg.balanceOf(address(strategy)), 0, "asset stranded");
+        assertEq(nvda.balanceOf(address(strategy)), 0, "volatile leg stranded");
+        assertEq(spUsdg.balanceOf(address(strategy)), 0, "wrapper shares stranded");
+    }
+
+    /// @notice Negative carry: no fees, a month of interest. Settle frees the shortfall from the
+    ///         collateral and completes; the vault gets its capital back minus the interest.
+    function test_settle_negativeCarry_deleveragesAndSettles() public {
+        uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
+        _execute();
+        vm.warp(vm.getBlockTimestamp() + 30 days);
+        uint256 interest = _interest();
+        assertGt(interest, 0, "premise: interest accrued");
+        uint256 swapsBefore = adapter.swapCalls();
+
+        _settle();
+
+        _assertCloneEmptyAndUnwound();
+        assertEq(morpho.repayCalls(), 2, "held first, then the residual");
+        assertEq(morpho.withdrawCollateralCalls(), 2, "the shortfall, then the rest");
+        assertEq(spUsdg.redeemCalls(), 2, "each withdrawal redeemed");
+        assertEq(adapter.swapCalls() - swapsBefore, 1, "no extra swap: the collateral redeems to the asset");
+        assertApproxEqAbs(usdg.balanceOf(address(vaultStub)), vaultBefore - interest, 1e6, "proceeds - debt");
+    }
+
+    /// @notice A shortfall the whole collateral cannot cover still reverts `ProceedsBelowDebt`,
+    ///         with nothing moved.
+    function test_settle_negativeCarry_revertsWhenEvenTheCollateralCannotCoverTheDebt() public {
         _execute();
         uint256 tid = strategy.tokenId();
         (uint128 d, uint128 c) = (_debtShares(), _collateral());
-        // No fees: interest has accrued, so proceeds cannot cover principal+interest.
-        vm.warp(vm.getBlockTimestamp() + 30 days);
+        // 1000%/yr for a year: the debt outgrows the collateral by an order of magnitude.
+        irm.setRate(uint256(10e18) / 365 days);
+        vm.warp(vm.getBlockTimestamp() + 365 days);
+        assertGt(_interest(), COLLATERAL, "premise: debt above the collateral");
 
         vm.prank(address(vaultStub));
         vm.expectPartialRevert(ConcentratedLiquidityStrategy.ProceedsBelowDebt.selector);
         strategy.settle();
 
         _assertUntouched(tid, d, c);
+    }
+
+    /// @notice The `settleSlippageBps` margin on the freed collateral is what absorbs a wrapper
+    ///         exit fee inside the bound; without it the one step would land short.
+    function test_settle_negativeCarry_marginCoversAWrapperExitFee() public {
+        _execute();
+        spUsdg.setExitFeeBps(100);
+        vm.warp(vm.getBlockTimestamp() + 30 days);
+
+        _settle();
+
+        _assertCloneEmptyAndUnwound();
+        assertEq(morpho.repayCalls(), 2, "one step");
+    }
+
+    /// @notice Control: positive carry takes exactly one repay, one withdrawal, one redeem.
+    function test_settle_positiveCarry_takesNoDeleverageStep() public {
+        _execute();
+        vm.warp(vm.getBlockTimestamp() + 30 days);
+        _accrueFees(1_000e6, 0);
+        uint256 swapsBefore = adapter.swapCalls();
+
+        _settle();
+
+        _assertCloneEmptyAndUnwound();
+        assertEq(morpho.repayCalls(), 1, "extra repay");
+        assertEq(morpho.withdrawCollateralCalls(), 1, "extra withdrawal");
+        assertEq(spUsdg.redeemCalls(), 1, "extra redeem");
+        assertEq(adapter.swapCalls() - swapsBefore, 1, "extra swap");
+        assertEq(morpho.healthChecks(), 0, "collateral withdrawn with debt open");
+    }
+
+    /// @notice The deleverage withdrawal runs with debt still open, so Morpho's health check
+    ///         applies. At the tightest LTV init allows (LLTV - buffer) it still passes, because
+    ///         the held proceeds are repaid before any collateral leaves.
+    function test_settle_deleverageNeverLeavesMorphoUnhealthy() public {
+        ConcentratedLiquidityStrategy.InitParams memory p = _defaultParams();
+        p.borrowAmount = (COLLATERAL * (9_150 - strategy.MIN_LLTV_BUFFER_BPS())) / 10_000;
+        strategy = _newStrategy(p);
+        status.set(1, 1, address(strategy));
+        vm.prank(address(vaultStub));
+        usdg.approve(address(strategy), type(uint256).max);
+        _execute();
+        vm.warp(vm.getBlockTimestamp() + 30 days);
+
+        _settle();
+
+        _assertCloneEmptyAndUnwound();
+        assertEq(morpho.healthChecks(), 1, "the deleverage withdrawal was not health-checked");
     }
 
     /// @notice Collateral that cannot leave Morpho reverts settle.

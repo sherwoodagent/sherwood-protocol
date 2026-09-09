@@ -7,7 +7,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockERC4626Wrapper} from "../mocks/MockERC4626Wrapper.sol";
-import {MockMorpho, MockIrm} from "../mocks/MockMorpho.sol";
+import {MockMorpho, MockIrm, MockMorphoOracle} from "../mocks/MockMorpho.sol";
 import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
 import {MockPermissiveTierRegistry} from "../mocks/MockPermissiveTierRegistry.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
@@ -78,6 +78,7 @@ abstract contract CLFixture is Test {
     MockERC4626Wrapper spUsdg;
     MockIrm irm;
     MockMorpho morpho;
+    MockMorphoOracle oracle;
     MockUniswapV3Pool pool;
     MockPositionManager posm;
     MockSwapAdapter adapter;
@@ -111,11 +112,13 @@ abstract contract CLFixture is Test {
         irm = new MockIrm();
         irm.setRate(uint256(0.05e18) / 365 days);
         morpho = new MockMorpho();
+        // Par: spUSDG shares and USDG are 1:1, so the wrapper and the market agree.
+        oracle = new MockMorphoOracle();
 
         mp = MarketParams({
             loanToken: address(usdg),
             collateralToken: address(spUsdg),
-            oracle: makeAddr("oracle"),
+            oracle: address(oracle),
             irm: address(irm),
             lltv: 0.915e18
         });

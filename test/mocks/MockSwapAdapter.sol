@@ -30,6 +30,9 @@ contract MockSwapAdapter is ISwapAdapter {
     /// @notice When set, `quote` reverts while `swap` still fills at the rate.
     bool public quoteReverts;
 
+    /// @notice Number of `swap` calls served.
+    uint256 public swapCalls;
+
     error RateNotSet();
     error QuoteDisabled();
     error SlippageExceeded();
@@ -60,6 +63,7 @@ contract MockSwapAdapter is ISwapAdapter {
     {
         uint256 rate = rates[_pairKey(tokenIn, tokenOut)];
         if (rate == 0) revert RateNotSet();
+        swapCalls++;
 
         amountOut = (amountIn * rate) / RATE_PRECISION;
         if (amountOut < amountOutMin) revert SlippageExceeded();
