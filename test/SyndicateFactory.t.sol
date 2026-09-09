@@ -143,7 +143,7 @@ contract SyndicateFactoryTest is Test {
     }
 
     /// @notice A freshly created vault's governor starts at the advertised 20%
-    ///         headline, not at the 30% protocol ceiling. The settle-time clamp
+    ///         headline, not at the 25% protocol ceiling. The settle-time clamp
     ///         resolves an over-ceiling rate silently, so a permissive default
     ///         would let an owner quietly charge above the headline; this must
     ///         fail closed instead. Leaving it at the old 1500 would be the
