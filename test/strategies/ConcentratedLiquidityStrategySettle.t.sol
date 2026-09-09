@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {Vm} from "forge-std/Vm.sol";
 import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {CLFixture} from "./ConcentratedLiquidityStrategy.t.sol";
 import {Market} from "../../src/vendor/morpho/IMorpho.sol";
 import {SharesMathLib} from "../../src/vendor/morpho/MorphoLibs.sol";
@@ -263,6 +264,42 @@ contract ConcentratedLiquidityStrategyAllOrRevertTest is SettleFixture {
         vm.prank(address(vaultStub));
         vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
         strategy.settle();
+    }
+
+    /// @notice The settle floor is the pool anchor at `settleSlippageBps` exactly: the requested
+    ///         minOut equals it, a fill one wei under it reverts, one wei over it settles.
+    function test_settle_floorBoundary_oneWeiBelowRevertsOneWeiAboveSettles() public {
+        _execute();
+        _accrueFees(0, 100e18);
+
+        // Measure the volatile balance the strategy sells and the floor it asks for, then rewind.
+        uint256 snap = vm.snapshotState();
+        vm.prank(address(vaultStub));
+        strategy.settle();
+        uint256 amountIn = adapter.lastAmountIn();
+        uint256 requested = adapter.lastAmountOutMin();
+        vm.revertToState(snap);
+
+        // NVDA is token1: divide by the price twice, fee first, slippage second.
+        (uint160 sp,,,,,,) = pool.slot0();
+        uint256 expected = Math.mulDiv(Math.mulDiv(amountIn, 1 << 96, sp), 1 << 96, sp);
+        expected = (expected * (1e6 - POOL_FEE)) / 1e6;
+        expected = (expected * (10_000 - strategy.settleSlippageBps())) / 10_000;
+        assertGt(expected, 0, "premise: a priced floor");
+        assertEq(requested, expected, "requested minOut is the pool anchor");
+
+        adapter.setFixedAmountOut(expected - 1);
+        vm.prank(address(vaultStub));
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
+        strategy.settle();
+
+        uint256 swapsBefore = adapter.swapCalls();
+        adapter.setFixedAmountOut(expected + 1);
+        vm.prank(address(vaultStub));
+        strategy.settle();
+        assertEq(adapter.swapCalls(), swapsBefore + 1, "one settle swap");
+        assertEq(adapter.lastAmountOutMin(), expected, "requested minOut at the boundary");
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled), "settled one wei over");
     }
 
     /// @notice D8: settle refuses to convert against a spot that is off the TWAP.

@@ -33,6 +33,13 @@ contract MockSwapAdapter is ISwapAdapter {
     /// @notice Number of `swap` calls served.
     uint256 public swapCalls;
 
+    /// @notice When nonzero, `swap` pays exactly this amount regardless of the rate.
+    uint256 public fixedAmountOut;
+
+    /// @notice Arguments of the last `swap` served.
+    uint256 public lastAmountIn;
+    uint256 public lastAmountOutMin;
+
     error RateNotSet();
     error QuoteDisabled();
     error SlippageExceeded();
@@ -47,6 +54,10 @@ contract MockSwapAdapter is ISwapAdapter {
 
     function setQuoteReverts(bool v) external {
         quoteReverts = v;
+    }
+
+    function setFixedAmountOut(uint256 v) external {
+        fixedAmountOut = v;
     }
 
     /// @inheritdoc ISwapAdapter
@@ -64,8 +75,10 @@ contract MockSwapAdapter is ISwapAdapter {
         uint256 rate = rates[_pairKey(tokenIn, tokenOut)];
         if (rate == 0) revert RateNotSet();
         swapCalls++;
+        lastAmountIn = amountIn;
+        lastAmountOutMin = amountOutMin;
 
-        amountOut = (amountIn * rate) / RATE_PRECISION;
+        amountOut = fixedAmountOut != 0 ? fixedAmountOut : (amountIn * rate) / RATE_PRECISION;
         if (amountOut < amountOutMin) revert SlippageExceeded();
 
         IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), (amountIn * pullBps) / 10_000);
