@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {Create3Factory} from "../../script/utils/Create3Factory.sol";
+import {DeploySherwood} from "../../script/Deploy.s.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
@@ -140,5 +141,15 @@ contract DeployScriptTest is Test {
         // Registry sees the real factory (not deployer placeholder). Per-vault
         // governors are authorized lazily via addGovernor at createSyndicate.
         assertEq(GuardianRegistry(registryProxy).factory(), factoryProxy);
+    }
+
+    /// @notice The script refuses an over-cap MANAGEMENT_FEE before the
+    ///         broadcast, so its mirror constant must equal the factory's own.
+    function test_managementFeeMirrorMatchesTheFactoryCap() public {
+        assertEq(
+            new DeploySherwood().MAX_MANAGEMENT_FEE_BPS(),
+            new SyndicateFactory().MAX_MANAGEMENT_FEE_BPS(),
+            "mirror must match the factory"
+        );
     }
 }
