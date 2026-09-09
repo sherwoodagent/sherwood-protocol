@@ -254,11 +254,16 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         vm.expectEmit(true, true, false, false);
         emit IGuardianRegistry.ReviewOpened(address(governor), PROPOSAL_ID, 0);
         address g = _guardian(0);
+        vm.recordLogs();
         vm.prank(g);
         registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, 0);
 
         (bool opened,,) = registry.getReviewState(address(governor), PROPOSAL_ID);
         assertTrue(opened, "vote opened the review");
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (, uint128 weight) = abi.decode(logs[1].data, (IGuardianRegistry.GuardianVoteType, uint128));
+        assertEq(weight, 10_000e18, "same-tx vote must land on the freshly opened review at the voter's full stake");
     }
 
     function test_voteOnProposal_stillRevertsBeforeVoteEndAndAfterReviewEnd() public {

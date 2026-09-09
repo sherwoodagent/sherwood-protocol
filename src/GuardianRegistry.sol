@@ -550,8 +550,8 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     // ── Guardian review voting ──
 
     /// @inheritdoc IGuardianRegistry
-    /// @dev First-vote path OR vote-change. Opens a due-but-unopened review
-    ///      itself, then requires `voteEnd <= now < reviewEnd`. Snapshots the caller's raw
+    /// @dev First-vote path OR vote-change. Requires `voteEnd <= now < reviewEnd`; within that window it opens a
+    ///      due-but-unopened review itself, so no keeper `openReview` is needed first. Snapshots the caller's raw
     ///      stake at `r.snapshotAt` — the same instant the denominator is read
     ///      at — and adds it to the chosen side's tally. Approvers are capped
     ///      (the slash loop iterates them); Blockers are NOT — the block tally is
@@ -579,7 +579,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         // A resolved review accepts no vote and is never re-opened.
         if (r.resolved) revert ReviewNotOpen();
 
-        // window consumable in the first place.
         uint256 nowEff = _effNow(r.clockShiftAtRegister);
         if (r.voteEnd == 0 || nowEff < r.voteEnd || nowEff >= r.reviewEnd) revert ReviewNotOpen();
         if (!r.opened) _openReview(r, governor, proposalId);
