@@ -262,8 +262,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @notice No floor could be derived: the adapter could not quote a leg (execute, rerange)
     ///         or the pool reports no price. No floor, no swap.
     error QuoteUnavailable();
-    /// @notice `MAX_DELEVERAGE_PASSES` passes left the proceeds below the Morpho debt; nothing
-    ///         moves. Only a top-up of the clone lets settle complete.
+    /// @notice The deleverage loop cannot cover the Morpho debt; nothing moves. Top up the clone.
+    ///         A wrapper exit fee above settleSlippageBps/(1+settleSlippageBps) makes every pass yield 0.
     error ProceedsBelowDebt(uint256 held, uint256 owed);
     /// @notice No collateral can leave Morpho without breaching health: the debt is at or past
     ///         what the collateral supports. Only a top-up or liquidation moves it.
@@ -1145,6 +1145,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             morpho.withdrawCollateral(_marketParams, need < freeable ? need : freeable, address(this), address(this));
             _redeemWrapper();
             held = IERC20(asset).balanceOf(address(this));
+            // A pass that yields nothing can never be followed by one that does: stop, do not spin to the cap.
+            if (held == 0) revert ProceedsBelowDebt(0, owed);
         }
         if (held < owed) revert ProceedsBelowDebt(held, owed);
     }

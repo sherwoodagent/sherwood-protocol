@@ -203,7 +203,8 @@ contract ConcentratedLiquidityStrategyAllOrRevertTest is SettleFixture {
         uint256 tid = strategy.tokenId();
         (uint128 d, uint128 c) = (_debtShares(), _collateral());
         _loseTheVolatileLeg();
-        // Freed collateral shrinks by (1 - fee) / lltv per pass; at 20% the series never covers the gap.
+        // Fee above settleSlippageBps/(1+s) (477 bps at 500): a need-capped pass under-delivers, the residual
+        // decays to 1 wei and previewWithdraw(1) redeems to zero; the loop must stop typed, not spin.
         spUsdg.setExitFeeBps(2_000);
 
         vm.prank(address(vaultStub));
@@ -365,7 +366,8 @@ contract ConcentratedLiquidityStrategyAllOrRevertTest is SettleFixture {
         (uint160 sp,,,,,,) = pool.slot0();
         uint256 expected = Math.mulDiv(Math.mulDiv(amountIn, 1 << 96, sp), 1 << 96, sp);
         expected = (expected * (1e6 - POOL_FEE)) / 1e6;
-        expected = (expected * (10_000 - strategy.settleSlippageBps())) / 10_000;
+        assertEq(strategy.settleSlippageBps(), 500, "fixture slippage drifted; the boundary pin assumes 500");
+        expected = (expected * (10_000 - 500)) / 10_000;
         assertGt(expected, 0, "premise: a priced floor");
         assertEq(requested, expected, "requested minOut is the pool anchor");
 
