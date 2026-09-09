@@ -125,6 +125,8 @@ interface IGuardianRegistry {
     ///         it once, on `propose`; the registry stores it and reads the
     ///         stored fields directly.
     function registerReview(uint256 proposalId, uint256 voteEnd, uint256 reviewEnd) external;
+    function reviewClockShift(address governor, uint256 proposalId) external view returns (uint64);
+    function effectiveNowFor(address governor, uint256 proposalId) external view returns (uint256);
 
     // ── Governor-only (emergency) ──
     function openEmergency(uint256 proposalId, bytes32 callsHash, BatchExecutorLib.Call[] calldata calls) external;
