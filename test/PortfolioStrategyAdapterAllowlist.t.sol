@@ -476,8 +476,7 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
     function test_tightenBelowFloor_reverts_valueUnchanged() public {
         PortfolioStrategy strategy = _initAndExecuteSingleToken(SLIPPAGE_100, "tighten-below");
 
-        uint256[] memory weights = new uint256[](1);
-        weights[0] = 10_000;
+        uint256[] memory weights = new uint256[](0);
         bytes[] memory noRoutes = new bytes[](0);
 
         vm.prank(proposer);
@@ -487,11 +486,10 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         assertEq(strategy.maxSlippageBps(), SLIPPAGE_100, "unchanged after a rejected tighten");
     }
 
-    function test_tighten_zeroSentinel_keepsCurrentAlongsideWeights() public {
+    function test_tighten_zeroSentinel_keepsCurrent() public {
         PortfolioStrategy strategy = _initAndExecuteSingleToken(SLIPPAGE_100, "tighten-zero");
 
-        uint256[] memory weights = new uint256[](1);
-        weights[0] = 10_000;
+        uint256[] memory weights = new uint256[](0);
         bytes[] memory noRoutes = new bytes[](0);
 
         vm.prank(proposer);
@@ -526,8 +524,7 @@ contract PortfolioStrategyAdapterAllowlistTest is Test {
         vm.prank(address(vaultStub));
         strategy.execute();
 
-        uint256[] memory weights = new uint256[](1);
-        weights[0] = 10_000;
+        uint256[] memory weights = new uint256[](0);
         bytes[] memory noRoutes = new bytes[](0);
 
         // Hoisted: `strategy.MIN_SLIPPAGE_BPS()` in argument position would

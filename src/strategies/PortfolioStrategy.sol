@@ -29,9 +29,10 @@ interface ITierBindingPath {
 
 /**
  * @title PortfolioStrategy
- * @notice Weighted basket of tokens bought on execute, sold on settle, rebalanced by the
- *         proposer in between. Every swap floor is the slot's Chainlink push-feed price
- *         discounted by `maxSlippageBps`; a feed older than `MAX_PUSH_PRICE_AGE` reverts.
+ * @notice Weighted basket of tokens bought on execute, sold on settle. Target weights and
+ *         routes are fixed at init, so `rebalanceDelta` trades only price drift. Every swap
+ *         floor is the slot's Chainlink push-feed price discounted by `maxSlippageBps`; a feed
+ *         older than `MAX_PUSH_PRICE_AGE` reverts.
  *
  *   Batch calls from governor:
  *     Execute: [asset.approve(strategy, totalAmount), strategy.execute()]
@@ -50,6 +51,7 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
     error InvalidPrice();
     error InvalidSlippage();
     error RoutesFrozen();
+    error WeightsFrozen();
     error InvalidPriceDecimals();
     error DuplicateToken(address token);
     error AdapterNotAllowed(address swapAdapter, address registry);
@@ -92,7 +94,6 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
     address[] internal _feeds;
 
     // ── Events ──
-    event WeightsUpdated(address[] tokens, uint256[] oldWeights, uint256[] newWeights);
     event RebalancedDelta(
         address[] tokens,
         uint256[] oldWeights,
@@ -212,34 +213,19 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
     // ── Update params ──
 
     /// @notice Update: (uint256[] newWeightsBps, uint256 newMaxSlippageBps, bytes[] newSwapExtraData)
-    /// @dev Pass empty arrays / 0 to keep current values.
+    /// @dev Only the tolerance is tunable, and only tighter: a re-targeted basket would let the
+    ///      proposer round-trip it at the floor through `rebalanceDelta`. Empty / 0 keeps current.
     function _updateParams(bytes calldata data) internal override {
         (uint256[] memory newWeightsBps, uint256 newMaxSlippageBps, bytes[] memory newSwapExtraData) =
             abi.decode(data, (uint256[], uint256, bytes[]));
 
-        if (newWeightsBps.length > 0) {
-            if (newWeightsBps.length != _allocations.length) revert LengthMismatch();
-            uint256 weightSum;
-            uint256[] memory oldWeights = new uint256[](newWeightsBps.length);
-            address[] memory tokens = new address[](newWeightsBps.length);
-            for (uint256 i; i < newWeightsBps.length; ++i) {
-                tokens[i] = _allocations[i].token;
-                oldWeights[i] = _allocations[i].targetWeightBps;
-                weightSum += newWeightsBps[i];
-                _allocations[i].targetWeightBps = newWeightsBps[i];
-            }
-            if (weightSum != BPS_DENOMINATOR) revert InvalidWeights();
-            emit WeightsUpdated(tokens, oldWeights, newWeightsBps);
-        }
+        if (newWeightsBps.length > 0) revert WeightsFrozen();
+        if (newSwapExtraData.length > 0) revert RoutesFrozen();
 
-        // Tighten-only, never below the floor: the tolerance was reviewed with the proposal.
         if (newMaxSlippageBps > 0) {
             if (newMaxSlippageBps > maxSlippageBps || newMaxSlippageBps < MIN_SLIPPAGE_BPS) revert InvalidSlippage();
             maxSlippageBps = newMaxSlippageBps;
         }
-
-        // Routes are reviewed with the proposal and frozen once it executes.
-        if (newSwapExtraData.length > 0) revert RoutesFrozen();
     }
 
     // ── Rebalancing ──
@@ -254,8 +240,8 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
         uint256[] currentValues;
     }
 
-    /// @notice Delta rebalance: price every slot off its feed, swap only the over/underweight
-    ///         differences. Proposer-only, Executed only.
+    /// @notice Delta rebalance: price every slot off its feed, swap only the drift away from the
+    ///         init weights. Proposer-only, Executed only.
     function rebalanceDelta() external onlyProposer nonReentrant {
         if (_state != State.Executed) revert NotExecuted();
         _requireAllowedAdapter(address(swapAdapter));

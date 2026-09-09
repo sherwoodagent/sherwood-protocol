@@ -505,35 +505,34 @@ contract PortfolioStrategyTest is Test {
 
     // ==================== UPDATE PARAMS ====================
 
-    function test_updateParams_weights() public {
+    /// @notice Target weights are reviewed with the proposal: once executed, no re-targeting.
+    function test_updateParams_weightsFrozenAfterExecute() public {
         _executeStrategy();
 
-        // Change weights: TSLA 60%, AMZN 30%, NFLX 10%
         uint256[] memory newWeights = new uint256[](3);
         newWeights[0] = 6000;
         newWeights[1] = 3000;
         newWeights[2] = 1000;
 
         vm.prank(proposer);
+        vm.expectRevert(PortfolioStrategy.WeightsFrozen.selector);
         strategy.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
 
         PortfolioStrategy.TokenAllocation[] memory allocs = strategy.getAllocations();
-        assertEq(allocs[0].targetWeightBps, 6000);
-        assertEq(allocs[1].targetWeightBps, 3000);
-        assertEq(allocs[2].targetWeightBps, 1000);
+        assertEq(allocs[0].targetWeightBps, 4000, "init weight kept");
+        assertEq(allocs[1].targetWeightBps, 3500, "init weight kept");
+        assertEq(allocs[2].targetWeightBps, 2500, "init weight kept");
     }
 
-    function test_updateParams_invalidWeights_reverts() public {
+    /// @notice Control: the keep-current sentinels still go through with the weights frozen.
+    function test_updateParams_emptyUpdateIsANoOp() public {
         _executeStrategy();
 
-        uint256[] memory newWeights = new uint256[](3);
-        newWeights[0] = 5000;
-        newWeights[1] = 3000;
-        newWeights[2] = 1000; // Sum = 9000
-
         vm.prank(proposer);
-        vm.expectRevert(PortfolioStrategy.InvalidWeights.selector);
-        strategy.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
+        strategy.updateParams(abi.encode(new uint256[](0), uint256(0), new bytes[](0)));
+
+        assertEq(strategy.maxSlippageBps(), MAX_SLIPPAGE, "tolerance kept");
+        assertEq(strategy.getAllocations()[0].targetWeightBps, 4000, "weight kept");
     }
 
     function test_updateParams_onlyProposer() public {
@@ -633,29 +632,55 @@ contract PortfolioStrategyTest is Test {
 
     // ==================== REBALANCE DELTA ====================
 
+    /// @notice With the weights fixed, `rebalanceDelta` trades only price drift: TSLA doubles,
+    ///         the overweight slot is sold down and the other two are topped up to target.
     function test_rebalanceDelta() public {
         _executeStrategy();
+        PortfolioStrategy.TokenAllocation[] memory before_ = strategy.getAllocations();
 
-        // Change weights: TSLA 60%, AMZN 30%, NFLX 10%
-        uint256[] memory newWeights = new uint256[](3);
-        newWeights[0] = 6000;
-        newWeights[1] = 3000;
-        newWeights[2] = 1000;
-
-        vm.prank(proposer);
-        strategy.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
+        _setPrice(tsla, fTsla, 0.02e18);
 
         vm.prank(proposer);
         strategy.rebalanceDelta();
 
-        // Verify new allocations are closer to target weights
         PortfolioStrategy.TokenAllocation[] memory after_ = strategy.getAllocations();
+        assertLt(after_[0].tokenAmount, before_[0].tokenAmount, "TSLA sold down");
+        assertGt(after_[1].tokenAmount, before_[1].tokenAmount, "AMZN topped up");
+        assertGt(after_[2].tokenAmount, before_[2].tokenAmount, "NFLX topped up");
+        _assertSharesAtTargets();
+    }
 
-        // After delta rebalance, positions should be adjusted toward new weights
-        // The exact amounts depend on the delta logic but should be non-zero
-        assertGt(after_[0].tokenAmount, 0); // TSLA should increase (underweight → 60%)
-        assertGt(after_[1].tokenAmount, 0); // AMZN
-        assertGt(after_[2].tokenAmount, 0); // NFLX should decrease (overweight → 10%)
+    /// @notice The round-trip drain needs the target to move. 20 `rebalanceDelta` calls against
+    ///         a route filling exactly at the floor, with a weight flip attempted before each,
+    ///         leave the basket within one leg of slippage of where it started.
+    function test_rebalanceDelta_cannotBeLoopedIntoADrainWhenWeightsAreFrozen() public {
+        _setFloorFillingRoutes();
+        _executeStrategy();
+        uint256 start = _fairValue();
+        assertGt(start, 0, "premise: basket bought");
+
+        uint256[] memory allTsla = new uint256[](3);
+        allTsla[0] = 10_000;
+        uint256[] memory allAmzn = new uint256[](3);
+        allAmzn[1] = 10_000;
+        bytes memory flipA = abi.encodeCall(strategy.updateParams, (abi.encode(allTsla, uint256(0), new bytes[](0))));
+        bytes memory flipB = abi.encodeCall(strategy.updateParams, (abi.encode(allAmzn, uint256(0), new bytes[](0))));
+
+        for (uint256 i; i < 10; ++i) {
+            // The flip is attempted, not required to land: the bound below is what is pinned.
+            vm.prank(proposer);
+            (bool okA,) = address(strategy).call(flipA);
+            okA;
+            vm.prank(proposer);
+            strategy.rebalanceDelta();
+            vm.prank(proposer);
+            (bool okB,) = address(strategy).call(flipB);
+            okB;
+            vm.prank(proposer);
+            strategy.rebalanceDelta();
+        }
+
+        assertGe(_fairValue(), (start * (10_000 - 2 * MAX_SLIPPAGE)) / 10_000, "basket drained through rebalanceDelta");
     }
 
     function test_rebalanceDelta_onlyProposer() public {
@@ -675,25 +700,16 @@ contract PortfolioStrategyTest is Test {
         vm.prank(vault);
         strategy.execute();
 
-        // 2. Update weights
-        uint256[] memory newWeights = new uint256[](3);
-        newWeights[0] = 5000;
-        newWeights[1] = 3000;
-        newWeights[2] = 2000;
-
-        vm.prank(proposer);
-        strategy.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
-
-        // 3. Rebalance
+        // 2. Rebalance (no drift yet: a no-op)
         vm.prank(proposer);
         strategy.rebalanceDelta();
 
-        // 4. Prices go up 10%
+        // 3. Prices go up 10%
         adapter.setRate(address(tsla), address(weth), 0.011e18);
         adapter.setRate(address(amzn), address(weth), 0.022e18);
         adapter.setRate(address(nflx), address(weth), 0.0055e18);
 
-        // 5. Settle
+        // 4. Settle
         uint256 vaultBefore = weth.balanceOf(vault);
         vm.prank(vault);
         strategy.settle();
@@ -914,123 +930,75 @@ contract PortfolioStrategyTest is Test {
         assertEq(nflx.balanceOf(address(s)), 0);
     }
 
-    /// @notice Delta rebalance to zero weight — move a token from active to 0%, sell its position
-    function test_rebalanceDelta_zeroWeightRemoval() public {
-        _executeStrategy();
+    /// @notice A 0% slot that comes to hold tokens (here: a donation) is sold on `rebalanceDelta`
+    ///         and not re-bought; the proceeds top up the weighted slots.
+    function test_rebalanceDelta_zeroWeightSlotIsSoldNotRebought() public {
+        PortfolioStrategy s = _initZeroWeightStrategy();
+        _execute(s);
+        PortfolioStrategy.TokenAllocation[] memory before_ = s.getAllocations();
+        assertEq(before_[2].tokenAmount, 0, "premise: 0% slot empty at execute");
 
-        // Initial: TSLA 40%, AMZN 35%, NFLX 25%
-        PortfolioStrategy.TokenAllocation[] memory before_ = strategy.getAllocations();
-        assertGt(before_[2].tokenAmount, 0); // NFLX has tokens
-
-        // Update: move NFLX to 0%, redistribute to TSLA 60%, AMZN 40%
-        uint256[] memory newWeights = new uint256[](3);
-        newWeights[0] = 6000; // 60%
-        newWeights[1] = 4000; // 40%
-        newWeights[2] = 0; // 0% — remove NFLX
+        nflx.mint(address(s), 100e18); // 0.5 WETH of drift into the 0% slot
 
         vm.prank(proposer);
-        strategy.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
+        s.rebalanceDelta();
 
-        // Rebalance — should sell NFLX and not re-buy
-        vm.prank(proposer);
-        strategy.rebalanceDelta();
-
-        PortfolioStrategy.TokenAllocation[] memory after_ = strategy.getAllocations();
-
-        // NFLX: 0 weight → sold, no re-buy (the delta path tracks balances, not investedAmount)
-        assertEq(after_[2].tokenAmount, 0);
-        assertEq(nflx.balanceOf(address(strategy)), 0);
-
-        // TSLA: 60% of recovered WETH
-        assertGt(after_[0].tokenAmount, before_[0].tokenAmount); // more TSLA now
+        PortfolioStrategy.TokenAllocation[] memory after_ = s.getAllocations();
+        assertEq(after_[2].tokenAmount, 0, "0% slot re-bought");
+        assertEq(nflx.balanceOf(address(s)), 0, "0% slot not sold");
+        assertGt(after_[0].tokenAmount, before_[0].tokenAmount, "TSLA topped up");
+        assertGt(after_[1].tokenAmount, before_[1].tokenAmount, "AMZN topped up");
         assertEq(after_[0].targetWeightBps, 6000);
-
-        // AMZN: 40% of recovered WETH
-        assertGt(after_[1].tokenAmount, before_[1].tokenAmount); // more AMZN now
         assertEq(after_[1].targetWeightBps, 4000);
+        assertEq(after_[2].targetWeightBps, 0);
     }
 
-    /// @notice Settle after rebalancing to zero weight — only 2 active tokens sell
+    /// @notice Settle after a rebalance that emptied the 0% slot: only the two active slots sell.
     function test_settle_afterZeroWeightRebalance() public {
-        _executeStrategy();
-
-        // Remove NFLX
-        uint256[] memory newWeights = new uint256[](3);
-        newWeights[0] = 6000;
-        newWeights[1] = 4000;
-        newWeights[2] = 0;
-
+        PortfolioStrategy s = _initZeroWeightStrategy();
+        _execute(s);
+        nflx.mint(address(s), 100e18);
         vm.prank(proposer);
-        strategy.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
+        s.rebalanceDelta();
 
-        vm.prank(proposer);
-        strategy.rebalanceDelta();
-
-        // Settle — should succeed even with a zero-balance token
         uint256 vaultBefore = weth.balanceOf(vault);
         vm.prank(vault);
-        strategy.settle();
+        s.settle();
 
         uint256 returned = weth.balanceOf(vault) - vaultBefore;
         assertGt(returned, 0);
-        assertEq(nflx.balanceOf(address(strategy)), 0);
-        assertEq(tsla.balanceOf(address(strategy)), 0);
-        assertEq(amzn.balanceOf(address(strategy)), 0);
+        assertEq(nflx.balanceOf(address(s)), 0);
+        assertEq(tsla.balanceOf(address(s)), 0);
+        assertEq(amzn.balanceOf(address(s)), 0);
     }
 
-    /// @notice Delta rebalance multiple times — weights can change between rebalances
+    /// @notice Three rounds of drift, each rebalanced back to the init weights; settle still
+    ///         unwinds everything.
     function test_multipleRebalanceDeltas() public {
         _executeStrategy();
 
-        // First rebalance: 60/30/10
-        uint256[] memory w1 = new uint256[](3);
-        w1[0] = 6000;
-        w1[1] = 3000;
-        w1[2] = 1000;
-        vm.prank(proposer);
-        strategy.updateParams(abi.encode(w1, uint256(0), new bytes[](0)));
+        _setPrice(tsla, fTsla, 0.02e18);
         vm.prank(proposer);
         strategy.rebalanceDelta();
+        _assertSharesAtTargets();
 
-        PortfolioStrategy.TokenAllocation[] memory r1 = strategy.getAllocations();
-        assertEq(r1[0].tokenAmount, 600e18); // 60% of 10 WETH * 100
-
-        // Second rebalance: 33/34/33
-        uint256[] memory w2 = new uint256[](3);
-        w2[0] = 3300;
-        w2[1] = 3400;
-        w2[2] = 3300;
-        vm.prank(proposer);
-        strategy.updateParams(abi.encode(w2, uint256(0), new bytes[](0)));
+        _setPrice(amzn, fAmzn, 0.01e18);
         vm.prank(proposer);
         strategy.rebalanceDelta();
+        _assertSharesAtTargets();
 
-        PortfolioStrategy.TokenAllocation[] memory r2 = strategy.getAllocations();
-        assertEq(r2[0].targetWeightBps, 3300);
-        assertEq(r2[1].targetWeightBps, 3400);
-        assertEq(r2[2].targetWeightBps, 3300);
-        // TSLA: 33% of 10 WETH = 3.3 WETH * 100 = 330 TSLA
-        assertEq(r2[0].tokenAmount, 330e18);
-
-        // Third rebalance: back to equal 34/33/33
-        uint256[] memory w3 = new uint256[](3);
-        w3[0] = 3400;
-        w3[1] = 3300;
-        w3[2] = 3300;
-        vm.prank(proposer);
-        strategy.updateParams(abi.encode(w3, uint256(0), new bytes[](0)));
+        _setPrice(nflx, fNflx, 0.01e18);
         vm.prank(proposer);
         strategy.rebalanceDelta();
+        _assertSharesAtTargets();
 
-        PortfolioStrategy.TokenAllocation[] memory r3 = strategy.getAllocations();
-        assertEq(r3[0].tokenAmount, 340e18); // 34% of 10 * 100
-
-        // Settle should still work after 3 rebalances
         uint256 vaultBefore = weth.balanceOf(vault);
         vm.prank(vault);
         strategy.settle();
-        uint256 returned = weth.balanceOf(vault) - vaultBefore;
-        assertEq(returned, TOTAL_AMOUNT); // no price change
+        assertGt(weth.balanceOf(vault) - vaultBefore, 0);
+        assertEq(tsla.balanceOf(address(strategy)), 0);
+        assertEq(amzn.balanceOf(address(strategy)), 0);
+        assertEq(nflx.balanceOf(address(strategy)), 0);
     }
 
     // ==================== GAS BENCHMARKS ====================
@@ -1043,7 +1011,6 @@ contract PortfolioStrategyTest is Test {
         uint256 count = 20;
         address[] memory tokens = new address[](count);
         uint256[] memory weights = new uint256[](count);
-        uint256[] memory newWeights = new uint256[](count);
         bytes[] memory extraData = new bytes[](count);
 
         for (uint256 i; i < count; ++i) {
@@ -1057,27 +1024,11 @@ contract PortfolioStrategyTest is Test {
             adapter.setRate(address(weth), address(token), 10e18);
             adapter.setRate(address(token), address(weth), 0.1e18);
             token.mint(address(adapter), 1_000_000e18);
-
-            // New weights: first token gets 50%, rest share remaining (263 bps each)
-            if (i == 0) {
-                newWeights[i] = 5000;
-            } else {
-                newWeights[i] = 263;
-            }
         }
-        // Fix rounding: 5000 + (263 * 19) = 5000 + 4997 = 9997, need 3 more
-        newWeights[1] += 3;
+        address[] memory feeds = _newFeeds(count, 18, int256(0.1e18));
 
         bytes memory initData = abi.encode(
-            address(weth),
-            address(adapter),
-            tokens,
-            weights,
-            20e18,
-            MAX_SLIPPAGE,
-            extraData,
-            _pd(tokens.length),
-            _newFeeds(count, 18, int256(0.1e18))
+            address(weth), address(adapter), tokens, weights, 20e18, MAX_SLIPPAGE, extraData, _pd(tokens.length), feeds
         );
         s.initialize(vault, proposer, initData);
 
@@ -1088,8 +1039,8 @@ contract PortfolioStrategyTest is Test {
         vm.prank(vault);
         s.execute();
 
-        vm.prank(proposer);
-        s.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
+        // Token 0 doubles: one sell, nineteen buys.
+        _setPrice(ERC20Mock(tokens[0]), MockAggregatorV3(feeds[0]), 0.2e18);
 
         vm.prank(proposer);
         uint256 gasBefore = gasleft();
@@ -1119,6 +1070,69 @@ contract PortfolioStrategyTest is Test {
         weth.approve(address(strategy), TOTAL_AMOUNT);
         vm.prank(vault);
         strategy.execute();
+    }
+
+    /// @dev Move a token's price at its feed and at the adapter (both directions).
+    function _setPrice(ERC20Mock token, MockAggregatorV3 feed, uint256 priceInWeth) internal {
+        feed.set(int256(priceInWeth), block.timestamp);
+        adapter.setRate(address(token), address(weth), priceInWeth);
+        adapter.setRate(address(weth), address(token), 1e36 / priceInWeth);
+    }
+
+    /// @dev Every fixture route fills exactly at the feed floor: feed x (1 - MAX_SLIPPAGE).
+    function _setFloorFillingRoutes() internal {
+        uint256 keep = 10_000 - MAX_SLIPPAGE;
+        adapter.setRate(address(weth), address(tsla), (100e18 * keep) / 10_000);
+        adapter.setRate(address(weth), address(amzn), (50e18 * keep) / 10_000);
+        adapter.setRate(address(weth), address(nflx), (200e18 * keep) / 10_000);
+        adapter.setRate(address(tsla), address(weth), (0.01e18 * keep) / 10_000);
+        adapter.setRate(address(amzn), address(weth), (0.02e18 * keep) / 10_000);
+        adapter.setRate(address(nflx), address(weth), (0.005e18 * keep) / 10_000);
+    }
+
+    /// @dev Basket value in WETH at the feeds, plus idle WETH.
+    function _fairValue() internal view returns (uint256 total) {
+        PortfolioStrategy.TokenAllocation[] memory allocs = strategy.getAllocations();
+        for (uint256 i; i < allocs.length; ++i) {
+            (, int256 answer,,,) = MockAggregatorV3(feedOf[allocs[i].token]).latestRoundData();
+            total += (IERC20(allocs[i].token).balanceOf(address(strategy)) * uint256(answer)) / 1e18;
+        }
+        total += weth.balanceOf(address(strategy));
+    }
+
+    /// @dev Each slot's value share is at its init weight, to rounding.
+    function _assertSharesAtTargets() internal view {
+        PortfolioStrategy.TokenAllocation[] memory allocs = strategy.getAllocations();
+        uint256 total = _fairValue();
+        for (uint256 i; i < allocs.length; ++i) {
+            (, int256 answer,,,) = MockAggregatorV3(feedOf[allocs[i].token]).latestRoundData();
+            uint256 value = (IERC20(allocs[i].token).balanceOf(address(strategy)) * uint256(answer)) / 1e18;
+            assertApproxEqAbs((value * 10_000) / total, allocs[i].targetWeightBps, 10, "slot off target");
+        }
+    }
+
+    /// @dev Fresh clone at TSLA 60% / AMZN 40% / NFLX 0%.
+    function _initZeroWeightStrategy() internal returns (PortfolioStrategy s) {
+        s = PortfolioStrategy(Clones.clone(address(template)));
+        address[] memory tokens = new address[](3);
+        tokens[0] = address(tsla);
+        tokens[1] = address(amzn);
+        tokens[2] = address(nflx);
+        uint256[] memory weights = new uint256[](3);
+        weights[0] = 6000;
+        weights[1] = 4000;
+        bytes memory initData = abi.encode(
+            address(weth),
+            address(adapter),
+            tokens,
+            weights,
+            TOTAL_AMOUNT,
+            MAX_SLIPPAGE,
+            new bytes[](3),
+            _pd(tokens.length),
+            _feedsForTokens(tokens)
+        );
+        s.initialize(vault, proposer, initData);
     }
 
     // ==================== SHERLOCK #21 + #29: 1e8 FEED REGRESSION ====================
@@ -1167,24 +1181,22 @@ contract PortfolioStrategyTest is Test {
         weth.approve(address(s), TOTAL_AMOUNT);
         vm.prank(vault);
         s.execute();
+        PortfolioStrategy.TokenAllocation[] memory before_ = s.getAllocations();
 
-        uint256[] memory newWeights = new uint256[](3);
-        newWeights[0] = 6000; // bump TSLA
-        newWeights[1] = 3000;
-        newWeights[2] = 1000;
-        vm.prank(proposer);
-        s.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
+        // TSLA doubles on its 8-dec feed and at the adapter.
+        MockAggregatorV3(feeds[0]).set(int256(2e6), block.timestamp);
+        adapter.setRate(address(tsla), address(weth), 0.02e18);
+        adapter.setRate(address(weth), address(tsla), 50e18);
 
         vm.prank(proposer);
         s.rebalanceDelta();
 
         // Pre-fix this either reverted on division-by-zero / no-op'd / OR
-        // ran swaps with effectively-zero minOuts. With the fix, allocations
-        // adjust toward the new weights.
+        // ran swaps with effectively-zero minOuts. With the fix, the drift is traded back.
         PortfolioStrategy.TokenAllocation[] memory after_ = s.getAllocations();
-        assertGt(after_[0].tokenAmount, 0, "TSLA bought to 60% target");
-        assertGt(after_[1].tokenAmount, 0, "AMZN");
-        assertGt(after_[2].tokenAmount, 0, "NFLX sold toward 10% target");
+        assertLt(after_[0].tokenAmount, before_[0].tokenAmount, "TSLA sold back toward 40%");
+        assertGt(after_[1].tokenAmount, before_[1].tokenAmount, "AMZN topped up");
+        assertGt(after_[2].tokenAmount, before_[2].tokenAmount, "NFLX topped up");
     }
 
     // ==================== FEED FAILURE MODES ====================
@@ -1268,25 +1280,23 @@ contract PortfolioStrategyTest is Test {
         s.initialize(vault, proposer, initData);
     }
 
-    /// @notice `rebalanceDelta` prices every slot off its 8-dec feed and moves toward the new weights.
+    /// @notice `rebalanceDelta` prices every slot off its 8-dec feed and trades the drift back.
     function test_rebalanceDelta_8DecFeeds_happyPath() public {
-        (PortfolioStrategy s,,,) = _init8DecStrategy();
+        (PortfolioStrategy s, MockAggregatorV3 f0,,) = _init8DecStrategy();
         _execute(s);
+        PortfolioStrategy.TokenAllocation[] memory before_ = s.getAllocations();
 
-        uint256[] memory newWeights = new uint256[](3);
-        newWeights[0] = 6000;
-        newWeights[1] = 3000;
-        newWeights[2] = 1000;
-        vm.prank(proposer);
-        s.updateParams(abi.encode(newWeights, uint256(0), new bytes[](0)));
+        f0.set(int256(2e6), block.timestamp);
+        adapter.setRate(address(tsla), address(weth), 0.02e18);
+        adapter.setRate(address(weth), address(tsla), 50e18);
 
         vm.prank(proposer);
         s.rebalanceDelta();
 
         PortfolioStrategy.TokenAllocation[] memory after_ = s.getAllocations();
-        assertGt(after_[0].tokenAmount, 0, "TSLA bought toward 60%");
-        assertGt(after_[1].tokenAmount, 0, "AMZN");
-        assertGt(after_[2].tokenAmount, 0, "NFLX sold toward 10%");
+        assertLt(after_[0].tokenAmount, before_[0].tokenAmount, "TSLA sold back toward 40%");
+        assertGt(after_[1].tokenAmount, before_[1].tokenAmount, "AMZN topped up");
+        assertGt(after_[2].tokenAmount, before_[2].tokenAmount, "NFLX topped up");
     }
 
     /// @notice One feed past `MAX_PUSH_PRICE_AGE` reverts the whole delta rebalance.
