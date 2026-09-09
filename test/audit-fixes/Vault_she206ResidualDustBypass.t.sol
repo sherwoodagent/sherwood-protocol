@@ -11,6 +11,7 @@ import {IVaultWithdrawalQueue} from "../../src/interfaces/IVaultWithdrawalQueue.
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
@@ -371,13 +372,13 @@ contract VaultShe206ResidualDustBypassTest is Test {
 
         // Instant lanes: shut.
         vm.startPrank(bob);
-        vm.expectRevert();
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
         vault.deposit(1e6, bob);
-        vm.expectRevert();
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
         vault.mint(1e6, bob);
-        vm.expectRevert();
+        vm.expectPartialRevert(ERC4626Upgradeable.ERC4626ExceededMaxRedeem.selector);
         vault.redeem(1e6, bob, bob);
-        vm.expectRevert();
+        vm.expectPartialRevert(ERC4626Upgradeable.ERC4626ExceededMaxWithdraw.selector);
         vault.withdraw(1e6, bob, bob);
         vm.stopPrank();
 

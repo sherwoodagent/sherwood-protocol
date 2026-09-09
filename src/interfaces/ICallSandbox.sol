@@ -28,8 +28,8 @@ pragma solidity 0.8.28;
  *         stake against a call set stored at propose time and readable through
  *         the whole review period.
  *
- * @dev    A sandbox holds nothing after `run`: the asset and every declared
- *         token are pushed home and any balance left reverts the run.
+ * @dev    After `run` the asset and every declared token are pushed home, any remainder
+ *         of those reverting the run; an undeclared leftover stays stranded, never priced.
  *
  *         See `openspec/changes/permissionless-tier2-sandbox/` — capability
  *         `sandbox-execution`.

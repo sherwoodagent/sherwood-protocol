@@ -299,10 +299,10 @@ contract PortfolioStrategy_stuckSettleEmergencyTest is Test {
         vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
 
         // Both pre-committed settle paths hit the stale feed.
-        vm.expectRevert();
+        vm.expectRevert(PortfolioStrategy.StalePrice.selector);
         governor.settleProposal(pid);
         vm.prank(owner);
-        vm.expectRevert();
+        vm.expectRevert(PortfolioStrategy.StalePrice.selector);
         governor.unstick(pid);
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
         assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed));
@@ -316,7 +316,7 @@ contract PortfolioStrategy_stuckSettleEmergencyTest is Test {
         // Review elapses. The feed is still dark: finalize reverts too, and stays recoverable.
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         vm.prank(owner);
-        vm.expectRevert();
+        vm.expectRevert(PortfolioStrategy.StalePrice.selector);
         governor.finalizeEmergencySettle(pid);
 
         // The feed comes back (Monday): the reviewed calls unwind the basket.

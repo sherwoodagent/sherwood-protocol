@@ -532,7 +532,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
         // Sequential storage writes instead of struct literal to avoid Yul
         // stack-too-deep under the coverage config (optimizer/viaIR off).
-        // votesAgainst / executedAt default to 0.
         StrategyProposal storage p = _proposals[proposalId];
         p.id = proposalId;
         p.proposer = msg.sender;
@@ -594,7 +593,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_commitState(proposal) != ProposalState.Pending) revert NotWithinVotingPeriod();
         if (_hasVoted[proposalId][msg.sender]) revert AlreadyVoted();
 
-        // Snapshot weight is final: no share can leave the vault while the
+        // Snapshot weight is final: no share is minted or burned while the
         // proposal is open (`SyndicateVault.redemptionsLocked`), so no live cap.
         uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, proposal.snapshotTimestamp);
         if (weight == 0) revert NoVotingPower();
@@ -1234,7 +1233,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Snapshots vetoThresholdBps so a mid-vote timelock finalize can't
         // retroactively move the threshold for this proposal.
         p.vetoThresholdBps = _params.vetoThresholdBps;
-        // Draft doesn't count (not binding on the vault); Pending does.
+        // The direct path binds the vault here; a Draft was bound at creation.
         unchecked {
             ++_openProposalCount;
         }
@@ -1801,9 +1800,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // proposal's own starting balance — a fund that fell and recovered has
         // already paid for this ground.
         uint256 base = ISyndicateVault(vault).aboveHighWaterMark();
-        // Never more than this proposal earned: share supply is frozen between
-        // execute and settle, so `pnl` and the mark's base share a unit, and a
-        // stale mark cannot charge principal or a donation as performance.
+        // Never more than this proposal earned: `pnl` is the pre-management-fee balance
+        // delta and `base` is post-fee, net of reserves; the min keeps a stale mark from
+        // charging principal or a donation as performance.
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 earned = pnl > 0 ? uint256(pnl) : 0;
         if (base > earned) base = earned;

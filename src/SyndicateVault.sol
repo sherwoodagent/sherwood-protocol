@@ -745,8 +745,7 @@ contract SyndicateVault is
                 }
                 continue;
             }
-            // Value landing on the vault itself needs no allowlist entry: the
-            // callee gate (PART 2a) already vetted who is being called.
+            // Value landing on the vault itself needs no allowlist entry: the recipient is this contract.
             if (recipient == address(this)) continue;
             if (!ITierRegistry(registry).isAdapterAllowed(recipient)) {
                 revert DisallowedTransferTarget(calls[i].target, sel, recipient);
@@ -845,8 +844,8 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev True from propose to settle: no share is minted or burned while a
-    ///      proposal is open, so the veto denominator cannot move (SHE-205).
+    /// @dev True from Draft creation to settle: no share is minted or burned while a
+    ///      proposal is open, so the veto denominator cannot move.
     ///      Fail-closed on a missing governor.
     function redemptionsLocked() public view returns (bool) {
         address gov = _getGovernor();
@@ -974,18 +973,9 @@ contract SyndicateVault is
         if (!_openDeposits && !_approvedDepositors.contains(who)) revert NotApprovedDepositor();
     }
 
-    /// @inheritdoc ERC4626Upgradeable
-    // The `nonReentrant` guard lives on the internal `_deposit` (both `deposit`
-    // and `mint` route through it), so the public entrypoints keep OZ's inherited
-    // bodies and we do not pay for two wrapper overrides (EIP-170 headroom).
-    // Defence-in-depth against cross-function reentrancy on the share-price path:
-    // a reentrant deposit during another mint could mint against a
-    // transiently-deflated NAV.
-    //
-    // The `withdraw`/`redeem` paths take no `nonReentrant` — not load-bearing.
-    // Withdraw transfers the asset OUT to the receiver, there is no live-withdraw
-    // adapter callback, and any reentry into deposit/mint is still blocked by
-    // `_deposit`'s latch.
+    // `nonReentrant` lives on the internal `_deposit`, which both `deposit` and `mint` route
+    // through; the public overrides below only re-check `depositsLocked` for a named error.
+    // `withdraw`/`redeem` take no guard: the asset leaves, nothing calls back in.
 
     /// @inheritdoc ERC4626Upgradeable
     /// @dev Idle float minus the queue reserve, floored at zero.

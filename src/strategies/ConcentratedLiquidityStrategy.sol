@@ -256,10 +256,9 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     /// @notice No floor could be derived: the adapter could not quote a leg (execute, rerange)
     ///         or the pool reports no price. No floor, no swap.
     error QuoteUnavailable();
-    /// @notice Settlement proceeds cannot cover the Morpho debt; the position stays as it
-    ///         is and settlement is retried (or exited under guardian review).
+    /// @notice Settlement proceeds cannot cover the Morpho debt; nothing moves and settle is retried.
     error ProceedsBelowDebt(uint256 held, uint256 owed);
-    /// @notice Settle left `amount` of `token` on the clone (clamping wrapper, partial-pull adapter).
+    /// @notice Settle left `amount` of `token` on the clone.
     error StrategyHoldsTokens(address token, uint256 amount);
     /// @notice Settle left a Morpho position open.
     error MorphoPositionOpen(uint256 borrowShares, uint256 collateral);
@@ -1074,8 +1073,8 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         _requireHoldsNothing();
     }
 
-    /// @dev Re-read after the pushes: a wrapper whose `redeem` clamps or an adapter that pulls
-    ///      part of `amountIn` would otherwise strand value behind `Settled`, which no path can reach.
+    /// @dev Re-read after the pushes: a clamping wrapper or a partial-pull adapter would
+    ///      otherwise strand value behind `Settled`.
     function _requireHoldsNothing() private view {
         _requireZeroBalance(asset);
         _requireZeroBalance(otherToken);

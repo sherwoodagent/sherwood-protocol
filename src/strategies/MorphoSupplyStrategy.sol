@@ -131,8 +131,7 @@ contract MorphoSupplyStrategy is BaseStrategy {
         if (!_isAdapterAllowed(registry, morpho_)) revert MorphoNotAllowed(morpho_, registry);
     }
 
-    /// @dev `vault() → governor() → tierRegistry()` walk. `address(0)` when unresolved,
-    ///      the condition under which `_requireAllowedMorpho` skips its check.
+    /// @dev `vault() → governor() → tierRegistry()` walk; `address(0)` when unresolved.
     function _resolveTierRegistry() private view returns (address registry) {
         address governor_ = _readAddress(vault(), abi.encodeCall(ITierBindingPath.governor, ()));
         if (governor_ == address(0)) return address(0);

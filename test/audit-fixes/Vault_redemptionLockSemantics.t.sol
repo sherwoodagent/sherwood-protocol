@@ -6,6 +6,7 @@ import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 
@@ -160,7 +161,7 @@ contract VaultRedemptionLockSemanticsTest is Test {
         assertEq(vault.maxRedeem(alice), 0, "redeem blocked during Pending");
 
         vm.prank(alice);
-        vm.expectRevert();
+        vm.expectPartialRevert(ERC4626Upgradeable.ERC4626ExceededMaxRedeem.selector);
         vault.redeem(shares, alice, alice);
     }
 

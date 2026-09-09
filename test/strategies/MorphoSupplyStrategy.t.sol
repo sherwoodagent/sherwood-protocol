@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockMorpho, MockIrm} from "../mocks/MockMorpho.sol";
 import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
@@ -244,7 +245,7 @@ contract MorphoSupplySettlementTest is MorphoSupplyFixture {
         usdg.transfer(borrower, idle - 10_000e6);
 
         vm.prank(address(vaultStub));
-        vm.expectRevert();
+        vm.expectPartialRevert(IERC20Errors.ERC20InsufficientBalance.selector);
         strategy.settle();
 
         assertEq(usdg.balanceOf(address(vaultStub)), 0, "delivered the drained remainder");

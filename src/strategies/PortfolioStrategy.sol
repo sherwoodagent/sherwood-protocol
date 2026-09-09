@@ -402,7 +402,7 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
 
     // ── Governance-allowlist binding ──
 
-    /// @dev Skips when the registry is unresolvable so a broken walk never strands settle/rebalance;
+    /// @dev Skips when the registry is unresolvable so a broken walk never strands `rebalanceDelta`;
     ///      init is fail-closed on resolution separately.
     function _requireAllowedAdapter(address swapAdapter_) private view {
         address registry = _resolveTierRegistry();
