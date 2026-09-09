@@ -683,6 +683,40 @@ contract PortfolioStrategyTest is Test {
         assertGe(_fairValue(), (start * (10_000 - 2 * MAX_SLIPPAGE)) / 10_000, "basket drained through rebalanceDelta");
     }
 
+    /// @notice The delta sell leg floors at feed x (1 - maxSlippageBps): a route filling one bp
+    ///         under it reverts, a route filling exactly at it clears.
+    function test_rebalanceDelta_sellLeg_revertsOnPoolManipulated() public {
+        _executeStrategy();
+        // TSLA doubles at the feed only, so the slot is overweight and the sell leg runs.
+        fTsla.set(int256(0.02e18), block.timestamp);
+        adapter.setRate(address(tsla), address(weth), (0.02e18 * (10_000 - MAX_SLIPPAGE - 1)) / 10_000);
+
+        vm.prank(proposer);
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
+        strategy.rebalanceDelta();
+
+        adapter.setRate(address(tsla), address(weth), (0.02e18 * (10_000 - MAX_SLIPPAGE)) / 10_000);
+        vm.prank(proposer);
+        strategy.rebalanceDelta();
+    }
+
+    /// @notice The delta re-buy leg floors at feed x (1 - maxSlippageBps): a route filling one bp
+    ///         under it reverts, a route filling exactly at it clears.
+    function test_rebalanceDelta_reBuyLeg_revertsOnPoolManipulated() public {
+        _executeStrategy();
+        // TSLA doubles at the feed and the route: the sell leg fills, AMZN is underweight.
+        _setPrice(tsla, fTsla, 0.02e18);
+        adapter.setRate(address(weth), address(amzn), (50e18 * (10_000 - MAX_SLIPPAGE - 1)) / 10_000);
+
+        vm.prank(proposer);
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
+        strategy.rebalanceDelta();
+
+        adapter.setRate(address(weth), address(amzn), (50e18 * (10_000 - MAX_SLIPPAGE)) / 10_000);
+        vm.prank(proposer);
+        strategy.rebalanceDelta();
+    }
+
     function test_rebalanceDelta_onlyProposer() public {
         _executeStrategy();
 

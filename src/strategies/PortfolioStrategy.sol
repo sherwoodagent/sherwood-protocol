@@ -264,7 +264,7 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
             if (_sellOverweight(i, totalValue, snap.currentValues[i], snap.prices[i])) ++swapsExecuted;
         }
         for (uint256 i; i < len; ++i) {
-            if (_buyUnderweight(i, totalValue, snap.currentValues[i], snap.prices[i])) ++swapsExecuted;
+            if (_buyUnderweight(i, totalValue, snap.currentValues[i])) ++swapsExecuted;
         }
 
         uint256[] memory newBalances = new uint256[](len);
@@ -310,18 +310,14 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
         if (tokensToSell > bal) tokensToSell = bal;
         if (tokensToSell == 0) return false;
         IERC20(token).forceApprove(address(swapAdapter), tokensToSell);
-        uint256 minOut =
-            (_tokensToValue(tokensToSell, price, i, assetDec) * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+        uint256 minOut = _sellFloor(i, tokensToSell);
         uint256 amountOut = swapAdapter.swap(token, asset, tokensToSell, minOut, _swapExtraData[i]);
         if (amountOut == 0) revert SwapFailed();
         return true;
     }
 
     /// @dev Buy slot `i`'s deficit under its target value (capped at held asset) at the feed-priced floor.
-    function _buyUnderweight(uint256 i, uint256 totalValue, uint256 currentValue, uint256 price)
-        private
-        returns (bool)
-    {
+    function _buyUnderweight(uint256 i, uint256 totalValue, uint256 currentValue) private returns (bool) {
         uint256 targetValue = (totalValue * _allocations[i].targetWeightBps) / BPS_DENOMINATOR;
         if (currentValue >= targetValue) return false;
         uint256 deficitValue = targetValue - currentValue;
@@ -329,9 +325,7 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
         uint256 amountToSpend = deficitValue > available ? available : deficitValue;
         if (amountToSpend == 0) return false;
         IERC20(asset).forceApprove(address(swapAdapter), amountToSpend);
-        uint256 assetDec = uint256(_assetDecimals);
-        uint256 minOut =
-            (_valueToTokens(amountToSpend, price, i, assetDec) * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+        uint256 minOut = _buyFloor(i, amountToSpend);
         uint256 amountOut = swapAdapter.swap(asset, _allocations[i].token, amountToSpend, minOut, _swapExtraData[i]);
         if (amountOut == 0) revert SwapFailed();
         return true;
