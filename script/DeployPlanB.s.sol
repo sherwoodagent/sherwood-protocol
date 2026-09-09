@@ -183,7 +183,9 @@ interface IProtocolConfigAdmin {
  *                                 the residual crash lag. The ledger DEFAULTS to
  *                                 10,000, which is no haircut and no allowance;
  *                                 pre-flight 9 refuses that. The shipped default
- *                                 sits ON the floor, so the two move together.
+ *                                 sits ON the floor, so the ledger's
+ *                                 MIN_WOOD_HAIRCUT_BPS, this script's mirror,
+ *                                 and DEFAULT_WOOD_HAIRCUT_BPS move together.
  *     WOOD_USD_FEED             — the AggregatorV3-shaped WOOD/USD feed: the
  *                                 `WoodPoolFeed` from DeployWoodPoolFeed on 4663,
  *                                 or any plain aggregator. The ledger's ONLY
@@ -260,7 +262,7 @@ contract DeployPlanB is ScriptBase {
     ///         unset. Public so the pre-flight tests assert against the SAME
     ///         value an unset environment produces.
     ///
-    /// @dev    WHY 7,000, i.e. a 30% discount on every bond valuation. The
+    /// @dev    WHY 5,000, i.e. a 50% discount on every bond valuation. The
     ///         ledger ships this parameter at 10,000 — no haircut — and that
     ///         default leaves ZERO allowance against the two overstatements
     ///         this design deliberately ACCEPTS rather than eliminates:
@@ -943,7 +945,7 @@ contract DeployPlanB is ScriptBase {
             "ZERO allowance for the two overstatements this design accepts: the feed's stale "
             "ETH/USD leg (an ETH drawdown inside the ~10.7h heartbeat reads WOOD/USD high by roughly "
             "the ETH move, no attacker needed) and the crash lag of up to window + maxDelay. "
-            "Set WOOD_HAIRCUT_BPS -- 7000 is the shipped value and absorbs a 30% overstatement."
+            "Set WOOD_HAIRCUT_BPS -- 5000 is the shipped value and absorbs a 50% overstatement."
         );
         require(
             ledger.woodHaircutBps() >= MIN_WOOD_HAIRCUT_BPS,
