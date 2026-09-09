@@ -85,14 +85,10 @@ abstract contract BaseStrategy is IStrategy {
     }
 
     modifier onlyProposer() {
-        _requireProposer();
-        _;
-    }
-
-    function _requireProposer() internal view {
         if (msg.sender != _proposer) revert NotProposer();
         (bool ok, bytes memory ret) = _vault.staticcall(abi.encodeCall(IAgentSet.isAgent, (_proposer)));
         if (!ok || ret.length != 32 || !abi.decode(ret, (bool))) revert ProposerNoLongerAgent();
+        _;
     }
 
     modifier onlyVault() {
