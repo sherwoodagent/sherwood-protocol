@@ -11,9 +11,6 @@ import {ITierRegistry} from "../../src/interfaces/ITierRegistry.sol";
 ///         previously ran with `_tierRegistry == 0`, under which
 ///         `SyndicateVault._guardBatchCalls` returned early and applied NO
 ///         allowlist — so granting everything is what preserves their behavior.
-///         The one visible difference is pricing: the registry-less branch in
-///         `_resolveTierAndCoverage` short-circuits to `(2, maxCapital)`, while
-///         resolving through here prices `sum(cap_i)` at `boundBps == 10_000`.
 ///
 ///         DO NOT reach for this when the assertion is about the registry —
 ///         allowlisting, demotion, callee gating, tier resolution. Those

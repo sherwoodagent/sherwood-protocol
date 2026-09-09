@@ -90,19 +90,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     /// @notice Proposal ID -> voter -> bool
     mapping(uint256 => mapping(address => bool)) private _hasVoted;
 
-    struct Ballot {
-        VoteType support;
-        uint256 weight;
-        uint256 cast;
-    }
-
     /// @notice Proposal ID -> vault balance at execution time
     mapping(uint256 => uint256) private _capitalSnapshots;
 
     /// @notice Currently executing proposal ID (0 if none)
     uint256 private _activeProposal;
 
-    // `_lastSettledAt` lives in ProposalLifecycle (stamped by `_decOpen`).
+    // `_cooldownEndsAt` lives in ProposalLifecycle (stamped by `_decOpen`).
 
     // ── Collaborative proposal storage ──
 
@@ -264,24 +258,17 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     mapping(uint256 => ICallSandbox.Call[]) private _sandboxCalls;
 
     /// @notice Proposal ID -> non-asset tokens the payload declares it may hold.
-    /// @dev Forwarded verbatim to `runSandbox`, where they become what the
-    ///      vault's residue probes can see. Undeclared leftovers are stranded in
-    ///      the sandbox by construction — never priced into a deposit, never
-    ///      collectable — which is the honest failure mode.
+    /// @dev Forwarded verbatim to `runSandbox`; the sandbox pushes each one home
+    ///      after its calls and reverts if any balance remains. Undeclared
+    ///      leftovers are stranded in the sandbox and never priced.
     mapping(uint256 => address[]) private _sandboxTokens;
-
-    uint256 private _voteExitPid;
-
-    uint256 private _voteExitShares;
-
-    mapping(uint256 => mapping(address => Ballot)) private _ballots;
 
     /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31)
     ///      for the three mappings above, then 1 more for `_escrowedFees`, then
     ///      1 more for `_ppsSnapshots`, then 3 more for the sandbox payload
-    ///      (23 -> 20) — append-only. See
+    ///      (23) — append-only. See
     ///      `script/syndicate-governor-layout.golden.json`.
-    uint256[20] private __gap;
+    uint256[23] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -485,11 +472,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (!ISyndicateVault(vault).isAgent(msg.sender)) revert NotRegisteredAgent();
         // (`openspec/changes/owner-bond-proposal-gate`)
         if (!IGuardianRegistry(_guardianRegistry).ownerBondLive(vault)) revert OwnerBondNotLive();
-        // Blocks new proposals when the vault still has a non-terminal
-        // lifecycle bound to it (Pending / GuardianReview / Approved / Executed).
-        // Draft co-proposals do not count toward openProposalCount and are
-        // independently gated at their Draft -> Pending transition.
+        // Blocks new proposals while the vault has a non-terminal lifecycle bound to it
+        // (Draft / Pending / GuardianReview / Approved / Executed); Drafts count from creation.
         if (_openProposalCount != 0) revert VaultHasOpenProposal();
+        // Cancel stamps the deadline too, so cancel+propose cycling cannot keep redemptions locked.
+        if (block.timestamp < _cooldownEndsAt) revert CooldownNotElapsed();
         if (strategy != address(0) && strategy.code.length != 0) {
             (bool okP, bytes memory pRet) = strategy.staticcall(abi.encodeCall(IStrategy.proposer, ()));
             address declaredProposer = (okP && pRet.length == 32) ? abi.decode(pRet, (address)) : address(0);
@@ -542,7 +529,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
         // Sequential storage writes instead of struct literal to avoid Yul
         // stack-too-deep under the coverage config (optimizer/viaIR off).
-        // votesFor / votesAgainst / votesAbstain / executedAt default to 0.
         StrategyProposal storage p = _proposals[proposalId];
         p.id = proposalId;
         p.proposer = msg.sender;
@@ -604,80 +590,16 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_commitState(proposal) != ProposalState.Pending) revert NotWithinVotingPeriod();
         if (_hasVoted[proposalId][msg.sender]) revert AlreadyVoted();
 
+        // Snapshot weight is final: no share is minted or burned while the
+        // proposal is open (`SyndicateVault.redemptionsLocked`), so no live cap.
         uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, proposal.snapshotTimestamp);
-        uint256 liveWeight = IVotes(proposal.vault).getVotes(msg.sender);
-        if (liveWeight < weight) weight = liveWeight;
         if (weight == 0) revert NoVotingPower();
 
         _hasVoted[proposalId][msg.sender] = true;
-        // if the voter's weight later moves. What is stored is the CAPPED
-        // weight -- the snapshot figure less anything already gone -- so the
-        // recompute below can never restore weight the voter did not carry
-        // when they voted.
-        _ballots[proposalId][msg.sender] = Ballot({support: support, weight: weight, cast: weight});
-
-        if (support == VoteType.For) {
-            proposal.votesFor += weight;
-        } else if (support == VoteType.Against) {
-            proposal.votesAgainst += weight;
-        } else {
-            proposal.votesAbstain += weight;
-        }
+        // Approval is optimistic: only Against votes are tallied, for the veto.
+        if (support == VoteType.Against) proposal.votesAgainst += weight;
 
         emit VoteCast(proposalId, msg.sender, support, weight);
-    }
-
-    function notifyShareExit(uint256 shares) external {
-        if (msg.sender != GovernorParameters.vault) return;
-        if (shares == 0) return;
-        (uint256 pid,) = _openVote();
-        if (pid == 0) return;
-
-        if (_voteExitPid != pid) {
-            _voteExitPid = pid;
-            _voteExitShares = 0;
-        }
-        _voteExitShares += shares;
-    }
-
-    function notifyVotingWeightMoved(address voter) external {
-        if (msg.sender != GovernorParameters.vault) return;
-        (uint256 pid, StrategyProposal storage p) = _openVote();
-        if (pid == 0) return;
-
-        Ballot storage b = _ballots[pid][voter];
-        uint256 cast = b.cast;
-        if (cast == 0) return;
-
-        uint256 live = IVotes(p.vault).getVotes(voter);
-        uint256 want = live < cast ? live : cast;
-        uint256 have = b.weight;
-        if (want == have) return;
-        b.weight = want;
-
-        if (want < have) {
-            uint256 cut = have - want;
-            if (b.support == VoteType.For) p.votesFor -= cut;
-            else if (b.support == VoteType.Against) p.votesAgainst -= cut;
-            else p.votesAbstain -= cut;
-            emit VoteWithdrawnOnExit(pid, voter, cut);
-        } else {
-            uint256 back = want - have;
-            if (b.support == VoteType.For) p.votesFor += back;
-            else if (b.support == VoteType.Against) p.votesAgainst += back;
-            else p.votesAbstain += back;
-            emit VoteRestoredOnReturn(pid, voter, back);
-        }
-    }
-
-    function _openVote() internal view returns (uint256 pid, StrategyProposal storage p) {
-        pid = _proposalCount;
-        p = _proposals[pid];
-        if (p.id == 0 || p.state != ProposalState.Pending || block.timestamp > p.voteEnd) pid = 0;
-    }
-
-    function _exitedDuringVote(uint256 proposalId) internal view override returns (uint256) {
-        return _voteExitPid == proposalId ? _voteExitShares : 0;
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -692,11 +614,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // propose and execute (`slashOwnerBond` has no open-proposal gate).
         // (`openspec/changes/owner-bond-proposal-gate`)
         if (!IGuardianRegistry(_guardianRegistry).ownerBondLive(vault)) revert OwnerBondNotLive();
-        // Cooldown check (skip if no prior settlement)
-        uint256 lastSettled = _lastSettledAt;
-        if (lastSettled != 0 && block.timestamp < lastSettled + _params.cooldownPeriod) {
-            revert CooldownNotElapsed();
-        }
 
         // Snapshot vault balance before execution
         address asset = IERC4626(vault).asset();
@@ -780,20 +697,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
                 proposal.effectiveMaxCapital
             );
 
-        {
-            uint256 basis = _capitalSnapshots[proposalId];
-            uint256 allowance = (proposal.effectiveMaxCapital * proposal.maxDrawdownBps) / BPS_DENOMINATOR;
-            // `allowance >= basis` covers the declared-total-loss envelope
-            // (`maxDrawdownBps == 10_000` on a proposal committing the whole
-            // float): the floor is zero, so any realized balance settles. That
-            // is the envelope working as declared, not a hole.
-            if (basis > allowance) {
-                uint256 floor = basis - allowance;
-                uint256 realized = IERC20(IERC4626(proposal.vault).asset()).balanceOf(proposal.vault);
-                if (realized < floor) revert SettlementBelowDrawdownFloor(realized, floor);
-            }
-        }
-
         _requireSettlePriceAboveFloorHook(proposalId, proposal, false);
 
         _finishSettlement(proposalId, proposal);
@@ -828,9 +731,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      execute is strictly less harmful, since no capital was deployed and
     ///      no fees accrued. Cancel during GuardianReview drives the registry's
     ///      `cancelReview` so a stale `resolveReview` cannot still slash
-    ///      approvers. `_lastSettledAt` is bumped on every cancel branch that
-    ///      decrements the open count, rate-limiting propose-cancel-propose-
-    ///      execute via the same cooldown that gates execute after a settle.
+    ///      approvers. `_cooldownEndsAt` is stamped on every cancel branch that
+    ///      decrements the open count, so the next propose waits out the same
+    ///      cooldown a settle imposes.
     function cancelProposal(uint256 proposalId) external nonReentrant {
         StrategyProposal storage proposal = _proposals[proposalId];
         if (msg.sender != proposal.proposer) revert NotProposer();
@@ -893,7 +796,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     // `_decOpen()` and `openProposalCount()` are inherited from
     // ProposalLifecycle (single chokepoint: `_decOpen` decrements the counter
-    // AND stamps `_lastSettledAt` so the permissionless lazy terminal path via
+    // AND stamps `_cooldownEndsAt` so the permissionless lazy terminal path via
     // `resolveProposalState` can't dodge the settle cooldown).
 
     /// @inheritdoc ISyndicateGovernor
@@ -1194,7 +1097,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     /// @inheritdoc ISyndicateGovernor
     function getCooldownEnd() external view returns (uint256) {
-        return _lastSettledAt + _params.cooldownPeriod;
+        return _cooldownEndsAt;
     }
 
     /// @inheritdoc ISyndicateGovernor
@@ -1322,7 +1225,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // Snapshots vetoThresholdBps so a mid-vote timelock finalize can't
         // retroactively move the threshold for this proposal.
         p.vetoThresholdBps = _params.vetoThresholdBps;
-        // Draft doesn't count (not binding on the vault); Pending does.
+        // The direct path binds the vault here; a Draft was bound at creation.
         unchecked {
             ++_openProposalCount;
         }
@@ -1480,7 +1383,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         bool checkCeiling
     ) private view returns (uint8 tier, uint256 coverage) {
         address registry = _tierRegistry;
-        if (registry == address(0)) return (2, maxCapital);
         uint256 tier2Ceiling = checkCeiling
             ? (IERC4626(GovernorParameters.vault).totalAssets() * tier2CallCapBps()) / BPS_DENOMINATOR
             : type(uint256).max;
@@ -1790,7 +1692,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // self-manage. Every proposal is charged the same way.
         {
             uint256 perfFee;
-            (agentFee, perfFee) = _chargePerformanceFee(proposalId, vault, asset, proposal.proposer);
+            (agentFee, perfFee) = _chargePerformanceFee(proposalId, vault, asset, proposal.proposer, pnl);
             totalFee += perfFee;
         }
 
@@ -1802,10 +1704,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _activeProposal = 0;
         _transition(proposal, ProposalState.Settled);
         delete _capitalSnapshots[proposalId];
-        // Symmetric with the capital snapshot above: both are read only on the
-        // way INTO settlement (the two floors), never after it, and `Settled`
-        // is terminal — no path re-enters `_finishSettlement` for this id — so
-        // clearing recovers the refund without weakening either gate.
+        // Read only on the way INTO settlement and `Settled` is terminal, so
+        // clearing recovers the refund without weakening the price floor.
         delete _ppsSnapshots[proposalId];
         _decOpen();
 
@@ -1882,7 +1782,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         emit ManagementFeeCharged(proposalId, asset, mgmtFee, assetSeconds);
     }
 
-    function _chargePerformanceFee(uint256 proposalId, address vault, address asset, address proposer)
+    function _chargePerformanceFee(uint256 proposalId, address vault, address asset, address proposer, int256 pnl)
         internal
         returns (uint256 agentFee, uint256 perfFee)
     {
@@ -1892,6 +1792,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // proposal's own starting balance — a fund that fell and recovered has
         // already paid for this ground.
         uint256 base = ISyndicateVault(vault).aboveHighWaterMark();
+        // Never more than this proposal earned: `pnl` is the pre-management-fee balance
+        // delta and `base` is post-fee, net of reserves; the min keeps a stale mark from
+        // charging principal or a donation as performance.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 earned = pnl > 0 ? uint256(pnl) : 0;
+        if (base > earned) base = earned;
 
         if (base > 0) {
             // Snapshotted at propose so it matches what voters approved, then
@@ -2034,12 +1940,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      transfers) or gated on `redemptionsLocked()` (instant redeem, queue
     ///      `claim`/`settleRedeem`, the `rescue*` helpers). An escrowed fee
     ///      leaving mid-strategy is indistinguishable from a strategy loss to
-    ///      both asset-balance-differencing consumers: it understates
-    ///      `_finishSettlement`'s `pnl`, and — since the drawdown floor —
-    ///      it can revert an otherwise-profitable `settleProposal` outright,
-    ///      which leaves `_activeProposal` set and therefore keeps redemptions,
-    ///      queue claims and every future proposal locked until the owner
-    ///      multisig runs `unstick`.
+    ///      `_finishSettlement`'s `pnl`, which understates it.
     ///
     ///      Costs the recipient nothing but a wait. The escrow only exists
     ///      because a transfer already failed once, it accrues no deadline, and

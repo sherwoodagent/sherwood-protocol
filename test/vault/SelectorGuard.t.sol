@@ -10,12 +10,44 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
+import {MockERC4626Wrapper} from "../mocks/MockERC4626Wrapper.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/// @notice Permit2 `AllowanceTransfer.transferFrom` stand-in that actually moves
+///         the tokens, so the batch is proven to execute and not merely to pass
+///         the guard.
+contract MockPermit2 {
+    uint256 public moved;
+
+    struct AllowanceTransferDetails {
+        address from;
+        address to;
+        uint160 amount;
+        address token;
+    }
+
+    function transferFrom(address from, address to, uint160 amount, address token) external {
+        IERC20(token).transferFrom(from, to, amount);
+        moved += amount;
+    }
+
+    function transferFrom(AllowanceTransferDetails[] calldata details) external {
+        for (uint256 i = 0; i < details.length; i++) {
+            IERC20(details[i].token).transferFrom(details[i].from, details[i].to, details[i].amount);
+            moved += details[i].amount;
+        }
+    }
+}
 
 /// @notice Governor stand-in WITHOUT a `tierRegistry()` getter — models a
 ///         pre-tier-registry governor. The vault must treat it exactly like an
 ///         unset registry (guard off) instead of bricking every batch.
 contract MockGovernorNoTierGetter {
     function getActiveProposal() external pure returns (uint256) {
+        return 0;
+    }
+
+    function proposalCount() external pure returns (uint256) {
         return 0;
     }
 }
@@ -505,42 +537,90 @@ contract SelectorGuardTest is Test {
         _exec(_one(dstoken, abi.encodeWithSelector(SEL_DSTOKEN_MOVE, address(vault), attacker, 1_000e18)));
     }
 
-    // ── PR #157 audit remediation: self-transfer fast-path scoped to asset() ──
+    // ── SHE-256: a recipient that is the vault itself needs no allowlist entry ──
     //
-    // Finding 2 [80]: Part 2's `recipient == address(this) -> continue`
-    // exempted ANY token whose destination decoded to the vault, not only
-    // `asset()` — the one token the outer `netOutflow` balance-diff meter in
-    // `executeGovernorBatch` actually verifies. A non-standard token the
-    // vault holds as a strategy position could execute arbitrary logic under
-    // `transferFrom(vault, vault, amount)` with zero verification anywhere in
-    // the pipeline.
+    // PR #157 scoped the self-recipient exemption to `asset()` because the
+    // callee was unvetted. The callee gate (PART 2a) now vets every target, so
+    // value landing on the vault is exempt on ANY allowlisted callee.
 
-    /// @notice The audit's exact attack shape: `EvilToken.transferFrom(vault,
-    ///         vault, amount)` on a token that is neither `asset()` nor
-    ///         allowlisted in the TierRegistry. Before this fix, `recipient ==
-    ///         vault` short-circuited straight past the registry check
-    ///         regardless of which token — this must now revert.
-    function test_nonAssetSelfTransferFastPathNoLongerExempt() public {
+    /// @notice `token.transferFrom(vault, vault, amount)` on an allowlisted
+    ///         non-asset token passes without the vault being an adapter.
+    function test_nonAssetSelfTransferToTheVaultNeedsNoAllowlistEntry() public {
         otherToken.mint(address(vault), 1_000e18);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                ISyndicateVault.DisallowedTransferTarget.selector,
-                address(otherToken),
-                SEL_TRANSFER_FROM,
-                address(vault)
-            )
-        );
-        _exec(
-            _one(
-                address(otherToken), abi.encodeCall(otherToken.transferFrom, (address(vault), address(vault), 1_000e18))
-            )
-        );
+        assertFalse(tierRegistry.isAdapterAllowed(address(vault)), "precondition: vault not allowlisted");
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(otherToken), data: abi.encodeCall(otherToken.approve, (address(vault), 1_000e18)), value: 0
+        });
+        calls[1] = BatchExecutorLib.Call({
+            target: address(otherToken),
+            data: abi.encodeCall(otherToken.transferFrom, (address(vault), address(vault), 1_000e18)),
+            value: 0
+        });
+        _exec(calls);
+        assertEq(otherToken.balanceOf(address(vault)), 1_000e18);
     }
 
-    /// @notice `asset()` itself keeps the fast-path: it is the one token the
-    ///         outer net-outflow meter independently verifies via a balance
-    ///         diff, so a vault-to-vault self-transfer of `asset()` is still
-    ///         exempt from the registry check (same self-approve pattern as
+    /// @notice An ERC-4626 `withdraw(_, vault, vault)` on an allowlisted wrapper
+    ///         executes inside a governor batch with the vault un-allowlisted.
+    function test_settlementBatchWithdrawingErc4626BackToTheVaultSucceeds() public {
+        MockERC4626Wrapper wrapper = new MockERC4626Wrapper(IERC20(address(otherToken)), "w", "w");
+        tierRegistry.setAdapterAllowed(address(wrapper), true);
+        otherToken.mint(address(vault), 1_000e18);
+        vm.startPrank(address(vault));
+        otherToken.approve(address(wrapper), 1_000e18);
+        wrapper.deposit(1_000e18, address(vault));
+        vm.stopPrank();
+        assertEq(otherToken.balanceOf(address(vault)), 0, "precondition: everything is in the wrapper");
+        assertFalse(tierRegistry.isAdapterAllowed(address(vault)), "precondition: vault not allowlisted");
+
+        _exec(
+            _one(
+                address(wrapper), abi.encodeWithSelector(SEL_ERC4626_WITHDRAW, 1_000e18, address(vault), address(vault))
+            )
+        );
+        assertEq(otherToken.balanceOf(address(vault)), 1_000e18, "withdraw did not land on the vault");
+    }
+
+    /// @notice A Permit2 `transferFrom(vault, vault, amount, token)` executes
+    ///         inside a governor batch with the vault un-allowlisted.
+    function test_permit2TransferFromToTheVaultSucceeds() public {
+        MockPermit2 router = new MockPermit2();
+        tierRegistry.setAdapterAllowed(address(router), true);
+        otherToken.mint(address(vault), 1_000e18);
+        vm.prank(address(vault));
+        otherToken.approve(address(router), 1_000e18);
+        assertFalse(tierRegistry.isAdapterAllowed(address(vault)), "precondition: vault not allowlisted");
+
+        _exec(
+            _one(
+                address(router),
+                abi.encodeWithSelector(
+                    SEL_PERMIT2_TRANSFER_FROM, address(vault), address(vault), uint160(1_000e18), address(otherToken)
+                )
+            )
+        );
+        assertEq(router.moved(), 1_000e18, "router did not execute the transfer");
+        assertEq(otherToken.balanceOf(address(vault)), 1_000e18);
+    }
+
+    /// @notice The Permit2 BATCH site: a `to == vault` element on a non-asset
+    ///         token passes without the vault being allowlisted.
+    function test_permit2BatchTransferFromToTheVaultSucceeds() public {
+        MockPermit2 router = new MockPermit2();
+        tierRegistry.setAdapterAllowed(address(router), true);
+        otherToken.mint(address(vault), 1_000e18);
+        vm.prank(address(vault));
+        otherToken.approve(address(router), 1_000e18);
+
+        PermitBatchDetail[] memory details = new PermitBatchDetail[](1);
+        details[0] =
+            PermitBatchDetail({from: address(vault), to: address(vault), amount: 1_000e18, token: address(otherToken)});
+        _exec(_one(address(router), abi.encodeWithSelector(SEL_PERMIT2_BATCH_TRANSFER_FROM, details)));
+        assertEq(router.moved(), 1_000e18, "router did not execute the batch");
+    }
+
+    /// @notice `asset()` self-transfer (same self-approve pattern as
     ///         `test_vaultSourcedTransferFromToAllowlistedAdapterPasses`).
     function test_assetSelfTransferFastPathStillExempt() public {
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);

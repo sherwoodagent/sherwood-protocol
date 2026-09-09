@@ -147,10 +147,12 @@ contract VaultBatchQueueTargetsTest is Test {
         usdc.approve(address(vault), type(uint256).max);
     }
 
+    /// @dev An executing proposal is also an open one: `redemptionsLocked()` reads
+    ///      `openProposalCount()` (SHE-258), so both selectors move together.
     function _setProposalActive(bool active) internal {
-        vm.mockCall(
-            MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(active ? uint256(1) : uint256(0))
-        );
+        uint256 pid = active ? uint256(1) : uint256(0);
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(pid));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(pid));
     }
 
     /// @dev The victim deposits and escrows a redeem against pid 1, leaving its
@@ -367,6 +369,7 @@ contract VaultBatchQueueTargetsTest is Test {
         // not the clone-ratchet binding property — see
         // `test/audit-fixes/Strategy_cloneRatchetBinding.t.sol` for that).
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(1)));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(1)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("strategyOf(uint256)"), abi.encode(address(strategy)));
 
         // execute() — onlyVault, named as a batch target, runs.

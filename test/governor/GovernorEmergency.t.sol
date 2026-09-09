@@ -848,16 +848,13 @@ contract GovernorEmergencyTest is Test {
     ///         exactly what it is tested at, and nothing else in the suite walks
     ///         the redirection end to end — so walk it here.
     ///
-    /// @dev    This is the band the floor NEWLY closes, and it is a band the
-    ///         protocol explicitly permits: `GovEnvelope.permissive` declares
-    ///         `maxDrawdownBps == 10_000`, i.e. voters accepted a total loss, so
-    ///         the CAPITAL floor does not bind and a genuine >90% loss is an
-    ///         allowed outcome. Both permissionless-ish exits now refuse it —
-    ///         `settleProposal` on the declared-envelope bar and `unstick` on the
-    ///         absolute backstop, which are the same 10% number here — which
-    ///         leaves `_activeProposal` set and the whole vault frozen. The only
-    ///         remaining exit is the bonded, guardian-reviewed one, and it must
-    ///         actually work.
+    /// @dev    `GovEnvelope.permissive` declares `maxDrawdownBps == 10_000`, so
+    ///         a >90% loss is inside the voted envelope, yet both
+    ///         permissionless-ish exits refuse it on the price floor —
+    ///         `settleProposal` and `unstick` share the 10% backstop here —
+    ///         which leaves `_activeProposal` set and the whole vault frozen.
+    ///         The only remaining exit is the bonded, guardian-reviewed one,
+    ///         and it must actually work.
     function test_subFloorSettlementIsClearedByFinalizeEmergencySettle() public {
         uint256 pid = _createExecutedProposal(7 days);
         vm.warp(vm.getBlockTimestamp() + 7 days);

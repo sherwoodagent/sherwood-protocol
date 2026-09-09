@@ -795,12 +795,18 @@ contract GovernorCoverageGatesTest is Test {
         _toApproved(pid);
 
         uint256 vaultBefore = usdg.balanceOf(address(vault));
+        // The funding is observable only in the events: `run` pushes what the
+        // payload did not spend straight back, inside the same transaction.
+        vm.expectEmit(true, false, false, true);
+        emit ICallSandbox.SandboxRun(address(vault), 1, 500e6);
+        vm.expectEmit(true, false, false, true);
+        emit ISyndicateVault.SandboxRun(pid, address(0), 500e6);
         governor.executeProposal(pid);
 
         address sandbox = vault.sandboxOf(pid);
         assertTrue(sandbox != address(0), "a sandbox was minted");
-        assertEq(usdg.balanceOf(sandbox), 500e6, "funded at half the declared amount");
-        assertEq(vaultBefore - usdg.balanceOf(address(vault)), 500e6, "and the vault paid exactly that");
+        assertEq(usdg.balanceOf(sandbox), 0, "the sandbox kept the funding past the run");
+        assertEq(usdg.balanceOf(address(vault)), vaultBefore, "the unspent funding did not come home");
         assertEq(governor.getEffectiveMaxCapital(pid), 500e6, "same raised-over-required ratio as the capital");
     }
 

@@ -5,6 +5,7 @@ import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {IVotes} from "@openzeppelin/contracts/governance/utils/IVotes.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title ProposalLifecycle
 /// @notice Abstract base owning the proposal lifecycle (propose -> vote ->
@@ -26,7 +27,8 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
     address internal _guardianRegistry;
     mapping(uint256 => StrategyProposal) internal _proposals;
     uint256 internal _openProposalCount;
-    uint256 internal _lastSettledAt;
+    /// @dev Cooldown deadline stamped at the last terminal event; zero before the first.
+    uint256 internal _cooldownEndsAt;
     /// @notice Draft collaboration deadline per proposal.
     /// @dev Public: the getter's bytecode cost is immaterial under Robinhood's
     ///      98,304-byte limit, and `_computeState` reads this for the Draft ->
@@ -54,11 +56,6 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         return _openProposalCount;
     }
 
-    function _exitedDuringVote(uint256 proposalId) internal view virtual returns (uint256) {
-        proposalId; // silence unused-parameter warning in the default
-        return 0;
-    }
-
     function _computeState(StrategyProposal storage p)
         internal
         view
@@ -73,18 +70,18 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         if (stored == ProposalState.Pending) {
             if (block.timestamp <= p.voteEnd) return (ProposalState.Pending, false);
 
-            // Voting ended — optimistic: approved unless AGAINST votes reach the
-            // veto threshold.
-            // Skip the veto check when liveSupply == 0, otherwise the
-            // threshold collapses to 0 and every proposal auto-rejects.
-            // Reads the vetoThresholdBps snapshot taken at Draft -> Pending,
-            // not a live param, so mid-vote finalizes don't move the bar.
+            // Voting ended — optimistic: approved unless AGAINST votes reach the veto threshold.
+            // Skip the veto check when liveSupply == 0, else the bar collapses to 0 and everything auto-rejects.
+            // vetoThresholdBps is the Draft -> Pending snapshot, so mid-vote finalizes don't move the bar.
+            // Votable set at the snapshot = supply minus the queue (queued shares keep snapshot weight).
+            // Cap it at totalSupply(): bounds the inflation side only. A holder who redeemed ahead of
+            // propose in the same block keeps snapshot vote weight against this live-capped bar.
             uint256 pastTotalSupply = IVotes(p.vault).getPastTotalSupply(p.snapshotTimestamp);
             address queue = ISyndicateVault(p.vault).withdrawalQueue();
             uint256 queueVotes = queue == address(0) ? 0 : IVotes(p.vault).getPastVotes(queue, p.snapshotTimestamp);
             uint256 liveSupply = pastTotalSupply > queueVotes ? pastTotalSupply - queueVotes : 0;
-            uint256 exited = _exitedDuringVote(p.id);
-            liveSupply = liveSupply > exited ? liveSupply - exited : 0;
+            uint256 nowTotalSupply = IERC20(p.vault).totalSupply();
+            if (nowTotalSupply < liveSupply) liveSupply = nowTotalSupply;
             if (liveSupply > 0) {
                 uint256 vetoThreshold = (liveSupply * p.vetoThresholdBps) / BPS_DENOMINATOR;
                 // FLOOR AT ONE VOTE. Integer division sends the threshold to
@@ -200,9 +197,12 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         try IGuardianRegistry(_guardianRegistry).cancelReview(p.id) {} catch {}
     }
 
-    /// @dev Release a vault binding and stamp the settlement clock.
+    /// @dev Release a vault binding and stamp the cooldown deadline with the period in force now,
+    ///      so a later `setCooldownPeriod` cannot move an open LP exit window.
     function _decOpen() internal {
         --_openProposalCount;
-        _lastSettledAt = block.timestamp;
+        _cooldownEndsAt = block.timestamp + _cooldownPeriod();
     }
+
+    function _cooldownPeriod() internal view virtual returns (uint256);
 }

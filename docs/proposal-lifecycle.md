@@ -218,5 +218,5 @@ prosecutor fee (default 5%, ≤ 20%) to the challenger, remainder burned.
 - **Registry paused mid-review** — proposal stays in `GuardianReview` until unpause
   (anyone can unpause after the 7-d dead-man delay).
 - **Unresolvable review** — governor/registry disagreement → terminal `Expired`.
-- Every non-executed terminal state leaves vault funds untouched; `_lastSettledAt`
+- Every non-executed terminal state leaves vault funds untouched; `_cooldownEndsAt`
   still stamps, so propose-cancel-propose spam is rate-limited by the cooldown.

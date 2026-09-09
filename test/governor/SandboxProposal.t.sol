@@ -62,8 +62,8 @@ contract TokenFaucet {
 }
 
 /// @dev A token that answers `balanceOf` honestly and refuses every transfer —
-///      a proposer can deploy exactly this. Without abandonment it would pin
-///      `hasUnvaluedResidue()` true forever with nothing able to move it.
+///      a proposer can deploy exactly this. `run` must revert rather than leave
+///      it behind.
 contract UnmovableToken {
     mapping(address => uint256) public balanceOf;
 
@@ -84,22 +84,14 @@ contract UnmovableFaucet {
     }
 }
 
-/// @dev A declared token whose `balanceOf` burns every drop of gas handed to it.
-///      A proposer can deploy exactly this, and it is the ADVERSARY the residue
-///      probes have to survive: the sandbox's loops run on gas BORROWED from the
-///      vault (150,000 for `hasUnvaluedResidue`, 1,500,000 for `collectResidue`'s
-///      sweep), so an entry that takes more than its share does not merely fail —
-///      it reverts the whole call, and `SyndicateVault._refreshUnvalued` reads an
-///      unreadable probe as "keep the last known flag".
-contract GasBurnerToken {
-    uint256 public sink;
+/// @dev A token whose `transfer` reports success and moves nothing. The push
+///      home "succeeds" and the balance stays — the shape only a re-read of
+///      the balance can catch.
+contract LyingToken {
+    mapping(address => uint256) public balanceOf;
 
-    function balanceOf(address) external view returns (uint256) {
-        uint256 acc;
-        while (true) {
-            acc = uint256(keccak256(abi.encode(acc, sink)));
-        }
-        return acc;
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
     }
 
     function transfer(address, uint256) external pure returns (bool) {
@@ -107,34 +99,10 @@ contract GasBurnerToken {
     }
 }
 
-/// @dev A token that can be made to refuse transfers and then allowed again —
-///      a paused token, a temporary blacklist, an incident. Distinguishes a
-///      TRANSIENT failure from a permanent one, which is the whole question
-///      `ABANDON_DELAY` exists to answer.
-contract PausableToken {
-    mapping(address => uint256) public balanceOf;
-    bool public paused;
-
-    function mint(address to, uint256 amount) external {
-        balanceOf[to] += amount;
-    }
-
-    function setPaused(bool p) external {
-        paused = p;
-    }
-
-    function transfer(address to, uint256 amount) external returns (bool) {
-        require(!paused, "paused");
-        balanceOf[msg.sender] -= amount;
-        balanceOf[to] += amount;
-        return true;
-    }
-}
-
-/// @dev Faucet for `PausableToken` — same reason as `TokenFaucet`.
-contract PausableFaucet {
+/// @dev Faucet for `LyingToken` — same reason as `TokenFaucet`.
+contract LyingFaucet {
     function pour(address token, uint256 amount) external {
-        PausableToken(token).mint(msg.sender, amount);
+        LyingToken(token).mint(msg.sender, amount);
     }
 }
 
@@ -433,9 +401,10 @@ contract SandboxProposalTest is Test {
     // ── 4.1 / 4.3 the max-loss invariant ──────────────────────────────────
 
     /// @notice A hostile call set that approves an attacker for the maximum AND
-    ///         transfers what it holds still costs the vault exactly `FUNDING` —
+    ///         transfers half of what it holds costs the vault exactly that half —
     ///         measured across execute, settle, and a follow-up transaction in
-    ///         which the attacker spends the approval that was granted.
+    ///         which the attacker spends the approval that was granted. The
+    ///         other half came home inside `run`, so the approval reaches nothing.
     function test_maxLoss_hostilePayloadCostsAtMostTheFundedAmount() public {
         ICallSandbox.Call[] memory calls = new ICallSandbox.Call[](2);
         calls[0] = ICallSandbox.Call({
@@ -455,12 +424,12 @@ contract SandboxProposalTest is Test {
 
         // The follow-up transaction: the attacker spends the standing approval
         // the payload granted. This is the drain that no per-call meter could
-        // have seen, and it reaches only the sandbox's own balance.
-        // Balance hoisted: an external call in argument position would consume
-        // the prank and the drain would run as this test contract.
-        uint256 sandboxLeft = usdc.balanceOf(sandbox);
+        // have seen, and it reaches only the sandbox's own balance — which
+        // `run` already pushed home, so there is nothing left to take.
+        assertEq(usdc.balanceOf(sandbox), 0, "the sandbox kept unspent funding past the run");
         vm.prank(attacker);
-        usdc.transferFrom(sandbox, attacker, sandboxLeft);
+        vm.expectRevert();
+        usdc.transferFrom(sandbox, attacker, 1);
 
         // And it cannot reach the vault: the sandbox holds no allowance there.
         vm.prank(attacker);
@@ -472,7 +441,8 @@ contract SandboxProposalTest is Test {
 
         uint256 lost = vaultBefore - usdc.balanceOf(address(vault));
         assertLe(lost, FUNDING, "structural bound: the funded amount, and never more");
-        assertEq(usdc.balanceOf(attacker), FUNDING, "the attacker got the funding and precisely nothing else");
+        assertEq(lost, FUNDING / 2, "the vault lost exactly what the payload transferred out");
+        assertEq(usdc.balanceOf(attacker), FUNDING / 2, "the attacker got the transfer and precisely nothing else");
     }
 
     /// @notice Funding is one-shot: a second `run()` on the minted sandbox
@@ -781,10 +751,10 @@ contract SandboxProposalTest is Test {
         assertEq(vault.sandboxOf(pid), address(0), "and no sandbox is ever minted");
     }
 
-    // ── 5.6 residue ───────────────────────────────────────────────────────
+    // ── 5.6 nothing stays in the sandbox ──────────────────────────────────
 
-    /// @dev Run a payload that leaves `amount` of `foreign` in the sandbox, with
-    ///      the token declared or not, and settle. Returns the sandbox address.
+    /// @dev Run a payload that leaves `amount` of `foreign` in the sandbox,
+    ///      declared or not, and settle. Returns the sandbox address.
     function _runLeavingForeignToken(uint256 amount, bool declare) internal returns (uint256 pid, address sandbox) {
         address[] memory tokens = new address[](declare ? 1 : 0);
         if (declare) tokens[0] = address(foreign);
@@ -798,87 +768,69 @@ contract SandboxProposalTest is Test {
         _advancePastVoting();
         governor.executeProposal(pid);
         sandbox = vault.sandboxOf(pid);
-        assertEq(foreign.balanceOf(sandbox), amount, "the payload really did leave a foreign token behind");
 
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
         governor.settleProposal(pid);
     }
 
-    /// @notice A DECLARED non-asset leftover is what the vault can see, so it
-    ///         refuses to mint rather than price a NAV it knows is incomplete —
-    ///         and `collectResidue` is the permissionless exit that reopens
-    ///         deposits.
-    function test_residue_declaredLeftoverLocksDepositsUntilCollected() public {
+    /// @notice A DECLARED leftover is pushed to the vault inside `run` itself:
+    ///         the sandbox holds nothing by the time execute returns, and
+    ///         settlement has nothing to wait for.
+    function test_sandboxRunPushesDeclaredLeftoverHome() public {
         (, address sandbox) = _runLeavingForeignToken(5e18, true);
 
-        assertTrue(vault.depositsLocked(), "an unvaluable leftover shuts the mint side");
-
-        vault.collectResidue(sandbox);
-
-        assertFalse(vault.depositsLocked(), "collecting it reopens deposits");
-        assertEq(foreign.balanceOf(sandbox), 0, "and the sandbox no longer holds it");
-    }
-
-    /// @notice THE COHORT-SPLIT DOOR STAYS SHUT. `_payCohortShare` splits a
-    ///         MEASURED BALANCE DELTA taken across the call inside
-    ///         `collectResidue`, and a delta is a complete measurement only
-    ///         while the vault is the one door vault asset arrives through. A
-    ///         sandbox is genuinely enrolled in that split — `onProposalSettled`
-    ///         records it against the settling pid — so a bare EOA driving
-    ///         `sweep()` directly used to land the whole balance in the vault
-    ///         OUTSIDE the measurement: the exited cohort credited nothing,
-    ///         unrepairably, and `depositNav()` double-counting until someone
-    ///         called `collectResidue`.
-    ///
-    ///         Both templates already carried `onlyVault` for this reason; the
-    ///         sandbox was a third residue holder merged with the door open.
-    function test_residue_directSweepIsRefusedSoTheCohortSplitStaysComplete() public {
-        (, address sandbox) = _runLeavingForeignToken(5e18, true);
-
-        // NON-VACUITY: there is really something to sweep, so a refusal here is
-        // the gate firing rather than an empty call trivially doing nothing.
-        assertGt(foreign.balanceOf(sandbox), 0, "the sandbox holds a leftover to sweep");
-
-        address keeper = makeAddr("keeper");
-        assertTrue(keeper != address(vault), "control: the caller is not the vault");
-        vm.prank(keeper);
-        vm.expectRevert(ICallSandbox.NotVault.selector);
-        ICallSandbox(sandbox).sweep();
-
-        // AND THE VAULT-ROUTED PATH STILL WORKS. The permissionless property is
-        // routed, not removed: `collectResidue` is itself callable by anyone.
-        vm.prank(keeper);
-        vault.collectResidue(sandbox);
-        assertEq(foreign.balanceOf(sandbox), 0, "the vault-routed exit still brings it home");
-        assertFalse(vault.depositsLocked(), "and it reopens deposits");
+        assertEq(foreign.balanceOf(sandbox), 0, "the sandbox kept a declared token past the run");
+        assertEq(foreign.balanceOf(address(vault)), 5e18, "and the vault did not receive it");
+        assertFalse(vault.depositsLocked(), "nothing is outstanding after settle");
     }
 
     /// @notice An UNDECLARED leftover is stranded in the sandbox and never
-    ///         priced into a deposit. The safe direction of error: the proposer
-    ///         loses what it failed to declare, and no LP ever mints against it.
+    ///         priced. The safe direction of error: the proposer loses what it
+    ///         failed to declare, and no LP ever mints against it.
     function test_residue_undeclaredLeftoverIsStrandedAndNeverPriced() public {
         uint256 navBefore = vault.totalAssets();
         (, address sandbox) = _runLeavingForeignToken(5e18, false);
 
-        assertFalse(vault.depositsLocked(), "the vault cannot see what was never declared");
         assertEq(foreign.balanceOf(sandbox), 5e18, "the token stays stranded in the sandbox");
         assertEq(foreign.balanceOf(address(vault)), 0, "and never reaches the vault");
         assertLe(vault.totalAssets(), navBefore, "it is never counted as vault value");
+        assertFalse(vault.depositsLocked(), "and it never gates a deposit");
     }
 
-    /// @notice A DECLARED token that refuses every transfer must not become a
-    ///         permanent deposit brick. `sweep` proves it unmovable, abandons it,
-    ///         and the lock clears — the token stays stranded and unpriced,
-    ///         which is exactly how an undeclared leftover is already treated.
-    ///         Any registered agent could otherwise shut minting forever.
-    /// @dev    TWO SWEEPS, `ABANDON_DELAY` APART, and that is the point rather
-    ///         than a wrinkle. One failed transfer is a snapshot: `sweep()` is
-    ///         permissionless, so if a single failure wrote the token off anyone
-    ///         could pick a moment when a PERFECTLY GOOD token happens to be
-    ///         paused and make the vault stop counting value it still holds.
-    ///         Abandonment therefore requires the failure to persist, and the
-    ///         lock it clears is bounded by that delay instead of permanent.
-    function test_residue_unmovableDeclaredTokenIsAbandonedRatherThanBrickingDeposits() public {
+    /// @notice A declared token whose transfer reports success and moves nothing
+    ///         reverts the run, naming the token and what stayed. Verified by
+    ///         mutation: drop the post-push balance re-read and this passes
+    ///         the run.
+    function test_sandboxRunRevertsIfAnyDeclaredTokenRemains() public {
+        LyingToken liar = new LyingToken();
+        LyingFaucet liarFaucet = new LyingFaucet();
+
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(liar);
+
+        uint256 pid = _proposeSandbox(
+            _payload(
+                _oneCall(address(liarFaucet), abi.encodeCall(LyingFaucet.pour, (address(liar), 5e18))), FUNDING, tokens
+            ),
+            agent
+        );
+        _advancePastVoting();
+
+        vm.expectRevert(abi.encodeWithSelector(ICallSandbox.SandboxHoldsTokens.selector, address(liar), 5e18));
+        governor.executeProposal(pid);
+
+        assertEq(vault.sandboxOf(pid), address(0), "a refused run must mint nothing");
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Approved),
+            "a refused run must not advance the proposal"
+        );
+    }
+
+    /// @notice A declared token that refuses every transfer reverts the whole
+    ///         execution: a proposer cannot execute against value that cannot
+    ///         come back, and the funded capital never leaves the vault.
+    function test_sandboxRunRevertsWhenADeclaredTokenCannotBeMoved() public {
         UnmovableToken bad = new UnmovableToken();
         UnmovableFaucet badFaucet = new UnmovableFaucet();
 
@@ -894,179 +846,30 @@ contract SandboxProposalTest is Test {
             agent
         );
         _advancePastVoting();
-        governor.executeProposal(pid);
-        address sandbox = vault.sandboxOf(pid);
-
-        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
-        governor.settleProposal(pid);
-        assertTrue(vault.depositsLocked(), "it locks like any other declared leftover");
-
-        vault.collectResidue(sandbox);
-        assertTrue(vault.depositsLocked(), "the FIRST failure only starts the clock - one sweep is not evidence");
-        assertEq(usdc.balanceOf(sandbox), 0, "while the real capital came home on that very first call");
-
-        vm.warp(vm.getBlockTimestamp() + sandboxImpl.ABANDON_DELAY());
-        vault.collectResidue(sandbox);
-
-        assertFalse(vault.depositsLocked(), "still failing a delay later: abandoned, and deposits reopen");
-        assertEq(bad.balanceOf(sandbox), 5e18, "the token itself is stranded, as it must be");
-    }
-
-    /// @notice A token that was merely PAUSED is not written off. Abandonment
-    ///         reopens deposits on value the vault then stops counting, and
-    ///         `sweep()` is permissionless — so a griefer must not be able to
-    ///         pick a moment of transient failure and make that call for
-    ///         everyone. Once the token moves again it is swept for real.
-    function test_abandon_transientFailureIsNotWrittenOff() public {
-        PausableToken flaky = new PausableToken();
-        PausableFaucet flakyFaucet = new PausableFaucet();
-
-        address[] memory tokens = new address[](1);
-        tokens[0] = address(flaky);
-
-        uint256 pid = _proposeSandbox(
-            _payload(
-                _oneCall(address(flakyFaucet), abi.encodeCall(PausableFaucet.pour, (address(flaky), 5e18))),
-                FUNDING,
-                tokens
-            ),
-            agent
-        );
-        _advancePastVoting();
-        governor.executeProposal(pid);
-        address sandbox = vault.sandboxOf(pid);
-
-        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
-        governor.settleProposal(pid);
-
-        flaky.setPaused(true);
-        vault.collectResidue(sandbox);
-        assertTrue(vault.depositsLocked(), "a paused token is still held, so it still counts");
-        assertEq(flaky.balanceOf(sandbox), 5e18, "and it is still there");
-
-        // The incident ends WITHIN the delay - exactly the case a single-failure
-        // write-off would have got wrong.
-        flaky.setPaused(false);
-        vault.collectResidue(sandbox);
-
-        assertFalse(vault.depositsLocked(), "it moved, so there is nothing left to count");
-        assertEq(flaky.balanceOf(sandbox), 0, "the value was RECOVERED, not written off");
-        assertEq(flaky.balanceOf(address(vault)), 5e18, "and it reached the vault");
-    }
-
-    // ── 5.6b gas-adversarial declared tokens ──────────────────────────────
-
-    /// @notice A declared token that BURNS GAS must not be able to freeze the
-    ///         residue flag. The vault reads `hasUnvaluedResidue()` through a
-    ///         150,000-gas staticcall and `_refreshUnvalued` KEEPS THE LAST KNOWN
-    ///         FLAG when that read fails — so a payload that latches the flag
-    ///         true and then makes the probe permanently unreadable would shut
-    ///         the mint side for the life of the vault, with no permissionless
-    ///         exit and no owner override.
-    /// @dev    The sequence is the exploit: `foreign` sits FIRST so the first
-    ///         probe returns true cheaply and the flag latches; sweeping it out
-    ///         then forces every later probe to walk past it into the burner.
-    ///         Against a fixed per-token gas ceiling equal to the caller's whole
-    ///         budget this reverts out of gas forever; against `_fairShare` the
-    ///         burner gets its slice and the loop still answers.
-    ///
-    ///         THE TRAILING TOKEN IS LOAD-BEARING, not padding. With the burner
-    ///         LAST this test passes against the broken code too: EIP-150 hands a
-    ///         sub-call only 63/64 of what is left, so a final burner still
-    ///         leaves its caller the 1/64 it needs to return. Only an entry that
-    ///         starves an entry BEHIND it makes the whole function unreadable,
-    ///         which is the condition `_fairShare` actually removes. Verified by
-    ///         mutation: restore the fixed `_PROBE_GAS` ceiling and this fails.
-    function test_probe_gasBurningDeclaredTokenCannotFreezeTheResidueFlag() public {
-        GasBurnerToken burner = new GasBurnerToken();
-
-        address[] memory tokens = new address[](3);
-        tokens[0] = address(foreign);
-        tokens[1] = address(burner);
-        tokens[2] = address(new ERC20Mock("Trailing", "TRAIL", 18));
-
-        uint256 pid = _proposeSandbox(
-            _payload(
-                _oneCall(address(faucet), abi.encodeCall(TokenFaucet.pour, (address(foreign), 5e18))), FUNDING, tokens
-            ),
-            agent
-        );
-        _advancePastVoting();
-        governor.executeProposal(pid);
-        address sandbox = vault.sandboxOf(pid);
-
-        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
-        governor.settleProposal(pid);
-        assertTrue(vault.depositsLocked(), "the flag latches true while the declared leftover is held");
-
-        vault.collectResidue(sandbox);
-
-        assertEq(foreign.balanceOf(sandbox), 0, "the leftover came home");
-        assertFalse(vault.depositsLocked(), "and the probe still ANSWERS with a burner behind it");
-    }
-
-    /// @notice The vault's `collectResidue` lends `sweep()` 1,500,000 gas. A full
-    ///         declared list of gas-burning tokens must not consume it before the
-    ///         ASSET leg — that leg is the only one carrying priced value, and
-    ///         losing it means the funded capital never comes home.
-    /// @dev    Measured against the pre-fix code: 16 burners consumed the entire
-    ///         1.5M, the whole sweep reverted, and the vault recovered ZERO.
-    function test_sweep_hostileTokenListStillReturnsTheFundedAsset() public {
-        address[] memory tokens = new address[](16);
-        for (uint256 i = 0; i < 16; i++) {
-            tokens[i] = address(new GasBurnerToken());
-        }
-
-        uint256 pid = _proposeSandbox(
-            _payload(_oneCall(address(spy), abi.encodeCall(IdentitySpy.ping, ())), FUNDING, tokens), agent
-        );
-        _advancePastVoting();
-        governor.executeProposal(pid);
-        address sandbox = vault.sandboxOf(pid);
-        assertEq(usdc.balanceOf(sandbox), FUNDING, "the payload spent nothing, so the funding is still out there");
-
-        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
-        governor.settleProposal(pid);
-
         uint256 vaultBefore = usdc.balanceOf(address(vault));
-        vault.collectResidue(sandbox);
 
-        assertEq(usdc.balanceOf(sandbox), 0, "the funded capital came home");
-        assertEq(usdc.balanceOf(address(vault)) - vaultBefore, FUNDING, "in full, despite 16 hostile declared tokens");
+        vm.expectRevert(bytes("nope"));
+        governor.executeProposal(pid);
+
+        assertEq(usdc.balanceOf(address(vault)), vaultBefore, "funding left the vault on a refused run");
     }
 
-    /// @notice A FULL list of entirely well-behaved declared tokens must stay
-    ///         readable inside the vault's own probe budget. This is the budget
-    ///         regression gate: `MAX_DECLARED_TOKENS`, the per-token ceilings and
-    ///         `SyndicateVault._PROBE_GAS` are three numbers in two contracts, and
-    ///         nothing else fails loudly when they drift apart — an unreadable
-    ///         probe is silently read as "keep the last known flag".
-    function test_probe_maxDeclaredTokensStayReadableInsideTheVaultProbeBudget() public {
-        address[] memory tokens = new address[](16);
-        tokens[0] = address(foreign);
-        for (uint256 i = 1; i < 16; i++) {
-            tokens[i] = address(new ERC20Mock("Filler", "FILL", 18));
-        }
-
+    /// @notice Unspent funding comes home in the same transaction as the run:
+    ///         the vault's balance is unchanged across execute and the sandbox
+    ///         holds nothing afterwards.
+    function test_sandboxRunReturnsUnspentFundingInTheSameTransaction() public {
         uint256 pid = _proposeSandbox(
-            _payload(
-                _oneCall(address(faucet), abi.encodeCall(TokenFaucet.pour, (address(foreign), 5e18))), FUNDING, tokens
-            ),
-            agent
+            _payload(_oneCall(address(spy), abi.encodeCall(IdentitySpy.ping, ())), FUNDING, new address[](0)), agent
         );
         _advancePastVoting();
+        uint256 vaultBefore = usdc.balanceOf(address(vault));
+
+        vm.expectEmit(true, false, false, true);
+        emit ICallSandbox.SandboxRun(address(vault), 1, FUNDING);
         governor.executeProposal(pid);
-        address sandbox = vault.sandboxOf(pid);
 
-        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
-        governor.settleProposal(pid);
-        vault.collectResidue(sandbox);
-
-        // Read it exactly as the vault does: same selector, same 150,000 budget.
-        (bool ok, bytes memory ret) = sandbox.staticcall{gas: 150_000}(abi.encodeWithSignature("hasUnvaluedResidue()"));
-        assertTrue(ok && ret.length == 32, "a full, benign declared list must answer inside the vault's budget");
-        assertFalse(abi.decode(ret, (bool)), "and answer that nothing is left");
-        assertFalse(vault.depositsLocked(), "so deposits reopen");
+        assertEq(usdc.balanceOf(vault.sandboxOf(pid)), 0, "the sandbox kept the funding");
+        assertEq(usdc.balanceOf(address(vault)), vaultBefore, "the unspent funding did not come home");
     }
 
     // ── 5.7 runSandbox authorization ──────────────────────────────────────

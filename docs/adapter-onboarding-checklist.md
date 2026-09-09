@@ -755,9 +755,9 @@ the allowlist alone says "this feed may be used", not "…for this token", and a
 valuable token paired with a cheap asset's allowlisted feed produces a floor
 computed off the wrong reference while every slippage check still passes.
 
-Pass the **bare** aggregator address widened to `bytes32` (push mode) or the
-feed id verbatim (Data Streams). Do not include any packed max-age — one
-attestation is meant to cover every staleness variant of the same aggregator.
+Pass the **bare** aggregator address widened to `bytes32` — exactly
+`bytes32(uint256(uint160(feed)))`, the key `PortfolioStrategy._initialize`
+looks up.
 
 ---
 

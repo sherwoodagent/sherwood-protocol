@@ -7,7 +7,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockERC4626Wrapper} from "../mocks/MockERC4626Wrapper.sol";
-import {MockMorpho, MockIrm} from "../mocks/MockMorpho.sol";
+import {MockMorpho, MockIrm, MockMorphoOracle} from "../mocks/MockMorpho.sol";
 import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
 import {MockPermissiveTierRegistry} from "../mocks/MockPermissiveTierRegistry.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
@@ -78,6 +78,7 @@ abstract contract CLFixture is Test {
     MockERC4626Wrapper spUsdg;
     MockIrm irm;
     MockMorpho morpho;
+    MockMorphoOracle oracle;
     MockUniswapV3Pool pool;
     MockPositionManager posm;
     MockSwapAdapter adapter;
@@ -111,11 +112,13 @@ abstract contract CLFixture is Test {
         irm = new MockIrm();
         irm.setRate(uint256(0.05e18) / 365 days);
         morpho = new MockMorpho();
+        // Par: spUSDG shares and USDG are 1:1, so the wrapper and the market agree.
+        oracle = new MockMorphoOracle();
 
         mp = MarketParams({
             loanToken: address(usdg),
             collateralToken: address(spUsdg),
-            oracle: makeAddr("oracle"),
+            oracle: address(oracle),
             irm: address(irm),
             lltv: 0.915e18
         });
@@ -139,10 +142,8 @@ abstract contract CLFixture is Test {
         nvda.mint(address(adapter), 1_000_000e18);
         usdg.mint(address(adapter), 1_000_000e6);
 
-        // Seat a real pool price. `_poolAnchoredMinOut` treats 0 as unreadable
-        // and degrades to the quote floor alone, so leaving the mock's default
-        // would make the anchored floor inert in every test here rather than
-        // fail loudly. FAIR_SQRT_PRICE_X96 encodes exactly the adapter's rate,
+        // Seat a real pool price: `_poolAnchoredMinOut` reverts on the mock's
+        // default of 0. FAIR_SQRT_PRICE_X96 encodes exactly the adapter's rate,
         // so the two floors agree and the honest path is unaffected; the
         // manipulation tests move the ADAPTER away from it.
         pool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96);
@@ -335,20 +336,6 @@ contract ConcentratedLiquidityStrategyLifecycleTest is CLFixture {
         vm.prank(address(vaultStub));
         vm.expectRevert(ConcentratedLiquidityStrategy.PositionExceedsPoolShareCap.selector);
         strategy.execute();
-    }
-
-    /// @dev `unwindPosition` is external ONLY so `_settle` can `try/catch` it as
-    ///      a unit. It moves the position and clears `tokenId`, so anything but
-    ///      a self-call must be refused.
-    function test_unwindPosition_onlySelfReverts() public {
-        _execute();
-        vm.prank(keeper);
-        vm.expectRevert(ConcentratedLiquidityStrategy.NotSelf.selector);
-        strategy.unwindPosition();
-
-        vm.prank(proposer);
-        vm.expectRevert(ConcentratedLiquidityStrategy.NotSelf.selector);
-        strategy.unwindPosition();
     }
 
     function test_execute_twiceReverts() public {
@@ -949,35 +936,23 @@ contract ConcentratedLiquidityStrategyPoolAnchoredFloorTest is CLFixture {
         strategy.execute();
     }
 
-    /// @dev SELF-PROVING COUNTERPART to the test above, and the reason it is not
-    ///      vacuous. Same halved routed venue, but with the pool price
-    ///      unreadable the floor degrades to the quote alone — the pre-fix
-    ///      construction — and the identical skim CLEARS.
-    ///
-    ///      Two things are pinned at once: the manipulation test is actually
-    ///      exercising the new floor rather than some unrelated guard, and the
-    ///      degradation path is a real, deliberate residual (an unreadable pool
-    ///      price buys back the old exposure) rather than an accident.
-    function test_execute_quoteFloorAloneAdmitsTheSkim_provingTheAnchorIsLoadBearing() public {
-        pool.setSqrtPriceX96(0);
+    /// @dev Counterpart to the test above: seat the POOL at the same halved price and the
+    ///      identical fill clears, so the pool anchor is what rejected it, not another guard.
+    function test_execute_poolSeatedAtTheHalvedPriceAdmitsTheFill_provingTheAnchorIsLoadBearing() public {
+        // sqrt(0.5e10) ~= 70_710.68; rounding down keeps the anchor a hair under the fill.
+        pool.setSqrtPriceX96(uint160(70_710) * uint160(2 ** 96));
         adapter.setRate(address(usdg), address(nvda), (1e18 * 1e12 / 100) / 2);
         _execute();
-        assertEq(
-            uint256(strategy.state()),
-            uint256(BaseStrategy.State.Executed),
-            "without the pool anchor the halved venue clears -- this is the pre-fix behaviour"
-        );
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed), "pool and venue agree: clears");
     }
 
-    /// @dev The pool read degrades rather than bricks: an unreadable price
-    ///      (`sqrtPriceX96 == 0`) must fall back to the quote floor alone, which
-    ///      is the pre-existing behaviour, not a new revert. Pins that the
-    ///      degradation path is deliberate — and, read against the test above,
-    ///      pins that a zero price is what made this floor inert.
-    function test_execute_unreadablePoolPriceDegradesToQuoteFloor() public {
+    /// @dev An unreadable pool price (`sqrtPriceX96 == 0`) is no floor at all, so execute
+    ///      reverts rather than degrading to the quote alone.
+    function test_execute_revertsWhenThePoolPriceIsUnreadable() public {
         pool.setSqrtPriceX96(0);
-        _execute();
-        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Executed));
+        vm.prank(address(vaultStub));
+        vm.expectRevert(ConcentratedLiquidityStrategy.QuoteUnavailable.selector);
+        strategy.execute();
     }
 
     /// @dev The anchor is the pool's MID price, while `_quoteMinOut`'s operand
@@ -1014,65 +989,46 @@ contract ConcentratedLiquidityStrategyPoolAnchoredFloorTest is CLFixture {
         assertEq(uint256(s.state()), uint256(BaseStrategy.State.Executed), "the fee haircut must not be double-counted");
     }
 
-    // ── The exit leg: the anchor must not become a settlement veto ──
+    // ── The exit leg: the anchor holds, and settle reverts rather than degrading ──
 
-    /// @dev THE REGRESSION THE GATE MUST NOT BREAK. Pool honest, routed venue
-    ///      short: the anchor holds and the skim is refused, leaving the residue
-    ///      for `sweep()`. If gating the anchor on `_spotNearTwap()` had
-    ///      disabled it on this path, this converts and the finding is back.
+    /// @dev Pool honest, routed venue short: the anchor holds and the swap is refused,
+    ///      which reverts the settlement (a swallowed failure would settle short of debt).
     function test_settle_shortRoutedVenueIsRefusedWhileSpotIsTwapVerified() public {
         _execute();
         // Half of what the pool says the token is worth.
         adapter.setRate(address(nvda), address(usdg), (100 * 1e18 / 1e12) / 2);
-        _settle();
-        assertGt(
-            nvda.balanceOf(address(strategy)), 0, "the halved venue must not clear while the pool price is verified"
-        );
+        vm.prank(address(vaultStub));
+        vm.expectRevert(MockSwapAdapter.SlippageExceeded.selector);
+        strategy.settle();
     }
 
-    /// @dev THE FIX, and the correction to its first attempt. `_settle`/`sweep`
-    ///      assert nothing about spot — unlike `_execute`/`rerange`, which
-    ///      revert `SpotOutsideTwapBound` first — so the anchor's safety is not
-    ///      inherited here and a pushed pool has to be handled explicitly.
-    ///
-    ///      SKIPPING THE ANCHOR IS THE WRONG HANDLING, which is what this pins.
-    ///      With the anchor off, `minOut` falls back to the routed venue quoting
-    ///      itself, so the same actor who pushed the pool also moves the venue
-    ///      and the original finding clears — measured at a full conversion of
-    ///      the position through a venue paying half the pool price. Skipping
-    ///      the SWAP instead costs delay rather than principal.
-    function test_settle_pushedPoolMustNotHandTheSkimBack() public {
+    /// @dev D8: a pushed pool is not handled by skipping the anchor (which would hand the
+    ///      skim back through the venue quoting itself) nor by skipping the swap — settle
+    ///      reverts `SpotOutsideTwapBound` and is retried when the pool is honest.
+    function test_settle_pushedPoolRevertsRatherThanHandingTheSkimBack() public {
         _execute();
         pool.setTicks(23_000, 0);
         adapter.setRate(address(nvda), address(usdg), (100 * 1e18 / 1e12) / 2);
-        _settle();
-        assertGt(
-            nvda.balanceOf(address(strategy)),
-            0,
-            "an unverified pool must skip the swap, not swap on the venue's own quote"
-        );
+        vm.prank(address(vaultStub));
+        vm.expectRevert(ConcentratedLiquidityStrategy.SpotOutsideTwapBound.selector);
+        strategy.settle();
     }
 
-    /// @dev And the delay is only that. The residue a pushed pool leaves is
-    ///      recoverable by the permissionless `sweep()` at any later honest
-    ///      moment, with no owner involvement — which is what makes trading the
-    ///      skim for a skipped swap the right way round. Holding spot outside
-    ///      the bound costs the attacker every block while the TWAP walks toward
-    ///      spot, so the deviation they are paying for closes underneath them.
-    function test_settle_pushedPoolResidueIsRecoveredBySweep() public {
+    /// @dev And the delay is only that: once the pool returns to itself the identical
+    ///      call converts everything and settles.
+    function test_settle_succeedsOnceThePoolIsHonestAgain() public {
         _execute();
         pool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96 / 3);
         pool.setTicks(23_000, 0);
+        vm.prank(address(vaultStub));
+        vm.expectRevert(ConcentratedLiquidityStrategy.SpotOutsideTwapBound.selector);
+        strategy.settle();
 
-        _settle();
-        assertGt(nvda.balanceOf(address(strategy)), 0, "precondition: the pushed pool left a residue");
-
-        // The pool returns to itself; anyone may retry.
         pool.setSqrtPriceX96(FAIR_SQRT_PRICE_X96);
         pool.setTicks(0, 0);
-        vm.prank(address(vaultStub));
-        strategy.sweep();
+        _settle();
 
-        assertEq(nvda.balanceOf(address(strategy)), 0, "sweep must recover the residue once the pool is honest");
+        assertEq(uint256(strategy.state()), uint256(BaseStrategy.State.Settled));
+        assertEq(nvda.balanceOf(address(strategy)), 0, "volatile leg left on the clone");
     }
 }

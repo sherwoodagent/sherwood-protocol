@@ -392,14 +392,14 @@ contract OpenProposalCountTest is Test {
         assertEq(governor.openProposalCount(), 0, "counter == 0 after flush");
 
         // PR #359 review #1: the lazy-resolution `_decOpen` MUST also bump
-        // `_lastSettledAt` so the settle cooldown gates the next execute.
+        // `_cooldownEndsAt` so the settle cooldown gates the next propose.
         // Pre-fix this branch decremented the counter WITHOUT the bump,
-        // letting propose→resolve→propose→execute skip the cooldown.
+        // letting propose→resolve→propose skip the cooldown.
         // `getCooldownEnd == now + COOLDOWN_PERIOD` proves the bump landed.
         assertEq(
             governor.getCooldownEnd(),
             vm.getBlockTimestamp() + COOLDOWN_PERIOD,
-            "resolveProposalState must bump _lastSettledAt (PR #359 #1)"
+            "resolveProposalState must bump _cooldownEndsAt (PR #359 #1)"
         );
 
         // Owner can now rage-quit.
@@ -411,7 +411,7 @@ contract OpenProposalCountTest is Test {
     ///         (`resolveProposalState` → `_resolveState` → `_decOpen`) bumps
     ///         the settle cooldown identically to the explicit cancel/veto
     ///         paths. Pre-fix it was the lone `_decOpen` site without the
-    ///         `_lastSettledAt` write, so a guardian-blocked / expired
+    ///         `_cooldownEndsAt` write, so a guardian-blocked / expired
     ///         proposal left the cooldown un-armed.
     function test_resolveProposalState_armsCooldownLikeVeto() public {
         // Path A: explicit veto bumps the cooldown.
@@ -419,6 +419,7 @@ contract OpenProposalCountTest is Test {
         vm.prank(owner);
         governor.vetoProposal(pidA);
         uint256 cooldownAfterVeto = governor.getCooldownEnd();
+        vm.warp(cooldownAfterVeto); // propose honours the cooldown the veto stamped
 
         // Same vault, fresh proposal, drive it to lazy Rejected via vote-veto.
         uint256 pidB = _propose();
@@ -509,6 +510,9 @@ contract OpenProposalCountTest is Test {
         vm.prank(owner);
         governor.emergencyCancel(pid);
         assertEq(governor.openProposalCount(), 0, "counter == 0 after emergencyCancel");
+        assertEq(
+            governor.getCooldownEnd(), vm.getBlockTimestamp() + COOLDOWN_PERIOD, "emergencyCancel stamped the cooldown"
+        );
 
         vm.prank(owner);
         swood.requestUnstakeOwner(address(vault));
@@ -525,6 +529,7 @@ contract OpenProposalCountTest is Test {
         vm.prank(agent);
         governor.cancelProposal(pid1);
         assertEq(governor.openProposalCount(), 0, "dec on cancel");
+        vm.warp(governor.getCooldownEnd()); // cancel stamps the settle cooldown propose honours
 
         // New proposal, settle through the full happy path.
         uint256 pid2 = _propose();
@@ -627,6 +632,11 @@ contract OpenProposalCountTest is Test {
         vm.prank(agent);
         governor.rejectCollaboration(pid);
         assertEq(governor.openProposalCount(), 0, "decremented on rejectCollaboration");
+        assertEq(
+            governor.getCooldownEnd(),
+            vm.getBlockTimestamp() + COOLDOWN_PERIOD,
+            "rejectCollaboration stamped the cooldown"
+        );
     }
 
     /// @notice PR #324 review comment 4454151855 — owner-`emergencyCancel`
@@ -672,6 +682,11 @@ contract OpenProposalCountTest is Test {
         // R9 fix: counter must drop back to 0.
         assertEq(governor.openProposalCount(), 0, "R9: emergencyCancel decremented Draft");
         assertEq(
+            governor.getCooldownEnd(),
+            vm.getBlockTimestamp() + COOLDOWN_PERIOD,
+            "emergencyCancel on a Draft stamped the cooldown"
+        );
+        assertEq(
             uint256(governor.getProposalState(pid)),
             uint256(ISyndicateGovernor.ProposalState.Cancelled),
             "state is Cancelled"
@@ -679,6 +694,7 @@ contract OpenProposalCountTest is Test {
 
         // Liveness regression: a fresh `propose` must succeed. Pre-fix this
         // reverted `VaultHasOpenProposal` because the counter stayed at 1.
+        vm.warp(governor.getCooldownEnd()); // the cancel stamped the settle cooldown propose honours
         vm.prank(agent);
         uint256 pid2 = governor.propose(
             address(vault),

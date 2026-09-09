@@ -267,8 +267,8 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
     /// @dev Pushes `proposalId` (currently Approved, unexecuted) past its
     ///      `executeBy` deadline and flushes the lazy Expired transition, so
     ///      `openProposalCount` releases and a new proposal can be raised.
-    ///      Also stamps `_lastSettledAt`, so callers must additionally clear
-    ///      `cooldownPeriod` before the NEXT proposal can `executeProposal`.
+    ///      Also stamps `_cooldownEndsAt`, so callers must additionally clear
+    ///      `cooldownPeriod` before the NEXT proposal can be raised.
     function _expireAndRelease(uint256 proposalId) internal {
         vm.warp(vm.getBlockTimestamp() + EXECUTION_WINDOW + 1);
         governor.resolveProposalState(proposalId);
@@ -307,7 +307,7 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
         assertEq(cloneB.executeCount(), 0, "clone B's _execute() never ran");
 
         _expireAndRelease(pid1);
-        // `_expireAndRelease` stamped `_lastSettledAt` — clear the cooldown
+        // `_expireAndRelease` stamped `_cooldownEndsAt` — clear the cooldown
         // before the next `executeProposal`.
         vm.warp(vm.getBlockTimestamp() + COOLDOWN_PERIOD + 1);
 
@@ -585,6 +585,7 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
         // live maxCapital ceiling.
         env.maxCapital = vault.totalAssets();
 
+        vm.warp(governor.getCooldownEnd()); // propose honours the settle cooldown `unstick` stamped
         vm.prank(agent);
         uint256 pid2 = governor.propose(
             address(vault),

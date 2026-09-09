@@ -14,82 +14,6 @@ import {IVaultWithdrawalQueue} from "../../src/interfaces/IVaultWithdrawalQueue.
 import {TierRegistry} from "../../src/TierRegistry.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 
-/// @notice A contract that satisfies `SyndicateGovernor.propose`'s strategy
-///         binding (`proposer()` == the proposing agent, `vault()` == the
-///         vault) while being nothing but a label: it is never a batch target
-///         and holds no capital.
-///
-///         Its only real surface is the pair of probes
-///         `SyndicateVault._depositsLocked` / `_undeliveredValueOf` call on
-///         `_lastSettledStrategy` after settlement. Modes let a test pick which
-///         way the proposer-controlled probe misbehaves.
-contract ProbeGriefStrategy {
-    enum Mode {
-        RevertAlways,
-        BurnGas,
-        LieUndelivered,
-        LieUnvalued,
-        Honest
-    }
-
-    Mode public mode;
-    address private immutable _proposer;
-    address private immutable _vault;
-
-    constructor(address proposer_, address vault_, Mode m) {
-        _proposer = proposer_;
-        _vault = vault_;
-        mode = m;
-    }
-
-    function setMode(Mode m) external {
-        mode = m;
-    }
-
-    function proposer() external view returns (address) {
-        return _proposer;
-    }
-
-    function vault() external view returns (address) {
-        return _vault;
-    }
-
-    function hasUndeliveredValue() external view returns (uint256) {
-        return _answer();
-    }
-
-    function undeliveredValue() external view returns (uint256) {
-        return _answer();
-    }
-
-    /// @dev The gate PR #243 moved the deposit lock onto. `_refreshUnvalued`
-    ///      takes the bool at face value and only ever clears it on a truthful
-    ///      zero from a code-bearing address, so a contract that answers 1
-    ///      forever is never un-flagged. Separate from `_answer` on purpose:
-    ///      `LieUnvalued` lies HERE and tells the truth everywhere else, which
-    ///      is what makes the resulting lock survive `collectResidue`.
-    function hasUnvaluedResidue() external view returns (uint256) {
-        return mode == Mode.LieUnvalued ? 1 : 0;
-    }
-
-    function _answer() private view returns (uint256) {
-        Mode m = mode;
-        if (m == Mode.RevertAlways) revert("probe griefs");
-        if (m == Mode.BurnGas) {
-            // Unbounded loop: consumes whatever gas the caller forwarded. The
-            // vault caps the probe at 150k, so this must OOG inside the probe
-            // frame and never reach the caller's own budget.
-            uint256 acc;
-            for (uint256 i = 0; i < type(uint256).max; ++i) {
-                acc = uint256(keccak256(abi.encode(acc, i)));
-            }
-            return acc;
-        }
-        if (m == Mode.LieUndelivered) return type(uint128).max;
-        return 0;
-    }
-}
-
 /// @notice Batch-callable adapter that attempts to re-enter every LP-facing and
 ///         lifecycle-facing entrypoint from inside `executeGovernorBatch`.
 ///         Records outcomes instead of propagating, so the batch itself still
@@ -209,7 +133,7 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
     // ==================== local lifecycle helpers ====================
     //
     // The base harness's `_proposeVoteExecute` hardcodes `GovEnvelope.permissive`
-    // (maxDrawdownBps = 10_000, i.e. the capital-floor gate is a no-op). Several
+    // (maxDrawdownBps = 10_000). Several
     // cases here need a REAL drawdown declaration, a defeated vote, or a review
     // that never approves — so the envelope stages are split out locally rather
     // than by editing the shared base.
@@ -432,15 +356,14 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
 
     // ==================== 2. SETTLEMENT FAILURE ====================
 
-    /// @notice Settlement that under-delivers past the declared drawdown must
-    ///         REVERT with the specific floor error, must not wedge the vault,
-    ///         and once the shortfall is repaired the proposal must settle
-    ///         exactly once — a second settle is refused.
-    function test_settleUnderDelivering_revertsAtFloor_thenSettlesExactlyOnce() public {
+    /// @notice A near-total under-delivery is refused on the PRICE floor (the
+    ///         capital floor is gone, SHE-256), must not wedge the vault, and
+    ///         once the shortfall is repaired the proposal settles exactly once.
+    function test_settleUnderDelivering_revertsAtPriceFloor_thenSettlesExactlyOnce() public {
         _requireFork();
         _allow(sink);
         uint256 vaultBefore = _usdg(address(vault));
-        uint256 loss = vaultBefore / 2; // 50% out the door; declared max 10%
+        uint256 loss = (vaultBefore * 95) / 100; // 95% out the door; the price floor is 10%
 
         BatchExecutorLib.Call[] memory execCalls = _single(
             BatchExecutorLib.Call({target: USDG, data: abi.encodeCall(IERC20.transfer, (sink, loss)), value: 0})
@@ -456,14 +379,7 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
 
         vm.warp(vm.getBlockTimestamp() + DURATION + 1);
 
-        // basis = pre-exec balance, allowance = maxCapital * 10%, so the floor is
-        // 90% of the pre-exec balance and a 50% loss is far below it.
-        uint256 floorAssets = vaultBefore - (vaultBefore * 1000) / 10_000;
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                ISyndicateGovernor.SettlementBelowDrawdownFloor.selector, vaultBefore - loss, floorAssets
-            )
-        );
+        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
         governor.settleProposal(pid);
 
         // NOT WEDGED: the proposal is still Executed, LPs can still queue an
@@ -537,10 +453,10 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
             BatchExecutorLib.Call({target: USDG, data: abi.encodeCall(IERC20.transfer, (sink, deployed)), value: 0})
         );
 
-        // --- Pending (voting open): deposits already shut, queue already open ---
+        // --- Pending (voting open): deposits and instant redeems shut from propose (SHE-258) ---
         uint256 pid = _propose(address(0), execCalls, _noop(), 10_000, DURATION);
         assertEq(governor.openProposalCount(), 1, "proposal did not bind the vault");
-        assertFalse(vault.redemptionsLocked(), "redemptions locked before execute");
+        assertTrue(vault.redemptionsLocked(), "redemptions not locked from propose");
 
         vm.startPrank(victim);
         IERC20(USDG).approve(address(vault), type(uint256).max);
@@ -771,169 +687,6 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
         vm.warp(vm.getBlockTimestamp() + DURATION + 1);
         governor.settleProposal(pid);
         assertTrue(adapter.depositOutsideBatch(), "control deposit failed - the reentry test proves nothing");
-    }
-
-    // ==================== 6. GRIEFING THE RESIDUE PROBE ====================
-
-    /// @dev Shared driver: run one no-op proposal whose STRATEGY LABEL is `probe`
-    ///      (never a batch target), settle it, and leave `probe` pinned as the
-    ///      vault's `_lastSettledStrategy`.
-    function _settleWithProbeLabel(ProbeGriefStrategy probe) internal returns (uint256 pid) {
-        pid = _runToExecuted(address(probe), _noop(), _noop(), 10_000);
-        vm.warp(vm.getBlockTimestamp() + DURATION + 1);
-        governor.settleProposal(pid);
-    }
-
-    /// @notice A settled strategy whose probe REVERTS, or burns unbounded gas,
-    ///         must degrade OPEN — it may not brick deposits and it may not make
-    ///         a deposit cost unbounded gas.
-    function test_grief_revertingAndGasBurningProbe_degradeOpen() public {
-        _requireFork();
-        ProbeGriefStrategy probe = new ProbeGriefStrategy(agent, address(vault), ProbeGriefStrategy.Mode.RevertAlways);
-        _settleWithProbeLabel(probe);
-
-        _dealUSDG(victim, 2_000e6);
-        vm.startPrank(victim);
-        IERC20(USDG).approve(address(vault), type(uint256).max);
-        uint256 sharesA = vault.deposit(1_000e6, victim);
-        vm.stopPrank();
-        assertGt(sharesA, 0, "reverting probe bricked deposits");
-
-        // Same again with the unbounded-gas probe. The vault caps the probe at
-        // 150k gas, so the loop must die inside the probe frame.
-        probe.setMode(ProbeGriefStrategy.Mode.BurnGas);
-        vm.startPrank(victim);
-        uint256 gasBefore = gasleft();
-        uint256 sharesB = vault.deposit(1_000e6, victim);
-        uint256 gasUsed = gasBefore - gasleft();
-        vm.stopPrank();
-        assertGt(sharesB, 0, "gas-burning probe bricked deposits");
-        console2.log("deposit gas with a gas-burning probe:", gasUsed);
-        // A deposit that has to eat the probe's 150k ceiling is still cheap
-        // enough to be unconditionally callable; an unbounded burn would blow
-        // straight past this.
-        assertLt(gasUsed, 900_000, "gas-burning probe made a deposit unboundedly expensive");
-    }
-
-    /// @notice The `hasUndeliveredValue` lie is CLOSED by PR #243 — recorded so
-    ///         the closure has a live regression pin.
-    /// @dev    Pre-#243, `_depositsLocked` trusted a nonzero answer from
-    ///         `_lastSettledStrategy.hasUndeliveredValue()`, so a proposer-named
-    ///         label that merely lied shut instant deposits for the whole vault.
-    ///         #243 replaced that read: residue is now PRICED (`depositNav()`)
-    ///         rather than used as a lock, and the deposit gate reads
-    ///         `_unvaluedCount` instead. A label lying on the old selector no
-    ///         longer moves the gate at all.
-    function test_grief_lyingUndeliveredValueNoLongerShutsDeposits() public {
-        _requireFork();
-        ProbeGriefStrategy probe = new ProbeGriefStrategy(agent, address(vault), ProbeGriefStrategy.Mode.LieUndelivered);
-        _settleWithProbeLabel(probe);
-
-        _dealUSDG(victim, 1_000e6);
-        vm.startPrank(victim);
-        IERC20(USDG).approve(address(vault), type(uint256).max);
-        uint256 shares = vault.deposit(1_000e6, victim);
-        vm.stopPrank();
-        assertGt(shares, 0, "the retired hasUndeliveredValue lie still shuts deposits");
-    }
-
-    /// @notice A label that lies on `hasUnvaluedResidue()` shuts the deposit
-    ///         gate — but only for `UNVALUED_MAX_LOCK`, not forever.
-    ///
-    ///         WAS a permanent, vault-wide deposit DoS with no lever, strictly
-    ///         worse than the vector #243 closed. The window is the fix.
-    ///
-    /// @dev    The vector moved rather than closed. `_refreshUnvalued` reads
-    ///         `hasUnvaluedResidue()` from the settled strategy label — still
-    ///         proposer-supplied, still only gated by `proposer() == msg.sender`
-    ///         and `vault() == vault` at `propose` — takes the bool at face
-    ///         value, and increments `_unvaluedCount`. `depositsLocked()` is
-    ///         then true for as long as that count is nonzero.
-    ///
-    ///         WHY IT IS PERMANENT, unlike its predecessor:
-    ///           - `_refreshUnvalued` only ever DECREMENTS on a truthful zero
-    ///             from a code-bearing address. A contract answering 1 forever
-    ///             is never un-flagged.
-    ///           - `collectResidue` is permissionless but force-clears the flag
-    ///             ONLY for a CODELESS strategy; against a lying contract it
-    ///             just calls `_refreshUnvalued` again and re-reads the lie.
-    ///           - `_unvaluedCount` is vault-wide, not per-proposal, so a later
-    ///             settlement does NOT overwrite it the way
-    ///             `_lastSettledStrategy` used to. The old vector cost one
-    ///             governance cycle to clear; this one has no clearing path.
-    ///           - The queue is no escape: `VaultWithdrawalQueue.claim` gates a
-    ///             deposit on `depositsLocked()`, so a request queued during
-    ///             some later proposal is mintable only at an instant this flag
-    ///             makes unreachable.
-    ///
-    ///         Note the residue AMOUNT was already bounded by `_residueBound`.
-    ///         The unvalued FLAG was a bare bool with no cap and no expiry, and
-    ///         that asymmetry was the bug.
-    ///
-    ///         FIXED, and this test flipped accordingly: `UNVALUED_MAX_LOCK`
-    ///         bounds the episode, so the lie holds the gate for a stated window
-    ///         and then stops. Every clause above still describes live behaviour
-    ///         — nothing clears the flag, `collectResidue` still re-reads the
-    ///         lie — which is exactly why the deadline is what closes it. The
-    ///         unit-level twin is
-    ///         `Vault_depositsPricedAgainstResidue::test_lyingUnvaluedLabelCannotLockDepositsForever`;
-    ///         this one proves it against a real settlement on a live fork.
-    function test_grief_lyingUnvaluedResidueLabel_isBoundedInTime() public {
-        _requireFork();
-        ProbeGriefStrategy probe = new ProbeGriefStrategy(agent, address(vault), ProbeGriefStrategy.Mode.LieUnvalued);
-        _settleWithProbeLabel(probe);
-
-        assertTrue(vault.depositsLocked(), "the unvalued lie did not lock deposits");
-
-        _dealUSDG(victim, 5_000e6);
-        vm.startPrank(victim);
-        IERC20(USDG).approve(address(vault), type(uint256).max);
-        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
-        vault.deposit(1_000e6, victim);
-        vm.stopPrank();
-
-        // The permissionless lever does NOT lift it -- `collectResidue`
-        // re-reads the same lie and leaves the flag standing. That is still
-        // true, and it is why the deadline below has to exist.
-        vault.collectResidue(address(probe));
-        assertTrue(vault.depositsLocked(), "collectResidue cleared a lying contract's flag");
-
-        // ...and the lock is real right up to the deadline.
-        vm.warp(vm.getBlockTimestamp() + 7 days - 1);
-        vm.startPrank(victim);
-        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
-        vault.deposit(1_000e6, victim);
-        vm.stopPrank();
-
-        // THEN IT LAPSES, which is the fix. Before `UNVALUED_MAX_LOCK` this
-        // survived 30 days and would have survived forever: no clearing arm can
-        // ever fire against a contract that keeps answering true, and
-        // `_unvaluedCount` is vault-wide so no later settlement displaces it.
-        vm.warp(vm.getBlockTimestamp() + 2);
-        assertFalse(vault.depositsLocked(), "the lie still holds the gate - the DoS is permanent again");
-        vm.startPrank(victim);
-        assertGt(vault.deposit(1_000e6, victim), 0, "deposits never reopened");
-        vm.stopPrank();
-
-        // The queue is not an escape either, though NOT for this reason —
-        // `requestDeposit` needs an open proposal and there is none here, so it
-        // refuses with `NoOpenProposal`. The queue-side block is one step
-        // later: `VaultWithdrawalQueue.claim` gates a deposit on
-        // `depositsLocked()`, so a request made during some future proposal
-        // would be mintable only at an instant this flag makes unreachable.
-        // Asserted as what it actually is rather than folded into the lock —
-        // an over-stated blast radius is how a real finding gets dismissed.
-        vm.startPrank(victim);
-        vm.expectRevert(ISyndicateVault.NoOpenProposal.selector);
-        vault.requestDeposit(1_000e6, victim);
-        vm.stopPrank();
-
-        // Blast radius: existing LPs are not trapped and no accounting is
-        // corrupted — this is a denial of entry, not a theft.
-        assertFalse(vault.redemptionsLocked(), "existing LPs trapped by the probe lie");
-        (uint256 sharesOut, uint256 out) = _instantRedeemMax(lp1);
-        assertGt(sharesOut, 0, "LP exit blocked by the probe lie");
-        assertLe(out, 10_000e6, "LP took out more than deposited");
     }
 
     // ==================== 7. ROUNDING DIRECTION ====================

@@ -161,12 +161,41 @@ contract DirectionalZeroSellAdapter {
     }
 }
 
+/// @notice Registry that attests NOTHING by default: every pairing must be set explicitly.
+contract StrictPairRegistry {
+    mapping(address => bool) public allowed;
+    mapping(address => mapping(bytes32 => bool)) public pair;
+
+    function setAllowed(address a, bool value) external {
+        allowed[a] = value;
+    }
+
+    function setPriceSourceForToken(address token, bytes32 src, bool allow) external {
+        pair[token][src] = allow;
+    }
+
+    function isAdapterAllowed(address a) external view returns (bool) {
+        return allowed[a];
+    }
+
+    function isCallableTarget(address a) external view returns (bool) {
+        return allowed[a];
+    }
+
+    function isPriceSourceForToken(address token, bytes32 src) external view returns (bool) {
+        return pair[token][src];
+    }
+
+    function classOf(address) external pure returns (bytes32) {
+        return bytes32(0);
+    }
+}
+
 /// @title PortfolioStrategy_oracleBinding
 /// @notice Regression tests for audit-181 issue #181 Findings #5 and #10 on
 ///         `PortfolioStrategy`:
-///           (a) an unbound Chainlink price source (Data Streams verifier or
-///               push-mode aggregator) must be rejected at init, exactly like
-///               `swapAdapter_` already is (Finding #5a).
+///           (a) an unbound Chainlink aggregator must be rejected at init,
+///               exactly like `swapAdapter_` already is (Finding #5a).
 ///           (b) a push feed reporting a future `updatedAt` must not panic
 ///               the guarded staleness subtraction (Finding #5b) — see the
 ///               divergence note on `_pushFeedPrice` for why the fixed
@@ -200,14 +229,9 @@ contract PortfolioStrategy_oracleBindingTest is Test {
         return PortfolioStrategy(Clones.clone(address(template)));
     }
 
-    /// @dev Single-token, 100%-weight push-mode basket, so
-    ///      over/underweight math is a no-op at target and rebalanceDelta
-    ///      completes cleanly once pricing succeeds.
-    function _pushModeInitData(address adapter, address feed, uint256 maxSlippageBps_)
-        internal
-        view
-        returns (bytes memory)
-    {
+    /// @dev Single-token, 100%-weight basket: over/underweight math is a no-op at
+    ///      target, so `rebalanceDelta` completes cleanly once pricing succeeds.
+    function _initData(address adapter, address feed, uint256 maxSlippageBps_) internal view returns (bytes memory) {
         address[] memory tokens = new address[](1);
         tokens[0] = address(tsla);
         uint256[] memory weights = new uint256[](1);
@@ -216,46 +240,11 @@ contract PortfolioStrategy_oracleBindingTest is Test {
         extra[0] = "";
         uint8[] memory priceDecs = new uint8[](1);
         priceDecs[0] = 18;
-        bytes32[] memory feedIds = new bytes32[](1);
-        feedIds[0] = bytes32(uint256(uint160(feed)));
+        address[] memory feeds = new address[](1);
+        feeds[0] = feed;
 
-        return abi.encode(
-            address(weth),
-            adapter,
-            address(0), // push mode
-            tokens,
-            weights,
-            TOTAL_AMOUNT,
-            maxSlippageBps_,
-            extra,
-            priceDecs,
-            feedIds
-        );
-    }
-
-    /// @dev Same shape but Data Streams mode: `chainlinkVerifier_` non-zero,
-    ///      `feedIds[0]` an arbitrary non-zero Data Streams feed id (the
-    ///      price-source binding check runs before any report is ever
-    ///      consumed, so no working verifier is needed to exercise it).
-    function _dataStreamsInitData(address adapter, address verifier, uint256 maxSlippageBps_)
-        internal
-        view
-        returns (bytes memory)
-    {
-        address[] memory tokens = new address[](1);
-        tokens[0] = address(tsla);
-        uint256[] memory weights = new uint256[](1);
-        weights[0] = 10_000;
-        bytes[] memory extra = new bytes[](1);
-        extra[0] = "";
-        uint8[] memory priceDecs = new uint8[](1);
-        priceDecs[0] = 18;
-        bytes32[] memory feedIds = new bytes32[](1);
-        feedIds[0] = bytes32(uint256(0xBEEF));
-
-        return abi.encode(
-            address(weth), adapter, verifier, tokens, weights, TOTAL_AMOUNT, maxSlippageBps_, extra, priceDecs, feedIds
-        );
+        return
+            abi.encode(address(weth), adapter, tokens, weights, TOTAL_AMOUNT, maxSlippageBps_, extra, priceDecs, feeds);
     }
 
     /// @dev Deploys the registry/governor/vault trio, clones, initializes and
@@ -276,7 +265,7 @@ contract PortfolioStrategy_oracleBindingTest is Test {
         vm.prank(address(vault));
         weth.approve(address(strategy), type(uint256).max);
 
-        strategy.initialize(address(vault), proposer, _pushModeInitData(adapter, address(feed), SLIPPAGE_100));
+        strategy.initialize(address(vault), proposer, _initData(adapter, address(feed), SLIPPAGE_100));
 
         vm.prank(address(vault));
         strategy.execute();
@@ -284,9 +273,7 @@ contract PortfolioStrategy_oracleBindingTest is Test {
 
     /// @dev A real, working 1:1 `MockSwapAdapter`, pre-funded with `tsla` so
     ///      `_execute()`'s buy leg can actually fill — needed anywhere
-    ///      `_initAndExecutePushMode` is used, since a codeless placeholder
-    ///      address makes `_quoteMinOut`'s `try swapAdapter.quote(...)`
-    ///      revert `QuoteUnavailable` before execute ever completes.
+    ///      `_initAndExecutePushMode` is used.
     function _deployFundedAdapter() internal returns (MockSwapAdapter adapter) {
         adapter = new MockSwapAdapter();
         adapter.setRate(address(weth), address(tsla), 1e18);
@@ -317,27 +304,7 @@ contract PortfolioStrategy_oracleBindingTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(PortfolioStrategy.PriceSourceNotAllowed.selector, address(feed), address(registry))
         );
-        strategy.initialize(address(vault), proposer, _pushModeInitData(adapter, address(feed), SLIPPAGE_100));
-    }
-
-    /// @dev Data Streams mode: the swap adapter IS allowlisted, but the
-    ///      verifier is not — must revert `PriceSourceNotAllowed` before any
-    ///      allocation is written, matching the push-mode case above.
-    function test_init_revertsWhenDataStreamsVerifierNotAllowlisted() public {
-        MockTierRegistry registry = new MockTierRegistry();
-        address adapter = makeAddr("adapter");
-        address verifier = makeAddr("verifier");
-        registry.setAllowed(adapter, true);
-        // Deliberately NOT allowlisting the verifier.
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
-
-        PortfolioStrategy strategy = _clone();
-
-        vm.expectRevert(
-            abi.encodeWithSelector(PortfolioStrategy.PriceSourceNotAllowed.selector, verifier, address(registry))
-        );
-        strategy.initialize(address(vault), proposer, _dataStreamsInitData(adapter, verifier, SLIPPAGE_100));
+        strategy.initialize(address(vault), proposer, _initData(adapter, address(feed), SLIPPAGE_100));
     }
 
     // ── Token↔price-source pairing (change: codehash-class-certification) ──
@@ -376,55 +343,24 @@ contract PortfolioStrategy_oracleBindingTest is Test {
                 address(registry)
             )
         );
-        strategy.initialize(address(vault), proposer, _pushModeInitData(adapter, address(feed), SLIPPAGE_100));
+        strategy.initialize(address(vault), proposer, _initData(adapter, address(feed), SLIPPAGE_100));
     }
 
-    /// @dev Data Streams mode, where this matters MORE than in push mode: only
-    ///      the verifier is allowlisted, feed ids are opaque, so the pairing is
-    ///      the only thing tying a slot's report to a slot's token.
-    function test_init_revertsWhenDataStreamsFeedNotPairedWithToken() public {
-        MockTierRegistry registry = new MockTierRegistry();
-        address adapter = makeAddr("adapter");
-        address verifier = makeAddr("verifier");
-        registry.setAllowed(adapter, true);
-        registry.setAllowed(verifier, true);
-        registry.setPriceSourceForToken(address(tsla), bytes32(uint256(0xBEEF)), false);
-
-        MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
-        MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
-        PortfolioStrategy strategy = _clone();
-
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                PortfolioStrategy.PriceSourceNotPairedWithToken.selector,
-                address(tsla),
-                bytes32(uint256(0xBEEF)),
-                address(registry)
-            )
-        );
-        strategy.initialize(address(vault), proposer, _dataStreamsInitData(adapter, verifier, SLIPPAGE_100));
-    }
-
-    /// @dev The packed max-age must NOT be part of the attestation key: one
-    ///      attestation has to cover an aggregator regardless of the staleness
-    ///      bound a proposer chose for a given slot. Otherwise every max-age
-    ///      variant needs its own attestation and operators paper over the
-    ///      friction by attesting broadly, hollowing out the guard.
-    function test_init_pairingIgnoresPackedMaxAge() public {
-        MockTierRegistry registry = new MockTierRegistry();
+    /// @notice Against a registry with no attestation for the token at all, an allowlisted
+    ///         feed is still refused; attesting the pairing is what lets init through.
+    function test_initialize_revertsWhenBasketTokenHasNoAttestedFeed() public {
+        StrictPairRegistry registry = new StrictPairRegistry();
         address adapter = makeAddr("adapter");
         MockAggregator feed = new MockAggregator(18, int256(1e18), START);
         registry.setAllowed(adapter, true);
         registry.setAllowed(address(feed), true);
-        // Deny by the BARE aggregator address, while the init data will carry
-        // that address packed together with a max-age.
-        registry.setPriceSourceForToken(address(tsla), bytes32(uint256(uint160(address(feed)))), false);
+        // No `setPriceSourceForToken` call: tsla has no attested feed.
 
         MockGovernorWithRegistry governor = new MockGovernorWithRegistry(address(registry));
         MockVaultWithGovernor vault = new MockVaultWithGovernor(address(governor));
         PortfolioStrategy strategy = _clone();
+        bytes memory data = _initData(adapter, address(feed), SLIPPAGE_100);
 
-        // The denial still bites, proving the lookup normalizes away the age.
         vm.expectRevert(
             abi.encodeWithSelector(
                 PortfolioStrategy.PriceSourceNotPairedWithToken.selector,
@@ -433,7 +369,12 @@ contract PortfolioStrategy_oracleBindingTest is Test {
                 address(registry)
             )
         );
-        strategy.initialize(address(vault), proposer, _pushModeInitData(adapter, address(feed), SLIPPAGE_100));
+        strategy.initialize(address(vault), proposer, data);
+
+        // Control: the attestation is the only thing missing.
+        registry.setPriceSourceForToken(address(tsla), bytes32(uint256(uint160(address(feed)))), true);
+        strategy.initialize(address(vault), proposer, data);
+        assertEq(strategy.getFeeds()[0], address(feed));
     }
 
     /// @dev Init is fail-closed on registry resolution. A clone initialized
@@ -448,9 +389,7 @@ contract PortfolioStrategy_oracleBindingTest is Test {
         MockAggregator feed = new MockAggregator(18, int256(1e18), START);
 
         vm.expectRevert(PortfolioStrategy.TierRegistryUnresolved.selector);
-        strategy.initialize(
-            address(vault), proposer, _pushModeInitData(makeAddr("adapter"), address(feed), SLIPPAGE_100)
-        );
+        strategy.initialize(address(vault), proposer, _initData(makeAddr("adapter"), address(feed), SLIPPAGE_100));
     }
 
     /// @dev Sanity companion: with BOTH the adapter and the feed allowlisted,
@@ -487,11 +426,9 @@ contract PortfolioStrategy_oracleBindingTest is Test {
         // Feed clock 1 hour ahead of block.timestamp.
         feed.setUpdatedAt(START + 1 hours);
 
-        bytes[] memory reports = new bytes[](1);
-        reports[0] = "";
         // Must NOT revert (old code panics here with Panic(0x11)).
         vm.prank(proposer);
-        strategy.rebalanceDelta(reports);
+        strategy.rebalanceDelta();
     }
 
     /// @dev Companion: genuine staleness (updatedAt far in the past,
@@ -505,11 +442,9 @@ contract PortfolioStrategy_oracleBindingTest is Test {
 
         feed.setUpdatedAt(START - 27 hours);
 
-        bytes[] memory reports = new bytes[](1);
-        reports[0] = "";
         vm.prank(proposer);
         vm.expectRevert(PortfolioStrategy.StalePrice.selector);
-        strategy.rebalanceDelta(reports);
+        strategy.rebalanceDelta();
     }
 
     // ── (c) Zero-output sell must revert SwapFailed ──

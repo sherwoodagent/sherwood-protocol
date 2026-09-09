@@ -904,35 +904,6 @@ contract SyndicateFactoryTest is Test {
         // asserted implicitly by the mocked registry accepting the call in setUp.
     }
 
-    /// @notice pashov finding #1 (THE live route) — a vault must not be
-    ///         CREATABLE without a TierRegistry.
-    /// @dev    `createSyndicate` SKIPPED the wiring when the factory's own
-    ///         pointer was unset, rather than refusing, so every vault created
-    ///         in that window was permanently registry-less. In that state
-    ///         `SyndicateVault._guardBatchCalls` resolves no registry and
-    ///         RETURNS, skipping the callee allowlist, the spender/recipient
-    ///         gate and the `UnrecognizedAssetSelector` branch — after which one
-    ///         instruction, `asset.approve(attacker, max)`, moves zero balance
-    ///         (so every meter reads zero) and licenses an unbounded pull in a
-    ///         LATER transaction.
-    ///
-    ///         Closes the STATE, not the symptom — the vault's runtime guard is
-    ///         deliberately untouched. This was the only LIVE route to
-    ///         `_tierRegistry == 0`: `setTierRegistry` is `onlyFactory` and both
-    ///         factory call sites already filtered zero, so the governor-side
-    ///         check is defence-in-depth, not a second open door.
-    function test_createSyndicate_refusesWhileFactoryHasNoRegistry() public {
-        // setUp wires one, so reproduce the unwired state explicitly. Zero is
-        // legal on the FACTORY setter on purpose — it blocks new syndicates.
-        vm.prank(owner);
-        factory.setTierRegistry(address(0));
-        assertEq(factory.tierRegistry(), address(0), "precondition: factory has no registry");
-
-        vm.prank(creator1);
-        vm.expectRevert(SyndicateFactory.TierRegistryNotWired.selector);
-        factory.createSyndicate(creator1AgentId, _configWithSubdomain("no-registry"));
-    }
-
     /// @notice pashov finding #1, defence-in-depth — a wired registry must not
     ///         be REMOVABLE. `setTierRegistry(address(0))` was explicitly legal
     ///         and its natspec called it "the safe default"; it would re-open
@@ -1013,19 +984,18 @@ contract SyndicateFactoryTest is Test {
         );
     }
 
-    /// @notice The factory-side setter rejects a codeless registry but still
-    ///         accepts `address(0)`.
-    /// @dev    Asymmetric on purpose: zero is a fail-CLOSED kill switch on new
-    ///         syndicates and cannot un-wire an existing governor, whereas an
-    ///         EOA would be pushed into every later governor and brick it.
-    function test_setTierRegistry_factoryRejectsCodelessButAllowsZero() public {
+    /// @notice The factory-side setter rejects zero and codeless alike: an
+    ///         unwired factory would brick `createSyndicate` at governor init.
+    function test_setTierRegistry_factoryRejectsCodelessAndZero() public {
+        address before = factory.tierRegistry();
         vm.prank(owner);
         vm.expectRevert(SyndicateFactory.TierRegistryNotWired.selector);
         factory.setTierRegistry(makeAddr("eoaRegistry"));
 
         vm.prank(owner);
+        vm.expectRevert(SyndicateFactory.TierRegistryNotWired.selector);
         factory.setTierRegistry(address(0));
-        assertEq(factory.tierRegistry(), address(0), "zero is a legal kill switch on the factory side");
+        assertEq(factory.tierRegistry(), before, "registry unchanged after both refusals");
     }
 
     /// @notice Task 7 wiring: when the factory owner sets a non-zero

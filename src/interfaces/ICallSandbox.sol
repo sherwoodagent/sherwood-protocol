@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {IStrategyDelivery} from "./IStrategyDelivery.sol";
-
 /**
  * @title ICallSandbox
  * @notice The isolation boundary that makes a tier-2 target's identity stop
@@ -30,17 +28,13 @@ import {IStrategyDelivery} from "./IStrategyDelivery.sol";
  *         stake against a call set stored at propose time and readable through
  *         the whole review period.
  *
- * @dev    Extends `IStrategyDelivery` because the vault's residue machinery must
- *         reach a sandbox exactly as it reaches a settled strategy — a sandbox
- *         holding value after settlement is the finding-#3 shape reintroduced
- *         through a new path, and routing it through the same probes means the
- *         deposit gate, the residue bound and the permissionless collection all
- *         apply with no parallel implementation.
+ * @dev    After `run` the asset and every declared token are pushed home, any remainder
+ *         of those reverting the run; an undeclared leftover stays stranded, never priced.
  *
  *         See `openspec/changes/permissionless-tier2-sandbox/` — capability
  *         `sandbox-execution`.
  */
-interface ICallSandbox is IStrategyDelivery {
+interface ICallSandbox {
     /// @notice One arbitrary call. NO `value` FIELD, deliberately:
     ///         `BatchExecutorLib.Call` carries one and native value would open a
     ///         transfer channel with no metering story, so v1 refuses it by
@@ -63,36 +57,15 @@ interface ICallSandbox is IStrategyDelivery {
     error AlreadyInitialized();
     /// @notice The call set was empty, or a call named the zero address.
     error InvalidCallSet();
-    /// @notice The declared-token list named the same token twice. Both residue
-    ///         loops divide a borrowed gas budget between entries, so padding the
-    ///         list starves the real ones.
+    /// @notice The declared-token list named the same token twice.
     error DuplicateDeclaredToken(address token);
+    /// @notice `run` finished with `amount` of `token` still here after the push
+    ///         home. The proposal cannot execute against value it cannot return.
+    error SandboxHoldsTokens(address token, uint256 amount);
 
-    /// @notice Emitted once per successful run, naming what was dispatched.
-    event SandboxRun(address indexed vault, uint256 callCount, uint256 funded);
-    /// @notice The sandbox returned assets to the vault.
-    event SandboxSwept(uint256 assets);
-    /// @notice A declared non-asset token was pushed to the vault. Emitted per
-    ///         token and only on a transfer that actually succeeded — a hostile
-    ///         entry that reverts is skipped silently, so the absence of this log
-    ///         for a declared token is the signal that it is still stranded.
-    event SandboxTokenSwept(address indexed token, uint256 amount);
-    /// @notice A declared token failed to transfer and has been abandoned: it
-    ///         stops counting toward `hasUnvaluedResidue()` and is stranded here.
-    ///         The alternative is a deposit lock nothing can clear, since no path
-    ///         can force an unmovable token out.
-    /// @dev    Only ever emitted once the transfer has been FAILING for
-    ///         `ABANDON_DELAY` — measured from the first observed failure, not
-    ///         from the run — so a TRANSIENT failure (paused token, temporary
-    ///         blacklist) cannot write off live value. `sweep()` is reachable
-    ///         by anyone through the permissionless `collectResidue`, and would
-    ///         otherwise let them do so by calling at the wrong moment. Cleared by `SandboxTokenAbandonmentCleared` if
-    ///         the token ever transfers successfully afterwards.
-    event SandboxTokenAbandoned(address indexed token, uint256 amount);
-    /// @notice A previously abandoned token transferred successfully after all,
-    ///         so it counts toward `hasUnvaluedResidue()` again. Abandonment
-    ///         records a belief about movability, not a verdict.
-    event SandboxTokenAbandonmentCleared(address indexed token);
+    /// @notice Emitted once per successful run: what was dispatched and how much
+    ///         vault asset came home with it.
+    event SandboxRun(address indexed vault, uint256 callCount, uint256 returned);
 
     /// @notice Bind this clone to its vault and freeze its payload.
     /// @dev    Callable once. The payload is written here and has no setter: the
@@ -101,21 +74,9 @@ interface ICallSandbox is IStrategyDelivery {
     ///         cannot change after it was approved.
     function init(address vault_, Call[] calldata calls_, address[] calldata declaredTokens_) external;
 
-    /// @notice Dispatch the stored calls. Vault-only, one-shot.
+    /// @notice Dispatch the stored calls, then push the asset and every declared
+    ///         token to the vault. Vault-only, one-shot; reverts if anything stays.
     function run() external;
-
-    /// @notice Return the sandbox's vault-asset balance to the vault.
-    /// @dev    VAULT-ONLY, and reached by a DIRECT call from the vault, never
-    ///         through a governor batch. The gate is what keeps this off the
-    ///         balance delta `SyndicateVault._payCohortShare` splits: a delta is
-    ///         a complete measurement only while the vault is the one door value
-    ///         arrives through, and a sandbox IS enrolled in that split.
-    ///         `SyndicateVault.collectResidue` supplies the permissionless entry
-    ///         point, so capital still comes home with no registry standing and
-    ///         no owner action, even after a demotion that would wedge a
-    ///         batch-reachable strategy.
-    /// @return assets Amount returned by this call.
-    function sweep() external returns (uint256 assets);
 
     /// @notice The vault this sandbox was bound to at `init`.
     function vault() external view returns (address);
@@ -123,11 +84,9 @@ interface ICallSandbox is IStrategyDelivery {
     /// @notice The full stored call set — the guardians' review artifact.
     function calls() external view returns (Call[] memory);
 
-    /// @notice Tokens the proposer declared this sandbox may come to hold.
-    /// @dev    A contract cannot enumerate every ERC-20 it holds, so without a
-    ///         declaration `hasUnvaluedResidue()` could only be a constant. An
-    ///         UNDER-declared leftover is stranded here and never counted as
-    ///         vault value — the safe direction, and the proposer's own loss.
+    /// @notice Tokens the proposer declared this sandbox may come to hold; each
+    ///         is pushed home by `run`. An undeclared leftover is stranded here
+    ///         and never counted as vault value — the proposer's own loss.
     function declaredTokens() external view returns (address[] memory);
 
     /// @notice True once `run` has executed.

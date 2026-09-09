@@ -109,25 +109,15 @@ contract AsyncRedeemInvariantsTest is StdInvariant, Test {
         );
     }
 
-    /// @notice INV-Q5 — the queue's ASSET balance must cover both pools it
-    ///         custodies: escrowed deposits (`pendingDepositAssets`) and the
-    ///         exiting cohorts' share of late-arriving residue (`cohortAssets`).
-    ///         These are two independent counters over one balance, so a bug
-    ///         that credits one pool from the other's money shows up here and
-    ///         nowhere else — each counter on its own would still look right.
-    ///
-    ///         Deliberately `>=` and not `==`: the slack is real and permanent.
-    ///         Entitlements floor-round, and a cohort member who never calls
-    ///         `claimRemainder` leaves their slice behind forever — there is no
-    ///         sweep path out of the queue. So the balance drifts ABOVE the sum
-    ///         and never below it. Pinned as an invariant rather than left
-    ///         implicit precisely because "monotonically slack" is an easy thing
-    ///         to break silently while every individual flow still balances.
-    function invariant_queueAssetBalanceCoversBothPools() public view {
+    /// @notice INV-Q5 — the queue's ASSET balance must cover the escrowed
+    ///         deposits it custodies (`pendingDepositAssets`). `>=` rather than
+    ///         `==`: nothing sweeps the queue, so the balance may only drift
+    ///         above the counter and never below it.
+    function invariant_queueAssetBalanceCoversPendingDeposits() public view {
         assertGe(
             IERC20(vault.asset()).balanceOf(address(queue)),
-            queue.cohortAssets() + queue.pendingDepositAssets(),
-            "INV-Q5: queue asset balance below the two pools it owes"
+            queue.pendingDepositAssets(),
+            "INV-Q5: queue asset balance below the deposits it owes"
         );
     }
 

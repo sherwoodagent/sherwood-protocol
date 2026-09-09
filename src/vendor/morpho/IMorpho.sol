@@ -111,3 +111,8 @@ interface IMorpho {
 interface IIrm {
     function borrowRateView(MarketParams memory marketParams, Market memory market) external view returns (uint256);
 }
+
+/// @notice Morpho Blue market oracle: collateral priced in loan-token units, scaled by 1e36.
+interface IOracle {
+    function price() external view returns (uint256);
+}

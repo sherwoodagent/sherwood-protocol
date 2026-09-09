@@ -24,9 +24,9 @@ interface ISyndicateGovernor {
     ///        GuardianReview → Approved        REGISTRY resolveReview: no block quorum
     ///        GuardianReview → Rejected        REGISTRY resolveReview: blocked
     ///        Approved       → Executed        executeProposal (anyone; gate is Approved
-    ///                                         state + no other active proposal + cooldown
-    ///                                         elapsed — no for-vote quorum exists in
-    ///                                         this optimistic model)
+    ///                                         state + no other active proposal — no
+    ///                                         for-vote quorum exists in this optimistic
+    ///                                         model; the settle cooldown gates propose)
     ///        Approved       → Expired         time (executeBy passes)
     ///        Executed       → Settled         settleProposal (proposer any time after
     ///                                         1h; anyone after strategyDuration) — or
@@ -86,9 +86,8 @@ interface ISyndicateGovernor {
         ///         voters approved. Clamped to `maxPerformanceFeeBps` at settle.
         uint256 performanceFeeBps;
         uint256 strategyDuration;
-        uint256 votesFor;
+        /// @notice Against weight only: approval is optimistic, the tally exists for the veto.
         uint256 votesAgainst;
-        uint256 votesAbstain;
         uint256 snapshotTimestamp;
         uint256 voteEnd;
         uint256 reviewEnd; // guardian review window end; zero for collaborative drafts
@@ -195,9 +194,8 @@ interface ISyndicateGovernor {
     /// @param calls          The call set, stored verbatim at propose and never
     ///                       mutable afterwards — it is what guardians underwrite.
     /// @param declaredTokens Non-asset tokens the payload may end up holding. What
-    ///                       is declared is reachable by the vault's residue
-    ///                       machinery; what is not is stranded in the sandbox and
-    ///                       never priced into a deposit.
+    ///                       is declared is pushed to the vault when the sandbox
+    ///                       runs; what is not is stranded there and never priced.
     struct SandboxPayload {
         uint256 funding;
         ICallSandbox.Call[] calls;
@@ -254,11 +252,9 @@ interface ISyndicateGovernor {
     /// @notice Fail-safe sibling to `TierRegressed`/`CoverageRegressed`: revert at
     ///         execute if `proposal.maxCapital` now exceeds the LIVE
     ///         `totalAssets() * maxCapitalBps / 10_000` ceiling. The propose-time
-    ///         check alone is not sufficient: `depositsLocked()` rises at PROPOSE
-    ///         but `redemptionsLocked()` only at EXECUTE, so between the two a
-    ///         proposer can inflate `totalAssets()` with its own deposit to pass
-    ///         the propose-time ratio, then redeem that same deposit during the
-    ///         vote. Distinct from `MaxCapitalExceedsCeiling` so indexers can tell
+    ///         check alone is not sufficient: `totalAssets()` can still fall
+    ///         between propose and execute (fees, losses), so the ratio is
+    ///         re-read. Distinct from `MaxCapitalExceedsCeiling` so indexers can tell
     ///         a propose-time rejection from an execute-time regression.
     error MaxCapitalCeilingRegressed();
     error StrategyAlreadyActive();
@@ -336,36 +332,15 @@ interface ISyndicateGovernor {
     ///         (it degrades OPEN with no registry); a codeless address bricks
     ///         the guard's typed call. Re-pointing to a real registry is legal.
     error TierRegistryNotWired();
-    /// @notice Revert if the realized vault balance at `settleProposal` sits
-    ///         below the proposal's declared drawdown floor. `settleProposal`
-    ///         freezes the Lane B settle price for every queued deposit and
-    ///         redeem, so a settlement that delivered materially less than the
-    ///         approved envelope must not be allowed to stamp that price —
-    ///         settlement completeness is not all-or-revert at the strategy
-    ///         layer, so without this the stamp can be driven arbitrarily low.
-    ///         The owner-multisig `unstick` / `finalizeEmergencySettle` paths
-    ///         are deliberately NOT gated on it: they are the escape hatch for
-    ///         a genuine loss that must still be able to settle.
-    /// @param  realized The vault's asset balance when settlement was attempted.
-    /// @param  floor    The pre-execute balance less
-    ///                  `effectiveMaxCapital * maxDrawdownBps / 10_000` — the
-    ///                  absolute drop the declared envelope permits on the
-    ///                  capital it actually covers, NOT a percentage of the
-    ///                  whole fund.
-    error SettlementBelowDrawdownFloor(uint256 realized, uint256 floor);
-    /// @notice The settle PRICE fell below the floor anchored at execute
-    ///         which bounds the strategy's absolute capital loss: this one
-    ///         bounds what may be FROZEN as the price every queued deposit and
-    ///         redeem is paid at. Two different questions, two separate gates —
-    ///         the first is waivable to nothing by a 100% drawdown declaration,
-    ///         and this one is not.
+    /// @notice The settle PRICE fell below the floor anchored at execute. Bounds
+    ///         what may be FROZEN as the price every queued deposit and redeem is
+    ///         paid at; not waivable by the declared drawdown.
     error SettlePriceBelowFloor(uint256 ppsNow, uint256 ppsFloor);
     /// @notice Revert if `claimUnclaimedFees` is called for a vault whose
     ///         proposal is currently Executed. An escrowed fee leaving the
     ///         vault mid-strategy is indistinguishable from a strategy loss to
-    ///         every asset-balance-differencing consumer — `_finishSettlement`'s
-    ///         `pnl` and the `SettlementBelowDrawdownFloor` gate — so the claim
-    ///         waits for the settlement that clears `_activeProposal`.
+    ///         `_finishSettlement`'s `pnl`, so the claim waits for the
+    ///         settlement that clears `_activeProposal`.
     error VaultProposalActive();
     /// @notice Revert if `executeCalls.length` or `settlementCalls.length`
     ///         exceeds MAX_CALLS_PER_PROPOSAL. Bounds calldata-unbounded
@@ -525,8 +500,6 @@ interface ISyndicateGovernor {
     event PerformanceFeeCharged(uint256 indexed proposalId, address indexed asset, uint256 amount, uint256 aboveMark);
 
     event VoteCast(uint256 indexed proposalId, address indexed voter, VoteType support, uint256 weight);
-    event VoteWithdrawnOnExit(uint256 indexed proposalId, address indexed voter, uint256 weight);
-    event VoteRestoredOnReturn(uint256 indexed proposalId, address indexed voter, uint256 weight);
 
     event ProposalExecuted(uint256 indexed proposalId, address indexed vault, uint256 capitalSnapshot);
 
@@ -767,6 +740,7 @@ interface ISyndicateGovernor {
     function setMaxPerformanceFeeBps(uint256 newMaxPerformanceFeeBps) external;
     function setMinStrategyDuration(uint256 newMinStrategyDuration) external;
     function setMaxStrategyDuration(uint256 newMaxStrategyDuration) external;
+    /// @notice Applies from the next terminal event; an already-open LP exit window keeps its deadline.
     function setCooldownPeriod(uint256 newCooldownPeriod) external;
     function setCollaborationWindow(uint256 newCollaborationWindow) external;
     function setMaxCoProposers(uint256 newMaxCoProposers) external;
@@ -853,6 +827,8 @@ interface ISyndicateGovernor {
     ///      block rage-quit while any proposal binds the vault — the OR check is
     ///      belt-and-braces so stale-cache transitions cannot slip through.
     function openProposalCount() external view returns (uint256);
+    /// @notice Deadline stamped at the last terminal event: when the LP exit window closes and the
+    ///         next propose is allowed. Zero before the first.
     function getCooldownEnd() external view returns (uint256);
     function getCapitalSnapshot(uint256 proposalId) external view returns (uint256);
 
