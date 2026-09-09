@@ -85,6 +85,17 @@ contract DeployMultisigHandoffTest is Test {
         vm.setEnv("OWNER_MULTISIG", "0x0000000000000000000000000000000000000000");
         vm.setEnv("SKIP_MULTISIG_HANDOFF", "false");
         vm.setEnv("WOOD_TOKEN", "0x0000000000000000000000000000000000000000");
+        vm.setEnv("MANAGEMENT_FEE", "200");
+    }
+
+    /// @notice The management-fee pre-flight refuses a value the factory would
+    ///         reject anyway, before anything is broadcast.
+    function test_run_rejectsManagementFeeAboveTheFactoryCap() public {
+        DeploySherwood s = new DeploySherwood();
+        vm.setEnv("MANAGEMENT_FEE", "301");
+        vm.expectRevert(bytes("PRE-FLIGHT: MANAGEMENT_FEE above MAX_MANAGEMENT_FEE_BPS (300)"));
+        s.run();
+        vm.setEnv("MANAGEMENT_FEE", "200");
     }
 
     /// @notice MS-H5 (C-1): after `_handoffOwnership`, all four proxies

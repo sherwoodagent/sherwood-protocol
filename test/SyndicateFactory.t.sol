@@ -137,6 +137,11 @@ contract SyndicateFactoryTest is Test {
         assertEq(address(uint160(uint256(vm.load(address(vault), bytes32(uint256(3)))))), address(executorLib));
     }
 
+    /// @notice Launch cap: a vault owner may charge at most 3%/yr management.
+    function test_launchCap_managementFeeIsThreePercent() public view {
+        assertEq(factory.MAX_MANAGEMENT_FEE_BPS(), 300, "3%/yr management cap");
+    }
+
     /// @notice A freshly created vault's governor starts at the advertised 20%
     ///         headline, not at the 30% protocol ceiling. The settle-time clamp
     ///         resolves an over-ceiling rate silently, so a permissive default
