@@ -1070,7 +1070,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      Unlike `recordApproval` (which books nothing past the horizon), the
     ///      alternative here is not moving, which expires the lock even earlier.
     function _horizonClampedEpochOf(uint256 t) internal view returns (uint256) {
-        uint256 edge = (block.timestamp - epochGenesis + MAX_COVERAGE_HORIZON) / epochLength;
+        uint256 edge = ((block.timestamp <= epochGenesis ? 0 : block.timestamp - epochGenesis) + MAX_COVERAGE_HORIZON)
+            / epochLength;
         uint256 e = t <= epochGenesis ? 0 : (t - epochGenesis) / epochLength;
         return e > edge ? edge : e;
     }
