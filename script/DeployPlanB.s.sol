@@ -316,15 +316,13 @@ contract DeployPlanB is ScriptBase {
     /// @dev    READS AS A CONFLICT WITH `script/robinhood-mainnet/Deploy.s.sol`
     ///         AND IS NOT ONE. That script's validation block (search
     ///         "The FUNDING CEILING is deliberately not asserted here") records
-    ///         the ceiling as left at 10_000, citing the
-    ///         `permissionless-tier2-sandbox` tasks.md §6.2 decision. THE TWO
+    ///         the ceiling as left at 10_000 by explicit decision. THE TWO
     ///         ACT AT DIFFERENT LIFECYCLE POINTS: that block runs during the
     ///         CORE ceremony, before any governor exists, so it has no subject
     ///         to assert against; this constant is the POLICY figure the
     ///         MANUAL NEXT below hands to each vault owner AFTER
     ///         `createSyndicate`. Neither script ever writes the parameter.
-    ///         Seeding it per vault is the escape hatch
-    ///         `openspec/specs/deployment-docs/spec.md:103` already names, and
+    ///         Seeding it per vault is the escape hatch, and
     ///         the gate that catches an owner who never did is
     ///         `script/CheckSyndicateParams.s.sol` (issue SHE-127/SHE-42;
     ///         `docs/pre-deployment-parameter-review.md`).

@@ -10,13 +10,7 @@ So the launch posture is: a syndicate is created, and until somebody makes three
 owner calls it runs with no per-call tier-2 ceiling, no envelope ceiling, and no
 idle-liquidity floor. That is a *live* configuration, not a broken one — other
 bounds still apply (§5) — but two of the three are the only bound of their kind
-in the system, and one of them is the configuration the permissionless-tier2
-proposal itself calls out:
-
-> `tier2CallCapBps` must be seeded to a real value — its inert default
-> (`10_000` = 100% of TVL) makes sandbox funding unbounded, **which is the one
-> configuration in which this change is strictly worse than today**.
-> — `openspec/changes/permissionless-tier2-sandbox/proposal.md:41`
+in the system.
 
 This document reviews each parameter against the code, and **recommends** a seed
 value. The operator decides. Where the code does not justify a number, this says
@@ -59,41 +53,26 @@ silent omission. The rule is unit-tested in
 
 ### Why it is inert
 
-Stored `0` is the unset sentinel and the getter maps it to `10_000`, so the two
-enforcement sites compute a ceiling equal to the vault's entire `totalAssets()`:
+Stored `0` is the unset sentinel and the getter maps it to `10_000`, so the
+enforcement site computes a ceiling equal to the vault's entire `totalAssets()`:
+at propose time, `SyndicateGovernor._resolveTierAndCoverage` /`_scanCalls`
+(`src/SyndicateGovernor.sol:1886`, `:1923`) requires every call resolving to
+tier 2 — uncertified included — to declare `caps[i] <= tier2Ceiling`, else
+`Tier2CallCapExceedsCeiling(i)`. At 10_000 no declaration can exceed it.
 
-1. **Propose time**, `SyndicateGovernor._resolveTierAndCoverage` /`_scanCalls`
-   (`src/SyndicateGovernor.sol:1886`, `:1923`): every call resolving to tier 2 —
-   uncertified included — must declare `caps[i] <= tier2Ceiling`, else
-   `Tier2CallCapExceedsCeiling(i)`. At 10_000 no declaration can exceed it.
-2. **Execute time**, `SyndicateVault.runSandbox` (`src/SyndicateVault.sol:890`):
-   `funding > (totalAssets() * tier2CallCapBps()) / 10_000` reverts
-   `SandboxFundingExceedsCeiling`. At 10_000 the whole vault is fundable into a
-   freshly-cloned sandbox running proposer-chosen calldata.
-
-Note the two sites are not the same bound. Propose-time caps **each** tier-2
-call; execute-time caps the sandbox's **total** funding in one number. A value
-chosen for one is not automatically right for the other; the batch-wide
-`maxCapital` (§2) is what stops *n* per-call ceilings from summing to the vault.
-
-The execute-time read is deliberately **live**, not snapshotted, so tightening
-this parameter binds proposals already in flight (see the comment above
-`SyndicateVault.sol:890`). That is the recovery lever if a seed turns out wrong —
-but `whenNoActiveProposal` means you cannot pull it while a proposal is open, so
-the lever is unavailable exactly when you would reach for it. Seed before the
-first `propose`.
+Propose-time caps **each** tier-2 call; the batch-wide `maxCapital` (§2) is what
+stops *n* per-call ceilings from summing to the vault. `whenNoActiveProposal`
+means you cannot change this parameter while a proposal is open, so seed before
+the first `propose`.
 
 ### What breaks at each end
 
 - **10_000 (default):** no tier-2-specific bound. Worst case is the loss the
-  proposal's own envelope permits, delivered through a sandbox holding
-  proposer-chosen calldata (bounded loss — the sandbox has no standing against
-  the vault and `runSandbox` meters the vault's balance across the run — but the
-  bound is "everything the envelope allows").
+  proposal's own envelope permits (bounded, but the bound is "everything the
+  envelope allows").
 - **Very low (single-digit bps):** liveness. Any legitimate uncertified call
   declaring a larger cap reverts at propose with
-  `Tier2CallCapExceedsCeiling(i)`, and a sandbox that needs real capital cannot
-  be funded. The failure is loud and at propose time, which is the safe
+  `Tier2CallCapExceedsCeiling(i)`. The failure is loud and at propose time, which is the safe
   direction, but a value below what any real strategy needs makes the tier-2
   path decorative.
 - **`0`:** rejected by the setter. There is no "disable tier 2 entirely" value
@@ -107,14 +86,12 @@ seat, with a pre-flight (`:672`) refusing anything outside the approved
 `1–200 bps` band from issue #43 / `design.md` D2. Seeding 200 makes the deployed
 state match the policy the repo already ships.
 
-**This contradicts a recorded decision, and that is deliberate.**
-`openspec/changes/permissionless-tier2-sandbox/tasks.md` §6.2 (Ana, 2026-08-14)
-decided "no cap — `tier2CallCapBps` stays at its `10_000` default", and
-`openspec/specs/deployment-docs/spec.md:103` records it. That decision is sound
+**This contradicts a recorded decision, and that is deliberate.** The
+`permissionless-tier2` change's tasks.md §6.2 (Ana, 2026-08-14) decided "no cap
+— `tier2CallCapBps` stays at its `10_000` default". That decision is sound
 about the *ceremony* (there is no governor instance at deploy time, so the core
-script genuinely cannot seed it) and the same spec line already says a
-deployment wanting a tighter bound "SHALL set it per vault via
-`setTier2CallCapBps`". This review's position is that a launch vault SHOULD be
+script genuinely cannot seed it), and a deployment wanting a tighter bound can
+set it per vault via `setTier2CallCapBps`. This review's position is that a launch vault SHOULD be
 such a deployment. Re-affirming 10_000 is a legitimate answer — it just has to
 be an answer, which is what `ALLOW_INERT_TIER2_CALL_CAP=true` records.
 
@@ -192,8 +169,8 @@ pre-batch `asset()` balance), so do not read "80% + 5% buffer" as a partition.
 ### Why it is inert
 
 Plain zero-initialised storage, with no sentinel indirection — the natspec says
-so outright ("0 = off"). Both enforcement sites,
-`_guardBatchCalls`/net-outflow (`:841`) and `runSandbox` (`:912`), compute
+so outright ("0 = off"). The enforcement site,
+`_guardBatchCalls`/net-outflow (`:841`), computes
 `reserve + (balanceBefore * minBufferBps) / 10_000`; at 0 the term vanishes and
 the check degenerates to the `balanceAfter >= reserve` queue-reserve check
 immediately above it.
@@ -278,9 +255,7 @@ bounded by: the proposal's declared `envelope.maxCapital` and the vault's
 net-outflow check against it; guardian coverage priced on that declaration; the
 tier system's per-call `extractableBoundBps`; the queue-reserve check
 (`QueueReserveBreached`); the vote, the guardian review window and the coverage
-quorum; and — for the sandbox path specifically — the fact that a sandbox holds
-no standing against the vault and `runSandbox` meters the vault's balance across
-the whole run.
+quorum.
 
 What is *missing* is a hard, guardian-independent ceiling on how much of one
 vault a single approved proposal can put at risk. That is what §1 and §2 are.

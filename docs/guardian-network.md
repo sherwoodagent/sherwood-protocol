@@ -16,7 +16,6 @@ run through these contracts:
 | `GuardianRegistry.sol` | review lifecycle + slash-appeal reserve; holds **zero assets** |
 | `ExposureLedger.sol` | the exposure book — how much guardian stake backs which strategy |
 | `TierRegistry.sol` | adapter-selector certification + the vault's adapter allowlist |
-| `CallSandbox.sol` | isolated clone that runs uncertified (tier-2) calldata against a funded envelope |
 | `ChallengeGame.sol` + `TokenCourt.sol` | post-execution accountability: challenge, dispute, adjudicate, slash |
 
 ## Becoming a guardian
@@ -235,71 +234,6 @@ any one selector clears the **whole adapter's** allowlist entry.
 Known blind spot (documented in-contract): EXTCODEHASH attestation catches
 same-address bytecode swaps, but not proxy implementation swaps or storage rewiring.
 Governance discipline: never certify proxied or storage-mutable adapters at tier 0/1.
-
-## Call sandbox
-
-`proposeWithSandbox` (`SyndicateGovernor.sol:403`) is the permissionless path to a
-tier-2 target. The payload's targets are never allowlisted and never certified.
-Four facts make that path sound:
-
-1. **Tier 2 is permissionlessly reachable.**
-2. **Isolation, not reputation, bounds the loss.**
-3. **Funding is the structural maximum.**
-4. **No owner transaction exists anywhere in the flow.**
-
-A governor batch cannot use the tier-2 default. `_guardBatchCalls` is **tier-blind**:
-an uncertified target is unreachable, not expensive. The gate cannot simply be
-dropped — a batch runs under `delegatecall`, so a sub-call arrives as the vault
-and can spend standing allowances. Isolation removes that premise.
-
-`CallSandbox` (`src/CallSandbox.sol:48`) is an ERC-1167 clone the vault mints at
-execute, salted on the proposal id. It holds nothing but the vault asset it was
-funded with. A target called from the clone sees `msg.sender == address(sandbox)`:
-no vault allowance to spend, no vault-held position token to move. The most a
-hostile call set can cost is the balance this contract was handed — which is
-exactly the figure full-notional tier-2 coverage already charged for.
-
-There is no `setAdapterAllowed`, `certify`, or `setTemplateApproval` step for a
-sandbox target. The vault-side binding is factory-only and set-once
-(`setSandboxImplementation`, `SyndicateVault.sol:722`; storage
-`_sandboxImplementation` at `:504`). `_guardBatchCalls` is not consulted and is
-not modified: `runSandbox` (`SyndicateVault.sol:873`) is a separate `onlyGovernor`
-entry point, not an exemption inside the batch guard.
-
-`proposeWithSandbox` takes the same arguments as `propose` plus a `SandboxPayload`.
-Every other gate belongs to the shared `_propose` body. Payload bounds:
-
-| Field | Bound | Meaning |
-|---|---|---|
-| `funding` | Non-zero; `≤ envelope.maxCapital` | Vault asset the clone is handed. Structural maximum loss. |
-| `calls` | 1–32 (`MAX_SANDBOX_CALLS`) | Arbitrary `(target, data)` pairs. No `value` field. Frozen at propose. |
-| `declaredTokens` | 0–16; no duplicates | Non-asset tokens the payload may end up holding. |
-
-`sandboxPayload(proposalId)` (`SyndicateGovernor.sol:506`) returns the stored
-payload for the whole review period. Guardians underwrite this call set.
-
-A sandbox is priced at **full funding** and forced to **tier 2** inside
-`_snapshotTierAndGate` (`SyndicateGovernor.sol:1747`, sandbox term `:1778-1782`):
-`coverage_ += sandboxFunding`. There is no certified bound that could reduce it.
-That force is not cosmetic: it is what prices the payload at full notional, so
-a payload that rode along at tier 0 would be arbitrary calldata carrying a
-coverage figure far below what it can move.
-
-`executeProposal` dispatches the sandbox **before** the execute batch. Coverage
-scaling uses the same `effective / max` ratio as `effectiveMaxCapital`
-(`SyndicateGovernor.sol:875-885`); a payload whose coverage floors to nothing
-runs nothing. `runSandbox` is `onlyGovernor`, `nonReentrant`, and pause-gated:
-clone, `init` (`CallSandbox.sol:165`), **push** funding (never approve-and-pull),
-then `run()` (`CallSandbox.sol:201`) — one-shot; any reverting call reverts the
-whole run.
-
-Residue: none. `run()` pushes the funded asset and every declared token back
-to the vault after the calls and reverts (`SandboxHoldsTokens`) if any balance
-remains, so a sandbox never holds value past execution. A sandbox holds no
-registry entry, so there is nothing to demote and nothing to wedge.
-
-Permissionless **targets**, not permissionless proposing: `registerAgent` stays
-`onlyOwner`; only a registered agent can call `proposeWithSandbox`.
 
 ## Post-execution accountability — ChallengeGame
 

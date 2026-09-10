@@ -5,7 +5,6 @@ import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
 import {IProposalStatus} from "./interfaces/IProposalStatus.sol";
-import {ICallSandbox} from "./interfaces/ICallSandbox.sol";
 import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IVaultWithdrawalQueue} from "./interfaces/IVaultWithdrawalQueue.sol";
@@ -28,7 +27,6 @@ import {ERC721Holder} from "@openzeppelin/contracts/token/ERC721/utils/ERC721Hol
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
-import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
@@ -228,27 +226,10 @@ contract SyndicateVault is
     ///         falls and recovers is not charged twice on the same dollars.
     uint256 private _highWaterPricePerShare;
 
-    /// @notice The `CallSandbox` implementation this vault clones per proposal.
-    ///         Factory-only and SET-ONCE, exactly like `_withdrawalQueue`.
-    /// @dev    The adversary is an owner who re-points the code the vault mints
-    ///         AFTER guardians have approved proposals on the strength of what
-    ///         that code does — the sandbox's confinement properties are what
-    ///         make an unreviewed target safe to call, so they must not be
-    ///         swappable behind a review. Unrepeatable rather than merely
-    ///         owner-gated; replacing it is a redeployment.
-    ///
-    ///         Zero is legal and means the sandbox path is simply absent, which
-    ///         is the posture of any deployment that does not wire one.
-    address private _sandboxImplementation;
-
-    /// @notice The sandbox minted for a proposal, if any. One per proposal,
-    ///         enforced at mint, so `sandboxOf(pid)` names the one that ran.
-    mapping(uint256 pid => address) private _proposalSandbox;
-
     /// @dev Reserved storage for future upgrades; shrinks from the front when a
-    ///      variable is appended above. 29: the residue slots were deleted (no
+    ///      variable is appended above. 31: the residue slots were deleted (no
     ///      vault proxy is live, so the lineage restarts here).
-    uint256[29] private __gap;
+    uint256[31] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -439,30 +420,6 @@ contract SyndicateVault is
         return _withdrawalQueue;
     }
 
-    /// @notice Bind the `CallSandbox` implementation this vault clones. Factory-only,
-    ///         set-once, mirroring `setWithdrawalQueue` above.
-    /// @dev    NO RE-POINTING PATH, deliberately. See `_sandboxImplementation`
-    ///         for the adversary: swapping the minted code behind an already
-    ///         reviewed proposal would invalidate the confinement argument that
-    ///         lets a sandbox call targets nobody allowlisted.
-    function setSandboxImplementation(address impl) external {
-        if (msg.sender != _factory) revert NotFactory();
-        if (impl == address(0)) revert ZeroAddress();
-        if (_sandboxImplementation != address(0)) revert SandboxImplementationAlreadySet();
-        _sandboxImplementation = impl;
-        emit SandboxImplementationSet(impl);
-    }
-
-    /// @inheritdoc ISyndicateVault
-    function sandboxImplementation() external view returns (address) {
-        return _sandboxImplementation;
-    }
-
-    /// @inheritdoc ISyndicateVault
-    function sandboxOf(uint256 pid) external view returns (address) {
-        return _proposalSandbox[pid];
-    }
-
     // ==================== GOVERNOR ====================
 
     modifier onlyGovernor() {
@@ -523,71 +480,6 @@ contract SyndicateVault is
         // Idle-liquidity floor: a batch may deploy at most (1 − minBufferBps)
         // of the pre-batch float. Inflow (settle) batches pass trivially.
         if (balanceAfter < reserve + (balanceBefore * minBufferBps) / 10_000) revert BufferBreached();
-    }
-
-    /// @notice Governor-only: mint this proposal's sandbox, fund it with exactly
-    ///         `funding`, and dispatch its stored calls.
-    /// @dev    THE SECOND ASSET-MOVING PATH THAT DOES NOT PASS `_guardBatchCalls`,
-    ///         and it does not need to. The batch guard exists because a batch
-    ///         runs under `delegatecall`, so a sub-call reaches its target AS THIS
-    ///         VAULT — able to spend our allowances, move our position tokens, and
-    ///         satisfy any `msg.sender == vault` gate. A sandbox call carries the
-    ///         SANDBOX's identity and can spend only the balance handed to it
-    ///         here, so the callee's identity stops being load-bearing and the
-    ///         most a hostile call set costs is `funding` — precisely what
-    ///         full-notional tier-2 coverage already charged for.
-    ///
-    ///         AUTHORIZATION IS `onlyGovernor` AND NOTHING ELSE, the same posture
-    ///         `settleRedeem`/`settleDeposit` take toward the queue. The adversary
-    ///         is any second caller: this moves vault assets to a fresh contract
-    ///         without the callee gate, so it must be reachable only through a
-    ///         proposal that cleared the vote, the guardian review period and the
-    ///         coverage quorum.
-    ///
-    ///         PUSH, NEVER APPROVE-AND-PULL. An allowance would be a standing
-    ///         authorization whose size proposer calldata could choose, which is
-    ///         the "authorization meters zero" failure this whole mechanism
-    ///         exists to avoid, reproduced at the funding step. Nothing here ever
-    ///         grants the sandbox an allowance against this vault.
-    ///
-    ///         ONE SANDBOX PER PROPOSAL, so `sandboxOf(pid)` names the one that
-    ///         ran the reviewed payload.
-    /// @return sandbox The address minted for `pid`.
-    function runSandbox(
-        uint256 pid,
-        ICallSandbox.Call[] calldata calls,
-        address[] calldata declaredTokens,
-        uint256 funding
-    ) external onlyGovernor nonReentrant whenNotPaused returns (address sandbox) {
-        address impl = _sandboxImplementation;
-        if (impl == address(0)) revert SandboxNotConfigured();
-        if (_proposalSandbox[pid] != address(0)) revert SandboxAlreadyMinted(pid);
-
-        uint256 ceiling = (totalAssets() * ISyndicateGovernor(msg.sender).tier2CallCapBps()) / 10_000;
-        if (funding > ceiling) revert SandboxFundingExceedsCeiling(funding, ceiling);
-
-        uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
-
-        // Deterministic so the address is derivable off-chain before execution —
-        // guardians reviewing a payload can compute where it will run.
-        sandbox = Clones.cloneDeterministic(impl, bytes32(pid));
-        _proposalSandbox[pid] = sandbox;
-        ICallSandbox(sandbox).init(address(this), calls, declaredTokens);
-        if (funding != 0) IERC20(asset()).safeTransfer(sandbox, funding);
-        ICallSandbox(sandbox).run();
-
-        // SAME THREE CUSTODY CHECKS `executeGovernorBatch` applies, for the same
-        // reasons. `run()` can return assets (a call that swaps back into the
-        // vault asset and pushes), so the delta is measured rather than assumed
-        // to equal `funding`.
-        uint256 balanceAfter = IERC20(asset()).balanceOf(address(this));
-        uint256 netOutflow = balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;
-        if (netOutflow > funding) revert MaxNetOutflowExceeded(netOutflow, funding);
-        uint256 reserve = reservedQueueAssets();
-        if (balanceAfter < reserve) revert QueueReserveBreached();
-        if (balanceAfter < reserve + (balanceBefore * minBufferBps) / 10_000) revert BufferBreached();
-
-        emit SandboxRun(pid, sandbox, funding);
     }
 
     /// @inheritdoc ISyndicateVault
@@ -951,7 +843,7 @@ contract SyndicateVault is
 
     /// @inheritdoc ISyndicateVault
     /// @dev Same predicate as `redemptionsLocked`: a proposal settles only when
-    ///      its strategy and sandbox hold nothing, so no receivable is ever priced.
+    ///      its strategy holds nothing, so no receivable is ever priced.
     function depositsLocked() public view returns (bool) {
         return redemptionsLocked();
     }

@@ -138,10 +138,6 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         // WireTokenCourt; without this key the later phases have nothing to
         // read and the operator has to recover it from broadcast logs.
         _patchAddress("TIER_REGISTRY", d.tierRegistry);
-        // CREATE3-salted, so not recoverable from a nonce; the factory's
-        // `sandboxImpl()` is the only on-chain copy and reading it presupposes
-        // already knowing the factory. Persist it for the CLI/SDK address books.
-        _patchAddress("CALL_SANDBOX_IMPL", d.sandboxImpl);
         _patchAddress("STAKED_WOOD", d.swoodProxy);
         _patchAddress("WOOD_TOKEN", woodToken);
 
@@ -265,18 +261,12 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         _checkAddr("protocolConfig.guardiansFeeRecipient", protocolConfig.guardiansFeeRecipient(), deployer);
 
         _checkAddr("factory.beacon", factory.beacon(), d.beacon);
-        // WITHOUT THIS THE PERMISSIONLESS TIER-2 PATH IS DEAD ON ARRIVAL. Every
-        // vault binds its sandbox at `createSyndicate` and the binding is
-        // set-once, so a factory that goes live unbound produces vaults that can
-        // never run a payload and can never be repaired.
-        //
         // The FUNDING CEILING is deliberately not asserted here. `tier2CallCapBps`
         // is per-governor and governors are minted at `createSyndicate`, so there
         // is no instance to seed at deploy time; and it is being left at its
-        // 10,000 default (no tier-2-specific ceiling) by explicit decision — see
-        // the change's tasks.md §6.2. What still bounds a payload is the
-        // proposal's own envelope, the guardian coverage scaling, and the vault's
-        // buffer and queue-reserve checks.
+        // 10,000 default (no tier-2-specific ceiling) by explicit decision. What
+        // still bounds a proposal is its own envelope, the guardian coverage
+        // scaling, and the vault's buffer and queue-reserve checks.
         //
         // NOT IN CONFLICT WITH `script/DeployPlanB.s.sol`, which pins
         // `TIER2_CALL_CAP_BPS = 200` and pre-flights it. THE TWO ACT AT DIFFERENT
@@ -289,11 +279,9 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         // (`script/DeployPlanB.s.sol:327`, `:672`, `:1087`). Neither script writes
         // this parameter; one records that the ceremony leaves it inert, the other
         // recommends what the owner should later make it. Seeding it per vault is
-        // exactly the escape hatch `openspec/specs/deployment-docs/spec.md:103`
-        // names, and the gate that catches an owner who never did is
+        // the escape hatch, and the gate that catches an owner who never did is
         // `script/CheckSyndicateParams.s.sol` (issue SHE-127/SHE-42;
         // `docs/pre-deployment-parameter-review.md`).
-        _checkAddr("factory.sandboxImpl", factory.sandboxImpl(), d.sandboxImpl);
         _checkAddr("factory.tierRegistry", address(factory.tierRegistry()), d.tierRegistry);
         _checkAddr("factory.ensRegistrar", address(factory.ensRegistrar()), address(0));
         _checkAddr("factory.agentRegistry", address(factory.agentRegistry()), address(0));

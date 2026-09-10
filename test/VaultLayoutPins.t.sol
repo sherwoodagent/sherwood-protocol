@@ -49,7 +49,7 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 ///           4-5 _approvedDepositors           14 _mgmtBase(u192)/
 ///           6  _openDeposits(bool)/              _mgmtLastUpdate(u64)
 ///              _agentRegistry(address)        15 _highWaterPricePerShare
-///           7  _managementFeeBps              16..26 residue / sandbox fields
+///           7  _managementFeeBps              16..26 residue fields
 ///           8  _factory                       27..45 __gap[19]
 ///           9  _expectedExecutorCodehash
 ///           10 _cachedDecimalsOffset(u8)/
@@ -310,7 +310,7 @@ contract VaultLayoutPinsTest is Test {
 
     // ==================== 27-45: __gap ====================
 
-    /// @notice The reserved gap follows the residue / sandbox fields and spans
+    /// @notice The reserved gap follows the residue fields and spans
     ///         19 words. Both boundary words must be unwritten in a fresh proxy.
     function test_layout_gapStartsAtSlot27() public view {
         assertEq(_slot(27), bytes32(0), "slot 27: __gap[0] must be unused");

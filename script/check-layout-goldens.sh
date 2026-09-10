@@ -136,8 +136,8 @@ types = d.get("types") or {}
 
 # Struct ast ids are NOT noise the way a contract`s or an enum`s are: they are the
 # only thing separating two structs that share a bare name. `SyndicateGovernor`
-# reaches two of them — `BatchExecutorLib.Call` (target, data, value) and
-# `ICallSandbox.Call` (target, data, deliberately no value) — and stripping the id
+# once reached two of them — `BatchExecutorLib.Call` (target, data, value) and a
+# since-deleted `Call` (target, data, no value) — and stripping the id
 # collapsed both onto the key `t_struct(Call)_storage`.
 #
 # That was not merely ambiguous, it was NONDETERMINISTIC and BLIND:

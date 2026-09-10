@@ -349,7 +349,7 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
     ///      this limit twice INDEPENDENTLY — once on `post-audit` (the
     ///      `_collectResidue` / `_assertFitsSweepCap` helpers, whose natspec
     ///      says a fourth local fails the file to compile) and once on
-    ///      `feat/permissionless-tier2-sandbox` (the `_initParams` split) — and
+    ///      PR #250 (the `_initParams` split) — and
     ///      git merged both cleanly, with no conflict marker, into a derived
     ///      contract one slot past what solc could schedule. Fixing it in the
     ///      shared base rather than in that suite puts the headroom where the

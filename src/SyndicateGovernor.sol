@@ -10,7 +10,6 @@ import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
 import {IProposerBondEscrow} from "./interfaces/IProposerBondEscrow.sol";
 import {IStrategy} from "./interfaces/IStrategy.sol";
-import {ICallSandbox} from "./interfaces/ICallSandbox.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
@@ -125,15 +124,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///         passed to `propose`. Caps batch size so executeGovernorBatch
     ///         can't be weaponized for gas griefing.
     uint256 internal constant MAX_CALLS_PER_PROPOSAL = 64;
-    /// @notice Upper bounds on a `proposeWithSandbox` payload. MUST EQUAL
-    ///         `CallSandbox.MAX_CALLS` / `MAX_DECLARED_TOKENS` — mirrored here
-    ///         rather than read from the implementation because this runs on
-    ///         every propose and the sandbox address is two external hops away,
-    ///         and pinned equal by `test_sandboxBounds_matchImplementation`. A
-    ///         governor bound ABOVE the sandbox's would let a proposal pass
-    ///         review and then revert `InvalidCallSet` at execute, unfixably.
-    uint256 internal constant MAX_SANDBOX_CALLS = 32;
-    uint256 internal constant MAX_SANDBOX_TOKENS = 16;
 
     /// @notice Minimum elapsed time post-execute before the proposer can
     ///         self-settle (skipping `strategyDuration`). Prevents the single-
@@ -241,34 +231,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      `./script/check-layout-goldens.sh --update-golden`.
     mapping(uint256 => uint256) private _ppsSnapshots;
 
-    /// @notice Proposal ID -> the vault asset a `proposeWithSandbox` payload asks
-    ///         the sandbox to be funded with. Zero for every ordinary proposal.
-    /// @dev THE ONE FIELD BOTH PRICING AND DISPATCH READ. Written before
-    ///      `_snapshotTierAndGate` runs, because that is where required coverage
-    ///      is computed and the proposer bond is locked — a funding figure
-    ///      written after it would be priced at zero and the bond would
-    ///      under-charge, the same "read state a later call in this transaction
-    ///      establishes" ordering bug the residue netting hit.
-    mapping(uint256 => uint256) private _sandboxFunding;
-
-    /// @notice Proposal ID -> the arbitrary call set the sandbox runs.
-    /// @dev Also the EXISTENCE FLAG: a non-empty array is what "this proposal has
-    ///      a sandbox" means everywhere, which is why an empty payload is refused
-    ///      at propose rather than stored.
-    mapping(uint256 => ICallSandbox.Call[]) private _sandboxCalls;
-
-    /// @notice Proposal ID -> non-asset tokens the payload declares it may hold.
-    /// @dev Forwarded verbatim to `runSandbox`; the sandbox pushes each one home
-    ///      after its calls and reverts if any balance remains. Undeclared
-    ///      leftovers are stranded in the sandbox and never priced.
-    mapping(uint256 => address[]) private _sandboxTokens;
-
     /// @dev Reserved storage for future upgrades. Carved by 3 slots (from 31)
     ///      for the three mappings above, then 1 more for `_escrowedFees`, then
-    ///      1 more for `_ppsSnapshots`, then 3 more for the sandbox payload
-    ///      (23) — append-only. See
+    ///      1 more for `_ppsSnapshots` — append-only. See
     ///      `script/syndicate-governor-layout.golden.json`.
-    uint256[23] private __gap;
+    uint256[26] private __gap;
 
     /// @param minVotingPeriod_   Per-deployment floor for `votingPeriod` (mainnet 24h).
     /// @param minCooldownPeriod_ Per-deployment floor for `cooldownPeriod` (mainnet 1h).
@@ -358,116 +325,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         uint256[] calldata settlementCallCaps,
         CoProposer[] calldata coProposers
     ) external returns (uint256 proposalId) {
-        proposalId = _propose(
-            vault,
-            strategy,
-            metadataURI,
-            strategyDuration,
-            envelope,
-            executeCalls,
-            executeCallCaps,
-            settlementCalls,
-            settlementCallCaps,
-            coProposers
-        );
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    function proposeWithSandbox(
-        SandboxPayload calldata sandbox,
-        address vault,
-        address strategy,
-        string calldata metadataURI,
-        uint256 strategyDuration,
-        RiskEnvelope calldata envelope,
-        BatchExecutorLib.Call[] calldata executeCalls,
-        uint256[] calldata executeCallCaps,
-        BatchExecutorLib.Call[] calldata settlementCalls,
-        uint256[] calldata settlementCallCaps,
-        CoProposer[] calldata coProposers
-    ) external returns (uint256 proposalId) {
-        // Payload validation only. Every OTHER gate — agent registration, the
-        // open-proposal lock, the envelope, the batch caps — belongs to the
-        // shared `_propose` body below and is not restated here, so the two
-        // entry points can never diverge on what a valid proposal is.
-        if (sandbox.calls.length == 0) revert EmptySandboxCalls();
-        // THE SANDBOX'S OWN BOUNDS, NOT `MAX_CALLS_PER_PROPOSAL`. `CallSandbox.init`
-        // refuses more than 32 calls or 16 declared tokens, and the batch bound is
-        // 64 — so validating against the batch figure here would accept a payload
-        // that reverts `InvalidCallSet` at execute, after the proposer's bond was
-        // locked and the review period spent, with no path to fix it.
-        if (sandbox.calls.length > MAX_SANDBOX_CALLS) revert TooManyCalls();
-        if (sandbox.declaredTokens.length > MAX_SANDBOX_TOKENS) revert TooManySandboxTokens();
-        for (uint256 i = 0; i < sandbox.calls.length; i++) {
-            if (sandbox.calls[i].target == address(0)) revert ZeroSandboxTarget(i);
-        }
-        for (uint256 i = 0; i < sandbox.declaredTokens.length; i++) {
-            for (uint256 j = 0; j < i; j++) {
-                if (sandbox.declaredTokens[i] == sandbox.declaredTokens[j]) {
-                    revert DuplicateSandboxToken(sandbox.declaredTokens[i]);
-                }
-            }
-        }
-        if (sandbox.funding == 0) revert ZeroSandboxFunding();
-        if (ISyndicateVault(vault).sandboxImplementation() == address(0)) {
-            revert SandboxNotAvailable(vault);
-        }
-        // THE SANDBOX SPENDS THE DECLARED ENVELOPE, NOT A SECOND ONE. Bounding
-        // funding by `maxCapital` here is what lets `executeProposal` subtract
-        // the funded amount from the capital handed to the execute batch without
-        // ever underflowing, and it keeps the figure voters approved as the true
-        // ceiling on everything this proposal can move.
-        if (sandbox.funding > envelope.maxCapital) {
-            revert SandboxFundingExceedsMaxCapital(sandbox.funding, envelope.maxCapital);
-        }
-
-        uint256 expectedId = _proposalCount + 1;
-        _storeSandbox(expectedId, sandbox);
-
-        proposalId = _propose(
-            vault,
-            strategy,
-            metadataURI,
-            strategyDuration,
-            envelope,
-            executeCalls,
-            executeCallCaps,
-            settlementCalls,
-            settlementCallCaps,
-            coProposers
-        );
-        if (proposalId != expectedId) revert SandboxProposalIdMismatch(expectedId, proposalId);
-        emit SandboxPayloadStored(proposalId, sandbox.funding, sandbox.calls.length, sandbox.declaredTokens.length);
-    }
-
-    /// @inheritdoc ISyndicateGovernor
-    function sandboxPayload(uint256 proposalId) external view returns (SandboxPayload memory payload) {
-        ICallSandbox.Call[] storage stored = _sandboxCalls[proposalId];
-        uint256 n = stored.length;
-        ICallSandbox.Call[] memory calls = new ICallSandbox.Call[](n);
-        for (uint256 i = 0; i < n; i++) {
-            calls[i] = ICallSandbox.Call({target: stored[i].target, data: stored[i].data});
-        }
-        payload = SandboxPayload({
-            funding: _sandboxFunding[proposalId], calls: calls, declaredTokens: _sandboxTokens[proposalId]
-        });
-    }
-
-    /// @dev The shared `propose` body. Split out so `proposeWithSandbox` reaches
-    ///      exactly the same lifecycle — same gates, same order, same storage
-    ///      writes — instead of a parallel copy that could drift from it.
-    function _propose(
-        address vault,
-        address strategy,
-        string calldata metadataURI,
-        uint256 strategyDuration,
-        RiskEnvelope calldata envelope,
-        BatchExecutorLib.Call[] calldata executeCalls,
-        uint256[] calldata executeCallCaps,
-        BatchExecutorLib.Call[] calldata settlementCalls,
-        uint256[] calldata settlementCallCaps,
-        CoProposer[] calldata coProposers
-    ) private returns (uint256 proposalId) {
         if (vault != GovernorParameters.vault) revert VaultNotRegistered();
         if (!ISyndicateVault(vault).isAgent(msg.sender)) revert NotRegisteredAgent();
         // (`openspec/changes/owner-bond-proposal-gate`)
@@ -639,7 +496,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // and the vault batch below (single SLOAD-loop; cold path, no stack risk).
         BatchExecutorLib.Call[] memory calls = _loadCalls(_executeCalls, proposalId);
 
-        uint256 sandboxFunding = _sandboxFunding[proposalId];
         (uint8 liveTier, uint256 liveCoverage) = _resolveTierAndCoverage(
             calls,
             _loadCaps(_executeCallCaps, proposalId),
@@ -649,31 +505,14 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             false
         );
         if (liveTier > proposal.envelopeTier) revert TierRegressed();
-        if (liveCoverage + sandboxFunding > proposal.requiredCoverage) revert CoverageRegressed();
+        if (liveCoverage > proposal.requiredCoverage) revert CoverageRegressed();
 
         if (proposal.maxCapital > _capitalCeiling()) revert MaxCapitalCeilingRegressed();
 
         uint256[] memory scaledExecuteCaps =
             _deriveAndStoreEffectiveCapital(proposalId, proposal, _exposureLedger, asset);
 
-        uint256 batchCapital = proposal.effectiveMaxCapital;
-        if (sandboxFunding != 0) {
-            uint256 maxCapital = proposal.maxCapital;
-            uint256 scaledFunding =
-                batchCapital == maxCapital ? sandboxFunding : (sandboxFunding * batchCapital) / maxCapital;
-            // A payload whose coverage floored to nothing runs NOTHING. Minting
-            // an unfunded sandbox would still execute arbitrary calldata — from
-            // an address holding no capital, so nothing could be lost, but it
-            // would also consume the one-sandbox-per-proposal slot and emit a
-            // run that under-covered guardians never underwrote at that size.
-            if (scaledFunding != 0) {
-                batchCapital -= scaledFunding;
-                ISyndicateVault(vault)
-                    .runSandbox(proposalId, _loadSandboxCalls(proposalId), _sandboxTokens[proposalId], scaledFunding);
-            }
-        }
-
-        ISyndicateVault(vault).executeGovernorBatch(calls, scaledExecuteCaps, batchCapital);
+        ISyndicateVault(vault).executeGovernorBatch(calls, scaledExecuteCaps, proposal.effectiveMaxCapital);
 
         emit ProposalExecuted(proposalId, vault, balanceBefore);
     }
@@ -1328,11 +1167,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             p.maxCapital,
             true
         );
-        uint256 sandboxFunding = _sandboxFunding[p.id];
-        if (sandboxFunding != 0) {
-            tier_ = 2;
-            coverage_ += sandboxFunding;
-        }
         p.envelopeTier = tier_;
         p.requiredCoverage = coverage_;
         // Skipped when unwired — the pre-ledger safe default matches the
@@ -1439,32 +1273,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ) internal {
         for (uint256 i = 0; i < calls.length; i++) {
             target[proposalId].push(calls[i]);
-        }
-    }
-
-    /// @dev Persist a sandbox payload verbatim under `proposalId`. WRITE-ONCE BY
-    ///      CONSTRUCTION: the only caller is `proposeWithSandbox`, which runs it
-    ///      against an id that does not exist yet, so there is never a stored
-    ///      payload to append to or overwrite — no setter, no re-open path, and
-    ///      what guardians read during the review period is what executes.
-    function _storeSandbox(uint256 proposalId, SandboxPayload calldata sandbox) private {
-        _sandboxFunding[proposalId] = sandbox.funding;
-        ICallSandbox.Call[] storage dst = _sandboxCalls[proposalId];
-        for (uint256 i = 0; i < sandbox.calls.length; i++) {
-            dst.push(sandbox.calls[i]);
-        }
-        address[] storage tokens = _sandboxTokens[proposalId];
-        for (uint256 i = 0; i < sandbox.declaredTokens.length; i++) {
-            tokens.push(sandbox.declaredTokens[i]);
-        }
-    }
-
-    /// @dev Copy a stored sandbox call set to memory for dispatch.
-    function _loadSandboxCalls(uint256 proposalId) private view returns (ICallSandbox.Call[] memory result) {
-        ICallSandbox.Call[] storage stored = _sandboxCalls[proposalId];
-        result = new ICallSandbox.Call[](stored.length);
-        for (uint256 i = 0; i < stored.length; i++) {
-            result[i] = stored[i];
         }
     }
 
