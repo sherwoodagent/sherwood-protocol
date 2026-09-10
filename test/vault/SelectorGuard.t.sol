@@ -12,6 +12,9 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
 import {MockERC4626Wrapper} from "../mocks/MockERC4626Wrapper.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {StrategyFactory, IVaultMembership} from "../../src/StrategyFactory.sol";
+import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
+import {MockStrategy} from "../mocks/MockStrategy.sol";
 
 /// @notice Permit2 `AllowanceTransfer.transferFrom` stand-in that actually moves
 ///         the tokens, so the batch is proven to execute and not merely to pass
@@ -50,6 +53,37 @@ contract MockGovernorNoTierGetter {
     function proposalCount() external pure returns (uint256) {
         return 0;
     }
+}
+
+/// @dev Minimal SyndicateFactory stand-in: `StrategyFactory._authClone` needs a registered vault.
+contract SyndicateRegistryStubSG {
+    function vaultToSyndicate(address) external pure returns (uint256) {
+        return 1;
+    }
+}
+
+/// @dev A second registered vault a factory clone can be bound to.
+contract OtherVaultSG {
+    address public owner;
+
+    constructor(address owner_) {
+        owner = owner_;
+    }
+
+    function isAgent(address) external pure returns (bool) {
+        return false;
+    }
+}
+
+/// @dev Never minted by the factory, but answers `vault()` with this vault.
+contract VaultNamingImpostorSG {
+    address public vault;
+
+    constructor(address v) {
+        vault = v;
+    }
+
+    function poke() external {}
 }
 
 /// @notice Findings 1+7 — value-moving-selector allowlist gate. The net-outflow
@@ -897,6 +931,157 @@ contract SelectorGuardTest is Test {
                 erc1363Token, abi.encodeWithSelector(SEL_ERC1363_TRANSFER_AND_CALL_DATA, attacker, 1_000e18, bytes(""))
             )
         );
+    }
+
+    // ── deny-unless-recognised outside asset() and the vault's own strategy clones ──
+
+    bytes4 constant SEL_MORPHO_SUPPLY = 0xa99aad89; // supply((address,address,address,address,uint256),uint256,uint256,address,bytes)
+    bytes4 constant SEL_SET_AUTHORIZATION = 0xeecea000; // setAuthorization(address,bool)
+    bytes4 constant SEL_EXECUTE_COUNT = 0x4ddc7767; // executeCount() — a MockStrategy read the guard never decodes
+    bytes4 constant SEL_AUTHORIZE_OPERATOR = 0x959b8c3f; // authorizeOperator(address)
+
+    /// @dev The real ceremony: approve the template in the factory, point the
+    ///      registry at the factory, class-certify `(template, execute)`.
+    function _certifyStrategyClass() internal returns (StrategyFactory factory, MockStrategy template) {
+        template = new MockStrategy();
+        factory = new StrategyFactory(address(new SyndicateRegistryStubSG()), address(this));
+        factory.setTemplateApproval(address(template), true);
+        tierRegistry.setStrategyFactory(address(factory));
+        tierRegistry.proposeClassCertification(
+            address(template), BaseStrategy.execute.selector, 1, 500, address(0), address(template).codehash
+        );
+        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
+        tierRegistry.certifyClass(address(template), BaseStrategy.execute.selector);
+        tierRegistry.setClassAllowed(address(template), true);
+    }
+
+    /// @dev A factory clone of `template` bound to `vault_`, minted by its owner.
+    function _cloneFor(StrategyFactory factory, MockStrategy template, address vault_)
+        internal
+        returns (address clone)
+    {
+        bytes memory data = abi.encode(address(usdc), address(0), uint256(0), uint256(0), false);
+        address caller = IVaultMembership(vault_).owner();
+        vm.prank(caller);
+        clone = factory.cloneAndInit(address(template), vault_, caller, data);
+    }
+
+    function _expectUnrecognized(address target, bytes4 sel) internal {
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.UnrecognizedSelector.selector, target, sel));
+    }
+
+    /// @notice Morpho-shaped `supply(..., onBehalf = attacker)` on an allowlisted
+    ///         protocol: the guard cannot vet the beneficiary, so it refuses.
+    function test_unrecognisedSelectorOnAnAllowlistedProtocolReverts() public {
+        address morpho = makeAddr("morpho");
+        tierRegistry.setAdapterAllowed(morpho, true);
+        bytes memory data = abi.encodeWithSelector(
+            SEL_MORPHO_SUPPLY,
+            address(usdc),
+            address(0),
+            address(0),
+            address(0),
+            uint256(0),
+            uint256(1e6),
+            uint256(0),
+            attacker,
+            bytes("")
+        );
+        _expectUnrecognized(morpho, SEL_MORPHO_SUPPLY);
+        _exec(_one(morpho, data));
+    }
+
+    /// @notice `setAuthorization(attacker, true)` hands account control to a
+    ///         third party and moves no balance; refused for the same reason.
+    function test_setAuthorizationShapedCallOnAnAllowlistedProtocolReverts() public {
+        address morpho = makeAddr("morpho");
+        tierRegistry.setAdapterAllowed(morpho, true);
+        _expectUnrecognized(morpho, SEL_SET_AUTHORIZATION);
+        _exec(_one(morpho, abi.encodeWithSelector(SEL_SET_AUTHORIZATION, attacker, true)));
+    }
+
+    /// @notice The vault's own strategy clone takes any selector: the shipped
+    ///         execute and settle batches, and a read the guard never decodes.
+    function test_anySelectorOnTheVaultsOwnStrategyCloneStillPasses() public {
+        (StrategyFactory factory, MockStrategy template) = _certifyStrategyClass();
+        address clone = _cloneFor(factory, template, address(vault));
+        vm.mockCall(address(governor), abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(1)));
+        vm.mockCall(address(governor), abi.encodeWithSignature("strategyOf(uint256)"), abi.encode(clone));
+
+        BatchExecutorLib.Call[] memory execute = new BatchExecutorLib.Call[](2);
+        execute[0] =
+            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.approve, (clone, 1e6)), value: 0});
+        execute[1] = BatchExecutorLib.Call({target: clone, data: abi.encodeCall(BaseStrategy.execute, ()), value: 0});
+        _exec(execute);
+        assertEq(MockStrategy(clone).executeCount(), 1, "execute batch ran");
+
+        _exec(_one(clone, abi.encodeCall(BaseStrategy.settle, ())));
+        assertEq(MockStrategy(clone).settleCount(), 1, "settle batch ran");
+
+        _exec(_one(clone, abi.encodeWithSelector(SEL_EXECUTE_COUNT)));
+    }
+
+    /// @notice A recognised transfer to an allowlisted recipient on an
+    ///         allowlisted token still passes and really executes.
+    function test_recognisedTransferToAnAllowlistedRecipientStillPasses() public {
+        otherToken.mint(address(vault), 1e18);
+        _exec(_one(address(otherToken), abi.encodeCall(otherToken.transfer, (adapter, 1e18))));
+        assertEq(otherToken.balanceOf(adapter), 1e18, "the batch really ran");
+    }
+
+    /// @notice A factory clone bound to ANOTHER vault is not this vault's
+    ///         clone: refused on an unrecognised selector.
+    function test_cloneBoundToAnotherVaultIsRefusedOnAnUnrecognisedSelector() public {
+        (StrategyFactory factory, MockStrategy template) = _certifyStrategyClass();
+        address rogue = _cloneFor(factory, template, address(new OtherVaultSG(attacker)));
+        assertTrue(tierRegistry.classOf(rogue) != bytes32(0), "precondition: a class member");
+        assertTrue(tierRegistry.isCallableTarget(rogue), "precondition: an allowlisted callee");
+        _expectUnrecognized(rogue, SEL_EXECUTE_COUNT);
+        _exec(_one(rogue, abi.encodeWithSelector(SEL_EXECUTE_COUNT)));
+    }
+
+    /// @notice Naming this vault is not provenance: a contract the factory
+    ///         never minted is refused even though its `vault()` is this vault.
+    function test_nonFactoryContractNamingThisVaultIsRefusedOnAnUnrecognisedSelector() public {
+        VaultNamingImpostorSG impostor = new VaultNamingImpostorSG(address(vault));
+        tierRegistry.setAdapterAllowed(address(impostor), true);
+        assertEq(tierRegistry.classOf(address(impostor)), bytes32(0), "precondition: no provenance");
+        _expectUnrecognized(address(impostor), VaultNamingImpostorSG.poke.selector);
+        _exec(_one(address(impostor), abi.encodeCall(impostor.poke, ())));
+    }
+
+    /// @notice The asset branch is unchanged: an unrecognised selector on
+    ///         `asset()` still reverts with its own error.
+    function test_unrecognisedSelectorOnAssetStillRevertsUnrecognizedAssetSelector() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.UnrecognizedAssetSelector.selector, SEL_AUTHORIZE_OPERATOR)
+        );
+        _exec(_one(address(usdc), abi.encodeWithSelector(SEL_AUTHORIZE_OPERATOR, attacker)));
+    }
+
+    function _certifyPair(address target, bytes4 sel) internal {
+        tierRegistry.proposeCertification(target, sel, 1, 500, address(0), target.codehash);
+        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
+        tierRegistry.certify(target, sel);
+    }
+
+    /// @notice The sanctioned route for a direct protocol call: the registry
+    ///         certified `(target, selector)`, so the pair is vetted.
+    function test_certifiedPairOnAnAllowlistedAdapterStillPasses() public {
+        bytes4 sel = otherToken.balanceOf.selector;
+        _certifyPair(address(otherToken), sel);
+        _exec(_one(address(otherToken), abi.encodeCall(otherToken.balanceOf, (attacker))));
+    }
+
+    /// @notice Demotion withdraws the vetting: the same pair is refused afterwards.
+    function test_demotedPairOnAnAllowlistedAdapterIsRefused() public {
+        bytes4 sel = otherToken.balanceOf.selector;
+        _certifyPair(address(otherToken), sel);
+        _exec(_one(address(otherToken), abi.encodeCall(otherToken.balanceOf, (attacker))));
+
+        tierRegistry.demote(address(otherToken), sel);
+        _expectUnrecognized(address(otherToken), sel);
+        _exec(_one(address(otherToken), abi.encodeCall(otherToken.balanceOf, (attacker))));
     }
 
     function test_erc1363TransferAndCallToAllowlistedAdapterPasses() public {

@@ -12,7 +12,7 @@ import {StringUtils} from "./utils/StringUtils.sol";
 import {EnumerableSet} from "./utils/EnumerableSet.sol";
 import {MockERC20} from "./utils/MockERC20.sol";
 import {FizzFactory} from "./utils/FizzFactory.sol";
-import {FizzAdapter} from "./utils/FizzAdapter.sol";
+import {FizzAdapter, FizzSyndicateRegistry} from "./utils/FizzAdapter.sol";
 
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
@@ -24,6 +24,7 @@ import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {ChallengeGame} from "../../src/ChallengeGame.sol";
 import {TokenCourt} from "../../src/TokenCourt.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
+import {StrategyFactory} from "../../src/StrategyFactory.sol";
 import {ProposerBondEscrow} from "../../src/ProposerBondEscrow.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
@@ -212,6 +213,8 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
     MockAggregatorV3 internal woodFeed;
     FizzFactory internal fizzFactory;
     FizzAdapter internal adapter;
+    FizzAdapter internal adapterTemplate;
+    StrategyFactory internal strategyFactory;
 
     // ―――――――――――――――――――――――――― Setup ―――――――――――――――――――――――――――
 
@@ -236,7 +239,7 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         protocolConfig = new ProtocolConfig(address(this));
         tierRegistry = new TierRegistry(address(this));
         fizzFactory = new FizzFactory();
-        adapter = new FizzAdapter();
+        adapterTemplate = new FizzAdapter();
 
         // $1.00, 8-decimal asset feed.
         assetFeed = new MockAggregatorV3(8, 1e8);
@@ -457,6 +460,17 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
     ///      propose → delay → certify cycle (I-30), so the clock is advanced in
     ///      between.
     function _certifyAdapter() internal {
+        // The adapter is a factory-minted clone bound to the vault: the real
+        // provenance the batch guard requires of a strategy target.
+        strategyFactory = new StrategyFactory(address(new FizzSyndicateRegistry()), address(this));
+        strategyFactory.setTemplateApproval(address(adapterTemplate), true);
+        tierRegistry.setStrategyFactory(address(strategyFactory));
+        tierRegistry.proposeClassCertification(
+            address(adapterTemplate), FizzAdapter.poke.selector, 1, 5_000, address(0), address(adapterTemplate).codehash
+        );
+        skipTime(tierRegistry.certifyDelay() + 1);
+        tierRegistry.certifyClass(address(adapterTemplate), FizzAdapter.poke.selector);
+        adapter = FizzAdapter(strategyFactory.cloneAndInit(address(adapterTemplate), address(vault), address(this), ""));
         // Tier 1 with a 50% extractable bound. `extractableBoundBps` must sit
         // strictly inside (0, FULL_NOTIONAL_BPS) — 10_000 is the exclusive
         // upper bound and reverts `BoundRequired`.

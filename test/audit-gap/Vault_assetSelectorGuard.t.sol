@@ -152,12 +152,15 @@ contract Vault_assetSelectorGuardTest is Test {
 
     // ── The scoping ──
 
-    /// @notice The terminal `continue` is load-bearing for every NON-asset
-    ///         target: an allowlisted adapter's arbitrary selectors (a
-    ///         strategy's `execute()`, an adapter's `swap()`) are exactly
-    ///         what a batch exists to call. The rejection must be scoped to
-    ///         `asset()` alone.
-    function test_unrecognizedSelectorOnAllowlistedNonAssetTargetPasses() public {
+    /// @notice Outside `asset()` the default is deny-unless-recognised: an
+    ///         allowlisted adapter's unrecognised selector is refused with
+    ///         `UnrecognizedSelector` (the asset branch keeps its own error).
+    function test_unrecognizedSelectorOnAllowlistedNonAssetTargetIsRefused() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISyndicateVault.UnrecognizedSelector.selector, address(acceptAll), SEL_AUTHORIZE_OPERATOR
+            )
+        );
         _exec(_one(address(acceptAll), abi.encodeWithSelector(SEL_AUTHORIZE_OPERATOR, attacker)));
     }
 }

@@ -115,9 +115,12 @@ interface ISyndicateVault {
     ///         shape), which moves nothing in-batch and is invisible to a balance
     ///         diff while the extraction it licenses lands in a later transaction.
     ///         Such a call also prices to zero coverage and zero proposer bond and
-    ///         cannot be challenged. Non-`asset()` targets are already bounded by
-    ///         the callee gate, so this rejection is scoped to `asset()` alone.
+    ///         cannot be challenged.
     error UnrecognizedAssetSelector(bytes4 selector);
+    /// @notice A governor-batch call carries a selector the batch guard does not
+    ///         decode, on a target that is neither `asset()`, this vault's own
+    ///         strategy clone, nor a `(target, selector)` the registry certified.
+    error UnrecognizedSelector(address target, bytes4 selector);
     /// @notice A governor-batch call carries `transferFrom` whose `from` is not
     ///         the vault itself. Unconditional: pulling a third party's ERC20
     ///         allowance (e.g. an LP's deposit allowance) is not a capability

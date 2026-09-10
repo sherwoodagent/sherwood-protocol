@@ -14,9 +14,22 @@ pragma solidity 0.8.28;
 ///      proposal without exercising anything the selected entry points cover.
 ///      Mirrors `TCE2EAdapter` in `test/TokenCourtEndToEnd.t.sol`, which the
 ///      repo's own end-to-end suite uses for exactly this purpose.
+/// @dev Minimal SyndicateFactory stand-in: `StrategyFactory._authClone` needs a registered vault.
+contract FizzSyndicateRegistry {
+    function vaultToSyndicate(address) external pure returns (uint256) {
+        return 1;
+    }
+}
+
 contract FizzAdapter {
     uint256 public pokes;
     uint256 public bumps;
+    /// @dev The vault this clone is bound to; set by `StrategyFactory.cloneAndInit`.
+    address public vault;
+
+    function initialize(address vault_, address, bytes calldata) external {
+        vault = vault_;
+    }
 
     function poke() external {
         pokes++;

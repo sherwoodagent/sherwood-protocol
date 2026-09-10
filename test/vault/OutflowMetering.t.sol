@@ -25,6 +25,11 @@ contract MockAssetSink {
     function pushBack(uint256 amt) external {
         usdc.transfer(vaultAddr, amt);
     }
+
+    /// @dev Bound to the vault, so the batch guard treats the sink as its strategy clone.
+    function vault() external view returns (address) {
+        return vaultAddr;
+    }
 }
 
 /// @notice Task 4 (spec 2026-07-22 §3.1): `executeGovernorBatch` enforces the

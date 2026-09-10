@@ -88,6 +88,9 @@ contract SyndicateVault is
     /// @notice Cap on the owner-set idle-liquidity floor (50%).
     uint256 private constant MAX_MIN_BUFFER_BPS = 5_000;
 
+    /// @dev `TierRegistry.TIER_ARBITRARY`: the uncertified tier.
+    uint8 private constant _TIER_ARBITRARY = 2;
+
     // ── Value-moving ERC20 selectors guarded in governor batches ──
     // (see `_guardBatchCalls`)
     bytes4 private constant _SEL_APPROVE = 0x095ea7b3; // approve(address,uint256)
@@ -678,7 +681,7 @@ contract SyndicateVault is
                 revert DisallowedBatchCallee(target);
             }
             bytes calldata data = calls[i].data;
-            // ── PART 2b: value-moving-selector checks (retained, unchanged) ──
+            // ── PART 2b: value-moving-selector checks ──
             if (data.length < 4) continue;
             bytes4 sel = bytes4(data[0:4]);
             address recipient;
@@ -738,8 +741,13 @@ contract SyndicateVault is
                 }
                 continue;
             } else {
-                if (target == asset_ && !_isBenignAssetRead(sel)) {
-                    revert UnrecognizedAssetSelector(sel);
+                // Deny unless recognised: outside asset() and this vault's own
+                // strategy clones, a selector the guard does not decode cannot
+                // be vetted (e.g. `supply(..., onBehalf)`), so it is refused.
+                if (target == asset_) {
+                    if (!_isBenignAssetRead(sel)) revert UnrecognizedAssetSelector(sel);
+                } else if (!_isVettedCall(registry, target, sel)) {
+                    revert UnrecognizedSelector(target, sel);
                 }
                 continue;
             }
@@ -750,6 +758,15 @@ contract SyndicateVault is
             }
             _requireRecipientVaultBinding(registry, recipient);
         }
+    }
+
+    /// @dev A class member (factory-minted strategy clone) is vetted iff it names
+    ///      this vault; `_readVaultOf` fails closed. Anything else is vetted iff
+    ///      the registry certified `(target, sel)` below the arbitrary tier.
+    function _isVettedCall(address registry, address target, bytes4 sel) private view returns (bool) {
+        if (ITierRegistry(registry).classOf(target) != bytes32(0)) return _readVaultOf(target) == address(this);
+        (uint8 tier,) = ITierRegistry(registry).tierOf(target, sel);
+        return tier < _TIER_ARBITRARY;
     }
 
     function _requireRecipientVaultBinding(address registry, address recipient) private view {

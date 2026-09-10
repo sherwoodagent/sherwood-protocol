@@ -50,6 +50,12 @@ contract SlashGasFeed {
 contract SlashGasAdapter {
     uint256 public pokes;
     uint256 public bumps;
+    /// @dev The vault this adapter stands in as a strategy clone for.
+    address public vault;
+
+    function setVault(address v) external {
+        vault = v;
+    }
 
     function poke() external {
         pokes++;
@@ -342,6 +348,15 @@ contract SlashGasCeilingTest is Test {
                 }))
         );
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
+        // The adapter models this vault's strategy clone: it names the vault and
+        // the registry reports factory provenance for it (mocked here; the real
+        // ceremony is pinned in test/vault/SelectorGuard.t.sol).
+        adapter.setVault(address(vault));
+        vm.mockCall(
+            address(tierRegistry),
+            abi.encodeCall(tierRegistry.classOf, (address(adapter))),
+            abi.encode(bytes32(uint256(1)))
+        );
 
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(

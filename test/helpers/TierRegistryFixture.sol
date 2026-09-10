@@ -36,10 +36,14 @@ contract PermissiveTierRegistry is ITierRegistry {
         return true;
     }
 
-    /// @dev SHE-209: no class concept in this stand-in — every address is a
-    ///      non-member, so the vault's class-binding check never fires.
-    function classOf(address) external pure returns (bytes32) {
-        return bytes32(0);
+    /// @dev Permissive mirror of factory provenance: anything that answers
+    ///      `vault()` is treated as a strategy clone (a class member), so the
+    ///      vault's bound-clone predicate and class-binding check see the same
+    ///      shape the real registry reports for a minted clone. Everything else
+    ///      (routers, tokens, EOAs) stays a non-member.
+    function classOf(address target) external view returns (bytes32) {
+        (bool ok, bytes memory ret) = target.staticcall(abi.encodeWithSignature("vault()"));
+        return ok && ret.length == 32 ? keccak256("permissive-strategy-class") : bytes32(0);
     }
 }
 

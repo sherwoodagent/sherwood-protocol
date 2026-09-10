@@ -37,6 +37,11 @@ contract DenyAllTierRegistry {
     function classOf(address) external pure returns (bytes32) {
         return bytes32(0);
     }
+
+    /// @dev Uncertified everywhere: `(target, selector)` pairs are never vetted here.
+    function tierOf(address, bytes4) external pure returns (uint8, uint16) {
+        return (2, 10_000);
+    }
 }
 
 /// @dev issue #166 companion fixture: `DenyAllTierRegistry` above is
@@ -65,10 +70,17 @@ contract AllowlistableTierRegistry {
         return isAdapterAllowed[target];
     }
 
-    /// @dev SHE-209: no class concept in this stand-in — every address is a
-    ///      non-member, so the vault's class-binding check never fires.
-    function classOf(address) external pure returns (bytes32) {
-        return bytes32(0);
+    /// @dev Permissive mirror of factory provenance: anything that answers
+    ///      `vault()` is treated as a strategy clone (a class member); everything
+    ///      else stays a non-member.
+    function classOf(address target) external view returns (bytes32) {
+        (bool ok, bytes memory ret) = target.staticcall(abi.encodeWithSignature("vault()"));
+        return ok && ret.length == 32 ? keccak256("permissive-strategy-class") : bytes32(0);
+    }
+
+    /// @dev Uncertified everywhere: `(target, selector)` pairs are never vetted here.
+    function tierOf(address, bytes4) external pure returns (uint8, uint16) {
+        return (2, 10_000);
     }
 }
 

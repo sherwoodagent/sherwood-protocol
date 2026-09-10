@@ -112,6 +112,14 @@ contract RegistryDemoteKeepsCalleeStandingTest is Test {
         tierRegistry.setStrategyFactory(address(strategyFactory));
         tierRegistry.setAdapterAllowed(address(strategy), true);
         tierRegistry.setAuthorizedDemoter(address(this));
+        // The stub stands in for a factory-minted clone bound to this vault:
+        // it answers `vault()` and the registry reports provenance for it
+        // (mocked; the real ceremony is pinned in test/vault/SelectorGuard.t.sol).
+        vm.mockCall(
+            address(tierRegistry),
+            abi.encodeCall(tierRegistry.classOf, (address(strategy))),
+            abi.encode(bytes32(uint256(1)))
+        );
 
         usdc.mint(alice, 1_000_000e6);
         vm.startPrank(alice);

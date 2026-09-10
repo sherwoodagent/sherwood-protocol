@@ -677,11 +677,11 @@ contract PerCallCapitalDeclarationsTest is Test {
         governor.executeProposal(pid);
     }
 
-    /// @notice design.md D2's deliberate residual: a zero-cap call's adapter
-    ///         demoting inside an ALREADY-tier-2 batch changes nothing —
-    ///         coverage is unaffected (0 * anything = 0) and the tier was
-    ///         already at the max, so execution proceeds normally.
-    function test_regression_zeroCapCallDemotion_insideAlreadyTier2Batch_executesFine() public {
+    /// @notice A zero-cap call's adapter demoting inside an ALREADY-tier-2
+    ///         batch moves neither tier nor coverage (0 * anything = 0), so no
+    ///         regression guard fires; the batch guard's deny-unless-recognised
+    ///         default is what refuses the now-uncertified pair.
+    function test_zeroCapCallDemotion_insideAlreadyTier2Batch_isRefusedByTheBatchGuard() public {
         _wireTierRegistry();
         // The vault's selector guard (Part 2) requires an `approve` spender to
         // be allowlisted -- orthogonal to this test's subject (tier/coverage
@@ -741,8 +741,18 @@ contract PerCallCapitalDeclarationsTest is Test {
         // mirroring the owner re-attestation ceremony `setAdapterAllowed`'s
         // natspec documents for a verified legitimate bytecode change.
         tierRegistry.setAdapterAllowed(address(mockAdapter), true);
+        // Re-attestation restores callee standing, not the pair's
+        // certification: `mint` is now an unrecognised selector on a target
+        // that is not this vault's strategy clone, and the batch guard's
+        // deny-unless-recognised default refuses it before the tier/coverage
+        // arithmetic runs. Neither `TierRegressed` nor `CoverageRegressed` fires.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISyndicateVault.UnrecognizedSelector.selector, address(mockAdapter), mockAdapter.mint.selector
+            )
+        );
         governor.executeProposal(pid);
-        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Executed));
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 }
 

@@ -39,8 +39,11 @@ contract PermissiveRegistryWithPairs is ITierRegistry {
         return true;
     }
 
-    function classOf(address) external pure returns (bytes32) {
-        return bytes32(0);
+    /// @dev Permissive mirror of factory provenance: anything that answers
+    ///      `vault()` is a class member (the strategy clone under test).
+    function classOf(address target) external view returns (bytes32) {
+        (bool ok, bytes memory ret) = target.staticcall(abi.encodeWithSignature("vault()"));
+        return ok && ret.length == 32 ? keccak256("permissive-strategy-class") : bytes32(0);
     }
 
     function isPriceSourceForToken(address, bytes32) external pure returns (bool) {

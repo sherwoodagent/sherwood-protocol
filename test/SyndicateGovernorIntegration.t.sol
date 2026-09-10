@@ -325,7 +325,7 @@ contract SyndicateGovernorIntegrationTest is Test {
 
     // ==================== MOONWELL: REAL DEFI LIFECYCLE ====================
 
-    function test_fullLifecycle_moonwellSupplyBorrowUnwind() public {
+    function test_moonwellDirectProtocolCallsAreRefusedAtExecute() public {
         uint256 supplyAmount = 50_000e6;
         uint256 borrowAmount = 25_000e6;
 
@@ -376,26 +376,17 @@ contract SyndicateGovernorIntegrationTest is Test {
         settleCaps[1] = borrowAmount;
 
         uint256 proposalId = _proposeVoteApprove(execCalls, execCaps, settleCalls, settleCaps, 1500, 7 days);
+        assertEq(usdc.balanceOf(address(vault)), 100_000e6);
 
-        uint256 vaultBalBefore = usdc.balanceOf(address(vault));
-        assertEq(vaultBalBefore, 100_000e6);
-
+        // Direct lending-protocol calls carry no vetted beneficiary: the batch
+        // guard refuses them at execute. Protocol calls belong inside a
+        // certified strategy clone.
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.UnrecognizedSelector.selector, address(mUsdc), bytes4(0xa0712d68))
+        );
         governor.executeProposal(proposalId);
 
-        assertTrue(vault.redemptionsLocked());
-        assertEq(mUsdc.balanceOf(address(vault)), supplyAmount);
-        assertEq(usdc.balanceOf(address(vault)), 75_000e6);
-
-        vm.warp(block.timestamp + 7 days);
-
-        vm.prank(random);
-        governor.settleProposal(proposalId);
-
-        assertEq(usdc.balanceOf(address(vault)), 100_000e6);
-        assertEq(mUsdc.balanceOf(address(vault)), 0);
-        assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Settled));
-        assertFalse(vault.redemptionsLocked());
-        assertEq(governor.getActiveProposal(), 0);
-        assertEq(usdc.balanceOf(agent), 0);
+        assertEq(usdc.balanceOf(address(vault)), 100_000e6, "nothing moved");
+        assertEq(mUsdc.balanceOf(address(vault)), 0, "no position opened");
     }
 }

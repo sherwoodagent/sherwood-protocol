@@ -182,11 +182,22 @@ contract CalleeGateTest is Test {
 
     // ── allowlisted callee passes through to the (still-live) selector checks ──
 
-    function test_allowlistedCalleePasses() public {
-        // Unrecognized selector on an ALLOWLISTED callee: the callee gate
-        // passes and the selector switch has nothing to say, so the call
-        // proceeds (no revert expected).
+    /// @notice The callee gate is necessary, not sufficient: an allowlisted
+    ///         callee still gets only the selectors the guard decodes. An
+    ///         unrecognised one is refused unless the target is this vault's
+    ///         own strategy clone or the registry certified the pair.
+    function test_allowlistedCalleeWithAnUnrecognisedSelectorIsRefused() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.UnrecognizedSelector.selector, adapter, bytes4(0x12345678))
+        );
         _exec(_one(adapter, abi.encodeWithSelector(bytes4(0x12345678), attacker)));
+    }
+
+    /// @notice Companion: a recognised, vetted selector on an allowlisted callee passes.
+    function test_allowlistedCalleeWithARecognisedSelectorPasses() public {
+        ERC20Mock allowlistedToken = new ERC20Mock("Allowlisted", "ALW", 18);
+        tierRegistry.setAdapterAllowed(address(allowlistedToken), true);
+        _exec(_one(address(allowlistedToken), abi.encodeCall(allowlistedToken.transfer, (address(vault), 0))));
     }
 
     /// @notice The retained inner layer is still load-bearing on an
@@ -255,14 +266,10 @@ contract CalleeGateTest is Test {
         ERC20Mock swappedAdapter = new ERC20Mock("Adapter", "ADP", 18);
         tierRegistry.setAdapterAllowed(address(swappedAdapter), true);
 
-        // Sanity: passes before the swap. Uses a real, harmless selector
-        // (`balanceOf`) rather than a made-up one — the guard's revert-path
-        // assertions below never reach delegatecall (the guard runs before
-        // `BatchExecutorLib.executeBatch`), but a PASSING call is actually
-        // delegatecalled through to `swappedAdapter`, and a real ERC20Mock
-        // has no fallback: an unrecognized selector would revert for a
-        // reason unrelated to this guard entirely.
-        _exec(_one(address(swappedAdapter), abi.encodeCall(swappedAdapter.balanceOf, (attacker))));
+        // Sanity: passes before the swap, on a recognised selector (a
+        // zero-value transfer back to the vault) — an unrecognised one would
+        // be refused for a reason unrelated to this gate.
+        _exec(_one(address(swappedAdapter), abi.encodeCall(swappedAdapter.transfer, (address(vault), 0))));
 
         vm.etch(address(swappedAdapter), hex"6001600101");
 
@@ -306,12 +313,10 @@ contract CalleeGateTest is Test {
         tierRegistry.certify(address(demotedAdapter), sel);
         assertTrue(tierRegistry.isAdapterAllowed(address(demotedAdapter)), "sanity: allowlisted before demotion");
 
-        // Sanity: callable before demotion. Uses a real, harmless selector
-        // (`balanceOf`) for the same reason as `test_codehashDrift_severeCalleeAfterEtch`
-        // above — this call actually executes via delegatecall, unlike the
-        // expected-revert calls below (which never reach delegatecall). `sel`
-        // stays reserved for the propose/certify/demote bookkeeping only.
-        _exec(_one(address(demotedAdapter), abi.encodeCall(demotedAdapter.balanceOf, (attacker))));
+        // Sanity: callable before demotion, on a recognised selector (a
+        // zero-value transfer back to the vault). `sel` stays reserved for
+        // the propose/certify/demote bookkeeping only.
+        _exec(_one(address(demotedAdapter), abi.encodeCall(demotedAdapter.transfer, (address(vault), 0))));
 
         tierRegistry.demote(address(demotedAdapter), sel);
         assertFalse(tierRegistry.isAdapterAllowed(address(demotedAdapter)), "demotion clears the allowlist flag too");
@@ -328,11 +333,8 @@ contract CalleeGateTest is Test {
         _exec(_one(address(usdc), abi.encodeCall(usdc.transfer, (address(demotedAdapter), 1e6))));
 
         // The CALLEE axis stays open, so vault capital held by the demoted
-        // address can still be reclaimed. Uses a real selector for the same
-        // reason as the sanity call above: this one actually delegatecalls
-        // through, so a made-up selector would revert on the mock's missing
-        // fallback for a reason unrelated to this gate.
-        _exec(_one(address(demotedAdapter), abi.encodeCall(demotedAdapter.balanceOf, (attacker))));
+        // address can still be reclaimed through a recognised selector.
+        _exec(_one(address(demotedAdapter), abi.encodeCall(demotedAdapter.transfer, (address(vault), 0))));
     }
 
     /// @notice A COUNTERPARTY grant does not open this gate.
@@ -368,9 +370,9 @@ contract CalleeGateTest is Test {
         ERC20Mock cp = new ERC20Mock("Counterparty", "CP", 18);
         tierRegistry.setCounterpartyAllowed(address(cp), true);
         _expectCalleeDisallowed(address(cp));
-        _exec(_one(address(cp), abi.encodeCall(cp.balanceOf, (attacker))));
+        _exec(_one(address(cp), abi.encodeCall(cp.transfer, (address(vault), 0))));
 
         tierRegistry.setAdapterAllowed(address(cp), true);
-        _exec(_one(address(cp), abi.encodeCall(cp.balanceOf, (attacker))));
+        _exec(_one(address(cp), abi.encodeCall(cp.transfer, (address(vault), 0))));
     }
 }

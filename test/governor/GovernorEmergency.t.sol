@@ -1117,6 +1117,30 @@ contract GovernorEmergencyTest is Test {
         governor.emergencySettleWithCalls(pid, _customCalls());
     }
 
+    /// @notice The reviewed emergency batch is held to the same default as a
+    ///         proposal batch: an unrecognised selector on an allowlisted
+    ///         protocol (here a token's `mint`) is refused at finalize.
+    function test_emergencyBatchIsHeldToTheSameDefault_unrecognisedProtocolSelectorReverts() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(targetToken), data: abi.encodeCall(targetToken.mint, (owner, 1e18)), value: 0
+        });
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, calls);
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
+
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISyndicateVault.UnrecognizedSelector.selector, address(targetToken), targetToken.mint.selector
+            )
+        );
+        governor.finalizeEmergencySettle(pid);
+    }
+
     function test_cancelEmergencySettle_afterStandardSettle_reverts() public {
         uint256 pid = _createExecutedProposal(7 days);
         vm.warp(vm.getBlockTimestamp() + 7 days);
