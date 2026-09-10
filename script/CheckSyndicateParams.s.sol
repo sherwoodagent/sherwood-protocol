@@ -127,8 +127,8 @@ contract CheckSyndicateParams is ScriptBase {
         if (tier2Inert) {
             reason = string.concat(
                 reason,
-                " tier2CallCapBps is 10_000 (100% of TVL), so sandbox funding and every tier-2 per-call"
-                " declaration are unbounded -- governor.setTier2CallCapBps(<bps>) or ALLOW_INERT_TIER2_CALL_CAP=true;"
+                " tier2CallCapBps is 10_000 (100% of TVL), so every tier-2 per-call"
+                " declaration is unbounded -- governor.setTier2CallCapBps(<bps>) or ALLOW_INERT_TIER2_CALL_CAP=true;"
             );
         }
         if (maxCapitalInert) {
