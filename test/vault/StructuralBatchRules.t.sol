@@ -492,6 +492,22 @@ contract StructuralBatchRulesTest is Test {
         assertEq(usdc.balanceOf(address(venue)), cap, "admitted and executed");
     }
 
+    /// @notice The class tier is a property of the code: a clone anyone minted through the
+    ///         permissionless factory prices at its class.
+    function test_certifiedTemplateClonePricesItsClassTier() public {
+        MorphoSupplyStrategy template = _morphoVenue();
+        _certifyClassNow(address(template), BaseStrategy.execute.selector, 1, uint16(CLASS_BOUND));
+
+        address rando = makeAddr("rando");
+        address clone = _morphoClone(address(template), rando, 1_000e6);
+        assertEq(strategyFactory.cloneTemplate(clone), address(template), "provenance recorded");
+        (uint8 tier, uint16 bound) = tierRegistry.tierOf(clone, BaseStrategy.execute.selector);
+        assertEq(tier, 1, "class tier inherited by a clone anyone minted");
+        assertEq(bound, CLASS_BOUND, "class bound");
+        (tier, bound) = tierRegistry.tierOf(clone, BaseStrategy.settle.selector);
+        assertEq(tier, 2, "uncertified selector on the same clone stays tier 2");
+    }
+
     function test_twoStrategyBatchPricesEachLegAtItsOwnTier() public {
         MorphoSupplyStrategy template = _morphoVenue();
         _certifyClassNow(address(template), BaseStrategy.execute.selector, 1, uint16(CLASS_BOUND));
