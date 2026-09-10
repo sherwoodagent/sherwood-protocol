@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
+import {IStrategyFactory} from "./interfaces/IStrategyFactory.sol";
 import {IProposalStatus} from "./interfaces/IProposalStatus.sol";
 import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
@@ -28,11 +29,6 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
-/// @dev Selectors for the privileged-target walk; each hop is a raw staticcall.
-interface IWiringReads {
-    function coverageFreezer() external view returns (address);
-    function swood() external view returns (address);
-}
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
@@ -91,6 +87,8 @@ contract SyndicateVault is
 
     /// @notice Cap on the owner-set idle-liquidity floor (50%).
     uint256 private constant MAX_MIN_BUFFER_BPS = 5_000;
+    /// @dev `increaseAllowance(address,uint256)`: the other allowance-granting ERC-20 selector.
+    bytes4 private constant _SEL_INCREASE_ALLOWANCE = 0x39509351;
 
     // ==================== STORAGE ====================
 
@@ -434,11 +432,6 @@ contract SyndicateVault is
         if (balanceAfter < reserve + (balanceBefore * minBufferBps) / 10_000) revert BufferBreached();
     }
 
-    /// @inheritdoc ISyndicateVault
-    function isPrivilegedBatchTarget(address target) external view returns (bool) {
-        return _isPrivilegedBatchTarget(target, _privilegedTargets());
-    }
-
     /// @notice Re-point the shared `BatchExecutorLib` and re-stamp its expected
     ///         codehash, atomically. Reached only through the factory's
     ///         lifecycle-gated `pushExecutor`.
@@ -455,49 +448,48 @@ contract SyndicateVault is
         emit ExecutorImplSet(old, newImpl);
     }
 
-    /// @dev Structural batch rules: no privileged target; on `asset()` only `approve`;
-    ///      every other target and selector is admitted and metered. Returns the spenders
-    ///      approved in the batch so `executeGovernorBatch` can zero them afterwards.
+    /// @dev Structural batch rules. Every non-asset target is a strategy registered with the
+    ///      protocol's factory (a fixed `IStrategy` shape, not a trust check); on `asset()`,
+    ///      `transferFrom` must draw from the vault. Returns the spenders granted.
     function _guardBatchCalls(BatchExecutorLib.Call[] calldata calls) private view returns (address[] memory spenders) {
-        address[10] memory privileged = _privilegedTargets();
+        address factory_ = _strategyFactory();
         address asset_ = asset();
         spenders = new address[](calls.length);
         uint256 n;
         for (uint256 i = 0; i < calls.length; i++) {
             address target = calls[i].target;
-            if (_isPrivilegedBatchTarget(target, privileged)) revert DisallowedBatchTarget(target);
-            if (target != asset_) continue;
+            if (target != asset_) {
+                if (!_isRegisteredStrategy(factory_, target)) revert NotARegisteredStrategy(target);
+                continue;
+            }
             bytes calldata data = calls[i].data;
             bytes4 sel = data.length >= 4 ? bytes4(data[0:4]) : bytes4(0);
-            if (sel != IERC20.approve.selector || data.length < 68) revert DisallowedAssetSelector(sel);
-            spenders[n++] = address(uint160(uint256(bytes32(data[4:36]))));
+            bytes32 arg0 = data.length >= 36 ? bytes32(data[4:36]) : bytes32(0);
+            if (sel == IERC20.transferFrom.selector) {
+                if (arg0 != bytes32(uint256(uint160(address(this))))) {
+                    revert TransferFromNotVault(address(uint160(uint256(arg0))));
+                }
+            } else if (sel == IERC20.approve.selector || sel == _SEL_INCREASE_ALLOWANCE) {
+                spenders[n++] = address(uint160(uint256(arg0)));
+            }
         }
         assembly ("memory-safe") {
             mstore(spenders, n)
         }
     }
 
-    /// @dev The protocol contracts a batch may never target, resolved from the vault's own
-    ///      wiring. A collaborator the governor cannot name reads as zero and is skipped.
-    function _privilegedTargets() private view returns (address[10] memory set) {
-        set[0] = address(this);
-        set[1] = _withdrawalQueue;
-        set[2] = _factory;
-        address gov = ISyndicateFactory(_factory).governorOf(address(this));
-        set[3] = gov;
-        set[4] = _readAddress(gov, abi.encodeCall(ISyndicateGovernor.tierRegistry, ()));
-        set[5] = _readAddress(set[4], abi.encodeCall(ITierRegistry.strategyFactory, ()));
-        set[6] = _readAddress(gov, abi.encodeCall(ISyndicateGovernor.exposureLedger, ()));
-        set[7] = _readAddress(set[6], abi.encodeCall(IWiringReads.coverageFreezer, ()));
-        set[8] = _readAddress(gov, abi.encodeCall(ISyndicateGovernor.guardianRegistry, ()));
-        set[9] = _readAddress(set[8], abi.encodeCall(IWiringReads.swood, ()));
+    /// @dev governor -> tierRegistry -> strategyFactory; a hop that does not answer reads as zero.
+    function _strategyFactory() private view returns (address) {
+        address registry = _readAddress(_getGovernor(), abi.encodeCall(ISyndicateGovernor.tierRegistry, ()));
+        return _readAddress(registry, abi.encodeCall(ITierRegistry.strategyFactory, ()));
     }
 
-    function _isPrivilegedBatchTarget(address target, address[10] memory set) private pure returns (bool) {
-        for (uint256 j = 0; j < set.length; j++) {
-            if (set[j] != address(0) && target == set[j]) return true;
-        }
-        return false;
+    /// @dev Fail-closed: an unwired or mis-pointed factory registers nothing.
+    function _isRegisteredStrategy(address factory_, address target) private view returns (bool) {
+        if (factory_ == address(0)) return false;
+        (bool ok, bytes memory ret) =
+            factory_.staticcall(abi.encodeCall(IStrategyFactory.isRegisteredStrategy, (target)));
+        return ok && ret.length == 32 && abi.decode(ret, (bool));
     }
 
     /// @dev Codeless target, revert, short return, or dirty upper bits all read as `address(0)`.

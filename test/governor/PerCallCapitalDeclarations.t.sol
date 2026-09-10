@@ -15,7 +15,7 @@ import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {AssetPuller} from "../mocks/AssetPuller.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Issue #43 — per-call capital declarations. Tests this change owes
 ///         beyond the ABI-migration sweep (tasks.md §8): the issue's own
@@ -49,6 +49,7 @@ contract PerCallCapitalDeclarationsTest is Test {
         agentRegistry = new MockAgentRegistry();
         guardianRegistry = new MockRegistryMinimal();
         tierRegistry = new TierRegistry(address(this));
+        tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
 
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(

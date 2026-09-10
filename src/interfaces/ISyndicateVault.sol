@@ -61,11 +61,11 @@ interface ISyndicateVault {
     /// @notice The batch's net asset outflow exceeded the proposal's declared
     ///         maxCapital.
     error MaxNetOutflowExceeded(uint256 netOutflow, uint256 cap);
-    /// @notice A governor batch named a privileged protocol contract (the vault, its queue,
-    ///         factory, governor, registries, ledger, game, sWOOD or the strategy factory).
-    error DisallowedBatchTarget(address target);
-    /// @notice A governor batch called `asset()` with anything other than `approve(address,uint256)`.
-    error DisallowedAssetSelector(bytes4 selector);
+    /// @notice A governor batch named a non-asset target that the protocol's `StrategyFactory`
+    ///         does not hold as a registered, code-unchanged strategy.
+    error NotARegisteredStrategy(address target);
+    /// @notice A governor batch called `asset().transferFrom` with a `from` other than the vault.
+    error TransferFromNotVault(address from);
 
     // ── Init Params ──
     struct InitParams {
@@ -105,9 +105,6 @@ interface ISyndicateVault {
     function factory() external view returns (address);
 
     // ── Governor ──
-    /// @notice Whether `target` is a privileged batch target — the predicate
-    ///         `executeGovernorBatch`'s guard enforces, exposed for propose-time validation.
-    function isPrivilegedBatchTarget(address target) external view returns (bool);
     /// @notice Run a governor-approved batch of calls, metering each call's
     ///         gross outflow of `asset()` against its declared `callCaps[i]`
     ///         `maxNetOutflow`. `callCaps.length == 0` skips per-call

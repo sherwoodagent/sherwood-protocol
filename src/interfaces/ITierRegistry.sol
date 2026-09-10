@@ -7,8 +7,8 @@ interface ITierRegistry {
     ///         swap adapter, price feed, token). Confers nothing to a governor batch.
     function isCounterpartyAllowed(address counterparty) external view returns (bool);
     /// @notice The code class `target` belongs to: non-zero iff it is an ERC-1167 clone of a
-    ///         certified template, minted by `strategyFactory`. `bytes32(0)` otherwise.
+    ///         certified template, minted by the registry's strategy factory. `bytes32(0)` otherwise.
     function classOf(address target) external view returns (bytes32);
-    /// @notice The `StrategyFactory` whose clone provenance class membership requires.
+    /// @notice The `StrategyFactory` that registers strategies and records clone provenance.
     function strategyFactory() external view returns (address);
 }

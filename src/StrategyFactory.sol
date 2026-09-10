@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IStrategy} from "./interfaces/IStrategy.sol";
+import {IStrategyFactory} from "./interfaces/IStrategyFactory.sol";
 
 /// @notice Minimal view surface needed to gate clone calls on registered vaults.
 interface ISyndicateRegistry {
@@ -43,7 +44,7 @@ interface ISyndicateRegistry {
 ///             the shipped templates do) and expose no payout / recipient /
 ///             router address settable from `initialize` or `updateParams`
 ///             data. See `TierRegistry.proposeClassCertification`.
-contract StrategyFactory is Ownable {
+contract StrategyFactory is Ownable, IStrategyFactory {
     /// @notice SyndicateFactory used to verify that `vault` is a registered vault.
     /// @dev Immutable: set once at construction. The vault-registered check is
     ///      meaningless if the registry it consults can be hot-swapped.
@@ -60,7 +61,14 @@ contract StrategyFactory is Ownable {
     ///         factory did not deploy it.
     mapping(address clone => address template) public cloneTemplate;
 
+    /// @notice Registered strategies and the code they were registered with.
+    mapping(address strategy => bool registered) public registeredStrategy;
+    mapping(address strategy => bytes32 codehash) public registeredCodehash;
+
     error VaultNotRegistered();
+    /// @notice `registerStrategy` was given a codeless address or one that does not answer
+    ///         `IStrategy`'s `vault()`, `proposer()` and `executed()`.
+    error NotAStrategy(address strategy);
     error InvalidSyndicateFactory();
     /// @notice `template` is not on the allowlist.
     error TemplateNotApproved(address template);
@@ -73,6 +81,7 @@ contract StrategyFactory is Ownable {
 
     event StrategyCloned(address indexed template, address indexed vault, address indexed clone);
     event TemplateApprovalSet(address indexed template, bool approved);
+    event StrategyRegistered(address indexed strategy, bytes32 codehash);
 
     constructor(address syndicateFactory_, address owner_) Ownable(owner_) {
         if (syndicateFactory_ == address(0)) revert InvalidSyndicateFactory();
@@ -83,6 +92,34 @@ contract StrategyFactory is Ownable {
     function setTemplateApproval(address template, bool approved) external onlyOwner {
         approvedTemplate[template] = approved;
         emit TemplateApprovalSet(template, approved);
+    }
+
+    /// @notice Register a hand-written strategy. Permissionless: registration fixes the shape a
+    ///         batch target has (`IStrategy`) so guardians can simulate it; it is not a trust check.
+    function registerStrategy(address strategy) external {
+        if (strategy.code.length == 0) revert NotAStrategy(strategy);
+        _mustAnswer(strategy, IStrategy.vault.selector);
+        _mustAnswer(strategy, IStrategy.proposer.selector);
+        _mustAnswer(strategy, IStrategy.executed.selector);
+        _register(strategy);
+    }
+
+    /// @inheritdoc IStrategyFactory
+    /// @dev A code change after registration de-registers.
+    function isRegisteredStrategy(address strategy) external view returns (bool) {
+        return registeredStrategy[strategy] && strategy.codehash == registeredCodehash[strategy];
+    }
+
+    function _register(address strategy) private {
+        registeredStrategy[strategy] = true;
+        registeredCodehash[strategy] = strategy.codehash;
+        emit StrategyRegistered(strategy, strategy.codehash);
+    }
+
+    /// @dev Fail-closed conformance probe: the getter must answer exactly one word.
+    function _mustAnswer(address strategy, bytes4 selector) private view {
+        (bool ok, bytes memory ret) = strategy.staticcall(abi.encodeWithSelector(selector));
+        if (!ok || ret.length != 32) revert NotAStrategy(strategy);
     }
 
     /// @dev The vault is a registered Sherwood vault: provenance only ever names real vaults.
@@ -116,6 +153,7 @@ contract StrategyFactory is Ownable {
         if (proposer != msg.sender) revert ProposerMustBeSender();
         clone = Clones.clone(template);
         cloneTemplate[clone] = template;
+        _register(clone);
         IStrategy(clone).initialize(vault, proposer, data);
         emit StrategyCloned(template, vault, clone);
     }
@@ -143,6 +181,7 @@ contract StrategyFactory is Ownable {
         if (proposer != msg.sender) revert ProposerMustBeSender();
         clone = Clones.cloneDeterministic(template, keccak256(abi.encode(vault, salt)));
         cloneTemplate[clone] = template;
+        _register(clone);
         IStrategy(clone).initialize(vault, proposer, data);
         emit StrategyCloned(template, vault, clone);
     }

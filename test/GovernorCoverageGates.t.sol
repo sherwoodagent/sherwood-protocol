@@ -21,7 +21,7 @@ import {MockCoverageFreezer} from "./mocks/MockCoverageFreezer.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "./helpers/TierRegistryFixture.sol";
 
 /// @dev Minimal sWOOD read surface the ExposureLedger constructor consumes.
 ///      `coolDownPeriod` (45d) covers epochLength (28d) + challengeWindow (14d).
@@ -903,6 +903,7 @@ contract GovernorCoverageGatesTest is Test {
 
     function _wireTierRegistryCertifiedAt(uint8 tier, uint16 bound) internal returns (TierRegistry reg) {
         reg = new TierRegistry(address(this));
+        reg.setStrategyFactory(address(new PermissiveStrategyFactory()));
         governor.setTierRegistry(address(reg)); // test contract is the factory
         reg.proposeCertification(
             address(targetToken), targetToken.approve.selector, tier, bound, address(0), address(targetToken).codehash

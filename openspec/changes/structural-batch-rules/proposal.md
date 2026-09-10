@@ -4,12 +4,14 @@ The vault's batch guard grew into an enumeration: fifteen ERC-20-shaped selector
 
 ## What Changes
 
-- **BREAKING** — `SyndicateVault._guardBatchCalls` is exactly four structural rules: (1) a fixed privileged-target denylist (vault, queue, governor, tier registry, guardian registry, sWOOD, ledger, game, both factories); (2) on `asset()` only `approve(spender, n)` is admitted; (3) every spender approved inside a batch is `forceApprove(spender, 0)`'d after the batch, so no allowance survives the transaction; (4) any other target with any selector is admitted. The net-outflow meter, queue reserve and buffer floor are unchanged. The selector constants, the recipient decoding, the callee gate, the class vault-binding probe, the benign-read list and the errors `DisallowedTransferTarget`, `DisallowedBatchCallee`, `UnrecognizedAssetSelector`, `DisallowedTransferFromSource`, `AdapterVaultMismatch`, `MalformedCall`, `TierRegistryUnresolved` are deleted. A new `DisallowedAssetSelector(bytes4)` names the asset rule.
+- **BREAKING** — `SyndicateVault._guardBatchCalls` is exactly four structural rules: (1) every call whose target is not `asset()` names a strategy the protocol's `StrategyFactory` holds as registered with unchanged code (`NotARegisteredStrategy(target)` otherwise; fail-closed through `governor → tierRegistry → strategyFactory → isRegisteredStrategy`); (2) on `asset()`, `transferFrom` whose `from` is not the vault is refused (`TransferFromNotVault(from)`) and every other selector is admitted; (3) every spender granted inside the batch via `approve` or `increaseAllowance` is `forceApprove(spender, 0)`'d after the batch, so no allowance survives the transaction; (4) the net-outflow meter, queue reserve and buffer floor are unchanged. The selector constants, the recipient decoding, the callee gate, the class vault-binding probe, the benign-read list, the privileged-target denylist and the errors `DisallowedTransferTarget`, `DisallowedBatchCallee`, `UnrecognizedAssetSelector`, `DisallowedTransferFromSource`, `AdapterVaultMismatch`, `MalformedCall`, `TierRegistryUnresolved`, `DisallowedBatchTarget` and the view `isPrivilegedBatchTarget` are deleted.
+- **BREAKING** — `StrategyFactory` becomes the permissionless strategy registry: `registerStrategy(strategy)` (any caller, no fee; requires code and one-word answers to `IStrategy`'s `vault()`, `proposer()`, `executed()`, else `NotAStrategy`), `isRegisteredStrategy(strategy)` (registered and codehash unchanged), `StrategyRegistered` event; minted clones are registered automatically.
+- **BREAKING** — `SyndicateGovernor.propose` requires `strategy` to be a registered strategy (`StrategyNotRegistered(strategy)`; `address(0)` is no longer accepted) and refuses any non-asset batch target that is not registered (`NotARegisteredStrategy(target)`) before storing the proposal. The `proposer()`/`vault()` consistency probe and `StrategyProposerMismatch` / `StrategyVaultMismatch` are deleted.
 - **BREAKING** — `TierRegistry` loses the callee and recipient axes: `setAdapterAllowed`, `setCallable`, `setClassAllowed`, `setClassCallable`, `isAdapterAllowed`, `isCallableTarget`, `isClassAllowed`, `isClassAllowDenied` and their events/storage. Tier certification (address and class), `isCounterpartyAllowed`, `isPriceSourceForToken`, `classOf` and `strategyFactory` stay. `isCounterpartyAllowed` no longer falls back to adapter standing; demotion clears the counterparty entry and the tier, nothing else.
 - **BREAKING** — `StrategyFactory.cloneAndInit` / `cloneAndInitDeterministic` are permissionless: the vault-owner / vault-agent gate is deleted. The template allowlist, the vault-registered check and `cloneTemplate` provenance stay.
 - The three shipped templates bind their venues through `isCounterpartyAllowed` (Morpho singleton; Portfolio swap adapter and price feeds; CL swap adapter). `PortfolioStrategy` keeps the per-token `isPriceSourceForToken` pairing.
 - Deploy scripts seed venues and feeds as counterparties only; no script calls `setAdapterAllowed`.
-- Governor: no change to `propose`, tiering or coverage. `strategy` stays informational.
+- Governor: tiering and coverage unchanged; `strategy` stays informational beyond registration.
 
 ## Capabilities
 
@@ -19,14 +21,16 @@ None.
 
 ### Modified Capabilities
 
-- `syndicate-vault`: batch guard requirements replaced by the structural rules; the privileged-target set is widened to every protocol contract the vault can resolve.
-- `tier-policy`: the callee axis and adapter allowlist requirements are removed; demotion no longer touches an allowlist; the counterparty axis is specified as the only address axis; the external read surface is restated.
-- `syndicate-governor`: proposal creation validation states that batch admission is structural and that `strategy` is informational.
+- `syndicate-vault`: batch guard requirements replaced by the structural rules; the privileged-target guard is removed (subsumed by the registered-strategy rule).
+- `tier-policy`: the callee axis and adapter allowlist requirements are removed; demotion no longer touches an allowlist; the counterparty axis is specified as the only address axis; the external read surface is restated; permissionless strategy registration on the `StrategyFactory` is added here (no separate strategy-factory spec exists).
+- `syndicate-governor`: proposal creation validation requires a registered `strategy` and registered batch targets; the strategy consistency probe is removed.
 - `deployment-docs`: the launch set seeds counterparties and feeds through `setCounterpartyAllowed` only.
 
 ## Impact
 
-- `src/SyndicateVault.sol`, `src/interfaces/ISyndicateVault.sol` — guard rewrite (~200 lines → ~40), allowance reset, privileged set.
+- `src/SyndicateVault.sol`, `src/interfaces/ISyndicateVault.sol` — guard rewrite (~200 lines → ~40), allowance reset, registered-strategy read.
+- `src/StrategyFactory.sol`, `src/interfaces/IStrategyFactory.sol` — permissionless registration.
+- `src/SyndicateGovernor.sol`, `src/interfaces/ISyndicateGovernor.sol` — registered `strategy` field, propose-time target mirror.
 - `src/TierRegistry.sol`, `src/interfaces/ITierRegistry.sol` — axes deleted.
 - `src/StrategyFactory.sol` — `_authClone` deleted.
 - `src/strategies/{MorphoSupplyStrategy,PortfolioStrategy,ConcentratedLiquidityStrategy}.sol` — venue binding via `isCounterpartyAllowed`.

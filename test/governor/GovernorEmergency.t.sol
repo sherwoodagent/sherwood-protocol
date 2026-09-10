@@ -19,7 +19,8 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {AssetPuller} from "../mocks/AssetPuller.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {deployTierRegistry, PermissiveTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {IStrategyFactory} from "../../src/interfaces/IStrategyFactory.sol";
 
 /// @title GovernorEmergency.t
 /// @notice Tests for the Task 24 guardian-review emergency settle lifecycle.
@@ -928,28 +929,16 @@ contract GovernorEmergencyTest is Test {
         governor.finalizeEmergencySettle(pid);
     }
 
-    /// @notice Issue #93 — the emergency path is the WEAKEST way into
-    ///         `executeGovernorBatch`, and therefore the one that matters most:
-    ///         the calls are owner-supplied, there is no LP vote, no coverage
-    ///         quorum, and with no guardian block votes cast, no second
-    ///         signature either. `_guardBatchCalls` runs on every
-    ///         `executeGovernorBatch` invocation regardless of which governor
-    ///         entrypoint drove it, so the privileged-target denylist covers
-    ///         this path for free — no per-entrypoint duplication.
-    ///
-    /// @dev    Asserts the vault-self target, because this harness binds no
-    ///         withdrawal queue. The queue variant of the same claim — a
-    ///         batch naming the bound queue rejected by
-    ///         `executeGovernorBatch` — is pinned at the unit level in
-    ///         `test/audit-fixes/Vault_batchQueueTargets.t.sol`, which drives
-    ///         that entrypoint directly. (Issue #118 retired the lifecycle
-    ///         version reached via `unstick`: it required a STORED
-    ///         queue-targeting settlement batch, and `propose` now rejects
-    ///         such a batch before it can ever be stored — see
-    ///         `test/audit-fixes/Vault_batchQueueTargets_lifecycle.t.sol`.)
+    /// @notice The emergency path is the weakest way into `executeGovernorBatch` (owner-supplied
+    ///         calls, no vote), and it runs the same guard: an unregistered target (here the vault,
+    ///         with the permissive fixture's factory told so) is refused before the delegatecall.
     function test_finalizeEmergencySettle_vaultSelfTargetingCalls_reverts() public {
         uint256 pid = _createExecutedProposal(7 days);
         vm.warp(vm.getBlockTimestamp() + 7 days);
+        address factory_ = PermissiveTierRegistry(governor.tierRegistry()).permissiveFactory();
+        vm.mockCall(
+            factory_, abi.encodeCall(IStrategyFactory.isRegisteredStrategy, (address(vault))), abi.encode(false)
+        );
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
@@ -961,12 +950,11 @@ contract GovernorEmergencyTest is Test {
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, calls);
 
-        // No guardian blocks → the review resolves clean and the owner is
-        // entitled to finalize. The batch itself is what refuses.
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(vault)));
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(vault)));
         governor.finalizeEmergencySettle(pid);
+        assertEq(usdc.balanceOf(random), 0, "nothing moved");
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -1388,23 +1376,21 @@ contract GovernorEmergencyTest is Test {
     }
 
     /// @notice An owner-supplied emergency batch is held to the same structural rules as a
-    ///         governor batch: a non-`approve` call on the asset is refused at finalize.
+    ///         governor batch: `transferFrom` an LP's deposit allowance is refused at finalize.
     function test_emergencyBatchIsHeldToTheSameRules() public {
         uint256 pid = _createExecutedProposal(7 days);
         vm.warp(vm.getBlockTimestamp() + 7 days);
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.transfer, (owner, 1_000e6)), value: 0
+            target: address(usdc), data: abi.encodeCall(usdc.transferFrom, (lp1, owner, 1_000e6)), value: 0
         });
         vm.prank(owner);
         governor.emergencySettleWithCalls(pid, calls);
         vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
 
         vm.prank(owner);
-        vm.expectRevert(
-            abi.encodeWithSelector(ISyndicateVault.DisallowedAssetSelector.selector, usdc.transfer.selector)
-        );
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.TransferFromNotVault.selector, lp1));
         governor.finalizeEmergencySettle(pid);
     }
 }

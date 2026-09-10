@@ -20,9 +20,12 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {PermissiveStrategyFactory} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Permissive registry that also attests every token-feed pairing.
 contract PermissiveRegistryWithPairs is ITierRegistry {
+    address public immutable permissiveFactory = address(new PermissiveStrategyFactory());
+
     function tierOf(address, bytes4) external pure returns (uint8, uint16) {
         return (2, 10_000);
     }
@@ -31,8 +34,8 @@ contract PermissiveRegistryWithPairs is ITierRegistry {
         return true;
     }
 
-    function strategyFactory() external pure returns (address) {
-        return address(0);
+    function strategyFactory() external view returns (address) {
+        return permissiveFactory;
     }
 
     function classOf(address) external pure returns (bytes32) {

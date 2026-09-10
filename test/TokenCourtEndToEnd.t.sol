@@ -25,7 +25,7 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "./helpers/TierRegistryFixture.sol";
 
 /// @dev Chainlink-shaped USD feed for the vault asset. Mirrors
 ///      `ChallengeEndToEndTest`'s own `ChallengeE2EFeed`.
@@ -171,6 +171,7 @@ contract TokenCourtEndToEndTest is Test {
         protocolConfig = new ProtocolConfig(owner);
         adapter = new TCE2EAdapter();
         tierRegistry = new TierRegistry(address(this));
+        tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
 
         // ── sWOOD (sole WOOD custodian). The test contract is the factory.
         StakedWood swoodImpl = new StakedWood();

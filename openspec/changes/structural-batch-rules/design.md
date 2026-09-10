@@ -11,20 +11,23 @@ Batches execute under `delegatecall`, so every sub-call carries `msg.sender == v
 
 ### D1 — Four rules, in this order
 
-1. Privileged-target denylist, every call, before anything else. The set is every protocol contract the vault can resolve from its own wiring: itself, its queue, its factory, its governor, the governor's tier registry, that registry's `strategyFactory`, the governor's exposure ledger, that ledger's `coverageFreezer` (the challenge game), the governor's guardian registry and its `swood`. Resolution is fail-soft (a missing getter reads as `address(0)`, which is never a target) so a stand-in governor without every getter still executes; nothing in the set is owner-extensible, so the set is fixed by deployment wiring.
-2. `target == asset()` admits exactly `approve(address,uint256)` with at least 68 calldata bytes; any other selector or shorter calldata reverts `DisallowedAssetSelector(sel)`. This covers `transfer`, `transferFrom` (including the LP-allowance-confiscation shape, whose only standing allowance is on the asset), `permit`, `increaseAllowance`, `transferAndCall`, `authorizeOperator` and every future sibling without naming any of them.
-3. Every spender approved in the batch is collected in memory and `forceApprove(spender, 0)`'d after the delegatecall returns, before the meters. A spender that did not pull loses the allowance; a spender that pulled has already been metered. A spender equal to the asset or the vault is reset the same way — an `approve(x, 0)` is harmless for any `x`. Duplicates are reset twice.
-4. Everything else is admitted. Admission is not endorsement: `tierOf` prices an unknown `(target, selector)` at tier 2 with `boundBps == 10_000`, so uncertified code costs full-notional coverage and a bond.
+1. Every call whose `target != asset()` must name a strategy the protocol's `StrategyFactory` holds as registered with unchanged code, else `NotARegisteredStrategy(target)`. The vault resolves the factory live: `governor → tierRegistry() → strategyFactory()` (raw reads; a hop that does not answer reads as zero) and then `isRegisteredStrategy(target)` on the factory (raw staticcall, one word required). Fail-closed at every hop: an unwired or mis-pointed factory registers nothing, so every non-asset target is refused until the wiring is fixed — loud at execute, never a silent admit.
+2. `target == asset()`: `transferFrom` whose `from` word is not the vault reverts `TransferFromNotVault(from)`; every other selector is admitted. `transfer` and `transferFrom(vault, …)` are metered like any outflow; `approve` and `increaseAllowance` record their spender for rule 3; reads are harmless; a selector the token does not have reverts in the token.
+3. Every spender recorded in the batch is `forceApprove(spender, 0)`'d after the delegatecall returns, before the meters. A spender that did not pull loses the allowance; a spender that pulled has already been metered.
+4. The meters (`maxNetOutflow`, `reservedQueueAssets`, buffer floor) run after the reset, unchanged.
 
-The meters (`maxNetOutflow`, `reservedQueueAssets`, buffer floor) run after the reset, unchanged.
+### D2 — Permissionless registration is a shape, not a trust check
 
-### D2 — The rejected `vault() == this` predicate
+`StrategyFactory.registerStrategy(strategy)` is callable by anyone, with no fee. It requires code and that the three `IStrategy` getters `vault()`, `proposer()`, `executed()` each answer one word; it records the address and its codehash and emits `StrategyRegistered`. `isRegisteredStrategy` is true only while the codehash still matches, so a code change after registration de-registers (a proxy-implementation swap is visible to guardians and the tier is 2 regardless). `cloneAndInit` and its deterministic twin register the clone they mint. Registration does NOT require `vault() == anything`: a strategy may serve several vaults if its code allows.
 
-A callee-side check ("only call contracts that answer `vault()` with this vault") was considered as a cheap way to keep batches inside strategy code. Rejected: a contract that answers the predicate and then calls Morpho reaches the identical outcome, so the predicate constrains nothing an attacker does and only taxes honest direct-protocol batches. The same argument retires the callee allowlist: any allowlisted contract that forwards calldata is an unallowlisted target with one extra hop.
+What registration buys is a fixed simulation shape for the guardian network: every batch target answers `IStrategy`, so a reviewer can read `vault()`, `proposer()` and `executed()` and simulate `execute()`/`settle()` against a known surface. It is not an endorsement: `tierOf` prices an unknown registered strategy at tier 2 with `boundBps == 10_000`; the protocol lowers the price only through `proposeCertification`/`certify` or `certifyClass`.
 
-### D3 — Why no source guard on non-asset tokens
+### D3 — What the registration rule subsumes, and what it does not
 
-The old `transferFrom` source guard protected the LP deposit allowance, which is on `asset()`; rule 2 refuses `transferFrom` on the asset outright. A `transferFrom(x, vault, n)` on some other token spends an allowance nobody grants the vault in the normal course of use; if a token holder did, the guardian reads the batch. Enumerating source-bearing selectors on arbitrary tokens is exactly the shape this change removes.
+- The privileged-target denylist. The only protocol function reachable because `msg.sender == vault` is on `VaultWithdrawalQueue` (`queueRedeem`, `queueDeposit`, `stampSettlement` are `onlyVault`; nothing on the vault, governor, registries, ledger, game, sWOOD or factories keys on the vault as caller). The queue answers no `IStrategy` getter, so it cannot register and is refused as a target by rule 1; so are the vault, governor, registries and every other protocol contract, for the same reason. No enumeration is needed.
+- The approve-only asset rule. On the asset, the only call the meter and the reset cannot see is `transferFrom(from != vault, …)`: it spends an LP's standing deposit allowance, assets flow IN, the meter reads zero, there is nothing to reset. Rule 2 refuses exactly that; `transfer` and `transferFrom(vault, …)` are metered, and any allowance the batch grants is reset.
+- A callee-side `vault() == this` predicate was considered as a cheap way to keep batches inside strategy code, and stays rejected: a registered strategy that answers the predicate and then calls Morpho reaches the identical outcome, so the predicate constrains nothing and only taxes honest multi-vault strategies. Registration asks for the shape, not for a binding.
+- Non-asset tokens the vault holds between execute and settle can still be moved by a settlement batch through a registered strategy; the tier price and the guardian bound that, as before.
 
 ### D4 — Emergency batches
 
@@ -40,7 +43,11 @@ Deleted: `_adapterAllowed`, `_adapterAllowedCodehash`, `_calleeAllowed`, `_calle
 
 ### D7 — Factory: clone is permissionless, the vault must exist
 
-`_authClone`'s owner/agent gate and the `Unauthorized` error are deleted. The `vaultToSyndicate(vault) != 0` check stays: a clone's `initialize` walks `vault() → governor() → tierRegistry()`, and `cloneTemplate` provenance is what makes a clone a class member for pricing, so provenance should only ever name real vaults. `proposer == msg.sender` stays. Note that anyone may now mint a class-member clone bound to any vault; the clone can only be executed by that vault's governor, through a proposal its agents write, priced at the class's tier — the tier is a property of the code, not of who deployed it.
+`_authClone`'s owner/agent gate and the `Unauthorized` error are deleted. The `vaultToSyndicate(vault) != 0` check stays: a clone's `initialize` walks `vault() → governor() → tierRegistry()`, and `cloneTemplate` provenance is what makes a clone a class member for pricing, so provenance should only ever name real vaults. `proposer == msg.sender` stays. Note that anyone may now mint a class-member clone bound to any vault; the clone can only be executed by that vault's governor, through a proposal its agents write, priced at the class's tier — the tier is a property of the code, not of who deployed it. Minted clones are registered (D2) as a side effect.
+
+### D9 — Governor: the `strategy` field is a registered strategy, and propose mirrors the target rule
+
+`propose` requires `isRegisteredStrategy(strategy)` through the same `tierRegistry → strategyFactory` path (`StrategyNotRegistered(strategy)` otherwise); the field is otherwise informational (it names the proposal's strategy for observers, `strategyOf`, and the emergency `rescueTo`). The former `proposer()`/`vault()` consistency probe is deleted: a contract answering neither getter passed it, so it was a shape check with holes, and registration is the shape check. `propose` also refuses any non-asset batch target that is not registered, with the vault's `NotARegisteredStrategy(target)`: a settlement leg naming an unregistered contract would otherwise be stored, executed, and wedge the proposal in `Executed` at settle (issue #118's shape). Execute time remains the security boundary; propose time is the early error.
 
 ### D8 — Storage
 
@@ -48,9 +55,9 @@ Deleted: `_adapterAllowed`, `_adapterAllowedCodehash`, `_calleeAllowed`, `_calle
 
 ## Risks / Trade-offs
 
-- A proposal may now `approve` the asset to any contract and call it. That is the design: the price is tier 2 on that call, and the reset guarantees the approval cannot be used after the batch. What the guard no longer promises is that the callee is known; the guardian review is where that judgement lives.
+- A proposal may now `approve` the asset to any registered strategy and call it. That is the design: registration is permissionless, the price is tier 2 on that call, and the reset guarantees the approval cannot be used after the batch. What the guard promises is the callee's shape, not its intent; the guardian review is where that judgement lives.
 - Non-asset tokens the vault holds between execute and settle can be moved by a settlement batch to anywhere. Previously the recipient allowlist bounded this; now the tier price and the guardian do. Recorded as accepted.
-- The privileged set is resolved live at each batch (≈10 warm reads). Cheap relative to the batch itself; the alternative (storing the set) would need a wiring hook on every rotation.
+- The factory is resolved live at each batch (two warm reads) plus one `isRegisteredStrategy` staticcall per non-asset call. Cheap relative to the batch itself; storing the factory on the vault would need a wiring hook on every rotation.
 
 ## Migration
 

@@ -33,7 +33,7 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
-import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Base contract with state variables and setup functions.
 ///
@@ -235,6 +235,7 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         agentRegistry = new MockAgentRegistry();
         protocolConfig = new ProtocolConfig(address(this));
         tierRegistry = new TierRegistry(address(this));
+        tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
         fizzFactory = new FizzFactory();
         adapter = new FizzAdapter();
 

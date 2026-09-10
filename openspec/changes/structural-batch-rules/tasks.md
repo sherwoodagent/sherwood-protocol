@@ -1,10 +1,11 @@
 ## 1. Vault — structural batch rules
 
-- [ ] 1.1 Rewrite `_guardBatchCalls` to the four rules (design D1): privileged denylist over the resolved protocol set, asset-only-`approve`, spender collection, everything else admitted. Return the spenders.
-- [ ] 1.2 After the delegatecall in `executeGovernorBatch`, `forceApprove(spender, 0)` for every collected spender, before the meters.
-- [ ] 1.3 Delete the fifteen `_SEL_*` constants, `_Permit2BatchDetail`, `_requireRecipientVaultBinding`, `_readVaultOf`, `_isBenignAssetRead`, and the guard doc block.
-- [ ] 1.4 `ISyndicateVault`: delete `DisallowedTransferTarget`, `DisallowedBatchCallee`, `UnrecognizedAssetSelector`, `DisallowedTransferFromSource`, `AdapterVaultMismatch`, `MalformedCall`, `TierRegistryUnresolved`; add `DisallowedAssetSelector(bytes4)`; restate `DisallowedBatchTarget` and `isPrivilegedBatchTarget` for the widened set.
-- [ ] 1.5 Governor: confirm no `isAdapterAllowed` / `isCallableTarget` read remains (grep); `_rejectPrivilegedTargets` unchanged.
+- [x] 1.1 Rewrite `_guardBatchCalls` to the four rules (design D1): every non-asset target is a registered strategy (fail-closed factory read), `transferFrom` on the asset draws from the vault, spender collection (`approve` + `increaseAllowance`), meters unchanged. Return the spenders.
+- [x] 1.2 After the delegatecall in `executeGovernorBatch`, `forceApprove(spender, 0)` for every collected spender, before the meters.
+- [x] 1.3 Delete the fifteen `_SEL_*` constants, `_Permit2BatchDetail`, `_requireRecipientVaultBinding`, `_readVaultOf`, `_isBenignAssetRead`, and the guard doc block.
+- [x] 1.4 `ISyndicateVault`: delete `DisallowedTransferTarget`, `DisallowedBatchCallee`, `UnrecognizedAssetSelector`, `DisallowedTransferFromSource`, `AdapterVaultMismatch`, `MalformedCall`, `TierRegistryUnresolved`, `DisallowedBatchTarget`, `isPrivilegedBatchTarget`; add `NotARegisteredStrategy(address)` and `TransferFromNotVault(address)`.
+- [x] 1.5 `StrategyFactory`: `registerStrategy`, `isRegisteredStrategy`, `StrategyRegistered`, `NotAStrategy`; clones register on mint. `IStrategyFactory.isRegisteredStrategy`.
+- [x] 1.7 Governor: `propose` requires a registered `strategy` (`StrategyNotRegistered`), refuses unregistered non-asset batch targets (`NotARegisteredStrategy`); the `proposer()`/`vault()` probe and its two errors are deleted.
 - [ ] 1.6 `./script/check-layout-goldens.sh` passes without regeneration.
 
 ## 2. Registry — pricing and template binding only
@@ -22,8 +23,8 @@
 
 ## 4. Tests
 
-- [ ] 4.1 New `test/vault/StructuralBatchRules.t.sol`: privileged-target loop, every non-approve asset selector, allowance reset, approve-then-drain-next-block, arbitrary contract admitted and metered, two-leg tier pricing, uncertified tier 2, certified class clone via permissionless `cloneAndInit`, the three templates through the real governor with counterparty grants only, emergency batch.
+- [x] 4.1 New `test/vault/StructuralBatchRules.t.sol`: unregistered targets refused (Morpho, queue, governor, vault, registry, stub), registered strategy admitted with any selector, registration shape check, de-registration on code change, unwired factory, factory without the selector, registered `strategy` field at propose, asset `transferFrom` from LP refused / from vault metered, `transfer` metered, allowance reset over `approve` and `increaseAllowance`, approve-then-drain-next-block, two-leg tier pricing, uncertified tier 2, certified class clone via permissionless `cloneAndInit`, the three templates through the real governor, emergency batch (in `GovernorEmergency`). Registration unit tests in `test/StrategyFactory.t.sol`.
 - [ ] 4.2 Delete `SelectorGuard.t.sol`, `CalleeGate.t.sol`, `Vault_assetSelectorGuard.t.sol`, `TierRegistryAdapterAllowlist.t.sol`, `TierRegistryClassMemberDenial.t.sol`, `Registry_demoteKeepsCalleeStanding.t.sol`, `PortfolioStrategyAdapterAllowlist.t.sol`'s allowlist cases, `StrategyFactory_auth.t.sol`'s gate cases, and every test whose only subject was the allowlist or recipient decoding.
 - [ ] 4.3 Re-pin `Vault_batchQueueTargets.t.sol` (privileged denylist), `OutflowMetering.t.sol`, the SHE-209 binding suites, `TierRegistryClassCertification.t.sol`, the direct-protocol governor proposals (now admitted and metered), the fizz handler and the deploy tests.
-- [ ] 4.4 Mutation table: reset dropped; asset rule admits `transfer`; denylist misses the queue; `isAdapterAllowed` symbol gone (compile); `cloneAndInit` gate restored.
+- [x] 4.4 Mutation table: registration check dropped; codehash check dropped; `transferFrom` rule dropped; reset dropped; reset misses `increaseAllowance`; propose field check dropped.
 - [ ] 4.5 Full `forge test --no-match-path 'test/integration/**'`, `forge fmt`, `forge build` incl. integration, `openspec validate --all --strict`.

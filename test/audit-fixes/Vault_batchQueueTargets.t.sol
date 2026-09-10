@@ -13,6 +13,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockStrategy} from "../mocks/MockStrategy.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title Vault_batchQueueTargets
 /// @notice Issue #93 — a governor batch could reach the withdrawal queue's
@@ -24,7 +25,7 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 ///
 ///         Every test below was written against unpatched `main` and PASSED
 ///         there — the theft, the pre-brick and the deposit mint all worked.
-///         They now assert `DisallowedBatchTarget` instead, so each one is a
+///         They now assert `NotARegisteredStrategy` instead, so each one is a
 ///         live regression test for one reachable consequence rather than a
 ///         restatement of the same guard.
 ///
@@ -121,7 +122,7 @@ contract VaultBatchQueueTargetsTest is Test {
         uint256 shares = _victimEscrowsRedeem();
 
         vm.prank(MOCK_GOVERNOR);
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(queue)));
         vault.executeGovernorBatch(
             _batch(address(queue), abi.encodeCall(IVaultWithdrawalQueue.queueRedeem, (attacker, shares, 1))),
             new uint256[](0),
@@ -171,7 +172,7 @@ contract VaultBatchQueueTargetsTest is Test {
         }
 
         vm.prank(MOCK_GOVERNOR);
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(queue)));
         vault.executeGovernorBatch(calls, new uint256[](0), 1);
 
         // No slot was burned, so every one of those settlements still lands.
@@ -190,7 +191,7 @@ contract VaultBatchQueueTargetsTest is Test {
         _victimEscrowsRedeem();
 
         vm.prank(MOCK_GOVERNOR);
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(queue)));
         vault.executeGovernorBatch(
             _batch(address(queue), abi.encodeCall(IVaultWithdrawalQueue.queueDeposit, (attacker, DEPOSIT, 1))),
             new uint256[](0),
@@ -198,23 +199,6 @@ contract VaultBatchQueueTargetsTest is Test {
         );
 
         assertEq(queue.getRequestsByOwner(attacker).length, 0, "no unfunded deposit claim exists");
-    }
-
-    /// @notice THE VAULT ITSELF is the other privileged callee reachable this
-    ///         way — `msg.sender == vault` satisfies every `NotQueue`-style
-    ///         self-gate exactly as it satisfies `onlyVault`.
-    /// @dev    Asserted as a TARGET-CLASS property with a harmless view call
-    ///         rather than through one specific self-call, so the guard is
-    ///         pinned to reject the class and not merely today's worst
-    ///         instance.
-    function test_governorBatch_cannotTargetTheVaultItself() public {
-        _victimEscrowsRedeem();
-
-        vm.prank(MOCK_GOVERNOR);
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(vault)));
-        vault.executeGovernorBatch(
-            _batch(address(vault), abi.encodeCall(ISyndicateVault.reservedQueueAssets, ())), new uint256[](0), 1
-        );
     }
 
     /// @notice THE GATE DOES NOT INHERIT THE REGISTRY EXEMPTION. `_guardBatchCalls`
@@ -230,7 +214,7 @@ contract VaultBatchQueueTargetsTest is Test {
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("tierRegistry()"), abi.encode(address(0)));
 
         vm.prank(MOCK_GOVERNOR);
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(queue)));
         vault.executeGovernorBatch(
             _batch(address(queue), abi.encodeCall(IVaultWithdrawalQueue.stampSettlement, (2, 1, 1))),
             new uint256[](0),
@@ -250,7 +234,7 @@ contract VaultBatchQueueTargetsTest is Test {
         // No `tierRegistry()` mock at all: the staticcall fails, second return.
 
         vm.prank(MOCK_GOVERNOR);
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(queue)));
         vault.executeGovernorBatch(
             _batch(address(queue), abi.encodeCall(IVaultWithdrawalQueue.stampSettlement, (2, 1, 1))),
             new uint256[](0),
@@ -270,22 +254,8 @@ contract VaultBatchQueueTargetsTest is Test {
         );
     }
 
-    /// @notice ADAPTERS STAY REACHABLE — the regression that matters most.
-    ///         `BaseStrategy.execute` / `settle` are `onlyVault` too, so they
-    ///         are satisfied by the very same delegatecall credential that made
-    ///         the queue reachable. But they are the LEGITIMATE batch surface:
-    ///         a denylist that caught them would break every honest proposal,
-    ///         which is worse than the hole it closed.
-    ///
-    /// @dev    The guard compares `calls[i].target` against exactly two
-    ///         addresses and never inspects the callee's own access control, so
-    ///         adapters are structurally out of reach of it. This test asserts
-    ///         that rather than arguing it — an argument rots the moment someone
-    ///         widens the denylist, an assertion fails loudly.
-    ///
-    ///         Uses a real `BaseStrategy` subclass (cloned, since the
-    ///         constructor marks the template initialized), not a bare mock, so
-    ///         the production `onlyVault` bodies are the ones being reached.
+    /// @notice A registered strategy's `onlyVault` entrypoints (`execute`, `settle`) are reachable
+    ///         from a batch: the guard checks registration, never the callee's access control.
     function test_adapterOnlyVaultEntrypointsStayReachable() public {
         MockStrategy template = new MockStrategy();
         MockStrategy strategy = MockStrategy(Clones.clone(address(template)));
@@ -300,6 +270,12 @@ contract VaultBatchQueueTargetsTest is Test {
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(1)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(1)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("strategyOf(uint256)"), abi.encode(address(strategy)));
+        // A permissive registry/factory: the clone reads as registered.
+        vm.mockCall(
+            MOCK_GOVERNOR,
+            abi.encodeWithSignature("tierRegistry()"),
+            abi.encode(address(deployTierRegistry(address(this))))
+        );
 
         // execute() — onlyVault, named as a batch target, runs.
         vm.prank(MOCK_GOVERNOR);

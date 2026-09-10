@@ -13,7 +13,21 @@ import {ITierRegistry} from "../../src/interfaces/ITierRegistry.sol";
 ///         counterparty binding, demotion, tier resolution. Those
 ///         fixtures deploy a real `TierRegistry` and seed it; a permissive
 ///         stand-in would make them pass vacuously.
+/// @notice A StrategyFactory stand-in that holds every address as registered and no clone
+///         provenance, so governance harnesses admit any batch target.
+contract PermissiveStrategyFactory {
+    function cloneTemplate(address) external pure returns (address) {
+        return address(0);
+    }
+
+    function isRegisteredStrategy(address) external pure returns (bool) {
+        return true;
+    }
+}
+
 contract PermissiveTierRegistry is ITierRegistry {
+    address public immutable permissiveFactory = address(new PermissiveStrategyFactory());
+
     /// @dev Tier 2 / full notional — the conservative end of the tier scale, so
     ///      a harness never gets a cheaper coverage bill than the real registry
     ///      would hand it.
@@ -25,8 +39,8 @@ contract PermissiveTierRegistry is ITierRegistry {
         return true;
     }
 
-    function strategyFactory() external pure returns (address) {
-        return address(0);
+    function strategyFactory() external view returns (address) {
+        return permissiveFactory;
     }
 
     /// @dev SHE-209: no class concept in this stand-in — every address is a

@@ -1,5 +1,25 @@
 ## ADDED Requirements
 
+### Requirement: Permissionless strategy registration
+
+`StrategyFactory.registerStrategy(strategy)` SHALL be callable by any address with no fee. It SHALL revert `NotAStrategy(strategy)` when `strategy` has no code or when any of `IStrategy`'s `vault()`, `proposer()` and `executed()` does not answer exactly one word; otherwise it SHALL record `registeredStrategy[strategy] = true` and `registeredCodehash[strategy] = strategy.codehash` and emit `StrategyRegistered(strategy, codehash)`. `isRegisteredStrategy(strategy)` SHALL return true iff the strategy is recorded and its current codehash equals the recorded one. `cloneAndInit` and `cloneAndInitDeterministic` SHALL register the clone they mint. Registration SHALL NOT require `vault()` to equal any particular vault. Registration is a shape, not a certification: a registered strategy prices at tier 2 until certified through the existing certification paths.
+
+#### Scenario: Anyone registers a conformant strategy
+- **WHEN** an arbitrary address calls `registerStrategy` with a contract answering the three getters
+- **THEN** the call succeeds, `StrategyRegistered` is emitted and `isRegisteredStrategy` is true
+
+#### Scenario: Non-strategies cannot register
+- **WHEN** `registerStrategy` is called with the withdrawal queue, an ERC-20, the vault, an EOA or a contract with no functions
+- **THEN** the call reverts `NotAStrategy(strategy)`
+
+#### Scenario: A code change de-registers
+- **WHEN** a registered strategy's code changes
+- **THEN** `isRegisteredStrategy` is false until it is registered again (which requires the new code to conform)
+
+#### Scenario: Minted clones are registered
+- **WHEN** `cloneAndInit` or `cloneAndInitDeterministic` mints a clone
+- **THEN** `isRegisteredStrategy(clone)` is true and the template itself is not registered by that act
+
 ### Requirement: The counterparty allowlist is the only address axis
 The registry SHALL maintain exactly one owner-managed address allowlist, `setCounterpartyAllowed(counterparty, allowed)` (emitting `CounterpartyAllowedSet`; read via `isCounterpartyAllowed(counterparty)`), answering one question: may a certified strategy template bind this address as a venue — a lending market, a position manager, a swap adapter, a price feed, a collateral or volatile-leg token — inside the template's own reviewed code. It SHALL confer nothing to a governor batch: the vault's batch guard does not read it, and a proposal may call any address with or without an entry here. The grant SHALL snapshot the counterparty's effective codehash and `isCounterpartyAllowed` SHALL return true only while the live effective codehash equals the snapshot (the same lazy self-heal as `tierOf`); a re-grant re-attests the current code. There SHALL be no class fallback and no implication from any other standing.
 

@@ -21,7 +21,7 @@ import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {IProtocolConfig} from "../../src/interfaces/IProtocolConfig.sol";
 
 import {ProtocolHandler} from "./handlers/ProtocolHandler.sol";
-import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "../helpers/TierRegistryFixture.sol";
 
 /// @title ProtocolInvariantsTest
 /// @notice 7-invariant harness closing INV-2, INV-3, INV-9, INV-10, INV-30,
@@ -199,6 +199,10 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
         {
             vaultImpl = new SyndicateVault();
             SyndicateFactory facImpl = new SyndicateFactory();
+            TierRegistry tierReg = new TierRegistry(factoryOwner);
+            address permissiveFactory = address(new PermissiveStrategyFactory());
+            vm.prank(factoryOwner);
+            tierReg.setStrategyFactory(permissiveFactory);
             SyndicateFactory.InitParams memory fp = SyndicateFactory.InitParams({
                 owner: factoryOwner,
                 executorImpl: address(0x1), // stateless lib; not invoked in this harness
@@ -210,7 +214,7 @@ contract ProtocolInvariantsTest is StdInvariant, Test {
                 managementFeeBps: 200,
                 guardianRegistry: address(registry),
                 // Mandatory since pashov finding #1.
-                tierRegistry: address(new TierRegistry(factoryOwner))
+                tierRegistry: address(tierReg)
             });
             factory = SyndicateFactory(
                 address(new ERC1967Proxy(address(facImpl), abi.encodeCall(SyndicateFactory.initialize, (fp))))

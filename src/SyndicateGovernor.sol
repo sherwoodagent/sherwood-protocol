@@ -9,7 +9,7 @@ import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
 import {IExposureLedger} from "./interfaces/IExposureLedger.sol";
 import {IChallengeGame} from "./interfaces/IChallengeGame.sol";
 import {IProposerBondEscrow} from "./interfaces/IProposerBondEscrow.sol";
-import {IStrategy} from "./interfaces/IStrategy.sol";
+import {IStrategyFactory} from "./interfaces/IStrategyFactory.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
@@ -334,17 +334,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_openProposalCount != 0) revert VaultHasOpenProposal();
         // Cancel stamps the deadline too, so cancel+propose cycling cannot keep redemptions locked.
         if (block.timestamp < _cooldownEndsAt) revert CooldownNotElapsed();
-        if (strategy != address(0) && strategy.code.length != 0) {
-            (bool okP, bytes memory pRet) = strategy.staticcall(abi.encodeCall(IStrategy.proposer, ()));
-            address declaredProposer = (okP && pRet.length == 32) ? abi.decode(pRet, (address)) : address(0);
-            if (declaredProposer != address(0)) {
-                if (declaredProposer != msg.sender) revert StrategyProposerMismatch();
-                (bool okV, bytes memory vRet) = strategy.staticcall(abi.encodeCall(IStrategy.vault, ()));
-                if (okV && vRet.length == 32 && abi.decode(vRet, (address)) != vault) {
-                    revert StrategyVaultMismatch();
-                }
-            }
-        }
+        if (!_isRegisteredStrategy(strategy)) revert StrategyNotRegistered(strategy);
         if (strategyDuration > _params.maxStrategyDuration) revert StrategyDurationTooLong();
         if (strategyDuration < _params.minStrategyDuration) revert StrategyDurationTooShort();
         if (executeCalls.length == 0) revert EmptyExecuteCalls();
@@ -357,10 +347,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (executeCalls.length > MAX_CALLS_PER_PROPOSAL || settlementCalls.length > MAX_CALLS_PER_PROPOSAL) {
             revert TooManyCalls();
         }
-        // Reject any call in either array whose target the vault's
-        // bounded by the TooManyCalls cap above, before any state write or
-        // state-changing external call (lockBond).
-        _rejectPrivilegedTargets(vault, executeCalls, settlementCalls);
+        // Refuse an unregistered target before the leg is stored: settle
+        // would revert on it forever and wedge the proposal in Executed.
+        _rejectUnregisteredTargets(vault, executeCalls, settlementCalls);
         // Caps metadata URI length.
         if (bytes(metadataURI).length > MAX_METADATA_URI_LENGTH) revert MetadataURITooLong();
         // Risk envelope: nonzero outflow ceiling, clamped to the maxCapitalBps
@@ -1091,35 +1080,30 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (maxCapital > _capitalCeiling()) revert MaxCapitalExceedsCeiling();
     }
 
-    function _rejectPrivilegedTargets(
+    /// @dev Propose-time mirror of the vault guard's target rule.
+    function _rejectUnregisteredTargets(
         address vault_,
         BatchExecutorLib.Call[] calldata executeCalls_,
         BatchExecutorLib.Call[] calldata settlementCalls_
     ) private view {
-        // Capability probe: address(0) is never a privileged target, so this
-        // call's SUCCESS (not its result) is what gates the loop below.
-        (bool ok, bytes memory ret) =
-            vault_.staticcall(abi.encodeCall(ISyndicateVault.isPrivilegedBatchTarget, (address(0))));
-        if (!ok || ret.length != 32) return;
-
+        address asset_ = IERC4626(vault_).asset();
         for (uint256 i = 0; i < executeCalls_.length; i++) {
-            _revertIfPrivilegedTarget(vault_, executeCalls_[i].target);
+            address t = executeCalls_[i].target;
+            if (t != asset_ && !_isRegisteredStrategy(t)) revert ISyndicateVault.NotARegisteredStrategy(t);
         }
         for (uint256 i = 0; i < settlementCalls_.length; i++) {
-            _revertIfPrivilegedTarget(vault_, settlementCalls_[i].target);
+            address t = settlementCalls_[i].target;
+            if (t != asset_ && !_isRegisteredStrategy(t)) revert ISyndicateVault.NotARegisteredStrategy(t);
         }
     }
 
-    /// @dev staticcall (not a typed call) so a vault that stops answering
-    ///      mid-loop (it cannot: the probe above already proved it exists,
-    ///      and this is a `view` in the same tx) still degrades open rather
-    ///      than reverting propose for an unrelated reason.
-    function _revertIfPrivilegedTarget(address vault_, address target) private view {
+    /// @dev Fail-closed: an unwired or mis-pointed factory registers nothing.
+    function _isRegisteredStrategy(address strategy) private view returns (bool) {
+        address factory_ = ITierRegistry(_tierRegistry).strategyFactory();
+        if (factory_ == address(0)) return false;
         (bool ok, bytes memory ret) =
-            vault_.staticcall(abi.encodeCall(ISyndicateVault.isPrivilegedBatchTarget, (target)));
-        if (ok && ret.length == 32 && abi.decode(ret, (bool))) {
-            revert ISyndicateVault.DisallowedBatchTarget(target);
-        }
+            factory_.staticcall(abi.encodeCall(IStrategyFactory.isRegisteredStrategy, (strategy)));
+        return ok && ret.length == 32 && abi.decode(ret, (bool));
     }
 
     function _validateAndStoreBatch(

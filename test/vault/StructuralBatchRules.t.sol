@@ -11,6 +11,7 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
 import {VaultWithdrawalQueue} from "../../src/queue/VaultWithdrawalQueue.sol";
+import {IVaultWithdrawalQueue} from "../../src/interfaces/IVaultWithdrawalQueue.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
 import {StrategyFactory} from "../../src/StrategyFactory.sol";
@@ -32,19 +33,45 @@ import {MockUniswapV3Pool} from "../mocks/MockUniswapV3Pool.sol";
 import {MockUniswapV3Factory} from "../mocks/MockUniswapV3Factory.sol";
 import {MockPositionManager} from "../mocks/MockPositionManager.sol";
 
-/// @notice An arbitrary contract nobody certified or allowlisted. `frobnicate` is
-///         a selector no registry names; it pulls `amount` of `token` from the caller.
-contract RandomVenue {
+/// @notice A hand-written strategy nobody certified: it answers `IStrategy`'s three getters,
+///         pulls `amount` of `token` on `frobnicate` (a selector no registry names) and
+///         accepts any other selector.
+contract CustomStrategy {
+    address public immutable vault;
+    address public immutable proposer;
+
+    constructor(address vault_, address proposer_) {
+        vault = vault_;
+        proposer = proposer_;
+    }
+
+    function executed() external pure returns (bool) {
+        return false;
+    }
+
     function frobnicate(address token, uint256 amount) external {
         IERC20(token).transferFrom(msg.sender, address(this), amount);
     }
+
+    fallback() external {}
 }
 
-/// @notice A contract with code and no functions; stands in for a protocol collaborator
-///         whose getters are mocked.
+/// @notice A contract with code and no functions.
 contract Stub {}
 
-/// @notice The vault's batch guard is four structural rules and nothing else.
+/// @notice A plain ERC-20 that also carries the pre-OZ-5 `increaseAllowance`.
+contract UsdcMock is ERC20Mock {
+    constructor() ERC20Mock("USD Coin", "USDC", 6) {}
+
+    function increaseAllowance(address spender, uint256 added) external returns (bool) {
+        _approve(msg.sender, spender, allowance(msg.sender, spender) + added);
+        return true;
+    }
+}
+
+/// @notice The vault's batch guard is four structural rules and nothing else: every non-asset
+///         target is a registered strategy, `transferFrom` on the asset draws from the vault,
+///         no allowance outlives the batch, the meters bound the rest.
 contract StructuralBatchRulesTest is Test {
     SyndicateGovernor governor;
     SyndicateVault vault;
@@ -55,9 +82,6 @@ contract StructuralBatchRulesTest is Test {
     MockRegistryMinimal guardianRegistry;
     TierRegistry tierRegistry;
     StrategyFactory strategyFactory;
-    Stub ledgerStub;
-    Stub gameStub;
-    Stub swoodStub;
 
     address owner = makeAddr("owner");
     address agent = makeAddr("agent");
@@ -69,7 +93,7 @@ contract StructuralBatchRulesTest is Test {
     uint256 constant CLASS_BOUND = 500;
 
     function setUp() public {
-        usdc = new ERC20Mock("USD Coin", "USDC", 6);
+        usdc = new UsdcMock();
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
         guardianRegistry = new MockRegistryMinimal();
@@ -123,15 +147,6 @@ contract StructuralBatchRulesTest is Test {
         strategyFactory = new StrategyFactory(address(this), address(this));
         tierRegistry.setStrategyFactory(address(strategyFactory));
 
-        // The ledger, game and sWOOD hops the governor cannot name here are mocked
-        // onto contracts with code, so the privileged set resolves all ten entries.
-        ledgerStub = new Stub();
-        gameStub = new Stub();
-        swoodStub = new Stub();
-        vm.mockCall(address(governor), abi.encodeCall(ISyndicateGovernor.exposureLedger, ()), abi.encode(ledgerStub));
-        vm.mockCall(address(ledgerStub), abi.encodeWithSignature("coverageFreezer()"), abi.encode(gameStub));
-        vm.mockCall(address(guardianRegistry), abi.encodeWithSignature("swood()"), abi.encode(swoodStub));
-
         uint256 agentId = agentRegistry.mint(agent);
         vm.prank(owner);
         vault.registerAgent(agentId, agent);
@@ -160,12 +175,24 @@ contract StructuralBatchRulesTest is Test {
         vault.executeGovernorBatch(calls, new uint256[](0), maxNetOutflow);
     }
 
-    function _expectAssetRefused(bytes memory data) internal {
-        bytes4 sel = data.length >= 4 ? bytes4(data) : bytes4(0);
-        BatchExecutorLib.Call[] memory calls = _one(address(usdc), data);
+    function _expectBatchRevert(BatchExecutorLib.Call[] memory calls, uint256 maxNetOutflow, bytes memory err)
+        internal
+    {
         vm.prank(address(governor));
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedAssetSelector.selector, sel));
-        vault.executeGovernorBatch(calls, new uint256[](0), 0);
+        vm.expectRevert(err);
+        vault.executeGovernorBatch(calls, new uint256[](0), maxNetOutflow);
+    }
+
+    /// @dev A registered, uncertified hand-written strategy.
+    function _custom() internal returns (CustomStrategy c) {
+        c = new CustomStrategy(address(vault), agent);
+        strategyFactory.registerStrategy(address(c));
+    }
+
+    function _expectTransferFromRefused(bytes memory data, address from) internal {
+        _expectBatchRevert(
+            _one(address(usdc), data), 0, abi.encodeWithSelector(ISyndicateVault.TransferFromNotVault.selector, from)
+        );
     }
 
     function _propose(
@@ -360,83 +387,222 @@ contract StructuralBatchRulesTest is Test {
         vm.warp(vm.getBlockTimestamp() + 1 days + 1);
     }
 
-    // ── Rule 1: privileged targets ──
+    // ── Rule 1: every non-asset target is a registered strategy ──
 
-    /// @notice Every protocol contract the vault can resolve is refused as a target, whatever the calldata.
-    function test_batchTargetingAPrivilegedContractReverts() public {
-        address[10] memory privileged = [
-            address(vault),
+    /// @notice Morpho directly, the queue, the governor, the vault, the registry, a stub: none registered.
+    function test_batchTargetingAnUnregisteredContractReverts() public {
+        _morphoVenue();
+        address[6] memory targets = [
+            address(morpho),
             address(queue),
             address(governor),
+            address(vault),
             address(tierRegistry),
-            address(strategyFactory),
-            address(this),
-            address(ledgerStub),
-            address(gameStub),
-            address(guardianRegistry),
-            address(swoodStub)
+            address(new Stub())
         ];
-        for (uint256 i = 0; i < privileged.length; i++) {
-            assertTrue(vault.isPrivilegedBatchTarget(privileged[i]), "privileged view");
-            BatchExecutorLib.Call[] memory calls = _one(privileged[i], hex"deadbeef");
-            vm.prank(address(governor));
-            vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, privileged[i]));
-            vault.executeGovernorBatch(calls, new uint256[](0), 0);
+        for (uint256 i = 0; i < targets.length; i++) {
+            assertFalse(strategyFactory.isRegisteredStrategy(targets[i]), "not registered");
+            bytes memory err = abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, targets[i]);
+            _expectBatchRevert(_one(targets[i], hex"deadbeef"), 0, err);
         }
-        assertFalse(vault.isPrivilegedBatchTarget(address(new RandomVenue())), "an ordinary contract is not");
-        assertFalse(vault.isPrivilegedBatchTarget(address(0)), "the governor's probe address is not");
-    }
-
-    // ── Rule 2: asset is approve-only ──
-
-    function test_assetTransferFromLpReverts() public {
-        _expectAssetRefused(abi.encodeCall(usdc.transferFrom, (lp1, address(vault), 1)));
-        _expectAssetRefused(abi.encodeCall(usdc.transferFrom, (address(vault), attacker, 1)));
-    }
-
-    function test_assetTransferReverts() public {
-        _expectAssetRefused(abi.encodeCall(usdc.transfer, (attacker, 1)));
-    }
-
-    function test_assetPermitReverts() public {
-        _expectAssetRefused(
-            abi.encodeWithSignature(
-                "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)",
-                address(vault),
-                attacker,
-                type(uint256).max,
-                type(uint256).max,
-                uint8(27),
-                bytes32(0),
-                bytes32(0)
-            )
+        _expectBatchRevert(
+            _one(address(queue), abi.encodeCall(IVaultWithdrawalQueue.queueRedeem, (attacker, 1e6, 1))),
+            0,
+            abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(queue))
+        );
+        _expectBatchRevert(
+            _one(address(vault), abi.encodeCall(ISyndicateVault.ratchetHighWaterMark, ())),
+            0,
+            abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(vault))
         );
     }
 
-    function test_assetIncreaseAllowanceReverts() public {
-        _expectAssetRefused(abi.encodeWithSignature("increaseAllowance(address,uint256)", attacker, 1));
-        _expectAssetRefused(abi.encodeWithSignature("transferAndCall(address,uint256)", attacker, 1));
-        _expectAssetRefused(abi.encodeWithSignature("authorizeOperator(address)", attacker));
-        _expectAssetRefused("");
-        _expectAssetRefused(abi.encodePacked(usdc.approve.selector, bytes32(uint256(uint160(attacker)))));
+    function test_batchTargetingARegisteredStrategyWithAnySelectorIsAdmitted() public {
+        CustomStrategy c = _custom();
+        uint256 amount = 1_000e6;
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](3);
+        calls[0] = _call(address(usdc), abi.encodeCall(usdc.approve, (address(c), amount)));
+        calls[1] = _call(address(c), abi.encodeCall(CustomStrategy.frobnicate, (address(usdc), amount)));
+        calls[2] = _call(address(c), hex"deadbeef");
+        _runBatch(calls, amount);
+        assertEq(usdc.balanceOf(address(c)), amount, "admitted and executed");
     }
 
-    /// @notice Control for the rule above: a well-formed `approve` on the asset is admitted.
-    function test_assetApproveIsAdmitted() public {
+    /// @notice Registration is a shape check, so the protocol contracts and an EOA cannot register.
+    function test_registerStrategy_rejectsAContractWithoutTheInterface() public {
+        address[5] memory rejected = [address(queue), address(usdc), address(vault), attacker, address(new Stub())];
+        for (uint256 i = 0; i < rejected.length; i++) {
+            vm.expectRevert(abi.encodeWithSelector(StrategyFactory.NotAStrategy.selector, rejected[i]));
+            strategyFactory.registerStrategy(rejected[i]);
+        }
+    }
+
+    function test_registeredStrategyDeregistersOnCodeChange() public {
+        CustomStrategy c = _custom();
+        assertTrue(strategyFactory.isRegisteredStrategy(address(c)), "registered");
+        vm.etch(address(c), address(new Stub()).code);
+        assertFalse(strategyFactory.isRegisteredStrategy(address(c)), "code changed");
+        _expectBatchRevert(
+            _one(address(c), hex"deadbeef"),
+            0,
+            abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(c))
+        );
+    }
+
+    /// @notice A registry with no factory wired registers nothing; the asset rules still run.
+    function test_unwiredStrategyFactoryRefusesEveryNonAssetTarget() public {
+        CustomStrategy c = _custom();
+        vm.mockCall(address(tierRegistry), abi.encodeWithSignature("strategyFactory()"), abi.encode(address(0)));
+        _expectBatchRevert(
+            _one(address(c), abi.encodeCall(CustomStrategy.frobnicate, (address(usdc), 0))),
+            0,
+            abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(c))
+        );
         _runBatch(_one(address(usdc), abi.encodeCall(usdc.approve, (attacker, 1))), 0);
+    }
+
+    function test_factoryWithoutTheSelectorFailsClosed() public {
+        CustomStrategy c = _custom();
+        vm.mockCallRevert(
+            address(strategyFactory), abi.encodeWithSelector(StrategyFactory.isRegisteredStrategy.selector), ""
+        );
+        _expectBatchRevert(
+            _one(address(c), hex"deadbeef"),
+            0,
+            abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(c))
+        );
+    }
+
+    /// @notice The `strategy` field names a registered strategy, nothing else: not zero, not an
+    ///         EOA, not an unregistered contract.
+    function test_proposeRequiresARegisteredStrategyField() public {
+        CustomStrategy c = new CustomStrategy(address(vault), agent);
+        BatchExecutorLib.Call[] memory calls = _one(address(usdc), abi.encodeCall(usdc.approve, (attacker, 0)));
+        uint256[] memory caps = new uint256[](1);
+        address[3] memory rejected = [address(0), attacker, address(c)];
+        for (uint256 i = 0; i < rejected.length; i++) {
+            vm.prank(agent);
+            vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.StrategyNotRegistered.selector, rejected[i]));
+            governor.propose(
+                address(vault),
+                rejected[i],
+                "ipfs://structural",
+                7 days,
+                ISyndicateGovernor.RiskEnvelope({maxCapital: 1, maxDrawdownBps: 10_000}),
+                calls,
+                caps,
+                calls,
+                caps,
+                new ISyndicateGovernor.CoProposer[](0)
+            );
+        }
+        strategyFactory.registerStrategy(address(c));
+        uint256 pid = _propose(address(c), calls, caps, calls, caps, 1);
+        assertEq(governor.getProposal(pid).strategy, address(c), "stored verbatim");
+    }
+
+    // ── Rule 2: transferFrom on the asset must draw from the vault ──
+
+    /// @notice The LP's standing deposit allowance is the one asset flow the meter cannot see.
+    function test_assetTransferFromLpReverts() public {
+        _expectTransferFromRefused(abi.encodeCall(usdc.transferFrom, (lp1, attacker, 1)), lp1);
+        _expectTransferFromRefused(abi.encodeCall(usdc.transferFrom, (lp1, address(vault), 1)), lp1);
+        _expectTransferFromRefused(abi.encodePacked(usdc.transferFrom.selector), address(0));
+        _expectTransferFromRefused(
+            abi.encodePacked(usdc.transferFrom.selector, bytes32(uint256(uint160(address(vault))) | (1 << 160))),
+            address(vault)
+        );
+        assertEq(usdc.allowance(lp1, address(vault)), type(uint256).max, "the LP allowance is untouched");
+    }
+
+    function test_assetTransferFromVaultItselfIsAdmittedAndMetered() public {
+        uint256 amount = 1_000e6;
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
+        calls[0] = _call(address(usdc), abi.encodeCall(usdc.approve, (address(vault), amount)));
+        calls[1] = _call(address(usdc), abi.encodeCall(usdc.transferFrom, (address(vault), attacker, amount)));
+        _expectBatchRevert(
+            calls,
+            amount - 1,
+            abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, amount, amount - 1)
+        );
+        _runBatch(calls, amount);
+        assertEq(usdc.balanceOf(attacker), amount, "admitted within the cap");
+        assertEq(usdc.allowance(address(vault), address(vault)), 0, "self-allowance reset");
+    }
+
+    function test_assetTransferIsAdmittedAndMetered() public {
+        uint256 amount = 1_000e6;
+        BatchExecutorLib.Call[] memory calls = _one(address(usdc), abi.encodeCall(usdc.transfer, (attacker, amount)));
+        _expectBatchRevert(
+            calls,
+            amount - 1,
+            abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, amount, amount - 1)
+        );
+        _runBatch(calls, amount);
+        assertEq(usdc.balanceOf(attacker), amount, "admitted within the cap");
+    }
+
+    /// @notice Reads and well-formed grants on the asset are admitted.
+    function test_assetReadsAndApproveAreAdmitted() public {
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](4);
+        calls[0] = _call(address(usdc), abi.encodeCall(usdc.balanceOf, (address(vault))));
+        calls[1] = _call(address(usdc), abi.encodeCall(usdc.allowance, (lp1, address(vault))));
+        calls[2] = _call(address(usdc), abi.encodeCall(usdc.approve, (attacker, 1)));
+        calls[3] = _call(address(usdc), abi.encodeWithSignature("increaseAllowance(address,uint256)", attacker, 1));
+        _runBatch(calls, 0);
+    }
+
+    /// @notice Selectors the guard does not name reach the token, which answers for itself:
+    ///         an empty revert (no such function) rather than any guard error.
+    function test_unrecognisedAssetSelectorsReachTheToken() public {
+        bytes[] memory shapes = new bytes[](5);
+        shapes[0] = abi.encodeWithSignature(
+            "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)",
+            address(vault),
+            attacker,
+            type(uint256).max,
+            type(uint256).max,
+            uint8(27),
+            bytes32(0),
+            bytes32(0)
+        );
+        shapes[1] = abi.encodeWithSignature("transferAndCall(address,uint256)", attacker, 1);
+        shapes[2] = abi.encodeWithSignature("authorizeOperator(address)", attacker);
+        shapes[3] = "";
+        shapes[4] = abi.encodePacked(usdc.approve.selector, bytes32(uint256(uint160(attacker))));
+        for (uint256 i = 0; i < shapes.length; i++) {
+            (bool ok, bytes memory ret) = address(usdc).call(shapes[i]);
+            assertTrue(!ok && ret.length == 0, "control: the token itself reverts empty");
+            _expectBatchRevert(_one(address(usdc), shapes[i]), 0, "");
+        }
     }
 
     // ── Rule 3: no standing allowance ──
 
     function test_allowanceToEverySpenderIsZeroAfterTheBatch() public {
-        RandomVenue puller = new RandomVenue();
-        RandomVenue idle = new RandomVenue();
+        CustomStrategy puller = _custom();
+        CustomStrategy idle = _custom();
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](3);
         calls[0] = _call(address(usdc), abi.encodeCall(usdc.approve, (address(puller), 100e6)));
-        calls[1] = _call(address(puller), abi.encodeCall(RandomVenue.frobnicate, (address(usdc), 100e6)));
+        calls[1] = _call(address(puller), abi.encodeCall(CustomStrategy.frobnicate, (address(usdc), 100e6)));
         calls[2] = _call(address(usdc), abi.encodeCall(usdc.approve, (address(idle), 100e6)));
         _runBatch(calls, 100e6);
         assertEq(usdc.balanceOf(address(puller)), 100e6, "the puller pulled inside the batch");
+        assertEq(usdc.allowance(address(vault), address(puller)), 0, "pulled spender reset");
+        assertEq(usdc.allowance(address(vault), address(idle)), 0, "idle spender reset");
+    }
+
+    function test_increaseAllowanceIsResetAfterTheBatch() public {
+        CustomStrategy puller = _custom();
+        CustomStrategy idle = _custom();
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](3);
+        calls[0] =
+            _call(address(usdc), abi.encodeWithSignature("increaseAllowance(address,uint256)", address(puller), 100e6));
+        calls[1] = _call(address(puller), abi.encodeCall(CustomStrategy.frobnicate, (address(usdc), 100e6)));
+        calls[2] =
+            _call(address(usdc), abi.encodeWithSignature("increaseAllowance(address,uint256)", address(idle), 100e6));
+        _runBatch(calls, 100e6);
+        assertEq(usdc.balanceOf(address(puller)), 100e6, "the allowance was live inside the batch");
         assertEq(usdc.allowance(address(vault), address(puller)), 0, "pulled spender reset");
         assertEq(usdc.allowance(address(vault), address(idle)), 0, "idle spender reset");
     }
@@ -452,11 +618,11 @@ contract StructuralBatchRulesTest is Test {
     // ── Rule 4: everything else is admitted and metered ──
 
     function test_arbitraryContractWithArbitrarySelectorIsAdmittedAndMetered() public {
-        RandomVenue venue = new RandomVenue();
+        CustomStrategy venue = _custom();
         uint256 amount = 1_000e6;
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
         calls[0] = _call(address(usdc), abi.encodeCall(usdc.approve, (address(venue), amount)));
-        calls[1] = _call(address(venue), abi.encodeCall(RandomVenue.frobnicate, (address(usdc), amount)));
+        calls[1] = _call(address(venue), abi.encodeCall(CustomStrategy.frobnicate, (address(usdc), amount)));
 
         vm.prank(address(governor));
         vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, amount, amount - 1));
@@ -469,18 +635,18 @@ contract StructuralBatchRulesTest is Test {
     // ── Pricing through the real governor and registry ──
 
     function test_uncertifiedStrategyPricesTierTwoFullCoverage() public {
-        RandomVenue venue = new RandomVenue();
+        CustomStrategy venue = _custom();
         uint256 cap = 1_000_000e6;
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
         execCalls[0] = _call(address(usdc), abi.encodeCall(usdc.approve, (address(venue), cap)));
-        execCalls[1] = _call(address(venue), abi.encodeCall(RandomVenue.frobnicate, (address(usdc), cap)));
+        execCalls[1] = _call(address(venue), abi.encodeCall(CustomStrategy.frobnicate, (address(usdc), cap)));
         uint256[] memory execCaps = new uint256[](2);
         execCaps[1] = cap;
         uint256 pid = _propose(
             address(venue),
             execCalls,
             execCaps,
-            _one(address(venue), abi.encodeCall(RandomVenue.frobnicate, (address(usdc), 0))),
+            _one(address(venue), abi.encodeCall(CustomStrategy.frobnicate, (address(usdc), 0))),
             new uint256[](1),
             cap
         );
@@ -514,13 +680,13 @@ contract StructuralBatchRulesTest is Test {
         uint256 c1 = 4_000_000e6;
         uint256 c2 = 1_000_000e6;
         address clone = _morphoClone(address(template), agent, c1);
-        RandomVenue custom = new RandomVenue();
+        CustomStrategy custom = _custom();
 
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](4);
         execCalls[0] = _call(address(usdc), abi.encodeCall(usdc.approve, (clone, c1)));
         execCalls[1] = _call(clone, abi.encodeCall(BaseStrategy.execute, ()));
         execCalls[2] = _call(address(usdc), abi.encodeCall(usdc.approve, (address(custom), c2)));
-        execCalls[3] = _call(address(custom), abi.encodeCall(RandomVenue.frobnicate, (address(usdc), c2)));
+        execCalls[3] = _call(address(custom), abi.encodeCall(CustomStrategy.frobnicate, (address(usdc), c2)));
         uint256[] memory execCaps = new uint256[](4);
         execCaps[1] = c1;
         execCaps[3] = c2;
