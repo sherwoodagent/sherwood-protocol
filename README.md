@@ -58,7 +58,7 @@ Lane B only, and no current template overrides it).
 | Template | Venue |
 |----------|-------|
 | `BaseStrategy.sol` | Abstract base (custody, state machine, proposer-tunable params) |
-| `PortfolioStrategy.sol` | Weighted basket of tokens (e.g. tokenized stocks on Robinhood Chain) — buys to target weights on execute, sells out on settle, rebalanceable by the proposer (sell-all/re-buy or delta-based off Chainlink Data Streams) |
+| `PortfolioStrategy.sol` | Weighted basket of tokens (e.g. tokenized stocks on Robinhood Chain) — buys to target weights on execute, sells out on settle, drift-only `rebalanceDelta()` off the aggregators bound at init |
 
 ### Swap adapters (`src/adapters/`)
 

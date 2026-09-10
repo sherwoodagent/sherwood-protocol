@@ -1078,10 +1078,9 @@ contract TierRegistry is Ownable2Step {
     // rather than derived. Without it the token list is an unbound init
     // parameter, which disqualifies a template from class certification.
 
-    /// @dev token => price source => attested. `bytes32` so one mapping serves
-    ///      both modes: a push aggregator address widened, or a Data Streams
-    ///      feed id verbatim. Callers MUST strip packed metadata (e.g. max-age)
-    ///      before lookup, so one attestation covers every staleness variant.
+    /// @dev token => price source (aggregator address widened to bytes32) => attested.
+    ///      Callers MUST strip packed metadata (e.g. max-age) before lookup, so one
+    ///      attestation covers every staleness variant.
     mapping(address token => mapping(bytes32 priceSource => bool)) private _tokenPriceSource;
 
     event PriceSourceForTokenSet(address indexed token, bytes32 indexed priceSource, bool allowed);
