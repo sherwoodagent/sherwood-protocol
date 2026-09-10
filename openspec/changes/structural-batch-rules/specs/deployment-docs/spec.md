@@ -1,3 +1,16 @@
+## ADDED Requirements
+
+### Requirement: The StrategyFactory phase wires the registry before handoff
+`DeployStrategyFactory` SHALL require `TIER_REGISTRY` in the address book and `TierRegistry.owner() == deployer`, SHALL call `setStrategyFactory(<minted factory>)` inside its broadcast, and SHALL assert `strategyFactory()` reads back the minted factory. There SHALL be no deferred or escape-hatch path: an unwired registry makes every `propose` revert `StrategyNotRegistered` and every non-asset batch target refused, so the phase runs BEFORE the multisig accepts TierRegistry ownership. A TierRegistry redeploy runbook SHALL list `setStrategyFactory(STRATEGY_FACTORY)` alongside the certification set.
+
+#### Scenario: The ceremony leaves the registry wired
+- **WHEN** `DeployStrategyFactory` completes against a registry the deployer still owns
+- **THEN** `tierRegistry.strategyFactory()` equals the minted factory and a `propose` naming a strategy registered on it succeeds
+
+#### Scenario: The ceremony refuses a handed-off registry
+- **WHEN** the multisig has already accepted TierRegistry ownership
+- **THEN** the phase reverts naming the wiring, deploying nothing
+
 ## MODIFIED Requirements
 
 ### Requirement: The Robinhood ceremony seats every owner-gated write before handoff

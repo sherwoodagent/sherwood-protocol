@@ -34,3 +34,37 @@
 #### Scenario: Unregistered batch target refused at propose
 - **WHEN** any call in `executeCalls` or `settlementCalls` names the vault, the queue, the governor or any unregistered contract
 - **THEN** `propose` reverts `NotARegisteredStrategy(target)` and nothing is stored
+
+### Requirement: Settlement and P&L
+`settleProposal` SHALL be callable on an `Executed` proposal by anyone after `executedAt + strategyDuration`, and by the proposer after only `executedAt + 1 hours` (the minimum self-settle delay that prevents a single-block execute-and-skim). Settlement SHALL run the pre-committed settlement calls via `executeGovernorBatch` with a net-outflow budget of ZERO: the settle batch may bring assets home (net inflow or zero) and SHALL revert `MaxNetOutflowExceeded(netOutflow, 0)` on any net asset egress, so the proposal's `effectiveMaxCapital` bounds the whole lifecycle's egress rather than each leg. Per-call settlement caps still meter the gross a settlement call may move. Then finalize: P&L SHALL be computed as the vault's asset-balance delta versus the capital snapshot minus the vault's interim LP net flow (deposits/withdrawals during the strategy are principal, not performance); state SHALL move to `Settled`, the active-proposal marker cleared, and the open count decremented before external fee transfers; the vault SHALL be notified via `onProposalSettled` after fees so queued flows settle against post-fee NAV.
+
+#### Scenario: Non-proposer must wait full duration
+- **WHEN** a caller other than the proposer calls `settleProposal` before `executedAt + strategyDuration`
+- **THEN** the call SHALL revert with `StrategyDurationNotElapsed`
+
+#### Scenario: Proposer early settle
+- **WHEN** the proposer calls `settleProposal` at least 1 hour after execution but before `strategyDuration` elapses
+- **THEN** settlement SHALL proceed
+
+#### Scenario: A settle batch cannot move assets out
+- **WHEN** the settlement calls approve a registered strategy and it pulls one unit of the asset from the vault
+- **THEN** `settleProposal` reverts `MaxNetOutflowExceeded(1, 0)` and the proposal stays `Executed`
+
+#### Scenario: A settle batch that brings assets home succeeds
+- **WHEN** the settlement calls make the strategy return what the execute batch deployed
+- **THEN** `settleProposal` succeeds and the vault's balance is back to its pre-execute level
+
+### Requirement: Emergency settlement paths
+For a proposal stuck in `Executed` past `executedAt + strategyDuration`, the vault owner SHALL have two escape hatches. (1) `unstick`: run the governance-approved pre-committed settlement calls (no guardian review required, no owner stake required — the calls were already voted on) under the same zero net-outflow budget as `settleProposal`, then finalize settlement. (2) Owner-supplied calls: `emergencySettleWithCalls` SHALL require the owner's bonded stake in the guardian registry to meet the required owner bond, and SHALL open a guardian review on the registry keyed by the hash of the supplied calls; `cancelEmergencySettle` withdraws an open review; `finalizeEmergencySettle` SHALL, after the registry review resolves, revert with `EmergencySettleBlocked` if guardians blocked it, otherwise execute the registry-stored calls under the proposal's `effectiveMaxCapital` net-outflow budget — the one settle path with egress, because an owner unwind may need to fund a repay from the vault to free stuck collateral, and it is guardian-reviewed and owner-bonded for that — and finalize settlement. All emergency entrypoints SHALL require the caller to be the vault owner, the proposal to be in `Executed` state, and SHALL share the governor's reentrancy lock.
+
+#### Scenario: Unstick before duration elapses is rejected
+- **WHEN** the vault owner calls `unstick` or `emergencySettleWithCalls` before `executedAt + strategyDuration`
+- **THEN** the call SHALL revert with `StrategyDurationNotElapsed`
+
+#### Scenario: Guardians block owner-supplied emergency calls
+- **WHEN** the guardian review of an emergency settle reaches block quorum
+- **THEN** `finalizeEmergencySettle` SHALL revert with `EmergencySettleBlocked` and the owner-supplied calls SHALL never execute
+
+#### Scenario: Unstick replays the settle batch with zero egress
+- **WHEN** the pre-committed settlement calls would move assets out of the vault, at any coverage level
+- **THEN** `unstick` reverts `MaxNetOutflowExceeded(netOutflow, 0)` exactly as `settleProposal` does

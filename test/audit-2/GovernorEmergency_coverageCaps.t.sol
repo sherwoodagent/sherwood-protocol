@@ -308,21 +308,12 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
         );
     }
 
-    /// @notice Liveness check (failure-mode guardrail): when coverage is
-    ///         FULL, `effectiveMaxCapital == maxCapital` and the scaled caps
-    ///         equal the raw declared caps -- `unstick` must still succeed
-    ///         and actually move the funds. Proves the fix does not brick
-    ///         the honest, fully-covered rescue path it was never meant to
-    ///         touch.
-    function test_unstick_fullCoverage_stillDrainsToSink() public {
+    /// @notice At FULL coverage the per-call caps clear, and what stops the drain is the settle
+    ///         batch's zero net-egress budget: `settleProposal` and `unstick` both revert
+    ///         `MaxNetOutflowExceeded(MAX_CAPITAL, 0)`. Only the execute leg spends capital.
+    function test_unstick_fullCoverage_settleLegHasZeroEgressBudget() public {
         uint256 pid = _proposeWithDrainSettleLeg();
 
-        // This proposal's settle leg really DRAINS, so it declares a full
-        // `MAX_CAPITAL` cap on both legs and `requiredCoverage` sums to
-        // 2 x MAX_CAPITAL == $2,000. (It used to read $1,000: the harness
-        // governor was registry-less, and the flat tier-2 default prices the
-        // envelope once. The registry is mandatory at init since pashov
-        // finding #1, so per-call pricing is live.)
         // 40,000e18 WOOD @ $0.05 == $2,000 == 100% of the required coverage.
         _seatApprover(pid, g1, 40_000e18);
         _toApproved(pid);
@@ -331,11 +322,15 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
 
         vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
 
+        bytes memory err = abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, MAX_CAPITAL, 0);
+        vm.expectRevert(err);
+        governor.settleProposal(pid);
         vm.prank(owner);
+        vm.expectRevert(err);
         governor.unstick(pid);
 
-        assertEq(usdg.balanceOf(sink), MAX_CAPITAL, "unstick still moves the full pre-committed amount");
-        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertEq(usdg.balanceOf(sink), 0, "a settle leg cannot move assets out, whatever the coverage");
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
     }
 }
 

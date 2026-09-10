@@ -35,6 +35,38 @@ contract _MockVault {
     }
 }
 
+/// @dev The three two-of-three `IStrategy` getter permutations: each answers two probes and
+///      not the third, so each pins one probe in `registerStrategy`.
+contract _VaultProposerOnly {
+    function vault() external pure returns (address) {
+        return address(1);
+    }
+
+    function proposer() external pure returns (address) {
+        return address(1);
+    }
+}
+
+contract _VaultExecutedOnly {
+    function vault() external pure returns (address) {
+        return address(1);
+    }
+
+    function executed() external pure returns (bool) {
+        return false;
+    }
+}
+
+contract _ProposerExecutedOnly {
+    function proposer() external pure returns (address) {
+        return address(1);
+    }
+
+    function executed() external pure returns (bool) {
+        return false;
+    }
+}
+
 contract StrategyFactoryTest is Test {
     StrategyFactory factory;
     MockStrategy template;
@@ -71,6 +103,18 @@ contract StrategyFactoryTest is Test {
 
     function test_registerStrategy_rejectsAContractWithoutTheInterface() public {
         address[3] memory rejected = [address(usdc), address(registry), attacker];
+        for (uint256 i = 0; i < rejected.length; i++) {
+            vm.expectRevert(abi.encodeWithSelector(StrategyFactory.NotAStrategy.selector, rejected[i]));
+            factory.registerStrategy(rejected[i]);
+            assertFalse(factory.isRegisteredStrategy(rejected[i]));
+        }
+    }
+
+    /// @notice Every one of the three getters is probed: a contract answering any two is refused.
+    function test_registerStrategy_rejectsAPartialInterface() public {
+        address[3] memory rejected = [
+            address(new _VaultProposerOnly()), address(new _VaultExecutedOnly()), address(new _ProposerExecutedOnly())
+        ];
         for (uint256 i = 0; i < rejected.length; i++) {
             vm.expectRevert(abi.encodeWithSelector(StrategyFactory.NotAStrategy.selector, rejected[i]));
             factory.registerStrategy(rejected[i]);

@@ -537,10 +537,10 @@ interface ISyndicateGovernor {
     ///         `uint256` per entry in the corresponding call array: each call's own
     ///         declared gross-outflow cap, denominated in the vault asset. Zero is
     ///         a legal declaration at every tier. Each sum must be
-    ///         `<= envelope.maxCapital`, checked PER BATCH and never combined — the
-    ///         two batches run in separate transactions, each independently bounded
-    ///         by the vault's net-outflow meter, and an honest settlement
-    ///         legitimately re-moves the same capital the execute batch deployed.
+    ///         `<= envelope.maxCapital`, checked PER BATCH: per-call caps meter the
+    ///         gross a settlement call may move (a strategy re-pulling what it
+    ///         deployed), while the settle batch's NET egress budget is zero — it
+    ///         may only bring assets home.
     function propose(
         address vault,
         address strategy,

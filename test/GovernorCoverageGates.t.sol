@@ -724,14 +724,14 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(governor.getEffectiveMaxCapital(pid), 0, "dust coverage floors to a zero net-outflow cap");
     }
 
-    /// @notice Settlement reuses the STORED `effectiveMaxCapital` from execute
-    ///         (issue #27 design D4) — never a live recompute. A guardian
-    ///         whose bond is later slashed to ZERO (modeled here as a direct
-    ///         stake write, standing in for a real slash's effect on live
-    ///         stake, same convention `ExposureLedger.t.sol`'s finding tests
-    ///         use) does not shrink what the position can unwind: the
-    ///         settlement batch still moves exactly the $500 the proposal
-    ///         executed at, proving settle never re-queries the ledger.
+    /// @notice Settlement reuses the STORED coverage-scaled figures from execute
+    ///         (issue #27 design D4) — never a live recompute. A guardian whose
+    ///         bond is later slashed to ZERO (modeled as a direct stake write,
+    ///         the convention `ExposureLedger.t.sol`'s finding tests use) does
+    ///         not shrink the settle leg's per-call cap: the $500 pull clears the
+    ///         stored 500e6 cap — a live recompute would floor it to 0 and revert
+    ///         `CallCapExceeded` inside the batch — and is stopped only by the
+    ///         settle batch's zero net-egress budget, which runs after the caps.
     function test_settle_reusesStoredEffectiveMaxCapital_despiteCoverageCollapsingBeforeSettle() public {
         address sink = address(new AssetPuller());
         uint256 maxCapital = 1_000e6;
@@ -771,17 +771,17 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(governor.getEffectiveMaxCapital(pid), 500e6, "executed at the coverage-scaled size");
 
         // The guardian's live bond craters to zero AFTER execute. A live
-        // recompute at settle would floor `effectiveMaxCapital` to 0 and this
-        // $500 settlement drain would revert `CallCapExceeded`/
-        // `MaxNetOutflowExceeded`. It does not, because settle reuses the
-        // STORED figure from execute.
+        // recompute at settle would scale the settle cap to 0 and the $500 pull
+        // would revert `CallCapExceeded(1, 500e6, 0)` inside the batch. It does
+        // not: the pull clears the STORED 500e6 cap and only the net meter,
+        // which runs after the batch, refuses the egress.
         swood.setStake(g1, 0);
         assertEq(ledger.slashableBondUsd(g1), 0, "sanity: coverage has fully collapsed");
 
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, 500e6, 0));
         governor.settleProposal(pid);
-        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
-        assertEq(usdg.balanceOf(sink), 500e6, "settle moved exactly the STORED effective cap, not a recomputed 0");
+        assertEq(usdg.balanceOf(sink), 0, "the net meter, not a recomputed per-call cap, stopped the pull");
     }
 
     /// @notice issue #43 x #27 (design D7): per-call caps scale by the SAME

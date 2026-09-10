@@ -87,8 +87,6 @@ contract SyndicateVault is
 
     /// @notice Cap on the owner-set idle-liquidity floor (50%).
     uint256 private constant MAX_MIN_BUFFER_BPS = 5_000;
-    /// @dev `increaseAllowance(address,uint256)`: the other allowance-granting ERC-20 selector.
-    bytes4 private constant _SEL_INCREASE_ALLOWANCE = 0x39509351;
 
     // ==================== STORAGE ====================
 
@@ -410,7 +408,8 @@ contract SyndicateVault is
                 revert(add(returnData, 32), mload(returnData))
             }
         }
-        // No allowance outlives the batch: a spender that did not pull loses it here.
+        // No allowance outlives the batch: every allowance-shaped asset call's first argument is
+        // reset, pulled or not. A reset of an address that never held one is a no-op.
         for (uint256 i = 0; i < spenders.length; i++) {
             IERC20(asset()).forceApprove(spenders[i], 0);
         }
@@ -449,8 +448,9 @@ contract SyndicateVault is
     }
 
     /// @dev Structural batch rules. Every non-asset target is a strategy registered with the
-    ///      protocol's factory (a fixed `IStrategy` shape, not a trust check); on `asset()`,
-    ///      `transferFrom` must draw from the vault. Returns the spenders granted.
+    ///      protocol's factory (a fixed `IStrategy` shape, not a trust check). On `asset()` a call is
+    ///      either a metered transfer (`transferFrom` from the vault only) or allowance-shaped: its
+    ///      first argument is a spender to reset after the batch, whatever the selector.
     function _guardBatchCalls(BatchExecutorLib.Call[] calldata calls) private view returns (address[] memory spenders) {
         address factory_ = _strategyFactory();
         address asset_ = asset();
@@ -463,13 +463,14 @@ contract SyndicateVault is
                 continue;
             }
             bytes calldata data = calls[i].data;
-            bytes4 sel = data.length >= 4 ? bytes4(data[0:4]) : bytes4(0);
-            bytes32 arg0 = data.length >= 36 ? bytes32(data[4:36]) : bytes32(0);
+            if (data.length < 36) revert MalformedAssetCall(data.length >= 4 ? bytes4(data[0:4]) : bytes4(0));
+            bytes4 sel = bytes4(data[0:4]);
+            bytes32 arg0 = bytes32(data[4:36]);
             if (sel == IERC20.transferFrom.selector) {
                 if (arg0 != bytes32(uint256(uint160(address(this))))) {
                     revert TransferFromNotVault(address(uint160(uint256(arg0))));
                 }
-            } else if (sel == IERC20.approve.selector || sel == _SEL_INCREASE_ALLOWANCE) {
+            } else if (sel != IERC20.transfer.selector) {
                 spenders[n++] = address(uint160(uint256(arg0)));
             }
         }

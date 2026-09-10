@@ -65,10 +65,9 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         _requireVaultOwner(p.vault);
         if (p.state != ProposalState.Executed) revert ProposalNotExecuted();
         if (block.timestamp < p.executedAt + p.strategyDuration) revert StrategyDurationNotElapsed();
+        // Same batch, same zero egress budget as `settleProposal`.
         ISyndicateVault(p.vault)
-            .executeGovernorBatch(
-                _getSettlementCalls(proposalId), _getEffectiveSettlementCallCaps(proposalId), p.effectiveMaxCapital
-            );
+            .executeGovernorBatch(_getSettlementCalls(proposalId), _getEffectiveSettlementCallCaps(proposalId), 0);
         _requireSettlePriceAboveFloorHook(proposalId, p, true);
         _finishSettlementHook(proposalId, p);
     }
@@ -120,6 +119,8 @@ abstract contract GovernorEmergency is ProposalLifecycle {
 
         if (reg.ownerStake(p.vault) == 0) revert OwnerBondInsufficient();
 
+        // The one settle path with an egress budget: an owner unwind may need to fund a repay
+        // from the vault to free stuck collateral. Guardian-reviewed and owner-bonded for it.
         ISyndicateVault(p.vault).executeGovernorBatch(calls, new uint256[](0), p.effectiveMaxCapital);
         (int256 pnl,) = _finishSettlementHook(proposalId, p);
         emit EmergencySettleFinalized(proposalId, pnl);

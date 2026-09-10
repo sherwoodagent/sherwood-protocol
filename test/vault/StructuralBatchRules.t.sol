@@ -23,6 +23,7 @@ import {ConcentratedLiquidityStrategy} from "../../src/strategies/ConcentratedLi
 import {MarketParams} from "../../src/vendor/morpho/IMorpho.sol";
 
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {GlobalDollarMock} from "../mocks/GlobalDollarMock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {MockMorpho, MockIrm, MockMorphoOracle} from "../mocks/MockMorpho.sol";
@@ -53,7 +54,21 @@ contract CustomStrategy {
         IERC20(token).transferFrom(msg.sender, address(this), amount);
     }
 
+    function refund(address token, uint256 amount) external {
+        IERC20(token).transfer(msg.sender, amount);
+    }
+
     fallback() external {}
+}
+
+/// @notice An asset with an allowance-granting selector no list would name.
+contract GrantSpendMock is ERC20Mock {
+    constructor() ERC20Mock("Odd", "ODD", 6) {}
+
+    function grantSpend(address spender, uint256 amount) external returns (bool) {
+        _approve(msg.sender, spender, amount);
+        return true;
+    }
 }
 
 /// @notice A contract with code and no functions.
@@ -70,8 +85,9 @@ contract UsdcMock is ERC20Mock {
 }
 
 /// @notice The vault's batch guard is four structural rules and nothing else: every non-asset
-///         target is a registered strategy, `transferFrom` on the asset draws from the vault,
-///         no allowance outlives the batch, the meters bound the rest.
+///         target is a registered strategy; on the asset a call is a metered transfer
+///         (`transferFrom` from the vault only) or allowance-shaped, and every allowance-shaped
+///         call's first argument is reset after the batch; the meters bound the rest.
 contract StructuralBatchRulesTest is Test {
     SyndicateGovernor governor;
     SyndicateVault vault;
@@ -93,7 +109,12 @@ contract StructuralBatchRulesTest is Test {
     uint256 constant CLASS_BOUND = 500;
 
     function setUp() public {
-        usdc = new UsdcMock();
+        _deployStack(new UsdcMock());
+    }
+
+    /// @dev The whole stack on `asset_`, so a test can re-run it on a differently shaped asset.
+    function _deployStack(ERC20Mock asset_) internal {
+        usdc = asset_;
         executorLib = new BatchExecutorLib();
         agentRegistry = new MockAgentRegistry();
         guardianRegistry = new MockRegistryMinimal();
@@ -507,7 +528,6 @@ contract StructuralBatchRulesTest is Test {
     function test_assetTransferFromLpReverts() public {
         _expectTransferFromRefused(abi.encodeCall(usdc.transferFrom, (lp1, attacker, 1)), lp1);
         _expectTransferFromRefused(abi.encodeCall(usdc.transferFrom, (lp1, address(vault), 1)), lp1);
-        _expectTransferFromRefused(abi.encodePacked(usdc.transferFrom.selector), address(0));
         _expectTransferFromRefused(
             abi.encodePacked(usdc.transferFrom.selector, bytes32(uint256(uint160(address(vault))) | (1 << 160))),
             address(vault)
@@ -542,7 +562,8 @@ contract StructuralBatchRulesTest is Test {
         assertEq(usdc.balanceOf(attacker), amount, "admitted within the cap");
     }
 
-    /// @notice Reads and well-formed grants on the asset are admitted.
+    /// @notice Reads and well-formed grants on the asset are admitted; a read's first argument is
+    ///         reset like a spender, which is a no-op.
     function test_assetReadsAndApproveAreAdmitted() public {
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](4);
         calls[0] = _call(address(usdc), abi.encodeCall(usdc.balanceOf, (address(vault))));
@@ -550,12 +571,34 @@ contract StructuralBatchRulesTest is Test {
         calls[2] = _call(address(usdc), abi.encodeCall(usdc.approve, (attacker, 1)));
         calls[3] = _call(address(usdc), abi.encodeWithSignature("increaseAllowance(address,uint256)", attacker, 1));
         _runBatch(calls, 0);
+        assertEq(usdc.allowance(address(vault), attacker), 0, "granted inside, gone after");
+        assertEq(usdc.allowance(lp1, address(vault)), type(uint256).max, "the LP's own allowance is not the vault's");
+    }
+
+    /// @notice Every asset call carries at least a selector and one argument word; shorter
+    ///         calldata has no spender to reset and is refused before the token sees it.
+    function test_shortAssetCalldataIsRefused() public {
+        bytes[] memory shapes = new bytes[](4);
+        shapes[0] = "";
+        shapes[1] = abi.encodeCall(usdc.decimals, ());
+        shapes[2] = abi.encodePacked(usdc.transferFrom.selector);
+        shapes[3] = abi.encodePacked(usdc.approve.selector, new bytes(31));
+        (bool ok,) = address(usdc).call(shapes[1]);
+        assertTrue(ok, "control: the token itself answers decimals()");
+        for (uint256 i = 0; i < shapes.length; i++) {
+            bytes4 sel = shapes[i].length >= 4 ? bytes4(shapes[i]) : bytes4(0);
+            _expectBatchRevert(
+                _one(address(usdc), shapes[i]),
+                0,
+                abi.encodeWithSelector(ISyndicateVault.MalformedAssetCall.selector, sel)
+            );
+        }
     }
 
     /// @notice Selectors the guard does not name reach the token, which answers for itself:
     ///         an empty revert (no such function) rather than any guard error.
     function test_unrecognisedAssetSelectorsReachTheToken() public {
-        bytes[] memory shapes = new bytes[](5);
+        bytes[] memory shapes = new bytes[](4);
         shapes[0] = abi.encodeWithSignature(
             "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)",
             address(vault),
@@ -568,8 +611,7 @@ contract StructuralBatchRulesTest is Test {
         );
         shapes[1] = abi.encodeWithSignature("transferAndCall(address,uint256)", attacker, 1);
         shapes[2] = abi.encodeWithSignature("authorizeOperator(address)", attacker);
-        shapes[3] = "";
-        shapes[4] = abi.encodePacked(usdc.approve.selector, bytes32(uint256(uint160(attacker))));
+        shapes[3] = abi.encodePacked(usdc.approve.selector, bytes32(uint256(uint160(attacker))));
         for (uint256 i = 0; i < shapes.length; i++) {
             (bool ok, bytes memory ret) = address(usdc).call(shapes[i]);
             assertTrue(!ok && ret.length == 0, "control: the token itself reverts empty");
@@ -613,6 +655,109 @@ contract StructuralBatchRulesTest is Test {
         vm.prank(attacker);
         vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, attacker, 0, 1));
         usdc.transferFrom(address(vault), attacker, 1);
+    }
+
+    /// @notice The launch asset (USDG, Paxos-shaped) grants through `increaseApproval`, a
+    ///         selector no OZ list names. It is reset like any other allowance-shaped call.
+    function test_increaseApprovalOnAPaxosShapedAssetIsResetAfterTheBatch() public {
+        _deployStack(new GlobalDollarMock());
+        (bool ok,) = address(usdc).call(abi.encodeWithSignature("increaseAllowance(address,uint256)", attacker, 1));
+        assertFalse(ok, "control: the Paxos shape has no increaseAllowance");
+
+        CustomStrategy puller = _custom();
+        CustomStrategy idle = _custom();
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](3);
+        calls[0] =
+            _call(address(usdc), abi.encodeWithSignature("increaseApproval(address,uint256)", address(puller), 100e6));
+        calls[1] = _call(address(puller), abi.encodeCall(CustomStrategy.frobnicate, (address(usdc), 100e6)));
+        calls[2] =
+            _call(address(usdc), abi.encodeWithSignature("increaseApproval(address,uint256)", address(idle), 100e6));
+        _runBatch(calls, 100e6);
+        assertEq(usdc.balanceOf(address(puller)), 100e6, "the allowance was live inside the batch");
+        assertEq(usdc.allowance(address(vault), address(puller)), 0, "pulled spender reset");
+        assertEq(usdc.allowance(address(vault), address(idle)), 0, "idle spender reset");
+    }
+
+    function test_approveThenDrainNextBlockIsImpossible_paxosAsset() public {
+        _deployStack(new GlobalDollarMock());
+        _runBatch(
+            _one(address(usdc), abi.encodeWithSignature("increaseApproval(address,uint256)", attacker, DEPOSIT)), 0
+        );
+        assertEq(usdc.allowance(address(vault), attacker), 0, "no allowance survives the batch");
+        vm.roll(block.number + 1);
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, attacker, 0, DEPOSIT));
+        usdc.transferFrom(address(vault), attacker, DEPOSIT);
+        assertEq(usdc.balanceOf(address(vault)), DEPOSIT, "the float is intact");
+    }
+
+    /// @notice A grant through a selector nobody has heard of is reset too: the rule is the
+    ///         shape of the call, not its name.
+    function test_unknownAllowanceShapedAssetSelectorIsReset() public {
+        _deployStack(new GrantSpendMock());
+        _runBatch(_one(address(usdc), abi.encodeWithSignature("grantSpend(address,uint256)", attacker, DEPOSIT)), 0);
+        assertEq(usdc.allowance(address(vault), attacker), 0, "reset without naming the selector");
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, attacker, 0, DEPOSIT));
+        usdc.transferFrom(address(vault), attacker, DEPOSIT);
+    }
+
+    // ── Settle batches bring assets home ──
+
+    /// @notice A settle leg has a zero net-egress budget: a registered strategy pulling one unit
+    ///         at settle reverts on `settleProposal` and on `unstick` alike.
+    function test_settleBatchCannotMoveAssetsOutOfTheVault() public {
+        CustomStrategy c = _custom();
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](2);
+        settleCalls[0] = _call(address(usdc), abi.encodeCall(usdc.approve, (address(c), 1)));
+        settleCalls[1] = _call(address(c), abi.encodeCall(CustomStrategy.frobnicate, (address(usdc), 1)));
+        uint256[] memory settleCaps = new uint256[](2);
+        settleCaps[1] = 1;
+        uint256 pid = _propose(
+            address(c),
+            _one(address(usdc), abi.encodeCall(usdc.approve, (address(c), 0))),
+            new uint256[](1),
+            settleCalls,
+            settleCaps,
+            1
+        );
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(pid);
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+
+        bytes memory err = abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, 1, 0);
+        vm.expectRevert(err);
+        governor.settleProposal(pid);
+        vm.prank(owner);
+        vm.expectRevert(err);
+        governor.unstick(pid);
+        assertEq(usdc.balanceOf(address(c)), 0, "nothing left at settle");
+    }
+
+    function test_settleBatchThatOnlyBringsAssetsHomeSucceeds() public {
+        CustomStrategy c = _custom();
+        uint256 amount = 1_000e6;
+        uint256 before = usdc.balanceOf(address(vault));
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
+        execCalls[0] = _call(address(usdc), abi.encodeCall(usdc.approve, (address(c), amount)));
+        execCalls[1] = _call(address(c), abi.encodeCall(CustomStrategy.frobnicate, (address(usdc), amount)));
+        uint256[] memory execCaps = new uint256[](2);
+        execCaps[1] = amount;
+        uint256 pid = _propose(
+            address(c),
+            execCalls,
+            execCaps,
+            _one(address(c), abi.encodeCall(CustomStrategy.refund, (address(usdc), amount))),
+            new uint256[](1),
+            amount
+        );
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(pid);
+        assertEq(usdc.balanceOf(address(vault)), before - amount, "execute deployed the capital");
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        governor.settleProposal(pid);
+        assertEq(usdc.balanceOf(address(vault)), before, "settle brought it home");
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
     }
 
     // ── Rule 4: everything else is admitted and metered ──

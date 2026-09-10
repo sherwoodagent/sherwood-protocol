@@ -24,13 +24,25 @@ For every governor-batch call whose `target` is not the vault's underlying `asse
 - **WHEN** `isRegisteredStrategy` on the resolved factory reverts or returns other than one word
 - **THEN** the batch reverts `NotARegisteredStrategy(target)`
 
-### Requirement: On the asset, transferFrom draws from the vault and no allowance survives the batch
+### Requirement: On the asset, a call is a metered transfer or allowance-shaped, and no allowance survives the batch
 
-For every governor-batch call whose `target` is `asset()`: `transferFrom` whose first argument word is not the vault's address SHALL revert `TransferFromNotVault(from)` (calldata shorter than 36 bytes reads `from` as zero and is refused); every other selector SHALL be admitted. The guard SHALL record the spender of every `approve(address,uint256)` and `increaseAllowance(address,uint256)`, and after the batch's delegatecall returns — before the outflow, reserve and buffer checks — the vault SHALL `forceApprove(spender, 0)` on `asset()` for each recorded spender. `transfer` and `transferFrom(vault, …)` are metered like any outflow. The rule SHALL apply on the execute, settlement and emergency batch paths alike. The asset is a plain ERC-20 by deployment; operator-style grants (`authorizeOperator`) are out of scope.
+For every governor-batch call whose `target` is `asset()`: calldata shorter than 36 bytes SHALL revert `MalformedAssetCall(selector)` before any call executes. `transfer(to, n)` and `transferFrom(vault, to, n)` SHALL be admitted as metered egress; `transferFrom` whose first argument word is not the vault's address SHALL revert `TransferFromNotVault(from)`. EVERY other call SHALL be treated as allowance-shaped: the guard SHALL record its first argument word as a spender, without enumerating selectors, and after the batch's delegatecall returns — before the outflow, reserve and buffer checks — the vault SHALL `forceApprove(spender, 0)` on `asset()` for each recorded spender. `approve`, `increaseAllowance`, `increaseApproval`, any future grant shape and harmless reads are all covered by the same rule; a reset of an address that never held an allowance is a no-op. The rule SHALL apply on the execute, settlement and emergency batch paths alike. The asset is a plain ERC-20 by deployment; operator-style grants (`authorizeOperator`) are out of scope.
 
 #### Scenario: transferFrom from an LP is refused
 - **WHEN** a batch contains `asset.transferFrom(lp, x, n)` where `lp` holds a standing deposit allowance to the vault
 - **THEN** the batch reverts `TransferFromNotVault(lp)` before any call executes and the LP's allowance is untouched
+
+#### Scenario: Short asset calldata is refused
+- **WHEN** a batch contains an asset call of fewer than 36 bytes (empty, `decimals()`, a bare `transferFrom` selector, an `approve` truncated to 35 bytes)
+- **THEN** the batch reverts `MalformedAssetCall(selector)` before any call executes
+
+#### Scenario: A Paxos-shaped asset's increaseApproval is reset
+- **WHEN** the asset grants through `increaseApproval(address,uint256)` and has no `increaseAllowance` (the launch asset's shape) and a batch grants two spenders through it, one of which pulls inside the batch
+- **THEN** after `executeGovernorBatch` returns, `asset.allowance(vault, spender)` is zero for both, and in the next block `transferFrom(vault, attacker, n)` by the idle spender reverts for insufficient allowance
+
+#### Scenario: An allowance-shaped selector nobody named is reset
+- **WHEN** a batch calls the asset with a selector the protocol has never seen whose first argument is an address, and the token grants that address an allowance
+- **THEN** after `executeGovernorBatch` returns, `asset.allowance(vault, thatAddress)` is zero
 
 #### Scenario: transferFrom from the vault is admitted and metered
 - **WHEN** a batch approves the vault itself and calls `asset.transferFrom(vault, x, n)`

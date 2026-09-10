@@ -66,6 +66,9 @@ interface ISyndicateVault {
     error NotARegisteredStrategy(address target);
     /// @notice A governor batch called `asset().transferFrom` with a `from` other than the vault.
     error TransferFromNotVault(address from);
+    /// @notice A governor batch called `asset()` with fewer than 36 bytes of calldata: no first
+    ///         argument to treat as a spender, so the call cannot be admitted as allowance-shaped.
+    error MalformedAssetCall(bytes4 selector);
 
     // ── Init Params ──
     struct InitParams {

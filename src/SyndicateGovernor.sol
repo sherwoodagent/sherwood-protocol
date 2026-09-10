@@ -518,11 +518,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             revert StrategyDurationNotElapsed();
         }
 
+        // Zero egress budget: a settle batch brings assets home, never out, so the
+        // declared capital bounds the whole lifecycle rather than each leg.
         ISyndicateVault(proposal.vault)
             .executeGovernorBatch(
-                _loadCalls(_settlementCalls, proposalId),
-                _loadCaps(_effectiveSettlementCallCaps, proposalId),
-                proposal.effectiveMaxCapital
+                _loadCalls(_settlementCalls, proposalId), _loadCaps(_effectiveSettlementCallCaps, proposalId), 0
             );
 
         _requireSettlePriceAboveFloorHook(proposalId, proposal, false);
