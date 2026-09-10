@@ -112,8 +112,8 @@ contract TierRegistryCounterpartyAllowlistTest is Test {
         reg.setCounterpartyAllowed(makeAddr("rogue"), true);
     }
 
-    /// @dev Demotion clears the counterparty entry: a convicted venue is not bindable.
-    function test_demotionClearsCounterpartyStanding() public {
+    /// @dev A per-selector conviction leaves the shared counterparty flag alone; only the owner revokes a venue.
+    function test_demotionLeavesCounterpartyStandingUntouched() public {
         bytes4 sel = bytes4(0x12345678);
         _certifyNow(target, sel, 1, 500, address(0));
         vm.prank(owner);
@@ -126,6 +126,12 @@ contract TierRegistryCounterpartyAllowlistTest is Test {
         vm.prank(demoter);
         reg.demoteByChallenge(target, sel);
 
-        assertFalse(reg.isCounterpartyAllowed(target), "counterparty standing cleared");
+        assertTrue(reg.isCounterpartyAllowed(target), "a per-proposal conviction must not disarm a shared venue");
+        (uint8 tier,) = reg.tierOf(target, sel);
+        assertEq(tier, 2, "the pair's tier discount is gone");
+
+        vm.prank(owner);
+        reg.setCounterpartyAllowed(target, false);
+        assertFalse(reg.isCounterpartyAllowed(target), "the explicit owner call is the only revocation");
     }
 }

@@ -599,10 +599,6 @@ contract TierRegistry is Ownable2Step {
             b.releasableAt = releasableAt;
             emit SubmitterBondReleaseStarted(target, selector, b.submitter, releasableAt);
         }
-        if (_counterpartyAllowed[target]) {
-            delete _counterpartyAllowed[target];
-            emit CounterpartyAllowedSet(target, false);
-        }
         emit TierDemoted(target, selector);
     }
 
