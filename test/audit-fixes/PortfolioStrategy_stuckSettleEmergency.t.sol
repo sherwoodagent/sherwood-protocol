@@ -27,14 +27,6 @@ contract PermissiveRegistryWithPairs is ITierRegistry {
         return (2, 10_000);
     }
 
-    function isAdapterAllowed(address) external pure returns (bool) {
-        return true;
-    }
-
-    function isCallableTarget(address) external pure returns (bool) {
-        return true;
-    }
-
     function isCounterpartyAllowed(address) external pure returns (bool) {
         return true;
     }

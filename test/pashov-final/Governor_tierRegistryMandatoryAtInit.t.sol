@@ -61,7 +61,7 @@ contract Governor_tierRegistryMandatoryAtInitTest is Test {
     /// @dev Zero and codeless are refused for DIFFERENT reasons, so both are
     ///      pinned. Zero leaves `_guardBatchCalls` unable to resolve an
     ///      allowlist at all — the finding. A codeless address passes every
-    ///      zero-check and then reverts the guard's typed `isCallableTarget`
+    ///      zero-check and then reverts the governor's typed `tierOf`
     ///      call in the VAULT's frame with empty returndata, bricking every
     ///      batch instead of merely un-gating them.
     ///

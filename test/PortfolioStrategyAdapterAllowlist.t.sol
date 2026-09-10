@@ -69,7 +69,7 @@ contract MockGovernorNoRegistryGetter {
     }
 }
 
-/// @notice Minimal registry stand-in: owner-settable per-adapter allowlist.
+/// @notice Minimal registry stand-in: owner-settable counterparty allowlist.
 contract MockTierRegistry {
     mapping(address => bool) public allowed;
 
@@ -77,7 +77,7 @@ contract MockTierRegistry {
         allowed[adapter] = value;
     }
 
-    function isAdapterAllowed(address adapter) external view returns (bool) {
+    function isCounterpartyAllowed(address adapter) external view returns (bool) {
         return allowed[adapter];
     }
 
@@ -85,23 +85,6 @@ contract MockTierRegistry {
     ///      non-member, so the vault's class-binding check never fires.
     function classOf(address) external pure returns (bytes32) {
         return bytes32(0);
-    }
-
-    /// @dev The CALLEE axis (`_guardBatchCalls` PART 2a), split out of
-    ///      `isAdapterAllowed` per pashov finding #14. MIRRORS the adapter axis
-    ///      rather than adding a second switch: nothing in this file exercises
-    ///      the demotion asymmetry (that lives in
-    ///      `test/pashov-final/Registry_demoteKeepsCalleeStanding.t.sol`,
-    ///      against the real registry), so mirroring keeps every case here
-    ///      meaning exactly what it meant before the split.
-    ///
-    ///      Present at all because the vault's PART 2a call is TYPED: a stand-in
-    ///      missing this selector reverts in the CALLER's frame with empty
-    ///      returndata, which is indistinguishable from a bug in the vault. The
-    ///      hostile fixtures below deliberately stay bare, for the same reason
-    ///      they lack `isPriceSourceForToken`.
-    function isCallableTarget(address target) external view returns (bool) {
-        return allowed[target];
     }
 
     /// @dev Token↔price-source attestation, permissive by default so the
@@ -120,18 +103,18 @@ contract MockTierRegistry {
     }
 }
 
-/// @notice A registry whose `isAdapterAllowed` always reverts — models a
+/// @notice A registry whose `isCounterpartyAllowed` always reverts — models a
 ///         wrong address wired as the registry.
 contract RevertingRegistry {
-    function isAdapterAllowed(address) external pure returns (bool) {
+    function isCounterpartyAllowed(address) external pure returns (bool) {
         revert("registry broken");
     }
 }
 
-/// @notice A registry whose `isAdapterAllowed` returns a malformed (wrong
+/// @notice A registry whose `isCounterpartyAllowed` returns a malformed (wrong
 ///         length) payload — models a non-registry contract at that slot.
 contract MalformedReturnRegistry {
-    function isAdapterAllowed(address) external pure returns (bool, bool) {
+    function isCounterpartyAllowed(address) external pure returns (bool, bool) {
         return (true, true);
     }
 }

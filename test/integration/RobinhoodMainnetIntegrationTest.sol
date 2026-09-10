@@ -246,7 +246,7 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
     /// @dev `PortfolioStrategy` gates oracles TWICE against the vault's
     ///      TierRegistry (`vault -> governor -> tierRegistry`):
     ///        1. `_requireAllowedPriceSource` — is this oracle allowed AT ALL
-    ///           (`isAdapterAllowed`); reverts `PriceSourceNotAllowed`.
+    ///           (`isCounterpartyAllowed`); reverts `PriceSourceNotAllowed`.
     ///        2. `_requireAllowedPriceSourceForToken` — is it attested for THIS
     ///           token (`isPriceSourceForToken`), keyed by the feed address
     ///           widened to bytes32 with any packed max-age stripped, so one
@@ -255,7 +255,7 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
     ///      that skips this cannot initialize any priced strategy.
     function _allowPriceSource(address feed, address token) internal {
         vm.startPrank(deployer);
-        TierRegistry(tierRegistry).setAdapterAllowed(feed, true);
+        TierRegistry(tierRegistry).setCounterpartyAllowed(feed, true);
         TierRegistry(tierRegistry).setPriceSourceForToken(token, bytes32(uint256(uint160(feed))), true);
         vm.stopPrank();
     }
@@ -328,7 +328,7 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
         // before this function runs, since #147's `_requireAllowedAdapter`
         // check is enforced synchronously inside `initialize` above.
         vm.prank(deployer);
-        TierRegistry(tierRegistry).setAdapterAllowed(clone, true);
+        TierRegistry(tierRegistry).setCounterpartyAllowed(clone, true);
     }
 
     /// @dev The `initialize` dispatch, in its OWN frame. Behaviour is identical

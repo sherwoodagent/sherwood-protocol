@@ -18,7 +18,7 @@ contract _MockSyndicateRegistry {
     }
 }
 
-/// @dev Minimal vault stand-in that exposes IVaultMembership (`owner`,
+/// @dev Minimal vault stand-in (`owner`,
 ///      `isAgent`). Strategies are pre-deployed by the vault owner, so the
 ///      tests prank as the owner.
 contract _MockVault {
@@ -97,7 +97,7 @@ contract StrategyFactoryTest is Test {
     ///      different vaults yields two DIFFERENT clone addresses (the salt is
     ///      folded with the vault). Without the fold the second deploy would
     ///      collide and revert; with it, an attacker can't precompute (or, via
-    ///      `_authClone`, even deploy at) a victim vault's address from a shared
+    ///      the factory, even deploy at) a victim vault's address from a shared
     ///      salt observed in the mempool.
     function test_cloneAndInitDeterministic_saltBoundToVault() public {
         bytes32 salt = keccak256("shared.salt");

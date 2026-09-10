@@ -59,18 +59,7 @@ contract MockTierRegistry {
         allowed[a] = value;
     }
 
-    function isAdapterAllowed(address a) external view returns (bool) {
-        return allowed[a];
-    }
-
-    /// @dev The CALLEE axis (`_guardBatchCalls` PART 2a), split out of
-    ///      `isAdapterAllowed` per pashov finding #14. Mirrors the adapter axis:
-    ///      the demotion asymmetry is exercised against the real registry in
-    ///      `test/pashov-final/Registry_demoteKeepsCalleeStanding.t.sol`, so
-    ///      mirroring keeps every oracle-binding case here unchanged. Present at
-    ///      all because the vault's PART 2a call is TYPED — a stand-in missing
-    ///      this selector reverts in the CALLER's frame with empty returndata.
-    function isCallableTarget(address a) external view returns (bool) {
+    function isCounterpartyAllowed(address a) external view returns (bool) {
         return allowed[a];
     }
 
@@ -174,11 +163,7 @@ contract StrictPairRegistry {
         pair[token][src] = allow;
     }
 
-    function isAdapterAllowed(address a) external view returns (bool) {
-        return allowed[a];
-    }
-
-    function isCallableTarget(address a) external view returns (bool) {
+    function isCounterpartyAllowed(address a) external view returns (bool) {
         return allowed[a];
     }
 

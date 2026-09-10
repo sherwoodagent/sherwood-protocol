@@ -214,11 +214,11 @@ contract ConcentratedLiquidityVaultE2EForkTest is RobinhoodMainnetIntegrationTes
         template = address(new ConcentratedLiquidityStrategy());
 
         // `_initialize` binds the swap adapter on the STRONG axis
-        // (`isAdapterAllowed`) and everything else it approves or calls on the
+        // (`isCounterpartyAllowed`) and everything else it approves or calls on the
         // weak one (`isCounterpartyAllowed`). A freshly deployed registry
         // answers false to both.
         vm.startPrank(deployer);
-        TierRegistry(tierRegistry).setAdapterAllowed(address(adapter), true);
+        TierRegistry(tierRegistry).setCounterpartyAllowed(address(adapter), true);
         TierRegistry(tierRegistry).setCounterpartyAllowed(POSITION_MANAGER, true);
         TierRegistry(tierRegistry).setCounterpartyAllowed(MORPHO, true);
         TierRegistry(tierRegistry).setCounterpartyAllowed(UNISWAP_V3_FACTORY, true);

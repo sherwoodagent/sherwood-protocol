@@ -9,13 +9,12 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IMorpho, Id, MarketParams} from "../vendor/morpho/IMorpho.sol";
 import {MarketParamsLib} from "../vendor/morpho/MorphoLibs.sol";
 
-/// @notice The `vault() -> governor() -> tierRegistry() -> isAdapterAllowed(x)` walk,
-///         the same registry `SyndicateVault._guardBatchCalls` gates batch approvals against.
+/// @notice The `vault() -> governor() -> tierRegistry() -> isCounterpartyAllowed(x)` walk.
 /// @dev    Declared locally: every hop is a length-checked raw staticcall. Generates selectors only.
 interface ITierBindingPath {
     function governor() external view returns (address);
     function tierRegistry() external view returns (address);
-    function isAdapterAllowed(address adapter) external view returns (bool);
+    function isCounterpartyAllowed(address counterparty) external view returns (bool);
 }
 
 /**
@@ -41,7 +40,7 @@ contract MorphoSupplyStrategy is BaseStrategy {
     error LoanAssetMismatch();
     /// @notice The derived market id has never been created on the configured Morpho contract.
     error MarketNotCreated();
-    /// @notice `morpho_` is not allowlisted in the `TierRegistry` the vault's governor gates against.
+    /// @notice `morpho_` is not a counterparty in the `TierRegistry` the vault's governor names.
     error MorphoNotAllowed(address morpho, address registry);
     /// @notice The `vault() -> governor() -> tierRegistry()` walk yielded no registry at `_initialize`.
     error TierRegistryUnresolved();
@@ -79,9 +78,8 @@ contract MorphoSupplyStrategy is BaseStrategy {
         if (morpho_ == address(0)) revert ZeroAddress();
         address registry = _resolveTierRegistry();
         if (registry == address(0)) revert TierRegistryUnresolved();
-        // Bind the proposer's Morpho singleton to the governance allowlist
-        // before ANY call is made into it and before anything is written.
-        if (!_isAdapterAllowed(registry, morpho_)) revert MorphoNotAllowed(morpho_, registry);
+        // Bind the proposer's Morpho singleton before any call is made into it.
+        if (!_isCounterpartyAllowed(registry, morpho_)) revert MorphoNotAllowed(morpho_, registry);
         if (supplyAmount_ == 0) revert InvalidAmount();
 
         address vaultAsset = IERC4626(vault()).asset();
@@ -123,12 +121,12 @@ contract MorphoSupplyStrategy is BaseStrategy {
         revert NoTunableParams();
     }
 
-    // ── Governance-allowlist binding (see the binding notes on `_initialize`) ──
+    // ── Counterparty binding (see the binding notes on `_initialize`) ──
 
     function _requireAllowedMorpho(address morpho_) private view {
         address registry = _resolveTierRegistry();
         if (registry == address(0)) return;
-        if (!_isAdapterAllowed(registry, morpho_)) revert MorphoNotAllowed(morpho_, registry);
+        if (!_isCounterpartyAllowed(registry, morpho_)) revert MorphoNotAllowed(morpho_, registry);
     }
 
     /// @dev `vault() → governor() → tierRegistry()` walk; `address(0)` when unresolved.
@@ -138,9 +136,10 @@ contract MorphoSupplyStrategy is BaseStrategy {
         registry = _readAddress(governor_, abi.encodeCall(ITierBindingPath.tierRegistry, ()));
     }
 
-    function _isAdapterAllowed(address registry, address adapter) private view returns (bool) {
+    function _isCounterpartyAllowed(address registry, address venue) private view returns (bool) {
         if (registry.code.length == 0) return false;
-        (bool ok, bytes memory ret) = registry.staticcall(abi.encodeCall(ITierBindingPath.isAdapterAllowed, (adapter)));
+        (bool ok, bytes memory ret) =
+            registry.staticcall(abi.encodeCall(ITierBindingPath.isCounterpartyAllowed, (venue)));
         if (!ok || ret.length != 32) return false;
         uint256 word;
         assembly ("memory-safe") {

@@ -22,7 +22,7 @@ import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice `StrategyFactory.syndicateFactory` stand-in: reports every vault as
-///         registered so the factory's `_authClone` gate passes.
+///         registered so the factory's vault check passes.
 contract MockSyndicateRegistry {
     function vaultToSyndicate(address) external pure returns (uint256) {
         return 1;

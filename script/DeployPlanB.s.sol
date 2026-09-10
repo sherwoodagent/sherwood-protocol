@@ -1034,7 +1034,7 @@ contract DeployPlanB is ScriptBase {
         console.log("  the delay elapses UNLESS a submitter bond is pinned, in which case only");
         console.log("  that submitter may call certify (finding #3), and must do so before");
         console.log("  MAX_CERTIFY_WINDOW elapses past readyAt (finding #5).");
-        console.log("  Re-apply setAdapterAllowed and setAuthorizedDemoter on the NEW registry");
+        console.log("  Re-apply setCounterpartyAllowed and setAuthorizedDemoter on the NEW registry");
         console.log("  before the switch. Only once the new registry is fully populated, call");
         console.log("  factory.setTierRegistry(new) so no governor ever reads an empty registry");
         console.log("  as tier 2 for an already-certified pair. Rollback: factory.setTierRegistry(old).");

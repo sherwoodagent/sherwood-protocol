@@ -111,8 +111,6 @@ contract TierResolutionTest is Test {
     ///      wired registry, onboarding an adapter now means certify + allowlist.
     function _wireTierRegistry() internal {
         governor.setTierRegistry(address(tierRegistry));
-        tierRegistry.setAdapterAllowed(address(mockAdapter), true);
-        tierRegistry.setAdapterAllowed(address(usdc), true);
     }
 
     /// @dev Certifies the shared `_settleCalls()` leg (`usdc.approve`) tier-0.

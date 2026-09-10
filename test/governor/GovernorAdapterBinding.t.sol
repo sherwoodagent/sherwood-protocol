@@ -148,8 +148,8 @@ contract GovernorStrategyOnProposalTest is Test {
     ///         pre-deployed, governance-allowlisted clone and drive it
     ///         Pending -> Executed. The ratchet is one-way, so the rightful
     ///         proposer's own later proposal reverts `AlreadyExecuted` forever;
-    ///         recovery needs a redeploy plus a fresh `setAdapterAllowed` and,
-    ///         if tier-certified, a new `proposeCertification` + `certifyDelay`.
+    ///         recovery needs a redeploy and, if tier-certified, a new
+    ///         `proposeCertification` + `certifyDelay`.
     function test_finding8_cannotProposeAnotherProposersClone() public {
         address rival = makeAddr("rivalAgent");
         StrategyOwnedBy foreign = new StrategyOwnedBy(rival, address(vault));

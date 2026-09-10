@@ -141,7 +141,7 @@ contract TierEndToEndTest is Test {
     ///      registry, onboarding an adapter now means certify + allowlist.
     function _wireTierRegistry() internal {
         governor.setTierRegistry(address(tierRegistry));
-        tierRegistry.setAdapterAllowed(address(adapter), true);
+        tierRegistry.setCounterpartyAllowed(address(adapter), true);
     }
 
     /// @dev Shared fixture helper (design.md / tasks.md 2.1): the test

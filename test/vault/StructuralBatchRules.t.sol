@@ -15,10 +15,22 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
 import {StrategyFactory} from "../../src/StrategyFactory.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
+import {MorphoSupplyStrategy} from "../../src/strategies/MorphoSupplyStrategy.sol";
+import {PortfolioStrategy} from "../../src/strategies/PortfolioStrategy.sol";
+import {ConcentratedLiquidityStrategy} from "../../src/strategies/ConcentratedLiquidityStrategy.sol";
+import {MarketParams} from "../../src/vendor/morpho/IMorpho.sol";
 
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {MockMorpho, MockIrm, MockMorphoOracle} from "../mocks/MockMorpho.sol";
+import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
+import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
+import {MockERC4626Wrapper} from "../mocks/MockERC4626Wrapper.sol";
+import {MockUniswapV3Pool} from "../mocks/MockUniswapV3Pool.sol";
+import {MockUniswapV3Factory} from "../mocks/MockUniswapV3Factory.sol";
+import {MockPositionManager} from "../mocks/MockPositionManager.sol";
 
 /// @notice An arbitrary contract nobody certified or allowlisted. `frobnicate` is
 ///         a selector no registry names; it pulls `amount` of `token` from the caller.
@@ -54,6 +66,7 @@ contract StructuralBatchRulesTest is Test {
 
     uint256 constant VOTING_PERIOD = 1 days;
     uint256 constant DEPOSIT = 20_000_000e6;
+    uint256 constant CLASS_BOUND = 500;
 
     function setUp() public {
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
@@ -176,6 +189,175 @@ contract StructuralBatchRulesTest is Test {
             settleCaps,
             new ISyndicateGovernor.CoProposer[](0)
         );
+    }
+
+    function _certifyClassNow(address template, bytes4 selector, uint8 tier, uint16 bound) internal {
+        tierRegistry.proposeClassCertification(template, selector, tier, bound, address(0), template.codehash);
+        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
+        tierRegistry.certifyClass(template, selector);
+    }
+
+    // ── Morpho template fixture ──
+
+    MockMorpho morpho;
+    MarketParams mp;
+
+    function _morphoVenue() internal returns (MorphoSupplyStrategy template) {
+        MockIrm irm = new MockIrm();
+        irm.setRate(uint256(0.05e18) / 365 days);
+        morpho = new MockMorpho();
+        mp = MarketParams({
+            loanToken: address(usdc),
+            collateralToken: makeAddr("collateral"),
+            oracle: makeAddr("oracle"),
+            irm: address(irm),
+            lltv: 0.86e18
+        });
+        morpho.createMarket(mp);
+        template = new MorphoSupplyStrategy();
+        strategyFactory.setTemplateApproval(address(template), true);
+        tierRegistry.setCounterpartyAllowed(address(morpho), true);
+    }
+
+    function _morphoClone(address template, address proposer, uint256 amount) internal returns (address clone) {
+        vm.prank(proposer);
+        clone =
+            strategyFactory.cloneAndInit(template, address(vault), proposer, abi.encode(address(morpho), mp, amount));
+    }
+
+    // ── Portfolio template fixture ──
+
+    MockAggregatorV3 portfolioFeed;
+
+    function _portfolioClone(uint256 amount) internal returns (address clone) {
+        ERC20Mock tsla = new ERC20Mock("Tesla", "TSLA", 18);
+        MockSwapAdapter adapter = new MockSwapAdapter();
+        // 1 USDC (1e6) buys 0.01 TSLA (1e16); 1 TSLA sells for 100 USDC (1e8).
+        adapter.setRate(address(usdc), address(tsla), 1e28);
+        adapter.setRate(address(tsla), address(usdc), 1e8);
+        tsla.mint(address(adapter), 1_000_000e18);
+        usdc.mint(address(adapter), 1_000_000e6);
+        MockAggregatorV3 feed = new MockAggregatorV3(18, int256(100e18));
+        portfolioFeed = feed;
+
+        PortfolioStrategy template = new PortfolioStrategy();
+        strategyFactory.setTemplateApproval(address(template), true);
+        tierRegistry.setCounterpartyAllowed(address(adapter), true);
+        tierRegistry.setCounterpartyAllowed(address(feed), true);
+        tierRegistry.setPriceSourceForToken(address(tsla), bytes32(uint256(uint160(address(feed)))), true);
+
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(tsla);
+        uint256[] memory weights = new uint256[](1);
+        weights[0] = 10_000;
+        bytes[] memory extra = new bytes[](1);
+        uint8[] memory pd = new uint8[](1);
+        pd[0] = 18;
+        address[] memory feeds = new address[](1);
+        feeds[0] = address(feed);
+        bytes memory data = abi.encode(address(usdc), address(adapter), tokens, weights, amount, 100, extra, pd, feeds);
+        vm.prank(agent);
+        clone = strategyFactory.cloneAndInit(address(template), address(vault), agent, data);
+    }
+
+    // ── Concentrated-liquidity template fixture ──
+
+    function _clClone() internal returns (address clone) {
+        ERC20Mock nvda = new ERC20Mock("NVDA", "NVDA", 18);
+        MockERC4626Wrapper spUsdc = new MockERC4626Wrapper(IERC20(address(usdc)), "spUSDC", "spUSDC");
+        MockIrm irm = new MockIrm();
+        irm.setRate(uint256(0.05e18) / 365 days);
+        MockMorpho clMorpho = new MockMorpho();
+        MarketParams memory clMp = MarketParams({
+            loanToken: address(usdc),
+            collateralToken: address(spUsdc),
+            oracle: address(new MockMorphoOracle()),
+            irm: address(irm),
+            lltv: 0.915e18
+        });
+        clMorpho.createMarket(clMp);
+        address supplier = makeAddr("supplier");
+        usdc.mint(supplier, 1_000_000e6);
+        vm.startPrank(supplier);
+        usdc.approve(address(clMorpho), 1_000_000e6);
+        clMorpho.supply(clMp, 1_000_000e6, 0, supplier, "");
+        vm.stopPrank();
+
+        MockUniswapV3Factory uniFactory = new MockUniswapV3Factory();
+        MockUniswapV3Pool pool = new MockUniswapV3Pool(address(usdc), address(nvda), 500, 10, address(uniFactory));
+        pool.setLiquidity(1e18);
+        pool.setTicks(0, 0);
+        pool.setSqrtPriceX96(uint160(1e5) * uint160(2 ** 96));
+        uniFactory.register(address(usdc), address(nvda), 500, address(pool));
+        MockPositionManager posm = new MockPositionManager(address(uniFactory));
+        MockSwapAdapter adapter = new MockSwapAdapter();
+        adapter.setRate(address(usdc), address(nvda), 1e18 * 1e12 / 100);
+        adapter.setRate(address(nvda), address(usdc), 100 * 1e18 / 1e12);
+        nvda.mint(address(adapter), 1_000_000e18);
+        usdc.mint(address(adapter), 1_000_000e6);
+
+        ConcentratedLiquidityStrategy template = new ConcentratedLiquidityStrategy();
+        strategyFactory.setTemplateApproval(address(template), true);
+        tierRegistry.setCounterpartyAllowed(address(adapter), true);
+        tierRegistry.setCounterpartyAllowed(address(posm), true);
+        tierRegistry.setCounterpartyAllowed(address(clMorpho), true);
+        tierRegistry.setCounterpartyAllowed(address(uniFactory), true);
+        tierRegistry.setCounterpartyAllowed(address(spUsdc), true);
+        tierRegistry.setCounterpartyAllowed(address(nvda), true);
+
+        ConcentratedLiquidityStrategy.InitParams memory p = ConcentratedLiquidityStrategy.InitParams({
+            pool: address(pool),
+            positionManager: address(posm),
+            uniswapFactory: address(uniFactory),
+            swapAdapter: address(adapter),
+            morpho: address(clMorpho),
+            marketParams: clMp,
+            collateralAmount: 100_000e6,
+            borrowAmount: 50_000e6,
+            tickLower: -1000,
+            tickUpper: 1000,
+            expectedLiquidity: 1e16,
+            swapFractionBps: 5_000,
+            twapWindow: 1800,
+            maxTwapDeviationBps: 100,
+            mintSlippageBps: 500,
+            rerange: ConcentratedLiquidityStrategy.RerangePolicy({
+                halfWidthTicks: 1000,
+                triggerBps: 8_000,
+                minInterval: 1 hours,
+                maxReranges: 3,
+                slippageBps: 500,
+                swapFractionBps: 5_000
+            }),
+            settleSlippageBps: 500,
+            settleDeadline: 0,
+            swapExtraData: ""
+        });
+        vm.prank(agent);
+        clone = strategyFactory.cloneAndInit(address(template), address(vault), agent, abi.encode(p));
+    }
+
+    /// @dev Propose → vote window → execute → duration → settle, for a template clone
+    ///      whose execute pulls `amount` of the asset.
+    function _runLifecycle(address clone, uint256 amount) internal returns (uint256 pid) {
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
+        execCalls[0] = _call(address(usdc), abi.encodeCall(usdc.approve, (clone, amount)));
+        execCalls[1] = _call(clone, abi.encodeCall(BaseStrategy.execute, ()));
+        uint256[] memory execCaps = new uint256[](2);
+        execCaps[1] = amount;
+        pid = _propose(
+            clone, execCalls, execCaps, _one(clone, abi.encodeCall(BaseStrategy.settle, ())), new uint256[](1), amount
+        );
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        if (address(portfolioFeed) != address(0)) portfolioFeed.setUpdatedAt(vm.getBlockTimestamp());
+        governor.executeProposal(pid);
+        assertEq(uint256(BaseStrategy(clone).state()), uint256(BaseStrategy.State.Executed), "executed");
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        if (address(portfolioFeed) != address(0)) portfolioFeed.setUpdatedAt(vm.getBlockTimestamp());
+        governor.settleProposal(pid);
+        assertEq(uint256(BaseStrategy(clone).state()), uint256(BaseStrategy.State.Settled), "settled");
+        assertEq(usdc.allowance(address(vault), clone), 0, "no allowance outlives the batch");
+        vm.warp(vm.getBlockTimestamp() + 1 days + 1);
     }
 
     // ── Rule 1: privileged targets ──
@@ -308,5 +490,53 @@ contract StructuralBatchRulesTest is Test {
         vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
         governor.executeProposal(pid);
         assertEq(usdc.balanceOf(address(venue)), cap, "admitted and executed");
+    }
+
+    function test_twoStrategyBatchPricesEachLegAtItsOwnTier() public {
+        MorphoSupplyStrategy template = _morphoVenue();
+        _certifyClassNow(address(template), BaseStrategy.execute.selector, 1, uint16(CLASS_BOUND));
+        uint256 c1 = 4_000_000e6;
+        uint256 c2 = 1_000_000e6;
+        address clone = _morphoClone(address(template), agent, c1);
+        RandomVenue custom = new RandomVenue();
+
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](4);
+        execCalls[0] = _call(address(usdc), abi.encodeCall(usdc.approve, (clone, c1)));
+        execCalls[1] = _call(clone, abi.encodeCall(BaseStrategy.execute, ()));
+        execCalls[2] = _call(address(usdc), abi.encodeCall(usdc.approve, (address(custom), c2)));
+        execCalls[3] = _call(address(custom), abi.encodeCall(RandomVenue.frobnicate, (address(usdc), c2)));
+        uint256[] memory execCaps = new uint256[](4);
+        execCaps[1] = c1;
+        execCaps[3] = c2;
+        uint256 pid = _propose(
+            clone, execCalls, execCaps, _one(clone, abi.encodeCall(BaseStrategy.settle, ())), new uint256[](1), c1 + c2
+        );
+        assertEq(governor.getProposalTier(pid), 2, "max over legs");
+        assertEq(governor.getRequiredCoverage(pid), c1 * CLASS_BOUND / 10_000 + c2, "tier_1 x cap_1 + tier_2 x cap_2");
+
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(pid);
+        assertEq(usdc.balanceOf(address(custom)), c2, "the uncertified leg executed");
+        assertEq(usdc.allowance(address(vault), clone), 0, "clone allowance reset");
+        assertEq(usdc.allowance(address(vault), address(custom)), 0, "custom allowance reset");
+    }
+
+    // ── Liveness: the shipped templates need only counterparty grants ──
+
+    function test_theThreeShippedTemplatesExecuteAndSettleWithNoAllowlisting() public {
+        uint256 before = usdc.balanceOf(address(vault));
+
+        MorphoSupplyStrategy morphoTemplate = _morphoVenue();
+        _runLifecycle(_morphoClone(address(morphoTemplate), agent, 1_000_000e6), 1_000_000e6);
+        assertGe(usdc.balanceOf(address(vault)), before, "morpho round-trips");
+
+        _runLifecycle(_portfolioClone(1_000_000e6), 1_000_000e6);
+        assertGe(
+            usdc.balanceOf(address(vault)), before - 1_000_000e6 * 2 / 100, "portfolio round-trips within slippage"
+        );
+        portfolioFeed = MockAggregatorV3(address(0));
+
+        _runLifecycle(_clClone(), 100_000e6);
+        assertEq(governor.getActiveProposal(), 0, "nothing open after three settled lifecycles");
     }
 }

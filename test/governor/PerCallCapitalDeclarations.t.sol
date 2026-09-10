@@ -107,8 +107,6 @@ contract PerCallCapitalDeclarationsTest is Test {
 
     function _wireTierRegistry() internal {
         governor.setTierRegistry(address(tierRegistry));
-        tierRegistry.setAdapterAllowed(address(mockAdapter), true);
-        tierRegistry.setAdapterAllowed(address(usdc), true);
         // The shared `_benignSettle()` leg calls `usdc.approve`. Certify it
         // tier-0 so a benign settlement is genuinely low-tier: since SHE-210
         // the settlement leg's tier counts toward the proposal tier, and an
@@ -562,11 +560,6 @@ contract PerCallCapitalDeclarationsTest is Test {
     function test_allZeroCaps_pricesZeroCoverage_meterStillBlocksOutflow() public {
         _wireTierRegistry();
         _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
-        // The vault's selector guard (Part 2, registry-dependent) requires
-        // transfer recipients to be allowlisted -- orthogonal to this test's
-        // subject (the per-call cap meter), so allowlist it explicitly rather
-        // than let an unrelated guard fire first.
-        tierRegistry.setAdapterAllowed(address(0xBEEF), true);
 
         address puller = address(new AssetPuller());
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
@@ -690,10 +683,6 @@ contract PerCallCapitalDeclarationsTest is Test {
     ///         already at the max, so execution proceeds normally.
     function test_regression_zeroCapCallDemotion_insideAlreadyTier2Batch_executesFine() public {
         _wireTierRegistry();
-        // The vault's selector guard (Part 2) requires an `approve` spender to
-        // be allowlisted -- orthogonal to this test's subject (tier/coverage
-        // regression under caps), so allowlist the spender explicitly.
-        tierRegistry.setAdapterAllowed(address(this), true);
         // Two calls: one uncertified (forces tier 2 already), one certified
         // tier-0 but capped at ZERO.
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
@@ -736,18 +725,6 @@ contract PerCallCapitalDeclarationsTest is Test {
         // tier/coverage arithmetic, not whether the demoted contract remains
         // independently callable.
         vm.etch(address(mockAdapter), address(new HarmlessFallback()).code);
-        // issue #166: the etch above changes `mockAdapter`'s codehash, which
-        // the pre-existing codehash-drift self-heal (issue #137) correctly
-        // reads as revoking `isAdapterAllowed` -- that check is now ALSO the
-        // batch callee gate (Part 2a), not just the fund-destination check
-        // Part 2b already was, so an un-re-attested etch would refuse the
-        // whole batch with `DisallowedBatchCallee` before execution even
-        // reaches the tier/coverage arithmetic this test is about (see the
-        // comment above: "not whether the demoted contract remains
-        // independently callable"). Re-snapshot the new (harmless) code,
-        // mirroring the owner re-attestation ceremony `setAdapterAllowed`'s
-        // natspec documents for a verified legitimate bytecode change.
-        tierRegistry.setAdapterAllowed(address(mockAdapter), true);
         governor.executeProposal(pid);
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Executed));
     }

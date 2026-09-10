@@ -1128,24 +1128,11 @@ contract CoverageEndToEndTest is Test {
         // `block.timestamp` local — the optimizer CSEs it across `vm.warp`),
         // execute. `_propose` and every later window below reads live state
         // relative to this new baseline, so the forward shift is safe.
-        // issue #166 (target-based batch callee gate, landed after this fixture
-        // was written): the vault's outer callee check requires the adapter be
-        // allowlisted independently of certification, or the batch never
-        // reaches the tier-1 poke call at all.
-        tierRegistry.setAdapterAllowed(address(adapter), true);
         tierRegistry.proposeCertification(
             address(adapter), adapter.poke.selector, 1, 100, address(0), address(adapter).codehash
         );
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(address(adapter), adapter.poke.selector);
-        // issue #166: certifying a (target, selector) prices it for tiering
-        // but does NOT make `target` batch-callable at all — that is the
-        // SEPARATE `isAdapterAllowed` allowlist `SyndicateVault._guardBatchCalls`
-        // PART 2a now enforces on every batch callee. `adapter` (`NoopAdapter`)
-        // is a benign, fund-neutral fixture, not an attacker probe — allowlist
-        // it or `executeProposal` below is refused with `DisallowedBatchCallee`
-        // before the bounded-tier coverage mechanics under test ever run.
-        tierRegistry.setAdapterAllowed(address(adapter), true);
 
         pid = _propose(govA, address(vaultA), agentA, _adapterCalls(), _adapterCalls());
         assertEq(govA.getProposal(pid).envelopeTier, 1, "certified tier 1");

@@ -7,13 +7,10 @@ import {ITierRegistry} from "../../src/interfaces/ITierRegistry.sol";
 ///         GOVERNANCE mechanics and never meant to test the registry.
 /// @dev    `SyndicateGovernor.initialize` now takes the registry as a
 ///         MANDATORY, must-hold-code argument (pashov finding #1), so a harness
-///         that used to pass nothing has to pass something. Those harnesses
-///         previously ran with `_tierRegistry == 0`, under which
-///         `SyndicateVault._guardBatchCalls` returned early and applied NO
-///         allowlist — so granting everything is what preserves their behavior.
+///         that used to pass nothing has to pass something.
 ///
 ///         DO NOT reach for this when the assertion is about the registry —
-///         allowlisting, demotion, callee gating, tier resolution. Those
+///         counterparty binding, demotion, tier resolution. Those
 ///         fixtures deploy a real `TierRegistry` and seed it; a permissive
 ///         stand-in would make them pass vacuously.
 contract PermissiveTierRegistry is ITierRegistry {
@@ -22,14 +19,6 @@ contract PermissiveTierRegistry is ITierRegistry {
     ///      would hand it.
     function tierOf(address, bytes4) external pure returns (uint8, uint16) {
         return (2, 10_000);
-    }
-
-    function isAdapterAllowed(address) external pure returns (bool) {
-        return true;
-    }
-
-    function isCallableTarget(address) external pure returns (bool) {
-        return true;
     }
 
     function isCounterpartyAllowed(address) external pure returns (bool) {

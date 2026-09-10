@@ -904,8 +904,6 @@ contract GovernorCoverageGatesTest is Test {
     function _wireTierRegistryCertifiedAt(uint8 tier, uint16 bound) internal returns (TierRegistry reg) {
         reg = new TierRegistry(address(this));
         governor.setTierRegistry(address(reg)); // test contract is the factory
-        reg.setAdapterAllowed(address(targetToken), true);
-        reg.setAdapterAllowed(address(usdg), true);
         reg.proposeCertification(
             address(targetToken), targetToken.approve.selector, tier, bound, address(0), address(targetToken).codehash
         );

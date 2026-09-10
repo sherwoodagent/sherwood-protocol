@@ -45,7 +45,7 @@ contract MockGovernorAlwaysActive {
 ///         is actually testing the binding needs precise, non-permissive
 ///         wiring instead (see `PortfolioStrategyAdapterAllowlist.t.sol`).
 contract MockPermissiveTierRegistry {
-    function isAdapterAllowed(address) external pure returns (bool) {
+    function isCounterpartyAllowed(address) external pure returns (bool) {
         return true;
     }
 
@@ -53,13 +53,6 @@ contract MockPermissiveTierRegistry {
     ///      non-member, so the vault's class-binding check never fires.
     function classOf(address) external pure returns (bytes32) {
         return bytes32(0);
-    }
-
-    /// @dev Callee axis (pashov finding #14). Permissive like its sibling —
-    ///      fixtures using this mock are resolving the binding path, not
-    ///      exercising the demotion asymmetry.
-    function isCallableTarget(address) external pure returns (bool) {
-        return true;
     }
 
     function isPriceSourceForToken(address, bytes32) external pure returns (bool) {
