@@ -533,14 +533,9 @@ interface ISyndicateGovernor {
     ///         queue-only proposal.
     /// @dev    The strategy is set immutably at propose time — voters approve based
     ///         on this address, and there is no later rebind path.
-    /// @dev    `executeCallCaps` and `settlementCallCaps` are parallel arrays, one
-    ///         `uint256` per entry in the corresponding call array: each call's own
-    ///         declared gross-outflow cap, denominated in the vault asset. Zero is
-    ///         a legal declaration at every tier. Each sum must be
-    ///         `<= envelope.maxCapital`, checked PER BATCH: per-call caps meter the
-    ///         gross a settlement call may move (a strategy re-pulling what it
-    ///         deployed), while the settle batch's NET egress budget is zero — it
-    ///         may only bring assets home.
+    /// @dev    `executeCallCaps` / `settlementCallCaps` parallel the call arrays: each call's declared
+    ///         gross-outflow cap in the vault asset (zero is legal), each batch's sum `<= envelope.maxCapital`.
+    ///         Settlement caps meter gross re-pulls; the settle batch's net egress budget is zero.
     function propose(
         address vault,
         address strategy,

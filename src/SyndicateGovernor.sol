@@ -13,6 +13,7 @@ import {IStrategyFactory} from "./interfaces/IStrategyFactory.sol";
 import {GovernorParameters} from "./GovernorParameters.sol";
 import {GovernorEmergency} from "./GovernorEmergency.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
+import {AssetCallRules} from "./AssetCallRules.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
@@ -347,9 +348,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (executeCalls.length > MAX_CALLS_PER_PROPOSAL || settlementCalls.length > MAX_CALLS_PER_PROPOSAL) {
             revert TooManyCalls();
         }
-        // Refuse an unregistered target before the leg is stored: settle
-        // would revert on it forever and wedge the proposal in Executed.
-        _rejectUnregisteredTargets(vault, executeCalls, settlementCalls);
+        // Refuse an unregistered target or an ill-shaped asset leg before it is
+        // stored: settle would revert on it forever and wedge the proposal in Executed.
+        _mirrorBatchRules(vault, executeCalls, settlementCalls);
         // Caps metadata URI length.
         if (bytes(metadataURI).length > MAX_METADATA_URI_LENGTH) revert MetadataURITooLong();
         // Risk envelope: nonzero outflow ceiling, clamped to the maxCapitalBps
@@ -1080,20 +1081,23 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (maxCapital > _capitalCeiling()) revert MaxCapitalExceedsCeiling();
     }
 
-    /// @dev Propose-time mirror of the vault guard's target rule.
-    function _rejectUnregisteredTargets(
+    /// @dev Propose-time mirror of the vault's structural batch rules: the same target rule and
+    ///      the same asset-leg predicate, so a stored leg cannot pass here and revert at settle.
+    function _mirrorBatchRules(
         address vault_,
         BatchExecutorLib.Call[] calldata executeCalls_,
         BatchExecutorLib.Call[] calldata settlementCalls_
     ) private view {
         address asset_ = IERC4626(vault_).asset();
-        for (uint256 i = 0; i < executeCalls_.length; i++) {
-            address t = executeCalls_[i].target;
-            if (t != asset_ && !_isRegisteredStrategy(t)) revert ISyndicateVault.NotARegisteredStrategy(t);
-        }
-        for (uint256 i = 0; i < settlementCalls_.length; i++) {
-            address t = settlementCalls_[i].target;
-            if (t != asset_ && !_isRegisteredStrategy(t)) revert ISyndicateVault.NotARegisteredStrategy(t);
+        _mirrorBatchLeg(vault_, asset_, executeCalls_);
+        _mirrorBatchLeg(vault_, asset_, settlementCalls_);
+    }
+
+    function _mirrorBatchLeg(address vault_, address asset_, BatchExecutorLib.Call[] calldata calls_) private view {
+        for (uint256 i = 0; i < calls_.length; i++) {
+            address t = calls_[i].target;
+            if (t == asset_) AssetCallRules.spenderOf(vault_, calls_[i].data);
+            else if (!_isRegisteredStrategy(t)) revert ISyndicateVault.NotARegisteredStrategy(t);
         }
     }
 

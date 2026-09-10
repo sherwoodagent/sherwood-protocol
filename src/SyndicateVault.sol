@@ -10,6 +10,7 @@ import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IVaultWithdrawalQueue} from "./interfaces/IVaultWithdrawalQueue.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
+import {AssetCallRules} from "./AssetCallRules.sol";
 import {SyndicateVaultAdminLib} from "./SyndicateVaultAdminLib.sol";
 import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import {
@@ -448,9 +449,8 @@ contract SyndicateVault is
     }
 
     /// @dev Structural batch rules. Every non-asset target is a strategy registered with the
-    ///      protocol's factory (a fixed `IStrategy` shape, not a trust check). On `asset()` a call is
-    ///      either a metered transfer (`transferFrom` from the vault only) or allowance-shaped: its
-    ///      first argument is a spender to reset after the batch, whatever the selector.
+    ///      protocol's factory (a fixed `IStrategy` shape, not a trust check); an asset call must
+    ///      pass `AssetCallRules.spenderOf`, and the spender it names is reset after the batch.
     function _guardBatchCalls(BatchExecutorLib.Call[] calldata calls) private view returns (address[] memory spenders) {
         address factory_ = _strategyFactory();
         address asset_ = asset();
@@ -462,17 +462,9 @@ contract SyndicateVault is
                 if (!_isRegisteredStrategy(factory_, target)) revert NotARegisteredStrategy(target);
                 continue;
             }
-            bytes calldata data = calls[i].data;
-            if (data.length < 36) revert MalformedAssetCall(data.length >= 4 ? bytes4(data[0:4]) : bytes4(0));
-            bytes4 sel = bytes4(data[0:4]);
-            bytes32 arg0 = bytes32(data[4:36]);
-            if (sel == IERC20.transferFrom.selector) {
-                if (arg0 != bytes32(uint256(uint160(address(this))))) {
-                    revert TransferFromNotVault(address(uint160(uint256(arg0))));
-                }
-            } else if (sel != IERC20.transfer.selector) {
-                spenders[n++] = address(uint160(uint256(arg0)));
-            }
+            // A zero first argument (`balanceOf(address(0))`) names no spender; resetting it would revert.
+            address spender = AssetCallRules.spenderOf(address(this), calls[i].data);
+            if (spender != address(0)) spenders[n++] = spender;
         }
         assembly ("memory-safe") {
             mstore(spenders, n)

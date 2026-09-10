@@ -760,6 +760,75 @@ contract StructuralBatchRulesTest is Test {
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
     }
 
+    /// @notice A zero first argument on the asset (`balanceOf(address(0))`) names no spender; the
+    ///         reset skips it instead of reverting `ERC20InvalidSpender` and losing the batch.
+    function test_zeroAddressArg0OnTheAssetExecutes() public {
+        _runBatch(_one(address(usdc), abi.encodeCall(usdc.balanceOf, (address(0)))), 0);
+    }
+
+    // ── Propose-time mirror of the asset rules ──
+
+    /// @notice A leg of each refused asset shape is rejected at propose with the vault's own error, in
+    ///         either batch, so no proposal can reach Executed on a leg settle would refuse.
+    function test_refusedAssetShapesAreRejectedAtPropose() public {
+        CustomStrategy c = _custom();
+        BatchExecutorLib.Call[] memory good = _one(address(usdc), abi.encodeCall(usdc.approve, (address(c), 0)));
+        bytes[] memory shapes = new bytes[](3);
+        bytes[] memory errs = new bytes[](3);
+        shapes[0] = abi.encodeCall(usdc.transferFrom, (lp1, address(vault), 1));
+        errs[0] = abi.encodeWithSelector(ISyndicateVault.TransferFromNotVault.selector, lp1);
+        shapes[1] = abi.encodePacked(usdc.approve.selector, new bytes(31));
+        errs[1] = abi.encodeWithSelector(ISyndicateVault.MalformedAssetCall.selector, usdc.approve.selector);
+        shapes[2] = abi.encodeCall(usdc.totalSupply, ());
+        errs[2] = abi.encodeWithSelector(ISyndicateVault.MalformedAssetCall.selector, usdc.totalSupply.selector);
+        for (uint256 i = 0; i < shapes.length; i++) {
+            BatchExecutorLib.Call[] memory bad = _one(address(usdc), shapes[i]);
+            _expectProposeRevert(address(c), good, bad, errs[i]);
+            _expectProposeRevert(address(c), bad, good, errs[i]);
+        }
+    }
+
+    /// @notice Control: a metered `transfer` and a 36-byte read in a settle leg still propose.
+    function test_transferAndReadSettleLegsStillPropose() public {
+        CustomStrategy c = _custom();
+        BatchExecutorLib.Call[] memory settle = new BatchExecutorLib.Call[](2);
+        settle[0] = _call(address(usdc), abi.encodeCall(usdc.transfer, (attacker, 1)));
+        settle[1] = _call(address(usdc), abi.encodeCall(usdc.balanceOf, (address(0))));
+        uint256 pid = _propose(
+            address(c),
+            _one(address(usdc), abi.encodeCall(usdc.approve, (address(c), 0))),
+            new uint256[](1),
+            settle,
+            new uint256[](2),
+            1
+        );
+        assertEq(governor.getProposal(pid).strategy, address(c), "proposed");
+    }
+
+    function _expectProposeRevert(
+        address strategy,
+        BatchExecutorLib.Call[] memory execCalls,
+        BatchExecutorLib.Call[] memory settleCalls,
+        bytes memory err
+    ) internal {
+        uint256[] memory execCaps = new uint256[](execCalls.length);
+        uint256[] memory settleCaps = new uint256[](settleCalls.length);
+        vm.prank(agent);
+        vm.expectRevert(err);
+        governor.propose(
+            address(vault),
+            strategy,
+            "ipfs://structural",
+            7 days,
+            ISyndicateGovernor.RiskEnvelope({maxCapital: 1, maxDrawdownBps: 10_000}),
+            execCalls,
+            execCaps,
+            settleCalls,
+            settleCaps,
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+    }
+
     // ── Rule 4: everything else is admitted and metered ──
 
     function test_arbitraryContractWithArbitrarySelectorIsAdmittedAndMetered() public {
