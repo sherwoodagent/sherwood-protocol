@@ -1,5 +1,7 @@
 # Adapter onboarding checklist — the dual-gate
 
+> **Stale — kept until SHE-278 rewrites it.** The adapter allowlist (`setAdapterAllowed`) no longer exists; counterparty and price-source seeding lives in `script/Deploy.s.sol::_seedTierRegistry`.
+
 Onboarding an adapter takes **two independent governance writes**, both
 `onlyOwner` on `TierRegistry`. Nothing on-chain requires you to do both, or
 checks that you did them consistently. Getting one without the other fails

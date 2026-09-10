@@ -23,7 +23,7 @@ interface AggregatorV3Interface {
 interface ITierBindingPath {
     function governor() external view returns (address);
     function tierRegistry() external view returns (address);
-    function isAdapterAllowed(address adapter) external view returns (bool);
+    function isCounterpartyAllowed(address counterparty) external view returns (bool);
     function isPriceSourceForToken(address token, bytes32 priceSource) external view returns (bool);
 }
 
@@ -378,20 +378,20 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
         return uint256(answer);
     }
 
-    // ── Governance-allowlist binding ──
+    // ── Counterparty binding ──
 
     /// @dev Skips when the registry is unresolvable so a broken walk never strands `rebalanceDelta`;
     ///      init is fail-closed on resolution separately.
     function _requireAllowedAdapter(address swapAdapter_) private view {
         address registry = _resolveTierRegistry();
         if (registry == address(0)) return;
-        if (!_isAdapterAllowed(registry, swapAdapter_)) revert AdapterNotAllowed(swapAdapter_, registry);
+        if (!_isCounterpartyAllowed(registry, swapAdapter_)) revert AdapterNotAllowed(swapAdapter_, registry);
     }
 
     function _requireAllowedPriceSource(address priceSource) private view {
         address registry = _resolveTierRegistry();
         if (registry == address(0)) return;
-        if (!_isAdapterAllowed(registry, priceSource)) revert PriceSourceNotAllowed(priceSource, registry);
+        if (!_isCounterpartyAllowed(registry, priceSource)) revert PriceSourceNotAllowed(priceSource, registry);
     }
 
     /// @dev Attestation key is the bare aggregator address widened to bytes32.
@@ -428,9 +428,10 @@ contract PortfolioStrategy is BaseStrategy, ReentrancyGuardTransient {
     }
 
     /// @dev Length-checked raw staticcall; unreadable reads as `false`.
-    function _isAdapterAllowed(address registry, address adapter) private view returns (bool) {
+    function _isCounterpartyAllowed(address registry, address venue) private view returns (bool) {
         if (registry.code.length == 0) return false;
-        (bool ok, bytes memory ret) = registry.staticcall(abi.encodeCall(ITierBindingPath.isAdapterAllowed, (adapter)));
+        (bool ok, bytes memory ret) =
+            registry.staticcall(abi.encodeCall(ITierBindingPath.isCounterpartyAllowed, (venue)));
         if (!ok || ret.length != 32) return false;
         return abi.decode(ret, (bool));
     }

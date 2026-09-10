@@ -42,7 +42,7 @@ contract PortfolioMainnetForkTest is RobinhoodMainnetIntegrationTest {
         // bind — the strategy CLONE itself is allowlisted separately, inside
         // `_cloneAndInit` (a pre-existing fix, not fallout of this change).
         vm.prank(deployer);
-        TierRegistry(tierRegistry).setAdapterAllowed(swapAdapter, true);
+        TierRegistry(tierRegistry).setCounterpartyAllowed(swapAdapter, true);
     }
 
     // ── Init-data builder: 100% WETH basket, push-feed mode ──

@@ -11,14 +11,14 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockMToken} from "./mocks/MockMToken.sol";
 
 /// @dev Minimal SyndicateFactory stand-in returning a non-zero
-///      `vaultToSyndicate(vault)` so `StrategyFactory._authClone` passes.
+///      `vaultToSyndicate(vault)` so the factory's vault check passes.
 contract _MockSyndicateRegistry {
     function vaultToSyndicate(address) external pure returns (uint256) {
         return 1;
     }
 }
 
-/// @dev Minimal vault stand-in exposing IVaultMembership.
+/// @dev Minimal vault stand-in.
 contract _MockVault {
     address public owner;
 
@@ -162,22 +162,18 @@ contract TierRegistryClassCertificationTest is Test {
 
     function _certifyAndAllowClass(address tmpl) internal {
         _certifyClass(tmpl);
-        vm.prank(owner);
-        registry.setClassAllowed(tmpl, true);
     }
 
     // ── 5.1 Membership positive ──
 
-    /// @notice The whole point: a clone is tiered and callable with NO
-    ///         per-clone owner action ever having been taken.
-    function test_classMembership_cloneInheritsTierAndAllowlist() public {
+    /// @notice The whole point: a clone is tiered with NO per-clone owner action.
+    function test_classMembership_cloneInheritsTier() public {
         _certifyAndAllowClass(address(template));
         address clone = _cloneViaFactory();
 
         (uint8 tier, uint16 bound) = registry.tierOf(clone, SEL);
         assertEq(tier, TIER_1, "clone inherits the class tier");
         assertEq(bound, BOUND, "clone inherits the class bound");
-        assertTrue(registry.isAdapterAllowed(clone), "clone inherits class allowlist standing");
         assertEq(registry.classOf(clone), registry.cloneCodehashOf(address(template)), "clone reports its class");
     }
 
@@ -190,7 +186,6 @@ contract TierRegistryClassCertificationTest is Test {
         (uint8 t2,) = registry.tierOf(second, SEL);
         assertEq(t1, TIER_1);
         assertEq(t2, TIER_1);
-        assertTrue(registry.isAdapterAllowed(second), "every clone, not just the first");
     }
 
     /// @notice An uncertified selector on a certified class stays tier 2 —
@@ -213,7 +208,6 @@ contract TierRegistryClassCertificationTest is Test {
         _certifyAndAllowClass(address(template));
         (uint8 tier,) = registry.tierOf(address(template), SEL);
         assertEq(tier, 2, "the template is not a clone of itself");
-        assertFalse(registry.isAdapterAllowed(address(template)), "and gains no allowlist standing");
         assertEq(registry.classOf(address(template)), bytes32(0), "belongs to no class");
     }
 
@@ -224,14 +218,12 @@ contract TierRegistryClassCertificationTest is Test {
         address foreign = Clones.clone(address(other));
         (uint8 tier,) = registry.tierOf(foreign, SEL);
         assertEq(tier, 2, "different template, different class");
-        assertFalse(registry.isAdapterAllowed(foreign));
     }
 
     /// @notice An EOA belongs to no class.
     function test_classMembership_eoaIsNotAMember() public {
         _certifyAndAllowClass(address(template));
         assertEq(registry.classOf(makeAddr("eoa")), bytes32(0));
-        assertFalse(registry.isAdapterAllowed(makeAddr("eoa")));
     }
 
     // ── 5.3 Level-2 staleness ──
@@ -256,8 +248,6 @@ contract TierRegistryClassCertificationTest is Test {
         (uint8 tierB,) = registry.tierOf(b, SEL);
         assertEq(tierA, 2, "yet the clone reads tier 2 on the very next read");
         assertEq(tierB, 2, "for every clone, not just one");
-        assertFalse(registry.isAdapterAllowed(a), "and loses allowlist standing");
-        assertFalse(registry.isAdapterAllowed(b));
         assertEq(registry.classOf(a), bytes32(0), "membership is gone with no demotion call");
     }
 
@@ -273,7 +263,6 @@ contract TierRegistryClassCertificationTest is Test {
         _certifyAndAllowClass(address(template));
         vm.etch(address(template), hex"600160005260206000f3");
         registry.pokeClass(address(template), SEL);
-        assertFalse(registry.isClassAllowed(address(template)), "class allowlist cleared on demotion");
     }
 
     // ── 5.4 Precedence ──
@@ -316,13 +305,10 @@ contract TierRegistryClassCertificationTest is Test {
         (uint8 tier, uint16 bound) = registry.tierOf(rogue, SEL);
         assertEq(tier, 2, "no provenance, no class tier");
         assertEq(bound, 10_000);
-        assertFalse(registry.isAdapterAllowed(rogue), "refused as a funds recipient");
         assertEq(registry.classOf(rogue), bytes32(0), "belongs to no class");
-        assertTrue(registry.isCallableTarget(rogue), "the callee axis reads code alone");
 
         (uint8 mTier,) = registry.tierOf(minted, SEL);
         assertEq(mTier, TIER_1, "control: the factory's own clone is a member");
-        assertTrue(registry.isAdapterAllowed(minted));
     }
 
     /// @notice A clone the factory DID deploy whose bytecode is later moved
@@ -338,7 +324,6 @@ contract TierRegistryClassCertificationTest is Test {
         assertEq(registry.classOf(clone), bytes32(0), "drifted bytecode leaves the class");
         (uint8 tier,) = registry.tierOf(clone, SEL);
         assertEq(tier, 2);
-        assertFalse(registry.isAdapterAllowed(clone));
         assertEq(factory.cloneTemplate(clone), address(template), "even though provenance still says so");
     }
 
@@ -356,8 +341,7 @@ contract TierRegistryClassCertificationTest is Test {
     }
 
     /// @notice Every class read STATICCALLs the factory, so an EOA there would
-    ///         revert `tierOf`, `isAdapterAllowed` and `isCallableTarget` for
-    ///         every target — settlement included.
+    ///         revert `tierOf` for every target — every proposal included.
     function test_setStrategyFactory_rejectsAnEoa() public {
         address eoa = makeAddr("notAFactory");
         vm.prank(owner);
@@ -376,15 +360,11 @@ contract TierRegistryClassCertificationTest is Test {
         vm.warp(block.timestamp + fresh.certifyDelay() + 1);
         vm.stopPrank();
         fresh.certifyClass(address(template), SEL);
-        vm.prank(owner);
-        fresh.setClassAllowed(address(template), true);
 
         address clone = _cloneViaFactory();
         assertEq(fresh.classOf(clone), bytes32(0), "no factory, no class");
         (uint8 tier,) = fresh.tierOf(clone, SEL);
         assertEq(tier, 2);
-        assertFalse(fresh.isAdapterAllowed(clone));
-        assertTrue(fresh.isCallableTarget(clone), "the callee axis never depends on the factory pointer");
     }
 
     /// @notice A contract that does not answer `cloneTemplate` cannot be the
@@ -400,27 +380,21 @@ contract TierRegistryClassCertificationTest is Test {
     ///         and funds axes from clones the old factory minted, but NOT the
     ///         callee axis: the vault must still be able to call in and reclaim
     ///         capital the clone is holding. Pointing back restores all three.
-    function test_repointingTheFactoryKeepsOldClonesCallable() public {
+    function test_repointingTheFactoryClosesTheClassTierUntilPointedBack() public {
         _certifyAndAllowClass(address(template));
         address clone = _cloneViaFactory();
         (uint8 tier0,) = registry.tierOf(clone, SEL);
         assertEq(tier0, TIER_1, "precondition: certified tier");
-        assertTrue(registry.isAdapterAllowed(clone), "precondition: fundable");
-        assertTrue(registry.isCallableTarget(clone), "precondition: reachable");
 
         StrategyFactory replacement = new StrategyFactory(address(syndicateRegistry), address(this));
         vm.prank(owner);
         registry.setStrategyFactory(address(replacement));
 
-        assertTrue(registry.isCallableTarget(clone), "settlement stays open across a factory re-point");
-        assertFalse(registry.isAdapterAllowed(clone), "while the funds axis closes");
         (uint8 tier1,) = registry.tierOf(clone, SEL);
         assertEq(tier1, 2, "and the tier falls back to the uncertified default");
 
         vm.prank(owner);
         registry.setStrategyFactory(address(factory));
-        assertTrue(registry.isCallableTarget(clone));
-        assertTrue(registry.isAdapterAllowed(clone), "pointing back restores the funds axis");
         (uint8 tier2,) = registry.tierOf(clone, SEL);
         assertEq(tier2, TIER_1, "and the certified tier");
     }
@@ -438,9 +412,7 @@ contract TierRegistryClassCertificationTest is Test {
         (uint8 tier, uint16 bound) = registry.tierOf(clone, SEL);
         assertEq(tier, 2, "no provenance answer, no class tier");
         assertEq(bound, 10_000);
-        assertFalse(registry.isAdapterAllowed(clone), "and no funds standing");
         assertEq(registry.classOf(clone), bytes32(0), "the target belongs to no class");
-        assertTrue(registry.isCallableTarget(clone), "but the vault can still reach its capital");
     }
 
     // ── 5.5c Re-pointing the class at new template code ──
@@ -455,15 +427,12 @@ contract TierRegistryClassCertificationTest is Test {
 
         _certifyClassFor(address(template), SEL);
         _certifyClassFor(address(template), selB);
-        vm.prank(owner);
-        registry.setClassAllowed(address(template), true);
         address clone = _cloneViaFactory();
 
         (uint8 tA,) = registry.tierOf(clone, SEL);
         (uint8 tB,) = registry.tierOf(clone, selB);
         assertEq(tA, TIER_1, "precondition: A certified");
         assertEq(tB, TIER_1, "precondition: B certified");
-        assertTrue(registry.isAdapterAllowed(clone), "precondition: class allowed");
 
         // The template's code moves; the clone's own codehash does not.
         vm.etch(address(template), hex"600160005260206000f3");
@@ -475,32 +444,9 @@ contract TierRegistryClassCertificationTest is Test {
         assertEq(tA2, 2, "A was certified against the old template code");
         assertEq(tB2, 2, "and so was B");
         assertEq(tC, TIER_1, "only the selector reviewed against the new code is served");
-        assertFalse(registry.isAdapterAllowed(clone), "the funds bit does not survive the re-point");
-        assertTrue(registry.isCallableTarget(clone), "but the callee bit does: the vault must still settle");
-        assertFalse(registry.isClassAllowed(address(template)), "and the class reports itself unallowed");
 
-        vm.prank(owner);
-        registry.setClassAllowed(address(template), true);
-        assertTrue(registry.isAdapterAllowed(clone), "an explicit owner grant reopens it against the new code");
         (uint8 tA3,) = registry.tierOf(clone, SEL);
         assertEq(tA3, 2, "and still does not revive A");
-    }
-
-    /// @notice A re-point closes the funds axis for the whole class, but the
-    ///         clones minted under the old code may still hold vault capital.
-    ///         The callee axis therefore survives it, exactly as it survives a
-    ///         demotion — the vault must be able to call in and reclaim.
-    function test_repointedClassMemberRemainsCallable() public {
-        _certifyAndAllowClass(address(template));
-        address clone = _cloneViaFactory();
-        assertTrue(registry.isCallableTarget(clone), "precondition: reachable");
-        assertTrue(registry.isAdapterAllowed(clone), "precondition: fundable");
-
-        vm.etch(address(template), hex"600160005260206000f3");
-        _certifyClassFor(address(template), bytes4(keccak256("unwind()")));
-
-        assertTrue(registry.isCallableTarget(clone), "the settlement path stays open across a re-point");
-        assertFalse(registry.isAdapterAllowed(clone), "while the funds path closes");
     }
 
     /// @notice Re-certifying against UNCHANGED template code is not a re-point:
@@ -509,8 +455,6 @@ contract TierRegistryClassCertificationTest is Test {
         bytes4 selB = bytes4(keccak256("settle()"));
         _certifyClassFor(address(template), SEL);
         _certifyClassFor(address(template), selB);
-        vm.prank(owner);
-        registry.setClassAllowed(address(template), true);
         address clone = _cloneViaFactory();
 
         vm.prank(owner);
@@ -541,7 +485,6 @@ contract TierRegistryClassCertificationTest is Test {
 
         (uint8 tier,) = registry.tierOf(fake, SEL);
         assertEq(tier, 2, "distinct codehash => not a member");
-        assertFalse(registry.isAdapterAllowed(fake), "and silently unallowlisted");
         assertEq(registry.classOf(fake), bytes32(0), "no error is raised anywhere");
     }
 
@@ -559,41 +502,27 @@ contract TierRegistryClassCertificationTest is Test {
         (uint8 tierB,) = registry.tierOf(b, SEL);
         assertEq(tierA, 2);
         assertEq(tierB, 2);
-        assertFalse(registry.isAdapterAllowed(a), "allowlist cleared for the whole class");
-        assertFalse(registry.isAdapterAllowed(b));
     }
 
-    /// @notice Re-certification must never restore allowlist standing — the
-    ///         address path's rule, and the blast radius here is every clone.
-    function test_demoteClass_reCertificationDoesNotRestoreAllowlist() public {
-        _certifyAndAllowClass(address(template));
+    /// @notice Re-certification restores the class tier; nothing else needs restoring.
+    function test_demoteClass_reCertificationRestoresTheTier() public {
+        _certifyClass(address(template));
         address clone = _cloneViaFactory();
 
         vm.prank(owner);
         registry.demoteClass(address(template), SEL);
-        assertFalse(registry.isClassAllowed(address(template)));
+        (uint8 demoted,) = registry.tierOf(clone, SEL);
+        assertEq(demoted, 2, "demoted");
 
         _certifyClass(address(template));
         (uint8 tier,) = registry.tierOf(clone, SEL);
         assertEq(tier, TIER_1, "tier is restored by re-certification");
-        assertFalse(registry.isAdapterAllowed(clone), "but the funds path is NOT");
-        assertFalse(registry.isClassAllowed(address(template)));
-
-        vm.prank(owner);
-        registry.setClassAllowed(address(template), true);
-        assertTrue(registry.isAdapterAllowed(clone), "only an explicit owner grant reopens it");
     }
 
     function test_demoteClass_onUncertifiedClassReverts() public {
         vm.prank(owner);
         vm.expectRevert(TierRegistry.ClassNotCertified.selector);
         registry.demoteClass(address(template), SEL);
-    }
-
-    function test_setClassAllowed_beforeCertificationReverts() public {
-        vm.prank(owner);
-        vm.expectRevert(TierRegistry.ClassNotCertified.selector);
-        registry.setClassAllowed(address(template), true);
     }
 
     // ── 5.8 Namespace isolation ──
@@ -625,46 +554,6 @@ contract TierRegistryClassCertificationTest is Test {
         vm.prank(owner);
         vm.expectRevert(TierRegistry.NotCertified.selector);
         registry.demote(address(template), SEL);
-    }
-
-    // ── Gas: the class fallback's cost on the address-miss branch (task 6.4) ──
-
-    /// @notice `SyndicateVault._guardBatchCalls` calls `isAdapterAllowed` once
-    ///         per batch sub-call, so any cost added there is paid on every
-    ///         governor batch. The class lookup runs ONLY when the address path
-    ///         misses, so this measures both branches and reports the delta
-    ///         rather than assuming it is negligible.
-    ///
-    ///         Measured, not asserted tight: the numbers are logged so a future
-    ///         change that makes the miss branch materially more expensive is
-    ///         visible in the diff. The bound below is a smoke test — a class
-    ///         lookup is two EXTCODEHASH plus a storage read, so anything past
-    ///         ~15k means the shape changed, not that it drifted.
-    function test_gas_isAdapterAllowed_addressHitVsClassMiss() public {
-        _certifyAndAllowClass(address(template));
-        address clone = _cloneViaFactory();
-
-        // Address-path hit: an explicitly allowlisted address returns before
-        // any class work happens.
-        vm.prank(owner);
-        registry.setAdapterAllowed(clone, true);
-        uint256 g0 = gasleft();
-        bool hit = registry.isAdapterAllowed(clone);
-        uint256 addressPathGas = g0 - gasleft();
-        assertTrue(hit);
-
-        // Address-path miss: falls through to the two-level class check.
-        address sibling = _cloneViaFactory();
-        uint256 g1 = gasleft();
-        bool viaClass = registry.isAdapterAllowed(sibling);
-        uint256 classPathGas = g1 - gasleft();
-        assertTrue(viaClass, "sibling is allowed via its class, not by address");
-
-        emit log_named_uint("isAdapterAllowed gas, address hit", addressPathGas);
-        emit log_named_uint("isAdapterAllowed gas, class fallback", classPathGas);
-        emit log_named_uint("delta paid only on address miss", classPathGas - addressPathGas);
-
-        assertLt(classPathGas - addressPathGas, 15_000, "class fallback cost changed shape, not just drifted");
     }
 
     // ── Certification guards ──

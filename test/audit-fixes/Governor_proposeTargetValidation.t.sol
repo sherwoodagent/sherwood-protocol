@@ -7,7 +7,6 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
 import {VaultWithdrawalQueue} from "../../src/queue/VaultWithdrawalQueue.sol";
-import {IVaultWithdrawalQueue} from "../../src/interfaces/IVaultWithdrawalQueue.sol";
 import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
@@ -15,14 +14,15 @@ import {BlacklistingERC20Mock} from "../mocks/BlacklistingERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
+import {StrategyFactory} from "../../src/StrategyFactory.sol";
+import {MockStrategyAdapter} from "../mocks/MockStrategyAdapter.sol";
 
 /// @title Governor_proposeTargetValidation
 /// @notice Issue #118 — propose-time coverage that doesn't fit the lifecycle
-///         file's real-attack-trace framing: the `executeCalls`-side rejection,
-///         the single-sourced predicate's parity with the execution-time guard,
-///         its degrade-open behavior against a vault that predates the view,
-///         and the `claimUnclaimedFees` reentrancy-latch addition.
+///         file's real-attack-trace framing: a batch naming the vault or the
+///         governor is refused at `propose` because neither is a registered
+///         strategy, and the `claimUnclaimedFees` re-entry shape never stores.
 ///
 ///         The six-step-trace and settlement-batch scenarios (the two
 ///         propose-time rejections that are #118's actual reported bugs) live
@@ -48,6 +48,20 @@ contract GovernorProposeTargetValidationTest is Test {
     uint256 constant COOLDOWN_PERIOD = 1 days;
     uint256 constant STRATEGY_DURATION = 7 days;
     uint256 constant SELF_SETTLE_FLOOR = 1 hours;
+
+    TierRegistry tierRegistry;
+    StrategyFactory strategyFactory;
+    MockStrategyAdapter strat;
+
+    /// @dev A real registry wired to a real factory, with one registered strategy for the field.
+    function _realRegistry() internal returns (TierRegistry) {
+        tierRegistry = new TierRegistry(address(this));
+        strategyFactory = new StrategyFactory(address(this), address(this));
+        tierRegistry.setStrategyFactory(address(strategyFactory));
+        strat = new MockStrategyAdapter();
+        strategyFactory.registerStrategy(address(strat));
+        return tierRegistry;
+    }
 
     function setUp() public {
         usdc = new BlacklistingERC20Mock("USD Coin", "USDC", 6);
@@ -91,7 +105,7 @@ contract GovernorProposeTargetValidationTest is Test {
                 address(guardianRegistry),
                 address(protocolConfig),
                 address(this),
-                address(deployTierRegistry(address(this))), // factory
+                address(_realRegistry()),
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: 1 days,
@@ -126,32 +140,18 @@ contract GovernorProposeTargetValidationTest is Test {
         return new ISyndicateGovernor.CoProposer[](0);
     }
 
-    /// @dev A call that clears both halves of the guard and moves nothing: a
-    ///      view selector on the asset token.
+    /// @dev A call that clears the guard and moves nothing: a zero `approve` on the asset.
     function _benignCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.balanceOf, (address(vault))), value: 0
-        });
-    }
-
-    function _queueRedeemCalls(uint256 shares, uint256 pid)
-        internal
-        view
-        returns (BatchExecutorLib.Call[] memory calls)
-    {
-        calls = new BatchExecutorLib.Call[](1);
-        calls[0] = BatchExecutorLib.Call({
-            target: address(queue),
-            data: abi.encodeCall(IVaultWithdrawalQueue.queueRedeem, (attacker, shares, pid)),
-            value: 0
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(vault), 0)), value: 0
         });
     }
 
     function _vaultSelfCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(vault), data: abi.encodeCall(ISyndicateVault.reservedQueueAssets, ()), value: 0
+            target: address(vault), data: abi.encodeCall(ISyndicateVault.ratchetHighWaterMark, ()), value: 0
         });
     }
 
@@ -163,39 +163,32 @@ contract GovernorProposeTargetValidationTest is Test {
 
     // ── executeCalls-side rejection ──
 
-    /// @notice The execute leg gets the same treatment as the settlement leg
-    ///         (both pinned in the lifecycle file): a batch that names the
-    ///         vault itself in `executeCalls` is rejected at `propose`,
-    ///         sparing a vote cycle on a proposal `executeProposal` could
-    ///         never run.
+    /// @notice The execute leg gets the same treatment as the settlement leg (pinned in the
+    ///         lifecycle file): the vault is not a registered strategy, so naming it is
+    ///         refused at `propose`, sparing a vote cycle on a proposal that could never run.
     function test_propose_rejectsVaultTargetInExecuteCalls() public {
         ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
+        BatchExecutorLib.Call[] memory ex = _vaultSelfCalls();
+        BatchExecutorLib.Call[] memory st = _benignCalls();
+        uint256[] memory exCaps = GovEnvelope.defaultCaps(env.maxCapital, ex.length);
+        uint256[] memory stCaps = GovEnvelope.defaultCaps(env.maxCapital, st.length);
+        ISyndicateGovernor.CoProposer[] memory cps = _noCoProposers();
 
         vm.prank(agent);
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(vault)));
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(vault)));
         governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://p",
-            STRATEGY_DURATION,
-            env,
-            _vaultSelfCalls(),
-            GovEnvelope.defaultCaps(env.maxCapital, (_vaultSelfCalls()).length),
-            _benignCalls(),
-            GovEnvelope.defaultCaps(env.maxCapital, (_benignCalls()).length),
-            _noCoProposers()
+            address(vault), address(strat), "ipfs://p", STRATEGY_DURATION, env, ex, exCaps, st, stCaps, cps
         );
     }
 
-    /// @notice Sanity: an honest proposal (no privileged targets in either
-    ///         array) is unaffected by the new check.
+    /// @notice Sanity: an honest proposal (registered strategy, asset-only calls) is unaffected.
     function test_propose_acceptsBenignProposal() public {
         ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
 
         vm.prank(agent);
         uint256 pid = governor.propose(
             address(vault),
-            address(0),
+            address(strat),
             "ipfs://p",
             STRATEGY_DURATION,
             env,
@@ -208,77 +201,14 @@ contract GovernorProposeTargetValidationTest is Test {
         assertGt(pid, 0, "benign proposal is accepted at propose");
     }
 
-    // ── predicate parity ──
-
-    /// @notice The view and the guard are two callers of one predicate: it
-    ///         must answer true for exactly the two addresses
-    ///         `executeGovernorBatch` would reject as targets, and false for
-    ///         everything else — an adapter, the asset token, and the zero
-    ///         address.
-    function test_isPrivilegedBatchTarget_matchesGuardDecisions() public {
-        address adapter = makeAddr("adapter");
-
-        assertTrue(vault.isPrivilegedBatchTarget(address(vault)), "vault itself is privileged");
-        assertTrue(vault.isPrivilegedBatchTarget(address(queue)), "bound queue is privileged");
-        assertFalse(vault.isPrivilegedBatchTarget(address(usdc)), "the asset token is not privileged");
-        assertFalse(vault.isPrivilegedBatchTarget(adapter), "an arbitrary adapter address is not privileged");
-        assertFalse(vault.isPrivilegedBatchTarget(address(0)), "the zero address is not privileged");
-    }
-
-    // ── degrade-open ──
-
-    /// @notice A vault that predates `isPrivilegedBatchTarget` must not brick
-    ///         `propose`. Simulated by making the EXTERNAL selector revert
-    ///         (`vm.mockCallRevert` intercepts the CALL/STATICCALL opcode
-    ///         only) — the INTERNAL `_isPrivilegedBatchTarget` that
-    ///         `_guardBatchCalls` actually calls is reached via a JUMP, never
-    ///         a CALL, so it is untouched and the execution-time guard stays
-    ///         authoritative.
-    function test_propose_degradesOpen_whenVaultLacksPredicateView() public {
-        vm.mockCallRevert(
-            address(vault), abi.encodeWithSelector(ISyndicateVault.isPrivilegedBatchTarget.selector), bytes("no view")
-        );
-
-        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
-        vm.prank(agent);
-        uint256 pid = governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://p",
-            STRATEGY_DURATION,
-            env,
-            _queueRedeemCalls(1e6, 1),
-            GovEnvelope.defaultCaps(env.maxCapital, (_queueRedeemCalls(1e6, 1)).length),
-            _benignCalls(),
-            GovEnvelope.defaultCaps(env.maxCapital, (_benignCalls()).length),
-            _noCoProposers()
-        );
-        assertGt(pid, 0, "propose accepted a queue-targeting batch when the view is unavailable");
-
-        _voteAndAdvance(pid);
-
-        // The authoritative layer is unchanged: executeGovernorBatch's guard
-        // fires exactly as it always has, mock or no mock.
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
-        governor.executeProposal(pid);
-    }
-
     // ── claimUnclaimedFees reentrancy latch ──
 
-    /// @notice A batch that re-enters `claimUnclaimedFees` mid-execution now
-    ///         reverts the whole batch, instead of no-oping as it did before
-    ///         this change. Constructed as the design doc traces it: a
-    ///         governor entrypoint holds the reentrancy latch through
-    ///         `executeGovernorBatch`, and a sub-call whose target is the
-    ///         governor itself (not denylisted — only the vault and its
-    ///         queue are) calls back into `claimUnclaimedFees`.
-    /// @dev    The escrow key the reentrant call resolves is
-    ///         `(vault, msg.sender, token)` with `msg.sender == vault`
-    ///         (delegatecall), so it only has anything to pay if a fee
-    ///         recipient is literally the vault's own address — configured
-    ///         here via the protocol-fee recipient, forced to escrow rather
-    ///         than pay by blacklisting the vault as a transfer recipient
-    ///         (even a self-transfer reverts once blacklisted).
+    /// @notice A batch that names the governor is refused at propose: the governor is not a
+    ///         registered strategy, so the mid-batch re-entry into `claimUnclaimedFees` the
+    ///         reentrancy latch also closes is never stored.
+    /// @dev    The escrow key the reentrant call would resolve is `(vault, vault, token)`,
+    ///         populated here by paying the protocol fee to the vault's own address while
+    ///         the vault is blacklisted as a transfer recipient.
     function test_claimUnclaimedFees_reentrantMidBatch_reverts() public {
         vm.prank(owner);
         protocolConfig.setProtocolFeeRecipient(address(vault));
@@ -288,7 +218,7 @@ contract GovernorProposeTargetValidationTest is Test {
         vm.prank(agent);
         uint256 pid1 = governor.propose(
             address(vault),
-            address(0),
+            address(strat),
             "ipfs://p1",
             STRATEGY_DURATION,
             env1,
@@ -317,26 +247,16 @@ contract GovernorProposeTargetValidationTest is Test {
         });
 
         ISyndicateGovernor.RiskEnvelope memory env2 = GovEnvelope.permissive(address(vault));
+        uint256[] memory caps = GovEnvelope.defaultCaps(env2.maxCapital, 1);
+        BatchExecutorLib.Call[] memory settle = _benignCalls();
+        ISyndicateGovernor.CoProposer[] memory cps = _noCoProposers();
         vm.prank(agent);
-        uint256 pid2 = governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://p2",
-            STRATEGY_DURATION,
-            env2,
-            reentrantCall,
-            GovEnvelope.defaultCaps(env2.maxCapital, reentrantCall.length),
-            _benignCalls(),
-            GovEnvelope.defaultCaps(env2.maxCapital, (_benignCalls()).length),
-            _noCoProposers()
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(governor)));
+        governor.propose(
+            address(vault), address(strat), "ipfs://p2", STRATEGY_DURATION, env2, reentrantCall, caps, settle, caps, cps
         );
-        _voteAndAdvance(pid2);
 
-        vm.expectRevert(ISyndicateGovernor.Reentrancy.selector);
-        governor.executeProposal(pid2);
-
-        // The escrow survives untouched: the reentrant attempt failed the
-        // whole batch instead of silently paying out mid-execution.
+        // The escrow survives untouched: the shape never reached execution.
         assertEq(governor.unclaimedFees(address(vault), address(vault), address(usdc)), escrowed, "escrow unaffected");
     }
 
@@ -350,7 +270,7 @@ contract GovernorProposeTargetValidationTest is Test {
         vm.prank(agent);
         uint256 pid = governor.propose(
             address(vault),
-            address(0),
+            address(strat),
             "ipfs://p",
             STRATEGY_DURATION,
             env,

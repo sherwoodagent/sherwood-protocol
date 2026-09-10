@@ -21,6 +21,10 @@ contract MockLiquidStrategy {
         vaultAddr = vault_;
     }
 
+    function pull(uint256 amt) external {
+        usdc.transferFrom(msg.sender, address(this), amt);
+    }
+
     function pushBack(uint256 amt) external {
         usdc.transfer(vaultAddr, amt);
     }
@@ -123,12 +127,14 @@ contract VaultInstantLiquidityTest is Test {
         assertEq(vault.minBufferBps(), 0);
     }
 
-    /// @dev Build a single-call batch that sends `amount` of vault float to `to`
+    /// @dev Approve `to` and have it pull `amount` of vault float inside the batch
     ///      (stands in for a strategy deployment pulling capital).
     function _deployBatch(address to, uint256 amount) internal view returns (BatchExecutorLib.Call[] memory calls) {
-        calls = new BatchExecutorLib.Call[](1);
+        calls = new BatchExecutorLib.Call[](2);
         calls[0] =
-            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.transfer, (to, amount)), value: 0});
+            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.approve, (to, amount)), value: 0});
+        calls[1] =
+            BatchExecutorLib.Call({target: to, data: abi.encodeCall(MockLiquidStrategy.pull, (amount)), value: 0});
     }
 
     // ── Task 2: buffer enforcement ──

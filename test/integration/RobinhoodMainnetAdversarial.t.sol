@@ -229,7 +229,7 @@ contract RobinhoodMainnetAdversarialTest is RobinhoodMainnetIntegrationTest {
 
     function _allow(address a) internal {
         vm.prank(deployer);
-        TierRegistry(tierRegistry).setAdapterAllowed(a, true);
+        TierRegistry(tierRegistry).setCounterpartyAllowed(a, true);
     }
 
     function _usdg(address who) internal view returns (uint256) {

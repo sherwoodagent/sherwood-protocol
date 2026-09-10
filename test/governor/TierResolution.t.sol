@@ -14,7 +14,7 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Task 5 — propose-time tier resolution (spec 2026-07-22 §3.2). The
 ///         proposal's tier is the MAX tier across its execute calls (resolved
@@ -49,6 +49,7 @@ contract TierResolutionTest is Test {
         agentRegistry = new MockAgentRegistry();
         guardianRegistry = new MockRegistryMinimal();
         tierRegistry = new TierRegistry(address(this));
+        tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
 
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
@@ -111,8 +112,6 @@ contract TierResolutionTest is Test {
     ///      wired registry, onboarding an adapter now means certify + allowlist.
     function _wireTierRegistry() internal {
         governor.setTierRegistry(address(tierRegistry));
-        tierRegistry.setAdapterAllowed(address(mockAdapter), true);
-        tierRegistry.setAdapterAllowed(address(usdc), true);
     }
 
     /// @dev Certifies the shared `_settleCalls()` leg (`usdc.approve`) tier-0.

@@ -555,8 +555,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     ///         Only affects governors created AFTER this call; existing ones are
     ///         rewired via `pushWiring(governor)`.
     /// @dev Zero and codeless are both refused: an EOA passes every zero-check,
-    ///      then reverts the batch guard's typed `isCallableTarget` call and
-    ///      bricks every vault it reaches. Cf. `setExecutorImpl`.
+    ///      then reverts every governor's typed `tierOf` call at propose.
     function setTierRegistry(address newRegistry) external onlyOwner {
         if (newRegistry.code.length == 0) revert TierRegistryNotWired();
         address old = tierRegistry;

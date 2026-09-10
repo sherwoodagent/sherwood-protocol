@@ -107,7 +107,7 @@ contract RobinhoodMainnetFullExitTest is RobinhoodMainnetIntegrationTest {
             address(new UniswapSwapAdapter(UNISWAP_SWAP_ROUTER, UNISWAP_QUOTER_V2, V4_POOL_MANAGER, V4_QUOTER));
         template = address(new PortfolioStrategy());
         vm.prank(deployer);
-        TierRegistry(tierRegistry).setAdapterAllowed(swapAdapter, true);
+        TierRegistry(tierRegistry).setCounterpartyAllowed(swapAdapter, true);
 
         // Asymmetric book: lp1 15k, lp2 10k.
         _dealUSDG(lp1, LP1_EXTRA);

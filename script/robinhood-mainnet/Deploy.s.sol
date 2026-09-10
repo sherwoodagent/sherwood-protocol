@@ -203,7 +203,7 @@ contract DeployRobinhoodMainnet is DeploySherwood {
     ///      owned by the deployer and wires it into the factory, and nothing
     ///      afterwards moved it — so a mainnet ceremony handed five contracts to
     ///      the Safe and left the adapter-certification authority
-    ///      (`proposeCertification`, `demote`, `setAdapterAllowed`) on the
+    ///      (`proposeCertification`, `demote`, `setCounterpartyAllowed`) on the
     ///      deployer key, with no assertion anywhere to notice.
     function _handoffRobinhood(Deployed memory d, address ownerMultisig) internal {
         // Per-vault governors: the beacon (shared impl) and ProtocolConfig

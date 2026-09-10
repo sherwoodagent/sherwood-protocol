@@ -149,7 +149,7 @@ contract MorphoSupplyVaultE2EForkTest is RobinhoodMainnetIntegrationTest {
         // singleton is allowlisted in the vault's own TierRegistry
         // (`MorphoNotAllowed`). The base harness only attests price feeds.
         vm.prank(deployer);
-        TierRegistry(tierRegistry).setAdapterAllowed(MORPHO, true);
+        TierRegistry(tierRegistry).setCounterpartyAllowed(MORPHO, true);
 
         mp = IMorpho(MORPHO).idToMarketParams(Id.wrap(MARKET_ID));
         template = address(new MorphoSupplyStrategy());

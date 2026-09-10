@@ -20,23 +20,22 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockSwapAdapter} from "../mocks/MockSwapAdapter.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {PermissiveStrategyFactory} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Permissive registry that also attests every token-feed pairing.
 contract PermissiveRegistryWithPairs is ITierRegistry {
+    address public immutable permissiveFactory = address(new PermissiveStrategyFactory());
+
     function tierOf(address, bytes4) external pure returns (uint8, uint16) {
         return (2, 10_000);
     }
 
-    function isAdapterAllowed(address) external pure returns (bool) {
-        return true;
-    }
-
-    function isCallableTarget(address) external pure returns (bool) {
-        return true;
-    }
-
     function isCounterpartyAllowed(address) external pure returns (bool) {
         return true;
+    }
+
+    function strategyFactory() external view returns (address) {
+        return permissiveFactory;
     }
 
     function classOf(address) external pure returns (bytes32) {
@@ -381,28 +380,16 @@ contract PortfolioStrategy_stuckSettleEmergencyTest is Test {
         assertEq(tsla.balanceOf(address(strategy)), 500e18, "moved without the vault");
     }
 
-    /// @notice The batch guard admits `rescueTo` on the callee axis alone, exactly as it admits
-    ///         `settle()`: the selector names no recipient, so `isAdapterAllowed` is never
-    ///         consulted (denied here), and denying `isCallableTarget` on the clone refuses it.
+    /// @notice `rescueTo` is an ordinary call on an ordinary target: the structural guard
+    ///         admits it with no registry entry of any kind.
     function test_rescueTo_isReachableFromAnEmergencyBatch() public {
         (PortfolioStrategy strategy,) = _executedBasket();
-        address tierRegistry = governor.tierRegistry();
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = _rescueCalls(address(strategy))[0];
 
-        vm.mockCall(
-            tierRegistry, abi.encodeCall(ITierRegistry.isAdapterAllowed, (address(strategy))), abi.encode(false)
-        );
         vm.prank(address(governor));
         vault.executeGovernorBatch(calls, new uint256[](0), 0);
         assertEq(tsla.balanceOf(address(vault)), 500e18, "rescue did not land");
-
-        vm.mockCall(
-            tierRegistry, abi.encodeCall(ITierRegistry.isCallableTarget, (address(strategy))), abi.encode(false)
-        );
-        vm.prank(address(governor));
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchCallee.selector, address(strategy)));
-        vault.executeGovernorBatch(calls, new uint256[](0), 0);
     }
 
     /// @notice Control: with a live feed the ordinary `settleProposal` clears at the same point.

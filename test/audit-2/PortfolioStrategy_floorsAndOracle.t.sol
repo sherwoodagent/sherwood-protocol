@@ -52,11 +52,7 @@ contract MockTierRegistry {
         allowed[a] = value;
     }
 
-    function isAdapterAllowed(address a) external view returns (bool) {
-        return allowed[a];
-    }
-
-    function isCallableTarget(address a) external view returns (bool) {
+    function isCounterpartyAllowed(address a) external view returns (bool) {
         return allowed[a];
     }
 

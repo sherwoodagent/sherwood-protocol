@@ -1034,10 +1034,15 @@ contract DeployPlanB is ScriptBase {
         console.log("  the delay elapses UNLESS a submitter bond is pinned, in which case only");
         console.log("  that submitter may call certify (finding #3), and must do so before");
         console.log("  MAX_CERTIFY_WINDOW elapses past readyAt (finding #5).");
-        console.log("  Re-apply setAdapterAllowed and setAuthorizedDemoter on the NEW registry");
-        console.log("  before the switch. Only once the new registry is fully populated, call");
-        console.log("  factory.setTierRegistry(new) so no governor ever reads an empty registry");
-        console.log("  as tier 2 for an already-certified pair. Rollback: factory.setTierRegistry(old).");
+        console.log("  Re-apply setCounterpartyAllowed and setAuthorizedDemoter on the NEW registry");
+        console.log("  before the switch, and call setStrategyFactory(STRATEGY_FACTORY) on it: an");
+        console.log("  unwired registry makes every propose revert StrategyNotRegistered and every");
+        console.log("  non-asset batch target refused. Only once the new registry is fully populated,");
+        console.log("  call factory.setTierRegistry(new) so no governor ever reads a half-seeded");
+        console.log("  registry (a missing certification prices tier 2). Rollback: factory.setTierRegistry(old).");
+        console.log("  Never re-run DeployStrategyFactory against a live stack: re-pointing the registry at a");
+        console.log("  fresh factory de-registers every strategy and class provenance (in-flight proposals");
+        console.log("  wedge; clones re-price tier 2). Recovery is permissionless re-registration.");
         if (liveGovernors == 0) {
             console.log("MANUAL NEXT: governor beacon upgrade.");
             console.log("  PRECONDITION MET: syndicateCount == 0 -- this beacon has no live governor");

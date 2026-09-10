@@ -16,6 +16,7 @@ import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {AssetPuller} from "../mocks/AssetPuller.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
@@ -92,7 +93,7 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
     address public ledgerRegistry = makeAddr("a2-ledgerRegistry");
     address public agent = makeAddr("a2-agent");
     address public lp1 = makeAddr("a2-lp1");
-    address public sink = makeAddr("a2-drainSink");
+    address public sink = address(new AssetPuller());
     address public g1 = makeAddr("a2-guardian1");
 
     uint256 constant VOTING_PERIOD = 1 days;
@@ -199,10 +200,19 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
     ///      settlement leg against the VOTED declaration, not the coverage
     ///      it will actually raise.
     function _drainSettleCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
-        calls = new BatchExecutorLib.Call[](1);
+        calls = new BatchExecutorLib.Call[](2);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdg), data: abi.encodeCall(usdg.transfer, (sink, MAX_CAPITAL)), value: 0
+            target: address(usdg), data: abi.encodeCall(usdg.approve, (sink, MAX_CAPITAL)), value: 0
         });
+        calls[1] = BatchExecutorLib.Call({
+            target: sink, data: abi.encodeCall(AssetPuller.pull, (address(usdg), MAX_CAPITAL)), value: 0
+        });
+    }
+
+    /// @dev The pull (call 1) carries the whole declaration; the approve moves nothing.
+    function _drainSettleCaps() internal pure returns (uint256[] memory caps) {
+        caps = new uint256[](2);
+        caps[1] = MAX_CAPITAL;
     }
 
     /// @dev Stake `g` and lock its WHOLE stake against `pid`: `type(uint256).max`
@@ -234,7 +244,7 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
             _execCalls(),
             GovEnvelope.defaultCaps(MAX_CAPITAL, 1),
             _drainSettleCalls(),
-            GovEnvelope.defaultCaps(MAX_CAPITAL, 1),
+            _drainSettleCaps(),
             new ISyndicateGovernor.CoProposer[](0)
         );
     }
@@ -273,7 +283,7 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
         // settleProposal is stuck: the scaled per-call cap (500e6) is
         // smaller than what the settlement call actually moves (1,000e6).
         vm.expectRevert(
-            abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, MAX_CAPITAL, MAX_CAPITAL / 2)
+            abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, MAX_CAPITAL, MAX_CAPITAL / 2)
         );
         governor.settleProposal(pid);
         assertEq(
@@ -286,7 +296,7 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
         // the full 1,000e6 under the raw declaration.
         vm.prank(owner);
         vm.expectRevert(
-            abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, MAX_CAPITAL, MAX_CAPITAL / 2)
+            abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, MAX_CAPITAL, MAX_CAPITAL / 2)
         );
         governor.unstick(pid);
 
@@ -298,21 +308,12 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
         );
     }
 
-    /// @notice Liveness check (failure-mode guardrail): when coverage is
-    ///         FULL, `effectiveMaxCapital == maxCapital` and the scaled caps
-    ///         equal the raw declared caps -- `unstick` must still succeed
-    ///         and actually move the funds. Proves the fix does not brick
-    ///         the honest, fully-covered rescue path it was never meant to
-    ///         touch.
-    function test_unstick_fullCoverage_stillDrainsToSink() public {
+    /// @notice At FULL coverage the per-call caps clear, and what stops the drain is the settle
+    ///         batch's zero net-egress budget: `settleProposal` and `unstick` both revert
+    ///         `MaxNetOutflowExceeded(MAX_CAPITAL, 0)`. Only the execute leg spends capital.
+    function test_unstick_fullCoverage_settleLegHasZeroEgressBudget() public {
         uint256 pid = _proposeWithDrainSettleLeg();
 
-        // This proposal's settle leg really DRAINS, so it declares a full
-        // `MAX_CAPITAL` cap on both legs and `requiredCoverage` sums to
-        // 2 x MAX_CAPITAL == $2,000. (It used to read $1,000: the harness
-        // governor was registry-less, and the flat tier-2 default prices the
-        // envelope once. The registry is mandatory at init since pashov
-        // finding #1, so per-call pricing is live.)
         // 40,000e18 WOOD @ $0.05 == $2,000 == 100% of the required coverage.
         _seatApprover(pid, g1, 40_000e18);
         _toApproved(pid);
@@ -321,11 +322,15 @@ contract GovernorEmergency_UnstickCoverageCapsTest is Test {
 
         vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
 
+        bytes memory err = abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, MAX_CAPITAL, 0);
+        vm.expectRevert(err);
+        governor.settleProposal(pid);
         vm.prank(owner);
+        vm.expectRevert(err);
         governor.unstick(pid);
 
-        assertEq(usdg.balanceOf(sink), MAX_CAPITAL, "unstick still moves the full pre-committed amount");
-        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertEq(usdg.balanceOf(sink), 0, "a settle leg cannot move assets out, whatever the coverage");
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
     }
 }
 
@@ -365,7 +370,7 @@ contract GovernorEmergency_FinalizeCoverageCapsTest is Test {
     address public agent = makeAddr("a2f-agent");
     address public lp1 = makeAddr("a2f-lp1");
     address public lp2 = makeAddr("a2f-lp2");
-    address public sink = makeAddr("a2f-rescueSink");
+    address public sink = address(new AssetPuller());
     address public factoryEoa;
     uint256 public agentNftId;
 
@@ -565,9 +570,12 @@ contract GovernorEmergency_FinalizeCoverageCapsTest is Test {
 
         _scaleEffectiveMaxCapital(pid, 10_000e6);
 
-        BatchExecutorLib.Call[] memory rescueCalls = new BatchExecutorLib.Call[](1);
+        BatchExecutorLib.Call[] memory rescueCalls = new BatchExecutorLib.Call[](2);
         rescueCalls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 50_000e6)), value: 0
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (sink, 50_000e6)), value: 0
+        });
+        rescueCalls[1] = BatchExecutorLib.Call({
+            target: sink, data: abi.encodeCall(AssetPuller.pull, (address(usdc), 50_000e6)), value: 0
         });
 
         vm.prank(owner);

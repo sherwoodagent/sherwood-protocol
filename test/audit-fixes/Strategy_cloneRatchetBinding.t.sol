@@ -22,7 +22,7 @@ import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice `StrategyFactory.syndicateFactory` stand-in: reports every vault as
-///         registered so the factory's `_authClone` gate passes.
+///         registered so the factory's vault check passes.
 contract MockSyndicateRegistry {
     function vaultToSyndicate(address) external pure returns (uint256) {
         return 1;
@@ -213,7 +213,7 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
     function _benignCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), value: 0, data: abi.encodeCall(usdc.balanceOf, (address(vault)))
+            target: address(usdc), value: 0, data: abi.encodeCall(usdc.approve, (address(vault), 0))
         });
     }
 
@@ -520,7 +520,7 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
         // the clone in `Executed`.
         BatchExecutorLib.Call[] memory settlementCalls = new BatchExecutorLib.Call[](1);
         settlementCalls[0] = BatchExecutorLib.Call({
-            target: address(usdc), value: 0, data: abi.encodeCall(usdc.balanceOf, (address(vault)))
+            target: address(usdc), value: 0, data: abi.encodeCall(usdc.approve, (address(vault), 0))
         });
 
         // executeCalls[0] (approve) moves no vault asset, so a zero cap is
@@ -574,7 +574,7 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
         uint256 vaultBalBefore = usdc.balanceOf(address(vault));
         BatchExecutorLib.Call[] memory recoveryExecute = new BatchExecutorLib.Call[](1);
         recoveryExecute[0] = BatchExecutorLib.Call({
-            target: address(usdc), value: 0, data: abi.encodeCall(usdc.balanceOf, (address(vault)))
+            target: address(usdc), value: 0, data: abi.encodeCall(usdc.approve, (address(vault), 0))
         });
         BatchExecutorLib.Call[] memory recoverySettle = new BatchExecutorLib.Call[](1);
         recoverySettle[0] =

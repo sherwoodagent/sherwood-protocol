@@ -14,13 +14,14 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
+import {AssetPuller} from "./mocks/AssetPuller.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
 import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
 import {MockCoverageFreezer} from "./mocks/MockCoverageFreezer.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "./helpers/TierRegistryFixture.sol";
 
 /// @dev Minimal sWOOD read surface the ExposureLedger constructor consumes.
 ///      `coolDownPeriod` (45d) covers epochLength (28d) + challengeWindow (14d).
@@ -723,16 +724,16 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(governor.getEffectiveMaxCapital(pid), 0, "dust coverage floors to a zero net-outflow cap");
     }
 
-    /// @notice Settlement reuses the STORED `effectiveMaxCapital` from execute
-    ///         (issue #27 design D4) — never a live recompute. A guardian
-    ///         whose bond is later slashed to ZERO (modeled here as a direct
-    ///         stake write, standing in for a real slash's effect on live
-    ///         stake, same convention `ExposureLedger.t.sol`'s finding tests
-    ///         use) does not shrink what the position can unwind: the
-    ///         settlement batch still moves exactly the $500 the proposal
-    ///         executed at, proving settle never re-queries the ledger.
+    /// @notice Settlement reuses the STORED coverage-scaled figures from execute
+    ///         (issue #27 design D4) — never a live recompute. A guardian whose
+    ///         bond is later slashed to ZERO (modeled as a direct stake write,
+    ///         the convention `ExposureLedger.t.sol`'s finding tests use) does
+    ///         not shrink the settle leg's per-call cap: the $500 pull clears the
+    ///         stored 500e6 cap — a live recompute would floor it to 0 and revert
+    ///         `CallCapExceeded` inside the batch — and is stopped only by the
+    ///         settle batch's zero net-egress budget, which runs after the caps.
     function test_settle_reusesStoredEffectiveMaxCapital_despiteCoverageCollapsingBeforeSettle() public {
-        address sink = makeAddr("settleDrainSink");
+        address sink = address(new AssetPuller());
         uint256 maxCapital = 1_000e6;
         address g1 = makeAddr("g1");
 
@@ -740,10 +741,9 @@ contract GovernorCoverageGatesTest is Test {
         execCalls[0] = BatchExecutorLib.Call({
             target: address(targetToken), data: abi.encodeCall(targetToken.approve, (address(usdg), 1)), value: 0
         });
-        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
-        settleCalls[0] = BatchExecutorLib.Call({
-            target: address(usdg), data: abi.encodeCall(usdg.transfer, (sink, 500e6)), value: 0
-        });
+        BatchExecutorLib.Call[] memory settleCalls = _pullCalls(sink, 500e6);
+        uint256[] memory settleCaps = new uint256[](2);
+        settleCaps[1] = maxCapital;
 
         vm.prank(agent);
         uint256 pid = governor.propose(
@@ -755,7 +755,7 @@ contract GovernorCoverageGatesTest is Test {
             execCalls,
             GovEnvelope.defaultCaps(maxCapital, execCalls.length),
             settleCalls,
-            GovEnvelope.defaultCaps(maxCapital, settleCalls.length),
+            settleCaps,
             new ISyndicateGovernor.CoProposer[](0)
         );
 
@@ -771,17 +771,17 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(governor.getEffectiveMaxCapital(pid), 500e6, "executed at the coverage-scaled size");
 
         // The guardian's live bond craters to zero AFTER execute. A live
-        // recompute at settle would floor `effectiveMaxCapital` to 0 and this
-        // $500 settlement drain would revert `CallCapExceeded`/
-        // `MaxNetOutflowExceeded`. It does not, because settle reuses the
-        // STORED figure from execute.
+        // recompute at settle would scale the settle cap to 0 and the $500 pull
+        // would revert `CallCapExceeded(1, 500e6, 0)` inside the batch. It does
+        // not: the pull clears the STORED 500e6 cap and only the net meter,
+        // which runs after the batch, refuses the egress.
         swood.setStake(g1, 0);
         assertEq(ledger.slashableBondUsd(g1), 0, "sanity: coverage has fully collapsed");
 
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, 500e6, 0));
         governor.settleProposal(pid);
-        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
-        assertEq(usdg.balanceOf(sink), 500e6, "settle moved exactly the STORED effective cap, not a recomputed 0");
+        assertEq(usdg.balanceOf(sink), 0, "the net meter, not a recomputed per-call cap, stopped the pull");
     }
 
     /// @notice issue #43 x #27 (design D7): per-call caps scale by the SAME
@@ -793,21 +793,19 @@ contract GovernorCoverageGatesTest is Test {
     ///         rather than the raw (larger) caps merely happening to pass.
     function test_execute_perCallCapsScaleByTheSameCoverageRatio() public {
         uint256 maxCapital = 1_000e6;
-        address sink0 = makeAddr("capSink0");
-        address sink1 = makeAddr("capSink1");
+        address sink0 = address(new AssetPuller());
+        address sink1 = address(new AssetPuller());
 
-        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
-        // Attempts to move 1 wei MORE than call 1's scaled cap (120e6) —
-        // still well under its RAW declared cap (300e6), so this only
-        // reverts if the per-call cap was actually scaled.
-        execCalls[0] =
-            BatchExecutorLib.Call({target: address(usdg), data: abi.encodeCall(usdg.transfer, (sink0, 1)), value: 0});
-        execCalls[1] = BatchExecutorLib.Call({
-            target: address(usdg), data: abi.encodeCall(usdg.transfer, (sink1, 120e6 + 1)), value: 0
-        });
-        uint256[] memory execCaps = new uint256[](2);
-        execCaps[0] = 700e6;
-        execCaps[1] = 300e6;
+        // Each pull is preceded by its approve. Call 3 attempts to move 1 wei
+        // MORE than its scaled cap (120e6) — still well under its RAW declared
+        // cap (300e6), so this only reverts if the per-call cap was scaled.
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](4);
+        BatchExecutorLib.Call[] memory a = _pullCalls(sink0, 1);
+        BatchExecutorLib.Call[] memory b = _pullCalls(sink1, 120e6 + 1);
+        (execCalls[0], execCalls[1], execCalls[2], execCalls[3]) = (a[0], a[1], b[0], b[1]);
+        uint256[] memory execCaps = new uint256[](4);
+        execCaps[1] = 700e6;
+        execCaps[3] = 300e6;
 
         BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
         settleCalls[0] = BatchExecutorLib.Call({
@@ -840,7 +838,7 @@ contract GovernorCoverageGatesTest is Test {
         _toApproved(pid);
 
         assertEq(governor.getRequiredCoverage(pid), maxCapital, "tier-2 flat coverage == maxCapital");
-        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, 120e6 + 1, 120e6));
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 3, 120e6 + 1, 120e6));
         governor.executeProposal(pid);
     }
 
@@ -892,11 +890,21 @@ contract GovernorCoverageGatesTest is Test {
     ///      local — this repo's optimizer CSEs it across `vm.warp`), execute.
     ///      Called before proposal creation in every site, so the forward warp
     ///      never interacts with an in-flight proposal's execution window.
+    /// @dev `[asset.approve(puller, n), puller.pull(asset, n)]`: the only shape that moves the asset.
+    function _pullCalls(address puller, uint256 amount) internal view returns (BatchExecutorLib.Call[] memory calls) {
+        calls = new BatchExecutorLib.Call[](2);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(usdg), data: abi.encodeCall(usdg.approve, (puller, amount)), value: 0
+        });
+        calls[1] = BatchExecutorLib.Call({
+            target: puller, data: abi.encodeCall(AssetPuller.pull, (address(usdg), amount)), value: 0
+        });
+    }
+
     function _wireTierRegistryCertifiedAt(uint8 tier, uint16 bound) internal returns (TierRegistry reg) {
         reg = new TierRegistry(address(this));
+        reg.setStrategyFactory(address(new PermissiveStrategyFactory()));
         governor.setTierRegistry(address(reg)); // test contract is the factory
-        reg.setAdapterAllowed(address(targetToken), true);
-        reg.setAdapterAllowed(address(usdg), true);
         reg.proposeCertification(
             address(targetToken), targetToken.approve.selector, tier, bound, address(0), address(targetToken).codehash
         );

@@ -9,14 +9,14 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockMToken} from "./mocks/MockMToken.sol";
 
 /// @dev Minimal SyndicateFactory stand-in returning a non-zero
-///      `vaultToSyndicate(vault)` so `StrategyFactory._authClone` passes.
+///      `vaultToSyndicate(vault)` so the factory's vault check passes.
 contract _MockSyndicateRegistry {
     function vaultToSyndicate(address) external pure returns (uint256) {
         return 1;
     }
 }
 
-/// @dev Minimal vault stand-in exposing IVaultMembership.
+/// @dev Minimal vault stand-in.
 contract _MockVault {
     address public owner;
 
@@ -32,7 +32,7 @@ contract _MockVault {
 /// @notice REVOCATION VS THE CLASS FALLBACK.
 ///
 ///         This registry expresses revocation as ERASURE: `_demote` deletes
-///         `_configs[k]` and `_adapterAllowed[target]`, which was a complete
+///         `_configs[k]`, which was a complete
 ///         revocation only because the absence of a record WAS the tier-2
 ///         default. `codehash-class-certification` put a permissive fallback
 ///         behind that absence, so without the per-member denial flags every
@@ -98,22 +98,18 @@ contract TierRegistryClassMemberDenialTest is Test {
 
     function _certifyAndAllowClass(address tmpl) internal {
         _certifyClass(tmpl, SEL);
-        vm.prank(owner);
-        registry.setClassAllowed(tmpl, true);
     }
 
     function _assertFullyTrusted(address clone, string memory ctx) internal view {
         (uint8 tier, uint16 bound) = registry.tierOf(clone, SEL);
         assertEq(tier, TIER_1, string.concat(ctx, ": tier"));
         assertEq(bound, BOUND, string.concat(ctx, ": bound"));
-        assertTrue(registry.isAdapterAllowed(clone), string.concat(ctx, ": allowlist"));
     }
 
     function _assertFullyRevoked(address clone, string memory ctx) internal view {
         (uint8 tier, uint16 bound) = registry.tierOf(clone, SEL);
         assertEq(tier, TIER_ARBITRARY, string.concat(ctx, ": tier"));
         assertEq(bound, FULL_NOTIONAL_BPS, string.concat(ctx, ": bound"));
-        assertFalse(registry.isAdapterAllowed(clone), string.concat(ctx, ": allowlist"));
     }
 
     // ── The core regression: a conviction must actually land ──
@@ -146,9 +142,7 @@ contract TierRegistryClassMemberDenialTest is Test {
 
         (uint8 classTier,) = registry.classTierOf(address(template), SEL);
         assertEq(classTier, TIER_1, "the class itself is untouched");
-        assertTrue(registry.isClassAllowed(address(template)), "and still allowlisted");
         assertTrue(registry.isClassTierDenied(clone, SEL), "the member is denied");
-        assertTrue(registry.isClassAllowDenied(clone), "on both axes");
         _assertFullyRevoked(clone, "re-read");
     }
 
@@ -212,39 +206,6 @@ contract TierRegistryClassMemberDenialTest is Test {
 
     // ── Owner-level denial, the same hole through a different door ──
 
-    /// @notice `setAdapterAllowed(x, false)` was a no-op against a class member:
-    ///         the address flag went false, the class fallback ran, and the next
-    ///         read returned true. The owner could not disallow a single member.
-    function test_setAdapterAllowed_falseBeatsTheClassFallback() public {
-        _certifyAndAllowClass(address(template));
-        address clone = _cloneViaFactory();
-        assertTrue(registry.isAdapterAllowed(clone), "allowed via class");
-
-        vm.prank(owner);
-        registry.setAdapterAllowed(clone, false);
-
-        assertFalse(registry.isAdapterAllowed(clone), "owner denial holds");
-        assertTrue(registry.isAdapterAllowed(_cloneViaFactory()), "siblings unaffected");
-    }
-
-    /// @notice And `true` is the recovery ceremony, exactly as it already was on
-    ///         the address path — no new instant-grant surface, just the
-    ///         existing one made to mean what it says.
-    function test_setAdapterAllowed_trueRestoresStandingAfterConviction() public {
-        _certifyAndAllowClass(address(template));
-        address clone = _cloneViaFactory();
-
-        vm.prank(court);
-        registry.demoteByChallenge(clone, SEL);
-        assertFalse(registry.isAdapterAllowed(clone), "revoked");
-
-        vm.prank(owner);
-        registry.setAdapterAllowed(clone, true);
-
-        assertTrue(registry.isAdapterAllowed(clone), "owner restored it");
-        assertFalse(registry.isClassAllowDenied(clone), "denial cleared");
-    }
-
     /// @notice The TIER axis has no instant restore, deliberately: recovery is
     ///         the ordinary announced `proposeCertification` / `certify`
     ///         ceremony, whose address entry wins ahead of both the denial flag
@@ -258,11 +219,11 @@ contract TierRegistryClassMemberDenialTest is Test {
         registry.demoteByChallenge(clone, SEL);
         assertTrue(registry.isClassTierDenied(clone, SEL), "denied");
 
-        // Re-allowlisting does NOT re-price it.
+        // A counterparty grant does NOT re-price it.
         vm.prank(owner);
-        registry.setAdapterAllowed(clone, true);
+        registry.setCounterpartyAllowed(clone, true);
         (uint8 stillDemoted,) = registry.tierOf(clone, SEL);
-        assertEq(stillDemoted, TIER_ARBITRARY, "allowlist restore does not restore tier");
+        assertEq(stillDemoted, TIER_ARBITRARY, "a venue grant does not restore tier");
 
         // The announced ceremony does, and only after the delay.
         vm.prank(owner);
@@ -321,10 +282,10 @@ contract TierRegistryClassMemberDenialTest is Test {
 
     // ── Non-members pay the flags but are otherwise unaffected ──
 
-    /// @notice `_demote` sets both flags unconditionally rather than probing
+    /// @notice `_demote` sets the tier denial unconditionally rather than probing
     ///         class membership first, so revocation completeness never depends
     ///         on membership state that can change afterwards. For a target that
-    ///         belongs to no class this is two SSTOREs and no behaviour change.
+    ///         belongs to no class this is one SSTORE and no behaviour change.
     function test_demote_nonMemberBehaviourUnchanged() public {
         address plain = address(new MockStrategy());
         vm.startPrank(owner);
@@ -332,8 +293,6 @@ contract TierRegistryClassMemberDenialTest is Test {
         vm.stopPrank();
         vm.warp(block.timestamp + registry.certifyDelay() + 1);
         registry.certify(plain, SEL);
-        vm.prank(owner);
-        registry.setAdapterAllowed(plain, true);
 
         vm.prank(owner);
         registry.demote(plain, SEL);
@@ -341,6 +300,5 @@ contract TierRegistryClassMemberDenialTest is Test {
         (uint8 tier, uint16 bound) = registry.tierOf(plain, SEL);
         assertEq(tier, TIER_ARBITRARY, "tier-2 default as always");
         assertEq(bound, FULL_NOTIONAL_BPS, "full notional as always");
-        assertFalse(registry.isAdapterAllowed(plain), "allowlist cleared as always");
     }
 }

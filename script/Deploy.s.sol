@@ -403,7 +403,7 @@ contract DeploySherwood is ScriptBase {
     ///      unattested dependency: `PortfolioStrategy` checks each Chainlink
     ///      aggregator (`_requireAllowedPriceSource`) AND its pairing to the
     ///      slot's token (`_requirePairedPriceSource`), `MorphoSupplyStrategy`
-    ///      checks `isAdapterAllowed(morpho)`, `ConcentratedLiquidityStrategy`
+    ///      checks `isCounterpartyAllowed(morpho)`, `ConcentratedLiquidityStrategy`
     ///      checks `isCounterpartyAllowed` on the position manager, Morpho and
     ///      the Uniswap v3 factory. A fresh registry answers false to all of
     ///      them, so a just-deployed protocol cannot run a single strategy
@@ -423,9 +423,6 @@ contract DeploySherwood is ScriptBase {
     ///      strategy deploys → multisig accepts. Accepting early is safe but
     ///      costs a multisig transaction per dependency.
     ///
-    ///      Per-clone `setAdapterAllowed` stays manual by construction — a
-    ///      clone's address is not known until an agent creates it.
-    ///
     ///      Best-effort per key: a chain whose address book lacks an entry
     ///      simply does not get that attestation. Silence is logged, never
     ///      assumed.
@@ -437,15 +434,11 @@ contract DeploySherwood is ScriptBase {
             return;
         }
 
-        // Counterparties: addresses a certified template may BIND to (pools,
-        // position managers, lending singletons) as distinct from addresses
-        // that may RECEIVE vault funds. Morpho needs both axes — CL binds it
-        // as a counterparty, MorphoSupplyStrategy spends into it as an adapter.
+        // Counterparties: the venues a certified template may bind (pools,
+        // position managers, lending singletons, feeds).
         _seedCounterparty(tierRegistry, "UNISWAP_V3_POSITION_MANAGER");
         _seedCounterparty(tierRegistry, "UNISWAP_V3_FACTORY");
-        if (_seedCounterparty(tierRegistry, "MORPHO_BLUE")) {
-            _seedAdapter(tierRegistry, "MORPHO_BLUE");
-        }
+        _seedCounterparty(tierRegistry, "MORPHO_BLUE");
 
         // Push-feed price sources. `symbols` drives BOTH lookups: the feed key
         // is CHAINLINK_<SYM>_USD_FEED and the token key is <SYM>, except ETH,
@@ -476,17 +469,6 @@ contract DeploySherwood is ScriptBase {
         return true;
     }
 
-    function _seedAdapter(address tierRegistry, string memory key) internal returns (bool) {
-        address target = _tryReadAddress(key);
-        if (target == address(0)) {
-            console.log("  adapter skipped (not in address book):", key);
-            return false;
-        }
-        TierRegistry(tierRegistry).setAdapterAllowed(target, true);
-        console.log("  adapter allowed:", key, target);
-        return true;
-    }
-
     /// @dev Allowlists the aggregator and pairs it to the token it prices.
     ///      `priceSource` MUST be the bare aggregator address widened to
     ///      bytes32 with no packed max-age — that is the exact normalization
@@ -500,7 +482,7 @@ contract DeploySherwood is ScriptBase {
             console.log("  feed skipped (not in address book):", symbol);
             return;
         }
-        TierRegistry(tierRegistry).setAdapterAllowed(feed, true);
+        TierRegistry(tierRegistry).setCounterpartyAllowed(feed, true);
 
         // ETH's feed prices the wrapped token — every other symbol's token key
         // is the symbol itself.

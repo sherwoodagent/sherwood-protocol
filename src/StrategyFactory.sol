@@ -4,16 +4,11 @@ pragma solidity 0.8.28;
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IStrategy} from "./interfaces/IStrategy.sol";
+import {IStrategyFactory} from "./interfaces/IStrategyFactory.sol";
 
 /// @notice Minimal view surface needed to gate clone calls on registered vaults.
 interface ISyndicateRegistry {
     function vaultToSyndicate(address vault) external view returns (uint256);
-}
-
-/// @notice Minimal view surface for agent / owner check.
-interface IVaultMembership {
-    function isAgent(address agentAddress) external view returns (bool);
-    function owner() external view returns (address);
 }
 
 /// @title StrategyFactory
@@ -27,16 +22,10 @@ interface IVaultMembership {
 ///
 ///         This factory bundles both into a single tx.
 ///
-///         Strategies must always be pre-deployed by the vault's creator or
-///         a registered agent BEFORE proposal execution. The governor itself
-///         does not deploy strategies during execute — proposals reference an
-///         already-cloned-and-initialized strategy address. Authorized callers:
-///
-///           - `vault.owner()` (creator pre-deploy);
-///           - `vault.isAgent(msg.sender)` (registered agent pre-deploy).
-///
-///         The vault must additionally be registered on `syndicateFactory` so
-///         a rogue contract cannot spoof the membership view.
+///         Cloning is permissionless: anyone may clone an approved template
+///         bound to a registered vault, naming themselves as proposer. A clone
+///         is only ever executed by that vault's governor through a proposal
+///         its agents write, priced at the template's class tier.
 ///
 ///         `template` is gated by an owner-managed allowlist: an unlisted
 ///         template reverts here, so this factory never clones an
@@ -46,9 +35,8 @@ interface IVaultMembership {
 ///         factory did not produce is not a class member.
 ///
 ///           - `setTemplateApproval(t, false)` stops NEW clones through this
-///             factory only. To stop a template's clones from being FUNDED,
-///             the owner must also run `TierRegistry.setClassAllowed(t, false)`
-///             — the two allowlists must be revoked together.
+///             factory only; `TierRegistry.demoteClass` re-prices the ones
+///             already minted.
 ///           - The class path's safety rests on a TEMPLATE invariant, checked
 ///             at certification review rather than enforced by code: every
 ///             certified template must derive its fund destination and its
@@ -56,9 +44,9 @@ interface IVaultMembership {
 ///             the shipped templates do) and expose no payout / recipient /
 ///             router address settable from `initialize` or `updateParams`
 ///             data. See `TierRegistry.proposeClassCertification`.
-contract StrategyFactory is Ownable {
+contract StrategyFactory is Ownable, IStrategyFactory {
     /// @notice SyndicateFactory used to verify that `vault` is a registered vault.
-    /// @dev Immutable: set once at construction. A clone-fn caller-vault gate is
+    /// @dev Immutable: set once at construction. The vault-registered check is
     ///      meaningless if the registry it consults can be hot-swapped.
     address public immutable syndicateFactory;
 
@@ -73,8 +61,14 @@ contract StrategyFactory is Ownable {
     ///         factory did not deploy it.
     mapping(address clone => address template) public cloneTemplate;
 
-    error Unauthorized();
+    /// @notice Registered strategies and the code they were registered with.
+    mapping(address strategy => bool registered) public registeredStrategy;
+    mapping(address strategy => bytes32 codehash) public registeredCodehash;
+
     error VaultNotRegistered();
+    /// @notice `registerStrategy` was given a codeless address or one that does not answer
+    ///         `IStrategy`'s `vault()`, `proposer()` and `executed()`.
+    error NotAStrategy(address strategy);
     error InvalidSyndicateFactory();
     /// @notice `template` is not on the allowlist.
     error TemplateNotApproved(address template);
@@ -87,6 +81,7 @@ contract StrategyFactory is Ownable {
 
     event StrategyCloned(address indexed template, address indexed vault, address indexed clone);
     event TemplateApprovalSet(address indexed template, bool approved);
+    event StrategyRegistered(address indexed strategy, bytes32 codehash);
 
     constructor(address syndicateFactory_, address owner_) Ownable(owner_) {
         if (syndicateFactory_ == address(0)) revert InvalidSyndicateFactory();
@@ -99,16 +94,39 @@ contract StrategyFactory is Ownable {
         emit TemplateApprovalSet(template, approved);
     }
 
-    /// @dev Caller is the vault's owner or a registered agent of the vault,
-    ///      and the vault is a registered Sherwood vault.
-    function _authClone(address vault) internal view {
+    /// @notice Register a hand-written strategy. Permissionless: registration fixes the shape a
+    ///         batch target has (`IStrategy`) so guardians can simulate it; it is not a trust check.
+    function registerStrategy(address strategy) external {
+        if (strategy.code.length == 0) revert NotAStrategy(strategy);
+        _mustAnswer(strategy, IStrategy.vault.selector);
+        _mustAnswer(strategy, IStrategy.proposer.selector);
+        _mustAnswer(strategy, IStrategy.executed.selector);
+        _register(strategy);
+    }
+
+    /// @inheritdoc IStrategyFactory
+    /// @dev A code change after registration de-registers.
+    function isRegisteredStrategy(address strategy) external view returns (bool) {
+        return registeredStrategy[strategy] && strategy.codehash == registeredCodehash[strategy];
+    }
+
+    function _register(address strategy) private {
+        registeredStrategy[strategy] = true;
+        registeredCodehash[strategy] = strategy.codehash;
+        emit StrategyRegistered(strategy, strategy.codehash);
+    }
+
+    /// @dev Fail-closed conformance probe: the getter must answer exactly one word.
+    function _mustAnswer(address strategy, bytes4 selector) private view {
+        (bool ok, bytes memory ret) = strategy.staticcall(abi.encodeWithSelector(selector));
+        if (!ok || ret.length != 32) revert NotAStrategy(strategy);
+    }
+
+    /// @dev The vault is a registered Sherwood vault: provenance only ever names real vaults.
+    function _requireRegisteredVault(address vault) internal view {
         if (ISyndicateRegistry(syndicateFactory).vaultToSyndicate(vault) == 0) {
             revert VaultNotRegistered();
         }
-        IVaultMembership v = IVaultMembership(vault);
-        if (msg.sender == v.owner()) return;
-        if (v.isAgent(msg.sender)) return;
-        revert Unauthorized();
     }
 
     /// @dev Gate the template against the allowlist.
@@ -119,34 +137,23 @@ contract StrategyFactory is Ownable {
     /// @notice Clone `template` and run `initialize(vault, proposer, data)` atomically.
     /// @param template Strategy template address. MUST be on the allowlist.
     /// @param vault    Vault that will own the clone's lifecycle. Registered on
-    ///                 `syndicateFactory`, and `msg.sender` MUST be its owner or
-    ///                 one of its agents (`_authClone`) — never the vault itself.
+    ///                 `syndicateFactory`.
     /// @param proposer Strategy proposer. MUST equal `msg.sender` (see the
     ///                 dev comment below for the rationale).
     /// @param data     Strategy-specific init bytes (decoded inside `_initialize`).
     /// @return clone   Address of the cloned + initialized strategy.
-    /// @dev Requiring `proposer == msg.sender` ties the strategy clone's
-    ///      stored `_proposer` to the deployer, closing the attack vector of
-    ///      an arbitrary EXTERNAL address X retaining `onlyProposer`
-    ///      mutation rights on the live strategy — `_proposer` is a known
-    ///      authorized address (vault owner OR registered agent of this
-    ///      vault) rather than an attacker-supplied unknown. Does NOT fully
-    ///      close the cross-agent case (agent A deploys, agent B proposes via
-    ///      governor → strategy's `_proposer = A` ≠ `proposal.proposer = B`);
-    ///      the full fix requires a governor-side `IStrategy.proposer() ==
-    ///      msg.sender` check at `propose`, deferred because the ~140 B
-    ///      `staticcall` setup doesn't fit governor's +12 B margin without
-    ///      ABI-breaking trims. In practice, agents deploy their own
-    ///      strategies and propose them, so this covers the common case.
+    /// @dev `proposer == msg.sender` ties the clone's stored `_proposer` to the
+    ///      deployer, so `onlyProposer` rights cannot be handed to a third party.
     function cloneAndInit(address template, address vault, address proposer, bytes calldata data)
         external
         returns (address clone)
     {
-        _authClone(vault);
+        _requireRegisteredVault(vault);
         _authTemplate(template);
         if (proposer != msg.sender) revert ProposerMustBeSender();
         clone = Clones.clone(template);
         cloneTemplate[clone] = template;
+        _register(clone);
         IStrategy(clone).initialize(vault, proposer, data);
         emit StrategyCloned(template, vault, clone);
     }
@@ -159,12 +166,9 @@ contract StrategyFactory is Ownable {
     ///      address namespace. `salt` is visible in calldata; without this a
     ///      front-runner could race the deploy and occupy the predicted address
     ///      with a clone bound to their own vault — a recoverable DoS that would
-    ///      brick a keyless propose referencing it. Occupying a vault's address
-    ///      requires passing that vault here, which `_authClone`
-    ///      only lets the vault's owner / registered agents do. The off-chain
-    ///      predictor mirrors this byte-for-byte (SDK `effectiveStrategySalt`);
-    ///      the two MUST stay in lockstep or predictions diverge from the
-    ///      deployed address.
+    ///      brick a keyless propose referencing it. The off-chain predictor
+    ///      mirrors this byte-for-byte (SDK `effectiveStrategySalt`); the two
+    ///      MUST stay in lockstep or predictions diverge from the deployed address.
     function cloneAndInitDeterministic(
         address template,
         address vault,
@@ -172,11 +176,12 @@ contract StrategyFactory is Ownable {
         bytes calldata data,
         bytes32 salt
     ) external returns (address clone) {
-        _authClone(vault);
+        _requireRegisteredVault(vault);
         _authTemplate(template);
         if (proposer != msg.sender) revert ProposerMustBeSender();
         clone = Clones.cloneDeterministic(template, keccak256(abi.encode(vault, salt)));
         cloneTemplate[clone] = template;
+        _register(clone);
         IStrategy(clone).initialize(vault, proposer, data);
         emit StrategyCloned(template, vault, clone);
     }

@@ -39,9 +39,9 @@ import {MorphoSupplyStrategy} from "../../src/strategies/MorphoSupplyStrategy.so
  *      pashov 2026-08 finding-12 fix, `MorphoSupplyStrategy._initialize` binds
  *      its proposer-supplied Morpho singleton to the governance-owned
  *      `TierRegistry` (`vault() -> governor() -> tierRegistry() ->
- *      isAdapterAllowed`) and reverts `MorphoNotAllowed` otherwise. The
+ *      isCounterpartyAllowed`) and reverts `MorphoNotAllowed` otherwise. The
  *      registry owner MUST therefore call
- *      `setAdapterAllowed(0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010, true)`
+ *      `setCounterpartyAllowed(0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010, true)`
  *      before any Morpho proposal can clone this template. It is deliberately
  *      not done here: this phase runs before `DeployStrategyFactory` and the
  *      registry is owned by the parameter multisig, not the deployer key.

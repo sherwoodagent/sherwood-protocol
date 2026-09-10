@@ -252,14 +252,7 @@ contract SyndicateFactoryTest is Test {
         vault.deposit(50_000e6, lp);
         vm.stopPrank();
 
-        // The fixture now wires a real TierRegistry (pashov finding #1), so the
-        // vault's spender gate is LIVE rather than skipped — allowlist the
-        // approve target the way a real deployment would.
-        address _owner = factory.owner();
-        TierRegistry _reg = TierRegistry(factory.tierRegistry());
         address _protocolSpender = makeAddr("protocol");
-        vm.prank(_owner);
-        _reg.setAdapterAllowed(_protocolSpender, true);
 
         // Governor executes batch (strategy-style approve — onlyGovernor after V-C3)
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
@@ -271,7 +264,7 @@ contract SyndicateFactoryTest is Test {
         vault.executeGovernorBatch(calls, new uint256[](0), type(uint256).max);
 
         // Verify: vault set the approval (delegatecall)
-        assertEq(usdc.allowance(vaultAddr, makeAddr("protocol")), 1_000e6);
+        assertEq(usdc.allowance(vaultAddr, makeAddr("protocol")), 0, "no allowance outlives the batch");
     }
 
     function test_storageIsolation() public {
@@ -884,7 +877,7 @@ contract SyndicateFactoryTest is Test {
         SyndicateGovernor(gov).setTierRegistry(address(0));
 
         // Same branch refuses codeless: an EOA passes every zero-check, then
-        // bricks the vault's typed `isCallableTarget` call.
+        // bricks the governor's typed `tierOf` call at propose.
         vm.prank(address(factory));
         vm.expectRevert(ISyndicateGovernor.TierRegistryNotWired.selector);
         SyndicateGovernor(gov).setTierRegistry(makeAddr("eoaRegistry"));

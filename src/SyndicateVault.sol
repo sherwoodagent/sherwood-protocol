@@ -4,11 +4,13 @@ pragma solidity 0.8.28;
 import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {ITierRegistry} from "./interfaces/ITierRegistry.sol";
+import {IStrategyFactory} from "./interfaces/IStrategyFactory.sol";
 import {IProposalStatus} from "./interfaces/IProposalStatus.sol";
 import {FeeConstants} from "./FeeConstants.sol";
 import {ISyndicateFactory} from "./interfaces/ISyndicateFactory.sol";
 import {IVaultWithdrawalQueue} from "./interfaces/IVaultWithdrawalQueue.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
+import {AssetCallRules} from "./AssetCallRules.sol";
 import {SyndicateVaultAdminLib} from "./SyndicateVaultAdminLib.sol";
 import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import {
@@ -27,6 +29,7 @@ import {ERC721Holder} from "@openzeppelin/contracts/token/ERC721/utils/ERC721Hol
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
@@ -85,64 +88,6 @@ contract SyndicateVault is
 
     /// @notice Cap on the owner-set idle-liquidity floor (50%).
     uint256 private constant MAX_MIN_BUFFER_BPS = 5_000;
-
-    // ── Value-moving ERC20 selectors guarded in governor batches ──
-    // (see `_guardBatchCalls`)
-    bytes4 private constant _SEL_APPROVE = 0x095ea7b3; // approve(address,uint256)
-    bytes4 private constant _SEL_INCREASE_ALLOWANCE = 0x39509351; // increaseAllowance(address,uint256)
-    bytes4 private constant _SEL_TRANSFER = 0xa9059cbb; // transfer(address,uint256)
-    bytes4 private constant _SEL_TRANSFER_FROM = 0x23b872dd; // transferFrom(address,address,uint256)
-
-    // Alternate-signature pull/push-via-delegated-allowance selectors: the same
-    // guarded CAPABILITY as the four legacy-ERC20 selectors above, exposed under
-    // different 4-byte selectors by non-legacy allowance routers. Permit2's
-    // AllowanceTransfer singleton — deployed at the same address on nearly every
-    // EVM chain, with huge numbers of standing LP allowances — and
-    // DSToken-lineage `pull`/`move` wrappers reproduce the exact
-    // LP-allowance-confiscation and poison-then-drain shapes Part 1b/Part 2 close,
-    // invisible to both because neither matched any legacy selector. Each decodes
-    // with the SAME argument layout as its legacy counterpart (source at bytes
-    // 4:36; destination, where present, at 36:68).
-    bytes4 private constant _SEL_PERMIT2_TRANSFER_FROM = 0x36c78516; // Permit2 AllowanceTransfer.transferFrom(address from,address to,uint160,address token)
-    bytes4 private constant _SEL_PERMIT2_APPROVE = 0x87517c45; // Permit2 AllowanceTransfer.approve(address token,address spender,uint160,uint48)
-    bytes4 private constant _SEL_DSTOKEN_PULL = 0xf2d5d56b; // DSToken pull(address usr, uint256 wad) — pulls TO msg.sender (the vault)
-    bytes4 private constant _SEL_DSTOKEN_MOVE = 0xbb35783b; // DSToken move(address src, address dst, uint256 wad)
-
-    // Four MORE sibling selectors on the exact routers/standards above, missed by
-    // the same enumeration approach — the evidence that motivated the
-    // target-based callee gate (PART 2a). These selectors, and everything below,
-    // remain the INNER boundary — still load-bearing for e.g. `approve(attacker)`
-    // on an otherwise-allowlisted token — but they are no longer the outer
-    // boundary against an unenumerated selector on an arbitrary target.
-    bytes4 private constant _SEL_DSTOKEN_PUSH = 0xb753a98c; // DSToken push(address dst, uint256 wad) — transfer-lineage sibling of guarded pull/move; internally transfer(dst, wad)
-    bytes4 private constant _SEL_ERC1363_TRANSFER_FROM_AND_CALL = 0xd8fbe994; // ERC1363 transferFromAndCall(address from,address to,uint256)
-    bytes4 private constant _SEL_ERC1363_TRANSFER_FROM_AND_CALL_DATA = 0xc1d34b89; // ERC1363 transferFromAndCall(address from,address to,uint256,bytes) — trailing bytes arg does not shift the leading from/to offsets
-    bytes4 private constant _SEL_ERC1363_APPROVE_AND_CALL = 0x3177029f; // ERC1363 approveAndCall(address spender,uint256)
-    bytes4 private constant _SEL_ERC1363_APPROVE_AND_CALL_DATA = 0xcae9ca51; // ERC1363 approveAndCall(address spender,uint256,bytes)
-    bytes4 private constant _SEL_PERMIT2_BATCH_TRANSFER_FROM = 0x0d58b1db; // Permit2 AllowanceTransfer.transferFrom(AllowanceTransferDetails[]) — dynamic-array batch sibling of the guarded single-transfer overload; decoded via `_Permit2BatchDetail`, NOT the fixed-offset slices the other selectors share
-
-    // ERC4626 withdraw/redeem: a THIRD allowance-pull shape. `owner` (the debited
-    // source, analogous to `transferFrom`'s `from`) sits at arg 2 (bytes 68:100),
-    // not arg 0 — every other guarded selector assumes the source is at bytes
-    // 4:36, so these need their own branch.
-    bytes4 private constant _SEL_ERC4626_WITHDRAW = 0xb460af94; // withdraw(uint256 assets, address receiver, address owner)
-    bytes4 private constant _SEL_ERC4626_REDEEM = 0xba087652; // redeem(uint256 shares, address receiver, address owner) — same arg shape as withdraw
-    // ERC1363 transferAndCall: push-with-callback sibling of the guarded
-    // `transfer`/`push`/`approveAndCall` — recipient at arg 0, same offset.
-    bytes4 private constant _SEL_ERC1363_TRANSFER_AND_CALL = 0x1296ee62; // transferAndCall(address to, uint256 value)
-    bytes4 private constant _SEL_ERC1363_TRANSFER_AND_CALL_DATA = 0x4000aea0; // transferAndCall(address to, uint256 value, bytes data)
-
-    /// @dev Decode-only mirror of Permit2's `AllowanceTransferDetails` struct —
-    ///      never used to call Permit2, only to `abi.decode` a batch
-    ///      `transferFrom` call's calldata so `_guardBatchCalls` can inspect every
-    ///      element's `from`/`to`. All fields are static, so the array decodes as
-    ///      tightly-packed 128-byte elements with no per-element dynamic pointer.
-    struct _Permit2BatchDetail {
-        address from;
-        address to;
-        uint160 amount;
-        address token;
-    }
 
     // ==================== STORAGE ====================
 
@@ -453,7 +398,7 @@ contract SyndicateVault is
         if (_executorImpl.codehash != _expectedExecutorCodehash) {
             revert ExecutorCodehashMismatch();
         }
-        _guardBatchCalls(calls);
+        address[] memory spenders = _guardBatchCalls(calls);
         uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
         // The lib's unmetered 1-arg `executeBatch(Call[])` overload was
         // one left, so `abi.encodeCall` resolves it unambiguously again.
@@ -463,6 +408,11 @@ contract SyndicateVault is
             assembly {
                 revert(add(returnData, 32), mload(returnData))
             }
+        }
+        // No allowance outlives the batch: every allowance-shaped asset call's first argument is
+        // reset, pulled or not. A reset of an address that never held one is a no-op.
+        for (uint256 i = 0; i < spenders.length; i++) {
+            IERC20(asset()).forceApprove(spenders[i], 0);
         }
         // First-class vault-level execution marker. Emitted after the
         // delegatecall succeeds so indexers only see confirmed executions.
@@ -482,15 +432,6 @@ contract SyndicateVault is
         if (balanceAfter < reserve + (balanceBefore * minBufferBps) / 10_000) revert BufferBreached();
     }
 
-    /// @inheritdoc ISyndicateVault
-    /// @dev Wraps `_isPrivilegedBatchTarget` — the same predicate
-    ///      `_guardBatchCalls` enforces. Exposed so the governor's
-    ///      propose-time validation answers through this one implementation
-    ///      instead of restating the address set (vault, bound queue).
-    function isPrivilegedBatchTarget(address target) external view returns (bool) {
-        return _isPrivilegedBatchTarget(target);
-    }
-
     /// @notice Re-point the shared `BatchExecutorLib` and re-stamp its expected
     ///         codehash, atomically. Reached only through the factory's
     ///         lifecycle-gated `pushExecutor`.
@@ -507,150 +448,47 @@ contract SyndicateVault is
         emit ExecutorImplSet(old, newImpl);
     }
 
-    function _guardBatchCalls(BatchExecutorLib.Call[] calldata calls) private view {
-        for (uint256 i = 0; i < calls.length; i++) {
-            address target = calls[i].target;
-            if (_isPrivilegedBatchTarget(target)) {
-                revert DisallowedBatchTarget(target);
-            }
-            // `transferFrom` SOURCE guard — unconditional, same pass, same
-            // rationale as the target denylist. Covers legacy `transferFrom` AND
-            // every alternate-signature pull-via-delegated-allowance selector this
-            // guard recognizes; all place the debited source at bytes 4:36.
-            bytes calldata data = calls[i].data;
-            if (data.length >= 4) {
-                bytes4 sel = bytes4(data[0:4]);
-                if (
-                    sel == _SEL_TRANSFER_FROM || sel == _SEL_PERMIT2_TRANSFER_FROM || sel == _SEL_DSTOKEN_PULL
-                        || sel == _SEL_DSTOKEN_MOVE || sel == _SEL_ERC1363_TRANSFER_FROM_AND_CALL
-                        || sel == _SEL_ERC1363_TRANSFER_FROM_AND_CALL_DATA
-                ) {
-                    if (data.length < 68) revert MalformedCall();
-                    address from = address(uint160(uint256(bytes32(data[4:36]))));
-                    if (from != address(this)) revert DisallowedTransferFromSource(target, from);
-                } else if (sel == _SEL_PERMIT2_BATCH_TRANSFER_FROM) {
-                    // Dynamic array, not a fixed-offset slice: decode every element
-                    // and require each one's `from` to be the vault, per-element
-                    // instead of once. `abi.decode` always returns memory for
-                    // dynamic types, which is fine here since it is only read.
-                    if (data.length < 36) revert MalformedCall();
-                    _Permit2BatchDetail[] memory details = abi.decode(data[4:], (_Permit2BatchDetail[]));
-                    for (uint256 j = 0; j < details.length; j++) {
-                        if (details[j].from != address(this)) {
-                            revert DisallowedTransferFromSource(target, details[j].from);
-                        }
-                    }
-                } else if (sel == _SEL_ERC4626_WITHDRAW || sel == _SEL_ERC4626_REDEEM) {
-                    // `owner` (the debited source) is arg 2 (bytes 68:100),
-                    // not arg 0 like every other guarded selector above —
-                    // OZ's ERC4626 `_withdraw` spends `owner`'s allowance to
-                    // `caller` (the vault) exactly like `transferFrom` spends
-                    // `from`'s.
-                    if (data.length < 100) revert MalformedCall();
-                    address ownerArg = address(uint160(uint256(bytes32(data[68:100]))));
-                    if (ownerArg != address(this)) revert DisallowedTransferFromSource(target, ownerArg);
-                }
-            }
-        }
-
-        // onlyGovernor holds, so msg.sender IS the governor. staticcall (not a
-        // typed call) so a governor without the getter resolves to "unset"
-        // HERE rather than reverting in this frame with empty returndata, which
-        // would be indistinguishable from a bug in the guard itself. Either way
-        // the outcome is the same refusal — only the error is legible.
-        (bool ok, bytes memory ret) = msg.sender.staticcall(abi.encodeCall(ISyndicateGovernor.tierRegistry, ()));
-        if (!ok || ret.length != 32) revert TierRegistryUnresolved();
-        address registry = abi.decode(ret, (address));
-        if (registry == address(0)) revert TierRegistryUnresolved();
-
+    /// @dev Structural batch rules. Every non-asset target is a strategy registered with the
+    ///      protocol's factory (a fixed `IStrategy` shape, not a trust check); an asset call must
+    ///      pass `AssetCallRules.spenderOf`, and the spender it names is reset after the batch.
+    function _guardBatchCalls(BatchExecutorLib.Call[] calldata calls) private view returns (address[] memory spenders) {
+        address factory_ = _strategyFactory();
         address asset_ = asset();
+        spenders = new address[](calls.length);
+        uint256 n;
         for (uint256 i = 0; i < calls.length; i++) {
             address target = calls[i].target;
-            if (target != asset_ && !ITierRegistry(registry).isCallableTarget(target)) {
-                revert DisallowedBatchCallee(target);
-            }
-            bytes calldata data = calls[i].data;
-            // ── PART 2b: value-moving-selector checks (retained, unchanged) ──
-            if (data.length < 4) continue;
-            bytes4 sel = bytes4(data[0:4]);
-            address recipient;
-            if (
-                sel == _SEL_APPROVE || sel == _SEL_INCREASE_ALLOWANCE || sel == _SEL_TRANSFER
-                    || sel == _SEL_DSTOKEN_PUSH || sel == _SEL_ERC1363_APPROVE_AND_CALL
-                    || sel == _SEL_ERC1363_APPROVE_AND_CALL_DATA || sel == _SEL_ERC1363_TRANSFER_AND_CALL
-                    || sel == _SEL_ERC1363_TRANSFER_AND_CALL_DATA
-            ) {
-                // DSToken push(dst, wad) is transfer's sibling — dst at arg 1
-                // (bytes 4:36), same as _SEL_TRANSFER. ERC1363 approveAndCall
-                // (+data) is approve's sibling, and transferAndCall(+data) is
-                // transfer's sibling — spender/to at arg 1, same offset,
-                // trailing args (amount/bytes) unread and irrelevant.
-                if (data.length < 36) revert MalformedCall();
-                recipient = address(uint160(uint256(bytes32(data[4:36]))));
-            } else if (
-                sel == _SEL_TRANSFER_FROM || sel == _SEL_PERMIT2_TRANSFER_FROM || sel == _SEL_DSTOKEN_MOVE
-                    || sel == _SEL_ERC1363_TRANSFER_FROM_AND_CALL || sel == _SEL_ERC1363_TRANSFER_FROM_AND_CALL_DATA
-            ) {
-                // Legacy/Permit2 transferFrom, DSToken move, and ERC1363
-                // transferFromAndCall (+data) all place `to`/`dst` at arg 2
-                // (bytes 36:68) — ERC1363's trailing `bytes` overload adds a
-                // 4th arg AFTER `amount`, so it does not shift this offset.
-                if (data.length < 68) revert MalformedCall();
-                recipient = address(uint160(uint256(bytes32(data[36:68]))));
-            } else if (sel == _SEL_PERMIT2_APPROVE) {
-                // Permit2's `approve(token, spender, uint160, uint48)` carries
-                // an extra leading `token` arg vs legacy `approve(spender,
-                // amount)`, shifting the guarded `spender` to arg 2 (bytes
-                // 36:68) instead of arg 1 (bytes 4:36).
-                if (data.length < 68) revert MalformedCall();
-                recipient = address(uint160(uint256(bytes32(data[36:68]))));
-            } else if (sel == _SEL_ERC4626_WITHDRAW || sel == _SEL_ERC4626_REDEEM) {
-                // `receiver` is arg 1 (bytes 36:68); `owner` (already
-                // source-checked in Part 1b above) is arg 2 and irrelevant
-                // here — same offset as the transferFrom-shaped group above,
-                // kept as its own branch since the source check that landed
-                // it here uses a different offset (arg 2, not arg 0).
-                if (data.length < 68) revert MalformedCall();
-                recipient = address(uint160(uint256(bytes32(data[36:68]))));
-            } else if (sel == _SEL_PERMIT2_BATCH_TRANSFER_FROM) {
-                // Dynamic array: apply the exact same per-element fast-path
-                // and registry check the single-recipient path below applies
-                // once, but once per element, then fall through to the next
-                // batch call — this selector never sets the shared
-                // `recipient` local.
-                if (data.length < 36) revert MalformedCall();
-                _Permit2BatchDetail[] memory details = abi.decode(data[4:], (_Permit2BatchDetail[]));
-                for (uint256 j = 0; j < details.length; j++) {
-                    address to = details[j].to;
-                    if (to == address(this)) continue;
-                    if (!ITierRegistry(registry).isAdapterAllowed(to)) {
-                        revert DisallowedTransferTarget(calls[i].target, sel, to);
-                    }
-                    _requireRecipientVaultBinding(registry, to);
-                }
-                continue;
-            } else {
-                if (target == asset_ && !_isBenignAssetRead(sel)) {
-                    revert UnrecognizedAssetSelector(sel);
-                }
+            if (target != asset_) {
+                if (!_isRegisteredStrategy(factory_, target)) revert NotARegisteredStrategy(target);
                 continue;
             }
-            // Value landing on the vault itself needs no allowlist entry: the recipient is this contract.
-            if (recipient == address(this)) continue;
-            if (!ITierRegistry(registry).isAdapterAllowed(recipient)) {
-                revert DisallowedTransferTarget(calls[i].target, sel, recipient);
-            }
-            _requireRecipientVaultBinding(registry, recipient);
+            // A zero first argument (`balanceOf(address(0))`) names no spender; resetting it would revert.
+            address spender = AssetCallRules.spenderOf(address(this), calls[i].data);
+            if (spender != address(0)) spenders[n++] = spender;
+        }
+        assembly ("memory-safe") {
+            mstore(spenders, n)
         }
     }
 
-    function _requireRecipientVaultBinding(address registry, address recipient) private view {
-        if (ITierRegistry(registry).classOf(recipient) == bytes32(0)) return;
-        if (_readVaultOf(recipient) != address(this)) revert AdapterVaultMismatch(recipient);
+    /// @dev governor -> tierRegistry -> strategyFactory; a hop that does not answer reads as zero.
+    function _strategyFactory() private view returns (address) {
+        address registry = _readAddress(_getGovernor(), abi.encodeCall(ISyndicateGovernor.tierRegistry, ()));
+        return _readAddress(registry, abi.encodeCall(ITierRegistry.strategyFactory, ()));
     }
 
-    function _readVaultOf(address recipient) private view returns (address) {
-        (bool ok, bytes memory ret) = recipient.staticcall(abi.encodeWithSignature("vault()"));
+    /// @dev Fail-closed: an unwired or mis-pointed factory registers nothing.
+    function _isRegisteredStrategy(address factory_, address target) private view returns (bool) {
+        if (factory_ == address(0)) return false;
+        (bool ok, bytes memory ret) =
+            factory_.staticcall(abi.encodeCall(IStrategyFactory.isRegisteredStrategy, (target)));
+        return ok && ret.length == 32 && abi.decode(ret, (bool));
+    }
+
+    /// @dev Codeless target, revert, short return, or dirty upper bits all read as `address(0)`.
+    function _readAddress(address target, bytes memory data) private view returns (address) {
+        if (target.code.length == 0) return address(0);
+        (bool ok, bytes memory ret) = target.staticcall(data);
         if (!ok || ret.length < 32) return address(0);
         uint256 word;
         assembly ("memory-safe") {
@@ -658,26 +496,6 @@ contract SyndicateVault is
         }
         if (word >> 160 != 0) return address(0);
         return address(uint160(word));
-    }
-
-    function _isBenignAssetRead(bytes4 sel) private pure returns (bool) {
-        return sel == 0x70a08231 // balanceOf(address)
-            || sel == 0x313ce567 // decimals()
-            || sel == 0x18160ddd // totalSupply()
-            || sel == 0xdd62ed3e // allowance(address,address)
-            || sel == 0x95d89b41 // symbol()
-            || sel == 0x06fdde03; // name()
-    }
-
-    /// @dev The single implementation of the privileged-batch-target
-    ///      predicate — the vault itself, or the bound withdrawal queue.
-    ///      `_guardBatchCalls`'s Part 1 loop and the external
-    ///      `isPrivilegedBatchTarget` view are its only two callers; neither
-    ///      may restate the address set (see the class-not-list rationale in
-    ///      `_guardBatchCalls`'s doc comment above).
-    function _isPrivilegedBatchTarget(address target) private view returns (bool) {
-        address q = _withdrawalQueue;
-        return target == address(this) || (q != address(0) && target == q);
     }
 
     /// @inheritdoc ISyndicateVault

@@ -33,7 +33,7 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
-import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Base contract with state variables and setup functions.
 ///
@@ -235,6 +235,7 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         agentRegistry = new MockAgentRegistry();
         protocolConfig = new ProtocolConfig(address(this));
         tierRegistry = new TierRegistry(address(this));
+        tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
         fizzFactory = new FizzFactory();
         adapter = new FizzAdapter();
 
@@ -450,12 +451,9 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         }
     }
 
-    /// @dev Certify and allowlist the benign batch target. Two separate gates
-    ///      have to pass for a proposal's calls to execute: `tierOf` prices the
-    ///      (target, selector) pair, and `isAdapterAllowed` decides whether the
-    ///      vault may call the target at all (issue #166). Certification is a
-    ///      propose → delay → certify cycle (I-30), so the clock is advanced in
-    ///      between.
+    /// @dev Certify the benign batch target: `tierOf` prices the (target, selector)
+    ///      pair. Certification is a propose → delay → certify cycle (I-30), so the
+    ///      clock is advanced in between.
     function _certifyAdapter() internal {
         // Tier 1 with a 50% extractable bound. `extractableBoundBps` must sit
         // strictly inside (0, FULL_NOTIONAL_BPS) — 10_000 is the exclusive
@@ -465,7 +463,6 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         );
         skipTime(tierRegistry.certifyDelay() + 1);
         tierRegistry.certify(address(adapter), FizzAdapter.poke.selector);
-        tierRegistry.setAdapterAllowed(address(adapter), true);
     }
 
     function _seedVault() internal {

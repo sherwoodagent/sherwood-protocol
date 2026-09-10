@@ -7,16 +7,21 @@ import {StrategyFactory} from "../src/StrategyFactory.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 
 /// @title  DeployStrategyFactory
-/// @notice #387 phase: deploy the keyless-clone StrategyFactory and approve the
-///         canonical templates so deterministic strategy proposals
-///         (cloneAndInitDeterministic) work. Run AFTER Deploy + DeployTemplates
-///         — reads SYNDICATE_FACTORY and the *_TEMPLATE keys from
-///         chains/{chainId}.json.
+/// @notice #387 phase: deploy the keyless-clone StrategyFactory, approve the
+///         canonical templates and wire the factory into the TierRegistry.
+///         Run AFTER Deploy + DeployTemplates and BEFORE the multisig accepts
+///         TierRegistry ownership — reads SYNDICATE_FACTORY, TIER_REGISTRY and
+///         the *_TEMPLATE keys from chains/{chainId}.json.
 ///
 /// @dev    The allowlist defaults empty (every clone reverts), so each template
 ///         the CLI can propose MUST be approved here. Absent keys (e.g. the HL
 ///         templates on Base) are skipped, so one list covers every chain.
-///         Owner-aware handoff mirrors the other phase scripts.
+///
+///         THE WIRING IS MANDATORY. The vault and the governor resolve the
+///         strategy registry through `TierRegistry.strategyFactory()`; while it
+///         is unwired every `propose` reverts `StrategyNotRegistered` and every
+///         non-asset batch target is refused. There is no deferred path: if the
+///         registry owner is no longer the deployer, the phase refuses to run.
 ///
 ///   Usage:
 ///     SKIP_MULTISIG_HANDOFF=true forge script \
@@ -32,49 +37,58 @@ contract DeployStrategyFactory is ScriptBase {
         }
 
         address syndicateFactory = _readAddress("SYNDICATE_FACTORY");
+        address tierRegistry = _optionalAddress("TIER_REGISTRY");
         string memory json = vm.readFile(_chainsPath());
         string[] memory keys = _templateKeys();
 
-        vm.startBroadcast();
-        address deployer = msg.sender;
-        StrategyFactory sf = new StrategyFactory(syndicateFactory, deployer);
-
-        uint256 approved;
+        address[] memory templates = new address[](keys.length);
+        uint256 found;
         for (uint256 i; i < keys.length; ++i) {
             address tmpl = _tryParseAddress(json, keys[i]);
             if (tmpl == address(0)) continue;
-            sf.setTemplateApproval(tmpl, true);
-            console.log(string.concat("approved ", keys[i]), tmpl);
-            ++approved;
+            templates[found++] = tmpl;
+            console.log(string.concat("approving ", keys[i]), tmpl);
         }
-        require(approved > 0, "no templates found in chains.json - run DeployTemplates first");
-
-        // TierRegistry class membership requires this factory's provenance
-        // record, so an unwired registry resolves NO class at all. The registry
-        // may already have been handed to the multisig by the core deploy, in
-        // which case this is a runbook item rather than a broadcast call.
-        address tierRegistry = _tryParseAddress(json, "TIER_REGISTRY");
-        bool wired = tierRegistry != address(0) && TierRegistry(tierRegistry).owner() == deployer;
-        if (wired) TierRegistry(tierRegistry).setStrategyFactory(address(sf));
-
-        if (!skipHandoff) sf.transferOwnership(ownerMultisig);
-        vm.stopBroadcast();
-
-        if (!wired) {
-            require(
-                vm.envOr("ALLOW_UNWIRED_TIER_REGISTRY", false),
-                "TIER_REGISTRY not wired: run TierRegistry.setStrategyFactory(STRATEGY_FACTORY) as the registry owner (runbook: StrategyFactory phase, tier-registry wiring step), or re-run with ALLOW_UNWIRED_TIER_REGISTRY=true to defer it deliberately"
-            );
-            console.log(
-                "DEFERRED: run TierRegistry.setStrategyFactory(<factory>) from the owner Safe; no class resolves until it runs"
-            );
+        assembly ("memory-safe") {
+            mstore(templates, found)
         }
+
+        StrategyFactory sf = deploy(syndicateFactory, tierRegistry, templates, skipHandoff ? address(0) : ownerMultisig);
 
         console.log("StrategyFactory:", address(sf));
-        console.log("Templates approved:", approved);
+        console.log("Templates approved:", found);
         console.log("Owner:", sf.owner());
+        console.log("TierRegistry.strategyFactory:", TierRegistry(tierRegistry).strategyFactory());
 
         _patchAddress("STRATEGY_FACTORY", address(sf));
+    }
+
+    /// @notice The ceremony proper, book passed in so a test can drive it without the env.
+    /// @param ownerMultisig `address(0)` keeps the deployer as the factory owner (handoff skipped).
+    function deploy(address syndicateFactory, address tierRegistry, address[] memory templates, address ownerMultisig)
+        public
+        returns (StrategyFactory sf)
+    {
+        require(tierRegistry != address(0), "TIER_REGISTRY missing from the address book: run Deploy first");
+        require(templates.length > 0, "no templates found in chains.json - run DeployTemplates first");
+
+        vm.startBroadcast();
+        address deployer = msg.sender;
+        require(
+            TierRegistry(tierRegistry).owner() == deployer,
+            "TIER_REGISTRY owner is not the deployer: run this phase BEFORE the multisig accepts TierRegistry ownership (unwired, every propose reverts StrategyNotRegistered)"
+        );
+
+        sf = new StrategyFactory(syndicateFactory, deployer);
+        for (uint256 i; i < templates.length; ++i) {
+            require(templates[i] != address(0), "zero template");
+            sf.setTemplateApproval(templates[i], true);
+        }
+        TierRegistry(tierRegistry).setStrategyFactory(address(sf));
+        if (ownerMultisig != address(0)) sf.transferOwnership(ownerMultisig);
+        vm.stopBroadcast();
+
+        require(TierRegistry(tierRegistry).strategyFactory() == address(sf), "TIER_REGISTRY wiring did not land");
     }
 
     /// @dev Every template the StrategyFactory must allowlist. THIS LIST IS THE

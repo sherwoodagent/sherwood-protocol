@@ -22,7 +22,7 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "./helpers/TierRegistryFixture.sol";
 
 /// @dev Chainlink-shaped USD feed for the vault asset: fixed answer, `decimals`,
 ///      `updatedAt` stamped at construction.
@@ -167,6 +167,7 @@ contract CoverageEndToEndTest is Test {
         protocolConfig = new ProtocolConfig(owner);
         adapter = new NoopAdapter();
         tierRegistry = new TierRegistry(address(this));
+        tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
 
         // ── sWOOD (sole WOOD custodian). Test contract is the factory.
         StakedWood swoodImpl = new StakedWood();
@@ -1128,24 +1129,11 @@ contract CoverageEndToEndTest is Test {
         // `block.timestamp` local — the optimizer CSEs it across `vm.warp`),
         // execute. `_propose` and every later window below reads live state
         // relative to this new baseline, so the forward shift is safe.
-        // issue #166 (target-based batch callee gate, landed after this fixture
-        // was written): the vault's outer callee check requires the adapter be
-        // allowlisted independently of certification, or the batch never
-        // reaches the tier-1 poke call at all.
-        tierRegistry.setAdapterAllowed(address(adapter), true);
         tierRegistry.proposeCertification(
             address(adapter), adapter.poke.selector, 1, 100, address(0), address(adapter).codehash
         );
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(address(adapter), adapter.poke.selector);
-        // issue #166: certifying a (target, selector) prices it for tiering
-        // but does NOT make `target` batch-callable at all — that is the
-        // SEPARATE `isAdapterAllowed` allowlist `SyndicateVault._guardBatchCalls`
-        // PART 2a now enforces on every batch callee. `adapter` (`NoopAdapter`)
-        // is a benign, fund-neutral fixture, not an attacker probe — allowlist
-        // it or `executeProposal` below is refused with `DisallowedBatchCallee`
-        // before the bounded-tier coverage mechanics under test ever run.
-        tierRegistry.setAdapterAllowed(address(adapter), true);
 
         pid = _propose(govA, address(vaultA), agentA, _adapterCalls(), _adapterCalls());
         assertEq(govA.getProposal(pid).envelopeTier, 1, "certified tier 1");

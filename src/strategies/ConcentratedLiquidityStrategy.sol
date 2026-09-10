@@ -15,18 +15,11 @@ import {IUniswapV3Pool} from "../vendor/uniswap/IUniswapV3Pool.sol";
 import {IUniswapV3Factory} from "../vendor/uniswap/IUniswapV3Factory.sol";
 import {INonfungiblePositionManager} from "../vendor/uniswap/INonfungiblePositionManager.sol";
 
-/// @notice The `vault() -> governor() -> tierRegistry() -> isAdapterAllowed(x)`
-///         walk. The SAME registry, reached the same way, that
-///         `SyndicateVault._guardBatchCalls` gates batch approvals against.
-/// @dev    Declared locally rather than imported, mirroring
-///         `PortfolioStrategy.ITierBindingPath`: every hop is a length-checked
-///         raw staticcall, so this template takes on no type dependency and no
-///         hop can revert `_initialize` undecodably. Exists to generate
-///         selectors, not to type the responses.
+/// @notice The `vault() -> governor() -> tierRegistry() -> isCounterpartyAllowed(x)` walk.
+/// @dev    Declared locally: every hop is a length-checked raw staticcall. Generates selectors only.
 interface ITierBindingPath {
     function governor() external view returns (address);
     function tierRegistry() external view returns (address);
-    function isAdapterAllowed(address adapter) external view returns (bool);
     function isCounterpartyAllowed(address counterparty) external view returns (bool);
 }
 
@@ -435,7 +428,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             // binding of the same role; weak axis for the rest, which adapter
             // standing implies. All four receive approvals — see the note above
             // for why that is not what separates them.
-            _requireAllowedAdapter(registry, p.swapAdapter);
+            _requireAllowedCounterparty(registry, p.swapAdapter);
             _requireAllowedCounterparty(registry, p.positionManager);
             _requireAllowedCounterparty(registry, p.morpho);
             // The factory is the authority check (1) delegates the pool's
@@ -599,13 +592,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
         return abi.decode(ret, (address)) == underlying;
     }
 
-    // ── Governance-allowlist binding (see check (0) in `_initialize`) ──
-
-    function _requireAllowedAdapter(address registry, address adapter) private view {
-        if (!_readAllowed(registry, abi.encodeCall(ITierBindingPath.isAdapterAllowed, (adapter)))) {
-            revert CounterpartyNotAllowed(adapter, registry);
-        }
-    }
+    // ── Counterparty binding (see check (0) in `_initialize`) ──
 
     function _requireAllowedCounterparty(address registry, address counterparty) private view {
         if (!_readAllowed(registry, abi.encodeCall(ITierBindingPath.isCounterpartyAllowed, (counterparty)))) {
@@ -626,7 +613,7 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
     function _requireCounterpartiesStillAllowed() private view {
         address registry = _resolveTierRegistry();
         if (registry == address(0)) return;
-        _requireAllowedAdapter(registry, address(swapAdapter));
+        _requireAllowedCounterparty(registry, address(swapAdapter));
         _requireAllowedCounterparty(registry, address(positionManager));
         _requireAllowedCounterparty(registry, address(morpho));
         // The volatile leg re-checks on the same terms as the rest: `rerange()`

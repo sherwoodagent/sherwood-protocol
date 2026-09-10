@@ -26,7 +26,7 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "./helpers/TierRegistryFixture.sol";
 
 /// @dev Chainlink-shaped USD feed for the vault asset.
 contract SlashGasFeed {
@@ -203,6 +203,7 @@ contract SlashGasCeilingTest is Test {
         protocolConfig = new ProtocolConfig(owner);
         adapter = new SlashGasAdapter();
         tierRegistry = new TierRegistry(address(this));
+        tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
 
         StakedWood swoodImpl = new StakedWood();
         bytes memory swoodInit = abi.encodeCall(
@@ -305,15 +306,6 @@ contract SlashGasCeilingTest is Test {
         );
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(address(adapter), adapter.poke.selector);
-        // issue #166: certifying a (target, selector) prices it for tiering
-        // but does NOT make `target` batch-callable at all — that is the
-        // SEPARATE `isAdapterAllowed` allowlist `SyndicateVault._guardBatchCalls`
-        // PART 2a now enforces on every batch callee. `adapter` (`SlashGasAdapter`)
-        // is a benign, fund-neutral fixture, not an attacker probe — allowlist
-        // it or every proposal touching it is refused with
-        // `DisallowedBatchCallee` before the gas-ceiling mechanics under test
-        // ever run. Inherited by `DemotionGasProbeTest` (`is SlashGasCeilingTest`).
-        tierRegistry.setAdapterAllowed(address(adapter), true);
 
         wood.mint(agent, 1_000_000e18);
         vm.prank(agent);

@@ -188,22 +188,9 @@ interface ISyndicateGovernor {
     error VaultNotRegistered();
     error VaultAlreadyRegistered();
     error NotRegisteredAgent();
-    /// @notice `propose` named a `strategy` clone whose `proposer()` is not the
-    ///         caller. `StrategyFactory.cloneAndInit` binds `_proposer` to the
-    ///         cloning caller (`ProposerMustBeSender`) so that it is "a known
-    ///         authorized address", and `BaseStrategy.execute()` then trusts
-    ///         `strategyOf(activePid) == address(this)` as its whole
-    ///         authorisation. Without this check the governor broke that
-    ///         chain: `strategy` was a label written by the proposer and
-    ///         consumed as an authorisation fact, so any registered agent
-    ///         could name a RIVAL agent's allowlisted clone and drive it to
-    ///         `State.Executed` — permanently bricking it (`AlreadyExecuted`
-    ///         thereafter) and round-tripping the vault's capital through its
-    ///         swap legs on the way.
-    error StrategyProposerMismatch();
-    /// @notice `propose` named a `strategy` clone initialized against a
-    ///         different vault than the one being proposed to.
-    error StrategyVaultMismatch();
+    /// @notice `propose` named a `strategy` the protocol's `StrategyFactory` does not hold as a
+    ///         registered, code-unchanged strategy.
+    error StrategyNotRegistered(address strategy);
     error StrategyDurationTooLong();
     error StrategyDurationTooShort();
     error EmptyExecuteCalls();
@@ -546,14 +533,9 @@ interface ISyndicateGovernor {
     ///         queue-only proposal.
     /// @dev    The strategy is set immutably at propose time — voters approve based
     ///         on this address, and there is no later rebind path.
-    /// @dev    `executeCallCaps` and `settlementCallCaps` are parallel arrays, one
-    ///         `uint256` per entry in the corresponding call array: each call's own
-    ///         declared gross-outflow cap, denominated in the vault asset. Zero is
-    ///         a legal declaration at every tier. Each sum must be
-    ///         `<= envelope.maxCapital`, checked PER BATCH and never combined — the
-    ///         two batches run in separate transactions, each independently bounded
-    ///         by the vault's net-outflow meter, and an honest settlement
-    ///         legitimately re-moves the same capital the execute batch deployed.
+    /// @dev    `executeCallCaps` / `settlementCallCaps` parallel the call arrays: each call's declared
+    ///         gross-outflow cap in the vault asset (zero is legal), each batch's sum `<= envelope.maxCapital`.
+    ///         Settlement caps meter gross re-pulls; the settle batch's net egress budget is zero.
     function propose(
         address vault,
         address strategy,
