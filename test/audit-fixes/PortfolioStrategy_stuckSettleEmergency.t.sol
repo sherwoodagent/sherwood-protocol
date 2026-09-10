@@ -39,6 +39,10 @@ contract PermissiveRegistryWithPairs is ITierRegistry {
         return true;
     }
 
+    function strategyFactory() external pure returns (address) {
+        return address(0);
+    }
+
     function classOf(address) external pure returns (bytes32) {
         return bytes32(0);
     }
@@ -381,28 +385,16 @@ contract PortfolioStrategy_stuckSettleEmergencyTest is Test {
         assertEq(tsla.balanceOf(address(strategy)), 500e18, "moved without the vault");
     }
 
-    /// @notice The batch guard admits `rescueTo` on the callee axis alone, exactly as it admits
-    ///         `settle()`: the selector names no recipient, so `isAdapterAllowed` is never
-    ///         consulted (denied here), and denying `isCallableTarget` on the clone refuses it.
+    /// @notice `rescueTo` is an ordinary call on an ordinary target: the structural guard
+    ///         admits it with no registry entry of any kind.
     function test_rescueTo_isReachableFromAnEmergencyBatch() public {
         (PortfolioStrategy strategy,) = _executedBasket();
-        address tierRegistry = governor.tierRegistry();
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = _rescueCalls(address(strategy))[0];
 
-        vm.mockCall(
-            tierRegistry, abi.encodeCall(ITierRegistry.isAdapterAllowed, (address(strategy))), abi.encode(false)
-        );
         vm.prank(address(governor));
         vault.executeGovernorBatch(calls, new uint256[](0), 0);
         assertEq(tsla.balanceOf(address(vault)), 500e18, "rescue did not land");
-
-        vm.mockCall(
-            tierRegistry, abi.encodeCall(ITierRegistry.isCallableTarget, (address(strategy))), abi.encode(false)
-        );
-        vm.prank(address(governor));
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchCallee.selector, address(strategy)));
-        vault.executeGovernorBatch(calls, new uint256[](0), 0);
     }
 
     /// @notice Control: with a live feed the ordinary `settleProposal` clears at the same point.

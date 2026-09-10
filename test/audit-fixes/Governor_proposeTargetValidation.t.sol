@@ -126,12 +126,11 @@ contract GovernorProposeTargetValidationTest is Test {
         return new ISyndicateGovernor.CoProposer[](0);
     }
 
-    /// @dev A call that clears both halves of the guard and moves nothing: a
-    ///      view selector on the asset token.
+    /// @dev A call that clears the guard and moves nothing: a zero `approve` on the asset.
     function _benignCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.balanceOf, (address(vault))), value: 0
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(vault), 0)), value: 0
         });
     }
 
@@ -265,20 +264,12 @@ contract GovernorProposeTargetValidationTest is Test {
 
     // ── claimUnclaimedFees reentrancy latch ──
 
-    /// @notice A batch that re-enters `claimUnclaimedFees` mid-execution now
-    ///         reverts the whole batch, instead of no-oping as it did before
-    ///         this change. Constructed as the design doc traces it: a
-    ///         governor entrypoint holds the reentrancy latch through
-    ///         `executeGovernorBatch`, and a sub-call whose target is the
-    ///         governor itself (not denylisted — only the vault and its
-    ///         queue are) calls back into `claimUnclaimedFees`.
-    /// @dev    The escrow key the reentrant call resolves is
-    ///         `(vault, msg.sender, token)` with `msg.sender == vault`
-    ///         (delegatecall), so it only has anything to pay if a fee
-    ///         recipient is literally the vault's own address — configured
-    ///         here via the protocol-fee recipient, forced to escrow rather
-    ///         than pay by blacklisting the vault as a transfer recipient
-    ///         (even a self-transfer reverts once blacklisted).
+    /// @notice A batch that names the governor as a call target is refused at propose:
+    ///         the governor is a privileged target, so the mid-batch re-entry into
+    ///         `claimUnclaimedFees` the reentrancy latch also closes is never reachable.
+    /// @dev    The escrow key the reentrant call would resolve is `(vault, vault, token)`,
+    ///         populated here by paying the protocol fee to the vault's own address while
+    ///         the vault is blacklisted as a transfer recipient.
     function test_claimUnclaimedFees_reentrantMidBatch_reverts() public {
         vm.prank(owner);
         protocolConfig.setProtocolFeeRecipient(address(vault));
@@ -317,26 +308,24 @@ contract GovernorProposeTargetValidationTest is Test {
         });
 
         ISyndicateGovernor.RiskEnvelope memory env2 = GovEnvelope.permissive(address(vault));
+        uint256[] memory caps = GovEnvelope.defaultCaps(env2.maxCapital, 1);
+        BatchExecutorLib.Call[] memory settle = _benignCalls();
         vm.prank(agent);
-        uint256 pid2 = governor.propose(
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(governor)));
+        governor.propose(
             address(vault),
             address(0),
             "ipfs://p2",
             STRATEGY_DURATION,
             env2,
             reentrantCall,
-            GovEnvelope.defaultCaps(env2.maxCapital, reentrantCall.length),
-            _benignCalls(),
-            GovEnvelope.defaultCaps(env2.maxCapital, (_benignCalls()).length),
+            caps,
+            settle,
+            caps,
             _noCoProposers()
         );
-        _voteAndAdvance(pid2);
 
-        vm.expectRevert(ISyndicateGovernor.Reentrancy.selector);
-        governor.executeProposal(pid2);
-
-        // The escrow survives untouched: the reentrant attempt failed the
-        // whole batch instead of silently paying out mid-execution.
+        // The escrow survives untouched: the shape never reached execution.
         assertEq(governor.unclaimedFees(address(vault), address(vault), address(usdc)), escrowed, "escrow unaffected");
     }
 

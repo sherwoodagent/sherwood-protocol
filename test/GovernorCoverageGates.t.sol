@@ -14,6 +14,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
+import {AssetPuller} from "./mocks/AssetPuller.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
 import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
 import {MockCoverageFreezer} from "./mocks/MockCoverageFreezer.sol";
@@ -732,7 +733,7 @@ contract GovernorCoverageGatesTest is Test {
     ///         settlement batch still moves exactly the $500 the proposal
     ///         executed at, proving settle never re-queries the ledger.
     function test_settle_reusesStoredEffectiveMaxCapital_despiteCoverageCollapsingBeforeSettle() public {
-        address sink = makeAddr("settleDrainSink");
+        address sink = address(new AssetPuller());
         uint256 maxCapital = 1_000e6;
         address g1 = makeAddr("g1");
 
@@ -740,10 +741,9 @@ contract GovernorCoverageGatesTest is Test {
         execCalls[0] = BatchExecutorLib.Call({
             target: address(targetToken), data: abi.encodeCall(targetToken.approve, (address(usdg), 1)), value: 0
         });
-        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
-        settleCalls[0] = BatchExecutorLib.Call({
-            target: address(usdg), data: abi.encodeCall(usdg.transfer, (sink, 500e6)), value: 0
-        });
+        BatchExecutorLib.Call[] memory settleCalls = _pullCalls(sink, 500e6);
+        uint256[] memory settleCaps = new uint256[](2);
+        settleCaps[1] = maxCapital;
 
         vm.prank(agent);
         uint256 pid = governor.propose(
@@ -755,7 +755,7 @@ contract GovernorCoverageGatesTest is Test {
             execCalls,
             GovEnvelope.defaultCaps(maxCapital, execCalls.length),
             settleCalls,
-            GovEnvelope.defaultCaps(maxCapital, settleCalls.length),
+            settleCaps,
             new ISyndicateGovernor.CoProposer[](0)
         );
 
@@ -793,21 +793,19 @@ contract GovernorCoverageGatesTest is Test {
     ///         rather than the raw (larger) caps merely happening to pass.
     function test_execute_perCallCapsScaleByTheSameCoverageRatio() public {
         uint256 maxCapital = 1_000e6;
-        address sink0 = makeAddr("capSink0");
-        address sink1 = makeAddr("capSink1");
+        address sink0 = address(new AssetPuller());
+        address sink1 = address(new AssetPuller());
 
-        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
-        // Attempts to move 1 wei MORE than call 1's scaled cap (120e6) —
-        // still well under its RAW declared cap (300e6), so this only
-        // reverts if the per-call cap was actually scaled.
-        execCalls[0] =
-            BatchExecutorLib.Call({target: address(usdg), data: abi.encodeCall(usdg.transfer, (sink0, 1)), value: 0});
-        execCalls[1] = BatchExecutorLib.Call({
-            target: address(usdg), data: abi.encodeCall(usdg.transfer, (sink1, 120e6 + 1)), value: 0
-        });
-        uint256[] memory execCaps = new uint256[](2);
-        execCaps[0] = 700e6;
-        execCaps[1] = 300e6;
+        // Each pull is preceded by its approve. Call 3 attempts to move 1 wei
+        // MORE than its scaled cap (120e6) — still well under its RAW declared
+        // cap (300e6), so this only reverts if the per-call cap was scaled.
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](4);
+        BatchExecutorLib.Call[] memory a = _pullCalls(sink0, 1);
+        BatchExecutorLib.Call[] memory b = _pullCalls(sink1, 120e6 + 1);
+        (execCalls[0], execCalls[1], execCalls[2], execCalls[3]) = (a[0], a[1], b[0], b[1]);
+        uint256[] memory execCaps = new uint256[](4);
+        execCaps[1] = 700e6;
+        execCaps[3] = 300e6;
 
         BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
         settleCalls[0] = BatchExecutorLib.Call({
@@ -840,7 +838,7 @@ contract GovernorCoverageGatesTest is Test {
         _toApproved(pid);
 
         assertEq(governor.getRequiredCoverage(pid), maxCapital, "tier-2 flat coverage == maxCapital");
-        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, 120e6 + 1, 120e6));
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 3, 120e6 + 1, 120e6));
         governor.executeProposal(pid);
     }
 
@@ -892,6 +890,17 @@ contract GovernorCoverageGatesTest is Test {
     ///      local — this repo's optimizer CSEs it across `vm.warp`), execute.
     ///      Called before proposal creation in every site, so the forward warp
     ///      never interacts with an in-flight proposal's execution window.
+    /// @dev `[asset.approve(puller, n), puller.pull(asset, n)]`: the only shape that moves the asset.
+    function _pullCalls(address puller, uint256 amount) internal view returns (BatchExecutorLib.Call[] memory calls) {
+        calls = new BatchExecutorLib.Call[](2);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(usdg), data: abi.encodeCall(usdg.approve, (puller, amount)), value: 0
+        });
+        calls[1] = BatchExecutorLib.Call({
+            target: puller, data: abi.encodeCall(AssetPuller.pull, (address(usdg), amount)), value: 0
+        });
+    }
+
     function _wireTierRegistryCertifiedAt(uint8 tier, uint16 bound) internal returns (TierRegistry reg) {
         reg = new TierRegistry(address(this));
         governor.setTierRegistry(address(reg)); // test contract is the factory

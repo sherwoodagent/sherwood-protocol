@@ -145,12 +145,11 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
     }
 
     /// @dev A call that clears both halves of the guard and moves nothing: a
-    ///      view selector on the asset token. Not a privileged target, and not
-    ///      one of the four guarded value-moving selectors.
+    ///      zero `approve` on the asset — the one asset selector the guard admits.
     function _benignCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.balanceOf, (address(vault))), value: 0
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(vault), 0)), value: 0
         });
     }
 

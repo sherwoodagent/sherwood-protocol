@@ -205,8 +205,9 @@ contract VaultQueueReservedNavTest is Test {
         assertEq(vault.totalAssets(), 0, "so the residual pool is reported as empty, not as solvent");
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
-        calls[0] =
-            BatchExecutorLib.Call({target: address(usdc), value: 0, data: abi.encodeCall(ERC20Mock.decimals, ())});
+        calls[0] = BatchExecutorLib.Call({
+            target: address(usdc), value: 0, data: abi.encodeCall(usdc.approve, (address(vault), 0))
+        });
         vm.prank(MOCK_GOVERNOR);
         vm.expectRevert(ISyndicateVault.QueueReserveBreached.selector);
         vault.executeGovernorBatch(calls, new uint256[](0), 0);

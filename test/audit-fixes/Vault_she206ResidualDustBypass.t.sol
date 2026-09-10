@@ -145,7 +145,7 @@ contract VaultShe206ResidualDustBypassTest is Test {
     function _benignCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.balanceOf, (address(vault))), value: 0
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(vault), 0)), value: 0
         });
     }
 

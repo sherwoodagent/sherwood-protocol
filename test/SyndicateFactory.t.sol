@@ -271,7 +271,7 @@ contract SyndicateFactoryTest is Test {
         vault.executeGovernorBatch(calls, new uint256[](0), type(uint256).max);
 
         // Verify: vault set the approval (delegatecall)
-        assertEq(usdc.allowance(vaultAddr, makeAddr("protocol")), 1_000e6);
+        assertEq(usdc.allowance(vaultAddr, makeAddr("protocol")), 0, "no allowance outlives the batch");
     }
 
     function test_storageIsolation() public {

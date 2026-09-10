@@ -16,6 +16,7 @@ import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {AssetPuller} from "../mocks/AssetPuller.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
@@ -249,6 +250,17 @@ contract GovernorEmergencyTest is Test {
             target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 0)), value: 0
         });
         return calls;
+    }
+
+    /// @dev `[asset.approve(puller, n), puller.pull(asset, n)]`: the only shape that moves the asset.
+    function _pullCalls(address puller, uint256 amount) internal view returns (BatchExecutorLib.Call[] memory calls) {
+        calls = new BatchExecutorLib.Call[](2);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (puller, amount)), value: 0
+        });
+        calls[1] = BatchExecutorLib.Call({
+            target: puller, data: abi.encodeCall(AssetPuller.pull, (address(usdc), amount)), value: 0
+        });
     }
 
     function _customCalls() internal view returns (BatchExecutorLib.Call[] memory) {
@@ -1286,18 +1298,15 @@ contract GovernorEmergencyTest is Test {
     ///         never re-executed within bounds) — matching the vault's own
     ///         `MaxNetOutflowExceeded` idiom at execute time.
     function test_capBreach_executeLeg_leavesProposalApproved() public {
-        address sink = makeAddr("execSink");
-        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
-        execCalls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0
-        });
-        uint256[] memory execCaps = new uint256[](1);
-        execCaps[0] = 500e6; // too tight -- the call moves 1_000e6
+        address sink = address(new AssetPuller());
+        BatchExecutorLib.Call[] memory execCalls = _pullCalls(sink, 1_000e6);
+        uint256[] memory execCaps = new uint256[](2);
+        execCaps[1] = 500e6; // too tight -- the pull moves 1_000e6
 
         uint256 pid = _proposeVoteApprove(execCalls, execCaps, _settleCalls(), new uint256[](1), 7 days);
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
 
-        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1_000e6, 500e6));
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, 1_000e6, 500e6));
         governor.executeProposal(pid);
 
         assertEq(
@@ -1315,21 +1324,18 @@ contract GovernorEmergencyTest is Test {
     ///         identically. Relief is the guardian-reviewed
     ///         `emergencySettleWithCalls` path (next test), not `unstick`.
     function test_capBreach_settleLeg_leavesExecutedAndUnstickReplaysIdentically() public {
-        address sink = makeAddr("settleSink");
+        address sink = address(new AssetPuller());
         uint256[] memory execCaps = GovEnvelope.defaultCaps(GovEnvelope.permissive(address(vault)).maxCapital, 1);
-        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
-        settleCalls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0
-        });
-        uint256[] memory settleCaps = new uint256[](1);
-        settleCaps[0] = 500e6; // too tight -- the call moves 1_000e6
+        BatchExecutorLib.Call[] memory settleCalls = _pullCalls(sink, 1_000e6);
+        uint256[] memory settleCaps = new uint256[](2);
+        settleCaps[1] = 500e6; // too tight -- the pull moves 1_000e6
 
         uint256 pid = _proposeVoteApprove(_execCalls(), execCaps, settleCalls, settleCaps, 7 days);
         governor.executeProposal(pid); // exec leg is benign (approve only) -- succeeds
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Executed));
 
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
-        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1_000e6, 500e6));
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, 1_000e6, 500e6));
         governor.settleProposal(pid);
         assertEq(
             uint256(governor.getProposalState(pid)),
@@ -1341,7 +1347,7 @@ contract GovernorEmergencyTest is Test {
         // stored caps -- it does not relax the declaration, so it fails
         // identically.
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1_000e6, 500e6));
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, 1_000e6, 500e6));
         governor.unstick(pid);
         assertEq(usdc.balanceOf(sink), 0, "nothing moved by either attempt");
     }
@@ -1356,19 +1362,16 @@ contract GovernorEmergencyTest is Test {
     ///         settlement-leg `CallCapExceeded` is a legitimate reason to
     ///         need it.
     function test_capBreach_settleLeg_emergencyRescueSucceedsUnderEmptyCaps() public {
-        address sink = makeAddr("rescueSink");
+        address sink = address(new AssetPuller());
         uint256[] memory execCaps = GovEnvelope.defaultCaps(GovEnvelope.permissive(address(vault)).maxCapital, 1);
-        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
-        settleCalls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.transfer, (sink, 1_000e6)), value: 0
-        });
-        uint256[] memory settleCaps = new uint256[](1);
-        settleCaps[0] = 500e6;
+        BatchExecutorLib.Call[] memory settleCalls = _pullCalls(sink, 1_000e6);
+        uint256[] memory settleCaps = new uint256[](2);
+        settleCaps[1] = 500e6;
 
         uint256 pid = _proposeVoteApprove(_execCalls(), execCaps, settleCalls, settleCaps, 7 days);
         governor.executeProposal(pid);
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
-        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1_000e6, 500e6));
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, 1_000e6, 500e6));
         governor.settleProposal(pid); // confirms the stuck state this test starts from
 
         // Owner rescues with the SAME calls (an honest unwind, just re-declared
@@ -1382,5 +1385,26 @@ contract GovernorEmergencyTest is Test {
 
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Settled));
         assertEq(usdc.balanceOf(sink), 1_000e6, "the rescue actually moved the funds");
+    }
+
+    /// @notice An owner-supplied emergency batch is held to the same structural rules as a
+    ///         governor batch: a non-`approve` call on the asset is refused at finalize.
+    function test_emergencyBatchIsHeldToTheSameRules() public {
+        uint256 pid = _createExecutedProposal(7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.transfer, (owner, 1_000e6)), value: 0
+        });
+        vm.prank(owner);
+        governor.emergencySettleWithCalls(pid, calls);
+        vm.warp(vm.getBlockTimestamp() + registry.reviewPeriod());
+
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(ISyndicateVault.DisallowedAssetSelector.selector, usdc.transfer.selector)
+        );
+        governor.finalizeEmergencySettle(pid);
     }
 }

@@ -12,6 +12,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {AssetPuller} from "../mocks/AssetPuller.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
@@ -525,12 +526,15 @@ contract PerCallCapitalDeclarationsTest is Test {
     ///         asset reverts at EXECUTE time (per-call meter), even though it
     ///         proposed fine (zero caps are always propose-time legal).
     function test_validation_zeroCapCallMoving1WeiReverts() public {
-        // A call that actually moves the vault's asset(): transfer 1 wei out.
-        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
-        execCalls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.transfer, (address(0xBEEF), 1)), value: 0
+        // A call that actually moves the vault's asset(): pull 1 wei out.
+        address puller = address(new AssetPuller());
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
+        execCalls[0] =
+            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.approve, (puller, 1)), value: 0});
+        execCalls[1] = BatchExecutorLib.Call({
+            target: puller, data: abi.encodeCall(AssetPuller.pull, (address(usdc), 1)), value: 0
         });
-        uint256[] memory execCaps = new uint256[](1); // zero cap
+        uint256[] memory execCaps = new uint256[](2); // zero cap
 
         vm.prank(agent);
         uint256 pid = governor.propose(
@@ -547,7 +551,7 @@ contract PerCallCapitalDeclarationsTest is Test {
         );
 
         _advancePastVoting();
-        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1, 0));
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, 1, 0));
         governor.executeProposal(pid);
     }
 
@@ -564,11 +568,14 @@ contract PerCallCapitalDeclarationsTest is Test {
         // than let an unrelated guard fire first.
         tierRegistry.setAdapterAllowed(address(0xBEEF), true);
 
-        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
-        execCalls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.transfer, (address(0xBEEF), 1)), value: 0
+        address puller = address(new AssetPuller());
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
+        execCalls[0] =
+            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.approve, (puller, 1)), value: 0});
+        execCalls[1] = BatchExecutorLib.Call({
+            target: puller, data: abi.encodeCall(AssetPuller.pull, (address(usdc), 1)), value: 0
         });
-        uint256[] memory execCaps = new uint256[](1); // zero
+        uint256[] memory execCaps = new uint256[](2); // zero
 
         vm.prank(agent);
         uint256 pid = governor.propose(
@@ -587,7 +594,7 @@ contract PerCallCapitalDeclarationsTest is Test {
         assertEq(governor.getRequiredCoverage(pid), 0, "all-zero caps price zero coverage regardless of tier");
 
         _advancePastVoting();
-        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1, 0));
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, 1, 0));
         governor.executeProposal(pid);
     }
 

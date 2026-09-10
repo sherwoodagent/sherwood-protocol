@@ -61,60 +61,11 @@ interface ISyndicateVault {
     /// @notice The batch's net asset outflow exceeded the proposal's declared
     ///         maxCapital.
     error MaxNetOutflowExceeded(uint256 netOutflow, uint256 cap);
-    /// @notice A governor-batch call carries a value-moving ERC20 selector
-    ///         (approve / increaseAllowance / transfer / transferFrom) whose
-    ///         spender/recipient is neither the vault itself nor an adapter
-    ///         allowlisted in the TierRegistry.
-    error DisallowedTransferTarget(address target, bytes4 selector, address recipient);
-    /// @notice A recipient that is a MEMBER of a TierRegistry code class
-    ///         (`classOf(recipient) != 0`, i.e. an ERC-1167 clone of a certified
-    ///         strategy template) is not bound to this vault — its own `vault()`
-    ///         does not equal `address(this)`, or is unreadable. Class
-    ///         membership proves the recipient's CODE is a certified template's
-    ///         clone, but `initialize` is unpermissioned, so the clone's
-    ///         class member is bound to this vault, INCLUDING one the owner also
-    ///         granted per-address via `setAdapterAllowed`; only non-members
-    ///         (`classOf == 0`: routers, Permit2, plain tokens) are exempt.
-    error AdapterVaultMismatch(address recipient);
-    /// @notice A governor batch named the vault or its withdrawal queue as a
-    ///         call target. Rejected as a class, whatever the selector: the
-    ///         batch executes under `delegatecall`, so `msg.sender == vault`
-    ///         would satisfy those contracts' own trust gates.
+    /// @notice A governor batch named a privileged protocol contract (the vault, its queue,
+    ///         factory, governor, registries, ledger, game, sWOOD or the strategy factory).
     error DisallowedBatchTarget(address target);
-    /// @notice A governor-batch call named a target that is neither the vault's
-    ///         underlying `asset()` nor an adapter allowlisted in the TierRegistry.
-    ///         Refused regardless of selector or calldata length — the callee gate
-    ///         is what closes the unenumerable-selector class, and the selector
-    ///         checks beneath it are defense-in-depth on allowlisted callees. Only
-    ///         raised when the calling governor resolves a nonzero TierRegistry.
-    error DisallowedBatchCallee(address target);
-    /// @notice The calling governor resolved no TierRegistry — no `tierRegistry()`
-    ///         getter, or one returning `address(0)`. The batch guard's callee
-    ///         allowlist and spender/recipient gate cannot be evaluated without
-    ///         `SyndicateFactory.pushWiring(governor)` rescues a pre-fix one.
-    error TierRegistryUnresolved();
-    /// @notice A governor-batch call carries a guarded value-moving selector but
-    ///         its calldata is too short to hold the spender/recipient argument.
-    error MalformedCall();
-    /// @notice A governor-batch call targets the vault's own `asset()` with a
-    ///         selector the batch guard does not recognize.
-    /// @dev    `asset()` is the sole target exempted from the callee allowlist, on
-    ///         the premise that the outer `netOutflow` balance diff independently
-    ///         verifies it. That premise covers selectors which MOVE balance; it
-    ///         does not cover a standing AUTHORIZATION grant (ERC-777
-    ///         `authorizeOperator`, and any unenumerated allowance-delegation
-    ///         shape), which moves nothing in-batch and is invisible to a balance
-    ///         diff while the extraction it licenses lands in a later transaction.
-    ///         Such a call also prices to zero coverage and zero proposer bond and
-    ///         cannot be challenged. Non-`asset()` targets are already bounded by
-    ///         the callee gate, so this rejection is scoped to `asset()` alone.
-    error UnrecognizedAssetSelector(bytes4 selector);
-    /// @notice A governor-batch call carries `transferFrom` whose `from` is not
-    ///         the vault itself. Unconditional: pulling a third party's ERC20
-    ///         allowance (e.g. an LP's deposit allowance) is not a capability
-    ///         the tier system prices, so this is refused regardless of the
-    ///         TierRegistry's presence or the `to` recipient.
-    error DisallowedTransferFromSource(address target, address from);
+    /// @notice A governor batch called `asset()` with anything other than `approve(address,uint256)`.
+    error DisallowedAssetSelector(bytes4 selector);
 
     // ── Init Params ──
     struct InitParams {
@@ -154,12 +105,8 @@ interface ISyndicateVault {
     function factory() external view returns (address);
 
     // ── Governor ──
-    /// @notice Whether `target` is a privileged batch target — the vault
-    ///         itself or its bound withdrawal queue — the SAME predicate
-    ///         `executeGovernorBatch`'s `_guardBatchCalls` enforces. Exposed so
-    ///         the governor's propose-time validation can consume this single
-    ///         implementation instead of restating the address set; consumers
-    ///         must never duplicate the check, only call through this view.
+    /// @notice Whether `target` is a privileged batch target — the predicate
+    ///         `executeGovernorBatch`'s guard enforces, exposed for propose-time validation.
     function isPrivilegedBatchTarget(address target) external view returns (bool);
     /// @notice Run a governor-approved batch of calls, metering each call's
     ///         gross outflow of `asset()` against its declared `callCaps[i]`

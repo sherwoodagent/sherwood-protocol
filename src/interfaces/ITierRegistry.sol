@@ -29,4 +29,6 @@ interface ITierRegistry {
     ///         code has not drifted AND `StrategyFactory` minted it from that
     ///         template. `bytes32(0)` for everything else.
     function classOf(address target) external view returns (bytes32);
+    /// @notice The `StrategyFactory` whose clone provenance class membership requires.
+    function strategyFactory() external view returns (address);
 }

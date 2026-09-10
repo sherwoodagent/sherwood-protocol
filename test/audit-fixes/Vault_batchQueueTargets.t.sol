@@ -328,7 +328,9 @@ contract VaultBatchQueueTargetsTest is Test {
         _victimEscrowsRedeem();
 
         vm.prank(MOCK_GOVERNOR);
-        vault.executeGovernorBatch(_batch(address(usdc), abi.encodeCall(ERC20Mock.decimals, ())), new uint256[](0), 1);
+        vault.executeGovernorBatch(
+            _batch(address(usdc), abi.encodeCall(usdc.approve, (address(vault), 0))), new uint256[](0), 1
+        );
     }
 
     /// @notice ADAPTERS STAY REACHABLE — the regression that matters most.

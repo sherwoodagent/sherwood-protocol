@@ -36,6 +36,10 @@ contract PermissiveTierRegistry is ITierRegistry {
         return true;
     }
 
+    function strategyFactory() external pure returns (address) {
+        return address(0);
+    }
+
     /// @dev SHE-209: no class concept in this stand-in — every address is a
     ///      non-member, so the vault's class-binding check never fires.
     function classOf(address) external pure returns (bytes32) {
