@@ -128,7 +128,7 @@ contract CheckSyndicateParams is ScriptBase {
             reason = string.concat(
                 reason,
                 " tier2CallCapBps is 10_000 (100% of TVL), so every tier-2 per-call"
-                " declaration are unbounded -- governor.setTier2CallCapBps(<bps>) or ALLOW_INERT_TIER2_CALL_CAP=true;"
+                " declaration is unbounded -- governor.setTier2CallCapBps(<bps>) or ALLOW_INERT_TIER2_CALL_CAP=true;"
             );
         }
         if (maxCapitalInert) {

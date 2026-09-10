@@ -192,11 +192,7 @@ contract SyndicateFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable 
     address public bondEscrow;
 
     /// @dev Reserved for future storage. Shrinks as named slots are carved off the
-    ///      FRONT of the gap, so every field behind it keeps its slot. One slot was
-    ///      RESTORED when `compensationEscrow` was removed rather than deprecated
-    ///      — legal only pre-mainnet, with the layout golden regenerated in the
-    ///      same change; from the first mainnet deploy onward that slot would have
-    ///      to stay.
+    ///      FRONT of the gap, so every field behind it keeps its slot (43 words).
     uint256[43] private __gap;
 
     // ── Events ──

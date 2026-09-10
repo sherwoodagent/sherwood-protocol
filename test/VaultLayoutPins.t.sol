@@ -32,8 +32,8 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 ///         baseline, not re-baseline" framing still held at the moment of
 ///         this second edit, so re-baselining rather than placeholder-padding
 ///         carries no live-proxy compatibility risk. `__gap` grew
-///         28 -> 31 words to hold the freed slots, so the contract's total
-///         reserved footprint (through slot 47) is unchanged.
+///         29 -> 31 words to hold the freed slots, so the contract's total
+///         reserved footprint (through slot 46) is unchanged.
 ///
 ///         Layout map (linear; every OZ upgradeable base this contract
 ///         inherits — `Initializable`, `ERC4626Upgradeable`,
@@ -49,8 +49,8 @@ import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 ///           4-5 _approvedDepositors           14 _mgmtBase(u192)/
 ///           6  _openDeposits(bool)/              _mgmtLastUpdate(u64)
 ///              _agentRegistry(address)        15 _highWaterPricePerShare
-///           7  _managementFeeBps              16..26 residue fields
-///           8  _factory                       27..45 __gap[19]
+///           7  _managementFeeBps              16..46 __gap[31]
+///           8  _factory
 ///           9  _expectedExecutorCodehash
 ///           10 _cachedDecimalsOffset(u8)/
 ///              _withdrawalQueue(address)
@@ -308,12 +308,12 @@ contract VaultLayoutPinsTest is Test {
         assertTrue(vault.isAccruingManagementFee(), "_mgmtLastUpdate getter disagrees with raw slot");
     }
 
-    // ==================== 27-45: __gap ====================
+    // ==================== 16-46: __gap ====================
 
-    /// @notice The reserved gap follows the residue fields and spans
-    ///         19 words. Both boundary words must be unwritten in a fresh proxy.
-    function test_layout_gapStartsAtSlot27() public view {
-        assertEq(_slot(27), bytes32(0), "slot 27: __gap[0] must be unused");
-        assertEq(_slot(45), bytes32(0), "slot 45: __gap[18] (last word) must be unused");
+    /// @notice The reserved gap follows `_highWaterPricePerShare` and spans
+    ///         31 words. Both boundary words must be unwritten in a fresh proxy.
+    function test_layout_gapStartsAtSlot16() public view {
+        assertEq(_slot(16), bytes32(0), "slot 16: __gap[0] must be unused");
+        assertEq(_slot(46), bytes32(0), "slot 46: __gap[30] (last word) must be unused");
     }
 }
