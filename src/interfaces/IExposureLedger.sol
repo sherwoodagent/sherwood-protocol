@@ -68,6 +68,19 @@ interface IExposureLedger {
     ///         halt, which is correct: no price means no proof of coverage.
     error NoWoodPrice();
 
+    /// @notice `block.timestamp` is strictly behind `epochGenesis`, so no epoch
+    ///         figure can be derived and every epoch-indexed read is refused.
+    /// @dev    FAIL CLOSED, NOT OPEN. Flooring the subtraction at zero is the
+    ///         tempting repair and it is wrong: `openExposure` would walk
+    ///         `[0, MAX_COVERAGE_HORIZON/L]` while `_coverageEpoch` floors every
+    ///         booking at `currentEpoch()`, so on a ledger older than the horizon
+    ///         the two ranges are DISJOINT and the view answers zero with live
+    ///         coverage — opening `StakedWood.claimUnstakeGuardian`, which gates a
+    ///         guardian's exit on exactly that zero. Strictly `<`: at genesis
+    ///         `elapsed == 0` is valid. Off-chain readers branch on
+    ///         `clockBeforeGenesis()` instead of catching this revert.
+    error ClockBeforeGenesis();
+
     // ── Events ──
     event WoodUsdPriceSet(uint256 oldPriceX8, uint256 newPriceX8);
     event WoodFeedSet(address indexed feed, uint256 maxDelay);
@@ -293,6 +306,12 @@ interface IExposureLedger {
     function coverageUsd(address asset, uint256 amount) external view returns (uint256);
     function proposerBondWood(address asset, uint256 requiredCoverage) external view returns (uint256);
     function currentEpoch() external view returns (uint256);
+
+    /// @notice Whether the chain clock is behind `epochGenesis`, i.e. whether
+    ///         every epoch-indexed read is presently refused with
+    ///         `ClockBeforeGenesis`. The one such read that never reverts, so an
+    ///         indexer can tell a clock fault from a dead node.
+    function clockBeforeGenesis() external view returns (bool);
 
     /// @notice The WOOD/USD price CAP, 8 decimals. NEVER SERVED AS A PRICE — it
     ///         only bounds whatever the market reports, and lowering it is the
