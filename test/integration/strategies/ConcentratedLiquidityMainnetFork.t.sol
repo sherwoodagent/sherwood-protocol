@@ -77,6 +77,9 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
 
     uint24 constant POOL_FEE = 100;
     uint32 constant TWAP_WINDOW = 1800;
+    /// @dev Unlevered funding, and the band half-width both init helpers use.
+    uint256 constant LP_AMOUNT = 10_000e6;
+    int24 constant HALF_WIDTH_TICKS = 5000;
 
     ConcentratedLiquidityStrategy template;
     ConcentratedLiquidityStrategy strategy;
@@ -133,7 +136,7 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
 
         collateralAmount = 10_000e6;
         borrowAmount = 2_000e6;
-        deal(USDG, address(vaultStub), collateralAmount * 2);
+        deal(USDG, address(vaultStub), collateralAmount * 2 + LP_AMOUNT * 2);
 
         template = new ConcentratedLiquidityStrategy();
     }
@@ -193,6 +196,64 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
         IERC20(USDG).approve(address(strategy), type(uint256).max);
     }
 
+    /// @dev Same venue and band as `_initStrategy`, funded by `lpAmount` with no
+    ///      Morpho surface and an empty market declaration.
+    function _initUnleveredStrategy() internal {
+        int24 spacing = pool.tickSpacing();
+        (, int24 spot,,,,,) = pool.slot0();
+        // Both edges from ONE snapped center: snapping each edge outward widens
+        // the band past `2 * halfWidthTicks` and init rejects that.
+        int24 mid = _snapDown(spot, spacing);
+        int24 lower = mid - HALF_WIDTH_TICKS;
+        int24 upper = mid + HALF_WIDTH_TICKS;
+
+        ConcentratedLiquidityStrategy.InitParams memory p = ConcentratedLiquidityStrategy.InitParams({
+            pool: address(pool),
+            positionManager: POSITION_MANAGER,
+            uniswapFactory: UNISWAP_V3_FACTORY,
+            swapAdapter: address(adapter),
+            morpho: address(0),
+            marketParams: MarketParams({
+                loanToken: address(0), collateralToken: address(0), oracle: address(0), irm: address(0), lltv: 0
+            }),
+            collateralAmount: 0,
+            borrowAmount: 0,
+            lpAmount: LP_AMOUNT,
+            tickLower: lower,
+            tickUpper: upper,
+            expectedLiquidity: uint128(pool.liquidity() / 100),
+            swapFractionBps: 5_000,
+            twapWindow: TWAP_WINDOW,
+            maxTwapDeviationBps: 1_000,
+            mintSlippageBps: 1_000,
+            rerange: ConcentratedLiquidityStrategy.RerangePolicy({
+                halfWidthTicks: HALF_WIDTH_TICKS,
+                triggerBps: 1,
+                minInterval: 0,
+                maxReranges: 2,
+                slippageBps: 1_000,
+                swapFractionBps: 5_000
+            }),
+            settleSlippageBps: 1_000,
+            settleDeadline: 0,
+            swapExtraData: abi.encodePacked(bytes1(0x00), abi.encode(POOL_FEE))
+        });
+
+        strategy = ConcentratedLiquidityStrategy(Clones.clone(address(template)));
+        strategy.initialize(address(vaultStub), proposer, abi.encode(p));
+        status.set(1, 1, address(strategy));
+
+        vm.prank(address(vaultStub));
+        IERC20(USDG).approve(address(strategy), type(uint256).max);
+    }
+
+    /// @dev Floor toward -inf onto the spacing grid — the contract's own idiom.
+    function _snapDown(int24 tick, int24 spacing) internal pure returns (int24) {
+        int24 q = tick / spacing;
+        if (tick < 0 && tick % spacing != 0) q--;
+        return q * spacing;
+    }
+
     /// @notice Full cycle: mint → accrue → rerange → settle, against live venues.
     function test_fork_fullLifecycle() public {
         _skipIfNoFork();
@@ -240,6 +301,47 @@ contract ConcentratedLiquidityMainnetForkTest is Test {
         assertEq(uint256(strategy.state()), 2, "not settled");
         assertEq(IERC20(USDG).balanceOf(address(strategy)), 0, "vault asset stranded in the clone");
         console2.log("vault USDG after settle", IERC20(USDG).balanceOf(address(vaultStub)));
+    }
+
+    /// @notice Unlevered lifecycle against the live venue, with no Morpho
+    ///         address configured at all — so a stray reach for the surface is a
+    ///         typed call to address(0) and the test is also the fork-grade
+    ///         never-touches-Morpho pin.
+    function test_fork_unleveredLifecycle() public {
+        _skipIfNoFork();
+
+        (,,, uint16 cardinality,,,) = pool.slot0();
+        if (cardinality < 2) {
+            pool.increaseObservationCardinalityNext(4);
+            vm.warp(block.timestamp + TWAP_WINDOW + 1);
+            vm.roll(block.number + 1);
+        }
+
+        _initUnleveredStrategy();
+        assertFalse(strategy.levered(), "clone initialized levered");
+
+        uint256 vaultBefore = IERC20(USDG).balanceOf(address(vaultStub));
+        vm.prank(address(vaultStub));
+        strategy.execute();
+
+        assertEq(vaultBefore - IERC20(USDG).balanceOf(address(vaultStub)), LP_AMOUNT, "pulled other than lpAmount");
+        uint256 tokenId = strategy.tokenId();
+        assertGt(tokenId, 0, "no position minted");
+        (,,,,,,, uint128 liquidity,,,,) = INonfungiblePositionManager(POSITION_MANAGER).positions(tokenId);
+        assertGt(liquidity, 0, "position holds no liquidity");
+        console2.log("unlevered minted liquidity", uint256(liquidity));
+
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(keeper);
+        strategy.rerange();
+        assertTrue(strategy.tokenId() != tokenId, "rerange did not replace the position");
+
+        vm.prank(address(vaultStub));
+        strategy.settle();
+
+        assertEq(uint256(strategy.state()), 2, "not settled");
+        assertEq(IERC20(USDG).balanceOf(address(strategy)), 0, "vault asset stranded in the clone");
+        console2.log("vault USDG after unlevered settle", IERC20(USDG).balanceOf(address(vaultStub)));
     }
 
     /// @notice The TWAP guard reads the REAL observation ring, not a stand-in.
