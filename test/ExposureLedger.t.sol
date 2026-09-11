@@ -26,6 +26,10 @@ contract ExposureLedgerHarness is ExposureLedger {
     function bucketOf(address guardian, uint256 epoch) external view returns (uint256) {
         return _buckets[guardian][epoch];
     }
+
+    function horizonClampedEpochOf(uint256 t) external view returns (uint256) {
+        return _horizonClampedEpochOf(t);
+    }
 }
 
 contract MockSwood {
@@ -746,7 +750,7 @@ contract ExposureLedgerTest is Test {
     function test_setWoodHaircutBps_boundedButNotRateLimited() public {
         vm.startPrank(owner);
         vm.expectRevert(IExposureLedger.InvalidParameter.selector);
-        ledger.setWoodHaircutBps(1); // below the floor -- a mis-set parameter
+        ledger.setWoodHaircutBps(4_999); // one bps below the floor -- a mis-set parameter
         vm.expectRevert(IExposureLedger.InvalidParameter.selector);
         ledger.setWoodHaircutBps(10_001);
 
@@ -1570,7 +1574,8 @@ contract ExposureLedgerTest is Test {
     ///         at their TRUE worth rather than at double it. The cap is held
     ///         deliberately NON-BINDING here — the overstated source lands
     ///         exactly on it — so the haircut is doing the work alone and the
-    ///         test cannot pass for the wrong reason.
+    ///         test cannot pass for the wrong reason. 5_000 is also the shipped
+    ///         value (`DeployPlanB.DEFAULT_WOOD_HAIRCUT_BPS`, the ledger floor).
     function test_woodHaircut_absorbsAnOverstatedMarketSource() public {
         swood.setStake(guardian, 100_000e18);
         uint256 trueBondUsd = 5_000e18; // 100k WOOD at the true $0.05
@@ -1588,46 +1593,13 @@ contract ExposureLedgerTest is Test {
         // And it is paid for in normal operation, which is the trade: an
         // unexaggerated market is valued at half.
         marketFeed.set(int256(MARKET_X8));
+        assertEq(ledger.woodPriceX8(), MARKET_X8 / 2, "a healthy source is served at half");
         assertEq(ledger.slashableBondUsd(guardian), trueBondUsd / 2, "the allowance costs conservatism when healthy");
-    }
 
-    /// @notice THE SHIPPED VALUE, 7,000 — a 30% allowance. Pinned here as the
-    ///         behaviour it buys, not merely as a number in a deploy script.
-    ///
-    /// @dev    `DeployPlanB` seats this as its `DEFAULT_WOOD_HAIRCUT_BPS`, with
-    ///         a pre-flight refusing the ledger's own 10,000 default; 5,000 was
-    ///         rejected as too costly to guardian return on equity. What 7,000
-    ///         buys, exactly: every source is valued at 70%, so an overstatement
-    ///         up to 1/0.7 — about +42.9% — still values bonds at or below their
-    ///         true worth. A 30% overstatement, the sizing case, leaves margin.
-    function test_woodHaircut_shippedValueAbsorbsAThirtyPercentOverstatement() public {
-        swood.setStake(guardian, 100_000e18);
-        uint256 trueBondUsd = 5_000e18; // 100k WOOD at the true $0.05
-
-        vm.prank(owner);
-        ledger.setWoodHaircutBps(7_000);
-
-        // Healthy market: bonds carry the 30% discount. That is what the
-        // allowance costs in normal operation.
-        assertEq(ledger.woodPriceX8(), (MARKET_X8 * 7_000) / 10_000);
-        assertEq(ledger.slashableBondUsd(guardian), (trueBondUsd * 7_000) / 10_000);
-
-        // A 30% overstatement — the sizing case — still leaves bonds valued
-        // BELOW their true worth, which is the property being bought.
-        marketFeed.set(int256((MARKET_X8 * 13_000) / 10_000));
-        assertLe((MARKET_X8 * 13_000) / 10_000, CAP_X8, "the cap must not be what absorbs this");
-        assertLt(ledger.slashableBondUsd(guardian), trueBondUsd, "a 30% overstatement is fully absorbed");
-
-        // Break-even: at +1/0.7 the discount exactly cancels the error, so bonds
-        // land at true worth and not a wei above it.
-        marketFeed.set(int256((MARKET_X8 * 10_000) / 7_000));
-        assertLe(ledger.slashableBondUsd(guardian), trueBondUsd, "break-even is the edge of the allowance");
-        assertApproxEqRel(ledger.slashableBondUsd(guardian), trueBondUsd, 1e12, "and it is genuinely AT the edge");
-
-        // Past it the overstatement starts landing — the allowance is finite,
-        // and the cap is the control that takes over.
-        marketFeed.set(int256(2 * MARKET_X8));
-        assertGt(ledger.slashableBondUsd(guardian), trueBondUsd, "a 2x error exceeds a 30% allowance");
+        // Past the allowance the cap takes over, so a wilder source still
+        // cannot value bonds above their true worth.
+        marketFeed.set(int256(4 * MARKET_X8));
+        assertEq(ledger.slashableBondUsd(guardian), trueBondUsd, "beyond the allowance the cap holds the line");
     }
 
     /// @notice N11 — the propose-time horizon gate was fed `p.executeBy`, which
@@ -2834,5 +2806,84 @@ contract ExposureLedgerTest is Test {
         );
         (, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
         assertEq(bps[0], 10_000, "and the rate saturates against the 50,000 basis");
+    }
+
+    /// @notice Nothing booked; a clock behind `epochGenesis` must refuse by name
+    ///         at all three epoch sites — `currentEpoch`, `openExposure`,
+    ///         `horizonClampedEpochOf` — including the incident's own ts=120.
+    /// @dev    The at-genesis leg is not decoration: the guard is strictly `<`,
+    ///         so `elapsed == 0` at genesis is a legitimate read, and weakening
+    ///         `<` to `<=` turns it into a revert and fails here.
+    function test_openExposure_preGenesisRevertsClockBeforeGenesis() public {
+        // A genesis at real wall-clock time, the way a deployed ledger has one.
+        uint256 genesis = 1_787_182_248; // 2026-08-19, the incident's own figure
+        vm.warp(genesis);
+        ExposureLedgerHarness late = new ExposureLedgerHarness(owner, address(swood), 28 days);
+        assertEq(late.epochGenesis(), genesis, "fixture: genesis is the deploy timestamp");
+
+        // ONE SECOND BEFORE GENESIS: every epoch-indexed read refuses, by name.
+        vm.warp(genesis - 1);
+        assertLt(vm.getBlockTimestamp(), late.epochGenesis(), "precondition: the clock is behind genesis");
+        vm.expectRevert(IExposureLedger.ClockBeforeGenesis.selector);
+        late.currentEpoch();
+        vm.expectRevert(IExposureLedger.ClockBeforeGenesis.selector);
+        late.openExposure(address(0xBEEF));
+        vm.expectRevert(IExposureLedger.ClockBeforeGenesis.selector);
+        late.horizonClampedEpochOf(0);
+
+        // The incident's own timestamp: block 21178828, ts=120.
+        vm.warp(120);
+        assertLt(vm.getBlockTimestamp(), late.epochGenesis());
+        vm.expectRevert(IExposureLedger.ClockBeforeGenesis.selector);
+        late.openExposure(address(0xBEEF));
+
+        // EXACTLY AT GENESIS the subtraction is a valid zero, not an underflow.
+        vm.warp(genesis);
+        assertEq(vm.getBlockTimestamp(), late.epochGenesis(), "at genesis the clock is not behind it");
+        assertEq(late.currentEpoch(), 0, "at genesis: elapsed == 0 is a valid read");
+        assertEq(late.openExposure(address(0xBEEF)), 0);
+        assertEq(late.horizonClampedEpochOf(0), 0, "t == 0 is an unset deadline, still floored");
+
+        // ...and the clock coming back is not a special case.
+        vm.warp(genesis + 28 days);
+        assertEq(late.currentEpoch(), 1, "the ledger resumes normally once the clock is restored");
+    }
+
+    /// @notice THE PoC: one approval booked in bucket 3 (genesis + 100d, L = 28d),
+    ///         strictly above the clamped walk's ceiling of `60d/28d = 2`. A
+    ///         pre-genesis read must REFUSE, not answer zero over a disjoint
+    ///         range — that zero is what releases the guardian's bond. The
+    ///         restored-clock leg asserts the book itself is untouched.
+    function test_openExposure_preGenesisRefusesRatherThanZeroingLiveExposure() public {
+        _wireRecording();
+
+        // AGE THE LEDGER PAST `MAX_COVERAGE_HORIZON` (60d) so the booking lands
+        // strictly above the clamped walk's ceiling. At L = 28d: 100d/28d = 3,
+        // and the clamped ceiling would be 60d/28d = 2. Buckets 3 and [0,2] do
+        // not intersect — that is the whole finding.
+        uint256 genesis = ledger.epochGenesis();
+        assertEq(ledger.epochLength(), 28 days, "fixture: the bucket arithmetic below assumes L = 28d");
+        vm.warp(genesis + 100 days);
+        assertEq(ledger.currentEpoch(), 3, "precondition: bookings now floor at bucket 3, above the clamped [0,2]");
+
+        mgov.set(1_000e6); // $1,000
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian, LOCK_ALL);
+        uint256 booked = ledger.openExposure(guardian);
+        assertGt(booked, 0, "precondition: real, live exposure is on the book");
+        assertEq(ExposureLedgerHarness(address(ledger)).bucketOf(guardian, 3), booked, "and it lives in bucket 3");
+
+        // NOW PUT THE CLOCK BEHIND GENESIS. The clamped implementation reads 0
+        // here — live coverage reported as nothing. The fix refuses to answer.
+        assertGt(genesis, 0, "fixture: genesis must be above zero to express a pre-genesis read");
+        vm.warp(genesis - 1);
+        assertLt(vm.getBlockTimestamp(), genesis, "precondition: the clock really is behind genesis");
+        vm.expectRevert(IExposureLedger.ClockBeforeGenesis.selector);
+        ledger.openExposure(guardian);
+
+        // The book is untouched by the fault: the guard changes whether the view
+        // answers, never what it answers.
+        vm.warp(genesis + 100 days);
+        assertEq(ledger.openExposure(guardian), booked, "the booked figure survives the clock fault");
     }
 }

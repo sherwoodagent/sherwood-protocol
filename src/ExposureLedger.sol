@@ -358,7 +358,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     // ── Views ──
 
+    /// @dev Strict `<`: at genesis `elapsed == 0` is a valid answer, not an underflow.
     function currentEpoch() public view returns (uint256) {
+        if (block.timestamp < epochGenesis) revert ClockBeforeGenesis();
         return (block.timestamp - epochGenesis) / epochLength;
     }
 
@@ -1070,7 +1072,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      Unlike `recordApproval` (which books nothing past the horizon), the
     ///      alternative here is not moving, which expires the lock even earlier.
     function _horizonClampedEpochOf(uint256 t) internal view returns (uint256) {
-        uint256 edge = (block.timestamp - epochGenesis + MAX_COVERAGE_HORIZON) / epochLength;
+        // Callers freeze and pin coverage, so a clock behind genesis is refused
+        // rather than clamped. The floor on `t` stays: t == 0 is an unset
+        // deadline, not a clock fault.
+        if (block.timestamp < epochGenesis) revert ClockBeforeGenesis();
+        uint256 edge = ((block.timestamp - epochGenesis) + MAX_COVERAGE_HORIZON) / epochLength;
         uint256 e = t <= epochGenesis ? 0 : (t - epochGenesis) / epochLength;
         return e > edge ? edge : e;
     }
@@ -1417,6 +1423,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      i.e. from = (elapsed - W) / L when elapsed > W. from <= cur always
     ///      (W > 0), so the loop is bounded by ceil(W/L) + 1 iterations.
     function openExposure(address guardian) public view returns (uint256 total) {
+        // Refused, not clamped: a zero here reads as no coverage; see `IExposureLedger.ClockBeforeGenesis`.
+        if (block.timestamp < epochGenesis) revert ClockBeforeGenesis();
         uint256 elapsed = block.timestamp - epochGenesis;
         uint256 from = elapsed > challengeWindow ? (elapsed - challengeWindow) / epochLength : 0;
         // Scans FORWARD as well as back. Approvals are booked into the bucket

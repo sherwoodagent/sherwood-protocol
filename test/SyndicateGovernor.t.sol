@@ -1120,6 +1120,11 @@ contract SyndicateGovernorTest is Test {
         assertLt(gain799, 1_000e6, "bounded by the LOWERED 10% cap, not the vault's 15%");
     }
 
+    /// @notice Launch cap: the protocol performance-fee ceiling is 25%.
+    function test_launchCap_performanceFeeCeilingIsTwentyFivePercent() public view {
+        assertEq(governor.MAX_PERFORMANCE_FEE_CAP(), 2500, "25% performance ceiling");
+    }
+
     /// @notice M5: the vault's hard cap must equal the governor's
     ///         MAX_PERFORMANCE_FEE_CAP. Catches a divergent hand-edit.
     function test_maxAgentFeeBps_equalsGovernorCap() public view {

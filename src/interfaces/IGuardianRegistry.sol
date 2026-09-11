@@ -105,10 +105,14 @@ interface IGuardianRegistry {
 
     // ── Guardian fns ──
     /// @notice Cast or change a guardian review vote on a proposal. Vote weight
-    ///         is read from sWOOD's `getPastVotes` at the review's `openedAt`.
+    ///         is read from sWOOD's `getPastStake` at the review's `snapshotAt`,
+    ///         which is frozen when the governor registers the review at propose
+    ///         time.
     ///         Block votes carry no proposed severity — the slash severity is
     ///         a deterministic function of block-side decisiveness, computed
-    ///         at `resolveReview`.
+    ///         at `resolveReview`. A vote cast once the review window is due but
+    ///         still unopened opens the review itself and then records the vote,
+    ///         so no keeper `openReview` call is needed first.
     /// @param  lockWood On an Approve vote, the WOOD the guardian DECLARES it
     ///         locks behind the proposal; the ledger locks
     ///         `min(lockWood, free budget)` and never rejects the vote for it.
@@ -125,6 +129,8 @@ interface IGuardianRegistry {
     ///         it once, on `propose`; the registry stores it and reads the
     ///         stored fields directly.
     function registerReview(uint256 proposalId, uint256 voteEnd, uint256 reviewEnd) external;
+    function reviewClockShift(address governor, uint256 proposalId) external view returns (uint64);
+    function effectiveNowFor(address governor, uint256 proposalId) external view returns (uint256);
 
     // ── Governor-only (emergency) ──
     function openEmergency(uint256 proposalId, bytes32 callsHash, BatchExecutorLib.Call[] calldata calls) external;
@@ -184,7 +190,8 @@ interface IGuardianRegistry {
 
     // ── Views ──
     /// @notice Returns the cached review state for a proposal.
-    /// @return opened Whether `openReview` was called
+    /// @return opened Whether the review has been opened — by `openReview`, or by
+    ///         the first vote cast once the review window is due
     /// @return resolved Whether `resolveReview` has finalized the review
     /// @return blocked Whether guardians reached the block quorum (requires resolved)
     function getReviewState(address governor, uint256 proposalId)

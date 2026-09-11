@@ -40,7 +40,7 @@ import {ScriptBase} from "./ScriptBase.sol";
  *                         use on mainnet.
  *     ENS_REGISTRAR     — L2 Registrar address (default: 0x0 = no ENS)
  *     AGENT_REGISTRY    — ERC-8004 Identity Registry (default: 0x0 = no identity)
- *     MANAGEMENT_FEE    — Management fee in bps (default: 50 = 0.5%)
+ *     MANAGEMENT_FEE    — Management fee in bps (default: 200 = 2%, max 300 = 3%)
  *     PROTOCOL_FEE      — Protocol fee in bps (default: 100 = 1%, max 1%)
  *     MAX_STRATEGY_DAYS — Max strategy duration in days (default: 14). NOTE (#421):
  *                         per-vault governors initialize from the factory's
@@ -84,6 +84,8 @@ contract DeploySherwood is ScriptBase {
     uint256 constant DEFAULT_MIN_OWNER_STAKE = 10_000e18;
     uint256 constant DEFAULT_COOLDOWN = 7 days;
     uint256 constant DEFAULT_REVIEW_PERIOD = 24 hours;
+    /// @notice Mirror of `SyndicateFactory.MAX_MANAGEMENT_FEE_BPS`; refused before the broadcast.
+    uint256 public constant MAX_MANAGEMENT_FEE_BPS = 300;
     // ── Per-deployment governance timing floors (constructor immutables) ──
     // Mainnet/default impls bake in the historical hard floors. A testnet
     // acceleration deploy overrides these via a dedicated upgrade script
@@ -124,6 +126,12 @@ contract DeploySherwood is ScriptBase {
         address tierRegistry; // adapter-selector tier certification (spec §3.2)
     }
 
+    /// @notice Pre-flight: the management fee the deploy is about to seed must sit
+    ///         under the factory's own ceiling, refused before anything is broadcast.
+    function requireManagementFeeUnderCap(uint256 bps) public pure {
+        require(bps <= MAX_MANAGEMENT_FEE_BPS, "PRE-FLIGHT: MANAGEMENT_FEE above MAX_MANAGEMENT_FEE_BPS (300)");
+    }
+
     function run() external virtual {
         Config memory cfg = Config({
             ensRegistrar: vm.envOr("ENS_REGISTRAR", address(0)),
@@ -139,6 +147,7 @@ contract DeploySherwood is ScriptBase {
             slashAppealSeed: vm.envOr("SLASH_APPEAL_SEED", DEFAULT_SLASH_APPEAL_SEED),
             epochZeroSeed: vm.envOr("EPOCH_ZERO_SEED", DEFAULT_EPOCH_ZERO_SEED)
         });
+        requireManagementFeeUnderCap(cfg.managementFeeBps);
         require(cfg.woodToken != address(0), "WOOD_TOKEN not set (env or chains.json)");
 
         // Multisig handoff is mandatory in prod.

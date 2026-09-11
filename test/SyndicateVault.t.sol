@@ -506,19 +506,21 @@ contract SyndicateVaultTest is Test {
         assertEq(vault.agentFeeBps(), 0, "0% agent fee is a valid config");
     }
 
+    /// @dev 2500, written out: the ceiling itself is a legal rate, so this
+    ///      pins the inclusive bound rather than tracking whatever the
+    ///      constant happens to say.
     function test_setAgentFeeBps_atCapSucceeds() public {
-        uint256 cap = vault.MAX_AGENT_FEE_BPS();
         vm.prank(owner);
-        vault.setAgentFeeBps(cap);
-        assertEq(vault.agentFeeBps(), cap);
+        vault.setAgentFeeBps(2500);
+        assertEq(vault.agentFeeBps(), 2500);
     }
 
+    /// @dev 2501, written out: one bps over the 2500 ceiling, so this stays
+    ///      red if the constant is raised.
     function test_setAgentFeeBps_aboveCapReverts() public {
-        // Hoist the view read so it doesn't consume the prank/expectRevert.
-        uint256 tooHigh = vault.MAX_AGENT_FEE_BPS() + 1;
         vm.prank(owner);
         vm.expectRevert(ISyndicateVault.AgentFeeTooHigh.selector);
-        vault.setAgentFeeBps(tooHigh);
+        vault.setAgentFeeBps(2501);
     }
 
     function test_setAgentFeeBps_nonOwnerReverts() public {

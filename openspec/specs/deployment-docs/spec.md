@@ -412,23 +412,25 @@ It is accepted because the remedy is worse. Requiring the ETH answer to be no ol
 
 Both OVERSTATE bond value — the dangerous direction — and both are bounded by the same two controls: `woodUsdPriceX8` truncates anything above the cap, and `woodHaircutBps` pre-funds an allowance below it. **`woodHaircutBps` is therefore LOAD-BEARING.**
 
-**The shipped value is 7,000 — a 30% allowance — and `DeployPlanB` SHALL seat it** inside its broadcast (constant `DEFAULT_WOOD_HAIRCUT_BPS`, overridable via `WOOD_HAIRCUT_BPS`). The ledger's own default is 10,000, which is no haircut and therefore no allowance at all, and its setter ACCEPTS 10,000 as a legal value — so nothing else in the stack refuses that configuration and it would ship silently. Pre-flight 9 refuses it. 5,000 (the ledger floor) was REJECTED as too costly to guardian return on equity, a recurring concern in review. Precisely: 7,000 values every source at 70%, so an overstatement of up to ~42.9% still leaves bonds valued at or below their true worth — the 30% sizing case with margin to spare.
+**The shipped value is 5,000 — a 50% allowance — and `DeployPlanB` SHALL seat it** inside its broadcast (constant `DEFAULT_WOOD_HAIRCUT_BPS`, overridable via `WOOD_HAIRCUT_BPS`). The ledger's own default is 10,000, which is no haircut and therefore no allowance at all, and its setter ACCEPTS 10,000 as a legal value — so nothing else in the stack refuses that configuration and it would ship silently. Pre-flight 9 refuses it. 5,000 is also the ledger's `MIN_WOOD_HAIRCUT_BPS`, so the deploy default and the floor coincide by design and any raise of the floor must move the deploy constant in the same change. Precisely: 5,000 values every source at 50%, so an overstatement of up to 100% still leaves bonds valued at or below their true worth.
 
-**Lowering the haircut is the safe direction** (more allowance, bonds valued lower, quorums harder), takes one owner transaction, and is NOT rate-limited on-chain — issue #89 removed the once-per-day interval from this setter too, so the haircut can be tightened repeatedly as a crisis develops. Its VALUE bounds `[5_000, 10_000]` remain; those cost nothing in a crisis.
+5,000 was once rejected as too costly to guardian return on equity, but that was under full-coverage reservation. With declared locks (SHE-227) the haircut is the ONLY buffer between the WOOD price at approval and at verdict 4–6 weeks later: at 7,000 the cohort's burn equals the loot after a 30% WOOD drop, at 5,000 after a 50% drop, and guardian ROE stays at 1.6–4.2%/yr. SHE-182 adopted 5,000 as the launch configuration on that basis.
+
+**The shipped value sits ON the floor, so there is no downward travel left.** Lowering the haircut would be the safe direction (more allowance, bonds valued lower, quorums harder), but the setter refuses anything below `MIN_WOOD_HAIRCUT_BPS`, and issue #89's removal of the once-per-day interval therefore buys nothing here. The crisis brake is the other lever this section names: lowering `woodUsdPriceX8` truncates every bond, takes one owner transaction, and is likewise un-rate-limited on-chain. Raising the floor is not a parameter change at all — `MIN_WOOD_HAIRCUT_BPS` is a constant, so it needs a ledger redeploy.
 
 Finding 5's `twapWindow <= maxTwapAge` invariant is unaffected and remains enforced — a different problem (structural unavailability) with a different fix.
 
 #### Scenario: Operator sizes the haircut
 - **WHEN** the operator seats `woodHaircutBps` before launch
-- **THEN** the runbook states that the value is an allowance against the ETH-staleness overstatement and the crash lag, that the shipped value is 7,000 (a 30% allowance), that 10,000 leaves none at all and is refused by pre-flight 9, and that 5,000 was rejected on guardian-ROE grounds
+- **THEN** the runbook states that the value is an allowance against the ETH-staleness overstatement and the crash lag, that the shipped value is 5,000 (a 50% allowance, equal to the ledger floor), that 10,000 leaves none at all and is refused by pre-flight 9, and that the earlier guardian-ROE objection to 5,000 was reconsidered under declared locks (SHE-182)
 
 #### Scenario: Deploy would leave the haircut at the ledger default
 - **WHEN** `DeployPlanB` would complete with `woodHaircutBps == 10_000`
 - **THEN** pre-flight 9 FAILS, naming what the allowance is FOR rather than only that the value is out of range
 
-#### Scenario: Haircut needs tightening during a crash
-- **GIVEN** the haircut was seated by the deploy minutes earlier
-- **THEN** `setWoodHaircutBps` succeeds — the on-chain interval that would have refused it is gone (issue #89), and any delay now comes from the owner Safe's module configuration
+#### Scenario: Bond valuation needs tightening during a crash
+- **GIVEN** the deploy seated the haircut at the floor minutes earlier
+- **THEN** `setWoodUsdPrice` succeeds at once — the on-chain interval that would have refused it is gone (issue #89), and any delay now comes from the owner Safe's module configuration — while `setWoodHaircutBps` below `MIN_WOOD_HAIRCUT_BPS` is refused by value, not by time
 
 ### Requirement: Rate limiting is enforced off-chain, and the contract imposes none
 `ExposureLedger.setWoodUsdPrice` and `setWoodHaircutBps` SHALL impose no rate limit and no per-call size ceiling. The owner may move either lever to any legal value, any number of times, within one block. **Rate limiting is enforced OFF-CHAIN by a Zodiac Delay/Roles module on the owner Safe** (issue #89, owner decision 2026-08-02).

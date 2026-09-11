@@ -75,8 +75,8 @@ the proposer get their bond back.
 | Strategy duration | ≤ 30 d | 1 h – 30 d (absolute) |
 | Cooldown between strategies | 1 h | 1 h – 30 d |
 | Challenge window | 14 d | ≥ review + 7 d |
-| Management fee | 0.5%/yr | 0 – 5%/yr |
-| Performance fee | 5% | 0 – 20% (vault cap) / 30% (protocol ceiling) |
+| Management fee | 0.5%/yr | 0 – 3%/yr |
+| Performance fee | 5% | 0 – 20% (vault cap) / 25% (protocol ceiling) |
 | Mgmt split (agent/protocol/guardian) | 70/20/10 | must sum to 100% |
 | Perf split (agent/protocol/guardian/owner) | 60/15/15/10 | must sum to 100% |
 | Min guardian stake | 10 000 WOOD | ≥ 1 WOOD |
