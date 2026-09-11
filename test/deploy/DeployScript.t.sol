@@ -145,11 +145,12 @@ contract DeployScriptTest is Test {
 
     /// @notice The script refuses an over-cap MANAGEMENT_FEE before the
     ///         broadcast, so its mirror constant must equal the factory's own.
+    /// @dev The literal is asserted too. Equality alone only proves the two
+    ///      move together — it stays green if BOTH are reverted to 500.
+    ///      (SHE-182 / SHE-18 lowered the cap from 500 to 300.)
     function test_managementFeeMirrorMatchesTheFactoryCap() public {
-        assertEq(
-            new DeploySherwood().MAX_MANAGEMENT_FEE_BPS(),
-            new SyndicateFactory().MAX_MANAGEMENT_FEE_BPS(),
-            "mirror must match the factory"
-        );
+        uint256 mirrored = new DeploySherwood().MAX_MANAGEMENT_FEE_BPS();
+        assertEq(mirrored, new SyndicateFactory().MAX_MANAGEMENT_FEE_BPS(), "mirror must match the factory");
+        assertEq(mirrored, 300, "the management ceiling is 3%/yr");
     }
 }
