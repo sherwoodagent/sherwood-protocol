@@ -55,10 +55,12 @@ contract DeploySherwoodHarness is DeploySherwood {
 ///           - Call the harness-exposed `_handoffOwnership` and
 ///           - Assert all three proxies report `owner() == multisig`.
 ///
-///         The env-var validation is exercised by spawning a fresh
+///         The `OWNER_MULTISIG` validation is exercised by spawning a fresh
 ///         `DeploySherwood` and calling `run()` with `vm.setEnv`/`vm.expectRevert`.
 ///         For the address(0) and EOA paths, `run()` reverts before any deploy
-///         happens, so we don't need WOOD_TOKEN / chains.json plumbing.
+///         happens, so we don't need WOOD_TOKEN / chains.json plumbing. The
+///         management-fee pre-flight is reached through its pure helper instead,
+///         since `vm.setEnv` writes OS state the parallel sibling tests share.
 contract DeployMultisigHandoffTest is Test {
     bytes32 constant SALT_GOVERNOR_IMPL = keccak256("sherwood.deploy.governor-impl.2");
     bytes32 constant SALT_GOVERNOR_PROXY = keccak256("sherwood.deploy.governor-proxy.2");
@@ -85,17 +87,18 @@ contract DeployMultisigHandoffTest is Test {
         vm.setEnv("OWNER_MULTISIG", "0x0000000000000000000000000000000000000000");
         vm.setEnv("SKIP_MULTISIG_HANDOFF", "false");
         vm.setEnv("WOOD_TOKEN", "0x0000000000000000000000000000000000000000");
-        vm.setEnv("MANAGEMENT_FEE", "200");
     }
 
     /// @notice The management-fee pre-flight refuses a value the factory would
-    ///         reject anyway, before anything is broadcast.
+    ///         reject anyway, before anything is broadcast. Driven through the
+    ///         pure helper `run()` calls, so this test mutates no process-global
+    ///         env that a sibling test running alongside it would read.
     function test_run_rejectsManagementFeeAboveTheFactoryCap() public {
         DeploySherwood s = new DeploySherwood();
-        vm.setEnv("MANAGEMENT_FEE", "301");
         vm.expectRevert(bytes("PRE-FLIGHT: MANAGEMENT_FEE above MAX_MANAGEMENT_FEE_BPS (300)"));
-        s.run();
-        vm.setEnv("MANAGEMENT_FEE", "200");
+        s.requireManagementFeeUnderCap(301);
+        // Exactly at the cap is not over it.
+        s.requireManagementFeeUnderCap(300);
     }
 
     /// @notice MS-H5 (C-1): after `_handoffOwnership`, all four proxies
