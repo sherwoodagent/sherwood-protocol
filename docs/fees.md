@@ -23,9 +23,9 @@ below the high-water mark while review workload is unchanged. See
 - **Rate source:** `vault.managementFeeBps()`, stamped once at vault creation from
   `SyndicateFactory.managementFeeBps` (`src/SyndicateFactory.sol`). There is no
   per-vault setter — changing the factory value only affects *new* vaults.
-- **Bounds:** 0 → `MAX_MANAGEMENT_FEE_BPS = 300` bps (3%/yr), enforced at vault
-  creation and at the factory setter (`SyndicateFactory.initialize` and
-  `setManagementFeeBps`). Deploy scripts seed 200 bps (2%/yr).
+- **Bounds:** 0 → `MAX_MANAGEMENT_FEE_BPS = 300` bps (3%/yr), enforced at factory
+  initialization and at the factory setter (`SyndicateFactory.initialize` and
+  `setManagementFeeBps`); `createSyndicate` copies the stored value unchecked. Deploy scripts seed 200 bps (2%/yr).
 - **Sticky per vault:** `_managementFeeBps` is written once at `initialize`
   (`src/SyndicateVault.sol`) and the vault exposes only a getter — there is no
   per-vault setter, and `SyndicateFactory.setManagementFeeBps`
@@ -105,7 +105,7 @@ management.
 
 ## Settlement ordering (load-bearing)
 
-`_finalizeSettlement` (`src/SyndicateGovernor.sol`) charges in a fixed
+`_finishSettlement` (`src/SyndicateGovernor.sol`) charges in a fixed
 order so no fee is charged on assets another fee already took:
 
 1. **Management fee** — lowers vault assets, therefore lowers price per share.

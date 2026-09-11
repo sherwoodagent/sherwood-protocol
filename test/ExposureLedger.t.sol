@@ -1574,7 +1574,8 @@ contract ExposureLedgerTest is Test {
     ///         at their TRUE worth rather than at double it. The cap is held
     ///         deliberately NON-BINDING here — the overstated source lands
     ///         exactly on it — so the haircut is doing the work alone and the
-    ///         test cannot pass for the wrong reason.
+    ///         test cannot pass for the wrong reason. 5_000 is also the shipped
+    ///         value (`DeployPlanB.DEFAULT_WOOD_HAIRCUT_BPS`, the ledger floor).
     function test_woodHaircut_absorbsAnOverstatedMarketSource() public {
         swood.setStake(guardian, 100_000e18);
         uint256 trueBondUsd = 5_000e18; // 100k WOOD at the true $0.05
@@ -1592,38 +1593,11 @@ contract ExposureLedgerTest is Test {
         // And it is paid for in normal operation, which is the trade: an
         // unexaggerated market is valued at half.
         marketFeed.set(int256(MARKET_X8));
+        assertEq(ledger.woodPriceX8(), MARKET_X8 / 2, "a healthy source is served at half");
         assertEq(ledger.slashableBondUsd(guardian), trueBondUsd / 2, "the allowance costs conservatism when healthy");
-    }
 
-    /// @notice THE SHIPPED VALUE, 5,000 — the ledger's own floor, and a 100%
-    ///         allowance: every source is valued at half, so a price reported at
-    ///         2x the truth still values bonds at or below what they are worth.
-    ///         `DeployPlanB` seats it as `DEFAULT_WOOD_HAIRCUT_BPS`; pinned here
-    ///         as the behaviour it buys, not merely a number in a deploy script.
-    function test_woodHaircut_shippedValueAbsorbsADoubledOverstatement() public {
-        swood.setStake(guardian, 100_000e18);
-        uint256 trueBondUsd = 5_000e18; // 100k WOOD at the true $0.05
-
-        vm.prank(owner);
-        ledger.setWoodHaircutBps(5_000);
-
-        // Healthy market: bonds carry the 50% discount. That is what the
-        // allowance costs in normal operation.
-        assertEq(ledger.woodPriceX8(), (MARKET_X8 * 5_000) / 10_000);
-        assertEq(ledger.slashableBondUsd(guardian), trueBondUsd / 2);
-
-        // A 100% overstatement — the sizing case — still leaves bonds valued at
-        // or below their true worth, which is the property being bought.
-        marketFeed.set(int256(2 * MARKET_X8));
-        assertLe(2 * MARKET_X8, CAP_X8, "the cap must not be what absorbs this");
-        assertLe(ledger.slashableBondUsd(guardian), trueBondUsd, "a doubled price is fully absorbed");
-
-        // And a doubling is exactly break-even: the discount cancels the error,
-        // so bonds land AT true worth and not a wei above it.
-        assertEq(ledger.slashableBondUsd(guardian), trueBondUsd, "break-even is the edge of the allowance");
-
-        // Past the allowance the cap is the control that takes over, so an even
-        // wilder source still cannot value bonds above their true worth.
+        // Past the allowance the cap takes over, so a wilder source still
+        // cannot value bonds above their true worth.
         marketFeed.set(int256(4 * MARKET_X8));
         assertEq(ledger.slashableBondUsd(guardian), trueBondUsd, "beyond the allowance the cap holds the line");
     }
