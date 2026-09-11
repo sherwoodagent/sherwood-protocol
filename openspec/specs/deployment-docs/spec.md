@@ -428,9 +428,9 @@ Finding 5's `twapWindow <= maxTwapAge` invariant is unaffected and remains enfor
 - **WHEN** `DeployPlanB` would complete with `woodHaircutBps == 10_000`
 - **THEN** pre-flight 9 FAILS, naming what the allowance is FOR rather than only that the value is out of range
 
-#### Scenario: Haircut needs tightening during a crash
-- **GIVEN** the haircut was seated by the deploy minutes earlier
-- **THEN** `setWoodHaircutBps` succeeds — the on-chain interval that would have refused it is gone (issue #89), and any delay now comes from the owner Safe's module configuration
+#### Scenario: Bond valuation needs tightening during a crash
+- **GIVEN** the deploy seated the haircut at the floor minutes earlier
+- **THEN** `setWoodUsdPrice` succeeds at once — the on-chain interval that would have refused it is gone (issue #89), and any delay now comes from the owner Safe's module configuration — while `setWoodHaircutBps` below `MIN_WOOD_HAIRCUT_BPS` is refused by value, not by time
 
 ### Requirement: Rate limiting is enforced off-chain, and the contract imposes none
 `ExposureLedger.setWoodUsdPrice` and `setWoodHaircutBps` SHALL impose no rate limit and no per-call size ceiling. The owner may move either lever to any legal value, any number of times, within one block. **Rate limiting is enforced OFF-CHAIN by a Zodiac Delay/Roles module on the owner Safe** (issue #89, owner decision 2026-08-02).
