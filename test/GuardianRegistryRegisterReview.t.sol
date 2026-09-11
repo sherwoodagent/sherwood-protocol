@@ -92,4 +92,50 @@ contract GuardianRegistryRegisterReviewTest is RegistryTestHarness {
         registry.addGovernor(gov2, vault2);
         assertEq(registry.vaultOf(gov2), vault2);
     }
+
+    /// @notice The stamp is the shift as it stood at `registerReview`, not the
+    ///         live total: shift accrued after the stamp must not move it.
+    function test_reviewClockShift_isTheShiftStampedAtRegister() public {
+        uint256 pid = 1;
+
+        // A first pause closes BEFORE the review exists, so the stamp is nonzero.
+        vm.prank(regOwner);
+        registry.pause();
+        vm.warp(block.timestamp + 2 hours);
+        vm.prank(regOwner);
+        registry.unpause();
+        uint64 shiftAtRegister = registry.pauseShiftTotal();
+        assertEq(shiftAtRegister, 2 hours, "first pause accrued");
+
+        _registerReview(pid, block.timestamp + 1 days, block.timestamp + 2 days);
+        assertEq(registry.reviewClockShift(address(governor), pid), shiftAtRegister, "stamped at register");
+
+        // A second pause accrues AFTER the stamp and must leave it alone.
+        vm.prank(regOwner);
+        registry.pause();
+        vm.warp(block.timestamp + 3 hours);
+        vm.prank(regOwner);
+        registry.unpause();
+        assertEq(registry.pauseShiftTotal(), 5 hours, "second pause accrued on top");
+        assertEq(registry.reviewClockShift(address(governor), pid), shiftAtRegister, "stamp is not the live total");
+        assertLt(
+            registry.reviewClockShift(address(governor), pid),
+            registry.pauseShiftTotal(),
+            "later shift is excluded from the stamp"
+        );
+    }
+
+    function test_effectiveNowFor_isNowMinusTheShiftAccruedSinceRegister() public {
+        uint256 pid = 1;
+        _registerReview(pid, block.timestamp + 1 days, block.timestamp + 2 days);
+        uint256 before = registry.effectiveNowFor(address(governor), pid);
+        assertEq(before, block.timestamp, "no pause since register: effective now is now");
+        // pause for an hour, then unpause: the review's clock must not have advanced
+        vm.prank(regOwner);
+        registry.pause();
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(regOwner);
+        registry.unpause();
+        assertEq(registry.effectiveNowFor(address(governor), pid), before, "paused time does not count");
+    }
 }

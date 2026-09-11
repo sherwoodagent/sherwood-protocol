@@ -612,6 +612,56 @@ contract CoverageEndToEndTest is Test {
         swood.claimUnstakeGuardian();
     }
 
+    /// @notice END TO END, PAST THE COOLDOWN: with the chain clock behind the
+    ///         wired ledger's `epochGenesis`, `claimUnstakeGuardian` refuses by
+    ///         name instead of releasing the bond on a zero read. The cooldown
+    ///         has already elapsed here, so the ledger read is the only gate
+    ///         left — which is the leg a clamped `elapsed` would let through.
+    ///         Bucket arithmetic: `ExposureLedger.t.sol`; consequence: here.
+    function test_exitGate_preGenesisClockFailsClosed() public {
+        vm.startPrank(owner);
+        swood.setExposureLedger(address(ledger));
+        // Production's 7-day cooldown, as `test_exitGate_blocksClaimWhileCoverageIsOpen`
+        // uses: the fixture's 45d would outlast this fixture's ~42d of coverage.
+        swood.setCooldownPeriod(7 days);
+        vm.stopPrank();
+
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pid);
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        assertGt(ledger.openExposure(g1), 0, "precondition: g1 is genuinely on the hook");
+
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+
+        uint256 requestedAt = vm.getBlockTimestamp();
+        uint256 balBefore = wood.balanceOf(g1);
+        uint256 stakeBefore = swood.guardianStake(g1);
+
+        // The live-coverage half of the argument, on the ledger holding the book.
+        vm.warp(ledger.epochGenesis() - 1);
+        vm.expectRevert(IExposureLedger.ClockBeforeGenesis.selector);
+        ledger.openExposure(g1);
+
+        // A SECOND ledger, deployed well past the cooldown and wired in through
+        // the plain owner setter, opens a window where the cooldown has cleared
+        // and only the ledger read stands between the guardian and its bond.
+        vm.warp(requestedAt + 7 days + 1 days);
+        ExposureLedger second = new ExposureLedger(ledgerOwner, address(swood), EPOCH_LENGTH);
+        vm.prank(owner);
+        swood.setExposureLedger(address(second));
+
+        vm.warp(second.epochGenesis() - 1);
+        assertGt(vm.getBlockTimestamp(), requestedAt + 7 days, "precondition: the cooldown has elapsed");
+        assertLt(vm.getBlockTimestamp(), second.epochGenesis(), "precondition: and the clock is behind genesis");
+
+        vm.prank(g1);
+        vm.expectRevert(IExposureLedger.ClockBeforeGenesis.selector);
+        swood.claimUnstakeGuardian();
+        assertEq(wood.balanceOf(g1), balBefore, "no bond left sWOOD while the clock was behind genesis");
+        assertEq(swood.guardianStake(g1), stakeBefore, "and the guardian stake is untouched");
+    }
+
     /// @notice ...and released once the coverage genuinely expires. The gate is
     ///         a condition, not a longer timer.
     function test_exitGate_releasesOnceCoverageExpires() public {
