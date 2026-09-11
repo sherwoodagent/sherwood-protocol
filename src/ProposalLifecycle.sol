@@ -3,9 +3,6 @@ pragma solidity 0.8.28;
 
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
-import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
-import {IVotes} from "@openzeppelin/contracts/governance/utils/IVotes.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title ProposalLifecycle
 /// @notice Abstract base owning the proposal lifecycle (propose -> vote ->
@@ -73,15 +70,12 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             // Voting ended — optimistic: approved unless AGAINST votes reach the veto threshold.
             // Skip the veto check when liveSupply == 0, else the bar collapses to 0 and everything auto-rejects.
             // vetoThresholdBps is the Draft -> Pending snapshot, so mid-vote finalizes don't move the bar.
-            // Votable set at the snapshot = supply minus the queue (queued shares keep snapshot weight).
-            // Cap it at totalSupply(): bounds the inflation side only. A holder who redeemed ahead of
-            // propose in the same block keeps snapshot vote weight against this live-capped bar.
-            uint256 pastTotalSupply = IVotes(p.vault).getPastTotalSupply(p.snapshotTimestamp);
-            address queue = ISyndicateVault(p.vault).withdrawalQueue();
-            uint256 queueVotes = queue == address(0) ? 0 : IVotes(p.vault).getPastVotes(queue, p.snapshotTimestamp);
-            uint256 liveSupply = pastTotalSupply > queueVotes ? pastTotalSupply - queueVotes : 0;
-            uint256 nowTotalSupply = IERC20(p.vault).totalSupply();
-            if (nowTotalSupply < liveSupply) liveSupply = nowTotalSupply;
+            // The electorate was RECORDED at propose, after any same-block burns
+            // (`SyndicateGovernor._votableSupplyOf`). Reconstructing it here from the
+            // snapshot cannot be exact: `totalSupply()` does not say whether a burn was a
+            // voter's redemption or a queued one, so any mix of the two reads is right for
+            // one shape and wrong for the other (SHE-282).
+            uint256 liveSupply = p.votableSupply;
             if (liveSupply > 0) {
                 uint256 vetoThreshold = (liveSupply * p.vetoThresholdBps) / BPS_DENOMINATOR;
                 // FLOOR AT ONE VOTE. Integer division sends the threshold to
