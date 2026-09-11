@@ -806,6 +806,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             _transition(proposal, ProposalState.Pending);
             // -1: see propose().
             proposal.snapshotTimestamp = block.timestamp - 1;
+            proposal.votableSupply = _votableSupplyOf(proposal.vault);
             // Timing comes from the propose-time snapshot, not live
             // `_params.*`. Single SLOAD; bit-shift to unpack.
             uint256 packed = _draftTimingSnap[proposalId];
@@ -1040,6 +1041,18 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     // ==================== INTERNAL ====================
 
+    /// @dev The veto electorate, read live at the Draft -> Pending transition:
+    ///      every share that exists minus the ones parked in the withdrawal
+    ///      queue, which cannot vote. Live on both terms so a redeem ordered
+    ///      ahead of this call in the same block is already reflected.
+    function _votableSupplyOf(address vault) private view returns (uint256) {
+        uint256 supply = IERC20(vault).totalSupply();
+        address queue = ISyndicateVault(vault).withdrawalQueue();
+        if (queue == address(0)) return supply;
+        uint256 queued = IERC20(vault).balanceOf(queue);
+        return supply > queued ? supply - queued : 0;
+    }
+
     /// @dev Hoisted out of `propose` to keep that function under Yul's
     ///      stack budget when `forge coverage` runs (optimizer + viaIR off).
     ///      Reads `vault` from storage (already written by caller) to keep
@@ -1047,6 +1060,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     function _initPendingProposal(StrategyProposal storage p, uint256 reviewPeriod_) private {
         // -1 closes the same-block flash-delegate window.
         p.snapshotTimestamp = block.timestamp - 1;
+        p.votableSupply = _votableSupplyOf(p.vault);
         p.voteEnd = block.timestamp + _params.votingPeriod;
         p.reviewEnd = p.voteEnd + reviewPeriod_;
         p.executeBy = p.reviewEnd + _params.executionWindow;

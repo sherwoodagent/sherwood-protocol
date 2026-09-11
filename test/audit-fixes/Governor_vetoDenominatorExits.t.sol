@@ -266,6 +266,68 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 
+    /// @notice THE SHE-282 REPRO. 100k parked in the queue, 200k redeemed ahead of propose in
+    ///         the same block: `min(snapshot - queueVotes, totalSupply())` read 200k and set the
+    ///         bar at 80k, while the electorate that could actually vote was 100k. 45k Against —
+    ///         45% of the real electorate — cleared the true 40k bar and missed the inflated one,
+    ///         so the veto failed. The recorded votable set is 100k, so it now rejects.
+    function test_parkedQueueAndSameBlockRedeemCannotInflateTheVetoBar() public {
+        address lp3 = makeAddr("lp3");
+        _deposit(lp1, 45_000e6);
+        _deposit(lp3, 55_000e6);
+        _deposit(lp2, 100_000e6);
+        _deposit(attacker, 200_000e6);
+
+        // lp2 parks its whole balance in the queue under a proposal that is then cancelled, so
+        // nothing ever stamps or claims it — the shape the old denominator overcounted.
+        uint256 parkPid = _propose();
+        // Hoisted: `balanceOf` in argument position would eat the one-shot prank.
+        uint256 lp2Shares = vault.balanceOf(lp2);
+        vm.prank(lp2);
+        vault.requestRedeem(lp2Shares, lp2);
+        vm.prank(agent);
+        governor.cancelProposal(parkPid);
+        vm.warp(governor.getCooldownEnd());
+
+        uint256 attackerShares = vault.balanceOf(attacker);
+        vm.prank(attacker);
+        vault.redeem(attackerShares, attacker, attacker); // ahead of propose, same block
+        uint256 pid = _propose();
+
+        uint256 electorate = vault.balanceOf(lp1) + vault.balanceOf(lp3);
+        assertEq(governor.getProposal(pid).votableSupply, electorate, "electorate is the two live LPs");
+        assertEq(vault.totalSupply(), electorate + lp2Shares, "the parked shares still exist");
+
+        // 45% of the electorate Against: over the true 40% bar, under the old inflated one.
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Rejected));
+    }
+
+    /// @notice The queue term is read LIVE at propose: shares queued between the snapshot and
+    ///         propose are already in the queue when the electorate is recorded, so they are out
+    ///         of it. 200k supply with 100k queued gives a 40k bar.
+    function test_queueTermIsReadLiveAtProposeNotAtTheSnapshot() public {
+        _deposit(lp1, 100_000e6);
+        _deposit(lp2, 100_000e6);
+
+        uint256 parkPid = _propose();
+        // Hoisted: `balanceOf` in argument position would eat the one-shot prank.
+        uint256 lp2Shares = vault.balanceOf(lp2);
+        vm.prank(lp2);
+        vault.requestRedeem(lp2Shares, lp2);
+        vm.prank(agent);
+        governor.cancelProposal(parkPid);
+        vm.warp(governor.getCooldownEnd());
+
+        uint256 pid = _propose();
+        assertEq(
+            governor.getProposal(pid).votableSupply, vault.balanceOf(lp1), "queued shares are not in the electorate"
+        );
+        assertEq(vault.totalSupply(), vault.balanceOf(lp1) + lp2Shares, "but they still exist");
+    }
+
     function _resolveWithAgainst(uint256 againstAssets) internal returns (ISyndicateGovernor.ProposalState) {
         _deposit(lp1, againstAssets);
         _deposit(lp2, 120_000e6 - againstAssets);
