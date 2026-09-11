@@ -190,6 +190,7 @@ abstract contract CLFixture is Test {
             marketParams: mp,
             collateralAmount: COLLATERAL,
             borrowAmount: BORROW,
+            lpAmount: 0,
             tickLower: TICK_LOWER,
             tickUpper: TICK_UPPER,
             expectedLiquidity: EXPECTED_LIQUIDITY,
