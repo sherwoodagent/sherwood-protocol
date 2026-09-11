@@ -126,6 +126,12 @@ contract DeploySherwood is ScriptBase {
         address tierRegistry; // adapter-selector tier certification (spec §3.2)
     }
 
+    /// @notice Pre-flight: the management fee the deploy is about to seed must sit
+    ///         under the factory's own ceiling, refused before anything is broadcast.
+    function requireManagementFeeUnderCap(uint256 bps) public pure {
+        require(bps <= MAX_MANAGEMENT_FEE_BPS, "PRE-FLIGHT: MANAGEMENT_FEE above MAX_MANAGEMENT_FEE_BPS (300)");
+    }
+
     function run() external virtual {
         Config memory cfg = Config({
             ensRegistrar: vm.envOr("ENS_REGISTRAR", address(0)),
@@ -141,10 +147,7 @@ contract DeploySherwood is ScriptBase {
             slashAppealSeed: vm.envOr("SLASH_APPEAL_SEED", DEFAULT_SLASH_APPEAL_SEED),
             epochZeroSeed: vm.envOr("EPOCH_ZERO_SEED", DEFAULT_EPOCH_ZERO_SEED)
         });
-        require(
-            cfg.managementFeeBps <= MAX_MANAGEMENT_FEE_BPS,
-            "PRE-FLIGHT: MANAGEMENT_FEE above MAX_MANAGEMENT_FEE_BPS (300)"
-        );
+        requireManagementFeeUnderCap(cfg.managementFeeBps);
         require(cfg.woodToken != address(0), "WOOD_TOKEN not set (env or chains.json)");
 
         // Multisig handoff is mandatory in prod.

@@ -105,7 +105,9 @@ interface IGuardianRegistry {
 
     // ── Guardian fns ──
     /// @notice Cast or change a guardian review vote on a proposal. Vote weight
-    ///         is read from sWOOD's `getPastVotes` at the review's `openedAt`.
+    ///         is read from sWOOD's `getPastStake` at the review's `snapshotAt`,
+    ///         which is frozen when the governor registers the review at propose
+    ///         time.
     ///         Block votes carry no proposed severity — the slash severity is
     ///         a deterministic function of block-side decisiveness, computed
     ///         at `resolveReview`. A vote cast once the review window is due but
@@ -188,7 +190,8 @@ interface IGuardianRegistry {
 
     // ── Views ──
     /// @notice Returns the cached review state for a proposal.
-    /// @return opened Whether `openReview` was called
+    /// @return opened Whether the review has been opened — by `openReview`, or by
+    ///         the first vote cast once the review window is due
     /// @return resolved Whether `resolveReview` has finalized the review
     /// @return blocked Whether guardians reached the block quorum (requires resolved)
     function getReviewState(address governor, uint256 proposalId)
