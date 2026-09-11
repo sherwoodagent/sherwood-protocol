@@ -17,25 +17,32 @@
 ## 2. Tests (guards mutation-verified: drop one, a test must fail)
 
 - [x] 2.1 Init matrix: all mixed configs revert; both valid modes init; the
-      unlevered config with a nonzero morpho reverts.
+      unlevered config carrying levered amounts reverts.
 - [x] 2.2 Unlevered lifecycle unit test: execute → rerange → settle with a
       mock pool/adapter and NO Morpho mock wired at all — the strongest
       possible "never calls Morpho" pin, since any call reverts undecodably.
 - [x] 2.3 Levered regression: existing CL suite passes untouched; add one
       test asserting a levered clone's `PositionOpened` event fields are
       unchanged by this diff.
-- [x] 2.4 Fork test (pinned block, vnet): unlevered NVDA/USDG 0.05% position
-      — real pool, real position manager; execute, one rerange, settle;
-      assert delivery within slippage bounds.
+- [x] 2.4 Fork test: unlevered position on the live 4663 USDG/WETH venue —
+      real pool, real position manager; execute, one rerange, settle; assert
+      delivery within slippage bounds. Run against
+      `rpc.mainnet.chain.robinhood.com` at latest (the public RPC prunes to a
+      ~5k-block window, so the block comes from `ROBINHOOD_FORK_BLOCK`).
 - [ ] 2.5 Invariant/lifecycle harness run with an unlevered clone (pid-22
       style flow).
 
 ## 3. Ops (vnet)
 
-- [x] 3.1 Deploy the (new) CL template build; owner `setTemplateApproval`
-      (owner is `0x5A00afAe…` — impersonation on the vnet, real key for any
-      future mainnet).
-- [x] 3.2 TierRegistry: confirm swap-adapter ADAPTER standing covers the CL
+- [ ] 3.1 Deploy the (new) CL template build; owner `setTemplateApproval`,
+      deapprove the superseded template, and RE-ANCHOR the registry's
+      `_classAnchors` entry — it is keyed by clone codehash against a template
+      codehash, so approval alone leaves the class unanchored. A builder on
+      the new ABI reaching a still-approved old template decodes `lpAmount` as
+      `tickLower`. (Owner `0x5A00afAe…`: impersonation on the vnet, real key
+      for mainnet.) Done once on the vnet for #288's template; this branch
+      builds a different one.
+- [ ] 3.2 TierRegistry: confirm swap-adapter ADAPTER standing covers the CL
       template's `_requireAllowedAdapter` binding on this vault (Deploy.s.sol
       already wires it for fresh deployments; the vnet predates the template).
 
