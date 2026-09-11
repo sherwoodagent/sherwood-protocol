@@ -358,8 +358,20 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     // ── Views ──
 
+    /// @dev Refuses a clock behind genesis with a named error rather than
+    ///      flooring at zero; see `IExposureLedger.ClockBeforeGenesis` for why a
+    ///      zero here is a fail-open. Strict `<`: at genesis `elapsed == 0` is a
+    ///      valid answer, not an underflow.
     function currentEpoch() public view returns (uint256) {
-        return block.timestamp <= epochGenesis ? 0 : (block.timestamp - epochGenesis) / epochLength;
+        if (block.timestamp < epochGenesis) revert ClockBeforeGenesis();
+        return (block.timestamp - epochGenesis) / epochLength;
+    }
+
+    /// @inheritdoc IExposureLedger
+    /// @dev Kept trivial on purpose: it must never acquire a reason of its own
+    ///      to revert.
+    function clockBeforeGenesis() external view returns (bool) {
+        return block.timestamp < epochGenesis;
     }
 
     /// @inheritdoc IExposureLedger
@@ -1070,8 +1082,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      Unlike `recordApproval` (which books nothing past the horizon), the
     ///      alternative here is not moving, which expires the lock even earlier.
     function _horizonClampedEpochOf(uint256 t) internal view returns (uint256) {
-        uint256 edge = ((block.timestamp <= epochGenesis ? 0 : block.timestamp - epochGenesis) + MAX_COVERAGE_HORIZON)
-            / epochLength;
+        // Callers freeze and pin coverage, so a clock behind genesis is refused
+        // rather than clamped. The floor on `t` stays: t == 0 is an unset
+        // deadline, not a clock fault.
+        if (block.timestamp < epochGenesis) revert ClockBeforeGenesis();
+        uint256 edge = ((block.timestamp - epochGenesis) + MAX_COVERAGE_HORIZON) / epochLength;
         uint256 e = t <= epochGenesis ? 0 : (t - epochGenesis) / epochLength;
         return e > edge ? edge : e;
     }
@@ -1418,7 +1433,13 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      i.e. from = (elapsed - W) / L when elapsed > W. from <= cur always
     ///      (W > 0), so the loop is bounded by ceil(W/L) + 1 iterations.
     function openExposure(address guardian) public view returns (uint256 total) {
-        uint256 elapsed = block.timestamp <= epochGenesis ? 0 : block.timestamp - epochGenesis;
+        // FAIL CLOSED. A clamped `elapsed` walks [0, MAX_COVERAGE_HORIZON/L]
+        // while `_coverageEpoch` floors every booking at `currentEpoch()`, so on
+        // a ledger older than the horizon the two ranges are DISJOINT and this
+        // view answers zero with live coverage — which is what opens
+        // `StakedWood`'s guardian exit. See `IExposureLedger.ClockBeforeGenesis`.
+        if (block.timestamp < epochGenesis) revert ClockBeforeGenesis();
+        uint256 elapsed = block.timestamp - epochGenesis;
         uint256 from = elapsed > challengeWindow ? (elapsed - challengeWindow) / epochLength : 0;
         // Scans FORWARD as well as back. Approvals are booked into the bucket
         // covering settlement, which is in the future at vote time, so a
