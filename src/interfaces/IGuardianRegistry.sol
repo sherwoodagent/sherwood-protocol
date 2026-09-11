@@ -108,7 +108,9 @@ interface IGuardianRegistry {
     ///         is read from sWOOD's `getPastVotes` at the review's `openedAt`.
     ///         Block votes carry no proposed severity — the slash severity is
     ///         a deterministic function of block-side decisiveness, computed
-    ///         at `resolveReview`.
+    ///         at `resolveReview`. A vote cast once the review window is due but
+    ///         still unopened opens the review itself and then records the vote,
+    ///         so no keeper `openReview` call is needed first.
     /// @param  lockWood On an Approve vote, the WOOD the guardian DECLARES it
     ///         locks behind the proposal; the ledger locks
     ///         `min(lockWood, free budget)` and never rejects the vote for it.
