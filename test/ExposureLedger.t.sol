@@ -2840,19 +2840,12 @@ contract ExposureLedgerTest is Test {
         assertEq(bps[0], 10_000, "and the rate saturates against the 50,000 basis");
     }
 
-    /// @notice A CLOCK BEHIND GENESIS FAILS CLOSED WITH A NAMED ERROR at all
-    ///         three epoch sites, and the non-reverting probe reports it.
-    ///
-    /// @dev    `epochGenesis` is stamped at construction, so a pre-genesis clock
-    ///         is unreachable on a live chain and reachable on every fork, vnet
-    ///         and test harness — it happened (a vnet reset its timestamp to 120
-    ///         against a genesis of 1787182248). The plain subtraction panicked
-    ///         0x11 there, which was ugly but CLOSED; flooring at zero is neither
-    ///         (see the PoC below and `IExposureLedger.ClockBeforeGenesis`).
-    ///
-    ///         THE AT-GENESIS LEG IS NOT DECORATION: the guard is strictly `<`,
-    ///         so `elapsed == 0` at genesis is a legitimate read. Weakening `<`
-    ///         to `<=` turns that read into a revert and fails here.
+    /// @notice Nothing booked; a clock behind `epochGenesis` must refuse by name
+    ///         at all three epoch sites — `currentEpoch`, `openExposure`,
+    ///         `horizonClampedEpochOf` — including the incident's own ts=120.
+    /// @dev    The at-genesis leg is not decoration: the guard is strictly `<`,
+    ///         so `elapsed == 0` at genesis is a legitimate read, and weakening
+    ///         `<` to `<=` turns it into a revert and fails here.
     function test_openExposure_preGenesisRevertsClockBeforeGenesis() public {
         // A genesis at real wall-clock time, the way a deployed ledger has one.
         uint256 genesis = 1_787_182_248; // 2026-08-19, the incident's own figure
@@ -2862,7 +2855,7 @@ contract ExposureLedgerTest is Test {
 
         // ONE SECOND BEFORE GENESIS: every epoch-indexed read refuses, by name.
         vm.warp(genesis - 1);
-        assertTrue(late.clockBeforeGenesis(), "the non-reverting probe reports the state");
+        assertLt(vm.getBlockTimestamp(), late.epochGenesis(), "precondition: the clock is behind genesis");
         vm.expectRevert(IExposureLedger.ClockBeforeGenesis.selector);
         late.currentEpoch();
         vm.expectRevert(IExposureLedger.ClockBeforeGenesis.selector);
@@ -2872,13 +2865,13 @@ contract ExposureLedgerTest is Test {
 
         // The incident's own timestamp: block 21178828, ts=120.
         vm.warp(120);
-        assertTrue(late.clockBeforeGenesis());
+        assertLt(vm.getBlockTimestamp(), late.epochGenesis());
         vm.expectRevert(IExposureLedger.ClockBeforeGenesis.selector);
         late.openExposure(address(0xBEEF));
 
         // EXACTLY AT GENESIS the subtraction is a valid zero, not an underflow.
         vm.warp(genesis);
-        assertFalse(late.clockBeforeGenesis(), "at genesis the clock is not behind it");
+        assertEq(vm.getBlockTimestamp(), late.epochGenesis(), "at genesis the clock is not behind it");
         assertEq(late.currentEpoch(), 0, "at genesis: elapsed == 0 is a valid read");
         assertEq(late.openExposure(address(0xBEEF)), 0);
         assertEq(late.horizonClampedEpochOf(0), 0, "t == 0 is an unset deadline, still floored");
@@ -2888,27 +2881,11 @@ contract ExposureLedgerTest is Test {
         assertEq(late.currentEpoch(), 1, "the ledger resumes normally once the clock is restored");
     }
 
-    /// @notice THE PoC POINTED THE OTHER WAY: with real coverage live in a
-    ///         bucket the clamped walk cannot reach, a pre-genesis read must
-    ///         REFUSE rather than answer zero.
-    ///
-    /// @dev    WHY A ZERO IS A FAIL-OPEN. `openExposure` walks
-    ///         `[(elapsed - W)/L, (elapsed + MAX_COVERAGE_HORIZON)/L]`. With
-    ///         `elapsed` clamped to 0 that is `[0, 60d/28d] = [0, 2]`, while
-    ///         `_coverageEpoch` floors EVERY booking at `currentEpoch()` — so a
-    ///         ledger older than the horizon has all its live bookings strictly
-    ///         above bucket 2. The clamped walk is not a superset of what is
-    ///         owed, it is DISJOINT from it, and the view reports a fully-pledged
-    ///         guardian as free. `StakedWood.claimUnstakeGuardian` releases the
-    ///         bond on exactly that zero; `CoverageEndToEnd` carries that leg.
-    ///
-    ///         FIXTURE NOTE: `setUp` deploys at the harness start timestamp, so
-    ///         this ledger's genesis is 1 and the clock can be put behind it
-    ///         directly. No `vm.store` poke is needed.
-    ///
-    ///         MUTATION NOTE: this is the test the clamp fails. Restore
-    ///         `elapsed = block.timestamp <= epochGenesis ? 0 : ...` and the
-    ///         rewound leg reads 0 instead of reverting.
+    /// @notice THE PoC: one approval booked in bucket 3 (genesis + 100d, L = 28d),
+    ///         strictly above the clamped walk's ceiling of `60d/28d = 2`. A
+    ///         pre-genesis read must REFUSE, not answer zero over a disjoint
+    ///         range — that zero is what releases the guardian's bond. The
+    ///         restored-clock leg asserts the book itself is untouched.
     function test_openExposure_preGenesisRefusesRatherThanZeroingLiveExposure() public {
         _wireRecording();
 
@@ -2932,7 +2909,7 @@ contract ExposureLedgerTest is Test {
         // here — live coverage reported as nothing. The fix refuses to answer.
         assertGt(genesis, 0, "fixture: genesis must be above zero to express a pre-genesis read");
         vm.warp(genesis - 1);
-        assertTrue(ledger.clockBeforeGenesis(), "precondition: the clock really is behind genesis");
+        assertLt(vm.getBlockTimestamp(), genesis, "precondition: the clock really is behind genesis");
         vm.expectRevert(IExposureLedger.ClockBeforeGenesis.selector);
         ledger.openExposure(guardian);
 

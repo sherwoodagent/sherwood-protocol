@@ -612,39 +612,17 @@ contract CoverageEndToEndTest is Test {
         swood.claimUnstakeGuardian();
     }
 
-    /// @notice END TO END: with the chain clock behind the ledger's
-    ///         `epochGenesis`, the exit gate FAILS CLOSED — no bond leaves while
-    ///         coverage is live, and the ledger refuses to answer rather than
-    ///         answering zero.
-    ///
-    /// @dev    WHAT THIS GUARDS. `claimUnstakeGuardian` releases on
-    ///         `openExposure(msg.sender) == 0`. Flooring `elapsed` at zero on a
-    ///         pre-genesis clock makes that view walk buckets
-    ///         `[0, MAX_COVERAGE_HORIZON/L]` while `_coverageEpoch` has floored
-    ///         every booking at `currentEpoch()` — disjoint ranges on any ledger
-    ///         older than the horizon, so the view reports a fully-pledged
-    ///         guardian as free and this gate opens on a clock fault. The bucket
-    ///         arithmetic is pinned in
-    ///         `ExposureLedger.test_openExposure_preGenesisRefusesRatherThanZeroingLiveExposure`;
-    ///         what this adds is the consequence, against the real sWOOD.
-    ///
-    ///         WHICH GUARD FIRES, HONESTLY. Under a pure rewind sWOOD's cooldown
-    ///         check runs first and also fails closed, because
-    ///         `unstakeRequestedAt` is necessarily at or after `epochGenesis`, so
-    ///         a timestamp behind genesis is behind the request too. That is
-    ///         defence in depth and an ordering accident, not the property under
-    ///         test — so the LEDGER's own refusal is pinned directly here as
-    ///         well, since it is the only guard that knows about coverage.
-    ///
-    ///         `test/StakedWood.t.sol` is deliberately not the home for this:
-    ///         its fixture wires no `ExposureLedger`, so the gate it would
-    ///         exercise is the unwired fail-open path.
+    /// @notice END TO END, PAST THE COOLDOWN: with the chain clock behind the
+    ///         wired ledger's `epochGenesis`, `claimUnstakeGuardian` refuses by
+    ///         name instead of releasing the bond on a zero read. The cooldown
+    ///         has already elapsed here, so the ledger read is the only gate
+    ///         left — which is the leg a clamped `elapsed` would let through.
+    ///         Bucket arithmetic: `ExposureLedger.t.sol`; consequence: here.
     function test_exitGate_preGenesisClockFailsClosed() public {
         vm.startPrank(owner);
         swood.setExposureLedger(address(ledger));
         // Production's 7-day cooldown, as `test_exitGate_blocksClaimWhileCoverageIsOpen`
-        // uses: the fixture's 45d would outlast this fixture's ~42d of coverage
-        // and mask the final leg behind a timer.
+        // uses: the fixture's 45d would outlast this fixture's ~42d of coverage.
         swood.setCooldownPeriod(7 days);
         vm.stopPrank();
 
@@ -656,36 +634,32 @@ contract CoverageEndToEndTest is Test {
         vm.prank(g1);
         swood.requestUnstakeGuardian();
 
-        uint256 genesis = ledger.epochGenesis();
-        assertGt(genesis, 0, "fixture: genesis must be above zero to express a pre-genesis read");
+        uint256 requestedAt = vm.getBlockTimestamp();
         uint256 balBefore = wood.balanceOf(g1);
         uint256 stakeBefore = swood.guardianStake(g1);
-        uint256 tsBefore = vm.getBlockTimestamp();
 
-        // THE INCIDENT: the clock falls behind the ledger's genesis.
-        vm.warp(genesis - 1);
-        assertTrue(ledger.clockBeforeGenesis(), "the non-reverting probe reports the state");
-        // THE PROPERTY UNDER TEST: the ledger refuses, rather than reading zero.
+        // The live-coverage half of the argument, on the ledger holding the book.
+        vm.warp(ledger.epochGenesis() - 1);
         vm.expectRevert(IExposureLedger.ClockBeforeGenesis.selector);
         ledger.openExposure(g1);
 
-        // The gate does not open. (Cooldown fires first here; see the note above.)
+        // A SECOND ledger, deployed well past the cooldown and wired in through
+        // the plain owner setter, opens a window where the cooldown has cleared
+        // and only the ledger read stands between the guardian and its bond.
+        vm.warp(requestedAt + 7 days + 1 days);
+        ExposureLedger second = new ExposureLedger(ledgerOwner, address(swood), EPOCH_LENGTH);
+        vm.prank(owner);
+        swood.setExposureLedger(address(second));
+
+        vm.warp(second.epochGenesis() - 1);
+        assertGt(vm.getBlockTimestamp(), requestedAt + 7 days, "precondition: the cooldown has elapsed");
+        assertLt(vm.getBlockTimestamp(), second.epochGenesis(), "precondition: and the clock is behind genesis");
+
         vm.prank(g1);
-        vm.expectRevert(StakedWood.CooldownNotElapsed.selector);
+        vm.expectRevert(IExposureLedger.ClockBeforeGenesis.selector);
         swood.claimUnstakeGuardian();
         assertEq(wood.balanceOf(g1), balBefore, "no bond left sWOOD while the clock was behind genesis");
         assertEq(swood.guardianStake(g1), stakeBefore, "and the guardian stake is untouched");
-
-        // ...and the fault is transient, not a brick: with the clock restored
-        // the same live coverage reads back, and once the cooldown does elapse
-        // the gate that refuses is the one that knows about coverage.
-        vm.warp(tsBefore);
-        assertFalse(ledger.clockBeforeGenesis(), "the clock is back");
-        assertGt(ledger.openExposure(g1), 0, "the book survived the clock fault untouched");
-        vm.warp(tsBefore + 7 days + 1);
-        vm.prank(g1);
-        vm.expectRevert(StakedWood.CoverageStillOpen.selector);
-        swood.claimUnstakeGuardian();
     }
 
     /// @notice ...and released once the coverage genuinely expires. The gate is

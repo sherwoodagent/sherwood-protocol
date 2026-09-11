@@ -416,7 +416,7 @@ Both OVERSTATE bond value — the dangerous direction — and both are bounded b
 
 5,000 was once rejected as too costly to guardian return on equity, but that was under full-coverage reservation. With declared locks (SHE-227) the haircut is the ONLY buffer between the WOOD price at approval and at verdict 4–6 weeks later: at 7,000 the cohort's burn equals the loot after a 30% WOOD drop, at 5,000 after a 50% drop, and guardian ROE stays at 1.6–4.2%/yr. SHE-182 adopted 5,000 as the launch configuration on that basis.
 
-**Lowering the haircut is the safe direction** (more allowance, bonds valued lower, quorums harder), takes one owner transaction, and is NOT rate-limited on-chain — issue #89 removed the once-per-day interval from this setter too, so the haircut can be tightened repeatedly as a crisis develops. Its VALUE bounds `[5_000, 10_000]` remain; those cost nothing in a crisis.
+**The shipped value sits ON the floor, so there is no downward travel left.** Lowering the haircut would be the safe direction (more allowance, bonds valued lower, quorums harder), but the setter refuses anything below `MIN_WOOD_HAIRCUT_BPS`, and issue #89's removal of the once-per-day interval therefore buys nothing here. The crisis brake is the other lever this section names: lowering `woodUsdPriceX8` truncates every bond, takes one owner transaction, and is likewise un-rate-limited on-chain. Raising the floor is not a parameter change at all — `MIN_WOOD_HAIRCUT_BPS` is a constant, so it needs a ledger redeploy.
 
 Finding 5's `twapWindow <= maxTwapAge` invariant is unaffected and remains enforced — a different problem (structural unavailability) with a different fix.
 

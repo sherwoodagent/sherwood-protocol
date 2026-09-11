@@ -137,14 +137,9 @@ contract SyndicateFactoryTest is Test {
         assertEq(address(uint160(uint256(vm.load(address(vault), bytes32(uint256(3)))))), address(executorLib));
     }
 
-    // ==================== The management-fee ceiling (SHE-182 / SHE-18) ====================
-    //
-    // Reverting `MAX_MANAGEMENT_FEE_BPS` from 300 to 500 left `test/fees/*`,
-    // `test/deploy/*` and this file green apart from a bare constant-equality
-    // check: neither enforcement site had a revert test at any value. These
-    // four are the pins. The performance ceiling has its own in
-    // `test/fees/FeeConstantsCap.t.sol`; this one lives on the factory, not in
-    // `FeeConstants`, so it is pinned where it is declared.
+    // ==================== The management-fee ceiling ====================
+    // Revert pins for both enforcement sites; the performance ceiling has its
+    // own in `test/fees/FeeConstantsCap.t.sol`.
 
     /// @notice 3%/yr, lowered from 5% in the launch configuration. This is the
     ///         depositor's real lever: management accrues on asset-seconds for

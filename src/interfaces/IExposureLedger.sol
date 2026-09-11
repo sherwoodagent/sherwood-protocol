@@ -77,8 +77,7 @@ interface IExposureLedger {
     ///         the two ranges are DISJOINT and the view answers zero with live
     ///         coverage — opening `StakedWood.claimUnstakeGuardian`, which gates a
     ///         guardian's exit on exactly that zero. Strictly `<`: at genesis
-    ///         `elapsed == 0` is valid. Off-chain readers branch on
-    ///         `clockBeforeGenesis()` instead of catching this revert.
+    ///         `elapsed == 0` is valid.
     error ClockBeforeGenesis();
 
     // ── Events ──
@@ -305,13 +304,9 @@ interface IExposureLedger {
     function openExposure(address guardian) external view returns (uint256);
     function coverageUsd(address asset, uint256 amount) external view returns (uint256);
     function proposerBondWood(address asset, uint256 requiredCoverage) external view returns (uint256);
+    /// @notice Epochs elapsed since `epochGenesis`; reverts `ClockBeforeGenesis`
+    ///         on a clock behind it.
     function currentEpoch() external view returns (uint256);
-
-    /// @notice Whether the chain clock is behind `epochGenesis`, i.e. whether
-    ///         every epoch-indexed read is presently refused with
-    ///         `ClockBeforeGenesis`. The one such read that never reverts, so an
-    ///         indexer can tell a clock fault from a dead node.
-    function clockBeforeGenesis() external view returns (bool);
 
     /// @notice The WOOD/USD price CAP, 8 decimals. NEVER SERVED AS A PRICE — it
     ///         only bounds whatever the market reports, and lowering it is the

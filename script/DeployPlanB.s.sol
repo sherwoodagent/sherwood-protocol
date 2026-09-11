@@ -100,7 +100,7 @@ interface IProtocolConfigAdmin {
  *      ledger's floor. The ledger DEFAULTS to 10,000 — no haircut — and its own
  *      setter accepts that value, so nothing else refuses the one configuration
  *      with zero allowance against the accepted overstatements. This script
- *      SEATS the haircut (7,000) rather than merely checking it. See the block.
+ *      SEATS the haircut (5,000) rather than merely checking it. See the block.
  * @dev PRE-FLIGHT 8 (design revision 2, 2026-08-02): POST-broadcast, the WOOD
  *      price CAP must be non-zero AND the composed `woodPriceX8()` must resolve
  *      to a non-zero price. The cap is no longer a fallback price — it only

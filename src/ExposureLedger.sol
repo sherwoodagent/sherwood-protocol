@@ -358,20 +358,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     // ── Views ──
 
-    /// @dev Refuses a clock behind genesis with a named error rather than
-    ///      flooring at zero; see `IExposureLedger.ClockBeforeGenesis` for why a
-    ///      zero here is a fail-open. Strict `<`: at genesis `elapsed == 0` is a
-    ///      valid answer, not an underflow.
+    /// @dev Strict `<`: at genesis `elapsed == 0` is a valid answer, not an underflow.
     function currentEpoch() public view returns (uint256) {
         if (block.timestamp < epochGenesis) revert ClockBeforeGenesis();
         return (block.timestamp - epochGenesis) / epochLength;
-    }
-
-    /// @inheritdoc IExposureLedger
-    /// @dev Kept trivial on purpose: it must never acquire a reason of its own
-    ///      to revert.
-    function clockBeforeGenesis() external view returns (bool) {
-        return block.timestamp < epochGenesis;
     }
 
     /// @inheritdoc IExposureLedger
@@ -1433,11 +1423,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      i.e. from = (elapsed - W) / L when elapsed > W. from <= cur always
     ///      (W > 0), so the loop is bounded by ceil(W/L) + 1 iterations.
     function openExposure(address guardian) public view returns (uint256 total) {
-        // FAIL CLOSED. A clamped `elapsed` walks [0, MAX_COVERAGE_HORIZON/L]
-        // while `_coverageEpoch` floors every booking at `currentEpoch()`, so on
-        // a ledger older than the horizon the two ranges are DISJOINT and this
-        // view answers zero with live coverage — which is what opens
-        // `StakedWood`'s guardian exit. See `IExposureLedger.ClockBeforeGenesis`.
+        // Refused, not clamped: a zero here reads as no coverage; see `IExposureLedger.ClockBeforeGenesis`.
         if (block.timestamp < epochGenesis) revert ClockBeforeGenesis();
         uint256 elapsed = block.timestamp - epochGenesis;
         uint256 from = elapsed > challengeWindow ? (elapsed - challengeWindow) / epochLength : 0;
