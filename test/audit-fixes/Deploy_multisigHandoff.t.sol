@@ -92,7 +92,8 @@ contract DeployMultisigHandoffTest is Test {
     /// @notice The management-fee pre-flight refuses a value the factory would
     ///         reject anyway, before anything is broadcast. Driven through the
     ///         pure helper `run()` calls, so this test mutates no process-global
-    ///         env that a sibling test running alongside it would read.
+    ///         env that a sibling test running alongside it would read. That
+    ///         `run()` calls the helper is not asserted here.
     function test_run_rejectsManagementFeeAboveTheFactoryCap() public {
         DeploySherwood s = new DeploySherwood();
         vm.expectRevert(bytes("PRE-FLIGHT: MANAGEMENT_FEE above MAX_MANAGEMENT_FEE_BPS (300)"));
