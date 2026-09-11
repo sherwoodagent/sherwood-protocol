@@ -724,12 +724,10 @@ contract DeployPlanBPreflightTest is Test {
         assertEq(ledger.woodPriceX8(), (WOOD_MARKET_X8 * 5_000) / 10_000, "the allowance reaches the price");
     }
 
-    /// @dev An operator override is honoured, and the floor still binds. The
-    ///      ledger's own setter rejects anything under 5,000 mid-broadcast, so
-    ///      this proves the script does not quietly widen the range.
-    /// @dev The override here is ABOVE the default, so it does not reach the
-    ///      floor branch — `test_deploy_refusesAHaircutBelowTheLedgerFloor`
-    ///      does, and that is the boundary that matters now.
+    /// @dev An operator override is honoured. The override here is ABOVE the
+    ///      default, so it does not reach the floor branch —
+    ///      `test_deploy_refusesAHaircutBelowTheLedgerFloor` does, and that is
+    ///      the boundary that matters now.
     function test_deploy_honoursAHaircutOverrideAndRespectsTheFloor() public {
         bookHaircutBps = 6_000;
         _run();
