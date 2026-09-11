@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {Vm} from "forge-std/Vm.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+
 import {CLFixture} from "./ConcentratedLiquidityStrategy.t.sol";
 import {ConcentratedLiquidityStrategy} from "../../src/strategies/ConcentratedLiquidityStrategy.sol";
 import {BaseStrategy} from "../../src/strategies/BaseStrategy.sol";
@@ -16,6 +19,11 @@ contract UnleveredConcentratedLiquidityTest is CLFixture {
 
     function setUp() public override {
         super.setUp();
+        // The real `TierRegistry` answers false for an unregistered address; the
+        // permissive mock answers TRUE for `address(0)` unless told otherwise,
+        // which would let an ungated Morpho binding pass here and brick init,
+        // execute and rerange on a real deployment.
+        tierRegistry.setDenied(address(0), true);
         unlevered = _newStrategy(_unleveredParams());
         status.set(1, 1, address(unlevered));
         vm.prank(address(vaultStub));
@@ -60,9 +68,11 @@ contract UnleveredConcentratedLiquidityTest is CLFixture {
         p.lpAmount = LP_AMOUNT;
         _expectInitRevert(ConcentratedLiquidityStrategy.MixedModeConfig.selector, p);
 
-        // A Morpho surface named by a config that will never touch it.
+        // Levered amounts under a config that names no Morpho surface — the
+        // fields would otherwise be stored and silently never used.
         p = _unleveredParams();
-        p.morpho = address(morpho);
+        p.collateralAmount = COLLATERAL;
+        p.borrowAmount = BORROW;
         _expectInitRevert(ConcentratedLiquidityStrategy.MixedModeConfig.selector, p);
 
         // A market declaration named by a config that will never touch it.
@@ -83,18 +93,76 @@ contract UnleveredConcentratedLiquidityTest is CLFixture {
         _expectInitRevert(ConcentratedLiquidityStrategy.InvalidAmount.selector, p);
     }
 
+    /// @dev The venue guards still bind in unlevered mode: only the Morpho and
+    ///      collateral-token bindings are mode-gated, and `address(0)` is denied
+    ///      here, so an ungated binding would fail this init rather than pass it.
+    function test_unlevered_initStillBindsTheVenueCounterparties() public {
+        tierRegistry.setDenied(address(posm), true);
+
+        ConcentratedLiquidityStrategy s = ConcentratedLiquidityStrategy(Clones.clone(address(template)));
+        bytes memory data = abi.encode(_unleveredParams());
+        address v = address(vaultStub);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ConcentratedLiquidityStrategy.CounterpartyNotAllowed.selector, address(posm), address(tierRegistry)
+            )
+        );
+        s.initialize(v, proposer, data);
+    }
+
     // ── Lifecycle ──
 
     function test_unlevered_executeMintsFromLpAmountAndTouchesNoMorpho() public {
         uint256 vaultBefore = usdg.balanceOf(address(vaultStub));
+        uint256 borrowedBefore = morpho.market(marketId).totalBorrowAssets;
 
         _executeUnlevered();
 
         assertEq(uint256(unlevered.state()), uint256(BaseStrategy.State.Executed));
         assertGt(unlevered.tokenId(), 0, "no position minted");
         assertEq(vaultBefore - usdg.balanceOf(address(vaultStub)), LP_AMOUNT, "pulled something other than lpAmount");
-        assertEq(morpho.position(marketId, address(unlevered)).collateral, 0, "posted collateral");
-        assertEq(morpho.position(marketId, address(unlevered)).borrowShares, 0, "borrowed");
+        // The pin is that no Morpho surface exists to reach, not a zero read on
+        // the fixture's own market — the clone can never appear in that one.
+        assertEq(address(unlevered.morpho()), address(0), "a Morpho surface was bound");
+        assertEq(morpho.market(marketId).totalBorrowAssets, borrowedBefore, "the market's borrow side moved");
+    }
+
+    /// @dev A levered execute still reports the borrow and the posted collateral
+    ///      in the same slots — the unlevered `collateral` reuse must not move them.
+    function test_levered_positionOpenedStillReportsBorrowAndCollateral() public {
+        // `setUp` points the proposal at the unlevered clone; the levered one is
+        // the subject here.
+        status.set(1, 1, address(strategy));
+        vm.recordLogs();
+        _execute();
+
+        (uint256 borrowed, uint256 collateral) = _positionOpenedCapital();
+        assertEq(borrowed, BORROW, "borrowed slot");
+        assertEq(collateral, morpho.position(marketId, address(strategy)).collateral, "collateral slot");
+    }
+
+    /// @dev Without this the unlevered family's deployed notional appears in no
+    ///      event on any path and is unreconstructable from logs.
+    function test_unlevered_positionOpenedReportsLpAmountAsCapital() public {
+        vm.recordLogs();
+        _executeUnlevered();
+
+        (uint256 borrowed, uint256 collateral) = _positionOpenedCapital();
+        assertEq(borrowed, 0, "unlevered position reports a borrow");
+        assertEq(collateral, LP_AMOUNT, "deployed notional is not in the log");
+    }
+
+    /// @dev Decodes the non-indexed tail of the one `PositionOpened` in the
+    ///      recorded logs; asserting topic1 alone would pass on any amounts.
+    function _positionOpenedCapital() internal returns (uint256 borrowed, uint256 collateral) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("PositionOpened(address,uint256,int24,int24,uint128,uint256,uint256)");
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics[0] != sig) continue;
+            (,,, borrowed, collateral) = abi.decode(logs[i].data, (int24, int24, uint128, uint256, uint256));
+            return (borrowed, collateral);
+        }
+        revert("no PositionOpened emitted");
     }
 
     function test_unlevered_settleClosesSwapsAndPushesEverythingHome() public {
@@ -121,6 +189,6 @@ contract UnleveredConcentratedLiquidityTest is CLFixture {
         unlevered.rerange();
 
         assertTrue(unlevered.tokenId() != first, "position not replaced");
-        assertEq(morpho.position(marketId, address(unlevered)).collateral, 0, "rerange reached Morpho");
+        assertEq(address(unlevered.morpho()), address(0), "a Morpho surface was bound");
     }
 }

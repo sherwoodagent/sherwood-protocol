@@ -26,20 +26,23 @@ interface ITierBindingPath {
 /**
  * @title ConcentratedLiquidityStrategy
  * @notice Deploys vault capital as a market-making position: concentrated
- *         liquidity over a bounded tick range in one Uniswap V3 pool, with the
- *         position funded by borrowing the vault asset against stable
- *         collateral rather than by selling into the volatile leg.
+ *         liquidity over a bounded tick range in one Uniswap V3 pool. Two
+ *         funding modes, fixed at init and never blended — LEVERED borrows the
+ *         vault asset against stable collateral, UNLEVERED (`morpho == 0`)
+ *         deploys `lpAmount` directly and touches no lending market at all.
  *
- *   Execute: pull the vault asset → post it (or its ERC-4626 wrapper) as
- *            Morpho collateral → borrow the vault asset → rebalance to the
- *            agent's declared fraction of the pool's other token → mint ONE
- *            position over the fixed tick range.
+ *   Execute: levered — pull the vault asset → post it (or its ERC-4626 wrapper)
+ *            as Morpho collateral → borrow the vault asset; unlevered — pull
+ *            `lpAmount`. Then, identically in both: rebalance to the agent's
+ *            declared fraction of the pool's other token → mint ONE position
+ *            over the fixed tick range.
  *   Rerange: permissionless and fully determined — burn, collect, re-mint the
  *            approved half-width centered on the current TWAP tick. Never
  *            touches the borrow or the collateral.
  *   Settle:  decrease to zero → collect → convert the other token back →
- *            repay → withdraw collateral → push everything to the vault.
- *            All-or-revert: every step is typed, a failed settlement is retried.
+ *            repay → withdraw collateral (levered only) → push everything to
+ *            the vault. All-or-revert: every step is typed, a failed
+ *            settlement is retried.
  *
  *   Batch calls from governor:
  *     Execute: [asset.approve(strategy, assetAmount), strategy.execute()]
@@ -437,16 +440,17 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
 
         // Two modes, decided here, never blended: levered is the original
         // borrow-funded configuration, unlevered funds the mint from `lpAmount`
-        // and names no Morpho surface at all. `morpho == 0` is the discriminator
-        // for the rest of the clone's life (`levered()`).
-        bool levered_ = p.collateralAmount != 0 || p.borrowAmount != 0;
+        // and names no Morpho surface at all. `morpho` ALONE decides, so the
+        // clone's lifelong discriminator (`levered()`) is the same rule init
+        // applied; each arm then requires the other mode's fields to be empty,
+        // so a field that would be silently ignored is a revert instead.
+        bool levered_ = p.morpho != address(0);
         if (levered_) {
-            if (p.morpho == address(0)) revert ZeroAddress();
             if (p.collateralAmount == 0 || p.borrowAmount == 0) revert InvalidAmount();
             if (p.lpAmount != 0) revert MixedModeConfig();
         } else {
             if (p.lpAmount == 0) revert InvalidAmount();
-            if (p.morpho != address(0)) revert MixedModeConfig();
+            if (p.collateralAmount != 0 || p.borrowAmount != 0) revert MixedModeConfig();
             // The market declaration must be empty, not merely unused: a
             // proposal naming a market it never touches invites review of the
             // wrong risk surface.
@@ -831,6 +835,9 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             morpho.borrow(_marketParams, borrowAmount, 0, address(this), address(this));
         } else {
             _pullFromVault(asset, lpAmount);
+            // The `collateral` slot carries deployed notional, so an unlevered
+            // position's size is reconstructable from logs like a levered one's.
+            posted = lpAmount;
         }
 
         (uint256 tid, uint128 liquidity) = _mintPosition(tickLower, tickUpper, swapFractionBps, mintSlippageBps);
@@ -1122,9 +1129,10 @@ contract ConcentratedLiquidityStrategy is BaseStrategy, ReentrancyGuardTransient
             tokenId = 0;
         }
         _swapToAsset(settleSlippageBps);
-        // Unlevered clones borrowed and posted nothing. The guard is
-        // load-bearing: the reads inside are TYPED calls that against
-        // `morpho == address(0)` revert here with empty returndata.
+        // Unlevered clones borrowed and posted nothing. Load-bearing, not
+        // cosmetic: `position` decodes a return value so it reverts against
+        // `morpho == address(0)`, while `accrueInterest`/`withdrawCollateral`
+        // return none and so would SILENTLY succeed — never rely on the latter.
         if (levered()) _repayAndWithdraw();
         _pushAllToVault(asset);
         _requireHoldsNothing();

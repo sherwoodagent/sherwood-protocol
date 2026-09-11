@@ -69,6 +69,12 @@ behavior is unchanged.
 
 NVDA/USDG 0.05%: tick spacing 10; the momentum pod's ±3% band ≈ ±296 ticks →
 `tickLower/Upper = _snapDown(spot, spacing) ∓ 300` (centered on a snapped mid so the width is exactly `2 * halfWidthTicks`; snapping the edges outward trips `_requireValidRerangePolicy`). In-range depth measured ~$36k per 1% of
-price move (2026-08-11), venue since 4×'d — re-measure at proposal time and
-size `lpAmount` to the existing pool-share cap, which already binds clone
-liquidity to a fraction of pool liquidity.
+price move (2026-08-11), venue since 4×'d — re-measure at proposal time.
+
+Size `lpAmount` deliberately: unlevered has NO on-chain notional ceiling. The
+pool-share cap bounds minted LIQUIDITY, not capital, and a wide range admits
+far more capital for the same liquidity; levered's borrow-≤-lendable and
+LTV-buffer checks were an implicit size ceiling that unlevered does not have.
+The envelope's `maxCapital` and the per-call outflow meter are the only
+backstops, so the guardians reviewing an unlevered proposal are reviewing the
+size itself.
