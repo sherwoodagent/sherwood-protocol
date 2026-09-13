@@ -729,17 +729,7 @@ contract SlashGasCeilingTest is Test {
     ///         ~45-50k; this anchors that to a real measurement against the
     ///         real `TierRegistry` rather than trusting the estimate.
     ///
-    /// @dev    Measures the WORST-CASE demotion, not the fixture's default
-    ///         zero-bond one: `_deployStack`'s `certify` call passes
-    ///         `submitter = address(0)`, which skips the submitter-bond
-    ///         machinery entirely. This test re-certifies the same
-    ///         (target, selector) with a real, funded submitter bond first, so
-    ///         `_demote`'s conditional bond-release branch — the
-    ///         `releasableAt` SSTORE from zero to non-zero, plus
-    ///         `SubmitterBondReleaseStarted` — actually runs, matching the
-    ///         sizing note's worst-case accounting.
-    ///
-    ///         Measured directly against `demoteByChallenge`, pranked as the
+    /// @dev    Measured directly against `demoteByChallenge`, pranked as the
     ///         registry's `authorizedDemoter` (the game, per `_deployStack`),
     ///         rather than through a full `_settle` — isolating the child's
     ///         own cost from the slash and payout work around it, which is
@@ -750,13 +740,7 @@ contract SlashGasCeilingTest is Test {
         // `_deployStack` constructs `tierRegistry = new TierRegistry(address(this))`
         // — the test contract itself is the owner, not the `owner` fixture
         // address used for the rest of the stack. No prank needed here.
-        address submitter = makeAddr("demotionGasSubmitter");
-        wood.mint(submitter, 10_000e18);
-        tierRegistry.setWood(address(wood));
-        tierRegistry.setSubmitterBondWood(10_000e18);
-        tierRegistry.setBondReleaseDelay(14 days);
-        vm.prank(submitter);
-        wood.approve(address(tierRegistry), type(uint256).max);
+        //
         // Re-certify the fixture's adapter so the demotion below runs against
         // a live certification.
         tierRegistry.certify(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(adapter).codehash);

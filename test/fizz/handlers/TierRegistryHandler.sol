@@ -10,8 +10,8 @@ import {Properties} from "../Properties.sol";
 ///      addresses would essentially never hit a certified key, so both are
 ///      drawn from small fixed domains: targets from the deployed protocol
 ///      contracts, selectors from a fixed set. That makes collisions frequent,
-///      which is the point — the certify → demote → claim cycle and I-2's bond
-///      accounting only come under pressure when many actions share one key.
+///      which is the point — the certify → demote cycle only comes under
+///      pressure when many actions share one key.
 abstract contract TierRegistryHandler is Properties {
     // ――――――――――――――――――――――――― Clamped ――――――――――――――――――――――――――
 
@@ -44,10 +44,6 @@ abstract contract TierRegistryHandler is Properties {
         );
     }
 
-    function tierRegistry_claimSubmitterBond_clamped(uint256 targetSeed, uint256 selectorSeed) public {
-        tierRegistry_claimSubmitterBond(_tierTarget(targetSeed), _tierSelector(selectorSeed));
-    }
-
     /// @dev `poke` is the permissionless self-heal: it demotes a certification
     ///      whose target codehash no longer matches (I-32).
     function tierRegistry_poke_clamped(uint256 targetSeed, uint256 selectorSeed) public {
@@ -58,19 +54,13 @@ abstract contract TierRegistryHandler is Properties {
         address target = _tierTarget(arg0);
         bytes4 sel = _tierSelector(arg1);
 
-        selector = uint8(selector % 5);
+        selector = uint8(selector % 3);
         if (selector == 0) {
             _tierRegistry_demote(target, sel);
         } else if (selector == 1) {
             _tierRegistry_demoteByChallenge(target, sel);
-        } else if (selector == 2) {
-            _tierRegistry_setCounterpartyAllowed(target, arg2 % 2 == 0);
-        } else if (selector == 3) {
-            _tierRegistry_setBondReleaseDelay(clampBetween(arg2, 1 days, 60 days));
         } else {
-            // I-2: a non-zero bond requires `wood` to be configured, and
-            // `setWood` refuses while bonds are outstanding.
-            _tierRegistry_setSubmitterBondWood(clampBetween(arg2, 0, 100_000e18));
+            _tierRegistry_setCounterpartyAllowed(target, arg2 % 2 == 0);
         }
     }
 
@@ -84,10 +74,6 @@ abstract contract TierRegistryHandler is Properties {
         bytes32 expectedCodehash
     ) public asAdmin {
         tierRegistry.certify(target, selector, tier, extractableBoundBps, expectedCodehash);
-    }
-
-    function tierRegistry_claimSubmitterBond(address target, bytes4 selector) public asActor {
-        tierRegistry.claimSubmitterBond(target, selector);
     }
 
     function tierRegistry_poke(address target, bytes4 selector) public asActor {
@@ -108,13 +94,5 @@ abstract contract TierRegistryHandler is Properties {
 
     function _tierRegistry_setCounterpartyAllowed(address counterparty, bool allowed) internal asAdmin {
         tierRegistry.setCounterpartyAllowed(counterparty, allowed);
-    }
-
-    function _tierRegistry_setBondReleaseDelay(uint256 delay) internal asAdmin {
-        tierRegistry.setBondReleaseDelay(delay);
-    }
-
-    function _tierRegistry_setSubmitterBondWood(uint256 amount) internal asAdmin {
-        tierRegistry.setSubmitterBondWood(amount);
     }
 }

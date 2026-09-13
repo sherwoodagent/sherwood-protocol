@@ -2,8 +2,6 @@
 pragma solidity 0.8.28;
 
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IStrategyFactory} from "./interfaces/IStrategyFactory.sol";
 
 /**
@@ -39,38 +37,14 @@ import {IStrategyFactory} from "./interfaces/IStrategyFactory.sol";
  *      setters, not just the presence or absence of a delegatecall.
  */
 contract TierRegistry is Ownable2Step {
-    using SafeERC20 for IERC20;
-
     struct TierConfig {
         uint8 tier; // 0 or 1 when certified; entry absent => tier 2
         uint16 extractableBoundBps; // certified extractable bound, bps of notional
         bytes32 certifiedCodehash; // EXTCODEHASH of target at certification
     }
 
-    /// @dev Submitter bond per certification. Held while certified; demotion
-    ///      starts `bondReleaseDelay`, then the submitter claims. The delay gives
-    ///      the slash mechanism a window to act before the bond can be pulled out
-    ///      from under it.
-    ///
-    ///      `token` pins the ERC20 this specific bond was actually PULLED in, so
-    ///      a later `setWood` can neither redirect an already-locked payout nor
-    ///      let one claimant drain another submitter's collateral out of a
-    ///      shared balance.
-    struct SubmitterBond {
-        address submitter;
-        uint96 amount;
-        uint64 releasableAt; // 0 while certified; set on demotion
-        IERC20 token;
-    }
-
     uint8 public constant TIER_ARBITRARY = 2;
     uint16 public constant FULL_NOTIONAL_BPS = 10_000;
-
-    /// @dev Floor keeps a demoted bond claimable-not-yet-claimed long enough
-    ///      for the slash mechanism to act before payout. Ceiling bounds
-    ///      governance error.
-    uint256 public constant MIN_BOND_RELEASE_DELAY = 1 days;
-    uint256 public constant MAX_BOND_RELEASE_DELAY = 365 days;
 
     /// @dev EXTCODEHASH of an EXISTING account with no code (EIP-1052). A funded
     ///      EOA hashes to this, not bytes32(0) — `certify` rejects both.
@@ -84,32 +58,6 @@ contract TierRegistry is Ownable2Step {
 
     /// @dev Grant-time codehash snapshot; meaningful only while the flag is set.
     mapping(address counterparty => bytes32) private _counterpartyAllowedCodehash;
-
-    IERC20 public wood;
-    /// @dev LAUNCH GATE: a non-zero value is inert as a warranty — and imposes a
-    ///      real, currently-unrecoverable cost on adapter submitters — until ALL
-    ///      THREE hold:
-    ///        1. a guard-bypass slash function exists and can reach `_bonds`;
-    ///        2. a seated court can enforce a DISPUTED slash, since a disputed
-    ///           challenge currently times out in the accused's favour;
-    ///        3. third-party adapter submission actually exists, so the bond
-    ///           filters submitters rather than merely deterring the only
-    ///           participant with no revenue from the adapter it warrants.
-    ///      The deploy script never calls `setSubmitterBondWood`, so this stays
-    ///      `0` at launch — do not enable it without meeting the gate above.
-    uint256 public submitterBondWood;
-    uint256 public bondReleaseDelay = 14 days;
-    mapping(bytes32 configKey => SubmitterBond) internal _bonds;
-
-    /// @notice Sum of all bonds held (active + pending release), across every
-    ///         token a bond has ever been pulled in.
-    /// @dev    NOT `wood.balanceOf(address(this)) == totalBondedWood`: each bond
-    ///         carries its OWN pinned token, so once bonds under two tokens
-    ///         coexist this sum spans both balances. What holds per token `t` is
-    ///         `t.balanceOf(this) >= sum(amount for bonds where token == t)`. The
-    ///         scalar is used only as the `BondsOutstanding` existence gate in
-    ///         `setWood` — zero iff no bond, in any token, is currently held.
-    uint256 public totalBondedWood;
 
     constructor(address initialOwner) Ownable(initialOwner) {}
 
@@ -200,68 +148,13 @@ contract TierRegistry is Ownable2Step {
     );
     event TierDemoted(address indexed target, bytes4 indexed selector);
     event CounterpartyAllowedSet(address indexed counterparty, bool allowed);
-    event SubmitterBondLocked(
-        address indexed target, bytes4 indexed selector, address indexed submitter, uint256 amount
-    );
-    event SubmitterBondClaimed(
-        address indexed target, bytes4 indexed selector, address indexed submitter, uint256 amount
-    );
-    event SubmitterBondConfigSet(address wood, uint256 bondWood, uint256 releaseDelay);
-    event SubmitterBondReleaseStarted(
-        address indexed target, bytes4 indexed selector, address indexed submitter, uint64 releasableAt
-    );
 
     error InvalidTier();
     error BoundRequired();
     error NotAContract();
     error CodehashMatches();
     error NotCertified();
-    error BondNotReleasable();
-    error BondPendingRelease();
-    error BondActive();
-    error BondConfigUnset();
-    error ZeroAddressSubmitter();
-    error BondTooLarge();
-    error InvalidDelay();
-    error BondsOutstanding();
     error CodehashChanged();
-
-    /// @notice Set the WOOD token used for submitter bonds.
-    /// @dev    The bond token cannot change while ANY bond is held. This is
-    ///         defense-in-depth, not load-bearing for fund safety: every bond pins
-    ///         its OWN token at certify time and `claimSubmitterBond` pays out
-    ///         against that pinned field, so an already-locked bond can no longer
-    ///         be stranded, misdirected, or pointed at `address(0)` by a swap. The
-    ///         guard is kept because letting bonds accumulate under multiple live
-    ///         tokens is unmaintainable operationally. Drain all bonds before
-    ///         swapping; clearing the token to zero while the bond amount is still
-    ///         armed is also rejected.
-    function setWood(address wood_) external onlyOwner {
-        if (totalBondedWood != 0) revert BondsOutstanding();
-        if (wood_ == address(0) && submitterBondWood != 0) revert BondConfigUnset();
-        wood = IERC20(wood_);
-        emit SubmitterBondConfigSet(wood_, submitterBondWood, bondReleaseDelay);
-    }
-
-    /// @notice Set the submitter bond amount. Zero disables the bond requirement.
-    /// @dev    Bounded to uint96 so the narrowing cast into `SubmitterBond.amount`
-    ///         is provably lossless.
-    function setSubmitterBondWood(uint256 amount) external onlyOwner {
-        if (amount != 0 && address(wood) == address(0)) revert BondConfigUnset();
-        if (amount > type(uint96).max) revert BondTooLarge();
-        submitterBondWood = amount;
-        emit SubmitterBondConfigSet(address(wood), amount, bondReleaseDelay);
-    }
-
-    /// @notice Set the timelock delay between demotion and submitter bond claim.
-    /// @dev    Bounded to [MIN_BOND_RELEASE_DELAY, MAX_BOND_RELEASE_DELAY]. The
-    ///         floor prevents a mis-certifying submitter from exiting before
-    ///         the slash mechanism can act.
-    function setBondReleaseDelay(uint256 delay) external onlyOwner {
-        if (delay < MIN_BOND_RELEASE_DELAY || delay > MAX_BOND_RELEASE_DELAY) revert InvalidDelay();
-        bondReleaseDelay = delay;
-        emit SubmitterBondConfigSet(address(wood), submitterBondWood, delay);
-    }
 
     /// @notice Certify (target, selector) at tier 0/1 with its extractable bound.
     /// @dev `expectedCodehash` is the hash the owner reviewed off-chain: reading
@@ -311,8 +204,7 @@ contract TierRegistry is Ownable2Step {
     }
 
     /// @notice Demote (target, selector) back to the tier-2 default because a
-    ///         challenge against it passed. Reuses the same `_demote` path as
-    ///         owner demotion, so the bond release timelock starts identically.
+    ///         challenge against it passed.
     /// @dev    REQUIRES AN EXISTING CERTIFICATION, mirroring `poke`: `ChallengeGame.file`
     ///         only checks that the pair appears in the executed calldata, so an
     ///         uncertified selector must not be demotable for ~1% of coverage.
@@ -346,40 +238,7 @@ contract TierRegistry is Ownable2Step {
             _classTierDenied[k] = true;
             emit ClassMemberTierDenied(target, selector);
         }
-        SubmitterBond storage b = _bonds[k];
-        if (b.amount != 0 && b.releasableAt == 0) {
-            uint64 releasableAt = uint64(block.timestamp + bondReleaseDelay);
-            b.releasableAt = releasableAt;
-            emit SubmitterBondReleaseStarted(target, selector, b.submitter, releasableAt);
-        }
         emit TierDemoted(target, selector);
-    }
-
-    /// @notice Release a demoted bond to its submitter, `bondReleaseDelay` after
-    ///         demotion. PERMISSIONLESS: the payout address is fixed to the
-    ///         recorded submitter, so a caller gate would protect nothing —
-    ///         and it would let a lost-key submitter permanently retire a
-    ///         (target, selector) key, since `certify` blocks while any bond
-    ///         exists. The delay is the window the slash mechanism acts in.
-    function claimSubmitterBond(address target, bytes4 selector) external {
-        bytes32 k = key(target, selector);
-        SubmitterBond memory b = _bonds[k];
-        if (b.releasableAt == 0 || block.timestamp < b.releasableAt) revert BondNotReleasable();
-        delete _bonds[k];
-        totalBondedWood -= b.amount;
-        // Pays out in the token THIS bond was pulled in (`b.token`, audit
-        // been repointed by `setWood` any number of times since this bond was
-        // locked (see `SubmitterBond.token` natspec for why the live variable
-        // is unsafe here — cross-token drain / permanent stranding).
-        b.token.safeTransfer(b.submitter, b.amount);
-        emit SubmitterBondClaimed(target, selector, b.submitter, b.amount);
-    }
-
-    /// @notice Full bond record for (target, selector); `releasableAt` times
-    ///         the challenge window for callers that need it. Zeroed struct
-    ///         when no bond exists.
-    function bondOf(address target, bytes4 selector) external view returns (SubmitterBond memory) {
-        return _bonds[key(target, selector)];
     }
 
     // ── Adapter allowlist (spender/recipient gate for value-moving selectors) ──
@@ -451,11 +310,6 @@ contract TierRegistry is Ownable2Step {
     ///      for another.
     mapping(bytes32 cloneCodehash => uint64 epoch) private _classEpoch;
 
-    /// @dev `classKey(cloneCodehash, selector)` => the class epoch its bond was
-    ///      locked at. A bond behind an epoch the class has since left warrants
-    ///      an orphaned config and is releasable at once.
-    mapping(bytes32 classConfigKey => uint64 epoch) private _classBondEpoch;
-
     /// @notice The StrategyFactory whose clone provenance gates class
     ///         membership. Zero resolves no class at all.
     address public strategyFactory;
@@ -514,9 +368,6 @@ contract TierRegistry is Ownable2Step {
 
     error ClassNotCertified();
     error InvalidStrategyFactory();
-    /// @notice The certified template's live codehash no longer matches the
-    ///         snapshot taken at certification.
-    error TemplateCodehashChanged();
 
     event ClassCertified(
         address indexed template,
@@ -647,37 +498,8 @@ contract TierRegistry is Ownable2Step {
 
     function _demoteClass(address template, bytes4 selector) private {
         bytes32 cch = cloneCodehashOf(template);
-        bytes32 k = classKey(cch, selector);
         delete _classConfigs[_classCfgKey(cch, selector)];
-        SubmitterBond storage b = _bonds[k];
-        if (b.amount != 0 && b.releasableAt == 0) {
-            uint64 releasableAt = uint64(block.timestamp + bondReleaseDelay);
-            b.releasableAt = releasableAt;
-            emit SubmitterBondReleaseStarted(template, selector, b.submitter, releasableAt);
-        }
         emit ClassDemoted(template, selector, cch);
-    }
-
-    /// @notice Release a demoted or epoch-orphaned class bond to its submitter.
-    ///         Permissionless, same model as `claimSubmitterBond` on the
-    ///         address path.
-    function claimClassSubmitterBond(address template, bytes4 selector) external {
-        bytes32 cch = cloneCodehashOf(template);
-        bytes32 k = classKey(cch, selector);
-        SubmitterBond memory b = _bonds[k];
-        if (b.amount == 0) revert NotCertified();
-        bool orphaned = _classBondEpoch[k] != _classEpoch[cch];
-        if (!orphaned && (b.releasableAt == 0 || block.timestamp < b.releasableAt)) revert BondNotReleasable();
-        delete _bonds[k];
-        delete _classBondEpoch[k];
-        totalBondedWood -= b.amount;
-        b.token.safeTransfer(b.submitter, b.amount);
-        emit SubmitterBondClaimed(template, selector, b.submitter, b.amount);
-    }
-
-    /// @notice Bond record for a (class, selector); zeroed when none.
-    function classBondOf(address template, bytes4 selector) external view returns (SubmitterBond memory) {
-        return _bonds[classKey(cloneCodehashOf(template), selector)];
     }
 
     // ── TOKEN ↔ PRICE-SOURCE ATTESTATION ──
