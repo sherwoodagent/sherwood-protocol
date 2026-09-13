@@ -16,11 +16,11 @@ The registry SHALL recognize exactly three tiers. Tier 0 (closed-loop) and tier 
 - **THEN** it returns the certified `(tier, extractableBoundBps)`
 
 ### Requirement: Config keying
-Tier configuration SHALL be keyed by `keccak256(abi.encodePacked(target, selector))`, exposed as the pure function `key(address target, bytes4 selector)`. Certification, bonds, and demotion all operate on this key.
+Tier configuration SHALL be keyed by `keccak256(abi.encodePacked(target, selector))`, exposed as the pure function `key(address target, bytes4 selector)`. Certification and demotion both operate on this key.
 
 #### Scenario: Same target, different selectors are independent
 - **WHEN** two selectors on the same target are certified separately
-- **THEN** each `(target, selector)` pair carries its own tier config and its own bond; demoting one does not affect the other
+- **THEN** each `(target, selector)` pair carries its own tier config; demoting one does not affect the other
 
 ### Requirement: Lazy fail-safe demotion on codehash mismatch
 `tierOf` SHALL verify the target's live `EXTCODEHASH` against the codehash snapshotted at certification on every read, and SHALL report `(2, 10_000)` on mismatch without writing state. This catches same-address bytecode mutation (metamorphic CREATE2 + SELFDESTRUCT redeploys) on the first post-mutation read. It does NOT catch proxy implementation swaps — an EIP-1967/UUPS/transparent/beacon proxy's runtime bytecode is static across upgrades — so governance SHALL NOT certify proxied adapters at tier 0/1; proxies stay at the tier-2 default.
@@ -34,18 +34,20 @@ Tier configuration SHALL be keyed by `keccak256(abi.encodePacked(target, selecto
 - **THEN** `tierOf` keeps returning the certified tier (the proxy's codehash is unchanged) — which is why certification of proxied targets is a governance prohibition, not a code check
 
 ### Requirement: Permissionless persistence of a lazy demotion
-`poke(target, selector)` SHALL be callable by anyone. It SHALL revert `NotCertified` when no certification exists and `CodehashMatches` when the live codehash still matches; otherwise it SHALL persist the demotion (delete the config, start the bond release timelock, emit `TierDemoted`) so indexers observe what `tierOf` already reports.
+`poke(target, selector)` SHALL be callable by anyone. It SHALL revert `NotCertified` when no certification exists and `CodehashMatches` when the live codehash still matches; otherwise it SHALL persist the demotion (delete the config, emit `TierDemoted`) so indexers observe what `tierOf` already reports.
 
 #### Scenario: Anyone persists a codehash-mismatch demotion
 - **WHEN** any caller invokes `poke` on a certified pair whose target codehash no longer matches
-- **THEN** the config is deleted, `TierDemoted` is emitted, and any active bond enters its release timelock
+- **THEN** the config is deleted and `TierDemoted` is emitted
 
 #### Scenario: Poke on a healthy certification reverts
 - **WHEN** `poke` is called while the live codehash matches the certified hash
 - **THEN** the call reverts `CodehashMatches` and the certification is untouched
 
 ### Requirement: Certification is owner-only with strict input guards
-`certify(target, selector, tier, extractableBoundBps, submitter)` SHALL be owner-only and SHALL revert: `InvalidTier` when `tier >= 2`; `BoundRequired` when `extractableBoundBps` is `0` or `>= 10_000`; `NotAContract` when the target's codehash is `bytes32(0)` or `keccak256("")` (a funded EOA hashes to the latter — both are rejected). On success it SHALL snapshot the target's `EXTCODEHASH` into the config and emit `TierCertified`.
+`certify(target, selector, tier, extractableBoundBps, expectedCodehash)` SHALL be owner-only, SHALL take effect in the same transaction, and SHALL revert: `InvalidTier` when `tier >= 2`; `BoundRequired` when `extractableBoundBps` is `0` or `>= 10_000`; `NotAContract` when the target's codehash is `bytes32(0)` or `keccak256("")` (a funded EOA hashes to the latter — both are rejected); `CodehashChanged` when the target's live `EXTCODEHASH` differs from `expectedCodehash`. On success it SHALL pin that codehash into the config and emit `TierCertified`.
+
+`expectedCodehash` is the hash the owner reviewed off-chain. Reading the live codehash without comparing it would let the target's deployer land different bytecode between review and inclusion and have the registry pin a hash nobody reviewed.
 
 #### Scenario: EOA target rejected
 - **WHEN** the owner certifies an address with no deployed code (including a funded EOA)
@@ -55,44 +57,16 @@ Tier configuration SHALL be keyed by `keccak256(abi.encodePacked(target, selecto
 - **WHEN** the owner certifies with `extractableBoundBps = 10_000`
 - **THEN** the call reverts `BoundRequired` — a full-notional "bound" is tier-2 economics and must not wear a tier-0/1 label
 
-### Requirement: Submitter bond pulled at certification when configured
-When `submitterBondWood` is non-zero, `certify` SHALL revert `ZeroAddressSubmitter` for `submitter == address(0)`, record a `SubmitterBond{submitter, amount, releasableAt: 0}` for the key, add the amount to `totalBondedWood`, pull `submitterBondWood` WOOD from the submitter via `safeTransferFrom`, and emit `SubmitterBondLocked`. When `submitterBondWood` is zero, certification SHALL proceed with no bond (the Plan A no-bond passthrough for the governance-assigned initial adapter set).
+#### Scenario: Code that drifted since review is rejected
+- **WHEN** the owner certifies a target whose live codehash no longer equals the reviewed `expectedCodehash`
+- **THEN** the call reverts `CodehashChanged` and nothing is written
 
-#### Scenario: Bonded certification locks WOOD
-- **WHEN** `submitterBondWood` is non-zero and the owner certifies with a submitter that has approved the registry
-- **THEN** the bond transfers into the registry, `totalBondedWood` increases by the bond amount, and `SubmitterBondLocked` is emitted
-
-#### Scenario: Zero-config bond skips the pull
-- **WHEN** `submitterBondWood` is 0
-- **THEN** `certify` records the tier config without touching WOOD or the bonds mapping
-
-### Requirement: A key with any existing bond cannot be re-certified
-`certify` SHALL revert while ANY bond exists for the key: `BondActive` when the bond is held under a live certification (`releasableAt == 0`), `BondPendingRelease` when a demoted bond is in its release timelock. Replacing a bonded certification requires demote → release timelock → claim → fresh certify; during that whole window the key reads as tier 2. This applies to benign edits too (correcting a bound typo, re-certifying after a legitimate adapter upgrade) — deliberate, so no path ever swaps a certification out from under a live bond or strands a submitter's WOOD.
-
-#### Scenario: Re-certify over an active bond refused
-- **WHEN** the owner calls `certify` on a key whose bond is still held under a live certification
-- **THEN** the call reverts `BondActive`
-
-#### Scenario: Re-certify during the release timelock refused
-- **WHEN** the owner calls `certify` on a demoted key whose bond has not yet been claimed
-- **THEN** the call reverts `BondPendingRelease`
-
-### Requirement: Bond configuration setters and their guards
-The owner SHALL configure the bond system through three setters, each emitting `SubmitterBondConfigSet`:
-- `setWood(wood_)` SHALL revert `BondsOutstanding` while `totalBondedWood != 0` (outstanding bonds are denominated in the old token; a swap would strand them), and SHALL revert `BondConfigUnset` when clearing the token to `address(0)` while `submitterBondWood` is still non-zero.
-- `setSubmitterBondWood(amount)` SHALL revert `BondConfigUnset` when setting a non-zero amount while no WOOD token is set, and `BondTooLarge` above `type(uint96).max` (making the `uint96` narrowing in `certify` provably lossless). Zero disables the bond requirement.
-- `setBondReleaseDelay(delay)` SHALL revert `InvalidDelay` outside `[MIN_BOND_RELEASE_DELAY = 1 days, MAX_BOND_RELEASE_DELAY = 365 days]`. The floor preserves the guard-bypass slash window (a demoted bond must stay claimable-not-yet-claimed long enough for the slash machinery to act); the ceiling bounds governance error. The default delay is 14 days.
-
-#### Scenario: Token swap with bonds outstanding refused
-- **WHEN** the owner calls `setWood` while any bond (active or pending release) is held
-- **THEN** the call reverts `BondsOutstanding`; the operator must drain all bonds (demote → timelock → claim) first
-
-#### Scenario: Delay outside bounds refused
-- **WHEN** the owner sets a bond release delay below 1 day or above 365 days
-- **THEN** the call reverts `InvalidDelay`
+#### Scenario: Re-certification is a plain overwrite
+- **WHEN** the owner certifies a key that is already certified
+- **THEN** the new tier, bound and pinned codehash replace the old ones in the same transaction — correcting a bound or re-attesting an upgraded adapter needs no demotion first
 
 ### Requirement: Three demotion paths converging on one effect
-Demotion SHALL delete the tier config (the key reverts to the tier-2 default), start the bond release timelock exactly once (`releasableAt = block.timestamp + bondReleaseDelay`, emitting `SubmitterBondReleaseStarted`, only if a bond exists and is not already releasing), delete the target's adapter-allowlist entry (emitting `AdapterAllowedSet(target, false)` if and only if the entry was set), and emit `TierDemoted`. Three callers reach it:
+Demotion SHALL delete the tier config (the key reverts to the tier-2 default), delete the target's adapter-allowlist entry (emitting `AdapterAllowedSet(target, false)` if and only if the entry was set), and emit `TierDemoted`. Three callers reach it:
 - `demote(target, selector)` — owner-only revocation.
 - `demoteByChallenge(target, selector)` — callable only by `authorizedDemoter` (reverts `NotAuthorizedDemoter` otherwise); the ChallengeGame's role, so the game can revoke a certification but never grant one.
 - `poke` — permissionless, gated on codehash mismatch (above).
@@ -101,15 +75,11 @@ The allowlist clear is DELIBERATELY over-broad: certification is keyed `(target,
 
 #### Scenario: Challenge-game demotion
 - **WHEN** the address set as `authorizedDemoter` calls `demoteByChallenge` on a certified pair
-- **THEN** the config is deleted, the bond release timelock starts, the adapter's allowlist entry is cleared, and `TierDemoted` is emitted
+- **THEN** the config is deleted, the adapter's allowlist entry is cleared, and `TierDemoted` is emitted
 
 #### Scenario: Unauthorized demoteByChallenge refused
 - **WHEN** any other address calls `demoteByChallenge`
 - **THEN** the call reverts `NotAuthorizedDemoter`
-
-#### Scenario: Double demotion does not restart the timelock
-- **WHEN** a key whose bond is already pending release is demoted again (e.g. owner `demote` after a challenge demotion)
-- **THEN** `releasableAt` is unchanged — the timelock starts once
 
 #### Scenario: Every demotion path clears the FUNDS axis and leaves the CALLEE axis
 - **WHEN** an allowlisted adapter is demoted via owner `demote`, via `demoteByChallenge`, or via permissionless `poke` after a codehash change
@@ -174,31 +144,6 @@ SCOPE, stated so it is not over-read: the callee axis confers no right to receiv
 - **WHEN** the demoter role is cleared to zero while a challenge is live
 - **THEN** the challenge still settles (the game's demotion attempt fails best-effort) and the owner can apply the lost demotion via `demote`
 
-### Requirement: Permissionless bond claim after the release timelock
-`claimSubmitterBond(target, selector)` SHALL be callable by anyone, SHALL revert `BondNotReleasable` while `releasableAt` is zero or in the future, and on success SHALL delete the bond, decrement `totalBondedWood`, and transfer the bond amount to the RECORDED submitter (never the caller). Permissionless because the payout address is fixed — a caller gate would protect nothing and would let a lost-key submitter permanently retire a key (since `certify` blocks while any bond exists). `SubmitterBondClaimed` is emitted.
-
-#### Scenario: Claim before the timelock elapses refused
-- **WHEN** `claimSubmitterBond` is called before `releasableAt`
-- **THEN** the call reverts `BondNotReleasable`
-
-#### Scenario: Third-party claim pays the submitter
-- **WHEN** an unrelated address claims a releasable bond
-- **THEN** the WOOD transfers to the recorded submitter and the key becomes certifiable again
-
-### Requirement: Bond introspection
-`bondOf(target, selector)` SHALL return the full `SubmitterBond` record (submitter, amount, releasableAt) — a zeroed struct when no bond exists. The slash contract and UIs need `releasableAt` to time the challenge window.
-
-#### Scenario: Reading a pending-release bond
-- **WHEN** `bondOf` is called on a demoted key
-- **THEN** the returned struct carries the recorded submitter, the bonded amount, and the non-zero `releasableAt`
-
-### Requirement: Registry WOOD balance invariant
-The registry SHALL maintain `wood.balanceOf(address(this)) == totalBondedWood` — every WOOD in the registry is an accounted bond (active or pending release), and every accounted bond is backed.
-
-#### Scenario: Invariant across the bond lifecycle
-- **WHEN** bonds are locked at certify, demoted, and claimed
-- **THEN** at every step the registry's WOOD balance equals `totalBondedWood`
-
 ### Requirement: Adapter allowlist is a separate axis from tiers
 The registry SHALL maintain an owner-managed allowlist of adapter addresses (`setAdapterAllowed(adapter, allowed)`, emitting `AdapterAllowedSet`; read via `isAdapterAllowed(adapter)`). Tiers PRICE extractable value for coverage; the allowlist bounds WHERE vault funds may be approved or sent at all — it gates the spender/recipient of value-moving ERC20 calls (approve / increaseAllowance / transfer / transferFrom-out) inside governor batches (consumed by `SyndicateVault._guardBatchCalls`).
 
@@ -206,7 +151,7 @@ THE ALLOWLIST SHALL BE CODEHASH-BOUND. `setAdapterAllowed(adapter, true)` SHALL 
 
 `isAdapterAllowed(adapter)` SHALL remain a `view` and SHALL return `true` only when the allowlist flag is set AND the adapter's live effective codehash equals the grant-time snapshot — a lazy, read-side self-heal mirroring `tierOf`: no state write in the hot path, nothing to grief, and no dependence on `poke` ever being called. The adversary: an allowlisted adapter whose bytecode is swapped at the same address (metamorphic CREATE2 + SELFDESTRUCT redeploy), or a codeless allowlisted address at which code later appears (counterfactual CREATE2), otherwise retains standing permission to appear as spender/recipient of vault-fund movements in governor batches until someone happens to persist a demotion — and for an allowlisted-but-uncertified adapter `poke` reverts `NotCertified`, so no permissionless persistence path exists at all; the read-side check is the ONLY automatic protection there. The codehash binding does NOT cover proxy implementation swaps (a proxy's runtime bytecode is static across upgrades) — allowlisting proxied adapters carries the same governance-discipline caveat as certifying them.
 
-The coupling between the two axes SHALL be exactly one-way and fail-closed: demotion clears the allowlist entry (see "Three demotion paths converging on one effect"), but NO certification action ever sets or restores it. In particular, re-certifying a previously demoted (target, selector) SHALL NOT re-allowlist the target — `certify` would otherwise silently re-grant a payment permission as a side effect of a pricing action, and the adversary is a submitter who gets a certification through and thereby re-opens the funds path without the owner ever deciding to. Restoring the allowlist after a demotion is always an explicit owner `setAdapterAllowed(adapter, true)` call. The grant-time codehash snapshot SHALL likewise remain dedicated to the allowlist axis: certification-path changes (e.g. a future `certify` timelock) MUST NOT repurpose it for their own audit trails — certification tier and transfer permission are structurally different axes with different keying and lifecycles.
+The coupling between the two axes SHALL be exactly one-way and fail-closed: demotion clears the allowlist entry (see "Three demotion paths converging on one effect"), but NO certification action ever sets or restores it. In particular, re-certifying a previously demoted (target, selector) SHALL NOT re-allowlist the target — `certify` would otherwise silently re-grant a payment permission as a side effect of a pricing action, and the adversary is a submitter who gets a certification through and thereby re-opens the funds path without the owner ever deciding to. Restoring the allowlist after a demotion is always an explicit owner `setAdapterAllowed(adapter, true)` call. The grant-time codehash snapshot SHALL likewise remain dedicated to the allowlist axis: certification-path changes MUST NOT repurpose it for their own audit trails — certification tier and transfer permission are structurally different axes with different keying and lifecycles.
 
 #### Scenario: Disallowed adapter as ERC20 spender
 - **WHEN** a governor batch contains an ERC20 approval whose spender is not on the allowlist

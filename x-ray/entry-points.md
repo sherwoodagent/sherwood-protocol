@@ -22,7 +22,7 @@ Counts come from the grep-verified signature scan over `src/` (interfaces and mo
 `ChallengeGame` (constructor) → `setExposureLedger()` → `setStakedWood()` → `setCourt()` ◄── window-fit invariant checked from both sides
 `TokenCourt` (constructor) → `setChallengeGame()` → `setStakedWood()` ◄── participationFloorBps < ageFloorBps
 
-`TierRegistry.setWood()` → `setSubmitterBondWood()` → `setAuthorizedDemoter(challengeGame)` → `setAdapterAllowed(adapter)`
+`TierRegistry.setAuthorizedDemoter(challengeGame)` → `setAdapterAllowed(adapter)`
 
 ### Vault Creation (Owner)
 
@@ -271,18 +271,6 @@ Entry points callable by any address with no effective access restriction. Sorte
 | Value flow | Tokens: ChallengeGame → contributor |
 | Reentrancy guard | no (CEI-ordered) |
 
-### `TierRegistry.claimSubmitterBond()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external |
-| Caller | Anyone (payout fixed to the recorded `b.submitter`) |
-| Parameters | `target`, `selector` (protocol-derived) |
-| Call chain | `→ IERC20.safeTransfer()` |
-| State modified | `_bonds[k]` deleted, `totalBondedWood` |
-| Value flow | Tokens: TierRegistry → submitter |
-| Reentrancy guard | no (CEI-ordered) |
-
 ### `StakedWood.claimUnstakeGuardian()`
 
 | Aspect | Detail |
@@ -463,16 +451,16 @@ Entry points callable by any address with no effective access restriction. Sorte
 | Value flow | Tokens: ChallengeGame → challenger + burn address; Escrow → challenger + burn |
 | Reentrancy guard | no (CEI-ordered) |
 
-### `TierRegistry.certify()` / `poke()`
+### `TierRegistry.poke()`
 
 | Aspect | Detail |
 |--------|--------|
 | Visibility | external |
-| Caller | `certify`: the pending submitter when a bond is pinned, **anyone** when `bondAmount == 0`. `poke`: anyone. |
+| Caller | Anyone (the codehash mismatch is the whole precondition) |
 | Parameters | `target`, `selector` (protocol-derived) |
-| Call chain | `certify → IERC20.safeTransferFrom()`; `poke` makes no external calls (EXTCODEHASH is an opcode, not a call) |
-| State modified | `certify`: `_pending[k]` deleted, `_bonds[k]`, `totalBondedWood`, `_configs[k]`. `poke`: `_configs[k]` deleted, `_pending[k]` deleted, `b.releasableAt`, `_adapterAllowed[target]` deleted |
-| Value flow | `certify`: submitter → TierRegistry |
+| Call chain | none (EXTCODEHASH is an opcode, not a call) |
+| State modified | `_configs[k]` deleted, `_classTierDenied[k]` set |
+| Value flow | none — the registry custodies no tokens |
 | Reentrancy guard | no |
 
 ### `WoodTwapOracle.update()`
@@ -608,7 +596,7 @@ Owner-restricted configuration surfaces. These configure the protocol rather tha
 | ChallengeGame | `setCourt`, `setExposureLedger`, `setTierRegistry`, `setChallengeWindow`, `setChallengerBondBps`, `setForfeitBurnBps`, `setStakedWood`, `setAutoSlashDelay`, `setDisputeTimeout`, `setSettleBurnBps`, `setProsecutorFeeBps`, `setInconclusiveBurnBps`, `setFilingsPaused` | 13 | none (`renounceOwnership` disabled) |
 | ExposureLedger | `setWoodUsdPrice`, `setWoodFeed`, `setWoodTwapOracle`, `setWoodHaircutBps`, `setGuardianRegistry`, `setChallengeWindow`, `setCoverageFreezer`, `setKNumerator`, `setCoveredTvlCapUsd`, `setQuorumTierThreshold`, `setProposerBondBps`, `setAssetFeed` | 12 | none |
 | StakedWood | `setRegistry`, `setMinGuardianStake`, `setCooldownPeriod`, `setMinOwnerStake`, `setMinSlashBps`, `setMaxSlashBps`, `setAgeFloorBps`, `setMaturationPeriod`, `setExposureLedger`, `setAuthorizedSlasher`, `_authorizeUpgrade` | 11 | none |
-| TierRegistry | `setWood`, `setSubmitterBondWood`, `setBondReleaseDelay`, `proposeCertification`, `cancelCertification`, `setCertifyDelay`, `setAuthorizedDemoter`, `demote`, `setAdapterAllowed` | 9 | `proposeCertification` → `certifyDelay` (1–30 d) → `certify`; every other setter instant |
+| TierRegistry | `certify`, `setAuthorizedDemoter`, `demote`, `setAdapterAllowed` | 4 | none |
 | GuardianRegistry | `fundSlashAppealReserve`, `refundSlash`, `pause`, `setReviewPeriod`, `setBlockQuorumBps`, `setExposureLedger`, `_authorizeUpgrade` | 7 | none |
 | ProtocolConfig | `setMgmtSplit`, `setPerfSplit`, `setMaxStrategyDuration`, `setProtocolFeeRecipient`, `setGuardiansFeeRecipient` | 5 | none (Ownable2Step) |
 | TokenCourt | `setChallengeGame`, `setStakedWood`, `setVoteWindow`, `setParticipationFloorBps` | 4 | none (`renounceOwnership` reverts) |

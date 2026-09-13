@@ -287,31 +287,9 @@ contract DeploySherwood is ScriptBase {
         // Wire the set-once registry reference on sWOOD.
         StakedWood(d.swoodProxy).setRegistry(d.registryProxy);
 
-        // Adapter-selector tier registry (spec §3.2). Owned by the deployer at
-        // birth so `demote`/`poke` and the launch-set announcement can run
-        // before the multisig handoff; passed into the factory's `InitParams`
-        // below so every governor `createSyndicate` stamps out picks it up via
-        // the factory-only `setTierRegistry`. A plain Ownable2Step contract —
-        // no proxy needed (certifications are re-issuable, not upgrade-state).
-        //
-        // Deployed BEFORE the factory: mandatory `InitParams` field since pashov
-        // finding #1. Free of ordering cost — the factory proxy is CREATE3, so
-        // an extra nonce ahead of it does not move `predictedFactoryProxy`.
-        //
-        // Granting is two-step (issue #45): `proposeCertification` is
-        // owner-only and now takes the reviewed codehash as
-        // `expectedCodehash` (PR #156 audit remediation, finding #6) so the
-        // pinned snapshot matches what was actually reviewed off-chain, not
-        // whatever is live when the transaction happens to mine. `certify`
-        // is permissionless once `certifyDelay` has elapsed. RUNBOOK for the launch adapter
-        // set: propose the whole set HERE, while the deployer still owns the
-        // registry (this call is not in this function — see the deploy
-        // runbook), hand off ownership to the multisig immediately after
-        // (below), and let anyone (deployer, multisig, a bot) execute each
-        // certification once its delay has passed and before
-        // `MAX_CERTIFY_WINDOW` (finding #5) lapses. Announcement and
-        // ownership handoff overlap instead of serializing; demotion
-        // (`demote`/`poke`) stays instant throughout.
+        // Owned by the deployer at birth so the launch certification set and any
+        // `demote` can run before the multisig handoff; passed into the factory's
+        // `InitParams` so every `createSyndicate` stamps it out.
         d.tierRegistry = address(new TierRegistry(d.deployer));
 
         address factoryImpl = c3.deploy(SALT_FACTORY_IMPL, abi.encodePacked(type(SyndicateFactory).creationCode));

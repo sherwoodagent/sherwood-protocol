@@ -158,18 +158,6 @@ Each block is classified into one of five **categories** by shape: `Conservation
 
 ---
 
-#### I-2
-
-`Conservation` · On-chain: **Yes**
-
-> `totalBondedWood == Σ _bonds[k].amount` over all live submitter bonds, and the bond token cannot change while any bond is outstanding.
-
-**Derivation** — Δ-pair: `TierRegistry.certify` `Δ(totalBondedWood) = +p.bondAmount` ↔ `Δ(_bonds[k]) = SubmitterBond{...}`; `claimSubmitterBond:711-712` `Δ(_bonds[k]) = delete` ↔ `Δ(totalBondedWood) = -b.amount`. These are the only two write sites of `totalBondedWood`. Token-swap guard-lift: `setWood:333` `if (totalBondedWood != 0) revert BondsOutstanding();` — the sole writer of `wood`.
-
-**If violated** — a submitter's bond becomes unclaimable, or the registry pays a bond in a token it no longer holds.
-
----
-
 #### I-3
 
 `Conservation` · On-chain: **Yes**
@@ -604,13 +592,13 @@ Each block is classified into one of five **categories** by shape: `Conservation
 
 #### I-39
 
-`Temporal` · On-chain: **Yes**
+`StateMachine` · On-chain: **Yes**
 
-> `certifyDelay ∈ [1 day, 30 days]`, `bondReleaseDelay ∈ [1 day, 365 days]`, and a certification must be executed inside `[readyAt, readyAt + MAX_CERTIFY_WINDOW]` against an unchanged codehash.
+> A certification is only ever written against the codehash the owner reviewed, and only stays priced while the target's live code still hashes to it.
 
-**Derivation** — guard-lift plus temporal: `TierRegistry.setCertifyDelay:573` and `setBondReleaseDelay:355` are the sole writers of their fields; `certify:505-508` enforces `readyAt != 0`, `block.timestamp >= readyAt`, `block.timestamp <= readyAt + MAX_CERTIFY_WINDOW`, and `target.codehash == p.codehash`.
+**Derivation** — guard-lift: `TierRegistry.certify` is the sole writer of `_configs[k]` and reverts `CodehashChanged` unless `target.codehash == expectedCodehash`, which it then pins into the config; `tierOf` re-reads `target.codehash` and falls back to `(TIER_ARBITRARY, FULL_NOTIONAL_BPS)` on any mismatch, and `poke` lets anyone delete the stale entry outright.
 
-**If violated** — a compromised registry owner could reprice extractable value instantly, or execute a stale certification against redeployed code.
+**If violated** — a certification could price code that no reviewer ever saw, either at write time or after a redeploy at the same address.
 
 ---
 

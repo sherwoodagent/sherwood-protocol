@@ -98,20 +98,6 @@ contract TierRegistry is Ownable2Step {
         return keccak256(abi.encodePacked(hex"363d3d373d3d3d363d73", template, hex"5af43d82803e903d91602b57fd5bf3"));
     }
 
-    /// @notice Config key for a code class. Distinct namespace from `key`.
-    /// @dev    Class entries live in their own mapping (`_classConfigs`), so
-    ///         aliasing between the two keying modes is structurally impossible
-    ///         rather than merely improbable — an address entry cannot be
-    ///         written or demoted through a class entry point, or vice versa
-    ///         (tier-policy: "Address and class keys never collide"). The
-    ///         preimages also differ in length (24 vs 36 bytes), so even a
-    ///         shared mapping could not be made to collide through
-    ///         `encodePacked` ambiguity; the separate mapping is belt and
-    ///         braces on a security boundary.
-    function classKey(bytes32 cloneCodehash, bytes4 selector) public pure returns (bytes32) {
-        return keccak256(abi.encodePacked(cloneCodehash, selector));
-    }
-
     /// @notice Effective tier for (target, selector). Uncertified, demoted, or
     ///         codehash-mismatched entries all report (2, 10_000).
     /// @dev Lookup order is address entry, then per-address DENIAL, then code

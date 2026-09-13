@@ -127,20 +127,6 @@ contract TierRegistryClassCertificationTest is Test {
         assertTrue(registry.cloneCodehashOf(never) != bytes32(0), "derivation is defined for any address");
     }
 
-    // ── Namespace isolation (task 5.8, key-derivation half) ──
-
-    /// @notice Address keys and class keys must not alias. Their preimages
-    ///         differ in length (24 vs 36 bytes), and the entries live in
-    ///         separate mappings, so neither can be reached through the other.
-    function test_classKey_doesNotAliasAddressKey() public view {
-        bytes4 sel = bytes4(keccak256("execute()"));
-        bytes32 clazz = registry.cloneCodehashOf(address(template));
-        assertTrue(
-            registry.classKey(clazz, sel) != registry.key(address(template), sel),
-            "class and address keys occupy distinct namespaces"
-        );
-    }
-
     // ── Certification helpers ──
 
     bytes4 constant SEL = bytes4(keccak256("execute()"));

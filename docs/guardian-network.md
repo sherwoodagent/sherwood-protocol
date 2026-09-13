@@ -219,15 +219,9 @@ Two independent axes:
    `isAdapterAllowed` — which checks both the flag *and* that the live codehash
    still equals the one snapshotted at grant time. Code changes self-revoke lazily.
 
-| Parameter | Default | Min | Max |
-|---|---|---|---|
-| `certifyDelay` (propose → certify) | 3 d | 1 d | 30 d |
-| certify window after ready | 14 d fixed | — | — |
-| `bondReleaseDelay` (submitter bond) | 14 d | 1 d | 365 d |
-| `submitterBondWood` | 0 (launch gate) | 0 | uint96 max |
-
-Certification is two-step (owner proposes, anyone executes after the delay if the
-codehash still matches). Revocation is instant: owner `demote`, challenge-driven
+Certification is a single owner call: `certify` pins the reviewed codehash and
+takes effect in the same transaction. Revocation is instant: owner `demote`,
+challenge-driven
 `demoteByChallenge`, or permissionless `poke` on codehash mismatch — and demoting
 any one selector clears the **whole adapter's** allowlist entry.
 
