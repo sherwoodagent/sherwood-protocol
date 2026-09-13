@@ -32,63 +32,7 @@ abstract contract ChallengeGameHandler is Properties {
         game.setProsecutorFeeBps(clampBetween(bps, 0, game.MAX_PROSECUTOR_FEE_BPS()));
     }
 
-    /// @dev What a contribution can still buy for this challenge. The pool is
-    ///      keyed per PROPOSAL, so the headroom is the pool's own target/raised
-    ///      until it completes; after that the pool answers only what it was
-    ///      raised against, and a `Filed` challenge it does not answer buys its
-    ///      own defence up to the same target.
-    function _counterBondHeadroom(uint256 challengeId) internal view returns (uint256) {
-        (, uint256 target, uint256 raised, uint256 completedAt,) = game.counterBondPoolOf(challengeId);
-        if (completedAt != 0) {
-            IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
-            if (c.status != IChallengeGame.Status.Filed) return 0;
-            raised = c.defenceWeight;
-        }
-        return target > raised ? target - raised : 0;
-    }
-
     // ――――――――――――――――――――――――― Clamped ――――――――――――――――――――――――――
-
-    /// @dev `challengeId` is 1-indexed and `challengeCount` is the high-water
-    ///      mark. Clamping into `[1, count]` is what makes these reach a real
-    ///      challenge instead of bouncing off `WrongStatus`.
-    function challengeGame_claimContribution_clamped(uint256 challengeId) public {
-        uint256 count = game.challengeCount();
-        if (count == 0) return;
-        challengeId = clampBetween(challengeId, 1, count);
-        challengeGame_claimContribution(challengeId);
-    }
-
-    function challengeGame_dispute_clamped(uint256 challengeId, uint256 amountWood) public {
-        uint256 count = game.challengeCount();
-        if (count == 0) return;
-        challengeId = clampBetween(challengeId, 1, count);
-
-        // Bound by what the actor holds AND by what the pool still needs: an
-        // over-target contribution is refused, and a balance-exceeding one
-        // reverts in the transfer rather than in the game.
-        uint256 bal = wood.balanceOf(actor);
-        if (bal == 0) return;
-        uint256 remaining = _counterBondHeadroom(challengeId);
-        if (remaining == 0) return;
-        amountWood = clampBetween(amountWood, 1, remaining < bal ? remaining : bal);
-
-        challengeGame_dispute(challengeId, amountWood);
-    }
-
-    /// @dev The pool-completing contribution is the transition that flips
-    ///      `Filed → Disputed` (I-38). Under the generic clamp above the fuzzer
-    ///      would rarely land on it exactly.
-    function challengeGame_dispute_completePool(uint256 challengeId) public {
-        uint256 count = game.challengeCount();
-        if (count == 0) return;
-        challengeId = clampBetween(challengeId, 1, count);
-
-        uint256 remaining = _counterBondHeadroom(challengeId);
-        if (remaining == 0 || wood.balanceOf(actor) < remaining) return;
-
-        challengeGame_dispute(challengeId, remaining);
-    }
 
     function challengeGame_file_clamped(uint256 proposalId, uint8 predicate, string memory evidenceURI) public {
         uint256 count = governor.proposalCount();
@@ -111,24 +55,16 @@ abstract contract ChallengeGameHandler is Properties {
     ///      parameter space rather than on `InvalidParameter` reverts — the
     ///      point is to perturb E-4's economics, not to re-test the bounds.
     function challengeGame_secondary(uint8 selector, uint256 arg0) public {
-        selector = uint8(selector % 8);
+        selector = uint8(selector % 6);
         if (selector == 0) {
-            _challengeGame_setAutoSlashDelay(
-                clampBetween(arg0, 1 hours, game.disputeTimeout() - game.MIN_SETTLE_WINDOW())
-            );
+            _challengeGame_setVoteWindow(clampBetween(arg0, game.MIN_VOTE_WINDOW(), 90 days));
         } else if (selector == 1) {
             _challengeGame_setChallengerBondBps(clampBetween(arg0, 1, 10_000));
         } else if (selector == 2) {
-            _challengeGame_setDisputeTimeout(
-                clampBetween(arg0, game.autoSlashDelay() + game.MIN_SETTLE_WINDOW(), 90 days)
-            );
-        } else if (selector == 3) {
             _challengeGame_setFilingsPaused(arg0 % 2 == 0);
-        } else if (selector == 4) {
+        } else if (selector == 3) {
             _challengeGame_setForfeitBurnBps(clampBetween(arg0, 0, 10_000));
-        } else if (selector == 5) {
-            _challengeGame_setInconclusiveBurnBps(clampBetween(arg0, 0, 10_000));
-        } else if (selector == 6) {
+        } else if (selector == 4) {
             _challengeGame_setProsecutorFeeBps(clampBetween(arg0, 0, 2_000));
         } else {
             _challengeGame_setSettleBurnBps(clampBetween(arg0, 0, 10_000));
@@ -185,7 +121,7 @@ abstract contract ChallengeGameHandler is Properties {
 
         // The clock this challenge received, not the live parameter: the
         // secondary dispatcher can move the latter after filing.
-        skipTime(game.challengeOf(challengeId).autoSlashDelayAtFiling + 1);
+        skipTime(game.challengeOf(challengeId).voteWindowAtFiling + 1);
         try game.resolve(challengeId) {} catch {}
     }
 
@@ -316,14 +252,6 @@ abstract contract ChallengeGameHandler is Properties {
 
     // ―――――――――――――――――――――――― Unclamped ―――――――――――――――――――――――――
 
-    function challengeGame_claimContribution(uint256 challengeId) public asActor {
-        game.claimContribution(challengeId);
-    }
-
-    function challengeGame_dispute(uint256 challengeId, uint256 amountWood) public asActor {
-        game.dispute(challengeId, amountWood);
-    }
-
     function challengeGame_file(
         address governor_,
         uint256 proposalId,
@@ -343,16 +271,12 @@ abstract contract ChallengeGameHandler is Properties {
 
     // ── Secondary (owner-gated; dispatcher-only entry) ──
 
-    function _challengeGame_setAutoSlashDelay(uint256 newDelay) internal asAdmin {
-        game.setAutoSlashDelay(newDelay);
+    function _challengeGame_setVoteWindow(uint256 newWindow) internal asAdmin {
+        game.setVoteWindow(newWindow);
     }
 
     function _challengeGame_setChallengerBondBps(uint256 newBps) internal asAdmin {
         game.setChallengerBondBps(newBps);
-    }
-
-    function _challengeGame_setDisputeTimeout(uint256 newTimeout) internal asAdmin {
-        game.setDisputeTimeout(newTimeout);
     }
 
     function _challengeGame_setFilingsPaused(bool paused) internal asAdmin {
@@ -361,10 +285,6 @@ abstract contract ChallengeGameHandler is Properties {
 
     function _challengeGame_setForfeitBurnBps(uint256 newBps) internal asAdmin {
         game.setForfeitBurnBps(newBps);
-    }
-
-    function _challengeGame_setInconclusiveBurnBps(uint256 newBps) internal asAdmin {
-        game.setInconclusiveBurnBps(newBps);
     }
 
     function _challengeGame_setProsecutorFeeBps(uint256 newBps) internal asAdmin {

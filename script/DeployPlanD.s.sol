@@ -151,7 +151,7 @@ contract DeployPlanD is ScriptBase {
         //
         // The failure is total and completely silent. An accused approver
         // requests an unstake, waits out `coolDownPeriod` (floor 1 day) inside
-        // the 7-day `autoSlashDelay`, and claims. At `resolve`, `_slashOne`
+        // the 7-day `voteWindow`, and claims. At `resolve`, `_slashOne`
         // finds nothing staked and returns 0, `slashVerdict` returns 0 —
         // and `_settle` still marks `_convicted[key]`, so the proposal can never
         // be re-challenged either. No revert, no distinguishing event, zero
@@ -252,14 +252,13 @@ contract DeployPlanD is ScriptBase {
 
         console.log("ChallengeGame:        %s", address(game));
         console.log("challengeWindow (s):  %s", game.challengeWindow());
-        console.log("autoSlashDelay (s):   %s", game.autoSlashDelay());
-        console.log("disputeTimeout (s):   %s", game.disputeTimeout());
+        console.log("voteWindow (s):       %s", game.voteWindow());
         console.log("challengerBondBps:    %s", game.challengerBondBps());
         console.log("MANUAL NEXT: stand up the OFF-CHAIN bug-bounty program keyed off");
         console.log("  ChallengeFiled / ChallengeSettled. On-chain a successful challenger only");
         console.log("  gets its bond BACK - without that program nobody is paid to file at all.");
-        console.log("MANUAL NEXT: review autoSlashDelay against the guardians' real response");
-        console.log("  capability - it is their ENTIRE window to notice a filing and counter-bond.");
+        console.log("MANUAL NEXT: review voteWindow against the guardians' real response");
+        console.log("  capability - it is their ENTIRE window to notice a filing and decide it.");
         console.log("MANUAL NEXT: hand game ownership to the protocol owner (Ownable2Step: transfer + accept).");
     }
 }

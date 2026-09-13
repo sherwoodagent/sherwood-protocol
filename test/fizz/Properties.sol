@@ -23,10 +23,10 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
 
     // ── Conservation (GL-01, GL-05, GL-06, GL-07, GL-09, GL-11, GL-14) ──
 
-    /// @notice GL-01 — WOOD held by `ChallengeGame` always covers bonded +
-    ///         unclaimed WOOD (verbatim NatSpec invariant on the contract).
-    function property_GL01_gameWoodCoversBondedAndUnclaimed() public view returns (bool) {
-        return wood.balanceOf(address(game)) >= game.bondedWood() + game.unclaimedWood();
+    /// @notice GL-01 — WOOD held by `ChallengeGame` always covers its bonded
+    ///         WOOD (verbatim NatSpec invariant on the contract).
+    function property_GL01_gameWoodCoversBondedWood() public view returns (bool) {
+        return wood.balanceOf(address(game)) >= game.bondedWood();
     }
 
     /// @notice GL-05 — Σ live (unclaimed, uncancelled) redeem-request amounts
@@ -112,101 +112,6 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         return sum == swood.totalGuardianStake();
     }
 
-    /// @notice GL-14 — the counter-bond pool is keyed per PROPOSAL, not per
-    ///         challenge (pashov 2026-08 finding #10), so this no longer asserts
-    ///         anything per-challenge. Walking every live (`Filed`/`Disputed`)
-    ///         challenge, it says three things — two about THE POOL THAT
-    ///         CHALLENGE BELONGS TO, and one about the whole ledger those pools
-    ///         and bonds add up to:
-    ///
-    ///           1. Σ `counterBondContributionOf` over the pool's contributor
-    ///              list equals the pool's `raisedWood` — the contributor ledger
-    ///              and the pool total never diverge.
-    ///           2. `bondedWood` equals Σ live challenge bonds + Σ DISTINCT
-    ///              open pool weights — the contract's own held-WOOD counter
-    ///              against the positions that counter is supposed to be
-    ///              summarising.
-    ///
-    ///              NOT a comparison between `poolWood` and `raisedWood`, which
-    ///              is what this clause used to be and what it cannot be:
-    ///              `counterBondPoolOf` derives BOTH from `p.weight`, returning
-    ///              `outcome == Open ? raisedWood : 0` alongside `raisedWood`
-    ///              itself, so `poolWood == raisedWood` holds by construction
-    ///              wherever the outcome is `Open` and the check is
-    ///              unsatisfiable. A derived field and its own source can never
-    ///              disagree; an invariant has to cross an independent boundary.
-    ///
-    ///              `bondedWood` is that boundary. Every mutation of it is a
-    ///              position this loop can see: `file` adds a bond, `dispute`
-    ///              adds a contribution, `_settle`/`_fail`/`_refundAll` each
-    ///              remove one bond, and `_burnPool`/`_releasePool` each remove
-    ///              one pool. So the equality catches a decrement keyed on the
-    ///              wrong pool, a double decrement, and a pool left `Open` after
-    ///              its last live challenge terminated — none of which the old
-    ///              form could see. Unit-side sibling: `_assertLiveBondsBacked`
-    ///              in `ChallengeGame.t.sol`, which asserts the same shape.
-    ///
-    ///              `poolWood` is already zero for any non-`Open` outcome, so a
-    ///              burned or released pool drops out of the sum without a
-    ///              second read — a terminal pool coexisting with a live
-    ///              challenge stays the normal state it is.
-    ///
-    ///              Custody (`balanceOf >= bondedWood + unclaimedWood`) is a
-    ///              different statement and is pinned separately by GL-01. This
-    ///              one is about whether the counter is right, not whether the
-    ///              tokens are there.
-    ///           3. Neither defence exceeds the target — `dispute` clamps the
-    ///              overshoot rather than refunding it. The SHARED defence is
-    ///              bounded until it completes, and a challenge the completion
-    ///              does not answer is bounded by its OWN `defenceWeight`; the
-    ///              round's raised total is their sum, so it is not itself
-    ///              bounded by one target.
-    ///
-    ///         The pre-fix version compared a per-challenge contributor sum
-    ///         against `challengeOf(id).counterBondWood`. That comparison went
-    ///         vacuous rather than false once the pool moved per-key: BOTH sides
-    ///         now read the shared pool, so it could no longer catch a
-    ///         divergence between a challenge and its own funding. Concurrent
-    ///         challenges on one review key deliberately report the SAME pool
-    ///         here, which is the whole point of the fix.
-    function property_GL14_counterBondPoolMatchesContributions() public view returns (bool) {
-        uint256 n = game.challengeCount();
-        uint256 accounted;
-        bytes32[] memory seen = new bytes32[](n);
-        uint256 seenN;
-        for (uint256 id = 1; id <= n; id++) {
-            IChallengeGame.Challenge memory c = game.challengeOf(id);
-            if (c.status != IChallengeGame.Status.Filed && c.status != IChallengeGame.Status.Disputed) continue;
-
-            (uint256 poolWood, uint256 targetWood, uint256 raisedWood, uint256 completedAt,) =
-                game.counterBondPoolOf(id);
-            address[] memory contributors = game.counterBondContributors(id);
-            uint256 sum;
-            for (uint256 j; j < contributors.length; j++) {
-                sum += game.counterBondContributionOf(id, contributors[j]);
-            }
-            if (sum != raisedWood) return false;
-            if (completedAt == 0 && raisedWood > targetWood) return false;
-            if (c.defenceWeight > targetWood) return false;
-
-            // THE LEDGER SIDE. Every live challenge's own bond counts once;
-            // each PROPOSAL's pool counts once however many challenges share
-            // it, which is why the key is deduplicated rather than the id.
-            // `poolWood` is already zero for any closed pool, so a burned or
-            // released one contributes nothing and needs no second read.
-            accounted += c.bondWood;
-            bytes32 key = keccak256(abi.encode(c.governor, c.proposalId));
-            bool counted;
-            for (uint256 j; j < seenN; j++) {
-                if (seen[j] == key) counted = true;
-            }
-            if (counted) continue;
-            seen[seenN++] = key;
-            accounted += poolWood;
-        }
-        return accounted == game.bondedWood();
-    }
-
     // ── Counts and state consistency (GL-15, GL-16, GL-17, GL-18) ──
     //
     // GL-19 is still NOT implemented: it needs BLOCKER set membership, and
@@ -274,18 +179,14 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     }
 
     /// @notice GL-17 — `game.liveChallengeCountOf(governor, pid)` equals the
-    ///         count of challenges against that key with status `Filed` or
-    ///         `Disputed`.
-    function property_GL17_liveChallengeCountMatchesFiledOrDisputed() public view returns (bool) {
+    ///         count of challenges against that key with status `Filed`.
+    function property_GL17_liveChallengeCountMatchesFiled() public view returns (bool) {
         uint256 pCount = governor.proposalCount();
         uint256 cCount = game.challengeCount();
         uint256[] memory liveCounts = new uint256[](pCount + 1);
         for (uint256 id = 1; id <= cCount; id++) {
             IChallengeGame.Challenge memory c = game.challengeOf(id);
-            if (
-                c.governor == address(governor) && c.proposalId <= pCount
-                    && (c.status == IChallengeGame.Status.Filed || c.status == IChallengeGame.Status.Disputed)
-            ) {
+            if (c.governor == address(governor) && c.proposalId <= pCount && c.status == IChallengeGame.Status.Filed) {
                 liveCounts[c.proposalId]++;
             }
         }
@@ -335,8 +236,7 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     }
 
     function _isTerminalChallengeStatus(uint8 s) private pure returns (bool) {
-        return s == uint8(IChallengeGame.Status.Failed) || s == uint8(IChallengeGame.Status.Settled)
-            || s == uint8(IChallengeGame.Status.Inconclusive);
+        return s == uint8(IChallengeGame.Status.Failed) || s == uint8(IChallengeGame.Status.Settled);
     }
 
     /// @notice GL-26 — a challenge reaches exactly one terminal status and
@@ -659,7 +559,7 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     }
 
     function _isLive(IChallengeGame.Status s) private pure returns (bool) {
-        return s == IChallengeGame.Status.Filed || s == IChallengeGame.Status.Disputed;
+        return s == IChallengeGame.Status.Filed;
     }
 
     // ―――――――――― ExposureLedger lock accounting (x-ray I-5 / X-8) ――――――――――

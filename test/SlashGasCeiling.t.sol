@@ -425,7 +425,7 @@ contract SlashGasCeilingTest is Test {
     /// @dev Runs the clock out, leaving the challenge exactly one `resolve` away
     ///      from a full-cap conviction.
     function _closeTheWindow(uint256 cid) internal {
-        vm.warp(vm.getBlockTimestamp() + game.challengeOf(cid).autoSlashDelayAtFiling);
+        vm.warp(vm.getBlockTimestamp() + game.challengeOf(cid).voteWindowAtFiling);
     }
 
     // ── 1. The CI gate ────────────────────────────────────────────────────

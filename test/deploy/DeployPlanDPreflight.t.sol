@@ -41,7 +41,7 @@ contract PlanDScriptCaller {
 ///           B4 — the script never checked `swood.exposureLedger()` at all, so
 ///                the game could freeze commitments on a ledger the exit gate
 ///                does not read. An accused approver then unstakes inside
-///                `autoSlashDelay`, `_slashOne` recovers 0, and `_settle`
+///                `voteWindow`, `_slashOne` recovers 0, and `_settle`
 ///                still marks `_convicted` — no revert, no distinguishing
 ///                event, nothing recovered, and the proposal can never be
 ///                re-challenged.
