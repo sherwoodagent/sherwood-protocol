@@ -257,7 +257,11 @@ file (bond = 1.5% of liability)
 `resolve` is permissionless and exercises no discretion. It settles the instant
 `convictWeight × 10 000 ≥ quorumBpsAtFiling × votableStakeAtFiling` — there is no
 un-vote, so a reached quorum is already final — and otherwise waits for
-`filedAt + voteWindowAtFiling` and fails. No transfer anywhere in the game reaches
+`filedAt + voteWindowAtFiling` and fails. Settling a reached quorum has no deadline
+of its own: `resolve` is permissionless and the challenger, whose bond returns only
+on settlement, is the party paid to call it, while the ledger freeze covers only
+`filedAt + voteWindow` — so a settlement left until after that may find the
+approvers' locks already retired. No transfer anywhere in the game reaches
 an approver or the proposer: the challenger's burns go to `0x…dEaD`, the slash
 burns inside sWOOD, and the prosecutor fee comes out of the convicted proposer's
 own escrowed bond.

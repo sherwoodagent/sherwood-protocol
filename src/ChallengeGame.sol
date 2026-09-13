@@ -51,10 +51,8 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     uint256 public constant MIN_VOTE_WINDOW = 2 days;
 
     /// @dev THE GAS FLOOR for a permissionless `resolve`: per approver plus a
-    ///      base, because the slash loop runs first and EIP-150 would otherwise
-    ///      leave the best-effort `demoteByChallenge` child 63/64 of an empty
-    ///      frame, its OOG swallowed by the catch while the adapter keeps its
-    ///      certification.
+    ///      base, so EIP-150 cannot starve the best-effort `demoteByChallenge`
+    ///      child behind the slash loop and leave the adapter certified.
     ///
     ///      THE NUMBERS ARE MEASURED, NOT ESTIMATED
     ///      (`test/SlashGasCeiling.t.sol`): 505,055 gas at 4 approvers,

@@ -303,13 +303,13 @@ abstract contract ChallengeEndToEndBase is Test {
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(address(adapter), adapter.poke.selector);
 
-        // ── WOOD for the proposer's bond, the challenger's bond, and the
-        //    accused guardian's counter-bond.
+        // ── WOOD for the proposer's bond, the challenger's bond, and a
+        //    spare balance for the accused guardian.
         wood.mint(agent, 1_000_000e18);
         vm.prank(agent);
         wood.approve(address(bondEscrow), type(uint256).max);
-        // 2x, not 1x: `_driveToInconclusiveRearm` (issue #94 fixtures) files
-        // once, takes a round-1 Inconclusive burn on the refund, and a
+        // 2x, not 1x: `_driveToFailedRearm` (issue #94 fixtures) files
+        // once, takes a round-1 forfeit burn on the refund, and a
         // second test-body filing then needs a FULL fresh bond out of what's
         // left — a bare 1x mint left no headroom for that once the mint
         // amount stopped being a stale, accidentally-oversized literal (was
@@ -318,7 +318,7 @@ abstract contract ChallengeEndToEndBase is Test {
         wood.mint(challenger, _challengerBond() * 2);
         vm.prank(challenger);
         wood.approve(address(game), type(uint256).max);
-        wood.mint(g1, _challengerBond()); // counter-bond matches the challenger's
+        wood.mint(g1, _challengerBond()); // a spare balance sized like the challenger's
         vm.prank(g1);
         wood.approve(address(game), type(uint256).max);
 

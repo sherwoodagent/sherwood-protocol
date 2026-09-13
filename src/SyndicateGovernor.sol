@@ -652,8 +652,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      confiscate it.
     ///
     ///      Elapsed time and the freeze are not sufficient on their own: the
-    ///      adversary is a proposer racing an `Inconclusive` unwind's re-armed
-    ///      window. `ChallengeGame._refundAll` releases the freeze AND raises
+    ///      adversary is a proposer racing a failed challenge's re-armed window.
+    ///      `ChallengeGame`'s failure path releases the freeze AND raises
     ///      `challengeableUntil` in the same call, so between that unwind and the
     ///      re-armed deadline both gates are open while a conviction is still
     ///      reachable. The third gate therefore asks the game itself and mirrors

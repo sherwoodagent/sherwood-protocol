@@ -160,7 +160,7 @@ interface IExposureLedger {
     // ── Coverage freeze (challenge game) ──
     /// @notice Freeze one proposal's coverage while a challenge is live and
     ///         re-bucket each approver's lock (raise-only) to the bucket
-    /// @param  liveUntil The challenge's worst-case end, `filedAt + disputeTimeout`.
+    /// @param  liveUntil The challenge's worst-case end, `filedAt + voteWindow`.
     function freezeCoverage(address governor, uint256 proposalId, uint256 liveUntil) external;
     /// @notice Release the freeze; each lock returns to max(current, booked, pinned) bucket.
     function unfreezeCoverage(address governor, uint256 proposalId) external;

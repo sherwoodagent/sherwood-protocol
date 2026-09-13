@@ -60,6 +60,13 @@ Checked after every call sequence.
   claims. Both tallies are checked against the one denominator because each voter's
   weight lands in exactly one of them and `votableStakeAtFiling` is the total those
   weights were drawn from (x-ray I-6).
+- [x] **GL-52** `SHOULD-HOLD` — the exact clause GL-12 relaxes: while nothing can yet
+  have expired (`block.timestamp - epochGenesis <= challengeWindow`), a guardian's
+  bucketed `openExposure` EQUALS the sum of its locks. Inside that span every bucket
+  ever written is still inside `openExposure`'s walk and `retireApproval` cannot have
+  run, so the only writers are `recordApproval` and `releaseApproval`, each moving
+  bucket and lock together; any drift is a bug in one of those two. Vacuous once the
+  clock passes the window, where GL-12's inequality carries on.
 
 ### Counts and state consistency
 

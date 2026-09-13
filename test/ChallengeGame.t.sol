@@ -233,11 +233,11 @@ contract MockChallengeLedger {
         _frozen[_key(governor, proposalId)] = false;
     }
 
-    /// @dev Issue #95: `_refundAll` calls this through the typed
-    ///      `IExposureLedger` interface, so every existing `Inconclusive` test
+    /// @dev Issue #95: the failure path calls this through the typed
+    ///      `IExposureLedger` interface, so every existing missed-quorum test
     ///      in this suite needs the mock to implement it or the call reverts.
-    ///      Recorded, not merely accepted, so a test can pin exactly what
-    ///      `_refundAll` passed — `pinCoverageUntil`'s whole job is carrying
+    ///      Recorded, not merely accepted, so a test can pin exactly what the
+    ///      re-arm passed — `pinCoverageUntil`'s whole job is carrying
     ///      the JUST-EXTENDED `challengeableUntil[rk]`, not some other value.
     mapping(bytes32 reviewKey => uint256) internal _pinnedUntil;
     uint256 public pinCoverageUntilCallCount;
@@ -1599,8 +1599,8 @@ contract ChallengeGameTest is Test {
     // ── The detector incentive is off-chain ──
 
     /// @notice AN UNCONTESTED win pays the challenger its bond back and nothing
-    ///         else, because there is nothing else to pay it FROM: no guardian
-    ///         funded a counter-bond, so no pool exists to forfeit. The
+    ///         else, because there is nothing else to pay it FROM: the guardians
+    ///         stake nothing to defend, so there is no pool to forfeit. The
     ///         challenger's upside comes strictly out of the accused side's own
     ///         stake — never out of protocol funds, and never out of WOOD sitting
     ///         on this contract. That is what the stray-WOOD assertion below
@@ -1797,9 +1797,8 @@ contract ChallengeGameTest is Test {
 
     /// @dev Like `_fileStandard`, but files `offset` after execution instead
     ///      of the fixed 3 days — needed to put the filing close enough to
-    ///      execution that a pool stalled to the edge of `voteWindow` can
-    ///      still land an `Inconclusive` verdict past
-    ///      `executedAt + challengeWindow`.
+    ///      execution that a challenge running to the edge of `voteWindow` can
+    ///      still fail on a missed quorum past `executedAt + challengeWindow`.
     function _fileStandardAt(uint256 proposalId, uint256 offset) internal returns (uint256 id) {
         _setCoverage(proposalId, 6_000e18, 4_000e18);
         _execute(proposalId);
@@ -2245,6 +2244,20 @@ contract ChallengeGameTest is Test {
         game.resolve(id);
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "settled");
         assertLt(swood.stakeOf(guardianA), stakeBefore, "approver slashed");
+    }
+
+    /// @notice A reached quorum has no settlement deadline of its own: the
+    ///         tally is monotone, so `resolve` still settles past
+    ///         `filedAt + voteWindowAtFiling` instead of failing to the accused.
+    ///         The ledger freeze does NOT stretch that far, so a settlement left
+    ///         this late may find the approvers' locks already retired.
+    function test_quorumMetCanBeSettledAfterTheWindow() public {
+        uint256 id = _fileStandard(PROPOSAL);
+        vm.prank(nonApproverGuardian);
+        game.voteOnChallenge(id, true);
+        vm.warp(vm.getBlockTimestamp() + game.voteWindow() + 1 days);
+        game.resolve(id);
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "settled, not failed");
     }
 
     function test_missedQuorumFailsToTheAccusedAndBurnsOneFixedFraction() public {

@@ -317,7 +317,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///         the pin was issued for. `retireApproval` reads THIS, not the max:
     ///         its question is whether THIS proposal's commitment may be swept,
     ///         and a pin against a guardian's OTHER stale proposal must not block
-    ///         that — otherwise one routine `Inconclusive` anywhere in a
+    ///         that — otherwise one routine missed-quorum failure anywhere in a
     ///         guardian's history blocks retirement of its entire book, reopening
     ///         the ~1/N shared-stake decay `retireApproval` exists to close.
     ///         `hasFrozenCoverage` keeps reading the max, because its question is
@@ -851,8 +851,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///        - `_pinnedUntil[key][guardian] < block.timestamp` — PER-KEY, not the
     ///          per-guardian max: a pin against some OTHER stale proposal the same
     ///          guardian once approved must not block sweeping this one, or a
-    ///          single routine `Inconclusive` anywhere in its history blocks
-    ///          retirement of the entire book;
+    ///          single routine missed-quorum failure anywhere in its history
+    ///          blocks retirement of the entire book;
     ///        - `block.timestamp` past the SAME expiry `openExposure` uses for
     ///          this booked epoch.
     ///      It then performs `releaseApproval`'s exact unwind, so the two cannot
@@ -1006,7 +1006,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     /// @dev EXTENDS THE FREEZE'S REACH PAST ITS OWN RELEASE. `unfreezeCoverage`
     ///      drops the moment no challenge against this key is LIVE — but
     ///      `ChallengeGame` can re-arm a legal re-challenge window that outlives
-    ///      the challenge that just resolved `Inconclusive`. Without this, both of
+    ///      the challenge that just failed on a missed quorum. Without this, both of
     ///      sWOOD's unstake gates read clean while a conviction is still legally
     ///      reachable: the accused claims its stake and the eventual verdict
     ///      recovers nothing.
