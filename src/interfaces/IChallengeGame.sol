@@ -364,24 +364,24 @@ interface IChallengeGame {
     ///         turns the stall into a delay.
     function challengeableUntil(bytes32 reviewKey) external view returns (uint256);
 
-    /// @notice Whether an honest, UNCONTESTED filing currently breaks even or
-    ///         better under the live settle-path parameters, i.e. whether
+    /// @notice Whether an honest filing that REACHES THE QUORUM currently breaks
+    ///         even or better under the live settle-path parameters, i.e. whether
     ///         `challengerBondBps * settleBurnBps <= proposerBondBps *
     ///         prosecutorFeeBps` (`proposerBondBps` read live from the wired
-    ///         ledger, which owns that rate). `false` means a guilty approver's
-    ///         dominant strategy is silence, because the challenger who correctly
-    ///         calls it net-loses WOOD even after a conviction. VIEW ONLY: no
-    ///         setter enforces this inequality.
+    ///         ledger, which owns that rate). That is the filing's best case -
+    ///         silence fails a challenge rather than convicting - so `false`
+    ///         means even a correct, convicting filing nets the challenger less
+    ///         than the burn. VIEW ONLY: no setter enforces this inequality.
     /// @dev    A BARE BOOLEAN CANNOT DISTINGUISH MAGNITUDE FROM A TRIVIAL PASS —
     ///         `settleBurnBps == 0` zeroes the cost side and this always reads
     ///         `true`, locally correct but easy to over-read. Prefer
     ///         `honestFilingNetPayoffBps` when the margin's size matters.
     function honestFilingBreaksEven() external view returns (bool);
-    /// @notice The SIGNED net WOOD-bps payoff to a challenger for a CORRECT,
-    ///         UNCONTESTED filing under the live settle-path parameters:
-    ///         `proposerBondBps * prosecutorFeeBps - challengerBondBps *
-    ///         settleBurnBps`. Positive means the filer profits, negative means it
-    ///         loses WOOD even after a correct, unanswered accusation.
+    /// @notice The SIGNED net WOOD-bps payoff to a challenger for a CORRECT
+    ///         filing that REACHES THE QUORUM, under the live settle-path
+    ///         parameters: `proposerBondBps * prosecutorFeeBps -
+    ///         challengerBondBps * settleBurnBps`. Positive means the filer
+    ///         profits, negative means it loses WOOD even on a conviction.
     /// @dev    Exposes the magnitude `honestFilingBreaksEven`'s boolean cannot:
     ///         two configurations that both read `true` there — one trivially,
     ///         one with a wide genuine margin — read apart here. VIEW ONLY.

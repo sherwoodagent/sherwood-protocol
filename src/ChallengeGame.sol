@@ -57,9 +57,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      certification.
     ///
     ///      THE NUMBERS ARE MEASURED, NOT ESTIMATED
-    ///      (`test/SlashGasCeiling.t.sol`): 713,853 gas at 4 approvers,
-    ///      5,428,313 at 52, 11,176,224 at 100 - fitting
-    ///      `~224*n^2 + 85,659*n + 367,629`, the quadratic term being the O(n^2)
+    ///      (`test/SlashGasCeiling.t.sol`): 505,055 gas at 4 approvers,
+    ///      5,332,237 at 52, 11,192,745 at 100 - fitting
+    ///      `~224*n^2 + 88,008*n + 149,434`, the quadratic term being the O(n^2)
     ///      pairwise dedup scan. 180k/approver keeps ~1.4x over the marginal
     ///      cost of the hundredth approver, headroom for a long-lived guardian
     ///      whose deeper checkpoint trace this fixture does not reproduce. The
@@ -759,15 +759,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     }
 
     /// @inheritdoc IChallengeGame
-    /// @dev VIEW ONLY - reports the inequality, it does not enforce it.
-    ///      `challengerBondBps * settleBurnBps <= proposerBondBps *
-    ///      prosecutorFeeBps` is the break-even condition for a CORRECT filing
-    ///      that REACHES THE QUORUM - the filing's best case, since silence
-    ///      fails a challenge rather than convicting. The net payoff there is
-    ///      the difference of those two products, scaled by coverage and the
-    ///      WOOD price, both of which cancel out of the SIGN. A `false` result
-    ///      means even that best case pays the challenger less than it costs.
-    ///      Recompute the margin from the four live values, not from prose.
+    /// @dev WHY THE SIGN CARRIES THE WHOLE ANSWER: the challenger's payoff on
+    ///      the quorum-reached path is the difference of the two products the
+    ///      interface names, scaled by coverage and the WOOD price, both of
+    ///      which cancel out of that sign. Recompute the margin from the four
+    ///      live values, not from prose.
     ///
     ///      This contract deliberately does NOT gate any setter on the result.
     ///      The values that would make it `true` trade off against
