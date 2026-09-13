@@ -115,9 +115,6 @@ contract PerCallCapitalDeclarationsTest is Test {
         _certifyNow(address(usdc), usdc.approve.selector, 0, 100);
     }
 
-    /// @dev Shared fixture helper (mirrors `TierRegistryTest._certifyNow`):
-    ///      reaches the same end state as the old instant `certify` via the
-    ///      new two-step flow from #45's certification timelock — propose
     function _certifyNow(address target_, bytes4 selector_, uint8 tier_, uint16 bound_) internal {
         tierRegistry.certify(target_, selector_, tier_, bound_, target_.codehash);
     }

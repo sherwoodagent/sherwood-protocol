@@ -145,7 +145,6 @@ contract TierEndToEndTest is Test {
         tierRegistry.setCounterpartyAllowed(address(adapter), true);
     }
 
-    /// @dev Shared fixture helper (design.md / tasks.md 2.1): the test
     function _certifyNow(address target_, bytes4 selector_, uint8 tier_, uint16 bound_) internal {
         tierRegistry.certify(target_, selector_, tier_, bound_, target_.codehash);
     }

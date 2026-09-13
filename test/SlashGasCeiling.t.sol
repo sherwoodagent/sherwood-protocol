@@ -758,7 +758,7 @@ contract SlashGasCeilingTest is Test {
         vm.prank(submitter);
         wood.approve(address(tierRegistry), type(uint256).max);
         // Re-certify the fixture's adapter so the demotion below runs against
-        // a live certification — the worst case.
+        // a live certification.
         tierRegistry.certify(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(adapter).codehash);
 
         uint256 forwarded = (game.DEMOTION_GAS() * 63) / 64;
@@ -768,7 +768,7 @@ contract SlashGasCeilingTest is Test {
         tierRegistry.demoteByChallenge(address(adapter), adapter.poke.selector);
         uint256 spent = before - gasleft();
 
-        emit log_named_uint("measured demoteByChallenge gas (worst case, real bond release)", spent);
+        emit log_named_uint("measured demoteByChallenge gas", spent);
         emit log_named_uint("DEMOTION_GAS * 63/64 (the stipend a starved-to-the-floor caller forwards)", forwarded);
         emit log_named_uint("headroom left for issue #77's extra delete", forwarded - spent);
 

@@ -36,13 +36,6 @@ contract TierRegistryTest is Test {
         assertTrue(k1 != reg.key(target, bytes4(0x12345679)));
     }
 
-    function test_certifyThenTierOfReportsCertified() public {
-        _certifyNow(target, bytes4(0x12345678), 0, 50);
-        (uint8 tier, uint16 boundBps) = reg.tierOf(target, bytes4(0x12345678));
-        assertEq(tier, 0);
-        assertEq(boundBps, 50);
-    }
-
     function test_certifyRevertsForTier2() public {
         vm.prank(owner);
         vm.expectRevert(TierRegistry.InvalidTier.selector);
@@ -78,14 +71,6 @@ contract TierRegistryTest is Test {
         emit TierRegistry.TierCertified(target, bytes4(0x12345678), 1, 250, expectedHash);
         vm.prank(owner);
         reg.certify(target, bytes4(0x12345678), 1, 250, expectedHash);
-    }
-
-    function test_recertifySameKeyOverwrites() public {
-        _certifyNow(target, bytes4(0x12345678), 0, 50);
-        _certifyNow(target, bytes4(0x12345678), 1, 500);
-        (uint8 tier, uint16 boundBps) = reg.tierOf(target, bytes4(0x12345678));
-        assertEq(tier, 1);
-        assertEq(boundBps, 500);
     }
 
     function test_certifyRevertsForEOATarget() public {

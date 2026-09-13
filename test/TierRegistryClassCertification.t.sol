@@ -564,7 +564,7 @@ contract TierRegistryClassCertificationTest is Test {
     }
 
     function test_certifyClass_onlyOwner() public {
-        vm.expectRevert();
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
         registry.certifyClass(address(template), SEL, TIER_1, BOUND, address(template).codehash);
     }
 
