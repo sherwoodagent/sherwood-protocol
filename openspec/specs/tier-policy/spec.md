@@ -39,6 +39,10 @@ drifted — and every clone of a template whose code has drifted — SHALL read 
 tier 2 with no call by anyone. The registry SHALL expose no permissionless
 entry point that only persists what the reads already report.
 
+#### Scenario: Drifted target reads as tier 2 without any call
+- **WHEN** a certified target's live codehash no longer equals the codehash pinned at certification
+- **THEN** `tierOf` returns `(2, 10_000)` and no owner or keeper transaction is required
+
 ### Requirement: Certification is owner-only with strict input guards
 `certify(target, selector, tier, extractableBoundBps, expectedCodehash)` SHALL be owner-only, SHALL take effect in the same transaction, and SHALL revert: `InvalidTier` when `tier >= 2`; `BoundRequired` when `extractableBoundBps` is `0` or `>= 10_000`; `NotAContract` when the target's codehash is `bytes32(0)` or `keccak256("")` (a funded EOA hashes to the latter — both are rejected); `CodehashChanged` when the target's live `EXTCODEHASH` differs from `expectedCodehash`. On success it SHALL pin that codehash into the config and emit `TierCertified`.
 
