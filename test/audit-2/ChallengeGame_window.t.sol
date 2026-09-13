@@ -106,6 +106,9 @@ contract ChallengeGame_window is Test {
         swood.setAuthorizedSlasher(address(game));
         vm.prank(owner);
         game.setStakedWood(address(swood));
+        // One guardian outside every accused cohort here, so `file` has an
+        // electorate to pin: it refuses a filing nobody could decide.
+        swood.setStake(makeAddr("windowVoter"), 100_000e18);
 
         address[3] memory funders = [challenger, challengerB, defender];
         for (uint256 i = 0; i < funders.length; i++) {

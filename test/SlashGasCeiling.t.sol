@@ -423,14 +423,14 @@ contract SlashGasCeilingTest is Test {
     }
 
     /// @dev Reaches the convict quorum from the two jurors — the cohort this
-    ///      filing accuses cannot vote on it — then runs the clock out, leaving
-    ///      the challenge exactly one `resolve` away from a full-cap conviction.
-    function _closeTheWindow(uint256 cid) internal {
+    ///      filing accuses cannot vote on it — leaving the challenge exactly one
+    ///      `resolve` away from a full-cap conviction. No warp: a reached quorum
+    ///      settles on the spot rather than waiting the window out.
+    function _reachTheQuorum(uint256 cid) internal {
         vm.prank(juror1);
         game.voteOnChallenge(cid, true);
         vm.prank(juror2);
         game.voteOnChallenge(cid, true);
-        vm.warp(vm.getBlockTimestamp() + game.challengeOf(cid).voteWindowAtFiling);
     }
 
     // ── 1. The CI gate ────────────────────────────────────────────────────
@@ -559,7 +559,7 @@ contract SlashGasCeilingTest is Test {
             assertGt(bps[i], 0, "every approver is really slashed, so this is the worst case");
         }
 
-        _closeTheWindow(cid);
+        _reachTheQuorum(cid);
 
         uint256 stakeBefore = swood.guardianStake(approvers[7]);
 
@@ -745,7 +745,7 @@ contract SlashGasCeilingTest is Test {
         _deployStack(n);
         uint256 pid = _proposeApproveExecute();
         uint256 cid = _file(pid);
-        _closeTheWindow(cid);
+        _reachTheQuorum(cid);
 
         uint256 before = gasleft();
         (bool ok,) =

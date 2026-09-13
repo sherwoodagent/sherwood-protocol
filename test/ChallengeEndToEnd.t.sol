@@ -1255,4 +1255,67 @@ contract ChallengeRearmEndToEndTest is ChallengeEndToEndBase {
         gov.reclaimProposerBond(pid);
         assertEq(wood.balanceOf(agent), agentBalBefore + PROPOSER_BOND, "and the bond goes home the moment it can");
     }
+
+    // ── The vote snapshot is frozen one second before the filing ──────────
+
+    /// @notice Stake added AFTER a filing is outside that challenge's
+    ///         electorate, in both directions: it does not grow the denominator
+    ///         the quorum is measured against, and it carries no weight of its
+    ///         own. Otherwise a conviction could be bought after the accusation
+    ///         was already on the table.
+    function test_stakeAddedAfterAFilingCannotVoteOnIt() public {
+        uint256 pid = _proposeApproveExecute();
+        uint256 cid = _file(challenger, pid, "ipfs://evidence/late-stake");
+        (, uint256 votableBefore,) = game.challengeTallyOf(cid);
+
+        vm.warp(vm.getBlockTimestamp() + 1);
+        address newcomer = makeAddr("newcomer");
+        _stakeGuardian(newcomer, FILLER_STAKE, 4);
+        assertTrue(swood.isActiveGuardian(newcomer), "the newcomer really is a guardian now");
+
+        (, uint256 votableAfter,) = game.challengeTallyOf(cid);
+        assertEq(votableAfter, votableBefore, "the pinned electorate does not grow");
+
+        vm.prank(newcomer);
+        vm.expectRevert(IChallengeGame.NoVotableStake.selector);
+        game.voteOnChallenge(cid, true);
+    }
+
+    /// @notice AND THE FILING'S OWN BLOCK IS ALREADY TOO LATE. sWOOD keys every
+    ///         checkpoint on the second a stake changes and a same-key push
+    ///         overwrites, so a snapshot taken at `block.timestamp` would admit
+    ///         a stake planted in the filing's own block — before it, into the
+    ///         denominator; after it, into the numerator alone. Both are read at
+    ///         `filedAt - 1`, so neither lands.
+    function test_sameBlockStakeIsOutsideBothTheElectorateAndTheVote() public {
+        uint256 pid = _proposeApproveExecute();
+
+        // Staked in the filing's own block, ahead of it.
+        address early = makeAddr("sameBlockEarly");
+        _stakeGuardian(early, FILLER_STAKE, 5);
+
+        uint256 cid = _file(challenger, pid, "ipfs://evidence/same-block");
+        uint256 snapshotAt = game.challengeOf(cid).filedAt - 1;
+        assertEq(vm.getBlockTimestamp(), snapshotAt + 1, "fixture: the stake and the filing share a block");
+
+        // And another in the same block, behind it.
+        address late = makeAddr("sameBlockLate");
+        _stakeGuardian(late, FILLER_STAKE, 6);
+
+        (, uint256 votable,) = game.challengeTallyOf(cid);
+        assertEq(
+            votable,
+            swood.getPastTotalVotes(snapshotAt) - swood.getPastStake(g1, snapshotAt),
+            "the electorate is the one a second before the filing, less the accused"
+        );
+        assertEq(votable, 2 * FILLER_STAKE, "g2 and g3 alone, and neither same-block staker");
+
+        vm.prank(early);
+        vm.expectRevert(IChallengeGame.NoVotableStake.selector);
+        game.voteOnChallenge(cid, true);
+
+        vm.prank(late);
+        vm.expectRevert(IChallengeGame.NoVotableStake.selector);
+        game.voteOnChallenge(cid, true);
+    }
 }

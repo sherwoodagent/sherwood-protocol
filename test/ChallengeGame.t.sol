@@ -1246,8 +1246,6 @@ contract ChallengeGameTest is Test {
         assertGe(wood.balanceOf(address(game)), game.bondedWood(), "custody < accounted obligations");
     }
 
-    // ── Undisputed: silence is the verdict ──
-
     /// @notice §3.4 + D1: nobody contested within `voteWindow`, so the
     ///         silence IS the adjudication. The accused are slashed into the
     ///         compensation escrow as a case pinned to the block before the
@@ -1555,12 +1553,6 @@ contract ChallengeGameTest is Test {
         assertEq(wood.balanceOf(address(bare)), 0, "no bond taken by a game that cannot adjudicate");
         assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "and no coverage frozen");
     }
-
-    // ── Dispute ──
-
-    // ── Dispute: best-effort auto-referral (Task 8) ──
-
-    // ── Disputed → timeout → fail (D5) ──
 
     // ── Coverage is released on BOTH terminal paths ──
 
@@ -2314,11 +2306,11 @@ contract ChallengeGameTest is Test {
     function test_quorumIsMeasuredAgainstStakeMinusTheAccused() public {
         uint256 id = _fileStandard(PROPOSAL);
         (, uint256 votable,) = game.challengeTallyOf(id);
-        uint256 filedAt = game.challengeOf(id).filedAt;
+        uint256 snapshotAt = game.challengeOf(id).filedAt - 1;
         assertEq(
             votable,
-            swood.getPastTotalVotes(filedAt) - swood.getPastStake(guardianA, filedAt)
-                - swood.getPastStake(guardianB, filedAt),
+            swood.getPastTotalVotes(snapshotAt) - swood.getPastStake(guardianA, snapshotAt)
+                - swood.getPastStake(guardianB, snapshotAt),
             "accused weight is out of the denominator"
         );
     }
@@ -2333,11 +2325,10 @@ contract ChallengeGameTest is Test {
         game.resolve(id);
     }
 
-    /// @notice EVERY failure re-arms the re-challenge window — there is no
-    ///         acquittal that closes a proposal, because nothing on the fail
-    ///         path adjudicated the merits. A missed quorum is silence, and
-    ///         silence must not spend the proposal's challengeability.
-    function test_failedChallengeAlwaysReArmsTheWindow() public {
+    /// @notice SILENCE RE-ARMS. A missed quorum adjudicated nothing, so it must
+    ///         not spend the proposal's challengeability — the negative case,
+    ///         where guardians actually voted to acquit, is below.
+    function test_silentFailureReArmsTheWindow() public {
         bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
         uint256 id = _fileStandard(PROPOSAL);
         assertEq(game.challengeableUntil(key), 0, "nothing re-armed yet");
@@ -2351,6 +2342,27 @@ contract ChallengeGameTest is Test {
             vm.getBlockTimestamp() + game.challengeWindow(),
             "the window moved, with no acquittal exception"
         );
+    }
+
+    /// @notice AND A VOTED ACQUITTAL DOES NOT. Guardians that looked at the
+    ///         accusation and cleared it have spent the window; re-arming on
+    ///         their verdict would make a cleared proposal permanently
+    ///         re-challengeable at the price of the forfeit burn.
+    function test_votedAcquittalDoesNotReArmTheWindow() public {
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+        uint256 id = _fileStandard(PROPOSAL);
+
+        vm.prank(nonApproverGuardian);
+        game.voteOnChallenge(id, false);
+
+        vm.warp(vm.getBlockTimestamp() + game.voteWindow());
+        uint256 pinCallsBefore = ledger.pinCoverageUntilCallCount();
+        game.resolve(id);
+
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Failed), "acquitted");
+        assertGt(game.challengeOf(id).acquitWeight, 0, "and on a real vote, not on silence");
+        assertEq(game.challengeableUntil(key), 0, "a verdict on the merits does not re-arm");
+        assertEq(ledger.pinCoverageUntilCallCount(), pinCallsBefore, "and pins nothing on the ledger");
     }
 
     /// @notice The re-arm carries the ledger pin with it: `challengeableUntil`
@@ -2380,21 +2392,22 @@ contract ChallengeGameTest is Test {
     }
 
     /// @notice An electorate with no non-accused stake can never reach a
-    ///         quorum, so the challenge can only fail. That is the fail-safe:
-    ///         a cohort that covers the entire stake cannot convict itself, and
-    ///         an empty denominator must never read as a quorum met.
-    function test_noVotableStakeMeansTheChallengeCanOnlyFail() public {
+    ///         quorum, so the filing is refused at the door rather than taking a
+    ///         bond it could only burn. A cohort that covers the entire stake
+    ///         cannot convict itself, and an empty denominator must never read
+    ///         as a quorum met.
+    function test_file_revertsWhenNoStakeCanVote() public {
         swood.setStake(nonApproverGuardian, 0);
-        uint256 id = _fileStandard(PROPOSAL);
-        (, uint256 votable,) = game.challengeTallyOf(id);
-        assertEq(votable, 0, "the accused are the whole electorate");
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
+        _execute(PROPOSAL);
 
-        vm.expectRevert(IChallengeGame.DelayNotElapsed.selector);
-        game.resolve(id);
+        uint256 before = wood.balanceOf(challenger);
+        vm.prank(challenger);
+        vm.expectRevert(IChallengeGame.NoVotableStake.selector);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
 
-        vm.warp(vm.getBlockTimestamp() + game.voteWindow());
-        game.resolve(id);
-        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Failed), "fails, never settles");
+        assertEq(wood.balanceOf(challenger), before, "no bond taken by a filing nobody could decide");
+        assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "and no coverage frozen");
     }
 
     function test_voteOnChallenge_refusesAnOutsiderAndAClosedWindow() public {
@@ -2429,15 +2442,81 @@ contract ChallengeGameTest is Test {
         assertEq(game.challengeQuorumBps(), 10_000);
     }
 
+    /// @dev Three guardians outside the accused cohort, so a convict vote can
+    ///      sit strictly below, exactly at, or above the quorum. The suite's
+    ///      default electorate is one guardian holding 100% of the votable
+    ///      stake, which no threshold can be read off.
+    function _threeVotableGuardians() internal returns (address second, address third) {
+        second = makeAddr("nonApproverGuardian2");
+        third = makeAddr("nonApproverGuardian3");
+        swood.setStake(second, 150_000e18);
+        swood.setStake(third, 50_000e18);
+    }
+
+    /// @notice THE QUORUM IS A THRESHOLD, NOT A HEADCOUNT. A convict vote short
+    ///         of it settles nothing, and the vote that carries it is the one
+    ///         that lands EXACTLY on the bar — `>=`, not `>`.
+    function test_theQuorumIsAThresholdNotASingleVote() public {
+        (, address third) = _threeVotableGuardians();
+        vm.prank(owner);
+        game.setChallengeQuorumBps(5_000);
+
+        uint256 id = _fileStandard(PROPOSAL);
+        (, uint256 votable, uint256 qBps) = game.challengeTallyOf(id);
+        assertEq(votable, 300_000e18, "three guardians outside the accused cohort");
+        assertEq(qBps, 5_000, "and a quorum the fixture straddles");
+
+        // 100,000 of 300,000 — a third of the electorate, short of the bar.
+        vm.prank(nonApproverGuardian);
+        game.voteOnChallenge(id, true);
+        (uint256 convictWeight,,) = game.challengeTallyOf(id);
+        assertLt(convictWeight * 10_000, qBps * votable, "fixture: strictly sub-quorum");
+        vm.expectRevert(IChallengeGame.DelayNotElapsed.selector);
+        game.resolve(id);
+
+        // 150,000 of 300,000 — exactly the bar, which must carry it.
+        vm.prank(third);
+        game.voteOnChallenge(id, true);
+        (convictWeight,,) = game.challengeTallyOf(id);
+        assertEq(convictWeight * 10_000, qBps * votable, "fixture: exactly at the bar, not past it");
+        game.resolve(id);
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "the bar itself settles");
+    }
+
+    /// @notice And a convict vote that never reaches the bar fails at the
+    ///         deadline like silence does — a minority is not a verdict.
+    function test_aSubQuorumConvictVoteFailsAtTheDeadline() public {
+        _threeVotableGuardians();
+        vm.prank(owner);
+        game.setChallengeQuorumBps(5_000);
+
+        uint256 id = _fileStandard(PROPOSAL);
+        vm.prank(nonApproverGuardian);
+        game.voteOnChallenge(id, true);
+
+        vm.warp(vm.getBlockTimestamp() + game.voteWindow());
+        game.resolve(id);
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Failed), "a minority convicts nobody");
+        assertEq(swood.callCount(), 0, "and nothing was slashed");
+    }
+
     /// @notice The quorum is pinned at filing like every other rate: an owner
-    ///         cannot raise it under a vote that has already been won.
+    ///         cannot raise it under a vote that has already been won. The
+    ///         convict weight sits BETWEEN the pinned bar and the raised one, so
+    ///         dropping the pin flips the outcome.
     function test_challengeQuorum_isPinnedAtFiling() public {
+        _threeVotableGuardians();
         uint256 id = _fileStandard(PROPOSAL);
         assertEq(game.challengeOf(id).quorumBpsAtFiling, 3_000, "pinned");
-        _convict(id);
 
         vm.prank(owner);
         game.setChallengeQuorumBps(10_000);
+
+        // 100,000 of 300,000: past the pinned 3,000 bps, far short of 10,000.
+        _convict(id);
+        (uint256 convictWeight, uint256 votable,) = game.challengeTallyOf(id);
+        assertGe(convictWeight * 10_000, 3_000 * votable, "fixture: over the pinned bar");
+        assertLt(convictWeight * 10_000, game.challengeQuorumBps() * votable, "and under the live one");
 
         game.resolve(id);
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "the pinned quorum stands");

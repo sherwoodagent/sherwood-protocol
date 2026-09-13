@@ -25,7 +25,7 @@ contract DemotionGasProbeTest is SlashGasCeilingTest {
         _deployStack(100);
         uint256 pid = _proposeApproveExecute();
         uint256 cid = _file(pid);
-        _closeTheWindow(cid);
+        _reachTheQuorum(cid);
 
         uint256 snapshotId = vm.snapshotState();
 

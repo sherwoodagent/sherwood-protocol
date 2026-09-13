@@ -96,6 +96,9 @@ interface IChallengeGame {
         uint256 quorumBpsAtFiling;
         /// @dev Running convict-side weight.
         uint256 convictWeight;
+        /// @dev Running acquit-side weight. Non-zero means guardians actually
+        ///      looked at the accusation and cleared it.
+        uint256 acquitWeight;
     }
 
     // ── Errors ──
@@ -317,10 +320,13 @@ interface IChallengeGame {
     function forfeitBurnBps() external view returns (uint256);
     function voteWindow() external view returns (uint256);
     function challengeQuorumBps() external view returns (uint256);
+    /// @notice This challenge's convict weight, its votable basis and its pinned
+    ///         quorum. The acquit weight is read off `challengeOf`.
     function challengeTallyOf(uint256 challengeId)
         external
         view
         returns (uint256 convictWeight, uint256 votableStake, uint256 quorumBps);
+    /// @notice Whether this guardian has already voted on this challenge.
     function hasVotedOn(uint256 challengeId, address voter) external view returns (bool);
     /// @notice Share of a SUCCESSFUL challenger's bond burned on settle, in bps.
     function settleBurnBps() external view returns (uint256);
