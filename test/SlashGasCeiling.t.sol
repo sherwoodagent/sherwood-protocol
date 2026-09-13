@@ -294,18 +294,8 @@ contract SlashGasCeilingTest is Test {
         gov.setBondEscrow(address(bondEscrow));
         gov.setTierRegistry(address(tierRegistry));
 
-        // Two-step certification (design.md / tasks.md 2.1): the test contract
-        // IS the registry owner, so no prank is needed — propose, warp past
-        // the pinned `readyAt` (`vm.getBlockTimestamp()`, never a cached
-        // `block.timestamp` local — the optimizer CSEs it across `vm.warp`),
-        // execute. Every later warp in this suite is relative
-        // (`vm.getBlockTimestamp() + X` or a live `gov.getProposal(...)`
-        // field), so this setUp-time shift is safe.
-        tierRegistry.proposeCertification(
-            address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(0), address(adapter).codehash
-        );
-        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
-        tierRegistry.certify(address(adapter), adapter.poke.selector);
+        // The test contract IS the registry owner, so no prank is needed.
+        tierRegistry.certify(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(adapter).codehash);
 
         wood.mint(agent, 1_000_000e18);
         vm.prank(agent);
@@ -767,18 +757,9 @@ contract SlashGasCeilingTest is Test {
         tierRegistry.setBondReleaseDelay(14 days);
         vm.prank(submitter);
         wood.approve(address(tierRegistry), type(uint256).max);
-        // Re-certify the fixture's adapter with a real bond so the demotion
-        // below actually starts the bond-release timelock — the worst case.
-        // Two-step flow (issue #45): propose (with the reviewed codehash),
-        // warp past the pinned readyAt, then execute pranked as the pinned
-        // submitter (PR #156 finding #3: execution is submitter-gated once a
-        // bond is pinned).
-        tierRegistry.proposeCertification(
-            address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, submitter, address(adapter).codehash
-        );
-        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
-        vm.prank(submitter);
-        tierRegistry.certify(address(adapter), adapter.poke.selector);
+        // Re-certify the fixture's adapter so the demotion below runs against
+        // a live certification — the worst case.
+        tierRegistry.certify(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(adapter).codehash);
 
         uint256 forwarded = (game.DEMOTION_GAS() * 63) / 64;
 

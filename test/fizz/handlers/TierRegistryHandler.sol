@@ -7,12 +7,11 @@ import {Properties} from "../Properties.sol";
 /// @notice Handles the interaction with TierRegistry
 ///
 /// @dev Certification is keyed by `(target, selector)`. A fuzzer handed raw
-///      addresses would essentially never hit a key that has a pending
-///      certification, so both are drawn from small fixed domains: targets
-///      from the deployed protocol contracts, selectors from a fixed set.
-///      That makes collisions frequent, which is the point — I-30's
-///      propose → certify → demote → claim cycle and I-2's bond accounting
-///      only come under pressure when many actions share one key.
+///      addresses would essentially never hit a certified key, so both are
+///      drawn from small fixed domains: targets from the deployed protocol
+///      contracts, selectors from a fixed set. That makes collisions frequent,
+///      which is the point — the certify → demote → claim cycle and I-2's bond
+///      accounting only come under pressure when many actions share one key.
 abstract contract TierRegistryHandler is Properties {
     // ――――――――――――――――――――――――― Clamped ――――――――――――――――――――――――――
 
@@ -34,8 +33,15 @@ abstract contract TierRegistryHandler is Properties {
         return bytes4(0xdeadbeef);
     }
 
-    function tierRegistry_certify_clamped(uint256 targetSeed, uint256 selectorSeed) public {
-        tierRegistry_certify(_tierTarget(targetSeed), _tierSelector(selectorSeed));
+    function tierRegistry_certify_clamped(uint256 targetSeed, uint256 selectorSeed, uint256 cfgSeed) public {
+        address target = _tierTarget(targetSeed);
+        tierRegistry_certify(
+            target,
+            _tierSelector(selectorSeed),
+            uint8(cfgSeed % 3),
+            uint16(clampBetween(cfgSeed, 0, 10_000)),
+            target.codehash
+        );
     }
 
     function tierRegistry_claimSubmitterBond_clamped(uint256 targetSeed, uint256 selectorSeed) public {
@@ -52,28 +58,15 @@ abstract contract TierRegistryHandler is Properties {
         address target = _tierTarget(arg0);
         bytes4 sel = _tierSelector(arg1);
 
-        selector = uint8(selector % 8);
+        selector = uint8(selector % 5);
         if (selector == 0) {
-            _tierRegistry_cancelCertification(target, sel);
-        } else if (selector == 1) {
             _tierRegistry_demote(target, sel);
-        } else if (selector == 2) {
+        } else if (selector == 1) {
             _tierRegistry_demoteByChallenge(target, sel);
-        } else if (selector == 3) {
-            _tierRegistry_proposeCertification(
-                target,
-                sel,
-                uint8(arg2 % 3),
-                uint16(clampBetween(arg2, 0, 10_000)),
-                toActor(address(uint160(arg2))),
-                target.codehash
-            );
-        } else if (selector == 4) {
+        } else if (selector == 2) {
             _tierRegistry_setCounterpartyAllowed(target, arg2 % 2 == 0);
-        } else if (selector == 5) {
+        } else if (selector == 3) {
             _tierRegistry_setBondReleaseDelay(clampBetween(arg2, 1 days, 60 days));
-        } else if (selector == 6) {
-            _tierRegistry_setCertifyDelay(clampBetween(arg2, 1 hours, 14 days));
         } else {
             // I-2: a non-zero bond requires `wood` to be configured, and
             // `setWood` refuses while bonds are outstanding.
@@ -83,8 +76,14 @@ abstract contract TierRegistryHandler is Properties {
 
     // ―――――――――――――――――――――――― Unclamped ―――――――――――――――――――――――――
 
-    function tierRegistry_certify(address target, bytes4 selector) public asActor {
-        tierRegistry.certify(target, selector);
+    function tierRegistry_certify(
+        address target,
+        bytes4 selector,
+        uint8 tier,
+        uint16 extractableBoundBps,
+        bytes32 expectedCodehash
+    ) public asAdmin {
+        tierRegistry.certify(target, selector, tier, extractableBoundBps, expectedCodehash);
     }
 
     function tierRegistry_claimSubmitterBond(address target, bytes4 selector) public asActor {
@@ -97,10 +96,6 @@ abstract contract TierRegistryHandler is Properties {
 
     // ── Secondary (owner-gated unless noted; dispatcher-only entry) ──
 
-    function _tierRegistry_cancelCertification(address target, bytes4 selector) internal asAdmin {
-        tierRegistry.cancelCertification(target, selector);
-    }
-
     function _tierRegistry_demote(address target, bytes4 selector) internal asAdmin {
         tierRegistry.demote(target, selector);
     }
@@ -111,27 +106,12 @@ abstract contract TierRegistryHandler is Properties {
         tierRegistry.demoteByChallenge(target, selector);
     }
 
-    function _tierRegistry_proposeCertification(
-        address target,
-        bytes4 selector,
-        uint8 tier,
-        uint16 extractableBoundBps,
-        address submitter,
-        bytes32 expectedCodehash
-    ) internal asAdmin {
-        tierRegistry.proposeCertification(target, selector, tier, extractableBoundBps, submitter, expectedCodehash);
-    }
-
     function _tierRegistry_setCounterpartyAllowed(address counterparty, bool allowed) internal asAdmin {
         tierRegistry.setCounterpartyAllowed(counterparty, allowed);
     }
 
     function _tierRegistry_setBondReleaseDelay(uint256 delay) internal asAdmin {
         tierRegistry.setBondReleaseDelay(delay);
-    }
-
-    function _tierRegistry_setCertifyDelay(uint256 delay) internal asAdmin {
-        tierRegistry.setCertifyDelay(delay);
     }
 
     function _tierRegistry_setSubmitterBondWood(uint256 amount) internal asAdmin {

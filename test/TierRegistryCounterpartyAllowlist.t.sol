@@ -18,24 +18,9 @@ contract TierRegistryCounterpartyAllowlistTest is Test {
         target = address(new TierRegistry(owner));
     }
 
-    /// @dev Shared fixture helper (design.md / tasks.md 2.1): reaches the same
-    ///      end state as the old instant `certify` via the new two-step flow
-    ///      — propose as owner, warp past the pinned `readyAt`, execute. Uses
-    ///      `vm.getBlockTimestamp()` (never a cached `block.timestamp` local)
-    ///      because this repo's optimizer CSEs `block.timestamp` across
-    ///      `vm.warp`. Pranks the final `certify` call as `submitter_` when
-    ///      one is set (audit finding #3: execution is submitter-gated once a
-    ///      bond is pinned) — every caller of this helper only ever pins a
-    ///      bond when `submitter_ != address(0)`, so this exactly mirrors
-    ///      each test's intent without changing any assertions.
-    function _certifyNow(address target_, bytes4 selector_, uint8 tier_, uint16 bound_, address submitter_) internal {
+    function _certifyNow(address target_, bytes4 selector_, uint8 tier_, uint16 bound_) internal {
         vm.prank(owner);
-        reg.proposeCertification(target_, selector_, tier_, bound_, submitter_, target_.codehash);
-        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
-        if (submitter_ != address(0)) {
-            vm.prank(submitter_);
-        }
-        reg.certify(target_, selector_);
+        reg.certify(target_, selector_, tier_, bound_, target_.codehash);
     }
 
     function test_setAuthorizedDemoter_onlyOwner() public {
@@ -44,7 +29,7 @@ contract TierRegistryCounterpartyAllowlistTest is Test {
     }
 
     function test_demoteByChallenge_onlyDemoter() public {
-        _certifyNow(target, bytes4(0x77777777), 1, 500, address(0));
+        _certifyNow(target, bytes4(0x77777777), 1, 500);
         vm.expectRevert(TierRegistry.NotAuthorizedDemoter.selector);
         reg.demoteByChallenge(target, bytes4(0x77777777));
     }
@@ -53,7 +38,7 @@ contract TierRegistryCounterpartyAllowlistTest is Test {
     ///         tier-2 default without needing registry ownership (§3.4).
     function test_demoteByChallenge_demotes() public {
         address demoter = makeAddr("demoter");
-        _certifyNow(target, bytes4(0x77777777), 1, 500, address(0));
+        _certifyNow(target, bytes4(0x77777777), 1, 500);
         vm.prank(owner);
         reg.setAuthorizedDemoter(demoter);
 
@@ -70,13 +55,13 @@ contract TierRegistryCounterpartyAllowlistTest is Test {
 
     /// @notice The demoter can only REVOKE. It must not be able to certify — that
     ///         is why this is a role rather than registry ownership.
-    function test_demoter_cannotProposeCertification() public {
+    function test_demoter_cannotCertify() public {
         address demoter = makeAddr("demoter");
         vm.prank(owner);
         reg.setAuthorizedDemoter(demoter);
         vm.prank(demoter);
         vm.expectRevert();
-        reg.proposeCertification(target, bytes4(0x88888888), 1, 500, address(0), target.codehash);
+        reg.certify(target, bytes4(0x88888888), 1, 500, target.codehash);
     }
 
     // ── Issue #77: demotion auto-clears the adapter allowlist ──
@@ -115,7 +100,7 @@ contract TierRegistryCounterpartyAllowlistTest is Test {
     /// @dev A per-selector conviction leaves the shared counterparty flag alone; only the owner revokes a venue.
     function test_demotionLeavesCounterpartyStandingUntouched() public {
         bytes4 sel = bytes4(0x12345678);
-        _certifyNow(target, sel, 1, 500, address(0));
+        _certifyNow(target, sel, 1, 500);
         vm.prank(owner);
         reg.setCounterpartyAllowed(target, true);
         assertTrue(reg.isCounterpartyAllowed(target), "precondition: counterparty standing");

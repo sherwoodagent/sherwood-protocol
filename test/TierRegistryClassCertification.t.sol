@@ -274,9 +274,7 @@ contract TierRegistryClassCertificationTest is Test {
         address clone = _cloneViaFactory();
 
         vm.prank(owner);
-        registry.proposeCertification(clone, SEL, 0, 100, address(0), clone.codehash);
-        vm.warp(block.timestamp + registry.certifyDelay() + 1);
-        registry.certify(clone, SEL);
+        registry.certify(clone, SEL, 0, 100, clone.codehash);
 
         (uint8 tier, uint16 bound) = registry.tierOf(clone, SEL);
         assertEq(tier, 0, "address certification wins");
@@ -533,9 +531,7 @@ contract TierRegistryClassCertificationTest is Test {
     function test_namespaceIsolation_addressCertNotVisibleAsClass() public {
         address clone = _cloneViaFactory();
         vm.prank(owner);
-        registry.proposeCertification(clone, SEL, 0, 100, address(0), clone.codehash);
-        vm.warp(block.timestamp + registry.certifyDelay() + 1);
-        registry.certify(clone, SEL);
+        registry.certify(clone, SEL, 0, 100, clone.codehash);
 
         // The address entry exists, but no class does.
         (uint8 tier,) = registry.tierOf(clone, SEL);

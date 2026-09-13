@@ -308,18 +308,8 @@ contract ChallengeEndToEndTest is Test {
         // half notional; `bump` is left uncertified so the batch as a whole is
         // still tier 2 and therefore coverage-gated.
         //
-        // Two-step certification (design.md / tasks.md 2.1): the test contract
-        // IS the registry owner, so no prank is needed — propose, warp past
-        // the pinned `readyAt` (`vm.getBlockTimestamp()`, never a cached
-        // `block.timestamp` local — the optimizer CSEs it across `vm.warp`),
-        // execute. Every later warp in this suite reads live state
-        // (`gov.getProposal(...)`, `game.challengeOf(...)`, or an
-        // in-test-live `filedAt`/`executedAt`), so this setUp-time shift is safe.
-        tierRegistry.proposeCertification(
-            address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(0), address(adapter).codehash
-        );
-        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
-        tierRegistry.certify(address(adapter), adapter.poke.selector);
+        // The test contract IS the registry owner, so no prank is needed.
+        tierRegistry.certify(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(adapter).codehash);
 
         // ── WOOD for the proposer's bond, the challenger's bond, and the
         //    accused guardian's counter-bond.

@@ -905,13 +905,8 @@ contract GovernorCoverageGatesTest is Test {
         reg = new TierRegistry(address(this));
         reg.setStrategyFactory(address(new PermissiveStrategyFactory()));
         governor.setTierRegistry(address(reg)); // test contract is the factory
-        reg.proposeCertification(
-            address(targetToken), targetToken.approve.selector, tier, bound, address(0), address(targetToken).codehash
-        );
-        reg.proposeCertification(address(usdg), usdg.approve.selector, tier, bound, address(0), address(usdg).codehash);
-        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
-        reg.certify(address(targetToken), targetToken.approve.selector);
-        reg.certify(address(usdg), usdg.approve.selector);
+        reg.certify(address(targetToken), targetToken.approve.selector, tier, bound, address(targetToken).codehash);
+        reg.certify(address(usdg), usdg.approve.selector, tier, bound, address(usdg).codehash);
     }
 
     /// @notice THE enforcement gap this ADR closes. A tier-0 proposal carrying

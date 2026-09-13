@@ -452,17 +452,12 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
     }
 
     /// @dev Certify the benign batch target: `tierOf` prices the (target, selector)
-    ///      pair. Certification is a propose → delay → certify cycle (I-30), so the
-    ///      clock is advanced in between.
+    ///      pair. Certification is one owner call.
     function _certifyAdapter() internal {
         // Tier 1 with a 50% extractable bound. `extractableBoundBps` must sit
         // strictly inside (0, FULL_NOTIONAL_BPS) — 10_000 is the exclusive
         // upper bound and reverts `BoundRequired`.
-        tierRegistry.proposeCertification(
-            address(adapter), FizzAdapter.poke.selector, 1, 5_000, address(0), address(adapter).codehash
-        );
-        skipTime(tierRegistry.certifyDelay() + 1);
-        tierRegistry.certify(address(adapter), FizzAdapter.poke.selector);
+        tierRegistry.certify(address(adapter), FizzAdapter.poke.selector, 1, 5_000, address(adapter).codehash);
     }
 
     function _seedVault() internal {
