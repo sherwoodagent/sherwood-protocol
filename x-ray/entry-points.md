@@ -22,7 +22,7 @@ Counts come from the grep-verified signature scan over `src/` (interfaces and mo
 `ChallengeGame` (constructor) → `setExposureLedger()` → `setStakedWood()` → `setCourt()` ◄── window-fit invariant checked from both sides
 `TokenCourt` (constructor) → `setChallengeGame()` → `setStakedWood()` ◄── participationFloorBps < ageFloorBps
 
-`TierRegistry.setAuthorizedDemoter(challengeGame)` → `setAdapterAllowed(adapter)`
+`TierRegistry.setAuthorizedDemoter(challengeGame)`
 
 ### Vault Creation (Owner)
 
@@ -596,7 +596,7 @@ Owner-restricted configuration surfaces. These configure the protocol rather tha
 | ChallengeGame | `setCourt`, `setExposureLedger`, `setTierRegistry`, `setChallengeWindow`, `setChallengerBondBps`, `setForfeitBurnBps`, `setStakedWood`, `setAutoSlashDelay`, `setDisputeTimeout`, `setSettleBurnBps`, `setProsecutorFeeBps`, `setInconclusiveBurnBps`, `setFilingsPaused` | 13 | none (`renounceOwnership` disabled) |
 | ExposureLedger | `setWoodUsdPrice`, `setWoodFeed`, `setWoodTwapOracle`, `setWoodHaircutBps`, `setGuardianRegistry`, `setChallengeWindow`, `setCoverageFreezer`, `setKNumerator`, `setCoveredTvlCapUsd`, `setQuorumTierThreshold`, `setProposerBondBps`, `setAssetFeed` | 12 | none |
 | StakedWood | `setRegistry`, `setMinGuardianStake`, `setCooldownPeriod`, `setMinOwnerStake`, `setMinSlashBps`, `setMaxSlashBps`, `setAgeFloorBps`, `setMaturationPeriod`, `setExposureLedger`, `setAuthorizedSlasher`, `_authorizeUpgrade` | 11 | none |
-| TierRegistry | `certify`, `setAuthorizedDemoter`, `demote`, `setAdapterAllowed` | 4 | none |
+| TierRegistry | `certify`, `setAuthorizedDemoter`, `demote` | 3 | none |
 | GuardianRegistry | `fundSlashAppealReserve`, `refundSlash`, `pause`, `setReviewPeriod`, `setBlockQuorumBps`, `setExposureLedger`, `_authorizeUpgrade` | 7 | none |
 | ProtocolConfig | `setMgmtSplit`, `setPerfSplit`, `setMaxStrategyDuration`, `setProtocolFeeRecipient`, `setGuardiansFeeRecipient` | 5 | none (Ownable2Step) |
 | TokenCourt | `setChallengeGame`, `setStakedWood`, `setVoteWindow`, `setParticipationFloorBps` | 4 | none (`renounceOwnership` reverts) |

@@ -1,6 +1,6 @@
 # Invariant Map
 
-> Sherwood Protocol | 40 guards | 39 inferred | 14 not enforced on-chain
+> Sherwood Protocol | 40 guards | 38 inferred | 14 not enforced on-chain
 
 Analyzed at `8b82598` (`main`).
 

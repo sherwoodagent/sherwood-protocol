@@ -392,7 +392,7 @@ Decertifying first opens a window in which the adapter is **allowlisted but
 uncertified**: governance has withdrawn its statement about what the target
 does, while the guard still lets vault funds be approved to it. Turning the
 allowlist off first closes the funds path immediately; the certification can
-then be withdrawn at whatever pace the bond mechanics require.
+then be withdrawn afterwards.
 
 ### `_demote` clears the FUNDS axis only — the callee axis survives by design
 
