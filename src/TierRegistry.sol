@@ -72,23 +72,6 @@ contract TierRegistry is Ownable2Step {
     uint256 public constant MIN_BOND_RELEASE_DELAY = 1 days;
     uint256 public constant MAX_BOND_RELEASE_DELAY = 365 days;
 
-    /// @dev Floor guarantees every grant is announced for at least one full
-    ///      day — `certifyDelay` can never be configured back into the
-    ///      instant path. Ceiling bounds governance error: an over-long
-    ///      delay stalls ALL adapter onboarding, so a mis-set value above it
-    ///      is un-settable rather than merely survivable.
-    uint256 public constant MIN_CERTIFY_DELAY = 1 days;
-    uint256 public constant MAX_CERTIFY_DELAY = 30 days;
-
-    /// @dev Upper bound on how long after `readyAt` a pending certification may
-    ///      still be executed. Without it a submitter fully controls WHEN to
-    ///      trigger the permissionless execute and can wait out a price collapse
-    ///      on the bond token before posting badly-stale collateral against an
-    ///      unchanged extractable bound. A fixed constant, not owner-configurable,
-    ///      so the owner has no lever to expire someone else's pending
-    ///      certification early.
-    uint256 public constant MAX_CERTIFY_WINDOW = 14 days;
-
     /// @dev EXTCODEHASH of an EXISTING account with no code (EIP-1052). A funded
     ///      EOA hashes to this, not bytes32(0) — `certify` rejects both.
     bytes32 private constant _EMPTY_CODEHASH = keccak256("");
@@ -215,7 +198,6 @@ contract TierRegistry is Ownable2Step {
     event TierCertified(
         address indexed target, bytes4 indexed selector, uint8 tier, uint16 extractableBoundBps, bytes32 codehash
     );
-    event CertifyDelaySet(uint256 delay);
     event TierDemoted(address indexed target, bytes4 indexed selector);
     event CounterpartyAllowedSet(address indexed counterparty, bool allowed);
     event SubmitterBondLocked(
@@ -242,10 +224,7 @@ contract TierRegistry is Ownable2Step {
     error BondTooLarge();
     error InvalidDelay();
     error BondsOutstanding();
-    error CertifyDelayNotElapsed();
     error CodehashChanged();
-    error CertificationExpired();
-    error NotSubmitter();
 
     /// @notice Set the WOOD token used for submitter bonds.
     /// @dev    The bond token cannot change while ANY bond is held. This is
@@ -257,12 +236,6 @@ contract TierRegistry is Ownable2Step {
     ///         tokens is unmaintainable operationally. Drain all bonds before
     ///         swapping; clearing the token to zero while the bond amount is still
     ///         armed is also rejected.
-    ///
-    ///         Deliberately silent about pending (unexecuted) certifications: one
-    ///         proposed while `wood` was TokenA pins TokenA at proposal time and
-    ///         `certify` pulls against that pinned token, then writes it onto the
-    ///         new bond, so swapping `wood` mid-window is inert to any pending
-    ///         certification's bond economics at both steps.
     function setWood(address wood_) external onlyOwner {
         if (totalBondedWood != 0) revert BondsOutstanding();
         if (wood_ == address(0) && submitterBondWood != 0) revert BondConfigUnset();
@@ -308,36 +281,10 @@ contract TierRegistry is Ownable2Step {
         emit TierCertified(target, selector, tier, extractableBoundBps, ch);
     }
 
-    /// @notice Set the delay between `proposeCertification` and the earliest
-    ///         allowed `certify`.
-    /// @dev    Bounded to `[MIN_CERTIFY_DELAY, MAX_CERTIFY_DELAY]`. The floor
-    ///         guarantees every grant is announced for at least a full day, so the
-    ///         delay can never be configured back into the instant path; the
-    ///         ceiling bounds governance error.
-    ///
-    ///         `readyAt` is computed ONCE at proposal time from whatever delay is
-    ///         live then, so changing this NEVER moves an already-pending
-    ///         certification's `readyAt`. The adversary is an owner shortening the
-    ///         delay to ripen an already-announced grant early — the emitted
-    ///         `readyAt` must stay trustworthy as the earliest possible
-    ///         activation. Applying a new delay requires re-proposing.
-    function setCertifyDelay(uint256 delay) external onlyOwner {
-        if (delay < MIN_CERTIFY_DELAY || delay > MAX_CERTIFY_DELAY) revert InvalidDelay();
-        certifyDelay = delay;
-        emit CertifyDelaySet(delay);
-    }
-
     /// @notice The one address permitted to demote on a passed challenge — the
     ///         ChallengeGame. A ROLE rather than registry ownership, so the
     ///         game can revoke a certification but never grant one.
     address public authorizedDemoter;
-
-    /// @notice Delay between `proposeCertification` and the earliest allowed
-    ///         `certify`. Bounded to [MIN_CERTIFY_DELAY, MAX_CERTIFY_DELAY].
-    ///         `readyAt` is computed once at proposal time from the delay
-    ///         live at that moment — changing `certifyDelay` never moves an
-    ///         already-pinned `readyAt` (see `setCertifyDelay`).
-    uint256 public certifyDelay = 3 days;
 
     error NotAuthorizedDemoter();
 
@@ -490,22 +437,6 @@ contract TierRegistry is Ownable2Step {
         bytes32 templateCodehash;
     }
 
-    /// @dev A proposed-but-not-yet-executed class certification. Mirrors
-    ///      `PendingCertification` field-for-field on the bond/timelock half —
-    ///      same pins, same rationale — and adds the template identity the
-    ///      address form has no need for. `readyAt == 0` is the existence
-    ///      sentinel.
-    struct PendingClassCertification {
-        uint8 tier;
-        uint16 extractableBoundBps;
-        address submitter;
-        uint64 readyAt;
-        uint96 bondAmount;
-        IERC20 bondToken; // ┘
-        address template;
-        bytes32 templateCodehash;
-    }
-
     /// @dev class fingerprint (clone codehash) => anchor. One per class,
     ///      shared by the tier and allowlist axes.
     mapping(bytes32 cloneCodehash => ClassAnchor) private _classAnchors;
@@ -515,9 +446,6 @@ contract TierRegistry is Ownable2Step {
     ///      or demoted through a class entry point or vice versa — namespace
     ///      isolation is structural here, not merely improbable.
     mapping(bytes32 classConfigKey => TierConfig) private _classConfigs;
-
-    /// @dev `classKey(cloneCodehash, selector)` => pending class certification.
-    mapping(bytes32 classConfigKey => PendingClassCertification) private _classPending;
 
     /// @dev A selector certified against one template codehash is never served
     ///      for another.
@@ -564,12 +492,9 @@ contract TierRegistry is Ownable2Step {
     ///      other selectors on the class, and leaves every sibling clone
     ///      untouched.
     ///
-    ///      WRITE-ONCE BY DESIGN — nothing clears it. The recovery path is the
-    ///      ordinary announced `proposeCertification` / `certify` ceremony,
-    ///      which writes an address entry that wins ahead of both this flag and
-    ///      the class. Adding a clear would be adding an INSTANT owner path to
-    ///      restore a convicted address's tier, undercutting `certifyDelay` —
-    ///      the one guarantee that every tier grant is announced in advance.
+    ///      WRITE-ONCE BY DESIGN — nothing clears it. The recovery path is an
+    ///      ordinary `certify`, which writes an address entry that wins ahead
+    ///      of both this flag and the class.
     mapping(bytes32 configKey => bool) private _classTierDenied;
 
     event ClassMemberTierDenied(address indexed target, bytes4 indexed selector);
@@ -588,23 +513,11 @@ contract TierRegistry is Ownable2Step {
     }
 
     error ClassNotCertified();
-    error NoPendingClassCertification();
     error InvalidStrategyFactory();
     /// @notice The certified template's live codehash no longer matches the
     ///         snapshot taken at certification.
     error TemplateCodehashChanged();
 
-    event ClassCertificationProposed(
-        address indexed template,
-        bytes4 indexed selector,
-        bytes32 indexed cloneCodehash,
-        uint8 tier,
-        uint16 extractableBoundBps,
-        address submitter,
-        uint256 bondAmount,
-        bytes32 templateCodehash,
-        uint64 readyAt
-    );
     event ClassCertified(
         address indexed template,
         bytes4 indexed selector,
@@ -613,7 +526,6 @@ contract TierRegistry is Ownable2Step {
         uint16 extractableBoundBps,
         bytes32 templateCodehash
     );
-    event ClassCertificationCancelled(address indexed template, bytes4 indexed selector);
     event ClassDemoted(address indexed template, bytes4 indexed selector, bytes32 indexed cloneCodehash);
 
     /// @notice Points class membership at a contract that answers `cloneTemplate(0)`
@@ -672,34 +584,14 @@ contract TierRegistry is Ownable2Step {
         return _classAnchors[cloneCodehash];
     }
 
-    /// @notice Propose certifying every ERC-1167 clone of `template` for
-    ///         `selector` at `tier` with `extractableBoundBps`. `onlyOwner`.
-    /// @dev    Mirrors `proposeCertification`: same delay, same bond pin, same
-    ///         codehash-drift guard — the gap between owner review and mining
-    ///         otherwise lets the template's deployer land different bytecode
-    ///         first, anchoring a class to code the owner never reviewed.
-    ///         `NotAContract` on a codeless template, else the level-2 check
-    ///         could later be satisfied by counterfactual CREATE2 code.
-    ///
-    ///         What the owner must check and this cannot: that `template` binds
-    ///         every init-supplied external address and is not itself a proxy.
-    ///
-    ///         A class certification admits every clone `StrategyFactory`
-    ///         minted from `template` as a batch recipient, whoever asked the
-    ///         factory for it. `SyndicateVault` binds each member to the vault
-    ///         (`vault() == vault`), which neutralizes a hostile clone ONLY IF
-    ///         the template derives its fund destination and its counterparty
-    ///         allowlist from `vault()` and exposes no payout / recipient /
-    ///         router address settable from `initialize` or `updateParams`
-    ///         data. `BaseStrategy._pushToVault` and the shipped templates
-    ///         satisfy this; the reviewer certifying a new template MUST verify
-    ///         it, because nothing on-chain does.
-    function proposeClassCertification(
+    /// @notice Certify every `StrategyFactory` clone of `template` for `selector`.
+    /// @dev The owner must verify off-chain that `template` binds every init-supplied
+    ///      address and is not itself a proxy; nothing here can check that.
+    function certifyClass(
         address template,
         bytes4 selector,
         uint8 tier,
         uint16 extractableBoundBps,
-        address submitter,
         bytes32 expectedTemplateCodehash
     ) external onlyOwner {
         if (tier >= TIER_ARBITRARY) revert InvalidTier();
@@ -707,84 +599,13 @@ contract TierRegistry is Ownable2Step {
         bytes32 tch = template.codehash;
         if (tch == bytes32(0) || tch == _EMPTY_CODEHASH) revert NotAContract();
         if (tch != expectedTemplateCodehash) revert CodehashChanged();
-        uint256 bondAmount = submitterBondWood;
-        if (bondAmount != 0 && submitter == address(0)) revert ZeroAddressSubmitter();
-
         bytes32 cch = cloneCodehashOf(template);
-        bytes32 k = classKey(cch, selector);
-        uint64 readyAt = uint64(block.timestamp + certifyDelay);
-        _classPending[k] = PendingClassCertification({
-            tier: tier,
-            extractableBoundBps: extractableBoundBps,
-            submitter: submitter,
-            readyAt: readyAt,
-            // casting to 'uint96' is safe because setSubmitterBondWood rejects
-            // amounts above type(uint96).max (BondTooLarge)
-            // forge-lint: disable-next-line(unsafe-typecast)
-            bondAmount: uint96(bondAmount),
-            bondToken: wood,
-            template: template,
-            templateCodehash: tch
-        });
-        emit ClassCertificationProposed(
-            template, selector, cch, tier, extractableBoundBps, submitter, bondAmount, tch, readyAt
-        );
-    }
-
-    /// @notice Execute a pending class certification once its delay elapsed.
-    /// @dev    Same execution model as `certify`: permissionless without a bond,
-    ///         submitter-only with one, every parameter fixed at proposal time.
-    ///         Reuses `_bonds` keyed by the class key. Re-verifies the TEMPLATE's
-    ///         codehash — a mid-window mutation voids the grant rather than
-    ///         certifying different bytecode under an old announcement.
-    function certifyClass(address template, bytes4 selector) external {
-        bytes32 cch = cloneCodehashOf(template);
-        bytes32 k = classKey(cch, selector);
-        PendingClassCertification memory p = _classPending[k];
-        if (p.readyAt == 0) revert NoPendingClassCertification();
-        if (block.timestamp < p.readyAt) revert CertifyDelayNotElapsed();
-        if (block.timestamp > p.readyAt + MAX_CERTIFY_WINDOW) revert CertificationExpired();
-        if (template.codehash != p.templateCodehash) revert TemplateCodehashChanged();
-        if (p.bondAmount != 0 && msg.sender != p.submitter) revert NotSubmitter();
-
-        SubmitterBond storage existing = _bonds[k];
-        if (existing.amount != 0) {
-            if (existing.releasableAt != 0) revert BondPendingRelease();
-            revert BondActive();
-        }
-        delete _classPending[k];
         bytes32 anchored = _classAnchors[cch].templateCodehash;
-        if (anchored != bytes32(0) && anchored != p.templateCodehash) ++_classEpoch[cch];
-        if (p.bondAmount != 0) {
-            _bonds[k] =
-                SubmitterBond({submitter: p.submitter, amount: p.bondAmount, releasableAt: 0, token: p.bondToken});
-            _classBondEpoch[k] = _classEpoch[cch];
-            totalBondedWood += p.bondAmount;
-            p.bondToken.safeTransferFrom(p.submitter, address(this), p.bondAmount);
-            emit SubmitterBondLocked(template, selector, p.submitter, p.bondAmount);
-        }
-        _classAnchors[cch] = ClassAnchor({template: p.template, templateCodehash: p.templateCodehash});
+        if (anchored != bytes32(0) && anchored != tch) ++_classEpoch[cch];
+        _classAnchors[cch] = ClassAnchor({template: template, templateCodehash: tch});
         _classConfigs[_classCfgKey(cch, selector)] =
-            TierConfig({tier: p.tier, extractableBoundBps: p.extractableBoundBps, certifiedCodehash: cch});
-        emit ClassCertified(template, selector, cch, p.tier, p.extractableBoundBps, p.templateCodehash);
-    }
-
-    /// @notice Withdraw a pending class certification before it executes.
-    function cancelClassCertification(address template, bytes4 selector) external onlyOwner {
-        bytes32 k = classKey(cloneCodehashOf(template), selector);
-        if (_classPending[k].readyAt == 0) revert NoPendingClassCertification();
-        delete _classPending[k];
-        emit ClassCertificationCancelled(template, selector);
-    }
-
-    /// @notice Full pending class-certification record; zeroed struct
-    ///         (`readyAt == 0`) when nothing is pending.
-    function pendingClassCertificationOf(address template, bytes4 selector)
-        external
-        view
-        returns (PendingClassCertification memory)
-    {
-        return _classPending[classKey(cloneCodehashOf(template), selector)];
+            TierConfig({tier: tier, extractableBoundBps: extractableBoundBps, certifiedCodehash: cch});
+        emit ClassCertified(template, selector, cch, tier, extractableBoundBps, tch);
     }
 
     /// @notice Effective tier for a class's `selector`, ignoring membership.
@@ -805,21 +626,10 @@ contract TierRegistry is Ownable2Step {
 
     /// @notice Demote a class for `selector` on a challenge conviction.
     ///         Restricted to `authorizedDemoter`, mirroring `demoteByChallenge`.
-    ///         Cancels a pending class certification ahead of the
-    ///         `ClassNotCertified` guard, on the same terms.
     function demoteClassByChallenge(address template, bytes4 selector) external {
         if (msg.sender != authorizedDemoter) revert NotAuthorizedDemoter();
         bytes32 cch = cloneCodehashOf(template);
-        bytes32 k = classKey(cch, selector);
-        bool cancelled = _classPending[k].readyAt != 0;
-        if (cancelled) {
-            delete _classPending[k];
-            emit ClassCertificationCancelled(template, selector);
-        }
-        if (_classConfigs[_classCfgKey(cch, selector)].certifiedCodehash == bytes32(0)) {
-            if (cancelled) return;
-            revert ClassNotCertified();
-        }
+        if (_classConfigs[_classCfgKey(cch, selector)].certifiedCodehash == bytes32(0)) revert ClassNotCertified();
         _demoteClass(template, selector);
     }
 
@@ -839,10 +649,6 @@ contract TierRegistry is Ownable2Step {
         bytes32 cch = cloneCodehashOf(template);
         bytes32 k = classKey(cch, selector);
         delete _classConfigs[_classCfgKey(cch, selector)];
-        if (_classPending[k].readyAt != 0) {
-            delete _classPending[k];
-            emit ClassCertificationCancelled(template, selector);
-        }
         SubmitterBond storage b = _bonds[k];
         if (b.amount != 0 && b.releasableAt == 0) {
             uint64 releasableAt = uint64(block.timestamp + bondReleaseDelay);

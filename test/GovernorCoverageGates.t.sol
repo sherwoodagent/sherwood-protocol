@@ -883,13 +883,8 @@ contract GovernorCoverageGatesTest is Test {
     ///      Created inside the tests rather than in `setUp` so the rest of this
     ///      suite keeps its simpler tier-2 / full-notional arithmetic.
     ///
-    ///      Two-step certification (design.md / tasks.md 2.1): the test
-    ///      contract IS the registry owner (`new TierRegistry(address(this))`),
-    ///      so no prank is needed — propose, warp past the pinned `readyAt`
-    ///      (via `vm.getBlockTimestamp()`, never a cached `block.timestamp`
-    ///      local — this repo's optimizer CSEs it across `vm.warp`), execute.
-    ///      Called before proposal creation in every site, so the forward warp
-    ///      never interacts with an in-flight proposal's execution window.
+    ///      The test contract IS the registry owner
+    ///      (`new TierRegistry(address(this))`), so no prank is needed.
     /// @dev `[asset.approve(puller, n), puller.pull(asset, n)]`: the only shape that moves the asset.
     function _pullCalls(address puller, uint256 amount) internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](2);

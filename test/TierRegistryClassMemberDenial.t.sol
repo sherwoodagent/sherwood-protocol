@@ -91,9 +91,7 @@ contract TierRegistryClassMemberDenialTest is Test {
 
     function _certifyClass(address tmpl, bytes4 sel) internal {
         vm.prank(owner);
-        registry.proposeClassCertification(tmpl, sel, TIER_1, BOUND, address(0), tmpl.codehash);
-        vm.warp(block.timestamp + registry.certifyDelay() + 1);
-        registry.certifyClass(tmpl, sel);
+        registry.certifyClass(tmpl, sel, TIER_1, BOUND, tmpl.codehash);
     }
 
     function _certifyAndAllowClass(address tmpl) internal {
