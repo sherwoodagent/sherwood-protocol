@@ -190,6 +190,14 @@ contract DeploySherwood is ScriptBase {
         // own natspec for the full dependency list).
         _seedTierRegistry(d.deployer, d.tierRegistry);
 
+        // The seeding above covers chain constants only. Strategy CLONES are
+        // gated on a class grant this deploy cannot make (the templates do not
+        // exist yet), and without it every batch naming a clone reverts.
+        console.log(
+            "RUNBOOK: after DeployTemplates, run CertifyStrategyClasses propose() then finalize()"
+            " once certifyDelay (default 3 days) has elapsed - until then no strategy proposal can execute."
+        );
+
         // Multisig handoff: prod hands all proxies to the multisig.
         address effectiveOwner = d.deployer;
         if (!skipHandoff) {
