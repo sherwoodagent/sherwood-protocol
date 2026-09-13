@@ -3,6 +3,10 @@
 **Commit:** `3f1099c` (`worktree-vivid-mixing-piglet` = `origin/main` merged with the
 local audit-gap fixes) · **Date:** 2026-08-04 · **Fuzzer:** Medusa 1.5.1
 
+This is a dated campaign record. Every coverage figure, property count and cited
+line number below is the measurement taken on its own run date against the
+contract set of that commit, and is kept as recorded rather than restated.
+
 ---
 
 ## Outcome
@@ -32,7 +36,7 @@ violated property is a lead, not a verdict, until a harness bug is ruled out.
 | `fizz_data/coverage-targets.md` | Per-contract targets, cycle history, and why cycles 2–3 were invalid |
 
 The harness deploys the real stack — `SyndicateVault`, `SyndicateGovernor`,
-`GuardianRegistry`, `StakedWood`, `ExposureLedger`, `ChallengeGame`, `TokenCourt`,
+`GuardianRegistry`, `StakedWood`, `ExposureLedger`, `ChallengeGame`,
 `TierRegistry`, `ProposerBondEscrow`, `VaultWithdrawalQueue` — behind real
 ERC-1967 proxies with production init signatures, plus a certified adapter,
 three matured guardians and a seeded vault.
@@ -142,10 +146,10 @@ a confirmed bug; each is a documentation or design question:
    aggregate exposure unbounded because N vaults could each sit just under
    `coveredTvlCapUsd`, and cited G-40. Both halves were wrong:
 
-   - **G-40 is about something else.** It pins `TokenCourt`'s participation
-     floor against sWOOD's age-weight floor (`x-ray/invariants.md`,
-     `TokenCourt.sol:258`). Nothing in it concerns covered TVL. The citation was
-     fabricated by cross-reference, not read.
+   - **G-40 is about something else.** In the x-ray generation this campaign
+     ran against, G-40 is a guardian-vote electorate guard, not a TVL guard
+     (`x-ray/invariants.md`). Nothing in it concerns covered TVL. The citation
+     was fabricated by cross-reference, not read.
    - **Aggregate exposure is bounded, just not by this cap.** `recordApproval`
      computes `capUsd = kNumerator * _slashableBondUsd(guardian, …)` against
      `open = openExposureUsd(guardian)`, and `_buckets[guardian][epoch]` is
@@ -204,12 +208,12 @@ Recorded because each cost a full run and each will recur:
 ## Next steps, highest value first
 
 1. **Add a challenge-lifecycle composite.** The single biggest coverage lever.
-   `ChallengeGame` 26%, `TokenCourt` 29%, `ExposureLedger` 33% and
+   `ChallengeGame` 26%, `ExposureLedger` 33% and
    `ProposerBondEscrow` 34% are all gated behind the same chain:
-   execute → file → dispute-to-pool-completion → refer → vote → finalize → rule.
+   execute → file → a convict quorum of guardian votes → resolve.
    Random sequencing almost never assembles it, exactly as it never assembled
    propose→execute before `syndicateGovernor_lifecycle_toExecuted` was added.
-   One `challengeGame_lifecycle_toConviction` handler should move all four.
+   One `challengeGame_lifecycle_toConviction` handler should move all three.
 2. **Implement the remaining 66 properties**, prioritising GL-12/GL-13/GL-49
    (the ExposureLedger shared-stake accumulators — x-ray X-8, the mathematical
    core of the protocol's central economic claim, currently asserted nowhere)
@@ -254,7 +258,7 @@ replay stale artifacts.
 than regressions — two are EXPLORATORY properties doing their job, one was a
 defect in a property added the same day.
 
-### Coverage: the adjudication chain unblocked
+### Coverage: the accountability chain unblocked
 
 | Contract | Before | Now | Lines |
 |---|------:|----:|------:|

@@ -21,7 +21,7 @@ Dollar values (`{USD}`) SHALL always be carried as `D18{USD}` in this layer, and
 - **THEN** it is a violation — the two producers are the only places asset/WOOD quantities are lifted to `D18{USD}`
 
 ### Requirement: WOOD amounts are 18-decimal wei of a plain ERC20
-`{WOOD}` quantities SHALL be WOOD wei (18 decimals), and WOOD SHALL be assumed a plain ERC20 — no fee-on-transfer, no rebasing. Carriers: `Guardian.stakedAmount`, `totalGuardianStake`, `minGuardianStake`, `minOwnerStake`, `bondWood`, `counterBondWood`, `bondedWood`, `forfeitedWood`, `unclaimedWood`, `Case.proceeds`, `Case.redeemed`, `totalEscrowed`.
+`{WOOD}` quantities SHALL be WOOD wei (18 decimals), and WOOD SHALL be assumed a plain ERC20 — no fee-on-transfer, no rebasing. Carriers: `Guardian.stakedAmount`, `totalGuardianStake`, `minGuardianStake`, `minOwnerStake`, `bondWood`, `bondedWood`, `votableStakeAtFiling`, `convictWeight`, `acquitWeight`, `totalEscrowed`.
 
 #### Scenario: Non-plain token substituted
 - **WHEN** a fee-on-transfer or rebasing token is used where `{WOOD}` is expected
@@ -49,14 +49,14 @@ Dollar values (`{USD}`) SHALL always be carried as `D18{USD}` in this layer, and
 - **THEN** the amount is mis-scaled — `{TOK}` sites must read `IERC20Metadata.decimals()`
 
 ### Requirement: Time quantities are seconds
-`{s}` quantities SHALL be seconds: `block.timestamp`, `epochLength`, `challengeWindow`, `reviewPeriod`, `maturationPeriod`, `autoSlashDelay`, `disputeTimeout`, `voteWindow`, `SECONDS_PER_YEAR`, `elapsed`, `age`.
+`{s}` quantities SHALL be seconds: `block.timestamp`, `epochLength`, `challengeWindow`, `reviewPeriod`, `maturationPeriod`, `voteWindow`, `voteWindowAtFiling`, `MIN_VOTE_WINDOW`, `SECONDS_PER_YEAR`, `elapsed`, `age`.
 
 #### Scenario: Window comparison
-- **WHEN** cross-contract window invariants are checked (e.g. `autoSlashDelay + voteWindow + FINALIZE_BUFFER <= disputeTimeout`)
+- **WHEN** a window is compared against its bound or its deadline (e.g. `voteWindow >= MIN_VOTE_WINDOW`, `block.timestamp >= filedAt + voteWindowAtFiling`)
 - **THEN** every operand is `{s}` — no mixed units enter the inequality
 
 ### Requirement: Basis points carry a 10_000 denominator
-`{bps}` quantities SHALL be basis points with denominator `BPS_DENOMINATOR = 10_000`, declared independently in `ExposureLedger`, `GuardianRegistry`, `ChallengeGame` and `TokenCourt`. Carriers: `proposerBondBps`, `woodHaircutBps`, `maxDelegatedSlashBps`, `minSlashBps`, `maxSlashBps`, `ageFloorBps`, `challengerBondBps`, `forfeitBurnBps`, `settleBurnBps`, `inconclusiveBurnBps`, `participationFloorBps`, `convictionBountyBps`, `maxSlippageBps`.
+`{bps}` quantities SHALL be basis points with denominator `BPS_DENOMINATOR = 10_000`, declared independently in `ExposureLedger`, `GuardianRegistry` and `ChallengeGame`. Carriers: `proposerBondBps`, `woodHaircutBps`, `maxDelegatedSlashBps`, `minSlashBps`, `maxSlashBps`, `ageFloorBps`, `challengerBondBps`, `forfeitBurnBps`, `settleBurnBps`, `prosecutorFeeBps`, `challengeQuorumBps`, `maxSlippageBps`.
 
 #### Scenario: bps applied without the denominator
 - **WHEN** a `{bps}` value multiplies a quantity without a `/ 10_000`
@@ -126,7 +126,7 @@ The `{ASSET}/{SHARE}` vault conversion rate SHALL be materialized as the frozen 
 - **THEN** later vault activity changes the payout — the frozen pair exists so it cannot
 
 ### Requirement: Per-approver slash rate rounds up and is positional
-`bps{slash}` SHALL be the severity ceiling for every approver holding a live commitment (`slashBpsFor`) — punitive, not a share of the loss, so it derives from no USD quantity and reads no price. It SHALL be consumed POSITIONALLY by `StakedWood.slashVerdict`: alignment with the approver array, and with the parallel `contestors` array, is load-bearing.
+`bps{slash}` SHALL be the severity ceiling for every approver holding a live commitment (`slashBpsFor`) — punitive, not a share of the loss, so it derives from no USD quantity and reads no price. It SHALL be consumed POSITIONALLY by `StakedWood.slashVerdict`: alignment with the approver array is load-bearing.
 
 #### Scenario: Array misalignment
 - **WHEN** the slash-bps array order diverges from the approver array order
