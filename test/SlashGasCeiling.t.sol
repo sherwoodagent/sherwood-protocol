@@ -93,11 +93,11 @@ contract SlashGasAdapter {
 ///                    _settle                (private, still frame 1)
 ///                    -> StakedWood.slashVerdict [frame 2, + proxy delegatecall]
 ///
-///         i.e. ONE `CALL` above the check. The ceiling gate below reserves more
-///         haircuts than that: the surplus pays the intrinsic transaction cost
-///         and `_settle`'s own pre-check work (`_accusedWithRates` reads the
-///         ledger's rate for all 100 approvers before the floor is ever
-///         consulted), all of which come out of the same 32M.
+///         i.e. ONE `CALL` above the check, so the ceiling gate below prices
+///         exactly one haircut. The intrinsic transaction cost and `_settle`'s
+///         own pre-check work (`_accusedWithRates` reads the ledger's rate for
+///         all 100 approvers before the floor is ever consulted) come out of
+///         the same 32M, and live in the margin the gate leaves above the floor.
 contract SlashGasCeilingTest is Test {
     // ── Real stack ──
     ERC20Mock public usdg;
@@ -449,14 +449,13 @@ contract SlashGasCeilingTest is Test {
     ///         `test_fullCapConviction_fitsInAMinableTransaction`; this is the
     ///         tripwire in front of it.
     ///
-    ///         The haircut is `(63/64)^3` against a VERIFIED depth of one frame
-    ///         (see the contract-level note and
-    ///         `test_theGasFloorSitsOneExternalFrameBelowAnEoa`). The surplus
-    ///         factors are not superstition — they are the budget reserved for
-    ///         everything the floor does NOT cover but the same 32M still has to
-    ///         pay for: the intrinsic transaction cost and `_settle`'s pre-check
-    ///         work, which reads the ledger's rate for all 100 approvers BEFORE
-    ///         `gasleft()` is ever consulted.
+    ///         The haircut is a single `(63/64)`, matching the VERIFIED depth of
+    ///         one frame (see the contract-level note and
+    ///         `test_theGasFloorSitsOneExternalFrameBelowAnEoa`). What the floor
+    ///         does NOT cover but the same 32M still has to pay for — the
+    ///         intrinsic transaction cost and `_settle`'s pre-check work, which
+    ///         reads the ledger's rate for all 100 approvers BEFORE `gasleft()`
+    ///         is ever consulted — has to fit in the gap this assertion leaves.
     function test_slashGasFloorFitsRobinhoodMaxTxGas() public {
         _deployStack(0); // the gate needs the constants, not a cohort
 
@@ -467,15 +466,16 @@ contract SlashGasCeilingTest is Test {
         uint256 cap = registry.MAX_APPROVERS_PER_PROPOSAL();
         uint256 floor = cap * game.SLASH_GAS_PER_APPROVER() + game.SLASH_GAS_BASE() + game.DEMOTION_GAS();
 
-        // 32,000,000 * 63^3 / 64^3, integer-exact.
-        uint256 ceiling = (MAX_TX_GAS * 63 * 63 * 63) / (64 * 64 * 64);
+        // 32,000,000 * 63 / 64, integer-exact: the one EIP-150 haircut an EOA
+        // calling `resolve` directly spends.
+        uint256 ceiling = (MAX_TX_GAS * 63) / 64;
 
         emit log_named_uint("MAX_APPROVERS_PER_PROPOSAL", cap);
         emit log_named_uint("SLASH_GAS_PER_APPROVER", game.SLASH_GAS_PER_APPROVER());
         emit log_named_uint("SLASH_GAS_BASE", game.SLASH_GAS_BASE());
         emit log_named_uint("DEMOTION_GAS", game.DEMOTION_GAS());
         emit log_named_uint("full-cap slash gas floor (adapter-naming)", floor);
-        emit log_named_uint("32M after (63/64)^3", ceiling);
+        emit log_named_uint("32M after one 63/64 haircut", ceiling);
 
         assertLt(floor, ceiling, "a full-cap conviction must fit inside one Robinhood transaction");
     }
@@ -502,10 +502,10 @@ contract SlashGasCeilingTest is Test {
     ///             it is `private` in `ChallengeGame` and the natspec above the
     ///             constants records the dependency.
     ///
-    ///         The gate above reserves more haircuts than the verified depth
-    ///         spends, leaving the surplus for the intrinsic cost and `_settle`'s
-    ///         pre-check work. This test's job is to make a change in depth loud
-    ///         rather than silent.
+    ///         The gate above prices exactly the haircut the verified depth
+    ///         spends, leaving the intrinsic cost and `_settle`'s pre-check work
+    ///         to the gap between the floor and that ceiling. This test's job is
+    ///         to make a change in depth loud rather than silent.
     function test_theGasFloorSitsOneExternalFrameBelowAnEoa() public {
         _deployStack(0);
 
@@ -514,11 +514,11 @@ contract SlashGasCeilingTest is Test {
         // ...and the same read DOES see a proxy, so a zero above means something.
         assertTrue(_implementationSlot(address(swood)) != address(0), "positive control: StakedWood is behind ERC-1967");
 
-        // The gate is conservative by construction: the haircuts it reserves are
-        // strictly more than the one the verified depth actually spends.
-        uint256 gateCeiling = (MAX_TX_GAS * 63 * 63 * 63) / (64 * 64 * 64);
-        uint256 reachableAtVerifiedDepth = (MAX_TX_GAS * 63) / 64;
-        assertLt(gateCeiling, reachableAtVerifiedDepth, "the gate under-claims what depth 1 can reach");
+        // The gate prices one haircut, which is exactly what the verified depth
+        // spends; the complement form is the same number reached another way.
+        uint256 gateCeiling = (MAX_TX_GAS * 63) / 64;
+        uint256 reachableAtVerifiedDepth = MAX_TX_GAS - MAX_TX_GAS / 64;
+        assertEq(gateCeiling, reachableAtVerifiedDepth, "the gate must price exactly the depth-1 haircut");
     }
 
     /// @dev The ERC-1967 implementation slot,

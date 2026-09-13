@@ -50,24 +50,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         an operator outage or a short chain halt.
     uint256 public constant MIN_VOTE_WINDOW = 2 days;
 
-    /// @dev THE GAS FLOOR for a permissionless `resolve`, sized per approver
-    ///      plus a base because the slash loop runs first and a flat floor would
-    ///      let a large batch consume it before the work that needs protecting.
-    ///      What it protects is the best-effort `demoteByChallenge` child below:
-    ///      under EIP-150 a caller supplying just enough gas to finish the slash
-    ///      alone would leave that child 63/64 of a nearly-empty frame, and its
-    ///      OOG would be swallowed by the catch while the adapter keeps its
-    ///      certification. Everything else after the slash either reverts the
-    ///      whole call (unguarded `safeTransfer`s) or is internal bookkeeping,
-    ///      so it is safe by rollback.
-    ///
-    ///      A FLOOR MUST ALSO BE REACHABLE. At a previous 300k/1M the full-cap
-    ///      floor was 31,000,000 against Robinhood Chain's `maxTxGasLimit` of
-    ///      32,000,000, which the EIP-150 haircut puts out of reach of any
-    ///      transaction: a conviction against a full cohort could not be mined,
-    ///      the challenge would run out its clock, and the accused would be
-    ///      ACQUITTED. A gas floor that converts a guilty verdict into an
-    ///      acquittal is worse than the out-of-gas it was written to prevent.
+    /// @dev THE GAS FLOOR for a permissionless `resolve`: per approver plus a
+    ///      base, because the slash loop runs first and EIP-150 would otherwise
+    ///      leave the best-effort `demoteByChallenge` child 63/64 of an empty
+    ///      frame, its OOG swallowed by the catch while the adapter keeps its
+    ///      certification.
     ///
     ///      THE NUMBERS ARE MEASURED, NOT ESTIMATED
     ///      (`test/SlashGasCeiling.t.sol`): 713,853 gas at 4 approvers,
@@ -76,9 +63,10 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      pairwise dedup scan. 180k/approver keeps ~1.4x over the marginal
     ///      cost of the hundredth approver, headroom for a long-lived guardian
     ///      whose deeper checkpoint trace this fixture does not reproduce. The
-    ///      2M base keeps a large multiple over any child call. Full-cap floor
-    ///      for a zero-adapter settle is 20,000,000 against a
-    ///      `32,000,000 * (63/64)^3 = 30,523,315` ceiling.
+    ///      2M base keeps a large multiple over any child call. An EOA calls
+    ///      `resolve` directly, so one haircut applies: the full-cap floor for a
+    ///      zero-adapter settle is 20,000,000 against a
+    ///      `32,000,000 * 63/64 = 31,500,000` ceiling.
     ///      `test_slashGasFloorFitsRobinhoodMaxTxGas` is the CI tripwire.
     ///      Re-derive end to end through `resolve` before moving these:
     ///      over-reserving only rejects an under-gassed caller, while
@@ -97,7 +85,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      ~50k. 200_000 forwards ~197k after 63/64 forwarding even if every
     ///      unit before the call was spent to the floor's budget. Full-cap floor
     ///      for an adapter-naming settle is 20,200,000 against the same
-    ///      30,523,315 ceiling - 1.511x headroom, gated in CI by
+    ///      31,500,000 ceiling - 1.559x headroom, gated in CI by
     ///      `test_slashGasFloorFitsRobinhoodMaxTxGas`.
     uint256 public constant DEMOTION_GAS = 200_000;
 
@@ -773,13 +761,13 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @inheritdoc IChallengeGame
     /// @dev VIEW ONLY - reports the inequality, it does not enforce it.
     ///      `challengerBondBps * settleBurnBps <= proposerBondBps *
-    ///      prosecutorFeeBps` is the break-even condition for a CORRECT,
-    ///      UNCONTESTED filing: the challenger's net payoff on that path is the
-    ///      difference of those two products, scaled by coverage and the WOOD
-    ///      price, both of which cancel out of the SIGN. A `false` result means
-    ///      silence is the accused's dominant strategy against the CURRENT
-    ///      configuration. Recompute the margin from the four live values rather
-    ///      than trusting any worked example in prose - one has gone stale twice.
+    ///      prosecutorFeeBps` is the break-even condition for a CORRECT filing
+    ///      that REACHES THE QUORUM - the filing's best case, since silence
+    ///      fails a challenge rather than convicting. The net payoff there is
+    ///      the difference of those two products, scaled by coverage and the
+    ///      WOOD price, both of which cancel out of the SIGN. A `false` result
+    ///      means even that best case pays the challenger less than it costs.
+    ///      Recompute the margin from the four live values, not from prose.
     ///
     ///      This contract deliberately does NOT gate any setter on the result.
     ///      The values that would make it `true` trade off against
