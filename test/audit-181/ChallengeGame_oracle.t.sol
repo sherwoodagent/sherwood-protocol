@@ -161,6 +161,40 @@ contract MockTierRegistryForOracleTest {
     function demoteByChallenge(address, bytes4) external {}
 }
 
+/// @dev sWOOD stand-in: `file` reads the electorate off it, so a game with
+///      none wired takes no filing at all. One guardian outside the accused
+///      cohort, which is all these price tests need.
+contract MockStakedWoodForOracleTest {
+    address public authorizedSlasher;
+    mapping(address guardian => uint256) internal _stake;
+    uint256 internal _total;
+
+    function setAuthorizedSlasher(address slasher) external {
+        authorizedSlasher = slasher;
+    }
+
+    function setStake(address guardian, uint256 amount) external {
+        _total = _total + amount - _stake[guardian];
+        _stake[guardian] = amount;
+    }
+
+    function getPastStake(address guardian, uint256) external view returns (uint256) {
+        return _stake[guardian];
+    }
+
+    function getPastTotalVotes(uint256) external view returns (uint256) {
+        return _total;
+    }
+
+    function isActiveGuardian(address guardian) external view returns (bool) {
+        return _stake[guardian] != 0;
+    }
+
+    function verdictSlashed(bytes32, address) external pure returns (bool) {
+        return false;
+    }
+}
+
 /// @title ChallengeGame_oracle
 /// @notice Regression coverage for audit issue #181, finding #12, against
 ///         `ChallengeGame`/`IChallengeGame`.
@@ -177,6 +211,7 @@ contract ChallengeGame_oracleTest is Test {
     MockGovernorForOracleTest internal governor;
     MockLedgerForOracleTest internal ledger;
     MockTierRegistryForOracleTest internal tierRegistry;
+    MockStakedWoodForOracleTest internal swood;
     ERC20Mock internal wood;
 
     address internal owner = address(this);
@@ -194,6 +229,10 @@ contract ChallengeGame_oracleTest is Test {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
 
         game = new ChallengeGame(owner, address(wood), address(ledger), address(tierRegistry));
+        swood = new MockStakedWoodForOracleTest();
+        swood.setAuthorizedSlasher(address(game));
+        swood.setStake(address(0xB0B), 1_000e18);
+        game.setStakedWood(address(swood));
 
         governor.setExecuted(PROPOSAL_ID, vault, block.timestamp);
 

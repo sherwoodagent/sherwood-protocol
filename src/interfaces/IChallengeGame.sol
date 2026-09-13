@@ -89,6 +89,13 @@ interface IChallengeGame {
         ///      bond, which the settle path treats as nothing-to-forfeit rather
         ///      than an error. Appended for tuple-position stability.
         address proposerBondEscrow;
+        /// @dev Stake eligible to vote on this challenge: the guardian total at
+        ///      filing less the accused cohort's own weight.
+        uint256 votableStakeAtFiling;
+        /// @dev The quorum in force at filing, pinned like every other rate.
+        uint256 quorumBpsAtFiling;
+        /// @dev Running convict-side weight.
+        uint256 convictWeight;
     }
 
     // ── Errors ──
@@ -155,6 +162,15 @@ interface IChallengeGame {
     ///         only way to move the freeze rail — have no permissionless
     ///         equivalent.
     error RenounceDisabled();
+    /// @dev One vote per guardian per challenge; there is no un-vote and no
+    ///      re-vote, which is what lets a reached quorum settle on the spot.
+    error AlreadyVoted();
+    /// @dev The voter is one of the approvers this challenge accuses. Its
+    ///      weight is out of the denominator, so it cannot be in the numerator.
+    error AccusedCannotVote();
+    /// @dev The voter is not an active guardian, or carried no staked WOOD at
+    ///      the filing instant.
+    error NoVotableStake();
 
     // ── Events ──
     /// @dev `evidenceURI` is carried on-chain unindexed so predicates that
@@ -233,6 +249,10 @@ interface IChallengeGame {
     event SettleBurnBpsSet(uint256 oldBps, uint256 newBps);
     event FilingsPausedSet(bool oldPaused, bool newPaused);
     event ProsecutorFeeBpsSet(uint256 oldBps, uint256 newBps);
+    /// @dev `weight` is the voter's staked WOOD at `filedAt`, the same basis
+    ///      the challenge's votable stake was measured on.
+    event ChallengeVoteCast(uint256 indexed challengeId, address indexed voter, bool convict, uint256 weight);
+    event ChallengeQuorumBpsSet(uint256 oldBps, uint256 newBps);
 
     // Filing
     /// @notice File a bonded challenge against an executed proposal, freezing the
@@ -260,6 +280,9 @@ interface IChallengeGame {
         bytes4 adapterSelector,
         string calldata evidenceURI
     ) external returns (uint256 challengeId);
+
+    // Deciding
+    function voteOnChallenge(uint256 challengeId, bool convict) external;
 
     // Resolution
     /// @notice Permissionless resolution once the decision window has closed.
@@ -293,6 +316,12 @@ interface IChallengeGame {
     ///         reach.
     function forfeitBurnBps() external view returns (uint256);
     function voteWindow() external view returns (uint256);
+    function challengeQuorumBps() external view returns (uint256);
+    function challengeTallyOf(uint256 challengeId)
+        external
+        view
+        returns (uint256 convictWeight, uint256 votableStake, uint256 quorumBps);
+    function hasVotedOn(uint256 challengeId, address voter) external view returns (bool);
     /// @notice Share of a SUCCESSFUL challenger's bond burned on settle, in bps.
     function settleBurnBps() external view returns (uint256);
     /// @notice Slice of the convicted proposer's forfeited bond paid to the
@@ -365,6 +394,7 @@ interface IChallengeGame {
     ///         self-challenge round trip.
     function setForfeitBurnBps(uint256 newBps) external;
     function setVoteWindow(uint256 newWindow) external;
+    function setChallengeQuorumBps(uint256 newBps) external;
     /// @notice Set the settle-path burn.
     function setSettleBurnBps(uint256 newBps) external;
     function setFilingsPaused(bool paused) external;

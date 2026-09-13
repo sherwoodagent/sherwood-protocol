@@ -119,6 +119,13 @@ abstract contract ChallengeGameHandler is Properties {
         uint256 challengeId = game.challengeCount();
         if (challengeId == idBefore) return;
 
+        // Silence fails a challenge, so the composite has to carry the vote:
+        // every guardian tries, and the ones this filing accuses are refused.
+        for (uint256 i; i < GUARDIAN_COUNT; i++) {
+            vm.prank(actors[i]);
+            try game.voteOnChallenge(challengeId, true) {} catch {}
+        }
+
         // The clock this challenge received, not the live parameter: the
         // secondary dispatcher can move the latter after filing.
         skipTime(game.challengeOf(challengeId).voteWindowAtFiling + 1);

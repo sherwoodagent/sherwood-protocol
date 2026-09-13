@@ -203,6 +203,18 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         pays `forfeitBurnBps` of the bond on a different path.
     uint256 public settleBurnBps = 500;
 
+    /// @notice Share of the votable stake that must vote to convict, in basis
+    ///         points. Bounded like the registry's block quorum; pinned onto
+    ///         each challenge at filing.
+    uint256 public challengeQuorumBps = 3_000;
+
+    /// @dev One vote per guardian per challenge.
+    mapping(uint256 challengeId => mapping(address voter => bool)) internal _voted;
+
+    /// @dev The approvers this challenge accuses, so the vote can refuse them
+    ///      in O(1). Written in the loop `file` already runs over the cohort.
+    mapping(uint256 challengeId => mapping(address approver => bool)) internal _accusedApprover;
+
     /// @notice Ceiling on `prosecutorFeeBps`, mirroring
     ///         `ProposerBondEscrow.MAX_PROSECUTOR_FEE_BPS`.
     /// @dev    A CONVENIENCE GUARD, NOT THE AUTHORITY. The escrow enforces its
@@ -376,6 +388,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         }
         if (lockedTotal == 0) revert NothingToFreeze();
 
+        challengeId = ++challengeCount;
         // Same refusal as `_convicted` above, but asked of sWOOD directly, whose
         // `verdictSlashed` key survives a redeploy of this game. Without it, a
         // replacement game would accept filings against a cohort the OLD game
@@ -385,6 +398,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         for (uint256 i = 0; i < lockedWood.length; i++) {
             if (lockedWood[i] == 0) continue;
             accused[--accusedCount] = covering[i];
+            _accusedApprover[challengeId][covering[i]] = true;
         }
         if (_verdictAlreadyCollected(key, accused)) revert AlreadyConvicted();
 
@@ -400,7 +414,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         uint256 bondWood = (((coverageUsd * challengerBondBps) / BPS_DENOMINATOR) * 1e8) / priceX8;
         if (bondWood == 0) revert BondTooSmall();
 
-        challengeId = ++challengeCount;
+        // The electorate is pinned ONCE, here. A later read would let stake
+        // moved after the filing change what the quorum is measured against.
+        IStakedWood swood = stakedWood;
+        if (address(swood) == address(0)) revert ZeroAddress();
+        uint256 votable = swood.getPastTotalVotes(block.timestamp);
+        for (uint256 i = 0; i < accused.length; i++) {
+            uint256 w = swood.getPastStake(accused[i], block.timestamp);
+            votable = votable > w ? votable - w : 0;
+        }
+
         _challenges[challengeId] = Challenge({
             governor: governor,
             proposalId: proposalId,
@@ -434,7 +457,10 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // `getProposal` read. Bound at propose time and never re-pointed, so
             // a verdict up to `voteWindow` later confiscates from the escrow the
             // bond was locked in.
-            proposerBondEscrow: p.proposerBondEscrow
+            proposerBondEscrow: p.proposerBondEscrow,
+            votableStakeAtFiling: votable,
+            quorumBpsAtFiling: challengeQuorumBps,
+            convictWeight: 0
         });
         _lastChallenge[key] = challengeId;
         _liveByChallenger[challengerKey] = challengeId;
@@ -485,6 +511,30 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         return keccak256(abi.encode(key, challenger));
     }
 
+    // ── Deciding ──
+
+    /// @notice Cast a guardian's vote on a live challenge. Weight is the
+    ///         voter's staked WOOD at the filing instant.
+    /// @dev The accused approvers are refused: they underwrote the proposal the
+    ///      challenge accuses, so their weight is out of the denominator too.
+    function voteOnChallenge(uint256 challengeId, bool convict) external {
+        Challenge storage c = _challenges[challengeId];
+        if (c.status != Status.Filed) revert WrongStatus();
+        if (block.timestamp >= c.filedAt + c.voteWindowAtFiling) revert WindowClosed();
+        if (_accusedApprover[challengeId][msg.sender]) revert AccusedCannotVote();
+        if (_voted[challengeId][msg.sender]) revert AlreadyVoted();
+
+        IStakedWood swood = stakedWood;
+        if (address(swood) == address(0)) revert ZeroAddress();
+        if (!swood.isActiveGuardian(msg.sender)) revert NoVotableStake();
+        uint256 weight = swood.getPastStake(msg.sender, c.filedAt);
+        if (weight == 0) revert NoVotableStake();
+
+        _voted[challengeId][msg.sender] = true;
+        if (convict) c.convictWeight += weight;
+        emit ChallengeVoteCast(challengeId, msg.sender, convict, weight);
+    }
+
     // ── Resolution ──
 
     /// @inheritdoc IChallengeGame
@@ -494,8 +544,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     function resolve(uint256 challengeId) external {
         Challenge storage c = _challenges[challengeId];
         if (c.status != Status.Filed) revert WrongStatus();
+        // Monotone: there is no un-vote, so a reached quorum can settle at once.
+        uint256 votable = c.votableStakeAtFiling;
+        if (votable != 0 && c.convictWeight * BPS_DENOMINATOR >= c.quorumBpsAtFiling * votable) {
+            _settle(challengeId, c);
+            return;
+        }
         if (block.timestamp < c.filedAt + c.voteWindowAtFiling) revert DelayNotElapsed();
-        _settle(challengeId, c);
+        _fail(challengeId, c);
     }
 
     function _settle(uint256 challengeId, Challenge storage c) private {
@@ -651,6 +707,21 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         return _challenges[challengeId];
     }
 
+    /// @notice This challenge's convict weight, its votable basis and its pinned quorum.
+    function challengeTallyOf(uint256 challengeId)
+        external
+        view
+        returns (uint256 convictWeight, uint256 votableStake, uint256 quorumBps)
+    {
+        Challenge storage c = _challenges[challengeId];
+        return (c.convictWeight, c.votableStakeAtFiling, c.quorumBpsAtFiling);
+    }
+
+    /// @notice Whether this guardian has already voted on this challenge.
+    function hasVotedOn(uint256 challengeId, address voter) external view returns (bool) {
+        return _voted[challengeId][voter];
+    }
+
     /// @inheritdoc IChallengeGame
     function liveChallengeOf(address governor, uint256 proposalId) external view returns (uint256) {
         return _liveChallengeId(_lastChallenge[_reviewKey(governor, proposalId)]);
@@ -802,6 +873,15 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (newWindow < MIN_VOTE_WINDOW) revert InvalidParameter();
         emit VoteWindowSet(voteWindow, newWindow);
         voteWindow = newWindow;
+    }
+
+    /// @notice Set the convict quorum, in basis points of the votable stake.
+    /// @dev Floored well above zero: a quorum a single dust guardian could meet
+    ///      would make the vote a formality rather than a decision.
+    function setChallengeQuorumBps(uint256 newBps) external onlyOwner {
+        if (newBps < 1_000 || newBps > BPS_DENOMINATOR) revert InvalidParameter();
+        emit ChallengeQuorumBpsSet(challengeQuorumBps, newBps);
+        challengeQuorumBps = newBps;
     }
 
     /// @dev Bounded [0, `MAX_SETTLE_BURN_BPS`]. Zero is legal and means the

@@ -422,9 +422,14 @@ contract SlashGasCeilingTest is Test {
         );
     }
 
-    /// @dev Runs the clock out, leaving the challenge exactly one `resolve` away
-    ///      from a full-cap conviction.
+    /// @dev Reaches the convict quorum from the two jurors — the cohort this
+    ///      filing accuses cannot vote on it — then runs the clock out, leaving
+    ///      the challenge exactly one `resolve` away from a full-cap conviction.
     function _closeTheWindow(uint256 cid) internal {
+        vm.prank(juror1);
+        game.voteOnChallenge(cid, true);
+        vm.prank(juror2);
+        game.voteOnChallenge(cid, true);
         vm.warp(vm.getBlockTimestamp() + game.challengeOf(cid).voteWindowAtFiling);
     }
 
