@@ -290,6 +290,10 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      cross-deployment fact, not the fact itself.
     mapping(bytes32 reviewKey => bool) internal _convicted;
 
+    /// @dev Whether this proposal's challenge window has already been re-armed
+    ///      by a silent failure. Once per key.
+    mapping(bytes32 reviewKey => bool) internal _rearmed;
+
     /// @dev Bounds the constructed `challengeWindow` against the wired ledger's
     ///      own window, as `setChallengeWindow` and `setExposureLedger` do at
     ///      runtime - a game window above the ledger's would let a filing freeze
@@ -660,7 +664,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     }
 
     function _rearmChallengeWindow(bytes32 rk, address governor, uint256 proposalId) private {
-        if (_convicted[rk]) return;
+        // One silent failure buys one more window; repeated silence lets the
+        // window close, so a re-filer cycling addresses cannot keep a cohort's
+        // coverage pinned indefinitely.
+        if (_convicted[rk] || _rearmed[rk]) return;
+        _rearmed[rk] = true;
         uint256 extended = block.timestamp + challengeWindow;
         if (extended > challengeableUntil[rk]) challengeableUntil[rk] = extended;
         exposureLedger.pinCoverageUntil(governor, proposalId, challengeableUntil[rk]);

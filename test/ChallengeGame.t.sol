@@ -2344,6 +2344,40 @@ contract ChallengeGameTest is Test {
         );
     }
 
+    /// @notice BUT ONLY ONCE. Silence is how a challenge normally ends, so an
+    ///         unbounded re-arm would let a griefer cycle addresses — file, wait
+    ///         the window out, fail, refile — and keep a cohort's coverage
+    ///         pinned and its stake unclaimable forever, for the price of the
+    ///         forfeit burn each round. One silent failure buys one more window;
+    ///         the second lets it close.
+    function test_windowReArmsAtMostOncePerProposal() public {
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+
+        uint256 first = _fileStandard(PROPOSAL);
+        vm.warp(vm.getBlockTimestamp() + game.challengeOf(first).voteWindowAtFiling);
+        game.resolve(first);
+        assertEq(uint8(game.challengeOf(first).status), uint8(IChallengeGame.Status.Failed), "silent failure");
+
+        uint256 rearmed = game.challengeableUntil(key);
+        assertEq(rearmed, vm.getBlockTimestamp() + game.challengeWindow(), "the first failure extends the window");
+        uint256 pinCallsAfterFirst = ledger.pinCoverageUntilCallCount();
+
+        // A second filing on the SAME execution — `_fileStandardFrom` does not
+        // re-stamp `executedAt`, so this is the same key and the same deadline.
+        uint256 second = _fileStandardFrom(challenger, PROPOSAL);
+        vm.warp(vm.getBlockTimestamp() + game.challengeOf(second).voteWindowAtFiling);
+        game.resolve(second);
+        assertEq(uint8(game.challengeOf(second).status), uint8(IChallengeGame.Status.Failed), "and a second one");
+
+        assertGt(
+            vm.getBlockTimestamp() + game.challengeWindow(),
+            rearmed,
+            "fixture: an unbounded re-arm would have pushed the deadline further out"
+        );
+        assertEq(game.challengeableUntil(key), rearmed, "the second silent failure buys nothing");
+        assertEq(ledger.pinCoverageUntilCallCount(), pinCallsAfterFirst, "and pins nothing further on the ledger");
+    }
+
     /// @notice AND A VOTED ACQUITTAL DOES NOT. Guardians that looked at the
     ///         accusation and cleared it have spent the window; re-arming on
     ///         their verdict would make a cleared proposal permanently
