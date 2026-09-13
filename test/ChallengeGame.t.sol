@@ -1349,9 +1349,9 @@ contract ChallengeGameTest is Test {
         assertEq(tiers.demoteCount(), 0, "nothing was accused, so nothing is demoted");
     }
 
-    /// @notice The delay is the guardians' entire window to notice and contest
+    /// @notice The window is the guardians' entire chance to notice and contest
     ///         (D1) — it cannot be short-circuited by an impatient challenger.
-    function test_resolve_revertsBeforeTheAutoSlashDelay() public {
+    function test_resolve_revertsBeforeTheVoteWindow() public {
         uint256 id = _fileStandard(PROPOSAL);
         vm.warp(vm.getBlockTimestamp() + game.voteWindow() - 1);
         vm.expectRevert(IChallengeGame.DelayNotElapsed.selector);
@@ -1723,16 +1723,6 @@ contract ChallengeGameTest is Test {
 
     // ── The §4 invariant ──
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Review #1 (2026-07-30) — the Inconclusive path prices the freeze too
-    // ─────────────────────────────────────────────────────────────────────────
-
-    // ── Issue #95: an Inconclusive re-arm must pin exposure to match ──
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Task 4 (review M3) — Inconclusive extends the re-challenge window
-    // ─────────────────────────────────────────────────────────────────────────
-
     /// @dev Mirrors `ChallengeGame._reviewKey` exactly — the two must derive
     ///      the same key or every `challengeableUntil` lookup below means
     ///      nothing.
@@ -1779,10 +1769,6 @@ contract ChallengeGameTest is Test {
         vm.expectRevert(IChallengeGame.WindowClosed.selector);
         _fileStandardFrom(makeAddr("otherChallenger"), PROPOSAL);
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // The pooled counter-bond
-    // ─────────────────────────────────────────────────────────────────────────
 
     /// @dev Three covering approvers — needed for the Sybil-split comparison,
     ///      where one operator shows up as two guardian identities.
@@ -2209,23 +2195,4 @@ contract ChallengeGameTest is Test {
         game.acceptOwnership();
         assertEq(game.owner(), successor, "transfer still works");
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // pashov 2026-08 finding #10 — the counter-bond pool is per PROPOSAL, and a
-    // conviction BURNS it
-    //
-    // The bug: `_liveByChallenger` gives every address its own filing slot and
-    // `_liveCount` is uncapped, so N addresses opened N concurrent challenges
-    // against one proposal — and `dispute`'s target was `c.bondWood` PER
-    // CHALLENGE. The accused cohort had to raise N counter-bonds in liquid WOOD
-    // inside `voteWindow`, while the filings' own coverage freeze barred
-    // every named approver from `claimUnstakeGuardian` and so from paying out of
-    // stake. One filing they could not answer auto-slashed the whole cohort at
-    // the severity ceiling.
-    // ─────────────────────────────────────────────────────────────────────────
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // The counter-bond pool defends only the challenges that were already live
-    // when it completed
-    // ─────────────────────────────────────────────────────────────────────────
 }

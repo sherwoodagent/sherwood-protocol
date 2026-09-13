@@ -380,8 +380,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // `verdictSlashed` key survives a redeploy of this game. Without it, a
         // replacement game would accept filings against a cohort the OLD game
         // already convicted, freeze coverage and take the bond, then be unable to
-        // terminate: `_settle` would revert `ApproverAlreadySlashed` and `rule`
-        // is unreachable from `Filed`.
+        // terminate: `_settle` would revert `ApproverAlreadySlashed`.
         address[] memory accused = new address[](accusedCount);
         for (uint256 i = 0; i < lockedWood.length; i++) {
             if (lockedWood[i] == 0) continue;

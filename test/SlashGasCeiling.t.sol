@@ -444,14 +444,14 @@ contract SlashGasCeilingTest is Test {
     ///         `test_fullCapConviction_fitsInAMinableTransaction`; this is the
     ///         tripwire in front of it.
     ///
-    ///         The haircut is `(63/64)^3` against a VERIFIED depth of two frames
+    ///         The haircut is `(63/64)^3` against a VERIFIED depth of one frame
     ///         (see the contract-level note and
-    ///         `test_theGasFloorSitsTwoExternalFramesBelowAnEoa`). The third factor is
-    ///         not superstition — it is the budget reserved for everything the
-    ///         floor does NOT cover but the same 32M still has to pay for: the
-    ///         intrinsic transaction cost, `finalize`'s vote-tally prelude, and
-    ///         `_settle`'s pre-check work, which reads the ledger's rate for all
-    ///         100 approvers BEFORE `gasleft()` is ever consulted.
+    ///         `test_theGasFloorSitsOneExternalFrameBelowAnEoa`). The surplus
+    ///         factors are not superstition — they are the budget reserved for
+    ///         everything the floor does NOT cover but the same 32M still has to
+    ///         pay for: the intrinsic transaction cost and `_settle`'s pre-check
+    ///         work, which reads the ledger's rate for all 100 approvers BEFORE
+    ///         `gasleft()` is ever consulted.
     function test_slashGasFloorFitsRobinhoodMaxTxGas() public {
         _deployStack(0); // the gate needs the constants, not a cohort
 
