@@ -156,7 +156,7 @@ contract FoundryTester is Test, Handlers {
         assertGt(challengeId, challengesBefore, "no challenge was filed");
 
         IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
-        console.log("challenge status (1=Filed,2=Disputed,3=Failed,4=Settled,5=Inconclusive)", uint256(c.status));
+        console.log("challenge status (1=Filed,2=Failed,3=Settled)", uint256(c.status));
         console.log("bondWood       ", c.bondWood);
         assertEq(uint256(c.status), uint256(IChallengeGame.Status.Settled), "challenge did not reach conviction");
     }
@@ -212,6 +212,56 @@ contract FoundryTester is Test, Handlers {
         vm.prank(challenger);
         vm.expectRevert(IChallengeGame.AlreadyConvicted.selector);
         game.file(address(governor), pid, IChallengeGame.Predicate(0), address(0), bytes4(0), "probe");
+    }
+
+    /// @notice The vote handler lands a real ballot, and the two properties
+    ///         retargeted at the tally see it.
+    ///
+    /// @dev A handler that can only ever revert is this suite's quietest
+    ///      failure: it costs the campaign a selector and nothing says so. The
+    ///      vote is doubly exposed to it — the harness contract holds no stake,
+    ///      so an unpranked call could only take `NoVotableStake`, and the
+    ///      guardians a filing accuses are refused by the game. So drive the
+    ///      fuzzer's OWN entry point and assert a ballot actually landed.
+    ///
+    ///      Both directions are pinned. The refused one (an accused approver)
+    ///      stops this passing against a handler that votes as anybody, and the
+    ///      acquit ballot is read back off `acquitWeight` with the convict tally
+    ///      asserted still zero — the same split `resolve` reads, so a vote that
+    ///      ignored its `convict` argument fails here.
+    ///
+    ///      GL-31's ghost is asserted, not just its return: the property is
+    ///      monotone, so it returns true on state it never looked at, and only
+    ///      the latched flag proves it saw the ballot.
+    function test_fizz_voteHandlerCastsABallotAndMovesTheTally() public {
+        syndicateGovernor_lifecycle_toExecuted(7 days, 50_000e6, 0);
+        uint256 pid = governor.proposalCount();
+        address filer = _nonGuardian(0);
+        require(_challengeableProposal(0, filer) == pid, "setup: nothing to file against");
+        require(game.challengeCount() == 0, "setup: the seed below assumes this is challenge 1");
+
+        vm.prank(filer);
+        game.file(address(governor), pid, IChallengeGame.Predicate(0), address(0), bytes4(0), "fizz-vote");
+        uint256 id = game.challengeCount();
+
+        // `actors[0..APPROVER_COUNT)` approved and are therefore the accused;
+        // `actors[APPROVER_COUNT]` is the reserve the electorate rests on.
+        address reserve = actors[APPROVER_COUNT];
+        challengeGame_voteOnChallenge_clamped(id, APPROVER_COUNT, false);
+        assertTrue(game.hasVotedOn(id, reserve), "the handler never landed a ballot");
+        assertEq(game.challengeOf(id).acquitWeight, swood.guardianStake(reserve), "the acquit tally missed the ballot");
+
+        (uint256 convictWeight, uint256 votable,) = game.challengeTallyOf(id);
+        assertEq(convictWeight, 0, "an acquit ballot moved the convict tally");
+        assertGt(votable, 0, "GL-14 would be vacuous against a zero denominator");
+
+        // Refused, and the handler survives the refusal rather than reverting.
+        challengeGame_voteOnChallenge_clamped(id, 0, true);
+        assertFalse(game.hasVotedOn(id, actors[0]), "an accused approver was allowed to vote");
+
+        assertTrue(property_GL14_convictWeightNeverExceedsVotableStake(), "GL-14 rejected a one-ballot tally");
+        assertTrue(property_GL31_challengeVoteIsOneShot(), "GL-31 rejected a legitimate first vote");
+        assertTrue(ghosts.everVotedOn[id][reserve], "GL-31 never latched the ballot it just read");
     }
 
     /// @notice The other gate the composite manufactures: one live challenge

@@ -100,8 +100,11 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         // change again.
         mapping(uint256 => uint8) lastProposalState;
         // GL-26: challengeId => last observed `Status` (uint8 cast). A
-        // terminal status (Failed/Settled/Inconclusive) must never change.
+        // terminal status (Failed/Settled) must never change.
         mapping(uint256 => uint8) lastChallengeStatus;
+        // GL-31: challengeId => voter => whether `hasVotedOn` has EVER been
+        // observed true. There is no un-vote, so the flag is a one-shot latch.
+        mapping(uint256 => mapping(address => bool)) everVotedOn;
         // GL-34: requestId => whether `claimed` / `cancelled` has EVER been
         // observed true (each is a one-shot latch).
         mapping(uint256 => bool) everClaimed;

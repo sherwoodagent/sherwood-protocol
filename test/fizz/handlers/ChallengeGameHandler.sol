@@ -43,6 +43,44 @@ abstract contract ChallengeGameHandler is Properties {
         challengeGame_file(address(governor), proposalId, uint8(predicate % 3), address(0), bytes4(0), evidenceURI);
     }
 
+    /// @dev Pranked rather than plain: the harness contract holds no stake, so
+    ///      an unpranked vote could only ever revert `NoVotableStake` and the
+    ///      handler would be dead surface. The voter is drawn from the guardians
+    ///      off its OWN seed — the game refuses the accused, so a voter derived
+    ///      from `challengeSeed` would tie which challenge is voted on to who
+    ///      votes, and leave most (challenge, guardian) pairs unreachable.
+    function challengeGame_voteOnChallenge_clamped(uint256 challengeSeed, uint256 voterSeed, bool convict) public {
+        uint256 n = game.challengeCount();
+        if (n == 0) return;
+        uint256 id = clampBetween(challengeSeed, 1, n);
+        vm.prank(toGuardian(voterSeed));
+        try game.voteOnChallenge(id, convict) {}
+        catch (bytes memory err) {
+            _assertExpectedVoteRevert(err);
+        }
+    }
+
+    function challengeGame_setChallengeQuorumBps(uint256 bps) public {
+        game.setChallengeQuorumBps(clampBetween(bps, 1_000, 10_000));
+    }
+
+    /// @dev The five refusals a vote is EXPECTED to take: an accused approver,
+    ///      a repeat vote, a caller with no stake behind it, a closed window, a
+    ///      challenge already decided. A blanket `catch {}` would swallow a
+    ///      regression in the vote itself, so anything else fails loudly —
+    ///      `t` panics, which is what both Foundry and the fuzzer's assertion
+    ///      mode catch. A bare `revert` would not: the fuzzer discards a
+    ///      reverting call sequence without reporting it.
+    function _assertExpectedVoteRevert(bytes memory err) internal {
+        bytes4 sel = err.length >= 4 ? bytes4(err) : bytes4(0);
+        t(
+            sel == IChallengeGame.AccusedCannotVote.selector || sel == IChallengeGame.AlreadyVoted.selector
+                || sel == IChallengeGame.NoVotableStake.selector || sel == IChallengeGame.WindowClosed.selector
+                || sel == IChallengeGame.WrongStatus.selector,
+            "voteOnChallenge reverted for an unexpected reason"
+        );
+    }
+
     function challengeGame_resolve_clamped(uint256 challengeId) public {
         uint256 count = game.challengeCount();
         if (count == 0) return;
@@ -87,13 +125,16 @@ abstract contract ChallengeGameHandler is Properties {
     ///      The challenger is drawn from the NON-guardian actors, leaving the
     ///      staked guardians unspent.
     ///
-    ///      Everything is try/catch: a step that cannot fire leaves the
-    ///      challenge parked in `Filed`, which is itself worth exploring. The
-    ///      handler never reverts the sequence.
+    ///      `file` and `resolve` are try/catch: a step that cannot fire leaves
+    ///      the challenge parked in `Filed`, which is itself worth exploring,
+    ///      and the handler never reverts the sequence. The VOTE leg catches
+    ///      narrowly instead — see `_assertExpectedVoteRevert`. Its refusals are
+    ///      a short, known list, and swallowing anything outside it would hide
+    ///      exactly the regression this composite was retargeted to cover.
     function challengeGame_lifecycle_toConviction(uint256 proposalSeed, uint256 predicateSeed) public {
-        // Challenger: a non-guardian actor, so the guardian pool stays eligible
-        // to decide the challenge. `_nonGuardian` wraps within the non-guardian
-        // range.
+        // Challenger: a non-guardian actor, so the whole guardian cohort stays
+        // eligible to decide the challenge. `_nonGuardian` wraps within the
+        // non-guardian range.
         //
         // DERIVED BEFORE the predictor and PASSED IN, not re-derived inside it.
         // `file`'s `AlreadyChallenged` gate is per (key, msg.sender), so the
@@ -119,17 +160,46 @@ abstract contract ChallengeGameHandler is Properties {
         uint256 challengeId = game.challengeCount();
         if (challengeId == idBefore) return;
 
-        // Silence fails a challenge, so the composite has to carry the vote:
-        // every guardian tries, and the ones this filing accuses are refused.
-        for (uint256 i; i < GUARDIAN_COUNT; i++) {
+        // Silence now FAILS a challenge, so the composite has to carry the vote
+        // itself or it can never reach the terminal paths it exists to reach.
+        // Every staked guardian is offered a convict ballot; the ones this
+        // filing accuses are refused by the game (`AccusedCannotVote`), which is
+        // why `SyndicateGovernorHandler` approves with only `APPROVER_COUNT` of
+        // them and leaves a reserve. The electorate is pinned one second before
+        // `filedAt` and every guardian was staked in `setup()`, so no extra roll
+        // is needed here — a guardian staked inside this call would carry zero
+        // weight and be refused.
+        //
+        // Stops at quorum rather than polling the whole cohort: `resolve`
+        // settles the moment the tally crosses, so the remaining ballots would
+        // be `WrongStatus` no-ops, and leaving them uncast keeps the ACQUIT side
+        // reachable for the clamped handler.
+        for (uint256 i; i < GUARDIAN_COUNT && !_quorumReached(challengeId); i++) {
+            if (game.hasVotedOn(challengeId, actors[i])) continue;
             vm.prank(actors[i]);
-            try game.voteOnChallenge(challengeId, true) {} catch {}
+            try game.voteOnChallenge(challengeId, true) {}
+            catch (bytes memory err) {
+                _assertExpectedVoteRevert(err);
+            }
         }
 
-        // The clock this challenge received, not the live parameter: the
-        // secondary dispatcher can move the latter after filing.
-        skipTime(game.challengeOf(challengeId).voteWindowAtFiling + 1);
+        // Quorum settles immediately; short of it the challenge can only fail,
+        // and only once its clock runs out. The clock is the one THIS challenge
+        // received, not the live parameter — the secondary dispatcher can move
+        // the latter after filing.
+        if (!_quorumReached(challengeId)) {
+            skipTime(game.challengeOf(challengeId).voteWindowAtFiling + 1);
+        }
         try game.resolve(challengeId) {} catch {}
+    }
+
+    /// @dev `resolve`'s own settle test, asked of the same three numbers.
+    ///      `BPS_DENOMINATOR` is inlined because the constant is `internal`. A
+    ///      zero denominator is not quorum: `resolve` reads it as a challenge
+    ///      nobody could decide and fails it.
+    function _quorumReached(uint256 challengeId) internal view returns (bool) {
+        (uint256 convictWeight, uint256 votable, uint256 quorumBps) = game.challengeTallyOf(challengeId);
+        return votable != 0 && convictWeight * 10_000 >= quorumBps * votable;
     }
 
     /// @dev First proposal that `file` would currently accept: executed, still
@@ -221,8 +291,8 @@ abstract contract ChallengeGameHandler is Properties {
             //
             // `file` then takes `max(deadline, challengeableUntil[key])`, so the
             // re-armed floor has to be honoured too or the predictor is too
-            // STRICT after an Inconclusive round and skips genuinely filable
-            // pids.
+            // STRICT after a round that missed quorum and skips genuinely
+            // filable pids.
             bytes32 rk = keccak256(abi.encode(address(governor), pid));
             uint256 deadline = p.executedAt + p.strategyDuration + game.challengeWindow();
             uint256 extended = game.challengeableUntil(rk);
@@ -250,8 +320,8 @@ abstract contract ChallengeGameHandler is Properties {
         return 0;
     }
 
-    /// @dev An actor outside the guardian range, so using it as challenger or
-    ///      counter-bond contributor does not burn an eligible voter.
+    /// @dev An actor outside the guardian range, so using it as the challenger
+    ///      does not burn an eligible voter.
     function _nonGuardian(uint256 seed) internal view returns (address) {
         uint256 span = actors.length - GUARDIAN_COUNT;
         return actors[GUARDIAN_COUNT + (seed % span)];
@@ -270,6 +340,12 @@ abstract contract ChallengeGameHandler is Properties {
         game.file(
             governor_, proposalId, IChallengeGame.Predicate(predicate), adapterTarget, adapterSelector, evidenceURI
         );
+    }
+
+    /// @dev A guardian that did not approve the challenged proposal votes; the
+    ///      accused are refused by the game itself.
+    function challengeGame_voteOnChallenge(uint256 challengeId, bool convict) public asActor {
+        game.voteOnChallenge(challengeId, convict);
     }
 
     function challengeGame_resolve(uint256 challengeId) public asActor {

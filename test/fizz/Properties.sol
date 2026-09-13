@@ -112,6 +112,24 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         return sum == swood.totalGuardianStake();
     }
 
+    /// @notice GL-14 — a challenge's convict tally never exceeds the stake that
+    ///         was eligible to cast it.
+    /// @dev The quorum test is `convictWeight * BPS >= quorumBps * votable`, so
+    ///      a tally that could outgrow its own denominator would let a filing
+    ///      convict on less than the fraction it claims. Both tallies are
+    ///      checked against the one denominator because each voter's weight is
+    ///      counted into exactly one of them, and `votableStakeAtFiling` is the
+    ///      total those weights were drawn from.
+    function property_GL14_convictWeightNeverExceedsVotableStake() public view returns (bool) {
+        uint256 n = game.challengeCount();
+        for (uint256 id = 1; id <= n; id++) {
+            (uint256 convictWeight, uint256 votable,) = game.challengeTallyOf(id);
+            if (convictWeight > votable) return false;
+            if (game.challengeOf(id).acquitWeight + convictWeight > votable) return false;
+        }
+        return true;
+    }
+
     // ── Counts and state consistency (GL-15, GL-16, GL-17, GL-18) ──
     //
     // GL-19 is still NOT implemented: it needs BLOCKER set membership, and
@@ -207,9 +225,9 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         return frozenCount == ledger.frozenCoverageCount();
     }
 
-    // ── One-shot latches and terminality (GL-23, GL-26, GL-30, GL-31, GL-34, GL-36) ──
+    // ── One-shot latches and terminality (GL-23, GL-26, GL-31, GL-34, GL-36) ──
     //
-    // GL-23, GL-26, GL-30, GL-31 and GL-34 are entirely SELF-MAINTAINED: each
+    // GL-23, GL-26, GL-31 and GL-34 are entirely SELF-MAINTAINED: each
     // property function reads the current on-chain value, compares it to the
     // ghost it wrote on its own previous call, then overwrites the ghost.
     // No handler wiring is needed for those. GL-36 is the one exception —
@@ -249,6 +267,25 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
             uint8 prev = ghosts.lastChallengeStatus[id];
             if (_isTerminalChallengeStatus(prev) && cur != prev) ok = false;
             ghosts.lastChallengeStatus[id] = cur;
+        }
+        return ok;
+    }
+
+    /// @notice GL-31 — a guardian's vote on a challenge is a one-shot latch:
+    ///         `hasVotedOn` never returns to false.
+    /// @dev There is no un-vote, and `resolve` leans on exactly that: it settles
+    ///      the instant the convict tally crosses quorum, without waiting for
+    ///      the window, because a tally that can only grow cannot be walked back
+    ///      under a verdict that has already been executed.
+    function property_GL31_challengeVoteIsOneShot() public returns (bool) {
+        uint256 n = game.challengeCount();
+        bool ok = true;
+        for (uint256 id = 1; id <= n; id++) {
+            for (uint256 i; i < actors.length; i++) {
+                bool cur = game.hasVotedOn(id, actors[i]);
+                if (ghosts.everVotedOn[id][actors[i]] && !cur) ok = false;
+                if (cur) ghosts.everVotedOn[id][actors[i]] = true;
+            }
         }
         return ok;
     }
@@ -540,8 +577,8 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     ///      what stops a challenger re-filing to re-freeze coverage that a
     ///      previous filing already released — a griefing loop that would pin a
     ///      guardian's stake indefinitely at the cost of one bond. Live means
-    ///      Filed or Disputed; the terminal statuses are allowed to repeat
-    ///      because the window legitimately re-arms after an Inconclusive.
+    ///      Filed; the terminal statuses are allowed to repeat because the
+    ///      window legitimately re-arms after a challenge that missed quorum.
     function property_GL21_oneLiveChallengePerProposalChallenger() public view returns (bool) {
         uint256 n = game.challengeCount();
         for (uint256 a = 1; a <= n; a++) {
@@ -668,11 +705,15 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     ///      a bug, and the expected outcome here is that this DOES fail. Three
     ///      reasons it is still worth running:
     ///
-    ///      1. It prices only the SILENCE branch, where the challenger
-    ///         recovers `bond - burned`. On the escalated branch it also takes
-    ///         the forfeited counter-bond (`Disputed` implies
-    ///         `pool == bondWood`), which the contract deliberately does not
-    ///         model. So negative here does not prove a losing game overall.
+    ///      1. It prices only the CONVICTION branch:
+    ///         `proposerBondBps * prosecutorFeeBps` against
+    ///         `challengerBondBps * settleBurnBps`. Reaching it now means
+    ///         winning a guardian vote, and the branch where that vote misses
+    ///         quorum — where the challenger pays `forfeitBurnBps` of the bond
+    ///         — is not in the formula at all. So the reading is the filing's
+    ///         BEST case: non-negative here does not make the filing profitable
+    ///         in expectation, and negative here is unambiguously a losing
+    ///         trade.
     ///      2. No setter can enforce it. `proposerBondBps` lives on
     ///         `ExposureLedger` and the other three on `ChallengeGame`, so
     ///         there is no single owner to check the product against — and a
