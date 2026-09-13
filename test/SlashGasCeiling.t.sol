@@ -15,8 +15,6 @@ import {ExposureLedger} from "../src/ExposureLedger.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 import {ChallengeGame} from "../src/ChallengeGame.sol";
 import {IChallengeGame} from "../src/interfaces/IChallengeGame.sol";
-import {TokenCourt} from "../src/TokenCourt.sol";
-import {ITokenCourt} from "../src/interfaces/ITokenCourt.sol";
 import {ProposerBondEscrow} from "../src/ProposerBondEscrow.sol";
 import {BatchExecutorLib} from "../src/BatchExecutorLib.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
@@ -68,20 +66,15 @@ contract SlashGasAdapter {
 /// @dev    THE FINDING. `ChallengeGame._settle` refuses to run unless
 ///         `gasleft() >= approvers.length * SLASH_GAS_PER_APPROVER +
 ///         SLASH_GAS_BASE`. At the old constants (300k / 1M) and the registry's
-///         `MAX_APPROVERS_PER_PROPOSAL = 100` that floor was 31,000,000 gas —
-///         measured INSIDE `ChallengeGame.rule`, two external frames below an
-///         EOA. Robinhood Chain (4663) caps a transaction at
+///         `MAX_APPROVERS_PER_PROPOSAL = 100` that floor was 31,000,000 gas,
+///         against Robinhood Chain (4663)'s per-transaction cap of
 ///         `maxTxGasLimit = 32,000,000` (`ArbGasInfo.getGasAccountingParams()`,
 ///         probed on mainnet 2026-07-24; the block `gasLimit` field reads 2^50,
 ///         Orbit's "no block cap" sentinel, so the per-tx limit is the binding
-///         one). After EIP-150's 63/64 haircut at each of those two frames a
-///         31,000,000 floor needs ~31,986,000 of frame-0 gas BEFORE `finalize`'s
-///         own prelude and `_settle`'s pre-check work — more than a transaction
-///         can carry. A full-cap conviction was therefore unminable:
-///         `TokenCourt.finalize` bubbles the revert (it only swallows
-///         `WrongStatus`), the case stays in `Voting`, and the challenge times
-///         out through `resolve` -> `_fail`, ACQUITTING the accused and paying
-///         them the challenger's forfeited bond.
+///         one). After EIP-150's 63/64 haircut a floor that large is out of
+///         reach of any transaction, so a full-cap conviction could not be
+///         mined: `resolve` reverts `InsufficientSlashGas`, the challenge runs
+///         out its clock, and the accused keep their stake.
 ///
 ///         And the cap is cheap to approach on purpose: an attacker stakes
 ///         `minGuardianStake` across ~100 addresses and approves its own
@@ -91,25 +84,20 @@ contract SlashGasAdapter {
 ///         address. The guard written to stop a mid-array out-of-gas became the
 ///         denial mechanism.
 ///
-/// @dev    THE VERIFIED CALL DEPTH IS TWO, NOT THREE. `_settle` is a PRIVATE
-///         function — it shares a frame with its caller. Neither `ChallengeGame`
-///         nor `TokenCourt` sits behind a proxy (both are plain `Ownable2Step`
-///         contracts, no delegatecall hop). So the deepest external path down to
-///         the `gasleft()` check is
+/// @dev    THE VERIFIED CALL DEPTH IS ONE. `_settle` is a PRIVATE function — it
+///         shares a frame with its caller — and `ChallengeGame` is not behind a
+///         proxy, so there is no delegatecall hop either. The path down to the
+///         `gasleft()` check is
 ///
-///             EOA -> TokenCourt.finalize   [frame 1]
-///                 -> ChallengeGame.rule    [frame 2]  <- gasleft() checked here
-///                    _settle               (private, still frame 2)
-///                    -> StakedWood.slashToEscrow [frame 3, + proxy delegatecall]
+///             EOA -> ChallengeGame.resolve  [frame 1]  <- gasleft() checked here
+///                    _settle                (private, still frame 1)
+///                    -> StakedWood.slashVerdict [frame 2, + proxy delegatecall]
 ///
-///         i.e. TWO `CALL`s above the check, so the haircut on the floor is
-///         `(63/64)^2`, not `(63/64)^3`. The `resolve` entry is shallower still
-///         (one frame). The ceiling gate below uses `(63/64)^3` anyway: the
-///         third factor is spent on `finalize`'s prelude, the intrinsic
-///         transaction cost, and `_settle`'s own pre-check work
-///         (`_accusedWithRates` reads the ledger's rate for all 100 approvers
-///         before the floor is ever consulted), all of which come out of the
-///         same 32M.
+///         i.e. ONE `CALL` above the check. The ceiling gate below reserves more
+///         haircuts than that: the surplus pays the intrinsic transaction cost
+///         and `_settle`'s own pre-check work (`_accusedWithRates` reads the
+///         ledger's rate for all 100 approvers before the floor is ever
+///         consulted), all of which come out of the same 32M.
 contract SlashGasCeilingTest is Test {
     // ── Real stack ──
     ERC20Mock public usdg;
@@ -126,7 +114,6 @@ contract SlashGasCeilingTest is Test {
     TierRegistry public tierRegistry;
     ProposerBondEscrow public bondEscrow;
     ChallengeGame public game;
-    TokenCourt public court;
 
     SyndicateVault public vault;
     SyndicateGovernor public gov;
@@ -140,9 +127,8 @@ contract SlashGasCeilingTest is Test {
 
     /// @dev The approver cohort — the accused set a conviction slashes.
     address[] public approvers;
-    /// @dev Two non-accused holders, so the court's participation floor can be
-    ///      cleared by somebody the conviction is not about (`vote` bars the
-    ///      accused, and at the cap the accused are most of the cohort).
+    /// @dev Two non-accused holders: at the cap the accused are most of the
+    ///      cohort, so a challenge needs stake outside it.
     address public juror1 = makeAddr("juror1");
     address public juror2 = makeAddr("juror2");
 
@@ -185,7 +171,7 @@ contract SlashGasCeilingTest is Test {
     ///         limit is what actually binds a conviction.
     uint256 internal constant MAX_TX_GAS = 32_000_000;
 
-    /// @dev Intrinsic cost of the `finalize(uint256)` transaction that carries a
+    /// @dev Intrinsic cost of the `resolve(uint256)` transaction that carries a
     ///      conviction: 21,000 base plus 4 selector bytes and 32 argument bytes
     ///      at 16 gas per non-zero byte. Rounded UP to 22,000, so the budget
     ///      handed to frame 0 below is never optimistic.
@@ -278,16 +264,12 @@ contract SlashGasCeilingTest is Test {
         bondEscrow = new ProposerBondEscrow(address(wood), address(registry), address(ledger));
 
         game = new ChallengeGame(owner, address(wood), address(ledger), address(tierRegistry));
-        court = new TokenCourt(owner);
         vm.prank(ledgerOwner);
         ledger.setCoverageFreezer(address(game));
         tierRegistry.setAuthorizedDemoter(address(game));
         vm.startPrank(owner);
         swood.setAuthorizedSlasher(address(game));
         game.setStakedWood(address(swood));
-        court.setChallengeGame(address(game));
-        court.setStakedWood(address(swood));
-        game.setCourt(address(court));
         vm.stopPrank();
 
         gov.setExposureLedger(address(ledger));
@@ -425,13 +407,10 @@ contract SlashGasCeilingTest is Test {
         );
     }
 
-    /// @dev File a challenge and escalate it, so the terminal path runs through
-    ///      the court — the DEEPEST route to `_settle`, and the one the finding
-    ///      is about. The disputer is one of the ACCUSED, which is what makes
-    ///      `_settle`'s per-approver work run over the approver array and hands
-    ///      `slashToEscrow` a non-zero `bountyBps`: the gas-hungriest settle
-    ///      there is.
-    function _fileDisputeRefer(uint256 pid) internal returns (uint256 cid, uint256 caseId) {
+    /// @dev File a challenge against the whole cohort. Every approver carries a
+    ///      real, non-zero rate, so `_settle`'s per-approver work runs over the
+    ///      full approver array: the gas-hungriest settle there is.
+    function _file(uint256 pid) internal returns (uint256 cid) {
         vm.prank(challenger);
         cid = game.file(
             address(gov),
@@ -441,32 +420,12 @@ contract SlashGasCeilingTest is Test {
             adapter.poke.selector,
             "ipfs://evidence"
         );
-
-        // Hoisted out of argument position: the read below would otherwise
-        // consume the prank meant for `dispute`.
-        uint256 bond = game.challengeOf(cid).bondWood;
-        address defender = approvers[0];
-        wood.mint(defender, bond);
-        vm.startPrank(defender);
-        wood.approve(address(game), type(uint256).max);
-        game.dispute(cid, type(uint256).max);
-        vm.stopPrank();
-        assertEq(
-            uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Disputed), "escalated to the court"
-        );
-
-        caseId = court.caseOfChallenge(address(game), cid);
-        assertGt(caseId, 0, "dispute auto-referred the case");
     }
 
-    /// @dev The jurors convict, then the vote window closes. Leaves the case
-    ///      exactly one `finalize` away from a full-cap conviction.
-    function _convictAndCloseTheWindow(uint256 caseId) internal {
-        vm.prank(juror1);
-        court.vote(caseId, true);
-        vm.prank(juror2);
-        court.vote(caseId, true);
-        vm.warp(vm.getBlockTimestamp() + court.voteWindow());
+    /// @dev Runs the clock out, leaving the challenge exactly one `resolve` away
+    ///      from a full-cap conviction.
+    function _closeTheWindow(uint256 cid) internal {
+        vm.warp(vm.getBlockTimestamp() + game.challengeOf(cid).autoSlashDelayAtFiling);
     }
 
     // ── 1. The CI gate ────────────────────────────────────────────────────
@@ -516,56 +475,45 @@ contract SlashGasCeilingTest is Test {
         assertLt(floor, ceiling, "a full-cap conviction must fit inside one Robinhood transaction");
     }
 
-    /// @notice The call depth the haircut is derived from, PINNED to the three
-    ///         facts that produce it rather than asserted as a number.
+    /// @notice The call depth the haircut is derived from, PINNED to the facts
+    ///         that produce it rather than asserted as a number.
     ///
     ///         The path an EOA takes to the `gasleft()` check is
     ///
-    ///           1. EOA      -> TokenCourt.finalize     (the transaction itself)
-    ///           2. finalize -> ChallengeGame.rule      <- gasleft() read here
-    ///                          _settle                 (private: same frame)
+    ///           1. EOA -> ChallengeGame.resolve   <- gasleft() read here
+    ///                     _settle                 (private: same frame)
     ///
-    ///         so TWO `CALL`s, and the reachable ceiling inside frame 2 is
-    ///         `(63/64)^2` of the transaction's budget — not `(63/64)^3`.
+    ///         so ONE `CALL`, and the reachable ceiling inside frame 1 is
+    ///         `(63/64)` of the transaction's budget.
     ///
     /// @dev    WHAT WOULD MAKE THIS WRONG, and what this test therefore checks:
     ///
-    ///         (a) A PROXY anywhere on the path. A `delegatecall` hop is subject
-    ///             to the same 63/64 rule as a `CALL`, so putting either contract
-    ///             behind ERC-1967 silently adds a haircut. Checked by reading
-    ///             the implementation slot of both — and, as a positive control
-    ///             that the check can actually see a proxy, of `StakedWood`,
-    ///             which IS one.
-    ///         (b) A ROUTER between them — `finalize` reaching `rule` through
-    ///             anything other than a direct call. Checked by pinning the two
-    ///             wiring pointers to each other.
-    ///         (c) `_settle` becoming external/public. Not observable at runtime;
+    ///         (a) A PROXY on the path. A `delegatecall` hop is subject to the
+    ///             same 63/64 rule as a `CALL`, so putting the game behind
+    ///             ERC-1967 silently adds a haircut. Checked by reading its
+    ///             implementation slot — and, as a positive control that the
+    ///             check can actually see a proxy, `StakedWood`'s, which IS one.
+    ///         (b) `_settle` becoming external/public. Not observable at runtime;
     ///             it is `private` in `ChallengeGame` and the natspec above the
     ///             constants records the dependency.
     ///
-    ///         The gate above deliberately uses the STRICTER `(63/64)^3`
-    ///         regardless, so the verified depth being two leaves a whole
-    ///         haircut in reserve for the intrinsic cost, `finalize`'s prelude
-    ///         and `_settle`'s pre-check work. This test's job is to make a
-    ///         change in depth loud rather than silent.
-    function test_theGasFloorSitsTwoExternalFramesBelowAnEoa() public {
+    ///         The gate above reserves more haircuts than the verified depth
+    ///         spends, leaving the surplus for the intrinsic cost and `_settle`'s
+    ///         pre-check work. This test's job is to make a change in depth loud
+    ///         rather than silent.
+    function test_theGasFloorSitsOneExternalFrameBelowAnEoa() public {
         _deployStack(0);
 
-        // (a) Neither contract on the path is proxied.
-        assertEq(_implementationSlot(address(court)), address(0), "TokenCourt must not be proxied");
+        // (a) The contract on the path is not proxied.
         assertEq(_implementationSlot(address(game)), address(0), "ChallengeGame must not be proxied");
         // ...and the same read DOES see a proxy, so a zero above means something.
         assertTrue(_implementationSlot(address(swood)) != address(0), "positive control: StakedWood is behind ERC-1967");
 
-        // (b) `finalize` calls the game directly, and `rule` accepts only the court.
-        assertEq(court.challengeGame(), address(game), "finalize calls the game with no router in between");
-        assertEq(game.court(), address(court), "and rule's only permitted caller is that court");
-
-        // The gate is conservative by construction: three haircuts reserve
-        // strictly less than the two the verified depth actually spends.
+        // The gate is conservative by construction: the haircuts it reserves are
+        // strictly more than the one the verified depth actually spends.
         uint256 gateCeiling = (MAX_TX_GAS * 63 * 63 * 63) / (64 * 64 * 64);
-        uint256 reachableAtVerifiedDepth = (MAX_TX_GAS * 63 * 63) / (64 * 64);
-        assertLt(gateCeiling, reachableAtVerifiedDepth, "the (63/64)^3 gate under-claims what depth 2 can reach");
+        uint256 reachableAtVerifiedDepth = (MAX_TX_GAS * 63) / 64;
+        assertLt(gateCeiling, reachableAtVerifiedDepth, "the gate under-claims what depth 1 can reach");
     }
 
     /// @dev The ERC-1967 implementation slot,
@@ -579,28 +527,23 @@ contract SlashGasCeilingTest is Test {
     // ── 2. The execution proof ────────────────────────────────────────────
 
     /// @notice H2's regression test. A conviction against the FULL approver cap,
-    ///         through the deepest path there is (court `finalize` -> `rule` ->
-    ///         `_settle` -> `slashToEscrow`), executed with the gas an actual
-    ///         Robinhood transaction can carry — and nothing more.
+    ///         through the real path (`resolve` -> `_settle` -> `slashVerdict`),
+    ///         executed with the gas an actual Robinhood transaction can carry —
+    ///         and nothing more.
     ///
     /// @dev    NOT AN ARITHMETIC ASSERTION. The budget handed to frame 0 is
     ///         `MAX_TX_GAS - INTRINSIC_TX_GAS`, i.e. exactly what a
-    ///         `finalize(uint256)` transaction submitted at the chain's per-tx
-    ///         ceiling leaves for execution; the two EIP-150 haircuts then happen
-    ///         for real inside the EVM rather than being multiplied out on paper.
-    ///         At the OLD constants (300k / 1M) this call reverts
+    ///         `resolve(uint256)` transaction submitted at the chain's per-tx
+    ///         ceiling leaves for execution; the EIP-150 haircut then happens for
+    ///         real inside the EVM rather than being multiplied out on paper. At
+    ///         the OLD constants (300k / 1M) this call reverts
     ///         `InsufficientSlashGas`.
-    ///
-    ///         `finalize` BUBBLES everything except `WrongStatus`, so a starved
-    ///         `rule` surfaces here as `ok == false` rather than as a silently
-    ///         swallowed verdict — which is exactly why the finding is a
-    ///         denial-of-conviction and not merely a wasted transaction.
     function test_fullCapConviction_fitsInAMinableTransaction() public {
         _deployStack(100);
         assertEq(approvers.length, registry.MAX_APPROVERS_PER_PROPOSAL(), "the cohort really is at the cap");
 
         uint256 pid = _proposeApproveExecute();
-        (uint256 cid, uint256 caseId) = _fileDisputeRefer(pid);
+        uint256 cid = _file(pid);
 
         // Every one of the 100 carries a real, non-zero rate: this is the
         // EXPENSIVE case (100 actual `_slashOne` writes), not the cheap
@@ -611,7 +554,7 @@ contract SlashGasCeilingTest is Test {
             assertGt(bps[i], 0, "every approver is really slashed, so this is the worst case");
         }
 
-        _convictAndCloseTheWindow(caseId);
+        _closeTheWindow(cid);
 
         uint256 stakeBefore = swood.guardianStake(approvers[7]);
 
@@ -626,7 +569,7 @@ contract SlashGasCeilingTest is Test {
         // it is the EVM's own.
         uint256 frameZeroGas = MAX_TX_GAS - INTRINSIC_TX_GAS;
         uint256 before = gasleft();
-        (bool ok,) = address(court).call{gas: frameZeroGas}(abi.encodeCall(TokenCourt.finalize, (caseId)));
+        (bool ok,) = address(game).call{gas: frameZeroGas}(abi.encodeCall(ChallengeGame.resolve, (cid)));
         uint256 spent = before - gasleft();
 
         emit log_named_uint("full-cap conviction gas (frame 0 and below)", spent);
@@ -638,7 +581,6 @@ contract SlashGasCeilingTest is Test {
         // The verdict actually landed — not swallowed, not timed out into an
         // acquittal.
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "Settled, not Failed");
-        assertEq(uint256(court.caseOf(caseId).verdict), uint256(IChallengeGame.Verdict.Guilty), "Guilty");
         assertLt(swood.guardianStake(approvers[7]), stakeBefore, "the cohort really was slashed");
         // The proceeds were destroyed, not routed: there is no case to open.
         assertEq(swood.pendingBurn(), 0, "and the burn landed rather than parking for a flush retry");
@@ -677,11 +619,11 @@ contract SlashGasCeilingTest is Test {
     ///         marginal cost (it is a floor that must cover the work) and far
     ///         enough below `32M / MAX_APPROVERS` for the gate above to pass.
     ///
-    /// @dev    Measures the whole `finalize` transaction, which is strictly MORE
+    /// @dev    Measures the whole `resolve` transaction, which is strictly MORE
     ///         than the floor is responsible for: the floor covers only what
     ///         happens AFTER the `gasleft()` check, while this also pays for
-    ///         `finalize`'s prelude and `_settle`'s pre-check ledger read. Using
-    ///         the larger number to size the floor is the conservative direction.
+    ///         `_settle`'s pre-check ledger read. Using the larger number to size
+    ///         the floor is the conservative direction.
     ///
     ///         Every approver here carries a real non-zero rate, so each one is a
     ///         genuine `_slashOne` — two checkpoint pushes, a stake write, a
@@ -721,7 +663,7 @@ contract SlashGasCeilingTest is Test {
     ///         classifier in `StakedWood` that the floor exists to protect loses
     ///         its guarantee.
     function test_theFloorExceedsWhatAFullCapConvictionSpends() public {
-        // `_measureConvictionGas` runs through `_fileDisputeRefer`, which
+        // `_measureConvictionGas` runs through `_file`, which
         // names a real adapter — the measured spend already includes the
         // demotion, so the floor it is compared against must include
         // DEMOTION_GAS too (issue #51, openspec settle-demotion-gas-floor).
@@ -797,12 +739,12 @@ contract SlashGasCeilingTest is Test {
     function _measureConvictionGas(uint256 n) internal returns (uint256 spent) {
         _deployStack(n);
         uint256 pid = _proposeApproveExecute();
-        (, uint256 caseId) = _fileDisputeRefer(pid);
-        _convictAndCloseTheWindow(caseId);
+        uint256 cid = _file(pid);
+        _closeTheWindow(cid);
 
         uint256 before = gasleft();
         (bool ok,) =
-            address(court).call{gas: MAX_TX_GAS - INTRINSIC_TX_GAS}(abi.encodeCall(TokenCourt.finalize, (caseId)));
+            address(game).call{gas: MAX_TX_GAS - INTRINSIC_TX_GAS}(abi.encodeCall(ChallengeGame.resolve, (cid)));
         spent = before - gasleft();
         assertTrue(ok, "the measurement must be of a conviction that landed");
     }

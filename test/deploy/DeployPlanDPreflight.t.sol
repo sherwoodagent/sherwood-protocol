@@ -13,7 +13,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
 import {MockCoverageFreezer} from "../mocks/MockCoverageFreezer.sol";
 
-/// @dev See `DeployTokenCourtPreflight.t.sol`'s copy of this contract for the
+/// @dev See `DeployPlanBPreflight.t.sol`'s copy of this contract for the
 ///      full explanation: `vm.startBroadcast` runs the script's calls as
 ///      `DEFAULT_SENDER` while `deployer = msg.sender` is whoever called
 ///      `run()`, and `vm.prank` cannot bridge the gap (foundry refuses to
@@ -218,8 +218,8 @@ contract DeployPlanDPreflightTest is Test {
     ///      `vm.setEnv` writes the PROCESS environment — one shared mutable
     ///      global that forge does not roll back between tests and that every
     ///      parallel suite writes to. Driving the script through `run()` here
-    ///      would race `DeployPlanBPreflight` and `DeployTokenCourtPreflight`
-    ///      over `STAKED_WOOD` and lose non-deterministically. `deploy()` takes
+    ///      would race `DeployPlanBPreflight` over `STAKED_WOOD` and lose
+    ///      non-deterministically. `deploy()` takes
     ///      the book directly, so nothing here is shared.
     function _book() internal view returns (DeployPlanD.AddressBook memory) {
         return DeployPlanD.AddressBook({

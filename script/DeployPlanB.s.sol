@@ -424,10 +424,9 @@ contract DeployPlanB is ScriptBase {
         (address ledgerAddr, address escrowAddr) = deploy(book);
 
         // PERSISTED FOR THE PHASES THAT COME NEXT. `DeployPlanD` reads
-        // EXPOSURE_LEDGER as an env address and `WireTokenCourt` reads it
-        // again; without these keys the operator has to scrape both addresses
-        // out of the broadcast log and hand-set them, which is the same failure
-        // the TIER_REGISTRY key was added to prevent.
+        // EXPOSURE_LEDGER as an env address; without these keys the operator has
+        // to scrape both addresses out of the broadcast log and hand-set them,
+        // which is the same failure the TIER_REGISTRY key was added to prevent.
         //
         // Written from `run()` and never from `deploy()`: `deploy()` is what the
         // pre-flight suite drives, and it runs on a chain id whose address book

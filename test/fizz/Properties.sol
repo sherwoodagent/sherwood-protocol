@@ -6,7 +6,6 @@ import {PropertiesAsserts} from "./utils/PropertiesAsserts.sol";
 
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {IChallengeGame} from "../../src/interfaces/IChallengeGame.sol";
-import {ITokenCourt} from "../../src/interfaces/ITokenCourt.sol";
 import {IVaultWithdrawalQueue} from "../../src/interfaces/IVaultWithdrawalQueue.sol";
 
 /// @notice Contains the functions that check the properties (invariants)
@@ -354,37 +353,6 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         return ok;
     }
 
-    /// @notice GL-30 — a court case's phase goes `Voting → Resolved` once,
-    ///         never back.
-    function property_GL30_caseResolvedIsOneShot() public returns (bool) {
-        uint256 n = court.caseCount();
-        bool ok = true;
-        for (uint256 id = 1; id <= n; id++) {
-            uint8 cur = uint8(court.caseOf(id).phase);
-            uint8 prev = ghosts.lastCasePhase[id];
-            if (prev == uint8(ITokenCourt.Phase.Resolved) && cur != prev) ok = false;
-            ghosts.lastCasePhase[id] = cur;
-        }
-        return ok;
-    }
-
-    /// @notice GL-31 — `voteOf[caseId][voter]` is one-shot: NatSpec says
-    ///         "NO VOTE CHANGES".
-    function property_GL31_voteOfIsOneShot() public returns (bool) {
-        uint256 n = court.caseCount();
-        bool ok = true;
-        for (uint256 id = 1; id <= n; id++) {
-            for (uint256 i; i < actors.length; i++) {
-                address voter = actors[i];
-                uint8 cur = uint8(court.voteOf(id, voter));
-                uint8 prev = ghosts.lastVoteOf[id][voter];
-                if (prev != uint8(ITokenCourt.Ruling.None) && cur != prev) ok = false;
-                ghosts.lastVoteOf[id][voter] = cur;
-            }
-        }
-        return ok;
-    }
-
     /// @notice GL-34 — a queue request's `claimed` and `cancelled` are
     ///         mutually exclusive and each one-shot.
     function property_GL34_requestClaimedAndCancelledAreExclusiveOneShot() public returns (bool) {
@@ -438,10 +406,6 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         uint256 cCount = game.challengeCount();
         if (cCount < ghosts.lastChallengeCount) ok = false;
         ghosts.lastChallengeCount = cCount;
-
-        uint256 caseCnt = court.caseCount();
-        if (caseCnt < ghosts.lastCaseCount) ok = false;
-        ghosts.lastCaseCount = caseCnt;
 
         uint256 reqId = queue.nextRequestId();
         if (reqId < ghosts.lastNextRequestId) ok = false;
@@ -536,44 +500,6 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
             uint256 prev = ghosts.lastExecutedAt[pid];
             if (prev != 0 && cur != prev) return false;
             if (cur != 0) ghosts.lastExecutedAt[pid] = cur;
-        }
-        return true;
-    }
-
-    /// @notice GL-32 `SHOULD-HOLD` — `caseOfChallenge` is set once per
-    ///         challenge.
-    /// @dev A second referral would hand one challenge two adjudications, and
-    ///      the two verdicts could disagree — `rule` would then be callable
-    ///      twice against the same bond. Relevant because referral has TWO
-    ///      entry points: the auto-referral inside `dispute` and the explicit
-    ///      `TokenCourt.refer`.
-    function property_GL32_caseOfChallengeSetOnce() public returns (bool) {
-        uint256 n = game.challengeCount();
-        for (uint256 id = 1; id <= n; id++) {
-            uint256 cur = court.caseOfChallenge(address(game), id);
-            uint256 prev = ghosts.lastCaseOfChallenge[id];
-            if (prev != 0 && cur != prev) return false;
-            if (cur != 0) ghosts.lastCaseOfChallenge[id] = cur;
-        }
-        return true;
-    }
-
-    /// @notice GL-33 `SHOULD-HOLD` — `isAccused` is never cleared mid-case.
-    /// @dev The bar exists so an approver cannot vote on their own conviction.
-    ///      Clearing it before `finalize` would let the accused cohort acquit
-    ///      itself, which is the single most valuable state to reach for an
-    ///      attacker in the whole court.
-    function property_GL33_accusedFlagNeverCleared() public returns (bool) {
-        uint256 n = court.caseCount();
-        for (uint256 id = 1; id <= n; id++) {
-            for (uint256 a; a < actors.length; a++) {
-                bool cur = court.isAccused(id, actors[a]);
-                if (cur) {
-                    ghosts.everAccused[id][actors[a]] = true;
-                } else if (ghosts.everAccused[id][actors[a]]) {
-                    return false;
-                }
-            }
         }
         return true;
     }
@@ -687,9 +613,8 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     ///      alone. The two views read identical storage since `settleCoverage`
     ///      went away (there is no longer a booking distinct from the pledge),
     ///      so their agreement — and agreement with `lockOf` — is pinned here
-    ///      too: `ChallengeGame.file` and `TokenCourt` ask `pledgedOf`, the
-    ///      quorum asks the approver list, and they must never see different
-    ///      cohorts.
+    ///      too: `ChallengeGame.file` asks `pledgedOf`, the quorum asks the
+    ///      approver list, and they must never see different cohorts.
     function property_GL20_approverArrayMatchesPledges() public view returns (bool) {
         uint256 n = governor.proposalCount();
         for (uint256 pid = 1; pid <= n; pid++) {

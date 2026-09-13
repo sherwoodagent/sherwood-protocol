@@ -77,8 +77,8 @@ abstract contract ChallengeGameHandler is Properties {
     }
 
     /// @dev The pool-completing contribution is the transition that flips
-    ///      `Filed → Disputed` and auto-refers to the court (I-38). Under the
-    ///      generic clamp above the fuzzer would rarely land on it exactly.
+    ///      `Filed → Disputed` (I-38). Under the generic clamp above the fuzzer
+    ///      would rarely land on it exactly.
     function challengeGame_dispute_completePool(uint256 challengeId) public {
         uint256 count = game.challengeCount();
         if (count == 0) return;
@@ -138,42 +138,26 @@ abstract contract ChallengeGameHandler is Properties {
     // ―――――――――――――――――――― Lifecycle composite ――――――――――――――――――――
 
     /// @notice Drives a filed challenge all the way to a conviction:
-    ///         file -> dispute to pool completion -> refer -> vote -> finalize
-    ///         -> rule.
+    ///         file -> run the clock out -> resolve.
     ///
-    /// @dev THE POINT: every terminal path in `ChallengeGame`, `TokenCourt`,
-    ///      `ProposerBondEscrow` and the slash half of `ExposureLedger` sits
+    /// @dev THE POINT: the terminal paths in `ChallengeGame`,
+    ///      `ProposerBondEscrow` and the slash half of `ExposureLedger` sit
     ///      behind this one chain, and random sequencing essentially never
-    ///      assembles it — the calls are order-dependent, separated by two time
-    ///      windows, and each has a different eligible caller. This is the same
+    ///      assembles it — the calls are order-dependent, separated by a time
+    ///      window, and each has a different eligible caller. This is the same
     ///      shape of gap `syndicateGovernor_lifecycle_toExecuted` closed for
     ///      propose->execute, and the same fix.
     ///
-    ///      Roles are kept disjoint on purpose, because the court bars three
-    ///      groups from voting and a naive assignment silently produces an
-    ///      Inconclusive verdict instead of a conviction:
-    ///        - approvers are `isAccused` (`AccusedCannotVote`),
-    ///        - the challenger is barred (`ChallengerCannotVote`),
-    ///        - counter-bond contributors are barred
-    ///          (`CounterBondContributorCannotVote`).
-    ///      So the challenger and the disputer are drawn from the NON-guardian
-    ///      actors, leaving the staked guardians as the voter pool. Voting is
-    ///      attempted from every guardian under try/catch rather than computing
-    ///      the accused set: whoever approved reverts and is skipped, which
-    ///      keeps this correct no matter which guardian the governor composite
-    ///      happened to use.
-    ///
-    ///      Court weight is sWOOD (`getPastVotes` at the case snapshot AND
-    ///      `getVotes` now), not WOOD — guardians qualify only because they are
-    ///      staked at setup, before any `executedAt`.
+    ///      The challenger is drawn from the NON-guardian actors, leaving the
+    ///      staked guardians unspent.
     ///
     ///      Everything is try/catch: a step that cannot fire leaves the
-    ///      challenge parked in a legitimate intermediate state (Filed,
-    ///      Disputed, or an Inconclusive/NotGuilty verdict), all of which are
-    ///      themselves worth exploring. The handler never reverts the sequence.
+    ///      challenge parked in `Filed`, which is itself worth exploring. The
+    ///      handler never reverts the sequence.
     function challengeGame_lifecycle_toConviction(uint256 proposalSeed, uint256 predicateSeed) public {
         // Challenger: a non-guardian actor, so the guardian pool stays eligible
-        // to vote. `_nonGuardian` wraps within the non-guardian range.
+        // to decide the challenge. `_nonGuardian` wraps within the non-guardian
+        // range.
         //
         // DERIVED BEFORE the predictor and PASSED IN, not re-derived inside it.
         // `file`'s `AlreadyChallenged` gate is per (key, msg.sender), so the
@@ -199,53 +183,10 @@ abstract contract ChallengeGameHandler is Properties {
         uint256 challengeId = game.challengeCount();
         if (challengeId == idBefore) return;
 
-        // Fund the counter-bond to exactly its target. `Disputed` requires
-        // `counterBondWood == bondWood`; a short pool leaves the challenge in
-        // Filed and `refer` reverts, so partial funding is not enough.
-        uint256 remaining = _counterBondHeadroom(challengeId);
-        for (uint256 i; i < actors.length && remaining != 0; i++) {
-            address d = _nonGuardian(i);
-            if (d == challenger) continue;
-            uint256 bal = wood.balanceOf(d);
-            if (bal == 0) continue;
-            uint256 amt = bal < remaining ? bal : remaining;
-            vm.prank(d);
-            try game.dispute(challengeId, amt) {
-                remaining -= amt;
-            } catch {}
-        }
-        if (remaining != 0) return; // pool never completed: stays Filed
-
-        // `dispute` AUTO-REFERS the moment the counter-bond pool completes
-        // (`ChallengeGame.sol:913`), so by here the case usually already
-        // exists and an explicit `refer` would revert. Read the mapping first
-        // and only refer when the auto-referral did not fire — treating refer
-        // as mandatory aborts the composite on its own success.
-        uint256 caseId = court.caseOfChallenge(address(game), challengeId);
-        if (caseId == 0) {
-            try court.refer(challengeId) returns (uint256 cid) {
-                caseId = cid;
-            } catch {
-                return;
-            }
-        }
-        if (caseId == 0) return;
-
-        // Guilty needs turnout >= the participation floor AND
-        // guiltyVotes > notGuiltyVotes (a tie fails safe to NotGuilty).
-        uint256 voted;
-        for (uint256 i; i < GUARDIAN_COUNT; i++) {
-            vm.prank(actors[i]);
-            try court.vote(caseId, true) {
-                voted++;
-            } catch {}
-        }
-        if (voted == 0) return; // every guardian barred: turnout 0 -> Inconclusive
-
-        skipTime(court.voteWindow() + 1);
-        // `finalize` calls back into `ChallengeGame.rule`, which is what
-        // actually settles the slash and forfeits the proposer bond.
-        try court.finalize(caseId) {} catch {}
+        // The clock this challenge received, not the live parameter: the
+        // secondary dispatcher can move the latter after filing.
+        skipTime(game.challengeOf(challengeId).autoSlashDelayAtFiling + 1);
+        try game.resolve(challengeId) {} catch {}
     }
 
     /// @dev First proposal that `file` would currently accept: executed, still
@@ -257,10 +198,9 @@ abstract contract ChallengeGameHandler is Properties {
     ///      specific on-chain gate and must use the same accumulator that gate
     ///      does. Finding #24 (PR #217) migrated `ChallengeGame.file` from the
     ///      booking (`_recorded`, via `approversOf`) to the pledge
-    ///      (`_reservedUsd`, via `pledgedOf`) — the last of five sites to move,
-    ///      after `slashBpsFor`, `freezeCoverage`, `pinCoverageUntil` and
-    ///      `TokenCourt._recordAccused`. That landed AFTER this helper did, so
-    ///      the two silently diverged.
+    ///      (`_reservedUsd`, via `pledgedOf`) — the last of the sites to move,
+    ///      after `slashBpsFor`, `freezeCoverage` and `pinCoverageUntil`. That
+    ///      landed AFTER this helper did, so the two silently diverged.
     ///
     ///      The divergence was one-directional and quiet, which is why it is
     ///      worth a comment rather than just a fix. The booking never exceeded
@@ -368,7 +308,7 @@ abstract contract ChallengeGameHandler is Properties {
     }
 
     /// @dev An actor outside the guardian range, so using it as challenger or
-    ///      counter-bond contributor does not burn a court voter.
+    ///      counter-bond contributor does not burn an eligible voter.
     function _nonGuardian(uint256 seed) internal view returns (address) {
         uint256 span = actors.length - GUARDIAN_COUNT;
         return actors[GUARDIAN_COUNT + (seed % span)];

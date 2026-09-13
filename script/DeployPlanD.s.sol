@@ -106,9 +106,9 @@ contract DeployPlanD is ScriptBase {
             })
         );
 
-        // PERSISTED FOR THE COURT PHASES. `DeployTokenCourt` and
-        // `WireTokenCourt` both read CHALLENGE_GAME as an env address; without
-        // this key the operator scrapes it out of the broadcast log by hand.
+        // PERSISTED FOR THE PHASES THAT COME NEXT, which read CHALLENGE_GAME as
+        // an env address; without this key the operator scrapes it out of the
+        // broadcast log by hand.
         // Written from `run()`, never from `deploy()` — see `DeployPlanB`.
         _patchAddressIfBook("CHALLENGE_GAME", gameAddr);
     }
@@ -260,8 +260,6 @@ contract DeployPlanD is ScriptBase {
         console.log("  gets its bond BACK - without that program nobody is paid to file at all.");
         console.log("MANUAL NEXT: review autoSlashDelay against the guardians' real response");
         console.log("  capability - it is their ENTIRE window to notice a filing and counter-bond.");
-        console.log("MANUAL NEXT: a DISPUTED challenge times out in favour of the accused until");
-        console.log("  the court (Plan E) ships. Until then a guilty approver can dispute and wait.");
         console.log("MANUAL NEXT: hand game ownership to the protocol owner (Ownable2Step: transfer + accept).");
     }
 }

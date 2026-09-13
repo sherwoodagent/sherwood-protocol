@@ -218,8 +218,8 @@ interface IExposureLedger {
     ///         "did this guardian underwrite it?" question asks for.
     /// @dev    Historically the settle-immune half of a booking/pledge pair. With
     ///         one lock per (proposal, guardian) the pair has collapsed; this
-    ///         selector survives because `ChallengeGame.file` and `TokenCourt`
-    ///         derive the accused set from it, and the lock is written once by
+    ///         selector survives because `ChallengeGame.file` derives the accused
+    ///         set from it, and the lock is written once by
     ///         `recordApproval` and erased only by `releaseApproval` (which reverts
     ///         `CoverageFrozen` for the whole life of a challenge) or
     ///         `retireApproval` (refused while frozen or pinned).

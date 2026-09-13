@@ -122,7 +122,6 @@ contract FoundryTester is Test, Handlers {
         console.log("guardian0 active    ", swood.isActiveGuardian(actors[0]) ? 1 : 0);
         console.log("ledger woodPriceX8  ", ledger.woodPriceX8());
         console.log("game challengeWindow", game.challengeWindow());
-        console.log("court voteWindow    ", court.voteWindow());
         console.log("registry ledger set ", address(registry.exposureLedger()) == address(ledger) ? 1 : 0);
         console.log("gov ledger set      ", governor.exposureLedger() == address(ledger) ? 1 : 0);
         console.log("queue wired         ", vault.withdrawalQueue() == address(queue) ? 1 : 0);
@@ -150,21 +149,15 @@ contract FoundryTester is Test, Handlers {
         require(governor.getProposal(pid).executedAt != 0, "setup: proposal not executed");
 
         uint256 challengesBefore = game.challengeCount();
-        uint256 casesBefore = court.caseCount();
 
         challengeGame_lifecycle_toConviction(0, 0);
 
         uint256 challengeId = game.challengeCount();
         assertGt(challengeId, challengesBefore, "no challenge was filed");
-        assertGt(court.caseCount(), casesBefore, "challenge never reached the court");
 
         IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
         console.log("challenge status (1=Filed,2=Disputed,3=Failed,4=Settled,5=Inconclusive)", uint256(c.status));
         console.log("bondWood       ", c.bondWood);
-        console.log("counterBondWood", c.counterBondWood);
-        assertEq(c.counterBondWood, c.bondWood, "counter-bond pool never completed");
-
-        // Settled is the conviction terminal: rule(Guilty) -> _settle.
         assertEq(uint256(c.status), uint256(IChallengeGame.Status.Settled), "challenge did not reach conviction");
     }
 
