@@ -437,8 +437,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_commitState(proposal) != ProposalState.Pending) revert NotWithinVotingPeriod();
         if (_hasVoted[proposalId][msg.sender]) revert AlreadyVoted();
 
-        // Snapshot weight is final: no share is minted or burned while the
-        // proposal is open (`SyndicateVault.redemptionsLocked`), so no live cap.
+        // Snapshot weight is final: no share is minted or burned while the proposal
+        // is open (`SyndicateVault.redemptionsLocked`), so no live cap. The one gap is
+        // the stamping block itself — see design.md Decision 2 (phantom weight).
         uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, proposal.snapshotTimestamp);
         if (weight == 0) revert NoVotingPower();
 

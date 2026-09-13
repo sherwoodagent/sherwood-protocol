@@ -174,7 +174,7 @@ contract GovernorVetoDenominatorExitsTest is Test {
     }
 
     /// @notice A redeem ordered ahead of propose in its block is in the snapshot but gone from
-    ///         supply; the bar is min(snapshot, live), so 100% of the live supply Against rejects.
+    ///         the supply recorded as the electorate, so 100% of that electorate Against rejects.
     function test_sameBlockPreProposeRedeemCannotInflateTheVetoBar() public {
         _deposit(lp1, 100_000e6);
         _deposit(attacker, 200_000e6); // block N-1; the fixture then warps to block N
@@ -192,9 +192,8 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Rejected));
     }
 
-    /// @notice Control: with nothing leaving in the propose block the bar is the snapshot supply
-    ///         and 39% Against does not reach the 40% bar. Live > snapshot is reachable only by a
-    ///         same-block deposit ahead of propose, and is harmless: the min then takes the snapshot.
+    /// @notice Control: with nothing leaving in the propose block the recorded electorate equals
+    ///         the snapshot supply, and 39% Against does not reach the 40% bar.
     function test_vetoBarIsTheSnapshotSupplyWhenNothingLeftInTheProposeBlock() public {
         _deposit(lp1, 39_000e6);
         _deposit(lp2, 61_000e6);
@@ -206,8 +205,8 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 
-    /// @notice The queue term is read at the snapshot: a holder who queues a redeem after the
-    ///         snapshot still votes with snapshot weight, so the bar must not shrink by his shares.
+    /// @notice A holder who queues a redeem AFTER propose still votes with snapshot weight, and
+    ///         the electorate was already recorded, so the bar must not shrink by his shares.
     ///         250k supply, bar 100k; 90k queued and voted Against is short of the bar.
     function test_queuedRedeemAfterTheSnapshotDoesNotShrinkTheVetoBar() public {
         _deposit(lp1, 160_000e6);
@@ -241,8 +240,8 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(vault.getPastVotes(address(queue), snap), burned, "and the queue term counts them");
     }
 
-    /// @notice 100k live vs 200k claimed: min-before-subtract gave liveSupply 0 and skipped the veto;
-    ///         the votable set is 100k, so 100% Against must reject.
+    /// @notice 100k live vs 200k claimed: the earlier min-before-subtract gave 0 and skipped the
+    ///         veto entirely; the recorded votable set is 100k, so 100% Against must reject.
     function test_queuedSharesClaimedInTheProposeBlockAreNotSubtractedTwice_zeroBar() public {
         _deposit(lp1, 100_000e6);
         _deposit(attacker, 200_000e6);
@@ -253,8 +252,8 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Rejected));
     }
 
-    /// @notice 75k/25k live vs 50k claimed: min-before-subtract halved the bar (40k -> 20k) and a
-    ///         25% Against rejected; the true bar is 40k, so it must approve.
+    /// @notice 75k/25k live vs 50k claimed: the earlier min-before-subtract halved the bar
+    ///         (40k -> 20k) and a 25% Against rejected; the true bar is 40k, so it must approve.
     function test_queuedSharesClaimedInTheProposeBlockAreNotSubtractedTwice_halvedBar() public {
         _deposit(lp1, 75_000e6);
         _deposit(lp2, 25_000e6);
@@ -305,10 +304,12 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Rejected));
     }
 
-    /// @notice The queue term is read LIVE at propose: shares queued between the snapshot and
-    ///         propose are already in the queue when the electorate is recorded, so they are out
-    ///         of it. 200k supply with 100k queued gives a 40k bar.
-    function test_queueTermIsReadLiveAtProposeNotAtTheSnapshot() public {
+    /// @notice Queued shares are outside the electorate: 200k of supply with 100k parked gives a
+    ///         100k votable set, not 200k. Deliberately does NOT distinguish the live-at-propose
+    ///         read from a snapshot read — on the direct path nothing can move shares into the
+    ///         queue between the two instants (`requestRedeem` needs an open proposal, `propose`
+    ///         needs none), so both reads agree here. See `design.md` Decision 1.
+    function test_queuedSharesAreOutsideTheVetoElectorate() public {
         _deposit(lp1, 100_000e6);
         _deposit(lp2, 100_000e6);
 
