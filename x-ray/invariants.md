@@ -596,7 +596,7 @@ Each block is classified into one of five **categories** by shape: `Conservation
 
 > A certification is only ever written against the codehash the owner reviewed, and only stays priced while the target's live code still hashes to it.
 
-**Derivation** — guard-lift: `TierRegistry.certify` is the sole writer of `_configs[k]` and reverts `CodehashChanged` unless `target.codehash == expectedCodehash`, which it then pins into the config; `tierOf` re-reads `target.codehash` and falls back to `(TIER_ARBITRARY, FULL_NOTIONAL_BPS)` on any mismatch, and `poke` lets anyone delete the stale entry outright.
+**Derivation** — guard-lift: `TierRegistry.certify` is the sole writer of `_configs[k]` and reverts `CodehashChanged` unless `target.codehash == expectedCodehash`, which it then pins into the config; `tierOf` re-reads `target.codehash` and falls back to `(TIER_ARBITRARY, FULL_NOTIONAL_BPS)` on any mismatch, with no call needed.
 
 **If violated** — a certification could price code that no reviewer ever saw, either at write time or after a redeploy at the same address.
 

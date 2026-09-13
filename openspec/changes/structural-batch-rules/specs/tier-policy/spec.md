@@ -37,11 +37,10 @@ The registry SHALL maintain exactly one owner-managed address allowlist, `setCou
 
 ## MODIFIED Requirements
 
-### Requirement: Three demotion paths converging on one effect
-Demotion SHALL delete the tier config (the key reverts to the tier-2 default), bar the target from reading that selector's tier off a class by setting the denial flag write-once (emitting `ClassMemberTierDenied` only on the first set), leave the target's counterparty entry untouched (a per-selector conviction must not disarm a venue every vault shares; `setCounterpartyAllowed(x, false)` is the only revocation), and emit `TierDemoted`. Three callers reach it:
+### Requirement: Two demotion paths converging on one effect
+Demotion SHALL delete the tier config (the key reverts to the tier-2 default), bar the target from reading that selector's tier off a class by setting the denial flag write-once (emitting `ClassMemberTierDenied` only on the first set), leave the target's counterparty entry untouched (a per-selector conviction must not disarm a venue every vault shares; `setCounterpartyAllowed(x, false)` is the only revocation), and emit `TierDemoted`. Two callers reach it:
 - `demote(target, selector)` — owner-only revocation.
 - `demoteByChallenge(target, selector)` — callable only by `authorizedDemoter` (reverts `NotAuthorizedDemoter` otherwise); the ChallengeGame's role, so the game can revoke a certification but never grant one.
-- `poke` — permissionless, gated on codehash mismatch (above).
 
 Demotion SHALL touch nothing about batch reachability: there is no callee axis, and the vault's ability to reclaim capital from a convicted strategy is a property of the vault's structural guard, not of registry state.
 

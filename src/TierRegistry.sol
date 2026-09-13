@@ -17,8 +17,7 @@ import {IStrategyFactory} from "./interfaces/IStrategyFactory.sol";
  *
  * @dev Fail-safe demotion is LAZY: `tierOf` verifies the target's live
  *      EXTCODEHASH against the certified hash on every read and reports tier 2
- *      on mismatch — no state write in the hot path, nothing to grief. `poke`
- *      persists the demotion and emits for indexers.
+ *      on mismatch — no state write in the hot path, nothing to grief.
  *
  *      SCOPE OF THE CODEHASH CHECK: EXTCODEHASH identity catches ONLY
  *      same-address bytecode mutation, i.e. metamorphic redeploys. It does NOT
@@ -138,7 +137,6 @@ contract TierRegistry is Ownable2Step {
     error InvalidTier();
     error BoundRequired();
     error NotAContract();
-    error CodehashMatches();
     error NotCertified();
     error CodehashChanged();
 
@@ -182,8 +180,8 @@ contract TierRegistry is Ownable2Step {
     }
 
     /// @notice Owner demotion (revoke certification).
-    /// @dev    Requires an existing certification, same as `poke` — see
-    ///         `demoteByChallenge`'s natspec for why this guard exists.
+    /// @dev    Requires an existing certification — see `demoteByChallenge`'s
+    ///         natspec for why this guard exists.
     function demote(address target, bytes4 selector) external onlyOwner {
         if (!_isCertifiedFor(target, selector)) revert NotCertified();
         _demote(target, selector);
@@ -191,7 +189,7 @@ contract TierRegistry is Ownable2Step {
 
     /// @notice Demote (target, selector) back to the tier-2 default because a
     ///         challenge against it passed.
-    /// @dev    REQUIRES AN EXISTING CERTIFICATION, mirroring `poke`: `ChallengeGame.file`
+    /// @dev    REQUIRES AN EXISTING CERTIFICATION: `ChallengeGame.file`
     ///         only checks that the pair appears in the executed calldata, so an
     ///         uncertified selector must not be demotable for ~1% of coverage.
     ///
@@ -205,15 +203,6 @@ contract TierRegistry is Ownable2Step {
     function demoteByChallenge(address target, bytes4 selector) external {
         if (msg.sender != authorizedDemoter) revert NotAuthorizedDemoter();
         if (!_isCertifiedFor(target, selector)) revert NotCertified();
-        _demote(target, selector);
-    }
-
-    /// @notice Permissionless demotion when the live codehash no longer matches
-    ///         the certified hash. Persists what `tierOf` already reports lazily.
-    function poke(address target, bytes4 selector) external {
-        TierConfig storage c = _configs[key(target, selector)];
-        if (c.certifiedCodehash == bytes32(0)) revert NotCertified();
-        if (target.codehash == c.certifiedCodehash) revert CodehashMatches();
         _demote(target, selector);
     }
 
@@ -467,18 +456,6 @@ contract TierRegistry is Ownable2Step {
         if (msg.sender != authorizedDemoter) revert NotAuthorizedDemoter();
         bytes32 cch = cloneCodehashOf(template);
         if (_classConfigs[_classCfgKey(cch, selector)].certifiedCodehash == bytes32(0)) revert ClassNotCertified();
-        _demoteClass(template, selector);
-    }
-
-    /// @notice Permissionless demotion once the certified template's live
-    ///         codehash no longer matches the anchor snapshot. Persists what
-    ///         `tierOf` already reports lazily.
-    /// @dev    Class analogue of `poke`, targeting level 2 specifically: level 1
-    ///         cannot change for an already-deployed address, level 2 can.
-    function pokeClass(address template, bytes4 selector) external {
-        bytes32 cch = cloneCodehashOf(template);
-        if (_classConfigs[_classCfgKey(cch, selector)].certifiedCodehash == bytes32(0)) revert ClassNotCertified();
-        if (template.codehash == _classAnchors[cch].templateCodehash) revert CodehashMatches();
         _demoteClass(template, selector);
     }
 

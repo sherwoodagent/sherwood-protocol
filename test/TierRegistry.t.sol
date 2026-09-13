@@ -97,55 +97,17 @@ contract TierRegistryTest is Test {
         assertEq(boundBps, 10_000);
     }
 
-    function test_pokePersistsDemotionOnMismatch() public {
-        _certifyNow(target, bytes4(0x12345678), 0, 50);
-        vm.etch(target, hex"6001600101");
-        vm.expectEmit(true, true, false, true);
-        emit TierRegistry.TierDemoted(target, bytes4(0x12345678));
-        reg.poke(target, bytes4(0x12345678)); // permissionless
-    }
-
-    function test_pokedDemotionSurvivesCodeRestore() public {
-        bytes memory originalCode = target.code;
-        _certifyNow(target, bytes4(0x12345678), 0, 50);
-        vm.etch(target, hex"6001600101");
-        reg.poke(target, bytes4(0x12345678));
-        // restore the certified bytecode: if poke had only masked lazily, tierOf
-        // would report tier 0 again — the config must actually be deleted
-        vm.etch(target, originalCode);
-        (uint8 tier, uint16 boundBps) = reg.tierOf(target, bytes4(0x12345678));
-        assertEq(tier, 2);
-        assertEq(boundBps, 10_000);
-    }
-
-    function test_recertifyAfterPokeRestoresTier() public {
-        _certifyNow(target, bytes4(0x12345678), 0, 50);
-        vm.etch(target, hex"6001600101");
-        reg.poke(target, bytes4(0x12345678));
-        // governance recovery path: re-certify against the NEW code
-        _certifyNow(target, bytes4(0x12345678), 1, 200);
-        (uint8 tier, uint16 boundBps) = reg.tierOf(target, bytes4(0x12345678));
-        assertEq(tier, 1);
-        assertEq(boundBps, 200);
-    }
-
-    function test_pokeRevertsWhenNotCertified() public {
-        vm.expectRevert(TierRegistry.NotCertified.selector);
-        reg.poke(target, bytes4(0x12345678));
-    }
-
-    function test_pokeRevertsWhenCodehashStillMatches() public {
-        _certifyNow(target, bytes4(0x12345678), 0, 50);
-        vm.expectRevert(TierRegistry.CodehashMatches.selector);
-        reg.poke(target, bytes4(0x12345678));
-    }
-
     function test_ownerDemote() public {
         _certifyNow(target, bytes4(0x12345678), 1, 100);
         vm.prank(owner);
         reg.demote(target, bytes4(0x12345678));
         (uint8 tier,) = reg.tierOf(target, bytes4(0x12345678));
         assertEq(tier, 2);
+        // governance recovery path: a demoted pair can be certified again
+        _certifyNow(target, bytes4(0x12345678), 1, 200);
+        (uint8 tierAfter, uint16 boundAfter) = reg.tierOf(target, bytes4(0x12345678));
+        assertEq(tierAfter, 1);
+        assertEq(boundAfter, 200);
     }
 
     function test_demoteOnlyOwner() public {

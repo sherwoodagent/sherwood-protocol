@@ -233,20 +233,6 @@ contract TierRegistryClassCertificationTest is Test {
         assertEq(registry.classOf(a), bytes32(0), "membership is gone with no demotion call");
     }
 
-    /// @notice The lazy revocation needs no `poke` — but `pokeClass` persists
-    ///         it for watchtowers, and refuses while the template is unchanged.
-    function test_pokeClass_refusesWhileTemplateUnchanged() public {
-        _certifyAndAllowClass(address(template));
-        vm.expectRevert(TierRegistry.CodehashMatches.selector);
-        registry.pokeClass(address(template), SEL);
-    }
-
-    function test_pokeClass_persistsAfterTemplateMutation() public {
-        _certifyAndAllowClass(address(template));
-        vm.etch(address(template), hex"600160005260206000f3");
-        registry.pokeClass(address(template), SEL);
-    }
-
     // ── 5.4 Precedence ──
 
     /// @notice An address entry always wins over class membership, so the owner

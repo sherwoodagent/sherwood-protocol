@@ -15,10 +15,10 @@ The onboarding section SHALL additionally document the allowlist's codehash bind
 
 The de-onboarding section SHALL additionally document the on-chain auto-clear and the watcher's NARROWED remaining job:
 
-- Every persisted demotion (`demote`, `demoteByChallenge`, `poke`) now clears the adapter's allowlist entry on-chain, atomically, emitting `AdapterAllowedSet(adapter, false)`; the operator no longer needs to react to `TierDemoted` with a manual `setAdapterAllowed(adapter, false)` for that adapter.
+- Every persisted demotion (`demote`, `demoteByChallenge`) now clears the adapter's allowlist entry on-chain, atomically, emitting `AdapterAllowedSet(adapter, false)`; the operator no longer needs to react to `TierDemoted` with a manual `setAdapterAllowed(adapter, false)` for that adapter.
 - The clear is over-broad by design (one selector's demotion de-allowlists the whole adapter); restoring the surviving selectors' adapter is an explicit owner `setAdapterAllowed(adapter, true)` call, and re-certification never restores it.
 - The one case the auto-clear structurally CANNOT cover: the ChallengeGame calls `demoteByChallenge` best-effort inside a `try/catch`, so a REVERTED demotion (e.g. the demoter role was rotated away mid-challenge) runs no `_demote` and clears nothing — only `AdapterDemotionFailed` is emitted. `AdapterDemotionFailed` therefore remains a mandatory allowlist alarm: on it, the operator applies the lost demotion via owner `demote` (which itself clears the allowlist) or calls `setAdapterAllowed(adapter, false)` directly.
-- The lazy path is now a HYGIENE item, not a live funds-path hazard: on a codehash mismatch both `tierOf` AND `isAdapterAllowed` self-heal on read, so vault funds cannot reach a code-changed adapter even before anyone calls `poke`. What survives un-poked is only stale STORAGE and stale indexer state (`AdapterAllowedSet` history says allowed; the read says no); the drift sweep (reconciling `AdapterAllowedSet` against certified, current-codehash pairs) remains in force to persist demotions via `poke` where a certification exists, and to owner-clear allowlist-only entries (which `poke` cannot reach — it reverts `NotCertified` for uncertified pairs).
+- The lazy path is a HYGIENE item, not a live funds-path hazard: on a codehash mismatch both `tierOf` AND `isAdapterAllowed` self-heal on read, so vault funds cannot reach a code-changed adapter and no call is needed. What survives is only stale STORAGE and stale indexer state (`AdapterAllowedSet` history says allowed; the read says no); the drift sweep (reconciling `AdapterAllowedSet` against certified, current-codehash pairs) remains in force to owner-clear the stale entries.
 
 #### Scenario: Operator onboards an adapter
 - **WHEN** an operator follows `docs/adapter-onboarding-checklist.md`
@@ -26,7 +26,7 @@ The de-onboarding section SHALL additionally document the on-chain auto-clear an
 
 #### Scenario: Operator learns the grant binds to the deployed code
 - **WHEN** an operator reads the onboarding section's allowlist step
-- **THEN** the document tells them to grant only after the final code is deployed and verified, that any later code change closes the funds path on the next read without waiting for `poke`, and that re-attesting after a verified upgrade is a fresh explicit `setAdapterAllowed(adapter, true)`
+- **THEN** the document tells them to grant only after the final code is deployed and verified, that any later code change closes the funds path on the next read, and that re-attesting after a verified upgrade is a fresh explicit `setAdapterAllowed(adapter, true)`
 
 #### Scenario: Reviewer audits an onboarding
 - **WHEN** a reviewer checks a completed onboarding against the checklist
@@ -38,5 +38,5 @@ The de-onboarding section SHALL additionally document the on-chain auto-clear an
 
 #### Scenario: Operator learns what the auto-clear does and does not cover
 - **WHEN** an operator reads the de-onboarding section after a demotion event
-- **THEN** the document tells them that persisted demotions cleared the allowlist on-chain already, that `AdapterDemotionFailed` remains the mandatory manual-action alarm, that un-poked codehash drift is stale storage/indexer state rather than an open funds path (both reads self-heal), and that re-allowlisting after any clear is an explicit owner decision
+- **THEN** the document tells them that persisted demotions cleared the allowlist on-chain already, that `AdapterDemotionFailed` remains the mandatory manual-action alarm, that unswept codehash drift is stale storage/indexer state rather than an open funds path (both reads self-heal), and that re-allowlisting after any clear is an explicit owner decision
 

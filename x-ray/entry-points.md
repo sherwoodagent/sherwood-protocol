@@ -1,6 +1,6 @@
 # Entry Point Map
 
-> Sherwood Protocol | ~195 entry points | ~50 permissionless | ~50 role-gated | ~95 admin-only
+> Sherwood Protocol | ~193 entry points | ~48 permissionless | ~50 role-gated | ~95 admin-only
 
 Counts come from the grep-verified signature scan over `src/` (interfaces and mocks excluded), cross-checked against per-contract access maps. `~` reflects that a handful of functions are permissionless at the modifier layer but self-scoped by key derivation; those are classified by effective reach, not by modifier presence.
 
@@ -94,7 +94,6 @@ Counts come from the grep-verified signature scan over `src/` (interfaces and mo
 `ExposureLedger.settleCoverage()` ◄── rebooks approvals down to actual need
 `ExposureLedger.retireApproval()` ◄── after bucket expiry + challengeWindow, unfrozen, unpinned
 `StakedWood.flushBurn()` ◄── retries a burn transfer that previously failed
-`TierRegistry.poke()` ◄── demotes a certification whose target codehash drifted
 `MorphoSupplyStrategy.sweep()` ◄── after Settled, recovers residual supply
 
 ---
@@ -450,18 +449,6 @@ Entry points callable by any address with no effective access restriction. Sorte
 | State modified | `c.status`, `bondedWood`, `unclaimedWood`, `_convicted`, `_liveCount`, `challengeableUntil`, `inconclusiveRounds`, `c.forfeitPayoutWood` |
 | Value flow | Tokens: ChallengeGame → challenger + burn address; Escrow → challenger + burn |
 | Reentrancy guard | no (CEI-ordered) |
-
-### `TierRegistry.poke()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external |
-| Caller | Anyone (the codehash mismatch is the whole precondition) |
-| Parameters | `target`, `selector` (protocol-derived) |
-| Call chain | none (EXTCODEHASH is an opcode, not a call) |
-| State modified | `_configs[k]` deleted, `_classTierDenied[k]` set |
-| Value flow | none — the registry custodies no tokens |
-| Reentrancy guard | no |
 
 ### `WoodTwapOracle.update()`
 

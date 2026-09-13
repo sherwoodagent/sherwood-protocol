@@ -44,12 +44,6 @@ abstract contract TierRegistryHandler is Properties {
         );
     }
 
-    /// @dev `poke` is the permissionless self-heal: it demotes a certification
-    ///      whose target codehash no longer matches (I-32).
-    function tierRegistry_poke_clamped(uint256 targetSeed, uint256 selectorSeed) public {
-        tierRegistry_poke(_tierTarget(targetSeed), _tierSelector(selectorSeed));
-    }
-
     function tierRegistry_secondary(uint8 selector, uint256 arg0, uint256 arg1, uint256 arg2) public {
         address target = _tierTarget(arg0);
         bytes4 sel = _tierSelector(arg1);
@@ -74,10 +68,6 @@ abstract contract TierRegistryHandler is Properties {
         bytes32 expectedCodehash
     ) public asAdmin {
         tierRegistry.certify(target, selector, tier, extractableBoundBps, expectedCodehash);
-    }
-
-    function tierRegistry_poke(address target, bytes4 selector) public asActor {
-        tierRegistry.poke(target, selector);
     }
 
     // ── Secondary (owner-gated unless noted; dispatcher-only entry) ──

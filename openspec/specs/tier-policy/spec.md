@@ -33,16 +33,11 @@ Tier configuration SHALL be keyed by `keccak256(abi.encodePacked(target, selecto
 - **WHEN** a certified target is a proxy whose implementation is swapped
 - **THEN** `tierOf` keeps returning the certified tier (the proxy's codehash is unchanged) — which is why certification of proxied targets is a governance prohibition, not a code check
 
-### Requirement: Permissionless persistence of a lazy demotion
-`poke(target, selector)` SHALL be callable by anyone. It SHALL revert `NotCertified` when no certification exists and `CodehashMatches` when the live codehash still matches; otherwise it SHALL persist the demotion (delete the config, emit `TierDemoted`) so indexers observe what `tierOf` already reports.
-
-#### Scenario: Anyone persists a codehash-mismatch demotion
-- **WHEN** any caller invokes `poke` on a certified pair whose target codehash no longer matches
-- **THEN** the config is deleted and `TierDemoted` is emitted
-
-#### Scenario: Poke on a healthy certification reverts
-- **WHEN** `poke` is called while the live codehash matches the certified hash
-- **THEN** the call reverts `CodehashMatches` and the certification is untouched
+### Requirement: No demotion call is needed to revoke a drifted target
+Every read SHALL re-verify the pinned codehash, so a target whose live code has
+drifted — and every clone of a template whose code has drifted — SHALL read as
+tier 2 with no call by anyone. The registry SHALL expose no permissionless
+entry point that only persists what the reads already report.
 
 ### Requirement: Certification is owner-only with strict input guards
 `certify(target, selector, tier, extractableBoundBps, expectedCodehash)` SHALL be owner-only, SHALL take effect in the same transaction, and SHALL revert: `InvalidTier` when `tier >= 2`; `BoundRequired` when `extractableBoundBps` is `0` or `>= 10_000`; `NotAContract` when the target's codehash is `bytes32(0)` or `keccak256("")` (a funded EOA hashes to the latter — both are rejected); `CodehashChanged` when the target's live `EXTCODEHASH` differs from `expectedCodehash`. On success it SHALL pin that codehash into the config and emit `TierCertified`.
@@ -65,13 +60,12 @@ Tier configuration SHALL be keyed by `keccak256(abi.encodePacked(target, selecto
 - **WHEN** the owner certifies a key that is already certified
 - **THEN** the new tier, bound and pinned codehash replace the old ones in the same transaction — correcting a bound or re-attesting an upgraded adapter needs no demotion first
 
-### Requirement: Three demotion paths converging on one effect
-Demotion SHALL delete the tier config (the key reverts to the tier-2 default), delete the target's adapter-allowlist entry (emitting `AdapterAllowedSet(target, false)` if and only if the entry was set), and emit `TierDemoted`. Three callers reach it:
+### Requirement: Two demotion paths converging on one effect
+Demotion SHALL delete the tier config (the key reverts to the tier-2 default), delete the target's adapter-allowlist entry (emitting `AdapterAllowedSet(target, false)` if and only if the entry was set), and emit `TierDemoted`. Two callers reach it:
 - `demote(target, selector)` — owner-only revocation.
 - `demoteByChallenge(target, selector)` — callable only by `authorizedDemoter` (reverts `NotAuthorizedDemoter` otherwise); the ChallengeGame's role, so the game can revoke a certification but never grant one.
-- `poke` — permissionless, gated on codehash mismatch (above).
 
-The allowlist clear is DELIBERATELY over-broad: certification is keyed `(target, selector)` while the allowlist is keyed by bare `address`, so demoting ONE selector de-allowlists the WHOLE adapter. The adversary is an adapter that was just convicted in a challenge, or whose bytecode was just swapped under it (the `poke` trigger), retaining the standing right to receive approvals and transfers of vault funds through a governor batch — tier 2 raises its coverage price but is a price, not a prohibition. For that adversary, de-allowlisting more than strictly necessary is the correct direction of error: the cost is one owner `setAdapterAllowed(adapter, true)` call to restore the surviving selectors' adapter; the alternative cost is vault funds approved to a convicted or mutated adapter. This over-breadth SHALL be recorded in the `_demote` natspec so it is not "fixed" back to per-selector.
+The allowlist clear is DELIBERATELY over-broad: certification is keyed `(target, selector)` while the allowlist is keyed by bare `address`, so demoting ONE selector de-allowlists the WHOLE adapter. The adversary is an adapter that was just convicted in a challenge, or whose bytecode was just swapped under it, retaining the standing right to receive approvals and transfers of vault funds through a governor batch — tier 2 raises its coverage price but is a price, not a prohibition. For that adversary, de-allowlisting more than strictly necessary is the correct direction of error: the cost is one owner `setAdapterAllowed(adapter, true)` call to restore the surviving selectors' adapter; the alternative cost is vault funds approved to a convicted or mutated adapter. This over-breadth SHALL be recorded in the `_demote` natspec so it is not "fixed" back to per-selector.
 
 #### Scenario: Challenge-game demotion
 - **WHEN** the address set as `authorizedDemoter` calls `demoteByChallenge` on a certified pair
@@ -82,9 +76,9 @@ The allowlist clear is DELIBERATELY over-broad: certification is keyed `(target,
 - **THEN** the call reverts `NotAuthorizedDemoter`
 
 #### Scenario: Every demotion path clears the FUNDS axis and leaves the CALLEE axis
-- **WHEN** an allowlisted adapter is demoted via owner `demote`, via `demoteByChallenge`, or via permissionless `poke` after a codehash change
-- **THEN** `isAdapterAllowed(adapter)` returns false and `AdapterAllowedSet(adapter, false)` was emitted, on each of the three paths
-- **AND** `isCallableTarget(adapter)` still returns true on each of the three paths, provided the adapter's codehash has not drifted — the axes are specified separately below, and asserting only the first half of this scenario would let a regression that re-closes the callee axis pass
+- **WHEN** an allowlisted adapter is demoted via owner `demote` or via `demoteByChallenge`
+- **THEN** `isAdapterAllowed(adapter)` returns false and `AdapterAllowedSet(adapter, false)` was emitted, on both paths
+- **AND** `isCallableTarget(adapter)` still returns true on both paths, provided the adapter's codehash has not drifted — the axes are specified separately below, and asserting only the first half of this scenario would let a regression that re-closes the callee axis pass
 
 #### Scenario: Demoting a never-allowlisted target is silent on the allowlist channel
 - **WHEN** a certified pair whose target was never allowlisted is demoted
@@ -149,7 +143,7 @@ The registry SHALL maintain an owner-managed allowlist of adapter addresses (`se
 
 THE ALLOWLIST SHALL BE CODEHASH-BOUND. `setAdapterAllowed(adapter, true)` SHALL snapshot the adapter's effective codehash into a dedicated per-address mapping at grant time, where the effective codehash normalizes both `bytes32(0)` (non-existent account) and `keccak256("")` (existing account with no code) to `bytes32(0)` — "no code" is one value, so merely funding a codeless allowlisted address cannot be used as a griefing donation that closes the vault's funds path. Every grant (re)writes the snapshot: an idempotent re-grant is the owner's re-attestation of the adapter's CURRENT code (the recovery ceremony after a verified legitimate upgrade). `setAdapterAllowed(adapter, false)` and the demotion paths do not touch the snapshot; a snapshot under a cleared flag is inert and is overwritten by the next grant.
 
-`isAdapterAllowed(adapter)` SHALL remain a `view` and SHALL return `true` only when the allowlist flag is set AND the adapter's live effective codehash equals the grant-time snapshot — a lazy, read-side self-heal mirroring `tierOf`: no state write in the hot path, nothing to grief, and no dependence on `poke` ever being called. The adversary: an allowlisted adapter whose bytecode is swapped at the same address (metamorphic CREATE2 + SELFDESTRUCT redeploy), or a codeless allowlisted address at which code later appears (counterfactual CREATE2), otherwise retains standing permission to appear as spender/recipient of vault-fund movements in governor batches until someone happens to persist a demotion — and for an allowlisted-but-uncertified adapter `poke` reverts `NotCertified`, so no permissionless persistence path exists at all; the read-side check is the ONLY automatic protection there. The codehash binding does NOT cover proxy implementation swaps (a proxy's runtime bytecode is static across upgrades) — allowlisting proxied adapters carries the same governance-discipline caveat as certifying them.
+`isAdapterAllowed(adapter)` SHALL remain a `view` and SHALL return `true` only when the allowlist flag is set AND the adapter's live effective codehash equals the grant-time snapshot — a lazy, read-side self-heal mirroring `tierOf`: no state write in the hot path, nothing to grief, and no dependence on any demotion call. The adversary: an allowlisted adapter whose bytecode is swapped at the same address (metamorphic CREATE2 + SELFDESTRUCT redeploy), or a codeless allowlisted address at which code later appears (counterfactual CREATE2), otherwise retains standing permission to appear as spender/recipient of vault-fund movements in governor batches until the owner happens to revoke the grant; the read-side check is the ONLY automatic protection there. The codehash binding does NOT cover proxy implementation swaps (a proxy's runtime bytecode is static across upgrades) — allowlisting proxied adapters carries the same governance-discipline caveat as certifying them.
 
 The coupling between the two axes SHALL be exactly one-way and fail-closed: demotion clears the allowlist entry (see "Three demotion paths converging on one effect"), but NO certification action ever sets or restores it. In particular, re-certifying a previously demoted (target, selector) SHALL NOT re-allowlist the target — `certify` would otherwise silently re-grant a payment permission as a side effect of a pricing action, and the adversary is a submitter who gets a certification through and thereby re-opens the funds path without the owner ever deciding to. Restoring the allowlist after a demotion is always an explicit owner `setAdapterAllowed(adapter, true)` call. The grant-time codehash snapshot SHALL likewise remain dedicated to the allowlist axis: certification-path changes MUST NOT repurpose it for their own audit trails — certification tier and transfer permission are structurally different axes with different keying and lifecycles.
 
@@ -162,7 +156,7 @@ The coupling between the two axes SHALL be exactly one-way and fail-closed: demo
 - **THEN** the call reverts (Ownable)
 
 #### Scenario: Metamorphic redeploy closes the funds path on the next read
-- **WHEN** an allowlisted adapter's bytecode changes at the same address after the grant, and nobody has called `poke`, `demote`, or `setAdapterAllowed`
+- **WHEN** an allowlisted adapter's bytecode changes at the same address after the grant, and nobody has called `demote` or `setAdapterAllowed`
 - **THEN** `isAdapterAllowed(adapter)` returns false on the very next read — a governor batch approving or transferring vault funds to the adapter reverts in the vault's batch guard even though the allowlist storage still holds `true`
 
 #### Scenario: Selfdestructed adapter fails closed

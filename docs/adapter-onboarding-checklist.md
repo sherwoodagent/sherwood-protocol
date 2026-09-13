@@ -102,7 +102,7 @@ write in the hot path. Consequences for onboarding:
   path closes the instant code appears there, and stays closed until the
   owner re-attests it.
 - **A legitimate bytecode change at the adapter's address closes the funds
-  path** on the very next read, without waiting for `poke`, until the owner
+  path** on the very next read, until the owner
   re-attests the new code with a fresh `setAdapterAllowed(adapter, true)` —
   the designed recovery ceremony, mirroring the demote → re-certify cycle for
   tiers (§4).
@@ -431,15 +431,12 @@ Every persisted demotion routes through `_demote`
 declared, [`:307`](../src/TierRegistry.sol#L307) emitted here) — the same
 event `setAdapterAllowed` itself emits
 ([`:348`](../src/TierRegistry.sol#L348)), so there is no new indexer channel
-to wire. All three demotion paths get this atomically with the demotion, for
+to wire. Both demotion paths get this atomically with the demotion, for
 free:
 
 - owner `demote` ([`:255`](../src/TierRegistry.sol#L255));
 - `demoteByChallenge` — the ChallengeGame's role
-  ([`:263`](../src/TierRegistry.sol#L263)), on a passed challenge;
-- `poke(target, selector)` — **permissionless**
-  ([`:270`](../src/TierRegistry.sol#L270)), callable by anyone the moment the
-  live codehash diverges from the certified one.
+  ([`:263`](../src/TierRegistry.sol#L263)), on a passed challenge.
 
 The clear is **deliberately over-broad**: certification is keyed (target,
 selector), the allowlist by bare address, so demoting *one* selector
@@ -460,29 +457,25 @@ because they either don't run `_demote`, or don't persist at all:
   `AdapterDemotionFailed`. This case is structurally uncoverable on-chain: the
   clear is a side effect of a demotion that never happened.
 - `tierOf` reporting tier 2 lazily on a codehash mismatch
-  ([`:95`](../src/TierRegistry.sol#L95)) writes no state until someone calls
-  `poke` — until then the stored `_configs`/`_adapterAllowed` entries survive
-  untouched. As of issue #137, `isAdapterAllowed` self-heals the same way on
-  the same read: it cross-checks the adapter's live codehash against the
-  snapshot taken at the last grant and answers `false` on a mismatch, with no
-  state write. **This is now a hygiene gap, not a funds-path hazard**: on a
-  codehash mismatch both `tierOf` AND `isAdapterAllowed` already report the
-  safe answer before anyone calls `poke`, so a governor batch cannot fund a
-  code-changed adapter regardless of whether `poke` has ever run. What
-  survives un-`poke`d is stale STORAGE and stale indexer state only —
-  `AdapterAllowedSet` history still says `allowed`, while the live read
-  already says `false`.
+  ([`:95`](../src/TierRegistry.sol#L95)) writes no state, so the stored
+  `_configs`/`_adapterAllowed` entries survive untouched. As of issue #137,
+  `isAdapterAllowed` self-heals the same way on the same read: it
+  cross-checks the adapter's live codehash against the snapshot taken at the
+  last grant and answers `false` on a mismatch, with no state write. **This
+  is a hygiene gap, not a funds-path hazard**: on a codehash mismatch both
+  `tierOf` AND `isAdapterAllowed` already report the safe answer, so a
+  governor batch cannot fund a code-changed adapter. What survives is stale
+  STORAGE and stale indexer state only — `AdapterAllowedSet` history still
+  says `allowed`, while the live read already says `false`.
 
 **Operational consequence:** `TierDemoted` alone no longer needs a manual
-allowlist reaction for `demote`, `demoteByChallenge`, or `poke` — the clear
-already happened on-chain, atomically. The allowlist alarms that remain: (a)
+allowlist reaction for `demote` or `demoteByChallenge` — the clear already
+happened on-chain, atomically. The allowlist alarms that remain: (a)
 `AdapterDemotionFailed` — apply the lost demotion via owner `demote` (which
 itself clears the allowlist) or call `setAdapterAllowed(adapter, false)`
-directly; (b) an un-`poke`d codehash drift — now storage/indexer hygiene
-only, since the funds path is already closed on read; keep running the §3
-drift sweep to persist the demotion via `poke` where a certification exists,
-and to owner-clear the allowlist-only entries `poke` cannot reach (it reverts
-`NotCertified` for an uncertified pair).
+directly; (b) an unswept codehash drift — storage/indexer hygiene only, since
+the funds path is already closed on read; keep running the §3 drift sweep to
+owner-clear the stale entries.
 
 ---
 

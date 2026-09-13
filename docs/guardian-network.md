@@ -221,9 +221,9 @@ Two independent axes:
 
 Certification is a single owner call: `certify` pins the reviewed codehash and
 takes effect in the same transaction. Revocation is instant: owner `demote`,
-challenge-driven
-`demoteByChallenge`, or permissionless `poke` on codehash mismatch — and demoting
-any one selector clears the **whole adapter's** allowlist entry.
+challenge-driven `demoteByChallenge`, or a codehash mismatch, which every read
+re-verifies — and demoting any one selector clears the **whole adapter's**
+allowlist entry.
 
 Known blind spot (documented in-contract): EXTCODEHASH attestation catches
 same-address bytecode swaps, but not proxy implementation swaps or storage rewiring.
