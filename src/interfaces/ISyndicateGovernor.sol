@@ -694,6 +694,9 @@ interface ISyndicateGovernor {
     ///      block rage-quit while any proposal binds the vault — the OR check is
     ///      belt-and-braces so stale-cache transitions cannot slip through.
     function openProposalCount() external view returns (uint256);
+    /// @notice Open proposals past Draft (Pending..Executed) — the ones that lock
+    ///         the vault's instant redemption.
+    function lockedProposalCount() external view returns (uint256);
     /// @notice Deadline stamped at the last terminal event: when the LP exit window closes and the
     ///         next propose is allowed. Zero before the first.
     function getCooldownEnd() external view returns (uint256);

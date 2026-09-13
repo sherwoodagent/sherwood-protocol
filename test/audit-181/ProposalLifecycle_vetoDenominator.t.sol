@@ -174,6 +174,7 @@ contract ProposalLifecycleVetoDenominatorTest is Test {
     function _setVaultProposal(uint256 activePid, uint256 openCount, uint256 proposalCount_) internal {
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(activePid));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(openCount));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(openCount));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("proposalCount()"), abi.encode(proposalCount_));
     }
 

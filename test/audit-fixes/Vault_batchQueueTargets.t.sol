@@ -78,6 +78,7 @@ contract VaultBatchQueueTargetsTest is Test {
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(uint256(0)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), abi.encode(uint256(0)));
 
         usdc.mint(victim, DEPOSIT);
@@ -85,12 +86,14 @@ contract VaultBatchQueueTargetsTest is Test {
         usdc.approve(address(vault), type(uint256).max);
     }
 
-    /// @dev An executing proposal is also an open one: `redemptionsLocked()` reads
-    ///      `openProposalCount()` (SHE-258), so both selectors move together.
+    /// @dev An executing proposal is open, past Draft and active, so all three
+    ///      selectors move together (`redemptionsLocked` reads `lockedProposalCount`,
+    ///      `depositsLocked` reads `getActiveProposal`; SHE-287).
     function _setProposalActive(bool active) internal {
         uint256 pid = active ? uint256(1) : uint256(0);
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(pid));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(pid));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(pid));
     }
 
     /// @dev The victim deposits and escrows a redeem against pid 1, leaving its
@@ -230,6 +233,7 @@ contract VaultBatchQueueTargetsTest is Test {
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(uint256(0)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getCapitalSnapshot(uint256)"), abi.encode(uint256(0)));
         // No `tierRegistry()` mock at all: the staticcall fails, second return.
 
@@ -269,6 +273,7 @@ contract VaultBatchQueueTargetsTest is Test {
         // `test/audit-fixes/Strategy_cloneRatchetBinding.t.sol` for that).
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(1)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(1)));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(uint256(1)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("strategyOf(uint256)"), abi.encode(address(strategy)));
         // A permissive registry/factory: the clone reads as registered.
         vm.mockCall(

@@ -21,8 +21,9 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 ///      governor selectors that matter:
 ///        - `getActiveProposal()` = 0 outside Executed, != 0 during Executed
 ///          (drives `activeStrategyAdapter()` only).
-///        - `openProposalCount()` = 0 outside Pending..Executed, != 0 from
-///          Pending through Executed (drives BOTH locks).
+///        - `lockedProposalCount()` != 0 from Pending through Executed drives
+///          the redeem lock; `getActiveProposal()` != 0 (Executed) drives the
+///          deposit lock (SHE-287).
 contract VaultRedemptionLockSemanticsTest is Test {
     SyndicateVault vault;
     BatchExecutorLib executorLib;
@@ -67,9 +68,9 @@ contract VaultRedemptionLockSemanticsTest is Test {
         usdc.approve(address(vault), type(uint256).max);
     }
 
-    /// @dev Mocks the two governor view selectors used by the vault locks.
-    ///      `openCount` drives both locks (Pending..Executed); `active` only
-    ///      selects the strategy adapter for Executed. Optional
+    /// @dev Mocks the governor view selectors used by the vault locks.
+    ///      `openCount` drives the redeem lock (Pending..Executed); `active`
+    ///      drives the deposit lock and selects the strategy adapter. Optional
     ///      `strategy` parameter (defaults to address(0)) is the address the
     ///      vault will resolve as `activeStrategyAdapter()` via
     ///      `strategyOf(activePid)`.
@@ -81,40 +82,36 @@ contract VaultRedemptionLockSemanticsTest is Test {
         uint256 pid = active ? uint256(1) : uint256(0);
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(pid));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(openCount));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(openCount));
         if (active) {
             vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("strategyOf(uint256)", pid), abi.encode(strategy));
         }
     }
 
-    // ──────────────────────── MS-H4: deposit lock during Pending ────────────────────────
+    // ───────────────── MS-H4 revisited (SHE-287): deposits open until execute ─────────────────
 
-    /// @notice Pending state: `openProposalCount > 0` but no active proposal yet.
-    ///         Deposits MUST revert (closes the late-deposit window).
-    function test_deposit_revertsDuringPending() public {
+    /// @notice Pending..Approved (`lockedProposalCount > 0`, nothing executed): the vault
+    ///         still holds everything, so the share price is knowable and instant deposit
+    ///         stays open. A deposit here buys no vote weight — weight is read at the
+    ///         propose snapshot — so MS-H4's late-deposit concern no longer applies.
+    ///         Redeem is the side that stays locked (the voter stays at risk).
+    function test_deposit_allowedWhilePendingRedeemStillLocked() public {
         _mockState({active: false, openCount: 1});
         vm.prank(alice);
-        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
-        vault.deposit(1_000e6, alice);
+        uint256 shares = vault.deposit(1_000e6, alice);
+        assertGt(shares, 0, "instant deposit open before execute");
+        assertEq(vault.maxRedeem(alice), 0, "instant redeem locked from Pending");
+        assertFalse(vault.depositsLocked(), "deposit lock waits for execute");
+        assertTrue(vault.redemptionsLocked(), "redeem lock is on");
     }
 
-    /// @notice GuardianReview state: same `openProposalCount > 0`, no active
-    ///         proposal yet. Deposits MUST revert.
-    function test_deposit_revertsDuringGuardianReview() public {
+    /// @notice The very block before `executeProposal` (Approved) is the same state:
+    ///         the deposit lands in the pool at the live price and is then metered by
+    ///         the execute batch like every other share — nothing is pulled at a stale NAV.
+    function test_deposit_allowedDuringApproved() public {
         _mockState({active: false, openCount: 1});
         vm.prank(alice);
-        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
-        vault.deposit(1_000e6, alice);
-    }
-
-    /// @notice Approved state: same `openProposalCount > 0`, no active
-    ///         proposal yet. Deposits MUST revert (this is the audit's
-    ///         worst-case late-deposit window: the very next block can
-    ///         `executeProposal` and pull the fresh USDC into a strategy).
-    function test_deposit_revertsDuringApproved() public {
-        _mockState({active: false, openCount: 1});
-        vm.prank(alice);
-        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
-        vault.deposit(1_000e6, alice);
+        assertGt(vault.deposit(1_000e6, alice), 0);
     }
 
     /// @notice Executed state: instant deposits revert. During an active
@@ -128,11 +125,11 @@ contract VaultRedemptionLockSemanticsTest is Test {
         vault.deposit(1_000e6, alice);
     }
 
-    /// @notice Settled (terminal) — `openProposalCount` decrements to 0,
-    ///         `getActiveProposal` clears. Deposits MUST succeed.
+    /// @notice Settled (terminal) — `getActiveProposal` clears and the counters drop.
+    ///         Deposits MUST succeed again.
     function test_deposit_allowedAfterSettle() public {
-        // Simulate Pending→Approved blocked, then settled (counter drops).
-        _mockState({active: false, openCount: 1});
+        // Executed: instant deposit closed.
+        _mockState({active: true, openCount: 1});
         vm.prank(alice);
         vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
         vault.deposit(1_000e6, alice);
@@ -226,17 +223,18 @@ contract VaultRedemptionLockSemanticsTest is Test {
         assertEq(queue.nextRequestId(), nextId, "nothing queued");
     }
 
-    /// @notice The deposit lane fails closed the same way: an unreadable `proposalCount()`
-    ///         reverts `requestDeposit` before any asset is escrowed.
-    function test_requestDepositRevertsWhenTheGovernorCannotReportAProposalCount() public {
+    /// @notice The deposit lane fails closed the same way: `requestDeposit` only opens once
+    ///         a proposal executes, so its gate reads `getActiveProposal()`; an unreadable
+    ///         governor reverts before any asset is escrowed.
+    function test_requestDepositRevertsWhenTheGovernorCannotReportTheActiveProposal() public {
         VaultWithdrawalQueue queue = new VaultWithdrawalQueue(address(vault));
         vault.setWithdrawalQueue(address(queue));
         uint256 aliceBefore = usdc.balanceOf(alice);
         uint256 nextId = queue.nextRequestId();
 
-        _mockState({active: false, openCount: 1}); // Pending: the tag comes from proposalCount()
-        bytes memory reason = abi.encodeWithSelector(bytes4(keccak256("CountUnavailable()")));
-        vm.mockCallRevert(MOCK_GOVERNOR, abi.encodeWithSignature("proposalCount()"), reason);
+        _mockState({active: true, openCount: 1}); // Executed: the only state the lane is open in
+        bytes memory reason = abi.encodeWithSelector(bytes4(keccak256("ActiveUnavailable()")));
+        vm.mockCallRevert(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), reason);
 
         vm.prank(alice);
         vm.expectRevert(reason);

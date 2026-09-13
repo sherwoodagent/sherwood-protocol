@@ -95,6 +95,7 @@ contract VaultDepositLifecycleAndHwmTest is Test {
     function _setProposal(uint256 activePid, uint256 openCount, uint256 proposalCount_) internal {
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(activePid));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(openCount));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(openCount));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("proposalCount()"), abi.encode(proposalCount_));
     }
 
@@ -124,12 +125,12 @@ contract VaultDepositLifecycleAndHwmTest is Test {
         vm.prank(lp1);
         vault.deposit(1_000e6, lp1);
 
-        // Proposal 1 opens (Pending: openCount=1, activePid still 0 pre-execute).
-        _setProposal(0, 1, 1);
+        // Proposal 1 executes (SHE-287: the async lane opens at execute, not Pending).
+        _setProposal(1, 1, 1);
         vm.prank(payer);
         uint256 requestId = vault.requestDeposit(500e6, receiver);
         IVaultWithdrawalQueue.Request memory r = queue.getRequest(requestId);
-        assertEq(r.pid, 1, "tagged to the open (Pending) proposal");
+        assertEq(r.pid, 1, "tagged to the executing proposal");
 
         // Proposal 1 dies WITHOUT ever settling — mirrors the governor's
         // Rejected/Expired/vetoed/cancelled paths, which call `_decOpen()`
@@ -259,8 +260,8 @@ contract VaultDepositLifecycleAndHwmTest is Test {
     function test_highWaterMark_seedsOnQueueOnlyFirstMint_viaSettleDeposit() public {
         assertEq(vault.highWaterPricePerShare(), 0, "sanity: never seeded, no Lane A deposit ever happened");
 
-        // Proposal 1 opens (Pending) so the async deposit path is open.
-        _setProposal(0, 1, 1);
+        // Proposal 1 executes, which is what opens the async deposit path (SHE-287).
+        _setProposal(1, 1, 1);
         vm.prank(payer);
         uint256 requestId = vault.requestDeposit(1_000e6, receiver);
 

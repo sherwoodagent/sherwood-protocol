@@ -76,6 +76,9 @@ contract MgmtFeeAccrualTest is Test {
             MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(locked ? PID : uint256(0))
         );
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(locked ? uint256(1) : 0));
+        vm.mockCall(
+            MOCK_GOVERNOR, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(locked ? uint256(1) : 0)
+        );
         if (locked) {
             ISyndicateGovernor.StrategyProposal memory p;
             p.id = PID;

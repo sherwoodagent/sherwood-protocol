@@ -552,10 +552,18 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev True from Draft creation to settle: no share is minted or burned while a
-    ///      proposal is open, so the veto denominator cannot move.
-    ///      Fail-closed on a missing governor.
+    /// @dev True from Pending to settle. A Draft locks nothing: the veto electorate is
+    ///      recorded at Draft -> Pending, and a voter must stay at risk only from there
+    ///      (SHE-287). Fail-closed on a missing governor.
     function redemptionsLocked() public view returns (bool) {
+        address gov = _getGovernor();
+        if (gov == address(0)) revert GovernorNotSet();
+        return IProposalStatus(gov).lockedProposalCount() != 0;
+    }
+
+    /// @dev Any open proposal, Drafts included: the vault is bound even when no LP
+    ///      flow is locked.
+    function _proposalOpen() private view returns (bool) {
         address gov = _getGovernor();
         if (gov == address(0)) revert GovernorNotSet();
         return IProposalStatus(gov).openProposalCount() != 0;
@@ -660,10 +668,13 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev Same predicate as `redemptionsLocked`: a proposal settles only when
-    ///      its strategy holds nothing, so no receivable is ever priced.
+    /// @dev True only while capital is deployed (execute to settle): that is the one
+    ///      window in which the share price is not knowable. A deposit after the vote
+    ///      snapshot buys no weight, so nothing else needs the gate (SHE-287).
     function depositsLocked() public view returns (bool) {
-        return redemptionsLocked();
+        address gov = _getGovernor();
+        if (gov == address(0)) revert GovernorNotSet();
+        return IProposalStatus(gov).getActiveProposal() != 0;
     }
 
     /// @dev Float available for instant exits = vault asset balance minus the
@@ -763,10 +774,10 @@ contract SyndicateVault is
         _requireApprovedDepositor(receiver);
     }
 
-    /// @dev Instant deposit is allowed only outside an open proposal. During an
-    ///      open proposal (Pending..Executed) it reverts and LPs use the async
-    ///      deposit queue (`requestDeposit`), entering at the realized settle
-    ///      price. Auto-delegate to self so shareholders get voting power.
+    /// @dev Instant deposit is allowed until capital is deployed. From execute to
+    ///      settle it reverts and LPs use the async deposit queue (`requestDeposit`),
+    ///      entering at the realized settle price. Auto-delegate to self so
+    ///      shareholders get voting power.
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares)
         internal
         override
@@ -881,8 +892,8 @@ contract SyndicateVault is
     ///         Escrows `assets` in the queue (off-vault, so they never inflate
     ///         `totalAssets` nor get swept into the strategy) and records a claim
     ///         that mints shares at the realized settle price.
-    /// @dev Gated on `openProposalCount() != 0`, the predicate instant deposit
-    ///      closes on, so exactly one deposit path is always open.
+    /// @dev Gated on `depositsLocked()`, the predicate instant deposit closes on,
+    ///      so exactly one deposit path is always open.
     /// @return requestId Always > 0 (the queue uses index 0 as a sentinel).
     function requestDeposit(uint256 assets, address receiver)
         external
@@ -892,7 +903,7 @@ contract SyndicateVault is
     {
         address q = _withdrawalQueue;
         if (q == address(0)) revert WithdrawalQueueNotSet();
-        if (IProposalStatus(_getGovernor()).openProposalCount() == 0) revert NoOpenProposal();
+        if (!depositsLocked()) revert NoOpenProposal();
         if (assets == 0) revert ZeroAssets();
         _requireApprovedDepositor(receiver);
         uint256 pid = _openProposalPid();
@@ -1099,7 +1110,7 @@ contract SyndicateVault is
     ///         ETH mid-strategy (e.g. an mWETH redemption that transiently
     ///         parks native ETH here before wrapping).
     function rescueEth(address payable to, uint256 amount) external onlyOwner {
-        if (redemptionsLocked()) revert RedemptionsLocked();
+        if (_proposalOpen()) revert RedemptionsLocked();
         if (to == address(0)) revert ZeroAddress();
         Address.sendValue(to, amount);
     }
@@ -1107,7 +1118,7 @@ contract SyndicateVault is
     /// @notice Rescue ERC-20 tokens accidentally sent to the vault (not the vault asset).
     ///         Blocked during active proposals to protect strategy position tokens.
     function rescueERC20(address token, address to, uint256 amount) external onlyOwner {
-        if (redemptionsLocked()) revert RedemptionsLocked();
+        if (_proposalOpen()) revert RedemptionsLocked();
         if (to == address(0)) revert ZeroAddress();
         address asset = asset();
         if (token == asset) revert CannotRescueAsset();
@@ -1117,7 +1128,7 @@ contract SyndicateVault is
     /// @notice Rescue ERC-721 tokens accidentally sent to the vault.
     ///         Blocked during active proposals to protect strategy position NFTs (e.g., Uniswap V3 LP).
     function rescueERC721(address token, uint256 tokenId, address to) external onlyOwner {
-        if (redemptionsLocked()) revert RedemptionsLocked();
+        if (_proposalOpen()) revert RedemptionsLocked();
         if (to == address(0)) revert ZeroAddress();
         IERC721(token).safeTransferFrom(address(this), to, tokenId);
     }

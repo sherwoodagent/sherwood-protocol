@@ -789,13 +789,14 @@ contract OpenProposalCountTest is Test {
         assertEq(governor.openProposalCount(), 1, "counter at 1 after fresh propose");
     }
 
-    /// @notice Sherlock run #1 finding #8 — once a Draft exists, the vault
-    ///         is bound and new deposits are blocked (vault's
-    ///         `_depositsLocked` reads `governor.openProposalCount > 0`).
-    ///         Pre-fix, Draft sat outside the counter, so depositors could
-    ///         front-run the Draft→Pending snapshot during the up-to-7-day
-    ///         collab window and have their fresh balance counted at vote time.
-    function test_draft_locksDeposits() public {
+    /// @notice A Draft binds the vault (`openProposalCount`) but locks no LP flow
+    ///         (`lockedProposalCount == 0`): instant deposit and instant redeem both
+    ///         stay open until the Draft → Pending stamp. Sherlock run #1 finding #8
+    ///         (a Draft-window deposit buys vote weight) is ACCEPTED under SHE-287 —
+    ///         that capital is then locked until settle, which is the price of the
+    ///         vote — and the electorate is recorded at the stamp, so the finding's
+    ///         "counted at vote time" mechanism no longer exists.
+    function test_draft_locksNoLpFlow() public {
         address agent2 = makeAddr("agent2");
         uint256 agent2Id = agentRegistry.mint(agent2);
         vm.prank(owner);
@@ -818,16 +819,24 @@ contract OpenProposalCountTest is Test {
             coProps
         );
 
-        // openProposalCount = 1; vault's _depositsLocked() returns true.
         assertEq(governor.openProposalCount(), 1, "Draft bumps openProposalCount");
+        assertEq(governor.lockedProposalCount(), 0, "but a Draft is not past Draft");
+        assertFalse(vault.depositsLocked(), "deposit lock waits for execute");
+        assertFalse(vault.redemptionsLocked(), "redeem lock waits for Pending");
 
-        // Attempt to deposit during the Draft window — must revert.
+        // Deposit during the Draft window: open.
         address depositor = makeAddr("depositor");
         usdc.mint(depositor, 1_000e6);
         vm.startPrank(depositor);
         usdc.approve(address(vault), type(uint256).max);
-        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
-        vault.deposit(1_000e6, depositor);
+        assertGt(vault.deposit(1_000e6, depositor), 0, "instant deposit open during a Draft");
         vm.stopPrank();
+
+        // Instant redeem during the Draft window: open too.
+        uint256 lp1Shares = vault.balanceOf(lp1);
+        assertGt(vault.maxRedeem(lp1), 0, "instant redeem open during a Draft");
+        vm.prank(lp1);
+        vault.redeem(lp1Shares / 2, lp1, lp1);
+        assertEq(vault.balanceOf(lp1), lp1Shares - lp1Shares / 2, "half of lp1 left during the Draft");
     }
 }

@@ -63,6 +63,9 @@ contract AsyncRedeemHandler is Test {
         vm.mockCall(
             mockGovernor, abi.encodeWithSignature("openProposalCount()"), abi.encode(l ? uint256(1) : uint256(0))
         );
+        vm.mockCall(
+            mockGovernor, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(l ? uint256(1) : uint256(0))
+        );
     }
 
     function lock() external {

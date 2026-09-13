@@ -406,11 +406,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // param change. Packed (executionWindow << 128 | votingPeriod).
             _draftTimingSnap[proposalId] =
                 (uint256(uint128(_params.executionWindow)) << 128) | uint256(uint128(_params.votingPeriod));
-            // Locks the vault at Draft creation: an unlocked Draft would let
-            // an attacker deposit between propose and the final approve,
-            // inflating the balance counted in the Pending snapshot.
+            // A Draft binds the vault (no second proposal, no param change) but
+            // locks no LP flow: the electorate is recorded at Draft -> Pending,
+            // so nothing before that instant can move it.
             unchecked {
                 ++_openProposalCount;
+                ++_draftCount;
             }
         } else {
             _initPendingProposal(p, reviewPeriod_);
@@ -596,6 +597,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             _requireNotNearQuorum(proposalId);
             // Draft binds the vault — decrement on cancel.
             _decOpen();
+            --_draftCount;
         } else {
             revert ProposalNotCancellable();
         }
@@ -620,6 +622,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // `_closeReviewIfRegistered` no-ops for the Draft case).
         _closeReviewIfRegistered(proposal);
         _decOpen();
+        if (s == ProposalState.Draft) --_draftCount;
         _transition(proposal, ProposalState.Cancelled);
         emit ProposalCancelled(proposalId, msg.sender);
     }
@@ -805,6 +808,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             if (_openProposalCount > 1) revert VaultHasOpenProposal();
             uint256 reviewPeriod_ = IGuardianRegistry(_guardianRegistry).reviewPeriod();
             _transition(proposal, ProposalState.Pending);
+            --_draftCount; // instant redemption locks from here
             // -1: see propose().
             proposal.snapshotTimestamp = block.timestamp - 1;
             proposal.votableSupply = _votableSupplyOf(proposal.vault);
@@ -842,6 +846,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _transition(proposal, ProposalState.Cancelled);
         // Draft binds the vault — decrement on reject.
         _decOpen();
+        --_draftCount;
         emit CollaborationRejected(proposalId, msg.sender);
         emit ProposalCancelled(proposalId, msg.sender);
     }

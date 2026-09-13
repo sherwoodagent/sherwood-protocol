@@ -31,10 +31,16 @@
       "type": "t_mapping(t_uint256,t_uint256)"
     },
     {
-      "label": "__lifecycleGap",
+      "label": "_draftCount",
       "slot": "5",
       "offset": 0,
-      "type": "t_array(t_uint256)10_storage"
+      "type": "t_uint256"
+    },
+    {
+      "label": "__lifecycleGap",
+      "slot": "6",
+      "offset": 0,
+      "type": "t_array(t_uint256)9_storage"
     },
     {
       "label": "vault",
