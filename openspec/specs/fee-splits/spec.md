@@ -93,7 +93,7 @@ above the headline requires an explicit, separately authorized governance action
 
 - **WHEN** a vault is created through the factory with default parameters
 - **THEN** its per-vault maximum performance-fee rate equals the headline rate (2000 bps),
-  which is strictly below the absolute protocol maximum (3000 bps)
+  which is strictly below the absolute protocol maximum (2500 bps)
 
 #### Scenario: A vault that never configures a rate keeps the existing conservative default
 
