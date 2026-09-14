@@ -94,7 +94,6 @@ contract SyndicateVaultTest is Test {
         // MS-H4: vault `_deposit` also reads `openProposalCount(address)` —
         // mock to zero so deposits aren't blocked by garbage memory.
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(uint256(0)));
         // The batch guard resolves the TierRegistry through the governor and now
         // REFUSES the batch when it resolves none (pashov finding #1), so a
         // placeholder governor has to answer this too.
@@ -428,7 +427,6 @@ contract SyndicateVaultTest is Test {
         // Simulate an open (executing) proposal for this vault.
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(42)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(1)));
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(uint256(1)));
 
         vm.prank(owner);
         vm.expectRevert(ISyndicateVault.RedemptionsLocked.selector);
@@ -1113,7 +1111,6 @@ contract SyndicateVaultTest is Test {
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(target)));
         vm.mockCall(address(target), abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(address(target), abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
-        vm.mockCall(address(target), abi.encodeWithSignature("lockedProposalCount()"), abi.encode(uint256(0)));
         vm.mockCall(
             address(target),
             abi.encodeWithSignature("tierRegistry()"),

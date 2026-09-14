@@ -9,24 +9,22 @@ pragma solidity 0.8.28;
  *         governor satisfies this interface without any change; a test fake
  *         satisfies it in ~10 lines (see `test/mocks/MockProposalStatus.sol`).
  *
- *   Narrowing the declared dependency to these five functions concentrates
+ *   Narrowing the declared dependency to these four functions concentrates
  *   the seam — "what can the vault possibly learn from governance" is
  *   answerable from this file alone, and vault tests satisfy one small
  *   adapter instead of mocking governor selectors by hand.
  *
  * @dev Every member is a scalar, so this file has no type dependency on
- *      `ISyndicateGovernor` at all — the seam is exactly these five
+ *      `ISyndicateGovernor` at all — the seam is exactly these four
  *      selectors and nothing else.
  */
 interface IProposalStatus {
     /// @notice Id of the proposal currently binding the vault (0 = none).
     function getActiveProposal() external view returns (uint256);
-    /// @notice Count of non-terminal proposals, Drafts included. Nonzero ⇒ the
-    ///         vault is bound (no owner ETH rescue); it gates no LP flow by itself.
+    /// @notice Count of non-terminal proposals, Drafts included. Nonzero ⇒
+    ///         instant redemption is locked and the owner rescue paths are closed
+    ///         (vault `redemptionsLocked`).
     function openProposalCount() external view returns (uint256);
-    /// @notice Non-terminal proposals past Draft (Pending..Executed). Nonzero ⇒
-    ///         instant redemption is locked (vault `redemptionsLocked`).
-    function lockedProposalCount() external view returns (uint256);
     /// @notice Total proposals ever created; the latest id tags queued requests
     ///         while the binding proposal is not yet executing.
     function proposalCount() external view returns (uint256);

@@ -61,7 +61,6 @@ contract AsyncRedeemInvariantsTest is StdInvariant, Test {
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(uint256(0)));
 
         handler = new AsyncRedeemHandler(vault, queue, IERC20(address(usdc)), MOCK_GOVERNOR);
         targetContract(address(handler));

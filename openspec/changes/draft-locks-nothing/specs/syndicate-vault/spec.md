@@ -1,7 +1,7 @@
 ## Purpose
 
-Split the two LP-flow locks, which were one predicate. A Draft locks nothing; the
-redeem lock starts at Pending, the deposit lock at execute.
+Split the two LP-flow locks, which were one predicate. The redeem lock keeps
+starting at Draft creation; the deposit lock starts at execute.
 
 ## MODIFIED Requirements
 
@@ -49,13 +49,14 @@ the caller, so pay-on-behalf funding is permitted.
 
 ### Requirement: Instant withdrawal flow and capacity
 
-While no proposal is open, and while an open proposal is still a Draft, instant
-`withdraw`/`redeem` SHALL be available up to the holder's balance, capped by instant
-capacity = available float (idle balance minus the queue's reserved assets). From
-Pending through settle, `maxWithdraw`/`maxRedeem` SHALL return 0 for every holder
-except the bound withdrawal queue, and exits route through the async queue — full
-stop. The lock starts at Pending because that is where the vote snapshot and the veto
-electorate are stamped: whoever can vote on a proposal SHALL remain exposed to its
+While no proposal is open, instant `withdraw`/`redeem` SHALL be available up to the
+holder's balance, capped by instant capacity = available float (idle balance minus
+the queue's reserved assets). From Draft creation through settle,
+`maxWithdraw`/`maxRedeem` SHALL return 0 for every holder except the bound withdrawal
+queue, and exits route through the async queue — full stop. The lock starts at Draft
+creation, ahead of the vote snapshot and the electorate stamp, so no exit can land on
+either side of the stamp: every share in the recorded electorate SHALL be capital at
+risk for the cycle, and whoever can vote on a proposal SHALL remain exposed to its
 outcome. A requested exit whose assets plus the queue reserve exceed the idle balance
 SHALL revert `QueueReserveBreached`; the vault SHALL NOT pull capital from a strategy
 to serve an exit.
@@ -68,14 +69,14 @@ to serve an exit.
 
 #### Scenario: Exit during a collaborative Draft
 
-- **WHEN** a proposal is in Draft and a holder redeems
-- **THEN** the exit is served instantly, and the holder's shares are outside the
-  electorate recorded at the later Draft → Pending transition
+- **WHEN** a proposal is in Draft and a holder tries an instant redeem
+- **THEN** it reverts (`maxRedeem` is 0); the holder's path is `requestRedeem`, and
+  the shares stay in the electorate recorded at the later Draft → Pending transition
 
 ### Requirement: Async redemption requests (Lane B)
 
 `requestRedeem(shares, owner)` SHALL be callable only while `redemptionsLocked()` is
-true (Pending through settle), the vault is not paused, and a withdrawal queue is
+true (Draft creation through settle), the vault is not paused, and a withdrawal queue is
 bound; zero shares SHALL revert `InsufficientShares`, an unset queue
 `WithdrawalQueueNotSet`, and an unlocked vault `RedemptionsNotLocked`. A caller other
 than the share owner SHALL spend ERC-20 allowance. The shares SHALL be transferred
@@ -90,9 +91,9 @@ strictly greater than 0 SHALL be returned with `RedeemRequested` emitted.
 
 #### Scenario: Request outside the lock window
 
-- **WHEN** no proposal is open, or the only open proposal is a Draft
+- **WHEN** no proposal is open
 - **THEN** `requestRedeem` reverts `RedemptionsNotLocked` (instant exit is the
-  correct path, and no share can enter the queue before the electorate is recorded)
+  correct path)
 
 ### Requirement: Async deposit requests (Lane B)
 `requestDeposit(assets, receiver)` SHALL be callable only while `depositsLocked()` is true (a proposal is executing), the vault is not paused, and a queue is bound; zero assets SHALL revert `ZeroAssets`, `DepositsNotLocked` otherwise, and the receiver SHALL pass the same whitelist rule as instant deposits. Assets SHALL be escrowed in the queue's own balance — never counted in `totalAssets()` and never sweepable into a strategy — tagged with the active proposal id, and a request id strictly greater than 0 SHALL be returned with `DepositRequested` emitted. Exactly one deposit path SHALL be open in every state: the instant one until execute, the lane from execute to settle.

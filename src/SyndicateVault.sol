@@ -552,18 +552,10 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev True from Pending to settle. A Draft locks nothing: the veto electorate is
-    ///      recorded at Draft -> Pending, and a voter must stay at risk only from there.
-    ///      Fail-closed on a missing governor.
+    /// @dev True from Draft creation to settle: no share is burned while a proposal is
+    ///      open, so no exit can land ahead of the electorate stamp. Fail-closed on a
+    ///      missing governor.
     function redemptionsLocked() public view returns (bool) {
-        address gov = _getGovernor();
-        if (gov == address(0)) revert GovernorNotSet();
-        return IProposalStatus(gov).lockedProposalCount() != 0;
-    }
-
-    /// @dev Any open proposal, Drafts included: the vault is bound even when no LP
-    ///      flow is locked.
-    function _proposalOpen() private view returns (bool) {
         address gov = _getGovernor();
         if (gov == address(0)) revert GovernorNotSet();
         return IProposalStatus(gov).openProposalCount() != 0;
@@ -1113,7 +1105,7 @@ contract SyndicateVault is
     ///         ETH mid-strategy (e.g. an mWETH redemption that transiently
     ///         parks native ETH here before wrapping).
     function rescueEth(address payable to, uint256 amount) external onlyOwner {
-        if (_proposalOpen()) revert RedemptionsLocked();
+        if (redemptionsLocked()) revert RedemptionsLocked();
         if (to == address(0)) revert ZeroAddress();
         Address.sendValue(to, amount);
     }
@@ -1121,7 +1113,7 @@ contract SyndicateVault is
     /// @notice Rescue ERC-20 tokens accidentally sent to the vault (not the vault asset).
     ///         Blocked during active proposals to protect strategy position tokens.
     function rescueERC20(address token, address to, uint256 amount) external onlyOwner {
-        if (_proposalOpen()) revert RedemptionsLocked();
+        if (redemptionsLocked()) revert RedemptionsLocked();
         if (to == address(0)) revert ZeroAddress();
         address asset = asset();
         if (token == asset) revert CannotRescueAsset();
@@ -1131,7 +1123,7 @@ contract SyndicateVault is
     /// @notice Rescue ERC-721 tokens accidentally sent to the vault.
     ///         Blocked during active proposals to protect strategy position NFTs (e.g., Uniswap V3 LP).
     function rescueERC721(address token, uint256 tokenId, address to) external onlyOwner {
-        if (_proposalOpen()) revert RedemptionsLocked();
+        if (redemptionsLocked()) revert RedemptionsLocked();
         if (to == address(0)) revert ZeroAddress();
         IERC721(token).safeTransferFrom(address(this), to, tokenId);
     }

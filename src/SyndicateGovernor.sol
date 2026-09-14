@@ -406,12 +406,12 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // param change. Packed (executionWindow << 128 | votingPeriod).
             _draftTimingSnap[proposalId] =
                 (uint256(uint128(_params.executionWindow)) << 128) | uint256(uint128(_params.votingPeriod));
-            // A Draft binds the vault (no second proposal, no param change) but
-            // locks no LP flow: the electorate is recorded at Draft -> Pending,
-            // so nothing before that instant can move it.
+            // A Draft binds the vault and holds the redeem lock: the electorate
+            // is stamped at the final approve, whose readiness is public, so no
+            // exit may land ahead of it. A Draft-window deposit is accepted —
+            // it buys weight with capital locked until settle.
             unchecked {
                 ++_openProposalCount;
-                ++_draftCount;
             }
         } else {
             _initPendingProposal(p, reviewPeriod_);
@@ -439,8 +439,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_hasVoted[proposalId][msg.sender]) revert AlreadyVoted();
 
         // Snapshot weight is final: the electorate was recorded at the stamp and
-        // no share is burned past Draft (`SyndicateVault.redemptionsLocked`), so
-        // no live cap. The one gap is the stamping block itself — see
+        // no share is burned while a proposal is open (`SyndicateVault.redemptionsLocked`),
+        // so no live cap. The one gap is the stamping block itself — see
         // veto-votable-supply design.md Decision 2 (phantom weight).
         uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, proposal.snapshotTimestamp);
         if (weight == 0) revert NoVotingPower();
@@ -598,7 +598,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             _requireNotNearQuorum(proposalId);
             // Draft binds the vault — decrement on cancel.
             _decOpen();
-            --_draftCount;
         } else {
             revert ProposalNotCancellable();
         }
@@ -623,7 +622,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         // `_closeReviewIfRegistered` no-ops for the Draft case).
         _closeReviewIfRegistered(proposal);
         _decOpen();
-        if (s == ProposalState.Draft) --_draftCount;
         _transition(proposal, ProposalState.Cancelled);
         emit ProposalCancelled(proposalId, msg.sender);
     }
@@ -809,7 +807,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             if (_openProposalCount > 1) revert VaultHasOpenProposal();
             uint256 reviewPeriod_ = IGuardianRegistry(_guardianRegistry).reviewPeriod();
             _transition(proposal, ProposalState.Pending);
-            --_draftCount; // instant redemption locks from here
             // -1: see propose().
             proposal.snapshotTimestamp = block.timestamp - 1;
             proposal.votableSupply = _votableSupplyAt(proposal.vault, proposal.snapshotTimestamp);
@@ -847,7 +844,6 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         _transition(proposal, ProposalState.Cancelled);
         // Draft binds the vault — decrement on reject.
         _decOpen();
-        --_draftCount;
         emit CollaborationRejected(proposalId, msg.sender);
         emit ProposalCancelled(proposalId, msg.sender);
     }
@@ -1061,11 +1057,11 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     }
 
     /// @dev The veto electorate for the collaborative path, read at the vote
-    ///      snapshot. Instant redeem is open until the final approve, whose
-    ///      readiness is public, so a live read here would let a same-block
-    ///      `{redeem, approveCollaboration}` vote full weight against a bar
-    ///      shrunk by its own exit. The queue self-delegates, so its past votes
-    ///      are its custody at `at`.
+    ///      snapshot. The redeem lane is open for the whole Draft and the final
+    ///      approve's readiness is public, so a live queue term could be shrunk
+    ///      by a same-block `requestRedeem` whose owner keeps `t - 1` weight.
+    ///      Both terms at `t - 1` see one set. The queue self-delegates, so its
+    ///      past votes are its custody at `at`.
     function _votableSupplyAt(address vault, uint256 at) private view returns (uint256) {
         uint256 supply = IVotes(vault).getPastTotalSupply(at);
         address queue = ISyndicateVault(vault).withdrawalQueue();

@@ -107,18 +107,20 @@ Not decided in this change. Same family as Decision 2: both are the cost of the
 vote-weight instant and the electorate instant being different, and both should
 be settled together rather than one at a time.
 
-**Resolution (`draft-locks-nothing`, SHE-287).** Neither (a) nor (b). A Draft no
-longer holds the redeem lock, so the queue is closed for the whole collaboration
-window and the `requestRedeem` front-run is unreachable. That reopened the same
-window through instant redeem — `{redeem, approveCollaboration}` in one block
-left the holder in the `t − 1` weight and out of the live supply — so the
-collaborative stamp reads the electorate at `snapshotTimestamp`:
-`getPastTotalSupply(t − 1) − getPastVotes(queue, t − 1)`. Numerator and
-denominator see the same set; the residual is Decision 2's class (a same-block
-exit keeps its weight, the bar stays consistent). The direct path keeps its live
-read: instant redeem is open right up to `propose`, and a `t − 1` read there
-would count shares that already left (NM 6.4's inflated bar). The double
-subtraction the claim-in-propose-block tests pin does not arise on the
-collaborative path, because nothing can claim from the queue between `t − 1` and
-the stamp without also leaving `getPastVotes(queue, t − 1)` — both terms are
-read at the same instant.
+**Resolution (`draft-locks-nothing`, SHE-287).** Neither (a) nor (b). The
+collaborative stamp reads both terms at `snapshotTimestamp` —
+`getPastTotalSupply(t − 1) − getPastVotes(queue, t − 1)` — so the same-block
+`requestRedeem` moves shares the recorded set still contains; the bar stays the
+one the voter's weight was measured against, and the shares stay locked for the
+cycle whether or not the request is cancelled. The double subtraction the
+claim-in-propose-block tests pin does not arise here: a claim in the approve block
+leaves both terms at `t − 1` together. The direct path keeps its live read —
+instant redeem is open right up to `propose`, and a `t − 1` read there would count
+shares that already left (NM 6.4's inflated bar).
+
+Two shapes were tried and rejected on the way (#320 review, rounds 1–2), both
+with instant redeem open during the Draft: a live collaborative read lets
+`{redeem, approveCollaboration}` vote full weight against a bar shrunk by its own
+exit; a `t − 1` read lets a Draft-window deposit `X` exit in the approve block and
+leave a bar of `0.4 (G + X)` that only `G` can reach. The Draft therefore keeps the
+redeem lock: every share in the recorded electorate is capital at risk.

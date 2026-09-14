@@ -709,8 +709,7 @@ contract OpenProposalCountTest is Test {
         vm.prank(agent);
         governor.rejectCollaboration(pid);
         assertEq(governor.openProposalCount(), 0, "decremented on rejectCollaboration");
-        assertEq(governor.lockedProposalCount(), 0, "the Draft count left with it");
-        assertFalse(vault.redemptionsLocked(), "lock read survives the exit");
+        assertFalse(vault.redemptionsLocked(), "the vault unlocks with it");
         assertEq(
             governor.getCooldownEnd(),
             vm.getBlockTimestamp() + COOLDOWN_PERIOD,
@@ -758,11 +757,9 @@ contract OpenProposalCountTest is Test {
         vm.prank(owner);
         governor.emergencyCancel(pid);
 
-        // R9 fix: counter must drop back to 0 — and so must the Draft count, or
-        // `lockedProposalCount` underflows and bricks every lock read.
+        // R9 fix: counter must drop back to 0.
         assertEq(governor.openProposalCount(), 0, "R9: emergencyCancel decremented Draft");
-        assertEq(governor.lockedProposalCount(), 0, "the Draft count left with it");
-        assertFalse(vault.redemptionsLocked(), "lock read survives the exit");
+        assertFalse(vault.redemptionsLocked(), "the vault unlocks with it");
         assertEq(
             governor.getCooldownEnd(),
             vm.getBlockTimestamp() + COOLDOWN_PERIOD,
@@ -794,14 +791,14 @@ contract OpenProposalCountTest is Test {
         assertEq(governor.openProposalCount(), 1, "counter at 1 after fresh propose");
     }
 
-    /// @notice A Draft binds the vault (`openProposalCount`) but locks no LP flow
-    ///         (`lockedProposalCount == 0`): instant deposit and instant redeem both
-    ///         stay open until the Draft → Pending stamp. Sherlock run #1 finding #8
-    ///         (a Draft-window deposit buys vote weight) is ACCEPTED under SHE-287 —
-    ///         that capital is then locked until settle, which is the price of the
-    ///         vote — and the electorate is recorded at the stamp, so the finding's
-    ///         "counted at vote time" mechanism no longer exists.
-    function test_draft_locksNoLpFlow() public {
+    /// @notice A Draft holds the redeem lock but not the deposit lock: instant redeem
+    ///         is closed from Draft creation (no exit can land ahead of the electorate
+    ///         stamp), instant deposit stays open until execute. Sherlock run #1
+    ///         finding #8 (a Draft-window deposit buys vote weight) is ACCEPTED under
+    ///         SHE-287 — that capital is locked until settle, which is the price of
+    ///         the vote — and the electorate is recorded at the stamp, so the
+    ///         finding's "counted at vote time" mechanism no longer exists.
+    function test_draft_locksRedeemNotDeposit() public {
         address agent2 = makeAddr("agent2");
         uint256 agent2Id = agentRegistry.mint(agent2);
         vm.prank(owner);
@@ -825,9 +822,8 @@ contract OpenProposalCountTest is Test {
         );
 
         assertEq(governor.openProposalCount(), 1, "Draft bumps openProposalCount");
-        assertEq(governor.lockedProposalCount(), 0, "but a Draft is not past Draft");
         assertFalse(vault.depositsLocked(), "deposit lock waits for execute");
-        assertFalse(vault.redemptionsLocked(), "redeem lock waits for Pending");
+        assertTrue(vault.redemptionsLocked(), "redeem lock is held from Draft creation");
 
         // Deposit during the Draft window: open.
         address depositor = makeAddr("depositor");
@@ -837,42 +833,34 @@ contract OpenProposalCountTest is Test {
         assertGt(vault.deposit(1_000e6, depositor), 0, "instant deposit open during a Draft");
         vm.stopPrank();
 
-        // Instant redeem during the Draft window: open too.
-        uint256 lp1Shares = vault.balanceOf(lp1);
-        assertGt(vault.maxRedeem(lp1), 0, "instant redeem open during a Draft");
-        vm.prank(lp1);
-        vault.redeem(lp1Shares / 2, lp1, lp1);
-        assertEq(vault.balanceOf(lp1), lp1Shares - lp1Shares / 2, "half of lp1 left during the Draft");
+        // Instant redeem during the Draft window: closed, for everyone.
+        assertEq(vault.maxRedeem(lp1), 0, "instant redeem closed during a Draft");
+        assertEq(vault.maxRedeem(depositor), 0, "including the Draft-window depositor");
 
         // The accepted trade: the Draft-window deposit buys weight at the stamp,
-        // and that capital is locked from the stamp until settle.
+        // and that capital stays locked until settle.
         vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(agent2);
         governor.approveCollaboration(pid);
-        assertEq(governor.lockedProposalCount(), 1, "Pending is past Draft");
         assertGt(governor.getVoteWeight(pid, depositor), 0, "the Draft-window deposit votes");
         assertTrue(vault.redemptionsLocked(), "and cannot leave until settle");
-        assertEq(vault.maxRedeem(depositor), 0, "instant redeem closed for it");
     }
 
-    /// @notice A lead cancel of a Draft is a Draft exit: both counts fall to zero, so the
-    ///         vault's lock reads survive. A missed `_draftCount` decrement here would leave
-    ///         `lockedProposalCount` underflowing (open 0, drafts 1) and brick them.
-    function test_cancelProposal_draftDecrementsBothCounts() public {
+    /// @notice A lead cancel of a Draft releases the vault: the redeem lock a Draft
+    ///         holds must lift with the binding.
+    function test_cancelProposal_draftReleasesTheLock() public {
         uint256 pid = _proposeDraftWithCoAgent();
-        assertEq(governor.openProposalCount(), 1, "Draft counted");
-        assertEq(governor.lockedProposalCount(), 0, "nothing past Draft");
+        assertTrue(vault.redemptionsLocked(), "Draft holds the redeem lock");
 
         vm.prank(agent);
         governor.cancelProposal(pid);
         assertEq(governor.openProposalCount(), 0, "cancel released the binding");
-        assertEq(governor.lockedProposalCount(), 0, "and the Draft count");
-        assertFalse(vault.redemptionsLocked(), "lock read survives the exit");
-        assertFalse(vault.depositsLocked(), "deposit lock too");
+        assertFalse(vault.redemptionsLocked(), "and the lock");
+        assertFalse(vault.depositsLocked(), "deposit lock never held");
     }
 
     /// @notice The lazy Draft -> Expired commit is the fifth Draft exit; same pin.
-    function test_draftExpiry_decrementsBothCounts() public {
+    function test_draftExpiry_releasesTheLock() public {
         uint256 pid = _proposeDraftWithCoAgent();
         vm.warp(governor.collaborationDeadline(pid) + 1);
         governor.resolveProposalState(pid);
@@ -880,8 +868,7 @@ contract OpenProposalCountTest is Test {
             uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Expired), "Draft lapsed"
         );
         assertEq(governor.openProposalCount(), 0, "expiry released the binding");
-        assertEq(governor.lockedProposalCount(), 0, "and the Draft count");
-        assertFalse(vault.redemptionsLocked(), "lock read survives the exit");
+        assertFalse(vault.redemptionsLocked(), "and the lock");
     }
 
     function _proposeDraftWithCoAgent() internal returns (uint256 pid) {

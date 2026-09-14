@@ -12,9 +12,6 @@ import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 contract MockProposalStatus is IProposalStatus {
     uint256 public activePid;
     uint256 public openCount;
-    /// @dev Open proposals past Draft. `set` keeps it equal to `openCount` (a
-    ///      locked vault).
-    uint256 public lockedCount;
     address public strategy;
     uint256 public proposalCount;
 
@@ -48,7 +45,6 @@ contract MockProposalStatus is IProposalStatus {
     function set(uint256 pid, uint256 openCount_, address strategy_) external {
         activePid = pid;
         openCount = openCount_;
-        lockedCount = openCount_;
         strategy = strategy_;
     }
 
@@ -58,10 +54,6 @@ contract MockProposalStatus is IProposalStatus {
 
     function openProposalCount() external view returns (uint256) {
         return openCount;
-    }
-
-    function lockedProposalCount() external view returns (uint256) {
-        return lockedCount;
     }
 
     function strategyOf(uint256) external view returns (address) {

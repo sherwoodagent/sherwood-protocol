@@ -20,9 +20,10 @@ import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @title Governor_vetoDenominatorExits
 /// @notice SHE-205 / SHE-258 / SHE-287: the veto electorate is recorded at the Draft -> Pending
-///         stamp, and from there to settle no share is burned, so the bar is measured against a
-///         set nothing can shrink. The only exit past Draft is a queued redeem, cancellable
-///         until its proposal is stamped at settle. A Draft locks nothing.
+///         stamp, and while a proposal is open no share is burned, so the bar is measured
+///         against a set nothing can shrink. The only exit is a queued redeem, cancellable until
+///         its proposal is stamped at settle. A Draft holds the redeem lock; deposits lock at
+///         execute.
 contract GovernorVetoDenominatorExitsTest is Test {
     SyndicateGovernor governor;
     SyndicateVault vault;
@@ -140,8 +141,8 @@ contract GovernorVetoDenominatorExitsTest is Test {
         vault.redeem(1, who, who);
     }
 
-    /// @notice Instant redeem/withdraw revert from Pending until settle; ERC20 transfer still works.
-    function test_sharesCannotLeaveTheVaultWhileAProposalIsPastDraft() public {
+    /// @notice Instant redeem/withdraw revert from propose until settle; ERC20 transfer still works.
+    function test_sharesCannotLeaveTheVaultWhileAProposalIsOpen() public {
         _deposit(lp1, 60_000e6);
         _deposit(lp2, 40_000e6);
         uint256 supply = vault.totalSupply();
@@ -357,37 +358,60 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(vault.totalSupply(), vault.balanceOf(lp1) + lp2Shares, "but they still exist");
     }
 
-    // ── SHE-287: a Draft locks nothing; redeem locks at Pending, deposit at execute ──
+    // ── SHE-287: a Draft holds the redeem lock; deposits lock at execute ──
 
-    /// @notice A Draft binds the vault but locks no LP flow: instant redeem is open, and a
-    ///         holder who leaves during the Draft is out of the supply at the snapshot instant,
-    ///         so the recorded electorate excludes them.
-    function test_draft_instantRedeemIsOpenAndLeavesTheElectorate() public {
+    /// @notice A Draft binds the vault and holds the redeem lock, so no exit can land ahead of
+    ///         the electorate stamp; instant deposit stays open and buys weight with capital
+    ///         that is locked until settle (Sherlock #8, accepted).
+    function test_draft_holdsTheRedeemLock_andLeavesDepositOpen() public {
         _deposit(lp1, 100_000e6);
         _deposit(lp2, 100_000e6);
         (uint256 pid, address coAgent) = _proposeDraft();
 
-        assertFalse(vault.redemptionsLocked(), "a Draft must not lock redemption");
+        assertTrue(vault.redemptionsLocked(), "a Draft holds the redeem lock");
         assertFalse(vault.depositsLocked(), "a Draft must not lock deposits");
-        uint256 lp2Shares = vault.balanceOf(lp2);
-        vm.prank(lp2);
-        vault.redeem(lp2Shares, lp2, lp2);
-        vm.warp(vm.getBlockTimestamp() + 1); // the exit is in the past at the stamp
+        _instantExitReverts(lp2);
+        _deposit(attacker, 50_000e6); // Draft-window deposit
+        uint256 attackerShares = vault.balanceOf(attacker);
 
         vm.prank(coAgent);
         governor.approveCollaboration(pid);
-        assertTrue(vault.redemptionsLocked(), "Pending locks redemption");
-        assertEq(governor.getProposal(pid).votableSupply, vault.balanceOf(lp1), "electorate is lp1 alone");
-        assertEq(governor.getVoteWeight(pid, lp2), 0, "and lp2 has no weight");
+        assertEq(governor.getVoteWeight(pid, attacker), attackerShares, "the Draft-window deposit votes");
+        assertEq(
+            governor.getProposal(pid).votableSupply, vault.totalSupply(), "and is in the electorate it was locked into"
+        );
+        _instantExitReverts(attacker);
     }
 
-    /// @notice THE COLLABORATIVE SAME-BLOCK EXIT (#320 review). The final approve's readiness is
-    ///         public and instant redeem is open until it lands, so a holder bundles
-    ///         `{redeem, approveCollaboration}`: gone from the live supply, still in the `t - 1`
-    ///         weight. The electorate is read at the snapshot, so the bar is the one the weight
-    ///         was measured against: 30k Against of a 100k electorate misses the 40% bar. A live
-    ///         read would make it 30k of 70k — a free veto.
-    function test_collab_sameBlockRedeemBeforeTheFinalApproveCannotShrinkTheVetoBar() public {
+    /// @notice THE #320 ROUND-2 SHAPE, closed by the lock: deposit `X` during the Draft one
+    ///         block ahead, then exit in the final-approve block so the bar reads `0.4 (G + X)`
+    ///         while only `G` can vote. The exit reverts — `X` stays locked until settle and
+    ///         keeps its weight, so the bar it inflates is capital at risk, not a free ride.
+    function test_collab_draftDepositCannotExitInTheApproveBlock() public {
+        _deposit(lp1, 100_000e6); // G
+        (uint256 pid, address coAgent) = _proposeDraft();
+        _deposit(attacker, 200_000e6); // X, one block ahead of the final approve
+
+        uint256 attackerShares = vault.balanceOf(attacker);
+        vm.prank(attacker);
+        vm.expectPartialRevert(ERC4626Upgradeable.ERC4626ExceededMaxRedeem.selector);
+        vault.redeem(attackerShares, attacker, attacker); // same block as the final approve
+        vm.prank(coAgent);
+        governor.approveCollaboration(pid);
+
+        assertEq(usdc.balanceOf(attacker), 0, "X is in the vault, not back in hand");
+        assertEq(governor.getVoteWeight(pid, attacker), attackerShares, "and can vote");
+        assertEq(vault.maxRedeem(attacker), 0, "and stays until settle");
+        assertEq(governor.getProposal(pid).votableSupply, vault.totalSupply(), "the bar counts only locked capital");
+    }
+
+    /// @notice DECISION 3 (SHE-282 design.md), closed by the snapshot read: the redeem lane is
+    ///         open for the whole Draft, so a holder can `requestRedeem` in the final-approve
+    ///         block ahead of it — shares move to the queue at `t`, the holder keeps `t - 1`
+    ///         weight. Both terms are read at `t - 1`, so the 30k that moved is still in the
+    ///         100k electorate and 30% Against misses the 40% bar. A live queue term would make
+    ///         it 30k of 70k — the `b / (10_000 + b)` cut.
+    function test_collab_sameBlockQueuedRedeemBeforeTheFinalApproveCannotShrinkTheVetoBar() public {
         _deposit(lp1, 70_000e6);
         _deposit(lp2, 30_000e6);
         (uint256 pid, address coAgent) = _proposeDraft();
@@ -395,19 +419,21 @@ contract GovernorVetoDenominatorExitsTest is Test {
         uint256 lp2Shares = vault.balanceOf(lp2);
 
         vm.prank(lp2);
-        vault.redeem(lp2Shares, lp2, lp2); // same block as the final approve
+        uint256 req = vault.requestRedeem(lp2Shares, lp2); // same block as the final approve
         vm.prank(coAgent);
         governor.approveCollaboration(pid);
 
         assertEq(governor.getProposal(pid).votableSupply, lp1Shares + lp2Shares, "electorate read at the snapshot");
-        assertEq(vault.totalSupply(), lp1Shares, "lp2 is gone from the live supply");
-        assertEq(governor.getVoteWeight(pid, lp2), lp2Shares, "but keeps snapshot weight (Decision 2 class)");
-        assertEq(usdc.balanceOf(lp2), 30_000e6, "with nothing at risk");
+        assertEq(vault.balanceOf(address(queue)), lp2Shares, "though the shares sit in the queue");
+        assertEq(governor.getVoteWeight(pid, lp2), lp2Shares, "and lp2 keeps snapshot weight");
 
         vm.prank(lp2);
         governor.vote(pid, ISyndicateGovernor.VoteType.Against);
         _endVote();
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
+        vm.prank(lp2);
+        queue.cancel(req); // the request is cancellable, but the shares stay locked
+        assertEq(vault.maxRedeem(lp2), 0, "capital stays at risk for the cycle");
     }
 
     /// @notice The collaborative stamp's queue term: shares parked in the queue under an
@@ -432,30 +458,6 @@ contract GovernorVetoDenominatorExitsTest is Test {
             governor.getProposal(pid).votableSupply, vault.balanceOf(lp1), "queued shares are not in the electorate"
         );
         assertEq(vault.totalSupply(), vault.balanceOf(lp1) + lp2Shares, "but they still exist");
-    }
-
-    /// @notice THE COLLABORATIVE WINDOW IS UNREACHABLE (SHE-282 design.md Decision 3). The
-    ///         attack front-ran the final `approveCollaboration` with `requestRedeem`, parking
-    ///         shares in the queue so they left the electorate while the holder kept snapshot
-    ///         weight. The queue only opens with the redeem lock, and a Draft does not hold it.
-    function test_draft_queueIsClosed_soTheCollaborativeWindowIsUnreachable() public {
-        _deposit(lp1, 100_000e6);
-        _deposit(lp2, 100_000e6);
-        (uint256 pid, address coAgent) = _proposeDraft();
-
-        uint256 lp2Shares = vault.balanceOf(lp2);
-        vm.prank(lp2);
-        vm.expectRevert(ISyndicateVault.RedemptionsNotLocked.selector);
-        vault.requestRedeem(lp2Shares, lp2); // the front-run, in the Draft window
-
-        vm.prank(coAgent);
-        governor.approveCollaboration(pid); // Pending: now the queue opens
-        vm.prank(lp2);
-        uint256 req = vault.requestRedeem(lp2Shares, lp2);
-        assertGt(req, 0, "queue opens once redemption is locked");
-        assertEq(
-            governor.getProposal(pid).votableSupply, lp2Shares + vault.balanceOf(lp1), "stamped before the queue move"
-        );
     }
 
     /// @notice Pending keeps instant deposit open, and a deposit after the stamp buys no vote:

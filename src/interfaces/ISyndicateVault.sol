@@ -132,8 +132,8 @@ interface ISyndicateVault {
     ///         implementation note for why an unbacked escrow is unrecoverable.
     function spendableFee(address asset) external view returns (uint256);
     function governor() external view returns (address);
-    /// @notice Instant withdraw/redeem closed: a proposal is past Draft and not
-    ///         yet settled. `requestRedeem` is the exit meanwhile.
+    /// @notice Instant withdraw/redeem closed: a proposal is open (Draft included)
+    ///         and not yet settled. `requestRedeem` is the exit meanwhile.
     function redemptionsLocked() external view returns (bool);
     /// @notice Instant deposit/mint closed: capital is deployed (execute to
     ///         settle). `requestDeposit` is the entry meanwhile.

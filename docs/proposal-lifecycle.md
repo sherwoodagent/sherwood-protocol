@@ -107,8 +107,9 @@ Cross-contract timing invariants (all enforced at the setters):
   `collaborationWindow` or the draft expires. The lead can `rejectCollaboration`.
 - Vault funds: **untouched**. Instant deposits stay open through propose, vote,
   review and approval — only execution locks them (`depositsLocked`). Instant
-  withdrawals lock from `Pending` (`redemptionsLocked`): whoever can vote stays
-  at risk for the outcome. A `Draft` locks neither; it only binds the vault.
+  withdrawals lock from propose, `Draft` included (`redemptionsLocked`): whoever
+  can vote stays at risk for the outcome, and no exit can land ahead of the
+  electorate stamp.
 
 ### 1. Vote (`vote`, `src/SyndicateGovernor.sol:378`)
 
@@ -119,8 +120,8 @@ Cross-contract timing invariants (all enforced at the setters):
   proposal's `votableSupply` — total supply minus the withdrawal queue's
   balance, recorded at the Draft → Pending transition: live on the direct path
   (nothing can move between the read and the stamp), at `snapshotTimestamp` on
-  the collaborative path (instant redeem is open until the final approve, so a
-  live read there could be shrunk by a same-block exit that keeps its weight).
+  the collaborative path (the redeem lane is open for the whole Draft, so a live
+  queue term could be shrunk by a same-block `requestRedeem` that keeps its weight).
 - Vault owner can hard-`vetoProposal` (Pending only) or `emergencyCancel`
   (Draft/Pending). Proposer can `cancelProposal` up to `voteEnd`.
 

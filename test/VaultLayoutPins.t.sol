@@ -115,7 +115,6 @@ contract VaultLayoutPinsTest is Test {
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(GOV_SENTINEL));
         vm.mockCall(GOV_SENTINEL, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(GOV_SENTINEL, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
-        vm.mockCall(GOV_SENTINEL, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(uint256(0)));
     }
 
     function _slot(uint256 index) internal view returns (bytes32) {

@@ -79,7 +79,6 @@ contract VaultQueueReservedNavTest is Test {
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(MOCK_GOVERNOR));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(0)));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(0)));
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(uint256(0)));
         // The batch guard resolves the TierRegistry through the governor and now
         // REFUSES the batch when it resolves none (pashov finding #1), so a
         // placeholder governor has to answer this too.
@@ -98,14 +97,12 @@ contract VaultQueueReservedNavTest is Test {
         usdc.approve(address(vault), type(uint256).max);
     }
 
-    /// @dev An executing proposal is open, past Draft and active, so all three
-    ///      selectors move together (`redemptionsLocked` reads `lockedProposalCount`,
-    ///      `depositsLocked` reads `getActiveProposal`; SHE-287).
+    /// @dev An executing proposal is also an open one: `redemptionsLocked()` reads
+    ///      `openProposalCount()` (SHE-258), so both selectors move together.
     function _setProposalActive(bool active) internal {
         uint256 pid = active ? uint256(1) : uint256(0);
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(pid));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(pid));
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(pid));
     }
 
     function _settle(uint256 pid) internal {

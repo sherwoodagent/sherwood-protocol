@@ -32,10 +32,7 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
     ///      Expired edge so an external reader (and the lifecycle harness)
     ///      legitimately wants it.
     mapping(uint256 => uint256) public collaborationDeadline;
-    /// @dev Open proposals still in Draft. `_openProposalCount - _draftCount` is the
-    ///      number past Draft, which is what locks instant redemption.
-    uint256 internal _draftCount;
-    uint256[9] private __lifecycleGap;
+    uint256[10] private __lifecycleGap;
 
     /// @notice Reverts parameter mutations while any proposal binds a vault.
     modifier whenNoActiveProposal() {
@@ -54,12 +51,6 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
     /// @notice Number of proposals currently binding a vault, Drafts included.
     function openProposalCount() public view virtual returns (uint256) {
         return _openProposalCount;
-    }
-
-    /// @notice Open proposals past Draft (Pending..Executed). Nonzero locks instant
-    ///         redemption: a Draft has stamped nothing, so it locks nothing.
-    function lockedProposalCount() public view returns (uint256) {
-        return _openProposalCount - _draftCount;
     }
 
     function _computeState(StrategyProposal storage p)
@@ -175,10 +166,7 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             // terminal transitions decrement. Draft additionally emits telemetry.
             if (resolved == ProposalState.Rejected || resolved == ProposalState.Expired) {
                 _decOpen();
-                if (stored == ProposalState.Draft) {
-                    --_draftCount;
-                    emit CollaborationDeadlineExpired(p.id);
-                }
+                if (stored == ProposalState.Draft) emit CollaborationDeadlineExpired(p.id);
             }
         }
 

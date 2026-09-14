@@ -12,18 +12,18 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 
 /// @title Vault_redemptionLockSemantics — MS-H4 / SHE-258 regression
-/// @notice The redeem lock covers Pending → GuardianReview → Approved → Executed
-///         via `lockedProposalCount`: no share is burned past Draft, so SHE-205's
-///         exit-inflated veto bar is closed for all four states. The deposit lock
-///         covers Executed only (SHE-287): a deposit after the stamp buys no vote
-///         weight, so the audit's late-deposit window is closed by the snapshot.
+/// @notice The redeem lock covers Draft → Pending → GuardianReview → Approved →
+///         Executed via `openProposalCount`: no share is burned while a proposal
+///         is open, so SHE-205's exit-inflated veto bar is closed for every state.
+///         The deposit lock covers Executed only (SHE-287): a deposit after the
+///         stamp buys no vote weight, so the audit's late-deposit window is closed
+///         by the snapshot.
 /// @dev Drives the vault directly with mocked governor reads. The two
 ///      governor selectors that matter:
-///        - `getActiveProposal()` = 0 outside Executed, != 0 during Executed
-///          (drives `activeStrategyAdapter()` only).
-///        - `lockedProposalCount()` != 0 from Pending through Executed drives
-///          the redeem lock; `getActiveProposal()` != 0 (Executed) drives the
-///          deposit lock (SHE-287).
+///        - `openProposalCount()` != 0 from Draft through Executed drives the
+///          redeem lock and the owner rescue gates.
+///        - `getActiveProposal()` != 0 (Executed) drives the deposit lock and
+///          `activeStrategyAdapter()`.
 contract VaultRedemptionLockSemanticsTest is Test {
     SyndicateVault vault;
     BatchExecutorLib executorLib;
@@ -82,7 +82,6 @@ contract VaultRedemptionLockSemanticsTest is Test {
         uint256 pid = active ? uint256(1) : uint256(0);
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(pid));
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(openCount));
-        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("lockedProposalCount()"), abi.encode(openCount));
         if (active) {
             vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("strategyOf(uint256)", pid), abi.encode(strategy));
         }
@@ -90,7 +89,7 @@ contract VaultRedemptionLockSemanticsTest is Test {
 
     // ───────────────── MS-H4 revisited (SHE-287): deposits open until execute ─────────────────
 
-    /// @notice Pending..Approved (`lockedProposalCount > 0`, nothing executed): the vault
+    /// @notice Pending..Approved (`openProposalCount > 0`, nothing executed): the vault
     ///         still holds everything, so the share price is knowable and instant deposit
     ///         stays open. A deposit here buys no vote weight — weight is read at the
     ///         propose snapshot — so MS-H4's late-deposit concern no longer applies.

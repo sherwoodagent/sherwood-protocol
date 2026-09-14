@@ -1,4 +1,4 @@
-# Proposal: a Draft locks nothing; redeem locks at Pending, deposit at execute
+# Proposal: deposits lock at execute; a Draft keeps the redeem lock
 
 ## Why
 
@@ -38,41 +38,44 @@ Before execute the vault still holds everything and the NAV is knowable.
 | window | instant deposit | instant redeem | queue |
 |---|---|---|---|
 | no proposal | open | open | closed |
-| Draft | **open** | **open** | closed |
-| Pending → Approved | **open** | closed | redeem lane |
+| Draft → Approved | **open** | closed | redeem lane |
 | Executed → settle | closed | closed | both lanes |
 
-- `ProposalLifecycle` tracks `_draftCount` alongside `_openProposalCount` and exposes
-  `lockedProposalCount() = open − drafts`.
-- `redemptionsLocked()` reads `lockedProposalCount()`; `depositsLocked()` reads
-  `getActiveProposal()` and stops being an alias.
-- `requestRedeem` follows the redeem lock (unchanged predicate, new boundary);
-  `requestDeposit` follows `depositsLocked()`, so exactly one deposit path is open in
-  every state — it used to be gated on the open-proposal count, which after this
-  change would have left both paths open from Draft to execute.
-- The owner rescue paths keep reading `openProposalCount()`: the vault is bound by a
-  Draft even though no LP flow is locked, and the owner must not siphon
-  strategy-transit assets while any proposal is alive.
+- `redemptionsLocked()` keeps reading `openProposalCount()` (Draft included).
+  `depositsLocked()` reads `getActiveProposal()` and stops being an alias.
+- `requestRedeem` is unchanged; `requestDeposit` follows `depositsLocked()`, so
+  exactly one deposit path is open in every state — it used to be gated on the
+  open-proposal count, which after this change would have left both paths open from
+  Draft to execute.
+- The collaborative stamp (`approveCollaboration`) reads `votableSupply` at
+  `snapshotTimestamp` — `getPastTotalSupply(t − 1) − getPastVotes(queue, t − 1)` —
+  instead of live. The redeem lane is open for the whole Draft and the final
+  approve's readiness is public, so a live queue term could be shrunk by a
+  same-block `requestRedeem` whose owner keeps `t − 1` weight (`veto-votable-supply`
+  Decision 3). Both terms at `t − 1` see one set. The direct path keeps its live read:
+  instant redeem is open right up to `propose`, and a `t − 1` read there would count
+  shares that already left.
 
-Redeem locks at **Pending**, not at execute, on purpose. Open until execute would let
-a holder vote Against and leave during the voting window — the cost of a veto would
-fall from capital committed for a cycle to capital present for one block, which is
-the opposite of what this change is for.
+Redeem stays locked from **Draft creation**, not from Pending. Two rounds of #320
+review showed why: with instant redeem open in Draft while the collaborative stamp
+lands later, an exit on either side of the read instant is mispriced — a live read
+lets `{redeem, approveCollaboration}` vote full weight against a bar shrunk by its own
+exit; a `t − 1` read lets a Draft-window deposit `X` exit in the approve block and
+leave a bar of `0.4 (G + X)` that only `G` can reach. Holding the lock through the
+Draft is the only shape in which every share in the recorded electorate is capital at
+risk for the cycle. What is lost is instant redeem during the collaboration window
+(≤ 24 h, collaborative proposals only).
 
 ## Impact
 
 - Closes `veto-votable-supply` design.md **Decision 3**: the collaborative-window
   attack (front-run the final `approveCollaboration` with `requestRedeem`, so shares
-  leave the electorate while their holder keeps snapshot weight) is unreachable —
-  the queue only opens with the redeem lock, and a Draft does not hold it. Opening
-  instant redeem in Draft reopens the same window through `redeem` (review of #320),
-  so the collaborative stamp reads the electorate at `snapshotTimestamp` rather than
-  live; the direct path keeps its live read. Residual: Decision 2's class.
+  leave the live electorate while their holder keeps snapshot weight) is priced out —
+  the collaborative stamp reads both terms at `snapshotTimestamp`, so the same-block
+  queue move is inside the recorded set. The shares stay locked either way.
 - Accepted and unchanged: Decision 2 (phantom weight inside the stamping block
   itself), and the Draft-window deposit buying weight (Sherlock run #1 finding #8,
   now a deliberate trade rather than a bug).
-- Governor storage: `_draftCount` carved from `__lifecycleGap` (10 → 9), append-only
-  in effect. Golden regenerated.
-- `IProposalStatus` gains a fifth selector; the mock and every governor fake follow.
+- No storage change; `IProposalStatus` unchanged in shape.
 - An integrator reading `openProposalCount()` as "can I deposit" now reads the wrong
   thing — the seam docstring says which selector answers which question.
