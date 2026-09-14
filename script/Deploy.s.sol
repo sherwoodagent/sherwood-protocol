@@ -180,6 +180,16 @@ contract DeploySherwood is ScriptBase {
         // own natspec for the full dependency list).
         _seedTierRegistry(d.deployer, d.tierRegistry);
 
+        // The seeding above covers chain constants only. A strategy CLASS grant
+        // needs templates that do not exist yet, and until it lands every
+        // proposal naming a clone books full-notional guardian coverage.
+        console.log(
+            "RUNBOOK: after DeployTemplates, run CertifyStrategyClasses propose() then finalize()"
+            " between certifyDelay (default 3 days) and MAX_CERTIFY_WINDOW (14 days) past it - miss the"
+            " window and every grant expires and must be cancelled and re-proposed. Until finalize() lands,"
+            " every strategy proposal is priced at full notional."
+        );
+
         // Multisig handoff: prod hands all proxies to the multisig.
         address effectiveOwner = d.deployer;
         if (!skipHandoff) {
