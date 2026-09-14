@@ -362,6 +362,7 @@ contract StructuralBatchRulesTest is Test {
             marketParams: clMp,
             collateralAmount: 100_000e6,
             borrowAmount: 50_000e6,
+            lpAmount: 0,
             tickLower: -1000,
             tickUpper: 1000,
             expectedLiquidity: 1e16,
