@@ -58,6 +58,38 @@ contract CertifyHarness is CertifyStrategyClasses {
         return super._strictMode();
     }
 
+    /// @dev Ratification defaults ON here so every other test drives the paths it
+    ///      is about; the gate itself is pinned by the two tests that flip it.
+    bool internal ratified = true;
+
+    function setRatified(bool on) external {
+        ratified = on;
+    }
+
+    function _ratified() internal view override returns (bool) {
+        return ratified;
+    }
+
+    function exposed_envRatified() external view returns (bool) {
+        return super._ratified();
+    }
+
+    /// @dev The reviewed codehash is an env var in production, injected here for
+    ///      the same reason as the templates.
+    mapping(string key => bytes32) internal injectedCodehash;
+
+    function setExpectedCodehash(string calldata key, bytes32 codehash) external {
+        injectedCodehash[key] = codehash;
+    }
+
+    function _expectedTemplateCodehash(string memory key) internal view override returns (bytes32) {
+        return useBook ? super._expectedTemplateCodehash(key) : injectedCodehash[key];
+    }
+
+    function exposed_envCodehash(string calldata key) external view returns (bytes32) {
+        return super._expectedTemplateCodehash(key);
+    }
+
     /// @dev No shipped address book carries the `*_TEMPLATE` keys, so the
     ///      templates are injected. `useBook` hands a test the production
     ///      resolution back.
@@ -292,9 +324,8 @@ contract DeployStrategyClassCertificationTest is Test {
 
     // -- 5. Ownership --
 
-    /// @notice `proposeClassCertification` is `onlyOwner`. Once the Ownable2Step
-    ///         handoff completes the multisig runs phase A, and the script must
-    ///         say so rather than aborting a deploy that already broadcast.
+    /// @notice Once the `Ownable2Step` handoff completes, phase A says so and
+    ///         skips rather than aborting a deploy that already broadcast.
     function test_propose_isSkippedOnceOwnershipHasMoved() public {
         _handoff();
 
@@ -353,6 +384,7 @@ contract DeployStrategyClassCertificationTest is Test {
 
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics.length == 0) continue; // anonymous log
             assertTrue(logs[i].topics[0] != TierRegistry.ClassCertified.selector, "re-run repeated the grant");
         }
         _assertPricedAt(portfolioClone, TIER_1, PORTFOLIO_BOUND, "re-run revoked the grant");
@@ -420,10 +452,8 @@ contract DeployStrategyClassCertificationTest is Test {
 
     // -- 8. Half-certified, revoked, expired, drifted --
 
-    /// @notice A governor batch names execute() AND settle(), so one certified
-    ///         selector still prices the other at full notional. A cancelled
-    ///         `settle()` record reads `readyAt == 0` - the same value as
-    ///         "already executed" - and treating that as done ships a half class.
+    /// @notice A cancelled `settle()` record reads `readyAt == 0`, the same value
+    ///         as "already executed", and treating that as done ships a half class.
     function test_finalize_haltsWhenOnlyOneSelectorWasAnnounced() public {
         _propose();
         _ownerCall(abi.encodeCall(TierRegistry.cancelClassCertification, (portfolioTemplate, SEL_SETTLE)));
@@ -472,10 +502,8 @@ contract DeployStrategyClassCertificationTest is Test {
         assertEq(settleBound, registry.FULL_NOTIONAL_BPS(), "re-granted a discount revoked for cause");
     }
 
-    /// @notice `_demoteClass` erases only the selector it is given, and nothing
-    ///         class-wide survives it, so a conviction on a selector the script
-    ///         never walks leaves execute()/settle() certified and both phases
-    ///         are clean no-ops. This is the guard the allowlist used to need.
+    /// @notice A conviction on a selector the script never walks leaves
+    ///         execute()/settle() certified and both phases as clean no-ops.
     function test_bothPhases_areNoOpsAfterAConvictionOnAnUnwalkedSelector() public {
         _runCeremony();
         _ownerCall(
@@ -548,9 +576,8 @@ contract DeployStrategyClassCertificationTest is Test {
 
     // -- 9. Strict mode --
 
-    /// @notice Every skip path exits 0 having written nothing, which is right
-    ///         behind a deploy that already broadcast and wrong for a run that IS
-    ///         the ceremony step. Strict mode is the latter.
+    /// @notice Strict mode turns a skip that exits 0 having written nothing into
+    ///         a revert, for a run that IS the ceremony step.
     function test_strictMode_revertsWhereTheDefaultSkips() public {
         _handoff();
 
@@ -598,6 +625,189 @@ contract DeployStrategyClassCertificationTest is Test {
         vm.expectRevert(bytes("strategy template missing from the address book"));
         _finalize();
         _strict(false);
+    }
+
+    /// @notice Phase A must not certify below tier 2 without an explicit human
+    ///         ratification: the tier, not the bound, carries the ceiling.
+    function test_propose_refusesToWriteWithoutRatification() public {
+        harness.setRatified(false);
+
+        vm.expectRevert(bytes("class certification not ratified - see RUNBOOK lines above"));
+        _propose();
+
+        assertEq(
+            registry.pendingClassCertificationOf(portfolioTemplate, SEL_EXECUTE).readyAt,
+            0,
+            "announced an unratified tier"
+        );
+        assertEq(
+            registry.pendingClassCertificationOf(portfolioTemplate, SEL_SETTLE).readyAt,
+            0,
+            "announced an unratified tier"
+        );
+
+        harness.setRatified(true);
+        _propose();
+        assertGt(
+            registry.pendingClassCertificationOf(portfolioTemplate, SEL_EXECUTE).readyAt,
+            0,
+            "ratified propose() wrote nothing - test is vacuous"
+        );
+    }
+
+    /// @notice The gate is phase A's alone; by phase B the owner has already
+    ///         written the record, so re-demanding the flag strands a ceremony.
+    function test_finalize_doesNotRequireRatification() public {
+        _propose();
+        vm.warp(vm.getBlockTimestamp() + registry.certifyDelay());
+        harness.setRatified(false);
+
+        _finalize(); // must not revert
+
+        _assertPricedAt(portfolioClone, TIER_1, PORTFOLIO_BOUND, "an unratified finalize() stranded the grant");
+    }
+
+    /// @notice And the knob that reaches the gate in production is
+    ///         `CERTIFY_RATIFIED`.
+    function test_ratification_isDrivenByTheCertifyRatifiedEnvVar() public {
+        vm.setEnv("CERTIFY_RATIFIED", "true");
+        assertTrue(harness.exposed_envRatified(), "CERTIFY_RATIFIED=true did not ratify");
+        vm.setEnv("CERTIFY_RATIFIED", "false");
+        assertFalse(harness.exposed_envRatified(), "ratification stayed armed");
+    }
+
+    // -- 10. The reviewed codehash --
+
+    /// @notice The pin is the codehash the OWNER reviewed, so a template
+    ///         redeployed between review and mining is refused by the registry.
+    function test_propose_surfacesCodehashChangedWhenTheReviewedCodehashIsStale() public {
+        harness.setExpectedCodehash(PORTFOLIO_KEY, keccak256("bytecode the owner reviewed"));
+        assertTrue(
+            portfolioTemplate.codehash != keccak256("bytecode the owner reviewed"), "pin matches live - test is vacuous"
+        );
+
+        vm.expectRevert(TierRegistry.CodehashChanged.selector);
+        _propose();
+
+        assertEq(
+            registry.pendingClassCertificationOf(portfolioTemplate, SEL_EXECUTE).readyAt,
+            0,
+            "announced against bytecode nobody reviewed"
+        );
+    }
+
+    /// @notice A pin matching the live template announces normally.
+    function test_propose_announcesWhenTheReviewedCodehashMatches() public {
+        harness.setExpectedCodehash(PORTFOLIO_KEY, portfolioTemplate.codehash);
+
+        _propose();
+
+        assertEq(
+            registry.pendingClassCertificationOf(portfolioTemplate, SEL_EXECUTE).templateCodehash,
+            portfolioTemplate.codehash,
+            "pinned the wrong codehash"
+        );
+        assertGt(
+            registry.pendingClassCertificationOf(portfolioTemplate, SEL_SETTLE).readyAt, 0, "settle() not announced"
+        );
+    }
+
+    /// @notice Unset, the script falls back to the live codehash - which makes
+    ///         the registry's guard compare a value against itself.
+    function test_strictMode_revertsWhenNoReviewedCodehashIsPinned() public {
+        _strict(true);
+        vm.expectRevert(bytes("expected template codehash unset - see RUNBOOK lines above"));
+        _propose();
+        _strict(false);
+    }
+
+    /// @notice And the knob that reaches the pin in production is
+    ///         `<KEY>_CODEHASH`.
+    function test_codehashPin_isDrivenByThePerTemplateEnvVar() public {
+        vm.setEnv("PORTFOLIO_TEMPLATE_CODEHASH", vm.toString(portfolioTemplate.codehash));
+        assertEq(harness.exposed_envCodehash(PORTFOLIO_KEY), portfolioTemplate.codehash, "env pin not read");
+        vm.setEnv("PORTFOLIO_TEMPLATE_CODEHASH", vm.toString(bytes32(0)));
+        assertEq(harness.exposed_envCodehash(PORTFOLIO_KEY), bytes32(0), "env pin stayed armed");
+    }
+
+    // -- 11. Certified on one selector, still pending on the other --
+
+    /// @dev `execute()` executed, `settle()` still merely announced: an anchor now
+    ///      stands over a selector that is not certified, which is also what a
+    ///      demotion looks like. Reachable from any interrupted `finalize()`.
+    function _certifyExecuteOnly() internal {
+        _propose();
+        vm.warp(vm.getBlockTimestamp() + registry.certifyDelay());
+        registry.certifyClass(portfolioTemplate, SEL_EXECUTE);
+    }
+
+    function _assertHalfExecutedCeremony() internal view {
+        assertTrue(
+            registry.classAnchorOf(registry.cloneCodehashOf(portfolioTemplate)).template != address(0),
+            "no anchor - the revoked-or-partial read cannot fire, test is vacuous"
+        );
+        (uint8 settleTier,) = registry.classTierOf(portfolioTemplate, SEL_SETTLE);
+        assertEq(settleTier, registry.TIER_ARBITRARY(), "settle() already certified - test is vacuous");
+        assertGt(
+            registry.pendingClassCertificationOf(portfolioTemplate, SEL_SETTLE).readyAt,
+            0,
+            "settle() is not pending - test is vacuous"
+        );
+    }
+
+    /// @notice An interrupted ceremony resumes: a still-pending selector under a
+    ///         standing anchor is an allowance, not a demotion.
+    function test_finalize_completesWhenOneSelectorIsCertifiedAndTheOtherIsStillPending() public {
+        _certifyExecuteOnly();
+        _assertHalfExecutedCeremony();
+
+        _finalize(); // must not revert
+
+        _assertPricedAt(portfolioClone, TIER_1, PORTFOLIO_BOUND, "an interrupted ceremony could not be resumed");
+    }
+
+    /// @notice And a re-run of phase A in that state is a no-op, not a refusal.
+    function test_propose_isANoOpWhenOneSelectorIsCertifiedAndTheOtherIsStillPending() public {
+        _certifyExecuteOnly();
+        _assertHalfExecutedCeremony();
+        uint64 readyAt = registry.pendingClassCertificationOf(portfolioTemplate, SEL_SETTLE).readyAt;
+
+        _propose(); // must not revert
+
+        assertEq(
+            registry.pendingClassCertificationOf(portfolioTemplate, SEL_SETTLE).readyAt,
+            readyAt,
+            "re-announced the pending selector and restarted its delay"
+        );
+    }
+
+    // -- 12. A bonded pending record --
+
+    /// @notice A record announced by hand with a real submitter is submitter-only
+    ///         at `certifyClass`, and this script funds no bonded flow.
+    function test_finalize_namesTheBondedRecordRatherThanRevertingBare() public {
+        _configureBond();
+        address submitter = makeAddr("submitter");
+        bytes4[2] memory selectors = [SEL_EXECUTE, SEL_SETTLE];
+        for (uint256 i; i < selectors.length; ++i) {
+            _ownerCall(
+                abi.encodeCall(
+                    TierRegistry.proposeClassCertification,
+                    (portfolioTemplate, selectors[i], TIER_1, PORTFOLIO_BOUND, submitter, portfolioTemplate.codehash)
+                )
+            );
+        }
+        vm.warp(vm.getBlockTimestamp() + registry.certifyDelay());
+        assertGt(
+            registry.pendingClassCertificationOf(portfolioTemplate, SEL_EXECUTE).bondAmount,
+            0,
+            "the record is unbonded - test is vacuous"
+        );
+
+        vm.expectRevert(HALT_FINALIZE);
+        _finalize();
+
+        _fullNotional(portfolioClone, "certified a bonded record this script cannot fund");
     }
 
     /// @notice The book address is present but codeless - a template deploy that

@@ -11,7 +11,13 @@ FULL NOTIONAL.
 answers `(TIER_ARBITRARY, FULL_NOTIONAL_BPS)`, so the whole declared cap of
 every leg has to be covered — and the per-call `Tier2CallCapExceedsCeiling`
 ceiling applies on top, because `_scanCalls` enforces it exactly when a call
-resolves to tier 2.
+resolves to tier 2. That ceiling is the other side of the trade, not only a
+cost of abstaining: `proposeClassCertification` rejects `tier >= TIER_ARBITRARY`,
+so every legal certification is below tier 2 and therefore DROPS the ceiling for
+every clone of the template, permanently and on every future proposal. The
+discount and the ceiling are welded; no `extractableBoundBps` buys one back.
+That makes the tier a deployment decision, so `propose()` refuses to write
+without `CERTIFY_RATIFIED=true`.
 
 Every strategy proposal names a freshly minted ERC-1167 clone, whose address
 nobody can certify ahead of time. `TierRegistry` already carries the mechanism
@@ -39,6 +45,10 @@ needs its own two-phase script with its own slot in the runbook.
   grants. `propose()` skips with a RUNBOOK line when the deployer no longer owns
   the registry; `finalize()` carries no such guard, because `certifyClass` is
   permissionless without a submitter bond. Both phases are re-runnable.
+- **`propose()` requires `CERTIFY_RATIFIED=true`** and pins
+  `<KEY>_CODEHASH` — the bytecode the owner reviewed — rather than the codehash
+  read live in the proposing transaction, which would compare a value against
+  itself and remove the registry's `CodehashChanged` guard entirely.
 - **Risk parameters are stated, not derived.** `tier` and `extractableBoundBps`
   are what the governor turns into required coverage, so they sit in a named
   constant block with their rationale, overridable by env. `_scanCalls`

@@ -13,6 +13,9 @@
 - [x] 1.11 Surface `MAX_CERTIFY_WINDOW`: print the deadline in phase A, give phase B an expiry branch with the cancel-and-re-propose recovery
 - [x] 1.12 Check the drift guard on both pending records AND on the class anchor, so drift after both grants executed is still caught
 - [x] 1.13 Add `CERTIFY_STRICT=true`, turning every skip path into a revert, reached through an overridable seam rather than a direct `vm.envOr` read
+- [x] 1.14 Gate `propose()` on `CERTIFY_RATIFIED=true` through the same seam shape, reverting unconditionally with a RUNBOOK line naming the tier and what certifying below tier 2 removes; leave `finalize()` ungated
+- [x] 1.15 Pin `expectedTemplateCodehash` from `<KEY>_CODEHASH`, never from the live codehash read in the same transaction; log the live codehash on every run and make an unset pin a `CERTIFY_STRICT` condition
+- [x] 1.16 Give the bonded-record path in phase B a RUNBOOK line rather than a bare `NotSubmitter()`
 
 ## 2. Discoverability
 
@@ -34,3 +37,7 @@
 - [x] 3.12 Drift after both grants executed halts `finalize()` on the anchor comparison
 - [x] 3.13 `CERTIFY_STRICT=true` reverts where the default skips — one test per reachable path: ownership moved, submitter bond, template missing from the book, template address codeless
 - [x] 3.14 A conviction on a selector the script never walks leaves `execute()`/`settle()` certified and both phases as clean no-ops
+- [x] 3.15 `propose()` without ratification reverts and writes nothing, the ratified run proceeds, and `finalize()` runs unratified
+- [x] 3.16 A stale reviewed codehash surfaces `CodehashChanged`; a matching one announces; an unset one is a strict-mode revert
+- [x] 3.17 With `execute()` certified and `settle()` still pending, `finalize()` completes and `propose()` is a no-op that does not restart the pending delay
+- [x] 3.18 A bonded pending record halts `finalize()` with the RUNBOOK line rather than a bare `NotSubmitter()`

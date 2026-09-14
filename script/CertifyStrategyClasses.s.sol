@@ -30,8 +30,11 @@ import {TierRegistry} from "../src/TierRegistry.sol";
  *     forge script script/CertifyStrategyClasses.s.sol:CertifyStrategyClasses \
  *       --sig 'finalize()' --rpc-url <rpc> --broadcast --account sherwood-agent
  *
- *   Risk-parameter overrides: PORTFOLIO_CLASS_TIER, PORTFOLIO_CLASS_BOUND_BPS.
- *   `CERTIFY_STRICT=true` turns every skip below into a revert.
+ *   `CERTIFY_RATIFIED=true` is required by `propose()`: the tier is a security
+ *   decision, not a script default. `PORTFOLIO_TEMPLATE_CODEHASH` pins the
+ *   bytecode the owner reviewed. Risk-parameter overrides:
+ *   PORTFOLIO_CLASS_TIER, PORTFOLIO_CLASS_BOUND_BPS. `CERTIFY_STRICT=true`
+ *   turns every skip below into a revert.
  */
 contract CertifyStrategyClasses is ScriptBase {
     /// @dev `IStrategy.execute()` / `IStrategy.settle()` — the only two
@@ -39,18 +42,10 @@ contract CertifyStrategyClasses is ScriptBase {
     bytes4 internal constant SEL_EXECUTE = 0x61461954;
     bytes4 internal constant SEL_SETTLE = 0x11da60b4;
 
-    // ── Risk parameters. RATIFY BEFORE ANY MAINNET RUN. ──
-    //
-    // `boundBps` becomes required guardian coverage PER CALL:
-    // `Σ cap_i * boundBps / 10_000` (`SyndicateGovernor._scanCalls`).
-    // 2_000 = 2x the <=1_000 bps single-call slippage ceiling
-    // (`PortfolioStrategy.MAX_SLIPPAGE_CEILING_BPS`), which is the whole
-    // in-batch surface: init binds the adapter, every feed, and each
-    // token<->feed pairing through the registry.
-    // NO BOUND PRICES `rebalanceDelta()` — `onlyProposer`, called on the clone
-    // rather than through a governor batch, and this branch carries no
-    // lifetime decay budget, so repeats are unbounded.
-    // RATIFY: tier < 2 also drops the per-call `Tier2CallCapExceedsCeiling`.
+    // Risk parameters, ratified per run via CERTIFY_RATIFIED. 2_000 bps = 2x
+    // `PortfolioStrategy.MAX_SLIPPAGE_CEILING_BPS`, the whole in-batch surface; tier 1
+    // also drops the per-call `Tier2CallCapExceedsCeiling`. Derivation: openspec change
+    // `certify-strategy-classes-at-deploy`.
     uint8 internal constant PORTFOLIO_TIER = 1;
     uint16 internal constant PORTFOLIO_BOUND_BPS = 2_000;
 
@@ -97,6 +92,7 @@ contract CertifyStrategyClasses is ScriptBase {
 
     function _proposeClasses(address deployer, address tierRegistryAddr) internal {
         console.log("\n=== Strategy class certification: propose ===");
+        _requireRatified();
         TierRegistry registry = TierRegistry(tierRegistryAddr);
         if (!_ownsRegistry(registry, deployer)) return;
         if (!_bondIsUnset(registry)) return;
@@ -112,8 +108,11 @@ contract CertifyStrategyClasses is ScriptBase {
             }
             console.log("  proposing:", set[i].key, template);
             console.log("    tier / extractableBoundBps:", uint256(set[i].tier), uint256(set[i].boundBps));
-            _proposeOne(registry, template, SEL_EXECUTE, set[i]);
-            _proposeOne(registry, template, SEL_SETTLE, set[i]);
+            console.log("    live template codehash:");
+            console.logBytes32(template.codehash);
+            bytes32 expected = _expectedCodehashOrLive(set[i].key, template);
+            _proposeOne(registry, template, SEL_EXECUTE, set[i], expected);
+            _proposeOne(registry, template, SEL_SETTLE, set[i], expected);
         }
         console.log("\n  RUNBOOK: run finalize() no earlier than certifyDelay seconds:", registry.certifyDelay());
         console.log(
@@ -123,7 +122,13 @@ contract CertifyStrategyClasses is ScriptBase {
         require(!halted, "class previously certified then revoked - see RUNBOOK lines above");
     }
 
-    function _proposeOne(TierRegistry registry, address template, bytes4 selector, ClassParams memory p) private {
+    function _proposeOne(
+        TierRegistry registry,
+        address template,
+        bytes4 selector,
+        ClassParams memory p,
+        bytes32 expectedCodehash
+    ) private {
         TierRegistry.PendingClassCertification memory pending = registry.pendingClassCertificationOf(template, selector);
         if (pending.readyAt != 0) {
             console.log("    already pending, readyAt:", pending.readyAt);
@@ -135,7 +140,7 @@ contract CertifyStrategyClasses is ScriptBase {
             return;
         }
         // `submitter` is address(0) because the bond is unset — checked above.
-        registry.proposeClassCertification(template, selector, p.tier, p.boundBps, address(0), template.codehash);
+        registry.proposeClassCertification(template, selector, p.tier, p.boundBps, address(0), expectedCodehash);
     }
 
     // ── Phase B ──
@@ -162,9 +167,9 @@ contract CertifyStrategyClasses is ScriptBase {
                 halted = true;
                 continue;
             }
-            // Both, never short-circuited: a governor batch names execute() and
-            // settle(), so one certified selector still prices the other at
-            // full notional.
+            // Both evaluated before the `&&`, so the RUNBOOK names every failing
+            // selector: a governor batch names execute() and settle(), and one
+            // certified selector still prices the other at full notional.
             bool certified = _certifyOne(registry, template, SEL_EXECUTE);
             certified = _certifyOne(registry, template, SEL_SETTLE) && certified;
             if (!certified) {
@@ -193,6 +198,12 @@ contract CertifyStrategyClasses is ScriptBase {
                 return true;
             }
             console.log("  RUNBOOK: SELECTOR NEITHER CERTIFIED NOR ANNOUNCED - run propose() first.");
+            return false;
+        }
+        if (p.bondAmount != 0) {
+            console.log("  RUNBOOK: THIS RECORD IS BONDED - certifyClass is submitter-only:", p.submitter);
+            console.log("  RUNBOOK: that submitter must approve the bond to TierRegistry and call it itself;");
+            console.log("  RUNBOOK: this script funds no bonded flow. Bond amount:", uint256(p.bondAmount));
             return false;
         }
         uint256 expiresAt = p.readyAt + registry.MAX_CERTIFY_WINDOW();
@@ -229,13 +240,9 @@ contract CertifyStrategyClasses is ScriptBase {
         return registry.pendingClassCertificationOf(template, selector).readyAt != 0;
     }
 
-    /// @dev A template redeployed between the phases voids the grant inside
-    ///      `certifyClass` with `TemplateCodehashChanged`. BOTH selectors: one
-    ///      record can already be executed while the other still carries drift.
-    ///      The ANCHOR too: with both grants already executed there is no
-    ///      pending record left to inspect, and a stale anchor makes
-    ///      `_classAnchorOf` resolve nothing, so every clone silently falls
-    ///      back to the uncertified default.
+    /// @dev Drift voids the grant inside `certifyClass`. Both selectors AND the
+    ///      anchor: with both grants executed no pending record survives, and a
+    ///      stale anchor drops every clone back to the uncertified default.
     function _templateDrifted(TierRegistry registry, address template, string memory key) private view returns (bool) {
         bytes32 live = template.codehash;
         TierRegistry.ClassAnchor memory anchor = registry.classAnchorOf(registry.cloneCodehashOf(template));
@@ -268,6 +275,44 @@ contract CertifyStrategyClasses is ScriptBase {
     ///      strict test flips the flag under every test running beside it.
     function _strictMode() internal view virtual returns (bool) {
         return vm.envOr("CERTIFY_STRICT", false);
+    }
+
+    /// @dev Unconditional, not `_haltIfStrict`: a gate whose purpose is to demand
+    ///      a human decision cannot default to skipping. Phase B carries no gate -
+    ///      by then the owner has already written the record.
+    function _requireRatified() private view {
+        if (_ratified()) return;
+        ClassParams[] memory set = _classSet();
+        for (uint256 i; i < set.length; ++i) {
+            console.log("  RUNBOOK: RATIFY tier for:", set[i].key, uint256(set[i].tier));
+        }
+        console.log("  RUNBOOK: a tier below 2 removes the per-call Tier2CallCapExceedsCeiling for EVERY");
+        console.log("  RUNBOOK: clone of that template, on every future proposal. The only reversal is");
+        console.log("  RUNBOOK: demoteClass, which surrenders the coverage discount with it.");
+        console.log("  RUNBOOK: set CERTIFY_RATIFIED=true to run phase A.");
+        revert("class certification not ratified - see RUNBOOK lines above");
+    }
+
+    /// @dev Seam for the same reason as `_strictMode`.
+    function _ratified() internal view virtual returns (bool) {
+        return vm.envOr("CERTIFY_RATIFIED", false);
+    }
+
+    /// @dev The codehash the OWNER reviewed, not the one live at mining time:
+    ///      passing `template.codehash` makes the registry's `CodehashChanged`
+    ///      guard compare a value against itself.
+    function _expectedCodehashOrLive(string memory key, address template) private view returns (bytes32) {
+        bytes32 expected = _expectedTemplateCodehash(key);
+        if (expected != bytes32(0)) return expected;
+        console.log("  RUNBOOK: no reviewed codehash pinned - set this env var to the value logged above:");
+        console.log("  RUNBOOK:", string.concat(key, "_CODEHASH"));
+        _haltIfStrict("expected template codehash unset - see RUNBOOK lines above");
+        return template.codehash;
+    }
+
+    /// @dev Seam for the same reason as `_strictMode`.
+    function _expectedTemplateCodehash(string memory key) internal view virtual returns (bytes32) {
+        return vm.envOr(string.concat(key, "_CODEHASH"), bytes32(0));
     }
 
     /// @dev Seam for the same reason as `_strictMode`: no shipped address book

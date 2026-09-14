@@ -33,7 +33,13 @@ The class set SHALL exclude any template whose `_initialize` does not bound the 
 - `ConcentratedLiquidityStrategy` is excluded on the same ground. Its levered path binds `swapAdapter`, `positionManager`, `uniswapFactory`, `morpho` and `marketParams.collateralToken` to the registry but leaves `marketParams.oracle`, `.irm` and `.lltv` proposer-chosen, and the LTV buffer test prices collateral off the strategy's own feed rather than the market oracle, so a levered clone can be pointed at a market with an attacker-authored oracle and lose the whole collateral. Tier and bound are per-CLASS, so the unlevered mode — which names no Morpho surface at all — does not change the price the class must carry.
 - `PortfolioStrategy` is in the set at `tier = 1`, `extractableBoundBps = 2_000`. Its `_initialize` binds the swap adapter, every price feed and each token↔feed pairing through the registry, and no single in-batch call can exceed `MAX_SLIPPAGE_CEILING_BPS` = 1_000 bps, so `2_000` is that ceiling with 2x headroom. The bound prices the in-batch surface only: `rebalanceDelta()` is `onlyProposer` and called on the clone rather than through a governor batch, and carries no lifetime decay budget, so its repeats are unbounded by any class parameter.
 
-Certifying ANY class below tier 2 SHALL be ratified by a human before a mainnet run, because it removes a control no `extractableBoundBps` restores. `SyndicateGovernor._scanCalls` applies the per-call `Tier2CallCapExceedsCeiling` ceiling only when a call resolves to tier 2, so a tier-1 class certification drops that ceiling for every clone of the template, permanently and for every future proposal. The bound is a coverage multiplier, not a cap; raising it narrows the coverage discount and does not reinstate the ceiling. Accepting that trade is a deployment decision, not a script default.
+Certifying ANY class below tier 2 SHALL be ratified by a human before a mainnet run, because it removes a control no `extractableBoundBps` restores. `SyndicateGovernor._scanCalls` applies the per-call `Tier2CallCapExceedsCeiling` ceiling only when a call resolves to tier 2, so a tier-1 class certification drops that ceiling for every clone of the template, permanently and for every future proposal. `proposeClassCertification` rejects `tier >= TIER_ARBITRARY`, so there is no configuration that takes the coverage discount and keeps the ceiling. The bound is a coverage multiplier, not a cap; raising it narrows the coverage discount and does not reinstate the ceiling. Accepting that trade is a deployment decision, not a script default.
+
+Phase A SHALL therefore refuse to write without an explicit ratification (`CERTIFY_RATIFIED=true`, reached through an overridable seam), printing a RUNBOOK line that names each template and the tier being ratified and states that only `demoteClass` reverses it, at the cost of the discount. This refusal SHALL be unconditional, not a `CERTIFY_STRICT`-gated skip: a gate whose purpose is to demand a human decision cannot default to skipping. Phase B SHALL NOT carry the gate — by then the owner has already written the record, and re-demanding the flag would strand an announced ceremony.
+
+Phase A SHALL pin `expectedTemplateCodehash` to the codehash the OWNER REVIEWED, read from `<TEMPLATE KEY>_CODEHASH`, and SHALL NOT pass the template's codehash read live in the proposing transaction: `proposeClassCertification` compares that argument against the live codehash, so passing the live value compares a value against itself and removes the guard whose purpose is to stop the template's deployer landing different bytecode between owner review and mining. The live codehash SHALL be logged on every run so an operator can pin it for the next one. With the env var unset the script falls back to the live codehash and SHALL treat that as a `CERTIFY_STRICT` skip condition.
+
+The pending-record allowance SHALL survive a partially executed ceremony: with `execute()` certified and `settle()` still merely announced, the anchor stands over a selector that is not certified, which is also what a demotion looks like. Reading only `classTierOf` there would refuse an interrupted `finalize()` and brick the ceremony.
 
 `DeployWood` SHALL be skipped — WOOD is already live on the fork. CREATE3 makes the core addresses order-independent. With handoff skipped, the deployer retains ownership of beacon / factory / registry / sWOOD / ProtocolConfig (needed for fork admin); on the real mainnet ceremony `SKIP_MULTISIG_HANDOFF` SHALL NOT be used and `OWNER_MULTISIG` MUST be a contract (Safe), not an EOA.
 
@@ -92,6 +98,18 @@ The ceremony SHALL persist `TIER_REGISTRY` into `chains/{chainId}.json`. `Deploy
 #### Scenario: Re-run after a challenge conviction demoted the class
 - **WHEN** the class is demoted by `demoteClassByChallenge` and either phase is re-run
 - **THEN** it refuses, printing a RUNBOOK line demanding an explicit owner re-announcement, and does not re-announce or re-certify the class
+
+#### Scenario: Phase A run without ratification
+- **WHEN** step 6 runs without `CERTIFY_RATIFIED=true`
+- **THEN** it reverts naming the tier being ratified and what ratifying removes, and announces nothing; step 7 does not carry the gate
+
+#### Scenario: Template redeployed between owner review and phase A
+- **WHEN** `<TEMPLATE KEY>_CODEHASH` names the reviewed bytecode and the template no longer carries it
+- **THEN** `proposeClassCertification` reverts `CodehashChanged` and nothing is announced, rather than the script pinning whatever bytecode is live at mining time
+
+#### Scenario: Ceremony interrupted between the two `certifyClass` calls
+- **WHEN** `execute()` is certified, `settle()` is still pending, and either phase is re-run
+- **THEN** step 7 completes the grant and the clone reads `(1, 2_000)` on both selectors, and step 6 is a no-op that leaves the pending `settle()` record and its delay untouched — the standing anchor is not read as a demotion
 
 #### Scenario: Conviction lands on a selector the script never walks
 - **WHEN** the owner has also certified a third selector on a template, a conviction demotes that third selector, and either phase is re-run
