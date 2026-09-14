@@ -38,8 +38,7 @@ Design paper: [`docs/papers/guardian-network-economic-security.md`](docs/papers/
 |----------|-------------|
 | `src/ExposureLedger.sol` | Dollar-denominated coverage accounting. Converts each guardian's sWOOD stake into a haircut USD `slashableBond`, tracks per-epoch committed coverage, and freezes the coverage backing a challenged proposal. Epoch length is immutable (28d initial); the WOOD→USD price is a conservative governance-set 8-decimal value. |
 | `src/ProposerBondEscrow.sol` | Holds the risk-scaled proposer bond for the lifetime of a proposal — the proposer is the actual attacker in the threat model, so it posts capital scaled to what the proposal can extract. Accepts forfeitures only from the ledger's `coverageFreezer`. |
-| `src/ChallengeGame.sol` | Anyone may post a bonded challenge against an executed proposal, citing one of five predicates plus an evidence pointer. Filing freezes the approvers' committed coverage. Guardians counter-bond within `autoSlashDelay` (hard floor 48h), or silence becomes a slash. |
-| `src/TokenCourt.sol` | Single-layer WOOD-vote adjudication of *disputed* challenges. One referral opens one vote window (`MAX_VOTE_WINDOW = 14 days`), one tally against a participation floor produces the verdict. No panel, no appeal, no bad-faith track. |
+| `src/ChallengeGame.sol` | Anyone may post a bonded challenge against an executed proposal, citing one of five predicates plus an evidence pointer. Filing freezes the approvers' committed coverage and opens a guardian vote: `voteOnChallenge(id, convict)` within `voteWindow` (7 d, hard floor 48 h), weighted by stake pinned one second before the filing. Convict weight reaching `challengeQuorumBps` of the votable stake settles the challenge; anything less fails it and burns a fifth of the challenger's bond. |
 | `src/TierRegistry.sol` | Adapter-selector tier certification: tier is a property of `(target, selector)`, set at listing by governance and consumed at propose/execute time. Also holds the owner-managed adapter allowlist that `SyndicateVault._guardBatchCalls` checks for the spender/recipient of value-moving ERC-20 calls inside a governor batch. |
 
 ### Pricing (Lane A) & queue (Lane B)
@@ -119,8 +118,9 @@ Independent of the syndicate machinery — team/contributor token grants.
   from the at-open quorum to a 2/3 supermajority (`_severityBps`), not voted.
 - **Bonded approval** — approving a proposal commits a guardian's dollar coverage in
   `ExposureLedger`, and the proposer posts a risk-scaled bond in `ProposerBondEscrow`.
-  A bonded challenge in `ChallengeGame` freezes that coverage; silence auto-slashes,
-  and a counter-bond sends the dispute to `TokenCourt` for a single WOOD vote.
+  A bonded challenge in `ChallengeGame` freezes that coverage and puts the accusation
+  to the staked guardians outside the accused cohort; a convict quorum slashes, and a
+  window that closes short of it burns a fifth of the challenger's bond.
 - **Two-lane liquidity** — while a proposal is live the vault is not instant against
   float. **Lane A** is oracle-instant entry/exit, available only when the
   `PriceRouter` prices the active strategy's positions within its gates (per-share

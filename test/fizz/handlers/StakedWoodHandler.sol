@@ -12,9 +12,9 @@ import {Properties} from "../Properties.sol";
 ///      here. The slash entry points are role-gated — `slashGuardians` /
 ///      `slashOwnerBond` to the registry, `slashVerdict` to the authorized
 ///      slasher (the game) — and are pranked accordingly. Without them the
-///      fuzzer could never drive stake DOWN except through a full
-///      challenge→court lifecycle, leaving I-4's conditional decrement branch
-///      essentially unexercised.
+///      fuzzer could never drive stake DOWN except through a full challenge
+///      lifecycle, leaving I-4's conditional decrement branch essentially
+///      unexercised.
 ///
 /// @dev A SLASH MUST HAVE A WAY BACK (SHE-215 review). Since the propose and
 ///      execute legs read `ownerBondLive`, `slashOwnerBond` is no longer just a

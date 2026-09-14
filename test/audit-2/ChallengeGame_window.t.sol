@@ -7,12 +7,7 @@ import {ChallengeGame} from "../../src/ChallengeGame.sol";
 import {IChallengeGame} from "../../src/interfaces/IChallengeGame.sol";
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
-import {
-    MockChallengeLedger,
-    MockChallengeTierRegistry,
-    MockChallengeStakedWood,
-    MockRecordingCourt
-} from "../ChallengeGame.t.sol";
+import {MockChallengeLedger, MockChallengeTierRegistry, MockChallengeStakedWood} from "../ChallengeGame.t.sol";
 
 /// @dev Governor stub identical in shape to `ChallengeGame.t.sol`'s
 ///      `MockChallengeGovernor`, EXTENDED with a settable `strategyDuration` —
@@ -69,22 +64,19 @@ contract MockChallengeLedgerWithBondBps is MockChallengeLedger {
     }
 }
 
-/// @title ChallengeGame_windowAndCourt
+/// @title ChallengeGame_window
 /// @notice Second-audit-181 regression suite for `ChallengeGame`/
-///         `IChallengeGame`, findings A, B, C and D. Each test exercises the
-///         FAILURE MODE the original finding described, not the happy path:
-///         a filing landing in the gap the old deadline formula left open
-///         (A), a court ruling on a challenge that was promised no ruling
-///         was possible (B), and a governance rate change that used to be
-///         permanently unreachable (C).
-contract ChallengeGame_windowAndCourt is Test {
+///         `IChallengeGame`, findings A and D. Each test exercises the FAILURE
+///         MODE the original finding described, not the happy path: a filing
+///         landing in the gap the old deadline formula left open (A), and a
+///         break-even boolean that cannot show magnitude (D).
+contract ChallengeGame_window is Test {
     ChallengeGame internal game;
     ERC20Mock internal wood;
     MockGovernorWithDuration internal gov;
     MockChallengeLedgerWithBondBps internal ledger;
     MockChallengeTierRegistry internal tiers;
     MockChallengeStakedWood internal swood;
-    address internal court;
 
     address internal owner = makeAddr("owner2");
     address internal challenger = makeAddr("challenger2");
@@ -99,11 +91,6 @@ contract ChallengeGame_windowAndCourt is Test {
     address internal constant ADAPTER = address(0xADA9);
     bytes4 internal constant SELECTOR = bytes4(0xfeedface);
 
-    /// @dev Mirrors `ChallengeGame.INCONCLUSIVE_BURN_ROUND3_BPS` — that
-    ///      constant is `internal`, so the value is restated here rather
-    ///      than read off the contract.
-    uint256 internal constant ROUND3_FIXED_BPS = 1_000;
-
     function setUp() public {
         vm.warp(365 days);
         wood = new ERC20Mock("Sherwood", "WOOD", 18);
@@ -114,17 +101,14 @@ contract ChallengeGame_windowAndCourt is Test {
         tiers = new MockChallengeTierRegistry();
         swood = new MockChallengeStakedWood();
         game = new ChallengeGame(owner, address(wood), address(ledger), address(tiers));
-        court = address(new MockRecordingCourt());
 
         ledger.setCoverageFreezer(address(game));
         swood.setAuthorizedSlasher(address(game));
-        vm.startPrank(owner);
+        vm.prank(owner);
         game.setStakedWood(address(swood));
-        vm.stopPrank();
-        // NOTE: the court is deliberately NOT wired here (unlike
-        // `ChallengeGame.t.sol`'s `setUp`) — findings A and B both need
-        // control over whether a court exists at filing time, so each test
-        // wires it explicitly where it matters.
+        // One guardian outside every accused cohort here, so `file` has an
+        // electorate to pin: it refuses a filing nobody could decide.
+        swood.setStake(makeAddr("windowVoter"), 100_000e18);
 
         address[3] memory funders = [challenger, challengerB, defender];
         for (uint256 i = 0; i < funders.length; i++) {
@@ -212,150 +196,6 @@ contract ChallengeGame_windowAndCourt is Test {
         vm.prank(challengerB);
         vm.expectRevert(IChallengeGame.WindowClosed.selector);
         game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
-    }
-
-    // ── FINDING B — `rule` must also gate on the PINNED `courtAtFiling` ──
-
-    /// @notice A challenge filed with no court wired pins
-    ///         `courtAtFiling == address(0)` specifically so its dispute can
-    ///         only ever unwind as a non-verdict, never an acquittal-by-
-    ///         ruling. Wiring a court AFTER filing must not retroactively
-    ///         grant that court the power to rule THIS challenge — the
-    ///         live-`court` identity check alone (the pre-fix guard) would
-    ///         have let it through. Liveness is preserved: the timeout path
-    ///         still resolves the challenge, just not via `rule`.
-    function test_rule_revertsForZeroCourtAtFiling_evenAfterCourtWiredLater() public {
-        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
-        gov.setExecuted(PROPOSAL, vault, vm.getBlockTimestamp(), 0);
-
-        // No court wired at filing time.
-        uint256 id = _fileAs(challenger, PROPOSAL);
-        assertEq(game.challengeOf(id).courtAtFiling, address(0));
-
-        // Fund the counter-bond pool in full so the challenge escalates.
-        vm.prank(defender);
-        game.dispute(id, type(uint256).max);
-        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Disputed));
-
-        // A court gets wired in AFTER filing.
-        vm.prank(owner);
-        game.setCourt(court);
-
-        // The live-court identity check alone would pass (`msg.sender ==
-        // court`); the pinned `courtAtFiling` must still refuse the ruling.
-        vm.prank(court);
-        vm.expectRevert(IChallengeGame.NotCourt.selector);
-        game.rule(id, IChallengeGame.Verdict.Guilty);
-
-        // RECOVERY PATH: the challenge is not stranded. Its timeout still
-        // resolves it — as the non-verdict `_refundAll` this challenge was
-        // always priced for, not `_fail`'s acquittal — so the counter-bond
-        // funders and the challenger both remain able to exit.
-        uint256 timeoutAt = game.challengeOf(id).filedAt + game.challengeOf(id).disputeTimeoutAtFiling;
-        vm.warp(timeoutAt + 1);
-        game.resolve(id);
-        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Inconclusive));
-    }
-
-    /// @notice Sibling check: a challenge that DID have a court pinned at
-    ///         filing may still be ruled by a REPLACEMENT court wired in
-    ///         later — the fix must not overcorrect into refusing every
-    ///         post-filing court rotation, only the zero-`courtAtFiling`
-    ///         case.
-    function test_rule_stillWorksForReplacementCourt_whenCourtAtFilingWasNonZero() public {
-        vm.prank(owner);
-        game.setCourt(court);
-
-        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
-        gov.setExecuted(PROPOSAL, vault, vm.getBlockTimestamp(), 0);
-
-        uint256 id = _fileAs(challenger, PROPOSAL);
-        assertEq(game.challengeOf(id).courtAtFiling, court);
-
-        vm.prank(defender);
-        game.dispute(id, type(uint256).max);
-
-        address replacementCourt = address(new MockRecordingCourt());
-        vm.prank(owner);
-        game.setCourt(replacementCourt);
-
-        vm.prank(replacementCourt);
-        game.rule(id, IChallengeGame.Verdict.NotGuilty);
-        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Failed));
-    }
-
-    // ── FINDING C — the Inconclusive ladder's round-4+ tier must be reachable ──
-
-    /// @notice Drives three genuine `Inconclusive` rounds against one
-    ///         proposal, then proves the fourth filing can actually price
-    ///         ABOVE round 3's fixed 1,000 bps — which the pre-fix mutual
-    ///         setter cross-check made permanently impossible (raising
-    ///         `inconclusiveBurnBps` past the live `settleBurnBps` reverted,
-    ///         and raising `settleBurnBps` itself breaks
-    ///         `honestFilingBreaksEven`). The boundary this test hits is the
-    ///         exact round-3-to-round-4 transition, not merely "some higher
-    ///         number".
-    function test_inconclusiveLadder_round4ReachesIndependentCeiling_afterThreeRounds() public {
-        vm.prank(owner);
-        game.setCourt(court); // every challenge below needs a pinned adjudicator to reach `rule`
-
-        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
-        gov.setExecuted(PROPOSAL, vault, vm.getBlockTimestamp(), 0);
-
-        for (uint256 i = 0; i < 3; i++) {
-            uint256 id = _fileAs(challenger, PROPOSAL);
-            vm.prank(defender);
-            game.dispute(id, type(uint256).max);
-            vm.prank(court);
-            game.rule(id, IChallengeGame.Verdict.Inconclusive);
-            assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Inconclusive));
-        }
-        assertEq(game.inconclusiveRounds(_reviewKey(address(gov), PROPOSAL)), 3, "three rounds must be recorded");
-
-        uint256 settleLive = game.settleBurnBps();
-        uint256 newCeiling = settleLive + 1_000; // strictly ABOVE the live settleBurnBps
-
-        // PRE-FIX, THIS REVERTED `InvalidParameter`: `setInconclusiveBurnBps`
-        // used to refuse any value above the live `settleBurnBps`. It must
-        // succeed now (second-audit finding C).
-        vm.prank(owner);
-        game.setInconclusiveBurnBps(newCeiling);
-        assertEq(game.inconclusiveBurnBps(), newCeiling);
-
-        // The fourth filing must pin the NEW, higher rate — not silently
-        // reclamp to `settleBurnBps`/round 3's fixed rate the way the
-        // pre-fix `_inconclusiveBurnBpsForRound` did, which made round 4
-        // indistinguishable from round 3.
-        uint256 id4 = _fileAs(challenger, PROPOSAL);
-        uint256 pinnedRate = game.challengeOf(id4).inconclusiveBurnBpsAtFiling;
-        assertEq(pinnedRate, newCeiling, "round 4+ must reach the independently-set ceiling");
-        assertGt(pinnedRate, ROUND3_FIXED_BPS, "round 4+ must be a genuinely distinct, higher tier than round 3");
-        assertGt(pinnedRate, settleLive, "the whole point: round 4+ may now exceed the live settleBurnBps");
-    }
-
-    /// @notice Sibling check: rounds 1-3 (the fixed literals) must stay
-    ///         clamped to the live `settleBurnBps` even after the round-4+
-    ///         decoupling — the fix must not have thrown out that half of
-    ///         the invariant along with the part that was actually broken.
-    function test_inconclusiveLadder_fixedTiersStillClampToLiveSettleBurnBps() public {
-        vm.prank(owner);
-        game.setCourt(court);
-
-        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
-        gov.setExecuted(PROPOSAL, vault, vm.getBlockTimestamp(), 0);
-
-        // Lower settleBurnBps below round 1's fixed 250 bps. Legal on its
-        // own since the mutual cross-check with `inconclusiveBurnBps` is
-        // gone (finding C) — zero is an explicitly documented legal value.
-        vm.prank(owner);
-        game.setSettleBurnBps(0);
-
-        uint256 id1 = _fileAs(challenger, PROPOSAL);
-        assertEq(
-            game.challengeOf(id1).inconclusiveBurnBpsAtFiling,
-            0,
-            "round 1 must clamp down to the live settleBurnBps, even at zero"
-        );
     }
 
     // ── FINDING D — the boolean alone cannot show magnitude ──

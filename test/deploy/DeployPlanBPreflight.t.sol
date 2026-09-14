@@ -27,7 +27,7 @@ import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
 ///      setters as another. `vm.prank` cannot bridge the gap — foundry
 ///      refuses to broadcast while a prank is active. So this etches a
 ///      forwarder at `DEFAULT_SENDER` and calls `run()` THROUGH it. Same
-///      idiom, and the same reason, as `DeployTokenCourtPreflight.t.sol`.
+///      idiom, and the same reason, as `DeployPlanDPreflight.t.sol`.
 contract PlanBScriptCaller {
     function fwd(address target, bytes calldata data) external {
         (bool ok, bytes memory ret) = target.call(data);
@@ -916,8 +916,8 @@ contract DeployPlanBPreflightTest is Test {
     ///      and `vm.setEnv` writes the PROCESS environment — one shared mutable
     ///      global that forge does not roll back between tests and that every
     ///      parallel suite writes to. Driving the script through `run()` here
-    ///      would race `DeployTokenCourtPreflight` and `DeployPlanDPreflight`
-    ///      over `STAKED_WOOD` and lose (observed: all 9 of this suite's tests
+    ///      would race `DeployPlanDPreflight` over `STAKED_WOOD` and lose
+    ///      (observed: all 9 of this suite's tests
     ///      failing on an address a sibling suite had just written, with an
     ///      undecodable `EvmError: Revert` from calling a code-less address).
     ///      `deploy()` takes the book directly, so nothing here is shared.
