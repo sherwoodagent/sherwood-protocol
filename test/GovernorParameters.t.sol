@@ -168,6 +168,13 @@ contract GovernorParametersTest is Test {
         governor.setMaxPerformanceFeeBps(2501);
     }
 
+    /// @dev The inclusive boundary: 2500 itself is legal.
+    function test_setMaxPerformanceFeeBps_atCapSucceeds() public {
+        vm.prank(owner);
+        governor.setMaxPerformanceFeeBps(2500);
+        assertEq(governor.getGovernorParams().maxPerformanceFeeBps, 2500, "the ceiling itself is accepted");
+    }
+
     // ==================== setMinStrategyDuration ====================
 
     function test_setMinStrategyDuration_happyPath() public {

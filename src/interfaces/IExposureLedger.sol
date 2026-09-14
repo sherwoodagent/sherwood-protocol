@@ -68,6 +68,18 @@ interface IExposureLedger {
     ///         halt, which is correct: no price means no proof of coverage.
     error NoWoodPrice();
 
+    /// @notice `block.timestamp` is strictly behind `epochGenesis`, so no epoch
+    ///         figure can be derived and every epoch-indexed read is refused.
+    /// @dev    FAIL CLOSED, NOT OPEN. Flooring the subtraction at zero is the
+    ///         tempting repair and it is wrong: `openExposure` would walk
+    ///         `[0, MAX_COVERAGE_HORIZON/L]` while `_coverageEpoch` floors every
+    ///         booking at `currentEpoch()`, so on a ledger older than the horizon
+    ///         the two ranges are DISJOINT and the view answers zero with live
+    ///         coverage — opening `StakedWood.claimUnstakeGuardian`, which gates a
+    ///         guardian's exit on exactly that zero. Strictly `<`: at genesis
+    ///         `elapsed == 0` is valid.
+    error ClockBeforeGenesis();
+
     // ── Events ──
     event WoodUsdPriceSet(uint256 oldPriceX8, uint256 newPriceX8);
     event WoodFeedSet(address indexed feed, uint256 maxDelay);
@@ -292,6 +304,8 @@ interface IExposureLedger {
     function openExposure(address guardian) external view returns (uint256);
     function coverageUsd(address asset, uint256 amount) external view returns (uint256);
     function proposerBondWood(address asset, uint256 requiredCoverage) external view returns (uint256);
+    /// @notice Epochs elapsed since `epochGenesis`; reverts `ClockBeforeGenesis`
+    ///         on a clock behind it.
     function currentEpoch() external view returns (uint256);
 
     /// @notice The WOOD/USD price CAP, 8 decimals. NEVER SERVED AS A PRICE — it

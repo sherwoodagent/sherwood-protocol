@@ -246,13 +246,54 @@ contract GuardianRegistryVoteTest is RegistryTestHarness {
         );
     }
 
-    function test_voteOnProposal_revertsIfReviewNotOpen() public {
+    /// @dev SHE-163: a vote on a due-but-unopened review opens it itself
+    ///      instead of reverting `ReviewNotOpen` — a keeper's `openReview` is
+    ///      no longer a precondition. `PROPOSAL_ID` is registered with
+    ///      `voteEnd == now` in `setUp` and never opened.
+    function test_voteOnProposal_opensADueReviewWithoutAKeeper() public {
+        vm.expectEmit(true, true, false, false);
+        emit IGuardianRegistry.ReviewOpened(address(governor), PROPOSAL_ID, 0);
+        address g = _guardian(0);
+        vm.recordLogs();
+        vm.prank(g);
+        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, 0);
+
+        (bool opened,,) = registry.getReviewState(address(governor), PROPOSAL_ID);
+        assertTrue(opened, "vote opened the review");
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (, uint128 weight) = abi.decode(logs[1].data, (IGuardianRegistry.GuardianVoteType, uint128));
+        assertEq(weight, 10_000e18, "same-tx vote must land on the freshly opened review at the voter's full stake");
+    }
+
+    function test_voteOnProposal_stillRevertsBeforeVoteEndAndAfterReviewEnd() public {
+        uint256 pid = 2;
+        uint256 ve = vm.getBlockTimestamp() + 1 hours;
+        _registerReview(pid, ve, ve + REVIEW_PERIOD);
+        address g = _guardian(0);
+
+        // Before voteEnd: the window check still refuses, auto-open included.
+        vm.prank(g);
+        vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 0);
+
+        // At/after reviewEnd: still refused, never opened along the way.
+        vm.warp(ve + REVIEW_PERIOD);
+        vm.prank(g);
+        vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
+        registry.voteOnProposal(address(governor), pid, IGuardianRegistry.GuardianVoteType.Block, 0);
+    }
+
+    function test_voteOnProposal_doesNotReopenACancelledReview() public {
+        // PROPOSAL_ID is due but unopened; cancel resolves it without ever
+        // opening it (mirrors `test_openReview_neverReopensACancelledReview`).
+        vm.prank(address(governor));
+        registry.cancelReview(PROPOSAL_ID);
+
         address g = _guardian(0);
         vm.prank(g);
         vm.expectRevert(IGuardianRegistry.ReviewNotOpen.selector);
-        registry.voteOnProposal(
-            address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max
-        );
+        registry.voteOnProposal(address(governor), PROPOSAL_ID, IGuardianRegistry.GuardianVoteType.Block, 0);
     }
 
     function test_voteOnProposal_revertsAfterReviewEnd() public {

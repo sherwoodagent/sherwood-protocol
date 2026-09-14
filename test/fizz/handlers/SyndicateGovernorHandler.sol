@@ -218,8 +218,10 @@ abstract contract SyndicateGovernorHandler is Properties {
         skipTime(1);
 
         // ORDER IS LOAD-BEARING: guardian review opens only AFTER `voteEnd`,
-        // so an approve vote cast here — before `openReview` — reverts
-        // `ReviewNotOpen`. This originally voted first, the revert was
+        // so casting a vote before then still reverts `ReviewNotOpen`; once
+        // inside the window, `voteOnProposal` opens a due-but-unopened review
+        // itself, so the explicit `openReview` call below is redundant but
+        // harmless. This originally voted first, the revert was
         // swallowed by the try/catch, and the result was that NO proposal this
         // harness ever executed carried booked coverage. `requiredCoverage`
         // stayed unbacked, `approversOf` came back empty, and
