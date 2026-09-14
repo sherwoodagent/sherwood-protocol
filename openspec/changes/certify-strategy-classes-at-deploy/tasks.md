@@ -13,6 +13,8 @@
 - [x] 1.11 Surface `MAX_CERTIFY_WINDOW`: print the deadline in phase A, give phase B an expiry branch with the cancel-and-re-propose recovery
 - [x] 1.12 Check the drift guard on both selectors, not just `execute()`
 - [x] 1.13 Add `CERTIFY_STRICT=true`, turning every skip path into a revert
+- [x] 1.14 Detect demotion through ANY selector, not just the two the script walks: `_demoteClass` leaves `_classCalleeAllowed` set, so callee-open with the class disallowed is the discriminator, read via a throwaway clone
+- [x] 1.15 Compare the class anchor's `templateCodehash` against the live template, and assert on a probe clone after `setClassAllowed` that both axes actually opened — a drift with no pending record left otherwise reports success and grants nothing
 
 ## 2. Discoverability
 
@@ -31,4 +33,6 @@
 - [x] 3.9 A class demoted by `demoteClassByChallenge` is refused by both phases, not re-granted
 - [x] 3.10 An expired grant produces the expiry branch, not a bare `CertificationExpired()`
 - [x] 3.11 One selector already certified plus a drifted template fires the guard on the other selector
-- [x] 3.12 `CERTIFY_STRICT=true` reverts where the default skips
+- [x] 3.12 `CERTIFY_STRICT=true` reverts where the default skips — one test per reachable path: ownership moved, submitter bond, template missing from the book, template address codeless
+- [x] 3.13 A conviction on a third selector, with `execute()`/`settle()` still certified, is refused by both phases
+- [x] 3.14 Drift after both grants executed halts `finalize()` under the drift reason, not the post-condition's

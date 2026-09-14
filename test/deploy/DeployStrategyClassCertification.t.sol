@@ -30,6 +30,24 @@ contract CertifyHarness is CertifyStrategyClasses {
         _finalizeClasses(deployer, registry);
     }
 
+    /// @dev Strict mode without `vm.setEnv`: that cheatcode is process-global and
+    ///      tests in a suite run in parallel, so an env-driven strict test makes
+    ///      every test beside it revert. `exposed_envStrict` keeps the env var
+    ///      itself pinned, and is the only place the suite touches it.
+    bool internal strict;
+
+    function setStrict(bool on) external {
+        strict = on;
+    }
+
+    function _strictMode() internal view override returns (bool) {
+        return strict;
+    }
+
+    function exposed_envStrict() external view returns (bool) {
+        return super._strictMode();
+    }
+
     /// @dev The harness IS the registry owner (see `setUp`), so owner-only
     ///      set-up a test needs - cancelling one pending record, wiring the
     ///      demoter - has to originate here. Not script surface.
@@ -72,6 +90,9 @@ contract DeployStrategyClassCertificationTest is Test {
 
     bytes4 constant SEL_EXECUTE = IStrategy.execute.selector;
     bytes4 constant SEL_SETTLE = IStrategy.settle.selector;
+    // Any selector the script does NOT walk. `_demoteClass` de-allowlists the
+    // whole class from this one just as readily.
+    bytes4 constant SEL_THIRD = IStrategy.name.selector;
 
     uint16 constant PORTFOLIO_BOUND = 2_000;
     uint16 constant CL_BOUND = 9_999;
@@ -302,8 +323,9 @@ contract DeployStrategyClassCertificationTest is Test {
     }
 
     /// @notice The grant is class-scoped, not global. `MorphoSupplyStrategy` is
-    ///         deliberately excluded from the class set (it validates its Morpho
-    ///         address by asking that address), so its clones stay refused.
+    ///         deliberately excluded from the class set — its
+    ///         `marketParams.oracle/irm/lltv` are proposer-chosen and bound to
+    ///         nothing — so its clones stay refused.
     function test_afterTheCeremony_anExcludedTemplatesCloneIsStillRefused() public {
         _runCeremony();
 
@@ -537,7 +559,7 @@ contract DeployStrategyClassCertificationTest is Test {
 
     /// @notice Every skip path exits 0 having written nothing, which is right
     ///         behind a deploy that already broadcast and wrong for a run that IS
-    ///         the ceremony step. `CERTIFY_STRICT=true` is the latter.
+    ///         the ceremony step. Strict mode is the latter.
     function test_strictMode_revertsWhereTheDefaultSkips() public {
         vm.prank(deployer);
         registry.transferOwnership(multisig);
@@ -545,12 +567,134 @@ contract DeployStrategyClassCertificationTest is Test {
         registry.acceptOwnership();
 
         // Default: skips. Pinned by test_ceremony_isSkippedOnceOwnershipHasMoved.
-        vm.setEnv("CERTIFY_STRICT", "true");
+        _strict(true);
         vm.expectRevert(bytes("deployer does not own TierRegistry - class certification would be a no-op"));
         _propose();
-        // `vm.setEnv` is process-global; leaving it set poisons every later suite.
-        vm.setEnv("CERTIFY_STRICT", "false");
+        _strict(false);
 
         _propose();
+    }
+
+    /// @notice And the knob that reaches it in production is `CERTIFY_STRICT`.
+    ///         The only place this suite reads that env var, so no test running
+    ///         beside it can see the flip.
+    function test_strictMode_isDrivenByTheCertifyStrictEnvVar() public {
+        vm.setEnv("CERTIFY_STRICT", "true");
+        assertTrue(harness.exposed_envStrict(), "CERTIFY_STRICT=true did not arm strict mode");
+        vm.setEnv("CERTIFY_STRICT", "false");
+        assertFalse(harness.exposed_envStrict(), "strict mode stayed armed");
+    }
+
+    function _strict(bool on) internal {
+        harness.setStrict(on);
+    }
+
+    /// @notice With a bond configured `certifyClass` is submitter-only and pulls
+    ///         WOOD. The default skip is right behind a deploy; a run that IS the
+    ///         ceremony step must not exit 0 having announced nothing.
+    function test_strictMode_revertsWhenASubmitterBondIsConfigured() public {
+        ERC20Mock wood = new ERC20Mock("WOOD", "WOOD", 18);
+        vm.startPrank(deployer);
+        registry.setWood(address(wood));
+        registry.setSubmitterBondWood(1e18);
+        vm.stopPrank();
+
+        _strict(true);
+        vm.expectRevert(bytes("submitterBondWood is non-zero - this script funds no bonded submitter"));
+        _propose();
+        _strict(false);
+    }
+
+    /// @notice A chain whose address book does not carry the template keys. The
+    ///         default skip would allowlist nothing and still exit 0.
+    function test_strictMode_revertsWhenATemplateIsMissingFromTheBook() public {
+        vm.chainId(424242); // no chains/424242.json in the repo
+        assertEq(vm.envOr("PORTFOLIO_TEMPLATE", address(0)), address(0), "the key leaked in from the environment");
+
+        _strict(true);
+        vm.expectRevert(bytes("strategy template missing from the address book"));
+        _propose();
+        _strict(false);
+
+        _strict(true);
+        vm.expectRevert(bytes("strategy template missing from the address book"));
+        _finalize();
+        _strict(false);
+    }
+
+    /// @notice The book address is present but codeless — a template deploy that
+    ///         never landed, or a book pointing at the wrong chain.
+    function test_strictMode_revertsWhenTheBookAddressHasNoCode() public {
+        vm.etch(PORTFOLIO_TEMPLATE, "");
+        assertEq(PORTFOLIO_TEMPLATE.code.length, 0, "etch did not clear the template - test is vacuous");
+
+        _strict(true);
+        vm.expectRevert(bytes("no code at the address book's strategy template address"));
+        _propose();
+        _strict(false);
+    }
+
+    // -- 9. Demotion reached through a selector the script never walks --
+
+    /// @notice `_demoteClass` clears `_classAllowed` for the WHOLE class from ANY
+    ///         selector, so a conviction on a third selector leaves `execute()`
+    ///         and `settle()` certified and the class unallowed. The per-selector
+    ///         sweep sees nothing wrong; the discriminator is that the demotion
+    ///         leaves `_classCalleeAllowed` set, so a clone still reads callable
+    ///         while `isClassAllowed` reads false.
+    function test_bothPhases_refuseAClassDemotedThroughAnUnwalkedSelector() public {
+        _runCeremony();
+
+        _ownerCall(
+            abi.encodeCall(
+                TierRegistry.proposeClassCertification,
+                (PORTFOLIO_TEMPLATE, SEL_THIRD, uint8(1), PORTFOLIO_BOUND, address(0), PORTFOLIO_TEMPLATE.codehash)
+            )
+        );
+        vm.warp(vm.getBlockTimestamp() + registry.certifyDelay());
+        registry.certifyClass(PORTFOLIO_TEMPLATE, SEL_THIRD);
+
+        _demoteForCause(SEL_THIRD);
+
+        (uint8 execTier,) = registry.classTierOf(PORTFOLIO_TEMPLATE, SEL_EXECUTE);
+        (uint8 settleTier,) = registry.classTierOf(PORTFOLIO_TEMPLATE, SEL_SETTLE);
+        assertTrue(execTier != registry.TIER_ARBITRARY(), "execute() lost its grant - the sweep would catch this");
+        assertTrue(settleTier != registry.TIER_ARBITRARY(), "settle() lost its grant - the sweep would catch this");
+        assertFalse(registry.isClassAllowed(PORTFOLIO_TEMPLATE), "the conviction did not clear the allowlist");
+        assertTrue(registry.isCallableTarget(portfolioClone), "the callee axis closed - no discriminator to read");
+
+        vm.expectRevert(HALT_REVOKED);
+        _propose();
+
+        vm.expectRevert(HALT_REVOKED);
+        _finalize();
+
+        assertFalse(registry.isClassAllowed(PORTFOLIO_TEMPLATE), "re-allowlisted a class demoted by conviction");
+        assertFalse(registry.isAdapterAllowed(portfolioClone), "re-granted the funds axis after a conviction");
+    }
+
+    // -- 10. Drift with no pending record left to carry it --
+
+    /// @notice Once both grants are executed no pending record survives, so the
+    ///         per-selector drift guard reads nothing. Without the ANCHOR check
+    ///         `finalize()` reports success and grants nothing: `_classOf` stops
+    ///         resolving, so every clone reads refused on both axes. The
+    ///         post-`setClassAllowed` probe halts under its own string, so
+    ///         matching this one pins the anchor guard and not the backstop.
+    function test_finalize_haltsWhenTheTemplateDriftedAfterBothGrantsExecuted() public {
+        _certifyOutsideTheScript();
+        vm.etch(PORTFOLIO_TEMPLATE, address(new MorphoSupplyStrategy()).code);
+
+        assertEq(
+            registry.pendingClassCertificationOf(PORTFOLIO_TEMPLATE, SEL_SETTLE).readyAt,
+            0,
+            "a pending record survived - the per-selector guard would catch this"
+        );
+        assertEq(registry.classOf(portfolioClone), bytes32(0), "drift did not void membership - test is vacuous");
+
+        vm.expectRevert(HALT_FINALIZE);
+        _finalize();
+
+        assertFalse(registry.isClassAllowed(PORTFOLIO_TEMPLATE), "allowlisted a class whose clones are all refused");
     }
 }

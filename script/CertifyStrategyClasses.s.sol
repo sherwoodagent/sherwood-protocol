@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+
 import {ScriptBase} from "./ScriptBase.sol";
 import {console} from "forge-std/console.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
@@ -113,12 +115,10 @@ contract CertifyStrategyClasses is ScriptBase {
         if (!_bondIsUnset(registry)) return;
 
         ClassParams[] memory set = _classSet();
-        uint256 found;
         bool halted;
         for (uint256 i; i < set.length; ++i) {
             address template = _templateOrSkip(set[i].key);
             if (template == address(0)) continue;
-            ++found;
             if (_revokedOrPartial(registry, template, set[i].key)) {
                 halted = true;
                 continue;
@@ -128,8 +128,6 @@ contract CertifyStrategyClasses is ScriptBase {
             _proposeOne(registry, template, SEL_EXECUTE, set[i]);
             _proposeOne(registry, template, SEL_SETTLE, set[i]);
         }
-        if (found == 0) _haltIfStrict("no strategy template in the address book - nothing announced");
-
         console.log("\n  RUNBOOK: run finalize() no earlier than certifyDelay seconds:", registry.certifyDelay());
         console.log(
             "  RUNBOOK: and no later than this unix deadline, else MAX_CERTIFY_WINDOW lapses:",
@@ -163,13 +161,12 @@ contract CertifyStrategyClasses is ScriptBase {
         if (!_ownsRegistry(registry, deployer)) return;
 
         ClassParams[] memory set = _classSet();
-        uint256 found;
         bool revoked;
         bool halted;
+        bool deadGrant;
         for (uint256 i; i < set.length; ++i) {
             address template = _templateOrSkip(set[i].key);
             if (template == address(0)) continue;
-            ++found;
             if (registry.isClassAllowed(template)) {
                 console.log("  skipped (class already allowed):", set[i].key);
                 continue;
@@ -192,15 +189,27 @@ contract CertifyStrategyClasses is ScriptBase {
                 continue;
             }
             registry.setClassAllowed(template, true);
+            // A grant is only real if a CLONE reads it. `_classOf` returns zero
+            // whenever the anchor's snapshot no longer matches the live template,
+            // so an allowed class can still refuse every clone it covers.
+            if (!_cloneAxesOpen(registry, template)) {
+                console.log("  RUNBOOK: ALLOWLISTED BUT EVERY CLONE IS STILL REFUSED -", set[i].key, template);
+                console.log("  RUNBOOK: the class anchor does not match the deployed template. Owner must");
+                console.log("  RUNBOOK: cancelClassCertification(template, selector) for both selectors and");
+                console.log("  RUNBOOK: re-run propose() against the code that is actually deployed.");
+                deadGrant = true;
+                continue;
+            }
             console.log("  class allowed (callee + funds axes):", set[i].key, template);
         }
-        if (found == 0) _haltIfStrict("no strategy template in the address book - nothing allowlisted");
         // Deferred on purpose: forge broadcasts only on a clean `run()`, so a
         // late revert makes the whole phase all-or-nothing under --broadcast.
-        // Two reasons, two strings: a revoked class needs an owner decision, a
-        // halted one needs the RUNBOOK recovery above.
+        // One string per reason, so a test can tell WHICH guard fired: a revoked
+        // class needs an owner decision, a halted one the RUNBOOK recovery above,
+        // and a dead grant means a guard ahead of the write missed the drift.
         require(!revoked, "class previously certified then revoked - see RUNBOOK lines above");
         require(!halted, "class certification halted - see RUNBOOK lines above");
+        require(!deadGrant, "class allowlisted but its clones are still refused - see RUNBOOK lines above");
     }
 
     /// @dev True once `selector` carries a live class certification. False is a
@@ -231,11 +240,11 @@ contract CertifyStrategyClasses is ScriptBase {
     /// @dev Anchor survives `_demoteClass`, configs do not: anchor present with a
     ///      selector uncertified and nothing pending is "certified, then revoked"
     ///      — `setClassAllowed` natspec: restoration is an explicit owner call.
-    function _revokedOrPartial(TierRegistry registry, address template, string memory key) private view returns (bool) {
+    function _revokedOrPartial(TierRegistry registry, address template, string memory key) private returns (bool) {
         if (registry.classAnchorOf(registry.cloneCodehashOf(template)).template == address(0)) return false;
-        if (_selectorLive(registry, template, SEL_EXECUTE) && _selectorLive(registry, template, SEL_SETTLE)) {
-            return false;
-        }
+        bool selectorsLive =
+            _selectorLive(registry, template, SEL_EXECUTE) && _selectorLive(registry, template, SEL_SETTLE);
+        if (selectorsLive && !_classDemoted(registry, template)) return false;
         console.log("  RUNBOOK: CLASS WAS CERTIFIED AND IS NO LONGER -", key, template);
         console.log("  RUNBOOK: owner demotion or a ChallengeGame conviction. This script will NOT re-grant it.");
         console.log("  RUNBOOK: after re-review the owner re-certifies and calls setClassAllowed(template, true)");
@@ -250,13 +259,34 @@ contract CertifyStrategyClasses is ScriptBase {
         return registry.pendingClassCertificationOf(template, selector).readyAt != 0;
     }
 
+    /// @dev The per-selector sweep only sees `execute()`/`settle()`, but
+    ///      `_demoteClass` clears `_classAllowed` for the WHOLE class on ANY
+    ///      selector. It leaves `_classCalleeAllowed` set, so callee-open with
+    ///      the class disallowed is exactly "was allowlisted, then demoted" —
+    ///      distinct from "certified, never allowlisted", where both are false.
+    function _classDemoted(TierRegistry registry, address template) private returns (bool) {
+        if (registry.isClassAllowed(template)) return false;
+        return registry.isCallableTarget(Clones.clone(template));
+    }
+
+    /// @dev Both axes, read through a throwaway clone: `_classCalleeAllowed` has
+    ///      no getter and class membership is only decidable from a member.
+    function _cloneAxesOpen(TierRegistry registry, address template) private returns (bool) {
+        address probe = Clones.clone(template);
+        return registry.isCallableTarget(probe) && registry.isAdapterAllowed(probe);
+    }
+
     /// @dev A template redeployed between the phases voids the grant inside
     ///      `certifyClass` with `TemplateCodehashChanged`. BOTH selectors: one
     ///      record can already be executed while the other still carries drift.
+    ///      The ANCHOR too: with both grants already executed there is no pending
+    ///      record left to inspect, and a stale anchor makes `_classOf` return
+    ///      zero, so `setClassAllowed` would succeed and grant nothing.
     function _templateDrifted(TierRegistry registry, address template, string memory key) private view returns (bool) {
         bytes32 live = template.codehash;
+        TierRegistry.ClassAnchor memory anchor = registry.classAnchorOf(registry.cloneCodehashOf(template));
+        bool drifted = anchor.template != address(0) && anchor.templateCodehash != live;
         bytes4[2] memory selectors = [SEL_EXECUTE, SEL_SETTLE];
-        bool drifted;
         for (uint256 i; i < selectors.length; ++i) {
             TierRegistry.PendingClassCertification memory p =
                 registry.pendingClassCertificationOf(template, selectors[i]);
@@ -276,7 +306,14 @@ contract CertifyStrategyClasses is ScriptBase {
     ///      broadcast is not aborted. `CERTIFY_STRICT=true` for a run that IS a
     ///      documented ceremony step and must not exit 0 having done nothing.
     function _haltIfStrict(string memory reason) private view {
-        if (vm.envOr("CERTIFY_STRICT", false)) revert(reason);
+        if (_strictMode()) revert(reason);
+    }
+
+    /// @dev The knob is the env var; the seam exists because `vm.setEnv` is
+    ///      process-global and tests in a suite run in parallel, so an env-driven
+    ///      strict test flips the flag under every test running beside it.
+    function _strictMode() internal view virtual returns (bool) {
+        return vm.envOr("CERTIFY_STRICT", false);
     }
 
     /// @dev Mirrors `Deploy._seedTierRegistry`: both phases are `onlyOwner`
