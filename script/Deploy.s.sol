@@ -195,7 +195,9 @@ contract DeploySherwood is ScriptBase {
         // exist yet), and without it every batch naming a clone reverts.
         console.log(
             "RUNBOOK: after DeployTemplates, run CertifyStrategyClasses propose() then finalize()"
-            " once certifyDelay (default 3 days) has elapsed - until then no strategy proposal can execute."
+            " between certifyDelay (default 3 days) and MAX_CERTIFY_WINDOW (14 days) past it - miss the"
+            " window and every grant expires and must be cancelled and re-proposed. Until finalize() lands,"
+            " no strategy proposal can execute."
         );
 
         // Multisig handoff: prod hands all proxies to the multisig.

@@ -19,18 +19,20 @@ import {TierRegistry} from "../src/TierRegistry.sol";
  *         dual-gate would have to be re-run once per proposal, forever.
  *
  *         TWO PHASES, because `certifyDelay` (default 3 days) sits between
- *         them. Run `propose()` while the deployer still owns the registry,
- *         wait out the delay, then run `finalize()`.
+ *         them, and phase B is legal only inside `MAX_CERTIFY_WINDOW` (14 days)
+ *         past that. Run `propose()` while the deployer still owns the
+ *         registry, wait out the delay, then run `finalize()` inside the window.
  *
  *   Usage:
  *     forge script script/CertifyStrategyClasses.s.sol:CertifyStrategyClasses \
  *       --sig 'propose()' --rpc-url <rpc> --broadcast --account sherwood-agent
- *     # ... wait certifyDelay (default 3 days) ...
+ *     # ... wait certifyDelay (default 3 days), finalize within 14 days ...
  *     forge script script/CertifyStrategyClasses.s.sol:CertifyStrategyClasses \
  *       --sig 'finalize()' --rpc-url <rpc> --broadcast --account sherwood-agent
  *
  *   Risk-parameter overrides (see `_classSet`): PORTFOLIO_CLASS_TIER,
  *   PORTFOLIO_CLASS_BOUND_BPS, CL_CLASS_TIER, CL_CLASS_BOUND_BPS.
+ *   `CERTIFY_STRICT=true` turns every skip below into a revert.
  */
 contract CertifyStrategyClasses is ScriptBase {
     /// @dev `IStrategy.execute()` / `IStrategy.settle()` — the only two
@@ -38,25 +40,24 @@ contract CertifyStrategyClasses is ScriptBase {
     bytes4 internal constant SEL_EXECUTE = 0x61461954;
     bytes4 internal constant SEL_SETTLE = 0x11da60b4;
 
-    // ── Risk parameters. RATIFY THESE BEFORE ANY MAINNET RUN. ──
+    // ── Risk parameters. RATIFY BEFORE ANY MAINNET RUN. ──
     //
-    // `tier` and `extractableBoundBps` are what the governor turns into
-    // required guardian coverage: `Σ cap_i * boundBps / 10_000`
-    // (`SyndicateGovernor._scanCalls`). A loose bound looks safe and prices the
-    // review away, so these are stated per template, not derived in a loop.
-    //
-    // TIER 1 (oracle-bounded discretion), not 0: both templates swap on
-    // external AMMs, bounded by oracle-derived floors rather than closed-loop.
-    //
-    // BOUND 2_000 bps = 2x the per-swap ceiling each template hard-codes
-    // (`PortfolioStrategy.MAX_SLIPPAGE_CEILING_BPS` /
-    // `ConcentratedLiquidityStrategy.MAX_SLIPPAGE_BPS`, both 1_000), covering
-    // the entry and exit legs of one proposal. 5x headroom under tier 2's
-    // 10_000 full notional.
+    // `boundBps` becomes required guardian coverage PER CALL:
+    // `Σ cap_i * boundBps / 10_000` (`SyndicateGovernor._scanCalls`).
+    // Tier 1, not 0: both templates swap on external AMMs.
+    // Portfolio 2_000 = 2x its <=1_000 bps single-call slippage ceiling.
+    // CL 9_999 (max below `FULL_NOTIONAL_BPS`) = tier-2-equivalent coverage:
+    // levered CL leaves `marketParams.oracle/irm/lltv` unbound (only
+    // `lastUpdate != 0` is checked, true of any permissionless Morpho market),
+    // so a hostile oracle seizes the whole collateral.
+    // NO BOUND PRICES `PortfolioStrategy.rebalance()`/`rebalanceDelta()`
+    // (`onlyProposer`, off-batch, <= `MAX_CUMULATIVE_DECAY_BPS` lifetime decay)
+    // or the permissionless `ConcentratedLiquidityStrategy.rerange()`.
+    // RATIFY: tier < 2 also drops the per-call `Tier2CallCapExceedsCeiling`.
     uint8 internal constant PORTFOLIO_TIER = 1;
     uint16 internal constant PORTFOLIO_BOUND_BPS = 2_000;
     uint8 internal constant CL_TIER = 1;
-    uint16 internal constant CL_BOUND_BPS = 2_000;
+    uint16 internal constant CL_BOUND_BPS = 9_999;
 
     struct ClassParams {
         string key;
@@ -65,11 +66,10 @@ contract CertifyStrategyClasses is ScriptBase {
     }
 
     /// @dev The templates eligible for CLASS certification, with their risk
-    ///      parameters. MORPHO_SUPPLY_TEMPLATE is deliberately absent:
-    ///      `MorphoSupplyStrategy` validates its Morpho address by asking that
-    ///      address, which disqualifies it per
-    ///      docs/adapter-onboarding-checklist.md §4b eligibility rule 1 — it
-    ///      stays address-certifiable only.
+    ///      parameters. MORPHO_SUPPLY_TEMPLATE is deliberately absent: its
+    ///      `marketParams.oracle/irm/lltv` are proposer-chosen and unbound, so
+    ///      no class bound holds over every initialization. Its address path is
+    ///      impractical rather than equivalent — see the openspec change.
     function _classSet() internal view returns (ClassParams[] memory set) {
         set = new ClassParams[](2);
         set[0] = ClassParams({
@@ -113,15 +113,29 @@ contract CertifyStrategyClasses is ScriptBase {
         if (!_bondIsUnset(registry)) return;
 
         ClassParams[] memory set = _classSet();
+        uint256 found;
+        bool halted;
         for (uint256 i; i < set.length; ++i) {
             address template = _templateOrSkip(set[i].key);
             if (template == address(0)) continue;
+            ++found;
+            if (_revokedOrPartial(registry, template, set[i].key)) {
+                halted = true;
+                continue;
+            }
             console.log("  proposing:", set[i].key, template);
             console.log("    tier / extractableBoundBps:", uint256(set[i].tier), uint256(set[i].boundBps));
             _proposeOne(registry, template, SEL_EXECUTE, set[i]);
             _proposeOne(registry, template, SEL_SETTLE, set[i]);
         }
-        console.log("\n  RUNBOOK: wait certifyDelay seconds, then run finalize():", registry.certifyDelay());
+        if (found == 0) _haltIfStrict("no strategy template in the address book - nothing announced");
+
+        console.log("\n  RUNBOOK: run finalize() no earlier than certifyDelay seconds:", registry.certifyDelay());
+        console.log(
+            "  RUNBOOK: and no later than this unix deadline, else MAX_CERTIFY_WINDOW lapses:",
+            block.timestamp + registry.certifyDelay() + registry.MAX_CERTIFY_WINDOW()
+        );
+        require(!halted, "class previously certified then revoked - see RUNBOOK lines above");
     }
 
     function _proposeOne(TierRegistry registry, address template, bytes4 selector, ClassParams memory p) private {
@@ -149,41 +163,106 @@ contract CertifyStrategyClasses is ScriptBase {
         if (!_ownsRegistry(registry, deployer)) return;
 
         ClassParams[] memory set = _classSet();
-        bool drifted;
+        uint256 found;
+        bool revoked;
+        bool halted;
         for (uint256 i; i < set.length; ++i) {
             address template = _templateOrSkip(set[i].key);
             if (template == address(0)) continue;
+            ++found;
             if (registry.isClassAllowed(template)) {
                 console.log("  skipped (class already allowed):", set[i].key);
                 continue;
             }
-            if (_templateDrifted(registry, template, set[i].key)) {
-                drifted = true;
+            if (_revokedOrPartial(registry, template, set[i].key)) {
+                revoked = true;
                 continue;
             }
-            _certifyOne(registry, template, SEL_EXECUTE);
-            _certifyOne(registry, template, SEL_SETTLE);
+            if (_templateDrifted(registry, template, set[i].key)) {
+                halted = true;
+                continue;
+            }
+            // Both, never short-circuited: `setClassAllowed` opens both axes for
+            // every selector at once, so one certified selector is not a class.
+            bool certified = _certifyOne(registry, template, SEL_EXECUTE);
+            certified = _certifyOne(registry, template, SEL_SETTLE) && certified;
+            if (!certified) {
+                console.log("  RUNBOOK: NOT allowlisted - both selectors must be certified first:", set[i].key);
+                halted = true;
+                continue;
+            }
             registry.setClassAllowed(template, true);
             console.log("  class allowed (callee + funds axes):", set[i].key, template);
         }
-        require(!drifted, "template codehash drifted since propose - see RUNBOOK lines above");
+        if (found == 0) _haltIfStrict("no strategy template in the address book - nothing allowlisted");
+        // Deferred on purpose: forge broadcasts only on a clean `run()`, so a
+        // late revert makes the whole phase all-or-nothing under --broadcast.
+        // Two reasons, two strings: a revoked class needs an owner decision, a
+        // halted one needs the RUNBOOK recovery above.
+        require(!revoked, "class previously certified then revoked - see RUNBOOK lines above");
+        require(!halted, "class certification halted - see RUNBOOK lines above");
     }
 
-    function _certifyOne(TierRegistry registry, address template, bytes4 selector) private {
-        if (registry.pendingClassCertificationOf(template, selector).readyAt == 0) {
-            console.log("    no pending certification (already executed), skipping certifyClass");
-            return;
+    /// @dev True once `selector` carries a live class certification. False is a
+    ///      halt, not a skip: `readyAt == 0` also means never proposed or
+    ///      cancelled, and allowlisting then opens both axes on a half class.
+    function _certifyOne(TierRegistry registry, address template, bytes4 selector) private returns (bool) {
+        TierRegistry.PendingClassCertification memory p = registry.pendingClassCertificationOf(template, selector);
+        if (p.readyAt == 0) {
+            (uint8 tier,) = registry.classTierOf(template, selector);
+            if (tier != registry.TIER_ARBITRARY()) {
+                console.log("    already certified, skipping certifyClass");
+                return true;
+            }
+            console.log("  RUNBOOK: SELECTOR NEITHER CERTIFIED NOR ANNOUNCED - run propose() first.");
+            return false;
+        }
+        uint256 expiresAt = p.readyAt + registry.MAX_CERTIFY_WINDOW();
+        if (block.timestamp > expiresAt) {
+            console.log("  RUNBOOK: CERTIFICATION WINDOW LAPSED at unix:", expiresAt);
+            console.log("  RUNBOOK: owner must cancelClassCertification(template, selector) for both");
+            console.log("  RUNBOOK: selectors, then re-run propose() and finalize() inside the window.");
+            return false;
         }
         registry.certifyClass(template, selector);
+        return true;
     }
 
-    /// @dev A template redeployed between the two phases voids the grant inside
-    ///      `certifyClass` with `TemplateCodehashChanged`. Name it here instead,
-    ///      with the recovery, rather than letting a bare selector surface.
+    /// @dev Anchor survives `_demoteClass`, configs do not: anchor present with a
+    ///      selector uncertified and nothing pending is "certified, then revoked"
+    ///      — `setClassAllowed` natspec: restoration is an explicit owner call.
+    function _revokedOrPartial(TierRegistry registry, address template, string memory key) private view returns (bool) {
+        if (registry.classAnchorOf(registry.cloneCodehashOf(template)).template == address(0)) return false;
+        if (_selectorLive(registry, template, SEL_EXECUTE) && _selectorLive(registry, template, SEL_SETTLE)) {
+            return false;
+        }
+        console.log("  RUNBOOK: CLASS WAS CERTIFIED AND IS NO LONGER -", key, template);
+        console.log("  RUNBOOK: owner demotion or a ChallengeGame conviction. This script will NOT re-grant it.");
+        console.log("  RUNBOOK: after re-review the owner re-certifies and calls setClassAllowed(template, true)");
+        console.log("  RUNBOOK: itself, so allowlist standing is never a side effect of re-running this script.");
+        return true;
+    }
+
+    /// @dev Certified, or announced and still executable.
+    function _selectorLive(TierRegistry registry, address template, bytes4 selector) private view returns (bool) {
+        (uint8 tier,) = registry.classTierOf(template, selector);
+        if (tier != registry.TIER_ARBITRARY()) return true;
+        return registry.pendingClassCertificationOf(template, selector).readyAt != 0;
+    }
+
+    /// @dev A template redeployed between the phases voids the grant inside
+    ///      `certifyClass` with `TemplateCodehashChanged`. BOTH selectors: one
+    ///      record can already be executed while the other still carries drift.
     function _templateDrifted(TierRegistry registry, address template, string memory key) private view returns (bool) {
-        TierRegistry.PendingClassCertification memory pending =
-            registry.pendingClassCertificationOf(template, SEL_EXECUTE);
-        if (pending.readyAt == 0 || pending.templateCodehash == template.codehash) return false;
+        bytes32 live = template.codehash;
+        bytes4[2] memory selectors = [SEL_EXECUTE, SEL_SETTLE];
+        bool drifted;
+        for (uint256 i; i < selectors.length; ++i) {
+            TierRegistry.PendingClassCertification memory p =
+                registry.pendingClassCertificationOf(template, selectors[i]);
+            if (p.readyAt != 0 && p.templateCodehash != live) drifted = true;
+        }
+        if (!drifted) return false;
         console.log("  RUNBOOK: TEMPLATE REDEPLOYED SINCE propose() -", key, template);
         console.log("  RUNBOOK: the pending grant is void. Owner must call");
         console.log("  RUNBOOK: cancelClassCertification(template, selector) for both selectors,");
@@ -193,6 +272,13 @@ contract CertifyStrategyClasses is ScriptBase {
 
     // ── Guards ──
 
+    /// @dev Default is skip-with-a-RUNBOOK-line, so a deploy that already
+    ///      broadcast is not aborted. `CERTIFY_STRICT=true` for a run that IS a
+    ///      documented ceremony step and must not exit 0 having done nothing.
+    function _haltIfStrict(string memory reason) private view {
+        if (vm.envOr("CERTIFY_STRICT", false)) revert(reason);
+    }
+
     /// @dev Mirrors `Deploy._seedTierRegistry`: both phases are `onlyOwner`
     ///      writes, so a completed Ownable2Step handoff means the multisig runs
     ///      the ceremony. Skip, never revert — the deploy has already broadcast.
@@ -200,6 +286,7 @@ contract CertifyStrategyClasses is ScriptBase {
         if (registry.owner() == deployer) return true;
         console.log("RUNBOOK: deployer no longer owns TierRegistry - class certification SKIPPED.");
         console.log("RUNBOOK: the owner must run propose()/finalize() itself before any strategy proposal.");
+        _haltIfStrict("deployer does not own TierRegistry - class certification would be a no-op");
         return false;
     }
 
@@ -210,6 +297,7 @@ contract CertifyStrategyClasses is ScriptBase {
         if (bond == 0) return true;
         console.log("RUNBOOK: submitterBondWood is non-zero - class certification SKIPPED:", bond);
         console.log("RUNBOOK: propose with a real submitter, who must approve WOOD and call certifyClass.");
+        _haltIfStrict("submitterBondWood is non-zero - this script funds no bonded submitter");
         return false;
     }
 
@@ -217,10 +305,12 @@ contract CertifyStrategyClasses is ScriptBase {
         address template = _optionalAddress(key);
         if (template == address(0)) {
             console.log("  skipped (not in address book):", key);
+            _haltIfStrict("strategy template missing from the address book");
             return address(0);
         }
         if (template.code.length == 0) {
             console.log("  skipped (no code at book address):", key, template);
+            _haltIfStrict("no code at the address book's strategy template address");
             return address(0);
         }
         return template;

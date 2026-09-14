@@ -29,6 +29,18 @@ contract CertifyHarness is CertifyStrategyClasses {
     function exposed_finalize(address deployer, address registry) external {
         _finalizeClasses(deployer, registry);
     }
+
+    /// @dev The harness IS the registry owner (see `setUp`), so owner-only
+    ///      set-up a test needs - cancelling one pending record, wiring the
+    ///      demoter - has to originate here. Not script surface.
+    function exposed_ownerCall(address target, bytes calldata data) external {
+        (bool ok, bytes memory ret) = target.call(data);
+        if (!ok) {
+            assembly ("memory-safe") {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
+    }
 }
 
 /// @title script/CertifyStrategyClasses.s.sol - the strategy class ceremony
@@ -60,6 +72,13 @@ contract DeployStrategyClassCertificationTest is Test {
 
     bytes4 constant SEL_EXECUTE = IStrategy.execute.selector;
     bytes4 constant SEL_SETTLE = IStrategy.settle.selector;
+
+    uint16 constant PORTFOLIO_BOUND = 2_000;
+    uint16 constant CL_BOUND = 9_999;
+
+    // The script's own halt strings, so a test cannot pass on an unrelated revert.
+    bytes constant HALT_FINALIZE = bytes("class certification halted - see RUNBOOK lines above");
+    bytes constant HALT_REVOKED = bytes("class previously certified then revoked - see RUNBOOK lines above");
 
     address internal deployer;
     address internal multisig = makeAddr("multisig");
@@ -199,6 +218,7 @@ contract DeployStrategyClassCertificationTest is Test {
 
         uint64 expectedReadyAt = uint64(vm.getBlockTimestamp() + registry.certifyDelay());
         address[2] memory templates = [PORTFOLIO_TEMPLATE, CL_TEMPLATE];
+        uint16[2] memory bounds = [PORTFOLIO_BOUND, CL_BOUND];
         bytes4[2] memory selectors = [SEL_EXECUTE, SEL_SETTLE];
 
         for (uint256 i; i < templates.length; ++i) {
@@ -207,10 +227,31 @@ contract DeployStrategyClassCertificationTest is Test {
                     registry.pendingClassCertificationOf(templates[i], selectors[j]);
                 assertEq(p.readyAt, expectedReadyAt, "selector not announced");
                 assertEq(p.tier, 1, "announced at the wrong tier");
-                assertEq(p.extractableBoundBps, 2_000, "announced with the wrong bound");
+                assertEq(p.extractableBoundBps, bounds[i], "announced with the wrong bound");
                 assertEq(p.templateCodehash, templates[i].codehash, "template codehash not pinned");
             }
         }
+    }
+
+    /// @notice CL's levered path leaves `marketParams.oracle/irm/lltv` unbound,
+    ///         so a hostile oracle reaches the whole collateral. Its bound is
+    ///         pinned at the maximum below `FULL_NOTIONAL_BPS`: certification
+    ///         buys callability, not a coverage discount on that surface.
+    function test_propose_boundsCLAtFullNotionalMinusOne() public {
+        assertEq(CL_BOUND, registry.FULL_NOTIONAL_BPS() - 1, "CL bound is not the maximum the registry accepts");
+
+        _propose();
+
+        assertEq(
+            registry.pendingClassCertificationOf(CL_TEMPLATE, SEL_EXECUTE).extractableBoundBps,
+            CL_BOUND,
+            "CL announced at a discounted bound"
+        );
+        assertEq(
+            registry.pendingClassCertificationOf(PORTFOLIO_TEMPLATE, SEL_EXECUTE).extractableBoundBps,
+            PORTFOLIO_BOUND,
+            "Portfolio bound moved with CL's"
+        );
     }
 
     // -- 3. The delay --
@@ -233,9 +274,12 @@ contract DeployStrategyClassCertificationTest is Test {
         (uint8 execTier, uint16 execBound) = registry.classTierOf(PORTFOLIO_TEMPLATE, SEL_EXECUTE);
         (uint8 settleTier, uint16 settleBound) = registry.classTierOf(PORTFOLIO_TEMPLATE, SEL_SETTLE);
         assertEq(execTier, 1, "execute() not certified");
-        assertEq(execBound, 2_000, "execute() bound not certified");
+        assertEq(execBound, PORTFOLIO_BOUND, "execute() bound not certified");
         assertEq(settleTier, 1, "settle() not certified");
-        assertEq(settleBound, 2_000, "settle() bound not certified");
+        assertEq(settleBound, PORTFOLIO_BOUND, "settle() bound not certified");
+
+        (, uint16 clBound) = registry.classTierOf(CL_TEMPLATE, SEL_SETTLE);
+        assertEq(clBound, CL_BOUND, "CL bound not certified");
     }
 
     // -- 4. The property --
@@ -396,5 +440,117 @@ contract DeployStrategyClassCertificationTest is Test {
             0,
             "announced a grant nobody can execute"
         );
+    }
+
+    // -- 8. Half-certified, revoked, expired, drifted --
+
+    function _ownerCall(bytes memory data) internal {
+        harness.exposed_ownerCall(address(registry), data);
+    }
+
+    /// @notice `setClassAllowed` opens both axes for every selector at once, so
+    ///         it must not run while one selector is still tier 2. A cancelled
+    ///         `settle()` record reads `readyAt == 0` - the same value as "already
+    ///         executed" - and treating that as done allowlists a half class.
+    function test_finalize_refusesToAllowAClassWithOnlyOneSelectorCertified() public {
+        _propose();
+        _ownerCall(abi.encodeCall(TierRegistry.cancelClassCertification, (PORTFOLIO_TEMPLATE, SEL_SETTLE)));
+        vm.warp(vm.getBlockTimestamp() + registry.certifyDelay());
+
+        vm.expectRevert(HALT_FINALIZE);
+        _finalize();
+
+        assertFalse(registry.isClassAllowed(PORTFOLIO_TEMPLATE), "allowlisted a half-certified class");
+        (uint8 settleTier,) = registry.classTierOf(PORTFOLIO_TEMPLATE, SEL_SETTLE);
+        assertEq(settleTier, registry.TIER_ARBITRARY(), "settle() was certified after all - test is vacuous");
+    }
+
+    function _demoteForCause(bytes4 selector) internal {
+        _ownerCall(abi.encodeCall(TierRegistry.setAuthorizedDemoter, (address(this))));
+        registry.demoteClassByChallenge(PORTFOLIO_TEMPLATE, selector);
+    }
+
+    /// @notice A conviction revokes a class. Re-running phase A must not quietly
+    ///         re-announce it - the anchor survives `_demoteClass`, so "never
+    ///         certified" and "certified then taken away" are distinguishable.
+    function test_propose_refusesToReannounceAClassDemotedForCause() public {
+        _runCeremony();
+        _demoteForCause(SEL_SETTLE);
+
+        vm.expectRevert(HALT_REVOKED);
+        _propose();
+
+        assertEq(
+            registry.pendingClassCertificationOf(PORTFOLIO_TEMPLATE, SEL_SETTLE).readyAt,
+            0,
+            "re-announced a class revoked for cause"
+        );
+    }
+
+    /// @notice And phase B must not re-open the axes on it either.
+    ///         `setClassAllowed`'s natspec: restoring allowlist standing after a
+    ///         demotion is always an explicit owner call.
+    function test_finalize_refusesToReallowlistAClassDemotedForCause() public {
+        _runCeremony();
+        _demoteForCause(SEL_SETTLE);
+        assertFalse(registry.isClassAllowed(PORTFOLIO_TEMPLATE), "demotion did not clear the allowlist");
+
+        vm.expectRevert(HALT_REVOKED);
+        _finalize();
+
+        // The FUNDS axis only. `_demoteClass` deliberately leaves the callee axis
+        // open so the settlement batch can still reclaim a convicted clone's
+        // capital - re-granting that is not what this test would catch.
+        assertFalse(registry.isAdapterAllowed(portfolioClone), "re-granted the funds axis after a conviction");
+        assertFalse(registry.isClassAllowed(PORTFOLIO_TEMPLATE), "re-allowlisted a class revoked for cause");
+    }
+
+    /// @notice `certifyClass` is legal only inside `MAX_CERTIFY_WINDOW` past
+    ///         `readyAt`. An operator who waits gets the window and the recovery
+    ///         named, not a bare `CertificationExpired()`.
+    function test_finalize_namesTheLapsedWindowRatherThanRevertingBare() public {
+        _propose();
+        vm.warp(vm.getBlockTimestamp() + registry.certifyDelay() + registry.MAX_CERTIFY_WINDOW() + 1);
+
+        vm.expectRevert(HALT_FINALIZE);
+        _finalize();
+    }
+
+    /// @notice The drift guard has to read both selectors: a third party can
+    ///         execute the `execute()` grant, leaving only `settle()` pending,
+    ///         and an `execute()`-only guard then misses the drift entirely.
+    function test_finalize_detectsDriftWhenOnlySettleIsStillPending() public {
+        _propose();
+        vm.warp(vm.getBlockTimestamp() + registry.certifyDelay());
+        registry.certifyClass(PORTFOLIO_TEMPLATE, SEL_EXECUTE);
+        assertEq(
+            registry.pendingClassCertificationOf(PORTFOLIO_TEMPLATE, SEL_EXECUTE).readyAt,
+            0,
+            "execute() record survived - the guard would still see it"
+        );
+
+        vm.etch(PORTFOLIO_TEMPLATE, address(new MorphoSupplyStrategy()).code);
+
+        vm.expectRevert(HALT_FINALIZE);
+        _finalize();
+    }
+
+    /// @notice Every skip path exits 0 having written nothing, which is right
+    ///         behind a deploy that already broadcast and wrong for a run that IS
+    ///         the ceremony step. `CERTIFY_STRICT=true` is the latter.
+    function test_strictMode_revertsWhereTheDefaultSkips() public {
+        vm.prank(deployer);
+        registry.transferOwnership(multisig);
+        vm.prank(multisig);
+        registry.acceptOwnership();
+
+        // Default: skips. Pinned by test_ceremony_isSkippedOnceOwnershipHasMoved.
+        vm.setEnv("CERTIFY_STRICT", "true");
+        vm.expectRevert(bytes("deployer does not own TierRegistry - class certification would be a no-op"));
+        _propose();
+        // `vm.setEnv` is process-global; leaving it set poisons every later suite.
+        vm.setEnv("CERTIFY_STRICT", "false");
+
+        _propose();
     }
 }
