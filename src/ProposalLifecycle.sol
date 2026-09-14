@@ -33,7 +33,7 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
     ///      legitimately wants it.
     mapping(uint256 => uint256) public collaborationDeadline;
     /// @dev Open proposals still in Draft. `_openProposalCount - _draftCount` is the
-    ///      number past Draft, which is what locks instant redemption (SHE-287).
+    ///      number past Draft, which is what locks instant redemption.
     uint256 internal _draftCount;
     uint256[9] private __lifecycleGap;
 

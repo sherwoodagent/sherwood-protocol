@@ -12,11 +12,11 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 
 /// @title Vault_redemptionLockSemantics — MS-H4 / SHE-258 regression
-/// @notice Both the deposit-side and the redeem-side lock cover the full
-///         Pending → GuardianReview → Approved → Executed window via
-///         `openProposalCount`: no share is minted or burned while a proposal
-///         is open, so the audit's late-deposit window and SHE-205's
-///         exit-inflated veto bar are both closed for all four states.
+/// @notice The redeem lock covers Pending → GuardianReview → Approved → Executed
+///         via `lockedProposalCount`: no share is burned past Draft, so SHE-205's
+///         exit-inflated veto bar is closed for all four states. The deposit lock
+///         covers Executed only (SHE-287): a deposit after the stamp buys no vote
+///         weight, so the audit's late-deposit window is closed by the snapshot.
 /// @dev Drives the vault directly with mocked governor reads. The two
 ///      governor selectors that matter:
 ///        - `getActiveProposal()` = 0 outside Executed, != 0 during Executed
@@ -105,15 +105,6 @@ contract VaultRedemptionLockSemanticsTest is Test {
         assertTrue(vault.redemptionsLocked(), "redeem lock is on");
     }
 
-    /// @notice The very block before `executeProposal` (Approved) is the same state:
-    ///         the deposit lands in the pool at the live price and is then metered by
-    ///         the execute batch like every other share — nothing is pulled at a stale NAV.
-    function test_deposit_allowedDuringApproved() public {
-        _mockState({active: false, openCount: 1});
-        vm.prank(alice);
-        assertGt(vault.deposit(1_000e6, alice), 0);
-    }
-
     /// @notice Executed state: instant deposits revert. During an active
     ///         proposal LPs must use the async deposit queue — the vault never
     ///         mints against an unrealized, strategy-influenced NAV (the V2
@@ -144,9 +135,9 @@ contract VaultRedemptionLockSemanticsTest is Test {
     // ──────────────────────── MS-H4: withdraw lock asymmetry ────────────────────────
 
     /// @notice Withdrawals during Pending..Approved (no active proposal yet)
-    ///         MUST revert: a share that leaves mid-vote shrinks the supply the
-    ///         veto bar was snapshotted against (SHE-205). Symmetric with the
-    ///         deposit lock.
+    ///         MUST revert: the voter stays at risk for the whole cycle it voted
+    ///         on (SHE-205). Deposits are open in the same window — the two
+    ///         locks are not symmetric.
     function test_withdraw_revertsDuringPending() public {
         _mockState({active: false, openCount: 0});
         vm.prank(alice);

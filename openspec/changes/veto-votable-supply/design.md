@@ -64,7 +64,7 @@ that share a recorded timepoint chosen to be after every same-block burn AND
 after every same-block delegation — which needs the vault's checkpoint surface
 to expose it.
 
-## Decision 3: the collaborative path stamps a window after the lock — OPEN
+## Decision 3: the collaborative path stamps a window after the lock — RESOLVED in `draft-locks-nothing`
 
 On the direct path the lock, the stamp and the snapshot are one transaction. On
 the collaborative path they are not: `redemptionsLocked()` is armed at Draft
@@ -106,3 +106,19 @@ re-opens the double subtraction the claim-in-propose-block tests pin:
 Not decided in this change. Same family as Decision 2: both are the cost of the
 vote-weight instant and the electorate instant being different, and both should
 be settled together rather than one at a time.
+
+**Resolution (`draft-locks-nothing`, SHE-287).** Neither (a) nor (b). A Draft no
+longer holds the redeem lock, so the queue is closed for the whole collaboration
+window and the `requestRedeem` front-run is unreachable. That reopened the same
+window through instant redeem — `{redeem, approveCollaboration}` in one block
+left the holder in the `t − 1` weight and out of the live supply — so the
+collaborative stamp reads the electorate at `snapshotTimestamp`:
+`getPastTotalSupply(t − 1) − getPastVotes(queue, t − 1)`. Numerator and
+denominator see the same set; the residual is Decision 2's class (a same-block
+exit keeps its weight, the bar stays consistent). The direct path keeps its live
+read: instant redeem is open right up to `propose`, and a `t − 1` read there
+would count shares that already left (NM 6.4's inflated bar). The double
+subtraction the claim-in-propose-block tests pin does not arise on the
+collaborative path, because nothing can claim from the queue between `t − 1` and
+the stamp without also leaving `getPastVotes(queue, t − 1)` — both terms are
+read at the same instant.

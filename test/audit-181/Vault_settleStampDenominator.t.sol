@@ -184,7 +184,7 @@ contract VaultSettleStampDenominatorTest is Test {
         // Pending: instant open, lane shut.
         _setProposal(0, 1, 1);
         vm.prank(newcomer);
-        vm.expectRevert(ISyndicateVault.NoOpenProposal.selector);
+        vm.expectRevert(ISyndicateVault.DepositsNotLocked.selector);
         vault.requestDeposit(NEWCOMER_ASSETS, newcomer);
         vm.prank(newcomer);
         assertGt(vault.deposit(NEWCOMER_ASSETS / 2, newcomer), 0, "instant deposit open while Pending");

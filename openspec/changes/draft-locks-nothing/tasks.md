@@ -38,9 +38,22 @@
       `OpenProposalCount.test_draft_locksNoLpFlow`.
 - [x] 3.6 Every governor fake gained `lockedProposalCount()`.
 - [ ] 3.7 Invariant/lifecycle harness pass with a Draft open across a redeem.
+- [x] 3.8 Every Draft exit pinned on `lockedProposalCount() == 0` plus a live
+      `redemptionsLocked()` read (cancel, emergencyCancel, rejectCollaboration,
+      expiry); the Sherlock #8 trade exercised through the stamp.
+- [x] 3.9 Collaborative same-block `{redeem, approveCollaboration}`: the recorded
+      electorate includes the exit, 30% Against of 100% misses the 40% bar.
+      Mutation — read the collaborative electorate live.
+
+## 1b. Governor (review of #320)
+
+- [x] 1.5 `approveCollaboration` stamps `votableSupply` at `snapshotTimestamp`
+      (`getPastTotalSupply − getPastVotes(queue)`); `propose` keeps the live read.
+- [x] 1.6 `requestDeposit` reverts `DepositsNotLocked` (was `NoOpenProposal`) and
+      resolves the governor once; dead `IRequestableVault.getPastVotes` removed.
 
 ## 4. Docs
 
 - [x] 4.1 `docs/proposal-lifecycle.md` lock table.
-- [ ] 4.2 `veto-votable-supply` design.md Decision 3 → resolved, pointing here.
-      Deferred until #318 merges, to keep that PR's diff stable.
+- [x] 4.2 `veto-votable-supply` design.md Decision 3 → resolved, pointing here.
+- [x] 4.3 `docs/deposit-withdraw-flow.md` on the two predicates.

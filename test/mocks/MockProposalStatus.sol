@@ -13,7 +13,7 @@ contract MockProposalStatus is IProposalStatus {
     uint256 public activePid;
     uint256 public openCount;
     /// @dev Open proposals past Draft. `set` keeps it equal to `openCount` (a
-    ///      locked vault); `setDraft` models an open Draft that locks nothing.
+    ///      locked vault).
     uint256 public lockedCount;
     address public strategy;
     uint256 public proposalCount;
@@ -50,13 +50,6 @@ contract MockProposalStatus is IProposalStatus {
         openCount = openCount_;
         lockedCount = openCount_;
         strategy = strategy_;
-    }
-
-    /// @dev An open Draft: bound (`openCount`) but nothing past Draft.
-    function setDraft(uint256 drafts) external {
-        activePid = 0;
-        openCount = drafts;
-        lockedCount = 0;
     }
 
     function getActiveProposal() external view returns (uint256) {

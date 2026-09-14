@@ -117,7 +117,10 @@ Cross-contract timing invariants (all enforced at the setters):
 - **Optimistic:** the proposal passes by default when `voteEnd` arrives; it is
   rejected only if AGAINST votes reach `vetoThresholdBps` (20–80%) of the
   proposal's `votableSupply` — total supply minus the withdrawal queue's
-  balance, both recorded live at the Draft → Pending transition.
+  balance, recorded at the Draft → Pending transition: live on the direct path
+  (nothing can move between the read and the stamp), at `snapshotTimestamp` on
+  the collaborative path (instant redeem is open until the final approve, so a
+  live read there could be shrunk by a same-block exit that keeps its weight).
 - Vault owner can hard-`vetoProposal` (Pending only) or `emergencyCancel`
   (Draft/Pending). Proposer can `cancelProposal` up to `voteEnd`.
 

@@ -1,8 +1,17 @@
 # Deposit → Withdraw Flow
 
 The vault is a standard ERC-4626 with one twist: liquidity is **instant while no
-strategy is live, async while one is**. The switch is `_activeProposal` — set at
-`executeProposal`, cleared at settlement. Everything below follows from that.
+strategy is live, async while one is**. Two predicates, read through the governor:
+
+- `redemptionsLocked()` = `lockedProposalCount() != 0` — a proposal is past Draft
+  (Pending → settle). Instant redeem closes, the redeem lane opens: whoever could
+  vote stays at risk for the outcome.
+- `depositsLocked()` = `getActiveProposal() != 0` — a proposal is executing
+  (execute → settle). Instant deposit closes, the deposit lane opens: the only
+  window in which the share price is not knowable.
+
+A collaborative Draft binds the vault (no second proposal, no owner rescue) but
+locks nothing. Everything below follows from that.
 
 ## The full flow
 
@@ -10,7 +19,7 @@ strategy is live, async while one is**. The switch is `_activeProposal` — set 
 flowchart TD
     U([LP / depositor]) --> W{Whitelist?\nopenDeposits or\nisApprovedDepositor}
     W -- not approved --> X1[revert NotApprovedDepositor]
-    W -- approved --> S{Strategy live?\nredemptionsLocked}
+    W -- approved --> S{Strategy live?\ndepositsLocked}
 
     %% ---- instant path ----
     S -- no --> D1["deposit / mint\n(instant, current NAV)"]
@@ -19,11 +28,11 @@ flowchart TD
 
     %% ---- proposal lifecycle around the vault ----
     V -.-> P1[Agent proposes strategy]
-    P1 -.-> P2[LP optimistic vote]
+    P1 -.-> P2[LP optimistic vote:\nelectorate recorded,\nredemptions LOCK]
     P2 -.-> P3[Guardian review]
-    P3 -.-> P4[executeProposal:\ncapital swept to strategy,\nredemptions LOCK]
+    P3 -.-> P4[executeProposal:\ncapital swept to strategy,\ndeposits LOCK]
     P4 -.-> P5[Strategy runs\n1h – 30d]
-    P5 -.-> P6[settleProposal:\ncapital returns, fees charged,\nfrozen settle price stamped,\nredemptions UNLOCK]
+    P5 -.-> P6[settleProposal:\ncapital returns, fees charged,\nfrozen settle price stamped,\nboth UNLOCK]
 
     %% ---- locked path: deposits ----
     S -- yes --> Q1["requestDeposit(assets)\nassets escrowed IN QUEUE\n(never swept to strategy)"]
@@ -34,7 +43,7 @@ flowchart TD
     Q1 -. before settlement .-> C0[cancel: assets returned]
 
     %% ---- exit: instant ----
-    SH --> E{Strategy live?}
+    SH --> E{Proposal past Draft?\nredemptionsLocked}
     E -- no --> E1["withdraw / redeem\n(instant vs idle float,\nqueue reserve protected)"]
     E1 --> OUT([Assets to LP])
 
@@ -47,14 +56,16 @@ flowchart TD
     E2 -. before settlement .-> E0[cancel: shares returned]
 ```
 
-## Instant path (no live strategy)
+## Instant path
 
 **Deposit** (`_deposit`, `src/SyndicateVault.sol:1334`):
 
 - Gate 1 — whitelist: `receiver` must be approved unless the vault is in
   open-deposit mode (`_openDeposits`). Owner manages via `approveDepositor(s)` /
   `setOpenDeposits`.
-- Gate 2 — `_depositsLocked()` must be false (no proposal past execution).
+- Gate 2 — `depositsLocked()` must be false (no proposal executing). Pending,
+  review and Approved keep instant deposit open; a deposit after the vote snapshot
+  buys no weight.
 - Shares minted at current NAV; the fund's first deposit seeds the performance
   high-water mark; shares auto-delegate to the receiver so depositors get voting
   power without a separate transaction.
@@ -64,22 +75,27 @@ flowchart TD
 - Instant against idle float only — `assets + reservedQueueAssets() ≤ float`
   (`QueueReserveBreached` otherwise). The float owed to already-settled,
   unclaimed queue redemptions is untouchable.
+- Open while no proposal is past Draft (`redemptionsLocked()` false); a Draft does
+  not close it.
 - `maxWithdraw`/`maxRedeem` report the true instant capacity (0 while locked), so
   ERC-4626 integrators never propose an impossible exit.
 
-## Locked path (strategy live)
+## Locked paths
 
-The moment `executeProposal` runs, `_activeProposal` is set:
+From the Draft → Pending stamp (`lockedProposalCount() != 0`):
 
-- `deposit`/`mint` revert `DepositsLocked` (`src/SyndicateVault.sol:1340`).
 - `maxWithdraw`/`maxRedeem` return 0; `withdraw`/`redeem` are closed.
 
-Both directions run through the per-vault `VaultWithdrawalQueue`:
+From `executeProposal` (`getActiveProposal() != 0`):
+
+- `deposit`/`mint` revert `DepositsLocked` (`src/SyndicateVault.sol:1340`).
+
+Both lanes run through the per-vault `VaultWithdrawalQueue`:
 
 ### Async deposit (`requestDeposit`, `src/SyndicateVault.sol:1462`)
 
-1. Only callable while locked (`RedemptionsNotLocked` guard) and only for approved
-   receivers. Zero assets rejected.
+1. Only callable while a proposal is executing (`DepositsNotLocked` guard) and only
+   for approved receivers. Zero assets rejected.
 2. Assets transfer straight into the **queue** — off-vault custody. They never
    inflate `totalAssets`, never count toward the strategy's capital, and can never
    be swept by a batch.
@@ -87,8 +103,9 @@ Both directions run through the per-vault `VaultWithdrawalQueue`:
 
 ### Async redeem (`requestRedeem`, `src/SyndicateVault.sol:1426`)
 
-1. Shares transfer from the LP into the queue (escrow, not burn).
-2. Request tagged with the active proposal id.
+1. Only callable while a proposal is past Draft (`RedemptionsNotLocked` guard).
+2. Shares transfer from the LP into the queue (escrow, not burn).
+3. Request tagged with the executing proposal id, else the latest.
 
 ### Settlement stamps one price for everyone
 
@@ -133,6 +150,7 @@ shuts once its proposal settles — the claim then exists at the frozen price.
 | Situation | Entry | Exit |
 |---|---|---|
 | No proposal open | instant `deposit` | instant `withdraw` up to idle float |
-| Proposal in vote/review (not yet executed) | instant `deposit` | instant `withdraw` |
+| Collaborative Draft | instant `deposit` | instant `withdraw` |
+| Proposal in vote/review/approved (not yet executed) | instant `deposit` | `requestRedeem` → claim after settle |
 | Strategy live (executed, not settled) | `requestDeposit` → claim after settle | `requestRedeem` → claim after settle |
 | Worst-case wait while live | — | `strategyDuration` remainder (≤ 30 d default cap), then permissionless settle |

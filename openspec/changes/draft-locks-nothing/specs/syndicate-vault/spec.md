@@ -95,7 +95,7 @@ strictly greater than 0 SHALL be returned with `RedeemRequested` emitted.
   correct path, and no share can enter the queue before the electorate is recorded)
 
 ### Requirement: Async deposit requests (Lane B)
-`requestDeposit(assets, receiver)` SHALL be callable only while `depositsLocked()` is true (a proposal is executing), the vault is not paused, and a queue is bound; zero assets SHALL revert `ZeroAssets`, `NoOpenProposal` otherwise, and the receiver SHALL pass the same whitelist rule as instant deposits. Assets SHALL be escrowed in the queue's own balance — never counted in `totalAssets()` and never sweepable into a strategy — tagged with the active proposal id, and a request id strictly greater than 0 SHALL be returned with `DepositRequested` emitted. Exactly one deposit path SHALL be open in every state: the instant one until execute, the lane from execute to settle.
+`requestDeposit(assets, receiver)` SHALL be callable only while `depositsLocked()` is true (a proposal is executing), the vault is not paused, and a queue is bound; zero assets SHALL revert `ZeroAssets`, `DepositsNotLocked` otherwise, and the receiver SHALL pass the same whitelist rule as instant deposits. Assets SHALL be escrowed in the queue's own balance — never counted in `totalAssets()` and never sweepable into a strategy — tagged with the active proposal id, and a request id strictly greater than 0 SHALL be returned with `DepositRequested` emitted. Exactly one deposit path SHALL be open in every state: the instant one until execute, the lane from execute to settle.
 
 #### Scenario: Escrowed deposit does not inflate NAV
 - **WHEN** assets are escrowed via `requestDeposit` during an executing proposal
@@ -103,7 +103,7 @@ strictly greater than 0 SHALL be returned with `RedeemRequested` emitted.
 
 #### Scenario: Lane closed before execution
 - **WHEN** a proposal is open but not executing and a depositor calls `requestDeposit`
-- **THEN** the call reverts `NoOpenProposal`, because the instant path is the open one
+- **THEN** the call reverts `DepositsNotLocked`, because the instant path is the open one
 
 ### Requirement: Pause and emergency behavior
 

@@ -709,6 +709,8 @@ contract OpenProposalCountTest is Test {
         vm.prank(agent);
         governor.rejectCollaboration(pid);
         assertEq(governor.openProposalCount(), 0, "decremented on rejectCollaboration");
+        assertEq(governor.lockedProposalCount(), 0, "the Draft count left with it");
+        assertFalse(vault.redemptionsLocked(), "lock read survives the exit");
         assertEq(
             governor.getCooldownEnd(),
             vm.getBlockTimestamp() + COOLDOWN_PERIOD,
@@ -756,8 +758,11 @@ contract OpenProposalCountTest is Test {
         vm.prank(owner);
         governor.emergencyCancel(pid);
 
-        // R9 fix: counter must drop back to 0.
+        // R9 fix: counter must drop back to 0 — and so must the Draft count, or
+        // `lockedProposalCount` underflows and bricks every lock read.
         assertEq(governor.openProposalCount(), 0, "R9: emergencyCancel decremented Draft");
+        assertEq(governor.lockedProposalCount(), 0, "the Draft count left with it");
+        assertFalse(vault.redemptionsLocked(), "lock read survives the exit");
         assertEq(
             governor.getCooldownEnd(),
             vm.getBlockTimestamp() + COOLDOWN_PERIOD,
@@ -806,7 +811,7 @@ contract OpenProposalCountTest is Test {
         coProps[0] = ISyndicateGovernor.CoProposer({agent: agent2, splitBps: 2000});
 
         vm.prank(agent);
-        governor.propose(
+        uint256 pid = governor.propose(
             address(vault),
             address(0),
             "ipfs://draft-lock",
@@ -838,5 +843,66 @@ contract OpenProposalCountTest is Test {
         vm.prank(lp1);
         vault.redeem(lp1Shares / 2, lp1, lp1);
         assertEq(vault.balanceOf(lp1), lp1Shares - lp1Shares / 2, "half of lp1 left during the Draft");
+
+        // The accepted trade: the Draft-window deposit buys weight at the stamp,
+        // and that capital is locked from the stamp until settle.
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(agent2);
+        governor.approveCollaboration(pid);
+        assertEq(governor.lockedProposalCount(), 1, "Pending is past Draft");
+        assertGt(governor.getVoteWeight(pid, depositor), 0, "the Draft-window deposit votes");
+        assertTrue(vault.redemptionsLocked(), "and cannot leave until settle");
+        assertEq(vault.maxRedeem(depositor), 0, "instant redeem closed for it");
+    }
+
+    /// @notice A lead cancel of a Draft is a Draft exit: both counts fall to zero, so the
+    ///         vault's lock reads survive. A missed `_draftCount` decrement here would leave
+    ///         `lockedProposalCount` underflowing (open 0, drafts 1) and brick them.
+    function test_cancelProposal_draftDecrementsBothCounts() public {
+        uint256 pid = _proposeDraftWithCoAgent();
+        assertEq(governor.openProposalCount(), 1, "Draft counted");
+        assertEq(governor.lockedProposalCount(), 0, "nothing past Draft");
+
+        vm.prank(agent);
+        governor.cancelProposal(pid);
+        assertEq(governor.openProposalCount(), 0, "cancel released the binding");
+        assertEq(governor.lockedProposalCount(), 0, "and the Draft count");
+        assertFalse(vault.redemptionsLocked(), "lock read survives the exit");
+        assertFalse(vault.depositsLocked(), "deposit lock too");
+    }
+
+    /// @notice The lazy Draft -> Expired commit is the fifth Draft exit; same pin.
+    function test_draftExpiry_decrementsBothCounts() public {
+        uint256 pid = _proposeDraftWithCoAgent();
+        vm.warp(governor.collaborationDeadline(pid) + 1);
+        governor.resolveProposalState(pid);
+        assertEq(
+            uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Expired), "Draft lapsed"
+        );
+        assertEq(governor.openProposalCount(), 0, "expiry released the binding");
+        assertEq(governor.lockedProposalCount(), 0, "and the Draft count");
+        assertFalse(vault.redemptionsLocked(), "lock read survives the exit");
+    }
+
+    function _proposeDraftWithCoAgent() internal returns (uint256 pid) {
+        address agent2 = makeAddr("agent2");
+        uint256 agent2Id = agentRegistry.mint(agent2);
+        vm.prank(owner);
+        vault.registerAgent(agent2Id, agent2);
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](1);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: agent2, splitBps: 2000});
+        vm.prank(agent);
+        pid = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://draft",
+            7 days,
+            GovEnvelope.permissive(address(vault)),
+            _execCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_execCalls()).length),
+            _settleCalls(),
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (_settleCalls()).length),
+            coProps
+        );
     }
 }

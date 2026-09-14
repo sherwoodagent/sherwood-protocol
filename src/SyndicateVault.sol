@@ -553,8 +553,8 @@ contract SyndicateVault is
 
     /// @inheritdoc ISyndicateVault
     /// @dev True from Pending to settle. A Draft locks nothing: the veto electorate is
-    ///      recorded at Draft -> Pending, and a voter must stay at risk only from there
-    ///      (SHE-287). Fail-closed on a missing governor.
+    ///      recorded at Draft -> Pending, and a voter must stay at risk only from there.
+    ///      Fail-closed on a missing governor.
     function redemptionsLocked() public view returns (bool) {
         address gov = _getGovernor();
         if (gov == address(0)) revert GovernorNotSet();
@@ -670,7 +670,7 @@ contract SyndicateVault is
     /// @inheritdoc ISyndicateVault
     /// @dev True only while capital is deployed (execute to settle): that is the one
     ///      window in which the share price is not knowable. A deposit after the vote
-    ///      snapshot buys no weight, so nothing else needs the gate (SHE-287).
+    ///      snapshot buys no weight, so nothing else needs the gate.
     function depositsLocked() public view returns (bool) {
         address gov = _getGovernor();
         if (gov == address(0)) revert GovernorNotSet();
@@ -903,10 +903,13 @@ contract SyndicateVault is
     {
         address q = _withdrawalQueue;
         if (q == address(0)) revert WithdrawalQueueNotSet();
-        if (!depositsLocked()) revert NoOpenProposal();
+        address gov = _getGovernor();
+        if (gov == address(0)) revert GovernorNotSet();
+        // The executing pid is the deposit lock: nonzero iff `depositsLocked()`.
+        uint256 pid = IProposalStatus(gov).getActiveProposal();
+        if (pid == 0) revert DepositsNotLocked();
         if (assets == 0) revert ZeroAssets();
         _requireApprovedDepositor(receiver);
-        uint256 pid = _openProposalPid();
         // Escrow assets in the queue (off-vault custody — never counted in
         // totalAssets, never swept into the strategy).
         IERC20(asset()).safeTransferFrom(msg.sender, q, assets);

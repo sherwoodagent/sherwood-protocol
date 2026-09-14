@@ -64,7 +64,10 @@ the opposite of what this change is for.
 - Closes `veto-votable-supply` design.md **Decision 3**: the collaborative-window
   attack (front-run the final `approveCollaboration` with `requestRedeem`, so shares
   leave the electorate while their holder keeps snapshot weight) is unreachable —
-  the queue only opens with the redeem lock, and a Draft does not hold it.
+  the queue only opens with the redeem lock, and a Draft does not hold it. Opening
+  instant redeem in Draft reopens the same window through `redeem` (review of #320),
+  so the collaborative stamp reads the electorate at `snapshotTimestamp` rather than
+  live; the direct path keeps its live read. Residual: Decision 2's class.
 - Accepted and unchanged: Decision 2 (phantom weight inside the stamping block
   itself), and the Draft-window deposit buying weight (Sherlock run #1 finding #8,
   now a deliberate trade rather than a bug).

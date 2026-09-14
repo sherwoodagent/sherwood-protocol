@@ -16,11 +16,12 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 ///
 ///   FINDING A (CRITICAL, introduced by the FIRST remediation): the prior fix
 ///   opened `requestDeposit` on `openProposalCount() != 0` (Draft+Pending, not
-///   just Executed). But a proposal in Draft/Pending can terminate WITHOUT
-///   ever settling — cancelled, vetoed, rejected, expired all call
-///   `_decOpen()` directly and never `onProposalSettled` — so a deposit
-///   tagged to one of those pids had `_settlePrice[pid].stamped` permanently
-///   false. `claim()` gated on THAT pid's stamp, so the claim reverted
+///   just Executed). A proposal in Draft/Pending could terminate WITHOUT ever
+///   settling — cancelled, vetoed, rejected, expired all call `_decOpen()`
+///   directly and never `onProposalSettled` — so a deposit tagged to one of
+///   those pids had `_settlePrice[pid].stamped` permanently false. The lane now
+///   opens at execute (SHE-287), so the premise is unreachable from the
+///   governor; the recovery path itself is still exercised below. `claim()` gated on THAT pid's stamp, so the claim reverted
 ///   `NotSettled` forever, with no symmetric recovery for a pay-on-behalf
 ///   depositor (`cancel` is receiver-gated; `requestDeposit` pulled from
 ///   `msg.sender`). Fixed by gating the deposit branch on
@@ -109,10 +110,10 @@ contract VaultDepositLifecycleAndHwmTest is Test {
     // FINDING A — deposit tagged to a proposal that dies without settling
     // =====================================================================
 
-    /// @notice THE FAILURE MODE: a deposit queued against a Pending proposal
-    ///         that is then rejected/cancelled/expired (terminal via
-    ///         `_decOpen()` alone, never `onProposalSettled`) must NOT be
-    ///         permanently stuck. Before this fix, `claim()` gated on
+    /// @notice THE FAILURE MODE: a deposit queued against an executing proposal
+    ///         whose settlement never stamps (the lane opens at execute; the
+    ///         governor releases the active pid without `onProposalSettled`
+    ///         here to model it) must NOT be permanently stuck. Before this fix, `claim()` gated on
     ///         `_settlePrice[r.pid].stamped` — a pid that can never stamp —
     ///         so the claim reverted `NotSettled` forever, even after a LATER,
     ///         unrelated proposal genuinely settled. This is also a
@@ -132,11 +133,10 @@ contract VaultDepositLifecycleAndHwmTest is Test {
         IVaultWithdrawalQueue.Request memory r = queue.getRequest(requestId);
         assertEq(r.pid, 1, "tagged to the executing proposal");
 
-        // Proposal 1 dies WITHOUT ever settling — mirrors the governor's
-        // Rejected/Expired/vetoed/cancelled paths, which call `_decOpen()`
-        // directly and never `onProposalSettled`. Simulated here by simply
-        // never calling `onProposalSettled(1)` and releasing the open-proposal
-        // gate, exactly as `_decOpen()` does.
+        // Proposal 1 dies WITHOUT ever settling. Unreachable from today's
+        // governor (an executing proposal always settles), modelled here by
+        // never calling `onProposalSettled(1)` and releasing the active pid,
+        // so the recovery below stays pinned.
         _setProposal(0, 0, 1);
 
         // THE FIX, STRENGTHENED BY FINDING #3. A deposit no longer prices

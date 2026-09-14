@@ -438,9 +438,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_commitState(proposal) != ProposalState.Pending) revert NotWithinVotingPeriod();
         if (_hasVoted[proposalId][msg.sender]) revert AlreadyVoted();
 
-        // Snapshot weight is final: no share is minted or burned while the proposal
-        // is open (`SyndicateVault.redemptionsLocked`), so no live cap. The one gap is
-        // the stamping block itself — see design.md Decision 2 (phantom weight).
+        // Snapshot weight is final: the electorate was recorded at the stamp and
+        // no share is burned past Draft (`SyndicateVault.redemptionsLocked`), so
+        // no live cap. The one gap is the stamping block itself — see
+        // veto-votable-supply design.md Decision 2 (phantom weight).
         uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, proposal.snapshotTimestamp);
         if (weight == 0) revert NoVotingPower();
 
@@ -811,7 +812,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             --_draftCount; // instant redemption locks from here
             // -1: see propose().
             proposal.snapshotTimestamp = block.timestamp - 1;
-            proposal.votableSupply = _votableSupplyOf(proposal.vault);
+            proposal.votableSupply = _votableSupplyAt(proposal.vault, proposal.snapshotTimestamp);
             // Timing comes from the propose-time snapshot, not live
             // `_params.*`. Single SLOAD; bit-shift to unpack.
             uint256 packed = _draftTimingSnap[proposalId];
@@ -1047,7 +1048,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     // ==================== INTERNAL ====================
 
-    /// @dev The veto electorate, read live at the Draft -> Pending transition:
+    /// @dev The veto electorate for the direct path, read live at `propose`:
     ///      every share that exists minus the ones parked in the withdrawal
     ///      queue, which cannot vote. Live on both terms so a redeem ordered
     ///      ahead of this call in the same block is already reflected.
@@ -1056,6 +1057,20 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         address queue = ISyndicateVault(vault).withdrawalQueue();
         if (queue == address(0)) return supply;
         uint256 queued = IERC20(vault).balanceOf(queue);
+        return supply > queued ? supply - queued : 0;
+    }
+
+    /// @dev The veto electorate for the collaborative path, read at the vote
+    ///      snapshot. Instant redeem is open until the final approve, whose
+    ///      readiness is public, so a live read here would let a same-block
+    ///      `{redeem, approveCollaboration}` vote full weight against a bar
+    ///      shrunk by its own exit. The queue self-delegates, so its past votes
+    ///      are its custody at `at`.
+    function _votableSupplyAt(address vault, uint256 at) private view returns (uint256) {
+        uint256 supply = IVotes(vault).getPastTotalSupply(at);
+        address queue = ISyndicateVault(vault).withdrawalQueue();
+        if (queue == address(0)) return supply;
+        uint256 queued = IVotes(vault).getPastVotes(queue, at);
         return supply > queued ? supply - queued : 0;
     }
 
