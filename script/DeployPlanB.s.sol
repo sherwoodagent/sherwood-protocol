@@ -503,6 +503,23 @@ contract DeployPlanB is ScriptBase {
             "locks; set it by governance before deploying the ledger."
         );
 
+        // ── Pre-flight 1d: the floor must cover the haircut ──
+        // The ledger credits every bond at `woodHaircutBps` of what the source
+        // reports — that discount IS the allowance against an overstated WOOD
+        // price. A conviction burns `minSlashBps` of the stake basis, so a floor
+        // BELOW the haircut burns a smaller fraction than the valuation already
+        // spent, and the worst case a guardian faces no longer covers the
+        // overstatement the bond was booked against. Shipped, the two are equal
+        // (`Deploy.s.sol`'s DEFAULT_MIN_SLASH_BPS and DEFAULT_WOOD_HAIRCUT_BPS
+        // are both 5,000), so raising the haircut alone is the state this
+        // refuses. Read against the value this run is about to SEAT rather than
+        // the ledger's, which does not exist until the broadcast below.
+        require(
+            ISwoodCooldown(swood).minSlashBps() >= book.woodHaircutBps,
+            "PRE-FLIGHT: sWOOD minSlashBps below the WOOD haircut -- a conviction would slash less "
+            "than the bond was over-valued by"
+        );
+
         // ── Pre-flight 2: a zero covered-TVL cap bricks all proposing ──
         require(
             coveredTvlCapUsd != 0, "PRE-FLIGHT: COVERED_TVL_CAP_USD18 is 0 (fail-closed: nothing could be proposed)"

@@ -63,10 +63,12 @@ contract DeafStakedWood {
         return 10_000;
     }
 
-    /// @dev Pre-flight 1c reads this too; a stub without it fails the typed
-    ///      call with no data, before the assertion this suite is pinning.
+    /// @dev Pre-flights 1c and 1d read this too; a stub without it fails the
+    ///      typed call with no data, before the assertion this suite is
+    ///      pinning. At the shipped haircut so 1d lets the run reach the
+    ///      wiring check.
     function minSlashBps() external pure returns (uint256) {
-        return 500;
+        return 5_000;
     }
 
     /// @dev The whole point: accepts the call, keeps the pointer at zero.
@@ -227,7 +229,8 @@ contract DeployPlanBPreflightTest is Test {
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,
                     minOwnerStake: 10_000e18,
-                    minSlashBps: 1_000,
+                    // Pre-flight 1d demands at least the haircut this script seats.
+                    minSlashBps: 5_000,
                     // Pre-flight 1b demands exactly this. Seated here so the
                     // fixture is a deployment the script is willing to touch.
                     maxSlashBps: 10_000,
@@ -373,11 +376,31 @@ contract DeployPlanBPreflightTest is Test {
         assertEq(address(registry.exposureLedger()), address(0), "a refused deploy must not have wired anything");
     }
 
-    /// @dev Control for 1c: the fixture's shipped 1_000-bps floor passes, so the
+    /// @dev Control for 1c: the fixture's 5_000-bps floor passes, so the
     ///      pre-flight refuses ZERO specifically rather than any small value —
     ///      the launch value is a governance decision, not a code default.
     function test_preflight_passes_atANonZeroMinSlashBps() public {
-        assertEq(swood.minSlashBps(), 1_000, "fixture floor");
+        assertEq(swood.minSlashBps(), 5_000, "fixture floor");
+        _run();
+        assertTrue(swood.exposureLedger() != address(0), "deployed and wired");
+    }
+
+    /// @dev PRE-FLIGHT 1d: the floor must be at least the haircut the run is
+    ///      about to seat. At 4,999 against the shipped 5,000 the conviction
+    ///      floor burns a smaller fraction than the valuation already
+    ///      discounted, which is the gap this refuses — one bps under is the
+    ///      boundary, so the check cannot be passing for a coarser reason.
+    function test_preflight_bites_whenMinSlashBpsIsBelowTheHaircut() public {
+        vm.prank(DEFAULT_SENDER);
+        swood.setMinSlashBps(4_999);
+        _runExpecting("PRE-FLIGHT: sWOOD minSlashBps below the WOOD haircut");
+        assertEq(address(registry.exposureLedger()), address(0), "a refused deploy must not have wired anything");
+    }
+
+    /// @dev Control for 1d: the SHIPPED pair is equal, not merely ordered, and
+    ///      equality is the passing edge — `Deploy.s.sol` seats 5,000 for both.
+    function test_preflight_passes_whenMinSlashBpsEqualsTheHaircut() public {
+        assertEq(swood.minSlashBps(), script.DEFAULT_WOOD_HAIRCUT_BPS(), "the shipped pair is equal");
         _run();
         assertTrue(swood.exposureLedger() != address(0), "deployed and wired");
     }
@@ -705,6 +728,10 @@ contract DeployPlanBPreflightTest is Test {
     ///      it ships silently and looks entirely healthy.
     function test_preflight_bites_whenTheHaircutLeavesNoAllowance() public {
         bookHaircutBps = 10_000;
+        // Clear pre-flight 1d, which bites earlier on this book: the point here
+        // is that 9 refuses a zero allowance, not that 1d refuses the pairing.
+        vm.prank(DEFAULT_SENDER);
+        swood.setMinSlashBps(10_000);
         _runExpecting("PRE-FLIGHT: ExposureLedger.woodHaircutBps is 10000");
     }
 
@@ -730,6 +757,10 @@ contract DeployPlanBPreflightTest is Test {
     ///      the boundary that matters now.
     function test_deploy_honoursAHaircutOverrideAndRespectsTheFloor() public {
         bookHaircutBps = 6_000;
+        // Raising the haircut alone is what pre-flight 1d refuses, so the
+        // deterrence floor moves with it. That coupling is the point.
+        vm.prank(DEFAULT_SENDER);
+        swood.setMinSlashBps(6_000);
         _run();
         assertEq(ExposureLedger(swood.exposureLedger()).woodHaircutBps(), 6_000, "an override must be seated");
     }

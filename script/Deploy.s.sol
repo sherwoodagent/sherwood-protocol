@@ -96,7 +96,13 @@ contract DeploySherwood is ScriptBase {
     uint256 constant DEFAULT_BLOCK_QUORUM_BPS = 3000; // 30%
     uint256 constant DEFAULT_SLASH_APPEAL_SEED = 1_000_000e18;
     uint256 constant DEFAULT_EPOCH_ZERO_SEED = 10_000e18;
-    uint256 constant DEFAULT_MIN_SLASH_BPS = 1000; // 10%
+    // The deterrence floor is pinned to the ledger's WOOD haircut
+    // (`DeployPlanB.DEFAULT_WOOD_HAIRCUT_BPS`, also 5,000): the ledger credits a
+    // bond at half what the source reports, so a floor below that would burn a
+    // smaller fraction than the allowance the valuation already spent. At the
+    // floor the two cancel, and a resolved slash covers what the haircut
+    // over-values. Raising either constant without the other reopens the gap.
+    uint256 constant DEFAULT_MIN_SLASH_BPS = 5_000; // 50%
     // The own-stake severity ceiling may be a full 100% — own stake is a
     // plain integer with no share math to brick.
     uint256 constant DEFAULT_MAX_SLASH_BPS = 10_000; // 100%
