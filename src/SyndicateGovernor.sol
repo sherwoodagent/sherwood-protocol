@@ -807,7 +807,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             _transition(proposal, ProposalState.Pending);
             // -1: see propose().
             proposal.snapshotTimestamp = block.timestamp - 1;
-            proposal.votableSupply = _votableSupplyOf(proposal.vault);
+            proposal.votableSupply = _votableSupplyAt(proposal.vault, proposal.snapshotTimestamp);
             // Timing comes from the propose-time snapshot, not live
             // `_params.*`. Single SLOAD; bit-shift to unpack.
             uint256 packed = _draftTimingSnap[proposalId];
@@ -1042,15 +1042,27 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     // ==================== INTERNAL ====================
 
-    /// @dev The veto electorate, read live at the Draft -> Pending transition:
+    /// @dev The veto electorate for the direct path, read live at `propose`:
     ///      every share that exists minus the ones parked in the withdrawal
-    ///      queue, which cannot vote. Live on both terms so a redeem ordered
-    ///      ahead of this call in the same block is already reflected.
+    ///      queue, which cannot vote. Live on both terms because instant redeem
+    ///      is open right up to this call, so a redeem ordered ahead of it in
+    ///      the same block is already reflected.
     function _votableSupplyOf(address vault) private view returns (uint256) {
         uint256 supply = IERC20(vault).totalSupply();
         address queue = ISyndicateVault(vault).withdrawalQueue();
         if (queue == address(0)) return supply;
         uint256 queued = IERC20(vault).balanceOf(queue);
+        return supply > queued ? supply - queued : 0;
+    }
+
+    /// @dev The collaborative stamp reads both terms at the snapshot instant, so
+    ///      a queued redeem in the approve block sits inside the recorded set
+    ///      exactly as its holder's weight does. The queue self-delegates.
+    function _votableSupplyAt(address vault, uint256 at) private view returns (uint256) {
+        uint256 supply = IVotes(vault).getPastTotalSupply(at);
+        address queue = ISyndicateVault(vault).withdrawalQueue();
+        if (queue == address(0)) return supply;
+        uint256 queued = IVotes(vault).getPastVotes(queue, at);
         return supply > queued ? supply - queued : 0;
     }
 

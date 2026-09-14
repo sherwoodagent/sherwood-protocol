@@ -27,6 +27,7 @@ contract GovernorVetoDenominatorExitsTest is Test {
     SyndicateVault vault;
     VaultWithdrawalQueue queue;
     ERC20Mock usdc;
+    MockAgentRegistry agentReg;
     address owner = makeAddr("owner");
     address agent = makeAddr("agent");
     address lp1 = makeAddr("lp1");
@@ -38,10 +39,17 @@ contract GovernorVetoDenominatorExitsTest is Test {
         vm.prank(owner);
         cfg.setProtocolFeeRecipient(owner);
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
-        MockAgentRegistry reg = new MockAgentRegistry();
-        uint256 nft = reg.mint(agent);
+        agentReg = new MockAgentRegistry();
+        uint256 nft = agentReg.mint(agent);
         ISyndicateVault.InitParams memory ip = ISyndicateVault.InitParams(
-            address(usdc), "Sherwood Vault", "swUSDC", owner, address(new BatchExecutorLib()), true, address(reg), 0
+            address(usdc),
+            "Sherwood Vault",
+            "swUSDC",
+            owner,
+            address(new BatchExecutorLib()),
+            true,
+            address(agentReg),
+            0
         );
         bytes memory vInit = abi.encodeCall(SyndicateVault.initialize, (ip));
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(new SyndicateVault()), vInit))));
@@ -327,6 +335,64 @@ contract GovernorVetoDenominatorExitsTest is Test {
             governor.getProposal(pid).votableSupply, vault.balanceOf(lp1), "queued shares are not in the electorate"
         );
         assertEq(vault.totalSupply(), vault.balanceOf(lp1) + lp2Shares, "but they still exist");
+    }
+
+    /// @notice The collaborative Draft already holds the redeem lock, so the queue is open right
+    ///         up to the approval that stamps the electorate. Read live there, lp2's escrowed 30k
+    ///         would leave the bar at 70k while his snapshot weight still voted — 42.9%, a veto.
+    ///         Read at the snapshot instant both terms predate the escrow, the bar is the full
+    ///         100k, and 30% falls short of the 40% threshold.
+    function test_collab_queuedRedeemInTheApproveBlockCannotShrinkTheVetoBar() public {
+        address coAgent = makeAddr("coAgent");
+        // startPrank, not prank: `agentReg.mint` sits in argument position and is evaluated
+        // first, so a one-shot prank would be consumed by the mint.
+        vm.startPrank(owner);
+        vault.registerAgent(agentReg.mint(coAgent), coAgent);
+        vm.stopPrank();
+
+        _deposit(lp1, 70_000e6);
+        _deposit(lp2, 30_000e6);
+        uint256 supply = vault.totalSupply();
+
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](1);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent, splitBps: 2000});
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(0),
+            "she282-collab",
+            7 days,
+            env,
+            _calls(1),
+            GovEnvelope.defaultCaps(env.maxCapital, 1),
+            _calls(0),
+            GovEnvelope.defaultCaps(env.maxCapital, 1),
+            coProps
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        assertEq(
+            uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Draft), "still a Draft"
+        );
+        assertTrue(vault.redemptionsLocked(), "the Draft holds the lock, so the queue is the only exit");
+
+        // Hoisted: `balanceOf` in argument position would eat the one-shot prank.
+        uint256 lp2Shares = vault.balanceOf(lp2);
+        vm.prank(lp2);
+        vault.requestRedeem(lp2Shares, lp2);
+
+        // SAME BLOCK, ahead of the approval that transitions Draft -> Pending and stamps.
+        vm.prank(coAgent);
+        governor.approveCollaboration(pid);
+
+        assertEq(vault.balanceOf(address(queue)), lp2Shares, "the shares really are escrowed in the queue");
+        assertEq(governor.getProposal(pid).votableSupply, supply, "the recorded electorate is the full supply");
+
+        vm.prank(lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 
     function _resolveWithAgainst(uint256 againstAssets) internal returns (ISyndicateGovernor.ProposalState) {
