@@ -118,7 +118,7 @@ ERC-4626 share accounting, a strategy pattern with `execute`/`settle`, and `tota
 | ChallengeGame owner | Trusted | 13 instant setters incl. all five economic knobs (`settleBurnBps`, `forfeitBurnBps`, `inconclusiveBurnBps`, `challengerBondBps`, `prosecutorFeeBps`) and `setFilingsPaused`. `renounceOwnership` disabled. |
 | StakedWood owner | Trusted | 10 instant setters incl. `setAuthorizedSlasher`, `setMinSlashBps`/`setMaxSlashBps`, `setAgeFloorBps`, `setCooldownPeriod`; also the UUPS upgrade authority over all guardian WOOD custody. |
 | GuardianRegistry owner | Trusted | `setReviewPeriod`, `setBlockQuorumBps`, `setExposureLedger`, `pause`, `fundSlashAppealReserve`, `refundSlash`; UUPS upgrade authority. `unpause` becomes permissionless after `DEADMAN_UNPAUSE_DELAY`. |
-| TierRegistry owner | Trusted | `proposeCertification` → `certify` behind a 1–30 day `certifyDelay`, but `setAdapterAllowed` and `demote` are **instant**. Ownable2Step. |
+| TierRegistry owner | Trusted | `certify`, `setAdapterAllowed` and `demote` are all **instant** owner calls. Ownable2Step. |
 | Vault owner | Bounded (per-vault; cannot move assets except via rescue when unlocked) | 11 governance-param setters (frozen while a proposal is open), agent registry, depositor whitelist, pause, `setAgentFeeBps`, `setMinBufferBps`, `rescueEth`/`rescueERC20`/`rescueERC721` (blocked while redemptions locked), `vetoProposal`, `emergencyCancel`, and the whole `GovernorEmergency` unwind surface. |
 | Agent (proposer) | Bounded (must be vault-registered; posts a WOOD bond per proposal) | `propose`, `cancelProposal` before `voteEnd`, `rejectCollaboration`; on a live strategy clone, `rebalance` / `rebalanceDelta` / `updateParams`. |
 | Guardian | Bounded (stake is slashable; weight is age-floored and lookback-gated) | `voteOnProposal` (approve books USD coverage against their bond; block counts toward the veto quorum), `voteBlockEmergencySettle`. Cannot unstake while coverage is open or frozen. |
@@ -146,7 +146,7 @@ See [entry-points.md](entry-points.md) for the full permissionless entry point m
 
 - **Vault owner → per-vault governance** — 11 parameter setters are frozen while a proposal is open ([G-23](invariants.md#g-23)), which bounds mid-flight manipulation, but between proposals each is instant. The spec calls the owner *"a multisig expected to enforce its own external delay"* — nothing on-chain enforces that.
 
-- **TierRegistry: two axes, two different delays** — certification runs `proposeCertification` → `certifyDelay` → `certify` ([I-39](invariants.md#i-39)), but `setAdapterAllowed` — the gate `SyndicateVault._guardBatchCalls` actually consults ([G-5](invariants.md#g-5)) — is instant.
+- **TierRegistry: certification and the counterparty allowlist are both instant owner calls** — `certify` pins the reviewed codehash ([I-39](invariants.md#i-39)); `setCounterpartyAllowed` pins it on grant. Neither is delayed.
 
 - **ChallengeGame owner → the sign of the challenger's payoff** — five economic knobs, each bounded only against its own ceiling and none cross-checked against `honestFilingBreaksEven()` ([E-2](invariants.md#e-2)).
 
@@ -272,7 +272,7 @@ See [entry-points.md](entry-points.md) for the full permissionless entry point m
 > A dedicated reference file contains the complete invariant analysis — do not look here for the catalog.
 >
 > - **40 Enforced Guards** (`G-1` … `G-40`) — per-call preconditions with `Check` / `Location` / `Purpose`
-> - **39 Single-Contract Invariants** (`I-1` … `I-39`) — Conservation, Bound, Ratio, StateMachine, Temporal
+> - **38 Single-Contract Invariants** (`I-1` … `I-39`, `I-2` retired) — Conservation, Bound, Ratio, StateMachine, Temporal
 > - **13 Cross-Contract Invariants** (`X-1` … `X-12`, incl. `X-1b`) — caller/callee pairs that cross contract boundaries
 > - **5 Economic Invariants** (`E-1` … `E-5`) — higher-order properties deriving from `I-N` + `X-N`
 >

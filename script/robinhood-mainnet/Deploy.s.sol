@@ -202,9 +202,9 @@ contract DeployRobinhoodMainnet is DeploySherwood {
     ///      `TierRegistry` was missing here entirely. `deployCore` mints it
     ///      owned by the deployer and wires it into the factory, and nothing
     ///      afterwards moved it — so a mainnet ceremony handed five contracts to
-    ///      the Safe and left the adapter-certification authority
-    ///      (`proposeCertification`, `demote`, `setCounterpartyAllowed`) on the
-    ///      deployer key, with no assertion anywhere to notice.
+    ///      the Safe and left the adapter-certification authority (`certify`,
+    ///      `demote`, `setCounterpartyAllowed`) on the deployer key, with no
+    ///      assertion anywhere to notice.
     function _handoffRobinhood(Deployed memory d, address ownerMultisig) internal {
         // Per-vault governors: the beacon (shared impl) and ProtocolConfig
         // (global fee params) are the governance handles — there is no

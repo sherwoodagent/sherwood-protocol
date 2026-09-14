@@ -293,45 +293,10 @@ contract DeploySherwood is ScriptBase {
         // Wire the set-once registry reference on sWOOD.
         StakedWood(d.swoodProxy).setRegistry(d.registryProxy);
 
-        // Adapter-selector tier registry (spec §3.2). Owned by the deployer at
-        // birth so `demote`/`poke` and the launch-set announcement can run
-        // before the multisig handoff; passed into the factory's `InitParams`
-        // below so every governor `createSyndicate` stamps out picks it up via
-        // the factory-only `setTierRegistry`. A plain Ownable2Step contract —
-        // no proxy needed (certifications are re-issuable, not upgrade-state).
-        //
-        // Deployed BEFORE the factory: mandatory `InitParams` field since pashov
-        // finding #1. Free of ordering cost — the factory proxy is CREATE3, so
-        // an extra nonce ahead of it does not move `predictedFactoryProxy`.
-        //
-        // Granting is two-step (issue #45): `proposeCertification` is
-        // owner-only and now takes the reviewed codehash as
-        // `expectedCodehash` (PR #156 audit remediation, finding #6) so the
-        // pinned snapshot matches what was actually reviewed off-chain, not
-        // whatever is live when the transaction happens to mine. `certify`
-        // is permissionless once `certifyDelay` has elapsed EXCEPT when a
-        // submitter bond is pinned (submitterBondWood != 0 at proposal
-        // time), in which case only that pinned submitter may trigger it
-        // (finding #3) — the launch set below carries no bond, so it stays
-        // fully permissionless in practice. RUNBOOK for the launch adapter
-        // set: propose the whole set HERE, while the deployer still owns the
-        // registry (this call is not in this function — see the deploy
-        // runbook), hand off ownership to the multisig immediately after
-        // (below), and let anyone (deployer, multisig, a bot) execute each
-        // certification once its delay has passed and before
-        // `MAX_CERTIFY_WINDOW` (finding #5) lapses. Announcement and
-        // ownership handoff overlap instead of serializing; demotion
-        // (`demote`/`poke`) stays instant throughout.
+        // Owned by the deployer at birth so the launch certification set and any
+        // `demote` can run before the multisig handoff; passed into the factory's
+        // `InitParams` so every `createSyndicate` stamps it out.
         d.tierRegistry = address(new TierRegistry(d.deployer));
-        // Issue #40: the submitter bond has no slash path yet, so it must
-        // stay disabled until the launch gate documented on
-        // `TierRegistry.submitterBondWood` is met. This script never calls
-        // `setSubmitterBondWood` — the assertion pins that fact rather than
-        // changing behavior.
-        require(
-            TierRegistry(d.tierRegistry).submitterBondWood() == 0,
-            "submitter bond must stay 0 at launch - see issue #40"
-        );
 
         address factoryImpl = c3.deploy(SALT_FACTORY_IMPL, abi.encodePacked(type(SyndicateFactory).creationCode));
         d.factoryProxy = _deployFactoryProxy(c3, factoryImpl, d, cfg);

@@ -1,6 +1,6 @@
 # Entry Point Map
 
-> Sherwood Protocol | ~195 entry points | ~50 permissionless | ~50 role-gated | ~95 admin-only
+> Sherwood Protocol | ~193 entry points | ~48 permissionless | ~50 role-gated | ~95 admin-only
 
 Counts come from the grep-verified signature scan over `src/` (interfaces and mocks excluded), cross-checked against per-contract access maps. `~` reflects that a handful of functions are permissionless at the modifier layer but self-scoped by key derivation; those are classified by effective reach, not by modifier presence.
 
@@ -22,7 +22,7 @@ Counts come from the grep-verified signature scan over `src/` (interfaces and mo
 `ChallengeGame` (constructor) → `setExposureLedger()` → `setStakedWood()` → `setCourt()` ◄── window-fit invariant checked from both sides
 `TokenCourt` (constructor) → `setChallengeGame()` → `setStakedWood()` ◄── participationFloorBps < ageFloorBps
 
-`TierRegistry.setWood()` → `setSubmitterBondWood()` → `setAuthorizedDemoter(challengeGame)` → `setAdapterAllowed(adapter)`
+`TierRegistry.setAuthorizedDemoter(challengeGame)`
 
 ### Vault Creation (Owner)
 
@@ -94,7 +94,6 @@ Counts come from the grep-verified signature scan over `src/` (interfaces and mo
 `ExposureLedger.settleCoverage()` ◄── rebooks approvals down to actual need
 `ExposureLedger.retireApproval()` ◄── after bucket expiry + challengeWindow, unfrozen, unpinned
 `StakedWood.flushBurn()` ◄── retries a burn transfer that previously failed
-`TierRegistry.poke()` ◄── demotes a certification whose target codehash drifted
 `MorphoSupplyStrategy.sweep()` ◄── after Settled, recovers residual supply
 
 ---
@@ -269,18 +268,6 @@ Entry points callable by any address with no effective access restriction. Sorte
 | Call chain | `→ IERC20.safeTransfer()` |
 | State modified | `_contributed[id][msg.sender]` → 0, `unclaimedWood` |
 | Value flow | Tokens: ChallengeGame → contributor |
-| Reentrancy guard | no (CEI-ordered) |
-
-### `TierRegistry.claimSubmitterBond()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external |
-| Caller | Anyone (payout fixed to the recorded `b.submitter`) |
-| Parameters | `target`, `selector` (protocol-derived) |
-| Call chain | `→ IERC20.safeTransfer()` |
-| State modified | `_bonds[k]` deleted, `totalBondedWood` |
-| Value flow | Tokens: TierRegistry → submitter |
 | Reentrancy guard | no (CEI-ordered) |
 
 ### `StakedWood.claimUnstakeGuardian()`
@@ -463,18 +450,6 @@ Entry points callable by any address with no effective access restriction. Sorte
 | Value flow | Tokens: ChallengeGame → challenger + burn address; Escrow → challenger + burn |
 | Reentrancy guard | no (CEI-ordered) |
 
-### `TierRegistry.certify()` / `poke()`
-
-| Aspect | Detail |
-|--------|--------|
-| Visibility | external |
-| Caller | `certify`: the pending submitter when a bond is pinned, **anyone** when `bondAmount == 0`. `poke`: anyone. |
-| Parameters | `target`, `selector` (protocol-derived) |
-| Call chain | `certify → IERC20.safeTransferFrom()`; `poke` makes no external calls (EXTCODEHASH is an opcode, not a call) |
-| State modified | `certify`: `_pending[k]` deleted, `_bonds[k]`, `totalBondedWood`, `_configs[k]`. `poke`: `_configs[k]` deleted, `_pending[k]` deleted, `b.releasableAt`, `_adapterAllowed[target]` deleted |
-| Value flow | `certify`: submitter → TierRegistry |
-| Reentrancy guard | no |
-
 ### `WoodTwapOracle.update()`
 
 | Aspect | Detail |
@@ -608,7 +583,7 @@ Owner-restricted configuration surfaces. These configure the protocol rather tha
 | ChallengeGame | `setCourt`, `setExposureLedger`, `setTierRegistry`, `setChallengeWindow`, `setChallengerBondBps`, `setForfeitBurnBps`, `setStakedWood`, `setAutoSlashDelay`, `setDisputeTimeout`, `setSettleBurnBps`, `setProsecutorFeeBps`, `setInconclusiveBurnBps`, `setFilingsPaused` | 13 | none (`renounceOwnership` disabled) |
 | ExposureLedger | `setWoodUsdPrice`, `setWoodFeed`, `setWoodTwapOracle`, `setWoodHaircutBps`, `setGuardianRegistry`, `setChallengeWindow`, `setCoverageFreezer`, `setKNumerator`, `setCoveredTvlCapUsd`, `setQuorumTierThreshold`, `setProposerBondBps`, `setAssetFeed` | 12 | none |
 | StakedWood | `setRegistry`, `setMinGuardianStake`, `setCooldownPeriod`, `setMinOwnerStake`, `setMinSlashBps`, `setMaxSlashBps`, `setAgeFloorBps`, `setMaturationPeriod`, `setExposureLedger`, `setAuthorizedSlasher`, `_authorizeUpgrade` | 11 | none |
-| TierRegistry | `setWood`, `setSubmitterBondWood`, `setBondReleaseDelay`, `proposeCertification`, `cancelCertification`, `setCertifyDelay`, `setAuthorizedDemoter`, `demote`, `setAdapterAllowed` | 9 | `proposeCertification` → `certifyDelay` (1–30 d) → `certify`; every other setter instant |
+| TierRegistry | `certify`, `setAuthorizedDemoter`, `demote` | 3 | none |
 | GuardianRegistry | `fundSlashAppealReserve`, `refundSlash`, `pause`, `setReviewPeriod`, `setBlockQuorumBps`, `setExposureLedger`, `_authorizeUpgrade` | 7 | none |
 | ProtocolConfig | `setMgmtSplit`, `setPerfSplit`, `setMaxStrategyDuration`, `setProtocolFeeRecipient`, `setGuardiansFeeRecipient` | 5 | none (Ownable2Step) |
 | TokenCourt | `setChallengeGame`, `setStakedWood`, `setVoteWindow`, `setParticipationFloorBps` | 4 | none (`renounceOwnership` reverts) |

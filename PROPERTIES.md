@@ -32,8 +32,6 @@ Checked after every call sequence.
   are the only two writers, each paired 1:1 with a real transfer.
 - [x] **GL-03** `SHOULD-HOLD` — `wood.balanceOf(ProposerBondEscrow) >= Σ locked bond amounts`.
   The escrow keeps no aggregate of its own, so this needs a ghost (x-ray I-24 shape).
-- [ ] **GL-04** `SHOULD-HOLD` — `wood.balanceOf(TierRegistry) >= totalBondedWood`
-  (valid while WOOD is the only configured bond token, which the harness enforces).
 - [x] **GL-05** `SHOULD-HOLD` — Σ live redeem-request amounts == `queue.pendingShares()`.
 - [x] **GL-06** `SHOULD-HOLD` — Σ live deposit-request amounts == `queue.pendingDepositAssets()`.
 - [x] **GL-07** `SHOULD-HOLD` — Σ stamped-but-unclaimed redeem amounts == `queue.stampedUnclaimedShares()`.
@@ -103,8 +101,6 @@ Checked after every call sequence.
 - [x] **GL-36** `SHOULD-HOLD` — a bond record goes `0 → proposer → 0` via exactly one of
   release XOR forfeit (x-ray I-24).
 - [x] **GL-37** `SHOULD-HOLD` — `Review.opened` and `Review.resolved` are each one-shot.
-- [ ] **GL-38** `SHOULD-HOLD` — a TierRegistry bond's `releasableAt` is one-shot per bond
-  instance; a fresh bond is a new struct, not a reset.
 
 ### Monotonicity
 

@@ -124,19 +124,11 @@ contract TierResolutionTest is Test {
     ///      notional -> 100 bps), which the coverage-assertion tests in this
     ///      file measure.
     function _certifyBenignSettleLeg() internal {
-        _certifyNow(address(usdc), usdc.approve.selector, 0, 100, address(0));
+        _certifyNow(address(usdc), usdc.approve.selector, 0, 100);
     }
 
-    /// @dev Shared fixture helper (design.md / tasks.md 2.1): the test
-    ///      contract IS the TierRegistry owner (`new TierRegistry(address(this))`
-    ///      in setUp), so no prank is needed — propose, warp past the pinned
-    ///      `readyAt` (via `vm.getBlockTimestamp()`, never a cached
-    ///      `block.timestamp` local — this repo's optimizer CSEs it across
-    ///      `vm.warp`), then execute.
-    function _certifyNow(address target_, bytes4 selector_, uint8 tier_, uint16 bound_, address submitter_) internal {
-        tierRegistry.proposeCertification(target_, selector_, tier_, bound_, submitter_, target_.codehash);
-        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
-        tierRegistry.certify(target_, selector_);
+    function _certifyNow(address target_, bytes4 selector_, uint8 tier_, uint16 bound_) internal {
+        tierRegistry.certify(target_, selector_, tier_, bound_, target_.codehash);
     }
 
     function _settleCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
@@ -215,8 +207,8 @@ contract TierResolutionTest is Test {
     ///         the single settle call keeps the default cap of MAX_CAPITAL.
     function test_allCertifiedTier0CallsYieldTier0Coverage() public {
         _wireTierRegistry();
-        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
-        _certifyNow(address(usdc), usdc.approve.selector, 0, 50, address(0)); // the settle call
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
+        _certifyNow(address(usdc), usdc.approve.selector, 0, 50); // the settle call
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
         calls[0] = _certifiedCall();
@@ -237,7 +229,7 @@ contract TierResolutionTest is Test {
     ///         `maxCapital` notional per call).
     function test_oneUncertifiedCallMakesProposalTier2() public {
         _wireTierRegistry();
-        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
         calls[0] = _certifiedCall();
@@ -259,7 +251,7 @@ contract TierResolutionTest is Test {
     ///         resolves as selector 0, which is uncertified → tier 2.
     function test_shortCalldataResolvesAsUncertifiedTier2() public {
         _wireTierRegistry();
-        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({target: address(mockAdapter), data: hex"aabb", value: 0});
@@ -279,9 +271,9 @@ contract TierResolutionTest is Test {
     ///         under-counts multi-adapter batches.
     function test_mixedTier0AndTier1CoverageIsSumNotMax() public {
         _wireTierRegistry();
-        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
-        _certifyNow(address(mockAdapter), mockAdapter.transfer.selector, 1, 200, address(0));
-        _certifyNow(address(usdc), usdc.approve.selector, 0, 50, address(0)); // the settle call
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
+        _certifyNow(address(mockAdapter), mockAdapter.transfer.selector, 1, 200);
+        _certifyNow(address(usdc), usdc.approve.selector, 0, 50); // the settle call
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](2);
         calls[0] = _certifiedCall(); // tier 0, 50 bps
@@ -314,7 +306,7 @@ contract TierResolutionTest is Test {
     function test_executeRevertsWhenTierRegressedSincePropose() public {
         _wireTierRegistry();
         _certifyBenignSettleLeg();
-        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = _certifiedCall();
@@ -342,7 +334,7 @@ contract TierResolutionTest is Test {
     function test_she210_executeRevertsWhenSettlementLegTierRegressedSincePropose() public {
         _wireTierRegistry();
         _certifyBenignSettleLeg();
-        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = _certifiedCall();
@@ -368,17 +360,10 @@ contract TierResolutionTest is Test {
     ///         check (liveTier == envelopeTier) while the stored
     ///         requiredCoverage is stale-low. The execute-time re-resolve must
     ///         catch the coverage regression.
-    /// @dev    The replacement certification must announce-then-execute INSIDE
-    ///         the proposal's `executionWindow` (1 day), so `certifyDelay` is
-    ///         floored to `MIN_CERTIFY_DELAY` (also 1 day == VOTING_PERIOD)
-    ///         and a single warp satisfies both "past voting" and "past the
-    ///         replacement's readyAt" — landing the re-certify and the
-    ///         `executeProposal` call in the same window instead of letting a
-    ///         3-day default delay run the proposal past `executeBy`.
     function test_executeRevertsWhenCoverageRegressedAtSameTier() public {
         _wireTierRegistry();
-        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
-        _certifyNow(address(usdc), usdc.approve.selector, 0, 50, address(0)); // the settle call
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
+        _certifyNow(address(usdc), usdc.approve.selector, 0, 50); // the settle call
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = _certifiedCall();
@@ -386,16 +371,10 @@ contract TierResolutionTest is Test {
         assertEq(governor.getProposalTier(pid), 0);
         assertEq(governor.getRequiredCoverage(pid), 10e6); // (50 + 50) bps of 1_000e6
 
-        // Announce the replacement (same tier 0, 10x the extractable bound) as
-        // soon as the delay allows it to land inside the execution window.
-        tierRegistry.setCertifyDelay(tierRegistry.MIN_CERTIFY_DELAY());
-        tierRegistry.proposeCertification(
-            address(mockAdapter), mockAdapter.approve.selector, 0, 500, address(0), address(mockAdapter).codehash
-        );
+        _advancePastVoting();
 
-        _advancePastVoting(); // == MIN_CERTIFY_DELAY, so the replacement is also ready
-
-        tierRegistry.certify(address(mockAdapter), mockAdapter.approve.selector);
+        // The replacement: same tier 0, 10x the extractable bound.
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 500);
         (uint8 liveTier,) = tierRegistry.tierOf(address(mockAdapter), mockAdapter.approve.selector);
         assertEq(liveTier, 0); // NOT a tier regression
 
@@ -409,7 +388,7 @@ contract TierResolutionTest is Test {
     function test_executeSucceedsWhenTierUnchanged() public {
         _wireTierRegistry();
         _certifyBenignSettleLeg();
-        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
 
         BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
         calls[0] = _certifiedCall();

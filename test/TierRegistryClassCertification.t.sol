@@ -127,33 +127,15 @@ contract TierRegistryClassCertificationTest is Test {
         assertTrue(registry.cloneCodehashOf(never) != bytes32(0), "derivation is defined for any address");
     }
 
-    // ── Namespace isolation (task 5.8, key-derivation half) ──
-
-    /// @notice Address keys and class keys must not alias. Their preimages
-    ///         differ in length (24 vs 36 bytes), and the entries live in
-    ///         separate mappings, so neither can be reached through the other.
-    function test_classKey_doesNotAliasAddressKey() public view {
-        bytes4 sel = bytes4(keccak256("execute()"));
-        bytes32 clazz = registry.cloneCodehashOf(address(template));
-        assertTrue(
-            registry.classKey(clazz, sel) != registry.key(address(template), sel),
-            "class and address keys occupy distinct namespaces"
-        );
-    }
-
     // ── Certification helpers ──
 
     bytes4 constant SEL = bytes4(keccak256("execute()"));
     uint8 constant TIER_1 = 1;
     uint16 constant BOUND = 500;
 
-    /// @dev Two-step certify: propose, warp past `certifyDelay`, execute.
-    ///      No bond is configured, so execution is permissionless.
     function _certifyClassFor(address tmpl, bytes4 sel) internal {
         vm.prank(owner);
-        registry.proposeClassCertification(tmpl, sel, TIER_1, BOUND, address(0), tmpl.codehash);
-        vm.warp(block.timestamp + registry.certifyDelay() + 1);
-        registry.certifyClass(tmpl, sel);
+        registry.certifyClass(tmpl, sel, TIER_1, BOUND, tmpl.codehash);
     }
 
     function _certifyClass(address tmpl) internal {
@@ -251,20 +233,6 @@ contract TierRegistryClassCertificationTest is Test {
         assertEq(registry.classOf(a), bytes32(0), "membership is gone with no demotion call");
     }
 
-    /// @notice The lazy revocation needs no `poke` — but `pokeClass` persists
-    ///         it for watchtowers, and refuses while the template is unchanged.
-    function test_pokeClass_refusesWhileTemplateUnchanged() public {
-        _certifyAndAllowClass(address(template));
-        vm.expectRevert(TierRegistry.CodehashMatches.selector);
-        registry.pokeClass(address(template), SEL);
-    }
-
-    function test_pokeClass_persistsAfterTemplateMutation() public {
-        _certifyAndAllowClass(address(template));
-        vm.etch(address(template), hex"600160005260206000f3");
-        registry.pokeClass(address(template), SEL);
-    }
-
     // ── 5.4 Precedence ──
 
     /// @notice An address entry always wins over class membership, so the owner
@@ -274,9 +242,7 @@ contract TierRegistryClassCertificationTest is Test {
         address clone = _cloneViaFactory();
 
         vm.prank(owner);
-        registry.proposeCertification(clone, SEL, 0, 100, address(0), clone.codehash);
-        vm.warp(block.timestamp + registry.certifyDelay() + 1);
-        registry.certify(clone, SEL);
+        registry.certify(clone, SEL, 0, 100, clone.codehash);
 
         (uint8 tier, uint16 bound) = registry.tierOf(clone, SEL);
         assertEq(tier, 0, "address certification wins");
@@ -355,11 +321,8 @@ contract TierRegistryClassCertificationTest is Test {
         TierRegistry fresh = new TierRegistry(owner);
         assertEq(fresh.strategyFactory(), address(0), "precondition: unset");
 
-        vm.startPrank(owner);
-        fresh.proposeClassCertification(address(template), SEL, TIER_1, BOUND, address(0), address(template).codehash);
-        vm.warp(block.timestamp + fresh.certifyDelay() + 1);
-        vm.stopPrank();
-        fresh.certifyClass(address(template), SEL);
+        vm.prank(owner);
+        fresh.certifyClass(address(template), SEL, TIER_1, BOUND, address(template).codehash);
 
         address clone = _cloneViaFactory();
         assertEq(fresh.classOf(clone), bytes32(0), "no factory, no class");
@@ -533,9 +496,7 @@ contract TierRegistryClassCertificationTest is Test {
     function test_namespaceIsolation_addressCertNotVisibleAsClass() public {
         address clone = _cloneViaFactory();
         vm.prank(owner);
-        registry.proposeCertification(clone, SEL, 0, 100, address(0), clone.codehash);
-        vm.warp(block.timestamp + registry.certifyDelay() + 1);
-        registry.certify(clone, SEL);
+        registry.certify(clone, SEL, 0, 100, clone.codehash);
 
         // The address entry exists, but no class does.
         (uint8 tier,) = registry.tierOf(clone, SEL);
@@ -561,58 +522,50 @@ contract TierRegistryClassCertificationTest is Test {
     /// @notice Task 1.3: a codeless template has no class to anchor, and
     ///         anchoring one would let whatever code later appears at that
     ///         address satisfy the level-2 check (counterfactual CREATE2).
-    function test_proposeClassCertification_codelessTemplateReverts() public {
+    function test_certifyClass_codelessTemplateReverts() public {
         address never = makeAddr("neverDeployed");
         vm.prank(owner);
         vm.expectRevert(TierRegistry.NotAContract.selector);
-        registry.proposeClassCertification(never, SEL, TIER_1, BOUND, address(0), bytes32(0));
+        registry.certifyClass(never, SEL, TIER_1, BOUND, bytes32(0));
     }
 
-    /// @notice Template code drifting between owner review and mining voids the
-    ///         proposal, mirroring the address path's guard.
-    function test_proposeClassCertification_codehashDriftReverts() public {
-        vm.prank(owner);
-        vm.expectRevert(TierRegistry.CodehashChanged.selector);
-        registry.proposeClassCertification(address(template), SEL, TIER_1, BOUND, address(0), keccak256("stale"));
-    }
-
-    /// @notice A template mutated mid-window voids the pending grant rather
-    ///         than certifying different bytecode under an old announcement.
-    function test_certifyClass_templateMutatedMidWindowReverts() public {
-        vm.prank(owner);
-        registry.proposeClassCertification(
-            address(template), SEL, TIER_1, BOUND, address(0), address(template).codehash
-        );
-        vm.warp(block.timestamp + registry.certifyDelay() + 1);
-        vm.etch(address(template), hex"600160005260206000f3");
-        vm.expectRevert(TierRegistry.TemplateCodehashChanged.selector);
-        registry.certifyClass(address(template), SEL);
-    }
-
-    function test_certifyClass_beforeDelayReverts() public {
-        vm.prank(owner);
-        registry.proposeClassCertification(
-            address(template), SEL, TIER_1, BOUND, address(0), address(template).codehash
-        );
-        vm.expectRevert(TierRegistry.CertifyDelayNotElapsed.selector);
-        registry.certifyClass(address(template), SEL);
-    }
-
-    function test_certifyClass_withNoPendingReverts() public {
-        vm.expectRevert(TierRegistry.NoPendingClassCertification.selector);
-        registry.certifyClass(address(template), SEL);
-    }
-
-    function test_proposeClassCertification_tier2Reverts() public {
+    function test_certifyClass_tier2Reverts() public {
         vm.prank(owner);
         vm.expectRevert(TierRegistry.InvalidTier.selector);
-        registry.proposeClassCertification(address(template), SEL, 2, BOUND, address(0), address(template).codehash);
+        registry.certifyClass(address(template), SEL, 2, BOUND, address(template).codehash);
     }
 
-    function test_proposeClassCertification_onlyOwner() public {
-        vm.expectRevert();
-        registry.proposeClassCertification(
-            address(template), SEL, TIER_1, BOUND, address(0), address(template).codehash
-        );
+    function test_certifyClass_onlyOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        registry.certifyClass(address(template), SEL, TIER_1, BOUND, address(template).codehash);
+    }
+
+    function test_certifyClass_isOneOwnerCallAndCoversClonesImmediately() public {
+        vm.prank(owner);
+        registry.certifyClass(address(template), SEL, 0, 4_000, address(template).codehash);
+        (uint8 t, uint16 bound) = registry.classTierOf(address(template), SEL);
+        assertEq(t, 0);
+        assertEq(bound, 4_000);
+    }
+
+    function test_certifyClass_revertsWhenTheTemplateCodehashIsNotTheReviewedOne() public {
+        vm.prank(owner);
+        vm.expectRevert(TierRegistry.CodehashChanged.selector);
+        registry.certifyClass(address(template), SEL, 0, 4_000, keccak256("not it"));
+    }
+
+    function test_certifyClass_rePointingTheTemplateBumpsTheEpochAndOrphansTheOldConfig() public {
+        bytes4 selB = bytes4(keccak256("settle()"));
+        vm.startPrank(owner);
+        registry.certifyClass(address(template), SEL, 0, 4_000, address(template).codehash);
+        registry.certifyClass(address(template), selB, 0, 4_000, address(template).codehash);
+        vm.etch(address(template), hex"600160005260206000f3");
+        registry.certifyClass(address(template), SEL, 0, 1_000, address(template).codehash);
+        vm.stopPrank();
+        (, uint16 bound) = registry.classTierOf(address(template), SEL);
+        assertEq(bound, 1_000, "new epoch serves the new config");
+        (uint8 tB, uint16 boundB) = registry.classTierOf(address(template), selB);
+        assertEq(tB, 2, "the selector certified against the old code is orphaned");
+        assertEq(boundB, 10_000);
     }
 }

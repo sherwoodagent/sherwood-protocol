@@ -883,13 +883,8 @@ contract GovernorCoverageGatesTest is Test {
     ///      Created inside the tests rather than in `setUp` so the rest of this
     ///      suite keeps its simpler tier-2 / full-notional arithmetic.
     ///
-    ///      Two-step certification (design.md / tasks.md 2.1): the test
-    ///      contract IS the registry owner (`new TierRegistry(address(this))`),
-    ///      so no prank is needed — propose, warp past the pinned `readyAt`
-    ///      (via `vm.getBlockTimestamp()`, never a cached `block.timestamp`
-    ///      local — this repo's optimizer CSEs it across `vm.warp`), execute.
-    ///      Called before proposal creation in every site, so the forward warp
-    ///      never interacts with an in-flight proposal's execution window.
+    ///      The test contract IS the registry owner
+    ///      (`new TierRegistry(address(this))`), so no prank is needed.
     /// @dev `[asset.approve(puller, n), puller.pull(asset, n)]`: the only shape that moves the asset.
     function _pullCalls(address puller, uint256 amount) internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](2);
@@ -905,13 +900,8 @@ contract GovernorCoverageGatesTest is Test {
         reg = new TierRegistry(address(this));
         reg.setStrategyFactory(address(new PermissiveStrategyFactory()));
         governor.setTierRegistry(address(reg)); // test contract is the factory
-        reg.proposeCertification(
-            address(targetToken), targetToken.approve.selector, tier, bound, address(0), address(targetToken).codehash
-        );
-        reg.proposeCertification(address(usdg), usdg.approve.selector, tier, bound, address(0), address(usdg).codehash);
-        vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
-        reg.certify(address(targetToken), targetToken.approve.selector);
-        reg.certify(address(usdg), usdg.approve.selector);
+        reg.certify(address(targetToken), targetToken.approve.selector, tier, bound, address(targetToken).codehash);
+        reg.certify(address(usdg), usdg.approve.selector, tier, bound, address(usdg).codehash);
     }
 
     /// @notice THE enforcement gap this ADR closes. A tier-0 proposal carrying

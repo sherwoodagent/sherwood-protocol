@@ -43,7 +43,7 @@ interface ISyndicateRegistry {
 ///             counterparty allowlist from `vault()` (as `BaseStrategy` and
 ///             the shipped templates do) and expose no payout / recipient /
 ///             router address settable from `initialize` or `updateParams`
-///             data. See `TierRegistry.proposeClassCertification`.
+///             data. See `TierRegistry.certifyClass`.
 contract StrategyFactory is Ownable, IStrategyFactory {
     /// @notice SyndicateFactory used to verify that `vault` is a registered vault.
     /// @dev Immutable: set once at construction. The vault-registered check is

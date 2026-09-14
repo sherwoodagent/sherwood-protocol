@@ -91,9 +91,7 @@ contract TierRegistryClassMemberDenialTest is Test {
 
     function _certifyClass(address tmpl, bytes4 sel) internal {
         vm.prank(owner);
-        registry.proposeClassCertification(tmpl, sel, TIER_1, BOUND, address(0), tmpl.codehash);
-        vm.warp(block.timestamp + registry.certifyDelay() + 1);
-        registry.certifyClass(tmpl, sel);
+        registry.certifyClass(tmpl, sel, TIER_1, BOUND, tmpl.codehash);
     }
 
     function _certifyAndAllowClass(address tmpl) internal {
@@ -190,11 +188,8 @@ contract TierRegistryClassMemberDenialTest is Test {
         _certifyAndAllowClass(address(template));
         address clone = _cloneViaFactory();
 
-        vm.startPrank(owner);
-        registry.proposeCertification(clone, SEL, 0, 100, address(0), clone.codehash);
-        vm.stopPrank();
-        vm.warp(block.timestamp + registry.certifyDelay() + 1);
-        registry.certify(clone, SEL);
+        vm.prank(owner);
+        registry.certify(clone, SEL, 0, 100, clone.codehash);
         (uint8 tierBefore,) = registry.tierOf(clone, SEL);
         assertEq(tierBefore, 0, "address entry wins while live");
 
@@ -206,12 +201,10 @@ contract TierRegistryClassMemberDenialTest is Test {
 
     // ── Owner-level denial, the same hole through a different door ──
 
-    /// @notice The TIER axis has no instant restore, deliberately: recovery is
-    ///         the ordinary announced `proposeCertification` / `certify`
-    ///         ceremony, whose address entry wins ahead of both the denial flag
-    ///         and the class. A clearable tier denial would be an instant owner
-    ///         path to re-price a convicted address, undercutting `certifyDelay`.
-    function test_demotedMember_recoversTierOnlyThroughTheAnnouncedCeremony() public {
+    /// @notice The denial flag is never cleared: recovery is an ordinary
+    ///         `certify`, whose address entry wins ahead of both the denial
+    ///         flag and the class. Nothing else re-prices a convicted address.
+    function test_demotedMember_recoversTierOnlyThroughRecertification() public {
         _certifyAndAllowClass(address(template));
         address clone = _cloneViaFactory();
 
@@ -225,17 +218,12 @@ contract TierRegistryClassMemberDenialTest is Test {
         (uint8 stillDemoted,) = registry.tierOf(clone, SEL);
         assertEq(stillDemoted, TIER_ARBITRARY, "a venue grant does not restore tier");
 
-        // The announced ceremony does, and only after the delay.
+        // Re-certification does.
         vm.prank(owner);
-        registry.proposeCertification(clone, SEL, TIER_1, BOUND, address(0), clone.codehash);
-        (uint8 duringDelay,) = registry.tierOf(clone, SEL);
-        assertEq(duringDelay, TIER_ARBITRARY, "still demoted during the announcement window");
-
-        vm.warp(block.timestamp + registry.certifyDelay() + 1);
-        registry.certify(clone, SEL);
+        registry.certify(clone, SEL, TIER_1, BOUND, clone.codehash);
         (uint8 restored, uint16 restoredBound) = registry.tierOf(clone, SEL);
         assertEq(restored, TIER_1, "address entry restores the tier");
-        assertEq(restoredBound, BOUND, "at its announced bound");
+        assertEq(restoredBound, BOUND, "at its certified bound");
     }
 
     // ── The anti-grief guard the widened check must not lose ──
@@ -288,11 +276,8 @@ contract TierRegistryClassMemberDenialTest is Test {
     ///         belongs to no class this is one SSTORE and no behaviour change.
     function test_demote_nonMemberBehaviourUnchanged() public {
         address plain = address(new MockStrategy());
-        vm.startPrank(owner);
-        registry.proposeCertification(plain, SEL, TIER_1, BOUND, address(0), plain.codehash);
-        vm.stopPrank();
-        vm.warp(block.timestamp + registry.certifyDelay() + 1);
-        registry.certify(plain, SEL);
+        vm.prank(owner);
+        registry.certify(plain, SEL, TIER_1, BOUND, plain.codehash);
 
         vm.prank(owner);
         registry.demote(plain, SEL);

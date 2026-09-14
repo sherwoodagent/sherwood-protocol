@@ -294,18 +294,8 @@ contract SlashGasCeilingTest is Test {
         gov.setBondEscrow(address(bondEscrow));
         gov.setTierRegistry(address(tierRegistry));
 
-        // Two-step certification (design.md / tasks.md 2.1): the test contract
-        // IS the registry owner, so no prank is needed — propose, warp past
-        // the pinned `readyAt` (`vm.getBlockTimestamp()`, never a cached
-        // `block.timestamp` local — the optimizer CSEs it across `vm.warp`),
-        // execute. Every later warp in this suite is relative
-        // (`vm.getBlockTimestamp() + X` or a live `gov.getProposal(...)`
-        // field), so this setUp-time shift is safe.
-        tierRegistry.proposeCertification(
-            address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(0), address(adapter).codehash
-        );
-        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
-        tierRegistry.certify(address(adapter), adapter.poke.selector);
+        // The test contract IS the registry owner, so no prank is needed.
+        tierRegistry.certify(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(adapter).codehash);
 
         wood.mint(agent, 1_000_000e18);
         vm.prank(agent);
@@ -739,17 +729,7 @@ contract SlashGasCeilingTest is Test {
     ///         ~45-50k; this anchors that to a real measurement against the
     ///         real `TierRegistry` rather than trusting the estimate.
     ///
-    /// @dev    Measures the WORST-CASE demotion, not the fixture's default
-    ///         zero-bond one: `_deployStack`'s `certify` call passes
-    ///         `submitter = address(0)`, which skips the submitter-bond
-    ///         machinery entirely. This test re-certifies the same
-    ///         (target, selector) with a real, funded submitter bond first, so
-    ///         `_demote`'s conditional bond-release branch — the
-    ///         `releasableAt` SSTORE from zero to non-zero, plus
-    ///         `SubmitterBondReleaseStarted` — actually runs, matching the
-    ///         sizing note's worst-case accounting.
-    ///
-    ///         Measured directly against `demoteByChallenge`, pranked as the
+    /// @dev    Measured directly against `demoteByChallenge`, pranked as the
     ///         registry's `authorizedDemoter` (the game, per `_deployStack`),
     ///         rather than through a full `_settle` — isolating the child's
     ///         own cost from the slash and payout work around it, which is
@@ -760,25 +740,10 @@ contract SlashGasCeilingTest is Test {
         // `_deployStack` constructs `tierRegistry = new TierRegistry(address(this))`
         // — the test contract itself is the owner, not the `owner` fixture
         // address used for the rest of the stack. No prank needed here.
-        address submitter = makeAddr("demotionGasSubmitter");
-        wood.mint(submitter, 10_000e18);
-        tierRegistry.setWood(address(wood));
-        tierRegistry.setSubmitterBondWood(10_000e18);
-        tierRegistry.setBondReleaseDelay(14 days);
-        vm.prank(submitter);
-        wood.approve(address(tierRegistry), type(uint256).max);
-        // Re-certify the fixture's adapter with a real bond so the demotion
-        // below actually starts the bond-release timelock — the worst case.
-        // Two-step flow (issue #45): propose (with the reviewed codehash),
-        // warp past the pinned readyAt, then execute pranked as the pinned
-        // submitter (PR #156 finding #3: execution is submitter-gated once a
-        // bond is pinned).
-        tierRegistry.proposeCertification(
-            address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, submitter, address(adapter).codehash
-        );
-        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
-        vm.prank(submitter);
-        tierRegistry.certify(address(adapter), adapter.poke.selector);
+        //
+        // Re-certify the fixture's adapter so the demotion below runs against
+        // a live certification.
+        tierRegistry.certify(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(adapter).codehash);
 
         uint256 forwarded = (game.DEMOTION_GAS() * 63) / 64;
 
@@ -787,7 +752,7 @@ contract SlashGasCeilingTest is Test {
         tierRegistry.demoteByChallenge(address(adapter), adapter.poke.selector);
         uint256 spent = before - gasleft();
 
-        emit log_named_uint("measured demoteByChallenge gas (worst case, real bond release)", spent);
+        emit log_named_uint("measured demoteByChallenge gas", spent);
         emit log_named_uint("DEMOTION_GAS * 63/64 (the stipend a starved-to-the-floor caller forwards)", forwarded);
         emit log_named_uint("headroom left for issue #77's extra delete", forwarded - spent);
 
