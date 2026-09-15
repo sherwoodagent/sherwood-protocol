@@ -89,9 +89,11 @@ interface IChallengeGame {
         ///      bond, which the settle path treats as nothing-to-forfeit rather
         ///      than an error. Appended for tuple-position stability.
         address proposerBondEscrow;
-        /// @dev Stake eligible to vote on this challenge: the guardian total at
-        ///      filing less the accused cohort's own weight.
-        uint256 votableStakeAtFiling;
+        /// @dev The whole staked WOOD at `filedAt - 1`, the denominator both the
+        ///      convict quorum and the acquit quorum are measured against. The
+        ///      accused cohort cannot vote but stays in it, so a wide approving
+        ///      cohort raises the bar a conviction clears rather than lowering it.
+        uint256 totalStakeAtFiling;
         /// @dev The quorum in force at filing, pinned like every other rate.
         uint256 quorumBpsAtFiling;
         /// @dev Running convict-side weight.
@@ -99,6 +101,9 @@ interface IChallengeGame {
         /// @dev Running acquit-side weight. Non-zero means guardians actually
         ///      looked at the accusation and cleared it.
         uint256 acquitWeight;
+        /// @dev The challenged proposal's proposer, pinned at filing so the vote
+        ///      can refuse it. Appended for tuple-position stability.
+        address proposer;
     }
 
     // ── Errors ──
@@ -174,6 +179,13 @@ interface IChallengeGame {
     /// @dev The voter is not an active guardian, or carried no staked WOOD at
     ///      the filing instant.
     error NoVotableStake();
+    /// @dev The voter filed this challenge. An identity check a second address
+    ///      defeats, so it is a floor rather than a ceiling: it stops the plain
+    ///      case where one address accuses, convicts and collects the fee.
+    error ChallengerCannotVote();
+    /// @dev The voter proposed the challenged proposal. It is the party the
+    ///      conviction confiscates a bond from, so its ballot is never neutral.
+    error ProposerCannotVote();
 
     // ── Events ──
     /// @dev `evidenceURI` is carried on-chain unindexed so predicates that
@@ -252,8 +264,8 @@ interface IChallengeGame {
     event SettleBurnBpsSet(uint256 oldBps, uint256 newBps);
     event FilingsPausedSet(bool oldPaused, bool newPaused);
     event ProsecutorFeeBpsSet(uint256 oldBps, uint256 newBps);
-    /// @dev `weight` is the voter's staked WOOD at `filedAt`, the same basis
-    ///      the challenge's votable stake was measured on.
+    /// @dev `weight` is the voter's staked WOOD at `filedAt - 1`, the same basis
+    ///      the challenge's total stake was measured on.
     event ChallengeVoteCast(uint256 indexed challengeId, address indexed voter, bool convict, uint256 weight);
     event ChallengeQuorumBpsSet(uint256 oldBps, uint256 newBps);
 
@@ -288,8 +300,10 @@ interface IChallengeGame {
     function voteOnChallenge(uint256 challengeId, bool convict) external;
 
     // Resolution
-    /// @notice Permissionless resolution once the decision window has closed.
-    ///         Reverts otherwise.
+    /// @notice Permissionless resolution. A challenge whose convict side has
+    ///         reached the quorum and outweighs the acquit side settles at once;
+    ///         otherwise resolution waits for the decision window to close and
+    ///         reverts `DelayNotElapsed` until then.
     function resolve(uint256 challengeId) external;
 
     // ── Views ──
@@ -320,12 +334,13 @@ interface IChallengeGame {
     function forfeitBurnBps() external view returns (uint256);
     function voteWindow() external view returns (uint256);
     function challengeQuorumBps() external view returns (uint256);
-    /// @notice This challenge's convict weight, its votable basis and its pinned
-    ///         quorum. The acquit weight is read off `challengeOf`.
+    /// @notice This challenge's two tallies, the total staked WOOD they are
+    ///         measured against, and its pinned quorum — every number `resolve`
+    ///         reads, so a caller can reproduce its decision exactly.
     function challengeTallyOf(uint256 challengeId)
         external
         view
-        returns (uint256 convictWeight, uint256 votableStake, uint256 quorumBps);
+        returns (uint256 convictWeight, uint256 acquitWeight, uint256 totalStake, uint256 quorumBps);
     /// @notice Whether this guardian has already voted on this challenge.
     function hasVotedOn(uint256 challengeId, address voter) external view returns (bool);
     /// @notice Share of a SUCCESSFUL challenger's bond burned on settle, in bps.

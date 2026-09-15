@@ -189,9 +189,9 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         pays `forfeitBurnBps` of the bond on a different path.
     uint256 public settleBurnBps = 500;
 
-    /// @notice Share of the votable stake that must vote to convict, in basis
-    ///         points. Bounded like the registry's block quorum; pinned onto
-    ///         each challenge at filing.
+    /// @notice Share of the total staked WOOD that must vote to convict, in basis
+    ///         points. The same bar an acquittal clears to adjudicate. Bounded
+    ///         like the registry's block quorum; pinned onto each challenge.
     uint256 public challengeQuorumBps = 3_000;
 
     /// @dev One vote per guardian per challenge.
@@ -404,16 +404,17 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         uint256 bondWood = (((coverageUsd * challengerBondBps) / BPS_DENOMINATOR) * 1e8) / priceX8;
         if (bondWood == 0) revert BondTooSmall();
 
-        // The electorate is pinned ONCE, here, and one second back. sWOOD
-        // checkpoints are keyed on the second a stake changes and a same-key
-        // push overwrites, so reading the current timestamp would let a stake
-        // planted in this very block sit in the numerator but not the
-        // denominator. `GuardianRegistry.snapshotAt` hardens the stamp the same
-        // way, for the same reason.
+        // Pinned ONCE, here, and one second back: sWOOD keys a checkpoint on the
+        // second a stake changes and a same-key push overwrites, so the current
+        // timestamp would admit stake planted in this very block.
         IStakedWood swood = stakedWood;
         if (address(swood) == address(0)) revert ZeroAddress();
         uint256 snapshotAt = block.timestamp - 1;
-        uint256 votable = swood.getPastTotalVotes(snapshotAt);
+        uint256 totalStake = swood.getPastTotalVotes(snapshotAt);
+        // The accused keep their weight in the denominator and lose only their
+        // ballot, so a wide approving cohort raises the bar rather than lowering
+        // it. This local sum only answers whether anyone else could decide it.
+        uint256 votable = totalStake;
         for (uint256 i = 0; i < accused.length; i++) {
             uint256 w = swood.getPastStake(accused[i], snapshotAt);
             votable = votable > w ? votable - w : 0;
@@ -435,31 +436,27 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             adapterSelector: adapterSelector,
             executedAt: executedAt,
             vault: p.vault,
-            // The clock is pinned here: read live, the owner could shorten
-            // `voteWindow` after filing and retroactively erase a window the
-            // accused was still inside.
+            // Pinned, not read live: the owner could otherwise shorten
+            // `voteWindow` after filing and erase a window the accused is still
+            // inside.
             voteWindowAtFiling: voteWindow,
-            // Both burn rates pinned too: the challenger relies on
-            // `settleBurnBps` when it files and cannot withdraw, and on
-            // `forfeitBurnBps` for what it gets back if it loses. A live read
-            // would let a post-filing raise take a larger bite of a commitment
-            // already made.
+            // Both burn rates pinned too. The challenger relies on them when it
+            // bonds and cannot withdraw, so a later raise must not take a larger
+            // bite of a commitment already made.
             settleBurnBpsAtFiling: settleBurnBps,
             forfeitBurnBpsAtFiling: forfeitBurnBps,
-            // Pinned for the same reason: a live read would change what the
-            // challenger stood to collect on a conviction it already bonded
-            // against. Bounded by `MAX_PROSECUTOR_FEE_BPS` at set time and again
-            // by the paying escrow, which is the authority.
+            // Pinned for the same reason. Bounded by `MAX_PROSECUTOR_FEE_BPS` at
+            // set time and again by the paying escrow, which is the authority.
             prosecutorFeeBpsAtFiling: prosecutorFeeBps,
             // The escrow holding this proposal's proposer bond, off the same
             // `getProposal` read. Bound at propose time and never re-pointed, so
-            // a verdict up to `voteWindow` later confiscates from the escrow the
-            // bond was locked in.
+            // a later verdict confiscates from the escrow the bond sits in.
             proposerBondEscrow: p.proposerBondEscrow,
-            votableStakeAtFiling: votable,
+            totalStakeAtFiling: totalStake,
             quorumBpsAtFiling: challengeQuorumBps,
             convictWeight: 0,
-            acquitWeight: 0
+            acquitWeight: 0,
+            proposer: p.proposer
         });
         _lastChallenge[key] = challengeId;
         _liveByChallenger[challengerKey] = challengeId;
@@ -514,13 +511,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
     /// @notice Cast a guardian's vote on a live challenge. Weight is the
     ///         voter's staked WOOD one second before the filing — the same
-    ///         instant the challenge's votable stake was measured at.
-    /// @dev The accused approvers are refused: they underwrote the proposal the
-    ///      challenge accuses, so their weight is out of the denominator too.
+    ///         instant the challenge's total stake was measured at.
+    /// @dev Three parties are refused: the challenger, the proposer of the
+    ///      accused proposal, and the approvers the filing accuses. Each has a
+    ///      direct stake in the verdict's own payouts.
     function voteOnChallenge(uint256 challengeId, bool convict) external {
         Challenge storage c = _challenges[challengeId];
         if (c.status != Status.Filed) revert WrongStatus();
         if (block.timestamp >= c.filedAt + c.voteWindowAtFiling) revert WindowClosed();
+        if (msg.sender == c.challenger) revert ChallengerCannotVote();
+        if (msg.sender == c.proposer) revert ProposerCannotVote();
         if (_accusedApprover[challengeId][msg.sender]) revert AccusedCannotVote();
         if (_voted[challengeId][msg.sender]) revert AlreadyVoted();
 
@@ -545,9 +545,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     function resolve(uint256 challengeId) external {
         Challenge storage c = _challenges[challengeId];
         if (c.status != Status.Filed) revert WrongStatus();
-        // Monotone: there is no un-vote, so a reached quorum can settle at once.
-        uint256 votable = c.votableStakeAtFiling;
-        if (votable != 0 && c.convictWeight * BPS_DENOMINATOR >= c.quorumBpsAtFiling * votable) {
+        // Both tallies are monotone, so a quorum the convict side carries is
+        // already final and settles at once. A convict majority is required on
+        // top of it: a minority must not convict over a larger acquit side.
+        uint256 totalStake = c.totalStakeAtFiling;
+        if (
+            totalStake != 0 && c.convictWeight * BPS_DENOMINATOR >= c.quorumBpsAtFiling * totalStake
+                && c.convictWeight > c.acquitWeight
+        ) {
             _settle(challengeId, c);
             return;
         }
@@ -718,10 +723,10 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     function challengeTallyOf(uint256 challengeId)
         external
         view
-        returns (uint256 convictWeight, uint256 votableStake, uint256 quorumBps)
+        returns (uint256 convictWeight, uint256 acquitWeight, uint256 totalStake, uint256 quorumBps)
     {
         Challenge storage c = _challenges[challengeId];
-        return (c.convictWeight, c.votableStakeAtFiling, c.quorumBpsAtFiling);
+        return (c.convictWeight, c.acquitWeight, c.totalStakeAtFiling, c.quorumBpsAtFiling);
     }
 
     /// @inheritdoc IChallengeGame
@@ -878,7 +883,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         voteWindow = newWindow;
     }
 
-    /// @notice Set the convict quorum, in basis points of the votable stake.
+    /// @notice Set the convict quorum, in basis points of the total staked WOOD.
     /// @dev Floored well above zero: a quorum a single dust guardian could meet
     ///      would make the vote a formality rather than a decision.
     function setChallengeQuorumBps(uint256 newBps) external onlyOwner {

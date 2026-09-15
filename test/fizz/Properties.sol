@@ -114,18 +114,18 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
 
     /// @notice GL-14 — a challenge's convict tally never exceeds the stake that
     ///         was eligible to cast it.
-    /// @dev The quorum test is `convictWeight * BPS >= quorumBps * votable`, so
-    ///      a tally that could outgrow its own denominator would let a filing
+    /// @dev The quorum test is `convictWeight * BPS >= quorumBps * totalStake`,
+    ///      so a tally that could outgrow its own denominator would let a filing
     ///      convict on less than the fraction it claims. Both tallies are
     ///      checked against the one denominator because each voter's weight is
-    ///      counted into exactly one of them, and `votableStakeAtFiling` is the
-    ///      total those weights were drawn from.
+    ///      counted into exactly one of them, and `totalStakeAtFiling` is the
+    ///      whole staked set those weights were drawn from.
     function property_GL14_convictWeightNeverExceedsVotableStake() public view returns (bool) {
         uint256 n = game.challengeCount();
         for (uint256 id = 1; id <= n; id++) {
-            (uint256 convictWeight, uint256 votable,) = game.challengeTallyOf(id);
-            if (convictWeight > votable) return false;
-            if (game.challengeOf(id).acquitWeight + convictWeight > votable) return false;
+            (uint256 convictWeight, uint256 acquitWeight, uint256 totalStake,) = game.challengeTallyOf(id);
+            if (convictWeight > totalStake) return false;
+            if (acquitWeight + convictWeight > totalStake) return false;
         }
         return true;
     }
@@ -331,8 +331,8 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     // `EmergencyReview`. Would need an invented accessor or a harness
     // contract; out of scope here.
 
-    /// @notice GL-39 — `challengeCount`, `caseCount`, `proposalCount` and
-    ///         `nextRequestId` never decrease.
+    /// @notice GL-39 — `challengeCount`, `proposalCount` and `nextRequestId`
+    ///         never decrease.
     function property_GL39_countersNeverDecrease() public returns (bool) {
         bool ok = true;
 

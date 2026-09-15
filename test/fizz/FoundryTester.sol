@@ -251,9 +251,9 @@ contract FoundryTester is Test, Handlers {
         assertTrue(game.hasVotedOn(id, reserve), "the handler never landed a ballot");
         assertEq(game.challengeOf(id).acquitWeight, swood.guardianStake(reserve), "the acquit tally missed the ballot");
 
-        (uint256 convictWeight, uint256 votable,) = game.challengeTallyOf(id);
+        (uint256 convictWeight,, uint256 totalStake,) = game.challengeTallyOf(id);
         assertEq(convictWeight, 0, "an acquit ballot moved the convict tally");
-        assertGt(votable, 0, "GL-14 would be vacuous against a zero denominator");
+        assertGt(totalStake, 0, "GL-14 would be vacuous against a zero denominator");
 
         // Refused, and the handler survives the refusal rather than reverting.
         challengeGame_voteOnChallenge_clamped(id, 0, true);

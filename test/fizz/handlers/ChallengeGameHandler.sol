@@ -64,19 +64,20 @@ abstract contract ChallengeGameHandler is Properties {
         game.setChallengeQuorumBps(clampBetween(bps, 1_000, 10_000));
     }
 
-    /// @dev The five refusals a vote is EXPECTED to take: an accused approver,
-    ///      a repeat vote, a caller with no stake behind it, a closed window, a
-    ///      challenge already decided. A blanket `catch {}` would swallow a
-    ///      regression in the vote itself, so anything else fails loudly —
-    ///      `t` panics, which is what both Foundry and the fuzzer's assertion
-    ///      mode catch. A bare `revert` would not: the fuzzer discards a
-    ///      reverting call sequence without reporting it.
+    /// @dev The seven refusals a vote is EXPECTED to take: the challenger, the
+    ///      proposer, an accused approver, a repeat vote, a caller with no stake
+    ///      behind it, a closed window, a challenge already decided. A blanket
+    ///      `catch {}` would swallow a regression in the vote itself, so anything
+    ///      else fails loudly — `t` panics, which is what both Foundry and the
+    ///      fuzzer's assertion mode catch. A bare `revert` would not: the fuzzer
+    ///      discards a reverting call sequence without reporting it.
     function _assertExpectedVoteRevert(bytes memory err) internal {
         bytes4 sel = err.length >= 4 ? bytes4(err) : bytes4(0);
         t(
             sel == IChallengeGame.AccusedCannotVote.selector || sel == IChallengeGame.AlreadyVoted.selector
                 || sel == IChallengeGame.NoVotableStake.selector || sel == IChallengeGame.WindowClosed.selector
-                || sel == IChallengeGame.WrongStatus.selector,
+                || sel == IChallengeGame.WrongStatus.selector || sel == IChallengeGame.ChallengerCannotVote.selector
+                || sel == IChallengeGame.ProposerCannotVote.selector,
             "voteOnChallenge reverted for an unexpected reason"
         );
     }
@@ -163,7 +164,8 @@ abstract contract ChallengeGameHandler is Properties {
         // Silence now FAILS a challenge, so the composite has to carry the vote
         // itself or it can never reach the terminal paths it exists to reach.
         // Every staked guardian is offered a convict ballot; the ones this
-        // filing accuses are refused by the game (`AccusedCannotVote`), which is
+        // filing accuses are refused by the game (`AccusedCannotVote`), as are
+        // its challenger and the proposal's proposer, which is
         // why `SyndicateGovernorHandler` approves with only `APPROVER_COUNT` of
         // them and leaves a reserve. The electorate is pinned one second before
         // `filedAt` and every guardian was staked in `setup()`, so no extra roll
@@ -193,13 +195,15 @@ abstract contract ChallengeGameHandler is Properties {
         try game.resolve(challengeId) {} catch {}
     }
 
-    /// @dev `resolve`'s own settle test, asked of the same three numbers.
+    /// @dev `resolve`'s own settle test, asked of the same four numbers — the
+    ///      quorum against the total stake AND a convict majority.
     ///      `BPS_DENOMINATOR` is inlined because the constant is `internal`. A
     ///      zero denominator is not quorum: `resolve` reads it as a challenge
     ///      nobody could decide and fails it.
     function _quorumReached(uint256 challengeId) internal view returns (bool) {
-        (uint256 convictWeight, uint256 votable, uint256 quorumBps) = game.challengeTallyOf(challengeId);
-        return votable != 0 && convictWeight * 10_000 >= quorumBps * votable;
+        (uint256 convictWeight, uint256 acquitWeight, uint256 totalStake, uint256 quorumBps) =
+            game.challengeTallyOf(challengeId);
+        return totalStake != 0 && convictWeight * 10_000 >= quorumBps * totalStake && convictWeight > acquitWeight;
     }
 
     /// @dev First proposal that `file` would currently accept: executed, still

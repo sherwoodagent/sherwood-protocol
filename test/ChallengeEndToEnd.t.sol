@@ -268,6 +268,11 @@ abstract contract ChallengeEndToEndBase is Test {
         vm.stopPrank();
         vm.prank(owner);
         registry.setExposureLedger(address(ledger));
+        // sWOOD's own half of the gate: without it `claimUnstakeGuardian` never
+        // consults `hasFrozenCoverage`, and the accused-cannot-exit property this
+        // suite states cannot be observed here at all.
+        vm.prank(owner);
+        swood.setExposureLedger(address(ledger));
 
         bondEscrow = new ProposerBondEscrow(address(wood), address(registry), address(ledger));
 
@@ -549,8 +554,9 @@ abstract contract ChallengeEndToEndBase is Test {
     }
 
     /// @dev Reaches the convict quorum from the two guardians the filing does
-    ///      not accuse — g1 is the only approver anywhere in this fixture. A
-    ///      settle needs it: silence at the deadline fails the challenge.
+    ///      not accuse — g1 is the only approver anywhere in this fixture. Their
+    ///      40,000 clears 30% of the 70,000 total and outweighs a silent acquit
+    ///      side, which is what a settle needs.
     function _convict(uint256 cid) internal {
         vm.prank(g2);
         game.voteOnChallenge(cid, true);
@@ -1256,15 +1262,15 @@ contract ChallengeRearmEndToEndTest is ChallengeEndToEndBase {
     function test_stakeAddedAfterAFilingCannotVoteOnIt() public {
         uint256 pid = _proposeApproveExecute();
         uint256 cid = _file(challenger, pid, "ipfs://evidence/late-stake");
-        (, uint256 votableBefore,) = game.challengeTallyOf(cid);
+        (,, uint256 totalBefore,) = game.challengeTallyOf(cid);
 
         vm.warp(vm.getBlockTimestamp() + 1);
         address newcomer = makeAddr("newcomer");
         _stakeGuardian(newcomer, FILLER_STAKE, 4);
         assertTrue(swood.isActiveGuardian(newcomer), "the newcomer really is a guardian now");
 
-        (, uint256 votableAfter,) = game.challengeTallyOf(cid);
-        assertEq(votableAfter, votableBefore, "the pinned electorate does not grow");
+        (,, uint256 totalAfter,) = game.challengeTallyOf(cid);
+        assertEq(totalAfter, totalBefore, "the pinned electorate does not grow");
 
         vm.prank(newcomer);
         vm.expectRevert(IChallengeGame.NoVotableStake.selector);
@@ -1292,13 +1298,13 @@ contract ChallengeRearmEndToEndTest is ChallengeEndToEndBase {
         address late = makeAddr("sameBlockLate");
         _stakeGuardian(late, FILLER_STAKE, 6);
 
-        (, uint256 votable,) = game.challengeTallyOf(cid);
+        (,, uint256 totalStake,) = game.challengeTallyOf(cid);
         assertEq(
-            votable,
-            swood.getPastTotalVotes(snapshotAt) - swood.getPastStake(g1, snapshotAt),
-            "the electorate is the one a second before the filing, less the accused"
+            totalStake,
+            swood.getPastTotalVotes(snapshotAt),
+            "the electorate is the one a second before the filing, accused included"
         );
-        assertEq(votable, 2 * FILLER_STAKE, "g2 and g3 alone, and neither same-block staker");
+        assertEq(totalStake, G1_STAKE + 2 * FILLER_STAKE, "g1, g2 and g3 alone, and neither same-block staker");
 
         vm.prank(early);
         vm.expectRevert(IChallengeGame.NoVotableStake.selector);
@@ -1307,5 +1313,50 @@ contract ChallengeRearmEndToEndTest is ChallengeEndToEndBase {
         vm.prank(late);
         vm.expectRevert(IChallengeGame.NoVotableStake.selector);
         game.voteOnChallenge(cid, true);
+    }
+
+    // ── The three parties the vote refuses ────────────────────────────────
+
+    /// @notice THE FILER CANNOT BE ITS OWN JURY. A challenger holding a real
+    ///         guardian seat files and tries to convict alone: refused on
+    ///         identity, so the accuse-convict-collect round trip is closed.
+    ///         A second address defeats the check, so this is a floor.
+    function test_challengerCannotConvictItsOwnFilingOnTheRealStack() public {
+        uint256 pid = _proposeApproveExecute();
+        _stakeGuardian(challenger, FILLER_STAKE, 7);
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        uint256 cid = _file(challenger, pid, "ipfs://evidence/self-jury");
+        uint256 snapshotAt = game.challengeOf(cid).filedAt - 1;
+        assertTrue(swood.isActiveGuardian(challenger), "fixture: a real guardian seat");
+        assertGt(swood.getPastStake(challenger, snapshotAt), 0, "with real weight behind it");
+
+        vm.prank(challenger);
+        vm.expectRevert(IChallengeGame.ChallengerCannotVote.selector);
+        game.voteOnChallenge(cid, true);
+
+        vm.warp(vm.getBlockTimestamp() + game.challengeOf(cid).voteWindowAtFiling);
+        game.resolve(cid);
+        assertEq(
+            uint8(game.challengeOf(cid).status),
+            uint8(IChallengeGame.Status.Failed),
+            "the filing fails instead of settling on its own ballot"
+        );
+    }
+
+    /// @notice AND NEITHER CAN THE PROPOSER. One minimum stake would otherwise
+    ///         buy an acquit ballot on a challenge against its own proposal.
+    function test_proposerCannotVoteOnAChallengeAgainstItsProposal() public {
+        uint256 pid = _proposeApproveExecute();
+        _stakeGuardian(agent, MIN_GUARDIAN_STAKE, 8);
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        uint256 cid = _file(challenger, pid, "ipfs://evidence/proposer-ballot");
+        assertEq(game.challengeOf(cid).proposer, agent, "pinned off the governor's own record");
+        assertTrue(swood.isActiveGuardian(agent), "fixture: refused as the proposer, not for want of stake");
+
+        vm.prank(agent);
+        vm.expectRevert(IChallengeGame.ProposerCannotVote.selector);
+        game.voteOnChallenge(cid, false);
     }
 }

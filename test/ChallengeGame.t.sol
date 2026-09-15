@@ -23,9 +23,18 @@ contract MockChallengeGovernor {
     address public defaultTarget;
     bytes4 public defaultSelector;
 
+    /// @dev The proposer every executed proposal here carries, so the vote's
+    ///      proposer bar has a real address to refuse rather than a zero one.
+    address public defaultProposer;
+
+    function setDefaultProposer(address who) external {
+        defaultProposer = who;
+    }
+
     function setExecuted(uint256 proposalId, address vault, uint256 executedAt) external {
         _proposals[proposalId].vault = vault;
         _proposals[proposalId].executedAt = executedAt;
+        _proposals[proposalId].proposer = defaultProposer;
     }
 
     function setDefaultCall(address target, bytes4 selector) external {
@@ -417,7 +426,11 @@ contract MockChallengeStakedWood {
     /// @dev The electorate the challenge vote reads. Held flat rather than
     ///      time-keyed: no test in this suite moves a guardian's stake between
     ///      a filing and its vote, so one value answers every lookup and the
-    ///      timestamp argument is deliberately ignored.
+    ///      timestamp argument is deliberately ignored. The timestamp's own
+    ///      semantics are covered on the real sWOOD instead, by
+    ///      `test_stakeAddedAfterAFilingCannotVoteOnIt` and
+    ///      `test_sameBlockStakeIsOutsideBothTheElectorateAndTheVote` in
+    ///      `test/ChallengeEndToEnd.t.sol`.
     mapping(address guardian => uint256) internal _stake;
     mapping(address guardian => bool) internal _active;
     uint256 internal _totalVotes;
@@ -505,6 +518,7 @@ contract ChallengeGameTest is Test {
         // Every proposal touches the adapter these tests accuse, so the 🟠F4
         // membership test passes by default; the mismatch cases override it.
         gov.setDefaultCall(ADAPTER, SELECTOR);
+        gov.setDefaultProposer(proposer);
         ledger = new MockChallengeLedger(0.05e8); // $0.05, the governance haircut price
         tiers = new MockChallengeTierRegistry();
         swood = new MockChallengeStakedWood();
@@ -517,12 +531,13 @@ contract ChallengeGameTest is Test {
         vm.prank(owner);
         game.setStakedWood(address(swood));
 
-        // The electorate. Only `nonApproverGuardian` is outside the accused
-        // cohort, so it alone carries votable weight — and alone it is the
-        // whole of it, which is what lets one vote reach the quorum.
+        // The electorate, 1,000,000 WOOD in total. Only `nonApproverGuardian` is
+        // outside the accused cohort, and it holds half the TOTAL stake — the
+        // denominator the quorum is measured against — so one vote reaches the
+        // 30% bar while the accused 500,000 still counts in that denominator.
         swood.setStake(guardianA, 300_000e18);
         swood.setStake(guardianB, 200_000e18);
-        swood.setStake(nonApproverGuardian, 100_000e18);
+        swood.setStake(nonApproverGuardian, 500_000e18);
 
         wood.mint(challenger, 10_000_000e18);
         vm.prank(challenger);
@@ -2239,8 +2254,9 @@ contract ChallengeGameTest is Test {
         uint256 stakeBefore = swood.stakeOf(guardianA);
         vm.prank(nonApproverGuardian);
         game.voteOnChallenge(id, true);
-        (uint256 convictWeight, uint256 votable, uint256 qBps) = game.challengeTallyOf(id);
-        assertGe(convictWeight * 10_000, qBps * votable, "quorum reached");
+        (uint256 convictWeight, uint256 acquitWeight, uint256 totalStake, uint256 qBps) = game.challengeTallyOf(id);
+        assertGe(convictWeight * 10_000, qBps * totalStake, "quorum reached");
+        assertGt(convictWeight, acquitWeight, "and carried on the merits");
         game.resolve(id);
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "settled");
         assertLt(swood.stakeOf(guardianA), stakeBefore, "approver slashed");
@@ -2316,23 +2332,99 @@ contract ChallengeGameTest is Test {
         game.voteOnChallenge(id, false);
     }
 
-    function test_quorumIsMeasuredAgainstStakeMinusTheAccused() public {
+    /// @notice THE DENOMINATOR IS THE WHOLE STAKED SET, ACCUSED INCLUDED.
+    ///         Subtracting the accused made a conviction cheaper the wider the
+    ///         cohort that had approved: here the accused hold 500,000 of
+    ///         700,000, so the lone outsider is 100% of what may vote and still
+    ///         under 30% of the stake the bar is read off.
+    function test_quorumIsMeasuredAgainstTotalStake() public {
+        swood.setStake(nonApproverGuardian, 200_000e18);
         uint256 id = _fileStandard(PROPOSAL);
-        (, uint256 votable,) = game.challengeTallyOf(id);
+        (,, uint256 totalStake, uint256 qBps) = game.challengeTallyOf(id);
         uint256 snapshotAt = game.challengeOf(id).filedAt - 1;
-        assertEq(
-            votable,
-            swood.getPastTotalVotes(snapshotAt) - swood.getPastStake(guardianA, snapshotAt)
-                - swood.getPastStake(guardianB, snapshotAt),
-            "accused weight is out of the denominator"
-        );
+        assertEq(totalStake, swood.getPastTotalVotes(snapshotAt), "the accused stay in the denominator");
+        assertEq(totalStake, 700_000e18, "fixture: 500,000 accused against a 200,000 outsider");
+
+        vm.prank(nonApproverGuardian);
+        game.voteOnChallenge(id, true);
+
+        uint256 votable =
+            totalStake - swood.getPastStake(guardianA, snapshotAt) - swood.getPastStake(guardianB, snapshotAt);
+        (uint256 convictWeight,,,) = game.challengeTallyOf(id);
+        assertGe(convictWeight * 10_000, qBps * votable, "fixture: past the accused-subtracted bar");
+        assertLt(convictWeight * 10_000, qBps * totalStake, "but short of the bar against the total");
+
+        vm.expectRevert(IChallengeGame.DelayNotElapsed.selector);
+        game.resolve(id);
+    }
+
+    /// @notice THE CHALLENGER DOES NOT SIT ON ITS OWN JURY. One address would
+    ///         otherwise accuse, convict and collect the prosecutor fee in a
+    ///         single round trip. A second address defeats an identity check, so
+    ///         this is a floor rather than a ceiling.
+    function test_challengerCannotVoteOnItsOwnFiling() public {
+        swood.setStake(challenger, 400_000e18);
+        uint256 id = _fileStandard(PROPOSAL);
+        assertTrue(swood.isActiveGuardian(challenger), "fixture: refused as the filer, not for want of stake");
+        vm.prank(challenger);
+        vm.expectRevert(IChallengeGame.ChallengerCannotVote.selector);
+        game.voteOnChallenge(id, true);
+    }
+
+    /// @notice NOR DOES THE PROPOSER. A conviction confiscates its bond, so its
+    ///         ballot is never neutral — and an acquit ballot below the quorum
+    ///         would otherwise spend the proposal's one re-arm for the price of a
+    ///         minimum stake.
+    function test_proposerCannotVoteOnAChallengeAgainstItsProposal() public {
+        swood.setStake(proposer, 400_000e18);
+        uint256 id = _fileStandard(PROPOSAL);
+        assertEq(game.challengeOf(id).proposer, proposer, "pinned at filing off the governor's own record");
+        vm.prank(proposer);
+        vm.expectRevert(IChallengeGame.ProposerCannotVote.selector);
+        game.voteOnChallenge(id, false);
+    }
+
+    /// @notice A QUORUM IS NOT ENOUGH ON ITS OWN. Convict weight past the bar but
+    ///         outweighed by the acquit side convicts nobody: `resolve` waits out
+    ///         the window and then fails the challenge.
+    function test_convictMustOutweighAcquit() public {
+        vm.prank(owner);
+        game.setChallengeQuorumBps(1_000);
+        address acquitter = makeAddr("acquitter");
+        swood.setStake(guardianA, 200_000e18);
+        swood.setStake(guardianB, 0);
+        swood.setStake(nonApproverGuardian, 300_000e18);
+        swood.setStake(acquitter, 700_000e18);
+
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+        uint256 id = _fileStandard(PROPOSAL);
+        (,, uint256 totalStake, uint256 qBps) = game.challengeTallyOf(id);
+        assertEq(totalStake, 1_200_000e18, "fixture: 30% convict against 70% acquit");
+
+        vm.prank(nonApproverGuardian);
+        game.voteOnChallenge(id, true);
+        vm.prank(acquitter);
+        game.voteOnChallenge(id, false);
+
+        (uint256 convictWeight, uint256 acquitWeight,,) = game.challengeTallyOf(id);
+        assertGe(convictWeight * 10_000, qBps * totalStake, "fixture: the convict side cleared the quorum");
+        assertLt(convictWeight, acquitWeight, "and is still the minority of the weight cast");
+
+        vm.expectRevert(IChallengeGame.DelayNotElapsed.selector);
+        game.resolve(id);
+
+        vm.warp(vm.getBlockTimestamp() + game.voteWindow());
+        game.resolve(id);
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Failed), "a minority convicts nobody");
+        assertEq(swood.callCount(), 0, "and nothing was slashed");
+        assertEq(game.challengeableUntil(key), 0, "the acquittal cleared the quorum, so it adjudicated");
     }
 
     function test_anAcquitVoteDoesNotCountTowardTheQuorum() public {
         uint256 id = _fileStandard(PROPOSAL);
         vm.prank(nonApproverGuardian);
         game.voteOnChallenge(id, false);
-        (uint256 convictWeight,,) = game.challengeTallyOf(id);
+        (uint256 convictWeight,,,) = game.challengeTallyOf(id);
         assertEq(convictWeight, 0, "acquit adds nothing");
         vm.expectRevert(IChallengeGame.DelayNotElapsed.selector);
         game.resolve(id);
@@ -2441,8 +2533,8 @@ contract ChallengeGameTest is Test {
     /// @notice An electorate with no non-accused stake can never reach a
     ///         quorum, so the filing is refused at the door rather than taking a
     ///         bond it could only burn. A cohort that covers the entire stake
-    ///         cannot convict itself, and an empty denominator must never read
-    ///         as a quorum met.
+    ///         cannot convict itself. The check is on the stake that may VOTE;
+    ///         the quorum's own denominator is the total, accused included.
     function test_file_revertsWhenNoStakeCanVote() public {
         swood.setStake(nonApproverGuardian, 0);
         _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
@@ -2490,14 +2582,14 @@ contract ChallengeGameTest is Test {
     }
 
     /// @dev Three guardians outside the accused cohort, so a convict vote can
-    ///      sit strictly below, exactly at, or above the quorum. The suite's
-    ///      default electorate is one guardian holding 100% of the votable
-    ///      stake, which no threshold can be read off.
+    ///      sit strictly below, exactly at, or above the quorum. Total staked
+    ///      WOOD — the quorum's denominator — becomes 1,500,000: the 500,000 the
+    ///      filing accuses plus 500,000 + 250,000 + 250,000 that may vote.
     function _threeVotableGuardians() internal returns (address second, address third) {
         second = makeAddr("nonApproverGuardian2");
         third = makeAddr("nonApproverGuardian3");
-        swood.setStake(second, 150_000e18);
-        swood.setStake(third, 50_000e18);
+        swood.setStake(second, 250_000e18);
+        swood.setStake(third, 250_000e18);
     }
 
     /// @notice THE QUORUM IS A THRESHOLD, NOT A HEADCOUNT. A convict vote short
@@ -2509,23 +2601,23 @@ contract ChallengeGameTest is Test {
         game.setChallengeQuorumBps(5_000);
 
         uint256 id = _fileStandard(PROPOSAL);
-        (, uint256 votable, uint256 qBps) = game.challengeTallyOf(id);
-        assertEq(votable, 300_000e18, "three guardians outside the accused cohort");
+        (,, uint256 totalStake, uint256 qBps) = game.challengeTallyOf(id);
+        assertEq(totalStake, 1_500_000e18, "the whole staked set, accused included");
         assertEq(qBps, 5_000, "and a quorum the fixture straddles");
 
-        // 100,000 of 300,000 — a third of the electorate, short of the bar.
+        // 500,000 of 1,500,000 — a third of the stake, short of the bar.
         vm.prank(nonApproverGuardian);
         game.voteOnChallenge(id, true);
-        (uint256 convictWeight,,) = game.challengeTallyOf(id);
-        assertLt(convictWeight * 10_000, qBps * votable, "fixture: strictly sub-quorum");
+        (uint256 convictWeight,,,) = game.challengeTallyOf(id);
+        assertLt(convictWeight * 10_000, qBps * totalStake, "fixture: strictly sub-quorum");
         vm.expectRevert(IChallengeGame.DelayNotElapsed.selector);
         game.resolve(id);
 
-        // 150,000 of 300,000 — exactly the bar, which must carry it.
+        // 750,000 of 1,500,000 — exactly the bar, which must carry it.
         vm.prank(third);
         game.voteOnChallenge(id, true);
-        (convictWeight,,) = game.challengeTallyOf(id);
-        assertEq(convictWeight * 10_000, qBps * votable, "fixture: exactly at the bar, not past it");
+        (convictWeight,,,) = game.challengeTallyOf(id);
+        assertEq(convictWeight * 10_000, qBps * totalStake, "fixture: exactly at the bar, not past it");
         game.resolve(id);
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "the bar itself settles");
     }
@@ -2559,11 +2651,11 @@ contract ChallengeGameTest is Test {
         vm.prank(owner);
         game.setChallengeQuorumBps(10_000);
 
-        // 100,000 of 300,000: past the pinned 3,000 bps, far short of 10,000.
+        // 500,000 of 1,500,000: past the pinned 3,000 bps, far short of 10,000.
         _convict(id);
-        (uint256 convictWeight, uint256 votable,) = game.challengeTallyOf(id);
-        assertGe(convictWeight * 10_000, 3_000 * votable, "fixture: over the pinned bar");
-        assertLt(convictWeight * 10_000, game.challengeQuorumBps() * votable, "and under the live one");
+        (uint256 convictWeight,, uint256 totalStake,) = game.challengeTallyOf(id);
+        assertGe(convictWeight * 10_000, 3_000 * totalStake, "fixture: over the pinned bar");
+        assertLt(convictWeight * 10_000, game.challengeQuorumBps() * totalStake, "and under the live one");
 
         game.resolve(id);
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Settled), "the pinned quorum stands");
