@@ -1311,6 +1311,107 @@ contract CoverageEndToEndTest is Test {
         );
     }
 
+    // ── SHE-168: an unstake request cannot shrink the block-quorum slash basis ──
+
+    /// @dev Blocked review on `pid` (g1 approves, g2/g3 block); returns g1's burn.
+    ///      `flicker`: g1 requests unstake the second BEFORE the open and cancels in
+    ///      the open block, so `openedAt` reads g1's zeroed votable checkpoint.
+    function _she168BlockedReview(uint256 pid, bool flicker) internal returns (uint256 burn) {
+        vm.warp(govA.getProposal(pid).voteEnd + 1);
+        if (flicker) {
+            vm.prank(g1);
+            swood.requestUnstakeGuardian();
+        }
+        vm.warp(vm.getBlockTimestamp() + 1);
+        // Nothing exposes `openedAt`; `GuardianRegistry._openReview` stamps
+        // `block.timestamp - 1` (src/GuardianRegistry.sol:860).
+        uint256 openedAt = vm.getBlockTimestamp() - 1;
+        if (flicker) {
+            vm.prank(g1);
+            swood.cancelUnstakeGuardian();
+            assertEq(swood.getPastStake(g1, openedAt), 0, "fixture: the anchor reads g1's zeroed votable checkpoint");
+        }
+        _voteLock(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve, WHALE_STAKE / 2);
+        _vote(govA, pid, g2, IGuardianRegistry.GuardianVoteType.Block);
+        _vote(govA, pid, g3, IGuardianRegistry.GuardianVoteType.Block);
+        assertEq(swood.slashableStakeAt(g1, openedAt + 1), WHALE_STAKE, "slash basis at the anchor is the whole stake");
+
+        uint256 before = swood.guardianStake(g1);
+        _pastReview(govA, pid);
+        assertTrue(registry.resolveReview(address(govA), pid), "blocked");
+        burn = before - swood.guardianStake(g1);
+    }
+
+    /// @notice SHE-168: requesting unstake the block before the review opens and
+    ///         cancelling in the open block zeroes the votable checkpoint at
+    ///         `openedAt`, and the block-quorum slash still burns exactly what it
+    ///         burns without the request.
+    function test_reviewSlash_she168_unstakeRequestBeforeOpenDoesNotShrinkTheSlash() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+
+        uint256 snap = vm.snapshotState();
+        uint256 controlBurn = _she168BlockedReview(pid, false);
+        assertGt(controlBurn, 0, "control: the conviction burns");
+        vm.revertToState(snap);
+
+        uint256 attackBurn = _she168BlockedReview(pid, true);
+        assertEq(attackBurn, controlBurn, "the request-then-cancel flicker changes nothing");
+    }
+
+    /// @notice SHE-168: a requested guardian cannot cast the approve vote at all,
+    ///         so the request-then-vote ordering the issue feared never produces
+    ///         an approver.
+    function test_reviewSlash_she168_requestedGuardianCannotApprove() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        vm.warp(govA.getProposal(pid).voteEnd + 1);
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        vm.prank(g1);
+        vm.expectRevert(IGuardianRegistry.NotActiveGuardian.selector);
+        registry.voteOnProposal(address(govA), pid, IGuardianRegistry.GuardianVoteType.Approve, WHALE_STAKE / 2);
+    }
+
+    /// @notice SHE-168: an approver who requests unstake after voting cannot claim
+    ///         while its coverage is open, and the blocked review burns exactly what
+    ///         the control burns without the request, whatever the resolve time
+    ///         (the control resolves at `reviewEnd + 1`, this one a week later).
+    function test_reviewSlash_she168_unstakeRequestAfterApproveDoesNotShrinkTheSlash() public {
+        vm.startPrank(owner);
+        swood.setExposureLedger(address(ledger));
+        swood.setCooldownPeriod(7 days);
+        vm.stopPrank();
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+
+        uint256 snap = vm.snapshotState();
+        uint256 controlBurn = _she168BlockedReview(pid, false);
+        assertGt(controlBurn, 0, "control: the conviction burns");
+        vm.revertToState(snap);
+
+        _openReview(govA, pid);
+        // `GuardianRegistry._openReview` stamps `block.timestamp - 1` (src/GuardianRegistry.sol:860).
+        uint256 openedAt = vm.getBlockTimestamp() - 1;
+        _voteLock(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve, WHALE_STAKE / 2);
+        _vote(govA, pid, g2, IGuardianRegistry.GuardianVoteType.Block);
+        _vote(govA, pid, g3, IGuardianRegistry.GuardianVoteType.Block);
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+        assertEq(swood.slashableStakeAt(g1, openedAt + 1), WHALE_STAKE, "slash basis at the anchor is the whole stake");
+
+        // Past the cooldown, before resolution: only the coverage gate holds the bond.
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        vm.prank(g1);
+        vm.expectRevert(StakedWood.CoverageStillOpen.selector);
+        swood.claimUnstakeGuardian();
+
+        uint256 before = swood.guardianStake(g1);
+        assertTrue(registry.resolveReview(address(govA), pid), "blocked");
+        assertEq(
+            before - swood.guardianStake(g1), controlBurn, "the pending request and the later resolve change nothing"
+        );
+    }
+
     /// @dev SHE-215: `SyndicateGovernor.propose` / `executeProposal` now refuse
     ///      a vault whose owner-stake slot is unbound, claimed, slashed, or
     ///      exiting. `SyndicateFactory.createSyndicate` ALWAYS binds that slot,
