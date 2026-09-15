@@ -10,6 +10,7 @@ import {StakedWoodHandler} from "./StakedWoodHandler.sol";
 import {SyndicateGovernorHandler} from "./SyndicateGovernorHandler.sol";
 import {SyndicateVaultHandler} from "./SyndicateVaultHandler.sol";
 import {TierRegistryHandler} from "./TierRegistryHandler.sol";
+import {TokenCourtHandler} from "./TokenCourtHandler.sol";
 import {VaultWithdrawalQueueHandler} from "./VaultWithdrawalQueueHandler.sol";
 
 /// @notice Inherits from all the handlers to expose all entry points in a single contract.
@@ -23,6 +24,7 @@ abstract contract Handlers is
     SyndicateGovernorHandler,
     SyndicateVaultHandler,
     TierRegistryHandler,
+    TokenCourtHandler,
     VaultWithdrawalQueueHandler
 {
     function setCurrentActor(uint256 entropy) public {

@@ -32,6 +32,35 @@
     "hasFallback": false,
     "functions": [
       {
+        "name": "claimContribution",
+        "inputs": [
+          {
+            "name": "challengeId",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "tier": "primary"
+      },
+      {
+        "name": "dispute",
+        "inputs": [
+          {
+            "name": "challengeId",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "amountWood",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "tier": "primary"
+      },
+      {
         "name": "file",
         "inputs": [
           {
@@ -81,10 +110,10 @@
         "tier": "primary"
       },
       {
-        "name": "setChallengeQuorumBps",
+        "name": "setAutoSlashDelay",
         "inputs": [
           {
-            "name": "newBps",
+            "name": "newDelay",
             "type": "uint256",
             "internalType": "uint256"
           }
@@ -97,6 +126,18 @@
         "inputs": [
           {
             "name": "newBps",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "tier": "secondary"
+      },
+      {
+        "name": "setDisputeTimeout",
+        "inputs": [
+          {
+            "name": "newTimeout",
             "type": "uint256",
             "internalType": "uint256"
           }
@@ -118,6 +159,18 @@
       },
       {
         "name": "setForfeitBurnBps",
+        "inputs": [
+          {
+            "name": "newBps",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "tier": "secondary"
+      },
+      {
+        "name": "setInconclusiveBurnBps",
         "inputs": [
           {
             "name": "newBps",
@@ -151,35 +204,6 @@
         ],
         "stateMutability": "nonpayable",
         "tier": "secondary"
-      },
-      {
-        "name": "setVoteWindow",
-        "inputs": [
-          {
-            "name": "newWindow",
-            "type": "uint256",
-            "internalType": "uint256"
-          }
-        ],
-        "stateMutability": "nonpayable",
-        "tier": "secondary"
-      },
-      {
-        "name": "voteOnChallenge",
-        "inputs": [
-          {
-            "name": "challengeId",
-            "type": "uint256",
-            "internalType": "uint256"
-          },
-          {
-            "name": "convict",
-            "type": "bool",
-            "internalType": "bool"
-          }
-        ],
-        "stateMutability": "nonpayable",
-        "tier": "primary"
       }
     ]
   },
@@ -1842,6 +1866,90 @@
         ],
         "stateMutability": "nonpayable",
         "tier": "secondary"
+      }
+    ]
+  },
+  {
+    "name": "TokenCourt",
+    "sourcePath": "src/TokenCourt.sol",
+    "artifactPath": "out/TokenCourt.sol/TokenCourt.json",
+    "constructor": {
+      "inputs": [
+        {
+          "name": "initialOwner",
+          "type": "address",
+          "internalType": "address"
+        }
+      ],
+      "stateMutability": "nonpayable"
+    },
+    "hasReceive": false,
+    "hasFallback": false,
+    "functions": [
+      {
+        "name": "finalize",
+        "inputs": [
+          {
+            "name": "caseId",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "tier": "primary"
+      },
+      {
+        "name": "refer",
+        "inputs": [
+          {
+            "name": "challengeId",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "tier": "primary"
+      },
+      {
+        "name": "setParticipationFloorBps",
+        "inputs": [
+          {
+            "name": "newBps",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "tier": "secondary"
+      },
+      {
+        "name": "setVoteWindow",
+        "inputs": [
+          {
+            "name": "newWindow",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "tier": "secondary"
+      },
+      {
+        "name": "vote",
+        "inputs": [
+          {
+            "name": "caseId",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "guilty",
+            "type": "bool",
+            "internalType": "bool"
+          }
+        ],
+        "stateMutability": "nonpayable",
+        "tier": "primary"
       }
     ]
   },

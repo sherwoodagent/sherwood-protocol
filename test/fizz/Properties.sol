@@ -6,6 +6,7 @@ import {PropertiesAsserts} from "./utils/PropertiesAsserts.sol";
 
 import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {IChallengeGame} from "../../src/interfaces/IChallengeGame.sol";
+import {ITokenCourt} from "../../src/interfaces/ITokenCourt.sol";
 import {IVaultWithdrawalQueue} from "../../src/interfaces/IVaultWithdrawalQueue.sol";
 
 /// @notice Contains the functions that check the properties (invariants)
@@ -23,10 +24,10 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
 
     // ── Conservation (GL-01, GL-05, GL-06, GL-07, GL-09, GL-11, GL-14) ──
 
-    /// @notice GL-01 — WOOD held by `ChallengeGame` always covers its bonded
-    ///         WOOD (verbatim NatSpec invariant on the contract).
-    function property_GL01_gameWoodCoversBondedWood() public view returns (bool) {
-        return wood.balanceOf(address(game)) >= game.bondedWood();
+    /// @notice GL-01 — WOOD held by `ChallengeGame` always covers bonded +
+    ///         unclaimed WOOD (verbatim NatSpec invariant on the contract).
+    function property_GL01_gameWoodCoversBondedAndUnclaimed() public view returns (bool) {
+        return wood.balanceOf(address(game)) >= game.bondedWood() + game.unclaimedWood();
     }
 
     /// @notice GL-05 — Σ live (unclaimed, uncancelled) redeem-request amounts
@@ -112,22 +113,99 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         return sum == swood.totalGuardianStake();
     }
 
-    /// @notice GL-14 — a challenge's convict tally never exceeds the stake that
-    ///         was eligible to cast it.
-    /// @dev The quorum test is `convictWeight * BPS >= quorumBps * votable`, so
-    ///      a tally that could outgrow its own denominator would let a filing
-    ///      convict on less than the fraction it claims. Both tallies are
-    ///      checked against the one denominator because each voter's weight is
-    ///      counted into exactly one of them, and `votableStakeAtFiling` is the
-    ///      total those weights were drawn from.
-    function property_GL14_convictWeightNeverExceedsVotableStake() public view returns (bool) {
+    /// @notice GL-14 — the counter-bond pool is keyed per PROPOSAL, not per
+    ///         challenge (pashov 2026-08 finding #10), so this no longer asserts
+    ///         anything per-challenge. Walking every live (`Filed`/`Disputed`)
+    ///         challenge, it says three things — two about THE POOL THAT
+    ///         CHALLENGE BELONGS TO, and one about the whole ledger those pools
+    ///         and bonds add up to:
+    ///
+    ///           1. Σ `counterBondContributionOf` over the pool's contributor
+    ///              list equals the pool's `raisedWood` — the contributor ledger
+    ///              and the pool total never diverge.
+    ///           2. `bondedWood` equals Σ live challenge bonds + Σ DISTINCT
+    ///              open pool weights — the contract's own held-WOOD counter
+    ///              against the positions that counter is supposed to be
+    ///              summarising.
+    ///
+    ///              NOT a comparison between `poolWood` and `raisedWood`, which
+    ///              is what this clause used to be and what it cannot be:
+    ///              `counterBondPoolOf` derives BOTH from `p.weight`, returning
+    ///              `outcome == Open ? raisedWood : 0` alongside `raisedWood`
+    ///              itself, so `poolWood == raisedWood` holds by construction
+    ///              wherever the outcome is `Open` and the check is
+    ///              unsatisfiable. A derived field and its own source can never
+    ///              disagree; an invariant has to cross an independent boundary.
+    ///
+    ///              `bondedWood` is that boundary. Every mutation of it is a
+    ///              position this loop can see: `file` adds a bond, `dispute`
+    ///              adds a contribution, `_settle`/`_fail`/`_refundAll` each
+    ///              remove one bond, and `_burnPool`/`_releasePool` each remove
+    ///              one pool. So the equality catches a decrement keyed on the
+    ///              wrong pool, a double decrement, and a pool left `Open` after
+    ///              its last live challenge terminated — none of which the old
+    ///              form could see. Unit-side sibling: `_assertLiveBondsBacked`
+    ///              in `ChallengeGame.t.sol`, which asserts the same shape.
+    ///
+    ///              `poolWood` is already zero for any non-`Open` outcome, so a
+    ///              burned or released pool drops out of the sum without a
+    ///              second read — a terminal pool coexisting with a live
+    ///              challenge stays the normal state it is.
+    ///
+    ///              Custody (`balanceOf >= bondedWood + unclaimedWood`) is a
+    ///              different statement and is pinned separately by GL-01. This
+    ///              one is about whether the counter is right, not whether the
+    ///              tokens are there.
+    ///           3. Neither defence exceeds the target — `dispute` clamps the
+    ///              overshoot rather than refunding it. The SHARED defence is
+    ///              bounded until it completes, and a challenge the completion
+    ///              does not answer is bounded by its OWN `defenceWeight`; the
+    ///              round's raised total is their sum, so it is not itself
+    ///              bounded by one target.
+    ///
+    ///         The pre-fix version compared a per-challenge contributor sum
+    ///         against `challengeOf(id).counterBondWood`. That comparison went
+    ///         vacuous rather than false once the pool moved per-key: BOTH sides
+    ///         now read the shared pool, so it could no longer catch a
+    ///         divergence between a challenge and its own funding. Concurrent
+    ///         challenges on one review key deliberately report the SAME pool
+    ///         here, which is the whole point of the fix.
+    function property_GL14_counterBondPoolMatchesContributions() public view returns (bool) {
         uint256 n = game.challengeCount();
+        uint256 accounted;
+        bytes32[] memory seen = new bytes32[](n);
+        uint256 seenN;
         for (uint256 id = 1; id <= n; id++) {
-            (uint256 convictWeight, uint256 votable,) = game.challengeTallyOf(id);
-            if (convictWeight > votable) return false;
-            if (game.challengeOf(id).acquitWeight + convictWeight > votable) return false;
+            IChallengeGame.Challenge memory c = game.challengeOf(id);
+            if (c.status != IChallengeGame.Status.Filed && c.status != IChallengeGame.Status.Disputed) continue;
+
+            (uint256 poolWood, uint256 targetWood, uint256 raisedWood, uint256 completedAt,) =
+                game.counterBondPoolOf(id);
+            address[] memory contributors = game.counterBondContributors(id);
+            uint256 sum;
+            for (uint256 j; j < contributors.length; j++) {
+                sum += game.counterBondContributionOf(id, contributors[j]);
+            }
+            if (sum != raisedWood) return false;
+            if (completedAt == 0 && raisedWood > targetWood) return false;
+            if (c.defenceWeight > targetWood) return false;
+
+            // THE LEDGER SIDE. Every live challenge's own bond counts once;
+            // each PROPOSAL's pool counts once however many challenges share
+            // it, which is why the key is deduplicated rather than the id.
+            // `poolWood` is already zero for any closed pool, so a burned or
+            // released one contributes nothing and needs no second read.
+            accounted += c.bondWood;
+            bytes32 key = keccak256(abi.encode(c.governor, c.proposalId));
+            bool counted;
+            for (uint256 j; j < seenN; j++) {
+                if (seen[j] == key) counted = true;
+            }
+            if (counted) continue;
+            seen[seenN++] = key;
+            accounted += poolWood;
         }
-        return true;
+        return accounted == game.bondedWood();
     }
 
     // ── Counts and state consistency (GL-15, GL-16, GL-17, GL-18) ──
@@ -197,14 +275,18 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     }
 
     /// @notice GL-17 — `game.liveChallengeCountOf(governor, pid)` equals the
-    ///         count of challenges against that key with status `Filed`.
-    function property_GL17_liveChallengeCountMatchesFiled() public view returns (bool) {
+    ///         count of challenges against that key with status `Filed` or
+    ///         `Disputed`.
+    function property_GL17_liveChallengeCountMatchesFiledOrDisputed() public view returns (bool) {
         uint256 pCount = governor.proposalCount();
         uint256 cCount = game.challengeCount();
         uint256[] memory liveCounts = new uint256[](pCount + 1);
         for (uint256 id = 1; id <= cCount; id++) {
             IChallengeGame.Challenge memory c = game.challengeOf(id);
-            if (c.governor == address(governor) && c.proposalId <= pCount && c.status == IChallengeGame.Status.Filed) {
+            if (
+                c.governor == address(governor) && c.proposalId <= pCount
+                    && (c.status == IChallengeGame.Status.Filed || c.status == IChallengeGame.Status.Disputed)
+            ) {
                 liveCounts[c.proposalId]++;
             }
         }
@@ -225,9 +307,9 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         return frozenCount == ledger.frozenCoverageCount();
     }
 
-    // ── One-shot latches and terminality (GL-23, GL-26, GL-31, GL-34, GL-36) ──
+    // ── One-shot latches and terminality (GL-23, GL-26, GL-30, GL-31, GL-34, GL-36) ──
     //
-    // GL-23, GL-26, GL-31 and GL-34 are entirely SELF-MAINTAINED: each
+    // GL-23, GL-26, GL-30, GL-31 and GL-34 are entirely SELF-MAINTAINED: each
     // property function reads the current on-chain value, compares it to the
     // ghost it wrote on its own previous call, then overwrites the ghost.
     // No handler wiring is needed for those. GL-36 is the one exception —
@@ -254,7 +336,8 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     }
 
     function _isTerminalChallengeStatus(uint8 s) private pure returns (bool) {
-        return s == uint8(IChallengeGame.Status.Failed) || s == uint8(IChallengeGame.Status.Settled);
+        return s == uint8(IChallengeGame.Status.Failed) || s == uint8(IChallengeGame.Status.Settled)
+            || s == uint8(IChallengeGame.Status.Inconclusive);
     }
 
     /// @notice GL-26 — a challenge reaches exactly one terminal status and
@@ -271,20 +354,32 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         return ok;
     }
 
-    /// @notice GL-31 — a guardian's vote on a challenge is a one-shot latch:
-    ///         `hasVotedOn` never returns to false.
-    /// @dev There is no un-vote, and `resolve` leans on exactly that: it settles
-    ///      the instant the convict tally crosses quorum, without waiting for
-    ///      the window, because a tally that can only grow cannot be walked back
-    ///      under a verdict that has already been executed.
-    function property_GL31_challengeVoteIsOneShot() public returns (bool) {
-        uint256 n = game.challengeCount();
+    /// @notice GL-30 — a court case's phase goes `Voting → Resolved` once,
+    ///         never back.
+    function property_GL30_caseResolvedIsOneShot() public returns (bool) {
+        uint256 n = court.caseCount();
+        bool ok = true;
+        for (uint256 id = 1; id <= n; id++) {
+            uint8 cur = uint8(court.caseOf(id).phase);
+            uint8 prev = ghosts.lastCasePhase[id];
+            if (prev == uint8(ITokenCourt.Phase.Resolved) && cur != prev) ok = false;
+            ghosts.lastCasePhase[id] = cur;
+        }
+        return ok;
+    }
+
+    /// @notice GL-31 — `voteOf[caseId][voter]` is one-shot: NatSpec says
+    ///         "NO VOTE CHANGES".
+    function property_GL31_voteOfIsOneShot() public returns (bool) {
+        uint256 n = court.caseCount();
         bool ok = true;
         for (uint256 id = 1; id <= n; id++) {
             for (uint256 i; i < actors.length; i++) {
-                bool cur = game.hasVotedOn(id, actors[i]);
-                if (ghosts.everVotedOn[id][actors[i]] && !cur) ok = false;
-                if (cur) ghosts.everVotedOn[id][actors[i]] = true;
+                address voter = actors[i];
+                uint8 cur = uint8(court.voteOf(id, voter));
+                uint8 prev = ghosts.lastVoteOf[id][voter];
+                if (prev != uint8(ITokenCourt.Ruling.None) && cur != prev) ok = false;
+                ghosts.lastVoteOf[id][voter] = cur;
             }
         }
         return ok;
@@ -343,6 +438,10 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
         uint256 cCount = game.challengeCount();
         if (cCount < ghosts.lastChallengeCount) ok = false;
         ghosts.lastChallengeCount = cCount;
+
+        uint256 caseCnt = court.caseCount();
+        if (caseCnt < ghosts.lastCaseCount) ok = false;
+        ghosts.lastCaseCount = caseCnt;
 
         uint256 reqId = queue.nextRequestId();
         if (reqId < ghosts.lastNextRequestId) ok = false;
@@ -437,6 +536,44 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
             uint256 prev = ghosts.lastExecutedAt[pid];
             if (prev != 0 && cur != prev) return false;
             if (cur != 0) ghosts.lastExecutedAt[pid] = cur;
+        }
+        return true;
+    }
+
+    /// @notice GL-32 `SHOULD-HOLD` — `caseOfChallenge` is set once per
+    ///         challenge.
+    /// @dev A second referral would hand one challenge two adjudications, and
+    ///      the two verdicts could disagree — `rule` would then be callable
+    ///      twice against the same bond. Relevant because referral has TWO
+    ///      entry points: the auto-referral inside `dispute` and the explicit
+    ///      `TokenCourt.refer`.
+    function property_GL32_caseOfChallengeSetOnce() public returns (bool) {
+        uint256 n = game.challengeCount();
+        for (uint256 id = 1; id <= n; id++) {
+            uint256 cur = court.caseOfChallenge(address(game), id);
+            uint256 prev = ghosts.lastCaseOfChallenge[id];
+            if (prev != 0 && cur != prev) return false;
+            if (cur != 0) ghosts.lastCaseOfChallenge[id] = cur;
+        }
+        return true;
+    }
+
+    /// @notice GL-33 `SHOULD-HOLD` — `isAccused` is never cleared mid-case.
+    /// @dev The bar exists so an approver cannot vote on their own conviction.
+    ///      Clearing it before `finalize` would let the accused cohort acquit
+    ///      itself, which is the single most valuable state to reach for an
+    ///      attacker in the whole court.
+    function property_GL33_accusedFlagNeverCleared() public returns (bool) {
+        uint256 n = court.caseCount();
+        for (uint256 id = 1; id <= n; id++) {
+            for (uint256 a; a < actors.length; a++) {
+                bool cur = court.isAccused(id, actors[a]);
+                if (cur) {
+                    ghosts.everAccused[id][actors[a]] = true;
+                } else if (ghosts.everAccused[id][actors[a]]) {
+                    return false;
+                }
+            }
         }
         return true;
     }
@@ -550,8 +687,9 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     ///      alone. The two views read identical storage since `settleCoverage`
     ///      went away (there is no longer a booking distinct from the pledge),
     ///      so their agreement — and agreement with `lockOf` — is pinned here
-    ///      too: `ChallengeGame.file` asks `pledgedOf`, the quorum asks the
-    ///      approver list, and they must never see different cohorts.
+    ///      too: `ChallengeGame.file` and `TokenCourt` ask `pledgedOf`, the
+    ///      quorum asks the approver list, and they must never see different
+    ///      cohorts.
     function property_GL20_approverArrayMatchesPledges() public view returns (bool) {
         uint256 n = governor.proposalCount();
         for (uint256 pid = 1; pid <= n; pid++) {
@@ -577,8 +715,8 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     ///      what stops a challenger re-filing to re-freeze coverage that a
     ///      previous filing already released — a griefing loop that would pin a
     ///      guardian's stake indefinitely at the cost of one bond. Live means
-    ///      Filed; the terminal statuses are allowed to repeat because the
-    ///      window legitimately re-arms after a challenge that missed quorum.
+    ///      Filed or Disputed; the terminal statuses are allowed to repeat
+    ///      because the window legitimately re-arms after an Inconclusive.
     function property_GL21_oneLiveChallengePerProposalChallenger() public view returns (bool) {
         uint256 n = game.challengeCount();
         for (uint256 a = 1; a <= n; a++) {
@@ -596,7 +734,7 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     }
 
     function _isLive(IChallengeGame.Status s) private pure returns (bool) {
-        return s == IChallengeGame.Status.Filed;
+        return s == IChallengeGame.Status.Filed || s == IChallengeGame.Status.Disputed;
     }
 
     // ―――――――――― ExposureLedger lock accounting (x-ray I-5 / X-8) ――――――――――
@@ -705,15 +843,11 @@ abstract contract Properties is PropertiesAsserts, Snapshots {
     ///      a bug, and the expected outcome here is that this DOES fail. Three
     ///      reasons it is still worth running:
     ///
-    ///      1. It prices only the CONVICTION branch:
-    ///         `proposerBondBps * prosecutorFeeBps` against
-    ///         `challengerBondBps * settleBurnBps`. Reaching it now means
-    ///         winning a guardian vote, and the branch where that vote misses
-    ///         quorum — where the challenger pays `forfeitBurnBps` of the bond
-    ///         — is not in the formula at all. So the reading is the filing's
-    ///         BEST case: non-negative here does not make the filing profitable
-    ///         in expectation, and negative here is unambiguously a losing
-    ///         trade.
+    ///      1. It prices only the SILENCE branch, where the challenger
+    ///         recovers `bond - burned`. On the escalated branch it also takes
+    ///         the forfeited counter-bond (`Disputed` implies
+    ///         `pool == bondWood`), which the contract deliberately does not
+    ///         model. So negative here does not prove a losing game overall.
     ///      2. No setter can enforce it. `proposerBondBps` lives on
     ///         `ExposureLedger` and the other three on `ChallengeGame`, so
     ///         there is no single owner to check the product against — and a

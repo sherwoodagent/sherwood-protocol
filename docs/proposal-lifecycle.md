@@ -73,10 +73,10 @@ Cross-contract timing invariants (all enforced at the setters):
 - `ledger.challengeWindow ≥ reviewPeriod + MAX_GOVERNOR_EXECUTION_WINDOW (7 d)` —
   coverage stays challengeable through the longest possible execution delay
   (`GuardianRegistry.sol:1018`).
-- `ChallengeGame.voteWindow ≥ MIN_VOTE_WINDOW (2 d)` — every filing gets a window the
-  guardian cohort can realistically notice and decide inside, and the window a
-  challenge actually receives is pinned at filing so no later change can close one the
-  accused is still inside (`ChallengeGame.sol:50`). At deployed values: 7 d ≥ 2 d.
+- `ChallengeGame: autoSlashDelay + court.voteWindow + FINALIZE_BUFFER +
+  MIN_REFERRAL_SLACK ≤ disputeTimeout` — a disputed challenge always has room for a
+  full court vote before the timeout, plus 1 h of referral slack
+  (`ChallengeGame.sol:117`). At deployed values: 7 d + 5 d + 1 d + 1 h ≈ 13 d ≤ 30 d.
 
 ## Step by step
 
@@ -184,11 +184,11 @@ pays the recorded proposer, but for executed proposals only after **three** gate
 
 1. `executedAt + ledger.challengeWindow` (default 14 d) has passed,
 2. coverage is not frozen by a live challenge,
-3. the challenge game's own deadline — including the one re-arm a silent failure
-   grants — is strictly past.
+3. the challenge game's own deadline — including any inconclusive-verdict re-arm —
+   is strictly past.
 
-A conviction in the challenge game forfeits the whole bond: prosecutor fee
-(default 20%, which is also the cap) to the challenger, remainder burned.
+A guilty or silence conviction in the challenge game forfeits the whole bond:
+prosecutor fee (default 5%, ≤ 20%) to the challenger, remainder burned.
 
 ## Who can call what (summary)
 

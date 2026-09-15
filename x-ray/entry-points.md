@@ -19,7 +19,8 @@ Counts come from the grep-verified signature scan over `src/` (interfaces and mo
 `ExposureLedger` (constructor) → `setWoodUsdPrice()` ◄── required; zero reverts every price read
                               → `setWoodTwapOracle()` → `setAssetFeed()` → `setGuardianRegistry()` → `setCoverageFreezer()`
 
-`ChallengeGame` (constructor) → `setExposureLedger()` → `setStakedWood()` ◄── `setStakedWood` is required before any filing: `file` reads the electorate off it and reverts `ZeroAddress` unwired
+`ChallengeGame` (constructor) → `setExposureLedger()` → `setStakedWood()` → `setCourt()` ◄── window-fit invariant checked from both sides
+`TokenCourt` (constructor) → `setChallengeGame()` → `setStakedWood()` ◄── participationFloorBps < ageFloorBps
 
 `TierRegistry.setAuthorizedDemoter(challengeGame)`
 
@@ -78,10 +79,14 @@ Counts come from the grep-verified signature scan over `src/` (interfaces and mo
 ### Challenger Flow
 
 `[proposal Executed above]` → `ChallengeGame.file()` ◄── inside challengeableUntil, not already convicted, bond in WOOD
-   ├─→ `voteOnChallenge(id, convict)` × N ◄── stake weight at filedAt−1; accused approvers barred
-   ├─→ [convict quorum reached] → `resolve()` → Settled → `StakedWood.slashVerdict()` + `ProposerBondEscrow.forfeitBond()` + `TierRegistry.demoteByChallenge()`
-   └─→ [voteWindow elapses short of quorum] → `resolve()` → Failed → burn `forfeitBurnBps`, remainder to the challenger
-          └─ window re-armed iff no acquit vote was cast and this proposal has not been re-armed before
+   ├─→ [silence past autoSlashDelay] → `resolve()` → Settled → `StakedWood.slashVerdict()` + `ProposerBondEscrow.forfeitBond()`
+   ├─→ `dispute()` × N until the counter-bond target is met → Disputed → `TokenCourt.refer()`
+   │      → `TokenCourt.vote()` ◄── WOOD weight at executedAt−1; accused and challenger barred
+   │      → [voteWindow elapses] → `TokenCourt.finalize()` → `ChallengeGame.rule()`
+   │           ├─ Guilty       → Settled
+   │           ├─ NotGuilty    → Failed        → `claimContribution()`
+   │           └─ Inconclusive → Inconclusive  → `claimContribution()`, window re-armed
+   └─→ [disputeTimeout with no verdict] → `resolve()` → Failed
 
 ### Maintenance (Permissionless Keepers)
 
@@ -140,22 +145,22 @@ Entry points callable by any address with no effective access restriction. Sorte
 | Visibility | external |
 | Caller | Anyone |
 | Parameters | `proposalId` (protocol-derived), `predicate` (user-controlled, **not verified on-chain**), `adapterTarget` / `adapterSelector` (user-controlled), `evidenceURI` (user-controlled) |
-| Call chain | `→ SyndicateGovernor.getProposal()/getExecuteCalls() → ExposureLedger.pledgedOf()/unsharedLiabilityUsd()/woodPriceX8() → StakedWood.verdictSlashed()/getPastTotalVotes()/getPastStake() → ExposureLedger.freezeCoverage() → IERC20.safeTransferFrom()` |
-| State modified | `challengeCount`, `_challenges` (incl. `votableStakeAtFiling`, `quorumBpsAtFiling`, `voteWindowAtFiling`), `_accusedApprover`, `_lastChallenge`, `_liveByChallenger`, `_liveCount`, `bondedWood` |
+| Call chain | `→ SyndicateGovernor.getProposal()/getExecuteCalls() → ExposureLedger.approversOf()/unsharedLiabilityUsd()/woodPriceX8() → StakedWood.verdictSlashed() → IERC20.safeTransferFrom() → ExposureLedger.freezeCoverage()` |
+| State modified | `challengeCount`, `_challenges`, `_lastChallenge`, `_liveByChallenger`, `_liveCount`, `bondedWood`, `inconclusiveRounds` |
 | Value flow | Tokens: challenger → ChallengeGame (bond) |
 | Reentrancy guard | no (CEI-ordered) |
 
-### `ChallengeGame.voteOnChallenge()`
+### `ChallengeGame.dispute()`
 
 | Aspect | Detail |
 |--------|--------|
 | Visibility | external |
-| Caller | Any active guardian with non-zero stake at `filedAt - 1`, except the challenge's accused approvers (`AccusedCannotVote`) |
-| Parameters | `challengeId` (protocol-derived), `convict` (user-controlled) |
-| Call chain | `→ StakedWood.isActiveGuardian() → StakedWood.getPastStake()` |
-| State modified | `_voted[id][voter]` (one-shot), and exactly one of `c.convictWeight` / `c.acquitWeight` |
-| Value flow | None — the vote moves no tokens |
-| Reentrancy guard | no (no external value transfer; both reads are to sWOOD) |
+| Caller | Anyone (explicitly open — the defense pool is crowdfunded) |
+| Parameters | `challengeId` (protocol-derived), `amountWood` (user-controlled) |
+| Call chain | `→ IERC20.safeTransferFrom() → ITokenCourt.refer()` (best-effort, try/catch) |
+| State modified | `_contributed`, `_contributors`, `c.counterBondWood`, `c.status` (Filed → Disputed on pool completion), `bondedWood` |
+| Value flow | Tokens: contributor → ChallengeGame (counter-bond) |
+| Reentrancy guard | no (CEI-ordered; writes precede the transfer) |
 
 ### `StakedWood.stakeAsGuardian()`
 
@@ -421,6 +426,18 @@ Entry points callable by any address with no effective access restriction. Sorte
 | Value flow | None (USD accounting only) |
 | Reentrancy guard | no |
 
+### `TokenCourt.refer()` / `vote()` / `finalize()`
+
+| Aspect | Detail |
+|--------|--------|
+| Visibility | external |
+| Caller | `refer` and `finalize`: anyone. `vote`: any WOOD holder except the accused and the challenger. |
+| Parameters | `challengeId` / `caseId` (protocol-derived), `guilty` (user-controlled) |
+| Call chain | `refer → ChallengeGame.challengeOf() → ExposureLedger.pledgedOf() → StakedWood.getPastStake()`; `vote → StakedWood.getPastVotes()/getPastStake()/getPastTotalVotes()/getVotes()`; `finalize → ChallengeGame.rule()` (try/catch swallowing only `WrongStatus`) |
+| State modified | `caseCount`, `caseOfChallenge`, `_cases`, `isAccused`, `_accused`, `voteOf`, `c.guiltyVotes` / `notGuiltyVotes`, `c.verdict`, `c.finalizedAt`, `c.phase` |
+| Value flow | None — the court holds no WOOD by design |
+| Reentrancy guard | no (CEI-ordered; `refer` claims the case slot before any external read) |
+
 ### `ChallengeGame.resolve()`
 
 | Aspect | Detail |
@@ -428,8 +445,8 @@ Entry points callable by any address with no effective access restriction. Sorte
 | Visibility | external |
 | Caller | Anyone |
 | Parameters | `challengeId` (protocol-derived) |
-| Call chain | `→ _settle / _fail → StakedWood.slashVerdict() → ProposerBondEscrow.forfeitBond() → TierRegistry.demoteByChallenge() → ExposureLedger.unfreezeCoverage()/pinCoverageUntil() → IERC20.safeTransfer()` |
-| State modified | `c.status`, `bondedWood`, `_convicted`, `_rearmed`, `_liveCount`, `challengeableUntil` |
+| Call chain | `→ _settle / _fail / _refundAll → StakedWood.slashVerdict() → ProposerBondEscrow.forfeitBond() → TierRegistry.demoteByChallenge() → ExposureLedger.unfreezeCoverage()/pinCoverageUntil() → IERC20.safeTransfer()` |
+| State modified | `c.status`, `bondedWood`, `unclaimedWood`, `_convicted`, `_liveCount`, `challengeableUntil`, `inconclusiveRounds`, `c.forfeitPayoutWood` |
 | Value flow | Tokens: ChallengeGame → challenger + burn address; Escrow → challenger + burn |
 | Reentrancy guard | no (CEI-ordered) |
 
@@ -548,6 +565,7 @@ Entry points restricted by a modifier or an internal `msg.sender` check.
 | StakedWood | `bindOwnerStake()`, `transferOwnerStakeSlot()` | `onlyFactory` | SyndicateFactory |
 | ProposerBondEscrow | `lockBond()` | `onlyGovernor` (via `registry.isAuthorizedGovernor`) | per-vault governors |
 | ProposerBondEscrow | `forfeitBond()` | `msg.sender != exposureLedger.coverageFreezer()` revert | ChallengeGame |
+| ChallengeGame | `rule()` | `msg.sender != court` revert | TokenCourt |
 | TierRegistry | `demoteByChallenge()` | `msg.sender != authorizedDemoter` revert | ChallengeGame |
 | BaseStrategy | `execute()`, `settle()` | `onlyVault` | SyndicateVault (via the batch) |
 | UniswapSwapAdapter | `unlockCallback()` | `msg.sender != poolManager` revert | Uniswap V4 PoolManager |
@@ -562,12 +580,13 @@ Owner-restricted configuration surfaces. These configure the protocol rather tha
 | Contract | Functions | Count | Delay |
 |----------|-----------|------:|-------|
 | SyndicateFactory | `setCreationFee`, `setVaultImpl`, `setExecutorImpl`, `pushExecutor`, `setManagementFeeBps`, `setUpgradesEnabled`, `setEnsRegistrar`, `setBeacon`, `setProtocolConfig`, `setParamsOverride`, `setGuardianRegistry`, `setTierRegistry`, `setExposureLedger`, `setBondEscrow`, `pushWiring`, `_authorizeUpgrade` | 16 | none |
-| ChallengeGame | `setExposureLedger`, `setTierRegistry`, `setChallengeWindow`, `setChallengerBondBps`, `setForfeitBurnBps`, `setStakedWood`, `setVoteWindow`, `setChallengeQuorumBps`, `setSettleBurnBps`, `setProsecutorFeeBps`, `setFilingsPaused` | 11 | none (`renounceOwnership` disabled); every rate and clock is pinned per challenge at filing |
+| ChallengeGame | `setCourt`, `setExposureLedger`, `setTierRegistry`, `setChallengeWindow`, `setChallengerBondBps`, `setForfeitBurnBps`, `setStakedWood`, `setAutoSlashDelay`, `setDisputeTimeout`, `setSettleBurnBps`, `setProsecutorFeeBps`, `setInconclusiveBurnBps`, `setFilingsPaused` | 13 | none (`renounceOwnership` disabled) |
 | ExposureLedger | `setWoodUsdPrice`, `setWoodFeed`, `setWoodTwapOracle`, `setWoodHaircutBps`, `setGuardianRegistry`, `setChallengeWindow`, `setCoverageFreezer`, `setKNumerator`, `setCoveredTvlCapUsd`, `setQuorumTierThreshold`, `setProposerBondBps`, `setAssetFeed` | 12 | none |
 | StakedWood | `setRegistry`, `setMinGuardianStake`, `setCooldownPeriod`, `setMinOwnerStake`, `setMinSlashBps`, `setMaxSlashBps`, `setAgeFloorBps`, `setMaturationPeriod`, `setExposureLedger`, `setAuthorizedSlasher`, `_authorizeUpgrade` | 11 | none |
 | TierRegistry | `certify`, `setAuthorizedDemoter`, `demote` | 3 | none |
 | GuardianRegistry | `fundSlashAppealReserve`, `refundSlash`, `pause`, `setReviewPeriod`, `setBlockQuorumBps`, `setExposureLedger`, `_authorizeUpgrade` | 7 | none |
 | ProtocolConfig | `setMgmtSplit`, `setPerfSplit`, `setMaxStrategyDuration`, `setProtocolFeeRecipient`, `setGuardiansFeeRecipient` | 5 | none (Ownable2Step) |
+| TokenCourt | `setChallengeGame`, `setStakedWood`, `setVoteWindow`, `setParticipationFloorBps` | 4 | none (`renounceOwnership` reverts) |
 | WoodTwapOracle | `setTwapWindow`, `setMaxTwapAge`, `setEthUsdMaxDelay` | 3 | none (Ownable2Step) |
 | GovernorBeacon | `upgradeTo` (inherited `UpgradeableBeacon`) | 1 | none — upgrades every per-vault governor at once |
 | StrategyFactory | `setTemplateApproval` | 1 | none |

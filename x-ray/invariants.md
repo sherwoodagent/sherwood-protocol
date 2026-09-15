@@ -122,13 +122,13 @@ Per-call preconditions. Heading IDs below (`G-N`) are anchor targets from x-ray.
 `if (_convicted[key]) revert AlreadyConvicted();` · `ChallengeGame.sol:854` · Enforces one liability per proposal — once collected, no further filing can extract a second one.
 
 #### G-38
-`if (newWindow < MIN_VOTE_WINDOW) revert InvalidParameter();` · `ChallengeGame.sol:878` · Floors the decision window at 48 h, so the owner cannot collapse it and turn a filing into an instant verdict. The window a live challenge runs on is `voteWindowAtFiling`, pinned at `file`, so this bounds only future filings.
+`if (newDelay < MIN_AUTO_SLASH_DELAY || newDelay >= disputeTimeout) revert InvalidParameter();` · `ChallengeGame.sol:2414` · Keeps the silence window strictly inside the dispute window; paired with G-39 the ordering is unbreakable from either setter.
 
 #### G-39
-`if (newBps < 1_000 || newBps > BPS_DENOMINATOR) revert InvalidParameter();` · `ChallengeGame.sol:887` · Bounds the convict quorum to [10%, 100%] of the votable stake — a bar a single dust guardian could clear would make the vote a formality. Pinned per challenge as `quorumBpsAtFiling`.
+`if (newTimeout <= autoSlashDelay || newTimeout > MAX_DISPUTE_TIMEOUT) revert InvalidParameter();` · `ChallengeGame.sol:2426` · Other half of the same ordering, plus the 60-day absolute ceiling.
 
 #### G-40
-`if (votable == 0) revert NoVotableStake();` · `ChallengeGame.sol:425` · Refuses a filing whose electorate, after striking the accused cohort's stake, is empty: nobody could decide it, so the bond could only burn.
+`if (participationFloorBps >= IStakedWoodAgeFloor(newStakedWood).ageFloorBps()) revert FloorInvariantViolated();` · `TokenCourt.sol:258` · Keeps the court's participation floor strictly below sWOOD's age-weight floor, so a fresh-stake electorate cannot be a quorum by construction. One-sided — see [X-2](#x-2).
 
 ---
 
@@ -150,11 +150,11 @@ Each block is classified into one of five **categories** by shape: `Conservation
 
 `Conservation` · On-chain: **No**
 
-> `wood.balanceOf(ChallengeGame) >= bondedWood` at all times.
+> `wood.balanceOf(ChallengeGame) >= bondedWood + unclaimedWood` at all times.
 
-**Derivation** — NatSpec on `bondedWood` — *"Invariant: `wood.balanceOf(this) >= bondedWood`"*. `bondedWood` is the sum of the live (`Filed`) challenges' challenger bonds, the only WOOD the game custodies. Structural confirmation via Δ-pairs over the one credit and two debits: `file:465` `Δ(bondedWood)=+bondWood` ↔ `wood.safeTransferFrom(challenger, this, bondWood)`; `_settle:572` `Δ(bondedWood)=-bond` ↔ a burn leg plus a challenger leg summing to `bond`; `_fail:673` `Δ(bondedWood)=-bond` ↔ the same two legs at `forfeitBurnBpsAtFiling`. Never asserted at runtime.
+**Derivation** — NatSpec: `ChallengeGame.sol` header — *"The game SHALL track `bondedWood` … and `unclaimedWood` … maintaining `wood.balanceOf(game) >= bondedWood + unclaimedWood` at all times"*. Structural confirmation via Δ-pairs: `file` `Δ(bondedWood)=+bondWood` ↔ `wood.safeTransferFrom(challenger, this, bondWood)`; `dispute:1221` `Δ(bondedWood)=+amount` ↔ `Δ(_contributed[id][sender])=+amount`; `_settle:1414` `Δ(bondedWood)=-(bond+pool)` ↔ two `safeTransfer` legs; `_fail:1790` `Δ(bondedWood)=-(bond+pool)`, `Δ(unclaimedWood)=+(pool+payout)`; `claimContribution:2098` `Δ(_contributed)=0` ↔ `Δ(unclaimedWood)=-amount`. Never asserted at runtime.
 
-**If violated** — a terminal path pays out more WOOD than the game holds, and the losing `safeTransfer` reverts, wedging the challenge in `Filed` with no other exit.
+**If violated** — a terminal path pays out more WOOD than the game holds, and the last claimant's `safeTransfer` reverts with no recovery route.
 
 ---
 
@@ -270,11 +270,11 @@ Each block is classified into one of five **categories** by shape: `Conservation
 
 `Bound` · On-chain: **Yes**
 
-> `voteWindow >= MIN_VOTE_WINDOW (2 days)` and `challengeQuorumBps ∈ [1_000, 10_000]` globally, and every live challenge runs on the pair pinned at its own filing.
+> `autoSlashDelay < disputeTimeout <= MAX_DISPUTE_TIMEOUT (60 days)` globally.
 
-**Derivation** — guard-lift over both write sites, `ChallengeGame.setVoteWindow:878` (G-38) and `setChallengeQuorumBps:887` (G-39), combined with the pin: `file` copies both into `voteWindowAtFiling` / `quorumBpsAtFiling`, and `voteOnChallenge` / `resolve` read only the pinned copies. The constructor seeds a valid pair.
+**Derivation** — guard-lift over both write sites: `ChallengeGame.setAutoSlashDelay:2414` (G-38) and `setDisputeTimeout:2426` (G-39) each reject values that would invert the ordering, so neither setter can break it unilaterally. The constructor seeds a valid pair.
 
-**If violated** — a live challenge could be re-timed or re-rated after the challenger bonded against it and after the accused began relying on the window.
+**If violated** — the silence window would outlast the dispute window, making `resolve` reachable on both branches at once.
 
 ---
 
@@ -282,11 +282,11 @@ Each block is classified into one of five **categories** by shape: `Conservation
 
 `Bound` · On-chain: **No**
 
-> "A missed quorum never costs less than a reached one" — i.e. `forfeitBurnBps >= settleBurnBps`, so being wrong is never cheaper than being right.
+> "A non-verdict never costs more than a verdict" — i.e. the Inconclusive burn rate never exceeds `settleBurnBps`.
 
-**Derivation** — guard-lift, negative result. `ChallengeGame.setForfeitBurnBps:848` bounds only against `MAX_FORFEIT_BURN_BPS` and `setSettleBurnBps:898` only against `MAX_SETTLE_BURN_BPS`; both ceilings are 5,000 bps and no cross-setter check relates them. The shipped defaults do satisfy it (2,000 vs 500), but nothing on-chain holds the ordering.
+**Derivation** — guard-lift, negative result. `ChallengeGame.setSettleBurnBps:2455` bounds only against `MAX_SETTLE_BURN_BPS`; `setInconclusiveBurnBps:2512` bounds only against `MAX_INCONCLUSIVE_BURN_BPS`. The cross-setter check was **deliberately removed** (second-audit finding C, documented in the setter's own natspec). `_inconclusiveBurnBpsForRound` still clamps rounds 1–3 to the live `settleBurnBps` but no longer clamps round 4+. Both ceilings are 5,000 bps, so the round-4+ tier can legally exceed `settleBurnBps`.
 
-**If violated** — filing becomes cheaper to lose than to win, and a griefer can freeze an honest cohort's coverage for a full window at less cost than a correct filing pays.
+**If violated** — a challenger drawing repeated Inconclusive verdicts pays more per round than a losing verdict would have cost. That is the intended pricing for a griefer, and simultaneously the honest filer's tail risk.
 
 ---
 
@@ -390,11 +390,11 @@ Each block is classified into one of five **categories** by shape: `Conservation
 
 `StateMachine` · On-chain: **Yes**
 
-> `_voted[challengeId][voter]` transitions `false → true` exactly once, and is written before either tally is credited.
+> `caseOfChallenge[game][challengeId]` transitions `0 → caseId` exactly once, and the claim is written before any external read.
 
-**Derivation** — edge: `ChallengeGame.voteOnChallenge:526 (checked) → :539 (set) → :540 (tally credited)`. There is no clearing write anywhere in the contract, so a guardian's ballot is a one-shot latch and neither tally can be double-credited.
+**Derivation** — edge: `TokenCourt.sol:387 (checked) → :390 (set)`, and `:390` precedes the external `IChallengeGame(game).challengeOf` read — the ordering is the reentrancy defense, not just style.
 
-**If violated** — one guardian could vote repeatedly and reach the convict quorum alone.
+**If violated** — one challenge could be referred to two cases and receive two verdicts.
 
 ---
 
@@ -462,11 +462,11 @@ Each block is classified into one of five **categories** by shape: `Conservation
 
 `StateMachine` · On-chain: **Yes**
 
-> No transfer the challenge game makes reaches an approver or the proposer of the challenged proposal.
+> `TokenCourt` holds no WOOD at any point in any case lifecycle.
 
-**Derivation** — NatSpec: `challenge-game/spec.md` — the game's payout sites are exhaustively `_settle` (burn leg to `BURN_ADDRESS`, remainder to `c.challenger`) and `_fail` (the same two payees), plus `ProposerBondEscrow.forfeitBond`, which splits into the challenger's bounded prosecutor fee and `BURN_ADDRESS`. `StakedWood.slashVerdict` takes no recipient argument. No accused address is ever a `to`.
+**Derivation** — NatSpec: `token-court/spec.md` — *"The court SHALL hold no WOOD at any point in any case lifecycle"*. Structural confirmation: `TokenCourt.sol` contains no `safeTransfer` / `safeTransferFrom` / `call{value:}` of any kind; its only state-changing external call is `IChallengeGame.rule`.
 
-**If violated** — a cohort could be paid out of a challenge against itself, and the coalition profit bound's C4 would not hold.
+**If violated** — the verdict contract would become a custody target, and its `finalize` a fund-moving function.
 
 ---
 
@@ -490,7 +490,7 @@ Each block is classified into one of five **categories** by shape: `Conservation
 
 **Derivation** — temporal: `ChallengeGame._rearmChallengeWindow` writes `max(current, block.timestamp + challengeWindow)`, immediately followed by `exposureLedger.pinCoverageUntil` with the same deadline. No decreasing write exists.
 
-**If violated** — a failed challenge could shorten the window its re-arm was supposed to extend.
+**If violated** — an Inconclusive or Failed round could shorten the window it was supposed to extend.
 
 ---
 
@@ -522,11 +522,11 @@ Each block is classified into one of five **categories** by shape: `Conservation
 
 `Temporal` · On-chain: **Yes**
 
-> Challenge voting weight and its denominator are both snapshotted at `filedAt - 1`, pinned once at `file`, and never re-read live.
+> Court voting weight is snapshotted at `executedAt - 1`, pinned once at `refer`, and never re-read live.
 
-**Derivation** — temporal: `file:414-425` writes `votableStakeAtFiling` from `getPastTotalVotes(block.timestamp - 1)` less each accused approver's `getPastStake` at the same stamp; `voteOnChallenge:534` reads `getPastStake(msg.sender, c.filedAt - 1)`. One second back, not the filing instant, because an sWOOD checkpoint is keyed on the second it changes and a same-second push overwrites.
+**Derivation** — temporal: `TokenCourt.refer` writes `c.snapshotTs` from the challenge's `executedAt - 1`; `vote:646` reads `getPastVotes` / `getPastStake` at that pinned timestamp, combined with a growth-gated lookback minimum over `FLOOR_LOOKBACK = 30 days`.
 
-**If violated** — WOOD staked in the filing block itself would score in the numerator while the denominator missed it, and a flash-acquired position could decide a verdict.
+**If violated** — a flash-acquired WOOD position could decide a verdict.
 
 ---
 
@@ -649,13 +649,13 @@ On-chain: **No**
 
 On-chain: **No**
 
-> `ChallengeGame.stakedWood` must be the same sWOOD whose stake backs `ExposureLedger.pledgedOf` — the challenge vote's numerator, its denominator and its accused set are read from two contracts and must describe one book of stake.
+> `TokenCourt.participationFloorBps < StakedWood.ageFloorBps` — the court's anti-capture floor must stay strictly below sWOOD's age-0 weight floor.
 
-**Caller side** — `ChallengeGame.file` reads the accused cohort from `exposureLedger.pledgedOf`, then the electorate from `stakedWood.getPastTotalVotes` / `getPastStake`, and subtracts one from the other. `setStakedWood:860` and `setExposureLedger:814` are independent owner setters with no cross-check; only `address(0)` is rejected.
+**Caller side** — `TokenCourt.sol:258-260` (`setStakedWood`, G-40) and `:320-322` (`setParticipationFloorBps`) both read the live `ageFloorBps()` and revert `FloorInvariantViolated`. The second is additionally vacuous when `stakedWood == address(0)`.
 
-**Callee side** — neither contract holds a pointer that would let it verify the other's. `StakedWood.setAuthorizedSlasher` is the only place the pairing is asserted at all, and it asserts the slash direction, not the read direction.
+**Callee side** — `StakedWood.setAgeFloorBps:874-876` — bounded only by `[1, 10_000]`. It holds no pointer back to the court and performs no reverse check. The court's own natspec documents this as intentional: *"giving it one would invert the dependency direction … covered by the wire-time pre-flight and off-chain monitoring, not by this setter — see issue #84."*
 
-**If violated** — the denominator is drawn from one staking contract and the subtracted accused stake from another, so the quorum is measured against a population the accused are not actually in. Wire-time pre-flight and off-chain monitoring, not an on-chain check.
+**If violated** — lowering `ageFloorBps` below the court's floor makes the participation floor unreachable by any electorate, so every disputed case resolves Inconclusive.
 
 ---
 
@@ -691,13 +691,13 @@ On-chain: **No** (fail-open, and vacuous when the freezer is unset)
 
 On-chain: **Yes**
 
-> A filing's freeze deadline, `filedAt + voteWindow`, must land inside the ledger's coverage horizon, or the frozen lock stops counting before the vote it was frozen for can close.
+> `ChallengeGame.autoSlashDelay + TokenCourt.voteWindow + FINALIZE_BUFFER + MIN_REFERRAL_SLACK <= ChallengeGame.disputeTimeout` — a referred case must have room to vote and finalize before the game times it out.
 
-**Caller side** — `ChallengeGame.file:474` calls `exposureLedger.freezeCoverage(governor, proposalId, block.timestamp + voteWindow)`. `setVoteWindow:877` bounds the window only from below, at `MIN_VOTE_WINDOW`; there is no ceiling and no read of the ledger.
+**Caller side** — `TokenCourt.sol:216-219` (`setChallengeGame`) and `:280-284` (`setVoteWindow`) read the game's live `autoSlashDelay` / `disputeTimeout` / `MIN_REFERRAL_SLACK`.
 
-**Callee side** — the ledger clamps a `_rebucket` target past `MAX_COVERAGE_HORIZON` (60 d) to the horizon's edge rather than reverting, because a bucket outside the scan would un-count the lock entirely. `hasFrozenCoverage` still blocks exit throughout, so the freeze itself is not lost.
+**Callee side** — `ChallengeGame._requireWindowFits:2398-2399`, invoked from `setCourt`, `setAutoSlashDelay`, and `setDisputeTimeout`, reads the court's live `voteWindow()` / `FINALIZE_BUFFER()`. Both sides guard, and neither `catch`es — this is the one window coupling with a symmetric hard check on both ends.
 
-**If violated** — a vote window stretched near the horizon leaves the lock counted only to the horizon's edge while the challenge remains live past it.
+**If violated** — a case could be referred with insufficient clock and resolve Inconclusive by construction.
 
 ---
 
@@ -825,7 +825,7 @@ On-chain: **No**
 
 **Follows from** — `I-13` + `I-12`
 
-**If violated** — nobody files, and every gate that depends on the threat of a challenge (`G-18`, `G-19`, `G-20`, [I-32](#i-32)) degrades into a pure time delay. `ChallengeGame` exposes `honestFilingBreaksEven()` and `honestFilingNetPayoffBps()` as views, but no setter is gated on them: `settleBurnBps`, `forfeitBurnBps`, `challengerBondBps` and `prosecutorFeeBps` are independently-settable owner knobs whose product determines the sign of the payoff, and `proposerBondBps` sits on a separately-owned ledger. Both views price the quorum-reached branch only, which is the filer's best case rather than a floor: a filing that misses the convict quorum pays `forfeitBurnBps` of the bond and collects nothing, so the real expectation is that margin discounted by the odds a guardian quorum convicts.
+**If violated** — nobody files, and every gate that depends on the threat of a challenge (`G-18`, `G-19`, `G-20`, [I-32](#i-32)) degrades into a pure time delay. `ChallengeGame` exposes `honestFilingBreaksEven()` and `honestFilingNetPayoffBps()` as views, but no setter is gated on them: `settleBurnBps`, `forfeitBurnBps`, `inconclusiveBurnBps`, `challengerBondBps`, and `prosecutorFeeBps` are five independently-settable owner knobs whose product determines the sign of the payoff.
 
 ---
 

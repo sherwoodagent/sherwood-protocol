@@ -22,6 +22,7 @@ import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {ChallengeGame} from "../../src/ChallengeGame.sol";
+import {TokenCourt} from "../../src/TokenCourt.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
 import {ProposerBondEscrow} from "../../src/ProposerBondEscrow.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
@@ -52,9 +53,10 @@ import {deployTierRegistry, PermissiveStrategyFactory} from "../helpers/TierRegi
 ///      (`vm.mockCall`, which the unit fixtures use for `governorOf`, is
 ///      supported by neither fuzzer.)
 ///
-///      The circular sWOOD ↔ registry dependency is resolved the way the unit
-///      fixtures resolve it: sWOOD takes the factory at init, and `setRegistry`
-///      closes the loop.
+///      Deployment order otherwise mirrors `test/TokenCourtEndToEnd.t.sol::setUp`,
+///      the most complete non-fork stack in the repo. The circular
+///      sWOOD ↔ registry dependency is resolved the same way it is there:
+///      sWOOD takes the factory at init, and `setRegistry` closes the loop.
 abstract contract Base is StringUtils, Clamp, Deployer, Math {
     using DecimalPrinter for uint256;
 
@@ -66,6 +68,11 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
     // Chosen to satisfy every cross-contract window invariant simultaneously:
     //   X-1  ledger.challengeWindow (14d default) >= REVIEW_PERIOD + 7d
     //   X-4  swood.coolDownPeriod                 >= REVIEW_PERIOD
+    //   X-2  autoSlashDelay + voteWindow + FINALIZE_BUFFER + MIN_REFERRAL_SLACK
+    //                                             <= disputeTimeout
+    //   X-3  participationFloorBps                <  ageFloorBps
+    // The game/court defaults (7d / 5d / 30d, and 1000 < 2500 bps) already
+    // satisfy X-2 and X-3, so only the two below need pinning here.
 
     uint256 internal constant MIN_GUARDIAN_STAKE = 10_000e18;
     uint256 internal constant MIN_OWNER_STAKE = 10_000e18;
@@ -100,11 +107,14 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         // change again.
         mapping(uint256 => uint8) lastProposalState;
         // GL-26: challengeId => last observed `Status` (uint8 cast). A
-        // terminal status (Failed/Settled) must never change.
+        // terminal status (Failed/Settled/Inconclusive) must never change.
         mapping(uint256 => uint8) lastChallengeStatus;
-        // GL-31: challengeId => voter => whether `hasVotedOn` has EVER been
-        // observed true. There is no un-vote, so the flag is a one-shot latch.
-        mapping(uint256 => mapping(address => bool)) everVotedOn;
+        // GL-30: caseId => last observed `Phase` (uint8 cast). `Resolved`
+        // must never change back to `Voting`.
+        mapping(uint256 => uint8) lastCasePhase;
+        // GL-31: caseId => voter => last observed `Ruling` (uint8 cast).
+        // Once non-`None`, NatSpec says "NO VOTE CHANGES".
+        mapping(uint256 => mapping(address => uint8)) lastVoteOf;
         // GL-34: requestId => whether `claimed` / `cancelled` has EVER been
         // observed true (each is a one-shot latch).
         mapping(uint256 => bool) everClaimed;
@@ -122,6 +132,13 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         // once non-zero it must never change, or a challenge's slash basis
         // could be moved out from under it after the fact.
         mapping(uint256 => uint256) lastExecutedAt;
+        // GL-32: challengeId => last observed caseId. Set once; a second
+        // referral would give one challenge two adjudications.
+        mapping(uint256 => uint256) lastCaseOfChallenge;
+        // GL-33: caseId => account => whether `isAccused` was EVER observed
+        // true. Clearing it mid-case would let an approver vote on their own
+        // conviction.
+        mapping(uint256 => mapping(address => bool)) everAccused;
         // GL-35: pid => whether the settle price was EVER observed stamped.
         // Re-stamping would re-price already-settled redemptions.
         mapping(uint256 => bool) everStamped;
@@ -131,6 +148,7 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         // GL-39: last observed value of each monotonic counter.
         uint256 lastProposalCount;
         uint256 lastChallengeCount;
+        uint256 lastCaseCount;
         uint256 lastNextRequestId;
         // GL-40: reviewKey (keccak256(abi.encode(governor, proposalId))) =>
         // last observed `challengeableUntil[key]`.
@@ -147,15 +165,16 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
     address internal actor;
     address internal admin;
 
-    /// @dev Guardians are a fixed prefix of `actors` so a challenge always has a
-    ///      non-accused electorate: the accused are barred from deciding their
-    ///      own challenge, so with too few staked guardians no challenge could
-    ///      ever reach a verdict (I-20).
+    /// @dev Guardians are a fixed prefix of `actors` so the court always has a
+    ///      non-accused electorate: TokenCourt bars both the accused and the
+    ///      challenger from voting, so with fewer than three staked guardians
+    ///      a conviction could never clear the participation floor (I-20).
     uint256 internal constant GUARDIAN_COUNT = 3;
     /// @dev Guardians that approve a proposal, leaving `GUARDIAN_COUNT -
     ///      APPROVER_COUNT` staked but unaccused. The reserve exists because
-    ///      the accused cannot decide their own challenge: with every guardian
-    ///      approving there is no eligible electorate and turnout is zero.
+    ///      TokenCourt bars approvers (`isAccused`) from voting: with every
+    ///      guardian approving there is no eligible electorate, turnout is zero
+    ///      and a disputed challenge can never reach a verdict.
     uint256 internal constant APPROVER_COUNT = GUARDIAN_COUNT - 1;
 
     modifier asActor() virtual {
@@ -186,6 +205,7 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
     ExposureLedger internal ledger;
     ProposerBondEscrow internal bondEscrow;
     ChallengeGame internal game;
+    TokenCourt internal court;
 
     MockAgentRegistry internal agentRegistry;
     MockAggregatorV3 internal assetFeed;
@@ -406,6 +426,7 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
 
         bondEscrow = new ProposerBondEscrow(address(wood), address(registry), address(ledger));
         game = new ChallengeGame(address(this), address(wood), address(ledger), address(tierRegistry));
+        court = new TokenCourt(address(this));
     }
 
     function _wireRoles() internal {
@@ -414,6 +435,9 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         swood.setAuthorizedSlasher(address(game));
 
         game.setStakedWood(address(swood));
+        court.setChallengeGame(address(game));
+        court.setStakedWood(address(swood));
+        game.setCourt(address(court));
 
         // Governor wiring — factory-gated.
         _asFactory(address(governor), abi.encodeCall(SyndicateGovernor.setExposureLedger, (address(ledger))));
