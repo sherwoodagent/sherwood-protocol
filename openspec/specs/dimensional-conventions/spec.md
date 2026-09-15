@@ -21,7 +21,7 @@ Dollar values (`{USD}`) SHALL always be carried as `D18{USD}` in this layer, and
 - **THEN** it is a violation — the two producers are the only places asset/WOOD quantities are lifted to `D18{USD}`
 
 ### Requirement: WOOD amounts are 18-decimal wei of a plain ERC20
-`{WOOD}` quantities SHALL be WOOD wei (18 decimals), and WOOD SHALL be assumed a plain ERC20 — no fee-on-transfer, no rebasing. Carriers: `Guardian.stakedAmount`, `totalGuardianStake`, `minGuardianStake`, `minOwnerStake`, `bondWood`, `bondedWood`, `votableStakeAtFiling`, `convictWeight`, `acquitWeight`, `totalEscrowed`.
+`{WOOD}` quantities SHALL be WOOD wei (18 decimals), and WOOD SHALL be assumed a plain ERC20 — no fee-on-transfer, no rebasing. Carriers: `Guardian.stakedAmount`, `totalGuardianStake`, `minGuardianStake`, `minOwnerStake`, `bondWood`, `bondedWood`, `totalStakeAtFiling`, `convictWeight`, `acquitWeight`, `totalEscrowed`.
 
 #### Scenario: Non-plain token substituted
 - **WHEN** a fee-on-transfer or rebasing token is used where `{WOOD}` is expected

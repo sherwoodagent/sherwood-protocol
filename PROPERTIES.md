@@ -52,12 +52,12 @@ Checked after every call sequence.
 - [x] **GL-13** `SHOULD-HOLD` — per guardian, pledged-basis total == Σ per-proposal
   `pledgedOf` entries. `_livePledgedUsd` has no accessor; needs a ghost (x-ray I-5, second clause).
 - [x] **GL-14** `SHOULD-HOLD` — for every challenge,
-  `convictWeight + acquitWeight <= votableStakeAtFiling`. The quorum test is
-  `convictWeight * 10_000 >= quorumBpsAtFiling * votableStakeAtFiling`, so a tally
+  `convictWeight + acquitWeight <= totalStakeAtFiling`. The quorum test is
+  `convictWeight * 10_000 >= quorumBpsAtFiling * totalStakeAtFiling`, so a tally
   that could outgrow its own denominator would convict on less than the fraction it
   claims. Both tallies are checked against the one denominator because each voter's
-  weight lands in exactly one of them and `votableStakeAtFiling` is the total those
-  weights were drawn from (x-ray I-6).
+  weight lands in exactly one of them and `totalStakeAtFiling` is the whole staked
+  set those weights were drawn from (x-ray I-6).
 - [x] **GL-52** `SHOULD-HOLD` — the exact clause GL-12 relaxes: while nothing can yet
   have expired (`block.timestamp - epochGenesis <= challengeWindow`), a guardian's
   bucketed `openExposure` EQUALS the sum of its locks. Inside that span every bucket
@@ -118,7 +118,7 @@ Checked after every call sequence.
 
 ### Monotonicity
 
-- [x] **GL-39** `SHOULD-HOLD` — `challengeCount`, `caseCount`, `proposalCount` and
+- [x] **GL-39** `SHOULD-HOLD` — `challengeCount`, `proposalCount` and
   `nextRequestId` never decrease.
 - [x] **GL-40** `SHOULD-HOLD` — `challengeableUntil[key]` never decreases. The contract
   leans on this "never shorten" high-water mark in several places.
@@ -218,9 +218,10 @@ Asserted inside the handler that performs the call.
   true for the caller, exactly one of `convictWeight`/`acquitWeight` increased by the
   caller's `getPastStake(voter, filedAt - 1)`, and the other is unchanged.
 - [ ] **SP-05** `SHOULD-HOLD` — after `resolve(id)`: status is `Settled` iff
-  `convictWeight * 10_000 >= quorumBpsAtFiling * votableStakeAtFiling`, else `Failed`
-  and only at or after `filedAt + voteWindowAtFiling`; `bondedWood` decreased by
-  exactly that challenge's bond either way.
+  `convictWeight * 10_000 >= quorumBpsAtFiling * totalStakeAtFiling` AND
+  `convictWeight > acquitWeight`, else `Failed` and only at or after
+  `filedAt + voteWindowAtFiling`; `bondedWood` decreased by exactly that
+  challenge's bond either way.
 - [ ] **SP-06** `SHOULD-HOLD` — after `stampSettlement`: `_pidReserved[pid]`,
   `reservedAssets` and `stampedUnclaimedShares` all move together, sourced from the
   same `redeemShares`.

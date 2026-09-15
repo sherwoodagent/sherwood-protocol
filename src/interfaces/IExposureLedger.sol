@@ -169,7 +169,7 @@ interface IExposureLedger {
     ///         approver, OR this guardian is within a `pinCoverageUntil` deadline
     ///         on ANY proposal it ever approved (the guardian-scoped max). sWOOD
     ///         gates the unstake CLAIM on it, which is what makes the freeze
-    ///         load-bearing: epoch buckets age out on wall-clock and a disputed
+    ///         load-bearing: epoch buckets age out on wall-clock and a live
     ///         challenge outlives them.
     /// @dev    INCLUSIVE of `deadline`, matching `ChallengeGame.file`'s own
     ///         inclusive filing-deadline check, so this cannot go clean one

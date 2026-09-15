@@ -125,10 +125,10 @@ Per-call preconditions. Heading IDs below (`G-N`) are anchor targets from x-ray.
 `if (newWindow < MIN_VOTE_WINDOW) revert InvalidParameter();` · `ChallengeGame.sol:878` · Floors the decision window at 48 h, so the owner cannot collapse it and turn a filing into an instant verdict. The window a live challenge runs on is `voteWindowAtFiling`, pinned at `file`, so this bounds only future filings.
 
 #### G-39
-`if (newBps < 1_000 || newBps > BPS_DENOMINATOR) revert InvalidParameter();` · `ChallengeGame.sol:887` · Bounds the convict quorum to [10%, 100%] of the votable stake — a bar a single dust guardian could clear would make the vote a formality. Pinned per challenge as `quorumBpsAtFiling`.
+`if (newBps < 1_000 || newBps > BPS_DENOMINATOR) revert InvalidParameter();` · `ChallengeGame.sol` · Bounds the convict quorum to [10%, 100%] of the total staked WOOD — a bar a single dust guardian could clear would make the vote a formality. Pinned per challenge as `quorumBpsAtFiling`, and the same bar an acquittal clears to adjudicate.
 
 #### G-40
-`if (votable == 0) revert NoVotableStake();` · `ChallengeGame.sol:425` · Refuses a filing whose electorate, after striking the accused cohort's stake, is empty: nobody could decide it, so the bond could only burn.
+`if (votable == 0) revert NoVotableStake();` · `ChallengeGame.sol` · Refuses a filing whose electorate, after striking the accused cohort's stake, is empty: nobody could decide it, so the bond could only burn. The quorum's own denominator is the total, accused included; this sum is computed locally and never stored.
 
 ---
 
@@ -524,7 +524,7 @@ Each block is classified into one of five **categories** by shape: `Conservation
 
 > Challenge voting weight and its denominator are both snapshotted at `filedAt - 1`, pinned once at `file`, and never re-read live.
 
-**Derivation** — temporal: `file:414-425` writes `votableStakeAtFiling` from `getPastTotalVotes(block.timestamp - 1)` less each accused approver's `getPastStake` at the same stamp; `voteOnChallenge:534` reads `getPastStake(msg.sender, c.filedAt - 1)`. One second back, not the filing instant, because an sWOOD checkpoint is keyed on the second it changes and a same-second push overwrites.
+**Derivation** — temporal: `file` writes `totalStakeAtFiling` from `getPastTotalVotes(block.timestamp - 1)`, and checks a locally computed `votable` (that total less each accused approver's `getPastStake` at the same stamp) against zero; `voteOnChallenge` reads `getPastStake(msg.sender, c.filedAt - 1)`. One second back, not the filing instant, because an sWOOD checkpoint is keyed on the second it changes and a same-second push overwrites.
 
 **If violated** — WOOD staked in the filing block itself would score in the numerator while the denominator missed it, and a flash-acquired position could decide a verdict.
 

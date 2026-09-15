@@ -90,10 +90,11 @@ Challenger → ChallengeGame.file(pid, predicate, adapterTarget, selector, evide
   └─ ExposureLedger.freezeCoverage(governor, pid)   ← locks every approver's stake
 
   Guardian → ChallengeGame.voteOnChallenge(id, convict)   ← weight = getPastStake(voter, filedAt-1)
-                                                          ← accused approvers refused
+                                                          ← challenger, proposer and
+                                                            accused approvers refused
 
   anyone → ChallengeGame.resolve(id)
-  ├─ [convictWeight*1e4 >= quorumBpsAtFiling * votableStakeAtFiling]
+  ├─ [convictWeight*1e4 >= quorumBpsAtFiling * totalStakeAtFiling && convictWeight > acquitWeight]
   │    → _settle → StakedWood.slashVerdict → burn
   │              → ProposerBondEscrow.forfeitBond → prosecutor fee + burn
   │              → TierRegistry.demoteByChallenge (best-effort)
