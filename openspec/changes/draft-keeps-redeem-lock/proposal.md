@@ -55,6 +55,13 @@ Before execute the vault still holds everything and the NAV is knowable.
   Decision 3). Both terms at `t − 1` see one set. The direct path keeps its live read:
   instant redeem is open right up to `propose`, and a `t − 1` read there would count
   shares that already left.
+- `delegate`/`delegateBySig` to anyone but the holder revert `DelegationLocked`
+  (`SyndicateVault._delegate`). Without it the two `t − 1` terms are not one set: a
+  holder that undelegates (`delegate(address(0))`) a block before the stamp stays in
+  `getPastTotalSupply` and votes for nobody, inflating the bar to `b·(G + X)` with
+  only `G` castable; `delegate(queue)` on the direct path removes live shares from the
+  denominator. No product flow delegates to a third party — the vault self-delegates
+  every receipt — so nothing is lost.
 
 Redeem stays locked from **Draft creation**, not from Pending. Two rounds of #320
 review showed why: with instant redeem open in Draft while the collaborative stamp

@@ -1058,8 +1058,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     }
 
     /// @dev Both terms at the snapshot instant, so a same-block queued redeem cannot
-    ///      shrink the bar. Not one set: an undelegated holder is counted in supply and
-    ///      votes for nobody (pre-existing, #318). The vault self-delegates the queue.
+    ///      shrink the bar. Recorded electorate == castable weight because the vault
+    ///      refuses delegation away from the holder and self-delegates the queue.
     function _votableSupplyAt(address vault, uint256 at) private view returns (uint256) {
         uint256 supply = IVotes(vault).getPastTotalSupply(at);
         address queue = ISyndicateVault(vault).withdrawalQueue();

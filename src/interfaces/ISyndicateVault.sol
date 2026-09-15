@@ -43,6 +43,9 @@ interface ISyndicateVault {
     ///         (`depositsLocked()` false): the instant `deposit`/`mint` path is
     ///         the open one; use it instead.
     error DepositsNotLocked();
+    /// @notice `delegate`/`delegateBySig` to anyone but the holder: voting power stays
+    ///         with the shares so the veto denominator and the castable weight match.
+    error DelegationLocked();
     error QueueReserveBreached();
     error NotQueue();
     error ZeroAssets();

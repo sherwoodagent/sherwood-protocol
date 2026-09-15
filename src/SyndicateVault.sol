@@ -634,6 +634,14 @@ contract SyndicateVault is
         }
     }
 
+    /// @dev Voting power never leaves the holder: `delegate`/`delegateBySig` to
+    ///      anyone else would keep shares in the veto denominator while they vote
+    ///      for nobody (or for the queue). Covers the auto-delegate above (self).
+    function _delegate(address account, address delegatee) internal override {
+        if (delegatee != account) revert DelegationLocked();
+        super._delegate(account, delegatee);
+    }
+
     /// @dev Use timestamp-based voting checkpoints instead of block numbers
     function clock() public view override returns (uint48) {
         return uint48(block.timestamp);
