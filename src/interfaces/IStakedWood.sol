@@ -124,7 +124,7 @@ interface IStakedWood {
     ///         measures of the same WOOD. Correct for weighing a vote, wrong for a
     ///         subtraction against the total — use `getPastStake` there. Aging
     ///         only ever shrinks weight, so per-account weight is bounded above by
-    ///         raw stake, biasing a subtraction against the total too HIGH when
+    ///         raw stake, biasing `TokenCourt._participationFloor` too HIGH when
     ///         the accused are freshly staked.
     /// @dev    ANCHOR-EXACT: the age factor is evaluated against the `stakedAt`
     ///         anchor AS IT STOOD at `timestamp`, checkpointed alongside the raw
@@ -135,9 +135,9 @@ interface IStakedWood {
 
     /// @notice A guardian's RAW votable own stake at a past timestamp — the same
     ///         basis `getPastTotalVotes` sums, so the two are comparable and
-    ///         subtractable. This is the operand an accused-cohort subtraction
-    ///         needs; `getPastVotes` there would let aging drive the remainder to
-    ///         zero.
+    ///         subtractable. This is the operand `TokenCourt._participationFloor`
+    ///         needs; `getPastVotes` there would let delegation drive the floor
+    ///         to zero.
     function getPastStake(address guardian, uint256 timestamp) external view returns (uint256);
 
     /// @notice Total guardian vote weight (quorum denominator) at a past timestamp.

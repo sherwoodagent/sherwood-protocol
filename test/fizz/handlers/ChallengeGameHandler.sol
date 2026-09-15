@@ -32,7 +32,63 @@ abstract contract ChallengeGameHandler is Properties {
         game.setProsecutorFeeBps(clampBetween(bps, 0, game.MAX_PROSECUTOR_FEE_BPS()));
     }
 
+    /// @dev What a contribution can still buy for this challenge. The pool is
+    ///      keyed per PROPOSAL, so the headroom is the pool's own target/raised
+    ///      until it completes; after that the pool answers only what it was
+    ///      raised against, and a `Filed` challenge it does not answer buys its
+    ///      own defence up to the same target.
+    function _counterBondHeadroom(uint256 challengeId) internal view returns (uint256) {
+        (, uint256 target, uint256 raised, uint256 completedAt,) = game.counterBondPoolOf(challengeId);
+        if (completedAt != 0) {
+            IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
+            if (c.status != IChallengeGame.Status.Filed) return 0;
+            raised = c.defenceWeight;
+        }
+        return target > raised ? target - raised : 0;
+    }
+
     // ――――――――――――――――――――――――― Clamped ――――――――――――――――――――――――――
+
+    /// @dev `challengeId` is 1-indexed and `challengeCount` is the high-water
+    ///      mark. Clamping into `[1, count]` is what makes these reach a real
+    ///      challenge instead of bouncing off `WrongStatus`.
+    function challengeGame_claimContribution_clamped(uint256 challengeId) public {
+        uint256 count = game.challengeCount();
+        if (count == 0) return;
+        challengeId = clampBetween(challengeId, 1, count);
+        challengeGame_claimContribution(challengeId);
+    }
+
+    function challengeGame_dispute_clamped(uint256 challengeId, uint256 amountWood) public {
+        uint256 count = game.challengeCount();
+        if (count == 0) return;
+        challengeId = clampBetween(challengeId, 1, count);
+
+        // Bound by what the actor holds AND by what the pool still needs: an
+        // over-target contribution is refused, and a balance-exceeding one
+        // reverts in the transfer rather than in the game.
+        uint256 bal = wood.balanceOf(actor);
+        if (bal == 0) return;
+        uint256 remaining = _counterBondHeadroom(challengeId);
+        if (remaining == 0) return;
+        amountWood = clampBetween(amountWood, 1, remaining < bal ? remaining : bal);
+
+        challengeGame_dispute(challengeId, amountWood);
+    }
+
+    /// @dev The pool-completing contribution is the transition that flips
+    ///      `Filed → Disputed` and auto-refers to the court (I-38). Under the
+    ///      generic clamp above the fuzzer would rarely land on it exactly.
+    function challengeGame_dispute_completePool(uint256 challengeId) public {
+        uint256 count = game.challengeCount();
+        if (count == 0) return;
+        challengeId = clampBetween(challengeId, 1, count);
+
+        uint256 remaining = _counterBondHeadroom(challengeId);
+        if (remaining == 0 || wood.balanceOf(actor) < remaining) return;
+
+        challengeGame_dispute(challengeId, remaining);
+    }
 
     function challengeGame_file_clamped(uint256 proposalId, uint8 predicate, string memory evidenceURI) public {
         uint256 count = governor.proposalCount();
@@ -41,44 +97,6 @@ abstract contract ChallengeGameHandler is Properties {
         // Only one governor exists in this harness; an arbitrary address would
         // revert before any challenge mechanics ran.
         challengeGame_file(address(governor), proposalId, uint8(predicate % 3), address(0), bytes4(0), evidenceURI);
-    }
-
-    /// @dev Pranked rather than plain: the harness contract holds no stake, so
-    ///      an unpranked vote could only ever revert `NoVotableStake` and the
-    ///      handler would be dead surface. The voter is drawn from the guardians
-    ///      off its OWN seed — the game refuses the accused, so a voter derived
-    ///      from `challengeSeed` would tie which challenge is voted on to who
-    ///      votes, and leave most (challenge, guardian) pairs unreachable.
-    function challengeGame_voteOnChallenge_clamped(uint256 challengeSeed, uint256 voterSeed, bool convict) public {
-        uint256 n = game.challengeCount();
-        if (n == 0) return;
-        uint256 id = clampBetween(challengeSeed, 1, n);
-        vm.prank(toGuardian(voterSeed));
-        try game.voteOnChallenge(id, convict) {}
-        catch (bytes memory err) {
-            _assertExpectedVoteRevert(err);
-        }
-    }
-
-    function challengeGame_setChallengeQuorumBps(uint256 bps) public {
-        game.setChallengeQuorumBps(clampBetween(bps, 1_000, 10_000));
-    }
-
-    /// @dev The five refusals a vote is EXPECTED to take: an accused approver,
-    ///      a repeat vote, a caller with no stake behind it, a closed window, a
-    ///      challenge already decided. A blanket `catch {}` would swallow a
-    ///      regression in the vote itself, so anything else fails loudly —
-    ///      `t` panics, which is what both Foundry and the fuzzer's assertion
-    ///      mode catch. A bare `revert` would not: the fuzzer discards a
-    ///      reverting call sequence without reporting it.
-    function _assertExpectedVoteRevert(bytes memory err) internal {
-        bytes4 sel = err.length >= 4 ? bytes4(err) : bytes4(0);
-        t(
-            sel == IChallengeGame.AccusedCannotVote.selector || sel == IChallengeGame.AlreadyVoted.selector
-                || sel == IChallengeGame.NoVotableStake.selector || sel == IChallengeGame.WindowClosed.selector
-                || sel == IChallengeGame.WrongStatus.selector,
-            "voteOnChallenge reverted for an unexpected reason"
-        );
     }
 
     function challengeGame_resolve_clamped(uint256 challengeId) public {
@@ -93,16 +111,24 @@ abstract contract ChallengeGameHandler is Properties {
     ///      parameter space rather than on `InvalidParameter` reverts — the
     ///      point is to perturb E-4's economics, not to re-test the bounds.
     function challengeGame_secondary(uint8 selector, uint256 arg0) public {
-        selector = uint8(selector % 6);
+        selector = uint8(selector % 8);
         if (selector == 0) {
-            _challengeGame_setVoteWindow(clampBetween(arg0, game.MIN_VOTE_WINDOW(), 90 days));
+            _challengeGame_setAutoSlashDelay(
+                clampBetween(arg0, 1 hours, game.disputeTimeout() - game.MIN_SETTLE_WINDOW())
+            );
         } else if (selector == 1) {
             _challengeGame_setChallengerBondBps(clampBetween(arg0, 1, 10_000));
         } else if (selector == 2) {
-            _challengeGame_setFilingsPaused(arg0 % 2 == 0);
+            _challengeGame_setDisputeTimeout(
+                clampBetween(arg0, game.autoSlashDelay() + game.MIN_SETTLE_WINDOW(), 90 days)
+            );
         } else if (selector == 3) {
-            _challengeGame_setForfeitBurnBps(clampBetween(arg0, 0, 10_000));
+            _challengeGame_setFilingsPaused(arg0 % 2 == 0);
         } else if (selector == 4) {
+            _challengeGame_setForfeitBurnBps(clampBetween(arg0, 0, 10_000));
+        } else if (selector == 5) {
+            _challengeGame_setInconclusiveBurnBps(clampBetween(arg0, 0, 10_000));
+        } else if (selector == 6) {
             _challengeGame_setProsecutorFeeBps(clampBetween(arg0, 0, 2_000));
         } else {
             _challengeGame_setSettleBurnBps(clampBetween(arg0, 0, 10_000));
@@ -112,29 +138,42 @@ abstract contract ChallengeGameHandler is Properties {
     // ―――――――――――――――――――― Lifecycle composite ――――――――――――――――――――
 
     /// @notice Drives a filed challenge all the way to a conviction:
-    ///         file -> run the clock out -> resolve.
+    ///         file -> dispute to pool completion -> refer -> vote -> finalize
+    ///         -> rule.
     ///
-    /// @dev THE POINT: the terminal paths in `ChallengeGame`,
-    ///      `ProposerBondEscrow` and the slash half of `ExposureLedger` sit
+    /// @dev THE POINT: every terminal path in `ChallengeGame`, `TokenCourt`,
+    ///      `ProposerBondEscrow` and the slash half of `ExposureLedger` sits
     ///      behind this one chain, and random sequencing essentially never
-    ///      assembles it — the calls are order-dependent, separated by a time
-    ///      window, and each has a different eligible caller. This is the same
+    ///      assembles it — the calls are order-dependent, separated by two time
+    ///      windows, and each has a different eligible caller. This is the same
     ///      shape of gap `syndicateGovernor_lifecycle_toExecuted` closed for
     ///      propose->execute, and the same fix.
     ///
-    ///      The challenger is drawn from the NON-guardian actors, leaving the
-    ///      staked guardians unspent.
+    ///      Roles are kept disjoint on purpose, because the court bars three
+    ///      groups from voting and a naive assignment silently produces an
+    ///      Inconclusive verdict instead of a conviction:
+    ///        - approvers are `isAccused` (`AccusedCannotVote`),
+    ///        - the challenger is barred (`ChallengerCannotVote`),
+    ///        - counter-bond contributors are barred
+    ///          (`CounterBondContributorCannotVote`).
+    ///      So the challenger and the disputer are drawn from the NON-guardian
+    ///      actors, leaving the staked guardians as the voter pool. Voting is
+    ///      attempted from every guardian under try/catch rather than computing
+    ///      the accused set: whoever approved reverts and is skipped, which
+    ///      keeps this correct no matter which guardian the governor composite
+    ///      happened to use.
     ///
-    ///      `file` and `resolve` are try/catch: a step that cannot fire leaves
-    ///      the challenge parked in `Filed`, which is itself worth exploring,
-    ///      and the handler never reverts the sequence. The VOTE leg catches
-    ///      narrowly instead — see `_assertExpectedVoteRevert`. Its refusals are
-    ///      a short, known list, and swallowing anything outside it would hide
-    ///      exactly the regression this composite was retargeted to cover.
+    ///      Court weight is sWOOD (`getPastVotes` at the case snapshot AND
+    ///      `getVotes` now), not WOOD — guardians qualify only because they are
+    ///      staked at setup, before any `executedAt`.
+    ///
+    ///      Everything is try/catch: a step that cannot fire leaves the
+    ///      challenge parked in a legitimate intermediate state (Filed,
+    ///      Disputed, or an Inconclusive/NotGuilty verdict), all of which are
+    ///      themselves worth exploring. The handler never reverts the sequence.
     function challengeGame_lifecycle_toConviction(uint256 proposalSeed, uint256 predicateSeed) public {
-        // Challenger: a non-guardian actor, so the whole guardian cohort stays
-        // eligible to decide the challenge. `_nonGuardian` wraps within the
-        // non-guardian range.
+        // Challenger: a non-guardian actor, so the guardian pool stays eligible
+        // to vote. `_nonGuardian` wraps within the non-guardian range.
         //
         // DERIVED BEFORE the predictor and PASSED IN, not re-derived inside it.
         // `file`'s `AlreadyChallenged` gate is per (key, msg.sender), so the
@@ -160,46 +199,53 @@ abstract contract ChallengeGameHandler is Properties {
         uint256 challengeId = game.challengeCount();
         if (challengeId == idBefore) return;
 
-        // Silence now FAILS a challenge, so the composite has to carry the vote
-        // itself or it can never reach the terminal paths it exists to reach.
-        // Every staked guardian is offered a convict ballot; the ones this
-        // filing accuses are refused by the game (`AccusedCannotVote`), which is
-        // why `SyndicateGovernorHandler` approves with only `APPROVER_COUNT` of
-        // them and leaves a reserve. The electorate is pinned one second before
-        // `filedAt` and every guardian was staked in `setup()`, so no extra roll
-        // is needed here — a guardian staked inside this call would carry zero
-        // weight and be refused.
-        //
-        // Stops at quorum rather than polling the whole cohort: `resolve`
-        // settles the moment the tally crosses, so the remaining ballots would
-        // be `WrongStatus` no-ops, and leaving them uncast keeps the ACQUIT side
-        // reachable for the clamped handler.
-        for (uint256 i; i < GUARDIAN_COUNT && !_quorumReached(challengeId); i++) {
-            if (game.hasVotedOn(challengeId, actors[i])) continue;
-            vm.prank(actors[i]);
-            try game.voteOnChallenge(challengeId, true) {}
-            catch (bytes memory err) {
-                _assertExpectedVoteRevert(err);
+        // Fund the counter-bond to exactly its target. `Disputed` requires
+        // `counterBondWood == bondWood`; a short pool leaves the challenge in
+        // Filed and `refer` reverts, so partial funding is not enough.
+        uint256 remaining = _counterBondHeadroom(challengeId);
+        for (uint256 i; i < actors.length && remaining != 0; i++) {
+            address d = _nonGuardian(i);
+            if (d == challenger) continue;
+            uint256 bal = wood.balanceOf(d);
+            if (bal == 0) continue;
+            uint256 amt = bal < remaining ? bal : remaining;
+            vm.prank(d);
+            try game.dispute(challengeId, amt) {
+                remaining -= amt;
+            } catch {}
+        }
+        if (remaining != 0) return; // pool never completed: stays Filed
+
+        // `dispute` AUTO-REFERS the moment the counter-bond pool completes
+        // (`ChallengeGame.sol:913`), so by here the case usually already
+        // exists and an explicit `refer` would revert. Read the mapping first
+        // and only refer when the auto-referral did not fire — treating refer
+        // as mandatory aborts the composite on its own success.
+        uint256 caseId = court.caseOfChallenge(address(game), challengeId);
+        if (caseId == 0) {
+            try court.refer(challengeId) returns (uint256 cid) {
+                caseId = cid;
+            } catch {
+                return;
             }
         }
+        if (caseId == 0) return;
 
-        // Quorum settles immediately; short of it the challenge can only fail,
-        // and only once its clock runs out. The clock is the one THIS challenge
-        // received, not the live parameter — the secondary dispatcher can move
-        // the latter after filing.
-        if (!_quorumReached(challengeId)) {
-            skipTime(game.challengeOf(challengeId).voteWindowAtFiling + 1);
+        // Guilty needs turnout >= the participation floor AND
+        // guiltyVotes > notGuiltyVotes (a tie fails safe to NotGuilty).
+        uint256 voted;
+        for (uint256 i; i < GUARDIAN_COUNT; i++) {
+            vm.prank(actors[i]);
+            try court.vote(caseId, true) {
+                voted++;
+            } catch {}
         }
-        try game.resolve(challengeId) {} catch {}
-    }
+        if (voted == 0) return; // every guardian barred: turnout 0 -> Inconclusive
 
-    /// @dev `resolve`'s own settle test, asked of the same three numbers.
-    ///      `BPS_DENOMINATOR` is inlined because the constant is `internal`. A
-    ///      zero denominator is not quorum: `resolve` reads it as a challenge
-    ///      nobody could decide and fails it.
-    function _quorumReached(uint256 challengeId) internal view returns (bool) {
-        (uint256 convictWeight, uint256 votable, uint256 quorumBps) = game.challengeTallyOf(challengeId);
-        return votable != 0 && convictWeight * 10_000 >= quorumBps * votable;
+        skipTime(court.voteWindow() + 1);
+        // `finalize` calls back into `ChallengeGame.rule`, which is what
+        // actually settles the slash and forfeits the proposer bond.
+        try court.finalize(caseId) {} catch {}
     }
 
     /// @dev First proposal that `file` would currently accept: executed, still
@@ -211,9 +257,10 @@ abstract contract ChallengeGameHandler is Properties {
     ///      specific on-chain gate and must use the same accumulator that gate
     ///      does. Finding #24 (PR #217) migrated `ChallengeGame.file` from the
     ///      booking (`_recorded`, via `approversOf`) to the pledge
-    ///      (`_reservedUsd`, via `pledgedOf`) — the last of the sites to move,
-    ///      after `slashBpsFor`, `freezeCoverage` and `pinCoverageUntil`. That
-    ///      landed AFTER this helper did, so the two silently diverged.
+    ///      (`_reservedUsd`, via `pledgedOf`) — the last of five sites to move,
+    ///      after `slashBpsFor`, `freezeCoverage`, `pinCoverageUntil` and
+    ///      `TokenCourt._recordAccused`. That landed AFTER this helper did, so
+    ///      the two silently diverged.
     ///
     ///      The divergence was one-directional and quiet, which is why it is
     ///      worth a comment rather than just a fix. The booking never exceeded
@@ -291,8 +338,8 @@ abstract contract ChallengeGameHandler is Properties {
             //
             // `file` then takes `max(deadline, challengeableUntil[key])`, so the
             // re-armed floor has to be honoured too or the predictor is too
-            // STRICT after a round that missed quorum and skips genuinely
-            // filable pids.
+            // STRICT after an Inconclusive round and skips genuinely filable
+            // pids.
             bytes32 rk = keccak256(abi.encode(address(governor), pid));
             uint256 deadline = p.executedAt + p.strategyDuration + game.challengeWindow();
             uint256 extended = game.challengeableUntil(rk);
@@ -320,14 +367,22 @@ abstract contract ChallengeGameHandler is Properties {
         return 0;
     }
 
-    /// @dev An actor outside the guardian range, so using it as the challenger
-    ///      does not burn an eligible voter.
+    /// @dev An actor outside the guardian range, so using it as challenger or
+    ///      counter-bond contributor does not burn a court voter.
     function _nonGuardian(uint256 seed) internal view returns (address) {
         uint256 span = actors.length - GUARDIAN_COUNT;
         return actors[GUARDIAN_COUNT + (seed % span)];
     }
 
     // ―――――――――――――――――――――――― Unclamped ―――――――――――――――――――――――――
+
+    function challengeGame_claimContribution(uint256 challengeId) public asActor {
+        game.claimContribution(challengeId);
+    }
+
+    function challengeGame_dispute(uint256 challengeId, uint256 amountWood) public asActor {
+        game.dispute(challengeId, amountWood);
+    }
 
     function challengeGame_file(
         address governor_,
@@ -342,24 +397,22 @@ abstract contract ChallengeGameHandler is Properties {
         );
     }
 
-    /// @dev A guardian that did not approve the challenged proposal votes; the
-    ///      accused are refused by the game itself.
-    function challengeGame_voteOnChallenge(uint256 challengeId, bool convict) public asActor {
-        game.voteOnChallenge(challengeId, convict);
-    }
-
     function challengeGame_resolve(uint256 challengeId) public asActor {
         game.resolve(challengeId);
     }
 
     // ── Secondary (owner-gated; dispatcher-only entry) ──
 
-    function _challengeGame_setVoteWindow(uint256 newWindow) internal asAdmin {
-        game.setVoteWindow(newWindow);
+    function _challengeGame_setAutoSlashDelay(uint256 newDelay) internal asAdmin {
+        game.setAutoSlashDelay(newDelay);
     }
 
     function _challengeGame_setChallengerBondBps(uint256 newBps) internal asAdmin {
         game.setChallengerBondBps(newBps);
+    }
+
+    function _challengeGame_setDisputeTimeout(uint256 newTimeout) internal asAdmin {
+        game.setDisputeTimeout(newTimeout);
     }
 
     function _challengeGame_setFilingsPaused(bool paused) internal asAdmin {
@@ -368,6 +421,10 @@ abstract contract ChallengeGameHandler is Properties {
 
     function _challengeGame_setForfeitBurnBps(uint256 newBps) internal asAdmin {
         game.setForfeitBurnBps(newBps);
+    }
+
+    function _challengeGame_setInconclusiveBurnBps(uint256 newBps) internal asAdmin {
+        game.setInconclusiveBurnBps(newBps);
     }
 
     function _challengeGame_setProsecutorFeeBps(uint256 newBps) internal asAdmin {

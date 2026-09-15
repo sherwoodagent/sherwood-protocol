@@ -3,7 +3,8 @@
 #
 # Reads chains/9994663.json and asserts, on-chain, every invariant the
 # deployment spec's "Post-deploy validation reads" scenario names, plus the
-# Plan B / Plan D wiring the later phases are supposed to leave behind. Read-only: it sends no transactions and needs no admin RPC.
+# Plan B / Plan D / TokenCourt wiring the later phases are supposed to leave
+# behind. Read-only: it sends no transactions and needs no admin RPC.
 #
 # The point is that an operator can run this against a vnet MINUTES OR WEEKS
 # after the ceremony and get the same answer. A deploy log scrolls past; this
@@ -37,7 +38,7 @@ call() { cast call "$1" "$2" --rpc-url "$RPC" 2>/dev/null | head -1 | awk '{prin
 FACTORY=$(a SYNDICATE_FACTORY); BEACON=$(a GOVERNOR_BEACON); CONFIG=$(a PROTOCOL_CONFIG)
 REGISTRY=$(a GUARDIAN_REGISTRY); SWOOD=$(a STAKED_WOOD); TIERS=$(a TIER_REGISTRY)
 WOOD=$(a WOOD_TOKEN); SFACTORY=$(a STRATEGY_FACTORY); LEDGER=$(a EXPOSURE_LEDGER)
-ESCROW=$(a PROPOSER_BOND_ESCROW); GAME=$(a CHALLENGE_GAME)
+ESCROW=$(a PROPOSER_BOND_ESCROW); GAME=$(a CHALLENGE_GAME); COURT=$(a TOKEN_COURT)
 WFEED=$(a WOOD_USD_FEED); DEPLOYER=$(a DEPLOYER)
 ZERO=0x0000000000000000000000000000000000000000
 
@@ -120,6 +121,28 @@ check "game.stakedWood (reciprocal)"  "$(call "$GAME" 'stakedWood()(address)')" 
 check "game.exposureLedger"           "$(call "$GAME" 'exposureLedger()(address)')"      "$LEDGER"
 check "game.tierRegistry"             "$(call "$GAME" 'tierRegistry()(address)')"        "$TIERS"
 check "game.challengeWindow == ledger" "$(call "$GAME" 'challengeWindow()(uint256)')"    "$(call "$LEDGER" 'challengeWindow()(uint256)')"
+
+echo; echo "── TokenCourt ──"
+check "game.court (ruling authority)" "$(call "$GAME" 'court()(address)')"               "$COURT"
+check "court.challengeGame"           "$(call "$COURT" 'challengeGame()(address)')"      "$GAME"
+check "court.stakedWood"              "$(call "$COURT" 'stakedWood()(address)')"         "$SWOOD"
+# The referral window must be POSITIVE or every disputed challenge free-wins
+# for the accused: autoSlashDelay + voteWindow + FINALIZE_BUFFER <= disputeTimeout.
+AS=$(call "$GAME" 'autoSlashDelay()(uint256)'); VW=$(call "$COURT" 'voteWindow()(uint256)')
+FB=$(call "$COURT" 'FINALIZE_BUFFER()(uint256)'); DT=$(call "$GAME" 'disputeTimeout()(uint256)')
+if [ $((AS+VW+FB)) -le "$DT" ]; then
+  printf '  \033[32mok\033[0m   %-46s %s + %s + %s <= %s\n' "referral window positive" "$AS" "$VW" "$FB" "$DT"; PASS=$((PASS+1))
+else
+  printf '  \033[31mFAIL\033[0m %-46s %s + %s + %s > %s\n' "referral window positive" "$AS" "$VW" "$FB" "$DT"; FAIL=$((FAIL+1))
+fi
+# Turnout is AGED weight while the floor's base is RAW stake, so a floor at or
+# above the age floor is unclearable with all stake young.
+PF=$(call "$COURT" 'participationFloorBps()(uint256)'); AF=$(call "$SWOOD" 'ageFloorBps()(uint256)')
+if [ "$PF" -lt "$AF" ]; then
+  printf '  \033[32mok\033[0m   %-46s %s < %s\n' "participationFloor < ageFloor" "$PF" "$AF"; PASS=$((PASS+1))
+else
+  printf '  \033[31mFAIL\033[0m %-46s %s >= %s (unclearable at launch)\n' "participationFloor < ageFloor" "$PF" "$AF"; FAIL=$((FAIL+1))
+fi
 
 echo; echo "── WOOD price source ──"
 check "fork feed decimals == 8"       "$(call "$WFEED" 'decimals()(uint8)')"             "8"

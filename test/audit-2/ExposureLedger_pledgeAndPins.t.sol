@@ -342,7 +342,7 @@ contract ExposureLedgerPledgeAndPinsTest is Test {
 
     /// @notice `retireApproval` must read the PER-KEY pin, not the
     ///         per-guardian max: a pin issued against one stale proposal (say,
-    ///         a grindable missed-quorum failure, no attacker required) must
+    ///         a grindable Inconclusive verdict, no attacker required) must
     ///         not block sweeping the guardian's other, unrelated
     ///         commitments. `hasFrozenCoverage` — a genuinely guardian-scoped
     ///         question — correctly stays conservative throughout.

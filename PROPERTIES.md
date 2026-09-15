@@ -12,7 +12,7 @@ deduplicated and curated to the set below). Each entry has a stable Spec ID.
   **lead for human review**, not automatically a bug.
 
 Scope: `SyndicateVault`, `VaultWithdrawalQueue`, `SyndicateGovernor`,
-`GuardianRegistry`, `StakedWood`, `ExposureLedger`, `ChallengeGame`,
+`GuardianRegistry`, `StakedWood`, `ExposureLedger`, `ChallengeGame`, `TokenCourt`,
 `TierRegistry`, `ProposerBondEscrow`. Strategies, adapters, the oracle and
 `SyndicateFactory` are out of scope for this campaign.
 
@@ -24,11 +24,9 @@ Checked after every call sequence.
 
 ### Conservation
 
-- [x] **GL-01** `SHOULD-HOLD` — `wood.balanceOf(ChallengeGame) >= bondedWood`.
-  Verbatim NatSpec on the contract header. `bondedWood` is the sum of the live
-  (`Filed`) challenges' challenger bonds, the only WOOD the game custodies, and it
-  is maintained across one credit site (`file`) and two terminal debits (`_settle`,
-  `_fail`) with no on-chain assertion (x-ray I-1).
+- [x] **GL-01** `SHOULD-HOLD` — `wood.balanceOf(ChallengeGame) >= bondedWood + unclaimedWood`.
+  Verbatim NatSpec on the contract header. Maintained across six write sites and
+  three terminal paths with no on-chain assertion (x-ray I-1).
 - [ ] **GL-02** `SHOULD-HOLD` — `wood.balanceOf(GuardianRegistry) == slashAppealReserve`.
   The registry custodies no other WOOD; `fundSlashAppealReserve` / `refundSlash`
   are the only two writers, each paired 1:1 with a real transfer.
@@ -51,20 +49,8 @@ Checked after every call sequence.
   guardian's per-proposal recorded exposure via `approversOf` (x-ray I-5, first clause).
 - [x] **GL-13** `SHOULD-HOLD` — per guardian, pledged-basis total == Σ per-proposal
   `pledgedOf` entries. `_livePledgedUsd` has no accessor; needs a ghost (x-ray I-5, second clause).
-- [x] **GL-14** `SHOULD-HOLD` — for every challenge,
-  `convictWeight + acquitWeight <= votableStakeAtFiling`. The quorum test is
-  `convictWeight * 10_000 >= quorumBpsAtFiling * votableStakeAtFiling`, so a tally
-  that could outgrow its own denominator would convict on less than the fraction it
-  claims. Both tallies are checked against the one denominator because each voter's
-  weight lands in exactly one of them and `votableStakeAtFiling` is the total those
-  weights were drawn from (x-ray I-6).
-- [x] **GL-52** `SHOULD-HOLD` — the exact clause GL-12 relaxes: while nothing can yet
-  have expired (`block.timestamp - epochGenesis <= challengeWindow`), a guardian's
-  bucketed `openExposure` EQUALS the sum of its locks. Inside that span every bucket
-  ever written is still inside `openExposure`'s walk and `retireApproval` cannot have
-  run, so the only writers are `recordApproval` and `releaseApproval`, each moving
-  bucket and lock together; any drift is a bug in one of those two. Vacuous once the
-  clock passes the window, where GL-12's inequality carries on.
+- [x] **GL-14** `SHOULD-HOLD` — while a challenge is live, Σ contributor amounts ==
+  `challengeOf(id).counterBondWood` (x-ray I-6).
 
 ### Counts and state consistency
 
@@ -74,8 +60,8 @@ Checked after every call sequence.
 - [x] **GL-16** `SHOULD-HOLD` — `openProposalCount()` == count of proposals in
   {Draft, Pending, GuardianReview, Approved, Executed}.
 - [x] **GL-17** `SHOULD-HOLD` — `game.liveChallengeCountOf(gov, pid)` == count of
-  challenges against that key with status `Filed`. This refcount gates the ledger's
-  coverage freeze.
+  challenges against that key with status Filed or Disputed. This refcount gates
+  the ledger's coverage freeze.
 - [x] **GL-18** `SHOULD-HOLD` — `ledger.frozenCoverageCount()` == number of keys
   reporting `isCoverageFrozen` true.
 - [ ] **GL-19** `SHOULD-HOLD` — a guardian never appears in both the approver and
@@ -95,20 +81,20 @@ Checked after every call sequence.
   `GuardianReview→{Approved,Rejected,Expired,Cancelled}`, `Approved→{Executed,Expired,Cancelled}`,
   `Executed→{Settled}`.
 - [x] **GL-25** `SHOULD-HOLD` — `proposal.executedAt` is a one-shot latch, never reset or overwritten.
-  `ChallengeGame.file` pins it onto the challenge as the verdict's slash basis.
-- [x] **GL-26** `SHOULD-HOLD` — a challenge reaches exactly one terminal status —
-  `Failed` or `Settled` — and never changes after (x-ray I-25).
+  `ChallengeGame.file` and `TokenCourt.refer` both derive snapshots from it.
+- [x] **GL-26** `SHOULD-HOLD` — a challenge reaches exactly one terminal status and never
+  changes after (x-ray I-25).
 - [ ] **GL-27** `SHOULD-HOLD` — challenge status edges are exactly
-  `None→Filed` and `Filed→{Settled,Failed}`; both terminal states are absorbing.
+  `Filed→{Disputed,Settled}`, `Disputed→{Settled,Failed,Inconclusive}`.
 - [ ] **GL-28** `SHOULD-HOLD` — `_convicted[reviewKey]` is one-shot; a second `file()`
   against a convicted key always reverts.
 - [ ] **GL-29** `SHOULD-HOLD` — `swood.verdictSlashed(caseKey, approver)` is one-shot
   (x-ray I-27). Twin of GL-28 across the contract boundary.
-- [x] **GL-31** `SHOULD-HOLD` — `game.hasVotedOn(challengeId, voter)` is one-shot and
-  never returns to false. There is no un-vote, and `resolve` leans on exactly that:
-  it settles the instant the convict tally crosses quorum without waiting for the
-  window, because a tally that can only grow cannot be walked back under a verdict
-  already executed (x-ray I-26).
+- [x] **GL-30** `SHOULD-HOLD` — a court case's phase goes `Voting→Resolved` once, never back.
+- [x] **GL-31** `SHOULD-HOLD` — `voteOf[caseId][voter]` is one-shot: NatSpec says
+  "NO VOTE CHANGES" (x-ray I-26).
+- [x] **GL-32** `SHOULD-HOLD` — `caseOfChallenge[game][challengeId]` is set once.
+- [x] **GL-33** `SHOULD-HOLD` — `isAccused[caseId][addr]` is never cleared mid-case.
 - [x] **GL-34** `SHOULD-HOLD` — a queue request's `claimed` and `cancelled` are mutually
   exclusive and each one-shot.
 - [x] **GL-35** `SHOULD-HOLD` — `_settlePrice[pid].stamped` is one-shot (x-ray G-19).
@@ -176,11 +162,9 @@ Checked after every call sequence.
   break-even condition but does not enforce it (x-ray E-4). Implemented together
   with the four setter handlers that make it non-vacuous (`challengerBondBps`,
   `settleBurnBps`, `prosecutorFeeBps` on ChallengeGame; `proposerBondBps` on
-  ExposureLedger). Expected to FAIL: the figure prices only the
-  quorum-reached branch — the best case, not a floor, since a filing that misses
-  quorum pays `forfeitBurnBps` of the bond and collects nothing — and no single
-  setter can enforce the condition because its inputs span two independently-owned
-  contracts. A counterexample names a parameter tuple
+  ExposureLedger). Expected to FAIL: the figure prices only the silence branch,
+  and no single setter can enforce the condition because its inputs span two
+  independently-owned contracts. A counterexample names a parameter tuple
   governance must not ship — it is not a protocol bug.
 
   **VIOLATED, as designed — counterexample found (deep campaign, 2026-08-05).**
@@ -214,13 +198,11 @@ Asserted inside the handler that performs the call.
   capital snapshot deleted, `openProposalCount` decreased by exactly 1.
 - [ ] **SP-03** `SHOULD-HOLD` — after `file()`: status is `Filed`, `bondedWood` increased
   by exactly the bond, live count for the key incremented by 1.
-- [ ] **SP-04** `SHOULD-HOLD` — after `voteOnChallenge(id, convict)`: `hasVotedOn` is
-  true for the caller, exactly one of `convictWeight`/`acquitWeight` increased by the
-  caller's `getPastStake(voter, filedAt - 1)`, and the other is unchanged.
-- [ ] **SP-05** `SHOULD-HOLD` — after `resolve(id)`: status is `Settled` iff
-  `convictWeight * 10_000 >= quorumBpsAtFiling * votableStakeAtFiling`, else `Failed`
-  and only at or after `filedAt + voteWindowAtFiling`; `bondedWood` decreased by
-  exactly that challenge's bond either way.
+- [ ] **SP-04** `SHOULD-HOLD` — after the pool-completing `dispute()`: status flips
+  `Filed→Disputed` and `counterBondWood == bondWood` exactly.
+- [ ] **SP-05** `SHOULD-HOLD` — after `finalize(caseId)`: phase is `Resolved`,
+  `finalizedAt == block.timestamp`, and the challenge is no longer Filed/Disputed
+  (or the only swallowed revert was `WrongStatus`).
 - [ ] **SP-06** `SHOULD-HOLD` — after `stampSettlement`: `_pidReserved[pid]`,
   `reservedAssets` and `stampedUnclaimedShares` all move together, sourced from the
   same `redeemShares`.
@@ -274,9 +256,7 @@ Asserted inside the handler that performs the call.
 - [ ] **SP-27** `SHOULD-HOLD` — the stake-age re-anchor on top-up rounds *toward now*
   (ceiling), never granting free age (`guardian-staking/spec.md`:
   "Rounding MUST never grant free age").
-- [ ] **SP-28** `SHOULD-HOLD` — a failed challenge burns exactly
-  `floor(bond * forfeitBurnBpsAtFiling / 10_000)` and returns the remainder to the
-  challenger, so the two legs sum to the bond and neither exceeds it.
+- [ ] **SP-28** `SHOULD-HOLD` — counter-bond refunds never pay out more than the pool.
 
 ### Snapshot integrity
 

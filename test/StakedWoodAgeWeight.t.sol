@@ -176,9 +176,9 @@ contract StakedWoodAgeWeightTest is Test {
     }
 
     // ── issue #82: anchor checkpoint exactness (the mock cannot witness this
-    //    — `MockStakedWood` has no age-factor model at all, so only the REAL
-    //    contract can prove a historical read is immune to a LATER anchor
-    //    write) ──
+    //    — TokenCourt.t.sol's MockStakedWood has no age-factor model at all,
+    //    so only the REAL contract can prove a historical read is immune to
+    //    a LATER anchor write) ──
 
     /// @notice A top-up strictly AFTER `ts` must not move `getPastVotes(g,
     ///         ts)` — the top-up's forward re-anchor (`stakeAsGuardian`'s
