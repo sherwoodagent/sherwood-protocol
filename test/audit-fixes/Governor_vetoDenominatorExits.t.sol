@@ -443,7 +443,15 @@ contract GovernorVetoDenominatorExitsTest is Test {
 
         uint256 pid = _proposeCollab(coAgent);
 
-        // One block ahead of the approval that stamps the electorate.
+        // The Draft already holds the redeem lock, so the queue is the only exit. lp2 takes it
+        // before the stamp, putting real weight on the excluded side of the electorate.
+        // Hoisted: `balanceOf` in argument position would eat the one-shot prank.
+        uint256 lp2Shares = vault.balanceOf(lp2);
+        vm.prank(lp2);
+        vault.requestRedeem(lp2Shares, lp2);
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        // At the snapshot instant itself, the tightest the exit could be timed.
         vm.prank(attacker);
         vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
         vault.delegate(address(0));
@@ -453,12 +461,23 @@ contract GovernorVetoDenominatorExitsTest is Test {
         governor.approveCollaboration(pid);
 
         uint256 s = governor.getProposal(pid).snapshotTimestamp;
-        assertEq(governor.getProposal(pid).votableSupply, honest + attackerShares, "electorate is G + X");
+        uint256 queued = vault.getPastVotes(address(queue), s);
+        assertEq(queued, lp2Shares, "lp2's escrowed shares are the queue's snapshot votes");
+        assertEq(
+            governor.getProposal(pid).votableSupply, honest + attackerShares - queued, "electorate is G + X - queued"
+        );
         assertEq(governor.getVoteWeight(pid, attacker), attackerShares, "capital at risk still buys a vote");
+        // Every share's votes are somewhere -- no holder walked out of the snapshot...
+        assertEq(
+            vault.getPastVotes(lp1, s) + vault.getPastVotes(lp2, s) + vault.getPastVotes(attacker, s) + queued,
+            vault.getPastTotalSupply(s),
+            "sum over every holder equals the snapshot supply"
+        );
+        // ...and the electorate is that sum less the queue's, which cannot vote.
         assertEq(
             governor.getProposal(pid).votableSupply,
             vault.getPastVotes(lp1, s) + vault.getPastVotes(lp2, s) + vault.getPastVotes(attacker, s),
-            "the electorate is exactly the castable weight"
+            "the electorate is exactly the castable weight outside the queue"
         );
     }
 
@@ -479,6 +498,8 @@ contract GovernorVetoDenominatorExitsTest is Test {
 
         uint256 pid = _propose();
         uint256 s = governor.getProposal(pid).snapshotTimestamp;
+        assertEq(vault.balanceOf(address(queue)), 0, "nothing is parked, so the electorate is the whole supply");
+        assertEq(governor.getProposal(pid).votableSupply, vault.totalSupply(), "300k of shares, 300k of electorate");
         assertEq(
             governor.getProposal(pid).votableSupply,
             vault.getPastVotes(lp1, s) + vault.getPastVotes(lp2, s) + vault.getPastVotes(attacker, s),
