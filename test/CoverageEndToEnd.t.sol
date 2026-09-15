@@ -1323,6 +1323,8 @@ contract CoverageEndToEndTest is Test {
             swood.requestUnstakeGuardian();
         }
         vm.warp(vm.getBlockTimestamp() + 1);
+        // Nothing exposes `openedAt`; `GuardianRegistry._openReview` stamps
+        // `block.timestamp - 1` (src/GuardianRegistry.sol:860).
         uint256 openedAt = vm.getBlockTimestamp() - 1;
         if (flicker) {
             vm.prank(g1);
@@ -1340,7 +1342,10 @@ contract CoverageEndToEndTest is Test {
         burn = before - swood.guardianStake(g1);
     }
 
-    /// @notice SHE-168: requesting unstake the block before the review opens and cancelling in the open block zeroes the votable checkpoint at `openedAt`, and the block-quorum slash still burns exactly what it burns without the request.
+    /// @notice SHE-168: requesting unstake the block before the review opens and
+    ///         cancelling in the open block zeroes the votable checkpoint at
+    ///         `openedAt`, and the block-quorum slash still burns exactly what it
+    ///         burns without the request.
     function test_reviewSlash_she168_unstakeRequestBeforeOpenDoesNotShrinkTheSlash() public {
         uint256 pid = _propose(govA, address(vaultA), agentA);
 
@@ -1353,7 +1358,9 @@ contract CoverageEndToEndTest is Test {
         assertEq(attackBurn, controlBurn, "the request-then-cancel flicker changes nothing");
     }
 
-    /// @notice SHE-168: a requested guardian cannot cast the approve vote at all, so the request-then-vote ordering the issue feared never produces an approver.
+    /// @notice SHE-168: a requested guardian cannot cast the approve vote at all,
+    ///         so the request-then-vote ordering the issue feared never produces
+    ///         an approver.
     function test_reviewSlash_she168_requestedGuardianCannotApprove() public {
         uint256 pid = _propose(govA, address(vaultA), agentA);
         vm.warp(govA.getProposal(pid).voteEnd + 1);
@@ -1366,7 +1373,10 @@ contract CoverageEndToEndTest is Test {
         registry.voteOnProposal(address(govA), pid, IGuardianRegistry.GuardianVoteType.Approve, WHALE_STAKE / 2);
     }
 
-    /// @notice SHE-168: an approver who requests unstake after voting cannot claim while its coverage is open, and the blocked review burns exactly what it burns without the request.
+    /// @notice SHE-168: an approver who requests unstake after voting cannot claim
+    ///         while its coverage is open, and the blocked review burns exactly what
+    ///         the control burns without the request, whatever the resolve time
+    ///         (the control resolves at `reviewEnd + 1`, this one a week later).
     function test_reviewSlash_she168_unstakeRequestAfterApproveDoesNotShrinkTheSlash() public {
         vm.startPrank(owner);
         swood.setExposureLedger(address(ledger));
@@ -1380,6 +1390,7 @@ contract CoverageEndToEndTest is Test {
         vm.revertToState(snap);
 
         _openReview(govA, pid);
+        // `GuardianRegistry._openReview` stamps `block.timestamp - 1` (src/GuardianRegistry.sol:860).
         uint256 openedAt = vm.getBlockTimestamp() - 1;
         _voteLock(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve, WHALE_STAKE / 2);
         _vote(govA, pid, g2, IGuardianRegistry.GuardianVoteType.Block);
@@ -1396,7 +1407,9 @@ contract CoverageEndToEndTest is Test {
 
         uint256 before = swood.guardianStake(g1);
         assertTrue(registry.resolveReview(address(govA), pid), "blocked");
-        assertEq(before - swood.guardianStake(g1), controlBurn, "the pending request changes nothing");
+        assertEq(
+            before - swood.guardianStake(g1), controlBurn, "the pending request and the later resolve change nothing"
+        );
     }
 
     /// @dev SHE-215: `SyndicateGovernor.propose` / `executeProposal` now refuse
