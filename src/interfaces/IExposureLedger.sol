@@ -160,7 +160,7 @@ interface IExposureLedger {
     // ── Coverage freeze (challenge game) ──
     /// @notice Freeze one proposal's coverage while a challenge is live and
     ///         re-bucket each approver's lock (raise-only) to the bucket
-    /// @param  liveUntil The challenge's worst-case end, `filedAt + disputeTimeout`.
+    /// @param  liveUntil The challenge's worst-case end, `filedAt + voteWindow`.
     function freezeCoverage(address governor, uint256 proposalId, uint256 liveUntil) external;
     /// @notice Release the freeze; each lock returns to max(current, booked, pinned) bucket.
     function unfreezeCoverage(address governor, uint256 proposalId) external;
@@ -169,7 +169,7 @@ interface IExposureLedger {
     ///         approver, OR this guardian is within a `pinCoverageUntil` deadline
     ///         on ANY proposal it ever approved (the guardian-scoped max). sWOOD
     ///         gates the unstake CLAIM on it, which is what makes the freeze
-    ///         load-bearing: epoch buckets age out on wall-clock and a disputed
+    ///         load-bearing: epoch buckets age out on wall-clock and a live
     ///         challenge outlives them.
     /// @dev    INCLUSIVE of `deadline`, matching `ChallengeGame.file`'s own
     ///         inclusive filing-deadline check, so this cannot go clean one
@@ -218,8 +218,8 @@ interface IExposureLedger {
     ///         "did this guardian underwrite it?" question asks for.
     /// @dev    Historically the settle-immune half of a booking/pledge pair. With
     ///         one lock per (proposal, guardian) the pair has collapsed; this
-    ///         selector survives because `ChallengeGame.file` and `TokenCourt`
-    ///         derive the accused set from it, and the lock is written once by
+    ///         selector survives because `ChallengeGame.file` derives the accused
+    ///         set from it, and the lock is written once by
     ///         `recordApproval` and erased only by `releaseApproval` (which reverts
     ///         `CoverageFrozen` for the whole life of a challenge) or
     ///         `retireApproval` (refused while frozen or pinned).

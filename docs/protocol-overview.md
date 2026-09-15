@@ -31,16 +31,16 @@ settle: capital returns, P&L is measured against the execution snapshot, the
 management fee then the performance fee (above the high-water mark only) are
 charged, and the queue's frozen settle price is stamped so every queued deposit and
 redemption clears at the same post-fee NAV. For the next 14 days the execution
-remains challengeable — anyone can bond 1.5% of coverage to accuse the cohort; silence
-convicts, a dispute goes to a WOOD-vote court. Only after that window closes does
-the proposer get their bond back.
+remains challengeable — anyone can bond 1.5% of coverage to accuse the cohort, and the
+staked guardians outside that cohort vote the accusation up or down within 7 days.
+Only after that window closes does the proposer get their bond back.
 
 ## Core documents
 
 | Doc | Covers |
 |---|---|
 | [proposal-lifecycle.md](proposal-lifecycle.md) | every state, every window, min/max of each period, who calls what, fund custody per stage |
-| [guardian-network.md](guardian-network.md) | staking, review mechanics, exposure ledger, adapter tiers, challenge game, token court |
+| [guardian-network.md](guardian-network.md) | staking, review mechanics, exposure ledger, adapter tiers, the challenge game and its guardian vote |
 | [fees.md](fees.md) | the two-number fee model, splits, every bound |
 | [deposit-withdraw-flow.md](deposit-withdraw-flow.md) | full LP flow with diagram — instant vs queued paths |
 
@@ -56,9 +56,10 @@ the proposer get their bond back.
    rather than carry veto power.
 4. **Coverage quorum at execute** — no strategy runs unless guardian stake covers
    its extractable value (fail-closed, re-checked against live tier state).
-5. **Post-execution challenge game** — a 14-day accountability tail with bonded
-   challenges, a silence-convicts default, an escalating anti-spam burn schedule,
-   and a WOOD-vote court. Convictions slash at 100% and burn.
+5. **Post-execution challenge game** — a 14-day accountability tail. A bonded
+   challenge opens a guardian vote; a convict quorum of the staked guardians
+   outside the accused cohort carries it, and a window that closes short of that
+   quorum burns a fifth of the challenger's bond. Convictions slash at 100% and burn.
 6. **Emergency rails** — owner veto, emergency cancel, `unstick` (replay voted
    settlement), bonded emergency settle behind a fresh guardian review, registry
    dead-man unpause.
@@ -110,14 +111,12 @@ flowchart LR
         GR[GuardianRegistry\nreviews]
         EL[ExposureLedger\ncoverage book]
         TR[TierRegistry\nadapter certification]
-        CG[ChallengeGame]
-        TC[TokenCourt]
+        CG[ChallengeGame\nfile + guardian vote]
         GR --> SW
         GR --> EL
         CG --> SW
         CG --> EL
         CG --> TR
-        CG <--> TC
     end
 
     G --> GR
