@@ -64,24 +64,6 @@ contract ChallengeE2EAdapter {
     }
 }
 
-/// @dev The court's only job in this suite is to hand `ChallengeGame.rule` an
-///      `Inconclusive` verdict, so it implements exactly the two views
-///      `_requireWindowFits` reads at `setCourt` and nothing else. `refer` is
-///      deliberately absent: `dispute`'s auto-referral is a try/catch, so the
-///      missing selector is swallowed and the challenge stays `Disputed` —
-///      which is the state `rule` requires. The turnout arithmetic that picks
-///      between the three verdicts belongs to `TokenCourt` and is proven in
-///      `TokenCourt.t.sol` and `TokenCourtEndToEnd.t.sol`; what is under test
-///      here is the GOVERNOR-side consequence of the verdict, not a second
-///      copy of the vote count.
-///
-///      7d `autoSlashDelay` + 5d + 1d == 13d, inside the shipped 30d
-///      `disputeTimeout`, so `setCourt`'s window invariant accepts it.
-contract StubInconclusiveCourt {
-    uint256 public constant FINALIZE_BUFFER = 1 days;
-    uint256 public constant voteWindow = 5 days;
-}
-
 /// @title ChallengeEndToEndTest
 /// @notice Plan D Task 5 — the whole challenge game against the REAL stack, with
 ///         no mock standing in for a protocol contract anywhere: a real UUPS
@@ -121,7 +103,7 @@ contract StubInconclusiveCourt {
 ///             commitment is the whole $1,000 the proposal needs; a full
 ///             (10,000 bps) verdict slash yields 30,000 WOOD of proceeds, split
 ///             70/30 into 21,000 / 9,000.
-contract ChallengeEndToEndTest is Test {
+abstract contract ChallengeEndToEndBase is Test {
     // ── Real stack ──
     ERC20Mock public usdg; // vault asset, 6-dec, $1.00
     ERC20Mock public wood; // stake + bond token, 18-dec
@@ -308,26 +290,16 @@ contract ChallengeEndToEndTest is Test {
         // half notional; `bump` is left uncertified so the batch as a whole is
         // still tier 2 and therefore coverage-gated.
         //
-        // Two-step certification (design.md / tasks.md 2.1): the test contract
-        // IS the registry owner, so no prank is needed — propose, warp past
-        // the pinned `readyAt` (`vm.getBlockTimestamp()`, never a cached
-        // `block.timestamp` local — the optimizer CSEs it across `vm.warp`),
-        // execute. Every later warp in this suite reads live state
-        // (`gov.getProposal(...)`, `game.challengeOf(...)`, or an
-        // in-test-live `filedAt`/`executedAt`), so this setUp-time shift is safe.
-        tierRegistry.proposeCertification(
-            address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(0), address(adapter).codehash
-        );
-        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
-        tierRegistry.certify(address(adapter), adapter.poke.selector);
+        // The test contract IS the registry owner, so no prank is needed.
+        tierRegistry.certify(address(adapter), adapter.poke.selector, 1, CERTIFIED_BOUND_BPS, address(adapter).codehash);
 
-        // ── WOOD for the proposer's bond, the challenger's bond, and the
-        //    accused guardian's counter-bond.
+        // ── WOOD for the proposer's bond, the challenger's bond, and a
+        //    spare balance for the accused guardian.
         wood.mint(agent, 1_000_000e18);
         vm.prank(agent);
         wood.approve(address(bondEscrow), type(uint256).max);
-        // 2x, not 1x: `_driveToInconclusiveRearm` (issue #94 fixtures) files
-        // once, takes a round-1 Inconclusive burn on the refund, and a
+        // 2x, not 1x: `_driveToFailedRearm` (issue #94 fixtures) files
+        // once, takes a round-1 forfeit burn on the refund, and a
         // second test-body filing then needs a FULL fresh bond out of what's
         // left — a bare 1x mint left no headroom for that once the mint
         // amount stopped being a stale, accidentally-oversized literal (was
@@ -336,7 +308,7 @@ contract ChallengeEndToEndTest is Test {
         wood.mint(challenger, _challengerBond() * 2);
         vm.prank(challenger);
         wood.approve(address(game), type(uint256).max);
-        wood.mint(g1, _challengerBond()); // counter-bond matches the challenger's
+        wood.mint(g1, _challengerBond()); // a spare balance sized like the challenger's
         vm.prank(g1);
         wood.approve(address(game), type(uint256).max);
 
@@ -516,6 +488,126 @@ contract ChallengeEndToEndTest is Test {
         ledger.releaseApproval(address(gov), pid, g1);
     }
 
+    // ── 4. Issue #94: the two clocks are independent ───────────────────────
+
+    function _reviewKey(uint256 pid) internal view returns (bytes32) {
+        return keccak256(abi.encode(address(gov), pid));
+    }
+
+    /// @dev SHE-215: `SyndicateGovernor.propose` / `executeProposal` now refuse
+    ///      a vault whose owner-stake slot is unbound, claimed, slashed, or
+    ///      exiting. `SyndicateFactory.createSyndicate` ALWAYS binds that slot,
+    ///      so a hand-built syndicate that skips it models a vault the real
+    ///      factory cannot produce. Binding here restores the fixture to a
+    ///      state the protocol can actually reach.
+    function _bondVaultOwner(address vault_) internal {
+        uint256 bond = swood.minOwnerStake();
+        wood.mint(owner, bond);
+        vm.startPrank(owner);
+        wood.approve(address(swood), bond);
+        swood.prepareOwnerStake(bond);
+        vm.stopPrank();
+        // The test contract is sWOOD's factory.
+        swood.bindOwnerStake(owner, vault_);
+    }
+
+    // ── SHE-213: every filing re-buckets the approvers' locks ──
+
+    /// @dev propose(`duration`) -> review -> g1 approves -> execute, without
+    ///      the 7-day-arc assertions `_proposeApproveExecute` makes.
+    function _proposeApproveExecuteWithDuration(uint256 duration) internal returns (uint256 pid) {
+        ISyndicateGovernor.RiskEnvelope memory env =
+            ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000});
+        vm.prank(agent);
+        pid = gov.propose(
+            address(vault),
+            address(0),
+            "ipfs://she-213",
+            duration,
+            env,
+            _execCalls(),
+            GovEnvelope.defaultCaps(MAX_CAPITAL, _execCalls().length),
+            _settleCalls(),
+            GovEnvelope.defaultCaps(MAX_CAPITAL, _settleCalls().length),
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+        vm.warp(gov.getProposal(pid).voteEnd + 1);
+        registry.openReview(address(gov), pid);
+        vm.prank(g1);
+        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+        vm.warp(gov.getProposal(pid).reviewEnd + 1);
+        gov.executeProposal(pid);
+    }
+
+    function _epochOf(uint256 t) internal view returns (uint256) {
+        return (t - ledger.epochGenesis()) / EPOCH_LENGTH;
+    }
+
+    /// @dev The instant bucket `epoch` stops counting in `openExposure`.
+    function _bucketExpiry(uint256 epoch) internal view returns (uint256) {
+        return ledger.epochGenesis() + (epoch + 1) * EPOCH_LENGTH + ledger.challengeWindow();
+    }
+
+    /// @dev Reaches the convict quorum from the two guardians the filing does
+    ///      not accuse — g1 is the only approver anywhere in this fixture. A
+    ///      settle needs it: silence at the deadline fails the challenge.
+    function _convict(uint256 cid) internal {
+        vm.prank(g2);
+        game.voteOnChallenge(cid, true);
+        vm.prank(g3);
+        game.voteOnChallenge(cid, true);
+    }
+
+    function _file(address who, uint256 pid, string memory uri) internal returns (uint256 cid) {
+        vm.prank(who);
+        cid = game.file(
+            address(gov),
+            pid,
+            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            address(adapter),
+            adapter.poke.selector,
+            uri
+        );
+    }
+
+    // ── SHE-246: a challenge is unrulable past its dispute deadline ──
+
+    uint256 internal pid_;
+
+    // ── The two clocks are independent ────────────────────────────────────
+
+    /// @dev Execute at T0, file on day 13, and let the vote miss its quorum so
+    ///      the challenge fails on day 24 — ten days PAST
+    ///      `executedAt + challengeWindow`, which is exactly what makes both of
+    ///      the governor's original gates read "open" while `_fail` has
+    ///      simultaneously re-armed the filing deadline to day 38.
+    ///
+    ///      Every warp is forward-only and every timestamp is derived from a
+    ///      value the CONTRACT stored (`executedAt`) or read back live, never
+    ///      from a `block.timestamp` local captured before a warp — the
+    ///      optimizer CSEs that across `vm.warp`.
+    function _driveToFailedRearm() internal returns (uint256 pid, uint256 cid) {
+        pid = _proposeApproveExecute();
+        uint256 executedAt = gov.getProposal(pid).executedAt;
+
+        // Terminal FIRST, so what the probes pin is the filing-deadline gate
+        // and not the pre-existing `ProposalNotTerminal` guard.
+        vm.warp(executedAt + 1 hours + 1);
+        vm.prank(agent);
+        gov.settleProposal(pid);
+        assertEq(_state(pid), uint256(ISyndicateGovernor.ProposalState.Settled), "self-settled an hour in");
+
+        // Day 13: a sock-puppet files on the second-to-last day of the window.
+        vm.warp(executedAt + 13 days);
+        cid = _file(challenger, pid, "ipfs://evidence/sock-puppet");
+
+        // Day 24: nobody ever voted, so the deadline fails the challenge.
+        vm.warp(executedAt + 24 days);
+        game.resolve(cid);
+    }
+}
+
+contract ChallengeEndToEndTest is ChallengeEndToEndBase {
     // ── 1. The happy arc: a real drain is challenged, slashed and compensated ──
 
     /// @notice Spec §3.4 + §3.8, end to end and with nothing mocked. A tier-2
@@ -592,7 +684,8 @@ contract ChallengeEndToEndTest is Test {
         uint256 lp2Before = wood.balanceOf(lp2);
 
         // ── Silence. Resolve is permissionless, so anyone may execute it.
-        vm.warp(c.filedAt + game.autoSlashDelay());
+        _convict(cid);
+        vm.warp(c.filedAt + game.voteWindow());
         game.resolve(cid);
 
         // ── The verdict landed. THE BURN IS THE LOCK: g1 declared its whole
@@ -665,135 +758,6 @@ contract ChallengeEndToEndTest is Test {
 
     // ── 2. The bad-faith arc: the bond is a real deterrent ────────────────
 
-    /// @notice D5's fail-safe. A CLEAN proposal is challenged; an accused
-    ///         approver buys the escalation with a matching counter-bond, which
-    ///         stops the auto-slash clock. The court of §3.5 does not exist
-    ///         yet, so nobody rules — and rather than pinning the guardian's
-    ///         coverage forever, the timeout unwinds the challenge once
-    ///         `disputeTimeout` elapses.
-    ///
-    ///         A TIMEOUT WITH NO ADJUDICATOR IS A NON-VERDICT, NOT AN
-    ///         ACQUITTAL (audit #181 finding 2). This path used to reach
-    ///         `_fail`, forfeiting the challenger's whole bond to whoever
-    ///         funded the counter-bond. Because `dispute` is open to ANYONE,
-    ///         that made funding the defence of a challenge you filed yourself
-    ///         a deterministic +80% round trip at the shipped rates, paid for
-    ///         by every honest filer — so no rational party would ever file.
-    ///         `courtAtFiling` is now pinned per challenge, and when it is the
-    ///         zero address the timeout routes to `_refundAll`: both sides
-    ///         unwind whole, exactly as `Inconclusive` already behaved.
-    ///
-    ///         The challenger is not made whole to the wei — it still pays the
-    ///         round-1 anti-grinding burn (finding 19), which is what stops a
-    ///         free filing from pinning a cohort's coverage for weeks. That is
-    ///         a small toll on the filer, not a transfer to the accused.
-    ///
-    ///         Nothing is slashed, no case is opened, and the adapter keeps its
-    ///         certification — an unwound challenge must leave no mark.
-    function test_badFaithArc_disputedChallengeTimesOutToANonVerdict() public {
-        uint256 pid = _proposeApproveExecute();
-        uint256 challengerBalBefore = wood.balanceOf(challenger);
-        uint256 g1BalBefore = wood.balanceOf(g1);
-        uint256 g1StakeBefore = swood.guardianStake(g1);
-        // sWOOD's own balance — the burn address also takes the challenger's
-        // forfeit burn on this path, so it cannot distinguish "no slash".
-        uint256 swoodBalBefore = wood.balanceOf(address(swood));
-
-        // ── A bad-faith filing against a clean proposal. Nothing on-chain can
-        //    tell it apart from the honest one — that is D1's whole point, and
-        //    the bond is what prices the difference.
-        vm.prank(challenger);
-        uint256 cid = game.file(
-            address(gov),
-            pid,
-            IChallengeGame.Predicate.ProposerLinkedOutflow,
-            address(adapter),
-            adapter.poke.selector,
-            "ipfs://evidence/fabricated"
-        );
-        assertTrue(ledger.isCoverageFrozen(address(gov), pid), "even a bad-faith filing pins the coverage");
-        _expectReleaseBlocked(pid);
-        assertEq(game.bondedWood(), _challengerBond());
-
-        uint256 filedAt = game.challengeOf(cid).filedAt;
-
-        // ── The accused answers, inside the window, at the same price the
-        //    challenger paid.
-        vm.warp(filedAt + 1 hours);
-        vm.prank(g1);
-        game.dispute(cid, type(uint256).max);
-        IChallengeGame.Challenge memory c = game.challengeOf(cid);
-        assertEq(uint256(c.status), uint256(IChallengeGame.Status.Disputed), "Disputed");
-        assertEq(c.counterBondWood, _challengerBond(), "the counter-bond pool matches the bond");
-        address[] memory funders = game.counterBondContributors(cid);
-        assertEq(funders.length, 1, "g1 covered all the coverage, so it funds the whole defence alone");
-        assertEq(funders[0], g1);
-        assertEq(game.counterBondContributionOf(cid, g1), _challengerBond(), "the forfeit follows this, not coverage");
-        assertEq(game.bondedWood(), 2 * _challengerBond(), "both bonds are live");
-        assertEq(wood.balanceOf(address(game)), 2 * _challengerBond());
-        assertEq(wood.balanceOf(g1), g1BalBefore - _challengerBond(), "the accused paid for the escalation");
-
-        // ── The dispute really did stop the auto-slash clock: at the instant the
-        //    silence verdict WOULD have fired, resolve still refuses.
-        vm.warp(filedAt + game.autoSlashDelay());
-        vm.expectRevert(IChallengeGame.DelayNotElapsed.selector);
-        game.resolve(cid);
-        assertEq(swood.guardianStake(g1), g1StakeBefore, "nothing slashed while the escalation stands");
-        assertEq(wood.balanceOf(address(swood)), swoodBalBefore, "and no WOOD left the custodian");
-
-        // ── Nobody rules, and no court was ever wired — so the timeout is a
-        //    NON-VERDICT, not an acquittal. Both sides unwind.
-        vm.warp(filedAt + game.disputeTimeout());
-        IChallengeGame.Challenge memory cAt = game.challengeOf(cid);
-        assertEq(cAt.courtAtFiling, address(0), "fixture: this challenge was filed against an unwired game");
-        game.resolve(cid);
-        assertEq(
-            uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Inconclusive), "unwound, not acquitted"
-        );
-
-        // ── The challenger keeps its bond less ONLY the round-1 anti-grinding
-        //    burn. Derived from the rate pinned at filing, not hardcoded, so a
-        //    later schedule change does not silently invalidate this.
-        uint256 burned = (_challengerBond() * cAt.inconclusiveBurnBpsAtFiling) / 10_000;
-        assertGt(burned, 0, "round 1 is priced, not free (finding 19)");
-        assertEq(
-            wood.balanceOf(challenger),
-            challengerBalBefore - burned,
-            "the challenger keeps its bond less only the anti-grinding burn"
-        );
-
-        // ── The counter-bond funder recovers exactly what it put in and NOT a
-        //    wei more. This is the assertion that proves the arbitrage is dead:
-        //    funding the defence of a challenge you filed yourself is now
-        //    strictly loss-making (you eat the burn), where it used to return
-        //    +80% at the shipped rates.
-        //
-        //    Collected rather than pushed — resolution records the entitlement
-        //    and the funder calls for it, which is what removed the unbounded
-        //    payout loop and let contribution standing open up.
-        vm.prank(g1);
-        game.claimContribution(cid);
-        assertEq(wood.balanceOf(g1), g1BalBefore, "the defence recovers its stake exactly, with no forfeit windfall");
-        assertEq(wood.balanceOf(game.BURN_ADDRESS()), burned, "and the burned slice left the system for good");
-        assertEq(wood.balanceOf(address(game)), 0, "nothing stranded in the game");
-        assertEq(game.bondedWood(), 0);
-
-        // ── A failed challenge leaves no mark anywhere else.
-        assertEq(swood.guardianStake(g1), g1StakeBefore, "the accused was never slashed");
-        assertEq(wood.balanceOf(address(swood)), swoodBalBefore, "and no WOOD left the custodian on its behalf");
-        (uint8 tierAfter, uint16 boundAfter) = tierRegistry.tierOf(address(adapter), adapter.poke.selector);
-        assertEq(tierAfter, 1, "the adapter keeps its certification");
-        assertEq(boundAfter, CERTIFIED_BOUND_BPS);
-
-        // ── And the coverage the filing pinned is genuinely free again.
-        assertFalse(ledger.isCoverageFrozen(address(gov), pid), "unfrozen on the fail path too");
-        assertEq(game.liveChallengeOf(address(gov), pid), 0, "no live challenge remains");
-        assertEq(ledger.openExposure(g1), G1_STAKE, "still locked until released");
-        vm.prank(address(registry));
-        ledger.releaseApproval(address(gov), pid, g1);
-        assertEq(ledger.openExposure(g1), 0, "the guardian recycled the budget a bad-faith filing had pinned");
-    }
-
     // ── 3. The proposer bond is a deterrent, not a deposit ─────────────────
 
     /// @notice THE SELF-SETTLE RACE. `MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE`
@@ -858,7 +822,7 @@ contract ChallengeEndToEndTest is Test {
     }
 
     /// @notice A LIVE CHALLENGE OUTLIVES THE FILING WINDOW, and the bond has to
-    ///         outlive it too. `autoSlashDelay` (7d) runs from `filedAt`, so a
+    ///         outlive it too. `voteWindow` (7d) runs from `filedAt`, so a
     ///         filing on the last day of the window convicts a week after the
     ///         window shut. A pure `executedAt + challengeWindow` gate would
     ///         hand the bond back mid-accusation and leave the forfeiture path
@@ -898,7 +862,8 @@ contract ChallengeEndToEndTest is Test {
 
         // Silence convicts, so this bond is forfeited rather than released —
         // the freeze lifts on the terminal path either way.
-        vm.warp(game.challengeOf(cid).filedAt + game.autoSlashDelay());
+        _convict(cid);
+        vm.warp(game.challengeOf(cid).filedAt + game.voteWindow());
         game.resolve(cid);
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled));
         assertFalse(ledger.isCoverageFrozen(address(gov), pid), "the freeze lifted with the verdict");
@@ -928,7 +893,8 @@ contract ChallengeEndToEndTest is Test {
         );
 
         // Silence is the verdict (D1).
-        vm.warp(game.challengeOf(cid).filedAt + game.autoSlashDelay());
+        _convict(cid);
+        vm.warp(game.challengeOf(cid).filedAt + game.voteWindow());
         game.resolve(cid);
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "convicted");
 
@@ -986,239 +952,6 @@ contract ChallengeEndToEndTest is Test {
         // release.
         vm.expectRevert(ISyndicateGovernor.NoBondToReclaim.selector);
         gov.reclaimProposerBond(pid);
-    }
-
-    // ── 4. Issue #94: the two clocks are independent ───────────────────────
-
-    /// @dev Issue #94's timeline, run against the real game at shipped
-    ///      defaults: execute at T0, file on day 13, escalate on day 19, and
-    ///      land an `Inconclusive` ruling on day 24 — ten days PAST
-    ///      `executedAt + challengeWindow`, which is exactly what makes both of
-    ///      the governor's original gates read "open" while `_refundAll` has
-    ///      simultaneously re-armed the filing deadline to day 38.
-    ///
-    ///      Every warp is forward-only and every timestamp is derived from a
-    ///      value the CONTRACT stored (`executedAt`) or read back live, never
-    ///      from a `block.timestamp` local captured before a warp — the
-    ///      optimizer CSEs that across `vm.warp`.
-    function _driveToInconclusiveRearm() internal returns (uint256 pid, uint256 cid) {
-        pid = _proposeApproveExecute();
-        uint256 executedAt = gov.getProposal(pid).executedAt;
-
-        // Terminal FIRST, so what the probes pin is the filing-deadline gate
-        // and not the pre-existing `ProposalNotTerminal` guard.
-        vm.warp(executedAt + 1 hours + 1);
-        vm.prank(agent);
-        gov.settleProposal(pid);
-        assertEq(_state(pid), uint256(ISyndicateGovernor.ProposalState.Settled), "self-settled an hour in");
-
-        // Hoisted: a CREATE in argument position would consume the prank and
-        // `setCourt` would run unpranked (`onlyOwner` → revert).
-        address stubCourt = address(new StubInconclusiveCourt());
-        vm.prank(owner);
-        game.setCourt(stubCourt);
-
-        // Day 13: a sock-puppet files on the second-to-last day of the window.
-        vm.warp(executedAt + 13 days);
-        vm.prank(challenger);
-        cid = game.file(
-            address(gov),
-            pid,
-            IChallengeGame.Predicate.OutOfAdapterOutflow,
-            address(adapter),
-            adapter.poke.selector,
-            "ipfs://evidence/sock-puppet"
-        );
-
-        // Day 19: the accused self-disputes, inside `autoSlashDelay` (7d from
-        // `filedAt`), which stops the silence clock and refers the case.
-        vm.warp(executedAt + 19 days);
-        vm.prank(g1);
-        game.dispute(cid, type(uint256).max);
-        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Disputed), "escalated");
-
-        // Day 24: turnout misses the participation floor, so the court unwinds
-        // rather than rules.
-        vm.warp(executedAt + 24 days);
-        vm.prank(stubCourt);
-        game.rule(cid, IChallengeGame.Verdict.Inconclusive);
-    }
-
-    function _reviewKey(uint256 pid) internal view returns (bytes32) {
-        return keccak256(abi.encode(address(gov), pid));
-    }
-
-    /// @notice ISSUE #94. `ChallengeGame._refundAll` does two things in one
-    ///         call: it RELEASES the coverage freeze and it RE-ARMS
-    ///         `challengeableUntil[rk]` to `block.timestamp + challengeWindow`.
-    ///         The governor's original two gates read the ledger only — elapsed
-    ///         time since `executedAt`, and the freeze — so between an
-    ///         `Inconclusive` unwind landing past the ordinary window and the
-    ///         re-armed deadline, BOTH of them said "open" while
-    ///         `ChallengeGame.file` would still have taken an accusation.
-    ///
-    ///         The proposer could therefore walk its bond home on day 24 and an
-    ///         honest challenge filed on day 30 would still convict — slashing
-    ///         the approvers who merely underwrote it for 100% of their bond
-    ///         while the party the threat model calls the actual attacker kept
-    ///         its stake, and (since the prosecutor's fee is carved from that
-    ///         same bond) paying the prosecutor nothing.
-    ///
-    ///         The bond now stays put for every instant a filing is still
-    ///         admissible, and opens one second after the deadline — not at it.
-    function test_issue94_inconclusiveRearm_holdsTheBondUntilFilingCloses() public {
-        (uint256 pid, uint256 cid) = _driveToInconclusiveRearm();
-        uint256 executedAt = gov.getProposal(pid).executedAt;
-
-        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Inconclusive), "unwound");
-
-        // ── The bug, stated as assertions rather than as prose: both of the
-        //    governor's ORIGINAL gates are open right now.
-        assertGt(vm.getBlockTimestamp(), executedAt + ledger.challengeWindow(), "the ledger's window lapsed on day 14");
-        assertFalse(ledger.isCoverageFrozen(address(gov), pid), "and `_refundAll` released the freeze");
-
-        // ── While the game's own deadline has been pushed a further 14 days out.
-        uint256 rearmed = game.challengeableUntil(_reviewKey(pid));
-        assertEq(rearmed, vm.getBlockTimestamp() + game.challengeWindow(), "re-armed to ruling + challengeWindow");
-        assertEq(rearmed, executedAt + 38 days, "day 38, exactly the figure in the issue");
-
-        // ── Every probe in (ruling, deadline] refuses. Forward-only warps; the
-        //    first probe is the ruling instant itself, so nothing warps back.
-        uint256[4] memory probes =
-            [executedAt + 24 days, executedAt + 30 days, executedAt + 37 days, executedAt + 38 days];
-        for (uint256 i = 0; i < probes.length; i++) {
-            vm.warp(probes[i]);
-            vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
-            gov.reclaimProposerBond(pid);
-            assertEq(wood.balanceOf(address(bondEscrow)), PROPOSER_BOND, "the escrow held on throughout");
-        }
-
-        // ── And it opens the instant the deadline lapses, not before.
-        uint256 agentBalBefore = wood.balanceOf(agent);
-        vm.warp(rearmed + 1);
-        gov.reclaimProposerBond(pid);
-        assertEq(wood.balanceOf(agent), agentBalBefore + PROPOSER_BOND, "returned whole, and to the proposer");
-        assertEq(wood.balanceOf(address(bondEscrow)), 0, "escrow drained");
-    }
-
-    /// @notice THE OTHER HALF OF #94, and the reason the hold is worth having:
-    ///         a challenge filed INSIDE the re-armed window still convicts, and
-    ///         because the bond never left, the conviction can actually take
-    ///         it. `ProposerBondForfeited`, not `ProposerBondForfeitureFailed`
-    ///         — the failure event is what a reclaim on day 24 used to produce,
-    ///         and with it a silently zeroed prosecutor fee.
-    function test_issue94_convictionInsideTheRearmedWindow_stillTakesTheBond() public {
-        (uint256 pid,) = _driveToInconclusiveRearm();
-        uint256 executedAt = gov.getProposal(pid).executedAt;
-        uint256 challengerBalBefore = wood.balanceOf(challenger);
-        uint256 burnBalBefore = wood.balanceOf(game.BURN_ADDRESS());
-
-        // Day 30: six days into the re-armed window, eight days before it lapses.
-        vm.warp(executedAt + 30 days);
-        vm.prank(challenger);
-        uint256 cid2 = game.file(
-            address(gov),
-            pid,
-            IChallengeGame.Predicate.OutOfAdapterOutflow,
-            address(adapter),
-            adapter.poke.selector,
-            "ipfs://evidence/honest-refiling"
-        );
-        assertTrue(ledger.isCoverageFrozen(address(gov), pid), "the re-filing pinned the coverage again");
-
-        // Silence convicts. Hoisted before the `expectEmit` — a call in
-        // argument position consumes a pending one-shot cheatcode.
-        uint256 filedAt2 = game.challengeOf(cid2).filedAt;
-        uint256 dueAt = filedAt2 + game.autoSlashDelay();
-        vm.warp(dueAt);
-        vm.expectEmit(true, true, true, true, address(game));
-        emit IChallengeGame.ProposerBondForfeited(cid2, address(gov), pid, agent, PROPOSER_BOND);
-        game.resolve(cid2);
-        assertEq(uint256(game.challengeOf(cid2).status), uint256(IChallengeGame.Status.Settled), "convicted");
-
-        // ── The bond really moved: fee to the prosecutor, remainder burned.
-        uint256 prosecutorFee = (PROPOSER_BOND * game.prosecutorFeeBps()) / 10_000;
-        uint256 settleBurn = (_challengerBond() * game.settleBurnBps()) / 10_000;
-        assertGt(prosecutorFee, 0, "the fee is live in this fixture");
-        assertEq(wood.balanceOf(address(bondEscrow)), 0, "the escrow gave the bond up");
-        (address bondProposer, uint256 bondAmount) = bondEscrow.bondOf(address(gov), pid);
-        assertEq(bondProposer, address(0), "and cleared the record");
-        assertEq(bondAmount, 0);
-        assertEq(
-            wood.balanceOf(challenger),
-            challengerBalBefore - settleBurn + prosecutorFee,
-            "the prosecutor was paid out of the bond it was nearly denied"
-        );
-        assertEq(
-            wood.balanceOf(game.BURN_ADDRESS()),
-            burnBalBefore + (PROPOSER_BOND - prosecutorFee) + settleBurn + G1_STAKE,
-            "bond net of the fee, plus the settle burn, plus the whole slashed guardian bond"
-        );
-
-        // ── And no later reclaim can resurrect it — but (issue #117 L1) the
-        //    governor's own gates all pass eventually, and reclaim now
-        //    acknowledges the forfeiture instead of dying in the escrow's
-        //    `NoBond`.
-        vm.warp(executedAt + 365 days);
-        uint256 burnBalBeforeReclaim = wood.balanceOf(game.BURN_ADDRESS());
-        vm.expectEmit(true, true, true, true, address(gov));
-        emit ISyndicateGovernor.ProposerBondForfeitureAcknowledged(pid, PROPOSER_BOND);
-        gov.reclaimProposerBond(pid);
-        assertEq(gov.getProposal(pid).proposerBondWood, 0, "the stale bond record is cleared");
-        assertEq(wood.balanceOf(game.BURN_ADDRESS()), burnBalBeforeReclaim, "acknowledge moves no further WOOD");
-
-        vm.expectRevert(ISyndicateGovernor.NoBondToReclaim.selector);
-        gov.reclaimProposerBond(pid);
-    }
-
-    /// @notice THE ONE-SECOND OVERLAP, proved from both sides. `file` admits
-    ///         while `block.timestamp <= deadline`, so a `>=` reclaim gate — the
-    ///         obvious reading, and the one issue #94 suggested — would leave
-    ///         exactly one timestamp at which a filing and a reclaim both
-    ///         succeed. At the deadline itself the game still takes a filing,
-    ///         so reclaim must still refuse.
-    function test_issue94_atTheDeadline_filingIsStillAdmissible() public {
-        (uint256 pid,) = _driveToInconclusiveRearm();
-        uint256 deadline = game.challengeableUntil(_reviewKey(pid));
-
-        vm.warp(deadline);
-        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
-        gov.reclaimProposerBond(pid);
-
-        // The same instant, from the game's side.
-        vm.prank(challenger);
-        uint256 cid2 = game.file(
-            address(gov),
-            pid,
-            IChallengeGame.Predicate.OutOfAdapterOutflow,
-            address(adapter),
-            adapter.poke.selector,
-            "ipfs://evidence/last-legal-instant"
-        );
-        assertEq(game.liveChallengeOf(address(gov), pid), cid2, "the game took it at exactly the deadline");
-    }
-
-    /// @notice The companion fixture at deadline + 1s. Separate contract state
-    ///         rather than a backward warp, which forge 1.7.1 ignores.
-    function test_issue94_oneSecondPast_filingClosesAndReclaimOpens() public {
-        (uint256 pid,) = _driveToInconclusiveRearm();
-        uint256 deadline = game.challengeableUntil(_reviewKey(pid));
-        uint256 agentBalBefore = wood.balanceOf(agent);
-
-        vm.warp(deadline + 1);
-        vm.prank(challenger);
-        vm.expectRevert(IChallengeGame.WindowClosed.selector);
-        game.file(
-            address(gov),
-            pid,
-            IChallengeGame.Predicate.OutOfAdapterOutflow,
-            address(adapter),
-            adapter.poke.selector,
-            "ipfs://evidence/too-late"
-        );
-
-        gov.reclaimProposerBond(pid);
-        assertEq(wood.balanceOf(agent), agentBalBefore + PROPOSER_BOND, "and the bond goes home the moment it can");
     }
 
     // ── 4. Declared coverage locks: the burn is the lock, and only the lock ──
@@ -1295,7 +1028,8 @@ contract ChallengeEndToEndTest is Test {
         assertEq(rateAfterTopUp[0], 5_000, "the rate is over the anchored basis, so the top-up does not dilute it");
 
         // ── Silence; the verdict lands.
-        vm.warp(c.filedAt + game.autoSlashDelay());
+        _convict(cid);
+        vm.warp(c.filedAt + game.voteWindow());
         uint256 swoodBalBefore = wood.balanceOf(address(swood));
         game.resolve(cid);
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "Settled");
@@ -1311,72 +1045,6 @@ contract ChallengeEndToEndTest is Test {
         assertEq(ledger.coverageUsdOf(address(gov), qid, g1), 750e18, "Q's coverage from g1 is unchanged");
         assertEq(ledger.liabilityUsd(address(gov), qid), COVERAGE_USD, "Q remains fully covered");
         assertFalse(ledger.isCoverageFrozen(address(gov), qid), "and was never frozen by P's challenge");
-    }
-
-    /// @dev SHE-215: `SyndicateGovernor.propose` / `executeProposal` now refuse
-    ///      a vault whose owner-stake slot is unbound, claimed, slashed, or
-    ///      exiting. `SyndicateFactory.createSyndicate` ALWAYS binds that slot,
-    ///      so a hand-built syndicate that skips it models a vault the real
-    ///      factory cannot produce. Binding here restores the fixture to a
-    ///      state the protocol can actually reach.
-    function _bondVaultOwner(address vault_) internal {
-        uint256 bond = swood.minOwnerStake();
-        wood.mint(owner, bond);
-        vm.startPrank(owner);
-        wood.approve(address(swood), bond);
-        swood.prepareOwnerStake(bond);
-        vm.stopPrank();
-        // The test contract is sWOOD's factory.
-        swood.bindOwnerStake(owner, vault_);
-    }
-
-    // ── SHE-213: every filing re-buckets the approvers' locks ──
-
-    /// @dev propose(`duration`) -> review -> g1 approves -> execute, without
-    ///      the 7-day-arc assertions `_proposeApproveExecute` makes.
-    function _proposeApproveExecuteWithDuration(uint256 duration) internal returns (uint256 pid) {
-        ISyndicateGovernor.RiskEnvelope memory env =
-            ISyndicateGovernor.RiskEnvelope({maxCapital: MAX_CAPITAL, maxDrawdownBps: 10_000});
-        vm.prank(agent);
-        pid = gov.propose(
-            address(vault),
-            address(0),
-            "ipfs://she-213",
-            duration,
-            env,
-            _execCalls(),
-            GovEnvelope.defaultCaps(MAX_CAPITAL, _execCalls().length),
-            _settleCalls(),
-            GovEnvelope.defaultCaps(MAX_CAPITAL, _settleCalls().length),
-            new ISyndicateGovernor.CoProposer[](0)
-        );
-        vm.warp(gov.getProposal(pid).voteEnd + 1);
-        registry.openReview(address(gov), pid);
-        vm.prank(g1);
-        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
-        vm.warp(gov.getProposal(pid).reviewEnd + 1);
-        gov.executeProposal(pid);
-    }
-
-    function _epochOf(uint256 t) internal view returns (uint256) {
-        return (t - ledger.epochGenesis()) / EPOCH_LENGTH;
-    }
-
-    /// @dev The instant bucket `epoch` stops counting in `openExposure`.
-    function _bucketExpiry(uint256 epoch) internal view returns (uint256) {
-        return ledger.epochGenesis() + (epoch + 1) * EPOCH_LENGTH + ledger.challengeWindow();
-    }
-
-    function _file(address who, uint256 pid, string memory uri) internal returns (uint256 cid) {
-        vm.prank(who);
-        cid = game.file(
-            address(gov),
-            pid,
-            IChallengeGame.Predicate.OutOfAdapterOutflow,
-            address(adapter),
-            adapter.poke.selector,
-            uri
-        );
     }
 
     /// @notice THE SECOND FILING REACHES THE LEDGER. A executes on day ~1 with
@@ -1395,7 +1063,7 @@ contract ChallengeEndToEndTest is Test {
 
         // Challenge 1 at execution.
         _file(challenger, pid, "ipfs://c1");
-        uint256 firstEpoch = _epochOf(vm.getBlockTimestamp() + game.disputeTimeout());
+        uint256 firstEpoch = _epochOf(vm.getBlockTimestamp() + game.voteWindow());
 
         // Challenge 2, from a second challenger, at the inclusive filing deadline.
         vm.warp(executedAt + 30 days + game.challengeWindow());
@@ -1404,7 +1072,7 @@ contract ChallengeEndToEndTest is Test {
         vm.prank(challenger2);
         wood.approve(address(game), type(uint256).max);
         uint256 cid2 = _file(challenger2, pid, "ipfs://c2");
-        uint256 secondLiveUntil = vm.getBlockTimestamp() + game.disputeTimeout();
+        uint256 secondLiveUntil = vm.getBlockTimestamp() + game.voteWindow();
         // Non-vacuity: the second clock must outlive the first target's bucket.
         assertGt(secondLiveUntil, _bucketExpiry(firstEpoch), "fixture: second clock outlives the first bucket");
 
@@ -1417,247 +1085,227 @@ contract ChallengeEndToEndTest is Test {
         assertTrue(ledger.hasFrozenCoverage(g1), "g1 still exit-blocked");
         assertEq(ledger.openExposure(g1), G1_STAKE, "frozen and slashable means COUNTED");
     }
+}
 
-    /// @notice The horizon clamp in `ExposureLedger._horizonClampedEpochOf`
-    ///         "only bites on a value the game itself would refuse" iff the
-    ///         game's dispute-timeout ceiling fits inside the ledger's coverage
-    ///         horizon. Pinned here so a later raise of `MAX_DISPUTE_TIMEOUT`
-    ///         cannot silently turn the clamp into an early expiry.
-    function test_constants_disputeTimeoutCeilingFitsTheCoverageHorizon() public view {
-        assertLe(game.MAX_DISPUTE_TIMEOUT(), ledger.MAX_COVERAGE_HORIZON(), "MAX_DISPUTE_TIMEOUT must fit the horizon");
-    }
-
-    // ── SHE-246: a challenge is unrulable past its dispute deadline ──
-
-    /// @notice THE LEDGER'S `liveUntil` IS THE END OF SLASHABILITY. Reviewer
-    ///         sequence on #299: freeze on day 20, `liveUntil` day 50, nobody
-    ///         resolves, day 70. The lock has aged out of `openExposure` (the
-    ///         bucket containing `liveUntil` expired), the key is still frozen,
-    ///         and the ONLY thing `resolve` may now do is unwind - never slash.
-    function test_staleUnbackedFiling_cannotSettlePastTheDisputeDeadline() public {
-        uint256 pid = _proposeApproveExecuteWithDuration(30 days);
+/// @dev The re-arm arc: a failure past the ordinary window pushes the filing
+///      deadline out, and the proposer bond must stay put for every instant a
+///      filing is still admissible. Split off the arc suite above only so each
+///      contract's bytecode stays inside solc's assembly tag space.
+contract ChallengeRearmEndToEndTest is ChallengeEndToEndBase {
+    /// @notice `ChallengeGame._fail` does two things in one call: it RELEASES
+    ///         the coverage freeze and it RE-ARMS `challengeableUntil[rk]` to
+    ///         `block.timestamp + challengeWindow`. The governor's original two
+    ///         gates read the ledger only — elapsed time since `executedAt`, and
+    ///         the freeze — so between a failure landing past the ordinary
+    ///         window and the re-armed deadline, BOTH of them said "open" while
+    ///         `ChallengeGame.file` would still have taken an accusation.
+    ///
+    ///         The proposer could therefore walk its bond home on day 24 and an
+    ///         honest challenge filed on day 30 would still convict — slashing
+    ///         the approvers who merely underwrote it while the party the threat
+    ///         model calls the actual attacker kept its stake, and (since the
+    ///         prosecutor's fee is carved from that same bond) paying the
+    ///         prosecutor nothing.
+    ///
+    ///         The bond now stays put for every instant a filing is still
+    ///         admissible, and opens one second after the deadline — not at it.
+    function test_issue94_failedRearm_holdsTheBondUntilFilingCloses() public {
+        (uint256 pid, uint256 cid) = _driveToFailedRearm();
         uint256 executedAt = gov.getProposal(pid).executedAt;
 
-        vm.warp(executedAt + 20 days);
-        uint256 cid = _file(challenger, pid, "ipfs://stale");
-        uint256 liveUntil = vm.getBlockTimestamp() + game.disputeTimeout();
-        uint256 stakeBefore = swood.guardianStake(g1);
-        uint256 challengerBefore = wood.balanceOf(challenger);
-        uint256 bond = game.challengeOf(cid).bondWood;
+        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Failed), "unwound");
 
-        // Past the deadline AND past the bucket's wall-clock expiry.
-        uint256 expiry = _bucketExpiry(_epochOf(liveUntil));
-        vm.warp((expiry > liveUntil ? expiry : liveUntil) + 1);
-        assertTrue(ledger.isCoverageFrozen(address(gov), pid), "fixture: still frozen, nobody resolved");
-        assertTrue(ledger.hasFrozenCoverage(g1), "fixture: exit still blocked");
-        assertEq(ledger.openExposure(g1), 0, "the lock aged out at liveUntil - correct iff nothing can slash it");
+        // ── The bug, stated as assertions rather than as prose: both of the
+        //    governor's ORIGINAL gates are open right now.
+        assertGt(vm.getBlockTimestamp(), executedAt + ledger.challengeWindow(), "the ledger's window lapsed on day 14");
+        assertFalse(ledger.isCoverageFrozen(address(gov), pid), "and `_fail` released the freeze");
 
-        game.resolve(cid);
-        assertEq(
-            uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Inconclusive), "a stale filing unwinds"
-        );
-        assertEq(swood.guardianStake(g1), stakeBefore, "nothing slashed past the deadline");
-        assertFalse(ledger.isCoverageFrozen(address(gov), pid), "unfrozen");
-        // A non-verdict re-arms the re-challenge window and pins the ledger
-        // through it: exit stays blocked and the lock is COUNTED again for
-        // exactly as long as a fresh filing is legal, then both clear.
-        uint256 rearmedUntil = game.challengeableUntil(_reviewKey(pid));
-        assertEq(rearmedUntil, vm.getBlockTimestamp() + game.challengeWindow(), "re-armed one window from now");
-        assertTrue(ledger.hasFrozenCoverage(g1), "pinned through the re-armed window");
-        assertEq(ledger.openExposure(g1), G1_STAKE, "re-counted while re-challengeable");
-        vm.warp(rearmedUntil + 1);
-        assertFalse(ledger.hasFrozenCoverage(g1), "exit unblocked once the window shuts");
-        uint256 burned = (bond * game.challengeOf(cid).inconclusiveBurnBpsAtFiling) / 10_000;
-        assertGt(burned, 0, "fixture: the free-freeze price is non-zero");
-        assertEq(wood.balanceOf(challenger), challengerBefore + bond - burned, "bond back net of the round burn");
+        // ── While the game's own deadline has been pushed a further 14 days out.
+        uint256 rearmed = game.challengeableUntil(_reviewKey(pid));
+        assertEq(rearmed, vm.getBlockTimestamp() + game.challengeWindow(), "re-armed to failure + challengeWindow");
+        assertEq(rearmed, executedAt + 38 days, "day 38, exactly the figure in the issue");
 
-        // Capacity is not over-committed: once the pinned bucket has aged out
-        // too, a fresh approval by the same guardian lands at full size.
-        vm.warp(_bucketExpiry(_epochOf(rearmedUntil)) + 1);
-        assertEq(ledger.openExposure(g1), 0, "nothing left counted");
-        vm.prank(agent);
-        gov.settleProposal(pid);
-        gov.resolveProposalState(pid);
-        vm.warp(gov.getCooldownEnd()); // propose honours the settle cooldown
-        uint256 pid2 = _proposeApproveExecuteWithDuration(30 days);
-        assertEq(ledger.lockOf(address(gov), pid2, g1), G1_STAKE, "a fresh lock lands at full size");
-        assertEq(ledger.openExposure(g1), G1_STAKE, "and is the only thing counted");
+        // ── Every probe in (failure, deadline] refuses. Forward-only warps; the
+        //    first probe is the failure instant itself, so nothing warps back.
+        uint256[4] memory probes =
+            [executedAt + 24 days, executedAt + 30 days, executedAt + 37 days, executedAt + 38 days];
+        for (uint256 i = 0; i < probes.length; i++) {
+            vm.warp(probes[i]);
+            vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+            gov.reclaimProposerBond(pid);
+            assertEq(wood.balanceOf(address(bondEscrow)), PROPOSER_BOND, "the escrow held on throughout");
+        }
+
+        // ── And it opens the instant the deadline lapses, not before.
+        uint256 agentBalBefore = wood.balanceOf(agent);
+        vm.warp(rearmed + 1);
+        gov.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), agentBalBefore + PROPOSER_BOND, "returned whole, and to the proposer");
+        assertEq(wood.balanceOf(address(bondEscrow)), 0, "escrow drained");
     }
 
-    /// @notice THE DEADLINE READS THE PINNED TIMEOUT, NOT THE LIVE ONE. An
-    ///         owner raising `disputeTimeout` after a filing must not extend
-    ///         that filing's slashability past the `liveUntil` it booked on the
-    ///         ledger - that would be SHE-246 reopened by a setter. The filing
-    ///         is placed so `liveUntil` is the LAST second of its bucket: the
-    ///         bucket then ages out `challengeWindow` after the deadline, well
-    ///         inside the raised clock, so the ledger boundary and the stale
-    ///         `resolve` are checked in one run under both clocks.
-    function test_deadlineReadsThePinnedTimeout_unbackedResolveUnwindsAndTheLedgerIsUnmoved() public {
-        uint256 pid = _proposeApproveExecuteWithDuration(30 days);
+    /// @notice THE OTHER HALF, and the reason the hold is worth having: a
+    ///         challenge filed INSIDE the re-armed window still convicts, and
+    ///         because the bond never left, the conviction can actually take
+    ///         it. `ProposerBondForfeited`, not `ProposerBondForfeitureFailed`
+    ///         — the failure event is what a reclaim on day 24 used to produce,
+    ///         and with it a silently zeroed prosecutor fee.
+    function test_issue94_convictionInsideTheRearmedWindow_stillTakesTheBond() public {
+        (uint256 pid,) = _driveToFailedRearm();
         uint256 executedAt = gov.getProposal(pid).executedAt;
-        uint256 oldTimeout = game.disputeTimeout();
-        uint256 e = _epochOf(executedAt + 1 + oldTimeout);
-        uint256 fileAt = ledger.epochGenesis() + (e + 1) * EPOCH_LENGTH - 1 - oldTimeout;
-        assertGe(fileAt, executedAt + 1, "fixture: filed after execution");
-        vm.warp(fileAt);
-        uint256 cid = _file(challenger, pid, "ipfs://pinned");
-        assertEq(game.challengeOf(cid).disputeTimeoutAtFiling, oldTimeout, "fixture: pinned the old clock");
+        uint256 challengerBalBefore = wood.balanceOf(challenger);
+        uint256 burnBalBefore = wood.balanceOf(game.BURN_ADDRESS());
 
-        // Hoisted: a call in argument position would consume the prank.
-        uint256 maxTimeout = game.MAX_DISPUTE_TIMEOUT();
-        vm.prank(owner);
-        game.setDisputeTimeout(maxTimeout);
-        uint256 liveDeadline = fileAt + game.disputeTimeout();
-        uint256 boundary = _bucketExpiry(e) + 1;
-        assertGt(liveDeadline, boundary, "fixture: the live clock outlives the booked bucket");
+        // Day 30: six days into the re-armed window, eight days before it lapses.
+        vm.warp(executedAt + 30 days);
+        uint256 cid2 = _file(challenger, pid, "ipfs://evidence/honest-refiling");
+        assertTrue(ledger.isCoverageFrozen(address(gov), pid), "the re-filing pinned the coverage again");
 
-        vm.warp(boundary);
-        assertTrue(ledger.isCoverageFrozen(address(gov), pid), "still frozen, nobody resolved");
-        assertEq(ledger.openExposure(g1), 0, "the raise moved nothing: the lock aged out at the booked liveUntil");
-
-        game.resolve(cid);
-        assertEq(
-            uint256(game.challengeOf(cid).status),
-            uint256(IChallengeGame.Status.Inconclusive),
-            "stale on the PINNED clock"
-        );
-        assertEq(swood.guardianStake(g1), G1_STAKE, "the live clock convicts nothing");
-    }
-
-    function test_deadlineReadsThePinnedTimeout_ruleRevertsAtTheOldDeadlineAfterARaise() public {
-        (uint256 cid, address stubCourt) = _fileAndDisputeWithStubCourt();
-        IChallengeGame.Challenge memory c = game.challengeOf(cid);
-        uint256 oldDeadline = c.filedAt + c.disputeTimeoutAtFiling;
-
-        // Hoisted: a call in argument position would consume the prank.
-        uint256 maxTimeout = game.MAX_DISPUTE_TIMEOUT();
-        vm.prank(owner);
-        game.setDisputeTimeout(maxTimeout);
-        assertGt(c.filedAt + game.disputeTimeout(), oldDeadline, "fixture: raised");
-
-        vm.warp(oldDeadline);
-        vm.prank(stubCourt);
-        vm.expectRevert(IChallengeGame.WindowClosed.selector);
-        game.rule(cid, IChallengeGame.Verdict.Guilty);
-
-        game.resolve(cid);
-        assertEq(
-            uint256(game.challengeOf(cid).status),
-            uint256(IChallengeGame.Status.Failed),
-            "timed out on the pinned clock"
-        );
-        assertEq(swood.guardianStake(g1), G1_STAKE, "never slashed");
-    }
-
-    /// @notice `rule` is open one second before the deadline and shut from the
-    ///         deadline on - the same instant `resolve`'s non-slashing branch
-    ///         opens, so no instant is both rulable and unwindable.
-    function test_rule_convictsAtDeadlineMinusOne() public {
-        (uint256 cid, address stubCourt) = _fileAndDisputeWithStubCourt();
-        IChallengeGame.Challenge memory c = game.challengeOf(cid);
-        vm.warp(c.filedAt + c.disputeTimeoutAtFiling - 1);
-        vm.prank(stubCourt);
-        game.rule(cid, IChallengeGame.Verdict.Guilty);
-        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Settled), "ruled in time");
-        assertEq(swood.guardianStake(g1), 0, "slashed");
-    }
-
-    function test_rule_revertsFromTheDeadlineOn_andResolveUnwinds() public {
-        (uint256 cid, address stubCourt) = _fileAndDisputeWithStubCourt();
-        IChallengeGame.Challenge memory c = game.challengeOf(cid);
-        uint256 stakeBefore = swood.guardianStake(g1);
-
-        vm.warp(c.filedAt + c.disputeTimeoutAtFiling);
-        vm.prank(stubCourt);
-        vm.expectRevert(IChallengeGame.WindowClosed.selector);
-        game.rule(cid, IChallengeGame.Verdict.Guilty);
-
-        vm.warp(c.filedAt + c.disputeTimeoutAtFiling + 1);
-        vm.prank(stubCourt);
-        vm.expectRevert(IChallengeGame.WindowClosed.selector);
-        game.rule(cid, IChallengeGame.Verdict.Guilty);
-
-        // The clock's own exit: a court WAS pinned, so the timeout is `_fail`.
-        game.resolve(cid);
-        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Failed), "timed out");
-        assertEq(swood.guardianStake(g1), stakeBefore, "never slashed");
-        assertFalse(ledger.isCoverageFrozen(address(gov), pid_), "unfrozen");
-    }
-
-    /// @notice CONCURRENT FILINGS: the deadline is per filing, and the key is
-    ///         slashable until the LATEST live filing's deadline. The earlier
-    ///         filing going stale neither unfreezes the key nor shortens the
-    ///         later one's window, and the ledger keeps counting the lock until
-    ///         that later `liveUntil` - which is what #299's raise-only freeze
-    ///         booked.
-    function test_twoFilings_keyStaysSlashableUntilTheLaterDeadline() public {
-        uint256 pid = _proposeApproveExecuteWithDuration(30 days);
-        uint256 executedAt = gov.getProposal(pid).executedAt;
-
-        vm.warp(executedAt + 1);
-        uint256 cid1 = _file(challenger, pid, "ipfs://c1");
-        uint256 deadline1 = vm.getBlockTimestamp() + game.disputeTimeout();
-
-        vm.warp(executedAt + 20 days);
-        address challenger2 = makeAddr("challenger2");
-        wood.mint(challenger2, _challengerBond() * 2);
-        vm.prank(challenger2);
-        wood.approve(address(game), type(uint256).max);
-        uint256 cid2 = _file(challenger2, pid, "ipfs://c2");
-        uint256 deadline2 = vm.getBlockTimestamp() + game.disputeTimeout();
-
-        // Between the two deadlines: 1 is stale, 2 is live.
-        vm.warp(deadline1 + 5 days);
-        assertLt(vm.getBlockTimestamp(), deadline2, "fixture: inside the second window");
-        game.resolve(cid1);
-        assertEq(uint256(game.challengeOf(cid1).status), uint256(IChallengeGame.Status.Inconclusive), "1 unwound");
-        assertEq(swood.guardianStake(g1), G1_STAKE, "the stale filing slashed nothing");
-        assertTrue(ledger.isCoverageFrozen(address(gov), pid), "still frozen by 2");
-        assertEq(ledger.openExposure(g1), G1_STAKE, "still counted until the later liveUntil");
-
+        // The guardians convict. Hoisted before the `expectEmit` — a call in
+        // argument position consumes a pending one-shot cheatcode.
+        _convict(cid2);
+        uint256 dueAt = game.challengeOf(cid2).filedAt + game.voteWindow();
+        vm.warp(dueAt);
+        vm.expectEmit(true, true, true, true, address(game));
+        emit IChallengeGame.ProposerBondForfeited(cid2, address(gov), pid, agent, PROPOSER_BOND);
         game.resolve(cid2);
-        assertEq(uint256(game.challengeOf(cid2).status), uint256(IChallengeGame.Status.Settled), "2 convicts");
-        assertEq(swood.guardianStake(g1), 0, "slashed through the later filing");
+        assertEq(uint256(game.challengeOf(cid2).status), uint256(IChallengeGame.Status.Settled), "convicted");
+
+        // ── The bond really moved: fee to the prosecutor, remainder burned.
+        uint256 prosecutorFee = (PROPOSER_BOND * game.prosecutorFeeBps()) / 10_000;
+        uint256 settleBurn = (_challengerBond() * game.settleBurnBps()) / 10_000;
+        assertGt(prosecutorFee, 0, "the fee is live in this fixture");
+        assertEq(wood.balanceOf(address(bondEscrow)), 0, "the escrow gave the bond up");
+        (address bondProposer, uint256 bondAmount) = bondEscrow.bondOf(address(gov), pid);
+        assertEq(bondProposer, address(0), "and cleared the record");
+        assertEq(bondAmount, 0);
+        assertEq(
+            wood.balanceOf(challenger),
+            challengerBalBefore - settleBurn + prosecutorFee,
+            "the prosecutor was paid out of the bond it was nearly denied"
+        );
+        assertEq(
+            wood.balanceOf(game.BURN_ADDRESS()),
+            burnBalBefore + (PROPOSER_BOND - prosecutorFee) + settleBurn + G1_STAKE,
+            "bond net of the fee, plus the settle burn, plus the whole slashed guardian bond"
+        );
+
+        // ── And no later reclaim can resurrect it — but the governor's own
+        //    gates all pass eventually, and reclaim now acknowledges the
+        //    forfeiture instead of dying in the escrow's `NoBond`.
+        vm.warp(executedAt + 365 days);
+        uint256 burnBalBeforeReclaim = wood.balanceOf(game.BURN_ADDRESS());
+        vm.expectEmit(true, true, true, true, address(gov));
+        emit ISyndicateGovernor.ProposerBondForfeitureAcknowledged(pid, PROPOSER_BOND);
+        gov.reclaimProposerBond(pid);
+        assertEq(gov.getProposal(pid).proposerBondWood, 0, "the stale bond record is cleared");
+        assertEq(wood.balanceOf(game.BURN_ADDRESS()), burnBalBeforeReclaim, "acknowledge moves no further WOOD");
+
+        vm.expectRevert(ISyndicateGovernor.NoBondToReclaim.selector);
+        gov.reclaimProposerBond(pid);
     }
 
-    function test_twoFilings_nothingSlashesPastTheLaterDeadline() public {
-        uint256 pid = _proposeApproveExecuteWithDuration(30 days);
-        uint256 executedAt = gov.getProposal(pid).executedAt;
+    /// @notice THE ONE-SECOND OVERLAP, proved from both sides. `file` admits
+    ///         while `block.timestamp <= deadline`, so a `>=` reclaim gate would
+    ///         leave exactly one timestamp at which a filing and a reclaim both
+    ///         succeed. At the deadline itself the game still takes a filing, so
+    ///         reclaim must still refuse.
+    function test_issue94_atTheDeadline_filingIsStillAdmissible() public {
+        (uint256 pid,) = _driveToFailedRearm();
+        uint256 deadline = game.challengeableUntil(_reviewKey(pid));
 
-        vm.warp(executedAt + 1);
-        uint256 cid1 = _file(challenger, pid, "ipfs://c1");
-        vm.warp(executedAt + 20 days);
-        address challenger2 = makeAddr("challenger2");
-        wood.mint(challenger2, _challengerBond() * 2);
-        vm.prank(challenger2);
-        wood.approve(address(game), type(uint256).max);
-        uint256 cid2 = _file(challenger2, pid, "ipfs://c2");
-        uint256 deadline2 = vm.getBlockTimestamp() + game.disputeTimeout();
+        vm.warp(deadline);
+        vm.expectRevert(ISyndicateGovernor.ChallengeWindowOpen.selector);
+        gov.reclaimProposerBond(pid);
 
-        vm.warp(deadline2);
-        game.resolve(cid2);
-        game.resolve(cid1);
-        assertEq(uint256(game.challengeOf(cid1).status), uint256(IChallengeGame.Status.Inconclusive));
-        assertEq(uint256(game.challengeOf(cid2).status), uint256(IChallengeGame.Status.Inconclusive));
-        assertEq(swood.guardianStake(g1), G1_STAKE, "no path slashes past the last deadline");
-        assertFalse(ledger.isCoverageFrozen(address(gov), pid), "fully released");
+        // The same instant, from the game's side.
+        uint256 cid2 = _file(challenger, pid, "ipfs://evidence/last-legal-instant");
+        assertEq(game.liveChallengeOf(address(gov), pid), cid2, "the game took it at exactly the deadline");
     }
 
-    uint256 internal pid_;
+    /// @notice The companion fixture at deadline + 1s. Separate contract state
+    ///         rather than a backward warp, which forge 1.7.1 ignores.
+    function test_issue94_oneSecondPast_filingClosesAndReclaimOpens() public {
+        (uint256 pid,) = _driveToFailedRearm();
+        uint256 deadline = game.challengeableUntil(_reviewKey(pid));
+        uint256 agentBalBefore = wood.balanceOf(agent);
 
-    /// @dev A court is wired BEFORE filing so `courtAtFiling` pins non-zero and
-    ///      `rule` is reachable; g1 completes the pool inside `autoSlashDelay`.
-    function _fileAndDisputeWithStubCourt() internal returns (uint256 cid, address stubCourt) {
-        pid_ = _proposeApproveExecute();
-        uint256 executedAt = gov.getProposal(pid_).executedAt;
-        stubCourt = address(new StubInconclusiveCourt());
-        vm.prank(owner);
-        game.setCourt(stubCourt);
-        vm.warp(executedAt + 1);
-        cid = _file(challenger, pid_, "ipfs://disputed");
-        vm.warp(executedAt + 2 days);
-        vm.prank(g1);
-        game.dispute(cid, type(uint256).max);
-        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Disputed), "fixture: backed");
+        vm.warp(deadline + 1);
+        vm.prank(challenger);
+        vm.expectRevert(IChallengeGame.WindowClosed.selector);
+        game.file(
+            address(gov),
+            pid,
+            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            address(adapter),
+            adapter.poke.selector,
+            "ipfs://evidence/too-late"
+        );
+
+        gov.reclaimProposerBond(pid);
+        assertEq(wood.balanceOf(agent), agentBalBefore + PROPOSER_BOND, "and the bond goes home the moment it can");
+    }
+
+    // ── The vote snapshot is frozen one second before the filing ──────────
+
+    /// @notice Stake added AFTER a filing is outside that challenge's
+    ///         electorate, in both directions: it does not grow the denominator
+    ///         the quorum is measured against, and it carries no weight of its
+    ///         own. Otherwise a conviction could be bought after the accusation
+    ///         was already on the table.
+    function test_stakeAddedAfterAFilingCannotVoteOnIt() public {
+        uint256 pid = _proposeApproveExecute();
+        uint256 cid = _file(challenger, pid, "ipfs://evidence/late-stake");
+        (, uint256 votableBefore,) = game.challengeTallyOf(cid);
+
+        vm.warp(vm.getBlockTimestamp() + 1);
+        address newcomer = makeAddr("newcomer");
+        _stakeGuardian(newcomer, FILLER_STAKE, 4);
+        assertTrue(swood.isActiveGuardian(newcomer), "the newcomer really is a guardian now");
+
+        (, uint256 votableAfter,) = game.challengeTallyOf(cid);
+        assertEq(votableAfter, votableBefore, "the pinned electorate does not grow");
+
+        vm.prank(newcomer);
+        vm.expectRevert(IChallengeGame.NoVotableStake.selector);
+        game.voteOnChallenge(cid, true);
+    }
+
+    /// @notice AND THE FILING'S OWN BLOCK IS ALREADY TOO LATE. sWOOD keys every
+    ///         checkpoint on the second a stake changes and a same-key push
+    ///         overwrites, so a snapshot taken at `block.timestamp` would admit
+    ///         a stake planted in the filing's own block — before it, into the
+    ///         denominator; after it, into the numerator alone. Both are read at
+    ///         `filedAt - 1`, so neither lands.
+    function test_sameBlockStakeIsOutsideBothTheElectorateAndTheVote() public {
+        uint256 pid = _proposeApproveExecute();
+
+        // Staked in the filing's own block, ahead of it.
+        address early = makeAddr("sameBlockEarly");
+        _stakeGuardian(early, FILLER_STAKE, 5);
+
+        uint256 cid = _file(challenger, pid, "ipfs://evidence/same-block");
+        uint256 snapshotAt = game.challengeOf(cid).filedAt - 1;
+        assertEq(vm.getBlockTimestamp(), snapshotAt + 1, "fixture: the stake and the filing share a block");
+
+        // And another in the same block, behind it.
+        address late = makeAddr("sameBlockLate");
+        _stakeGuardian(late, FILLER_STAKE, 6);
+
+        (, uint256 votable,) = game.challengeTallyOf(cid);
+        assertEq(
+            votable,
+            swood.getPastTotalVotes(snapshotAt) - swood.getPastStake(g1, snapshotAt),
+            "the electorate is the one a second before the filing, less the accused"
+        );
+        assertEq(votable, 2 * FILLER_STAKE, "g2 and g3 alone, and neither same-block staker");
+
+        vm.prank(early);
+        vm.expectRevert(IChallengeGame.NoVotableStake.selector);
+        game.voteOnChallenge(cid, true);
+
+        vm.prank(late);
+        vm.expectRevert(IChallengeGame.NoVotableStake.selector);
+        game.voteOnChallenge(cid, true);
     }
 }

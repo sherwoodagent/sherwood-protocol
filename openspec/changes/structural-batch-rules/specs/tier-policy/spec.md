@@ -37,25 +37,20 @@ The registry SHALL maintain exactly one owner-managed address allowlist, `setCou
 
 ## MODIFIED Requirements
 
-### Requirement: Three demotion paths converging on one effect
-Demotion SHALL delete the tier config (the key reverts to the tier-2 default), cancel any pending certification for the key, start the bond release timelock exactly once (`releasableAt = block.timestamp + bondReleaseDelay`, emitting `SubmitterBondReleaseStarted`, only if a bond exists and is not already releasing), bar the target from reading that selector's tier off a class (`ClassMemberTierDenied`), leave the target's counterparty entry untouched (a per-selector conviction must not disarm a venue every vault shares; `setCounterpartyAllowed(x, false)` is the only revocation), and emit `TierDemoted`. Three callers reach it:
+### Requirement: Two demotion paths converging on one effect
+Demotion SHALL delete the tier config (the key reverts to the tier-2 default), bar the target from reading that selector's tier off a class by setting the denial flag write-once (emitting `ClassMemberTierDenied` only on the first set), leave the target's counterparty entry untouched (a per-selector conviction must not disarm a venue every vault shares; `setCounterpartyAllowed(x, false)` is the only revocation), and emit `TierDemoted`. Two callers reach it:
 - `demote(target, selector)` — owner-only revocation.
 - `demoteByChallenge(target, selector)` — callable only by `authorizedDemoter` (reverts `NotAuthorizedDemoter` otherwise); the ChallengeGame's role, so the game can revoke a certification but never grant one.
-- `poke` — permissionless, gated on codehash mismatch (above).
 
 Demotion SHALL touch nothing about batch reachability: there is no callee axis, and the vault's ability to reclaim capital from a convicted strategy is a property of the vault's structural guard, not of registry state.
 
 #### Scenario: Challenge-game demotion
 - **WHEN** the address set as `authorizedDemoter` calls `demoteByChallenge` on a certified pair
-- **THEN** the config is deleted, the bond release timelock starts, the target's counterparty entry (if any) is unchanged, and `TierDemoted` is emitted
+- **THEN** the config is deleted, the class-denial flag is set, the target's counterparty entry (if any) is unchanged, and `TierDemoted` is emitted
 
 #### Scenario: Unauthorized demoteByChallenge refused
 - **WHEN** any other address calls `demoteByChallenge`
 - **THEN** the call reverts `NotAuthorizedDemoter`
-
-#### Scenario: Double demotion does not restart the timelock
-- **WHEN** a key whose bond is already pending release is demoted again (e.g. owner `demote` after a challenge demotion)
-- **THEN** `releasableAt` is unchanged — the timelock starts once
 
 #### Scenario: A demoted strategy is still reachable by a settlement batch
 - **WHEN** a strategy clone holding vault capital is demoted via `demoteByChallenge`

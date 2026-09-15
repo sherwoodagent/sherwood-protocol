@@ -240,9 +240,7 @@ contract StructuralBatchRulesTest is Test {
     }
 
     function _certifyClassNow(address template, bytes4 selector, uint8 tier, uint16 bound) internal {
-        tierRegistry.proposeClassCertification(template, selector, tier, bound, address(0), template.codehash);
-        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
-        tierRegistry.certifyClass(template, selector);
+        tierRegistry.certifyClass(template, selector, tier, bound, template.codehash);
     }
 
     // ── Morpho template fixture ──

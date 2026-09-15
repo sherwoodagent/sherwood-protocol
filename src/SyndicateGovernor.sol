@@ -655,8 +655,8 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      confiscate it.
     ///
     ///      Elapsed time and the freeze are not sufficient on their own: the
-    ///      adversary is a proposer racing an `Inconclusive` unwind's re-armed
-    ///      window. `ChallengeGame._refundAll` releases the freeze AND raises
+    ///      adversary is a proposer racing a failed challenge's re-armed window.
+    ///      `ChallengeGame`'s failure path releases the freeze AND raises
     ///      `challengeableUntil` in the same call, so between that unwind and the
     ///      re-armed deadline both gates are open while a conviction is still
     ///      reachable. The third gate therefore asks the game itself and mirrors
@@ -1046,8 +1046,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     /// @dev The veto electorate for the direct path, read live at `propose`:
     ///      every share that exists minus the ones parked in the withdrawal
-    ///      queue, which cannot vote. Live on both terms so a redeem ordered
-    ///      ahead of this call in the same block is already reflected.
+    ///      queue, which cannot vote. Live on both terms because instant redeem
+    ///      is open right up to this call, so a redeem ordered ahead of it in
+    ///      the same block is already reflected.
     function _votableSupplyOf(address vault) private view returns (uint256) {
         uint256 supply = IERC20(vault).totalSupply();
         address queue = ISyndicateVault(vault).withdrawalQueue();
@@ -1056,12 +1057,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         return supply > queued ? supply - queued : 0;
     }
 
-    /// @dev The veto electorate for the collaborative path, read at the vote
-    ///      snapshot. The redeem lane is open for the whole Draft and the final
-    ///      approve's readiness is public, so a live queue term could be shrunk
-    ///      by a same-block `requestRedeem` whose owner keeps `t - 1` weight.
-    ///      Both terms at `t - 1` see one set. The queue self-delegates, so its
-    ///      past votes are its custody at `at`.
+    /// @dev The collaborative stamp reads both terms at the snapshot instant, so
+    ///      a queued redeem in the approve block sits inside the recorded set
+    ///      exactly as its holder's weight does. The vault auto-delegates the queue to itself.
     function _votableSupplyAt(address vault, uint256 at) private view returns (uint256) {
         uint256 supply = IVotes(vault).getPastTotalSupply(at);
         address queue = ISyndicateVault(vault).withdrawalQueue();

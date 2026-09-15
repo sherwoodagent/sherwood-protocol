@@ -29,7 +29,7 @@ contract GovernorVetoDenominatorExitsTest is Test {
     SyndicateVault vault;
     VaultWithdrawalQueue queue;
     ERC20Mock usdc;
-    MockAgentRegistry reg;
+    MockAgentRegistry agentReg;
     address owner = makeAddr("owner");
     address agent = makeAddr("agent");
     address lp1 = makeAddr("lp1");
@@ -41,10 +41,17 @@ contract GovernorVetoDenominatorExitsTest is Test {
         vm.prank(owner);
         cfg.setProtocolFeeRecipient(owner);
         usdc = new ERC20Mock("USD Coin", "USDC", 6);
-        reg = new MockAgentRegistry();
-        uint256 nft = reg.mint(agent);
+        agentReg = new MockAgentRegistry();
+        uint256 nft = agentReg.mint(agent);
         ISyndicateVault.InitParams memory ip = ISyndicateVault.InitParams(
-            address(usdc), "Sherwood Vault", "swUSDC", owner, address(new BatchExecutorLib()), true, address(reg), 0
+            address(usdc),
+            "Sherwood Vault",
+            "swUSDC",
+            owner,
+            address(new BatchExecutorLib()),
+            true,
+            address(agentReg),
+            0
         );
         bytes memory vInit = abi.encodeCall(SyndicateVault.initialize, (ip));
         vault = SyndicateVault(payable(address(new ERC1967Proxy(address(new SyndicateVault()), vInit))));
@@ -102,7 +109,7 @@ contract GovernorVetoDenominatorExitsTest is Test {
     ///      approved yet. Returns the pid and the co-proposer that can take it to Pending.
     function _proposeDraft() internal returns (uint256 pid, address coAgent) {
         coAgent = makeAddr("coAgent");
-        uint256 nft = reg.mint(coAgent);
+        uint256 nft = agentReg.mint(coAgent);
         vm.prank(owner);
         vault.registerAgent(nft, coAgent);
         ISyndicateGovernor.CoProposer[] memory co = new ISyndicateGovernor.CoProposer[](1);
@@ -405,35 +412,62 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(governor.getProposal(pid).votableSupply, vault.totalSupply(), "the bar counts only locked capital");
     }
 
-    /// @notice DECISION 3 (SHE-282 design.md), closed by the snapshot read: the redeem lane is
-    ///         open for the whole Draft, so a holder can `requestRedeem` in the final-approve
-    ///         block ahead of it — shares move to the queue at `t`, the holder keeps `t - 1`
-    ///         weight. Both terms are read at `t - 1`, so the 30k that moved is still in the
-    ///         100k electorate and 30% Against misses the 40% bar. A live queue term would make
-    ///         it 30k of 70k — the `b / (10_000 + b)` cut.
-    function test_collab_sameBlockQueuedRedeemBeforeTheFinalApproveCannotShrinkTheVetoBar() public {
+    /// @notice The collaborative Draft already holds the redeem lock, so the queue is open right
+    ///         up to the approval that stamps the electorate. Read live there, lp2's escrowed 30k
+    ///         would leave the bar at 70k while his snapshot weight still voted — 42.9%, a veto.
+    ///         Read at the snapshot instant both terms predate the escrow, the bar is the full
+    ///         100k, and 30% falls short of the 40% threshold.
+    function test_collab_queuedRedeemInTheApproveBlockCannotShrinkTheVetoBar() public {
+        address coAgent = makeAddr("coAgent");
+        // startPrank, not prank: `agentReg.mint` sits in argument position and is evaluated
+        // first, so a one-shot prank would be consumed by the mint.
+        vm.startPrank(owner);
+        vault.registerAgent(agentReg.mint(coAgent), coAgent);
+        vm.stopPrank();
+
         _deposit(lp1, 70_000e6);
         _deposit(lp2, 30_000e6);
-        (uint256 pid, address coAgent) = _proposeDraft();
-        uint256 lp1Shares = vault.balanceOf(lp1);
-        uint256 lp2Shares = vault.balanceOf(lp2);
+        uint256 supply = vault.totalSupply();
 
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](1);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent, splitBps: 2000});
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(0),
+            "she282-collab",
+            7 days,
+            env,
+            _calls(1),
+            GovEnvelope.defaultCaps(env.maxCapital, 1),
+            _calls(0),
+            GovEnvelope.defaultCaps(env.maxCapital, 1),
+            coProps
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        assertEq(
+            uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Draft), "still a Draft"
+        );
+        assertTrue(vault.redemptionsLocked(), "the Draft holds the lock, so the queue is the only exit");
+
+        // Hoisted: `balanceOf` in argument position would eat the one-shot prank.
+        uint256 lp2Shares = vault.balanceOf(lp2);
         vm.prank(lp2);
-        uint256 req = vault.requestRedeem(lp2Shares, lp2); // same block as the final approve
+        vault.requestRedeem(lp2Shares, lp2);
+
+        // SAME BLOCK, ahead of the approval that transitions Draft -> Pending and stamps.
         vm.prank(coAgent);
         governor.approveCollaboration(pid);
 
-        assertEq(governor.getProposal(pid).votableSupply, lp1Shares + lp2Shares, "electorate read at the snapshot");
-        assertEq(vault.balanceOf(address(queue)), lp2Shares, "though the shares sit in the queue");
-        assertEq(governor.getVoteWeight(pid, lp2), lp2Shares, "and lp2 keeps snapshot weight");
+        assertEq(vault.balanceOf(address(queue)), lp2Shares, "the shares really are escrowed in the queue");
+        assertEq(governor.getProposal(pid).votableSupply, supply, "the recorded electorate is the full supply");
 
         vm.prank(lp2);
         governor.vote(pid, ISyndicateGovernor.VoteType.Against);
         _endVote();
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
-        vm.prank(lp2);
-        queue.cancel(req); // the request is cancellable, but the shares stay locked
-        assertEq(vault.maxRedeem(lp2), 0, "capital stays at risk for the cycle");
     }
 
     /// @notice The collaborative stamp's queue term: shares parked in the queue under an

@@ -134,9 +134,9 @@ contract DeployRobinhoodMainnet is DeploySherwood {
         _patchAddress("GOVERNOR_BEACON", d.beacon);
         _patchAddress("PROTOCOL_CONFIG", d.protocolConfig);
         _patchAddress("GUARDIAN_REGISTRY", d.registryProxy);
-        // TIER_REGISTRY is read as an env address by DeployPlanD and
-        // WireTokenCourt; without this key the later phases have nothing to
-        // read and the operator has to recover it from broadcast logs.
+        // TIER_REGISTRY is read as an env address by DeployPlanD; without this
+        // key the later phases have nothing to read and the operator has to
+        // recover it from broadcast logs.
         _patchAddress("TIER_REGISTRY", d.tierRegistry);
         _patchAddress("STAKED_WOOD", d.swoodProxy);
         _patchAddress("WOOD_TOKEN", woodToken);
@@ -202,9 +202,9 @@ contract DeployRobinhoodMainnet is DeploySherwood {
     ///      `TierRegistry` was missing here entirely. `deployCore` mints it
     ///      owned by the deployer and wires it into the factory, and nothing
     ///      afterwards moved it — so a mainnet ceremony handed five contracts to
-    ///      the Safe and left the adapter-certification authority
-    ///      (`proposeCertification`, `demote`, `setCounterpartyAllowed`) on the
-    ///      deployer key, with no assertion anywhere to notice.
+    ///      the Safe and left the adapter-certification authority (`certify`,
+    ///      `demote`, `setCounterpartyAllowed`) on the deployer key, with no
+    ///      assertion anywhere to notice.
     function _handoffRobinhood(Deployed memory d, address ownerMultisig) internal {
         // Per-vault governors: the beacon (shared impl) and ProtocolConfig
         // (global fee params) are the governance handles — there is no

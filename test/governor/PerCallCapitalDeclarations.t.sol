@@ -112,21 +112,11 @@ contract PerCallCapitalDeclarationsTest is Test {
         // tier-0 so a benign settlement is genuinely low-tier: since SHE-210
         // the settlement leg's tier counts toward the proposal tier, and an
         // uncertified selector resolves to the fail-closed tier 2.
-        _certifyNow(address(usdc), usdc.approve.selector, 0, 100, address(0));
+        _certifyNow(address(usdc), usdc.approve.selector, 0, 100);
     }
 
-    /// @dev Shared fixture helper (mirrors `TierRegistryTest._certifyNow`):
-    ///      reaches the same end state as the old instant `certify` via the
-    ///      new two-step flow from #45's certification timelock — propose
-    ///      (test contract is `tierRegistry`'s owner, no prank needed), warp
-    ///      past the pinned `readyAt` (`vm.getBlockTimestamp()`, never a
-    ///      cached `block.timestamp` local — this repo's optimizer CSEs it
-    ///      across `vm.warp`), execute. Every call site here pins no bond
-    ///      (`submitter == address(0)`), so the finalize step needs no prank.
-    function _certifyNow(address target_, bytes4 selector_, uint8 tier_, uint16 bound_, address submitter_) internal {
-        tierRegistry.proposeCertification(target_, selector_, tier_, bound_, submitter_, target_.codehash);
-        vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
-        tierRegistry.certify(target_, selector_);
+    function _certifyNow(address target_, bytes4 selector_, uint8 tier_, uint16 bound_) internal {
+        tierRegistry.certify(target_, selector_, tier_, bound_, target_.codehash);
     }
 
     function _benignSettle() internal view returns (BatchExecutorLib.Call[] memory calls) {
@@ -152,8 +142,8 @@ contract PerCallCapitalDeclarationsTest is Test {
     ///         per-call sum.
     function test_issueHeadlineScenario_tierAndCoverage() public {
         _wireTierRegistry();
-        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 100, address(0));
-        _certifyNow(address(mockAdapter), mockAdapter.transfer.selector, 1, 500, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 100);
+        _certifyNow(address(mockAdapter), mockAdapter.transfer.selector, 1, 500);
         // Third call: uncertified (tier 2, 10_000 bps) -- mockAdapter.mint has
         // no certification entry.
 
@@ -205,7 +195,7 @@ contract PerCallCapitalDeclarationsTest is Test {
     function test_she210_settlementLegLiftsProposalTier() public {
         _wireTierRegistry();
         // Execute leg: certified tier-0.
-        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 100, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 100);
 
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
         execCalls[0] = BatchExecutorLib.Call({
@@ -247,7 +237,7 @@ contract PerCallCapitalDeclarationsTest is Test {
     ///         the reject test is not vacuously always-2.
     function test_she210_certifiedSettlementLegKeepsLowTier() public {
         _wireTierRegistry();
-        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 100, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 100);
         // `usdc.approve` is certified tier-0 inside `_wireTierRegistry`.
 
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
@@ -321,7 +311,7 @@ contract PerCallCapitalDeclarationsTest is Test {
     ///         binds tier-2 pricing specifically, not caps in general.
     function test_tier2Ceiling_sameCapAcceptedOnCertifiedTier0Call() public {
         _wireTierRegistry();
-        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50);
         vm.prank(owner);
         governor.setTier2CallCapBps(200);
 
@@ -560,7 +550,7 @@ contract PerCallCapitalDeclarationsTest is Test {
     ///         actual outflow at execute time.
     function test_allZeroCaps_pricesZeroCoverage_meterStillBlocksOutflow() public {
         _wireTierRegistry();
-        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50);
 
         address puller = address(new AssetPuller());
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
@@ -596,7 +586,7 @@ contract PerCallCapitalDeclarationsTest is Test {
 
     function test_regression_coverageRegressed_whenACappedCallsBoundRises() public {
         _wireTierRegistry();
-        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50);
 
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
         execCalls[0] = BatchExecutorLib.Call({
@@ -621,24 +611,9 @@ contract PerCallCapitalDeclarationsTest is Test {
         assertEq(governor.getRequiredCoverage(pid), 5e6, "1_000e6 * 50/10_000");
 
         // Same tier, but the certified bound rises 10x -- coverage regresses
-        // even though the tier does not. The re-certification must clear
-        // #45's certification timelock before `executeProposal` re-resolves
-        // live coverage below, but a second full `certifyDelay` (default 3
-        // days) stacked on top of `_advancePastVoting`'s warp would blow past
-        // this proposal's EXECUTION_WINDOW (1 day) and revert
-        // `ProposalNotApproved` instead of the `CoverageRegressed` this test
-        // is actually about. Fix: shrink `certifyDelay` to its floor
-        // (MIN_CERTIFY_DELAY, exactly VOTING_PERIOD here) and propose the
-        // re-cert NOW, so its `readyAt` elapses from the SAME
-        // `_advancePastVoting` warp that clears the vote, instead of adding
-        // a second one.
-        tierRegistry.setCertifyDelay(tierRegistry.MIN_CERTIFY_DELAY());
-        tierRegistry.proposeCertification(
-            address(mockAdapter), mockAdapter.mint.selector, 0, 500, address(0), address(mockAdapter).codehash
-        );
-
+        // even though the tier does not.
         _advancePastVoting();
-        tierRegistry.certify(address(mockAdapter), mockAdapter.mint.selector);
+        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 500);
 
         vm.expectRevert(ISyndicateGovernor.CoverageRegressed.selector);
         governor.executeProposal(pid);
@@ -646,7 +621,7 @@ contract PerCallCapitalDeclarationsTest is Test {
 
     function test_regression_tierRegressed_whenAdapterDemoted() public {
         _wireTierRegistry();
-        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50);
 
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
         execCalls[0] = BatchExecutorLib.Call({
@@ -695,7 +670,7 @@ contract PerCallCapitalDeclarationsTest is Test {
         execCalls[1] = BatchExecutorLib.Call({
             target: address(mockAdapter), data: abi.encodeCall(mockAdapter.mint, (address(this), 1)), value: 0
         });
-        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
+        _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50);
         uint256[] memory execCaps = new uint256[](2);
         execCaps[0] = 0; // uncertified call -- moves nothing declared
         execCaps[1] = 0; // certified tier-0 call, ALSO capped at zero

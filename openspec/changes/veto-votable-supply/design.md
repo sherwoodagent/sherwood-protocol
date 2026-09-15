@@ -64,7 +64,7 @@ that share a recorded timepoint chosen to be after every same-block burn AND
 after every same-block delegation — which needs the vault's checkpoint surface
 to expose it.
 
-## Decision 3: the collaborative path stamps a window after the lock — RESOLVED in `draft-locks-nothing`
+## Decision 3: the collaborative path stamps a window after the lock — RESOLVED
 
 On the direct path the lock, the stamp and the snapshot are one transaction. On
 the collaborative path they are not: `redemptionsLocked()` is armed at Draft
@@ -86,8 +86,10 @@ collaborative proposals, not a fund path. The pre-change code did not have this
 particular hole (its `getPastVotes(queue, snapshot)` term could not see a
 same-block queue transfer); it had the two the proposal documents instead.
 
-Two honest shapes. Neither is "read the queue term at the snapshot", which
-re-opens the double subtraction the claim-in-propose-block tests pin:
+Three shapes. The one to be careful with is "read the QUEUE TERM at the
+snapshot while supply stays live" — that mixes two instants and re-opens the
+double subtraction the claim-in-propose-block tests pin. Reading BOTH terms at
+the snapshot does not, because the two then agree about which shares exist:
 
 - **(a) Stamp the collaborative path at Draft creation** — the block that arms
   the lock — taking `snapshotTimestamp` there too. From that instant supply is
@@ -102,25 +104,41 @@ re-opens the double subtraction the claim-in-propose-block tests pin:
 - **(b) Accept it as bounded** — easier veto, collaborative path only, requires
   an open Draft — and pin the current number with a test so a later change is
   deliberate.
+- **(c) Stamp the collaborative electorate AT the snapshot** — read supply and
+  the queue term both at `snapshotTimestamp` (`getPastTotalSupply` minus the
+  queue's `getPastVotes`), leaving the direct path's live read alone.
 
-Not decided in this change. Same family as Decision 2: both are the cost of the
-vote-weight instant and the electorate instant being different, and both should
-be settled together rather than one at a time.
+**RESOLVED: (c).** The asymmetry is not arbitrary — it follows the lock:
 
-**Resolution (`draft-locks-nothing`, SHE-287).** Neither (a) nor (b). The
-collaborative stamp reads both terms at `snapshotTimestamp` —
-`getPastTotalSupply(t − 1) − getPastVotes(queue, t − 1)` — so the same-block
-`requestRedeem` moves shares the recorded set still contains; the bar stays the
-one the voter's weight was measured against, and the shares stay locked for the
-cycle whether or not the request is cancelled. The double subtraction the
-claim-in-propose-block tests pin does not arise here: a claim in the approve block
-leaves both terms at `t − 1` together. The direct path keeps its live read —
-instant redeem is open right up to `propose`, and a `t − 1` read there would count
-shares that already left (NM 6.4's inflated bar).
+- The **direct path** reads live because instant redeem is open right up to
+  `propose`. A redeem ordered ahead of it in the same block has really left, and
+  the live read is the one that sees that. Reading the past there would count an
+  exit that no longer exists.
+- The **collaborative path** reads at the snapshot instant because the Draft
+  already holds the redeem lock, so the only exit in the approve block is a
+  queued one — shares that still exist and whose holder still carries weight at
+  `t − 1`. Recording the electorate at that same instant puts the queued shares
+  inside the set exactly as their holder's weight is inside the vote: subtracted
+  once, or not at all, but never on one side only.
 
-Two shapes were tried and rejected on the way (#320 review, rounds 1–2), both
-with instant redeem open during the Draft: a live collaborative read lets
+That is what made the front-run work: the live queue term saw the escrow
+transfer at *t*, while `getPastVotes(lp, t − 1)` did not. Both terms at *t − 1*
+and the asymmetry is gone — the bar stays at the full supply and a 30% holder
+votes 30% of it. Pinned by
+`test_collab_queuedRedeemInTheApproveBlockCannotShrinkTheVetoBar`
+(`test/audit-fixes/Governor_vetoDenominatorExits.t.sol`), which goes red if the
+stamp is moved back to the live read.
+
+(a) was not needed: it moves the collaborative vote snapshot earlier by the
+whole collaboration window — a product change — to buy what (c) buys with a
+different read at the same instant. (b) leaves a repeatable griefing vector
+open. Decision 2's residual is a different instant pair (vote weight vs.
+electorate on the direct path) and stays open.
+
+The two shapes that keep instant redeem open during the Draft were tried in #320
+(SHE-287) and rejected in review: a live collaborative read lets
 `{redeem, approveCollaboration}` vote full weight against a bar shrunk by its own
-exit; a `t − 1` read lets a Draft-window deposit `X` exit in the approve block and
-leave a bar of `0.4 (G + X)` that only `G` can reach. The Draft therefore keeps the
-redeem lock: every share in the recorded electorate is capital at risk.
+exit, and a `t − 1` read lets a Draft-window deposit `X` exit in the approve block
+and leave a bar of `0.4 (G + X)` that only `G` can reach. (c) holds only because
+the Draft keeps the redeem lock, so every share in the recorded set is capital at
+risk for the cycle.

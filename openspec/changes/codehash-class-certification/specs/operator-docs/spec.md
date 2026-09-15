@@ -2,7 +2,7 @@
 
 ### Requirement: The onboarding checklist covers class certification
 
-`docs/adapter-onboarding-checklist.md` SHALL carry a class-certification section covering, in order: why address-keyed consent does not survive per-proposal clones; the eligibility bar a template must clear before it may be class-certified; the three writes (`proposeClassCertification`, `certifyClass`, `setClassAllowed`) and which one replaces the per-proposal `setAdapterAllowed(clone, true)`; verification reads for class membership; the rollback path and its guarantee that demotion is never worse than the status quo; and the token↔price-source attestation, including that the packed max-age must be stripped before attesting.
+`docs/adapter-onboarding-checklist.md` SHALL carry a class-certification section covering, in order: why address-keyed consent does not survive per-proposal clones; the eligibility bar a template must clear before it may be class-certified; the two writes (`certifyClass`, `setClassAllowed`) and which one replaces the per-proposal `setAdapterAllowed(clone, true)`; verification reads for class membership; the rollback path and its guarantee that demotion is never worse than the status quo; and the token↔price-source attestation, including that the packed max-age must be stripped before attesting.
 
 The eligibility bar SHALL state all four disqualifying conditions: an unbound init-supplied external address, a price source not bound to the token it prices, a clone mechanism that writes per-instance bytecode, and a template that is itself a proxy.
 
