@@ -22,10 +22,6 @@ interface IRequestableVault {
     /// @notice Queue-only: mint `shares` to `to`. Assets were pushed to the
     ///         vault by the queue immediately before this call.
     function settleDeposit(uint256 shares, address to) external;
-    /// @notice ERC20Votes read — the queue's own checkpointed custody balance at
-    ///         a past instant. Its original consumer was the compensation
-    ///         pay-through's denominator, which is gone with the escrow.
-    function getPastVotes(address account, uint256 timepoint) external view returns (uint256);
     /// @notice The factory that deployed this vault (and this queue).
     function factory() external view returns (address);
 }
@@ -185,8 +181,8 @@ contract VaultWithdrawalQueue is IVaultWithdrawalQueue, ReentrancyGuardTransient
     ///
     ///      A DEPOSIT asks "is this an honest instant to mint?" — it carries no
     ///      frozen price at all (it is converted live below), so no stamp is
-    ///      relevant to it. `depositsLocked()` is the whole gate: no open
-    ///      proposal.
+    ///      relevant to it. `depositsLocked()` is the whole gate: no proposal
+    ///      executing.
     function claim(uint256 requestId) external nonReentrant returns (uint256 outAmount) {
         Request storage r = _req(requestId);
         if (r.claimed) revert AlreadyClaimed();

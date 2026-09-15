@@ -140,6 +140,74 @@ contract SyndicateVaultTest is Test {
         assertGt(vault.getVotes(lp1), 0);
     }
 
+    // ==================== DELEGATION ====================
+
+    /// @notice Voting power stays with the holder: delegating to another address
+    ///         would let shares sit in the veto denominator while voting for nobody
+    ///         (or for the queue), bending the bar without an exit.
+    function test_delegate_toOther_reverts() public {
+        _depositLp1();
+        vm.prank(lp1);
+        vm.expectRevert(ISyndicateVault.DelegationLocked.selector);
+        vault.delegate(lp2);
+    }
+
+    function test_delegate_toZero_reverts() public {
+        _depositLp1();
+        vm.prank(lp1);
+        vm.expectRevert(ISyndicateVault.DelegationLocked.selector);
+        vault.delegate(address(0));
+    }
+
+    function test_delegate_toSelf_succeeds() public {
+        _depositLp1();
+        vm.prank(lp1);
+        vault.delegate(lp1);
+        assertEq(vault.delegates(lp1), lp1);
+    }
+
+    function test_delegateBySig_toOther_reverts() public {
+        (address signer, uint256 pk) = makeAddrAndKey("sigLp");
+        usdc.mint(signer, 10_000e6);
+        vm.startPrank(signer);
+        usdc.approve(address(vault), 10_000e6);
+        vault.deposit(10_000e6, signer);
+        vm.stopPrank();
+
+        uint256 expiry = block.timestamp + 1 days;
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256("Delegation(address delegatee,uint256 nonce,uint256 expiry)"),
+                lp2,
+                vault.nonces(signer),
+                expiry
+            )
+        );
+        (, string memory name, string memory version,,,,) = vault.eip712Domain();
+        bytes32 domain = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes(name)),
+                keccak256(bytes(version)),
+                block.chainid,
+                address(vault)
+            )
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domain, structHash));
+        (uint8 v, bytes32 r, bytes32 sHalf) = vm.sign(pk, digest);
+
+        uint256 nonce = vault.nonces(signer);
+        vm.expectRevert(ISyndicateVault.DelegationLocked.selector);
+        vault.delegateBySig(lp2, nonce, expiry, v, r, sHalf);
+    }
+
+    function _depositLp1() internal {
+        vm.startPrank(lp1);
+        usdc.approve(address(vault), 10_000e6);
+        vault.deposit(10_000e6, lp1);
+        vm.stopPrank();
+    }
+
     // ==================== AGENT REGISTRATION ====================
 
     function test_registerAgent() public view {

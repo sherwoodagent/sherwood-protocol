@@ -406,9 +406,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             // param change. Packed (executionWindow << 128 | votingPeriod).
             _draftTimingSnap[proposalId] =
                 (uint256(uint128(_params.executionWindow)) << 128) | uint256(uint128(_params.votingPeriod));
-            // Locks the vault at Draft creation: an unlocked Draft would let
-            // an attacker deposit between propose and the final approve,
-            // inflating the balance counted in the Pending snapshot.
+            // A Draft binds the vault and holds the redeem lock: the electorate
+            // is stamped at the final approve, whose readiness is public, so no
+            // exit may land ahead of it. A Draft-window deposit is accepted —
+            // it buys weight with capital locked until settle.
             unchecked {
                 ++_openProposalCount;
             }
@@ -437,9 +438,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_commitState(proposal) != ProposalState.Pending) revert NotWithinVotingPeriod();
         if (_hasVoted[proposalId][msg.sender]) revert AlreadyVoted();
 
-        // Snapshot weight is final: no share is minted or burned while the proposal
-        // is open (`SyndicateVault.redemptionsLocked`), so no live cap. The one gap is
-        // the stamping block itself — see design.md Decision 2 (phantom weight).
+        // Snapshot weight is final: the electorate was recorded at the stamp and
+        // no share is burned while a proposal is open (`SyndicateVault.redemptionsLocked`),
+        // so no live cap. The one gap is the stamping block itself — see
+        // veto-votable-supply design.md Decision 2 (phantom weight).
         uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, proposal.snapshotTimestamp);
         if (weight == 0) revert NoVotingPower();
 
@@ -1055,9 +1057,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         return supply > queued ? supply - queued : 0;
     }
 
-    /// @dev The collaborative stamp reads both terms at the snapshot instant, so
-    ///      a queued redeem in the approve block sits inside the recorded set
-    ///      exactly as its holder's weight does. The vault auto-delegates the queue to itself.
+    /// @dev Both terms at the snapshot instant, so a same-block queued redeem cannot
+    ///      shrink the bar. Recorded electorate == castable weight because the vault
+    ///      refuses delegation away from the holder and self-delegates the queue.
     function _votableSupplyAt(address vault, uint256 at) private view returns (uint256) {
         uint256 supply = IVotes(vault).getPastTotalSupply(at);
         address queue = ISyndicateVault(vault).withdrawalQueue();

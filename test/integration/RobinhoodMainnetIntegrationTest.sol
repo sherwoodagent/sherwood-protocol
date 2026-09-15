@@ -522,8 +522,8 @@ abstract contract RobinhoodMainnetIntegrationTest is Test {
         requestId = vault.requestRedeem(shares, who);
     }
 
-    /// @notice Queue an async deposit (requires an OPEN proposal — reverts
-    ///         `NoOpenProposal` otherwise). The vault pulls the assets straight
+    /// @notice Queue an async deposit (requires an EXECUTING proposal — reverts
+    ///         `DepositsNotLocked` otherwise). The vault pulls the assets straight
     ///         into queue custody, so the approval is owner → vault.
     function _requestDeposit(address who, uint256 assets) internal returns (uint256 requestId) {
         address asset_ = vault.asset();

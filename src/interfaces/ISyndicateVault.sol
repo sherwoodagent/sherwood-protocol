@@ -39,11 +39,13 @@ interface ISyndicateVault {
     error WithdrawalQueueAlreadySet();
     error InsufficientShares();
     error RedemptionsNotLocked();
-    /// @notice `requestDeposit` was called with no non-terminal proposal open
-    ///         on the vault (`openProposalCount() == 0`) — the async path is
-    ///         only for entering while the instant `deposit`/`mint` path is
-    ///         closed by an open proposal; use those instead.
-    error NoOpenProposal();
+    /// @notice `requestDeposit` was called while no proposal is executing
+    ///         (`depositsLocked()` false): the instant `deposit`/`mint` path is
+    ///         the open one; use it instead.
+    error DepositsNotLocked();
+    /// @notice `delegate`/`delegateBySig` to anyone but the holder: voting power stays
+    ///         with the shares so the veto denominator and the castable weight match.
+    error DelegationLocked();
     error QueueReserveBreached();
     error NotQueue();
     error ZeroAssets();
@@ -133,9 +135,11 @@ interface ISyndicateVault {
     ///         implementation note for why an unbacked escrow is unrecoverable.
     function spendableFee(address asset) external view returns (uint256);
     function governor() external view returns (address);
+    /// @notice Instant withdraw/redeem closed: a proposal is open (Draft included)
+    ///         and not yet settled. `requestRedeem` is the exit meanwhile.
     function redemptionsLocked() external view returns (bool);
-    /// @notice Same predicate as `redemptionsLocked`; kept under both names for
-    ///         the queue and off-chain readers.
+    /// @notice Instant deposit/mint closed: capital is deployed (execute to
+    ///         settle). `requestDeposit` is the entry meanwhile.
     function depositsLocked() external view returns (bool);
     function managementFeeBps() external view returns (uint256);
     /// @notice Vault-owner-set agent performance fee (basis points). Defaults

@@ -21,8 +21,10 @@ pragma solidity 0.8.28;
 interface IProposalStatus {
     /// @notice Id of the proposal currently binding the vault (0 = none).
     function getActiveProposal() external view returns (uint256);
-    /// @notice Count of non-terminal proposals (Pending..Executed). Nonzero ⇒
-    ///         instant deposits and redemptions are gated (see vault `redemptionsLocked`).
+    /// @notice Count of non-terminal proposals, Drafts included. Nonzero ⇒ instant
+    ///         redemption is locked (vault `redemptionsLocked`), `propose` and
+    ///         `whenNoActiveProposal` refuse, the factory swap gates and the owner's
+    ///         `requestUnstakeOwner` rescue path are closed.
     function openProposalCount() external view returns (uint256);
     /// @notice Total proposals ever created; the latest id tags queued requests
     ///         while the binding proposal is not yet executing.

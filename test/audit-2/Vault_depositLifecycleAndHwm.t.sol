@@ -16,17 +16,19 @@ import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 ///
 ///   FINDING A (CRITICAL, introduced by the FIRST remediation): the prior fix
 ///   opened `requestDeposit` on `openProposalCount() != 0` (Draft+Pending, not
-///   just Executed). But a proposal in Draft/Pending can terminate WITHOUT
-///   ever settling — cancelled, vetoed, rejected, expired all call
-///   `_decOpen()` directly and never `onProposalSettled` — so a deposit
-///   tagged to one of those pids had `_settlePrice[pid].stamped` permanently
-///   false. `claim()` gated on THAT pid's stamp, so the claim reverted
-///   `NotSettled` forever, with no symmetric recovery for a pay-on-behalf
-///   depositor (`cancel` is receiver-gated; `requestDeposit` pulled from
+///   just Executed). A proposal in Draft/Pending could terminate WITHOUT ever
+///   settling — cancelled, vetoed, rejected, expired all call `_decOpen()`
+///   directly and never `onProposalSettled` — so a deposit tagged to one of
+///   those pids had `_settlePrice[pid].stamped` permanently false. `claim()`
+///   gated on THAT pid's stamp, so the claim reverted `NotSettled` forever,
+///   with no symmetric recovery for a pay-on-behalf depositor (`cancel` is
+///   receiver-gated; `requestDeposit` pulled from
 ///   `msg.sender`). Fixed by gating the deposit branch on
 ///   `_settlePrice[_lastStampedPid].stamped` — the price it actually uses —
 ///   so the claim unlocks at the next REAL settlement, whichever proposal
 ///   that turns out to be.
+///   The lane now opens at execute (SHE-287), so the premise is unreachable
+///   from the governor; the recovery path itself is still exercised below.
 ///
 ///   FINDING B (pre-existing): `_highWaterPricePerShare` was seeded once and
 ///   never reset when `totalSupply()` returns to zero, while the share/asset
@@ -108,12 +110,12 @@ contract VaultDepositLifecycleAndHwmTest is Test {
     // FINDING A — deposit tagged to a proposal that dies without settling
     // =====================================================================
 
-    /// @notice THE FAILURE MODE: a deposit queued against a Pending proposal
-    ///         that is then rejected/cancelled/expired (terminal via
-    ///         `_decOpen()` alone, never `onProposalSettled`) must NOT be
-    ///         permanently stuck. Before this fix, `claim()` gated on
-    ///         `_settlePrice[r.pid].stamped` — a pid that can never stamp —
-    ///         so the claim reverted `NotSettled` forever, even after a LATER,
+    /// @notice THE FAILURE MODE: a deposit queued against an executing proposal
+    ///         whose settlement never stamps must NOT be permanently stuck. The
+    ///         lane opens at execute, so this is modelled by releasing the active
+    ///         pid without `onProposalSettled`. Before this fix, `claim()` gated
+    ///         on `_settlePrice[r.pid].stamped` — a pid that can never stamp — so
+    ///         the claim reverted `NotSettled` forever, even after a LATER,
     ///         unrelated proposal genuinely settled. This is also a
     ///         pay-on-behalf deposit: `payer` funds it, `receiver` gets the
     ///         claim, and `cancel` (receiver-gated) is deliberately left
@@ -124,18 +126,17 @@ contract VaultDepositLifecycleAndHwmTest is Test {
         vm.prank(lp1);
         vault.deposit(1_000e6, lp1);
 
-        // Proposal 1 opens (Pending: openCount=1, activePid still 0 pre-execute).
-        _setProposal(0, 1, 1);
+        // Proposal 1 executes (SHE-287: the async lane opens at execute, not Pending).
+        _setProposal(1, 1, 1);
         vm.prank(payer);
         uint256 requestId = vault.requestDeposit(500e6, receiver);
         IVaultWithdrawalQueue.Request memory r = queue.getRequest(requestId);
-        assertEq(r.pid, 1, "tagged to the open (Pending) proposal");
+        assertEq(r.pid, 1, "tagged to the executing proposal");
 
-        // Proposal 1 dies WITHOUT ever settling — mirrors the governor's
-        // Rejected/Expired/vetoed/cancelled paths, which call `_decOpen()`
-        // directly and never `onProposalSettled`. Simulated here by simply
-        // never calling `onProposalSettled(1)` and releasing the open-proposal
-        // gate, exactly as `_decOpen()` does.
+        // Proposal 1 dies WITHOUT ever settling. Unreachable from today's
+        // governor (an executing proposal always settles), modelled here by
+        // never calling `onProposalSettled(1)` and releasing the active pid,
+        // so the recovery below stays pinned.
         _setProposal(0, 0, 1);
 
         // THE FIX, STRENGTHENED BY FINDING #3. A deposit no longer prices
@@ -259,8 +260,8 @@ contract VaultDepositLifecycleAndHwmTest is Test {
     function test_highWaterMark_seedsOnQueueOnlyFirstMint_viaSettleDeposit() public {
         assertEq(vault.highWaterPricePerShare(), 0, "sanity: never seeded, no Lane A deposit ever happened");
 
-        // Proposal 1 opens (Pending) so the async deposit path is open.
-        _setProposal(0, 1, 1);
+        // Proposal 1 executes, which is what opens the async deposit path (SHE-287).
+        _setProposal(1, 1, 1);
         vm.prank(payer);
         uint256 requestId = vault.requestDeposit(1_000e6, receiver);
 

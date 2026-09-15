@@ -48,7 +48,7 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
         return s;
     }
 
-    /// @notice Number of proposals currently binding a vault.
+    /// @notice Number of proposals currently binding a vault, Drafts included.
     function openProposalCount() public view virtual returns (uint256) {
         return _openProposalCount;
     }
