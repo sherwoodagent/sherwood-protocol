@@ -634,6 +634,17 @@ contract SyndicateVault is
         }
     }
 
+    /// @dev Delegation is refused on both entrypoints: `_update` self-delegates every
+    ///      receiver, so a holder's votes always equal its balance and the veto
+    ///      electorate and the weight castable against it are one and the same set.
+    function delegate(address) public pure override {
+        revert DelegationDisabled();
+    }
+
+    function delegateBySig(address, uint256, uint256, uint8, bytes32, bytes32) public pure override {
+        revert DelegationDisabled();
+    }
+
     /// @dev Use timestamp-based voting checkpoints instead of block numbers
     function clock() public view override returns (uint48) {
         return uint48(block.timestamp);

@@ -103,6 +103,35 @@ contract GovernorVetoDenominatorExitsTest is Test {
         vm.warp(vm.getBlockTimestamp() + 1);
     }
 
+    /// @dev The collaborative path: a Draft that stamps its electorate at the co-agent's approval.
+    function _proposeCollab(address coAgent) internal returns (uint256 pid) {
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](1);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent, splitBps: 2000});
+        vm.prank(agent);
+        pid = governor.propose(
+            address(vault),
+            address(0),
+            "she282-collab",
+            7 days,
+            env,
+            _calls(1),
+            GovEnvelope.defaultCaps(env.maxCapital, 1),
+            _calls(0),
+            GovEnvelope.defaultCaps(env.maxCapital, 1),
+            coProps
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+    }
+
+    function _registerCoAgent(address who) internal {
+        // startPrank, not prank: `agentReg.mint` sits in argument position and is evaluated
+        // first, so a one-shot prank would be consumed by the mint.
+        vm.startPrank(owner);
+        vault.registerAgent(agentReg.mint(who), who);
+        vm.stopPrank();
+    }
+
     function _endVote() internal {
         vm.warp(vm.getBlockTimestamp() + 1 days + 1);
     }
@@ -344,33 +373,13 @@ contract GovernorVetoDenominatorExitsTest is Test {
     ///         100k, and 30% falls short of the 40% threshold.
     function test_collab_queuedRedeemInTheApproveBlockCannotShrinkTheVetoBar() public {
         address coAgent = makeAddr("coAgent");
-        // startPrank, not prank: `agentReg.mint` sits in argument position and is evaluated
-        // first, so a one-shot prank would be consumed by the mint.
-        vm.startPrank(owner);
-        vault.registerAgent(agentReg.mint(coAgent), coAgent);
-        vm.stopPrank();
+        _registerCoAgent(coAgent);
 
         _deposit(lp1, 70_000e6);
         _deposit(lp2, 30_000e6);
         uint256 supply = vault.totalSupply();
 
-        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
-        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](1);
-        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent, splitBps: 2000});
-        vm.prank(agent);
-        uint256 pid = governor.propose(
-            address(vault),
-            address(0),
-            "she282-collab",
-            7 days,
-            env,
-            _calls(1),
-            GovEnvelope.defaultCaps(env.maxCapital, 1),
-            _calls(0),
-            GovEnvelope.defaultCaps(env.maxCapital, 1),
-            coProps
-        );
-        vm.warp(vm.getBlockTimestamp() + 1);
+        uint256 pid = _proposeCollab(coAgent);
 
         assertEq(
             uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Draft), "still a Draft"
@@ -393,6 +402,88 @@ contract GovernorVetoDenominatorExitsTest is Test {
         governor.vote(pid, ISyndicateGovernor.VoteType.Against);
         _endVote();
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    /// @notice Both delegation entrypoints are refused whatever the target, and `delegateBySig`
+    ///         reverts before it ever looks at the signature (zeros get the same revert).
+    function test_delegate_isRefused() public {
+        _deposit(lp1, 60_000e6);
+        _deposit(lp2, 40_000e6);
+        vm.startPrank(lp1);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegate(address(0));
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegate(lp2);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegate(lp1);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegateBySig(lp2, 0, type(uint256).max, 0, bytes32(0), bytes32(0));
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegateBySig(address(0), 0, 0, 0, bytes32(0), bytes32(0));
+        vm.stopPrank();
+        assertEq(vault.delegates(lp1), lp1, "the receipt self-delegated and nothing could move it");
+        assertEq(vault.getVotes(lp1), vault.balanceOf(lp1), "votes equal balance");
+    }
+
+    /// @notice THE ATTACK SHAPE. The attacker holds X == 2G, twice the honest float, and tries to
+    ///         walk its votes out of the electorate one block before the approval stamps it:
+    ///         `getPastTotalSupply` would still count the shares while `getPastVotes` no longer
+    ///         did, so the bar would be b*(G+X) over an electorate of only G — unreachable. The
+    ///         vault refuses, so the recorded electorate is exactly the weight that can be cast.
+    function test_undelegationCannotInflateTheVetoBar() public {
+        address coAgent = makeAddr("coAgent");
+        _registerCoAgent(coAgent);
+
+        _deposit(lp1, 60_000e6);
+        _deposit(lp2, 40_000e6);
+        uint256 honest = vault.totalSupply(); // G
+        _deposit(attacker, 200_000e6);
+        uint256 attackerShares = vault.balanceOf(attacker); // X
+        assertEq(attackerShares, 2 * honest, "the attacker holds twice the honest float");
+
+        uint256 pid = _proposeCollab(coAgent);
+
+        // One block ahead of the approval that stamps the electorate.
+        vm.prank(attacker);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegate(address(0));
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        vm.prank(coAgent);
+        governor.approveCollaboration(pid);
+
+        uint256 s = governor.getProposal(pid).snapshotTimestamp;
+        assertEq(governor.getProposal(pid).votableSupply, honest + attackerShares, "electorate is G + X");
+        assertEq(governor.getVoteWeight(pid, attacker), attackerShares, "capital at risk still buys a vote");
+        assertEq(
+            governor.getProposal(pid).votableSupply,
+            vault.getPastVotes(lp1, s) + vault.getPastVotes(lp2, s) + vault.getPastVotes(attacker, s),
+            "the electorate is exactly the castable weight"
+        );
+    }
+
+    /// @notice The same invariant on the direct path, whose electorate is read live at `propose`.
+    ///         `delegate(queue)` is the other half of the attack there — the queue's votes are
+    ///         subtracted only on the collaborative stamp — and it is refused alongside.
+    function test_directPath_votableSupplyEqualsTheCastableWeight() public {
+        _deposit(lp1, 60_000e6);
+        _deposit(lp2, 40_000e6);
+        _deposit(attacker, 200_000e6);
+
+        vm.startPrank(attacker);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegate(address(0));
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegate(address(queue));
+        vm.stopPrank();
+
+        uint256 pid = _propose();
+        uint256 s = governor.getProposal(pid).snapshotTimestamp;
+        assertEq(
+            governor.getProposal(pid).votableSupply,
+            vault.getPastVotes(lp1, s) + vault.getPastVotes(lp2, s) + vault.getPastVotes(attacker, s),
+            "the electorate is exactly the castable weight"
+        );
     }
 
     function _resolveWithAgainst(uint256 againstAssets) internal returns (ISyndicateGovernor.ProposalState) {
