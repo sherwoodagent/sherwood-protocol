@@ -156,7 +156,7 @@ Cross-contract timing invariants (all enforced at the setters):
   batch runs via `executeGovernorBatch` under that effective cap. See
   [coverage.md](coverage.md).
 - Effects: capital snapshot taken, `_activeProposal = id` (**deposits lock** —
-  redemptions have been locked since `Pending`), management-fee clock starts.
+  redemptions have been locked since propose, `Draft` included), management-fee clock starts.
 - Batch metering: per-call caps (`CallCapExceeded`), net outflow ≤ `maxCapital`
   (`MaxNetOutflowExceeded`), queue reserve untouchable (`QueueReserveBreached`),
   idle-float floor (`BufferBreached`), callee gate + adapter allowlist.

@@ -12,9 +12,10 @@ EXECUTING (governor `getActiveProposal() == 0`); from execute to settle they SHA
 revert `DepositsLocked` and depositors use the async queue (`requestDeposit`). The
 lock tracks the one window in which the share price is not knowable — capital
 deployed in a strategy — and nothing else: a deposit made before execute mints at a
-live NAV the vault can compute, and buys no vote weight, because weight is read at
-the proposal's `snapshotTimestamp` and the veto electorate was recorded at the same
-instant. The whitelist check SHALL run against the `receiver` (the share holder), not
+live NAV the vault can compute. A deposit after the electorate stamp (`propose` on
+the direct path, the final `approveCollaboration` on the collaborative path) buys no
+vote weight, because weight is read at the proposal's `snapshotTimestamp` and the
+veto electorate was recorded at the same instant. The whitelist check SHALL run against the `receiver` (the share holder), not
 the caller, so pay-on-behalf funding is permitted.
 
 #### Scenario: Deposit outside any open proposal
@@ -23,11 +24,18 @@ the caller, so pay-on-behalf funding is permitted.
   receiver whitelisted)
 - **THEN** the deposit mints shares at the current NAV
 
-#### Scenario: Deposit while a proposal is Draft, Pending, GuardianReview or Approved
+#### Scenario: Deposit while a proposal is Pending, GuardianReview or Approved
 
-- **WHEN** a proposal is open but has not executed
+- **WHEN** a proposal is stamped but has not executed
 - **THEN** `deposit`/`mint` succeed at the live NAV, and the depositor gains no
   voting power over that proposal
+
+#### Scenario: Deposit while a collaborative proposal is Draft
+
+- **WHEN** a collaborative Draft is open and its electorate is not yet stamped
+- **THEN** `deposit`/`mint` succeed at the live NAV, the shares are inside the
+  electorate stamped at the final `approveCollaboration` and vote on that proposal
+  (the accepted Sherlock #8 trade), and they cannot exit before settle
 
 #### Scenario: Mid-execution deposit is locked
 

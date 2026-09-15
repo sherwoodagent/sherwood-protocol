@@ -1057,9 +1057,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         return supply > queued ? supply - queued : 0;
     }
 
-    /// @dev The collaborative stamp reads both terms at the snapshot instant, so
-    ///      a queued redeem in the approve block sits inside the recorded set
-    ///      exactly as its holder's weight does. The vault auto-delegates the queue to itself.
+    /// @dev Both terms at the snapshot instant, so a same-block queued redeem cannot
+    ///      shrink the bar. Not one set: an undelegated holder is counted in supply and
+    ///      votes for nobody (pre-existing, #318). The vault self-delegates the queue.
     function _votableSupplyAt(address vault, uint256 at) private view returns (uint256) {
         uint256 supply = IVotes(vault).getPastTotalSupply(at);
         address queue = ISyndicateVault(vault).withdrawalQueue();

@@ -68,7 +68,7 @@ to expose it.
 
 On the direct path the lock, the stamp and the snapshot are one transaction. On
 the collaborative path they are not: `redemptionsLocked()` is armed at Draft
-creation (so a deposit cannot inflate the Pending snapshot), while
+creation (so no share can leave before the stamp lands), while
 `votableSupply` and `snapshotTimestamp` are stamped later, at the final
 `approveCollaboration`. `requestRedeem` is open for the whole collaboration
 window.

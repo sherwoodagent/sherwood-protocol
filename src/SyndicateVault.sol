@@ -884,7 +884,7 @@ contract SyndicateVault is
     ///         Escrows `assets` in the queue (off-vault, so they never inflate
     ///         `totalAssets` nor get swept into the strategy) and records a claim
     ///         that mints shares at the realized settle price.
-    /// @dev Gated on `depositsLocked()`, the predicate instant deposit closes on,
+    /// @dev Gated on the executing pid, the same read `depositsLocked()` makes,
     ///      so exactly one deposit path is always open.
     /// @return requestId Always > 0 (the queue uses index 0 as a sentinel).
     function requestDeposit(uint256 assets, address receiver)
