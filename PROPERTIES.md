@@ -57,7 +57,11 @@ Checked after every call sequence.
   that could outgrow its own denominator would convict on less than the fraction it
   claims. Both tallies are checked against the one denominator because each voter's
   weight lands in exactly one of them and `totalStakeAtFiling` is the whole staked
-  set those weights were drawn from (x-ray I-6).
+  set those weights were drawn from (x-ray I-6). NOTE THIS IS THE LOOSER OF TWO TRUE
+  BOUNDS: with the accused, challenger, proposer and co-proposers all barred, the
+  tight one is `convict + acquit <= total − accused`, under which a same-basis double
+  count could still hide. The struct stores only the total, so the tight bound needs
+  an accessor that does not exist.
 - [x] **GL-52** `SHOULD-HOLD` — the exact clause GL-12 relaxes: while nothing can yet
   have expired (`block.timestamp - epochGenesis <= challengeWindow`), a guardian's
   bucketed `openExposure` EQUALS the sum of its locks. Inside that span every bucket

@@ -83,7 +83,7 @@ Each challenge SHALL pin at filing: `voteWindowAtFiling`, `quorumBpsAtFiling`, `
 - **THEN** that challenge's windows and payouts continue to use the values pinned at its filing; only challenges filed after the change use the new values
 
 ### Requirement: The challenge vote — the quorum's denominator is the whole staked set
-`file` SHALL pin the challenge's denominator in the same call, as `totalStakeAtFiling = stakedWood.getPastTotalVotes(block.timestamp - 1)` — the TOTAL staked WOOD, the accused cohort included. The accused lose their ballot, not their weight in the denominator: subtracting them would make a conviction cheaper the wider the cohort that approved, so a proposal most of the stake approved could be convicted by a small minority of it. The stamp SHALL be one second before the filing, never the filing instant: an sWOOD checkpoint is keyed on the second a stake changes and a same-key push overwrites, so reading the current timestamp would let stake planted in the filing block itself score in the numerator while the denominator missed it. `file` SHALL additionally compute, WITHOUT storing it, that total less `stakedWood.getPastStake(accused_i, block.timestamp - 1)` for every accused approver, saturating at zero, and SHALL revert `NoVotableStake` when it is zero — the accused cohort is the entire staked guardian set and no one could adjudicate the filing. `file` SHALL also pin the proposal's `proposer` and record each accused approver in an O(1) membership map for the vote's own gate, written in the loop it already runs over the cohort, and SHALL revert `ZeroAddress` when `stakedWood` is unwired.
+`file` SHALL pin the challenge's denominator in the same call, as `totalStakeAtFiling = stakedWood.getPastTotalVotes(block.timestamp - 1)` — the TOTAL staked WOOD, the accused cohort included. The accused lose their ballot, not their weight in the denominator: subtracting them would make a conviction cheaper the wider the cohort that approved, so a proposal most of the stake approved could be convicted by a small minority of it. The stamp SHALL be one second before the filing, never the filing instant: an sWOOD checkpoint is keyed on the second a stake changes and a same-key push overwrites, so reading the current timestamp would let stake planted in the filing block itself score in the numerator while the denominator missed it. `file` SHALL additionally compute, WITHOUT storing it, that total less `stakedWood.getPastStake(accused_i, block.timestamp - 1)` for every accused approver, saturating at zero, and SHALL revert `NoVotableStake` when `votable * 10_000 < challengeQuorumBps * totalStake` — NO CONVICTION COULD CLEAR THE QUORUM. That stake outside the cohort is the ceiling on either tally, so once the accused hold more than `1 - quorum` of the total, every filing against the proposal is guaranteed to fail as silence: the challenger loses the forfeit burn, the coverage freezes for the whole window and the proposal's one re-arm is spent, for a verdict that was never reachable. The guard SHALL read the same `challengeQuorumBps` the challenge pins, so the door and the bar cannot drift apart. `file` SHALL also pin the proposal's `proposer`, record each accused approver in an O(1) membership map for the vote's own gate, written in the loop it already runs over the cohort, record each of the proposal's `getCoProposers` entries in a second such map, and SHALL revert `ZeroAddress` when `stakedWood` is unwired.
 
 #### Scenario: Electorate measured one second before the filing
 - **WHEN** a guardian stakes WOOD in the same block as a filing
@@ -93,12 +93,16 @@ Each challenge SHALL pin at filing: `voteWindowAtFiling`, `quorumBpsAtFiling`, `
 - **WHEN** the accused cohort holds most of the staked WOOD and one outsider holding all of the remainder votes convict
 - **THEN** the quorum is measured against the total, so that outsider alone does not reach it even though it is the whole of the stake that may vote
 
+#### Scenario: A filing no conviction could clear is refused
+- **WHEN** the accused cohort holds 75% of the total staked WOOD at a 3,000 bps quorum — so the stake outside it cannot reach the bar
+- **THEN** `file` reverts `NoVotableStake`, no bond is taken, and no coverage is frozen; at 65% the same filing is admitted
+
 #### Scenario: Whole staked set accused refuses the filing
 - **WHEN** every active guardian's stake backs the challenged proposal
-- **THEN** `file` reverts `NoVotableStake`, no bond is taken, and no coverage is frozen
+- **THEN** `file` reverts `NoVotableStake` — the zero case the quorum guard subsumes
 
 ### Requirement: Casting a ballot
-`voteOnChallenge(challengeId, convict)` SHALL be callable only on a `Filed` challenge (otherwise `WrongStatus`) and strictly before `filedAt + voteWindowAtFiling` (otherwise `WindowClosed`). It SHALL refuse the challenge's own challenger (`ChallengerCannotVote`), the challenged proposal's pinned proposer (`ProposerCannotVote`), an accused approver of that challenge (`AccusedCannotVote`) and a second ballot from the same address (`AlreadyVoted`). The challenger and proposer bars are identity checks a second address defeats, so they are floors rather than ceilings; without them a filer convicts its own accusation and collects the prosecutor fee for it, and a proposer votes on the challenge that would confiscate its bond. The voter MUST be an active guardian (`isActiveGuardian`) with non-zero `getPastStake(voter, filedAt - 1)`, otherwise `NoVotableStake`. The ballot's weight SHALL be that `getPastStake` value, credited to exactly one of `convictWeight` / `acquitWeight`, and `ChallengeVoteCast(challengeId, voter, convict, weight)` SHALL be emitted. There SHALL be no vote change and no un-vote: the ballot latch is one-shot, which is what lets `resolve` settle on a crossed quorum without waiting for the window. Consequently `convictWeight + acquitWeight <= totalStakeAtFiling` always holds.
+`voteOnChallenge(challengeId, convict)` SHALL be callable only on a `Filed` challenge (otherwise `WrongStatus`) and strictly before `filedAt + voteWindowAtFiling` (otherwise `WindowClosed`). It SHALL refuse the challenge's own challenger (`ChallengerCannotVote`), the challenged proposal's pinned proposer AND each of its recorded co-proposers (`ProposerCannotVote`), an accused approver of that challenge (`AccusedCannotVote`) and a second ballot from the same address (`AlreadyVoted`). Co-proposers are named on-chain and take a share of the proposal's performance fee, so they are the same interested-party class as the lead. All three identity bars are checks a second, unlinked address defeats, so they are floors rather than ceilings; what BOUNDS a self-dealing voter is the denominator, which requires a sybil to hold the quorum of the TOTAL staked WOOD and to outweigh the acquit side. Without the bars a filer convicts its own accusation and collects the prosecutor fee for it, and a proposer or co-proposer votes on the challenge that would confiscate the proposer bond. The voter MUST be an active guardian (`isActiveGuardian`) with non-zero `getPastStake(voter, filedAt - 1)`, otherwise `NoVotableStake`. The ballot's weight SHALL be that `getPastStake` value, credited to exactly one of `convictWeight` / `acquitWeight`, and `ChallengeVoteCast(challengeId, voter, convict, weight)` SHALL be emitted. There SHALL be no vote change and no un-vote: the ballot latch is one-shot, which is what lets `resolve` settle on a crossed quorum without waiting for the window. Consequently `convictWeight + acquitWeight <= totalStakeAtFiling` always holds.
 
 #### Scenario: Challenger refused on its own filing
 - **WHEN** the address that filed the challenge calls `voteOnChallenge`, holding a guardian seat of its own
@@ -106,6 +110,10 @@ Each challenge SHALL pin at filing: `voteWindowAtFiling`, `quorumBpsAtFiling`, `
 
 #### Scenario: Proposer refused
 - **WHEN** the proposer of the challenged proposal calls `voteOnChallenge`, holding a guardian seat of its own
+- **THEN** the call reverts `ProposerCannotVote` and neither tally moves
+
+#### Scenario: Co-proposer refused
+- **WHEN** a co-proposer of a collaborative proposal calls `voteOnChallenge`, holding a guardian seat of its own
 - **THEN** the call reverts `ProposerCannotVote` and neither tally moves
 
 #### Scenario: Accused approver refused
@@ -146,9 +154,9 @@ On the fail path the game SHALL re-arm the proposal's challenge window — raisi
 - **WHEN** a challenge fails with `acquitWeight` at or above `quorumBpsAtFiling` of `totalStakeAtFiling`
 - **THEN** `challengeableUntil[reviewKey]` is unchanged and the proposal's ordinary window runs out on its original schedule
 
-#### Scenario: A dust acquittal does not foreclose the re-arm
-- **WHEN** a challenge fails with acquit weight below that bar
-- **THEN** the failure counts as silence: `challengeableUntil[reviewKey]` is raised and the ledger's coverage is pinned to the same deadline
+#### Scenario: A sub-quorum acquittal does not foreclose the re-arm
+- **WHEN** a challenge fails with acquit weight below that bar — one wei, or a substantial 25% of the total against 20% convict at a 3,000 bps quorum
+- **THEN** the failure counts as silence in both cases: `challengeableUntil[reviewKey]` is raised and the ledger's coverage is pinned to the same deadline
 
 #### Scenario: Silence re-arms exactly once
 - **WHEN** a second challenge against the same proposal also fails in silence

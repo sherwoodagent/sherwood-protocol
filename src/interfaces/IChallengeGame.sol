@@ -183,8 +183,9 @@ interface IChallengeGame {
     ///      defeats, so it is a floor rather than a ceiling: it stops the plain
     ///      case where one address accuses, convicts and collects the fee.
     error ChallengerCannotVote();
-    /// @dev The voter proposed the challenged proposal. It is the party the
-    ///      conviction confiscates a bond from, so its ballot is never neutral.
+    /// @dev The voter proposed the challenged proposal, or co-proposed it. The
+    ///      conviction confiscates the proposer bond and both share the
+    ///      proposal's fee, so neither ballot is neutral.
     error ProposerCannotVote();
 
     // ── Events ──

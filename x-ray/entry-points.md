@@ -140,8 +140,8 @@ Entry points callable by any address with no effective access restriction. Sorte
 | Visibility | external |
 | Caller | Anyone |
 | Parameters | `proposalId` (protocol-derived), `predicate` (user-controlled, **not verified on-chain**), `adapterTarget` / `adapterSelector` (user-controlled), `evidenceURI` (user-controlled) |
-| Call chain | `→ SyndicateGovernor.getProposal()/getExecuteCalls() → ExposureLedger.pledgedOf()/unsharedLiabilityUsd()/woodPriceX8() → StakedWood.verdictSlashed()/getPastTotalVotes()/getPastStake() → ExposureLedger.freezeCoverage() → IERC20.safeTransferFrom()` |
-| State modified | `challengeCount`, `_challenges` (incl. `totalStakeAtFiling`, `quorumBpsAtFiling`, `voteWindowAtFiling`, `proposer`), `_accusedApprover`, `_lastChallenge`, `_liveByChallenger`, `_liveCount`, `bondedWood` |
+| Call chain | `→ SyndicateGovernor.getProposal()/getExecuteCalls()/getCoProposers() → ExposureLedger.pledgedOf()/unsharedLiabilityUsd()/woodPriceX8() → StakedWood.verdictSlashed()/getPastTotalVotes()/getPastStake() → ExposureLedger.freezeCoverage() → IERC20.safeTransferFrom()` |
+| State modified | `challengeCount`, `_challenges` (incl. `totalStakeAtFiling`, `quorumBpsAtFiling`, `voteWindowAtFiling`, `proposer`), `_accusedApprover`, `_coProposer`, `_lastChallenge`, `_liveByChallenger`, `_liveCount`, `bondedWood` |
 | Value flow | Tokens: challenger → ChallengeGame (bond) |
 | Reentrancy guard | no (CEI-ordered) |
 
@@ -150,7 +150,7 @@ Entry points callable by any address with no effective access restriction. Sorte
 | Aspect | Detail |
 |--------|--------|
 | Visibility | external |
-| Caller | Any active guardian with non-zero stake at `filedAt - 1`, except the challenger (`ChallengerCannotVote`), the challenged proposal's proposer (`ProposerCannotVote`) and the challenge's accused approvers (`AccusedCannotVote`) |
+| Caller | Any active guardian with non-zero stake at `filedAt - 1`, except the challenger (`ChallengerCannotVote`), the challenged proposal's proposer and co-proposers (`ProposerCannotVote`) and the challenge's accused approvers (`AccusedCannotVote`) |
 | Parameters | `challengeId` (protocol-derived), `convict` (user-controlled) |
 | Call chain | `→ StakedWood.isActiveGuardian() → StakedWood.getPastStake()` |
 | State modified | `_voted[id][voter]` (one-shot), and exactly one of `c.convictWeight` / `c.acquitWeight` |

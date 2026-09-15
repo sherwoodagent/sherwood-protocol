@@ -1344,6 +1344,27 @@ contract ChallengeRearmEndToEndTest is ChallengeEndToEndBase {
         );
     }
 
+    /// @notice THE ACCUSED CANNOT EXIT UNDER A LIVE CHALLENGE. sWOOD gates the
+    ///         unstake CLAIM on the ledger's freeze, so a filing pins the
+    ///         approver's collateral for as long as the challenge stands — the
+    ///         property this suite states, and the one the wired
+    ///         `swood.setExposureLedger` makes observable here at all.
+    function test_accusedApproverCannotClaimItsUnstakeWhileFiled() public {
+        uint256 pid = _proposeApproveExecute();
+        vm.warp(gov.getProposal(pid).executedAt + 13 days);
+        uint256 cid = _file(challenger, pid, "ipfs://evidence/no-exit");
+
+        vm.prank(g1);
+        swood.requestUnstakeGuardian();
+        vm.warp(vm.getBlockTimestamp() + COOL_DOWN + 1);
+
+        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Filed), "still live");
+        assertTrue(ledger.hasFrozenCoverage(g1), "the filing froze the coverage g1 committed");
+        vm.prank(g1);
+        vm.expectRevert(StakedWood.CoverageStillOpen.selector);
+        swood.claimUnstakeGuardian();
+    }
+
     /// @notice AND NEITHER CAN THE PROPOSER. One minimum stake would otherwise
     ///         buy an acquit ballot on a challenge against its own proposal.
     function test_proposerCannotVoteOnAChallengeAgainstItsProposal() public {

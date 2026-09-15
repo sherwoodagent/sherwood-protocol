@@ -26,6 +26,12 @@ contract MockGovernorForOracleTest {
         return _proposals[proposalId];
     }
 
+    /// @dev No collaborative drafts here; the vote's co-proposer bar reads an
+    ///      empty set.
+    function getCoProposers(uint256) external pure returns (ISyndicateGovernor.CoProposer[] memory) {
+        return new ISyndicateGovernor.CoProposer[](0);
+    }
+
     function getExecuteCalls(uint256) external pure returns (BatchExecutorLib.Call[] memory) {
         return new BatchExecutorLib.Call[](0);
     }

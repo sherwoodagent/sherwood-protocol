@@ -280,15 +280,19 @@ own escrowed bond.
   approved could be convicted by a few percent of it. The accused lose their ballot,
   not their weight.
 - **Who cannot vote:** the challenger (`ChallengerCannotVote`), the challenged
-  proposal's pinned proposer (`ProposerCannotVote`), and the accused approvers
-  (`AccusedCannotVote`). The first two are identity checks a second address defeats —
-  floors, not ceilings — but they close the plain case where a filer convicts its own
-  accusation, or a proposer votes on the challenge that would take its bond.
+  proposal's pinned proposer and each of its co-proposers (`ProposerCannotVote`), and
+  the accused approvers (`AccusedCannotVote`). Co-proposers are named on-chain and
+  take a share of the performance fee, so they are the same interested party as the
+  lead. The identity checks are floors, not ceilings — a second, unlinked address
+  defeats all of them — but they close the plain case where a filer convicts its own
+  accusation, or a proposer votes on the challenge that would take its bond. What
+  BOUNDS a sybil is the denominator: it must hold 30% of the TOTAL staked WOOD and
+  outweigh the acquit side.
 - **Quorum:** `challengeQuorumBps` of that pinned total, and the convict side must
   also outweigh the acquit side. Abstention still adds nothing to either tally, so a
   challenge carries on an active convicting majority reaching the bar, or not at all.
-  A filing whose non-accused stake is empty is refused at `file` (`NoVotableStake`)
-  rather than opened against an electorate that could never decide it.
+  A filing no conviction could clear is refused at `file` (`NoVotableStake`) rather
+  than opened on a verdict that was never reachable — see below.
 
 D6 parameters. These are launch defaults and await an economics run:
 
@@ -296,7 +300,7 @@ D6 parameters. These are launch defaults and await an economics run:
 |---|---|---|---|
 | `voteWindow` (`setVoteWindow`) | 7 d | `MIN_VOTE_WINDOW` = 2 d – `MAX_VOTE_WINDOW` = 60 d (the ledger's `MAX_COVERAGE_HORIZON`) | yes |
 | `challengeQuorumBps` (`setChallengeQuorumBps`) | 3 000 bps (30%) of the TOTAL staked WOOD | owner-set in [1 000, 10 000] | yes |
-| denominator — `totalStakeAtFiling` | total staked WOOD at `filedAt − 1`, accused included | `file` reverts `NoVotableStake` when the total less the accused cohort is zero | yes |
+| denominator — `totalStakeAtFiling` | total staked WOOD at `filedAt − 1`, accused included | `file` reverts `NoVotableStake` when the total less the accused cohort is under `challengeQuorumBps` of the total — no conviction could clear the quorum | yes |
 | convict majority | `convictWeight > acquitWeight`, required on top of the quorum | — | — |
 | `forfeitBurnBps` — no conviction (`setForfeitBurnBps`) | 20% of the challenger bond burns, the remainder returns | 0 – 50% | yes |
 | `settleBurnBps` — conviction (`setSettleBurnBps`) | 5% burns; the challenger takes `bond − settleBurn` | 0 – 50% | yes |
@@ -315,13 +319,21 @@ Filing parameters:
 
 ### What the vote guarantees
 
-- **A challenge nobody outside the accused could decide is never opened.** When the
-  accused cohort is the whole staked guardian set, the stake that may vote is zero and
-  `file` reverts `NoVotableStake` rather than taking a bond that could only burn.
+- **A challenge no conviction could clear is never opened.** The stake outside the
+  accused cohort is the ceiling on either tally, so once that cohort holds more than
+  `1 − quorum` of the total — 70% at the 3 000 bps default — every filing against the
+  proposal is guaranteed to fail as silence. `file` reverts `NoVotableStake` rather
+  than taking a bond that could only burn, freezing a window of coverage and spending
+  the proposal's one re-arm for a verdict that was never reachable. A cohort that
+  large already controls the stake; what this refuses is selling it an unwinnable
+  accusation.
 - **An acquittal ends the matter only at the quorum.** An acquit side that clears the
   same bar a conviction must has decided, so the challenge fails *and* the proposal's
   challenge window is spent. Below that bar nothing was adjudicated: the failure
   counts as silence and re-arms the window, so one dust ballot cannot foreclose it.
+  This holds for a substantial minority too — 25% acquit against 20% convict at a
+  30% quorum still reads as silence — because the bar is the quorum, not the balance
+  of the two sides.
 - **A proposal's window re-arms at most once.** The re-arm flag is one-shot per
   proposal, so a filer cycling addresses cannot keep a cohort's coverage pinned
   indefinitely: repeated silent failures let the window lapse and the proposal stops

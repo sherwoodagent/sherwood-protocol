@@ -62,6 +62,18 @@ contract MockChallengeGovernor {
         return _proposals[proposalId];
     }
 
+    /// @dev The co-proposers a proposal names. Empty unless a test adds one;
+    ///      the vote's co-proposer bar is the only reader.
+    mapping(uint256 proposalId => ISyndicateGovernor.CoProposer[]) internal _coProposers;
+
+    function addCoProposer(uint256 proposalId, address agent, uint256 splitBps) external {
+        _coProposers[proposalId].push(ISyndicateGovernor.CoProposer({agent: agent, splitBps: splitBps}));
+    }
+
+    function getCoProposers(uint256 proposalId) external view returns (ISyndicateGovernor.CoProposer[] memory) {
+        return _coProposers[proposalId];
+    }
+
     function getExecuteCalls(uint256 proposalId) external view returns (BatchExecutorLib.Call[] memory) {
         BatchExecutorLib.Call[] storage stored = _calls[proposalId];
         if (stored.length != 0) return stored;
@@ -2334,16 +2346,26 @@ contract ChallengeGameTest is Test {
 
     /// @notice THE DENOMINATOR IS THE WHOLE STAKED SET, ACCUSED INCLUDED.
     ///         Subtracting the accused made a conviction cheaper the wider the
-    ///         cohort that had approved: here the accused hold 500,000 of
-    ///         700,000, so the lone outsider is 100% of what may vote and still
-    ///         under 30% of the stake the bar is read off.
+    ///         cohort that had approved: here one outsider carrying half of what
+    ///         may vote clears the accused-subtracted bar and still sits under
+    ///         30% of the stake the bar is actually read off.
+    ///
+    /// @dev    THE OTHER OUTSIDER NEVER VOTES, and that is the point of the
+    ///         fixture: with a single outsider the filing itself would be
+    ///         refused, because the stake outside the cohort would be under the
+    ///         quorum and no conviction could clear it —
+    ///         `test_file_refusesAFilingNoConvictionCouldClear`.
     function test_quorumIsMeasuredAgainstTotalStake() public {
+        // Two outsiders, only one of which votes: the filing must still be
+        // admissible (400,000 of 900,000 could convict) while the lone ballot
+        // is not.
         swood.setStake(nonApproverGuardian, 200_000e18);
+        swood.setStake(makeAddr("silentGuardian"), 200_000e18);
         uint256 id = _fileStandard(PROPOSAL);
         (,, uint256 totalStake, uint256 qBps) = game.challengeTallyOf(id);
         uint256 snapshotAt = game.challengeOf(id).filedAt - 1;
         assertEq(totalStake, swood.getPastTotalVotes(snapshotAt), "the accused stay in the denominator");
-        assertEq(totalStake, 700_000e18, "fixture: 500,000 accused against a 200,000 outsider");
+        assertEq(totalStake, 900_000e18, "fixture: 500,000 accused against two 200,000 outsiders");
 
         vm.prank(nonApproverGuardian);
         game.voteOnChallenge(id, true);
@@ -2352,6 +2374,7 @@ contract ChallengeGameTest is Test {
             totalStake - swood.getPastStake(guardianA, snapshotAt) - swood.getPastStake(guardianB, snapshotAt);
         (uint256 convictWeight,,,) = game.challengeTallyOf(id);
         assertGe(convictWeight * 10_000, qBps * votable, "fixture: past the accused-subtracted bar");
+        assertEq(votable, 400_000e18, "fixture: and both outsiders could have convicted between them");
         assertLt(convictWeight * 10_000, qBps * totalStake, "but short of the bar against the total");
 
         vm.expectRevert(IChallengeGame.DelayNotElapsed.selector);
@@ -2369,6 +2392,52 @@ contract ChallengeGameTest is Test {
         vm.prank(challenger);
         vm.expectRevert(IChallengeGame.ChallengerCannotVote.selector);
         game.voteOnChallenge(id, true);
+    }
+
+    /// @notice A FILING NO CONVICTION COULD CLEAR IS REFUSED AT THE DOOR. The
+    ///         convict side cannot exceed the stake outside the accused cohort,
+    ///         so once the cohort holds more than `1 - quorum` of the total,
+    ///         every filing against it is guaranteed to fail as silence — a
+    ///         forfeit burn, a full window of frozen coverage and the proposal's
+    ///         one re-arm, bought for nothing.
+    function test_file_refusesAFilingNoConvictionCouldClear() public {
+        // 600,000 accused of 800,000 — 75%, past the 70% the 3,000 bps quorum
+        // leaves room for.
+        swood.setStake(guardianA, 350_000e18);
+        swood.setStake(guardianB, 250_000e18);
+        swood.setStake(nonApproverGuardian, 200_000e18);
+        _setCoverage(PROPOSAL, 6_000e18, 4_000e18);
+        _execute(PROPOSAL);
+
+        uint256 before = wood.balanceOf(challenger);
+        vm.prank(challenger);
+        vm.expectRevert(IChallengeGame.NoVotableStake.selector);
+        game.file(address(gov), PROPOSAL, IChallengeGame.Predicate.OutOfAdapterOutflow, ADAPTER, SELECTOR, EVIDENCE);
+        assertEq(wood.balanceOf(challenger), before, "no bond taken by a filing that could only burn");
+        assertFalse(ledger.isCoverageFrozen(address(gov), PROPOSAL), "and no coverage frozen");
+
+        // 520,000 of 800,000 — 65%, and the door opens again.
+        swood.setStake(guardianB, 170_000e18);
+        swood.setStake(nonApproverGuardian, 280_000e18);
+        uint256 id = _fileStandard(PROPOSAL);
+        (,, uint256 totalStake,) = game.challengeTallyOf(id);
+        assertEq(totalStake, 800_000e18, "same total, a reachable verdict");
+        assertTrue(ledger.isCoverageFrozen(address(gov), PROPOSAL), "and this one froze the coverage");
+    }
+
+    /// @notice AND SO ARE THE CO-PROPOSERS. Each holds a share of the
+    ///         proposal's performance fee, so none of them is neutral about a
+    ///         verdict that confiscates the proposer bond.
+    function test_coProposerCannotVoteOnAChallengeAgainstItsProposal() public {
+        address coProposer = makeAddr("coProposer");
+        gov.addCoProposer(PROPOSAL, coProposer, 2_000);
+        swood.setStake(coProposer, 400_000e18);
+
+        uint256 id = _fileStandard(PROPOSAL);
+        assertTrue(swood.isActiveGuardian(coProposer), "fixture: refused as a co-proposer, not for want of stake");
+        vm.prank(coProposer);
+        vm.expectRevert(IChallengeGame.ProposerCannotVote.selector);
+        game.voteOnChallenge(id, false);
     }
 
     /// @notice NOR DOES THE PROPOSER. A conviction confiscates its bond, so its
@@ -2399,7 +2468,7 @@ contract ChallengeGameTest is Test {
         bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
         uint256 id = _fileStandard(PROPOSAL);
         (,, uint256 totalStake, uint256 qBps) = game.challengeTallyOf(id);
-        assertEq(totalStake, 1_200_000e18, "fixture: 30% convict against 70% acquit");
+        assertEq(totalStake, 1_200_000e18, "fixture: 25% convict against 58.3% acquit, at a 1,000 bps quorum");
 
         vm.prank(nonApproverGuardian);
         game.voteOnChallenge(id, true);

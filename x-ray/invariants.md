@@ -128,7 +128,7 @@ Per-call preconditions. Heading IDs below (`G-N`) are anchor targets from x-ray.
 `if (newBps < 1_000 || newBps > BPS_DENOMINATOR) revert InvalidParameter();` · `ChallengeGame.sol` · Bounds the convict quorum to [10%, 100%] of the total staked WOOD — a bar a single dust guardian could clear would make the vote a formality. Pinned per challenge as `quorumBpsAtFiling`, and the same bar an acquittal clears to adjudicate.
 
 #### G-40
-`if (votable == 0) revert NoVotableStake();` · `ChallengeGame.sol` · Refuses a filing whose electorate, after striking the accused cohort's stake, is empty: nobody could decide it, so the bond could only burn. The quorum's own denominator is the total, accused included; this sum is computed locally and never stored.
+`if (votable * BPS_DENOMINATOR < challengeQuorumBps * totalStake) revert NoVotableStake();` · `ChallengeGame.sol` · Refuses a filing no conviction could clear: the stake outside the accused cohort is the ceiling on either tally, so once that cohort holds more than `1 - quorum` of the total the verdict is unreachable and the bond could only burn. The quorum's own denominator is the total, accused included; this sum is computed locally and never stored, and the guard reads the same `challengeQuorumBps` the challenge pins.
 
 ---
 

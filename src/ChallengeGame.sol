@@ -206,6 +206,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///      in O(1). Written in the loop `file` already runs over the cohort.
     mapping(uint256 challengeId => mapping(address approver => bool)) internal _accusedApprover;
 
+    /// @dev The challenged proposal's co-proposers, refused alongside the lead
+    ///      proposer. Each holds a share of the performance fee, so none of them
+    ///      is neutral about a verdict that confiscates the proposer bond.
+    mapping(uint256 challengeId => mapping(address coProposer => bool)) internal _coProposer;
+
     /// @notice Ceiling on `prosecutorFeeBps`, mirroring
     ///         `ProposerBondEscrow.MAX_PROSECUTOR_FEE_BPS`.
     /// @dev    A CONVENIENCE GUARD, NOT THE AUTHORITY. The escrow enforces its
@@ -395,6 +400,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             accused[--accusedCount] = covering[i];
             _accusedApprover[challengeId][covering[i]] = true;
         }
+
+        // Co-proposers take a share of the proposal's performance fee, so the
+        // vote refuses them alongside the lead. Bounded by the governor's own
+        // `maxCoProposers`.
+        ISyndicateGovernor.CoProposer[] memory coProposers = ISyndicateGovernor(governor).getCoProposers(proposalId);
+        for (uint256 i = 0; i < coProposers.length; i++) {
+            _coProposer[challengeId][coProposers[i].agent] = true;
+        }
         if (_verdictAlreadyCollected(key, accused)) revert AlreadyConvicted();
 
         uint256 coverageUsd;
@@ -418,15 +431,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         uint256 totalStake = swood.getPastTotalVotes(snapshotAt);
         // The accused keep their weight in the denominator and lose only their
         // ballot, so a wide approving cohort raises the bar rather than lowering
-        // it. This local sum only answers whether anyone else could decide it.
+        // it. This local sum is the ceiling on either side's tally.
         uint256 votable = totalStake;
         for (uint256 i = 0; i < accused.length; i++) {
             uint256 w = swood.getPastStake(accused[i], snapshotAt);
             votable = votable > w ? votable - w : 0;
         }
-        // Nobody outside the accused cohort could decide it, so the filing is
-        // refused rather than taking a bond it can only burn.
-        if (votable == 0) revert NoVotableStake();
+        // No conviction could clear the quorum, so the filing is refused rather
+        // than taking a bond that can only burn. Same value the challenge pins
+        // below, so the door and the bar cannot drift apart.
+        if (votable * BPS_DENOMINATOR < challengeQuorumBps * totalStake) revert NoVotableStake();
 
         _challenges[challengeId] = Challenge({
             governor: governor,
@@ -517,15 +531,15 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     /// @notice Cast a guardian's vote on a live challenge. Weight is the
     ///         voter's staked WOOD one second before the filing — the same
     ///         instant the challenge's total stake was measured at.
-    /// @dev Three parties are refused: the challenger, the proposer of the
-    ///      accused proposal, and the approvers the filing accuses. Each has a
-    ///      direct stake in the verdict's own payouts.
+    /// @dev Four parties are refused: the challenger, the proposal's lead
+    ///      proposer, its co-proposers, and the approvers the filing accuses.
+    ///      Each has a direct stake in the verdict's own payouts.
     function voteOnChallenge(uint256 challengeId, bool convict) external {
         Challenge storage c = _challenges[challengeId];
         if (c.status != Status.Filed) revert WrongStatus();
         if (block.timestamp >= c.filedAt + c.voteWindowAtFiling) revert WindowClosed();
         if (msg.sender == c.challenger) revert ChallengerCannotVote();
-        if (msg.sender == c.proposer) revert ProposerCannotVote();
+        if (msg.sender == c.proposer || _coProposer[challengeId][msg.sender]) revert ProposerCannotVote();
         if (_accusedApprover[challengeId][msg.sender]) revert AccusedCannotVote();
         if (_voted[challengeId][msg.sender]) revert AlreadyVoted();
 
