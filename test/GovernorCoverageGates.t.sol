@@ -94,7 +94,7 @@ contract MockFeed {
 ///      arithmetic over those two numbers — the `max`, and the strict
 ///      comparison — and a stub is the only way to drive them independently:
 ///      the real game's own setters forbid exactly the window divergence one of
-///      these tests needs. The full `_refundAll` re-arm arc against the real
+///      these tests needs. The full failure-path re-arm arc against the real
 ///      game lives in `ChallengeEndToEnd.t.sol`.
 contract MockFilingDeadline {
     uint256 public challengeWindow;
@@ -1224,7 +1224,7 @@ contract GovernorCoverageGatesTest is Test {
     }
 
     /// @notice DESIGN D2 — why the gate is a `max` and not `challengeableUntil`
-    ///         alone. The two windows can diverge with no `Inconclusive`
+    ///         alone. The two windows can diverge with no failed challenge
     ///         anywhere in the picture, and the gate must hold the bond to the
     ///         LATER of the two whichever way they diverge.
     ///
@@ -1261,7 +1261,7 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(
             stubGame.challengeableUntil(keccak256(abi.encode(address(governor), pid))),
             0,
-            "no Inconclusive here -- the divergence IS the two windows"
+            "no failed challenge here -- the divergence IS the two windows"
         );
 
         // Both original gates are open at the ledger's deadline...
@@ -1282,8 +1282,8 @@ contract GovernorCoverageGatesTest is Test {
     }
 
     /// @notice The other arm of the same `max`: a `challengeableUntil` raised
-    ///         above the ordinary window — what `ChallengeGame._refundAll`
-    ///         writes on an `Inconclusive` unwind — holds the bond past
+    ///         above the ordinary window — what `ChallengeGame` writes when a
+    ///         challenge fails on silence — holds the bond past
     ///         `executedAt + challengeWindow`. Placed exactly, from a stub; the
     ///         real unwind that produces it is in `ChallengeEndToEnd.t.sol`.
     function test_reclaimBond_challengeableUntilAboveTheWindow_waitsForIt() public {

@@ -161,19 +161,43 @@ contract MockTierRegistryForOracleTest {
     function demoteByChallenge(address, bytes4) external {}
 }
 
-/// @title ChallengeGame_courtAndOracle
-/// @notice Regression coverage for audit issue #181, findings #2 and #12,
-///         against `ChallengeGame`/`IChallengeGame` as fixed on
-///         `fix/audit-181-critical-high`.
-///
-/// @dev    Finding #2 (CRITICAL): a Disputed challenge that times out with no
-///         adjudicator ever pinned at filing must unwind as a NON-VERDICT
-///         (`_refundAll`), not an acquittal (`_fail`) — under the pre-fix
-///         code every such dispute was a guaranteed, risk-free forfeit to
-///         whoever funded the counter-bond pool, funded entirely by the
-///         challenger's bond, which made filing against an unwired game
-///         strictly irrational. `test_disputedTimeout_withNoCourtAtFiling_refundsBothSides`
-///         proves the fix.
+/// @dev sWOOD stand-in: `file` reads the electorate off it, so a game with
+///      none wired takes no filing at all. One guardian outside the accused
+///      cohort, which is all these price tests need.
+contract MockStakedWoodForOracleTest {
+    address public authorizedSlasher;
+    mapping(address guardian => uint256) internal _stake;
+    uint256 internal _total;
+
+    function setAuthorizedSlasher(address slasher) external {
+        authorizedSlasher = slasher;
+    }
+
+    function setStake(address guardian, uint256 amount) external {
+        _total = _total + amount - _stake[guardian];
+        _stake[guardian] = amount;
+    }
+
+    function getPastStake(address guardian, uint256) external view returns (uint256) {
+        return _stake[guardian];
+    }
+
+    function getPastTotalVotes(uint256) external view returns (uint256) {
+        return _total;
+    }
+
+    function isActiveGuardian(address guardian) external view returns (bool) {
+        return _stake[guardian] != 0;
+    }
+
+    function verdictSlashed(bytes32, address) external pure returns (bool) {
+        return false;
+    }
+}
+
+/// @title ChallengeGame_oracle
+/// @notice Regression coverage for audit issue #181, finding #12, against
+///         `ChallengeGame`/`IChallengeGame`.
 ///
 /// @dev    Finding #12a (HIGH): `file()` used to read `woodPriceX8()`
 ///         unguarded, and that view now REVERTS (`NoWoodPrice`) rather than
@@ -182,19 +206,12 @@ contract MockTierRegistryForOracleTest {
 ///         which — combined with `challengeWindow` being pure wall clock —
 ///         can convert a recoverable delay into permanent immunity.
 ///         `test_file_succeedsWhenWoodPriceX8Reverts` proves the fallback.
-///
-/// @dev    Finding #12b (HIGH): `inconclusiveBurnBpsAtFiling` was pinned from
-///         `inconclusiveRounds[key]` alone, which only increments on an
-///         actual `Inconclusive` unwind — so every challenge filed
-///         concurrently, before the first one ever unwound, pinned the free
-///         round-1 rate, regardless of how many were already live.
-///         `test_concurrentFilings_pinDistinctEscalatingTiers` proves the
-///         fix (`_liveCount[key]` folded into the round).
-contract ChallengeGame_courtAndOracleTest is Test {
+contract ChallengeGame_oracleTest is Test {
     ChallengeGame internal game;
     MockGovernorForOracleTest internal governor;
     MockLedgerForOracleTest internal ledger;
     MockTierRegistryForOracleTest internal tierRegistry;
+    MockStakedWoodForOracleTest internal swood;
     ERC20Mock internal wood;
 
     address internal owner = address(this);
@@ -212,6 +229,10 @@ contract ChallengeGame_courtAndOracleTest is Test {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
 
         game = new ChallengeGame(owner, address(wood), address(ledger), address(tierRegistry));
+        swood = new MockStakedWoodForOracleTest();
+        swood.setAuthorizedSlasher(address(game));
+        swood.setStake(address(0xB0B), 1_000e18);
+        game.setStakedWood(address(swood));
 
         governor.setExecuted(PROPOSAL_ID, vault, block.timestamp);
 
@@ -223,11 +244,6 @@ contract ChallengeGame_courtAndOracleTest is Test {
 
         ledger.setWoodPriceX8(PRICE_X8);
         ledger.setRevertOnWoodPriceX8(false);
-
-        // `game.court()` is never set in this suite — every test starts (and,
-        // except where noted, stays) with the unwired-court configuration
-        // finding #2 is about.
-        assertEq(game.court(), address(0), "sanity: court starts unwired");
     }
 
     function _fund(address who, uint256 amount) internal {
@@ -247,85 +263,6 @@ contract ChallengeGame_courtAndOracleTest is Test {
     }
 
     // ── Finding #2 ──
-
-    /// @notice A Disputed challenge whose game had no court wired AT FILING
-    ///         must, on timeout, refund BOTH the challenger's bond and the
-    ///         counter-bond pool — not forfeit the bond to the pool as an
-    ///         acquittal-by-timeout would.
-    /// @dev    FAILS AGAINST THE PRE-FIX CODE: `resolve`'s Disputed branch
-    ///         used to call `_fail` unconditionally, which (a) leaves the
-    ///         challenge `Failed`, not `Inconclusive`, and (b) pays the pool
-    ///         funder `contributed + forfeitPayoutWood * contributed / pool`
-    ///         — strictly more than it put in, entirely at the challenger's
-    ///         expense, even though a `Guilty` ruling (the only way that pool
-    ///         could ever have lost) was never reachable (`rule` requires
-    ///         `msg.sender == court`, and `court` was never wired). Both
-    ///         assertions below — the status and the funder's exact
-    ///         break-even payout — catch that.
-    function test_disputedTimeout_withNoCourtAtFiling_refundsBothSides() public {
-        address challenger = address(0xC4A11E7);
-        address funder = address(0xF00DE12);
-
-        uint256 bondWood = _expectedBondWood(PRICE_X8);
-        _fund(challenger, bondWood);
-        _fund(funder, bondWood);
-
-        vm.prank(challenger);
-        uint256 id = game.file(
-            address(governor), PROPOSAL_ID, IChallengeGame.Predicate.OutOfAdapterOutflow, address(0), bytes4(0), "ev"
-        );
-
-        IChallengeGame.Challenge memory c = game.challengeOf(id);
-        assertEq(c.courtAtFiling, address(0), "courtAtFiling must pin the unwired court");
-        assertEq(c.bondWood, bondWood, "sanity: bond sizing");
-        // First-ever filing against this proposal: round 1, the entry tier
-        // (issue #181 finding 19) — no attempt is ever free, closing the
-        // free-freeze griefing path a zero-cost round 1 used to open.
-        assertEq(c.inconclusiveBurnBpsAtFiling, 250, "sanity: round-1 pinned rate is the entry tier, not free");
-
-        // Fully fund the counter-bond pool — flips the challenge to Disputed
-        // and (because `court == address(0)`) skips the auto-referral.
-        vm.prank(funder);
-        game.dispute(id, type(uint256).max);
-        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Disputed), "must be Disputed");
-
-        // Run out the pinned dispute clock. The warp target is computed from
-        // freshly-read contract state, not a locally-cached
-        // `block.timestamp` — the optimizer can CSE a pre-warp local across
-        // `vm.warp` in this repo's build.
-        c = game.challengeOf(id);
-        vm.warp(c.filedAt + c.disputeTimeoutAtFiling + 1);
-
-        uint256 challengerBefore = wood.balanceOf(challenger);
-
-        game.resolve(id);
-
-        c = game.challengeOf(id);
-        assertEq(
-            uint8(c.status), uint8(IChallengeGame.Status.Inconclusive), "timeout with no court must be a non-verdict"
-        );
-
-        // Round-1 now pins the entry-tier rate (issue #181 finding 19: no
-        // attempt is ever free), so the challenger's bond returns minus that
-        // slice, not whole — derived from the challenge's own pinned rate
-        // rather than hardcoded, so this survives a future schedule change.
-        uint256 round1Burned = (bondWood * c.inconclusiveBurnBpsAtFiling) / 10_000;
-        assertEq(
-            wood.balanceOf(challenger) - challengerBefore,
-            bondWood - round1Burned,
-            "challenger must recover its bond minus the round-1 entry-tier burn"
-        );
-
-        // The pool funder recovers exactly its stake — no forfeit share,
-        // because nothing was forfeited. The inconclusive-path burn is taken
-        // off the CHALLENGER's bond only (mirroring `_settle`'s silence
-        // branch); the pool is untouched and booked whole via `_bookRefund`.
-        uint256 funderBefore = wood.balanceOf(funder);
-        vm.prank(funder);
-        uint256 claimed = game.claimContribution(id);
-        assertEq(claimed, bondWood, "funder's claim must equal its own contribution, not a share of a forfeit");
-        assertEq(wood.balanceOf(funder) - funderBefore, bondWood, "funder must not profit from an unruled timeout");
-    }
 
     // ── Finding #12a ──
 
@@ -377,62 +314,4 @@ contract ChallengeGame_courtAndOracleTest is Test {
     }
 
     // ── Finding #12b ──
-
-    /// @notice Two challenges filed concurrently against the same proposal —
-    ///         before either resolves — must pin DISTINCT, escalating
-    ///         `inconclusiveBurnBpsAtFiling` rates, not the same round-1 rate
-    ///         twice.
-    /// @dev    FAILS AGAINST THE PRE-FIX CODE: the pinned rate used to be
-    ///         `_inconclusiveBurnBpsForRound(inconclusiveRounds[key])` alone,
-    ///         and `inconclusiveRounds[key]` only increments in `_refundAll`
-    ///         — at unwind. Neither challenge below has unwound when the
-    ///         second is filed, so the pre-fix code pins round-1 (0 bps, back
-    ///         when round 1 was free — issue #181 finding 19 has since made
-    ///         it the entry tier) on BOTH, letting an attacker file
-    ///         arbitrarily many challenges from arbitrarily many addresses
-    ///         before the first ever resolves and pay the free rate on every
-    ///         one.
-    function test_concurrentFilings_pinDistinctEscalatingTiers() public {
-        address challengerA = address(0xA11CE);
-        address challengerB = address(0xB0B00);
-
-        uint256 bondWood = _expectedBondWood(PRICE_X8);
-        _fund(challengerA, bondWood);
-        _fund(challengerB, bondWood);
-
-        vm.prank(challengerA);
-        uint256 idA = game.file(
-            address(governor), PROPOSAL_ID, IChallengeGame.Predicate.OutOfAdapterOutflow, address(0), bytes4(0), "ev"
-        );
-        // First-ever filing against this proposal: round 1, the entry tier
-        // (250 bps == `INCONCLUSIVE_BURN_ROUND1_BPS`, issue #181 finding 19 —
-        // no attempt is ever free).
-        assertEq(
-            game.challengeOf(idA).inconclusiveBurnBpsAtFiling,
-            250,
-            "first concurrent filing must pin round 1 (the entry tier)"
-        );
-        // Still live — neither settled, disputed, nor timed out.
-        assertEq(uint8(game.challengeOf(idA).status), uint8(IChallengeGame.Status.Filed));
-
-        vm.prank(challengerB);
-        uint256 idB = game.file(
-            address(governor), PROPOSAL_ID, IChallengeGame.Predicate.OutOfAdapterOutflow, address(0), bytes4(0), "ev"
-        );
-
-        // Second concurrent filing, still before any unwind: must escalate
-        // to the round-2 fixed step (500 bps == `INCONCLUSIVE_BURN_ROUND2_BPS`
-        // in `ChallengeGame.sol`; hardcoded here because that constant is
-        // `internal`), not repeat round 1's entry tier.
-        uint256 round2Bps = 500;
-        assertEq(
-            game.challengeOf(idB).inconclusiveBurnBpsAtFiling,
-            round2Bps,
-            "second concurrent filing must pin a distinct, escalated tier"
-        );
-        assertTrue(
-            game.challengeOf(idA).inconclusiveBurnBpsAtFiling != game.challengeOf(idB).inconclusiveBurnBpsAtFiling,
-            "concurrent filings must not both pin round 1's entry tier"
-        );
-    }
 }
