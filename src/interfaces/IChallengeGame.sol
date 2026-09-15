@@ -98,8 +98,8 @@ interface IChallengeGame {
         uint256 quorumBpsAtFiling;
         /// @dev Running convict-side weight.
         uint256 convictWeight;
-        /// @dev Running acquit-side weight. Non-zero means guardians actually
-        ///      looked at the accusation and cleared it.
+        /// @dev Running acquit-side weight. It adjudicates an acquittal only once
+        ///      it clears the same quorum a conviction must.
         uint256 acquitWeight;
         /// @dev The challenged proposal's proposer, pinned at filing so the vote
         ///      can refuse it. Appended for tuple-position stability.

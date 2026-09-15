@@ -2483,23 +2483,54 @@ contract ChallengeGameTest is Test {
         assertEq(ledger.pinCoverageUntilCallCount(), pinCallsAfterFirst, "and pins nothing further on the ledger");
     }
 
-    /// @notice AND A VOTED ACQUITTAL DOES NOT. Guardians that looked at the
-    ///         accusation and cleared it have spent the window; re-arming on
-    ///         their verdict would make a cleared proposal permanently
+    /// @notice A DUST ACQUIT IS NOT A VERDICT. Below the quorum the cohort did
+    ///         not decide, so the failure is silence and the proposal's window
+    ///         re-arms — otherwise one minimum stake forecloses it.
+    function test_dustAcquitDoesNotForecloseTheReArm() public {
+        address duster = makeAddr("duster");
+        swood.setStake(duster, 1);
+        bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
+
+        uint256 id = _fileStandard(PROPOSAL);
+        vm.prank(duster);
+        game.voteOnChallenge(id, false);
+        (, uint256 acquitWeight, uint256 totalStake, uint256 qBps) = game.challengeTallyOf(id);
+        assertEq(acquitWeight, 1, "one wei of acquit weight");
+        assertLt(acquitWeight * 10_000, qBps * totalStake, "fixture: nowhere near the bar");
+
+        vm.warp(vm.getBlockTimestamp() + game.voteWindow());
+        game.resolve(id);
+        assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Failed), "failed");
+        uint256 rearmed = game.challengeableUntil(key);
+        assertEq(rearmed, vm.getBlockTimestamp() + game.challengeWindow(), "and re-armed, because it was silence");
+
+        // Still at most once per proposal: a second dust acquittal buys nothing.
+        uint256 second = _fileStandardFrom(challenger, PROPOSAL);
+        vm.prank(duster);
+        game.voteOnChallenge(second, false);
+        vm.warp(vm.getBlockTimestamp() + game.challengeOf(second).voteWindowAtFiling);
+        game.resolve(second);
+        assertEq(game.challengeableUntil(key), rearmed, "the one-shot latch still holds");
+    }
+
+    /// @notice AND AN ACQUITTAL AT THE QUORUM DOES NOT. A cohort that cleared the
+    ///         same bar a conviction must clear has spent the window; re-arming
+    ///         on its verdict would make a cleared proposal permanently
     ///         re-challengeable at the price of the forfeit burn.
-    function test_votedAcquittalDoesNotReArmTheWindow() public {
+    function test_acquittalAtQuorumDoesNotReArm() public {
         bytes32 key = _reviewKeyFor(address(gov), PROPOSAL);
         uint256 id = _fileStandard(PROPOSAL);
 
         vm.prank(nonApproverGuardian);
         game.voteOnChallenge(id, false);
+        (, uint256 acquitWeight, uint256 totalStake, uint256 qBps) = game.challengeTallyOf(id);
+        assertGe(acquitWeight * 10_000, qBps * totalStake, "fixture: the acquittal itself carries a quorum");
 
         vm.warp(vm.getBlockTimestamp() + game.voteWindow());
         uint256 pinCallsBefore = ledger.pinCoverageUntilCallCount();
         game.resolve(id);
 
         assertEq(uint8(game.challengeOf(id).status), uint8(IChallengeGame.Status.Failed), "acquitted");
-        assertGt(game.challengeOf(id).acquitWeight, 0, "and on a real vote, not on silence");
         assertEq(game.challengeableUntil(key), 0, "a verdict on the merits does not re-arm");
         assertEq(ledger.pinCoverageUntilCallCount(), pinCallsBefore, "and pins nothing on the ledger");
     }
@@ -2579,6 +2610,19 @@ contract ChallengeGameTest is Test {
         game.setChallengeQuorumBps(10_000);
         vm.stopPrank();
         assertEq(game.challengeQuorumBps(), 10_000);
+    }
+
+    /// @notice The ceiling matches `ExposureLedger.MAX_COVERAGE_HORIZON`: past it
+    ///         the freeze `file` books outlives the horizon the ledger clamps a
+    ///         lock to, and the two stop naming the same instant.
+    function test_setVoteWindow_refusesAboveTheHorizon() public {
+        assertEq(game.MAX_VOTE_WINDOW(), 60 days, "the ledger's own coverage horizon");
+        vm.startPrank(owner);
+        vm.expectRevert(IChallengeGame.InvalidParameter.selector);
+        game.setVoteWindow(61 days);
+        game.setVoteWindow(60 days);
+        vm.stopPrank();
+        assertEq(game.voteWindow(), 60 days, "the ceiling itself is legal");
     }
 
     /// @dev Three guardians outside the accused cohort, so a convict vote can

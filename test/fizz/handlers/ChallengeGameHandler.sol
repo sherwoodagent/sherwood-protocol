@@ -96,7 +96,7 @@ abstract contract ChallengeGameHandler is Properties {
     function challengeGame_secondary(uint8 selector, uint256 arg0) public {
         selector = uint8(selector % 6);
         if (selector == 0) {
-            _challengeGame_setVoteWindow(clampBetween(arg0, game.MIN_VOTE_WINDOW(), 90 days));
+            _challengeGame_setVoteWindow(clampBetween(arg0, game.MIN_VOTE_WINDOW(), game.MAX_VOTE_WINDOW()));
         } else if (selector == 1) {
             _challengeGame_setChallengerBondBps(clampBetween(arg0, 1, 10_000));
         } else if (selector == 2) {

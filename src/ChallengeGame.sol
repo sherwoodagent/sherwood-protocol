@@ -50,6 +50,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///         an operator outage or a short chain halt.
     uint256 public constant MIN_VOTE_WINDOW = 2 days;
 
+    /// @notice Ceiling on `voteWindow`, the same value as
+    ///         `ExposureLedger.MAX_COVERAGE_HORIZON`: past it the freeze `file`
+    ///         books outlives the horizon the ledger clamps a lock to.
+    uint256 public constant MAX_VOTE_WINDOW = 60 days;
+
     /// @dev THE GAS FLOOR for a permissionless `resolve`: per approver plus a
     ///      base, so EIP-150 cannot starve the best-effort `demoteByChallenge`
     ///      child behind the slash loop and leave the adapter certified.
@@ -676,9 +681,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
 
         bytes32 rk = _reviewKey(governor, proposalId);
         _releaseFreeze(rk, governor, proposalId);
-        // Silence adjudicated nothing, so the proposal stays challengeable. A
-        // voted acquittal DID adjudicate, and spends the window.
-        if (c.acquitWeight == 0) _rearmChallengeWindow(rk, governor, proposalId);
+        // An acquittal adjudicates, and spends the window, only at the same
+        // quorum a conviction needs. Below the bar the cohort did not decide, so
+        // the failure is silence and the proposal stays challengeable.
+        if (c.acquitWeight * BPS_DENOMINATOR < c.quorumBpsAtFiling * c.totalStakeAtFiling) {
+            _rearmChallengeWindow(rk, governor, proposalId);
+        }
 
         // Integer division keeps `burnAmount <= bond`, so the remainder cannot
         // underflow, and a zero rate returns the bond whole.
@@ -875,10 +883,11 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         revert RenounceDisabled();
     }
 
-    /// @dev Floored at `MIN_VOTE_WINDOW`: a window the owner could collapse to
-    ///      zero would turn a filing into an instant verdict.
+    /// @dev Floored at `MIN_VOTE_WINDOW`: a window collapsed to zero would turn a
+    ///      filing into an instant verdict. Capped at `MAX_VOTE_WINDOW`: past it
+    ///      the booked freeze outlives the ledger's own coverage horizon.
     function setVoteWindow(uint256 newWindow) external onlyOwner {
-        if (newWindow < MIN_VOTE_WINDOW) revert InvalidParameter();
+        if (newWindow < MIN_VOTE_WINDOW || newWindow > MAX_VOTE_WINDOW) revert InvalidParameter();
         emit VoteWindowSet(voteWindow, newWindow);
         voteWindow = newWindow;
     }
