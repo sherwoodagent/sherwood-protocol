@@ -195,8 +195,8 @@ contract CoverageEndToEndTest is ProtocolFixture {
         swood.setRegistry(address(registry));
 
         // ── Two syndicates on the shared registry.
-        (govA, vaultA) = _deploySyndicate();
-        (govB, vaultB) = _deploySyndicate();
+        (govA, vaultA) = this.deploySyndicate();
+        (govB, vaultB) = this.deploySyndicate();
         registry.addGovernor(address(govA), address(vaultA)); // test contract IS the registry factory
         registry.addGovernor(address(govB), address(vaultB));
         _bondVaultOwner(address(vaultA));
@@ -280,7 +280,10 @@ contract CoverageEndToEndTest is ProtocolFixture {
 
     // ── Fixture helpers ───────────────────────────────────────────────────
 
-    function _deploySyndicate() internal returns (SyndicateGovernor gov, SyndicateVault v) {
+    // An external self-call keeps this deployment out of setUp's optimized IR.
+    // Inlining both stacks triggers solc 0.8.28's "Tag too large for reserved
+    // space" assembler error. The test contract remains the deployer/factory.
+    function deploySyndicate() external returns (SyndicateGovernor gov, SyndicateVault v) {
         v = _deployVault(
             ISyndicateVault.InitParams({
                 asset: address(usdg),

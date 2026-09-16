@@ -67,7 +67,7 @@ Compared with `post-audit-v2` at `188941b6`:
 - 58 audit-batch files moved to subsystem directories; no audit-named test directories remain.
 - 139 existing files relocated, including root suites, layout pins and fork tests.
 - All 2,277 existing test/invariant function declarations preserved, including fork suites.
-- Existing test bodies preserved except the strengthened blocked-review invariant; two new tests cover fixture wiring and invariant reachability.
+- Existing test bodies preserved except the strengthened blocked-review invariant and a cooldown timing correction in the newly included `TierEndToEnd` suite; two new tests cover fixture wiring and invariant reachability.
 - All 20 invariant names and all 30 fizz harness files retained. Fizz edits only update comments pointing to moved tests.
 - Three existing `LayoutPins` suites retained; the ticket's count of four was stale. The separate golden script still checks all five upgradeable contracts.
 

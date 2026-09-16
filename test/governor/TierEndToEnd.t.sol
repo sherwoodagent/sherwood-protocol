@@ -276,6 +276,9 @@ contract TierEndToEndTest is Test {
         // Free the (still-Approved) slot so a fresh proposal can be filed.
         vm.prank(agent);
         governor.cancelProposal(pidOver);
+        // Cancellation gates the next proposal itself, so let LPs' exit window
+        // elapse before proposing the within-cap batch.
+        vm.warp(governor.getCooldownEnd());
 
         // --- Within-cap proposal: executes and moves exactly `amountOk` out.
         uint256 amountOk = MAX_CAPITAL / 2; // 500e6 <= cap
@@ -283,7 +286,7 @@ contract TierEndToEndTest is Test {
         assertEq(governor.getProposalTier(pidOk), 2);
         assertEq(governor.getRequiredCoverage(pidOk), 2 * MAX_CAPITAL); // see arithmetic above
 
-        // Same warp clears both the voting window AND the cancel-stamped cooldown.
+        // The replacement proposal has its own full voting window.
         _advancePastVoting();
 
         uint256 vaultBefore = usdc.balanceOf(address(vault));
