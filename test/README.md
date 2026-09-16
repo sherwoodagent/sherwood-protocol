@@ -71,15 +71,41 @@ Compared with `post-audit-v2` at `188941b6`:
 - All 20 invariant names and all 30 fizz harness files retained. Fizz edits only update comments pointing to moved tests.
 - Three existing `LayoutPins` suites retained; the ticket's count of four was stale. The separate golden script still checks all five upgradeable contracts.
 
-## Runtime baseline
+## Measured runtime
 
 Foundry v1.7.1 on GitHub Actions `ubuntu-latest`, non-fork command above:
 
 | Revision | Suites | Passed | Failed | Skipped | Suite wall time | Compilation |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Before (`188941b6`) | 180 | 2,714 | 0 | 1 | 436.91 s | 1,125.16 s |
+| After (`b7946726`) | 183 | 2,719 | 0 | 1 | 426.36 s | 1,128.56 s |
 
 Baseline evidence: [CI run 35008993338](https://github.com/sherwoodagent/sherwood-protocol/actions/runs/35008993338/job/104515888236).
 The job checked out PR merge `930989e59f6db61427498f16b601272089968bb2`, whose
 Git tree exactly matches `188941b6` (`9bd0a7191d34d1b2d94896941282564c40a0da21`).
 The full job took 26m20s; suite wall time excludes compilation and setup.
+
+After evidence: [CI run 35045261450](https://github.com/sherwoodagent/sherwood-protocol/actions/runs/35045261450/job/104633637429).
+All 2,715 baseline runtime cases are present. The five additions are three
+previously excluded non-RPC tests and the two new fixture/invariant regressions.
+The existing skip is unchanged. These are individual CI observations, not a
+controlled performance benchmark.
+
+## Measured coverage
+
+[Coverage job 104633637331](https://github.com/sherwoodagent/sherwood-protocol/actions/runs/35045261450/job/104633637331)
+passed all 2,719 runnable tests, with the same one skip. Its `coverage-lcov`
+artifact contains all eight formerly excluded files and the vault. Production
+`src/` line coverage is **94.11% (4,329/4,600)**. The full report is
+**70.83% (7,518/10,614)** across production, scripts and test helpers.
+
+| Contract | Covered lines | Line coverage |
+| --- | ---: | ---: |
+| SyndicateGovernor | 593 / 631 | 93.98% |
+| SyndicateVault | 359 / 385 | 93.25% |
+| ConcentratedLiquidityStrategy | 384 / 406 | 94.58% |
+| PortfolioStrategy | 204 / 209 | 97.61% |
+
+Coverage compilation took 429.14 s and test execution took 1,303.85 s. This
+minimal-IR run is separate from the default-profile runtime comparison above;
+its approximate source maps remain advisory.

@@ -106,6 +106,8 @@ jobs:
       # all production files, including governor, vault, and strategies. IR source
       # maps are approximate, so this job remains advisory. The fork exclusion
       # matches the Test step above; those suites need live RPC endpoints.
+      # Measured with forge 1.7.1 (CI run 35045261450): 2719 passed, 1 skipped;
+      # 70.83% lines overall (7518/10614), 94.11% in src/ (4329/4600).
       - name: forge coverage
         env:
           FOUNDRY_PROFILE: coverage
