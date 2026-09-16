@@ -111,7 +111,9 @@ interface IGuardianRegistry {
     ///         at `resolveReview`.
     /// @param  lockWood On an Approve vote, the WOOD the guardian DECLARES it
     ///         locks behind the proposal; the ledger locks
-    ///         `min(lockWood, free budget)` and never rejects the vote for it.
+    ///         `min(lockWood, free budget)`, and rejects the vote when what it
+    ///         books is worth less than a hundredth of the proposal's coverage
+    ///         need — approver slots are bounded, so one has to be paid for.
     ///         That lock is what a conviction burns (under sWOOD's
     ///         `[minSlashBps, maxSlashBps]` envelope) and what counts toward the
     ///         execute-time coverage quorum at live value. Ignored on Block.

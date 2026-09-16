@@ -706,22 +706,46 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(governor.getEffectiveMaxCapital(pid), 1_000e6, "surplus coverage never raises the ceiling");
     }
 
-    /// @notice Dust coverage floors `effectiveMaxCapital` to ZERO — fail-closed
-    ///         and accepted (design D5): execution still proceeds (there IS an
-    ///         identified, nonzero-bonded signer, so the R1 floor is met), but
-    ///         the batch's net-outflow ceiling is 0.
-    function test_execute_dustCoverage_floorsEffectiveMaxCapitalToZero() public {
-        uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
+    /// @notice SHE-240, re-aimed from the D5 "dust coverage floors the effective
+    ///         cap to ZERO" pin. A dust lock no longer books at all — the ledger
+    ///         refuses any approver slot carrying under a hundredth of the need —
+    ///         so the smallest coverage the approve path can express is one
+    ///         slot's share, and the scaled cap is bounded below by
+    ///         `maxCapital / 100` instead of collapsing to zero.
+    ///
+    ///         D5 itself is unchanged and still reachable, by coverage that
+    ///         collapses AFTER it was booked; the WOOD-crash tests pin that.
+    function test_execute_slotFloorBoundsEffectiveMaxCapital() public {
+        uint256 maxCapital = 1_000e6;
+        uint256 pid = _proposeSolo(governor, address(vault), agent, maxCapital);
         address[] memory gs = new address[](1);
         gs[0] = makeAddr("g1");
-        // 1e12 wei WOOD ($0.00000005 at $0.05/WOOD) is nonzero but negligible
-        // next to the $1,000 required — floors to an effective cap of 0.
-        _seatApprovers(pid, gs, 1e12);
+
+        // The smallest stake whose whole-budget lock the floor will accept:
+        // one slot's share of the need, in WOOD, rounded up.
+        uint256 needUsd = ledger.coverageUsd(address(usdg), maxCapital);
+        uint256 priceX8 = ledger.woodPriceX8();
+        uint256 shareUsd = (needUsd + 99) / 100;
+        uint256 floorWood = (shareUsd * 1e8 + priceX8 - 1) / priceX8;
+
+        // A hair under the floor buys nothing at all.
+        swood.setStake(gs[0], floorWood - 1);
+        vm.prank(address(ledgerRegistry));
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        ledger.recordApproval(address(governor), pid, gs[0], type(uint256).max);
+
+        _seatApprovers(pid, gs, floorWood);
         _toApproved(pid);
         governor.executeProposal(pid);
 
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
-        assertEq(governor.getEffectiveMaxCapital(pid), 0, "dust coverage floors to a zero net-outflow cap");
+        uint256 raisedUsd = (floorWood * priceX8) / 1e8;
+        assertEq(
+            governor.getEffectiveMaxCapital(pid),
+            (maxCapital * raisedUsd) / needUsd,
+            "the cap is the coverage ratio, unchanged"
+        );
+        assertGe(governor.getEffectiveMaxCapital(pid), maxCapital / 100, "and the floor bounds it from below");
     }
 
     /// @notice Settlement reuses the STORED coverage-scaled figures from execute

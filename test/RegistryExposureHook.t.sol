@@ -268,14 +268,12 @@ contract RegistryExposureHookTest is Test {
         assertEq(ledger.openExposure(g1), 0);
     }
 
-    /// @notice N1 — a guardian with no free budget can still VOTE; it just
-    ///         books no coverage. Previously the hook reverted and took the vote
-    ///         with it, silencing the approve side while Block votes still
-    ///         worked. That is the shape the C1 veto survived in: an attacker
-    ///         who front-runs while the cohort is busy bricks the proposal,
-    ///         because the guardians who would have covered it cannot
-    ///         participate at all.
-    function test_overCapGuardianVotesButBooksNothing() public {
+    /// @notice SHE-240, re-aimed from the N1 "votes but books nothing" pin. A
+    ///         guardian with no free budget underwrites nothing, so the hook
+    ///         refuses it the approver slot rather than seating it beside the
+    ///         guardians carrying the risk. Approver slots are capped, so a slot
+    ///         held without coverage is a slot denied to a real underwriter.
+    function test_overCapGuardianIsRefusedTheSlot() public {
         // Zero g1's slashable bond so its free budget is exactly $0. Done by
         // mocking the ledger's stake reads rather than by zeroing the WOOD
         // price: the price setter is rate-limited now (review M4) and this test
@@ -287,13 +285,13 @@ contract RegistryExposureHookTest is Test {
         assertEq(ledger.slashableBondUsd(g1), 0, "no slashable bond -> no free budget");
 
         vm.prank(g1);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
         wired.registry
             .voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
 
         assertEq(ledger.openExposure(g1), 0, "no coverage booked");
         (address[] memory approvers,,) = wired.registry.getApproverWeights(address(wired.gov), PID);
-        assertEq(approvers.length, 1, "...but the vote itself counted");
-        assertEq(approvers[0], g1);
+        assertEq(approvers.length, 0, "...and no slot taken");
     }
 
     /// @notice THE FEE-WEIGHTING GAP (§3.10). The test above pins the divergence
@@ -309,42 +307,40 @@ contract RegistryExposureHookTest is Test {
     ///         approve books zero and consumes no capacity, yet still bills at
     ///         full stake.
     ///
-    ///         `getApproverCoverage` is the weight the fee should be paid on. It
-    ///         reports what each approver actually underwrote, so a zero-coverage
-    ///         approve weighs zero — closing the free-ride WITHOUT gating the
-    ///         vote, which review N1 rejected because it silenced the approve
-    ///         side and revived the C1 veto.
-    function test_getApproverCoverage_zeroForAnApproverThatUnderwroteNothing() public {
+    ///         `getApproverCoverage` is the weight the fee should be paid on,
+    ///         and it stays the right weight to pay on. SHE-240 closes the
+    ///         free-ride one step earlier: the zero-coverage approve no longer
+    ///         reaches the approver list at all, so the two views can no longer
+    ///         diverge on the approve path. This asserts both halves — the
+    ///         free-rider is absent, and the guardian that did underwrite
+    ///         carries weight in both views.
+    function test_getApproverCoverage_theFreeRiderNeverReachesTheList() public {
         // Same setup as above: g1 has no slashable bond, so no free budget.
         vm.mockCall(address(wired.swood), abi.encodeWithSignature("guardianStake(address)", g1), abi.encode(uint256(0)));
 
         vm.prank(g1);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
         wired.registry
             .voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(g2);
         wired.registry
             .voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
 
-        // Stake weighting: both approvers listed, and g1 is NOT weighted zero --
-        // this is the surface that overpays.
+        // Stake weighting: only the guardian that actually underwrote is listed,
+        // so the surface that used to overpay has nothing to overpay for.
         (address[] memory sApprovers, uint128[] memory stakeWeights,) =
             wired.registry.getApproverWeights(address(wired.gov), PID);
-        assertEq(sApprovers.length, 2, "both votes counted for attribution");
+        assertEq(sApprovers.length, 1, "the free-rider took no slot");
+        assertEq(sApprovers[0], g2);
+        assertGt(uint256(stakeWeights[0]), 0);
 
-        // Coverage weighting: same set, but the free-rider weighs nothing.
+        // Coverage weighting agrees with it, member for member.
         (address[] memory cApprovers, uint256[] memory coverage, bool priced) =
             wired.registry.getApproverCoverage(address(wired.gov), PID);
         assertTrue(priced, "asset feed is live in this fixture");
-        assertEq(cApprovers.length, 2, "same approver set as the stake view");
-
-        for (uint256 i; i < cApprovers.length; ++i) {
-            if (cApprovers[i] == g1) {
-                assertEq(coverage[i], 0, "underwrote nothing -> weighs nothing");
-                assertGt(uint256(stakeWeights[i]), 0, "...while stake weighting paid it in full");
-            } else {
-                assertGt(coverage[i], 0, "the guardian that actually covered it carries weight");
-            }
-        }
+        assertEq(cApprovers.length, 1, "same approver set as the stake view");
+        assertEq(cApprovers[0], g2);
+        assertGt(coverage[0], 0, "the guardian that actually covered it carries weight");
     }
 
     /// @notice An unwired ledger has no coverage to attribute, and that is a

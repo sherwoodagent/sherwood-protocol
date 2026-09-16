@@ -611,10 +611,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
             // voteOnProposal observes committed state — do NOT move any state
             // write below this hook. Same discipline as resolveReview.
             if (support == GuardianVoteType.Approve && address(exposureLedger) != address(0)) {
-                // The aggregate exposure cap is checked here, at the approve
-                // vote. An over-exposed guardian locks nothing rather than
-                // reverting; the vote still lands and the shortfall surfaces
-                // at the execute-time quorum.
+                // Unwrapped, deliberately: the ledger refuses a lock too small
+                // to carry its share of a bounded approver slot, and that
+                // refusal has to undo the push above rather than seat a
+                // guardian the coverage quorum will never see.
                 exposureLedger.recordApproval(governor, proposalId, msg.sender, lockWood);
             }
             emit GuardianVoteCast(governor, proposalId, msg.sender, support, weight);
