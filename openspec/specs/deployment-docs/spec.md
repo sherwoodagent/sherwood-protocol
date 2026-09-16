@@ -298,6 +298,23 @@ Pre-flights, all PRE-broadcast:
 - **GIVEN** a Tenderly vnet, where the pool stops trading at the fork point and `idle` grows without bound
 - **THEN** no amount of keeper activity primes the oracle there, and the vnet SHALL either generate swaps against the pair or wire a Chainlink-shaped WOOD feed via `ledger.setWoodFeed` instead — on mainnet the pair trades continuously (measured 2026-08-04: 10s idle), so the guard is near-free in production
 
+### Requirement: The WOOD feed's second leg is a Uniswap V3 pool, and its ring is grown before the feed deploys
+
+Chain 4663 carries ONE Uniswap-V2-style WOOD/WETH pair, so the second leg of the two-leg WOOD/USD feed SHALL be a Uniswap **V3** WOOD/WETH pool rather than a second V2 pair. `chains/{chainId}.json` SHALL carry it under `WOOD_WETH_UNISWAP_V3_POOL`, and `script/DeployWoodPoolFeed.s.sol:DeployWoodPoolFeed` SHALL read that key — environment override first, address book second — with NO `WOOD_WETH_SUSHI_V2_PAIR` reference remaining. The V2 leg keeps its stored snapshots; the V3 leg is read live from the pool's own observation ring over the same window, and its depth floor is the pool's in-range `liquidity()` (`MIN_V3_LIQUIDITY`), the V3 equivalent of the V2 leg's WETH reserve floor.
+
+Pre-flights on the pool, all PRE-broadcast: it has code, it holds exactly `{WOOD, WETH}`, `fee()` answers, `liquidity() >= MIN_V3_LIQUIDITY`, and `observe([window, 0])` answers. `MIN_V3_LIQUIDITY` SHALL be refused rather than truncated above the `uint128` width a pool reports liquidity in — a silent truncation there REMOVES the floor instead of raising it.
+
+Growing the ring SHALL be a NAMED ceremony step run BEFORE the feed deploy, not an assumption: `script/DeployWoodPoolFeed.s.sol:GrowV3Cardinality` broadcasts the permissionless `increaseObservationCardinalityNext(V3_CARDINALITY)`. The deploy script SHALL print the remedy with `N = ceil(window / AVG_BLOCK_TIME_SECONDS) + slack`. A pool indexes its ring with a `uint16`, so 65,535 observations is the hard ceiling and the script SHALL say so plainly: the ring stores one observation per block in which the pool is TOUCHED, so it spans only what those observations cover — under continuous 1s-block trading roughly 18h, LESS than a 24h window, while a pool traded less often spans proportionally longer. The `observe` pre-flight is therefore the authority on whether a given pool can serve the window; the derived N is only an operator's starting point.
+
+#### Scenario: The lower of the two legs is served, with the V3 leg read live
+- **WHEN** `latestRoundData()` answers after the window has been spanned
+- **THEN** the V3 leg is the arithmetic-mean tick over `window` from the pool's own `observe`, converted into the V2 leg's orientation and scale, the LOWER of the two legs is served, and `updatedAt` is the older of the two — the V2 snapshot
+
+#### Scenario: A pool whose ring cannot span the window is refused pre-broadcast
+- **GIVEN** the V3 pool's `observe([TWAP_WINDOW, 0])` reverts or answers malformed
+- **WHEN** `DeployWoodPoolFeed` runs
+- **THEN** it reverts `PRE-FLIGHT: V3 pool cannot span TWAP_WINDOW` before broadcasting, having printed the permissionless `increaseObservationCardinalityNext(N)` remedy and, where N is the 65,535 ceiling, what that ceiling does and does not buy
+
 ### Requirement: The fork supplies its WOOD price through a fixture feed
 Because a vnet cannot prime `WoodTwapOracle`, the fork ceremony SHALL deploy `script/fork/DeployForkWoodUsdFeed.s.sol:DeployForkWoodUsdFeed` in the slot `DeployWoodTwapOracle` occupies on a real chain — after the core phases, before `DeployPlanB` — and pass its address to Plan B as `WOOD_USD_FEED`. The script persists `WOOD_USD_FEED` into `chains/{chainId}.json`.
 

@@ -118,11 +118,27 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
 - **WOOD is priced by one feed, capped by governance.** `woodPriceX8()` reads a
   single `AggregatorV3`-shaped WOOD/USD feed, takes `min(feed, woodUsdPriceX8)`
   — the cap is never served as a price — and applies `woodHaircutBps`. On chain
-  4663 that feed is `WoodPoolFeed`: the lower of the Uniswap and Sushiswap
-  WOOD/WETH pools' TWAPs over a window of at least 24h, converted through
-  ETH/USD; every snapshot syncs both pairs first, so there is no idle tail, and
-  each pool is held to a WETH depth floor. A stale or shallow reading yields no
-  price at all — `NoWoodPrice` — rather than a wrong one.
+  4663 that feed is `WoodPoolFeed`: the lower of two WOOD/WETH TWAPs over a
+  window of at least 24h, converted through ETH/USD. One leg is the Uniswap V2
+  pair, snapshotted by the keeper and synced before each snapshot so there is no
+  idle tail, held to a WETH reserve floor; the other is the Uniswap V3 pool
+  `0xF683…1C69`, read live from its own observation ring via `observe`, held to
+  an in-range `liquidity()` floor instead. **The V3 leg answers only if that ring
+  can span the window** — the live pool's `observationCardinality` is 1, which
+  cannot, so growing it with the permissionless
+  `increaseObservationCardinalityNext` is a named deploy step
+  (`GrowV3Cardinality`) and `DeployWoodPoolFeed` refuses to deploy against a pool
+  whose `observe(window)` reverts. The ring is indexed by a uint16, so 65,535
+  observations is the hard ceiling, and it stores one observation per block in
+  which the pool is TOUCHED: under continuous 1s-block trading that is ~18h12m of
+  history, LESS than a 24h window, while a pool traded less often spans
+  proportionally longer — which is why the pre-flight asks the pool rather than
+  deriving an answer. Accepted: the V3 leg carries no staleness gate of its own,
+  so a pool that stops trading keeps answering at its last tick, symmetric with
+  the V2 leg, which keeps averaging its last synced spot. `updatedAt` is the V2
+  snapshot's — the older of the two legs — so `WOOD_FEED_MAX_DELAY` at the ledger
+  is what bounds the whole feed's age. A stale or shallow reading yields no price
+  at all — `NoWoodPrice` — rather than a wrong one.
 - **Cohort liability is the lock sum, capped at need.**
   `liabilityUsd(governor, proposalId)` returns
   `min(needUsd, Σ min(lock_i, live stake_i) × woodPriceX8())`;
