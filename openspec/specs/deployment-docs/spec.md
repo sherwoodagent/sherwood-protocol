@@ -48,7 +48,7 @@ On the fork the deployer (`0x5A00afAecE9CF61A768E2AE2713084C8d354DF94`) SHALL be
 
 ### Requirement: Deploy ceremony order and skip rules
 The fork ceremony SHALL run five scripts in order, each broadcast with the flags above:
-1. `script/robinhood-mainnet/Deploy.s.sol:DeployRobinhoodMainnet` with `WOOD_TOKEN=<live WOOD>`, `SKIP_MULTISIG_HANDOFF=true`, `ROBINHOOD_FORK_CHAIN_ID=9994663` — core only; no ENS/ERC-8004 (both registrar addresses are `address(0)` on Robinhood).
+1. `script/robinhood-mainnet/Deploy.s.sol:DeployRobinhoodMainnet` with `WOOD_TOKEN=<live WOOD>`, `SKIP_MULTISIG_HANDOFF=true`, `ROBINHOOD_FORK_CHAIN_ID=9994663` — core only; `ensRegistrar` and `agentRegistry` are both `address(0)` (identity gating disabled at v1; the ERC-8004 IdentityRegistry itself is live on 4663).
 2. `script/robinhood-mainnet/DeployPortfolioStrategy.s.sol` — UniswapSwapAdapter (v3+v4) + PortfolioStrategy template.
 3. `script/robinhood-mainnet/DeployMorphoStrategy.s.sol` — MorphoSupplyStrategy template. Separate from step 2 because that script reads four Uniswap addresses to build its adapter and this template needs none of them.
 4. `script/robinhood-mainnet/DeployConcentratedLiquidityStrategy.s.sol` — ConcentratedLiquidityStrategy template. It reads `UNISWAP_V3_POSITION_MANAGER`, `UNISWAP_V3_FACTORY` and `MORPHO_BLUE` from the address book and asserts the position manager's identity, not merely its code presence; the first and third keys SHALL be seeded before this step runs.
@@ -364,7 +364,7 @@ Manual follow-ups: an sWOOD upgrade touching `slashVerdict`'s ABI and any Challe
 - **THEN** `WireTokenCourt` reverts PRE-FLIGHT 5 — the court must not be granted ruling authority over a game whose verdicts cannot execute
 
 ### Requirement: Chain-specific factory identity configuration
-On Robinhood Chain (no ENS/Durin registrar, no ERC-8004 identity registry) the factory SHALL be deployed with `address(0)` for both `ensRegistrar` and `agentRegistry` (identity + subname registration disabled), and validation SHALL assert both read back as zero.
+On Robinhood Chain the factory SHALL be deployed with `address(0)` for both `ensRegistrar` and `agentRegistry` (identity + subname registration disabled), and validation SHALL assert both read back as zero. There is no ENS/Durin registrar on 4663; the canonical ERC-8004 IdentityRegistry (`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`) IS live there, so the zero `agentRegistry` is a v1 product decision, not a chain constraint, and wiring it later is a factory-config change with no redeploy.
 
 #### Scenario: Identity disabled on Robinhood
 - **WHEN** post-deploy validation runs on 4663 or its fork

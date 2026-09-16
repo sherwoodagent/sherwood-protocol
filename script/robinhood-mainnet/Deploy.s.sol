@@ -12,9 +12,10 @@ import {DeploySherwood} from "../Deploy.s.sol";
 /**
  * @notice Deploy the Sherwood core stack to Robinhood Chain mainnet (chain 4663).
  *
- *         Robinhood Chain is an Arbitrum Orbit L2 with no ENS/Durin registrar
- *         and no ERC-8004 agent-identity registry, so the factory is deployed
- *         with address(0) for both (identity + subname registration disabled).
+ *         Robinhood Chain is an Arbitrum Orbit L2 with no ENS/Durin registrar.
+ *         The canonical ERC-8004 IdentityRegistry (0x8004A169…) is live on 4663,
+ *         but v1 ships with identity gating OFF, so the factory is deployed
+ *         with address(0) for both registrars (identity + subname disabled).
  *
  *         Inherits the canonical `DeploySherwood` and delegates the core
  *         ceremony to its `deployCore` (CREATE3-salted, insertion-order-
@@ -35,7 +36,7 @@ import {DeploySherwood} from "../Deploy.s.sol";
  *       --rpc-url robinhood --account sherwood-deployer --broadcast --slow
  */
 contract DeployRobinhoodMainnet is DeploySherwood {
-    // No ENS or ERC-8004 on Robinhood Chain.
+    // No ENS on Robinhood Chain; ERC-8004 exists but v1 leaves identity gating off.
     address constant L2_REGISTRAR = address(0);
     address constant AGENT_REGISTRY = address(0);
 

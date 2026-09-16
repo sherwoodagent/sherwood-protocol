@@ -10,8 +10,12 @@ there with its pre-flights and scenarios. Parameter values live in
 and this file is stale.
 
 Chain constraints: 4663 is an Arbitrum Orbit L2 with `MaxCodeSize` 98,304 bytes,
-no ENS/Durin registrar, no ERC-8004 registry (factory takes `address(0)` for
-both), and no sequencer-uptime feed.
+no ENS/Durin registrar, and no sequencer-uptime feed. The canonical ERC-8004
+IdentityRegistry (`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`, same address as
+Base) and EAS v1.4.0 (`chains/4663.json` → `EAS`, `EAS_SCHEMA_REGISTRY`, deployed
+by `DeployEAS` + `SeedAttestations` in #278) are both live. The v1 factory still
+takes `address(0)` for `ensRegistrar` and `agentRegistry` — a deploy decision
+(identity gating off), not a chain limit. EAS is not part of this ceremony.
 
 ---
 
