@@ -5,7 +5,6 @@ import {Test, console2} from "forge-std/Test.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {WoodPoolFeed, IUniswapV2PairMinimal, IAggregatorMinimal} from "../../src/pricing/WoodPoolFeed.sol";
 import {IUniswapV3Pool} from "../../src/vendor/uniswap/IUniswapV3Pool.sol";
-import {TickMath} from "../../src/vendor/uniswap/TickMath.sol";
 
 /**
  * @title WoodPoolFeedV3LegForkTest
@@ -16,10 +15,11 @@ import {TickMath} from "../../src/vendor/uniswap/TickMath.sol";
  *         and a real observation ring, meet in the same scale, so `min` compares
  *         prices rather than units.
  *
- *         Both legs are recomputed HERE, from the pair's own cumulatives and the
- *         pool's own tick cumulatives, and the feed's answer is asserted equal to
- *         the lower of them. A scale or orientation error in either leg changes
- *         that equality by orders of magnitude.
+ *         Both legs are recomputed HERE without reusing the feed's arithmetic —
+ *         the pair's own cumulative-price delta, and the pool's own
+ *         `slot0().sqrtPriceX96` rather than a second copy of the mean-tick math
+ *         — and the feed's answer is asserted to be the lower of them. A scale or
+ *         orientation error in either leg misses by orders of magnitude.
  *
  *         On-chain facts (probed 2026-09-16): the V3 pool is fee 3000 /
  *         tickSpacing 60, liquidity 2.128e22, and reports `observationCardinality`
@@ -127,15 +127,22 @@ contract WoodPoolFeedV3LegForkTest is Test {
     // ── The feed itself ──
 
     /// @dev THE POINT OF THE SUITE. Both legs are recomputed from the venues'
-    ///      own state and the answer is asserted equal to the LOWER one.
+    ///      own state — the pair's accumulators and the pool's `slot0` price,
+    ///      neither of them the feed's own machinery — and the answer is asserted
+    ///      to be the LOWER one.
     ///
-    ///      A CAVEAT THE ASSERTION DOES NOT CARRY: `observe` answers here partly
-    ///      because the fork is frozen — the whole window post-dates the pool's
+    ///      WHAT THAT DOES AND DOES NOT ESTABLISH. `observe` answers here partly
+    ///      because the fork is frozen: the whole window post-dates the pool's
     ///      last touch, so the ring extrapolates at the standing tick instead of
     ///      searching for an observation it does not have. That is a property of
     ///      a fork, NOT evidence that cardinality 1 serves a 24h window on a
-    ///      trading chain. The deploy pre-flight asks the live pool, which is the
-    ///      only place that question can be answered.
+    ///      trading chain — the deploy pre-flight asks the live pool, which is the
+    ///      only place that question can be answered. For the same reason BOTH
+    ///      legs here report the standing price rather than an average over live
+    ///      history: what this suite pins is that the two machineries agree on
+    ///      SCALE AND ORIENTATION against real venues, so `min` compares prices
+    ///      and not units. Averaging behaviour is the unit suite's claim, where
+    ///      the price history is ours to write.
     function test_theFeedAnswersTheLowerOfTheTwoLiveLegsOnceTheWindowIsSpanned() public {
         IUniswapV3Pool(V3_POOL).increaseObservationCardinalityNext(GROWN_CARDINALITY);
 
@@ -165,25 +172,39 @@ contract WoodPoolFeedV3LegForkTest is Test {
         unchecked {
             v2X112 = (c1 - c0) / (t1 - t0);
         }
-        uint256 v3X112 = _v3LegX112();
+        uint256 v3X112 = _v3SpotX112();
         uint256 ethUsdX8 = _ethUsdX8();
 
         console2.log("V2 leg (WETH per WOOD, x8): %s", Math.mulDiv(v2X112, ethUsdX8, Q112));
         console2.log("V3 leg (WETH per WOOD, x8): %s", Math.mulDiv(v3X112, ethUsdX8, Q112));
 
+        // SEPARATE THE TWO LEGS IN TIME. Reading in the same second as the second
+        // snapshot would make the `updatedAt` assertion below vacuous: the V3
+        // leg's stamp is `block.timestamp`, which would equal the V2 snapshot's.
+        vm.warp(block.timestamp + 30);
+        vm.roll(block.number + 30 / AVG_BLOCK_TIME);
+
         (, int256 answer,, uint256 updatedAt,) = feed.latestRoundData();
         assertGt(answer, 0, "the feed answers");
-        assertEq(
+        // APPROXIMATE BY CONSTRUCTION, not by sloppiness: the expected value here
+        // comes from `slot0().sqrtPriceX96`, the exact price INSIDE the current
+        // tick, while the feed prices the tick itself. One tick is 0.01%, so the
+        // two can differ by up to that and no more — a scale or orientation error
+        // in either leg misses by orders of magnitude, not by a tick.
+        assertApproxEqRel(
             uint256(answer),
             Math.mulDiv(v2X112 < v3X112 ? v2X112 : v3X112, ethUsdX8, Q112),
+            5e14,
             "the answer is the LOWER leg, converted through ETH/USD"
         );
+        // Exact on this side: the V2 leg is the pair's own accumulator delta.
         assertLe(uint256(answer), Math.mulDiv(v2X112, ethUsdX8, Q112), "above the V2 leg");
-        assertLe(uint256(answer), Math.mulDiv(v3X112, ethUsdX8, Q112), "above the V3 leg");
 
         // The live V3 leg never dates the reading forward: `updatedAt` is the
-        // OLDER of the two, i.e. the V2 snapshot the keeper just rolled.
+        // OLDER of the two legs, i.e. the V2 snapshot the keeper rolled 30s ago,
+        // not the V3 leg's `block.timestamp`.
         assertEq(updatedAt, t1, "updatedAt is the V2 snapshot");
+        assertLt(updatedAt, block.timestamp, "control: the two legs' stamps are distinguishable");
 
         // Both legs price the same asset in the same units. An orientation or
         // scale error in either shows up as orders of magnitude here, long
@@ -200,25 +221,28 @@ contract WoodPoolFeedV3LegForkTest is Test {
             : IUniswapV2PairMinimal(V2_PAIR).price1CumulativeLast();
     }
 
-    /// @dev The V3 leg, computed here rather than read off the feed: mean tick
-    ///      over the window, floored, then converted to WETH per WOOD in X112.
-    function _v3LegX112() internal view returns (uint256) {
-        uint32[] memory secondsAgos = new uint32[](2);
-        secondsAgos[0] = uint32(WINDOW);
-        (int56[] memory cumulatives,) = IUniswapV3Pool(V3_POOL).observe(secondsAgos);
+    /// @dev The V3 leg's expected value, derived INDEPENDENTLY of the feed: from
+    ///      `slot0().sqrtPriceX96` — the pool's own standing price — rather than
+    ///      from `observe`, `TickMath` and a mean-tick calculation, which would
+    ///      only be the feed's own arithmetic written twice.
+    ///
+    ///      Legitimate here precisely because the fork is frozen: with the whole
+    ///      window post-dating the pool's last touch, both `observe` samples
+    ///      extrapolate at the standing tick, so the window's mean tick IS the
+    ///      standing tick and the standing tick's price is `slot0`'s. The
+    ///      remaining gap is sub-tick — `sqrtPriceX96` sits inside the tick, the
+    ///      feed prices the tick's own boundary — which is why the caller asserts
+    ///      approximately. On a chain where the pool is trading this derivation
+    ///      would NOT hold, and neither would this suite's freeze.
+    function _v3SpotX112() internal view returns (uint256) {
+        (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(V3_POOL).slot0();
+        assertGt(sqrtPriceX96, 0, "the live V3 pool reports no price");
 
-        int256 span = int256(WINDOW);
-        int256 delta = int256(cumulatives[1]) - int256(cumulatives[0]);
-        int256 mean = delta / span;
-        if (delta < 0 && delta % span != 0) --mean;
-
-        uint256 sqrtRatioX96 = TickMath.getSqrtRatioAtTick(int24(mean));
-        if (sqrtRatioX96 <= type(uint128).max) {
-            uint256 ratioX192 = sqrtRatioX96 * sqrtRatioX96;
-            return woodIsToken0Pool ? Math.mulDiv(ratioX192, Q112, 1 << 192) : Math.mulDiv(1 << 192, Q112, ratioX192);
-        }
-        uint256 ratioX128 = Math.mulDiv(sqrtRatioX96, sqrtRatioX96, 1 << 64);
-        return woodIsToken0Pool ? Math.mulDiv(ratioX128, Q112, 1 << 128) : Math.mulDiv(1 << 128, Q112, ratioX128);
+        // token1 per token0, in X112: (sqrtP / 2**96)**2 * 2**112, split across
+        // two mulDivs so the square never has to fit a uint256 on its own.
+        uint256 token1PerToken0X112 = Math.mulDiv(Math.mulDiv(sqrtPriceX96, sqrtPriceX96, 1 << 96), Q112, 1 << 96);
+        // WETH per WOOD, in the V2 leg's orientation.
+        return woodIsToken0Pool ? token1PerToken0X112 : Math.mulDiv(Q112, Q112, token1PerToken0X112);
     }
 
     function _ethUsdX8() internal view returns (uint256) {

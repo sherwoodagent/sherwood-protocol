@@ -202,7 +202,7 @@ contract DeployWoodPoolFeed is ScriptBase {
         console.log("     still snapshots and the keeper never has to sync anything first.");
         console.log("     A snapshot ROLLS AT MOST ONCE PER WINDOW, so extra calls in");
         console.log("     between are no-ops for the feed's snapshots (each one still");
-        console.log("     syncs both pairs) and updatedAt does not advance: a stale");
+        console.log("     syncs the V2 pair) and updatedAt does not advance: a stale");
         console.log("     reading is NoWoodPrice, and nothing proposes.");
         console.log("  2. Wait for latestRoundData() to answer (needs a second snapshot");
         console.log("     one full window after the baseline this script just recorded).");

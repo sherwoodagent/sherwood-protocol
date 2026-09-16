@@ -164,6 +164,15 @@ contract DeployWoodPoolFeedTest is Test {
         script.deploy(p);
     }
 
+    /// @dev One venue booked twice is one leg, not two: the `min` that makes the
+    ///      feed manipulation-resistant would compare a number with itself.
+    function test_preflight_bites_whenBothLegsAreTheSameAddress() public {
+        DeployWoodPoolFeed.Params memory p = _params();
+        p.v3Pool = p.uniPair;
+        vm.expectRevert(bytes("PRE-FLIGHT: the V2 pair and the V3 pool are the same address"));
+        script.deploy(p);
+    }
+
     /// @dev A staticcall to an address with no code SUCCEEDS with empty
     ///      returndata, so without this check the first decode fails with a bare
     ///      panic and an operator who fat-fingered the book learns nothing.
@@ -217,23 +226,47 @@ contract DeployWoodPoolFeedTest is Test {
 
     // ── GrowV3Cardinality ──
 
-    function test_grow_raisesTheRingTarget() public {
+    /// @dev THE STEP RAISES A TARGET, NOT THE RING. `observationCardinality` is
+    ///      what `observe` can actually serve, and it catches up one slot at a
+    ///      time as the pool is written to — which is why the ceremony has to
+    ///      leave time between this step and the feed deploy, and why asserting
+    ///      the ring itself grew here would pin the misconception the script's
+    ///      own console output warns against.
+    function test_grow_raisesTheTargetAndNotTheRingItself() public {
         GrowV3Cardinality grower = new GrowV3Cardinality();
+        (,,, uint16 ringBefore, uint16 targetBefore,,) = v3Pool.slot0();
+        assertLt(targetBefore, 65_535, "control: the target really was below");
+
         grower.grow(address(v3Pool), 65_535);
 
-        (,,, uint16 cardinality,,,) = v3Pool.slot0();
-        assertEq(cardinality, 65_535, "the pool was asked to grow");
+        (,,, uint16 ring, uint16 target,,) = v3Pool.slot0();
+        assertEq(target, 65_535, "the growth target rose");
+        assertEq(ring, ringBefore, "the ring itself did NOT grow: it fills as the pool is traded");
     }
 
     /// @dev Monotonic upstream, so a re-run of the ceremony step is a no-op
-    ///      rather than a revert — an operator can repeat it safely.
+    ///      rather than a revert — an operator can repeat it safely. Asserted as
+    ///      NO CALL, because a monotonic setter makes "called and ignored"
+    ///      indistinguishable from "not called" by state alone.
+    function test_grow_isANoOpWhenTheTargetIsAlreadyThatHigh() public {
+        GrowV3Cardinality grower = new GrowV3Cardinality();
+        grower.grow(address(v3Pool), 65_535);
+        assertEq(v3Pool.cardinalityGrowCalls(), 1, "the first ask reached the pool");
+
+        grower.grow(address(v3Pool), 600);
+        assertEq(v3Pool.cardinalityGrowCalls(), 1, "a repeat below the standing target broadcasts nothing");
+    }
+
+    /// @dev And the same once the ring has actually filled: a pool already
+    ///      serving that much history is not asked to pay for more.
     function test_grow_isANoOpWhenTheRingIsAlreadyThatLong() public {
         GrowV3Cardinality grower = new GrowV3Cardinality();
         v3Pool.setObservationCardinality(65_535);
         grower.grow(address(v3Pool), 600);
 
-        (,,, uint16 cardinality,,,) = v3Pool.slot0();
-        assertEq(cardinality, 65_535, "never shrunk");
+        (,,, uint16 ring,,,) = v3Pool.slot0();
+        assertEq(ring, 65_535, "never shrunk");
+        assertEq(v3Pool.cardinalityGrowCalls(), 0, "nothing broadcast");
     }
 
     function test_grow_refusesATargetAboveTheUint16Ceiling() public {
