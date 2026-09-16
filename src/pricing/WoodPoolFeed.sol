@@ -2,6 +2,8 @@
 pragma solidity 0.8.28;
 
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {IUniswapV3Pool} from "../vendor/uniswap/IUniswapV3Pool.sol";
+import {TickMath} from "../vendor/uniswap/TickMath.sol";
 
 interface IUniswapV2PairMinimal {
     function token0() external view returns (address);
@@ -21,16 +23,17 @@ interface IAggregatorMinimal {
  * @title  WoodPoolFeed
  * @notice WOOD/USD on the `AggregatorV3` read surface, 8 decimals: the LOWER of
  *         two WOOD/WETH pool TWAPs over a window of at least 24h, each pool held
- *         to a WETH depth floor. Both pairs are synced before every snapshot, so
- *         tails are zero.
+ *         to a depth floor. One leg is a Uniswap-V2-style pair, snapshotted here
+ *         and synced before every snapshot so tails are zero; the other is a
+ *         Uniswap V3 pool, read live from its own observation ring.
  */
 contract WoodPoolFeed {
     error InvalidParameter();
-    /// @notice No window spanned yet, a pool below the depth floor, or an
-    ///         unusable ETH/USD leg.
+    /// @notice No window spanned yet, a pool below its depth floor, a V3 ring
+    ///         that cannot serve the window, or an unusable ETH/USD leg.
     error PriceUnavailable();
 
-    event SnapshotRecorded(uint256 indexed pairIndex, uint256 cumulative, uint32 timestamp, uint32 spanFromPrevious);
+    event SnapshotRecorded(uint256 cumulative, uint32 timestamp, uint32 spanFromPrevious);
 
     /// @dev UQ112x112 scaling factor, the format `UniswapV2Pair` accumulates in.
     uint256 internal constant Q112 = 2 ** 112;
@@ -45,74 +48,83 @@ contract WoodPoolFeed {
     }
 
     address public immutable pairA;
-    address public immutable pairB;
+    address public immutable pool;
     address public immutable wood;
     address public immutable weth;
-    /// @dev Derived from each pair's own `token0()`, never passed in.
+    /// @dev Derived from each venue's own `token0()`, never passed in.
     bool internal immutable _woodIsToken0A;
-    bool internal immutable _woodIsToken0B;
+    bool internal immutable _woodIsToken0Pool;
     address public immutable ethUsdFeed;
     uint8 internal immutable _ethUsdFeedDecimals;
     uint256 public immutable ethUsdMaxAge;
     uint256 public immutable window;
-    /// @dev SPOT LIVENESS GATE, in the pool's WETH-side reserve: it refuses an
+    /// @dev SPOT LIVENESS GATE, in the pair's WETH-side reserve: it refuses an
     ///      empty or dust pool, and is not a manipulation control -- supplied
     ///      depth passes it. The two-pool `min` is the manipulation control.
     uint256 public immutable minWethReserve;
+    /// @dev The V3 equivalent of `minWethReserve`: in-range liquidity at the
+    ///      time of the read, which is the depth actually standing behind the
+    ///      pool's tick. Same gate, same non-claim about manipulation.
+    uint128 public immutable minV3Liquidity;
 
-    Observation[2] public previousObservation;
-    Observation[2] public latestObservation;
+    Observation public previousObservation;
+    Observation public latestObservation;
 
     constructor(
         address pairA_,
-        address pairB_,
+        address pool_,
         address wood_,
         address weth_,
         address ethUsdFeed_,
         uint256 ethUsdMaxAge_,
         uint256 window_,
-        uint256 minWethReserve_
+        uint256 minWethReserve_,
+        uint128 minV3Liquidity_
     ) {
-        if (pairA_ == address(0) || pairB_ == address(0) || pairA_ == pairB_) {
+        if (pairA_ == address(0) || pool_ == address(0) || pairA_ == pool_) {
             revert InvalidParameter();
         }
         if (wood_ == address(0) || weth_ == address(0) || wood_ == weth_) revert InvalidParameter();
         if (ethUsdFeed_ == address(0) || ethUsdMaxAge_ == 0 || minWethReserve_ == 0) revert InvalidParameter();
+        if (minV3Liquidity_ == 0) revert InvalidParameter();
         if (window_ < MIN_WINDOW || window_ > MAX_SNAPSHOT_SPAN) revert InvalidParameter();
 
         uint8 dec = IAggregatorMinimal(ethUsdFeed_).decimals();
         if (dec > MAX_ETH_FEED_DECIMALS) revert InvalidParameter();
 
         pairA = pairA_;
-        pairB = pairB_;
+        pool = pool_;
         wood = wood_;
         weth = weth_;
-        _woodIsToken0A = _deriveWoodSide(pairA_, wood_, weth_);
-        _woodIsToken0B = _deriveWoodSide(pairB_, wood_, weth_);
+        _woodIsToken0A = _deriveWoodSide(
+            IUniswapV2PairMinimal(pairA_).token0(), IUniswapV2PairMinimal(pairA_).token1(), wood_, weth_
+        );
+        _woodIsToken0Pool =
+            _deriveWoodSide(IUniswapV3Pool(pool_).token0(), IUniswapV3Pool(pool_).token1(), wood_, weth_);
         ethUsdFeed = ethUsdFeed_;
         _ethUsdFeedDecimals = dec;
         ethUsdMaxAge = ethUsdMaxAge_;
         window = window_;
         minWethReserve = minWethReserve_;
+        minV3Liquidity = minV3Liquidity_;
     }
 
-    /// @notice Roll each pool's snapshot pair forward once `window` has elapsed.
-    ///         Permissionless, and a no-op rather than a revert when a pool is
-    ///         early, empty or below the depth floor.
-    /// @dev    Both pairs are synced first. `sync()` is permissionless and books
-    ///         the standing price over the elapsed span, so an untraded pool still snapshots.
+    /// @notice Roll the V2 pair's snapshot pair forward once `window` has
+    ///         elapsed. Permissionless, and a no-op rather than a revert when the
+    ///         pair is early, empty or below the depth floor. The V3 leg stores
+    ///         nothing and needs no keeper.
+    /// @dev    The pair is synced first. `sync()` is permissionless and books the
+    ///         standing price over the elapsed span, so an untraded pair still snapshots.
     function update() external {
         IUniswapV2PairMinimal(pairA).sync();
-        IUniswapV2PairMinimal(pairB).sync();
-        _update(0);
-        _update(1);
+        _update();
     }
 
     /// @notice The lower of the two pools' TWAPs in USD, 8 decimals, with
-    ///         `updatedAt` the OLDER of the two snapshots.
+    ///         `updatedAt` the OLDER of the two legs' readings.
     function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
-        (uint256 twapA, uint32 tsA) = _twapX112(0);
-        (uint256 twapB, uint32 tsB) = _twapX112(1);
+        (uint256 twapA, uint32 tsA) = _twapX112();
+        (uint256 twapB, uint32 tsB) = _poolTwapX112();
 
         uint256 priceX8 = Math.mulDiv(twapA < twapB ? twapA : twapB, _ethUsdX8(), Q112);
         if (priceX8 == 0 || priceX8 > uint256(type(int256).max)) revert PriceUnavailable();
@@ -135,28 +147,21 @@ contract WoodPoolFeed {
 
     // -- Internals --
 
-    /// @dev A pair holding anything other than exactly {WOOD, WETH} is refused.
-    function _deriveWoodSide(address pair, address wood_, address weth_) internal view returns (bool) {
-        address t0 = IUniswapV2PairMinimal(pair).token0();
-        address t1 = IUniswapV2PairMinimal(pair).token1();
+    /// @dev A venue holding anything other than exactly {WOOD, WETH} is refused.
+    function _deriveWoodSide(address t0, address t1, address wood_, address weth_) internal pure returns (bool) {
         if (t0 == wood_ && t1 == weth_) return true;
         if (t0 == weth_ && t1 == wood_) return false;
         revert InvalidParameter();
     }
 
-    function _pair(uint256 index) internal view returns (address pair, bool woodIsToken0) {
-        return index == 0 ? (pairA, _woodIsToken0A) : (pairB, _woodIsToken0B);
-    }
-
-    function _update(uint256 index) internal {
-        (address pair, bool woodIsToken0) = _pair(index);
-        (uint256 cumulative, uint32 nowTs, bool ok) = _currentCumulative(pair, woodIsToken0);
+    function _update() internal {
+        (uint256 cumulative, uint32 nowTs, bool ok) = _currentCumulative();
         if (!ok) return;
 
-        Observation memory latest = latestObservation[index];
+        Observation memory latest = latestObservation;
         if (latest.timestamp == 0) {
-            latestObservation[index] = Observation({cumulative: cumulative, timestamp: nowTs});
-            emit SnapshotRecorded(index, cumulative, nowTs, 0);
+            latestObservation = Observation({cumulative: cumulative, timestamp: nowTs});
+            emit SnapshotRecorded(cumulative, nowTs, 0);
             return;
         }
 
@@ -168,17 +173,16 @@ contract WoodPoolFeed {
         }
         if (span < window) return;
 
-        previousObservation[index] = latest;
-        latestObservation[index] = Observation({cumulative: cumulative, timestamp: nowTs});
-        emit SnapshotRecorded(index, cumulative, nowTs, span);
+        previousObservation = latest;
+        latestObservation = Observation({cumulative: cumulative, timestamp: nowTs});
+        emit SnapshotRecorded(cumulative, nowTs, span);
     }
 
     /// @dev Priced off stored snapshots only; live reserves are read as a depth
     ///      gate, never as a price.
-    function _twapX112(uint256 index) internal view returns (uint256 avgX112, uint32 updatedAt) {
-        (address pair, bool woodIsToken0) = _pair(index);
-        Observation memory previous = previousObservation[index];
-        Observation memory latest = latestObservation[index];
+    function _twapX112() internal view returns (uint256 avgX112, uint32 updatedAt) {
+        Observation memory previous = previousObservation;
+        Observation memory latest = latestObservation;
         if (previous.timestamp == 0 || latest.timestamp == 0) revert PriceUnavailable();
 
         uint32 span;
@@ -187,8 +191,8 @@ contract WoodPoolFeed {
         }
         if (span < window || span > MAX_SNAPSHOT_SPAN) revert PriceUnavailable();
 
-        (uint112 r0, uint112 r1,) = IUniswapV2PairMinimal(pair).getReserves();
-        if ((woodIsToken0 ? uint256(r1) : uint256(r0)) < minWethReserve) revert PriceUnavailable();
+        (uint112 r0, uint112 r1,) = IUniswapV2PairMinimal(pairA).getReserves();
+        if ((_woodIsToken0A ? uint256(r1) : uint256(r0)) < minWethReserve) revert PriceUnavailable();
 
         // The pair's accumulator wraps at 2^256, so the difference is unchecked.
         unchecked {
@@ -198,27 +202,77 @@ contract WoodPoolFeed {
         return (avgX112, latest.timestamp);
     }
 
-    function _storedCumulative(address pair, bool woodIsToken0) internal view returns (uint256) {
-        return woodIsToken0
-            ? IUniswapV2PairMinimal(pair).price0CumulativeLast()
-            : IUniswapV2PairMinimal(pair).price1CumulativeLast();
+    /// @dev Read live off the pool's observation ring, so this leg is as fresh as
+    ///      the block. A ring that cannot serve `window` is unavailability, never
+    ///      a silent fall back to spot.
+    function _poolTwapX112() internal view returns (uint256 avgX112, uint32 updatedAt) {
+        if (IUniswapV3Pool(pool).liquidity() < minV3Liquidity) revert PriceUnavailable();
+
+        uint32[] memory secondsAgos = new uint32[](2);
+        // `window` is bounded by `MAX_SNAPSHOT_SPAN` at construction.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        secondsAgos[0] = uint32(window);
+
+        try IUniswapV3Pool(pool).observe(secondsAgos) returns (int56[] memory cumulatives, uint160[] memory) {
+            if (cumulatives.length != 2) revert PriceUnavailable();
+            avgX112 = _tickToX112(_meanTick(cumulatives));
+        } catch {
+            revert PriceUnavailable();
+        }
+        if (avgX112 == 0) revert PriceUnavailable();
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return (avgX112, uint32(block.timestamp));
     }
 
-    function _currentCumulative(address pair, bool woodIsToken0)
-        internal
-        view
-        returns (uint256 cumulative, uint32 nowTs, bool ok)
-    {
+    /// @dev Arithmetic-mean tick over `window`, rounded toward NEGATIVE INFINITY:
+    ///      truncating division rounds a negative delta up, which would report a
+    ///      WOOD price one tick better than the pool actually held.
+    function _meanTick(int56[] memory cumulatives) internal view returns (int24) {
+        // `window` is bounded by `MAX_SNAPSHOT_SPAN` at construction.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        int256 span = int256(window);
+        int256 delta = int256(cumulatives[1]) - int256(cumulatives[0]);
+        int256 mean = delta / span;
+        if (delta < 0 && delta % span != 0) --mean;
+        if (mean < TickMath.MIN_TICK || mean > TickMath.MAX_TICK) revert PriceUnavailable();
+        // Bounded against the tick range above; the cast cannot change the value.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return int24(mean);
+    }
+
+    /// @dev WETH per WOOD in X112 — the orientation and scale `_twapX112`
+    ///      returns, so both legs meet the same `min` and the same USD
+    ///      conversion. A V3 tick prices token1 in token0, hence the reciprocal
+    ///      when WOOD is token1.
+    function _tickToX112(int24 tick) internal view returns (uint256) {
+        uint256 sqrtRatioX96 = TickMath.getSqrtRatioAtTick(tick);
+        if (sqrtRatioX96 <= type(uint128).max) {
+            uint256 ratioX192 = sqrtRatioX96 * sqrtRatioX96;
+            return _woodIsToken0Pool ? Math.mulDiv(ratioX192, Q112, 1 << 192) : Math.mulDiv(1 << 192, Q112, ratioX192);
+        }
+        uint256 ratioX128 = Math.mulDiv(sqrtRatioX96, sqrtRatioX96, 1 << 64);
+        return _woodIsToken0Pool ? Math.mulDiv(ratioX128, Q112, 1 << 128) : Math.mulDiv(1 << 128, Q112, ratioX128);
+    }
+
+    function _storedCumulative() internal view returns (uint256) {
+        return _woodIsToken0A
+            ? IUniswapV2PairMinimal(pairA).price0CumulativeLast()
+            : IUniswapV2PairMinimal(pairA).price1CumulativeLast();
+    }
+
+    function _currentCumulative() internal view returns (uint256 cumulative, uint32 nowTs, bool ok) {
         // forge-lint: disable-next-line(unsafe-typecast)
         nowTs = uint32(block.timestamp);
-        (uint112 r0, uint112 r1,) = IUniswapV2PairMinimal(pair).getReserves();
-        // The depth floor binds at SNAPSHOT time as well as at read time: a pool
+        (uint112 r0, uint112 r1,) = IUniswapV2PairMinimal(pairA).getReserves();
+        // The depth floor binds at SNAPSHOT time as well as at read time: a pair
         // below it never enters the average in the first place.
-        if (r0 == 0 || r1 == 0 || (woodIsToken0 ? uint256(r1) : uint256(r0)) < minWethReserve) return (0, 0, false);
+        if (r0 == 0 || r1 == 0 || (_woodIsToken0A ? uint256(r1) : uint256(r0)) < minWethReserve) {
+            return (0, 0, false);
+        }
 
         // `update()` syncs the pair first, so the stored accumulator is current
         // as of this block and there is no tail left to account for.
-        return (_storedCumulative(pair, woodIsToken0), nowTs, true);
+        return (_storedCumulative(), nowTs, true);
     }
 
     function _ethUsdX8() internal view returns (uint256 priceX8) {

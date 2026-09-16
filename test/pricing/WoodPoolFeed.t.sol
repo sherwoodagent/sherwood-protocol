@@ -6,11 +6,13 @@ import {WoodPoolFeed} from "src/pricing/WoodPoolFeed.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
 import {MockUniswapV2Pair} from "test/mocks/MockUniswapV2Pair.sol";
+import {MockUniswapV3Pool} from "test/mocks/MockUniswapV3Pool.sol";
 import {MockAggregatorV3} from "test/mocks/MockAggregatorV3.sol";
 
-/// @dev The two pools, the ETH leg and the parameters every test in this file
-///      shares. `uni` holds WOOD as token0 and `sushi` as token1, so both
-///      accumulator sides are exercised by the fixture itself.
+/// @dev The two legs, the ETH leg and the parameters every test in this file
+///      shares. `uni` is the V2 pair and holds WOOD as token0; `v3` is the
+///      Uniswap V3 pool and holds WOOD as token0 too; the flipped ordering is
+///      built per-test with `_newPool(WETH, WOOD, ...)`.
 abstract contract WoodPoolFeedFixture is Test {
     address internal constant WOOD = address(uint160(0xD00D));
     address internal constant WETH = address(uint160(0xE7E7));
@@ -18,30 +20,53 @@ abstract contract WoodPoolFeedFixture is Test {
     uint112 internal constant WOOD_RESERVE = 1e26; // 100M WOOD
     uint112 internal constant WETH_RESERVE = 240e18; // ~$720k at $3,000/ETH
     uint256 internal constant MIN_WETH = 100e18;
+    uint128 internal constant MIN_V3_LIQUIDITY = 1e22;
+    uint128 internal constant V3_LIQUIDITY = 2e22;
     uint256 internal constant WINDOW = 24 hours;
     uint256 internal constant ETH_MAX_AGE = 24 hours;
     int256 internal constant ETH_USD_X8 = 3000e8;
 
+    /// @dev `1.0001 ** tick` is WETH per WOOD when WOOD is the pool's token0.
+    ///      The V2 pair stands at 240e18 / 1e26 = 2.4e-6 WETH per WOOD, which is
+    ///      tick -129407; each factor of two is 6932 ticks. A tick is a 0.01%
+    ///      step, so these land within half a tick of the round price and the
+    ///      assertions against them are held to 0.1%, not to the wei.
+    int24 internal constant TICK_TWICE_V2 = -122475; // ~$0.0144
+    int24 internal constant TICK_HALF_V2 = -136339; // ~$0.0036
+    int24 internal constant TICK_QUARTER_V2 = -143271; // ~$0.0018
+
+    uint256 internal constant V2_ANSWER_X8 = 720_000;
+    uint256 internal constant HALF_ANSWER_X8 = 360_000;
+    uint256 internal constant QUARTER_ANSWER_X8 = 180_000;
+
     MockUniswapV2Pair internal uni;
-    MockUniswapV2Pair internal sushi;
+    MockUniswapV3Pool internal v3;
     MockAggregatorV3 internal ethUsd;
     WoodPoolFeed internal feed;
 
     function _deployFeed() internal {
         vm.warp(1_800_000_000); // a real chain time, not forge's t = 1
         uni = new MockUniswapV2Pair(WOOD, WETH, WOOD_RESERVE, WETH_RESERVE);
-        sushi = new MockUniswapV2Pair(WETH, WOOD, WETH_RESERVE, WOOD_RESERVE);
+        v3 = _newPool(WOOD, WETH, TICK_TWICE_V2);
         ethUsd = new MockAggregatorV3(8, ETH_USD_X8);
-        feed =
-            new WoodPoolFeed(address(uni), address(sushi), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, WINDOW, MIN_WETH);
+        feed = new WoodPoolFeed(
+            address(uni), address(v3), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, WINDOW, MIN_WETH, MIN_V3_LIQUIDITY
+        );
     }
 
-    /// @dev Move time forward with both pools trading and the ETH leg fresh: the
-    ///      ordinary background against which a snapshot is taken.
+    /// @dev A pool deep enough to clear the floor, averaging at `twapTick`.
+    function _newPool(address token0, address token1, int24 twapTick) internal returns (MockUniswapV3Pool p) {
+        p = new MockUniswapV3Pool(token0, token1, 3000, 60, makeAddr("v3Factory"));
+        p.setLiquidity(V3_LIQUIDITY);
+        p.setTicks(twapTick, twapTick);
+    }
+
+    /// @dev Move time forward with the V2 pool trading and the ETH leg fresh: the
+    ///      ordinary background against which a snapshot is taken. The V3 leg is
+    ///      read live and has nothing to advance.
     function _advance(uint256 dt) internal {
         vm.warp(vm.getBlockTimestamp() + dt);
         uni.sync();
-        sushi.sync();
         ethUsd.setUpdatedAt(vm.getBlockTimestamp());
     }
 
@@ -51,6 +76,14 @@ abstract contract WoodPoolFeedFixture is Test {
         feed.update();
         _advance(WINDOW + 1);
         feed.update();
+    }
+
+    /// @dev `_prime()` for a second feed built inside a test: its snapshots are
+    ///      its own, so the shared V2 pair has to be rolled again for it.
+    function _primeOther(WoodPoolFeed other) internal {
+        other.update();
+        _advance(WINDOW + 1);
+        other.update();
     }
 
     function _answer() internal view returns (uint256) {
@@ -72,8 +105,9 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
     function test_pricesTheTwoPoolsInUsdAtEightDecimals() public {
         _prime();
         assertEq(feed.decimals(), 8, "the ledger normalises against this");
-        // 240 WETH per 100M WOOD at $3,000/ETH = $0.0072.
-        assertApproxEqRel(_answer(), 720_000, 1e13, "the pools' price, converted through ETH/USD");
+        // 240 WETH per 100M WOOD at $3,000/ETH = $0.0072, and the V3 pool sits
+        // above it, so the V2 pair is the mark.
+        assertApproxEqRel(_answer(), V2_ANSWER_X8, 1e13, "the pools' price, converted through ETH/USD");
     }
 
     /// @notice A 100x spike held three minutes is BOUNDED BY ITS TIME SHARE of
@@ -87,13 +121,12 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
         _prime();
         uint256 before = _answer();
 
-        // Both pools pushed 100x at once, held three minutes, then put back, so
-        // the spike sits INSIDE the interval the next snapshot averages over.
+        // The V2 pool pushed 100x, held three minutes, then put back, so the
+        // spike sits INSIDE the interval the next snapshot averages over. It
+        // stays the lower leg throughout, so the V3 pool never masks it.
         uni.setReserves(WOOD_RESERVE / 100, WETH_RESERVE);
-        sushi.setReserves(WETH_RESERVE, WOOD_RESERVE / 100);
         vm.warp(vm.getBlockTimestamp() + 3 minutes);
         uni.setReserves(WOOD_RESERVE, WETH_RESERVE);
-        sushi.setReserves(WETH_RESERVE, WOOD_RESERVE);
 
         _advance(WINDOW + 1);
         feed.update();
@@ -114,18 +147,16 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
         _prime();
         uint256 before = _answer();
 
-        // ONE trade, in both pools, then nothing: no restoring trade, no keeper
-        // co-operation, no second touch of the pair.
+        // ONE trade, then nothing: no restoring trade, no keeper co-operation,
+        // no second touch of the pair.
         uni.setReserves(WOOD_RESERVE / 100, WETH_RESERVE);
-        sushi.setReserves(WETH_RESERVE, WOOD_RESERVE / 100);
 
         vm.warp(vm.getBlockTimestamp() + 300);
         ethUsd.setUpdatedAt(vm.getBlockTimestamp());
-        feed.update(); // syncs both pairs: 300s at 100x lands in the accumulator
+        feed.update(); // syncs the pair: 300s at 100x lands in the accumulator
 
-        // Arbitrage puts the pools back, and the rest of the window is ordinary.
+        // Arbitrage puts the pool back, and the rest of the window is ordinary.
         uni.setReserves(WOOD_RESERVE, WETH_RESERVE);
-        sushi.setReserves(WETH_RESERVE, WOOD_RESERVE);
         _advance(WINDOW + 1);
         feed.update();
 
@@ -134,31 +165,149 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
         assertLt(answer, (before * 136) / 100, "and no more than that -- the share is arithmetic");
     }
 
-    /// @notice One pool manipulated alone cannot raise the answer AT ALL, even
-    ///         when it is held long enough for that pool's own average to move:
-    ///         the answer is the LOWER of the two.
-    function test_onePoolManipulatedAloneCannotRaiseTheAnswer() public {
+    /// @notice The V3 leg manipulated alone cannot raise the answer AT ALL, even
+    ///         at 100x: the answer is the LOWER of the two legs.
+    function test_theV3LegManipulatedAloneCannotRaiseTheAnswer() public {
         _prime();
         uint256 before = _answer();
 
-        sushi.setReserves(WETH_RESERVE, WOOD_RESERVE / 100); // 100x, in sushi only
+        v3.setTicks(0, 0); // 1 WETH per WOOD, ~400,000x the real price
+        assertEq(_answer(), before, "the cheaper leg sets the mark");
+    }
+
+    /// @notice And the V2 leg manipulated alone cannot raise it either, which is
+    ///         the same claim taken from the other side: with the V3 pool the
+    ///         lower leg, a 100x in the V2 pair moves nothing.
+    function test_theV2LegManipulatedAloneCannotRaiseTheAnswer() public {
+        v3.setTicks(TICK_HALF_V2, TICK_HALF_V2);
+        _prime();
+        assertApproxEqRel(_answer(), HALF_ANSWER_X8, 1e15, "control: the V3 pool is the mark");
+
+        uni.setReserves(WOOD_RESERVE / 100, WETH_RESERVE);
         _advance(WINDOW + 1);
         feed.update();
 
-        assertEq(_answer(), before, "the cheaper pool sets the mark");
+        assertApproxEqRel(_answer(), HALF_ANSWER_X8, 1e15, "the cheaper leg still sets the mark");
     }
 
     /// @notice A crash IS tracked: the min follows the market down, which is the
     ///         direction where a stale mark over-values guardian bonds.
-    function test_aSustainedCrashInOnePoolIsTracked() public {
+    function test_aSustainedCrashInTheV3PoolIsTracked() public {
         _prime();
-        uint256 before = _answer();
+        assertApproxEqRel(_answer(), V2_ANSWER_X8, 1e13, "control: the V2 pair is the mark");
 
-        sushi.setReserves(WETH_RESERVE, WOOD_RESERVE * 4); // WOOD 4x cheaper in sushi
-        _advance(WINDOW + 1);
-        feed.update();
+        v3.setTicks(TICK_QUARTER_V2, TICK_QUARTER_V2);
 
-        assertApproxEqRel(_answer(), before / 4, 1e13, "the lower pool is what the mark follows");
+        assertApproxEqRel(_answer(), QUARTER_ANSWER_X8, 1e15, "the lower leg is what the mark follows");
+    }
+
+    /// @notice The V3 leg is averaged over the CONFIGURED window. The pool's
+    ///         cumulatives scale with the span asked for, so observing over a
+    ///         different span recovers a different tick and a different price.
+    function test_theV3LegIsAveragedOverExactlyTheConfiguredWindow() public {
+        assertEq(feed.window(), feed.MIN_WINDOW(), "this fixture sits exactly on the minimum window");
+
+        v3.setTicks(TICK_HALF_V2, TICK_HALF_V2);
+        _prime();
+        assertApproxEqRel(_answer(), HALF_ANSWER_X8, 1e15, "the V3 average at the configured window");
+    }
+
+    /// @notice A V3 pool below its in-range-liquidity floor makes the feed
+    ///         unavailable, exactly as a V2 pair below its WETH floor does.
+    function test_aV3PoolBelowTheLiquidityFloorMakesTheFeedUnavailable() public {
+        _prime();
+        v3.setLiquidity(MIN_V3_LIQUIDITY);
+        _answer(); // control: the floor is INCLUSIVE, so exactly at it still answers
+
+        v3.setLiquidity(MIN_V3_LIQUIDITY - 1);
+        vm.expectRevert(WoodPoolFeed.PriceUnavailable.selector);
+        feed.latestRoundData();
+    }
+
+    /// @notice An `observe` the ring cannot serve — cardinality too low for the
+    ///         window, or a pool that has stopped answering — is unavailability.
+    ///         It is NEVER a silent fall back to the pool's spot tick.
+    function test_anObserveThatRevertsMakesTheFeedUnavailable() public {
+        _prime();
+        _answer(); // control
+
+        v3.setObserveReverts(true);
+        vm.expectRevert(WoodPoolFeed.PriceUnavailable.selector);
+        feed.latestRoundData();
+    }
+
+    /// @notice A pool that answers the selector but not the contract — here a
+    ///         one-element array — is unavailability too, not a decode panic.
+    function test_aMalformedObserveResponseMakesTheFeedUnavailable() public {
+        _prime();
+        v3.setObserveShortArray(true);
+        vm.expectRevert(WoodPoolFeed.PriceUnavailable.selector);
+        feed.latestRoundData();
+    }
+
+    /// @notice A NEGATIVE mean tick with a remainder rounds toward NEGATIVE
+    ///         INFINITY, as Uniswap's own oracle library does. Truncating
+    ///         division rounds it up instead, reporting WOOD one whole tick more
+    ///         expensive than the pool actually held it.
+    function test_aNegativeMeanTickRoundsTowardNegativeInfinity() public {
+        _prime();
+        int56 span = int56(uint56(WINDOW));
+
+        v3.setTickCumulatives(0, int56(TICK_HALF_V2) * span);
+        uint256 atTick = _answer();
+
+        // One below an exact multiple: the quotient is inexact and negative.
+        v3.setTickCumulatives(0, int56(TICK_HALF_V2) * span - 1);
+        uint256 justBelow = _answer();
+
+        v3.setTickCumulatives(0, int56(TICK_HALF_V2 - 1) * span);
+        uint256 atTickBelow = _answer();
+
+        assertEq(justBelow, atTickBelow, "a negative remainder is a whole tick down");
+        assertLt(justBelow, atTick, "and that is genuinely below the truncated answer");
+    }
+
+    /// @notice A POSITIVE remainder still truncates, which is already rounding
+    ///         toward negative infinity: the correction must not fire on it.
+    function test_aPositiveMeanTickIsNotRoundedDown() public {
+        _prime();
+        int56 span = int56(uint56(WINDOW));
+
+        // A positive mean tick prices WOOD above WETH, far above the V2 pair, so
+        // read the V3 leg through a pool whose tokens are flipped instead: WOOD
+        // as token1 makes a positive tick the cheap direction.
+        MockUniswapV3Pool flipped = _newPool(WETH, WOOD, -TICK_HALF_V2);
+        WoodPoolFeed flippedFeed = new WoodPoolFeed(
+            address(uni), address(flipped), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, WINDOW, MIN_WETH, MIN_V3_LIQUIDITY
+        );
+        _primeOther(flippedFeed);
+
+        flipped.setTickCumulatives(0, int56(-TICK_HALF_V2) * span);
+        (, int256 atTick,,,) = flippedFeed.latestRoundData();
+
+        flipped.setTickCumulatives(0, int56(-TICK_HALF_V2) * span + 1);
+        (, int256 justAbove,,,) = flippedFeed.latestRoundData();
+
+        assertEq(uint256(justAbove), uint256(atTick), "a positive remainder truncates, it is not pushed a tick down");
+    }
+
+    /// @notice Which side of the V3 pool holds WOOD is DERIVED, and the leg is
+    ///         put in the V2 pair's orientation either way: a pool quoting
+    ///         `WOOD per WETH` gives the same USD answer as its mirror.
+    function test_theV3LegIsOrientedFromThePoolsOwnTokenOrdering() public {
+        v3.setTicks(TICK_HALF_V2, TICK_HALF_V2);
+        _prime();
+        uint256 woodIsToken0 = _answer();
+
+        MockUniswapV3Pool flipped = _newPool(WETH, WOOD, -TICK_HALF_V2);
+        WoodPoolFeed flippedFeed = new WoodPoolFeed(
+            address(uni), address(flipped), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, WINDOW, MIN_WETH, MIN_V3_LIQUIDITY
+        );
+        _primeOther(flippedFeed);
+        (, int256 answer,,,) = flippedFeed.latestRoundData();
+
+        assertApproxEqRel(uint256(answer), woodIsToken0, 1e14, "the mirrored pool prices WOOD identically");
+        assertApproxEqRel(uint256(answer), HALF_ANSWER_X8, 1e15, "and both are the pool's real price");
     }
 
     /// @notice A pool below the depth floor makes the feed unavailable rather
@@ -192,49 +341,42 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
         assertEq(_answer(), before, "so its price never entered the average");
     }
 
-    /// @notice `updatedAt` is the OLDER of the two snapshots, so a consumer's
-    ///         staleness bound binds on whichever pool was refreshed last.
-    function test_updatedAtIsTheOlderOfTheTwoSnapshots() public {
+    /// @notice `updatedAt` is the OLDER of the two legs. The V3 leg is read live
+    ///         and is always as fresh as the block, so the V2 snapshot is what
+    ///         dates the reading — a consumer's staleness bound binds on it.
+    function test_updatedAtIsTheOlderOfTheTwoLegs() public {
         _prime();
-        uint256 primedAt = _updatedAt();
+        uint256 snapshotAt = vm.getBlockTimestamp();
+        assertEq(_updatedAt(), snapshotAt, "the snapshot dates the reading");
 
-        // `sushi` sits under the depth floor for a whole window, so only `uni`'s
-        // snapshot rolls; its depth is restored before the reading is taken.
-        sushi.setReserves(uint112(MIN_WETH - 1), WOOD_RESERVE);
-        _advance(WINDOW + 1);
-        feed.update();
-        uint256 uniSnapshot = vm.getBlockTimestamp();
-        sushi.setReserves(WETH_RESERVE, WOOD_RESERVE);
+        vm.warp(vm.getBlockTimestamp() + 6 hours);
+        ethUsd.setUpdatedAt(vm.getBlockTimestamp());
 
-        assertGt(uniSnapshot, primedAt, "control: the deep pool did roll");
-        assertEq(_updatedAt(), primedAt, "the older snapshot dates the reading");
-        assertLt(_updatedAt(), uniSnapshot, "and it is genuinely behind the newer one");
+        assertEq(_updatedAt(), snapshotAt, "the live V3 leg never dates the reading forward");
+        assertLt(_updatedAt(), vm.getBlockTimestamp(), "and it is genuinely behind the block");
     }
 
-    /// @notice Liveness does NOT depend on both pools trading. `update()` syncs
-    ///         each pair itself, and a sync accumulates the standing price over
+    /// @notice Liveness does NOT depend on the pool trading. `update()` syncs
+    ///         the pair itself, and a sync accumulates the standing price over
     ///         the elapsed span and restamps the pair, so a pool nobody has
     ///         traded all day still snapshots and `updatedAt` still advances.
-    ///         Three windows of one-sided trading leave the feed answering.
-    function test_theFeedStaysFreshAcrossWindowsInWhichOnlyOnePoolTrades() public {
+    function test_theFeedStaysFreshAcrossWindowsInWhichThePoolNeverTrades() public {
         _prime();
         uint256 lastUpdatedAt = _updatedAt();
 
         for (uint256 i = 0; i < 3; ++i) {
-            // Only `uni` trades. `sushi` is untouched for the entire window;
-            // `update()`'s own sync is what still rolls its snapshot.
+            // Nobody trades. `update()`'s own sync is what rolls the snapshot.
             vm.warp(vm.getBlockTimestamp() + WINDOW + 1);
-            uni.sync();
             ethUsd.setUpdatedAt(vm.getBlockTimestamp());
             feed.update();
 
             uint256 updatedAt = _updatedAt();
-            assertEq(updatedAt, vm.getBlockTimestamp(), "the idle pool rolled too, so neither lags");
+            assertEq(updatedAt, vm.getBlockTimestamp(), "the idle pool rolled, so nothing lags");
             assertGt(updatedAt, lastUpdatedAt, "and the reading advanced this window");
             lastUpdatedAt = updatedAt;
         }
 
-        assertApproxEqRel(_answer(), 720_000, 1e13, "idleness alone never staled the feed");
+        assertApproxEqRel(_answer(), V2_ANSWER_X8, 1e13, "idleness alone never staled the feed");
     }
 
     function test_isUnavailableUntilAFullWindowHasBeenSpanned() public {
@@ -264,21 +406,41 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
 
     function test_constructorRefusesAWindowBelowTwentyFourHours() public {
         vm.expectRevert(WoodPoolFeed.InvalidParameter.selector);
-        new WoodPoolFeed(address(uni), address(sushi), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, WINDOW - 1, MIN_WETH);
+        new WoodPoolFeed(
+            address(uni), address(v3), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, WINDOW - 1, MIN_WETH, MIN_V3_LIQUIDITY
+        );
     }
 
-    function test_constructorRefusesTheSamePoolTwice() public {
+    function test_constructorRefusesTheSameVenueTwice() public {
         vm.expectRevert(WoodPoolFeed.InvalidParameter.selector);
-        new WoodPoolFeed(address(uni), address(uni), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, WINDOW, MIN_WETH);
+        new WoodPoolFeed(
+            address(uni), address(uni), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, WINDOW, MIN_WETH, MIN_V3_LIQUIDITY
+        );
     }
 
-    /// @notice Which side of each pair holds WOOD is DERIVED, so a pair holding
+    function test_constructorRefusesAZeroV3LiquidityFloor() public {
+        vm.expectRevert(WoodPoolFeed.InvalidParameter.selector);
+        new WoodPoolFeed(address(uni), address(v3), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, WINDOW, MIN_WETH, 0);
+    }
+
+    /// @notice Which side of each venue holds WOOD is DERIVED, so a venue holding
     ///         anything else cannot be wired with a hand-supplied flag.
     function test_constructorRefusesAPairThatDoesNotHoldWoodAndWeth() public {
-        sushi.setTokens(WETH, makeAddr("notWood"));
+        uni.setTokens(WETH, makeAddr("notWood"));
 
         vm.expectRevert(WoodPoolFeed.InvalidParameter.selector);
-        new WoodPoolFeed(address(uni), address(sushi), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, WINDOW, MIN_WETH);
+        new WoodPoolFeed(
+            address(uni), address(v3), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, WINDOW, MIN_WETH, MIN_V3_LIQUIDITY
+        );
+    }
+
+    function test_constructorRefusesAV3PoolThatDoesNotHoldWoodAndWeth() public {
+        MockUniswapV3Pool wrong = _newPool(WETH, makeAddr("notWood"), TICK_HALF_V2);
+
+        vm.expectRevert(WoodPoolFeed.InvalidParameter.selector);
+        new WoodPoolFeed(
+            address(uni), address(wrong), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, WINDOW, MIN_WETH, MIN_V3_LIQUIDITY
+        );
     }
 
     function test_updateIsPermissionless() public {
@@ -351,7 +513,7 @@ contract WoodPoolFeedLedgerTest is WoodPoolFeedFixture {
     }
 
     function test_theLedgerPricesWoodOffThePoolFeed() public view {
-        assertApproxEqRel(ledger.woodPriceX8(), 720_000, 1e13, "one feed, read through setWoodFeed");
+        assertApproxEqRel(ledger.woodPriceX8(), V2_ANSWER_X8, 1e13, "one feed, read through setWoodFeed");
     }
 
     /// @notice A pool below the depth floor makes the feed unavailable, and the
@@ -368,6 +530,15 @@ contract WoodPoolFeedLedgerTest is WoodPoolFeedFixture {
         ledger.woodPriceX8();
     }
 
+    /// @notice A V3 pool whose observation ring cannot serve the window halts the
+    ///         same path: the ledger sees no price at all, never a spot fallback.
+    function test_aV3RingThatCannotServeTheWindowHaltsTheProposePath() public {
+        v3.setObserveReverts(true);
+
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.woodPriceX8();
+    }
+
     /// @notice A reading older than the ledger's own `maxDelay` is rejected
     ///         exactly as a stale Chainlink round is, and recovers the moment
     ///         the keeper snapshots again.
@@ -377,7 +548,7 @@ contract WoodPoolFeedLedgerTest is WoodPoolFeedFixture {
         // protocol between rolls rather than catch a stale feed.
         vm.warp(vm.getBlockTimestamp() + FEED_MAX_DELAY);
         ethUsd.setUpdatedAt(vm.getBlockTimestamp()); // isolate the WOOD leg
-        assertApproxEqRel(ledger.woodPriceX8(), 720_000, 1e13, "still inside maxDelay");
+        assertApproxEqRel(ledger.woodPriceX8(), V2_ANSWER_X8, 1e13, "still inside maxDelay");
 
         vm.warp(vm.getBlockTimestamp() + 1);
         ethUsd.setUpdatedAt(vm.getBlockTimestamp());
@@ -386,7 +557,7 @@ contract WoodPoolFeedLedgerTest is WoodPoolFeedFixture {
 
         _advance(1);
         feed.update();
-        assertApproxEqRel(ledger.woodPriceX8(), 720_000, 1e13, "a fresh snapshot restores pricing");
+        assertApproxEqRel(ledger.woodPriceX8(), V2_ANSWER_X8, 1e13, "a fresh snapshot restores pricing");
     }
 
     /// @notice Swapping the pool feed for a plain Chainlink aggregator is ONE

@@ -5,6 +5,7 @@ import {console} from "forge-std/Script.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {ScriptBase} from "./ScriptBase.sol";
 import {WoodPoolFeed, IUniswapV2PairMinimal, IAggregatorMinimal} from "../src/pricing/WoodPoolFeed.sol";
+import {IUniswapV3Pool} from "../src/vendor/uniswap/IUniswapV3Pool.sol";
 
 /**
  * @title  DeployWoodPoolFeed
@@ -52,6 +53,9 @@ contract DeployWoodPoolFeed is ScriptBase {
     uint256 constant DEFAULT_ETH_USD_MAX_AGE = 1 days;
     /// @dev Depth floor per pool, WETH side. The live WOOD/WETH pool is ~$438k.
     uint256 constant DEFAULT_MIN_WETH_RESERVE = 10e18;
+    /// @dev The V3 leg's depth floor, in in-range liquidity: half of what the
+    ///      live WOOD/WETH V3 pool carries today.
+    uint128 constant DEFAULT_MIN_V3_LIQUIDITY = 1e22;
     /// @dev DEPLOY POLICY ONLY, not a feed parameter: how stale a pair's last
     ///      trade may be for this script to accept it as a live market.
     uint256 constant MAX_PAIR_IDLE = 5 minutes;
@@ -69,13 +73,14 @@ contract DeployWoodPoolFeed is ScriptBase {
 
     struct Params {
         address uniPair;
-        address sushiPair;
+        address v3Pool;
         address wood;
         address weth;
         address ethUsdFeed;
         uint256 window;
         uint256 ethUsdMaxAge;
         uint256 minWethReserve;
+        uint128 minV3Liquidity;
     }
 
     /// @notice Thin env adapter. `deploy()` takes the params as an argument so
@@ -84,13 +89,14 @@ contract DeployWoodPoolFeed is ScriptBase {
         WoodPoolFeed feed = deploy(
             Params({
                 uniPair: vm.envOr("WOOD_WETH_V2_PAIR", _readAddress("WOOD_WETH_V2_PAIR")),
-                sushiPair: vm.envOr("WOOD_WETH_SUSHI_V2_PAIR", _readAddress("WOOD_WETH_SUSHI_V2_PAIR")),
+                v3Pool: vm.envOr("WOOD_WETH_SUSHI_V2_PAIR", _readAddress("WOOD_WETH_SUSHI_V2_PAIR")),
                 wood: vm.envOr("WOOD_TOKEN", _readAddress("WOOD_TOKEN")),
                 weth: vm.envOr("WETH", _readAddress("WETH")),
                 ethUsdFeed: vm.envOr("CHAINLINK_ETH_USD_FEED", _readAddress("CHAINLINK_ETH_USD_FEED")),
                 window: vm.envOr("TWAP_WINDOW", DEFAULT_TWAP_WINDOW),
                 ethUsdMaxAge: vm.envOr("ETH_USD_MAX_AGE", DEFAULT_ETH_USD_MAX_AGE),
-                minWethReserve: vm.envOr("MIN_WETH_RESERVE", DEFAULT_MIN_WETH_RESERVE)
+                minWethReserve: vm.envOr("MIN_WETH_RESERVE", DEFAULT_MIN_WETH_RESERVE),
+                minV3Liquidity: uint128(vm.envOr("MIN_V3_LIQUIDITY", uint256(DEFAULT_MIN_V3_LIQUIDITY)))
             })
         );
 
@@ -107,7 +113,15 @@ contract DeployWoodPoolFeed is ScriptBase {
         // The constructor derives which side of each pair holds WOOD from the
         // pair itself, and refuses a pair that is not exactly {WOOD, WETH}.
         feed = new WoodPoolFeed(
-            p.uniPair, p.sushiPair, p.wood, p.weth, p.ethUsdFeed, p.ethUsdMaxAge, p.window, p.minWethReserve
+            p.uniPair,
+            p.v3Pool,
+            p.wood,
+            p.weth,
+            p.ethUsdFeed,
+            p.ethUsdMaxAge,
+            p.window,
+            p.minWethReserve,
+            p.minV3Liquidity
         );
         // The first call only ever lays a baseline on each pool; `latestRoundData`
         // still needs a SECOND snapshot a full window later, which is the keeper's
@@ -117,9 +131,10 @@ contract DeployWoodPoolFeed is ScriptBase {
 
         console.log("WoodPoolFeed:      %s", address(feed));
         console.log("uni pair:          %s", p.uniPair);
-        console.log("sushi pair:        %s", p.sushiPair);
+        console.log("v3 pool:           %s", p.v3Pool);
         console.log("window (s):        %s", p.window);
         console.log("minWethReserve:    %s", p.minWethReserve);
+        console.log("minV3Liquidity:    %s", p.minV3Liquidity);
 
         // INSTANTANEOUS SPOT, FOR SIZING THE CAP ONLY — the manipulable quantity
         // the averaging exists to defeat, never a price. It is printed because the
@@ -153,8 +168,8 @@ contract DeployWoodPoolFeed is ScriptBase {
 
     function _preflight(Params memory p) internal view {
         require(p.uniPair != address(0), "PRE-FLIGHT: WOOD_WETH_V2_PAIR unset");
-        require(p.sushiPair != address(0), "PRE-FLIGHT: WOOD_WETH_SUSHI_V2_PAIR unset");
-        require(p.uniPair != p.sushiPair, "PRE-FLIGHT: the two pairs are the same address");
+        require(p.v3Pool != address(0), "PRE-FLIGHT: WOOD_WETH_SUSHI_V2_PAIR unset");
+        require(p.uniPair != p.v3Pool, "PRE-FLIGHT: the two pairs are the same address");
         require(p.wood != address(0), "PRE-FLIGHT: WOOD_TOKEN unset");
         require(p.weth != address(0), "PRE-FLIGHT: WETH unset");
         require(p.ethUsdFeed != address(0), "PRE-FLIGHT: CHAINLINK_ETH_USD_FEED unset");
@@ -163,6 +178,7 @@ contract DeployWoodPoolFeed is ScriptBase {
         require(p.window <= 7 days, "PRE-FLIGHT: TWAP_WINDOW above MAX_SNAPSHOT_SPAN (7d)");
         require(p.ethUsdMaxAge != 0, "PRE-FLIGHT: ETH_USD_MAX_AGE zero");
         require(p.minWethReserve != 0, "PRE-FLIGHT: MIN_WETH_RESERVE zero");
+        require(p.minV3Liquidity != 0, "PRE-FLIGHT: MIN_V3_LIQUIDITY zero");
 
         // WOOD AND WETH MUST SHARE A DECIMALS COUNT: the feed multiplies the
         // pairs' raw UQ112x112 ratio by ETH/USD with no decimals normalisation.
@@ -172,7 +188,7 @@ contract DeployWoodPoolFeed is ScriptBase {
         );
 
         _preflightPair(p, p.uniPair);
-        _preflightPair(p, p.sushiPair);
+        _preflightV3Pool(p);
         _preflightEthLeg(p);
     }
 
@@ -202,6 +218,21 @@ contract DeployWoodPoolFeed is ScriptBase {
             "PRE-FLIGHT: pair has no trade in the last 5m - no live market is standing behind "
             "it. On a fork/vnet the pool does not trade at all: generate swaps, or wire a plain "
             "Chainlink-shaped WOOD feed instead."
+        );
+    }
+
+    /// @dev The V3 leg carries no reserves and no last-trade stamp: its depth is
+    ///      the in-range liquidity standing behind the tick, and its liveness is
+    ///      the observation ring, which the ceremony's cardinality step covers.
+    function _preflightV3Pool(Params memory p) internal view {
+        address t0 = IUniswapV3Pool(p.v3Pool).token0();
+        address t1 = IUniswapV3Pool(p.v3Pool).token1();
+        require(
+            (t0 == p.wood && t1 == p.weth) || (t0 == p.weth && t1 == p.wood),
+            "PRE-FLIGHT: V3 pool does not hold exactly {WOOD, WETH}"
+        );
+        require(
+            IUniswapV3Pool(p.v3Pool).liquidity() >= p.minV3Liquidity, "PRE-FLIGHT: V3 pool is below MIN_V3_LIQUIDITY"
         );
     }
 
