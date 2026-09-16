@@ -92,6 +92,29 @@ via_ir = true
 paths = "src/strategies/ConcentratedLiquidityStrategy.sol"
 via_ir = true
 
+# The CREATE3 factory's address is keccak of its own creation code, pinned in DeploySalts.
+# `type(X).creationCode` is emitted by whoever REFERENCES it, so every embedder must build
+# the way the ceremony does or the pin reads as a drift under legacy codegen.
+[[profile.coverage.compilation_restrictions]]
+paths = "script/utils/Create3Factory.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "script/ScriptBase.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "script/robinhood-mainnet/DeployAll.s.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "test/deploy/Create3Bootstrap.t.sol"
+via_ir = true
+
+[[profile.coverage.compilation_restrictions]]
+paths = "test/deploy/DeployAll.t.sol"
+via_ir = true
+
 # Profile used by the Medusa/Echidna harness under test/fizz/. The fuzzers compile
 # through crytic-compile, which shells out to this profile.
 #
