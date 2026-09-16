@@ -116,8 +116,9 @@ interface IExposureLedger {
     ///         requirement, and nothing reduces a lock other than
     ///         `releaseApproval`/`retireApproval`.
     /// @param  lockWood The WOOD the guardian declares. Clamped to the free
-    ///         budget; rejected only if what remains is under the slot floor —
-    ///         so a whole-budget declaration is always admitted.
+    ///         budget, then refused when what it books is worth less than the
+    ///         smaller of one slot's share of the need and the guardian's
+    ///         whole-budget valuation, or when that valuation is zero.
     function recordApproval(address governor, uint256 proposalId, address guardian, uint256 lockWood) external;
     function releaseApproval(address governor, uint256 proposalId, address guardian) external;
 
