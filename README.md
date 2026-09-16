@@ -144,7 +144,7 @@ Independent of the syndicate machinery — team/contributor token grants.
 
 ```
 src/            Contracts (core, strategies/, pricing/, queue/, adapters/, vesting/, interfaces/, libraries/)
-test/           Foundry tests (unit + fork/integration under test/integration/, plus invariants/, mocks/)
+test/           Foundry tests (unit + fork/integration under test/fork/, plus invariants/, mocks/)
 script/         Deploy + admin scripts (inherit script/ScriptBase.sol) and storage-layout goldens
 openspec/       Executable specs (openspec/specs/) and in-flight change proposals (openspec/changes/)
 chains/         Per-chain deployed addresses, {chainId}.json (auto-written by deploy scripts)
@@ -161,7 +161,7 @@ Requires [Foundry](https://book.getfoundry.sh/getting-started/installation)
 forge build
 
 # Unit tests. --no-match-path skips fork/integration tests that need an RPC URL.
-forge test --no-match-path "test/integration/**"
+forge test --no-match-path "test/fork/**"
 
 forge test                 # everything, including fork tests (needs RPC endpoints)
 forge fmt                  # format (CI runs forge fmt --check)

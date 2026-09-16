@@ -589,7 +589,7 @@ contract DeployPlanB is ScriptBase {
         // 43 -> 0, `_tierRegistry` 48 -> 58). That is legitimate for a FRESH
         // deployment and only for a fresh deployment — pushed onto a beacon with
         // live proxies, every governor reads garbage at every slot. See
-        // `test/governor/GovernorLayoutPins.t.sol`, which pins the new baseline
+        // `test/layout/GovernorLayoutPins.t.sol`, which pins the new baseline
         // and carries the same warning.
         //
         // So the three live states differ completely and the script must not

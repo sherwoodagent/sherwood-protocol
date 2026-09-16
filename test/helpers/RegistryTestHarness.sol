@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import "forge-std/Test.sol";
+import {ProtocolFixture} from "./ProtocolFixture.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
@@ -19,7 +20,7 @@ import {MockLedgerFullLocks} from "../mocks/MockLedgerFullLocks.sol";
 ///         Guardians stake through `swood.stakeAsGuardian`, not the registry.
 ///         `_stakeGuardian` is the canonical helper review tests use to build
 ///         a cohort.
-abstract contract RegistryTestHarness is Test {
+abstract contract RegistryTestHarness is ProtocolFixture {
     GuardianRegistry internal registry;
     StakedWood internal swood;
     ERC20Mock internal wood;
@@ -39,29 +40,26 @@ abstract contract RegistryTestHarness is Test {
         governor = new MockGovernorMinimal();
 
         // sWOOD first — the registry's `initialize` takes the sWOOD address.
-        StakedWood swoodImpl = new StakedWood();
-        bytes memory swoodInit = abi.encodeCall(
-            StakedWood.initialize,
-            (StakedWood.InitParams({
-                    owner: regOwner,
-                    wood: address(wood),
-                    factory: regFactory,
-                    minGuardianStake: 10_000e18,
-                    coolDownPeriod: 7 days,
-                    minOwnerStake: 10_000e18,
-                    minSlashBps: 1000,
-                    maxSlashBps: 9999,
-                    ageFloorBps: 2500,
-                    maturationPeriod: 30 days
-                }))
+        swood = _deployStakedWood(
+            StakedWood.InitParams({
+                owner: regOwner,
+                wood: address(wood),
+                factory: regFactory,
+                minGuardianStake: 10_000e18,
+                coolDownPeriod: 7 days,
+                minOwnerStake: 10_000e18,
+                minSlashBps: 1000,
+                maxSlashBps: 9999,
+                ageFloorBps: 2500,
+                maturationPeriod: 30 days
+            })
         );
-        swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
-        GuardianRegistry regImpl = new GuardianRegistry(6 hours);
-        bytes memory regInit = abi.encodeCall(
-            GuardianRegistry.initialize, (regOwner, regFactory, address(swood), reviewPeriod, blockQuorumBps)
+        registry = _deployRegistry(
+            abi.encodeCall(
+                GuardianRegistry.initialize, (regOwner, regFactory, address(swood), reviewPeriod, blockQuorumBps)
+            )
         );
-        registry = GuardianRegistry(address(new ERC1967Proxy(address(regImpl), regInit)));
 
         // Resolve the registry ↔ sWOOD circular dependency.
         vm.prank(regOwner);

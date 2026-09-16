@@ -1,0 +1,876 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+import {ProtocolFixture} from "../helpers/ProtocolFixture.sol";
+
+import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
+import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
+import {SyndicateVault} from "../../src/SyndicateVault.sol";
+import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
+import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+
+contract CollaborativeProposalsTest is ProtocolFixture {
+    SyndicateGovernor public governor;
+
+    /// @dev Widest legal risk envelope, computed once in setUp (see there).
+    ISyndicateGovernor.RiskEnvelope internal permissiveEnv;
+    SyndicateVault public vault;
+    BatchExecutorLib public executorLib;
+    ERC20Mock public usdc;
+    MockAgentRegistry public agentRegistry;
+    MockRegistryMinimal public guardianRegistry;
+
+    address public owner = makeAddr("owner");
+    address public leadAgent = makeAddr("leadAgent");
+    address public leadAgentEoa = makeAddr("leadAgentEoa");
+    address public coAgent1 = makeAddr("coAgent1");
+    address public coAgent1Eoa = makeAddr("coAgent1Eoa");
+    address public coAgent2 = makeAddr("coAgent2");
+    address public coAgent2Eoa = makeAddr("coAgent2Eoa");
+    address public lp1 = makeAddr("lp1");
+    address public lp2 = makeAddr("lp2");
+    address public random = makeAddr("random");
+
+    uint256 public leadNftId;
+    uint256 public coNftId1;
+    uint256 public coNftId2;
+
+    ERC20Mock public targetToken;
+
+    uint256 constant VOTING_PERIOD = 1 days;
+    uint256 constant EXECUTION_WINDOW = 1 days;
+    uint256 constant VETO_THRESHOLD_BPS = 4000;
+    uint256 constant MAX_PERF_FEE_BPS = 1500;
+    uint256 constant COOLDOWN_PERIOD = 1 days;
+
+    function setUp() public {
+        usdc = new ERC20Mock("USD Coin", "USDC", 6);
+        targetToken = new ERC20Mock("Target", "TGT", 18);
+        executorLib = new BatchExecutorLib();
+        agentRegistry = new MockAgentRegistry();
+        guardianRegistry = new MockRegistryMinimal();
+
+        leadNftId = agentRegistry.mint(leadAgent);
+        coNftId1 = agentRegistry.mint(coAgent1);
+        coNftId2 = agentRegistry.mint(coAgent2);
+
+        // Deploy the vault first — the per-vault governor is initialized with the
+        // vault address, so the vault proxy must exist before the governor.
+        vault = _deployVault(
+            ISyndicateVault.InitParams({
+                asset: address(usdc),
+                name: "Sherwood Vault",
+                symbol: "swUSDC",
+                owner: owner,
+                executorImpl: address(executorLib),
+                openDeposits: true,
+                agentRegistry: address(agentRegistry),
+                managementFeeBps: 50
+            })
+        );
+
+        // Deploy the per-vault governor bound to this vault.
+        governor = _deployGovernor(
+            abi.encodeCall(
+                SyndicateGovernor.initialize,
+                (
+                    address(vault), // vault_: this test's vault (per-vault governor)
+                    address(guardianRegistry),
+                    address(new ProtocolConfig(owner)),
+                    address(this),
+                    address(deployTierRegistry(address(this))), // factory (test contract)
+                    ISyndicateGovernor.GovernorParams({
+                        votingPeriod: VOTING_PERIOD,
+                        executionWindow: EXECUTION_WINDOW,
+                        vetoThresholdBps: VETO_THRESHOLD_BPS,
+                        maxPerformanceFeeBps: MAX_PERF_FEE_BPS,
+                        cooldownPeriod: COOLDOWN_PERIOD,
+                        collaborationWindow: 48 hours,
+                        maxCoProposers: 5,
+                        minStrategyDuration: 1 days,
+                        maxStrategyDuration: 7 days
+                    })
+                )
+            )
+        );
+
+        // The vault resolves its governor via factory.governorOf(vault); this test
+        // contract is the vault's factory, so mock the lookup.
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+
+        // Register agents
+        vm.startPrank(owner);
+        vault.registerAgent(leadNftId, leadAgent);
+        vault.registerAgent(coNftId1, coAgent1);
+        vault.registerAgent(coNftId2, coAgent2);
+        vm.stopPrank();
+
+        // Fund LPs
+        usdc.mint(lp1, 100_000e6);
+        usdc.mint(lp2, 100_000e6);
+
+        vm.startPrank(lp1);
+        usdc.approve(address(vault), 60_000e6);
+        vault.deposit(60_000e6, lp1);
+        vm.stopPrank();
+
+        vm.startPrank(lp2);
+        usdc.approve(address(vault), 40_000e6);
+        vault.deposit(40_000e6, lp2);
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 1);
+
+        // Widest legal envelope at setUp TVL (finding 3 ceiling). Hoisted to a
+        // state var: computing it inline made an external staticcall between
+        // vm.prank/vm.expectRevert and propose(), consuming the cheatcode.
+        permissiveEnv = GovEnvelope.permissive(address(vault));
+    }
+
+    // ==================== HELPERS ====================
+
+    function _emptyCoProposers() internal pure returns (ISyndicateGovernor.CoProposer[] memory) {
+        return new ISyndicateGovernor.CoProposer[](0);
+    }
+
+    function _simpleExecuteCalls() internal view returns (BatchExecutorLib.Call[] memory) {
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 50_000e6)), value: 0
+        });
+        return calls;
+    }
+
+    function _simpleSettlementCalls() internal view returns (BatchExecutorLib.Call[] memory) {
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 0)), value: 0
+        });
+        return calls;
+    }
+
+    /// @dev Create a collaborative proposal with lead (60%) + coAgent1 (30%) + coAgent2 (10%)
+    function _createCollabProposal() internal returns (uint256 proposalId) {
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](2);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent1, splitBps: 3000});
+        coProps[1] = ISyndicateGovernor.CoProposer({agent: coAgent2, splitBps: 1000});
+
+        vm.prank(owner);
+        vault.setAgentFeeBps(1500);
+        vm.prank(leadAgent);
+        proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://collab",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps
+        );
+    }
+
+    /// @dev Create a collaborative proposal with lead (40%) + THREE co-props
+    ///      (20% each) — `_createCollabProposal()` only ever has two, which
+    ///      makes a single approval already "all but one" under
+    ///      `_requireNotNearQuorum`'s `total == 2` case. A third co-proposer
+    ///      is what lets a partial-approval test land NOT near quorum (see
+    ///      `test_rejection_byLead_notNearQuorum_stillCancels`).
+    function _createThreeCoProposerCollabProposal() internal returns (uint256 proposalId) {
+        address co3 = makeAddr("co3");
+        // startPrank, not prank: `agentRegistry.mint(co3)` sits in argument
+        // position and is evaluated FIRST, so a one-shot `vm.prank` would be
+        // consumed by the mint and `registerAgent` would run unpranked.
+        // Mirrors the multi-agent registration at the bottom of this file.
+        vm.startPrank(owner);
+        vault.registerAgent(agentRegistry.mint(co3), co3);
+        vm.stopPrank();
+
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](3);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent1, splitBps: 2000});
+        coProps[1] = ISyndicateGovernor.CoProposer({agent: coAgent2, splitBps: 2000});
+        coProps[2] = ISyndicateGovernor.CoProposer({agent: co3, splitBps: 2000});
+
+        vm.prank(owner);
+        vault.setAgentFeeBps(1500);
+        vm.prank(leadAgent);
+        proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://collab3",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps
+        );
+    }
+
+    /// @dev Create collab proposal, get all approvals, advance to Pending
+    function _createApprovedCollabProposal() internal returns (uint256 proposalId) {
+        proposalId = _createCollabProposal();
+        vm.prank(coAgent1);
+        governor.approveCollaboration(proposalId);
+        vm.prank(coAgent2);
+        governor.approveCollaboration(proposalId);
+        vm.warp(block.timestamp + 1);
+    }
+
+    /// @dev Create collab proposal, approve, vote, advance past voting
+    function _createVotedCollabProposal() internal returns (uint256 proposalId) {
+        proposalId = _createApprovedCollabProposal();
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+    }
+
+    /// @dev Full lifecycle up to execution
+    function _createAndExecuteCollabProposal() internal returns (uint256 proposalId) {
+        proposalId = _createVotedCollabProposal();
+        governor.executeProposal(proposalId);
+    }
+
+    // ==================== SOLO BACKWARD COMPATIBILITY ====================
+
+    function test_soloProposal_backwardCompatible() public {
+        vm.prank(leadAgent);
+        uint256 proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://solo",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Pending));
+
+        ISyndicateGovernor.CoProposer[] memory coProps = governor.getCoProposers(proposalId);
+        assertEq(coProps.length, 0);
+    }
+
+    function test_soloProposal_settlementGoesToProposer() public {
+        vm.prank(owner);
+        vault.setAgentFeeBps(1500);
+        vm.prank(leadAgent);
+        uint256 proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://solo",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+        vm.warp(block.timestamp + 1);
+
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+        governor.executeProposal(proposalId);
+
+        usdc.mint(address(vault), 10_000e6);
+        uint256 leadBalBefore = usdc.balanceOf(leadAgent);
+
+        // MS-H3: proposer self-settle requires MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE.
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+        vm.prank(leadAgent);
+        governor.settleProposal(proposalId);
+
+        // With no co-proposers the lead takes the agent side of BOTH fees
+        // whole. What this test guards is that a solo proposal routes to the
+        // proposer rather than being split or stranded, not the exact amount.
+        uint256 lead = usdc.balanceOf(leadAgent) - leadBalBefore;
+        assertGt(lead, 0, "the solo proposer is paid");
+        // 15% of the 10k gain is 1500, of which the agent takes 60%; the
+        // management fee adds a little on top. Bound it so a runaway or
+        // mis-split payout still fails.
+        assertLt(lead, 1_500e6, "and never more than the whole performance fee");
+    }
+
+    // ==================== COLLABORATIVE PROPOSAL CREATION ====================
+
+    function test_collabProposal_createdInDraftState() public {
+        uint256 proposalId = _createCollabProposal();
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Draft));
+    }
+
+    function test_collabProposal_storesCoProposers() public {
+        uint256 proposalId = _createCollabProposal();
+        ISyndicateGovernor.CoProposer[] memory coProps = governor.getCoProposers(proposalId);
+        assertEq(coProps.length, 2);
+        assertEq(coProps[0].agent, coAgent1);
+        assertEq(coProps[0].splitBps, 3000);
+        assertEq(coProps[1].agent, coAgent2);
+        assertEq(coProps[1].splitBps, 1000);
+    }
+
+    // ==================== FULL CONSENT FLOW ====================
+
+    function test_fullConsentFlow_allApprove_transitionsToPending() public {
+        uint256 proposalId = _createCollabProposal();
+
+        vm.prank(coAgent1);
+        governor.approveCollaboration(proposalId);
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Draft));
+
+        vm.prank(coAgent2);
+        governor.approveCollaboration(proposalId);
+        p = governor.getProposal(proposalId);
+        assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Pending));
+    }
+
+    /// @notice The collaborative path stamps the veto ELECTORATE as well as the
+    ///         snapshot. Without it `votableSupply` is zero, `_computeState` skips
+    ///         the veto branch, and no Against vote can ever reject a collaborative
+    ///         proposal. lp1 holds 60% of supply against a 40% bar.
+    function test_approveCollaboration_stampsTheVetoElectorate() public {
+        uint256 proposalId = _createApprovedCollabProposal();
+
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(p.votableSupply, vault.totalSupply(), "electorate not stamped at the transition");
+
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.Against);
+        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+
+        assertEq(
+            uint256(governor.getProposalState(proposalId)),
+            uint256(ISyndicateGovernor.ProposalState.Rejected),
+            "veto did not reject a collaborative proposal"
+        );
+    }
+
+    /// @notice G-C1: approveCollaboration() must also stamp the snapshot at
+    ///         block.timestamp - 1 when Draft -> Pending transition fires, so
+    ///         a same-block delegation cannot be counted. Mirrors propose().
+    function test_approveCollaboration_snapshotIsPriorTimestamp() public {
+        uint256 proposalId = _createCollabProposal();
+        vm.prank(coAgent1);
+        governor.approveCollaboration(proposalId);
+        uint256 tsAtTransition = block.timestamp;
+        vm.prank(coAgent2);
+        governor.approveCollaboration(proposalId);
+
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Pending));
+        assertEq(p.snapshotTimestamp, tsAtTransition - 1);
+    }
+
+    function test_fullConsentFlow_votingTimestampsResetOnTransition() public {
+        uint256 proposalId = _createCollabProposal();
+        vm.warp(block.timestamp + 12 hours);
+
+        vm.prank(coAgent1);
+        governor.approveCollaboration(proposalId);
+        vm.prank(coAgent2);
+        governor.approveCollaboration(proposalId);
+
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        // G-C1: snapshot stamped one second in the past so same-block
+        // delegations cannot count via ERC20Votes.getPastVotes.
+        assertEq(p.snapshotTimestamp, block.timestamp - 1);
+        assertEq(p.voteEnd, block.timestamp + VOTING_PERIOD);
+        assertEq(p.executeBy, block.timestamp + VOTING_PERIOD + EXECUTION_WINDOW);
+    }
+
+    function test_fullConsentFlow_completeLifecycle() public {
+        uint256 proposalId = _createAndExecuteCollabProposal();
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Executed));
+        assertTrue(vault.redemptionsLocked());
+    }
+
+    // ==================== REJECTION ====================
+
+    /// @notice Sherlock #9: rejection is lead-only post-fix; co-proposers
+    ///         who disagree must withhold their approval. Lead bails the
+    ///         collab early instead of waiting for the collab window to
+    ///         lapse.
+    function test_rejection_byLead_cancelsProposal() public {
+        uint256 proposalId = _createCollabProposal();
+        vm.prank(leadAgent);
+        governor.rejectCollaboration(proposalId);
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Cancelled));
+    }
+
+    /// @notice Audit issue #181 finding #16: `rejectCollaboration` performs the
+    ///         IDENTICAL Draft -> Cancelled transition, by the SAME actor
+    ///         (`proposal.proposer`), as `cancelProposal`'s Draft branch — but
+    ///         used to skip that branch's `_requireNotNearQuorum` guard
+    ///         entirely. `_createCollabProposal()` has exactly two
+    ///         co-proposers, so a SINGLE approval already leaves the Draft
+    ///         "all but one approved" (`_requireNotNearQuorum`'s `total == 2`
+    ///         case), which is exactly the front-run window the guard exists
+    ///         to close: without it, the lead could watch the final approval
+    ///         land in the mempool and race a `rejectCollaboration` in ahead
+    ///         of it, burning the last co-proposer's approve gas for nothing,
+    ///         at will and for free. Both entrypoints must refuse identically
+    ///         here, or a lead near quorum simply routes around whichever one
+    ///         still enforces the guard.
+    /// @dev Renamed from `test_rejection_byLead_afterPartialApproval_cancels`
+    ///      (issue #181 finding #16): the old name and body pinned the
+    ///      pre-fix behaviour — this same setup used to succeed and cancel
+    ///      the Draft. Post-fix it must revert. See
+    ///      `test_rejection_byLead_notNearQuorum_stillCancels` below for the
+    ///      companion case proving the guard is narrow, not a blanket ban on
+    ///      lead rejection.
+    function test_rejection_byLead_nearQuorum_reverts() public {
+        uint256 proposalId = _createCollabProposal();
+        vm.prank(coAgent1);
+        governor.approveCollaboration(proposalId);
+        vm.prank(leadAgent);
+        vm.expectRevert(ISyndicateGovernor.CancelNotAllowedNearQuorum.selector);
+        governor.rejectCollaboration(proposalId);
+    }
+
+    /// @notice Companion to `test_rejection_byLead_nearQuorum_reverts`: the
+    ///         near-quorum guard is narrow, not a blanket ban on the lead ever
+    ///         declining a collaboration. With THREE co-proposers, one
+    ///         approval leaves two outstanding (`_requireNotNearQuorum`'s
+    ///         `approvedCount + 1 >= total` is `1 + 1 >= 3`, false), so the
+    ///         Draft is not one approval away from Pending and
+    ///         `rejectCollaboration` must still succeed exactly as it did
+    ///         before the fix. Without this case, the fix above would read as
+    ///         though the lead can never decline post-approval, which would be
+    ///         a real regression in coverage, not just a stricter guard.
+    function test_rejection_byLead_notNearQuorum_stillCancels() public {
+        uint256 proposalId = _createThreeCoProposerCollabProposal();
+        vm.prank(coAgent1);
+        governor.approveCollaboration(proposalId);
+        vm.prank(leadAgent);
+        governor.rejectCollaboration(proposalId);
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Cancelled));
+    }
+
+    /// @notice Sherlock run #1 finding #9 — any co-proposer used to be able
+    ///         to unilaterally cancel a Draft by calling `rejectCollaboration`,
+    ///         enabling a single hostile co-prop to grief the lead. Post-fix,
+    ///         co-proposer rejection reverts with `NotLeadProposer`; protest
+    ///         channel is withholding approval (Draft lapses at the collab
+    ///         window).
+    function test_rejection_byCoProposer_revertsAfterFix() public {
+        uint256 proposalId = _createCollabProposal();
+        vm.prank(coAgent1);
+        vm.expectRevert(ISyndicateGovernor.NotLeadProposer.selector);
+        governor.rejectCollaboration(proposalId);
+    }
+
+    // ==================== EXPIRY ====================
+
+    function test_expiry_afterDeadline_autoResolves() public {
+        uint256 proposalId = _createCollabProposal();
+        vm.prank(coAgent1);
+        governor.approveCollaboration(proposalId);
+        vm.warp(block.timestamp + 48 hours + 1);
+        assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Expired));
+    }
+
+    function test_expiry_beforeDeadline_stillDraft() public {
+        uint256 proposalId = _createCollabProposal();
+        assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Draft));
+    }
+
+    function test_expiry_blocksApproval() public {
+        uint256 proposalId = _createCollabProposal();
+        vm.warp(block.timestamp + 48 hours + 1);
+        vm.prank(coAgent1);
+        vm.expectRevert(ISyndicateGovernor.CollaborationExpired.selector);
+        governor.approveCollaboration(proposalId);
+    }
+
+    // ==================== SETTLEMENT FEE DISTRIBUTION ====================
+
+    function test_settlement_feeDistribution_collaborative() public {
+        // Lead 60%, coAgent1 30%, coAgent2 10%
+        uint256 proposalId = _createAndExecuteCollabProposal();
+        usdc.mint(address(vault), 10_000e6);
+
+        uint256 leadBalBefore = usdc.balanceOf(leadAgent);
+        uint256 co1BalBefore = usdc.balanceOf(coAgent1);
+        uint256 co2BalBefore = usdc.balanceOf(coAgent2);
+
+        // MS-H3: proposer self-settle requires MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE.
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+        vm.prank(leadAgent);
+        governor.settleProposal(proposalId);
+
+        // The agent pot is now management + performance rather than performance
+        // alone, so absolute amounts moved. What this test guards is the SPLIT
+        // — 30 / 10 / 60 — which is invariant to the size of the pot.
+        uint256 co1 = usdc.balanceOf(coAgent1) - co1BalBefore;
+        uint256 co2 = usdc.balanceOf(coAgent2) - co2BalBefore;
+        uint256 lead = usdc.balanceOf(leadAgent) - leadBalBefore;
+        uint256 pot = co1 + co2 + lead;
+
+        assertGt(pot, 0, "the agent side was paid");
+        assertApproxEqRel(co1, (pot * 3000) / 10_000, 1e15, "coAgent1 takes 30%");
+        assertApproxEqRel(co2, (pot * 1000) / 10_000, 1e15, "coAgent2 takes 10%");
+        assertApproxEqRel(lead, (pot * 6000) / 10_000, 1e15, "lead takes the remaining 60%");
+    }
+
+    function test_settlement_feeDistribution_managementFeeUnchanged() public {
+        uint256 proposalId = _createAndExecuteCollabProposal();
+        usdc.mint(address(vault), 10_000e6);
+        uint256 ownerBalBefore = usdc.balanceOf(owner);
+
+        // MS-H3: proposer self-settle requires MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE.
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+        vm.prank(leadAgent);
+        governor.settleProposal(proposalId);
+
+        // The owner is paid its 10% share of the PERFORMANCE fee — it has no
+        // share of the management leg, which splits agent/protocol/guardian
+        // only. Under the old waterfall the owner received the management fee
+        // itself, hence the retired 42.5 figure.
+        assertGt(usdc.balanceOf(owner), ownerBalBefore, "owner earns its performance share");
+    }
+
+    function test_settlement_noProfit_noDistribution() public {
+        uint256 proposalId = _createAndExecuteCollabProposal();
+        uint256 leadBalBefore = usdc.balanceOf(leadAgent);
+        uint256 co1BalBefore = usdc.balanceOf(coAgent1);
+
+        // MS-H3: proposer self-settle requires MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE.
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+        vm.prank(leadAgent);
+        governor.settleProposal(proposalId);
+
+        // The always-on management fee is charged even with no profit, and the
+        // agent's share of it flows through the SAME co-proposer split as
+        // carry — so both balances move. What must not happen is a
+        // performance distribution, which the zero-profit case guarantees.
+        assertGt(usdc.balanceOf(leadAgent), leadBalBefore, "lead earns its management share");
+        assertGt(usdc.balanceOf(coAgent1), co1BalBefore, "co-proposer shares the management fee too");
+    }
+
+    // ==================== ROUNDING ====================
+
+    function test_settlement_rounding_leadGetsRemainder() public {
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](2);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent1, splitBps: 3333});
+        coProps[1] = ISyndicateGovernor.CoProposer({agent: coAgent2, splitBps: 3334});
+
+        vm.prank(owner);
+        vault.setAgentFeeBps(1500);
+        vm.prank(leadAgent);
+        uint256 proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://round",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps
+        );
+
+        vm.prank(coAgent1);
+        governor.approveCollaboration(proposalId);
+        vm.prank(coAgent2);
+        governor.approveCollaboration(proposalId);
+        vm.warp(block.timestamp + 1);
+
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+
+        governor.executeProposal(proposalId);
+        usdc.mint(address(vault), 7e6);
+
+        uint256 leadBalBefore = usdc.balanceOf(leadAgent);
+        uint256 co1BalBefore = usdc.balanceOf(coAgent1);
+        uint256 co2BalBefore = usdc.balanceOf(coAgent2);
+
+        // MS-H3: proposer self-settle requires MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE.
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+        vm.prank(leadAgent);
+        governor.settleProposal(proposalId);
+
+        // Ratio, not absolute amount — the pot now includes the management fee.
+        uint256 co1 = usdc.balanceOf(coAgent1) - co1BalBefore;
+        uint256 co2 = usdc.balanceOf(coAgent2) - co2BalBefore;
+        uint256 lead = usdc.balanceOf(leadAgent) - leadBalBefore;
+        uint256 pot = co1 + co2 + lead;
+
+        assertGt(pot, 0, "the agent side was paid");
+        assertApproxEqRel(co1, (pot * 3333) / 10_000, 1e15, "coAgent1 takes 33.33%");
+        assertApproxEqRel(co2, (pot * 3334) / 10_000, 1e15, "coAgent2 takes 33.34%");
+        // Nothing is stranded: the three shares account for the whole pot.
+        assertEq(co1 + co2 + lead, pot, "splits sum to the distributed total");
+    }
+
+    // ==================== G-C7: zero-rounding regression ====================
+
+    /// @dev 5 active co-proposers each at MIN_SPLIT_BPS (100 bps). If the agent
+    ///      fee is small enough that `fee * 100 / 10000` rounds to zero, each
+    ///      active co-prop is floored at 1 wei (C-11 fix). Settlement no
+    ///      longer reverts on tiny PnL.
+    function test_coProposerShare_floorAtOneWei() public {
+        // Register 3 additional co-props so we can hit 5 at 100bps each.
+        address co3 = makeAddr("co3");
+        address co4 = makeAddr("co4");
+        address co5 = makeAddr("co5");
+        vm.startPrank(owner);
+        vault.registerAgent(agentRegistry.mint(co3), co3);
+        vault.registerAgent(agentRegistry.mint(co4), co4);
+        vault.registerAgent(agentRegistry.mint(co5), co5);
+        vm.stopPrank();
+
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](5);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent1, splitBps: 100});
+        coProps[1] = ISyndicateGovernor.CoProposer({agent: coAgent2, splitBps: 100});
+        coProps[2] = ISyndicateGovernor.CoProposer({agent: co3, splitBps: 100});
+        coProps[3] = ISyndicateGovernor.CoProposer({agent: co4, splitBps: 100});
+        coProps[4] = ISyndicateGovernor.CoProposer({agent: co5, splitBps: 100});
+
+        vm.prank(owner);
+        vault.setAgentFeeBps(1500);
+        vm.prank(leadAgent);
+        uint256 proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://tiny",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps
+        );
+        vm.prank(coAgent1);
+        governor.approveCollaboration(proposalId);
+        vm.prank(coAgent2);
+        governor.approveCollaboration(proposalId);
+        vm.prank(co3);
+        governor.approveCollaboration(proposalId);
+        vm.prank(co4);
+        governor.approveCollaboration(proposalId);
+        vm.prank(co5);
+        governor.approveCollaboration(proposalId);
+        vm.warp(block.timestamp + 1);
+
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+
+        governor.executeProposal(proposalId);
+
+        // Profit of 49 wei of USDC. perfFeeBps=1500 => agentFee = 7.
+        // 7 * 100 / 10000 = 0 → each active co-prop floored at 1 wei.
+        // 5 co-props * 1 wei = 5 wei distributed; lead gets agentFee - 5 = 2 wei.
+        usdc.mint(address(vault), 49);
+
+        uint256 leadBefore = usdc.balanceOf(leadAgent);
+        uint256 co1Before = usdc.balanceOf(coAgent1);
+        // MS-H3: proposer self-settle requires MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE.
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+        vm.prank(leadAgent);
+        governor.settleProposal(proposalId);
+
+        // The floor-at-1-wei guard fires when a share rounds to zero. With the
+        // management fee now in the pot the shares are comfortably above that,
+        // so what remains testable here is the property the guard protects: an
+        // ACTIVE co-proposer is never paid zero, and the lead takes the rest.
+        assertGt(usdc.balanceOf(coAgent1), co1Before, "an active co-proposer is never zeroed");
+        assertGt(usdc.balanceOf(leadAgent), leadBefore, "lead gets the remainder");
+    }
+
+    /// @dev Deregistered co-proposers with splits that round to zero are
+    ///      fine — the `active && share == 0` guard only targets currently
+    ///      registered agents. This preserves the existing skip-path.
+    function test_coProposerShare_deregisteredGetsZeroOk() public {
+        uint256 proposalId = _createAndExecuteCollabProposal();
+
+        // Deregister coAgent2 — its share is now forfeit, routed to the lead.
+        vm.prank(owner);
+        vault.removeAgent(coAgent2);
+
+        // Small profit: 49 wei. Vault agent fee is 1500 bps => agentFee = 7.
+        //   coAgent1 (3000 bps, still active): 7 * 3000 / 10000 = 2
+        //   coAgent2 (1000 bps, DEREGISTERED): 7 * 1000 / 10000 = 0 → skipped (no revert)
+        //   lead: remainder = 7 - 2 = 5
+        usdc.mint(address(vault), 49);
+
+        uint256 leadBalBefore = usdc.balanceOf(leadAgent);
+        uint256 co1BalBefore = usdc.balanceOf(coAgent1);
+        uint256 co2BalBefore = usdc.balanceOf(coAgent2);
+
+        // MS-H3: proposer self-settle requires MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE.
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+        vm.prank(leadAgent);
+        governor.settleProposal(proposalId);
+
+        assertGt(usdc.balanceOf(coAgent1), co1BalBefore, "active co-prop gets non-zero share");
+        assertEq(usdc.balanceOf(coAgent2), co2BalBefore, "deregistered co-prop skipped even with zero share");
+        assertGt(usdc.balanceOf(leadAgent), leadBalBefore, "lead absorbs deregistered residual");
+    }
+
+    // ==================== VALIDATION ====================
+
+    function test_validation_leadSplitBelow10Percent() public {
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](2);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent1, splitBps: 5000});
+        coProps[1] = ISyndicateGovernor.CoProposer({agent: coAgent2, splitBps: 4100});
+
+        vm.prank(leadAgent);
+        vm.expectRevert(ISyndicateGovernor.LeadSplitTooLow.selector);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps
+        );
+    }
+
+    function test_validation_splitTooLow() public {
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](1);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent1, splitBps: 50});
+
+        vm.prank(leadAgent);
+        vm.expectRevert(ISyndicateGovernor.SplitTooLow.selector);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps
+        );
+    }
+
+    function test_validation_tooManyCoProposers() public {
+        address co3 = makeAddr("co3");
+        address co4 = makeAddr("co4");
+        address co5 = makeAddr("co5");
+        address co6 = makeAddr("co6");
+        vm.startPrank(owner);
+        vault.registerAgent(agentRegistry.mint(co3), co3);
+        vault.registerAgent(agentRegistry.mint(co4), co4);
+        vault.registerAgent(agentRegistry.mint(co5), co5);
+        vault.registerAgent(agentRegistry.mint(co6), co6);
+        vm.stopPrank();
+
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](6);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent1, splitBps: 1000});
+        coProps[1] = ISyndicateGovernor.CoProposer({agent: coAgent2, splitBps: 1000});
+        coProps[2] = ISyndicateGovernor.CoProposer({agent: co3, splitBps: 1000});
+        coProps[3] = ISyndicateGovernor.CoProposer({agent: co4, splitBps: 1000});
+        coProps[4] = ISyndicateGovernor.CoProposer({agent: co5, splitBps: 1000});
+        coProps[5] = ISyndicateGovernor.CoProposer({agent: co6, splitBps: 1000});
+
+        vm.prank(leadAgent);
+        vm.expectRevert(ISyndicateGovernor.TooManyCoProposers.selector);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps
+        );
+    }
+
+    function test_validation_unregisteredAgent() public {
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](1);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: random, splitBps: 3000});
+
+        vm.prank(leadAgent);
+        vm.expectRevert(ISyndicateGovernor.NotRegisteredAgent.selector);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps
+        );
+    }
+
+    function test_validation_duplicateCoProposer() public {
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](2);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent1, splitBps: 3000});
+        coProps[1] = ISyndicateGovernor.CoProposer({agent: coAgent1, splitBps: 2000});
+
+        vm.prank(leadAgent);
+        vm.expectRevert(ISyndicateGovernor.DuplicateCoProposer.selector);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            coProps
+        );
+    }
+
+    /// @notice P1: a collaborative proposal snapshots the fee at Draft creation
+    ///         (propose), so an owner change during the collaboration window
+    ///         cannot alter what the proposal will charge.
+    function test_collaborative_feeSnapshottedAtDraftCreation() public {
+        uint256 proposalId = _createCollabProposal(); // sets vault fee 1500, proposes
+        assertEq(governor.getProposal(proposalId).performanceFeeBps, 1500, "snapshot at Draft creation");
+        // Owner changes the live vault fee during the collaboration window.
+        vm.prank(owner);
+        vault.setAgentFeeBps(500);
+        assertEq(vault.agentFeeBps(), 500, "live vault fee changed mid-window");
+        // The proposal's snapshot is unaffected.
+        assertEq(governor.getProposal(proposalId).performanceFeeBps, 1500, "snapshot immutable through window");
+    }
+}

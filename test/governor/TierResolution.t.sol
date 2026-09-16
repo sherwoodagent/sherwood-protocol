@@ -331,7 +331,7 @@ contract TierResolutionTest is Test {
     ///         only if the live comparison prices the settle leg too — a
     ///         refactor that split the propose and execute tier resolutions
     ///         apart would regress it silently without this pin.
-    function test_she210_executeRevertsWhenSettlementLegTierRegressedSincePropose() public {
+    function test_executeRevertsWhenSettlementLegTierRegressedSincePropose() public {
         _wireTierRegistry();
         _certifyBenignSettleLeg();
         _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 50);
