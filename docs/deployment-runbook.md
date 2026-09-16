@@ -72,9 +72,10 @@ Nothing is read from the environment. Every number comes from
 with `--unlocked --sender 0x5A00afAecE9CF61A768E2AE2713084C8d354DF94` instead of
 `--account`. Posture is derived from the chain id, so there is no flag: the fork
 mints `ForkWoodFeedFixture` (priced off the fork's own pair reserves x the live
-ETH/USD answer) instead of `WoodPoolFeed`, skips the handoff entirely, and
-completes in one run. A fork book carrying `OWNER_MULTISIG` is REFUSED — that key
-is what says "hand off", so its presence on a fork is a mistake, not a choice.
+ETH/USD answer) instead of `WoodPoolFeed`, and completes in one run. A fork owns
+itself: the handoff still runs, with the deployer as its own target, so it changes
+nothing. A fork book may name `OWNER_MULTISIG` only when it equals `DEPLOYER`,
+which keeps a mainnet Safe from being handed a fork by a copied book.
 Verify with `./script/verify-robinhood.sh 9994663`.
 
 `DeployWood` is skipped on both: WOOD is already live at
