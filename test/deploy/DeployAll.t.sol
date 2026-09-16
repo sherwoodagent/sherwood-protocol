@@ -579,7 +579,9 @@ contract DeployAllTest is DeployAllFixture {
         vm.chainId(SCRATCH_CHAIN_ID);
         script.exposed_persist(s, i, cp);
 
+        // Read, then delete BEFORE asserting: a failed assert must not leave a book on disk.
         string memory written = vm.readFile(path);
+        vm.removeFile(path);
         assertEq(vm.parseJsonAddress(written, ".CREATE3_FACTORY"), s.create3Factory, "CREATE3_FACTORY");
         assertEq(vm.parseJsonAddress(written, ".SYNDICATE_FACTORY"), s.core.factoryProxy, "SYNDICATE_FACTORY");
         assertEq(vm.parseJsonAddress(written, ".GUARDIAN_REGISTRY"), s.core.registryProxy, "GUARDIAN_REGISTRY");
@@ -593,7 +595,6 @@ contract DeployAllTest is DeployAllFixture {
         assertEq(vm.parseJsonAddress(written, ".TOKEN_COURT"), s.tokenCourt, "TOKEN_COURT");
         // Governors are per-vault; the key is recorded as zero rather than left absent.
         assertEq(vm.parseJsonAddress(written, ".SYNDICATE_GOVERNOR"), address(0), "SYNDICATE_GOVERNOR");
-        vm.removeFile(path);
     }
 
     /// @notice A run that stopped at the feed gate records no Plan B address.
@@ -609,10 +610,10 @@ contract DeployAllTest is DeployAllFixture {
         script.exposed_persist(s, i, cp);
 
         string memory written = vm.readFile(path);
+        vm.removeFile(path);
         assertEq(vm.parseJsonAddress(written, ".WOOD_USD_FEED"), s.woodUsdFeed, "the feed IS recorded");
         assertFalse(vm.keyExistsJson(written, ".EXPOSURE_LEDGER"), "no ledger key before the gate opens");
         assertFalse(vm.keyExistsJson(written, ".CHALLENGE_GAME"), "no game key before the gate opens");
         assertFalse(vm.keyExistsJson(written, ".TOKEN_COURT"), "no court key before the gate opens");
-        vm.removeFile(path);
     }
 }
