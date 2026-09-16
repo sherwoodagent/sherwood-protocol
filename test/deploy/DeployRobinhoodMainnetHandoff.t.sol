@@ -32,11 +32,9 @@ contract MockOwned2Step {
     }
 }
 
-/// @notice Exposes the two internals the ceremony's correctness actually lives
-///         in. `run()` is not driven here: it reads its whole address book from
-///         `vm.envAddress`, and `vm.setEnv` writes the shared process
-///         environment that forge does not roll back between tests and that
-///         every parallel suite races.
+/// @notice `DeployRobinhoodMainnet` is an abstract mixin; this makes it concrete and lifts the
+///         three internals the ceremony's correctness lives in into reach. The whole-ceremony
+///         entry point is `DeployAll.run()`, driven by its own suite.
 contract DeployRobinhoodMainnetHarness is DeployRobinhoodMainnet {
     function exposed_handoff(Deployed memory d, address ownerMultisig) external {
         _handoffRobinhood(d, ownerMultisig);
@@ -53,10 +51,9 @@ contract DeployRobinhoodMainnetHarness is DeployRobinhoodMainnet {
 
 /// @title DeployRobinhoodMainnet — multisig handoff regression
 ///
-/// @notice The Robinhood override reimplements `run()` rather than extending the
-///         canonical one, and had NO test at all. Two defects had accumulated in
-///         that gap, both of which only appear on the real mainnet path
-///         (`SKIP_MULTISIG_HANDOFF` unset), which is why fork runs never saw them:
+/// @notice The Robinhood half of the ceremony had NO test at all. Two defects had accumulated in
+///         that gap, both of which only appear on the mainnet posture (a real Safe to hand off
+///         to), which is why fork runs never saw them:
 ///
 ///           1. `TierRegistry` was never handed off. `deployCore` mints it owned
 ///              by the deployer and wires it into the factory; the override moved
@@ -90,14 +87,7 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
 
         DeploySherwood.Config memory cfg = DeploySherwood.Config({
-            ensRegistrar: address(0),
-            agentRegistry: address(0),
-            managementFeeBps: 200,
-            maxStrategyDays: 14,
-            votingPeriod: 1 days,
-            woodToken: address(wood),
-            slashAppealSeed: 0,
-            epochZeroSeed: 0
+            ensRegistrar: address(0), agentRegistry: address(0), managementFeeBps: 200, woodToken: address(wood)
         });
 
         // `deployCore`'s inner `c3.deploy` calls run as the harness address, so
@@ -118,9 +108,8 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
 
     /// @dev THE THIRD DEFECT IN THIS GAP, found by the 2026-08-19 fork redeploy.
     ///      `deployCore` mints the TierRegistry EMPTY and wires it into the
-    ///      factory; the attestations are separate `onlyOwner` writes that the
-    ///      canonical `DeploySherwood.run()` makes and this override — which
-    ///      reimplements `run()` rather than extending it — did not.
+    ///      factory; the attestations are separate `onlyOwner` writes that the Robinhood half of
+    ///      the ceremony did not make.
     ///
     ///      The consequence is not cosmetic. `isCounterpartyAllowed` gates
     ///      CLONE-INIT, so an unattested counterparty means every
@@ -143,13 +132,12 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
         );
     }
 
-    /// @dev THE ORDERING THIS DEPENDS ON. Every write in `_seatOwnerWrites` is
-    ///      `onlyOwner` on a contract `_handoffRobinhood` then transfers, so the
-    ///      seeding has exactly one window. `TierRegistry` is `Ownable2Step`, so
-    ///      the transfer alone leaves the deployer in charge — the window closes
-    ///      only when the Safe accepts. This pins the failure that a later
-    ///      refactor moving the seed call BELOW the handoff would introduce.
-    function test_seatOwnerWrites_isSkippedOnceTheSafeHasAccepted() public {
+    /// @notice Seeding after the Safe has accepted is refused, not skipped.
+    /// @dev Every write in `_seatOwnerWrites` is `onlyOwner` on a contract `_handoffRobinhood` then
+    ///      transfers, so the seeding has exactly one window; `TierRegistry` is `Ownable2Step`, so
+    ///      it closes only when the Safe accepts. A refactor moving the seed below the handoff hits
+    ///      this revert instead of shipping an empty registry.
+    function test_seatOwnerWrites_revertsOnceTheSafeHasAccepted() public {
         DeployRobinhoodMainnetHarness fresh = new DeployRobinhoodMainnetHarness();
         TierRegistry registry = new TierRegistry(address(fresh));
 
@@ -160,13 +148,10 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
 
         DeploySherwood.Deployed memory stale = d;
         stale.tierRegistry = address(registry);
-        stale.protocolConfig = d.protocolConfig;
 
-        // Seeding SKIPS rather than reverting — it is best-effort by design and
-        // logs a RUNBOOK line. The point of the assert is that the launch set
-        // does NOT land, so a seed call that drifted below the handoff produces
-        // a ceremony that looks clean and ships an empty registry.
-        vm.prank(address(harness));
+        vm.expectRevert(
+            bytes("PRE-FLIGHT: TIER_REGISTRY owner is not the deployer - seed the launch set before the Safe accepts")
+        );
         harness.exposed_seatOwnerWrites(stale, address(harness));
 
         assertFalse(
@@ -204,10 +189,9 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
 
     // ── The fork posture ──
 
-    /// @dev `SKIP_MULTISIG_HANDOFF=true`: the deployer keeps everything and the
-    ///      two-step pair has no pending owner. This is the path every fork run
-    ///      in this repo exercises, and the one that stayed green while the
-    ///      mainnet path was broken.
+    /// @dev Fork posture: the deployer keeps everything and the two-step pair has no pending
+    ///      owner. This is the path every fork run exercises, and the one that stayed green while
+    ///      the mainnet path was broken.
     function test_validate_passesWhenTheHandoffIsSkipped() public view {
         harness.exposed_validate(d, address(harness), address(0), address(wood));
     }

@@ -90,44 +90,6 @@ abstract contract ScriptBase is Script {
         }
     }
 
-    /// @notice Write core deployed addresses to chains/{chainId}.json.
-    /// @dev When the file already exists, patches the core keys IN PLACE so
-    ///      pre-existing keys (templates, ENS, PRICE_ROUTER, WOOD_TOKEN written
-    ///      by other phases) survive — the deploy phases are order-independent
-    ///      and re-runnable. Only a first-ever deploy on a novel chain serializes
-    ///      a fresh object. (Previously this overwrote the whole file, silently
-    ///      dropping every key it didn't own.)
-    function _writeAddresses(
-        string memory name,
-        address deployer,
-        address factory,
-        address governor,
-        address executorLib,
-        address vaultImpl
-    ) internal {
-        string memory path = _chainsPath();
-        if (_fileExists(path)) {
-            _patchAddress("BATCH_EXECUTOR_LIB", executorLib);
-            _patchAddress("DEPLOYER", deployer);
-            _patchAddress("SYNDICATE_FACTORY", factory);
-            _patchAddress("SYNDICATE_GOVERNOR", governor);
-            _patchAddress("SYNDICATE_VAULT_IMPL", vaultImpl);
-            vm.writeJson(vm.toString(block.chainid), path, ".chainId");
-            vm.writeJson(string.concat("\"", name, "\""), path, ".name");
-        } else {
-            string memory obj = "deploy";
-            vm.serializeAddress(obj, "BATCH_EXECUTOR_LIB", executorLib);
-            vm.serializeAddress(obj, "DEPLOYER", deployer);
-            vm.serializeAddress(obj, "SYNDICATE_FACTORY", factory);
-            vm.serializeAddress(obj, "SYNDICATE_GOVERNOR", governor);
-            vm.serializeAddress(obj, "SYNDICATE_VAULT_IMPL", vaultImpl);
-            vm.serializeUint(obj, "chainId", block.chainid);
-            string memory json = vm.serializeString(obj, "name", name);
-            vm.writeJson(json, path);
-        }
-        console.log("Addresses written to %s", path);
-    }
-
     /// @notice Patch a single address into chains/{chainId}.json at a top-level
     ///         key, preserving any existing keys (uses `vm.writeJson` path mode).
     /// @dev Writes the address as a flat JSON string at `.key`. The path-mode
@@ -169,8 +131,6 @@ abstract contract ScriptBase is Script {
     ///         the core deploy cannot ask "is TIER_REGISTRY in the book yet?"
     ///         without a tolerant read. Returns `address(0)` for a missing
     ///         file, key, or value; callers treat zero as "not on this chain".
-    ///         (`Deploy.s.sol` predates this and keeps its own equivalent —
-    ///         a differently-named helper here avoids shadowing that one.)
     function _optionalAddress(string memory key) internal view returns (address) {
         string memory path = _chainsPath();
         if (!_fileExists(path)) return address(0);

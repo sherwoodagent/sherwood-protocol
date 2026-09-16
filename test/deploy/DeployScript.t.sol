@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {Create3Factory} from "../../script/utils/Create3Factory.sol";
+import {DeploySalts} from "../../script/DeploySalts.sol";
 import {DeploySherwood} from "../../script/Deploy.s.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
@@ -17,23 +18,22 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 
+/// @notice `DeploySherwood` is an abstract mixin; this makes it concrete so the
+///         mirrored fee cap can be read off it.
+contract DeploySherwoodHarness is DeploySherwood {}
+
 /// @notice Simulates the Deploy.s.sol sequence (without `forge script`) to
 ///         confirm the circular dep between GuardianRegistry + SyndicateFactory
 ///         is resolved via CREATE3 address prediction. This is the CI-friendly
 ///         version of "did the deploy script run" — no fork needed.
-///
-///         The production script broadcasts the same sequence; running it with
-///         a live fork requires `BASE_RPC_URL`/etc. which we don't assume is
-///         set in CI.
 contract DeployScriptTest is Test {
-    bytes32 constant SALT_EXECUTOR = keccak256("sherwood.deploy.executor.2");
-    bytes32 constant SALT_VAULT_IMPL = keccak256("sherwood.deploy.vault-impl.2");
-    bytes32 constant SALT_GOVERNOR_IMPL = keccak256("sherwood.deploy.governor-impl.2");
-    bytes32 constant SALT_GOVERNOR_PROXY = keccak256("sherwood.deploy.governor-proxy.2");
-    bytes32 constant SALT_FACTORY_IMPL = keccak256("sherwood.deploy.factory-impl.2");
-    bytes32 constant SALT_FACTORY_PROXY = keccak256("sherwood.deploy.factory-proxy.2");
-    bytes32 constant SALT_REGISTRY_IMPL = keccak256("sherwood.deploy.guardian-registry-impl.1");
-    bytes32 constant SALT_REGISTRY_PROXY = keccak256("sherwood.deploy.guardian-registry-proxy.1");
+    bytes32 constant SALT_EXECUTOR = DeploySalts.EXECUTOR;
+    bytes32 constant SALT_VAULT_IMPL = DeploySalts.VAULT_IMPL;
+    bytes32 constant SALT_GOVERNOR_IMPL = DeploySalts.GOVERNOR_IMPL;
+    bytes32 constant SALT_FACTORY_IMPL = DeploySalts.FACTORY_IMPL;
+    bytes32 constant SALT_FACTORY_PROXY = DeploySalts.FACTORY_PROXY;
+    bytes32 constant SALT_REGISTRY_IMPL = DeploySalts.REGISTRY_IMPL;
+    bytes32 constant SALT_REGISTRY_PROXY = DeploySalts.REGISTRY_PROXY;
 
     function test_predictedFactoryAddressMatchesRealDeploy() public {
         address deployer = address(this);
@@ -149,7 +149,7 @@ contract DeployScriptTest is Test {
     ///      move together — it stays green if BOTH are reverted to 500.
     ///      (SHE-182 / SHE-18 lowered the cap from 500 to 300.)
     function test_managementFeeMirrorMatchesTheFactoryCap() public {
-        uint256 mirrored = new DeploySherwood().MAX_MANAGEMENT_FEE_BPS();
+        uint256 mirrored = new DeploySherwoodHarness().MAX_MANAGEMENT_FEE_BPS();
         assertEq(mirrored, new SyndicateFactory().MAX_MANAGEMENT_FEE_BPS(), "mirror must match the factory");
         assertEq(mirrored, 300, "the management ceiling is 3%/yr");
     }

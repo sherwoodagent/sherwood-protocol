@@ -9,186 +9,28 @@ import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {DeploySherwood} from "../Deploy.s.sol";
 
-/**
- * @notice Deploy the Sherwood core stack to Robinhood Chain mainnet (chain 4663).
- *
- *         Robinhood Chain is an Arbitrum Orbit L2 with no ENS/Durin registrar.
- *         The canonical ERC-8004 IdentityRegistry (0x8004A169…) is live on 4663,
- *         but v1 ships with identity gating OFF, so the factory is deployed
- *         with address(0) for both registrars (identity + subname disabled).
- *
- *         Inherits the canonical `DeploySherwood` and delegates the core
- *         ceremony to its `deployCore` (CREATE3-salted, insertion-order-
- *         independent) — no hand-maintained linear-nonce offsets. This override
- *         layers the Robinhood-specific bits on top: the multisig handoff,
- *         post-deploy validation, and address persistence.
- *
- *   Environment:
- *     WOOD_TOKEN            — REQUIRED. Guardian-layer WOOD custody token.
- *     OWNER_MULTISIG        — Multisig receiving ownership of the proxies as the
- *                             final step. Required unless SKIP_MULTISIG_HANDOFF.
- *     SKIP_MULTISIG_HANDOFF — "true"/"1" to keep the deployer as owner (fork/dry
- *                             runs only — never on the real mainnet ceremony).
- *
- *   Usage:
- *     WOOD_TOKEN=0x.. OWNER_MULTISIG=0xSafe.. \
- *       forge script script/robinhood-mainnet/Deploy.s.sol:DeployRobinhoodMainnet \
- *       --rpc-url robinhood --account sherwood-deployer --broadcast --slow
- */
-contract DeployRobinhoodMainnet is DeploySherwood {
-    // No ENS on Robinhood Chain; ERC-8004 exists but v1 leaves identity gating off.
-    address constant L2_REGISTRAR = address(0);
-    address constant AGENT_REGISTRY = address(0);
-
-    // Production governor / factory parameters (mirror script/Deploy.s.sol prod).
-    /// @dev 200 = the 2%-management headline of the two-number fee model, and
-    ///      the same value the canonical `DeploySherwood` defaults to. THIS IS A
-    ///      GUARDIAN-BUDGET NUMBER, NOT A REVENUE ONE: 20% of the management fee
-    ///      funds the guardian pool (`ProtocolConfig._mgmtSplit.guardianBps`),
-    ///      and it is the only leg that pays in flat and losing markets — the
-    ///      performance leg pays nothing below the high-water mark while the
-    ///      review workload is unchanged.
-    ///
-    ///      The prior 50 here was a leftover from before the split rework and
-    ///      undershot the tier-1 guardian ROE hurdle: at 50 bps the pool reaches
-    ///      0.60% of TVL/yr against the 0.90% the 15% hurdle needs. It is a
-    ///      FLOOR rather than a generous choice, because management accrues only
-    ///      while a strategy is deployed — at partial utilisation the mgmt leg
-    ///      shrinks proportionally and 200 itself lands near the hurdle.
-    ///
-    ///      STAMPED ONCE PER VAULT at `initialize`; `SyndicateVault` has no
-    ///      setter and the factory's `setManagementFeeBps` reaches only NEW
-    ///      vaults, so every fund created under a wrong value keeps it forever.
-    uint256 constant MANAGEMENT_FEE_BPS = 200;
-    uint256 constant MAX_STRATEGY_DAYS = 14;
-    uint256 constant VOTING_PERIOD = 1 days;
-
-    function run() external override {
-        // Accept Robinhood mainnet (4663) OR a Tenderly-fork chain id passed via
-        // ROBINHOOD_FORK_CHAIN_ID (e.g. 9994663) so the byte-same ceremony runs
-        // against a mainnet fork. The fork writes chains/{forkChainId}.json.
-        uint256 forkChainId = vm.envOr("ROBINHOOD_FORK_CHAIN_ID", uint256(0));
-        require(
-            block.chainid == 4663 || (forkChainId != 0 && block.chainid == forkChainId),
-            "wrong chain: expected Robinhood mainnet 4663 or ROBINHOOD_FORK_CHAIN_ID"
-        );
-
-        address woodToken = vm.envAddress("WOOD_TOKEN");
-        require(woodToken != address(0), "WOOD_TOKEN required");
-
-        bool skipHandoff = vm.envOr("SKIP_MULTISIG_HANDOFF", false);
-        address ownerMultisig = vm.envOr("OWNER_MULTISIG", address(0));
-        if (!skipHandoff) {
-            require(ownerMultisig != address(0), "OWNER_MULTISIG required (or set SKIP_MULTISIG_HANDOFF=true)");
-            require(ownerMultisig.code.length > 0, "OWNER_MULTISIG must be a contract (Safe), not an EOA");
-        }
-
-        Config memory cfg = Config({
-            ensRegistrar: L2_REGISTRAR,
-            agentRegistry: AGENT_REGISTRY,
-            managementFeeBps: MANAGEMENT_FEE_BPS,
-            maxStrategyDays: MAX_STRATEGY_DAYS,
-            votingPeriod: VOTING_PERIOD,
-            woodToken: woodToken,
-            slashAppealSeed: 0,
-            epochZeroSeed: 0
-        });
-
-        vm.startBroadcast();
-        address deployer = msg.sender;
-        console.log("Deployer:", deployer);
-        console.log("Network: Robinhood Chain (chain ID 4663)");
-
-        // Canonical core ceremony (CREATE3, order-independent + setFactory).
-        // Called on `this` so `msg.sender` inside deployCore is the broadcaster.
-        Deployed memory d = deployCore(cfg);
-
-        // ProtocolConfig ships with ZERO fee recipients (its constructor seeds
-        // only the splits), and a zero recipient does NOT strand its leg — it
-        // FOLDS INTO THE AGENT'S REMAINDER (`SyndicateGovernor._chargeManagementFee`,
-        // and again in `_chargePerformanceFee`). So an unseated recipient is not
-        // a missing payment, it is a silent re-routing of that leg to the
-        // proposer, with nothing on-chain to notice.
-        //
-        // BOTH LEGS, NOT JUST THE PROTOCOL ONE. The guardian leg is the reason
-        // MANAGEMENT_FEE_BPS is 200: 20% of management and 25% of performance
-        // fund the guardian pool. Left unseated, that whole budget pays the
-        // agent instead, and the fee level is sized for a pool receiving
-        // nothing. Seat both inside the broadcast, while the deployer still
-        // owns the config.
-        _seatOwnerWrites(d, deployer);
-
-        // Multisig handoff (final action inside the broadcast).
-        if (!skipHandoff) _handoffRobinhood(d, ownerMultisig);
-
-        vm.stopBroadcast();
-
-        // `address(0)` for the multisig is how validation is told the handoff
-        // was skipped — the fork posture, where the deployer keeps everything.
-        _validateMainnet(d, deployer, skipHandoff ? address(0) : ownerMultisig, woodToken);
-
-        // Persist. `_writeAddresses` patches the core keys in place, so the
-        // external addresses (WETH / USDG / Uniswap / Chainlink feeds) that were
-        // committed into chains/4663.json survive. SYNDICATE_GOVERNOR stays zero:
-        // governors are per-vault, resolved via `factory.governorOf(vault)`.
-        _writeAddresses("Robinhood Chain", deployer, d.factoryProxy, address(0), d.executorLib, d.vaultImpl);
-        _patchAddress("GOVERNOR_BEACON", d.beacon);
-        _patchAddress("PROTOCOL_CONFIG", d.protocolConfig);
-        _patchAddress("GUARDIAN_REGISTRY", d.registryProxy);
-        // TIER_REGISTRY is read as an env address by DeployPlanD and
-        // WireTokenCourt; without this key the later phases have nothing to
-        // read and the operator has to recover it from broadcast logs.
-        _patchAddress("TIER_REGISTRY", d.tierRegistry);
-        _patchAddress("STAKED_WOOD", d.swoodProxy);
-        _patchAddress("WOOD_TOKEN", woodToken);
-
-        console.log("SyndicateFactory:", d.factoryProxy);
-        console.log("GovernorBeacon:", d.beacon);
-        console.log("ProtocolConfig:", d.protocolConfig);
-        console.log("GuardianRegistry:", d.registryProxy);
-        console.log("StakedWood:", d.swoodProxy);
-        console.log(
-            "\nNext: forge script script/robinhood-mainnet/DeployPortfolioStrategy.s.sol --rpc-url robinhood --broadcast"
-        );
-    }
-
-    /// @notice Every write that REQUIRES the deployer to still be the owner,
-    ///         collected into one place so the set can be asserted as a set.
-    /// @dev    THIS GROUPING IS THE POINT. Each of these is an `onlyOwner` write
-    ///         on a contract `_handoffRobinhood` is about to transfer, so each
-    ///         has exactly one window in which it is cheap and an eternity
-    ///         afterwards in which it is a multisig chore. Scattered inline,
-    ///         they were three unrelated-looking statements and one of them went
-    ///         missing for the entire life of this script.
-    ///
-    ///         Fee recipients: `ProtocolConfig`'s constructor seeds only the
-    ///         SPLITS, and a zero recipient does NOT strand its leg — it folds
-    ///         into the agent's remainder in both `_chargeManagementFee` and
-    ///         `_chargePerformanceFee`. So an unseated recipient is not a
-    ///         missing payment, it is a SILENT RE-ROUTING to the proposer.
-    ///         BOTH legs, not just the protocol one: the guardian leg is why
-    ///         `MANAGEMENT_FEE_BPS` is 200, since 20% of management and 25% of
-    ///         performance fund the guardian pool. Left unseated, that whole
-    ///         budget pays the agent while depositors are charged at a rate
-    ///         sized for a pool receiving nothing. Both are seeded to the
-    ///         DEPLOYER as a PLACEHOLDER, never as the destination — the runbook
-    ///         directs the multisig to repoint them after `acceptOwnership()`.
-    ///
-    ///         TierRegistry launch set: `deployCore` mints the registry EMPTY
-    ///         and wires it into the factory; the attestations are separate
-    ///         `onlyOwner` writes. The canonical `DeploySherwood.run()` makes
-    ///         them, but this script overrides `run()` and calls `deployCore`
-    ///         directly — so until this existed, the Robinhood ceremony deployed
-    ///         an empty registry and handed it straight to the Safe. Not
-    ///         cosmetic: `isCounterpartyAllowed` GATES CLONE-INIT, so an empty
-    ///         registry makes every ConcentratedLiquidity clone revert
-    ///         `CounterpartyNotAllowed` and makes
-    ///         `DeployConcentratedLiquidityStrategy` refuse to run at all.
-    ///         Caught by the fork redeploy, where phase 4 stopped on exactly
-    ///         that.
+/// @notice The Robinhood-specific half of the core ceremony: the owner-gated writes that only the
+///         deployer can make, the multisig handoff, and the post-deploy validation table.
+///         An abstract mixin — `DeployAll` owns `run()`, the broadcast and the address book.
+///
+///         Robinhood Chain is an Arbitrum Orbit L2 with no ENS registrar. The canonical ERC-8004
+///         IdentityRegistry is live on 4663, but v1 ships with identity gating OFF, so the factory
+///         is deployed with address(0) for both registrars.
+abstract contract DeployRobinhoodMainnet is DeploySherwood {
+    /// @notice Every `onlyOwner` write the deployer must make before `_handoffRobinhood` moves the
+    ///         owner. Grouped so the set can be asserted as a set — scattered inline, one of them
+    ///         went missing for the whole life of this script.
+    /// @dev    Fee recipients are seeded to the DEPLOYER as a PLACEHOLDER: a zero recipient does not
+    ///         strand its leg, it folds into the agent's remainder silently (both
+    ///         `_chargeManagementFee` and `_chargePerformanceFee`). Set only when unset, so a
+    ///         resumed run cannot repoint a recipient the Safe has already moved.
+    ///         TierRegistry launch set: `deployCore` mints the registry EMPTY, and
+    ///         `isCounterpartyAllowed` gates CLONE-INIT — an unseeded registry makes every
+    ///         ConcentratedLiquidity clone revert `CounterpartyNotAllowed`.
     function _seatOwnerWrites(Deployed memory d, address deployer) internal {
-        ProtocolConfig(d.protocolConfig).setProtocolFeeRecipient(deployer);
-        ProtocolConfig(d.protocolConfig).setGuardiansFeeRecipient(deployer);
+        ProtocolConfig config = ProtocolConfig(d.protocolConfig);
+        if (config.protocolFeeRecipient() == address(0)) config.setProtocolFeeRecipient(deployer);
+        if (config.guardiansFeeRecipient() == address(0)) config.setGuardiansFeeRecipient(deployer);
         _seedTierRegistry(deployer, d.tierRegistry);
     }
 
