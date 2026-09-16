@@ -91,7 +91,7 @@ contract DeployAllForkTest is Test {
         _assertCoverageStack(s);
         _assertVerdictPath(s);
 
-        // Fork posture never hands off.
+        // A fork owns itself: the handoff runs and is a no-op.
         assertEq(Ownable(s.core.beacon).owner(), deployer, "beacon.owner");
         assertEq(Ownable(s.core.factoryProxy).owner(), deployer, "factory.owner");
         assertEq(Ownable(s.core.registryProxy).owner(), deployer, "registry.owner");
@@ -106,6 +106,7 @@ contract DeployAllForkTest is Test {
     function _inputs() internal view returns (Inputs memory i) {
         i.posture = Posture.Fork;
         i.deployer = deployer;
+        i.ownerMultisig = deployer;
         i.wood = _bookAddr("WOOD_TOKEN");
         i.weth = _bookAddr("WETH");
         i.usdg = _bookAddr("USDG");

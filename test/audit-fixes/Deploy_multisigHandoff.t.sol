@@ -16,8 +16,10 @@ contract DeploySherwoodHarness is DeploySherwood {}
 ///         `OWNER_MULTISIG` preconditions moved out of env into the committed address book.
 ///         The MS-H5 scenarios are restated against those entry points here.
 contract DeployMultisigHandoffTest is DeployAllFixture {
-    /// @dev A Fork book carrying `OWNER_MULTISIG`, staged for the posture refusal. Gitignored.
+    /// @dev Staged Fork books, both gitignored. Distinct chain ids because the tests in one
+    ///      suite share the filesystem and run concurrently; one path would race.
     uint256 internal constant STAGED_FORK_CHAIN_ID = 424_242;
+    uint256 internal constant STAGED_SELF_OWNED_CHAIN_ID = 424_243;
 
     function setUp() public {
         _stageCeremony();
@@ -31,6 +33,48 @@ contract DeployMultisigHandoffTest is DeployAllFixture {
         s.requireManagementFeeUnderCap(301);
         // Exactly at the cap is not over it.
         s.requireManagementFeeUnderCap(300);
+    }
+
+    /// @notice A fork owns itself, so a Fork book whose `OWNER_MULTISIG` IS its `DEPLOYER` is
+    ///         accepted and the handoff it runs changes nothing.
+    function test_run_acceptsAForkBookWhoseOwnerMultisigIsTheDeployer() public {
+        string memory path =
+            string.concat(vm.projectRoot(), "/chains/", vm.toString(STAGED_SELF_OWNED_CHAIN_ID), ".json");
+        vm.writeFile(
+            path,
+            string.concat(
+                '{"DEPLOYER":"',
+                vm.toString(deployer),
+                '","OWNER_MULTISIG":"',
+                vm.toString(deployer),
+                '","chainId":',
+                vm.toString(STAGED_SELF_OWNED_CHAIN_ID),
+                "}"
+            )
+        );
+
+        vm.chainId(STAGED_SELF_OWNED_CHAIN_ID);
+        vm.prank(deployer);
+        try script.run() {
+            vm.removeFile(path);
+            revert("the staged book is missing every external, so run() cannot have succeeded");
+        } catch Error(string memory reason) {
+            vm.removeFile(path);
+            // Past the posture gate: it now fails on the first missing external, not on the owner.
+            assertEq(reason, "WOOD_TOKEN missing from the address book", reason);
+        } catch (bytes memory) {
+            vm.removeFile(path);
+            revert("expected a named pre-flight string");
+        }
+    }
+
+    /// @notice Handing the protocol to address(0) is unrecoverable, so the handoff refuses it.
+    function test_handoffAll_refusesAnUnsetTarget() public {
+        vm.chainId(FORK_CHAIN_ID);
+        (Stack memory s,) = _runCeremony(Posture.Fork);
+
+        vm.expectRevert(bytes("handoff target unset"));
+        script.exposed_handoffAll(s, address(0));
     }
 
     /// @notice MS-H5 (C-1): the handoff moves all five one-step owners, arms the five two-step
@@ -75,9 +119,9 @@ contract DeployMultisigHandoffTest is DeployAllFixture {
         script.exposed_preflight(i);
     }
 
-    /// @notice Skipping the handoff is a POSTURE, never a flag, so a Fork book that carries
-    ///         an `OWNER_MULTISIG` is refused rather than quietly handing off.
-    function test_run_rejectsAForkBookCarryingAnOwnerMultisig() public {
+    /// @notice A fork owns itself, so a Fork book naming an `OWNER_MULTISIG` other than its
+    ///         own `DEPLOYER` is refused rather than handing the fork to a mainnet Safe.
+    function test_run_rejectsAForkBookNamingAForeignOwnerMultisig() public {
         string memory path = string.concat(vm.projectRoot(), "/chains/", vm.toString(STAGED_FORK_CHAIN_ID), ".json");
         vm.writeFile(
             path,
@@ -96,11 +140,13 @@ contract DeployMultisigHandoffTest is DeployAllFixture {
         vm.prank(deployer);
         try script.run() {
             vm.removeFile(path);
-            revert("a Fork book carrying OWNER_MULTISIG was accepted");
+            revert("a Fork book naming a foreign OWNER_MULTISIG was accepted");
         } catch Error(string memory reason) {
             vm.removeFile(path);
             assertEq(
-                reason, "Fork posture never hands off: remove OWNER_MULTISIG from this chain's address book", reason
+                reason,
+                "Fork posture hands off to the deployer: OWNER_MULTISIG must be absent or equal DEPLOYER",
+                reason
             );
         } catch (bytes memory raw) {
             // A panic or custom error would otherwise leave the staged book on disk.

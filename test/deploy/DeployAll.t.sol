@@ -144,7 +144,8 @@ abstract contract DeployAllFixture is Test {
     function _inputs(Posture posture) internal view returns (Inputs memory i) {
         i.posture = posture;
         i.deployer = deployer;
-        i.ownerMultisig = posture == Posture.Mainnet ? address(safe) : address(0);
+        // Mirrors `_readInputs`: the Safe on Mainnet, the deployer itself on a fork.
+        i.ownerMultisig = posture == Posture.Mainnet ? address(safe) : deployer;
         i.wood = address(wood);
         i.weth = address(weth);
         i.usdg = address(usdg);
@@ -389,7 +390,7 @@ contract DeployAllTest is DeployAllFixture {
         _assertVerdictPath(s);
         _assertFeeRecipients(s);
 
-        // Fork posture never hands off.
+        // A fork owns itself: the handoff runs and is a no-op.
         _assertOneStepOwners(s, deployer);
         _assertTwoStepPending(s, address(0));
         assertEq(Ownable(s.core.protocolConfig).owner(), deployer, "protocolConfig.owner");

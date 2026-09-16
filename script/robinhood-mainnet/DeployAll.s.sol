@@ -155,8 +155,9 @@ contract DeployAll is
 
         _requireNoPredictionDrift(c3, s, i.posture);
 
-        // LAST, and only on Mainnet: every phase above is `onlyOwner` on something.
-        if (i.posture == Posture.Mainnet) _handoffAll(s, i.ownerMultisig);
+        // LAST: every phase above is `onlyOwner` on something. On Fork the owner IS the
+        // deployer, so this is a no-op rather than a skipped step.
+        _handoffAll(s, i.ownerMultisig);
         cp = Checkpoint.Complete;
     }
 
@@ -263,6 +264,9 @@ contract DeployAll is
     ///      and the Safe must `acceptOwnership()`. Each leg is skipped when already done, so a
     ///      resumed run is a no-op.
     function _handoffAll(Stack memory s, address ownerMultisig) internal {
+        // Handing the protocol to address(0) is unrecoverable, and every caller that skips
+        // `_readInputs` (tests, a future phase) can reach here with an unset field.
+        require(ownerMultisig != address(0), "handoff target unset");
         _giveOneStep(s.core.beacon, ownerMultisig);
         _giveOneStep(s.core.factoryProxy, ownerMultisig);
         _giveOneStep(s.core.registryProxy, ownerMultisig);
@@ -304,8 +308,8 @@ contract DeployAll is
     // ── Inputs ──
 
     /// @dev Posture from the chain id alone: 4663 is Mainnet, any other chain with a
-    ///      committed book carrying DEPLOYER is a Fork. Skipping the handoff is a POSTURE,
-    ///      never a flag, which is why a Fork book carrying OWNER_MULTISIG is refused.
+    ///      committed book carrying DEPLOYER is a Fork. Who ends up owning the protocol is a
+    ///      POSTURE, never a flag: the Safe on Mainnet, the deployer itself on a fork or vnet.
     function _readInputs() internal view returns (Inputs memory i) {
         require(_fileExists(_chainsPath()), "wrong chain: no chains/<chainid>.json for this chain");
         i.posture = block.chainid == RobinhoodParams.MAINNET_CHAIN_ID ? Posture.Mainnet : Posture.Fork;
@@ -314,10 +318,14 @@ contract DeployAll is
         if (i.posture == Posture.Mainnet) {
             i.ownerMultisig = _required("OWNER_MULTISIG", "OWNER_MULTISIG missing from the address book");
         } else {
+            // A fork owns itself. A book key is allowed only when it says exactly that, so a
+            // mainnet Safe copied into a fork book cannot silently become the handoff target.
+            address booked = _optionalAddress("OWNER_MULTISIG");
             require(
-                _optionalAddress("OWNER_MULTISIG") == address(0),
-                "Fork posture never hands off: remove OWNER_MULTISIG from this chain's address book"
+                booked == address(0) || booked == i.deployer,
+                "Fork posture hands off to the deployer: OWNER_MULTISIG must be absent or equal DEPLOYER"
             );
+            i.ownerMultisig = i.deployer;
         }
 
         i.wood = _required("WOOD_TOKEN", "WOOD_TOKEN missing from the address book");

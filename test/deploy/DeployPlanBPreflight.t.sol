@@ -728,8 +728,8 @@ contract DeployPlanBPreflight10Test is DeployAllFixture {
         script.exposed_validateAll(s, i, Checkpoint.Complete);
     }
 
-    /// @notice Fork posture never hands off, so the owner check has no subject: the deployer
-    ///         keeps the ledger and nothing is armed.
+    /// @notice A fork hands off to the deployer, so the Safe-is-a-contract check has no
+    ///         subject: the deployer keeps the ledger and nothing is armed.
     function test_preflight10_forkPostureSkipsTheOwnerCheck() public {
         vm.chainId(FORK_CHAIN_ID);
         (Stack memory s,) = _runCeremony(Posture.Fork);

@@ -26,3 +26,4 @@ test/pocs/
 
 # Ceremony fixture: a staged Fork address book DeployMultisigHandoffTest writes and removes.
 chains/424242.json
+chains/424243.json
