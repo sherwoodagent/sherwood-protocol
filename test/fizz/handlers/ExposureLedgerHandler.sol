@@ -3,6 +3,7 @@ pragma solidity >=0.6.2 <0.9.0;
 
 import "../Base.sol";
 import {Properties} from "../Properties.sol";
+import {IExposureLedger} from "../../../src/interfaces/IExposureLedger.sol";
 
 /// @notice Handles the interaction with ExposureLedger
 ///
@@ -20,9 +21,11 @@ import {Properties} from "../Properties.sol";
 ///
 ///      `recordApproval` takes the guardian's DECLARED lock and clamps it to
 ///      the free budget. The dispatcher draws the declaration from
-///      `[0, 2 x guardianStake + 1]` so zero (locks nothing, never listed),
-///      partial, exactly-full and over-budget (clamped) declarations are all
-///      reached.
+///      `[0, 2 x guardianStake + 1]` so zero, partial, exactly-full and
+///      over-budget (clamped) declarations are all reached. Since SHE-240 a
+///      booked lock worth under one approver slot's share of the need buys no
+///      slot and reverts `ApproveLockBelowFloor`; the wrapper below treats that
+///      as the specified answer and lets every other revert surface.
 abstract contract ExposureLedgerHandler is Properties {
     // ―――――――――――――――――― Challenge economics (GL-51) ―――――――――――――――――
     // The fourth input to `ChallengeGame.honestFilingNetPayoffBps`. It lives
@@ -99,7 +102,16 @@ abstract contract ExposureLedgerHandler is Properties {
         internal
     {
         vm.prank(address(registry));
-        ledger.recordApproval(governor_, proposalId, guardian, lockWood);
+        try ledger.recordApproval(governor_, proposalId, guardian, lockWood) {}
+        catch (bytes memory err) {
+            // SHE-240: below-floor declarations are REFUSED, by design — the
+            // campaign draws plenty of them. Any other revert is a finding and
+            // must not be swallowed here.
+            require(
+                bytes4(err) == IExposureLedger.ApproveLockBelowFloor.selector,
+                "recordApproval reverted for a reason other than the slot floor"
+            );
+        }
     }
 
     function _exposureLedger_releaseApproval(address governor_, uint256 proposalId, address guardian) internal {

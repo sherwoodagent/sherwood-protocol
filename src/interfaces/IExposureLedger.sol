@@ -26,6 +26,10 @@ interface IExposureLedger {
     error CoverageHorizonExceeded();
 
     error InsufficientApproveCoverage();
+
+    /// @notice The booked lock carries less than one slot's share of the need.
+    error ApproveLockBelowFloor();
+
     error NotGuardianRegistry();
     error FeedNotConfigured();
     error StalePrice();
@@ -61,11 +65,11 @@ interface IExposureLedger {
     ///         than meaning uncapped: an unset cap would admit an unbounded market
     ///         price and hand a ~$438k pool the valuation of every guardian bond.
     ///
-    ///         HALTING SEMANTICS. Every consumer lets this propagate.
-    ///         `recordApproval` never reads it — the lock and the cap are WOOD —
-    ///         so the approve vote keeps landing through a WOOD outage. Execution,
-    ///         proposal creation, challenge filing and the fee-weight view all
-    ///         halt, which is correct: no price means no proof of coverage.
+    ///         HALTING SEMANTICS. Every consumer lets this propagate. Execution,
+    ///         proposal creation, challenge filing, the fee-weight view and the
+    ///         approve-side slot floor all halt, which is correct: no price means
+    ///         no proof of coverage, and a slot that cannot be shown to carry its
+    ///         share is not one the ledger will grant.
     error NoWoodPrice();
 
     // ── Events ──
@@ -97,15 +101,19 @@ interface IExposureLedger {
     // ── Registry-only mutations ──
     /// @notice Lock `min(lockWood, kNumerator x slashableStake(guardian) -
     ///         openExposure(guardian))` WOOD behind (governor, proposalId) for
-    ///         `guardian`. Idempotent per (proposal, guardian). NEVER REVERTS on
-    ///         a booking failure: a zero `lockWood`, zero required coverage, an
-    ///         unpriceable vault asset, zero free budget, or settlement beyond the
-    ///         coverage horizon all lock nothing and return, so the approve vote
-    ///         still lands and any shortfall surfaces at the execute-time quorum.
-    ///         Reads NO WOOD price. There is no cohort cap: locks across a
-    ///         proposal's approvers may sum above its requirement, and nothing
-    ///         reduces a lock other than `releaseApproval`/`retireApproval`.
-    /// @param  lockWood The WOOD the guardian declares. Clamped, never rejected.
+    ///         `guardian`. Idempotent per (proposal, guardian). Reverts
+    ///         `ApproveLockBelowFloor` when the booked lock is worth less than
+    ///         a hundredth of the need — the registry's approver array is
+    ///         bounded, so a slot has to carry its share of the coverage.
+    ///         Zero required coverage, an unresolvable or unpriceable vault
+    ///         asset, and settlement beyond the coverage horizon still lock
+    ///         nothing and return, so the approve vote lands and the shortfall
+    ///         surfaces at the execute-time quorum. There is no cohort cap:
+    ///         locks across a proposal's approvers may sum above its
+    ///         requirement, and nothing reduces a lock other than
+    ///         `releaseApproval`/`retireApproval`.
+    /// @param  lockWood The WOOD the guardian declares. Clamped to the free
+    ///         budget; rejected only if what remains is under the slot floor.
     function recordApproval(address governor, uint256 proposalId, address guardian, uint256 lockWood) external;
     function releaseApproval(address governor, uint256 proposalId, address guardian) external;
 

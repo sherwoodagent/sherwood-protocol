@@ -533,18 +533,15 @@ contract CoverageEndToEndTest is Test {
         );
     }
 
-    // ── N1: budget exhaustion must not silence the approve side ───────────
+    // ── N1: budget exhaustion must not brick the review ───────────────────
 
-    /// @notice N1 (re-review) — a guardian whose budget went on an earlier
-    ///         proposal can still CAST an approve vote on the next one. It
-    ///         books nothing, so the batching cap is untouched, but the vote
-    ///         itself lands.
-    ///
-    ///         Before this, `recordApproval` reverted `ExposureCapExceeded` and
-    ///         took `voteOnProposal` down with it. That is what let the C1 veto
-    ///         survive in a second form: an attacker who front-runs while the
-    ///         cohort is busy still bricks the proposal, because the guardians
-    ///         who would have covered it cannot participate at all.
+    /// @notice N1 (re-review), re-aimed for SHE-240. A guardian whose budget
+    ///         went on an earlier proposal underwrites nothing on the next one,
+    ///         so it is refused an approver slot rather than seated holding no
+    ///         coverage. What N1 protects is unchanged and is what this still
+    ///         asserts: the refusal is confined to that one guardian, the slot
+    ///         stays open, and the review proceeds to execute on the coverage
+    ///         another guardian actually raises.
     function test_n1_spentBudgetStillVotesAndDoesNotBreakTheReview() public {
         // Warm-up on syndicate B consumes g3's budget entirely.
         uint256 pidB = _propose(govB, address(vaultB), agentB);
@@ -556,13 +553,19 @@ contract CoverageEndToEndTest is Test {
         uint256 pidA = _propose(govA, address(vaultA), agentA);
         _openReview(govA, pidA);
 
-        // g3 has nothing left to pledge -- and votes anyway.
-        _vote(govA, pidA, g3, IGuardianRegistry.GuardianVoteType.Approve);
+        // SHE-240 re-aim: g3 has nothing left to pledge, so it cannot take an
+        // approver slot either. The cap still binds exactly as before — nothing
+        // is committed — but the refusal is loud and the slot stays open. g3's
+        // Block vote is untouched, which is the disenfranchisement bound N1
+        // cared about.
+        vm.prank(g3);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        registry.voteOnProposal(address(govA), pidA, IGuardianRegistry.GuardianVoteType.Approve, COVERAGE_WOOD);
         assertEq(ledger.lockOf(address(govA), pidA, g3), 0, "locks nothing: the cap still binds");
 
         (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pidA);
-        assertEq(approvers.length, 1, "but the review counted the vote");
-        assertEq(approvers[0], g3);
+        assertEq(approvers.length, 0, "and takes no slot it cannot underwrite");
+        assertEq(ledger.openExposure(g3), FILLER_STAKE, "nothing moved on the refusal");
 
         // g1 still has budget, so the proposal is genuinely coverable.
         _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Approve);
@@ -1017,6 +1020,57 @@ contract CoverageEndToEndTest is Test {
         ledger.requireApproveQuorum(address(govB), pidB, address(usdg), MAX_CAPITAL);
     }
 
+    /// @notice SHE-240 — approver slots are bounded (`MAX_APPROVERS_PER_PROPOSAL`)
+    ///         and were granted on vote admission alone, so a guardian at the
+    ///         minimum stake could take one while declaring a zero lock: the
+    ///         ledger booked nothing and never listed it. Enough of them filled
+    ///         the array, every honest approve then hit `NewSideFull`, and the
+    ///         coverage quorum saw an empty ledger list.
+    ///
+    ///         The floor refuses the slot at the FIRST squatter, and a real
+    ///         underwriter still takes one afterwards.
+    function test_approveSlotSquatIsRefused() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+
+        // The squat needs no special identity: any active guardian with free
+        // budget can declare nothing. g2/g3/g4 each hold 20,000 WOOD and could
+        // underwrite this proposal outright -- they simply decline to.
+        address[3] memory squatters = [g2, g3, g4];
+        _openReview(govA, pid);
+
+        // The first squatter is refused; the array never grows.
+        vm.prank(squatters[0]);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        registry.voteOnProposal(address(govA), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+
+        (address[] memory afterSquat,,) = registry.getApproverWeights(address(govA), pid);
+        assertEq(afterSquat.length, 0, "a refused vote seats no approver");
+        (address[] memory ledgerListed,) = ledger.approversOf(address(govA), pid);
+        assertEq(ledgerListed.length, 0, "and books no coverage");
+
+        // Every remaining squatter meets the same refusal, so the array cannot
+        // be filled this way at any price.
+        for (uint256 i = 1; i < squatters.length; i++) {
+            vm.prank(squatters[i]);
+            vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+            registry.voteOnProposal(address(govA), pid, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        }
+        (address[] memory stillEmpty,,) = registry.getApproverWeights(address(govA), pid);
+        assertEq(stillEmpty.length, 0, "the slots stay open for honest approvers");
+
+        // An honest approver takes its slot and the proposal executes on real
+        // coverage — the censorship the squat bought is gone.
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        (address[] memory honest,,) = registry.getApproverWeights(address(govA), pid);
+        assertEq(honest.length, 1, "the honest approve still lands");
+        assertEq(honest[0], g1);
+        assertEq(ledger.openExposure(g1), COVERAGE_WOOD, "and carries real coverage");
+
+        _pastReview(govA, pid);
+        govA.executeProposal(pid);
+        assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Executed), "executes on real coverage");
+    }
+
     // ── 3. Cold start: a thin cohort BLOCKS execution, it does not force it ──
 
     /// @notice Spec §3.3a cold-start. The guardian cohort collapses to a single
@@ -1232,19 +1286,24 @@ contract CoverageEndToEndTest is Test {
     }
 
     /// @notice Spec scenarios "Negligible declaration still pays the floor" and
-    ///         "Owner cannot raise the floor on a decided review". g1 locks ONE
-    ///         WEI: its lock rate rounds up to 1 bps, the severity leaves it at
-    ///         1 bps, and the envelope floors it at the `minSlashBps` in force
-    ///         AT OPEN — 1,000 bps of the whole bond, a real penalty for a token
-    ///         declaration. The owner raising the floor to 5,000 after the
+    ///         "Owner cannot raise the floor on a decided review". g1 locks the
+    ///         smallest declaration SHE-240 will grant a slot for — one
+    ///         hundredth of the $1,000 need, 200 WOOD of its 30,000 bond. Its
+    ///         lock rate is a fraction of the envelope, the severity leaves it
+    ///         far below the `minSlashBps` in force AT OPEN, and the envelope
+    ///         floors it at 1,000 bps of the whole bond: a real penalty for a
+    ///         token declaration. The owner raising the floor to 5,000 after the
     ///         review opened changes nothing about it; a review opened after the
     ///         raise is floored at 5,000.
     function test_reviewSlash_tokenLockPaysTheAtOpenFloor_ownerCannotRaiseItMidReview() public {
         uint256 pid = _propose(govA, address(vaultA), agentA);
-        _blockedReview(govA, pid, 1);
-        assertEq(ledger.lockOf(address(govA), pid, g1), 1, "a 1-wei lock");
+        // One slot's share of the need: COVERAGE_WOOD backs the whole $1,000.
+        uint256 tokenLock = COVERAGE_WOOD / 100;
+        _blockedReview(govA, pid, tokenLock);
+        assertEq(ledger.lockOf(address(govA), pid, g1), tokenLock, "the smallest declaration that buys a slot");
         (, uint256[] memory rate) = ledger.slashBpsFor(address(govA), pid);
-        assertEq(rate[0], 1, "which rounds up to 1 bps");
+        assertEq(rate[0], (tokenLock * 10_000 + WHALE_STAKE - 1) / WHALE_STAKE, "ceil(lock / bond) in bps");
+        assertLt(rate[0], 1_000, "and far below the at-open floor, which is what makes the floor load-bearing");
 
         // The owner raises the floor AFTER the review opened and the votes are in.
         assertEq(swood.minSlashBps(), 1_000, "fixture floor at open");
@@ -1260,7 +1319,7 @@ contract CoverageEndToEndTest is Test {
         // Control: a review opened AFTER the raise is judged under the new floor.
         uint256 stakeNow = swood.guardianStake(g1);
         uint256 pidB = _propose(govB, address(vaultB), agentB);
-        _blockedReview(govB, pidB, 1);
+        _blockedReview(govB, pidB, tokenLock);
         _pastReview(govB, pidB);
         assertTrue(registry.resolveReview(address(govB), pidB), "blocked");
         assertEq(
