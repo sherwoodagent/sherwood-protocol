@@ -3,13 +3,68 @@ pragma solidity 0.8.28;
 
 import {Script, console} from "forge-std/Script.sol";
 
+import {DeploySalts} from "./DeploySalts.sol";
+import {Create3} from "./utils/Create3.sol";
+import {Create3Factory} from "./utils/Create3Factory.sol";
+
 /// @notice Shared helpers for deploy and admin scripts.
 ///         - Assertion helpers (_checkAddr, _checkUint)
-///         - JSON address persistence (_writeAddresses, _readAddress)
+///         - CREATE3 minting (_c3Factory, _c3, _predict)
+///         - JSON address persistence (_patchAddress, _readAddress)
 ///
-///         Chain addresses live in contracts/chains/{chainId}.json with
+///         Chain addresses live in chains/{chainId}.json with
 ///         CAPS_SNAKE_CASE keys matching contract names.
 abstract contract ScriptBase is Script {
+    /// @notice Deterministic deployment proxy, same address on every EVM chain.
+    address internal constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+
+    // ── CREATE3 ──
+
+    /// @notice Bootstrap (or adopt) the Create3Factory at its CREATE2 address.
+    /// @dev Address = f(CREATE2_DEPLOYER, salt, initcode), so it is the same for
+    ///      any deployer that pins the same `deployer` constructor arg; the
+    ///      initcode-hash assert turns a solc/optimizer drift into a loud failure
+    ///      instead of silently moving every CREATE3 address downstream.
+    function _c3Factory(address deployer) internal returns (Create3Factory) {
+        require(CREATE2_DEPLOYER.code.length != 0, "CREATE2 deployer not on this chain");
+        require(
+            keccak256(type(Create3Factory).creationCode) == DeploySalts.CREATE3_FACTORY_INITCODE_HASH,
+            "Create3Factory initcode hash drift"
+        );
+        bytes memory initcode = abi.encodePacked(type(Create3Factory).creationCode, abi.encode(deployer));
+        address predicted = address(
+            uint160(
+                uint256(
+                    keccak256(
+                        abi.encodePacked(
+                            bytes1(0xff), CREATE2_DEPLOYER, DeploySalts.CREATE3_FACTORY, keccak256(initcode)
+                        )
+                    )
+                )
+            )
+        );
+        if (predicted.code.length == 0) {
+            (bool ok,) = CREATE2_DEPLOYER.call(abi.encodePacked(DeploySalts.CREATE3_FACTORY, initcode));
+            require(ok, "Create3Factory bootstrap reverted");
+            require(predicted.code.length != 0, "Create3Factory bootstrap produced no code");
+        }
+        Create3Factory c3 = Create3Factory(predicted);
+        require(c3.owner() == deployer, "Create3Factory owned by a different deployer");
+        return c3;
+    }
+
+    /// @notice Address this factory mints `salt` at. Depends on (factory, salt) only.
+    function _predict(Create3Factory c3, bytes32 salt) internal pure returns (address) {
+        return Create3.addressOf(address(c3), salt);
+    }
+
+    /// @notice Mint `initcode` at the salt's address, or adopt it if already there.
+    function _c3(Create3Factory c3, bytes32 salt, bytes memory initcode) internal returns (address deployed) {
+        deployed = _predict(c3, salt);
+        if (deployed.code.length != 0) return deployed;
+        require(c3.deploy(salt, initcode) == deployed, "CREATE3 address mismatch");
+    }
+
     // ── Assertions ──
 
     function _checkAddr(string memory label, address actual, address expected) internal pure {
@@ -124,26 +179,5 @@ abstract contract ScriptBase is Script {
         } catch {
             return address(0);
         }
-    }
-
-    /// @notice Write tokenomics addresses to chains/{chainId}.json (appends to existing)
-    function _writeTokenomicsAddresses(
-        address woodToken,
-        address votingEscrow,
-        address voter,
-        address minter,
-        address rewardsDistributor,
-        address voteIncentive
-    ) internal {
-        string memory path = string.concat(vm.projectRoot(), "/chains/", vm.toString(block.chainid), ".json");
-
-        vm.writeJson(vm.serializeAddress("", "", woodToken), path, ".WOOD_TOKEN");
-        vm.writeJson(vm.serializeAddress("", "", votingEscrow), path, ".VOTING_ESCROW");
-        vm.writeJson(vm.serializeAddress("", "", voter), path, ".VOTER");
-        vm.writeJson(vm.serializeAddress("", "", minter), path, ".MINTER");
-        vm.writeJson(vm.serializeAddress("", "", rewardsDistributor), path, ".REWARDS_DISTRIBUTOR");
-        vm.writeJson(vm.serializeAddress("", "", voteIncentive), path, ".VOTE_INCENTIVE");
-
-        console.log("Tokenomics addresses written to %s", path);
     }
 }

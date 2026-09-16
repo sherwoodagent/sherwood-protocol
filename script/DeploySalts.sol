@@ -14,9 +14,10 @@ library DeploySalts {
 
     // CREATE2 salt through CREATE2_DEPLOYER (0x4e59...); initcode = Create3Factory ++ abi.encode(deployer).
     bytes32 internal constant CREATE3_FACTORY = keccak256("sherwood.robinhood.v1.create3-factory");
-    // keccak256(type(Create3Factory).creationCode) under the pinned toolchain; recorded in task 2,
-    // asserted pre-broadcast so a solc/optimizer drift fails loudly instead of moving every address.
-    bytes32 internal constant CREATE3_FACTORY_INITCODE_HASH = bytes32(0);
+    // keccak256(type(Create3Factory).creationCode) under the pinned toolchain (solc 0.8.28, via_ir,
+    // 50 runs); asserted in _c3Factory so a compiler drift fails loudly instead of moving every address.
+    bytes32 internal constant CREATE3_FACTORY_INITCODE_HASH =
+        0x9b43cdf8c567a900f554912c0feed5de9a5fa3eb1d2098234acb53ce78bcbac3;
 
     // Core
     bytes32 internal constant EXECUTOR = keccak256("sherwood.robinhood.v1.batch-executor-lib");
