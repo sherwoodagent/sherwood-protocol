@@ -13,6 +13,8 @@ ffi = false
 extra_output = ["storageLayout"]
 fs_permissions = [
   { access = "read-write", path = "chains" },
+  # Read-only: the source-hygiene test greps the ceremony scripts for `vm.env`.
+  { access = "read", path = "script" },
 ]
 
 [profile.default.fmt]

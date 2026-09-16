@@ -3,7 +3,12 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {DeployPlanB} from "../../script/DeployPlanB.s.sol";
+import {Checkpoint} from "../../script/robinhood-mainnet/DeployAll.s.sol";
+import {Posture, Inputs, Stack} from "../../script/robinhood-mainnet/DeployTypes.sol";
+import {DeployAllFixture} from "./DeployAll.t.sol";
 import {DeploySalts} from "../../script/DeploySalts.sol";
 import {RobinhoodParams} from "../../script/robinhood-mainnet/RobinhoodParams.sol";
 import {Create3} from "../../script/utils/Create3.sol";
@@ -611,31 +616,9 @@ contract DeployPlanBPreflightTest is Test {
         script.deploy(book);
     }
 
-    // ─────── pre-flight 10: the ledger owner (issue #89) — MOVED ───────────
-    //
-    // The check that the ledger owner is a CONTRACT is no longer a phase pre-flight: this
-    // mixin runs BEFORE the handoff, so the owner is always the deployer here. It becomes
-    // `ledger.pendingOwner() == OWNER_MULTISIG && multisig.code.length != 0` in DeployAll's
-    // post-handoff validate, and the three cases below belong to that harness (SHE-36 task
-    // 9). They stay named so the coverage is visibly parked, not lost.
-    //
-    // DO NOT "IMPROVE" ANY OF THEM INTO A ZODIAC MODULE PROBE.
-    // `openspec/specs/deployment-docs/spec.md` records why: enumerating a Safe's modules
-    // proves only that SOME module is attached, never that the delay is ASYMMETRIC (raises
-    // delayed, drops immediate), and a probe that appears to verify the requirement while
-    // verifying something weaker is worse than none.
-
-    function test_preflight10_mainnetPendingOwnerIsTheSafe() public {
-        vm.skip(true); // TODO(SHE-36 task 9): drive `_validateAll` on Mainnet posture.
-    }
-
-    function test_preflight10_mainnetRefusesAnEoaPendingOwner() public {
-        vm.skip(true); // TODO(SHE-36 task 9): EOA multisig key -> refusal.
-    }
-
-    function test_preflight10_forkPostureSkipsTheOwnerCheck() public {
-        vm.skip(true); // TODO(SHE-36 task 9): Fork posture leaves everything with the deployer.
-    }
+    // Pre-flight 10 (the ledger owner, issue #89) is no longer a phase pre-flight — this
+    // mixin runs BEFORE the handoff. It lives in `DeployAll._validateAll`; the three cases
+    // are `DeployPlanBPreflight10Test` at the bottom of this file.
 
     // ─────────────────────────────── helpers ───────────────────────────────
 
@@ -704,5 +687,77 @@ contract MockWindowedFeed is MockAggregatorV3 {
 
     constructor(uint8 decimals_, int256 answer_, uint256 window_) MockAggregatorV3(decimals_, answer_) {
         window = window_;
+    }
+}
+
+/**
+ * @notice Pre-flight 10 in its new home: the ledger's owner is the slashing and freeze
+ *         authority, so on Mainnet it must end up at a CONTRACT — and a two-step transfer
+ *         leaves that in `pendingOwner` until the Safe accepts.
+ *
+ * @dev DO NOT "IMPROVE" ANY OF THESE INTO A ZODIAC MODULE PROBE.
+ *      `openspec/specs/deployment-docs/spec.md` records why: enumerating a Safe's modules
+ *      proves only that SOME module is attached, never that the delay is ASYMMETRIC, and a
+ *      probe that appears to verify the requirement while verifying something weaker is
+ *      worse than none.
+ */
+contract DeployPlanBPreflight10Test is DeployAllFixture {
+    function setUp() public {
+        _stageCeremony();
+    }
+
+    /// @notice A finished Mainnet ceremony leaves the ledger armed for the Safe.
+    function test_preflight10_mainnetPendingOwnerIsTheSafe() public {
+        Stack memory s = _completeMainnetCeremony();
+        Inputs memory i = _inputs(Posture.Mainnet);
+
+        assertEq(Ownable2Step(s.exposureLedger).pendingOwner(), address(safe), "ledger armed for the Safe");
+        script.exposed_validateAll(s, i, Checkpoint.Complete);
+    }
+
+    /// @notice An EOA `OWNER_MULTISIG` that slipped past the pre-flight is caught after the
+    ///         handoff, where the ledger's pending owner is read back.
+    function test_preflight10_mainnetRefusesAnEoaPendingOwner() public {
+        address eoa = address(0xA11CE);
+        Stack memory s = _completeMainnetCeremony(eoa);
+        Inputs memory i = _inputs(Posture.Mainnet);
+        i.ownerMultisig = eoa;
+
+        assertEq(Ownable2Step(s.exposureLedger).pendingOwner(), eoa, "armed for an EOA");
+        vm.expectRevert(bytes("OWNER_MULTISIG must be a contract (Safe), not an EOA"));
+        script.exposed_validateAll(s, i, Checkpoint.Complete);
+    }
+
+    /// @notice Fork posture never hands off, so the owner check has no subject: the deployer
+    ///         keeps the ledger and nothing is armed.
+    function test_preflight10_forkPostureSkipsTheOwnerCheck() public {
+        vm.chainId(FORK_CHAIN_ID);
+        (Stack memory s,) = _runCeremony(Posture.Fork);
+        Inputs memory i = _inputs(Posture.Fork);
+
+        assertEq(Ownable(s.exposureLedger).owner(), deployer, "ledger still the deployer's");
+        assertEq(Ownable2Step(s.exposureLedger).pendingOwner(), address(0), "nothing armed");
+        script.exposed_validateAll(s, i, Checkpoint.Complete);
+    }
+
+    // ─────────────────────────────── helpers ───────────────────────────────
+
+    function _completeMainnetCeremony() internal returns (Stack memory) {
+        return _completeMainnetCeremony(address(safe));
+    }
+
+    /// @dev Two runs: the first mints the WOOD feed and stops, the keeper primes it, the
+    ///      second completes and hands off.
+    function _completeMainnetCeremony(address ownerMultisig) internal returns (Stack memory s) {
+        vm.chainId(MAINNET_CHAIN_ID);
+        Inputs memory i = _inputs(Posture.Mainnet);
+        i.ownerMultisig = ownerMultisig;
+
+        vm.prank(deployer);
+        (Stack memory first,) = script.deployAll(i);
+        _primeWoodFeed(first.woodUsdFeed);
+
+        vm.prank(deployer);
+        (s,) = script.deployAll(i);
     }
 }
