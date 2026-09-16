@@ -15,7 +15,9 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {TierRegistry} from "../../src/TierRegistry.sol";
+import {StrategyFactory} from "../../src/StrategyFactory.sol";
+import {MockStrategyAdapter} from "../mocks/MockStrategyAdapter.sol";
 
 /// @title Vault_batchQueueTargets_lifecycle
 /// @notice Issue #93 through the REAL governor lifecycle. The sibling unit file
@@ -36,7 +38,7 @@ import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 ///         `address(0)` and the SELECTOR guard degrades open — the documented
 ///         posture for a registry-less deployment. That makes this harness a
 ///         second, independent witness for the placement claim: the batches
-///         below are stopped by the target denylist alone, sitting above that
+///         below are stopped by the target rule alone, sitting above that
 ///         early return, with the rest of the guard switched off.
 contract VaultBatchQueueTargetsLifecycleTest is Test {
     SyndicateGovernor governor;
@@ -58,6 +60,20 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
     uint256 constant COOLDOWN_PERIOD = 1 days;
     uint256 constant STRATEGY_DURATION = 7 days;
     uint256 constant SELF_SETTLE_FLOOR = 1 hours;
+
+    TierRegistry tierRegistry;
+    StrategyFactory strategyFactory;
+    MockStrategyAdapter strat;
+
+    /// @dev A real registry wired to a real factory, with one registered strategy for the field.
+    function _realRegistry() internal returns (TierRegistry) {
+        tierRegistry = new TierRegistry(address(this));
+        strategyFactory = new StrategyFactory(address(this), address(this));
+        tierRegistry.setStrategyFactory(address(strategyFactory));
+        strat = new MockStrategyAdapter();
+        strategyFactory.registerStrategy(address(strat));
+        return tierRegistry;
+    }
 
     function setUp() public {
         protocolConfig = new ProtocolConfig(owner);
@@ -102,7 +118,7 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
                 address(guardianRegistry),
                 address(protocolConfig),
                 address(this),
-                address(deployTierRegistry(address(this))), // factory
+                address(_realRegistry()),
                 ISyndicateGovernor.GovernorParams({
                     votingPeriod: VOTING_PERIOD,
                     executionWindow: 1 days,
@@ -145,12 +161,11 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
     }
 
     /// @dev A call that clears both halves of the guard and moves nothing: a
-    ///      view selector on the asset token. Not a privileged target, and not
-    ///      one of the four guarded value-moving selectors.
+    ///      zero `approve` on the asset — the one asset selector the guard admits.
     function _benignCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.balanceOf, (address(vault))), value: 0
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(vault), 0)), value: 0
         });
     }
 
@@ -186,7 +201,7 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
         vm.prank(agent);
         pid = governor.propose(
             address(vault),
-            address(0),
+            address(strat),
             "ipfs://p",
             STRATEGY_DURATION,
             env,
@@ -229,13 +244,13 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
     ///           2. the prior proposal settles and stamps
     ///           3. `propose` with `maxCapital = 1` and
     ///              `executeCalls = [queueRedeem(attacker, victimShares, pid)]`
-    ///              reverts immediately — the target denylist runs inside
+    ///              reverts immediately — the target rule runs inside
     ///              `propose` itself, before a vote cycle is ever spent
     ///         On pre-#118 `main`, steps 3-6 instead were: it PASSED review
     ///         (nothing about it looks expensive — the outflow meter reads
     ///         zero, tier-2 coverage asks for 1 wei), `executeProposal`
     ///         reached `vault.executeGovernorBatch`, and only THERE did the
-    ///         target denylist refuse it. That execute-time chokepoint claim
+    ///         target rule refuse it. That execute-time chokepoint claim
     ///         is retained by the sibling unit file
     ///         (`Vault_batchQueueTargets.t.sol`), which drives
     ///         `executeGovernorBatch` directly behind a mocked governor.
@@ -249,10 +264,10 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
             ISyndicateGovernor.RiskEnvelope({maxCapital: 1, maxDrawdownBps: 10_000});
 
         vm.prank(agent);
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(queue)));
         governor.propose(
             address(vault),
-            address(0),
+            address(strat),
             "ipfs://p",
             STRATEGY_DURATION,
             steal,
@@ -289,10 +304,10 @@ contract VaultBatchQueueTargetsLifecycleTest is Test {
         ISyndicateGovernor.RiskEnvelope memory env = _permissiveEnv();
 
         vm.prank(agent);
-        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.DisallowedBatchTarget.selector, address(queue)));
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.NotARegisteredStrategy.selector, address(queue)));
         governor.propose(
             address(vault),
-            address(0),
+            address(strat),
             "ipfs://p",
             STRATEGY_DURATION,
             env,

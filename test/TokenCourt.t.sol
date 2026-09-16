@@ -150,12 +150,13 @@ contract MockGameForCourt {
     }
 }
 
-/// @dev Mirrors the real ledger's TWO numbers per approver, because #83 is
-///      about the gap between them. `recordApproval` writes the pledge and the
-///      live booking equal, so `setApprovers` does too; `settleCoverage` moves
-///      only the booking, so `setCommittedOnly` is this mock's stand-in for a
-///      settlement pass and is what lets a test drive the booking to zero while
-///      the pledge stands.
+/// @dev Mirrors the TWO numbers per approver the ledger USED to keep, because
+///      #83 was about the gap between them. Declared coverage locks collapsed
+///      booking and pledge into one lock and deleted `settleCoverage`, so the
+///      real ledger can no longer produce the gap; the mock keeps it so the
+///      court's choice of selector (`pledgedOf`, never `approversOf`) stays
+///      pinned — `setCommittedOnly` is the lever that drives the booking to
+///      zero while the pledge stands.
 contract MockLedgerForCourt {
     address[] internal _approvers;
     uint256[] internal _committed;

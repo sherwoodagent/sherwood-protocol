@@ -41,6 +41,7 @@ contract GuardianRegistrySeverityTest is RegistryTestHarness {
 
     function setUp() public {
         _deployRegistryAndSwood(REVIEW_PERIOD, Q);
+        _wireFullLockLedger(); // review-path slashes need locks to burn against
         // Widen the slash band to [1000, 10_000]: the harness deploys
         // 1000/9999, but Part D allows maxSlashBps == 10_000 (full wipe at
         // the supermajority ceiling) and deploy scripts use it.
@@ -89,9 +90,9 @@ contract GuardianRegistrySeverityTest is RegistryTestHarness {
         registry.openReview(address(governor), PID);
 
         vm.prank(approver1);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(blocker1);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(reviewEnd);
         assertTrue(registry.resolveReview(address(governor), PID), "expected blocked");
@@ -186,7 +187,7 @@ contract GuardianRegistrySeverityTest is RegistryTestHarness {
         registry.openReview(address(governor), PID);
 
         vm.prank(blocker1);
-        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governor), PID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(reviewEnd);
         assertTrue(registry.resolveReview(address(governor), PID), "block vote registered");

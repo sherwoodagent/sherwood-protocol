@@ -3,7 +3,6 @@ pragma solidity 0.8.28;
 
 import {IStrategy} from "../interfaces/IStrategy.sol";
 import {IProposalStatus} from "../interfaces/IProposalStatus.sol";
-import {IStrategyDelivery} from "../interfaces/IStrategyDelivery.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -18,7 +17,6 @@ interface IGovernorBinding {
 
 /// @notice The vault's live agent set, consulted by `onlyProposer` so that a
 ///         de-registered agent loses its standing on already-deployed clones
-///         (pashov review finding #9). Declared locally for the same reason
 ///         `IGovernorBinding` is: to generate the selector, not to type the
 ///         vault.
 interface IAgentSet {
@@ -43,7 +41,7 @@ interface IAgentSet {
  *   Proposer can update tunable params (slippage, amounts) between execute
  *   and settle — no new proposal needed.
  */
-abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
+abstract contract BaseStrategy is IStrategy {
     using SafeERC20 for IERC20;
 
     // ── Errors ──
@@ -60,20 +58,6 @@ abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
 
     /// @notice `execute()` was reached by a batch other than the one belonging
     ///         to the proposal that declared this clone as its strategy.
-    /// @dev The clone-ratchet bypass (issue #150): `executeGovernorBatch`
-    ///      delegatecalls through `BatchExecutorLib`, so every sub-call of
-    ///      every proposal's batch reaches its target with
-    ///      `msg.sender == vault` (src/SyndicateVault.sol:504-505). `onlyVault`
-    ///      alone can't distinguish "this clone's own proposal" from "any
-    ///      other proposal on the same vault" — a registered agent could get
-    ///      any proposal executed and target an unrelated, pre-deployed
-    ///      clone's `execute()` from its batch, flipping the one-shot
-    ///      `Pending → Executed` ratchet and permanently bricking that
-    ///      clone's own later legitimate proposal (`AlreadyExecuted` forever).
-    ///      Fail-closed by design (no capability probe, no try/catch): this
-    ///      check IS the security boundary here, unlike #118's propose-time
-    ///      check, which degrades open behind a second, authoritative layer.
-    ///      See design.md of `fix-strategy-clone-ratchet`, Decision 2.
     error NotActiveProposalStrategy();
 
     // ── State ──
@@ -100,35 +84,6 @@ abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
         _initialized = true;
     }
 
-    /// @dev RE-CHECKED LIVE, NOT JUST AGAINST THE PIN (pashov review finding
-    ///      #9). `_proposer` is written once at `initialize` and never
-    ///      revisited, while `SyndicateVault.removeAgent` — the owner's
-    ///      revocation lever — only deletes `_agents[a]` and reaches no
-    ///      already-deployed clone. A de-registered agent therefore kept
-    ///      unbounded `updateParams` / `rebalance` / `rebalanceDelta` authority
-    ///      over deployed capital for the rest of `strategyDuration` (30 days
-    ///      by factory default, up to `ABSOLUTE_MAX_STRATEGY_DURATION`), and
-    ///      the owner's only alternatives were demoting the shared swap adapter
-    ///      or price feed — whose blast radius is every strategy on the
-    ///      protocol — or waiting for a permissionless settle.
-    ///
-    ///      `PortfolioStrategy.rebalance` already re-checks the swap ADAPTER
-    ///      and the price SOURCES live on every call; this closes the same gap
-    ///      for the CALLER, which was the one input still trusted from init.
-    ///      Failing closed strands nothing: `settle()` is `onlyVault` and never
-    ///      consults this modifier, so the exit path is unaffected.
-    ///      RAW STATICCALL, NOT A HIGH-LEVEL CALL — same doctrine as
-    ///      `SyndicateVault._openProposalPid` / `_pricingSupply` and
-    ///      `ExposureLedger._feedPriceX8`. A typed call into a vault that does
-    ///      not answer `isAgent` reverts in THIS frame with no data, which
-    ///      turns a missing selector into an undecodable failure of every
-    ///      proposer-gated path rather than a stated one. Decoding the answer
-    ///      explicitly keeps the failure branch a DECISION: a vault that says
-    ///      `false`, and a vault that cannot answer at all, both fail closed
-    ///      here with a named error — closed rather than open because the
-    ///      whole point is that revocation must bite, and blocking a
-    ///      rebalance strands nothing (`settle()` is `onlyVault` and never
-    ///      consults this modifier).
     modifier onlyProposer() {
         if (msg.sender != _proposer) revert NotProposer();
         (bool ok, bytes memory ret) = _vault.staticcall(abi.encodeCall(IAgentSet.isAgent, (_proposer)));
@@ -201,6 +156,13 @@ abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
         _settle();
     }
 
+    /// @notice Emergency exit: push the clone's whole balance of `token` to the vault.
+    ///         No price read, no state change, any lifecycle state — reachable only
+    ///         through a vault batch.
+    function rescueTo(address token) external onlyVault {
+        _pushAllToVault(token);
+    }
+
     /// @inheritdoc IStrategy
     function updateParams(bytes calldata data) external virtual onlyProposer {
         if (_state != State.Executed) revert NotExecuted();
@@ -226,52 +188,6 @@ abstract contract BaseStrategy is IStrategy, IStrategyDelivery {
     function state() external view returns (State) {
         return _state;
     }
-
-    /// @inheritdoc IStrategyDelivery
-    /// @dev FALSE BY DEFAULT, and that is the safe default rather than a lazy
-    ///      one: this base has no idea what a given template can strand, and a
-    ///      template that answers true when it holds nothing would shut the
-    ///      vault's deposits until someone calls a sweep that moves nothing.
-    ///      Templates whose settlement is deliverable-maximum override it —
-    ///      `MorphoSupplyStrategy` (market utilization caps the withdrawal) and
-    ///      `ConcentratedLiquidityStrategy` (debt, collateral wrapper, LP legs).
-    ///      A template that always settles all-or-nothing correctly inherits
-    ///      this.
-    function hasUndeliveredValue() public view virtual returns (bool) {
-        return false;
-    }
-
-    /// @notice The vault-asset value this strategy still holds undelivered.
-    /// @dev    Default 0, matching `hasUndeliveredValue`'s default of false: a
-    ///         template that settles all-or-nothing has no residue to report.
-    ///         Overriding one without the other is a bug — the bool gates the
-    ///         deposit lock, this figure corrects the settle price, and they
-    ///         must describe the same value.
-    function undeliveredValue() public view virtual returns (uint256) {
-        return 0;
-    }
-
-    /// @inheritdoc IStrategyDelivery
-    /// @dev Default FALSE, matching the zero default above: a template that
-    ///      holds nothing has nothing it cannot value. A template that DOES
-    ///      hold value its `undeliveredValue()` override cannot express must
-    ///      override this too, or the vault will price mints against a figure
-    ///      that silently omits it.
-    function hasUnvaluedResidue() public view virtual returns (bool) {
-        return false;
-    }
-
-    /// @dev Dust floor for the residue probes. Anyone may transfer 1 wei to a
-    ///      long-settled clone, and `hasUndeliveredValue()` keying on `!= 0`
-    ///      turned that into an indefinite deposit DoS: `sweep()` clears it,
-    ///      the griefer re-donates for 1 wei plus gas, forever. A residue below
-    ///      this is not worth shutting deposits over — it cannot move a share
-    ///      price meaningfully, which is the only thing the lock protects.
-    ///
-    ///      Denominated in the strategy's own units on purpose: the templates
-    ///      that override this hold the VAULT ASSET, so the threshold reads in
-    ///      the same units as the value being judged.
-    uint256 internal constant RESIDUE_DUST = 1e3;
 
     // ── Internal helpers ──
 

@@ -62,12 +62,9 @@ contract DeployPortfolioStrategy is ScriptBase {
 
     /// @dev Attest the adapter this script just minted, in the same broadcast.
     ///
-    ///      `PortfolioStrategy._initialize` calls `_requireAllowedAdapter`, and
-    ///      the vault's `_guardBatchCalls` independently refuses an
-    ///      `asset.approve(spender)` whose spender is not adapter-allowed. So
-    ///      an unattested adapter does not degrade the template — it makes it
-    ///      INERT, exactly as an unlisted factory does for the CL template,
-    ///      and the failure surfaces a governance cycle later at clone-init.
+    ///      `PortfolioStrategy._initialize` binds the swap adapter through
+    ///      `isCounterpartyAllowed`, so an unattested adapter makes the template
+    ///      INERT: the failure surfaces a governance cycle later at clone-init.
     ///
     ///      This address cannot be seeded by `Deploy.s.sol` because it does not
     ///      exist until this phase runs. `TierRegistry` is `Ownable2Step`, so
@@ -80,15 +77,15 @@ contract DeployPortfolioStrategy is ScriptBase {
         address registry = _optionalAddress("TIER_REGISTRY");
         if (registry == address(0)) {
             console.log("RUNBOOK: no TIER_REGISTRY in the address book - adapter NOT attested.");
-            console.log("RUNBOOK: the registry owner must call setAdapterAllowed(<adapter>, true):", adapter);
+            console.log("RUNBOOK: the registry owner must call setCounterpartyAllowed(<adapter>, true):", adapter);
             return;
         }
         if (TierRegistry(registry).owner() != deployer) {
             console.log("RUNBOOK: deployer no longer owns TIER_REGISTRY - adapter NOT attested.");
-            console.log("RUNBOOK: the owner must call setAdapterAllowed(<adapter>, true):", adapter);
+            console.log("RUNBOOK: the owner must call setCounterpartyAllowed(<adapter>, true):", adapter);
             return;
         }
-        TierRegistry(registry).setAdapterAllowed(adapter, true);
+        TierRegistry(registry).setCounterpartyAllowed(adapter, true);
         console.log("UniswapSwapAdapter attested on TierRegistry:", registry);
     }
 }

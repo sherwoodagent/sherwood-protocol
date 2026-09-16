@@ -21,12 +21,12 @@ import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 ///         `GuardianReview` and `Approved`, mirroring the proposer-anytime
 ///         settle path. Specifically verifies:
 ///           1. `cancelProposal` from `Approved` decrements `openProposalCount`
-///              and bumps `_lastSettledAt` so cooldown engages.
+///              and bumps `_cooldownEndsAt` so cooldown engages.
 ///           2. `cancelProposal` from `GuardianReview` invokes
 ///              `registry.cancelReview(pid)` so a stale `resolveReview` after
 ///              `reviewEnd` cannot still slash approvers.
 ///           3. Non-proposers cannot cancel from any state.
-///           4. The cooldown wired through `_lastSettledAt` actually gates
+///           4. The cooldown wired through `_cooldownEndsAt` actually gates
 ///              the next `executeProposal` after a propose-cancel-propose
 ///              cycle.
 contract CancelProposalTest is Test {
@@ -214,7 +214,7 @@ contract CancelProposalTest is Test {
         governor.cancelProposal(pid);
 
         // Bump past cooldown then propose again — should succeed (open count
-        // dec'd, _lastSettledAt + cooldown elapsed).
+        // dec'd, _cooldownEndsAt + cooldown elapsed).
         vm.warp(vm.getBlockTimestamp() + COOLDOWN_PERIOD + 1);
 
         vm.prank(agent);
@@ -287,9 +287,8 @@ contract CancelProposalTest is Test {
 
     // ────────────────────────── Cooldown rate-limit ──────────────────────────
 
-    /// @notice The new cancel branches set `_lastSettledAt[vault] = block.timestamp`.
-    ///         Verified via `getCooldownEnd(vault)` which projects forward
-    ///         `_lastSettledAt + cooldownPeriod`. Direct read avoids the time-
+    /// @notice The new cancel branches stamp `_cooldownEndsAt = block.timestamp + cooldownPeriod`,
+    ///         read back through `getCooldownEnd()`. Direct read avoids the time-
     ///         math gymnastics of driving a second proposal through propose
     ///         → vote → execute under the parameter bounds.
     function test_cancelProposal_fromApproved_bumpsCooldown() public {

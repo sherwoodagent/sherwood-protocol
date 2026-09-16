@@ -126,7 +126,7 @@ contract GuardianRegistryCompositeKeyTest is Test {
 
         // Approve under A only.
         vm.prank(guardian1);
-        registry.voteOnProposal(address(governorA), PID, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(governorA), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
 
         // A: opened, approver recorded with weight.
         (bool openedA,,) = registry.getReviewState(address(governorA), PID);
@@ -148,7 +148,7 @@ contract GuardianRegistryCompositeKeyTest is Test {
         // Block under B: 20k / 60k = 33% >= the 30% quorum. Resolutions must
         // diverge — A (no A-side blocks) unblocked, B blocked.
         vm.prank(guardian2);
-        registry.voteOnProposal(address(governorB), PID, IGuardianRegistry.GuardianVoteType.Block);
+        registry.voteOnProposal(address(governorB), PID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
 
         vm.warp(vm.getBlockTimestamp() + REVIEW_PERIOD + 1);
         vm.prank(address(governorA));
