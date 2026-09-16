@@ -2,7 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
-import {DeployWoodPoolFeed} from "../../script/DeployWoodPoolFeed.s.sol";
+import {DeployWoodPoolFeed, GrowV3Cardinality} from "../../script/DeployWoodPoolFeed.s.sol";
 import {WoodPoolFeed} from "../../src/pricing/WoodPoolFeed.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
@@ -138,6 +138,121 @@ contract DeployWoodPoolFeedTest is Test {
             )
         );
         script.deploy(_params());
+    }
+
+    /// @dev THE CHECK THE CEREMONY'S CARDINALITY STEP EXISTS FOR. The live 4663
+    ///      pool reports `observationCardinality` 1, which cannot span 24h: the
+    ///      feed would deploy and then revert from every read.
+    function test_preflight_bites_whenTheV3PoolCannotSpanTheWindow() public {
+        v3Pool.setObserveReverts(true);
+        vm.expectRevert(bytes("PRE-FLIGHT: V3 pool cannot span TWAP_WINDOW"));
+        script.deploy(_params());
+    }
+
+    /// @dev A pool that answers the selector but not the contract fails the same
+    ///      way: what the pre-flight asserts is a usable window, not a response.
+    function test_preflight_bites_whenTheV3PoolAnswersObserveMalformed() public {
+        v3Pool.setObserveShortArray(true);
+        vm.expectRevert(bytes("PRE-FLIGHT: V3 pool cannot span TWAP_WINDOW"));
+        script.deploy(_params());
+    }
+
+    function test_preflight_bites_whenTheV3PoolKeyIsMissing() public {
+        DeployWoodPoolFeed.Params memory p = _params();
+        p.v3Pool = address(0);
+        vm.expectRevert(bytes("PRE-FLIGHT: WOOD_WETH_UNISWAP_V3_POOL unset"));
+        script.deploy(p);
+    }
+
+    /// @dev A staticcall to an address with no code SUCCEEDS with empty
+    ///      returndata, so without this check the first decode fails with a bare
+    ///      panic and an operator who fat-fingered the book learns nothing.
+    function test_preflight_bites_whenTheV3PoolAddressHasNoCode() public {
+        DeployWoodPoolFeed.Params memory p = _params();
+        p.v3Pool = makeAddr("notAPool");
+        vm.expectRevert(bytes("PRE-FLIGHT: V3 pool has no code"));
+        script.deploy(p);
+    }
+
+    // ── The cardinality derivation and its ceiling ──
+
+    /// @dev A 24h window at 1s blocks needs 86,410 observations, which a uint16
+    ///      ring cannot hold. The script reports the CEILING and says so, rather
+    ///      than truncating 86,410 to 20,874 and presenting it as sufficient.
+    function test_requiredCardinality_capsAtTheUint16CeilingAndSaysSo() public view {
+        (uint16 n, bool capped) = script.requiredCardinality(24 hours, 1);
+        assertEq(n, 65_535, "the uint16 ceiling");
+        assertTrue(capped, "the ceiling is flagged as a different claim");
+    }
+
+    function test_requiredCardinality_isCeilingDivisionPlusSlack() public view {
+        (uint16 n, bool capped) = script.requiredCardinality(24 hours, 2);
+        assertEq(n, 43_210, "86400/2 + 10 slack");
+        assertFalse(capped, "well inside the ring");
+
+        // Ceiling, not truncation: 86400/7 is 12342.86, and a ring of 12342
+        // observations is one block short of the window.
+        (uint16 odd,) = script.requiredCardinality(24 hours, 7);
+        assertEq(odd, 12_353, "ceil(86400/7) + 10 slack");
+    }
+
+    function test_requiredCardinality_refusesAZeroBlockTime() public {
+        vm.expectRevert(bytes("PRE-FLIGHT: AVG_BLOCK_TIME_SECONDS zero"));
+        script.requiredCardinality(24 hours, 0);
+    }
+
+    // ── MIN_V3_LIQUIDITY is narrowed, not truncated ──
+
+    /// @dev The dangerous direction: `uint128(2**128)` is ZERO, i.e. the floor
+    ///      an operator asked to RAISE would silently disappear.
+    function test_minV3Liquidity_refusesAValueAboveTheUint128Width() public {
+        vm.expectRevert(bytes("PRE-FLIGHT: MIN_V3_LIQUIDITY above uint128"));
+        script.toMinV3Liquidity(uint256(type(uint128).max) + 1);
+    }
+
+    function test_minV3Liquidity_acceptsTheWidthItself() public view {
+        assertEq(script.toMinV3Liquidity(type(uint128).max), type(uint128).max, "the boundary is inclusive");
+        assertEq(script.toMinV3Liquidity(MIN_V3_LIQUIDITY), MIN_V3_LIQUIDITY, "the deploy default");
+    }
+
+    // ── GrowV3Cardinality ──
+
+    function test_grow_raisesTheRingTarget() public {
+        GrowV3Cardinality grower = new GrowV3Cardinality();
+        grower.grow(address(v3Pool), 65_535);
+
+        (,,, uint16 cardinality,,,) = v3Pool.slot0();
+        assertEq(cardinality, 65_535, "the pool was asked to grow");
+    }
+
+    /// @dev Monotonic upstream, so a re-run of the ceremony step is a no-op
+    ///      rather than a revert — an operator can repeat it safely.
+    function test_grow_isANoOpWhenTheRingIsAlreadyThatLong() public {
+        GrowV3Cardinality grower = new GrowV3Cardinality();
+        v3Pool.setObservationCardinality(65_535);
+        grower.grow(address(v3Pool), 600);
+
+        (,,, uint16 cardinality,,,) = v3Pool.slot0();
+        assertEq(cardinality, 65_535, "never shrunk");
+    }
+
+    function test_grow_refusesATargetAboveTheUint16Ceiling() public {
+        GrowV3Cardinality grower = new GrowV3Cardinality();
+        vm.expectRevert(bytes("PRE-FLIGHT: V3_CARDINALITY above the uint16 ceiling (65535)"));
+        grower.grow(address(v3Pool), 65_536);
+    }
+
+    function test_grow_refusesAnUnsetTargetOrPool() public {
+        GrowV3Cardinality grower = new GrowV3Cardinality();
+
+        vm.expectRevert(bytes("PRE-FLIGHT: V3_CARDINALITY unset"));
+        grower.grow(address(v3Pool), 0);
+
+        vm.expectRevert(bytes("PRE-FLIGHT: WOOD_WETH_UNISWAP_V3_POOL unset"));
+        grower.grow(address(0), 600);
+
+        vm.expectRevert(bytes("PRE-FLIGHT: V3 pool has no code"));
+        grower.grow(makeAddr("notAPool"), 600);
     }
 
     // ─────────────────────────────── helpers ───────────────────────────────
