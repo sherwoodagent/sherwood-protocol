@@ -18,7 +18,7 @@ contract MockSyndicateRegistry {
     }
 }
 
-/// @dev Minimal vault stand-in — implements IVaultMembership (`owner` + `isAgent`).
+/// @dev Minimal vault stand-in.
 contract MockVault {
     address public owner;
     mapping(address => bool) public agents;
@@ -36,23 +36,11 @@ contract MockVault {
     }
 }
 
-/// @title StrategyFactory_auth — MS-C2 regression
-/// @notice Before MS-C2, `StrategyFactory.cloneAndInit` and
-///         `cloneAndInitDeterministic` were fully permissionless. Anyone
-///         could clone any strategy template and bind the clone to an
-///         arbitrary `vault` parameter — including a victim vault, locking
-///         them into an attacker-controlled strategy adapter pointer if a
-///         later proposal pinned it.
-///
-///         The fix gates both fns on:
-///           1. `msg.sender == vault` — caller must BE the vault being bound.
-///           2. SyndicateFactory has a non-zero `vaultToSyndicate(vault)` —
-///              the vault must be a registered SyndicateFactory vault.
-///
-///         The legitimate caller path is the governor batch executing inside
-///         the vault's `executeGovernorBatch` (delegatecall to
-///         BatchExecutorLib), which makes the outer `msg.sender` arriving at
-///         this factory equal to the vault.
+/// @title StrategyFactory_auth
+/// @notice `cloneAndInit` / `cloneAndInitDeterministic` are permissionless: anyone may
+///         mint a clone of an approved template bound to a registered vault, naming
+///         themselves as proposer. The vault-registered check and the template allowlist
+///         are the only gates.
 contract StrategyFactoryAuthTest is Test {
     StrategyFactory public factory;
     MockSyndicateRegistry public registry;
@@ -112,37 +100,12 @@ contract StrategyFactoryAuthTest is Test {
 
     // ── cloneAndInit ──
 
-    /// @notice MS-C2: a random EOA that is neither vault, owner, nor a
-    ///         registered agent cannot clone-and-bind a strategy.
-    function test_cloneAndInit_revertsForRandomEoa() public {
-        vm.prank(attacker);
-        vm.expectRevert(StrategyFactory.Unauthorized.selector);
-        factory.cloneAndInit(address(template), address(registeredVault), proposer, _initData());
-    }
-
     /// @notice MS-C2: an unregistered vault always fails — even when the caller
     ///         IS that vault (no spoofing the membership view).
     function test_cloneAndInit_revertsForUnregisteredVault() public {
         vm.prank(address(unregisteredVault));
         vm.expectRevert(StrategyFactory.VaultNotRegistered.selector);
         factory.cloneAndInit(address(template), address(unregisteredVault), proposer, _initData());
-    }
-
-    /// @notice MS-C2: an outsider cannot pass a registered vault as `vault`
-    ///         to bind a clone to a victim.
-    function test_cloneAndInit_revertsWhenVaultMismatchesSender() public {
-        vm.prank(attacker);
-        vm.expectRevert(StrategyFactory.Unauthorized.selector);
-        factory.cloneAndInit(address(template), address(registeredVault), proposer, _initData());
-    }
-
-    /// @notice MS-C2: the vault itself cannot pre-deploy (strategies must be
-    ///         pre-deployed by owner/agent — the governor does not deploy
-    ///         strategies during executeProposal).
-    function test_cloneAndInit_revertsWhenVaultIsCaller() public {
-        vm.prank(address(registeredVault));
-        vm.expectRevert(StrategyFactory.Unauthorized.selector);
-        factory.cloneAndInit(address(template), address(registeredVault), proposer, _initData());
     }
 
     /// @notice Happy path: the vault owner (creator pre-deploy).
@@ -185,23 +148,24 @@ contract StrategyFactoryAuthTest is Test {
         assertTrue(clone != address(0));
     }
 
-    /// @notice MS-C2: a deregistered agent loses access.
-    function test_cloneAndInit_revertsAfterAgentDeregistered() public {
-        registeredVault.setAgent(agentAddr, false);
-        vm.prank(agentAddr);
-        vm.expectRevert(StrategyFactory.Unauthorized.selector);
-        factory.cloneAndInit(address(template), address(registeredVault), proposer, _initData());
+    /// @notice Anyone may clone: a random EOA with no relation to the vault succeeds.
+    function test_cloneAndInit_succeedsForRandomEoa() public {
+        vm.prank(attacker);
+        address clone = factory.cloneAndInit(address(template), address(registeredVault), attacker, _initData());
+        assertEq(MockStrategy(payable(clone)).vault(), address(registeredVault));
+        assertEq(factory.cloneTemplate(clone), address(template), "provenance recorded for every clone");
+    }
+
+    function testFuzz_cloneAndInit_succeedsForAnyCaller(address caller) public {
+        vm.assume(caller != address(0));
+        vm.assume(uint160(caller) > 0xff);
+        vm.assume(caller.code.length == 0);
+        vm.prank(caller);
+        address clone = factory.cloneAndInit(address(template), address(registeredVault), caller, _initData());
+        assertTrue(clone != address(0));
     }
 
     // ── cloneAndInitDeterministic ──
-
-    function test_cloneAndInitDeterministic_revertsForRandomEoa() public {
-        vm.prank(attacker);
-        vm.expectRevert(StrategyFactory.Unauthorized.selector);
-        factory.cloneAndInitDeterministic(
-            address(template), address(registeredVault), proposer, _initData(), bytes32("salt")
-        );
-    }
 
     function test_cloneAndInitDeterministic_revertsForUnregisteredVault() public {
         vm.prank(address(unregisteredVault));
@@ -223,15 +187,4 @@ contract StrategyFactoryAuthTest is Test {
     }
 
     // ── Fuzz: no random caller can clone (must be vault/owner/agent) ──
-
-    function testFuzz_cloneAndInit_revertsForAnyUnauthorizedCaller(address caller) public {
-        vm.assume(caller != vaultOwner);
-        vm.assume(caller != agentAddr);
-        vm.assume(caller != address(0));
-        vm.assume(uint160(caller) > 0xff);
-
-        vm.prank(caller);
-        vm.expectRevert(StrategyFactory.Unauthorized.selector);
-        factory.cloneAndInit(address(template), address(registeredVault), proposer, _initData());
-    }
 }

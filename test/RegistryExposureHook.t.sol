@@ -11,7 +11,7 @@ import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockGovernorMinimal} from "./mocks/MockGovernorMinimal.sol";
-import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
+import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
 
 /// @dev Chainlink feed stub (copied from test/ExposureLedger.t.sol) — the
 ///      ledger reads `latestRoundData` + `decimals` to value coverage.
@@ -164,12 +164,14 @@ contract RegistryExposureHookTest is Test {
         ledger = new ExposureLedger(ledgerOwner, address(wired.swood), 28 days);
         feed = new MockFeed(1e8, 8); // $1.00, 8-dec feed
         // Design revision 2: `woodUsdPriceX8` is a CAP, never a price. WOOD is
-        // valued from the TWAP oracle at $0.05, with the cap 2x ABOVE it and
+        // valued from the WOOD/USD feed at $0.05, with the cap 2x ABOVE it and
         // therefore NOT binding — the configuration production ships.
-        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(0.05e8);
+        MockAggregatorV3 woodFeed = new MockAggregatorV3(8, 0.05e8);
         vm.startPrank(ledgerOwner);
         ledger.setWoodUsdPrice(0.1e8);
-        ledger.setWoodTwapOracle(address(woodTwap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         ledger.setAssetFeed(address(wired.asset), address(feed), 1 days);
         ledger.setCoveredTvlCapUsd(1_000_000e18); // generous
         ledger.setGuardianRegistry(address(wired.registry));
@@ -243,23 +245,27 @@ contract RegistryExposureHookTest is Test {
 
     function test_approveVote_recordsExposure() public {
         vm.prank(g1);
-        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
-        assertGt(ledger.openExposureUsd(g1), 0);
+        wired.registry
+            .voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+        assertGt(ledger.openExposure(g1), 0);
     }
 
     function test_blockVote_recordsNothing() public {
         vm.prank(g1);
-        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Block);
-        assertEq(ledger.openExposureUsd(g1), 0);
+        wired.registry
+            .voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
+        assertEq(ledger.openExposure(g1), 0);
     }
 
     function test_voteChange_approveToBlock_releases() public {
         vm.prank(g1);
-        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
-        assertGt(ledger.openExposureUsd(g1), 0);
+        wired.registry
+            .voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+        assertGt(ledger.openExposure(g1), 0);
         vm.prank(g1);
-        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Block);
-        assertEq(ledger.openExposureUsd(g1), 0);
+        wired.registry
+            .voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
+        assertEq(ledger.openExposure(g1), 0);
     }
 
     /// @notice N1 — a guardian with no free budget can still VOTE; it just
@@ -281,9 +287,10 @@ contract RegistryExposureHookTest is Test {
         assertEq(ledger.slashableBondUsd(g1), 0, "no slashable bond -> no free budget");
 
         vm.prank(g1);
-        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
+        wired.registry
+            .voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
 
-        assertEq(ledger.openExposureUsd(g1), 0, "no coverage booked");
+        assertEq(ledger.openExposure(g1), 0, "no coverage booked");
         (address[] memory approvers,,) = wired.registry.getApproverWeights(address(wired.gov), PID);
         assertEq(approvers.length, 1, "...but the vote itself counted");
         assertEq(approvers[0], g1);
@@ -312,9 +319,11 @@ contract RegistryExposureHookTest is Test {
         vm.mockCall(address(wired.swood), abi.encodeWithSignature("guardianStake(address)", g1), abi.encode(uint256(0)));
 
         vm.prank(g1);
-        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
+        wired.registry
+            .voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(g2);
-        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
+        wired.registry
+            .voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
 
         // Stake weighting: both approvers listed, and g1 is NOT weighted zero --
         // this is the surface that overpays.
@@ -343,7 +352,8 @@ contract RegistryExposureHookTest is Test {
     ///         payout job does not retry forever against a Plan A deployment.
     function test_getApproverCoverage_unwiredLedgerReportsPricedZeros() public {
         vm.prank(g1);
-        unwired.registry.voteOnProposal(address(unwired.gov), PID2, IGuardianRegistry.GuardianVoteType.Approve);
+        unwired.registry
+            .voteOnProposal(address(unwired.gov), PID2, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
 
         (address[] memory approvers, uint256[] memory coverage, bool priced) =
             unwired.registry.getApproverCoverage(address(unwired.gov), PID2);
@@ -356,37 +366,59 @@ contract RegistryExposureHookTest is Test {
         // Plan A behavior preserved: an unwired registry runs no hooks.
         assertEq(address(unwired.registry.exposureLedger()), address(0));
         vm.prank(g1);
-        unwired.registry.voteOnProposal(address(unwired.gov), PID2, IGuardianRegistry.GuardianVoteType.Approve);
+        unwired.registry
+            .voteOnProposal(address(unwired.gov), PID2, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         // no revert, no recording anywhere
-        assertEq(ledger.openExposureUsd(g1), 0);
+        assertEq(ledger.openExposure(g1), 0);
     }
 
+    /// @notice Declared coverage locks, task 3.2: the Approve -> Block ->
+    ///         Approve round trip through the REAL registry releases and
+    ///         re-locks cleanly under the `lockWood`-carrying signature. Pinned
+    ///         on `lockOf` (the per-guardian figure) as well as `openExposure`
+    ///         (the bucket sum), because the two are separate storage and the
+    ///         round trip has to leave both where it found them.
     function test_voteChange_approveBlockApprove_rebooks() public {
-        // Approve → Block → Approve: record, release, re-record (cap re-checked
-        // on the final approve). Exposure returns to the originally booked amount.
+        uint256 declared = 40_000e18; // a partial declaration: 40% of the 100k stake
         vm.prank(g1);
-        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
-        uint256 booked = ledger.openExposureUsd(g1);
-        assertGt(booked, 0);
+        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve, declared);
+        uint256 locked = ledger.lockOf(address(wired.gov), PID, g1);
+        assertEq(locked, declared, "approve locks exactly the declaration (within budget)");
+        assertEq(ledger.openExposure(g1), declared, "and the bucket carries it");
 
+        // Approve -> Block: the lock is released, the bucket is credited back,
+        // and the guardian leaves the ledger's approver list.
         vm.prank(g1);
-        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Block);
-        assertEq(ledger.openExposureUsd(g1), 0);
+        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Block, declared);
+        assertEq(ledger.lockOf(address(wired.gov), PID, g1), 0, "block releases the lock");
+        assertEq(ledger.openExposure(g1), 0, "and frees the budget");
+        (address[] memory listed,) = ledger.approversOf(address(wired.gov), PID);
+        assertEq(listed.length, 0, "and unlists the guardian");
 
+        // Block -> Approve re-locks FROM SCRATCH against the budget as it now
+        // stands — a fresh `min(lockWood, free)`, not a restoration — so a
+        // different declaration on the way back is honoured.
+        uint256 redeclared = 25_000e18;
         vm.prank(g1);
-        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
-        assertEq(ledger.openExposureUsd(g1), booked);
+        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve, redeclared);
+        assertEq(ledger.lockOf(address(wired.gov), PID, g1), redeclared, "re-approve locks the new declaration");
+        assertEq(ledger.openExposure(g1), redeclared, "and the bucket follows it exactly");
+        (listed,) = ledger.approversOf(address(wired.gov), PID);
+        assertEq(listed.length, 1, "re-listed once, not twice");
+        assertEq(listed[0], g1);
     }
 
     function test_voteChange_blockToApprove_booksFresh() public {
         // Block records nothing; changing to Approve books fresh exposure.
         vm.prank(g1);
-        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Block);
-        assertEq(ledger.openExposureUsd(g1), 0);
+        wired.registry
+            .voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Block, type(uint256).max);
+        assertEq(ledger.openExposure(g1), 0);
 
         vm.prank(g1);
-        wired.registry.voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve);
-        assertGt(ledger.openExposureUsd(g1), 0);
+        wired.registry
+            .voteOnProposal(address(wired.gov), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+        assertGt(ledger.openExposure(g1), 0);
     }
 
     function test_setExposureLedger_accessControl() public {

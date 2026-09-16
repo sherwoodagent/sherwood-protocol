@@ -12,7 +12,7 @@ All line references are against `origin/main` @ `00a264a`.
 
 The clone stores its vault and its deployer-proposer (`_vault`, `_proposer`, :45-46) — but **no proposal identity**. It cannot: clones are pre-deployed *before* the proposal that will use them exists (src/StrategyFactory.sol:30-36), so no `proposalId` is available at `initialize` time.
 
-`propose` stores the declared clone address as `p.strategy` (src/SyndicateGovernor.sol:276) but never validates it (src/StrategyFactory.sol:44-46: "The governor doesn't independently validate the strategy address … the allowlist here is the single chokepoint" — and that allowlist gates *templates*, not clone instances).
+`propose` stores the declared clone address as `p.strategy` (src/SyndicateGovernor.sol:276) but never validates it (at the time of writing, src/StrategyFactory.sol natspec called its allowlist "the single chokepoint"; that claim was retired in SHE-209 / PR #284 — the `TierRegistry` class allowlist admits any clone of a class-allowed template, factory-made or not, and the vault binds each to itself. Either way the factory allowlist gates *templates*, not clone instances).
 
 ## Decision 1 — the authorization gap, named precisely
 

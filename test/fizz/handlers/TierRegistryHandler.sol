@@ -69,7 +69,7 @@ abstract contract TierRegistryHandler is Properties {
                 target.codehash
             );
         } else if (selector == 4) {
-            _tierRegistry_setAdapterAllowed(target, arg2 % 2 == 0);
+            _tierRegistry_setCounterpartyAllowed(target, arg2 % 2 == 0);
         } else if (selector == 5) {
             _tierRegistry_setBondReleaseDelay(clampBetween(arg2, 1 days, 60 days));
         } else if (selector == 6) {
@@ -122,8 +122,8 @@ abstract contract TierRegistryHandler is Properties {
         tierRegistry.proposeCertification(target, selector, tier, extractableBoundBps, submitter, expectedCodehash);
     }
 
-    function _tierRegistry_setAdapterAllowed(address adapter, bool allowed) internal asAdmin {
-        tierRegistry.setAdapterAllowed(adapter, allowed);
+    function _tierRegistry_setCounterpartyAllowed(address counterparty, bool allowed) internal asAdmin {
+        tierRegistry.setCounterpartyAllowed(counterparty, allowed);
     }
 
     function _tierRegistry_setBondReleaseDelay(uint256 delay) internal asAdmin {

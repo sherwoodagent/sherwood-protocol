@@ -42,7 +42,6 @@ interface IChallengeGame {
     }
 
     /// @notice Challenge lifecycle. There is deliberately no `Proven` state:
-    ///         nothing is proven on-chain, so a challenge is only ever live
     ///         (`Filed`/`Disputed`) or terminal
     ///         (`Failed`/`Settled`/`Inconclusive`). `Inconclusive` is a terminal
     ///         NON-VERDICT, reachable only from `Disputed`.
@@ -84,8 +83,6 @@ interface IChallengeGame {
     ///        every contributor. There is deliberately no single `disputer` field:
     ///        the defence is bought collectively.
     ///
-    ///        SHARED ACROSS EVERY CHALLENGE ON THE PROPOSAL (pashov 2026-08
-    ///        finding #10): the pool is keyed per review key, not per challenge,
     ///        so two concurrent challenges report the SAME figure here and one
     ///        funding answers both. `challengeOf` synthesises it from the pool
     ///        while the challenge is live, and the value is pinned into storage
@@ -183,6 +180,11 @@ interface IChallengeGame {
         ///      `resolve` routes that case to `_refundAll` — a non-verdict, not an
         ///      acquittal. Appended last for tuple-position stability.
         address courtAtFiling;
+        /// @dev WOOD paid into THIS challenge's own defence, when the shared pool
+        ///      completed before it was filed. Appended for tuple stability.
+        uint256 defenceWeight;
+        /// @dev When that own defence reached the pool's target; zero means never.
+        uint256 defendedAt;
     }
 
     // ── Errors ──
@@ -203,10 +205,12 @@ interface IChallengeGame {
     error NotAccusedApprover();
     error ZeroAddress();
     error InvalidParameter();
-    /// @dev No WOOD price is configured on the ledger, so a bond cannot be
-    ///      denominated at all. Transient and protocol-wide: nothing is
-    ///      challengeable until governance sets one. Split out from
-    ///      `InvalidParameter` because the two call for opposite responses.
+    /// @dev The ledger could not price the bond: no WOOD price source (feed and
+    ///      TWAP both unavailable, or the cap unset), or the vault-asset feed
+    ///      needed for the proposal's need is stale. Transient and
+    ///      protocol-wide: nothing is challengeable until the price returns, and
+    ///      filing WAITS rather than falling back to an inflated figure. Split out
+    ///      from `InvalidParameter` because the two call for opposite responses.
     error WoodPriceUnset();
     /// @dev The bond floored to zero, so the filing would have bought its
     ///      freeze for nothing. Permanent and specific to this proposal:
@@ -308,10 +312,9 @@ interface IChallengeGame {
     /// @dev `challengeId` IS THE CHALLENGE THE COMPLETING CONTRIBUTION WAS PAID
     ///      THROUGH, not the only one it disputes. The pool is per proposal, so
     ///      every live challenge on that review key whose own silence window
-    ///      still contains this instant becomes `Disputed` in the same call, and
-    ///      any filed afterwards is adopted by it. An indexer must re-read
-    ///      `challengeOf(...).status` for the siblings rather than assume one
-    ///      event means one challenge.
+    ///      still contains this instant becomes `Disputed` in the same call. An
+    ///      indexer must re-read `challengeOf(...).status` for the siblings
+    ///      rather than assume one event means one challenge.
     event ChallengeDisputed(uint256 indexed challengeId, uint256 counterBondWood);
     /// @notice A conviction destroyed the proposal's counter-bond pool. Emitted
     ///         once per pool, by whichever challenge convicted first.

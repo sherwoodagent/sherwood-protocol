@@ -424,8 +424,9 @@ contract SyndicateVaultTest is Test {
     function test_rescueEth_revertsDuringActiveStrategy() public {
         vm.deal(address(vault), 1 ether);
 
-        // Simulate an active proposal for this vault.
+        // Simulate an open (executing) proposal for this vault.
         vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("getActiveProposal()"), abi.encode(uint256(42)));
+        vm.mockCall(MOCK_GOVERNOR, abi.encodeWithSignature("openProposalCount()"), abi.encode(uint256(1)));
 
         vm.prank(owner);
         vm.expectRevert(ISyndicateVault.RedemptionsLocked.selector);

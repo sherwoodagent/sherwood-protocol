@@ -33,8 +33,7 @@ import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
-import {MockWoodTwapOracle} from "../mocks/MockWoodTwapOracle.sol";
-import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Base contract with state variables and setup functions.
 ///
@@ -210,7 +209,7 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
 
     MockAgentRegistry internal agentRegistry;
     MockAggregatorV3 internal assetFeed;
-    MockWoodTwapOracle internal woodTwap;
+    MockAggregatorV3 internal woodFeed;
     FizzFactory internal fizzFactory;
     FizzAdapter internal adapter;
 
@@ -236,6 +235,7 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         agentRegistry = new MockAgentRegistry();
         protocolConfig = new ProtocolConfig(address(this));
         tierRegistry = new TierRegistry(address(this));
+        tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
         fizzFactory = new FizzFactory();
         adapter = new FizzAdapter();
 
@@ -244,7 +244,7 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         // WOOD at $0.05 from the market source, with the governance cap set
         // ABOVE it at $0.10 so `min(oracle, governance)` resolves to the
         // oracle — the configuration production ships (see X-7).
-        woodTwap = new MockWoodTwapOracle(0.05e8);
+        woodFeed = new MockAggregatorV3(8, 0.05e8);
     }
 
     function _deployStakingAndRegistry() internal {
@@ -348,6 +348,17 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
 
         _asFactory(address(registry), abi.encodeCall(GuardianRegistry.addGovernor, (address(governor), address(vault))));
 
+        // SHE-215: `propose` / `executeProposal` refuse a vault whose
+        // owner-stake slot is unbound, claimed, slashed, or exiting. The real
+        // `SyndicateFactory.createSyndicate` always binds that slot, so this
+        // hand-built syndicate must too or the entire proposal surface is
+        // trivially unreachable for the fuzzer. `admin` (this harness) is the
+        // vault owner; `bindOwnerStake` is factory-gated like the calls above.
+        wood.deal(address(this), MIN_OWNER_STAKE);
+        wood.approve(address(swood), MIN_OWNER_STAKE);
+        swood.prepareOwnerStake(MIN_OWNER_STAKE);
+        _asFactory(address(swood), abi.encodeCall(StakedWood.bindOwnerStake, (address(this), address(vault))));
+
         // Async LP lane. `setWithdrawalQueue` is factory-gated and set-once
         // (G-17, I-28).
         queue = new VaultWithdrawalQueue(address(vault));
@@ -405,7 +416,9 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         // current relative to the warps above.
         ledger = new ExposureLedger(address(this), address(swood), EPOCH_LENGTH);
         ledger.setWoodUsdPrice(0.1e8);
-        ledger.setWoodTwapOracle(address(woodTwap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         ledger.setAssetFeed(address(asset), address(assetFeed), 365 days);
         ledger.setCoveredTvlCapUsd(10_000_000e18);
         ledger.setGuardianRegistry(address(registry));
@@ -438,12 +451,9 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         }
     }
 
-    /// @dev Certify and allowlist the benign batch target. Two separate gates
-    ///      have to pass for a proposal's calls to execute: `tierOf` prices the
-    ///      (target, selector) pair, and `isAdapterAllowed` decides whether the
-    ///      vault may call the target at all (issue #166). Certification is a
-    ///      propose → delay → certify cycle (I-30), so the clock is advanced in
-    ///      between.
+    /// @dev Certify the benign batch target: `tierOf` prices the (target, selector)
+    ///      pair. Certification is a propose → delay → certify cycle (I-30), so the
+    ///      clock is advanced in between.
     function _certifyAdapter() internal {
         // Tier 1 with a 50% extractable bound. `extractableBoundBps` must sit
         // strictly inside (0, FULL_NOTIONAL_BPS) — 10_000 is the exclusive
@@ -453,7 +463,6 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         );
         skipTime(tierRegistry.certifyDelay() + 1);
         tierRegistry.certify(address(adapter), FizzAdapter.poke.selector);
-        tierRegistry.setAdapterAllowed(address(adapter), true);
     }
 
     function _seedVault() internal {

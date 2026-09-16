@@ -62,6 +62,5 @@ interface IProposerBondEscrow {
     ///         must not lock a bond into an escrow whose `exposureLedger`
     ///         differs from the ledger it is pricing/pinning that bond
     ///         against, or the escrow will reject every forfeiture attempt
-    ///         from the ledger's game, forever (audit finding, PR #136 round 1).
     function exposureLedger() external view returns (address);
 }

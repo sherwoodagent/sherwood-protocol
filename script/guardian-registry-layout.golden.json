@@ -25,7 +25,7 @@
       "type": "t_mapping(t_bytes32,t_array(t_address)dyn_storage)"
     },
     {
-      "label": "_blockers",
+      "label": "__retiredBlockers",
       "slot": "4",
       "offset": 0,
       "type": "t_mapping(t_bytes32,t_array(t_address)dyn_storage)"
@@ -37,7 +37,7 @@
       "type": "t_mapping(t_bytes32,t_mapping(t_address,t_uint256))"
     },
     {
-      "label": "_blockerIndex",
+      "label": "__retiredBlockerIndex",
       "slot": "6",
       "offset": 0,
       "type": "t_mapping(t_bytes32,t_mapping(t_address,t_uint256))"

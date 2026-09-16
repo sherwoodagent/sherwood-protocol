@@ -14,29 +14,20 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
+import {AssetPuller} from "./mocks/AssetPuller.sol";
 import {MockRegistryMinimal} from "./mocks/MockRegistryMinimal.sol";
-import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
+import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
+import {MockCoverageFreezer} from "./mocks/MockCoverageFreezer.sol";
 import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {TierRegistry} from "../src/TierRegistry.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
-import {CallSandbox} from "../src/CallSandbox.sol";
-import {ICallSandbox} from "../src/interfaces/ICallSandbox.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "./helpers/TierRegistryFixture.sol";
 
 /// @dev Minimal sWOOD read surface the ExposureLedger constructor consumes.
 ///      `coolDownPeriod` (45d) covers epochLength (28d) + challengeWindow (14d).
 contract MockSwood {
     mapping(address => uint256) public guardianStake;
     uint256 public coolDownPeriod = 45 days;
-    /// @dev Read by `CallSandbox`'s denylist chain (ledger -> sWOOD -> WOOD).
-    ///      The real `StakedWood` exposes the same getter; without it here the
-    ///      WOOD arm of the denylist would resolve to `address(0)` and pass
-    ///      vacuously, which is indistinguishable from it working.
-    address public wood;
-
-    function setWood(address w) external {
-        wood = w;
-    }
 
     function setStake(address g, uint256 own) external {
         guardianStake[g] = own;
@@ -116,11 +107,16 @@ contract MockFilingDeadline {
     function setChallengeableUntil(bytes32 key, uint256 until) external {
         challengeableUntil[key] = until;
     }
-}
 
-/// @dev A non-zero freezer that answers neither of those views — a slot rotated
-///      to something that is not a game, or simply a broken address.
-contract MuteFreezer {}
+    /// @dev Unchecked against the ledger, deliberately. Since SHE-214 the
+    ///      ledger refuses to WIRE a game whose window exceeds its own, so a
+    ///      divergence is seated by raising the stub AFTER wiring — the route
+    ///      the real game's own setter also forbids, which is the point of a
+    ///      stub here.
+    function setChallengeWindow(uint256 window_) external {
+        challengeWindow = window_;
+    }
+}
 
 /// @dev The permissive ledger an attacker re-points the governor's LIVE
 ///      `_exposureLedger` slot at (issue #116): zero challenge window, no
@@ -163,6 +159,12 @@ contract MockEscrowAuth {
 ///         every proposal resolves to tier 2 / full notional (coverage ==
 ///         maxCapital) — the simplest coverage arithmetic.
 contract GovernorCoverageGatesTest is Test {
+    /// @dev A few tests wire THIS contract as the ledger's coverage freezer;
+    ///      since SHE-214 a freezer must answer `challengeWindow()` to wire.
+    function challengeWindow() external view returns (uint256) {
+        return ledger.challengeWindow();
+    }
+
     SyndicateGovernor public governor;
     SyndicateVault public vault;
     SyndicateGovernor public unwiredGovernor;
@@ -203,16 +205,17 @@ contract GovernorCoverageGatesTest is Test {
 
         // ── Ledger: $0.05 WOOD, $1.00 USDG feed, generous cap, default bps 100.
         swood = new MockSwood();
-        swood.setWood(address(wood));
         ledger = new ExposureLedger(ledgerOwner, address(swood), 28 days);
         feed = new MockFeed(1e8, 8); // $1.00, 8-dec
         // Design revision 2: `woodUsdPriceX8` is a CAP, never a price. WOOD is
-        // valued from the TWAP oracle at $0.05, with the cap 2x ABOVE it and
+        // valued from the WOOD/USD feed at $0.05, with the cap 2x ABOVE it and
         // therefore NOT binding — the configuration production ships.
-        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(0.05e8);
+        MockAggregatorV3 woodFeed = new MockAggregatorV3(8, 0.05e8);
         vm.startPrank(ledgerOwner);
         ledger.setWoodUsdPrice(0.1e8);
-        ledger.setWoodTwapOracle(address(woodTwap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         // Generous staleness bound: the §3.3a quorum re-reads this feed at
         // EXECUTE time, which is a voting period (+ review window) after
         // propose. A `maxDelay` shorter than that lifecycle would make every
@@ -221,10 +224,10 @@ contract GovernorCoverageGatesTest is Test {
         // deliberately. Feed staleness itself is covered in ExposureLedger.t.sol.
         ledger.setAssetFeed(address(usdg), address(feed), 365 days);
         ledger.setCoveredTvlCapUsd(10_000_000e18); // $10M — generous
-        // The ledger books commitments itself and the quorum reads its OWN
+        // The ledger holds the locks itself and the quorum reads its OWN
         // approver list, so this slot is only the record/release authorization.
-        // Nothing is committed by default — the cold-start case the quorum must
-        // fail closed on; `_seatApprovers` books real commitments.
+        // Nothing is locked by default — the cold-start case the quorum must
+        // fail closed on; `_seatApprovers` locks real commitments.
         ledger.setGuardianRegistry(ledgerRegistry);
         vm.stopPrank();
 
@@ -294,10 +297,6 @@ contract GovernorCoverageGatesTest is Test {
                 }))
         );
         v = SyndicateVault(payable(address(new ERC1967Proxy(address(vaultImpl), vaultInit))));
-        // Factory-gated and set-once; the test contract is the factory. Wired on
-        // every syndicate this fixture builds so the sandbox coverage tests
-        // below run against the same ledger-gated governor as everything else.
-        v.setSandboxImplementation(address(new CallSandbox()));
 
         SyndicateGovernor govImpl = new SyndicateGovernor(24 hours, 1 hours);
         bytes memory govInit = abi.encodeCall(
@@ -625,16 +624,22 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 
-    /// @dev Stake each guardian and book a REAL commitment against `pid`
-    ///      through the ledger's registry-only entrypoint. The quorum sums the
-    ///      ledger's own committed shares, so coverage has to be booked, not
-    ///      merely asserted by a mock approver list. At $0.05/WOOD, 20,000 WOOD
-    ///      == $1,000 of slashable bond.
+    /// @dev Stake each guardian and lock a REAL commitment against `pid`
+    ///      through the ledger's registry-only entrypoint. The quorum sums
+    ///      `min(lock, slashable stake) x price` over the ledger's OWN approver
+    ///      list, so coverage has to be locked, not merely asserted by a mock
+    ///      approver list. Each guardian declares `type(uint256).max`, which
+    ///      the ledger clamps to its whole free budget (`kNumerator x stake -
+    ///      openExposure`, k = 1 here), so the lock equals the stake and the
+    ///      coverage each guardian raises is exactly its stake at the price:
+    ///      at $0.05/WOOD, 20,000 WOOD == $1,000. The stake figure is therefore
+    ///      still the single knob every test below reasons about.
     function _seatApprovers(uint256 pid, address[] memory gs, uint256 ownStakeEach) internal {
         for (uint256 i = 0; i < gs.length; i++) {
             swood.setStake(gs[i], ownStakeEach);
             vm.prank(address(ledgerRegistry));
-            ledger.recordApproval(address(governor), pid, gs[i]);
+            ledger.recordApproval(address(governor), pid, gs[i], type(uint256).max);
+            assertEq(ledger.lockOf(address(governor), pid, gs[i]), ownStakeEach, "fixture: lock == whole stake");
         }
     }
 
@@ -719,172 +724,16 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(governor.getEffectiveMaxCapital(pid), 0, "dust coverage floors to a zero net-outflow cap");
     }
 
-    // ── permissionless-tier2-sandbox §5.4: coverage sizes the payload ──────
-
-    /// @dev A sandbox proposal whose BATCHES declare zero caps, so every unit of
-    ///      required coverage is the payload's own funding and the scaling can be
-    ///      read off the sandbox alone. The payload target is `targetToken`, a
-    ///      plain ERC-20 that no owner allowlisted and no registry certified —
-    ///      reachable only because the sandbox calls it as itself.
-    function _proposeSandbox(uint256 funding) internal returns (uint256) {
-        ICallSandbox.Call[] memory calls = new ICallSandbox.Call[](1);
-        calls[0] = ICallSandbox.Call({
-            target: address(targetToken), data: abi.encodeCall(targetToken.approve, (address(usdg), 1))
-        });
-
-        vm.prank(agent);
-        return governor.proposeWithSandbox(
-            ISyndicateGovernor.SandboxPayload({funding: funding, calls: calls, declaredTokens: new address[](0)}),
-            address(vault),
-            address(0),
-            "uri",
-            7 days,
-            _envelope(funding),
-            _execCalls(),
-            new uint256[](1),
-            _settleCalls(),
-            new uint256[](1),
-            new ISyndicateGovernor.CoProposer[](0)
-        );
-    }
-
-    /// @notice A funded payload prices coverage, and coverage is what silence
-    ///         cannot buy: with no approver there is no identified, stake-backed
-    ///         signer underwriting arbitrary calldata, so execution fails closed.
-    ///         This is the gate that replaced the registry owner's allowlist
-    ///         decision — if silence passed it, nothing would have replaced it.
-    function test_sandbox_noApprovers_cannotExecuteOnSilence() public {
-        uint256 pid = _proposeSandbox(1_000e6);
-        assertEq(governor.getRequiredCoverage(pid), 1_000e6, "the payload's own funding, at full notional");
-
-        _toApproved(pid);
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
-        governor.executeProposal(pid);
-        assertEq(vault.sandboxOf(pid), address(0), "and no sandbox was minted");
-    }
-
-    /// @notice Half the coverage funds half the payload. The sandbox is a
-    ///         structural loss bound, so scaling the funding IS scaling the risk
-    ///         — a half-underwritten proposal must not put the whole declared
-    ///         amount at stake.
-    function test_sandbox_halfRaisedCoverage_fundsHalfTheDeclaredAmount() public {
-        uint256 pid = _proposeSandbox(1_000e6);
-        address[] memory gs = new address[](1);
-        gs[0] = makeAddr("g1");
-        _seatApprovers(pid, gs, 10_000e18); // $500 against $1,000 required
-        _toApproved(pid);
-
-        uint256 vaultBefore = usdg.balanceOf(address(vault));
-        governor.executeProposal(pid);
-
-        address sandbox = vault.sandboxOf(pid);
-        assertTrue(sandbox != address(0), "a sandbox was minted");
-        assertEq(usdg.balanceOf(sandbox), 500e6, "funded at half the declared amount");
-        assertEq(vaultBefore - usdg.balanceOf(address(vault)), 500e6, "and the vault paid exactly that");
-        assertEq(governor.getEffectiveMaxCapital(pid), 500e6, "same raised-over-required ratio as the capital");
-    }
-
-    /// @notice Coverage that floors the funding to zero runs NOTHING. Minting an
-    ///         unfunded sandbox would still dispatch arbitrary calldata and would
-    ///         consume the one-sandbox-per-proposal slot, recorded as a run that
-    ///         the (dust-covered) guardians never underwrote at that size.
-    ///         Execution itself still proceeds — there is an identified signer,
-    ///         so the R1 floor is met — it simply carries no payload and no
-    ///         capital.
-    function test_sandbox_dustCoverage_runsNoSandboxAtAll() public {
-        uint256 pid = _proposeSandbox(1_000e6);
-        address[] memory gs = new address[](1);
-        gs[0] = makeAddr("g1");
-        _seatApprovers(pid, gs, 1e12); // $0.00000005 against $1,000 required
-        _toApproved(pid);
-
-        uint256 vaultBefore = usdg.balanceOf(address(vault));
-        governor.executeProposal(pid);
-
-        assertEq(governor.getEffectiveMaxCapital(pid), 0, "dust coverage floors the capital to zero");
-        assertEq(vault.sandboxOf(pid), address(0), "so no sandbox is minted");
-        assertEq(usdg.balanceOf(address(vault)), vaultBefore, "and not one unit left the vault");
-        assertEq(
-            uint256(governor.getProposal(pid).state),
-            uint256(ISyndicateGovernor.ProposalState.Executed),
-            "the proposal still executes, carrying nothing"
-        );
-    }
-
-    /// @dev A fully covered sandbox proposal naming `denied` among its calls.
-    ///      Coverage is seated so execution reaches `run()` — otherwise the
-    ///      quorum would revert first and the denylist assertion would pass for
-    ///      the wrong reason.
-    function _assertSandboxDenies(address denied) internal {
-        ICallSandbox.Call[] memory calls = new ICallSandbox.Call[](1);
-        calls[0] = ICallSandbox.Call({target: denied, data: abi.encodeWithSignature("owner()")});
-
-        vm.prank(agent);
-        uint256 pid = governor.proposeWithSandbox(
-            ISyndicateGovernor.SandboxPayload({funding: 1_000e6, calls: calls, declaredTokens: new address[](0)}),
-            address(vault),
-            address(0),
-            "uri",
-            7 days,
-            _envelope(1_000e6),
-            _execCalls(),
-            new uint256[](1),
-            _settleCalls(),
-            new uint256[](1),
-            new ISyndicateGovernor.CoProposer[](0)
-        );
-
-        address[] memory gs = new address[](1);
-        gs[0] = makeAddr("g1");
-        _seatApprovers(pid, gs, 20_000e18); // $1,000 — fully covers the payload
-        _toApproved(pid);
-
-        vm.expectRevert(abi.encodeWithSelector(ICallSandbox.DeniedTarget.selector, denied));
-        governor.executeProposal(pid);
-    }
-
-    /// @notice The four best-effort arms of the denylist, resolved through the
-    ///         governor -> ledger -> sWOOD -> WOOD chain. Each is reachable only
-    ///         because this fixture actually wires them; an unwired hop resolves
-    ///         to `address(0)`, never matches, and would make the assertion
-    ///         vacuous — which is why the vault/queue/governor arms live in the
-    ///         un-gated suite and these live here.
-    function test_sandbox_denylistCoversTheExposureLedger() public {
-        assertEq(governor.exposureLedger(), address(ledger), "fixture sanity: the ledger is wired");
-        _assertSandboxDenies(address(ledger));
-    }
-
-    function test_sandbox_denylistCoversSwood() public {
-        _assertSandboxDenies(address(swood));
-    }
-
-    function test_sandbox_denylistCoversWood() public {
-        assertEq(swood.wood(), address(wood), "fixture sanity: the WOOD hop resolves");
-        _assertSandboxDenies(address(wood));
-    }
-
-    function test_sandbox_denylistCoversTheTierRegistry() public {
-        // Permissive on purpose: the assertion here is about the DENYLIST
-        // resolving the registry address, not about anything the registry
-        // decides. A real one would only add allowlisting noise to a test that
-        // is not about allowlisting.
-        address registry = address(deployTierRegistry(address(this)));
-        governor.setTierRegistry(registry); // factory-only; test contract is factory
-
-        assertEq(governor.tierRegistry(), registry, "fixture sanity: the registry is wired");
-        _assertSandboxDenies(registry);
-    }
-
-    /// @notice Settlement reuses the STORED `effectiveMaxCapital` from execute
-    ///         (issue #27 design D4) — never a live recompute. A guardian
-    ///         whose bond is later slashed to ZERO (modeled here as a direct
-    ///         stake write, standing in for a real slash's effect on live
-    ///         stake, same convention `ExposureLedger.t.sol`'s finding tests
-    ///         use) does not shrink what the position can unwind: the
-    ///         settlement batch still moves exactly the $500 the proposal
-    ///         executed at, proving settle never re-queries the ledger.
+    /// @notice Settlement reuses the STORED coverage-scaled figures from execute
+    ///         (issue #27 design D4) — never a live recompute. A guardian whose
+    ///         bond is later slashed to ZERO (modeled as a direct stake write,
+    ///         the convention `ExposureLedger.t.sol`'s finding tests use) does
+    ///         not shrink the settle leg's per-call cap: the $500 pull clears the
+    ///         stored 500e6 cap — a live recompute would floor it to 0 and revert
+    ///         `CallCapExceeded` inside the batch — and is stopped only by the
+    ///         settle batch's zero net-egress budget, which runs after the caps.
     function test_settle_reusesStoredEffectiveMaxCapital_despiteCoverageCollapsingBeforeSettle() public {
-        address sink = makeAddr("settleDrainSink");
+        address sink = address(new AssetPuller());
         uint256 maxCapital = 1_000e6;
         address g1 = makeAddr("g1");
 
@@ -892,10 +741,9 @@ contract GovernorCoverageGatesTest is Test {
         execCalls[0] = BatchExecutorLib.Call({
             target: address(targetToken), data: abi.encodeCall(targetToken.approve, (address(usdg), 1)), value: 0
         });
-        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
-        settleCalls[0] = BatchExecutorLib.Call({
-            target: address(usdg), data: abi.encodeCall(usdg.transfer, (sink, 500e6)), value: 0
-        });
+        BatchExecutorLib.Call[] memory settleCalls = _pullCalls(sink, 500e6);
+        uint256[] memory settleCaps = new uint256[](2);
+        settleCaps[1] = maxCapital;
 
         vm.prank(agent);
         uint256 pid = governor.propose(
@@ -907,7 +755,7 @@ contract GovernorCoverageGatesTest is Test {
             execCalls,
             GovEnvelope.defaultCaps(maxCapital, execCalls.length),
             settleCalls,
-            GovEnvelope.defaultCaps(maxCapital, settleCalls.length),
+            settleCaps,
             new ISyndicateGovernor.CoProposer[](0)
         );
 
@@ -923,17 +771,17 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(governor.getEffectiveMaxCapital(pid), 500e6, "executed at the coverage-scaled size");
 
         // The guardian's live bond craters to zero AFTER execute. A live
-        // recompute at settle would floor `effectiveMaxCapital` to 0 and this
-        // $500 settlement drain would revert `CallCapExceeded`/
-        // `MaxNetOutflowExceeded`. It does not, because settle reuses the
-        // STORED figure from execute.
+        // recompute at settle would scale the settle cap to 0 and the $500 pull
+        // would revert `CallCapExceeded(1, 500e6, 0)` inside the batch. It does
+        // not: the pull clears the STORED 500e6 cap and only the net meter,
+        // which runs after the batch, refuses the egress.
         swood.setStake(g1, 0);
         assertEq(ledger.slashableBondUsd(g1), 0, "sanity: coverage has fully collapsed");
 
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateVault.MaxNetOutflowExceeded.selector, 500e6, 0));
         governor.settleProposal(pid);
-        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
-        assertEq(usdg.balanceOf(sink), 500e6, "settle moved exactly the STORED effective cap, not a recomputed 0");
+        assertEq(usdg.balanceOf(sink), 0, "the net meter, not a recomputed per-call cap, stopped the pull");
     }
 
     /// @notice issue #43 x #27 (design D7): per-call caps scale by the SAME
@@ -945,21 +793,19 @@ contract GovernorCoverageGatesTest is Test {
     ///         rather than the raw (larger) caps merely happening to pass.
     function test_execute_perCallCapsScaleByTheSameCoverageRatio() public {
         uint256 maxCapital = 1_000e6;
-        address sink0 = makeAddr("capSink0");
-        address sink1 = makeAddr("capSink1");
+        address sink0 = address(new AssetPuller());
+        address sink1 = address(new AssetPuller());
 
-        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
-        // Attempts to move 1 wei MORE than call 1's scaled cap (120e6) —
-        // still well under its RAW declared cap (300e6), so this only
-        // reverts if the per-call cap was actually scaled.
-        execCalls[0] =
-            BatchExecutorLib.Call({target: address(usdg), data: abi.encodeCall(usdg.transfer, (sink0, 1)), value: 0});
-        execCalls[1] = BatchExecutorLib.Call({
-            target: address(usdg), data: abi.encodeCall(usdg.transfer, (sink1, 120e6 + 1)), value: 0
-        });
-        uint256[] memory execCaps = new uint256[](2);
-        execCaps[0] = 700e6;
-        execCaps[1] = 300e6;
+        // Each pull is preceded by its approve. Call 3 attempts to move 1 wei
+        // MORE than its scaled cap (120e6) — still well under its RAW declared
+        // cap (300e6), so this only reverts if the per-call cap was scaled.
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](4);
+        BatchExecutorLib.Call[] memory a = _pullCalls(sink0, 1);
+        BatchExecutorLib.Call[] memory b = _pullCalls(sink1, 120e6 + 1);
+        (execCalls[0], execCalls[1], execCalls[2], execCalls[3]) = (a[0], a[1], b[0], b[1]);
+        uint256[] memory execCaps = new uint256[](4);
+        execCaps[1] = 700e6;
+        execCaps[3] = 300e6;
 
         BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
         settleCalls[0] = BatchExecutorLib.Call({
@@ -992,28 +838,21 @@ contract GovernorCoverageGatesTest is Test {
         _toApproved(pid);
 
         assertEq(governor.getRequiredCoverage(pid), maxCapital, "tier-2 flat coverage == maxCapital");
-        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, 120e6 + 1, 120e6));
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 3, 120e6 + 1, 120e6));
         governor.executeProposal(pid);
     }
 
-    /// @notice Below the tier threshold, optimistic passage is preserved — the
-    ///         lane the §3.10 ROE gate depends on (spec §4 gate 2). Threshold 3
-    ///         puts every tier below it, which is the same branch a tier-0/1
-    ///         proposal takes at the launch threshold of 2.
-    function test_execute_tierBelowThreshold_skipsQuorum() public {
+    /// @notice No envelope tier buys a proposal out of the approve quorum. The
+    ///         highest tier, carrying non-zero `requiredCoverage` and no
+    ///         covering approver, is refused at execute.
+    function test_execute_highestTierWithCoverageAndNoApprovers_stillRequiresTheQuorum() public {
         uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
-        vm.prank(ledgerOwner);
-        ledger.setQuorumTierThreshold(3); // no tier qualifies
-        _toApproved(pid);
+        assertEq(governor.getProposalTier(pid), 2, "the highest envelope tier");
+        assertGt(governor.getRequiredCoverage(pid), 0);
 
-        // issue #27: the gate not running means NOTHING measured coverage, so
-        // nothing scales — `effectiveMaxCapital` is stored equal to the
-        // declared `maxCapital`, and the event reports zero USD figures.
-        vm.expectEmit(true, false, false, true, address(governor));
-        emit ISyndicateGovernor.EffectiveMaxCapitalSet(pid, 1_000e6, 1_000e6, 0, 0);
-        governor.executeProposal(pid); // zero approvers, still executes
-        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
-        assertEq(governor.getEffectiveMaxCapital(pid), 1_000e6, "ungated path stores the declared maxCapital");
+        _toApproved(pid);
+        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
+        governor.executeProposal(pid);
     }
 
     /// @notice OPERATIONAL COUPLING, pinned deliberately: the quorum re-reads
@@ -1036,7 +875,7 @@ contract GovernorCoverageGatesTest is Test {
         governor.executeProposal(pid);
     }
 
-    // ── ADR 2026-07-27: quorumTierThreshold == 0 (coverage required at EVERY tier) ──
+    // ── Coverage required at EVERY tier ──
 
     /// @dev Wires a TierRegistry and certifies BOTH the execute and settlement
     ///      calls at `tier` with `bound` bps, so the proposal resolves to that
@@ -1051,11 +890,21 @@ contract GovernorCoverageGatesTest is Test {
     ///      local — this repo's optimizer CSEs it across `vm.warp`), execute.
     ///      Called before proposal creation in every site, so the forward warp
     ///      never interacts with an in-flight proposal's execution window.
+    /// @dev `[asset.approve(puller, n), puller.pull(asset, n)]`: the only shape that moves the asset.
+    function _pullCalls(address puller, uint256 amount) internal view returns (BatchExecutorLib.Call[] memory calls) {
+        calls = new BatchExecutorLib.Call[](2);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(usdg), data: abi.encodeCall(usdg.approve, (puller, amount)), value: 0
+        });
+        calls[1] = BatchExecutorLib.Call({
+            target: puller, data: abi.encodeCall(AssetPuller.pull, (address(usdg), amount)), value: 0
+        });
+    }
+
     function _wireTierRegistryCertifiedAt(uint8 tier, uint16 bound) internal returns (TierRegistry reg) {
         reg = new TierRegistry(address(this));
+        reg.setStrategyFactory(address(new PermissiveStrategyFactory()));
         governor.setTierRegistry(address(reg)); // test contract is the factory
-        reg.setAdapterAllowed(address(targetToken), true);
-        reg.setAdapterAllowed(address(usdg), true);
         reg.proposeCertification(
             address(targetToken), targetToken.approve.selector, tier, bound, address(0), address(targetToken).codehash
         );
@@ -1063,12 +912,6 @@ contract GovernorCoverageGatesTest is Test {
         vm.warp(vm.getBlockTimestamp() + reg.certifyDelay());
         reg.certify(address(targetToken), targetToken.approve.selector);
         reg.certify(address(usdg), usdg.approve.selector);
-    }
-
-    /// @notice The launch default is 0 — every tier fail-closed. The §3.10 ROE
-    ///         gate that held this at 2 is resolved (ADR 2026-07-27).
-    function test_quorumTierThresholdDefaultsToZero() public view {
-        assertEq(ledger.quorumTierThreshold(), 0);
     }
 
     /// @notice THE enforcement gap this ADR closes. A tier-0 proposal carrying
@@ -1125,6 +968,8 @@ contract GovernorCoverageGatesTest is Test {
         assertEq(governor.getRequiredCoverage(pid), 0);
 
         _toApproved(pid);
+        vm.expectEmit(true, false, false, true, address(governor));
+        emit ISyndicateGovernor.EffectiveMaxCapitalSet(pid, 1, 1, 0, 0);
         governor.executeProposal(pid); // no approvers, still executes
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
         // issue #27: zero `requiredCoverage` skips the gate, so nothing scales.
@@ -1390,25 +1235,33 @@ contract GovernorCoverageGatesTest is Test {
 
     /// @notice DESIGN D2 — why the gate is a `max` and not `challengeableUntil`
     ///         alone. The two windows can diverge with no `Inconclusive`
-    ///         anywhere in the picture: `ChallengeGame`'s own setters floor its
-    ///         window under the ledger's, but `ExposureLedger.setChallengeWindow`
-    ///         floors only against the registry's review period and has no
-    ///         game-side check, so the ledger owner can drop the ledger's window
-    ///         below the game's afterwards.
+    ///         anywhere in the picture, and the gate must hold the bond to the
+    ///         LATER of the two whichever way they diverge.
+    ///
+    ///         Since SHE-214 no ledger setter can seat `game > ledger`:
+    ///         `ChallengeGame`'s setters floor its window under the ledger's,
+    ///         and `ExposureLedger.setCoverageFreezer` / `setChallengeWindow`
+    ///         both floor the ledger's over the game's. The divergence is
+    ///         therefore seated from the stub's side, AFTER wiring — a
+    ///         defense-in-depth fixture for the arithmetic, not a reachable
+    ///         configuration.
     ///
     ///         Here `challengeableUntil` is ZERO throughout — a gate reading
     ///         only that value would have released on the ledger's deadline
-    ///         while the game still admitted a filing for another week. The
-    ///         divergence is set up from the game's side (a stub with a longer
-    ///         window) because it is the identical condition and does not
-    ///         require an `ExposureLedger` setter whose floor this fixture's
-    ///         EOA registry cannot answer.
+    ///         while the game still admitted a filing for another week.
     function test_reclaimBond_gameWindowAboveTheLedgers_waitsForTheGame() public {
         uint256 pid = _executeThenSettle();
+        // INVERSION FIXTURE: a game window ABOVE the ledger's. #297 (SHE-214)
+        // makes `setCoverageFreezer` refuse this at wiring, so once it lands
+        // this fixture fails there by design — rebuild the divergence from the
+        // ledger side. Until then it is also the one configuration in which an
+        // acquittal leaves a lock filable-but-uncounted for `game.W - ledger.W`
+        // (SHE-213 `unfreezeCoverage` natspec).
         uint256 gameWindow = ledger.challengeWindow() + 7 days;
-        MockFilingDeadline stubGame = new MockFilingDeadline(gameWindow);
+        MockFilingDeadline stubGame = new MockFilingDeadline(ledger.challengeWindow());
         vm.prank(ledgerOwner);
         ledger.setCoverageFreezer(address(stubGame));
+        stubGame.setChallengeWindow(gameWindow); // past the wiring check, deliberately
 
         uint256 executedAt = governor.getProposal(pid).executedAt;
         // Every deadline here is anchored at `executedAt + strategyDuration`,
@@ -1473,11 +1326,16 @@ contract GovernorCoverageGatesTest is Test {
     ///         and under fail-open a lying freezer releases early. Matches this
     ///         function's existing posture for an unset ledger, and is
     ///         recoverable the same way: the ledger owner rotates the slot.
+    ///
+    ///         Since SHE-214 the ledger itself refuses to WIRE a freezer that
+    ///         cannot answer, so the muteness is switched on after wiring — a
+    ///         game that answered once and stopped (upgraded, or broken).
     function test_reclaimBond_freezerThatCannotAnswer_failsClosedButIsRecoverable() public {
         uint256 pid = _executeThenSettle();
-        address mute = address(new MuteFreezer());
+        MockCoverageFreezer mute = new MockCoverageFreezer(ledger.challengeWindow());
         vm.prank(ledgerOwner);
-        ledger.setCoverageFreezer(mute);
+        ledger.setCoverageFreezer(address(mute));
+        mute.setMuted(true);
 
         vm.warp(governor.getProposal(pid).executedAt + ledger.challengeWindow() + 365 days);
         vm.expectRevert();

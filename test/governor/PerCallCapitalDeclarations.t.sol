@@ -12,10 +12,10 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {AssetPuller} from "../mocks/AssetPuller.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
-import {unwireTierRegistry} from "../helpers/TierRegistryUnwire.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice Issue #43 — per-call capital declarations. Tests this change owes
 ///         beyond the ABI-migration sweep (tasks.md §8): the issue's own
@@ -49,6 +49,7 @@ contract PerCallCapitalDeclarationsTest is Test {
         agentRegistry = new MockAgentRegistry();
         guardianRegistry = new MockRegistryMinimal();
         tierRegistry = new TierRegistry(address(this));
+        tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
 
         SyndicateVault vaultImpl = new SyndicateVault();
         bytes memory vaultInit = abi.encodeCall(
@@ -107,8 +108,11 @@ contract PerCallCapitalDeclarationsTest is Test {
 
     function _wireTierRegistry() internal {
         governor.setTierRegistry(address(tierRegistry));
-        tierRegistry.setAdapterAllowed(address(mockAdapter), true);
-        tierRegistry.setAdapterAllowed(address(usdc), true);
+        // The shared `_benignSettle()` leg calls `usdc.approve`. Certify it
+        // tier-0 so a benign settlement is genuinely low-tier: since SHE-210
+        // the settlement leg's tier counts toward the proposal tier, and an
+        // uncertified selector resolves to the fail-closed tier 2.
+        _certifyNow(address(usdc), usdc.approve.selector, 0, 100, address(0));
     }
 
     /// @dev Shared fixture helper (mirrors `TierRegistryTest._certifyNow`):
@@ -188,6 +192,94 @@ contract PerCallCapitalDeclarationsTest is Test {
         //     = 80_000e6 + 95_000e6 + 100_000e6 = 275_000e6
         // settle: single call, cap defaults to 0 (new uint256[](1) is zero-initialized).
         assertEq(governor.getRequiredCoverage(pid), 275_000e6, "issue's own worked example: 275,000, not 10M+");
+    }
+
+    // ── SHE-210: settlement-leg tier must lift the whole-proposal tier ──────
+
+    /// @notice A tier-2 (uncertified) extraction parked entirely in
+    ///         `settlementCalls`, under a certified tier-0 execute leg, must
+    ///         still price the proposal at tier 2. Pre-fix `tier = execTier`
+    ///         discarded the settlement leg's tier, so the proposal recorded
+    ///         tier 0 while coverage — always summed over both legs — priced the
+    ///         extraction. Now tier is the MAX across both legs.
+    function test_she210_settlementLegLiftsProposalTier() public {
+        _wireTierRegistry();
+        // Execute leg: certified tier-0.
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 100, address(0));
+
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(mockAdapter), data: abi.encodeCall(mockAdapter.approve, (address(usdc), 1)), value: 0
+        });
+        uint256[] memory execCaps = new uint256[](1);
+        execCaps[0] = 1_000_000e6;
+
+        // Settlement leg: uncertified selector -> tier 2.
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(mockAdapter), data: abi.encodeCall(mockAdapter.mint, (address(this), 1)), value: 0
+        });
+        uint256[] memory settleCaps = new uint256[](1);
+        settleCaps[0] = 100_000e6;
+
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://she210-settle-tier2",
+            7 days,
+            ISyndicateGovernor.RiskEnvelope({maxCapital: 10_000_000e6, maxDrawdownBps: 10_000}),
+            execCalls,
+            execCaps,
+            settleCalls,
+            settleCaps,
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+
+        assertEq(
+            governor.getProposalTier(pid), 2, "settlement-leg tier-2 lifts the whole-proposal tier (was execTier=0)"
+        );
+    }
+
+    /// @notice CONTROL: with BOTH legs certified tier-0, the proposal stays
+    ///         tier 0. Pins that the lift above is driven by the settlement
+    ///         leg's TIER, not by the mere presence of a settlement call — so
+    ///         the reject test is not vacuously always-2.
+    function test_she210_certifiedSettlementLegKeepsLowTier() public {
+        _wireTierRegistry();
+        _certifyNow(address(mockAdapter), mockAdapter.approve.selector, 0, 100, address(0));
+        // `usdc.approve` is certified tier-0 inside `_wireTierRegistry`.
+
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(mockAdapter), data: abi.encodeCall(mockAdapter.approve, (address(usdc), 1)), value: 0
+        });
+        uint256[] memory execCaps = new uint256[](1);
+        execCaps[0] = 1_000_000e6;
+
+        // Settlement leg: certified tier-0 (usdc.approve).
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(mockAdapter), 0)), value: 0
+        });
+        uint256[] memory settleCaps = new uint256[](1);
+        settleCaps[0] = 1_000e6;
+
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://she210-settle-tier0",
+            7 days,
+            ISyndicateGovernor.RiskEnvelope({maxCapital: 10_000_000e6, maxDrawdownBps: 10_000}),
+            execCalls,
+            execCaps,
+            settleCalls,
+            settleCaps,
+            new ISyndicateGovernor.CoProposer[](0)
+        );
+
+        assertEq(governor.getProposalTier(pid), 0, "both legs certified tier-0 -> proposal stays tier 0");
     }
 
     // ── 8.1(d) / design.md D2: the per-call tier-2 ceiling ──────────────────
@@ -433,12 +525,15 @@ contract PerCallCapitalDeclarationsTest is Test {
     ///         asset reverts at EXECUTE time (per-call meter), even though it
     ///         proposed fine (zero caps are always propose-time legal).
     function test_validation_zeroCapCallMoving1WeiReverts() public {
-        // A call that actually moves the vault's asset(): transfer 1 wei out.
-        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
-        execCalls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.transfer, (address(0xBEEF), 1)), value: 0
+        // A call that actually moves the vault's asset(): pull 1 wei out.
+        address puller = address(new AssetPuller());
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
+        execCalls[0] =
+            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.approve, (puller, 1)), value: 0});
+        execCalls[1] = BatchExecutorLib.Call({
+            target: puller, data: abi.encodeCall(AssetPuller.pull, (address(usdc), 1)), value: 0
         });
-        uint256[] memory execCaps = new uint256[](1); // zero cap
+        uint256[] memory execCaps = new uint256[](2); // zero cap
 
         vm.prank(agent);
         uint256 pid = governor.propose(
@@ -455,7 +550,7 @@ contract PerCallCapitalDeclarationsTest is Test {
         );
 
         _advancePastVoting();
-        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1, 0));
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, 1, 0));
         governor.executeProposal(pid);
     }
 
@@ -466,17 +561,15 @@ contract PerCallCapitalDeclarationsTest is Test {
     function test_allZeroCaps_pricesZeroCoverage_meterStillBlocksOutflow() public {
         _wireTierRegistry();
         _certifyNow(address(mockAdapter), mockAdapter.mint.selector, 0, 50, address(0));
-        // The vault's selector guard (Part 2, registry-dependent) requires
-        // transfer recipients to be allowlisted -- orthogonal to this test's
-        // subject (the per-call cap meter), so allowlist it explicitly rather
-        // than let an unrelated guard fire first.
-        tierRegistry.setAdapterAllowed(address(0xBEEF), true);
 
-        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
-        execCalls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.transfer, (address(0xBEEF), 1)), value: 0
+        address puller = address(new AssetPuller());
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
+        execCalls[0] =
+            BatchExecutorLib.Call({target: address(usdc), data: abi.encodeCall(usdc.approve, (puller, 1)), value: 0});
+        execCalls[1] = BatchExecutorLib.Call({
+            target: puller, data: abi.encodeCall(AssetPuller.pull, (address(usdc), 1)), value: 0
         });
-        uint256[] memory execCaps = new uint256[](1); // zero
+        uint256[] memory execCaps = new uint256[](2); // zero
 
         vm.prank(agent);
         uint256 pid = governor.propose(
@@ -495,7 +588,7 @@ contract PerCallCapitalDeclarationsTest is Test {
         assertEq(governor.getRequiredCoverage(pid), 0, "all-zero caps price zero coverage regardless of tier");
 
         _advancePastVoting();
-        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, 1, 0));
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, 1, 0));
         governor.executeProposal(pid);
     }
 
@@ -591,10 +684,6 @@ contract PerCallCapitalDeclarationsTest is Test {
     ///         already at the max, so execution proceeds normally.
     function test_regression_zeroCapCallDemotion_insideAlreadyTier2Batch_executesFine() public {
         _wireTierRegistry();
-        // The vault's selector guard (Part 2) requires an `approve` spender to
-        // be allowlisted -- orthogonal to this test's subject (tier/coverage
-        // regression under caps), so allowlist the spender explicitly.
-        tierRegistry.setAdapterAllowed(address(this), true);
         // Two calls: one uncertified (forces tier 2 already), one certified
         // tier-0 but capped at ZERO.
         BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
@@ -637,71 +726,8 @@ contract PerCallCapitalDeclarationsTest is Test {
         // tier/coverage arithmetic, not whether the demoted contract remains
         // independently callable.
         vm.etch(address(mockAdapter), address(new HarmlessFallback()).code);
-        // issue #166: the etch above changes `mockAdapter`'s codehash, which
-        // the pre-existing codehash-drift self-heal (issue #137) correctly
-        // reads as revoking `isAdapterAllowed` -- that check is now ALSO the
-        // batch callee gate (Part 2a), not just the fund-destination check
-        // Part 2b already was, so an un-re-attested etch would refuse the
-        // whole batch with `DisallowedBatchCallee` before execution even
-        // reaches the tier/coverage arithmetic this test is about (see the
-        // comment above: "not whether the demoted contract remains
-        // independently callable"). Re-snapshot the new (harmless) code,
-        // mirroring the owner re-attestation ceremony `setAdapterAllowed`'s
-        // natspec documents for a verified legitimate bytecode change.
-        tierRegistry.setAdapterAllowed(address(mockAdapter), true);
         governor.executeProposal(pid);
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Executed));
-    }
-
-    // ── 8.4: unwired-registry default ───────────────────────────────────────
-
-    /// @dev Models a PRE-FIX governor (see `unwireTierRegistry`): the registry
-    ///      is a mandatory `initialize` argument since pashov finding #1, so
-    ///      this pricing branch is now reachable only for governors deployed
-    ///      before it — which is precisely why it still needs a test.
-    function test_unwiredRegistry_defaultIgnoresCapsForPricing_butStillMeters() public {
-        unwireTierRegistry(address(governor));
-        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
-        execCalls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.transfer, (address(0xBEEF), 1)), value: 0
-        });
-        uint256 maxCapital = 1_000e6;
-        uint256[] memory execCaps = new uint256[](1);
-        execCaps[0] = 500e6; // an arbitrary legal cap; irrelevant to pricing when unwired
-
-        vm.prank(agent);
-        uint256 pid = governor.propose(
-            address(vault),
-            address(0),
-            "ipfs://unwired",
-            7 days,
-            ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: 10_000}),
-            execCalls,
-            execCaps,
-            _benignSettle(),
-            new uint256[](1),
-            new ISyndicateGovernor.CoProposer[](0)
-        );
-
-        assertEq(governor.getProposalTier(pid), 2, "unwired -> tier 2 regardless of caps");
-        assertEq(governor.getRequiredCoverage(pid), maxCapital, "unwired -> requiredCoverage == maxCapital flat");
-
-        // But EXECUTION is refused outright (pashov finding #1). This used to
-        // assert the opposite — that the 1-wei call, well under its declared
-        // 500e6 cap, "executes fine" — which is the whole finding: an unwired
-        // governor ran batches with the callee allowlist and the
-        // spender/recipient gate dropped, and the per-call cap it did meter
-        // reads zero for the `approve` that actually drains the vault. Pricing
-        // still degrades to the flat default above; the CAPABILITY gate does
-        // not degrade at all.
-        _advancePastVoting();
-        vm.expectRevert(ISyndicateVault.TierRegistryUnresolved.selector);
-        governor.executeProposal(pid);
-        assertEq(
-            uint256(governor.getProposalState(pid)),
-            uint256(ISyndicateGovernor.ProposalState.Approved),
-            "the revert rolls the proposal back to Approved, not Executed"
-        );
     }
 }
 

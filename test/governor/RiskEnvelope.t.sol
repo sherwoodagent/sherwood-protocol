@@ -11,6 +11,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
 import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {AssetPuller} from "../mocks/AssetPuller.sol";
 import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {GovEnvelope} from "../helpers/GovEnvelope.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
@@ -253,14 +254,19 @@ contract RiskEnvelopeTest is Test {
     ///         so a correctly-metered batch's vault-level meter cannot fire
     ///         first) — `CallCapExceeded`, not `MaxNetOutflowExceeded`.
     function test_settlementBatchExceedingMaxCapitalReverts() public {
-        address sinkAddr = makeAddr("extractionSink");
+        address sinkAddr = address(new AssetPuller());
         uint256 maxCapital = 1_000e6;
         uint256 drain = 2_000e6; // > maxCapital, < 60_000e6 vault balance
 
-        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](2);
         settleCalls[0] = BatchExecutorLib.Call({
-            target: address(usdc), data: abi.encodeCall(usdc.transfer, (sinkAddr, drain)), value: 0
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (sinkAddr, drain)), value: 0
         });
+        settleCalls[1] = BatchExecutorLib.Call({
+            target: sinkAddr, data: abi.encodeCall(AssetPuller.pull, (address(usdc), drain)), value: 0
+        });
+        uint256[] memory settleCaps = new uint256[](2);
+        settleCaps[1] = maxCapital;
 
         vm.prank(agent);
         uint256 pid = governor.propose(
@@ -276,12 +282,7 @@ contract RiskEnvelopeTest is Test {
             ),
             // benign approve — zero net outflow at execute
             settleCalls,
-            GovEnvelope.defaultCaps(
-                (ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: 10_000})).maxCapital,
-                ( // benign approve — zero net outflow at execute
-                        settleCalls
-                    ).length
-            ),
+            settleCaps,
             new ISyndicateGovernor.CoProposer[](0)
         );
 
@@ -291,7 +292,7 @@ contract RiskEnvelopeTest is Test {
         // Proposer self-settles at the 1h minimum — the drain moment.
         vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
         vm.prank(agent);
-        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 0, drain, maxCapital));
+        vm.expectRevert(abi.encodeWithSelector(BatchExecutorLib.CallCapExceeded.selector, 1, drain, maxCapital));
         governor.settleProposal(pid);
     }
 

@@ -4,7 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
-import {MockWoodTwapOracle} from "test/mocks/MockWoodTwapOracle.sol";
+import {MockAggregatorV3} from "test/mocks/MockAggregatorV3.sol";
 
 /// @dev Minimal sWOOD stub exposing exactly the reads the ledger consumes.
 ///      Live-basis only (`slashableStakeAt` mirrors live stake) — none of
@@ -61,8 +61,8 @@ contract HighDecimalsFeed {
 ///      normally, within bound) whose `latestRoundData()` returns too few
 ///      words to decode — ONE word (32 bytes) where the tuple `(uint80,
 ///      int256, uint256, uint256, uint80)` needs five (160 bytes). Mirrors
-///      `test/mocks/MockWoodTwapOracle.sol`'s `ShortReturnWoodTwapOracle`
-///      exactly, for the identical reason: a typed `try ... returns (...)`
+///      the ledger's own defensive read, for the same reason: a typed
+///      `try ... returns (...)`
 ///      does not route a return-data decode failure through `catch` — it is
 ///      an uncaught, full revert of the transaction (Solidity's own
 ///      documented limitation) — so a defensive reader must reject the
@@ -166,25 +166,25 @@ contract MockGovernorForLedger {
 ///         data reverted uncatchably. Fixed by bounding `feedDecimals` at
 ///         write time (`MAX_FEED_DECIMALS`, both setters) and by rewriting
 ///         `_feedPriceX8` to a raw staticcall with an explicit length check
-///         before decoding — the exact pattern `_twapPriceX8` already used.
+///         before decoding.
 ///
-///         FINDING 23 (`test_recordApproval_...`, `test_settleCoverage_...`):
-///         `recordApproval` and `settleCoverage` each used to write the
-///         equivalent of `try this.coverageUsd(IVaultAssetMinimal(pv.vault)
+///         FINDING 23 (`test_recordApproval_...`): `recordApproval` (and the
+///         since-deleted `settleCoverage`) used to write the equivalent of `try this.coverageUsd(IVaultAssetMinimal(pv.vault)
 ///         .asset(), gov.getRequiredCoverage(proposalId)) returns (...) {
 ///         ... } catch { ... }`. Solidity evaluates a call's ARGUMENTS in the
 ///         caller's frame, before the call the `try` actually guards, so a
 ///         revert from either the vault's `asset()` or the governor's
 ///         `getRequiredCoverage` propagated straight past the `catch` —
-///         reverting the whole APPROVE vote (or settlement pass) instead of
-///         booking/settling nothing, exactly the failure mode each
-///         function's own natspec says must never happen. Fixed by hoisting
-///         both reads into their own try/catch in `_tryResolveCoverageInputs`,
-///         called ahead of the `coverageUsd` try each caller still performs.
+///         reverting the whole APPROVE vote instead of locking nothing,
+///         exactly the failure mode the function's own natspec says must never
+///         happen. Fixed by hoisting both reads into their own try/catch in
+///         `_tryResolveCoverageInputs`, called ahead of the `coverageUsd` try
+///         the caller still performs. The `settleCoverage` half of the finding
+///         went with the function itself (declared coverage locks).
 contract ExposureLedgerPriceAndScopeTest is Test {
     ExposureLedger internal ledger;
     MockSwood internal swood;
-    MockWoodTwapOracle internal twap;
+    MockAggregatorV3 internal woodFeed;
     MockGovernorForLedger internal mgov;
     MockVaultForLedger internal vault;
     address internal usdgAsset;
@@ -200,7 +200,7 @@ contract ExposureLedgerPriceAndScopeTest is Test {
     function setUp() public {
         swood = new MockSwood();
         ledger = new ExposureLedger(owner, address(swood), 28 days);
-        twap = new MockWoodTwapOracle(MARKET_X8);
+        woodFeed = new MockAggregatorV3(8, int256(MARKET_X8));
 
         usdgAsset = makeAddr("usdgAsset");
         vm.mockCall(usdgAsset, abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
@@ -210,7 +210,9 @@ contract ExposureLedgerPriceAndScopeTest is Test {
 
         vm.startPrank(owner);
         ledger.setWoodUsdPrice(CAP_X8);
-        ledger.setWoodTwapOracle(address(twap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         ledger.setAssetFeed(usdgAsset, address(assetFeed), 365 days);
         ledger.setGuardianRegistry(registry);
         vm.stopPrank();
@@ -265,25 +267,22 @@ contract ExposureLedgerPriceAndScopeTest is Test {
     }
 
     /// @notice A wired-but-malformed WOOD feed (too little `latestRoundData`
-    ///         return data to decode) must make `woodPriceX8` fall through to
-    ///         the TWAP, not revert the whole read.
+    ///         return data to decode) must resolve to the ledger's own
+    ///         `NoWoodPrice`, not to an undecodable revert bubbled out of the
+    ///         decoder.
     ///
-    ///         Fails against the pre-fix code: the typed
-    ///         `try IAggregatorMinimal(feed).latestRoundData() returns (...)`
-    ///         does not catch a return-data ABI-decode failure (an
-    ///         uncatchable, full revert per Solidity's own documented
-    ///         behaviour), so `woodPriceX8()` reverts outright and this test
-    ///         fails on the unexpected revert. Passes against the fix, which
-    ///         rejects the short return by length BEFORE attempting to decode.
-    function test_woodPriceX8_fallsThroughToTwap_onShortReturnFeedData() public {
+    ///         The typed `try IAggregatorMinimal(feed).latestRoundData()
+    ///         returns (...)` does not catch a return-data ABI-decode failure
+    ///         (an uncatchable, full revert per Solidity's own documented
+    ///         behaviour), so the read must reject the short return by LENGTH
+    ///         before attempting to decode it.
+    function test_woodPriceX8_isNoWoodPrice_onShortReturnFeedData() public {
         ShortReturnAggregator badFeed = new ShortReturnAggregator();
         vm.prank(owner);
         ledger.setWoodFeed(address(badFeed), 1 days); // decimals() == 8, within bound: wires cleanly
 
-        assertEq(ledger.woodPriceX8(), MARKET_X8, "must fall through to the TWAP, not revert");
-
-        (, bool fromFeed,) = ledger.woodPriceDetail();
-        assertFalse(fromFeed, "malformed feed data must not be reported as the live source");
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
+        ledger.woodPriceX8();
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -306,7 +305,7 @@ contract ExposureLedgerPriceAndScopeTest is Test {
         mgov.setRevertOnRequiredCoverage(true);
 
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), proposalId, guardian);
+        ledger.recordApproval(address(mgov), proposalId, guardian, type(uint256).max);
 
         (address[] memory approvers,) = ledger.pledgedOf(address(mgov), proposalId);
         assertEq(approvers.length, 0, "guardian must not be booked when required coverage is unreadable");
@@ -324,42 +323,9 @@ contract ExposureLedgerPriceAndScopeTest is Test {
         mgov.set(_requiredCoverage6(1_000e18));
 
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), proposalId, guardian);
+        ledger.recordApproval(address(mgov), proposalId, guardian, type(uint256).max);
 
         (address[] memory approvers,) = ledger.pledgedOf(address(mgov), proposalId);
         assertEq(approvers.length, 0, "guardian must not be booked when the vault's asset() is unreadable");
-    }
-
-    /// @notice The same hazard inside `settleCoverage`: once required coverage
-    ///         becomes unreadable between approval and settlement, the
-    ///         permissionless settlement pass must be a no-op retried later,
-    ///         never a revert — and it must not have mutated anything.
-    ///
-    ///         Fails against the pre-fix code (the inline-argument call
-    ///         reverts `settleCoverage` outright), passes against the fix.
-    function test_settleCoverage_requiredCoverageReverts_doesNotRevert() public {
-        uint256 proposalId = 3;
-        uint256 needUsd = 1_000e18;
-
-        swood.setStake(guardian, 10_000e18); // plenty of slashable bond at $2.00
-        mgov.set(_requiredCoverage6(needUsd));
-        mgov.setSchedule(block.timestamp + 1 days, 7 days);
-
-        vm.prank(registry);
-        ledger.recordApproval(address(mgov), proposalId, guardian);
-
-        (, uint256[] memory pledgedBefore) = ledger.pledgedOf(address(mgov), proposalId);
-        assertEq(pledgedBefore.length, 1, "sanity: guardian must have booked before settlement");
-        assertEq(pledgedBefore[0], needUsd, "sanity: guardian must have reserved the full requirement");
-
-        // Close the review window, then make `getRequiredCoverage` start
-        // reverting before the settlement pass runs.
-        vm.warp(mgov.executeBy() + 1);
-        mgov.setRevertOnRequiredCoverage(true);
-
-        ledger.settleCoverage(address(mgov), proposalId); // must not revert
-
-        (, uint256[] memory pledgedAfter) = ledger.pledgedOf(address(mgov), proposalId);
-        assertEq(pledgedAfter[0], pledgedBefore[0], "a failed settlement pass must not mutate the pledge");
     }
 }

@@ -141,12 +141,6 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
             TierRegistry(d.tierRegistry).isCounterpartyAllowed(MORPHO_BLUE),
             "morpho unattested on the counterparty axis: CL binds it as a counterparty"
         );
-        // Morpho needs BOTH axes — CL binds it as a counterparty, while
-        // MorphoSupplyStrategy spends vault funds into it as an adapter.
-        assertTrue(
-            TierRegistry(d.tierRegistry).isAdapterAllowed(MORPHO_BLUE),
-            "morpho unattested on the adapter axis: MorphoSupplyStrategy cannot spend into it"
-        );
     }
 
     /// @dev THE ORDERING THIS DEPENDS ON. Every write in `_seatOwnerWrites` is

@@ -6,6 +6,7 @@ import {console} from "forge-std/console.sol";
 import {Handlers} from "./handlers/Handlers.sol";
 import {IChallengeGame} from "../../src/interfaces/IChallengeGame.sol";
 import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
+import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
 
 /// @notice Contract to be used for quick testing with Foundry
 contract FoundryTester is Test, Handlers {
@@ -14,6 +15,22 @@ contract FoundryTester is Test, Handlers {
     modifier asActor() override {
         vm.startPrank(actor);
         _;
+        vm.stopPrank();
+    }
+
+    /// @notice `vm.stopPrank()`, called from a frame one level down.
+    ///
+    /// @dev Only ever needed after a handler carrying `asActor` REVERTS: the
+    ///      modifier's trailing `stopPrank` is skipped, and the cheatcode state
+    ///      does not unwind with the EVM frame, so the prank outlives the call.
+    ///      A plain `vm.stopPrank()` from the test body does not clear it —
+    ///      the prank was registered one call deep (inside the self-call that
+    ///      reverted) and the cheatcode is depth-scoped, so the shallower stop
+    ///      is a silent no-op. Verified the hard way: without the extra frame
+    ///      the leftover prank re-targets every later call and the recovery
+    ///      assertions fail as `NoActiveStake`, from an actor that was never
+    ///      the vault owner.
+    function clearLeakedPrank() external {
         vm.stopPrank();
     }
 
@@ -289,6 +306,113 @@ contract FoundryTester is Test, Handlers {
         vm.prank(filer);
         vm.expectRevert(IChallengeGame.AlreadyChallenged.selector);
         game.file(address(governor), pid, IChallengeGame.Predicate(0), address(0), bytes4(0), "probe");
+    }
+
+    /// @notice `slashOwnerBond` closes the proposal lane, and the harness can
+    ///         open it again — so no sequence that draws the slash selector
+    ///         costs the campaign the rest of the lifecycle.
+    ///
+    /// @dev SHE-215 made `propose` and `executeProposal` read `ownerBondLive`.
+    ///      `Base.setup()` binds the owner slot exactly once, to `address(this)`,
+    ///      and `stakedWood_requestUnstakeOwner_clamped` /
+    ///      `stakedWood_claimUnstakeOwner_clamped` run `asActor` — no actor is
+    ///      that owner, so both revert always. The only owner-slot mutation the
+    ///      fuzzer could land was `_stakedWood_slashOwnerBond`, which `delete`s
+    ///      the record. One draw of it removed propose → vote → execute →
+    ///      settle from the explored surface FOR THE REST OF THE RUN, and
+    ///      nothing said so: no property fails, the campaign just stops covering
+    ///      its largest lane.
+    ///
+    ///      This is the assertion that would have caught that, and the one that
+    ///      keeps catching it — a silently-unreachable lifecycle is invisible in
+    ///      a green campaign, so it has to be pinned by a test that drives the
+    ///      transition. Every step goes through a HANDLER, not through
+    ///      `swood` / `governor` directly: the claim under test is about the
+    ///      EXPLORED SURFACE, so exercising anything the fuzzer cannot itself
+    ///      reach would prove nothing.
+    ///
+    ///      Asserts both directions. A test that only checked the recovery
+    ///      would pass just as well if the slash had quietly become a no-op, so
+    ///      the closed state is pinned too — and pinned by revert REASON, since
+    ///      "propose reverted" on its own is satisfied by the open-proposal
+    ///      lock, the agent gate, and half a dozen other things.
+    function test_fizz_proposalLaneRecoversAfterSlashOwnerBond() public {
+        assertTrue(swood.ownerBondLive(address(vault)), "setup: the harness must start with a live owner bond");
+
+        // 1. The slash really does close the lane — reached through the
+        //    fuzzer's own selector, `stakedWood_secondary`'s `else` branch.
+        stakedWood_secondary(15, 0, 0);
+        assertFalse(swood.ownerBondLive(address(vault)), "slashOwnerBond left the bond live");
+        assertEq(swood.ownerStake(address(vault)), 0, "slashOwnerBond left the record standing");
+
+        uint256 countSlashed = governor.proposalCount();
+        _assertProposeRefusedForOwnerBond();
+        assertEq(governor.proposalCount(), countSlashed, "a refused propose must not have minted an id");
+
+        // 2. ...and the harness can climb back out.
+        stakedWood_restoreOwnerBond();
+        assertTrue(swood.ownerBondLive(address(vault)), "the re-bind route did not restore the bond");
+        assertGt(swood.ownerStake(address(vault)), 0, "the slot was restored empty");
+
+        syndicateGovernor_propose_clamped(1 days, 1_000e6);
+        assertGt(governor.proposalCount(), countSlashed, "the proposal lane never came back");
+    }
+
+    /// @notice The other half of the same reachability claim: the EXITING state
+    ///         (`unstakeRequestedAt != 0`) is reachable at all, and reversible.
+    ///
+    /// @dev Distinct from the slash: that one empties the record, this one
+    ///      leaves it funded and merely flags it. So it exercises the SECOND
+    ///      clause of `ownerBondLive` and the `cancelUnstakeOwner` branch of
+    ///      `stakedWood_restoreOwnerBond`, rather than the re-bind branch.
+    ///      Before the owner-acting selectors this state had no producer in the
+    ///      harness at all — the clause SHE-215 added was dead surface for the
+    ///      fuzzer, which is the quieter half of the same defect.
+    function test_fizz_proposalLaneRecoversAfterOwnerRequestsUnstake() public {
+        require(swood.ownerBondLive(address(vault)), "setup: bond not live");
+        require(governor.openProposalCount() == 0, "setup: the request is barred while a proposal is open");
+
+        // `stakedWood_secondary`'s owner-acting request selector.
+        stakedWood_secondary(12, 0, 0);
+        assertFalse(swood.ownerBondLive(address(vault)), "requestUnstakeOwner should close the lane");
+        assertGt(swood.ownerStake(address(vault)), 0, "the record must stay FUNDED - this is not the slash path");
+
+        uint256 countExiting = governor.proposalCount();
+        _assertProposeRefusedForOwnerBond();
+
+        stakedWood_restoreOwnerBond();
+        assertTrue(swood.ownerBondLive(address(vault)), "cancelUnstakeOwner did not reopen the lane");
+        assertGt(swood.ownerStake(address(vault)), 0, "the cancel path must not have moved the bond");
+
+        syndicateGovernor_propose_clamped(1 days, 1_000e6);
+        assertGt(governor.proposalCount(), countExiting, "the proposal lane never came back");
+    }
+
+    /// @dev Drives the fuzzer's own propose handler and asserts it is refused
+    ///      for the OWNER-BOND reason specifically.
+    ///
+    ///      Routed through a low-level self-call rather than `vm.expectRevert`
+    ///      so the revert DATA is available to check — "propose reverted" on
+    ///      its own is satisfied by the open-proposal lock, the agent gate and
+    ///      half a dozen other things, none of which is the claim here.
+    ///
+    ///      The trailing `clearLeakedPrank` is not tidiness: `asActor`'s
+    ///      `vm.stopPrank()` is skipped when the body reverts, and the prank
+    ///      does not unwind with the EVM frame, so it would re-target every
+    ///      later call — including `stakedWood_restoreOwnerBond`, whose whole
+    ///      point is acting as the bound owner. See that helper for why the
+    ///      stop has to happen one frame down.
+    function _assertProposeRefusedForOwnerBond() internal {
+        (bool ok, bytes memory ret) =
+            address(this).call(abi.encodeCall(this.syndicateGovernor_propose_clamped, (1 days, 1_000e6)));
+        assertFalse(ok, "propose must be refused while the owner bond is not live");
+        assertEq(
+            bytes4(ret),
+            ISyndicateGovernor.OwnerBondNotLive.selector,
+            "propose was refused, but not by the owner-bond gate"
+        );
+
+        this.clearLeakedPrank();
     }
 
     // ── Violation Repros (auto-generated by Step 11) ──────────────────

@@ -22,7 +22,6 @@ interface ISyndicateFactory {
     event BondEscrowSet(address indexed oldEscrow, address indexed newEscrow);
     event WiringPushed(address indexed governor);
 
-    // ── Events (issue #43 — executor migration) ──
     /// @notice Emitted by `setExecutorImpl` — the shared `BatchExecutorLib`
     ///         new syndicates are wired to at `createSyndicate`.
     event ExecutorImplUpdated(address oldImpl, address newImpl);
@@ -65,7 +64,6 @@ interface ISyndicateFactory {
     ///         into an EXISTING factory-deployed governor.
     function pushWiring(address governor) external;
     /// @notice Update the shared `BatchExecutorLib` new syndicates are wired
-    ///         to at `createSyndicate` (issue #43). Existing vaults are
     ///         untouched — re-point them individually via `pushExecutor`.
     function setExecutorImpl(address newExecutorImpl) external;
     /// @notice Re-point an EXISTING factory-deployed vault at the factory's

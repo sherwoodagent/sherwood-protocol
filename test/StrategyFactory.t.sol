@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {StrategyFactory} from "../src/StrategyFactory.sol";
 import {MockStrategy} from "./mocks/MockStrategy.sol";
+import {MockStrategyAdapter} from "./mocks/MockStrategyAdapter.sol";
 import {BaseStrategy} from "../src/strategies/BaseStrategy.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockMToken} from "./mocks/MockMToken.sol";
@@ -18,7 +19,7 @@ contract _MockSyndicateRegistry {
     }
 }
 
-/// @dev Minimal vault stand-in that exposes IVaultMembership (`owner`,
+/// @dev Minimal vault stand-in (`owner`,
 ///      `isAgent`). Strategies are pre-deployed by the vault owner, so the
 ///      tests prank as the owner.
 contract _MockVault {
@@ -31,6 +32,38 @@ contract _MockVault {
 
     function isAgent(address a) external view returns (bool) {
         return agents[a];
+    }
+}
+
+/// @dev The three two-of-three `IStrategy` getter permutations: each answers two probes and
+///      not the third, so each pins one probe in `registerStrategy`.
+contract _VaultProposerOnly {
+    function vault() external pure returns (address) {
+        return address(1);
+    }
+
+    function proposer() external pure returns (address) {
+        return address(1);
+    }
+}
+
+contract _VaultExecutedOnly {
+    function vault() external pure returns (address) {
+        return address(1);
+    }
+
+    function executed() external pure returns (bool) {
+        return false;
+    }
+}
+
+contract _ProposerExecutedOnly {
+    function proposer() external pure returns (address) {
+        return address(1);
+    }
+
+    function executed() external pure returns (bool) {
+        return false;
     }
 }
 
@@ -55,6 +88,60 @@ contract StrategyFactoryTest is Test {
         usdc = new ERC20Mock("USDC", "USDC", 6);
         mUsdc = new MockMToken(address(usdc), "Moonwell USDC", "mUsdc");
         vault = new _MockVault(vaultOwner);
+    }
+
+    // ── permissionless registration ──
+
+    function test_registerStrategy_isPermissionless() public {
+        MockStrategyAdapter s = new MockStrategyAdapter();
+        vm.expectEmit(true, false, false, true);
+        emit StrategyFactory.StrategyRegistered(address(s), address(s).codehash);
+        vm.prank(attacker);
+        factory.registerStrategy(address(s));
+        assertTrue(factory.isRegisteredStrategy(address(s)), "anyone registers a conformant strategy");
+    }
+
+    function test_registerStrategy_rejectsAContractWithoutTheInterface() public {
+        address[3] memory rejected = [address(usdc), address(registry), attacker];
+        for (uint256 i = 0; i < rejected.length; i++) {
+            vm.expectRevert(abi.encodeWithSelector(StrategyFactory.NotAStrategy.selector, rejected[i]));
+            factory.registerStrategy(rejected[i]);
+            assertFalse(factory.isRegisteredStrategy(rejected[i]));
+        }
+    }
+
+    /// @notice Every one of the three getters is probed: a contract answering any two is refused.
+    function test_registerStrategy_rejectsAPartialInterface() public {
+        address[3] memory rejected = [
+            address(new _VaultProposerOnly()), address(new _VaultExecutedOnly()), address(new _ProposerExecutedOnly())
+        ];
+        for (uint256 i = 0; i < rejected.length; i++) {
+            vm.expectRevert(abi.encodeWithSelector(StrategyFactory.NotAStrategy.selector, rejected[i]));
+            factory.registerStrategy(rejected[i]);
+            assertFalse(factory.isRegisteredStrategy(rejected[i]));
+        }
+    }
+
+    function test_registeredStrategyDeregistersOnCodeChange() public {
+        MockStrategyAdapter s = new MockStrategyAdapter();
+        factory.registerStrategy(address(s));
+        vm.etch(address(s), address(usdc).code);
+        assertFalse(factory.isRegisteredStrategy(address(s)), "code changed since registration");
+        vm.expectRevert(abi.encodeWithSelector(StrategyFactory.NotAStrategy.selector, address(s)));
+        factory.registerStrategy(address(s));
+    }
+
+    function test_cloneAndInitRegistersTheClone() public {
+        bytes memory initData = abi.encode(address(usdc), address(mUsdc), 1_000e6, 990e6, false);
+        vm.prank(vaultOwner);
+        address clone = factory.cloneAndInit(address(template), address(vault), vaultOwner, initData);
+        assertTrue(factory.isRegisteredStrategy(clone), "clone registered");
+        vm.prank(vaultOwner);
+        address det = factory.cloneAndInitDeterministic(
+            address(template), address(vault), vaultOwner, initData, bytes32(uint256(7))
+        );
+        assertTrue(factory.isRegisteredStrategy(det), "deterministic clone registered");
+        assertFalse(factory.isRegisteredStrategy(address(template)), "the template itself is not");
     }
 
     function test_cloneAndInit_atomic() public {
@@ -97,7 +184,7 @@ contract StrategyFactoryTest is Test {
     ///      different vaults yields two DIFFERENT clone addresses (the salt is
     ///      folded with the vault). Without the fold the second deploy would
     ///      collide and revert; with it, an attacker can't precompute (or, via
-    ///      `_authClone`, even deploy at) a victim vault's address from a shared
+    ///      the factory, even deploy at) a victim vault's address from a shared
     ///      salt observed in the mempool.
     function test_cloneAndInitDeterministic_saltBoundToVault() public {
         bytes32 salt = keccak256("shared.salt");
