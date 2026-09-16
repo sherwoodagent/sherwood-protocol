@@ -16,8 +16,10 @@ library DeploySalts {
     bytes32 internal constant CREATE3_FACTORY = keccak256("sherwood.robinhood.v1.create3-factory");
     // keccak256(type(Create3Factory).creationCode) under the pinned toolchain (solc 0.8.28, via_ir,
     // 50 runs); asserted in _c3Factory so a compiler drift fails loudly instead of moving every address.
+    // The trailing CBOR metadata hashes the SOURCE, so any edit to Create3Factory.sol or Create3.sol —
+    // a comment included — moves this value and with it every CREATE3 address. Re-record it here.
     bytes32 internal constant CREATE3_FACTORY_INITCODE_HASH =
-        0x9b43cdf8c567a900f554912c0feed5de9a5fa3eb1d2098234acb53ce78bcbac3;
+        0x44bc4edbbea879077cdecb78ef2f04be06eb9659cd79302d514d8b16c7a3db5a;
 
     // Core
     bytes32 internal constant EXECUTOR = keccak256("sherwood.robinhood.v1.batch-executor-lib");
