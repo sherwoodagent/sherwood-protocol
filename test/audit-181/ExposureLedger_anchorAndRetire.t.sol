@@ -226,12 +226,13 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
     ///         Before the fix, `requireApproveQuorum` read live stake
     ///         (`anchor = 0`) and would have seen $1,000,000 — passing a gate
     ///         a conviction could only ever collect $500,000 against. This
-    ///         test asserts the FIXED behaviour: the gate must revert, because
-    ///         `min(max(500_000e18, 500_000e18), 1_000_000e18) = 500,000e18`
-    ///         is short of the $1,000,000 requirement.
+    ///         test asserts the FIXED behaviour: the gate must report only
+    ///         `min(max(500_000e18, 500_000e18), 1_000_000e18) = 500,000e18`,
+    ///         short of the $1,000,000 requirement.
     ///
-    ///         Fails against the pre-fix code (which returns normally here —
-    ///         `vm.expectRevert` would see no revert), passes against the fix.
+    ///         Fails against the pre-fix code, which reads live stake and so
+    ///         certifies the full $1,000,000 — the `assertEq(raised, 500_000e18)`
+    ///         below is what catches it.
     function test_requireApproveQuorum_sameBlockTopUp_doesNotCertifyPhantomCoverage() public {
         uint256 proposalId = 1;
         uint256 needUsd = 1_000_000e18;
