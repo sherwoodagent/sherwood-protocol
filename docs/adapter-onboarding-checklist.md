@@ -561,8 +561,13 @@ if** the template derives its fund destination and its counterparty allowlist
 from `vault()` and exposes no payout / recipient / router address settable
 from `initialize` or `updateParams` data. Nothing on-chain checks this. Before
 step 1, the reviewer must confirm it for the template being certified
-(`BaseStrategy._pushToVault` and the shipped templates satisfy it; grep the
-template for `recipient` / `receiver` / `dest` / `beneficiary` params).
+(`BaseStrategy._pushToVault` and the shipped templates satisfy it).
+`script/check-template-destinations.sh` (CI job "Template destinations") pins
+the mechanical half: every token movement out of `src/strategies/` names the
+vault or the template itself, and no `recipient` / `receiver` / `dest` /
+`beneficiary`-shaped identifier escapes that binding. It cannot see a
+counterparty that is *approved* rather than paid — that part stays on the
+reviewer.
 
 Note that the vault binding applies to every class member, **including a clone
 the owner also granted per-address** with `setAdapterAllowed(clone, true)` —
