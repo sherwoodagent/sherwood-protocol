@@ -2848,8 +2848,8 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.currentEpoch(), 0, "vote must land in epoch 0 for the straddle to exist");
 
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), 1, guardian);
-        assertEq(ledger.openExposureUsd(guardian), 1_000e18, "coverage booked");
+        ledger.recordApproval(address(mgov), 1, guardian, _wood(1_000e18));
+        assertEq(ledger.openExposure(guardian), 20_000e18, "coverage booked");
 
         // Day 29: past where an epoch-0 booking ages out (28d bucket + 1d
         // window), still 6 days inside #1's execution window.
@@ -2857,8 +2857,8 @@ contract ExposureLedgerTest is Test {
         assertLt(block.timestamp, executeBy, "control: #1 must still be executable at this instant");
 
         assertEq(
-            ledger.openExposureUsd(guardian),
-            1_000e18,
+            ledger.openExposure(guardian),
+            20_000e18,
             "budget returned while the proposal it backs was still executable - one bond, two drains"
         );
     }
@@ -2879,10 +2879,10 @@ contract ExposureLedgerTest is Test {
         // `executeBy` left at 0 => `coverUntil <= epochGenesis` => books into
         // `currentEpoch()`, the rule the floor was sized against.
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), 1, guardian);
-        assertEq(ledger.openExposureUsd(guardian), 1_000e18, "booked into epoch 0");
+        ledger.recordApproval(address(mgov), 1, guardian, _wood(1_000e18));
+        assertEq(ledger.openExposure(guardian), 20_000e18, "booked into epoch 0");
 
         vm.warp(ledger.epochGenesis() + 29 days + 1);
-        assertEq(ledger.openExposureUsd(guardian), 0, "epoch-0 booking ages out at 28d bucket + 1d window");
+        assertEq(ledger.openExposure(guardian), 0, "epoch-0 booking ages out at 28d bucket + 1d window");
     }
 }
