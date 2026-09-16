@@ -2723,6 +2723,33 @@ contract ExposureLedgerTest is Test {
         assertEq(listed[0], small);
     }
 
+    /// @notice SHE-240. The whole-budget arm is an admission for the SMALL, not
+    ///         for the empty: a guardian whose entire budget values to nothing at
+    ///         this instant has nothing at risk, so `min(share, budget)` would be
+    ///         a floor of zero and any dust lock would clear it. That is refused.
+    ///
+    /// @dev    Reachable without mocks: one wei of WOOD at the fixture's $0.05
+    ///         truncates to $0 in `_recoverableUsd` (`1 x 5e6 / 1e8 == 0`), so
+    ///         the guardian holds a non-zero cap, a non-zero free budget and a
+    ///         non-zero clamped lock while every USD figure on the path is zero.
+    function test_recordApproval_zeroValuedBudgetIsRefused() public {
+        _wireRecording();
+        mgov.set(5_000e6);
+
+        address dust = makeAddr("dustGuardian");
+        swood.setStake(dust, 1); // one wei of WOOD
+        assertEq(ledger.slashableBondUsd(dust), 0, "fixture: the whole budget values to $0");
+
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        ledger.recordApproval(address(mgov), 1, dust, LOCK_ALL);
+
+        assertEq(ledger.lockOf(address(mgov), 1, dust), 0, "nothing books");
+        assertEq(ledger.openExposure(dust), 0);
+        (address[] memory listed,) = ledger.approversOf(address(mgov), 1);
+        assertEq(listed.length, 0, "and a worthless budget buys no slot");
+    }
+
     /// @notice SHE-240. The whole-budget admission is measured against the
     ///         guardian's FULL cap, never the remainder after its other open
     ///         locks. Otherwise a squatter parks its stake on a benign

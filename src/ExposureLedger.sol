@@ -766,15 +766,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 free = open >= cap ? 0 : cap - open;
 
         uint256 lock = lockWood < free ? lockWood : free;
-        // A slot is granted to a lock carrying its share of the need, or to a
-        // guardian's WHOLE budget when that is smaller — valued at this instant
-        // exactly as `requireApproveQuorum` values it, so a full approver set
-        // is covered at the vote and no slot is ever free.
+        // A slot costs a lock carrying its share of the need, or a guardian's
+        // WHOLE budget when that is smaller, valued here exactly as the quorum
+        // values it; a budget worth nothing at this instant buys no slot at all.
         uint256 priceX8 = woodPriceX8();
         uint256 shareUsd = (needUsd + APPROVER_SLOTS - 1) / APPROVER_SLOTS;
         uint256 budgetUsd = _recoverableUsd(guardian, cap, priceX8, block.timestamp);
         uint256 floorUsd = shareUsd < budgetUsd ? shareUsd : budgetUsd;
-        if (lock == 0 || _recoverableUsd(guardian, lock, priceX8, block.timestamp) < floorUsd) {
+        if (lock == 0 || budgetUsd == 0 || _recoverableUsd(guardian, lock, priceX8, block.timestamp) < floorUsd) {
             revert ApproveLockBelowFloor();
         }
         // Truncation in the uint128 store below would book a phantom (smaller)

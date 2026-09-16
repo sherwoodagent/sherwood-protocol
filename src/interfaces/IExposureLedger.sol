@@ -102,11 +102,12 @@ interface IExposureLedger {
     /// @notice Lock `min(lockWood, kNumerator x slashableStake(guardian) -
     ///         openExposure(guardian))` WOOD behind (governor, proposalId) for
     ///         `guardian`. Idempotent per (proposal, guardian). Reverts
-    ///         `ApproveLockBelowFloor` when the booked lock is zero, or worth
-    ///         less than BOTH a hundredth of the need and the guardian's whole
-    ///         budget at this instant — the registry's approver array is
-    ///         bounded, so a slot has to be paid for, while a guardian too small
-    ///         to carry a hundredth keeps its voice by committing everything.
+    ///         `ApproveLockBelowFloor` when the booked lock is zero, when the
+    ///         guardian's whole budget values to zero at this instant, or when
+    ///         the lock is worth less than BOTH a hundredth of the need and that
+    ///         whole budget — the registry's approver array is bounded, so a
+    ///         slot has to be paid for, while a guardian too small to carry a
+    ///         hundredth keeps its voice by committing all it has at risk.
     ///         Zero required coverage, an unresolvable or unpriceable vault
     ///         asset, and settlement beyond the coverage horizon still lock
     ///         nothing and return, so the approve vote lands and the shortfall
