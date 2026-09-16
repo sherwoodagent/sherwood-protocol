@@ -18,6 +18,8 @@ so instead of inventing one.
 
 Line references are against this commit; re-derive them if the contracts move.
 
+Where this sits in the ceremony: `docs/deployment-runbook.md` §2.
+
 ---
 
 ## 0. The gate
