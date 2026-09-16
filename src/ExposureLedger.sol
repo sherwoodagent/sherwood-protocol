@@ -726,10 +726,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///
     ///      Consequence: an under-bonded guardian books what it can, and the
     ///      proposal fails the execute-time quorum unless other approvers make
-    ///      up the rest. What it may NOT do is take a slot for less than
-    ///      `1/APPROVER_SLOTS` of the need — below that the vote reverts, so the
-    ///      registry's bounded approver array cannot be filled with underwriters
-    ///      who carry no coverage.
+    ///      up the rest. A guardian small next to the need keeps its voice by
+    ///      putting its WHOLE budget on one proposal. What nobody may do is take
+    ///      a slot for less than both — `1/APPROVER_SLOTS` of the need and its
+    ///      own budget — so the registry's bounded approver array cannot be
+    ///      filled by underwriters who carry nothing.
     function recordApproval(address governor, uint256 proposalId, address guardian, uint256 lockWood)
         external
         onlyRegistry
@@ -765,10 +766,15 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 free = open >= cap ? 0 : cap - open;
 
         uint256 lock = lockWood < free ? lockWood : free;
-        // A slot is granted only to a lock worth at least `1/APPROVER_SLOTS` of
-        // the need, valued exactly as `requireApproveQuorum` values it, so a
-        // full approver set is by construction a fully covered proposal.
-        if (_recoverableUsd(guardian, lock, woodPriceX8(), block.timestamp) * APPROVER_SLOTS < needUsd) {
+        // A slot is granted to a lock carrying its share of the need, or to a
+        // guardian's WHOLE budget when that is smaller — valued at this instant
+        // exactly as `requireApproveQuorum` values it, so a full approver set
+        // is covered at the vote and no slot is ever free.
+        uint256 priceX8 = woodPriceX8();
+        uint256 shareUsd = (needUsd + APPROVER_SLOTS - 1) / APPROVER_SLOTS;
+        uint256 budgetUsd = _recoverableUsd(guardian, cap, priceX8, block.timestamp);
+        uint256 floorUsd = shareUsd < budgetUsd ? shareUsd : budgetUsd;
+        if (lock == 0 || _recoverableUsd(guardian, lock, priceX8, block.timestamp) < floorUsd) {
             revert ApproveLockBelowFloor();
         }
         // Truncation in the uint128 store below would book a phantom (smaller)

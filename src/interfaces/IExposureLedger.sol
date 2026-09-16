@@ -102,9 +102,11 @@ interface IExposureLedger {
     /// @notice Lock `min(lockWood, kNumerator x slashableStake(guardian) -
     ///         openExposure(guardian))` WOOD behind (governor, proposalId) for
     ///         `guardian`. Idempotent per (proposal, guardian). Reverts
-    ///         `ApproveLockBelowFloor` when the booked lock is worth less than
-    ///         a hundredth of the need — the registry's approver array is
-    ///         bounded, so a slot has to carry its share of the coverage.
+    ///         `ApproveLockBelowFloor` when the booked lock is zero, or worth
+    ///         less than BOTH a hundredth of the need and the guardian's whole
+    ///         budget at this instant — the registry's approver array is
+    ///         bounded, so a slot has to be paid for, while a guardian too small
+    ///         to carry a hundredth keeps its voice by committing everything.
     ///         Zero required coverage, an unresolvable or unpriceable vault
     ///         asset, and settlement beyond the coverage horizon still lock
     ///         nothing and return, so the approve vote lands and the shortfall
@@ -113,7 +115,8 @@ interface IExposureLedger {
     ///         requirement, and nothing reduces a lock other than
     ///         `releaseApproval`/`retireApproval`.
     /// @param  lockWood The WOOD the guardian declares. Clamped to the free
-    ///         budget; rejected only if what remains is under the slot floor.
+    ///         budget; rejected only if what remains is under the slot floor —
+    ///         so a whole-budget declaration is always admitted.
     function recordApproval(address governor, uint256 proposalId, address guardian, uint256 lockWood) external;
     function releaseApproval(address governor, uint256 proposalId, address guardian) external;
 

@@ -2669,6 +2669,97 @@ contract ExposureLedgerTest is Test {
         (uint256 raisedUsd, uint256 requiredUsd) = ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6);
         assertEq(requiredUsd, needUsd);
         assertGe(raisedUsd, requiredUsd, "a full approver set is a fully covered proposal");
+
+        // THE INVARIANT IS PER-SLOT AND AT THE VOTE INSTANT: the quorum re-values
+        // at execute, so a WOOD decline in between can leave the cohort short.
+        // What survives any decline is the durable property the floor buys --
+        // every slot-holder carries a NONZERO lock, so the zero-aggregate revert
+        // is unreachable from a full array and execution scales instead of
+        // bricking.
+        marketFeed.set(int256(MARKET_X8 / 2));
+        (uint256 halvedUsd, uint256 stillRequiredUsd) =
+            ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6);
+        assertEq(stillRequiredUsd, needUsd, "the requirement is unmoved by the WOOD price");
+        assertGt(halvedUsd, 0, "a full array never takes the zero-aggregate revert");
+        assertLt(halvedUsd, stillRequiredUsd, "but it is a shortfall now, reported rather than reverted");
+    }
+
+    /// @notice SHE-240 liveness. The floor is the SMALLER of one slot's share
+    ///         and the guardian's whole budget, so a guardian too small to carry
+    ///         a hundredth of the need keeps its voice by committing everything.
+    ///         Without this, a large need shuts every minimum-stake guardian out
+    ///         of the approve side and the proposal bricks instead of executing
+    ///         at scaled capital.
+    function test_recordApproval_wholeBudgetBelowSlotShareIsAdmitted() public {
+        _wireRecording();
+        mgov.set(5_000e6);
+        uint256 needUsd = ledger.coverageUsd(usdgAsset, 5_000e6);
+        uint256 shareWood = _slotFloorWood(needUsd);
+
+        // A guardian whose ENTIRE budget is under one slot's share.
+        address small = makeAddr("smallGuardian");
+        uint256 budget = shareWood / 4;
+        swood.setStake(small, budget);
+        assertLt(
+            (budget * ledger.woodPriceX8()) / 1e8,
+            needUsd / ExposureLedgerHarness(address(ledger)).approverSlots(),
+            "fixture: the whole budget really is under a slot's share"
+        );
+
+        // One wei short of everything: still refused -- holding budget back is
+        // exactly what buys a slot cheaply.
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        ledger.recordApproval(address(mgov), 1, small, budget - 1);
+        (address[] memory none,) = ledger.approversOf(address(mgov), 1);
+        assertEq(none.length, 0, "a held-back declaration buys no slot");
+
+        // Everything: admitted, and the lock is the whole budget.
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, small, budget);
+        assertEq(ledger.lockOf(address(mgov), 1, small), budget, "the whole budget books");
+        (address[] memory listed,) = ledger.approversOf(address(mgov), 1);
+        assertEq(listed.length, 1, "and takes a slot");
+        assertEq(listed[0], small);
+    }
+
+    /// @notice SHE-240. The whole-budget admission is measured against the
+    ///         guardian's FULL cap, never the remainder after its other open
+    ///         locks. Otherwise a squatter parks its stake on a benign
+    ///         self-proposal, drives the remainder to dust, and buys every
+    ///         further slot for nothing.
+    function test_recordApproval_otherOpenLocksDoNotShrinkTheFloor() public {
+        _wireRecording();
+        mgov.set(5_000e6);
+        uint256 needUsd = ledger.coverageUsd(usdgAsset, 5_000e6);
+        uint256 shareWood = _slotFloorWood(needUsd);
+
+        address g = makeAddr("parker");
+        uint256 budget = shareWood * 2;
+        swood.setStake(g, budget);
+
+        // Park most of the budget elsewhere, leaving a remainder under the share.
+        uint256 parked = budget - (shareWood / 4);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g, parked);
+        assertEq(ledger.lockOf(address(mgov), 1, g), parked, "the parking lock stands");
+
+        // The remainder is neither a slot's share nor the whole budget: refused.
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        ledger.recordApproval(address(mgov), 2, g, LOCK_ALL);
+        (address[] memory stillNone,) = ledger.approversOf(address(mgov), 2);
+        assertEq(stillNone.length, 0, "a dust remainder buys no second slot");
+
+        // Releasing the parked lock restores the whole budget, and with it the
+        // guardian's ability to take the slot.
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 1, g);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 2, g, LOCK_ALL);
+        assertEq(ledger.lockOf(address(mgov), 2, g), budget, "the whole budget books once it is free");
+        (address[] memory seated,) = ledger.approversOf(address(mgov), 2);
+        assertEq(seated.length, 1, "and the slot is granted");
     }
 
     /// @notice SHE-240 residual, pinned deliberately. The floor sits AFTER the
