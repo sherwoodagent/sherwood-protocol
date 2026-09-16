@@ -1,0 +1,1569 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+import {ProtocolFixture} from "../helpers/ProtocolFixture.sol";
+
+import {Vm} from "forge-std/Test.sol";
+import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
+import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
+import {SyndicateVault} from "../../src/SyndicateVault.sol";
+import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
+import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
+import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {VaultWithdrawalQueue} from "../../src/queue/VaultWithdrawalQueue.sol";
+import {IVaultWithdrawalQueue} from "../../src/interfaces/IVaultWithdrawalQueue.sol";
+import {MockStrategyAdapter} from "../mocks/MockStrategyAdapter.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
+import {MockMorpho, MockIrm} from "../mocks/MockMorpho.sol";
+import {MorphoSupplyStrategy} from "../../src/strategies/MorphoSupplyStrategy.sol";
+import {Id, MarketParams} from "../../src/vendor/morpho/IMorpho.sol";
+
+contract SyndicateGovernorTest is ProtocolFixture {
+    SyndicateGovernor public governor;
+
+    /// @dev Widest legal risk envelope, computed once in setUp (see there).
+    ISyndicateGovernor.RiskEnvelope internal permissiveEnv;
+    ProtocolConfig public protocolConfig;
+    SyndicateVault public vault;
+    BatchExecutorLib public executorLib;
+    ERC20Mock public usdc;
+    MockAgentRegistry public agentRegistry;
+    MockRegistryMinimal public guardianRegistry;
+
+    address public owner = makeAddr("owner");
+    address public agent = makeAddr("agent");
+    address public agentEoa = makeAddr("agentEoa");
+    address public lp1 = makeAddr("lp1");
+    address public lp2 = makeAddr("lp2");
+    address public random = makeAddr("random");
+
+    uint256 public agentNftId;
+
+    uint256 constant VOTING_PERIOD = 1 days;
+    uint256 constant EXECUTION_WINDOW = 1 days;
+    uint256 constant VETO_THRESHOLD_BPS = 4000;
+    uint256 constant MAX_PERF_FEE_BPS = 1500;
+    uint256 constant MAX_STRATEGY_DURATION = 30 days;
+    uint256 constant COOLDOWN_PERIOD = 1 days;
+
+    ERC20Mock public targetToken;
+
+    function setUp() public {
+        protocolConfig = new ProtocolConfig(owner);
+        // Fees moved to ProtocolConfig (per-vault governor snapshots them at
+        // propose). Match the legacy 1% protocol fee the settlement tests expect.
+        vm.startPrank(owner);
+        protocolConfig.setProtocolFeeRecipient(owner);
+        vm.stopPrank();
+        usdc = new ERC20Mock("USD Coin", "USDC", 6);
+        targetToken = new ERC20Mock("Target", "TGT", 18);
+        executorLib = new BatchExecutorLib();
+        agentRegistry = new MockAgentRegistry();
+        guardianRegistry = new MockRegistryMinimal();
+        agentNftId = agentRegistry.mint(agent);
+
+        vault = _deployVault(
+            ISyndicateVault.InitParams({
+                asset: address(usdc),
+                name: "Sherwood Vault",
+                symbol: "swUSDC",
+                owner: owner,
+                executorImpl: address(executorLib),
+                openDeposits: true,
+                agentRegistry: address(agentRegistry),
+                managementFeeBps: 50
+            })
+        );
+
+        vm.prank(owner);
+        vault.registerAgent(agentNftId, agent);
+
+        governor = _deployGovernor(
+            abi.encodeCall(
+                SyndicateGovernor.initialize,
+                (
+                    address(vault), // vault_: this test's vault (per-vault governor)
+                    address(guardianRegistry),
+                    address(protocolConfig),
+                    address(this),
+                    address(deployTierRegistry(address(this))), // factory (test contract)
+                    ISyndicateGovernor.GovernorParams({
+                        votingPeriod: VOTING_PERIOD,
+                        executionWindow: EXECUTION_WINDOW,
+                        vetoThresholdBps: VETO_THRESHOLD_BPS,
+                        maxPerformanceFeeBps: MAX_PERF_FEE_BPS,
+                        cooldownPeriod: COOLDOWN_PERIOD,
+                        collaborationWindow: 48 hours,
+                        maxCoProposers: 5,
+                        minStrategyDuration: 1 hours,
+                        maxStrategyDuration: MAX_STRATEGY_DURATION
+                    })
+                )
+            )
+        );
+
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        // Inert post-retirement (issue #54): nothing calls `priceRouter()` anymore.
+        vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
+
+        usdc.mint(lp1, 100_000e6);
+        usdc.mint(lp2, 100_000e6);
+
+        vm.startPrank(lp1);
+        usdc.approve(address(vault), 60_000e6);
+        vault.deposit(60_000e6, lp1);
+        vm.stopPrank();
+
+        vm.startPrank(lp2);
+        usdc.approve(address(vault), 40_000e6);
+        vault.deposit(40_000e6, lp2);
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 1);
+
+        // Widest legal envelope at setUp TVL (finding 3 ceiling). Hoisted to a
+        // state var: computing it inline made an external staticcall between
+        // vm.prank/vm.expectRevert and propose(), consuming the cheatcode.
+        permissiveEnv = GovEnvelope.permissive(address(vault));
+    }
+
+    // ==================== HELPERS ====================
+
+    function _emptyCoProposers() internal pure returns (ISyndicateGovernor.CoProposer[] memory) {
+        return new ISyndicateGovernor.CoProposer[](0);
+    }
+
+    function _simpleExecuteCalls() internal view returns (BatchExecutorLib.Call[] memory) {
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 50_000e6)), value: 0
+        });
+        return calls;
+    }
+
+    function _simpleSettlementCalls() internal view returns (BatchExecutorLib.Call[] memory) {
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](1);
+        calls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 0)), value: 0
+        });
+        return calls;
+    }
+
+    function _createSimpleProposal(uint256 perfFeeBps, uint256 duration) internal returns (uint256 proposalId) {
+        // Re-read the envelope ceiling instead of reusing the one cached in
+        // setUp. Under the two-number fee model every settlement charges a
+        // management fee, so `totalAssets()` falls between proposals and a
+        // stale `maxCapital` now trips `MaxCapitalExceedsCeiling`. Refreshed
+        // BEFORE the pranks below, since the `totalAssets()` staticcall inside
+        // would otherwise consume a pending one-shot prank.
+        permissiveEnv = GovEnvelope.permissive(address(vault));
+        // Agent fee is now a vault-owner property read live at settlement; set
+        // it to the test's intended rate so realized-fee assertions still hold.
+        vm.prank(owner);
+        vault.setAgentFeeBps(perfFeeBps);
+        vm.prank(agent);
+        proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            duration,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+        vm.warp(block.timestamp + 1);
+    }
+
+    function _createApprovedProposal(uint256 perfFeeBps, uint256 duration) internal returns (uint256 proposalId) {
+        proposalId = _createSimpleProposal(perfFeeBps, duration);
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+    }
+
+    function _createAndExecuteProposal(uint256 perfFeeBps, uint256 duration) internal returns (uint256 proposalId) {
+        proposalId = _createApprovedProposal(perfFeeBps, duration);
+        governor.executeProposal(proposalId);
+        // MS-H3: proposer self-settle requires `MIN_STRATEGY_DURATION_BEFORE_SELF_SETTLE` (1h) elapsed.
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+    }
+
+    /// @dev As `_createAndExecuteProposal` but pins a concrete `strategy` address on the proposal
+    ///      (the default helpers use address(0) = Lane-B-only). Used by tests that pin proposals
+    ///      carrying a real strategy address.
+    function _createAndExecuteProposalWithStrategy(uint256 perfFeeBps, uint256 duration, address strategy)
+        internal
+        returns (uint256 proposalId)
+    {
+        vm.prank(owner);
+        vault.setAgentFeeBps(perfFeeBps);
+        vm.prank(agent);
+        proposalId = governor.propose(
+            address(vault),
+            strategy,
+            "ipfs://test",
+            duration,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+        vm.warp(block.timestamp + 1);
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+        governor.executeProposal(proposalId);
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+    }
+
+    // ==================== INITIALIZATION ====================
+
+    function test_initialize() public view {
+        ISyndicateGovernor.GovernorParams memory params = governor.getGovernorParams();
+        assertEq(params.votingPeriod, VOTING_PERIOD);
+        assertEq(params.executionWindow, EXECUTION_WINDOW);
+        assertEq(params.vetoThresholdBps, VETO_THRESHOLD_BPS);
+        assertEq(params.maxPerformanceFeeBps, MAX_PERF_FEE_BPS);
+        assertEq(params.maxStrategyDuration, MAX_STRATEGY_DURATION);
+        assertEq(params.cooldownPeriod, COOLDOWN_PERIOD);
+        assertEq(governor.proposalCount(), 0);
+        // isRegisteredVault removed in per-vault design - governor.vault() tracks the linked vault
+        // assertTrue(governor.isRegisteredVault(address(vault)));
+        assertEq(protocolConfig.protocolFeeRecipient(), owner);
+    }
+
+    // ==================== PROPOSE ====================
+
+    function test_propose() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        assertEq(proposalId, 1);
+        assertEq(governor.proposalCount(), 1);
+
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(p.proposer, agent);
+        assertEq(p.vault, address(vault));
+        assertEq(p.performanceFeeBps, 1500, "snapshotted from vault at propose");
+        assertEq(p.strategyDuration, 7 days);
+        assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Pending));
+
+        BatchExecutorLib.Call[] memory execCalls = governor.getExecuteCalls(proposalId);
+        assertEq(execCalls.length, 1);
+        BatchExecutorLib.Call[] memory settleCalls = governor.getSettlementCalls(proposalId);
+        assertEq(settleCalls.length, 1);
+    }
+
+    function test_propose_notRegisteredAgent_reverts() public {
+        vm.prank(random);
+        vm.expectRevert(ISyndicateGovernor.NotRegisteredAgent.selector);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+    }
+
+    function test_propose_vaultNotRegistered_reverts() public {
+        vm.prank(agent);
+        vm.expectRevert(ISyndicateGovernor.VaultNotRegistered.selector);
+        governor.propose(
+            makeAddr("fakeVault"),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+    }
+
+    function test_propose_strategyDurationTooLong_reverts() public {
+        vm.prank(agent);
+        vm.expectRevert(ISyndicateGovernor.StrategyDurationTooLong.selector);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            MAX_STRATEGY_DURATION + 1,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+    }
+
+    function test_propose_strategyDurationTooShort_reverts() public {
+        vm.prank(agent);
+        vm.expectRevert(ISyndicateGovernor.StrategyDurationTooShort.selector);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            30 minutes,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+    }
+
+    function test_propose_emptyExecuteCalls_reverts() public {
+        BatchExecutorLib.Call[] memory empty = new BatchExecutorLib.Call[](0);
+        vm.prank(agent);
+        vm.expectRevert(ISyndicateGovernor.EmptyExecuteCalls.selector);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            empty,
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (empty).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+    }
+
+    function test_propose_emptySettlementCalls_reverts() public {
+        BatchExecutorLib.Call[] memory empty = new BatchExecutorLib.Call[](0);
+        vm.prank(agent);
+        vm.expectRevert(ISyndicateGovernor.EmptySettlementCalls.selector);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            empty,
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (empty).length),
+            _emptyCoProposers()
+        );
+    }
+
+    /// @notice G-C1: propose() stamps snapshot at block.timestamp - 1 so any
+    ///         delegation landing in the same block cannot be counted via
+    ///         ERC20Votes.getPastVotes (which returns votes "at or before t").
+    function test_propose_snapshotIsPriorTimestamp() public {
+        uint256 tsBefore = block.timestamp;
+        uint256 proposalId = governor.proposalCount() + 1;
+        vm.prank(agent);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(p.snapshotTimestamp, tsBefore - 1);
+    }
+
+    /// @notice G-C1: a delegation that lands in the same block as propose()
+    ///         must NOT count toward voting weight. Exercises the full path
+    ///         via governor.vote(): the voter holds shares but only delegates
+    ///         in the propose block, so getPastVotes at snapshotTimestamp
+    ///         (= block.timestamp - 1) returns 0 and the vote reverts as
+    ///         NoVotingPower.
+    function test_flashDelegate_sameBlock_notCounted() public {
+        address flashVoter = makeAddr("flashVoter");
+
+        // flashVoter receives shares via transfer so auto-delegation in
+        // _deposit() does not fire -- delegates(flashVoter) stays at zero.
+        vm.prank(lp1);
+        vault.transfer(flashVoter, 10_000e6);
+
+        // Same block: flashVoter delegates to self AND agent proposes.
+        vm.prank(flashVoter);
+        vault.delegate(flashVoter);
+
+        vm.prank(agent);
+        uint256 proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+
+        // Snapshot is block.timestamp - 1; delegation checkpoint was written
+        // at block.timestamp, so getPastVotes returns 0 and vote() reverts.
+        vm.prank(flashVoter);
+        vm.expectRevert(ISyndicateGovernor.NoVotingPower.selector);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+    }
+
+    // ==================== VOTING ====================
+
+    function test_vote() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        uint256 lp1Weight = vault.balanceOf(lp1);
+        // For votes are not tallied (approval is optimistic); the event carries the weight.
+        vm.expectEmit(true, true, false, true);
+        emit ISyndicateGovernor.VoteCast(proposalId, lp1, ISyndicateGovernor.VoteType.For, lp1Weight);
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.Against);
+
+        assertTrue(governor.hasVoted(proposalId, lp1));
+        assertTrue(governor.hasVoted(proposalId, lp2));
+        assertFalse(governor.hasVoted(proposalId, random));
+
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(p.votesAgainst, vault.balanceOf(lp2));
+    }
+
+    function test_vote_doubleVote_reverts() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp1);
+        vm.expectRevert(ISyndicateGovernor.AlreadyVoted.selector);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+    }
+
+    function test_vote_noShares_reverts() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.prank(random);
+        vm.expectRevert(ISyndicateGovernor.NoVotingPower.selector);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+    }
+
+    function test_vote_afterVotingPeriod_reverts() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+        vm.prank(lp1);
+        vm.expectRevert(ISyndicateGovernor.NotWithinVotingPeriod.selector);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+    }
+
+    // ==================== PROPOSAL STATE RESOLUTION ====================
+
+    function test_proposalState_approved() public {
+        uint256 proposalId = _createApprovedProposal(1500, 7 days);
+        assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    function test_proposal_passesWithNoVotes() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+        assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    function test_proposal_rejectedWhenVetoThresholdReached() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.Against);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.Against);
+        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+        assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Rejected));
+    }
+
+    function test_proposalState_expired() public {
+        uint256 proposalId = _createApprovedProposal(1500, 7 days);
+        vm.warp(block.timestamp + EXECUTION_WINDOW + 1);
+        assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Expired));
+    }
+
+    // ==================== EXECUTE ====================
+
+    function test_executeProposal() public {
+        uint256 proposalId = _createApprovedProposal(1500, 7 days);
+        governor.executeProposal(proposalId);
+
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Executed));
+        assertEq(governor.getActiveProposal(), proposalId);
+        assertTrue(vault.redemptionsLocked());
+        assertEq(governor.getCapitalSnapshot(proposalId), 100_000e6);
+    }
+
+    function test_executeProposal_notApproved_reverts() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.Against);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.Against);
+        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+        vm.expectRevert(ISyndicateGovernor.ProposalNotApproved.selector);
+        governor.executeProposal(proposalId);
+    }
+
+    /// @dev Post G-M1, `propose` reverts on `VaultHasOpenProposal` before
+    ///      reaching the `StrategyAlreadyActive` guard inside `executeProposal`.
+    ///      Belt-and-suspenders: the `executeProposal` guard stays as a safety
+    ///      net, but the new primary defense is the propose-time check.
+    function test_propose_blocksDuplicateWhileExecuted() public {
+        _createAndExecuteProposal(1500, 7 days);
+        vm.prank(agent);
+        vm.expectRevert(ISyndicateGovernor.VaultHasOpenProposal.selector);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://dup",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+    }
+
+    function test_executeProposal_afterCooldown_succeeds() public {
+        uint256 proposalId1 = _createAndExecuteProposal(1500, 7 days);
+        vm.prank(agent);
+        governor.settleProposal(proposalId1);
+        vm.warp(block.timestamp + COOLDOWN_PERIOD + 1);
+        uint256 proposalId2 = _createApprovedProposal(1500, 7 days);
+        governor.executeProposal(proposalId2);
+        assertEq(governor.getActiveProposal(), proposalId2);
+    }
+
+    // ==================== SETTLEMENT ====================
+
+    function test_settleProposal_proposerSettlesEarly() public {
+        uint256 proposalId = _createAndExecuteProposal(1500, 7 days);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertEq(governor.getActiveProposal(), 0);
+        assertFalse(vault.redemptionsLocked());
+    }
+
+    function test_settleProposal_nonProposerBeforeDuration_reverts() public {
+        uint256 proposalId = _createAndExecuteProposal(1500, 7 days);
+        vm.prank(random);
+        vm.expectRevert(ISyndicateGovernor.StrategyDurationNotElapsed.selector);
+        governor.settleProposal(proposalId);
+    }
+
+    function test_settleProposal_permissionless_afterDuration() public {
+        uint256 proposalId = _createAndExecuteProposal(1500, 7 days);
+        vm.warp(block.timestamp + 7 days);
+        vm.prank(random);
+        governor.settleProposal(proposalId);
+        assertEq(uint256(governor.getProposal(proposalId).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
+    function test_settleProposal_notExecuted_reverts() public {
+        uint256 proposalId = _createApprovedProposal(1500, 7 days);
+        vm.expectRevert(ISyndicateGovernor.ProposalNotExecuted.selector);
+        governor.settleProposal(proposalId);
+    }
+
+    /// @dev Propose with a REAL drawdown envelope. Every other helper in this
+    ///      file goes through `GovEnvelope.permissive` (`maxDrawdownBps = 10_000`).
+    function _createAndExecuteProposalWithDrawdown(uint16 maxDrawdownBps) internal returns (uint256 proposalId) {
+        // `totalAssets()` is read HERE, outside the callee, so the staticcall
+        // cannot consume the one-shot prank armed for `propose` inside it.
+        return _createAndExecuteProposalWithEnvelope(vault.totalAssets(), maxDrawdownBps);
+    }
+
+    /// @dev As above, but with `maxCapital` decoupled from the ceiling.
+    function _createAndExecuteProposalWithEnvelope(uint256 maxCapital, uint16 maxDrawdownBps)
+        internal
+        returns (uint256 proposalId)
+    {
+        ISyndicateGovernor.RiskEnvelope memory env =
+            ISyndicateGovernor.RiskEnvelope({maxCapital: maxCapital, maxDrawdownBps: maxDrawdownBps});
+        vm.prank(agent);
+        proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://drawdown",
+            7 days,
+            env,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps(env.maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps(env.maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(proposalId);
+        vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
+    }
+
+    /// @notice SHE-256 deleted the capital drawdown floor: a balance below the
+    ///         declared capital envelope but above the PRICE floor settles. A
+    ///         20% envelope on half the float separates the two (old capital
+    ///         floor 90% of basis, price floor 80% of pps).
+    function test_settleBelowTheDeclaredCapitalEnvelopeSettles() public {
+        uint256 basis = vault.totalAssets();
+        uint256 pid = _createAndExecuteProposalWithEnvelope(basis / 2, 2_000);
+        uint256 committed = governor.getProposal(pid).effectiveMaxCapital;
+        uint256 oldCapitalFloor = basis - (committed * 2_000) / 10_000;
+        uint256 priceFloorAssets = (basis * 8_000) / 10_000;
+        assertGt(oldCapitalFloor, priceFloorAssets, "the two floors must separate");
+
+        deal(address(usdc), address(vault), oldCapitalFloor - 1);
+        vm.prank(agent);
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
+    // ── pashov finding #2 — the settle PRICE needs its own floor ──
+
+    /// @notice THE FINDING. A total-loss declaration reaches a party the
+    ///         envelope never spoke for: `onProposalSettled` freezes
+    ///         `num = totalAssets() + 1` as the price EVERY queued deposit and
+    ///         redeem is paid at.
+    ///
+    ///         Proven on a live Robinhood fork before this test existed, with a
+    ///         PoC kept OUT of the repo (it needs an RPC and would red the
+    ///         non-fork CI job): deploy
+    ///         100% of a 20,000 USDG vault into Morpho, queue a 1 USDG deposit,
+    ///         then settle from inside a `flashLoan` that empties Morpho's idle
+    ///         balance so the strategy delivers ZERO. The stamp lands at
+    ///         `num == 1`, the 1 USDG mints 99.99% of the supply, and `sweep()`
+    ///         plus `redeem()` returns 20,001 USDG to the attacker.
+    ///
+    ///         The strategy's P&L envelope is NOT what is wrong — voters may
+    ///         legitimately accept a total loss. What is wrong is that one
+    ///         number was also acting as the only bound on the stamp. The fix
+    ///         gives the stamp a SEPARATE floor, anchored to the price per
+    ///         share recorded at execute (before capital left, while the vault
+    ///         was whole) and capped independently of the declared drawdown.
+    function test_pashovFinding2_settleCannotStampANearZeroPrice() public {
+        uint256 pid = _createAndExecuteProposalWithDrawdown(10_000);
+        // The unwind delivers nothing — the state a flash loan manufactures.
+        deal(address(usdc), address(vault), 0);
+        vm.prank(agent);
+        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
+        governor.settleProposal(pid);
+
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Executed),
+            "a refused settle must not advance the proposal"
+        );
+    }
+
+    /// @notice The legacy-anchor concession must (a) still let a proposal that
+    ///         executed BEFORE this upgrade settle, and (b) never be reachable
+    ///         by a new proposal. The `+1` offset at the write site is what
+    ///         separates those two, so pin it directly: force the raw slot to 0
+    ///         (the pre-upgrade state) and confirm the gate stands down.
+    function test_pashovFinding2_legacyProposalWithNoAnchorStillSettles() public {
+        uint256 pid = _createAndExecuteProposalWithDrawdown(10_000);
+
+        // Reproduce a pre-upgrade proposal: anchor slot never written.
+        bytes32 slot = keccak256(abi.encode(pid, uint256(65)));
+        vm.store(address(governor), slot, bytes32(0));
+
+        deal(address(usdc), address(vault), 0);
+        vm.prank(agent);
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+    }
+
+    /// @notice The price floor's BOUNDARY. Without this the only price-floor
+    ///         evidence is a near-zero stamp, which says nothing about where the
+    ///         line actually sits.
+    function test_pashovFinding2_priceFloorBoundary() public {
+        uint256 pid = _createAndExecuteProposalWithDrawdown(10_000);
+        // 10% of the 100_000e6 basis is exactly MAX_STAMP_DRAWDOWN_BPS' floor.
+        deal(address(usdc), address(vault), 10_000e6);
+        vm.prank(agent);
+        governor.settleProposal(pid);
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Settled),
+            "at the floor it settles"
+        );
+    }
+
+    /// @notice pashov finding #12 — the same hole through the other door.
+    ///         `unstick` replays the identical stored batch under the identical
+    ///         caps and skipped the floor entirely, so the attack above needs no
+    ///         100% declaration at all: the owner queues a deposit, waits out
+    ///         the term, and calls `unstick` inside the flash loan.
+    /// @dev    Only a near-zero stamp is refused; ordinary losses still unstick.
+    function test_pashovFinding12_unstickCannotStampANearZeroPrice() public {
+        uint256 pid = _createAndExecuteProposalWithDrawdown(10_000);
+        // `unstick` gates on the FULL `strategyDuration`, not the proposer's
+        // 1-hour self-settle window the fixture leaves us in. Without this the
+        // test passes on `StrategyDurationNotElapsed` and proves nothing.
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        deal(address(usdc), address(vault), 0);
+        vm.prank(vault.owner());
+        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
+        governor.unstick(pid);
+
+        // Same assertion as the `settleProposal` twin: a refused rescue must
+        // leave the proposal where it was, so no queued claim was ever priced
+        // against the near-zero stamp.
+        assertEq(
+            uint256(governor.getProposal(pid).state),
+            uint256(ISyndicateGovernor.ProposalState.Executed),
+            "a refused unstick must not advance the proposal"
+        );
+    }
+
+    /// @notice An escrowed fee may not leave the vault while a strategy is live.
+    /// @dev    `claimUnclaimedFees` -> `vault.transferPerformanceFee` was the one
+    ///         asset outflow between execute and settle that is neither the
+    ///         strategy nor gated on `redemptionsLocked()`. Both consumers of the
+    ///         vault's asset balance difference read that outflow as a strategy
+    ///         loss, understating `_finishSettlement`'s `pnl`.
+    ///
+    ///         The gate is unconditional, ahead of the zero-amount early return,
+    ///         so the invariant is "no escrow moves during a live strategy" and
+    ///         not "no escrow LARGE ENOUGH TO MATTER moves".
+    function test_pashovFinding1_escrowClaimIsClosedWhileTheStrategyIsLive() public {
+        uint256 pid = _createAndExecuteProposalWithDrawdown(2_000);
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.VaultProposalActive.selector);
+        governor.claimUnclaimedFees(address(vault), address(usdc));
+
+        // Reopens the moment settlement clears `_activeProposal`. Nothing is
+        // owed here, so the claim is the documented no-op — the point is that
+        // it no longer reverts.
+        vm.prank(agent);
+        governor.settleProposal(pid);
+        vm.prank(owner);
+        governor.claimUnclaimedFees(address(vault), address(usdc));
+    }
+
+    /// @notice A settle driven from inside a flash loan that empties Morpho's
+    ///         idle balance cannot freeze a depressed price: the strategy is
+    ///         all-or-revert (SHE-255) so nothing is delivered partially, and a
+    ///         strategy that delivers nothing still meets the price floor. The
+    ///         honest retry after the frame settles at par.
+    function test_flashLoanedSettleRevertsInsteadOfFreezingADepressedPrice() public {
+        MockIrm irm = new MockIrm();
+        MockMorpho morpho = new MockMorpho();
+        MarketParams memory mp = MarketParams({
+            loanToken: address(usdc),
+            collateralToken: makeAddr("collateral"),
+            oracle: makeAddr("oracle"),
+            irm: address(irm),
+            lltv: 0.86e18
+        });
+        morpho.createMarket(mp);
+        uint256 supply = permissiveEnv.maxCapital;
+        MorphoSupplyStrategy strat = MorphoSupplyStrategy(Clones.clone(address(new MorphoSupplyStrategy())));
+        strat.initialize(address(vault), agent, abi.encode(address(morpho), mp, supply));
+
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(strat), supply)), value: 0
+        });
+        execCalls[1] =
+            BatchExecutorLib.Call({target: address(strat), data: abi.encodeCall(strat.execute, ()), value: 0});
+        uint256[] memory execCaps = new uint256[](2);
+        execCaps[1] = supply;
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] =
+            BatchExecutorLib.Call({target: address(strat), data: abi.encodeCall(strat.settle, ()), value: 0});
+
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(strat),
+            "ipfs://flash",
+            7 days,
+            permissiveEnv,
+            execCalls,
+            execCaps,
+            settleCalls,
+            new uint256[](1),
+            _emptyCoProposers()
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.For);
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(pid);
+        assertEq(usdc.balanceOf(address(morpho)), supply, "precondition: the market holds the whole supply idle");
+        uint256 ppsAtExecute = vault.pricePerShare();
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+
+        // Frame 1: the flash loan takes the tokens, the accounting stays. The
+        // strategy cannot deliver in full, so it reverts; nothing is stamped.
+        address flashBorrower = makeAddr("flashBorrower");
+        vm.prank(address(morpho));
+        usdc.transfer(flashBorrower, supply - 1_000e6);
+        vm.expectPartialRevert(IERC20Errors.ERC20InsufficientBalance.selector);
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+
+        // Frame 2: a strategy that delivers NOTHING (the pre-SHE-255 clamp
+        // shape) is stopped by the price floor alone.
+        vm.mockCall(address(strat), abi.encodeCall(strat.settle, ()), "");
+        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
+        governor.settleProposal(pid);
+        vm.clearMockedCalls(); // also drops setUp's `governorOf` mock; re-arm it
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+
+        // The frame ends and the honest retry settles at par.
+        vm.prank(flashBorrower);
+        usdc.transfer(address(morpho), supply - 1_000e6);
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertGe(vault.pricePerShare() + 2, ppsAtExecute, "settled below par after a full delivery");
+    }
+
+    /// @notice A real template that cannot fully unwind reverts settle, and the
+    ///         vault records nothing: no assets move, the price is untouched and
+    ///         the proposal stays Executed until the market can pay in full.
+    function test_settleRevertsWhenTheStrategyCannotFullyUnwind() public {
+        MockIrm irm = new MockIrm();
+        MockMorpho morpho = new MockMorpho();
+        MarketParams memory mp = MarketParams({
+            loanToken: address(usdc),
+            collateralToken: makeAddr("collateral"),
+            oracle: makeAddr("oracle"),
+            irm: address(irm),
+            lltv: 0.86e18
+        });
+        Id marketId = morpho.createMarket(mp);
+        uint256 supply = permissiveEnv.maxCapital;
+        MorphoSupplyStrategy strat = MorphoSupplyStrategy(Clones.clone(address(new MorphoSupplyStrategy())));
+        strat.initialize(address(vault), agent, abi.encode(address(morpho), mp, supply));
+
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](2);
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(strat), supply)), value: 0
+        });
+        execCalls[1] =
+            BatchExecutorLib.Call({target: address(strat), data: abi.encodeCall(strat.execute, ()), value: 0});
+        uint256[] memory execCaps = new uint256[](2);
+        execCaps[1] = supply;
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] =
+            BatchExecutorLib.Call({target: address(strat), data: abi.encodeCall(strat.settle, ()), value: 0});
+
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(strat),
+            "ipfs://illiquid",
+            7 days,
+            permissiveEnv,
+            execCalls,
+            execCaps,
+            settleCalls,
+            new uint256[](1),
+            _emptyCoProposers()
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.For);
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(pid);
+
+        // A borrower takes most of the market and does not repay: the position
+        // is intact on paper but cannot be withdrawn in full.
+        address borrower = makeAddr("borrower");
+        morpho.simulateBorrow(mp, supply - 1_000e6, borrower);
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+
+        uint256 vaultBefore = usdc.balanceOf(address(vault));
+        uint256 ppsBefore = vault.pricePerShare();
+        uint256 sharesBefore = morpho.position(marketId, address(strat)).supplyShares;
+        assertGt(sharesBefore, 0, "precondition: the strategy holds the position");
+
+        vm.expectRevert(bytes("MockMorpho: insufficient liquidity"));
+        governor.settleProposal(pid);
+
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+        assertEq(usdc.balanceOf(address(vault)), vaultBefore, "a refused settle moved assets");
+        assertEq(vault.pricePerShare(), ppsBefore, "a refused settle moved the price");
+        assertEq(morpho.position(marketId, address(strat)).supplyShares, sharesBefore, "the position was touched");
+        assertTrue(vault.redemptionsLocked(), "the proposal is still open");
+
+        // Control: once the market can pay in full, the identical call settles.
+        uint256 owed = supply - 1_000e6;
+        usdc.mint(borrower, owed);
+        vm.startPrank(borrower);
+        usdc.approve(address(morpho), type(uint256).max);
+        morpho.simulateRepayAll(mp);
+        vm.stopPrank();
+        governor.settleProposal(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertEq(morpho.position(marketId, address(strat)).supplyShares, 0, "the position was not fully unwound");
+        assertFalse(vault.redemptionsLocked(), "settlement did not reopen the vault");
+    }
+
+    // Legacy `emergencySettle(uint256, Call[])` is a revert stub as of Task 24.
+    // See `test/governor/GovernorEmergency.t.sol` for the new 4-way lifecycle tests
+    // (unstick / emergencySettleWithCalls / cancelEmergencySettle / finalizeEmergencySettle).
+
+    // ==================== P&L CALCULATION ====================
+
+    /// @dev Settle and report whether a performance fee was charged, by
+    ///      looking for its event. Balance deltas are not a usable signal in
+    ///      this fixture: `protocolFeeRecipient` is the vault owner, so the
+    ///      owner's balance moves on the MANAGEMENT leg too.
+    function _settleAndSawPerformanceFee(uint256 proposalId) internal returns (bool saw) {
+        vm.recordLogs();
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == ISyndicateGovernor.PerformanceFeeCharged.selector) return true;
+        }
+    }
+
+    /// @notice No profit means no PERFORMANCE fee — but the management fee is
+    ///         always-on and is still charged. (Under the previous waterfall
+    ///         every fee was profit-gated, so this asserted a flat zero.)
+    function test_settlement_noProfit_noPerformanceFee() public {
+        uint256 proposalId = _createAndExecuteProposal(1500, 7 days);
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+
+        assertFalse(_settleAndSawPerformanceFee(proposalId), "no profit, no performance fee");
+        assertGt(usdc.balanceOf(agent), agentBalBefore, "the agent still earns the management fee");
+    }
+
+    /// @notice A profitable settlement charges both legs. The management fee
+    ///         comes first (it lowers price per share), then the performance
+    ///         fee on whatever sits above the high-water mark.
+    function test_settlement_withProfit_managementAndPerformanceFee() public {
+        uint256 proposalId = _createAndExecuteProposal(1500, 7 days);
+        usdc.mint(address(vault), 10_000e6);
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        uint256 ownerBalBefore = usdc.balanceOf(owner);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+
+        // Agent takes 70% of management and 60% of performance — the largest
+        // earner on both legs, which is the property the model is built on.
+        assertGt(usdc.balanceOf(agent), agentBalBefore, "agent earns on both legs");
+        // Owner takes 10% of performance only.
+        assertGt(usdc.balanceOf(owner), ownerBalBefore, "owner earns its performance share");
+        // 15% of a 10k gain is 1.5k; the agent's 60% of that is 900, plus its
+        // management share. Bound it so a runaway fee would still fail.
+        assertLt(usdc.balanceOf(agent) - agentBalBefore, 1_500e6, "agent share stays within the performance fee");
+    }
+
+    // ==================== issue #151: selfManagesFees deleted ====================
+
+    /// @notice Universal post-#151 rule: a proposal with a real (non-zero) `strategy`
+    ///         address has fees distributed exactly as one with no strategy attached.
+    ///         There is no self-report a strategy can make to exempt any fee leg —
+    ///         the mechanism that used to allow that (`selfManagesFees`) is deleted.
+    ///         The distinguishing signal is the OWNER's balance: it moves whenever a
+    ///         performance fee is charged, which under the old mechanism was exactly
+    ///         the leg a `selfManagesFees() == true` strategy could skip.
+    function test_settlement_strategyProposal_chargesNormalFees() public {
+        MockStrategyAdapter strat = new MockStrategyAdapter();
+        uint256 proposalId = _createAndExecuteProposalWithStrategy(1500, 7 days, address(strat));
+        usdc.mint(address(vault), 10_000e6);
+
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        uint256 ownerBalBefore = usdc.balanceOf(owner);
+
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+
+        assertGt(usdc.balanceOf(agent), agentBalBefore, "agent earns on both legs");
+        assertGt(usdc.balanceOf(owner), ownerBalBefore, "performance fee charged");
+    }
+
+    /// @notice Issue #151 removed the only external call `propose()` made into an
+    ///         agent-supplied address (the `selfManagesFees()` snapshot read). One
+    ///         accepted side effect: `propose()` no longer probes `strategy` for
+    ///         code, so an EOA / codeless address now succeeds at propose instead of
+    ///         reverting. This is the decided tradeoff (design.md D2) — strategy
+    ///         provenance remains an open, owned problem tracked separately under
+    ///         #58 (clone registry) and #118 (propose-time call-target validation),
+    ///         not a fee-integrity concern now that nothing reads the strategy for
+    ///         fee purposes.
+    function test_propose_eoaStrategySucceedsAtPropose() public {
+        ISyndicateGovernor.CoProposer[] memory empty = _emptyCoProposers();
+        vm.prank(agent);
+        uint256 proposalId = governor.propose(
+            address(vault),
+            address(0xBEEF), // EOA, no code — no longer probed at propose
+            "ipfs://eoa",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps(permissiveEnv.maxCapital, _simpleExecuteCalls().length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps(permissiveEnv.maxCapital, _simpleSettlementCalls().length),
+            empty
+        );
+        assertEq(governor.getProposal(proposalId).strategy, address(0xBEEF), "EOA strategy stored as-is");
+    }
+
+    /// @notice H2: the snapshot is clamped to `maxPerformanceFeeBps` at propose,
+    ///         so the recorded/emitted rate equals what settlement charges — a
+    ///         vault fee above the cap is never shown to voters as higher.
+    function test_settlement_agentFeeClampedToMax() public {
+        // Protocol owner lowers the configured cap below the vault's fee.
+        vm.prank(owner);
+        governor.setMaxPerformanceFeeBps(1000); // 10%, under the vault's 15%
+        // Vault owner sets 15% — above the 10% param; the snapshot clamps to 10%.
+        uint256 proposalId = _createAndExecuteProposal(MAX_PERF_FEE_BPS, 7 days);
+        assertEq(vault.agentFeeBps(), MAX_PERF_FEE_BPS, "vault stores the owner's 15%");
+        assertEq(governor.getProposal(proposalId).performanceFeeBps, 1000, "snapshot clamped at propose");
+        usdc.mint(address(vault), 10_000e6);
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+        // The clamp is proven by the snapshot assertion above (1000, not 1500).
+        // Here just pin that the realized agent payout is bounded by the
+        // clamped rate: 10% of the 10k gain is 1000, and the agent takes 60%
+        // of that plus its management share — comfortably under the 15% the
+        // vault asked for.
+        uint256 agentGain = usdc.balanceOf(agent) - agentBalBefore;
+        assertGt(agentGain, 0, "agent is paid");
+        assertLt(agentGain, 1_000e6, "and never at the unclamped 15% rate");
+    }
+
+    /// @notice C1: the fee is snapshotted at propose, so an owner who changes
+    ///         the vault's agentFeeBps after the vote cannot alter what this
+    ///         proposal charges. Settlement uses the snapshot, not the live fee.
+    function test_settlement_usesProposeTimeSnapshot() public {
+        // Snapshot 15% at propose (helper sets the vault fee, then proposes).
+        uint256 proposalId = _createAndExecuteProposal(MAX_PERF_FEE_BPS, 7 days);
+        // Owner drops the live vault fee to 5% AFTER the proposal is created.
+        vm.prank(owner);
+        vault.setAgentFeeBps(500);
+        assertEq(vault.agentFeeBps(), 500, "live vault fee changed post-propose");
+        usdc.mint(address(vault), 10_000e6);
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+        // Uses the 15% snapshot, not the live 5%: protocol 1% of 10k = 100;
+        // agent 15% of 9900 = 1485 (a live read would have charged 5% = 495).
+        uint256 gain775 = usdc.balanceOf(agent) - agentBalBefore;
+        assertGt(gain775, 0, "uses propose-time snapshot");
+        assertLt(gain775, 1_500e6, "bounded by the snapshotted 15%, not the raised live rate");
+    }
+
+    /// @notice H2 belt-and-braces: if the protocol lowers maxPerformanceFeeBps
+    ///         AFTER a proposal is created, settlement re-clamps the (higher)
+    ///         snapshot to the new cap.
+    function test_settlement_clampsOnMidFlightCapReduction() public {
+        uint256 proposalId = _createAndExecuteProposal(MAX_PERF_FEE_BPS, 7 days);
+        assertEq(governor.getProposal(proposalId).performanceFeeBps, MAX_PERF_FEE_BPS, "snapshot 15%");
+        // Cap lowered to 10% after the proposal exists. Owner setters are
+        // frozen while a proposal is open; use the freeze-exempt factory
+        // rescue path (this test contract is the governor's factory).
+        ISyndicateGovernor.GovernorParams memory gp = governor.getGovernorParams();
+        gp.maxPerformanceFeeBps = 1000;
+        governor.forceSetParams(gp);
+        usdc.mint(address(vault), 10_000e6);
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        // H1 (pass 3): the settle-time re-clamp must EMIT FeeClamped too, not
+        // silently clamp — indexers/voters need the on-chain signal.
+        vm.expectEmit(true, true, true, false, address(governor));
+        emit ISyndicateGovernor.FeeClamped(proposalId, MAX_PERF_FEE_BPS, 1000);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+        // Settle re-clamps the 15% snapshot to the new 10% cap: 10% of 9900 = 990.
+        uint256 gain799 = usdc.balanceOf(agent) - agentBalBefore;
+        assertGt(gain799, 0, "settle clamps to lowered cap");
+        assertLt(gain799, 1_000e6, "bounded by the LOWERED 10% cap, not the vault's 15%");
+    }
+
+    /// @notice Launch cap: the protocol performance-fee ceiling is 25%.
+    function test_launchCap_performanceFeeCeilingIsTwentyFivePercent() public view {
+        assertEq(governor.MAX_PERFORMANCE_FEE_CAP(), 2500, "25% performance ceiling");
+    }
+
+    /// @notice M5: the vault's hard cap must equal the governor's
+    ///         MAX_PERFORMANCE_FEE_CAP. Catches a divergent hand-edit.
+    function test_maxAgentFeeBps_equalsGovernorCap() public view {
+        assertEq(vault.MAX_AGENT_FEE_BPS(), governor.MAX_PERFORMANCE_FEE_CAP(), "vault cap must mirror governor cap");
+    }
+
+    /// @notice H1: when the vault's snapshotted fee exceeds maxPerformanceFeeBps,
+    ///         propose emits FeeClamped(pid, snapshotted, clamped) so voters can
+    ///         detect the recorded fee was clamped below the owner's intent.
+    function test_propose_emitsFeeClampedWhenAboveCap() public {
+        vm.prank(owner);
+        governor.setMaxPerformanceFeeBps(1000); // cap 10%
+        vm.prank(owner);
+        vault.setAgentFeeBps(MAX_PERF_FEE_BPS); // vault 15% > cap
+        uint256 expectedId = governor.proposalCount() + 1;
+        // All three params indexed → check topic1/2/3, no data.
+        vm.expectEmit(true, true, true, false, address(governor));
+        emit ISyndicateGovernor.FeeClamped(expectedId, MAX_PERF_FEE_BPS, 1000);
+        vm.prank(agent);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+    }
+
+    /// @notice H1: no clamp when the vault fee is at or below the cap — the
+    ///         snapshot equals the set fee (so FeeClamped is not emitted).
+    function test_propose_noClampWhenWithinCap() public {
+        uint256 pid = _createSimpleProposal(500, 7 days); // vault 5% <= cap 15%
+        assertEq(governor.getProposal(pid).performanceFeeBps, 500, "no clamp within cap");
+    }
+
+    /// @notice A loss charges no performance fee, but does not excuse the
+    ///         management fee — that is the whole point of an always-on leg:
+    ///         the work of managing and reviewing happened regardless.
+    function test_settlement_withLoss_noPerformanceFee() public {
+        uint256 proposalId = _createAndExecuteProposal(1500, 7 days);
+        usdc.burn(address(vault), 5_000e6);
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+
+        assertFalse(_settleAndSawPerformanceFee(proposalId), "no performance fee on a loss");
+        assertGt(usdc.balanceOf(agent), agentBalBefore, "management is charged through a loss");
+    }
+
+    // ==================== REDEMPTION LOCK ====================
+
+    function test_redemptionLock_withdrawReverts() public {
+        _createAndExecuteProposal(1500, 7 days);
+        // While `redemptionsLocked()` is true the vault advertises
+        // `maxWithdraw == 0`, so OZ's standard pre-check surfaces the
+        // canonical EIP-4626 revert first. The inner `RedemptionsLocked`
+        // guard remains as defence-in-depth.
+        assertEq(vault.maxWithdraw(lp1), 0);
+        vm.prank(lp1);
+        vm.expectPartialRevert(ERC4626Upgradeable.ERC4626ExceededMaxWithdraw.selector);
+        vault.withdraw(1_000e6, lp1, lp1);
+    }
+
+    function test_redemptionUnlocked_afterSettlement() public {
+        uint256 proposalId = _createAndExecuteProposal(1500, 7 days);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+
+        uint256 balBefore = usdc.balanceOf(lp1);
+        vm.prank(lp1);
+        vault.withdraw(1_000e6, lp1, lp1);
+        assertEq(usdc.balanceOf(lp1), balBefore + 1_000e6);
+    }
+
+    // ==================== CANCEL ====================
+
+    function test_cancelProposal() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.prank(agent);
+        governor.cancelProposal(proposalId);
+        assertEq(uint256(governor.getProposal(proposalId).state), uint256(ISyndicateGovernor.ProposalState.Cancelled));
+    }
+
+    function test_cancelProposal_clearsActiveProposal() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.prank(agent);
+        governor.cancelProposal(proposalId);
+        assertEq(governor.getActiveProposal(), 0, "activeProposal should be cleared after cancel");
+        // Vault should not be locked after cancellation
+        assertFalse(vault.redemptionsLocked(), "vault should not be locked after cancel");
+    }
+
+    function test_cancelProposal_notProposer_reverts() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.prank(random);
+        vm.expectRevert(ISyndicateGovernor.NotProposer.selector);
+        governor.cancelProposal(proposalId);
+    }
+
+    function test_emergencyCancel() public {
+        // Task 25: emergencyCancel is narrowed to Draft/Pending only.
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.prank(owner);
+        governor.emergencyCancel(proposalId);
+        assertEq(uint256(governor.getProposal(proposalId).state), uint256(ISyndicateGovernor.ProposalState.Cancelled));
+    }
+
+    function test_emergencyCancel_clearsActiveProposal() public {
+        // Task 25: emergencyCancel is narrowed to Draft/Pending only.
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.prank(owner);
+        governor.emergencyCancel(proposalId);
+        assertEq(governor.getActiveProposal(), 0, "activeProposal should be cleared after emergencyCancel");
+        assertFalse(vault.redemptionsLocked(), "vault should not be locked after emergencyCancel");
+    }
+
+    function test_emergencyCancel_approved_reverts() public {
+        // Task 25: once the vote passes the proposal enters GuardianReview (or Approved
+        // when no registry is wired); owner can no longer unilaterally cancel.
+        uint256 proposalId = _createApprovedProposal(1500, 7 days);
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.ProposalNotCancellable.selector);
+        governor.emergencyCancel(proposalId);
+    }
+
+    function test_emergencyCancel_executedProposal_reverts() public {
+        uint256 proposalId = _createAndExecuteProposal(1500, 7 days);
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.ProposalNotCancellable.selector);
+        governor.emergencyCancel(proposalId);
+    }
+
+    // ==================== VETO ====================
+
+    function test_vetoProposal_pending() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.prank(owner);
+        governor.vetoProposal(proposalId);
+        assertEq(uint256(governor.getProposal(proposalId).state), uint256(ISyndicateGovernor.ProposalState.Rejected));
+    }
+
+    function test_vetoProposal_clearsActiveProposal() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.prank(owner);
+        governor.vetoProposal(proposalId);
+        assertEq(governor.getActiveProposal(), 0, "activeProposal should be cleared after veto");
+        assertFalse(vault.redemptionsLocked(), "vault should not be locked after veto");
+    }
+
+    function test_vetoProposal_approved_reverts() public {
+        // Task 25: vetoProposal is narrowed to Pending only; approved/GuardianReview
+        // proposals flow through the guardian-review path instead.
+        uint256 proposalId = _createApprovedProposal(1500, 7 days);
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.ProposalNotCancellable.selector);
+        governor.vetoProposal(proposalId);
+    }
+
+    function test_vetoProposal_notVaultOwner_reverts() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.prank(random);
+        vm.expectRevert(ISyndicateGovernor.NotVaultOwner.selector);
+        governor.vetoProposal(proposalId);
+    }
+
+    function test_vetoProposal_emitsEvent() public {
+        uint256 proposalId = _createSimpleProposal(1500, 7 days);
+        vm.expectEmit(true, true, false, false);
+        emit ISyndicateGovernor.ProposalVetoed(proposalId, owner);
+        vm.prank(owner);
+        governor.vetoProposal(proposalId);
+    }
+
+    // (Legacy `emergencySettle_notVaultOwner_reverts` deleted — Task 24 stub reverts unconditionally.)
+
+    // ==================== PARAMETER SETTERS (TIMELOCK) ====================
+
+    function test_setVotingPeriod_appliesImmediately() public {
+        vm.prank(owner);
+        governor.setVotingPeriod(2 days);
+        assertEq(governor.getGovernorParams().votingPeriod, 2 days);
+    }
+
+    function test_setVotingPeriod_tooLow_reverts() public {
+        // V1.5: setters apply immediately and bounds are validated at call time.
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.InvalidVotingPeriod.selector);
+        governor.setVotingPeriod(30 minutes);
+    }
+
+    function test_setters_notOwner_reverts() public {
+        vm.startPrank(random);
+        vm.expectRevert();
+        governor.setVotingPeriod(2 days);
+        vm.expectRevert();
+        governor.setExecutionWindow(2 days);
+        vm.expectRevert();
+        governor.setVetoThresholdBps(5000);
+        vm.expectRevert();
+        governor.setMaxPerformanceFeeBps(2000);
+        vm.expectRevert();
+        governor.setMaxStrategyDuration(20 days);
+        vm.expectRevert();
+        governor.setCooldownPeriod(2 days);
+        vm.stopPrank();
+    }
+
+    // ==================== VAULT MANAGEMENT ====================
+
+    function test_addVault() public {
+        // G-M9: governor rejects EOAs via extcodesize probe, so use a
+        // deployed contract address — the executorLib has bytecode and is
+        // not already registered.
+        address newVault = address(executorLib);
+        // isRegisteredVault removed in per-vault governor design
+    }
+
+    /* test_addVault_duplicate_reverts — stubbed: references removed API in per-vault governor design */
+    function test_addVault_duplicate_reverts() public {}
+
+    /* test_removeVault — stubbed: references removed API in per-vault governor design */
+    function test_removeVault() public {}
+
+    /* test_addVault_fromFactory — stubbed: references removed API in per-vault governor design */
+    function test_addVault_fromFactory() public {}
+
+    /* test_addVault_unauthorizedCaller_reverts — stubbed: addVault removed in per-vault governor design */
+    function test_addVault_unauthorizedCaller_reverts() public {}
+
+    // ==================== GOVERNOR ON VAULT ====================
+
+    /* test_governor_readFromFactory — stubbed: references removed API in per-vault governor design */
+    function test_governor_readFromFactory() public {}
+
+    function test_redemptionsLocked_duringActiveProposal() public {
+        assertFalse(vault.redemptionsLocked());
+        _createAndExecuteProposal(1500, 7 days);
+        assertTrue(vault.redemptionsLocked());
+    }
+
+    function test_executeGovernorBatch_notGovernor_reverts() public {
+        BatchExecutorLib.Call[] memory calls = new BatchExecutorLib.Call[](0);
+        vm.prank(random);
+        vm.expectRevert(ISyndicateVault.NotGovernor.selector);
+        vault.executeGovernorBatch(calls, new uint256[](0), type(uint256).max);
+    }
+
+    // ==================== VETO ON EXECUTED PROPOSAL ====================
+
+    function test_vetoProposal_executed_reverts() public {
+        uint256 proposalId = _createAndExecuteProposal(1500, 7 days);
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateGovernor.ProposalNotCancellable.selector);
+        governor.vetoProposal(proposalId);
+    }
+
+    // ==================== SETTLEMENT FEE EDGE CASES ====================
+
+    function test_settlement_smallProfit_feeMath() public {
+        uint256 proposalId = _createAndExecuteProposal(1500, 7 days);
+        // 1 unit of USDC profit (0.000001 USDC)
+        usdc.mint(address(vault), 1);
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        uint256 ownerBalBefore = usdc.balanceOf(owner);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+        // The performance fee on 1 wei of gain rounds to zero. The management
+        // fee does NOT — it is charged on assets x time, not on profit, so a
+        // 7-day proposal on a 100k fund owes a real amount regardless.
+        assertGe(usdc.balanceOf(agent), agentBalBefore, "no performance fee on dust");
+        assertGe(usdc.balanceOf(owner), ownerBalBefore);
+    }
+
+    function test_settlement_zeroPerformanceFee_noAgentPayout() public {
+        uint256 proposalId = _createAndExecuteProposal(0, 7 days);
+        usdc.mint(address(vault), 10_000e6);
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        uint256 ownerBalBefore = usdc.balanceOf(owner);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+        // A 0% performance rate means no profit-share — but the agent is still
+        // the 70% recipient of the always-on management fee, so its balance
+        // moves. What must NOT happen is a performance payout.
+        assertGt(usdc.balanceOf(agent), agentBalBefore, "management fee still flows to the agent");
+        assertGt(usdc.balanceOf(owner), ownerBalBefore, "protocol share of management still flows");
+    }
+
+    // ==================== COOLDOWN BLOCKS RE-EXECUTION ====================
+
+    /// @dev After a settle the cooldown gates `propose` itself: a proposal cannot even
+    ///      open inside the window, so the execute-side check is never the first to fire.
+    function test_cooldown_blocksPropose() public {
+        uint256 proposalId1 = _createAndExecuteProposal(1500, 7 days);
+        vm.prank(agent);
+        governor.settleProposal(proposalId1);
+        uint256 settledAt = block.timestamp;
+        assertEq(governor.getCooldownEnd(), settledAt + COOLDOWN_PERIOD, "settle stamped the clock");
+
+        vm.warp(settledAt + COOLDOWN_PERIOD - 1);
+        permissiveEnv = GovEnvelope.permissive(address(vault));
+        vm.prank(agent);
+        vm.expectRevert(ISyndicateGovernor.CooldownNotElapsed.selector);
+        governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            permissiveEnv,
+            _simpleExecuteCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleExecuteCalls()).length),
+            _simpleSettlementCalls(),
+            GovEnvelope.defaultCaps((permissiveEnv).maxCapital, (_simpleSettlementCalls()).length),
+            _emptyCoProposers()
+        );
+
+        vm.warp(settledAt + COOLDOWN_PERIOD);
+        uint256 proposalId2 = _createSimpleProposal(1500, 7 days);
+        assertGt(proposalId2, proposalId1, "opens at the cooldown boundary");
+    }
+
+    // ==================== DEPOSIT LOCK DURING ACTIVE PROPOSAL ====================
+
+    function test_deposit_blockedDuringActiveProposal() public {
+        _createAndExecuteProposal(1500, 7 days);
+
+        usdc.mint(random, 10_000e6);
+        vm.startPrank(random);
+        usdc.approve(address(vault), 10_000e6);
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(10_000e6, random);
+        vm.stopPrank();
+    }
+
+    function test_deposit_succeedsAfterSettlement() public {
+        uint256 proposalId = _createAndExecuteProposal(1500, 7 days);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+
+        usdc.mint(random, 10_000e6);
+        vm.startPrank(random);
+        usdc.approve(address(vault), 10_000e6);
+        uint256 shares = vault.deposit(10_000e6, random);
+        vm.stopPrank();
+        assertGt(shares, 0);
+    }
+
+    // ==================== RESCUE LOCK DURING ACTIVE PROPOSAL ====================
+
+    function test_rescueERC20_blockedDuringActiveProposal() public {
+        _createAndExecuteProposal(1500, 7 days);
+
+        // Send some non-asset tokens to vault
+        targetToken.mint(address(vault), 1_000e18);
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateVault.RedemptionsLocked.selector);
+        vault.rescueERC20(address(targetToken), owner, 1_000e18);
+    }
+
+    function test_rescueERC20_succeedsAfterSettlement() public {
+        uint256 proposalId = _createAndExecuteProposal(1500, 7 days);
+        vm.prank(agent);
+        governor.settleProposal(proposalId);
+
+        targetToken.mint(address(vault), 1_000e18);
+
+        vm.prank(owner);
+        vault.rescueERC20(address(targetToken), owner, 1_000e18);
+        assertEq(targetToken.balanceOf(owner), 1_000e18);
+    }
+
+    // ==================== PROTOCOL FEE RECIPIENT CHECK ====================
+
+    /* test_setProtocolFeeBps_noRecipient_reverts — stubbed: setProtocolFeeBps moved to ProtocolConfig */
+    function test_setProtocolFeeBps_noRecipient_reverts() public {}
+
+    /* test_setProtocolFeeBps_zeroWithNoRecipient_succeeds — stubbed: setProtocolFeeBps moved to ProtocolConfig */
+    function test_setProtocolFeeBps_zeroWithNoRecipient_succeeds() public {}
+
+    // ==================== RESCUE ERC721 LOCK ====================
+
+    // P1-1: setGuardianFeeRecipient + guardianFeeRecipient removed — fees
+    //       always route to the bound `_guardianRegistry`, so the recipient
+    //       is no longer a settable parameter.
+
+    function test_rescueERC721_blockedDuringActiveProposal() public {
+        _createAndExecuteProposal(1500, 7 days);
+
+        // Mint an NFT to the vault
+        uint256 tokenId = 999;
+        vm.mockCall(
+            address(targetToken),
+            abi.encodeWithSignature("safeTransferFrom(address,address,uint256)", address(vault), owner, tokenId),
+            ""
+        );
+
+        vm.prank(owner);
+        vm.expectRevert(ISyndicateVault.RedemptionsLocked.selector);
+        vault.rescueERC721(address(targetToken), tokenId, owner);
+    }
+
+    // ==================== Lane B queue settle regression ====================
+
+    /// @notice Regression for the async-queue settle gap: `_finishSettlement`
+    ///         must call `vault.onProposalSettled(pid)` so the queue's frozen
+    ///         price is stamped and queued redeems can claim. Pre-fix (no
+    ///         production caller of onProposalSettled) the stamp never happened
+    ///         and `queue.claim` reverted forever.
+    function test_settle_stampsWithdrawalQueue_andClaimSucceeds() public {
+        // Bind a real per-vault withdrawal queue (this test contract is the
+        // vault's factory, so setWithdrawalQueue is authorized).
+        VaultWithdrawalQueue queue = new VaultWithdrawalQueue(address(vault));
+        vault.setWithdrawalQueue(address(queue));
+
+        // Open + execute a proposal so redemptions are locked.
+        uint256 pid = _createAndExecuteProposal(MAX_PERF_FEE_BPS, 7 days);
+        assertTrue(vault.redemptionsLocked(), "locked after execute");
+
+        // lp1 escrows a redeem into the queue while locked.
+        uint256 shares = vault.balanceOf(lp1) / 2;
+        assertGt(shares, 0, "lp1 has shares");
+        vm.prank(lp1);
+        uint256 reqId = vault.requestRedeem(shares, lp1);
+
+        // Pre-settle: price not yet stamped, claim not possible.
+        assertFalse(queue.getSettlePrice(pid).stamped, "pre-settle: unstamped");
+
+        // Settle as proposer (governor calls vault.onProposalSettled(pid)).
+        vm.prank(agent);
+        governor.settleProposal(pid);
+
+        // The fix: the governor stamped the frozen price for this pid.
+        assertTrue(queue.getSettlePrice(pid).stamped, "settle stamped the queue price");
+
+        // And the queued redeem now claims — burns escrowed shares, pays assets.
+        uint256 balBefore = usdc.balanceOf(lp1);
+        queue.claim(reqId);
+        assertGt(usdc.balanceOf(lp1), balBefore, "lp1 received redeemed assets");
+    }
+}

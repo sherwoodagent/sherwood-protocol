@@ -36,7 +36,7 @@ parameter has a named, per-parameter waiver env var for the case where the inert
 value *is* the decision — `ALLOW_INERT_TIER2_CALL_CAP`, `ALLOW_INERT_MAX_CAPITAL`,
 `ALLOW_ZERO_MIN_BUFFER` — so a waiver is a written, greppable act and never a
 silent omission. The rule is unit-tested in
-`test/deploy/CheckSyndicateParams.t.sol`.
+`test/factory/deploy/CheckSyndicateParams.t.sol`.
 
 ---
 

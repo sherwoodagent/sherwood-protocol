@@ -256,7 +256,7 @@ contract OwnerStakeAtCreationTest is Test {
         // Issue #98: the rotation SPENDS `newOwner`'s escrow, so `newOwner`
         // must consent to the binding first. Rotation is two transactions now.
         // The negative case lives in
-        // test/audit-fixes/StakedWood_ownerStakeBindingConsent.t.sol.
+        // test/guardian/StakedWood_ownerStakeBindingConsent.t.sol.
         vm.prank(newOwner);
         swood.approveOwnerStakeBinding(vault);
 

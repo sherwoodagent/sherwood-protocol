@@ -53,7 +53,7 @@ import {deployTierRegistry, PermissiveStrategyFactory} from "../helpers/TierRegi
 ///      (`vm.mockCall`, which the unit fixtures use for `governorOf`, is
 ///      supported by neither fuzzer.)
 ///
-///      Deployment order otherwise mirrors `test/TokenCourtEndToEnd.t.sol::setUp`,
+///      Deployment order otherwise mirrors `test/challenge/TokenCourtEndToEnd.t.sol::setUp`,
 ///      the most complete non-fork stack in the repo. The circular
 ///      sWOOD ↔ registry dependency is resolved the same way it is there:
 ///      sWOOD takes the factory at init, and `setRegistry` closes the loop.
@@ -417,7 +417,7 @@ abstract contract Base is StringUtils, Clamp, Deployer, Math {
         ledger = new ExposureLedger(address(this), address(swood), EPOCH_LENGTH);
         ledger.setWoodUsdPrice(0.1e8);
         // The mock publishes one round at construction and these suites warp far
-        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        // past it; staleness is exercised in test/guardian/ExposureLedger.t.sol.
         ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         ledger.setAssetFeed(address(asset), address(assetFeed), 365 days);
         ledger.setCoveredTvlCapUsd(10_000_000e18);

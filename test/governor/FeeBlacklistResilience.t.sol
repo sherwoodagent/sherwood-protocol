@@ -266,7 +266,7 @@ contract FeeBlacklistResilienceTest is Test {
     ///         Driven directly against the guard rather than through a second
     ///         settlement, because what is being pinned is the ARITHMETIC: with
     ///         an escrow outstanding, the spendable figure must exclude it.
-    function test_finding23_escrowedFeeIsReservedAgainstLaterPayouts() public {
+    function test_escrowedFeeIsReservedAgainstLaterPayouts() public {
         uint256 proposalId = _executeThroughSettle(1500, 7 days, _emptyCoProposers());
 
         usdc.mint(address(vault), 10_000e6);

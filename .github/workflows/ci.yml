@@ -55,8 +55,8 @@ jobs:
       - name: Build
         run: forge build
 
-      # Fork/integration tests need live RPC endpoints (no secrets in CI), so
-      # everything under test/integration/ is excluded. All other tests run.
+      # Fork tests need live RPC endpoints (no secrets in CI), so
+      # everything under test/fork/ is excluded. All other tests run.
       #
       # `test/WstETHMoonwellStrategy.t.sol` was excluded here too until the
       # Base-chain strategies were deleted (PR #53). That path no longer exists,
@@ -64,7 +64,7 @@ jobs:
       # would have been silently skipped by CI. Removed rather than kept "just
       # in case" (issue #73).
       - name: Test
-        run: forge test --no-match-path "test/integration/**" -vv
+        run: forge test --no-match-path "test/fork/**" -vv
 
   coverage:
     name: Coverage (advisory)
@@ -82,9 +82,8 @@ jobs:
         with:
           version: ${{ env.FOUNDRY_VERSION }}
 
-      # Own cache key: the coverage profile builds with via_ir off, so its
-      # artifacts are incompatible with the default profile's — sharing the
-      # `forge-` key would make the two jobs thrash each other's cache.
+      # Own cache key: coverage uses minimal IR optimization, so its artifacts
+      # are incompatible with the default profile's optimized build.
       - name: Cache build artifacts
         uses: actions/cache@v4
         with:
@@ -103,25 +102,19 @@ jobs:
           # the only difference was the restored cache. An exact-key miss now means
           # a full clean build — slower, and correct.
 
-      # `forge coverage` disables the optimizer and via_ir project-wide to keep
-      # source maps accurate, and unoptimized legacy codegen blows the stack in
-      # this repo's eight largest contracts. `[profile.coverage]` works around
-      # that with per-file `compilation_restrictions` that keep exactly those
-      # eight on the IR pipeline; see the comment block in foundry.toml for the
-      # list, the reproduce command, and what the workaround costs. Same
-      # fork-path exclusion as the Test step above: those suites need live RPC.
-      #
-      # Still `continue-on-error` (see above) on stability grounds only — as of
-      # forge 1.7.1 this step passes: 1478 tests, ~52% line coverage over the 83
-      # instrumented files.
+      # Minimal IR optimization avoids stack-too-deep failures and instruments
+      # all production files, including governor, vault, and strategies. IR source
+      # maps are approximate, so this job remains advisory. The fork exclusion
+      # matches the Test step above; those suites need live RPC endpoints.
       - name: forge coverage
         env:
           FOUNDRY_PROFILE: coverage
         run: |
           forge coverage \
+            --ir-minimum \
             --report lcov \
             --report summary \
-            --no-match-path "test/integration/**"
+            --no-match-path "test/fork/**"
 
       # TODO(#63): sink is artifact-only for now — wiring Codecov needs a
       # CODECOV_TOKEN repository secret, a decision deferred out of this change.

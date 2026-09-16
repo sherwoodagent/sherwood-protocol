@@ -79,7 +79,7 @@ The set is: `setProtocolFeeRecipient`, `setGuardiansFeeRecipient`, and **the Tie
 
 #### Scenario: Seeding moved below the handoff
 - **GIVEN** a refactor that moves the seed call after the Safe has accepted ownership
-- **THEN** the seeding SKIPS rather than reverting — it is best-effort by design — and the ceremony ships an empty registry while looking clean, which `test/deploy/DeployRobinhoodMainnetHandoff.t.sol` pins
+- **THEN** the seeding SKIPS rather than reverting — it is best-effort by design — and the ceremony ships an empty registry while looking clean, which `test/factory/deploy/DeployRobinhoodMainnetHandoff.t.sol` pins
 
 The ceremony SHALL seat BOTH `protocolFeeRecipient` AND `guardiansFeeRecipient` on `ProtocolConfig` inside the broadcast, and validation SHALL assert both. `ProtocolConfig`'s constructor seeds only the splits, and a zero recipient does NOT strand its leg — the governor zeroes that slice and hands it to the agent as remainder, in both `_chargeManagementFee` and `_chargePerformanceFee`. An unseated recipient is therefore a SILENT RE-ROUTING to the proposer, not a missing payment. The guardian leg is the load-bearing one: `MANAGEMENT_FEE_BPS = 200` is sized so 20% of management and 25% of performance fund the guardian pool, so leaving it unset charges depositors at a rate justified by a pool that receives nothing.
 
@@ -111,7 +111,7 @@ The list SHALL name `PORTFOLIO_TEMPLATE`, `MORPHO_SUPPLY_TEMPLATE` and `CONCENTR
 
 #### Scenario: Deprecated template keys refused entry
 - **WHEN** a deprecated key is re-added to `_templateKeys()`
-- **THEN** the exact-set assertion in `test/deploy/DeployMorphoStrategy.t.sol` FAILS, because a key with no backing contract overstates what the protocol can propose
+- **THEN** the exact-set assertion in `test/factory/deploy/DeployMorphoStrategy.t.sol` FAILS, because a key with no backing contract overstates what the protocol can propose
 
 ### Requirement: The Uniswap V3 factory is counterparty-allowlisted before the CL template ships
 
@@ -326,7 +326,7 @@ The script SHALL refuse to run anywhere but the chain id named by `ROBINHOOD_FOR
 - **THEN** the run FAILS with a message naming the delegator-walkout hole
 
 #### Scenario: Preflight tests cover both invariants
-- **THEN** `test/deploy/DeployPlanBPreflight.t.sol` covers: default duration seating lands; zero override rejected; delegation-on fails the named assert; delegation-off passes; and, for the WOOD feed, each half of the pre-flight-12 pairing refused, a code-less feed refused, the feed preferred when both sources are wired, the feed carrying the price alone on the fork shape, and both keys unset leaving the ledger TWAP-only
+- **THEN** `test/factory/deploy/DeployPlanBPreflight.t.sol` covers: default duration seating lands; zero override rejected; delegation-on fails the named assert; delegation-off passes; and, for the WOOD feed, each half of the pre-flight-12 pairing refused, a code-less feed refused, the feed preferred when both sources are wired, the feed carrying the price alone on the fork shape, and both keys unset leaving the ledger TWAP-only
 
 ### Requirement: Plan D deployment pre-flights and wiring order
 `DeployPlanD` (ChallengeGame against an existing Plan B + Plan C deployment) SHALL run pre-flights before deploying anything, then wire the game's four roles in this order: `ledger.setCoverageFreezer(game)` → `tierRegistry.setAuthorizedDemoter(game)` → `swood.setAuthorizedSlasher(game)` → `game.setStakedWood(swood)` (the reciprocal pointer, owner-set rather than a constructor arg because the role is granted on sWOOD's side; the slasher grant and the reciprocal pointer can be wired in either order). Checks:

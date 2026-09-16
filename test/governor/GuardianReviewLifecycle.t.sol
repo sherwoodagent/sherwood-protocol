@@ -341,7 +341,7 @@ contract GuardianReviewLifecycleTest is Test {
     /// @notice PR #195 review, item 7 — the piece that was documented but never
     ///         driven: pause-deferral MEETING the governor's wall-clock expiry,
     ///         against a real governor rather than asserted in a comment.
-    /// @dev    `GuardianRegistry`'s own `test_finding7_repeatedPauseCyclesCompound`
+    /// @dev    `GuardianRegistry`'s own `test_repeatedPauseCyclesCompound`
     ///         pins that resolution is refused past the raw `reviewEnd`, but it
     ///         runs on a `MockGovernorMinimal` with no `executeBy` at all, so it
     ///         cannot see what the deferral costs the proposal. This can.

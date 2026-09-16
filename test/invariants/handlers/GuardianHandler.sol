@@ -64,7 +64,7 @@ contract GuardianHandler is Test {
     uint256 public currentProposalId;
 
     /// @dev Per-proposal snapshot of approvers taken just before resolveReview.
-    ///      INV-2 uses this to verify slashed approvers had stake at resolve time.
+    ///      Retained for inspecting the approver set when debugging a resolution.
     mapping(uint256 => address[]) public _approversSnapshot;
 
     // Stats for debugging / logs.
@@ -222,12 +222,13 @@ contract GuardianHandler is Test {
         uint256[] memory rates = new uint256[](1);
         rates[0] = slashBps;
 
+        uint256 openedAt = vm.getBlockTimestamp();
         vm.prank(address(registry));
         // Pass openedAt = now: the own-slash basis is the raw own-stake
         // checkpoint at openedAt (spec 2026-07-19 §5), so `now` sizes the
         // slash off the approver's current stake and keeps the own-stake
         // leg exercised. (openedAt=0 would find no checkpoint → own basis 0.)
-        try swood.slashGuardians(bytes32(uint256(pid)), block.timestamp, approvers, rates) {
+        try swood.slashGuardians(bytes32(uint256(pid)), openedAt, approvers, rates) {
             successfulSlashes += 1;
         } catch {}
     }
@@ -264,8 +265,7 @@ contract GuardianHandler is Test {
         if (proposalIds.length == 0) return;
         uint256 pid = proposalIds[bound(proposalSeed, 0, proposalIds.length - 1)];
 
-        // Snapshot approvers BEFORE the registry zeroes their stake on a
-        // blocked resolve (INV-2 needs to see the slashed set).
+        // Keep the pre-resolution approver set for debugging slash behavior.
         (bool opened, bool alreadyResolved,) = registry.getReviewState(address(governor), pid);
         if (opened && !alreadyResolved) {
             address[] memory snapshot = _snapshotApprovers(pid);
@@ -286,13 +286,9 @@ contract GuardianHandler is Test {
         voteEndOffset = bound(voteEndOffset, 1 hours, 1 days);
         reviewPeriodOffset = bound(reviewPeriodOffset, 1 hours, 1 days);
         currentProposalId += 1;
-        uint256 ve = block.timestamp + voteEndOffset;
+        uint256 ve = vm.getBlockTimestamp() + voteEndOffset;
         uint256 re = ve + reviewPeriodOffset;
-        // registerReview is onlyGovernor; this handler's governor is never added
-        // via addGovernor, so the call reverts UnauthorizedGovernor and is
-        // swallowed by the catch — matching the prior mock where reviews never
-        // actually opened. The slash bucket is exercised via a direct registry
-        // prank in `slash`.
+        // The harness authorizes this governor through the factory in setUp.
         vm.prank(address(governor));
         try registry.registerReview(currentProposalId, ve, re) {} catch {}
         proposalIds.push(currentProposalId);
@@ -300,7 +296,7 @@ contract GuardianHandler is Test {
 
     function warp(uint256 delta) external {
         delta = bound(delta, 1, 7 days);
-        vm.warp(block.timestamp + delta);
+        vm.warp(vm.getBlockTimestamp() + delta);
     }
 
     // ──────────────────────────────────────────────────────────────

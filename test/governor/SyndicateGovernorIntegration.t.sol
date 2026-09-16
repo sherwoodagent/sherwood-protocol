@@ -1,0 +1,399 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+import {ProtocolFixture} from "../helpers/ProtocolFixture.sol";
+
+import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
+import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
+import {SyndicateVault} from "../../src/SyndicateVault.sol";
+import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
+import {BatchExecutorLib} from "../../src/BatchExecutorLib.sol";
+import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {ERC20Mock} from "../mocks/ERC20Mock.sol";
+import {MockAgentRegistry} from "../mocks/MockAgentRegistry.sol";
+import {MockMToken} from "../mocks/MockMToken.sol";
+import {MockComptroller} from "../mocks/MockComptroller.sol";
+import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {GovEnvelope} from "../helpers/GovEnvelope.sol";
+import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
+
+/**
+ * @title SyndicateGovernorIntegrationTest
+ * @notice Integration tests that exercise the full proposal lifecycle across
+ *         governor + vault, including real DeFi mock interactions (Moonwell
+ *         supply/borrow, unwind, P&L settlement).
+ */
+contract SyndicateGovernorIntegrationTest is ProtocolFixture {
+    SyndicateGovernor public governor;
+    ProtocolConfig public protocolConfig;
+    SyndicateVault public vault;
+    BatchExecutorLib public executorLib;
+    ERC20Mock public usdc;
+    ERC20Mock public targetToken;
+    MockAgentRegistry public agentRegistry;
+    MockMToken public mUsdc;
+    MockComptroller public comptroller;
+    MockRegistryMinimal public guardianRegistry;
+
+    address public owner = makeAddr("owner");
+    address public agent = makeAddr("agent");
+    address public agentEoa = makeAddr("agentEoa");
+    address public lp1 = makeAddr("lp1");
+    address public lp2 = makeAddr("lp2");
+    address public random = makeAddr("random");
+
+    uint256 public agentNftId;
+
+    uint256 constant VOTING_PERIOD = 1 days;
+    uint256 constant EXECUTION_WINDOW = 1 days;
+    uint256 constant VETO_THRESHOLD_BPS = 4000;
+    uint256 constant MAX_PERF_FEE_BPS = 1500;
+    uint256 constant MAX_STRATEGY_DURATION = 30 days;
+    uint256 constant COOLDOWN_PERIOD = 1 days;
+
+    function setUp() public {
+        protocolConfig = new ProtocolConfig(owner);
+        // 1% protocol fee — the settlement expectations below (742.5 of 5k
+        // profit) assume it. Snapshotted onto proposals at propose time.
+        vm.startPrank(owner);
+        protocolConfig.setProtocolFeeRecipient(owner);
+        vm.stopPrank();
+        usdc = new ERC20Mock("USD Coin", "USDC", 6);
+        targetToken = new ERC20Mock("Target", "TGT", 18);
+        mUsdc = new MockMToken(address(usdc), "Moonwell USDC", "mUSDC");
+        comptroller = new MockComptroller();
+        executorLib = new BatchExecutorLib();
+        agentRegistry = new MockAgentRegistry();
+        guardianRegistry = new MockRegistryMinimal();
+        agentNftId = agentRegistry.mint(agent);
+
+        vault = _deployVault(
+            ISyndicateVault.InitParams({
+                asset: address(usdc),
+                name: "Sherwood Vault",
+                symbol: "swUSDC",
+                owner: owner,
+                executorImpl: address(executorLib),
+                openDeposits: true,
+                agentRegistry: address(agentRegistry),
+                managementFeeBps: 0
+            })
+        );
+
+        vm.prank(owner);
+        vault.registerAgent(agentNftId, agent);
+
+        governor = _deployGovernor(
+            abi.encodeCall(
+                SyndicateGovernor.initialize,
+                (
+                    address(vault), // vault_: this test's vault (per-vault governor)
+                    address(guardianRegistry),
+                    address(protocolConfig),
+                    address(this),
+                    address(deployTierRegistry(address(this))), // factory (test contract)
+                    ISyndicateGovernor.GovernorParams({
+                        votingPeriod: VOTING_PERIOD,
+                        executionWindow: EXECUTION_WINDOW,
+                        vetoThresholdBps: VETO_THRESHOLD_BPS,
+                        maxPerformanceFeeBps: MAX_PERF_FEE_BPS,
+                        cooldownPeriod: COOLDOWN_PERIOD,
+                        collaborationWindow: 48 hours,
+                        maxCoProposers: 5,
+                        minStrategyDuration: 1 hours,
+                        maxStrategyDuration: MAX_STRATEGY_DURATION
+                    })
+                )
+            )
+        );
+
+        vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
+        // Inert post-retirement (issue #54): nothing calls `priceRouter()` anymore.
+        vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
+
+        usdc.mint(lp1, 100_000e6);
+        usdc.mint(lp2, 100_000e6);
+
+        vm.startPrank(lp1);
+        usdc.approve(address(vault), 60_000e6);
+        vault.deposit(60_000e6, lp1);
+        vm.stopPrank();
+
+        vm.startPrank(lp2);
+        usdc.approve(address(vault), 40_000e6);
+        vault.deposit(40_000e6, lp2);
+        vm.stopPrank();
+
+        usdc.mint(address(mUsdc), 1_000_000e6);
+        vm.warp(block.timestamp + 1);
+    }
+
+    // ── Helpers ──
+
+    function _emptyCoProposers() internal pure returns (ISyndicateGovernor.CoProposer[] memory) {
+        return new ISyndicateGovernor.CoProposer[](0);
+    }
+
+    function _proposeVoteApprove(
+        BatchExecutorLib.Call[] memory executeCalls,
+        BatchExecutorLib.Call[] memory settlementCalls,
+        uint256 feeBps,
+        uint256 duration
+    ) internal returns (uint256 proposalId) {
+        return _proposeVoteApprove(
+            executeCalls,
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, executeCalls.length),
+            settlementCalls,
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, settlementCalls.length),
+            feeBps,
+            duration
+        );
+    }
+
+    /// @dev Explicit-caps overload (issue #43): every OTHER call site in this
+    ///      file uses single-call exec/settle arrays, where the generic
+    ///      `GovEnvelope.defaultCaps` (cap the first call, zero the rest)
+    ///      happens to be correct. `test_fullLifecycle_moonwellSupplyBorrowUnwind`
+    ///      is the one exception — its mover calls are NOT at index 0 — so it
+    ///      calls this overload directly with hand-computed caps instead.
+    function _proposeVoteApprove(
+        BatchExecutorLib.Call[] memory executeCalls,
+        uint256[] memory executeCallCaps,
+        BatchExecutorLib.Call[] memory settlementCalls,
+        uint256[] memory settlementCallCaps,
+        uint256 feeBps,
+        uint256 duration
+    ) internal returns (uint256 proposalId) {
+        // Agent performance fee is now a vault property — owner sets it before proposing
+        vm.prank(owner);
+        vault.setAgentFeeBps(feeBps);
+        vm.prank(agent);
+        proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            duration,
+            GovEnvelope.permissive(address(vault)),
+            executeCalls,
+            executeCallCaps,
+            settlementCalls,
+            settlementCallCaps,
+            _emptyCoProposers()
+        );
+        // via_ir-safe: use vm.getBlockTimestamp() so the IR optimizer can't reorder
+        // block.timestamp reads across vm.warp cheatcodes
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+    }
+
+    // ==================== FULL LIFECYCLE: PROPOSE -> VOTE -> EXECUTE -> SETTLE ====================
+
+    function test_fullLifecycle_proposeVoteExecuteSettle() public {
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 50_000e6)), value: 0
+        });
+
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 0)), value: 0
+        });
+
+        uint256 proposalId = _proposeVoteApprove(execCalls, settleCalls, 1500, 7 days);
+
+        assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Approved));
+
+        governor.executeProposal(proposalId);
+        assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Executed));
+        assertTrue(vault.redemptionsLocked());
+        assertEq(usdc.allowance(address(vault), address(targetToken)), 0, "no allowance outlives the batch");
+
+        // While the proposal is active `maxWithdraw == 0` so OZ's standard
+        // pre-check produces the canonical EIP-4626 revert.
+        assertEq(vault.maxWithdraw(lp1), 0);
+        vm.prank(lp1);
+        vm.expectPartialRevert(ERC4626Upgradeable.ERC4626ExceededMaxWithdraw.selector);
+        vault.withdraw(1_000e6, lp1, lp1);
+
+        usdc.mint(address(vault), 5_000e6);
+
+        vm.warp(block.timestamp + 7 days);
+        uint256 agentBalBefore = usdc.balanceOf(agent);
+        vm.prank(random);
+        governor.settleProposal(proposalId);
+
+        assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertFalse(vault.redemptionsLocked());
+        assertEq(governor.getActiveProposal(), 0);
+
+        // The agent is paid its share of both fees. Amount unpinned — the
+        // retired waterfall's 742.5 came from a rate structure that no longer
+        // exists; 15% of the 5k gain is 750, and the agent takes 60% of that
+        // plus its management share.
+        uint256 agentPaid = usdc.balanceOf(agent) - agentBalBefore;
+        assertGt(agentPaid, 0, "agent paid at settlement");
+        assertLt(agentPaid, 750e6, "and bounded by the performance fee");
+        assertEq(usdc.allowance(address(vault), address(targetToken)), 0);
+
+        vm.warp(governor.getCooldownEnd() + 1);
+        vm.prank(lp1);
+        vault.withdraw(10_000e6, lp1, lp1);
+    }
+
+    // ==================== REJECTED PROPOSAL ====================
+
+    function test_fullLifecycle_rejectedProposal() public {
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 50_000e6)), value: 0
+        });
+
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 0)), value: 0
+        });
+
+        vm.prank(agent);
+        uint256 proposalId = governor.propose(
+            address(vault),
+            address(0),
+            "ipfs://test",
+            7 days,
+            GovEnvelope.permissive(address(vault)),
+            execCalls,
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (execCalls).length),
+            settleCalls,
+            GovEnvelope.defaultCaps((GovEnvelope.permissive(address(vault))).maxCapital, (settleCalls).length),
+            _emptyCoProposers()
+        );
+        vm.warp(block.timestamp + 1);
+
+        // Both vote against -- triggers veto threshold
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.Against);
+        vm.prank(lp2);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.Against);
+        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+
+        assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Rejected));
+        vm.expectRevert(ISyndicateGovernor.ProposalNotApproved.selector);
+        governor.executeProposal(proposalId);
+    }
+
+    // The old `emergencySettle(uint256, Call[])` integration scenario was replaced
+    // by the Task 24 guardian-review lifecycle. See
+    // `test/governor/GovernorEmergency.t.sol` for full-lifecycle tests of
+    // unstick / emergencySettleWithCalls / cancel / finalize.
+
+    // ==================== SEQUENTIAL STRATEGIES ====================
+
+    function test_fullLifecycle_multipleProposalsSequential() public {
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](1);
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 50_000e6)), value: 0
+        });
+
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](1);
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(targetToken), 0)), value: 0
+        });
+
+        uint256 pid1 = _proposeVoteApprove(execCalls, settleCalls, 1500, 3 days);
+        governor.executeProposal(pid1);
+        vm.warp(block.timestamp + 3 days);
+        governor.settleProposal(pid1);
+        vm.warp(block.timestamp + COOLDOWN_PERIOD + 1);
+
+        uint256 pid2 = _proposeVoteApprove(execCalls, settleCalls, 1200, 5 days);
+        governor.executeProposal(pid2);
+        vm.warp(block.timestamp + 5 days);
+        governor.settleProposal(pid2);
+
+        assertEq(uint256(governor.getProposal(pid1).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertEq(uint256(governor.getProposal(pid2).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertEq(governor.getActiveProposal(), 0);
+        assertFalse(vault.redemptionsLocked());
+    }
+
+    // ==================== MOONWELL: REAL DEFI LIFECYCLE ====================
+
+    function test_fullLifecycle_moonwellSupplyBorrowUnwind() public {
+        uint256 supplyAmount = 50_000e6;
+        uint256 borrowAmount = 25_000e6;
+
+        // Execute calls: approve + supply + enter markets + borrow
+        BatchExecutorLib.Call[] memory execCalls = new BatchExecutorLib.Call[](4);
+        execCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(mUsdc), supplyAmount)), value: 0
+        });
+        execCalls[1] = BatchExecutorLib.Call({
+            target: address(mUsdc), data: abi.encodeWithSignature("mint(uint256)", supplyAmount), value: 0
+        });
+        address[] memory markets = new address[](1);
+        markets[0] = address(mUsdc);
+        execCalls[2] = BatchExecutorLib.Call({
+            target: address(comptroller), data: abi.encodeCall(comptroller.enterMarkets, (markets)), value: 0
+        });
+        execCalls[3] = BatchExecutorLib.Call({
+            target: address(mUsdc), data: abi.encodeWithSignature("borrow(uint256)", borrowAmount), value: 0
+        });
+
+        // Settlement calls: approve + repay + redeem
+        BatchExecutorLib.Call[] memory settleCalls = new BatchExecutorLib.Call[](3);
+        settleCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), data: abi.encodeCall(usdc.approve, (address(mUsdc), borrowAmount)), value: 0
+        });
+        settleCalls[1] = BatchExecutorLib.Call({
+            target: address(mUsdc), data: abi.encodeWithSignature("repayBorrow(uint256)", borrowAmount), value: 0
+        });
+        settleCalls[2] = BatchExecutorLib.Call({
+            target: address(mUsdc), data: abi.encodeWithSignature("redeemUnderlying(uint256)", supplyAmount), value: 0
+        });
+
+        // Issue #43 explicit per-call caps: the movers are NOT at index 0.
+        // execCalls[0] approve — balance-invisible, cap 0.
+        // execCalls[1] mint — PULLS supplyAmount USDC from the vault (the
+        //   mover), cap = supplyAmount.
+        // execCalls[2] enterMarkets — touches no USDC balance, cap 0.
+        // execCalls[3] borrow — SENDS borrowAmount USDC to the vault (an
+        //   inflow, never capped by the outflow meter: outflow = max(0,
+        //   before-after) = 0), cap 0.
+        uint256[] memory execCaps = new uint256[](4);
+        execCaps[1] = supplyAmount;
+        // settleCalls[0] approve — cap 0.
+        // settleCalls[1] repayBorrow — PULLS borrowAmount USDC from the vault
+        //   (the mover), cap = borrowAmount.
+        // settleCalls[2] redeemUnderlying — an inflow, cap 0.
+        uint256[] memory settleCaps = new uint256[](3);
+        settleCaps[1] = borrowAmount;
+
+        uint256 proposalId = _proposeVoteApprove(execCalls, execCaps, settleCalls, settleCaps, 1500, 7 days);
+
+        uint256 vaultBalBefore = usdc.balanceOf(address(vault));
+        assertEq(vaultBalBefore, 100_000e6);
+
+        governor.executeProposal(proposalId);
+
+        assertTrue(vault.redemptionsLocked());
+        assertEq(mUsdc.balanceOf(address(vault)), supplyAmount);
+        assertEq(usdc.balanceOf(address(vault)), 75_000e6);
+
+        vm.warp(block.timestamp + 7 days);
+
+        vm.prank(random);
+        governor.settleProposal(proposalId);
+
+        assertEq(usdc.balanceOf(address(vault)), 100_000e6);
+        assertEq(mUsdc.balanceOf(address(vault)), 0);
+        assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertFalse(vault.redemptionsLocked());
+        assertEq(governor.getActiveProposal(), 0);
+        assertEq(usdc.balanceOf(agent), 0);
+    }
+}
