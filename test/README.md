@@ -70,3 +70,16 @@ Compared with `post-audit-v2` at `188941b6`:
 - Existing test bodies preserved except the strengthened blocked-review invariant; two new tests cover fixture wiring and invariant reachability.
 - All 20 invariant names and all 30 fizz harness files retained. Fizz edits only update comments pointing to moved tests.
 - Three existing `LayoutPins` suites retained; the ticket's count of four was stale. The separate golden script still checks all five upgradeable contracts.
+
+## Runtime baseline
+
+Foundry v1.7.1 on GitHub Actions `ubuntu-latest`, non-fork command above:
+
+| Revision | Suites | Passed | Failed | Skipped | Suite wall time | Compilation |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Before (`188941b6`) | 180 | 2,714 | 0 | 1 | 436.91 s | 1,125.16 s |
+
+Baseline evidence: [CI run 35008993338](https://github.com/sherwoodagent/sherwood-protocol/actions/runs/35008993338/job/104515888236).
+The job checked out PR merge `930989e59f6db61427498f16b601272089968bb2`, whose
+Git tree exactly matches `188941b6` (`9bd0a7191d34d1b2d94896941282564c40a0da21`).
+The full job took 26m20s; suite wall time excludes compilation and setup.

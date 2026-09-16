@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {Create3Factory} from "../../script/utils/Create3Factory.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {SyndicateVault} from "../../src/SyndicateVault.sol";
 import {ISyndicateVault} from "../../src/interfaces/ISyndicateVault.sol";
@@ -115,9 +116,11 @@ abstract contract ProtocolFixture is Test {
         p.config = new ProtocolConfig(owner_);
         p.beacon = new GovernorBeacon(address(new SyndicateGovernor(24 hours, 1 hours)), owner_);
         p.tiers = new TierRegistry(owner_);
-        // Resolve the factory/registry cycle before initializing either consumer.
-        // All initialization happens atomically within this fixture invocation.
-        p.factory = SyndicateFactory(address(new ERC1967Proxy(address(new SyndicateFactory()), "")));
+        // Match production's CREATE3 prediction to resolve the factory/registry
+        // cycle while initializing every proxy in its constructor.
+        Create3Factory create3 = new Create3Factory(address(this));
+        bytes32 factorySalt = keccak256("protocol-fixture.factory");
+        p.factory = SyndicateFactory(create3.addressOf(factorySalt));
         p.swood = _deployStakedWood(
             StakedWood.InitParams({
                 owner: owner_,
@@ -135,9 +138,9 @@ abstract contract ProtocolFixture is Test {
         p.registry = _deployRegistry(
             abi.encodeCall(GuardianRegistry.initialize, (owner_, address(p.factory), address(p.swood), 24 hours, 3000))
         );
-        p.factory
-            .initialize(
-                SyndicateFactory.InitParams({
+        bytes memory factoryInit = abi.encodeCall(
+            SyndicateFactory.initialize,
+            (SyndicateFactory.InitParams({
                     owner: owner_,
                     executorImpl: address(p.executor),
                     vaultImpl: address(new SyndicateVault()),
@@ -148,8 +151,13 @@ abstract contract ProtocolFixture is Test {
                     managementFeeBps: 0,
                     guardianRegistry: address(p.registry),
                     tierRegistry: address(p.tiers)
-                })
-            );
+                }))
+        );
+        address factoryImpl = address(new SyndicateFactory());
+        address deployedFactory = create3.deploy(
+            factorySalt, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(factoryImpl, factoryInit))
+        );
+        assertEq(deployedFactory, address(p.factory), "factory prediction");
         p.strategies = new StrategyFactory(address(p.factory), owner_);
         p.ledger = new ExposureLedger(owner_, address(p.swood), 28 days);
         p.escrow = new ProposerBondEscrow(address(p.wood), address(p.registry), address(p.ledger));
