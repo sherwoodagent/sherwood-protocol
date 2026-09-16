@@ -51,6 +51,10 @@ contract DeployAllHarness is DeployAll {
     function exposed_handoffAll(Stack memory s, address ownerMultisig) external {
         _handoffAll(s, ownerMultisig);
     }
+
+    function exposed_persist(Stack memory s, Inputs memory i, Checkpoint cp) external {
+        _persist(s, i, cp);
+    }
 }
 
 /// @notice A Safe stand-in: `OWNER_MULTISIG` must hold code, and the two-step half of the
@@ -81,12 +85,16 @@ abstract contract DeployAllFixture is Test {
         hex"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3";
 
     uint256 internal constant FORK_CHAIN_ID = 9_994_663;
+    /// @dev Chain ids no book is committed for: `_persist` writes, so it must not touch one,
+    ///      and one id per test so two runs of this file cannot share a scratch path.
+    uint256 internal constant SCRATCH_CHAIN_ID = 4_242_424;
+    uint256 internal constant SCRATCH_CHAIN_ID_2 = 4_242_425;
     uint256 internal constant MAINNET_CHAIN_ID = RobinhoodParams.MAINNET_CHAIN_ID;
 
-    // WOOD/WETH = 1e-4 against ETH at $3,000 puts spot at 3e7 x8 ($0.30), so the shipped
-    // WOOD_PRICE_CAP_X8 (5e7) lands at 1.67x spot — inside the pre-flight's [1.25x, 2x] band.
+    // WOOD/WETH = 1e-6 against ETH at $3,000 puts spot at 3e5 x8 ($0.003), so the shipped
+    // WOOD_PRICE_CAP_X8 (5e5) lands at 1.67x spot — inside the pre-flight's [1.25x, 2x] band.
     uint112 internal constant WETH_RESERVE = 100e18;
-    uint112 internal constant WOOD_RESERVE = 1_000_000e18;
+    uint112 internal constant WOOD_RESERVE = 100_000_000e18;
     int256 internal constant ETH_USD_X8 = 3000e8;
 
     DeployAllHarness internal script;
@@ -277,7 +285,7 @@ abstract contract DeployAllFixture is Test {
         assertEq(SyndicateFactory(s.core.factoryProxy).exposureLedger(), s.exposureLedger, "factory issues here");
         assertEq(SyndicateFactory(s.core.factoryProxy).bondEscrow(), s.proposerBondEscrow, "bond escrow");
         assertEq(ledger.woodHaircutBps(), RobinhoodParams.WOOD_HAIRCUT_BPS, "haircut");
-        assertEq(ledger.woodUsdPriceX8(), RobinhoodParams.WOOD_PRICE_CAP_X8, "price cap");
+        assertEq(ledger.woodUsdPriceX8(), s.woodPriceCapX8, "price cap");
         assertEq(ledger.coveredTvlCapUsd(), RobinhoodParams.COVERED_TVL_CAP_USD18, "covered TVL cap");
         // The composed price is min(cap, market) haircut — non-zero is what makes a bond priceable.
         assertGt(ledger.woodPriceX8(), 0, "WOOD is priceable");
@@ -368,8 +376,10 @@ contract DeployAllTest is DeployAllFixture {
         _assertAddressTable(s, Posture.Fork);
         // The prediction table is what lets a pointer slot be refused before its contract
         // exists, so a salt that drifts between prediction and phase has to be caught here.
-        // `core.deployer` is the one field a prediction cannot carry: it is the broadcaster.
+        // `core.deployer` and the derived price cap are the two fields a prediction cannot
+        // carry: one is the broadcaster, the other is read off the live pair at deploy time.
         predicted.core.deployer = deployer;
+        predicted.woodPriceCapX8 = s.woodPriceCapX8;
         assertEq(abi.encode(predicted), abi.encode(s), "predicted table == minted table");
 
         _assertCoreWiring(s);
@@ -515,7 +525,7 @@ contract DeployAllTest is DeployAllFixture {
         Inputs memory i = _inputs(Posture.Mainnet);
         script.exposed_preflight(i);
 
-        // Ten times the depth makes spot 3e6, so the shipped 5e7 cap is far above 2x.
+        // Ten times the depth makes spot 3e4, so the shipped 5e5 cap is far above 2x.
         uniPair.setReserves(WOOD_RESERVE * 10, WETH_RESERVE);
         sushiPair.setReserves(WETH_RESERVE, WOOD_RESERVE * 10);
         vm.expectRevert(bytes("PRE-FLIGHT: WOOD_PRICE_CAP_X8 is above 2x spot"));
@@ -525,30 +535,84 @@ contract DeployAllTest is DeployAllFixture {
     // ── Case 7: source hygiene ──
 
     /// @notice Zero environment reads anywhere in the ceremony: the whole point of the rewrite.
+    /// @dev Walks `script/` instead of listing files: a hardcoded list leaves every script added
+    ///      later unchecked, which is exactly the file a `vm.env` read would slip back in through.
     function test_noCeremonyScriptReadsTheProcessEnvironment() public view {
-        string[9] memory files = [
-            "script/robinhood-mainnet/DeployAll.s.sol",
-            "script/robinhood-mainnet/Deploy.s.sol",
-            "script/robinhood-mainnet/DeployPortfolioStrategy.s.sol",
-            "script/robinhood-mainnet/DeployConcentratedLiquidityStrategy.s.sol",
-            "script/robinhood-mainnet/DeployMorphoStrategy.s.sol",
-            "script/Deploy.s.sol",
-            "script/DeployStrategyFactory.s.sol",
-            "script/DeployWoodPoolFeed.s.sol",
-            "script/DeployPlanB.s.sol"
-        ];
-        for (uint256 n; n < files.length; ++n) {
-            _assertNoEnvRead(files[n]);
+        Vm.DirEntry[] memory entries = vm.readDir(string.concat(vm.projectRoot(), "/script"), 3);
+        uint256 scanned;
+        for (uint256 n; n < entries.length; ++n) {
+            if (entries[n].isDir || !vm.contains(entries[n].path, ".sol")) continue;
+            if (_isOneOffScript(entries[n].path)) continue;
+            assertFalse(
+                vm.contains(vm.readFile(entries[n].path), "vm.env"),
+                string.concat(entries[n].path, " reads the environment")
+            );
+            ++scanned;
         }
-        _assertNoEnvRead("script/DeployPlanD.s.sol");
-        _assertNoEnvRead("script/DeployTokenCourt.s.sol");
-        _assertNoEnvRead("script/ScriptBase.sol");
+        assertGt(scanned, 12, "the walk found fewer .sol scripts than the ceremony has");
+    }
+
+    /// @dev The one-off admin scripts, which are NOT part of the ceremony and take their
+    ///      arguments from the environment by design. Named one by one so a new ceremony
+    ///      script is scanned by default.
+    function _isOneOffScript(string memory path) internal pure returns (bool) {
+        return vm.contains(path, "CheckSyndicateParams") || vm.contains(path, "DeployWood.s.sol")
+            || vm.contains(path, "DeployVestingFactory") || vm.contains(path, "DeployEAS")
+            || vm.contains(path, "SeedAttestations");
     }
 
     // ─────────────────────────────── helpers ───────────────────────────────
 
-    function _assertNoEnvRead(string memory relPath) internal view {
-        string memory source = vm.readFile(string.concat(vm.projectRoot(), "/", relPath));
-        assertFalse(vm.contains(source, "vm.env"), string.concat(relPath, " reads the environment"));
+    // ── Case 8: the address book the ceremony leaves behind ──
+
+    /// @notice `_persist` records every minted address under the key `verify-robinhood.sh` reads,
+    ///         and records nothing of Plan B on a run that stopped at the feed gate.
+    /// @dev Writes into a scratch book under a scratch chain id: the committed books are inputs,
+    ///      and no other test reaches these writes at all.
+    function test_persist_writesEveryKeyTheVerifierReadsBack() public {
+        vm.chainId(FORK_CHAIN_ID);
+        (Stack memory s, Checkpoint cp) = _runCeremony(Posture.Fork);
+        Inputs memory i = _inputs(Posture.Fork);
+
+        string memory path = string.concat(vm.projectRoot(), "/chains/", vm.toString(SCRATCH_CHAIN_ID), ".json");
+        vm.writeFile(path, "{\"chainId\":0,\"name\":\"scratch\"}");
+        vm.chainId(SCRATCH_CHAIN_ID);
+        script.exposed_persist(s, i, cp);
+
+        string memory written = vm.readFile(path);
+        assertEq(vm.parseJsonAddress(written, ".CREATE3_FACTORY"), s.create3Factory, "CREATE3_FACTORY");
+        assertEq(vm.parseJsonAddress(written, ".SYNDICATE_FACTORY"), s.core.factoryProxy, "SYNDICATE_FACTORY");
+        assertEq(vm.parseJsonAddress(written, ".GUARDIAN_REGISTRY"), s.core.registryProxy, "GUARDIAN_REGISTRY");
+        assertEq(vm.parseJsonAddress(written, ".TIER_REGISTRY"), s.core.tierRegistry, "TIER_REGISTRY");
+        assertEq(vm.parseJsonAddress(written, ".STAKED_WOOD"), s.core.swoodProxy, "STAKED_WOOD");
+        assertEq(vm.parseJsonAddress(written, ".STRATEGY_FACTORY"), s.strategyFactory, "STRATEGY_FACTORY");
+        assertEq(vm.parseJsonAddress(written, ".WOOD_USD_FEED"), s.woodUsdFeed, "WOOD_USD_FEED");
+        assertEq(vm.parseJsonAddress(written, ".EXPOSURE_LEDGER"), s.exposureLedger, "EXPOSURE_LEDGER");
+        assertEq(vm.parseJsonAddress(written, ".PROPOSER_BOND_ESCROW"), s.proposerBondEscrow, "PROPOSER_BOND_ESCROW");
+        assertEq(vm.parseJsonAddress(written, ".CHALLENGE_GAME"), s.challengeGame, "CHALLENGE_GAME");
+        assertEq(vm.parseJsonAddress(written, ".TOKEN_COURT"), s.tokenCourt, "TOKEN_COURT");
+        // Governors are per-vault; the key is recorded as zero rather than left absent.
+        assertEq(vm.parseJsonAddress(written, ".SYNDICATE_GOVERNOR"), address(0), "SYNDICATE_GOVERNOR");
+        vm.removeFile(path);
+    }
+
+    /// @notice A run that stopped at the feed gate records no Plan B address.
+    function test_persist_recordsNoCoverageStackBeforeTheFeedAnswers() public {
+        vm.chainId(MAINNET_CHAIN_ID);
+        (Stack memory s, Checkpoint cp) = _runCeremony(Posture.Mainnet);
+        assertTrue(cp == Checkpoint.AwaitingWoodFeed, "run 1 stops at the gate");
+        Inputs memory i = _inputs(Posture.Mainnet);
+
+        string memory path = string.concat(vm.projectRoot(), "/chains/", vm.toString(SCRATCH_CHAIN_ID_2), ".json");
+        vm.writeFile(path, "{\"chainId\":0,\"name\":\"scratch\"}");
+        vm.chainId(SCRATCH_CHAIN_ID_2);
+        script.exposed_persist(s, i, cp);
+
+        string memory written = vm.readFile(path);
+        assertEq(vm.parseJsonAddress(written, ".WOOD_USD_FEED"), s.woodUsdFeed, "the feed IS recorded");
+        assertFalse(vm.keyExistsJson(written, ".EXPOSURE_LEDGER"), "no ledger key before the gate opens");
+        assertFalse(vm.keyExistsJson(written, ".CHALLENGE_GAME"), "no game key before the gate opens");
+        assertFalse(vm.keyExistsJson(written, ".TOKEN_COURT"), "no court key before the gate opens");
+        vm.removeFile(path);
     }
 }

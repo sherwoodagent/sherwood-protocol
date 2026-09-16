@@ -60,23 +60,14 @@ abstract contract DeployTokenCourt is ScriptBase {
     }
 
     /// @notice Grant the configured court ruling authority over the game.
-    /// @dev PRE-FLIGHT 1: the court points where we think. A court wired to a different
-    ///      game rules for one that rejects it (`NotCourt`); a court with the wrong sWOOD
-    ///      reads its electorate from a contract nobody staked in.
-    /// @dev PRE-FLIGHT 2: sWOOD identity must match on BOTH contracts, or the electorate
-    ///      that votes is not the cohort that gets slashed.
-    /// @dev PRE-FLIGHT 3: `autoSlashDelay + voteWindow + FINALIZE_BUFFER +
-    ///      MIN_REFERRAL_SLACK <= disputeTimeout`. Both contracts enforce this against
-    ///      whatever the OTHER is currently wired to, which is vacuous for a pair's very
-    ///      FIRST handshake — that gap is what this check covers.
-    /// @dev PRE-FLIGHT 4 (launch-math, spec §5): `participationFloorBps < ageFloorBps`.
-    ///      Turnout is AGED weight while the floor's base is RAW stake, so with all stake
-    ///      young a floor at or above that fraction can never be cleared. The court's own
-    ///      setters guard this too, but cannot see `StakedWood.setAgeFloorBps` LOWERING
-    ///      the floor after deploy — sWOOD holds no pointer back to the court.
-    /// @dev PRE-FLIGHT 5: Plan D's wiring is still intact, or a `Guilty` verdict
-    ///      dead-ends at `_settle`. Ranked by what a miss costs (review M4); the demoter
-    ///      is last because `_settle` try/catches it and emits `AdapterDemotionFailed`.
+    /// @dev PRE-FLIGHT 1-2: court and game must name each other and the SAME sWOOD, or the
+    ///      electorate that votes is not the cohort that gets slashed.
+    /// @dev PRE-FLIGHT 3: `autoSlashDelay + voteWindow + FINALIZE_BUFFER + MIN_REFERRAL_SLACK
+    ///      <= disputeTimeout` — each contract's own guard is vacuous on the FIRST handshake.
+    /// @dev PRE-FLIGHT 4 (spec §5): `participationFloorBps < ageFloorBps`; turnout is AGED
+    ///      weight over a RAW-stake floor, so an equal floor is unclearable at launch.
+    /// @dev PRE-FLIGHT 5: Plan D's wiring is intact, or a `Guilty` verdict dead-ends at
+    ///      `_settle` (review M4).
     function _wireCourt(Stack memory s) internal {
         TokenCourt court = TokenCourt(s.tokenCourt);
         ChallengeGame game = ChallengeGame(s.challengeGame);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Script} from "forge-std/Script.sol";
+import {console, Script} from "forge-std/Script.sol";
 
 import {DeploySalts} from "./DeploySalts.sol";
 import {Create3} from "./utils/Create3.sol";
@@ -59,9 +59,15 @@ abstract contract ScriptBase is Script {
     }
 
     /// @notice Mint `initcode` at the salt's address, or adopt it if already there.
+    /// @dev ADOPTION DOES NOT RE-CHECK BYTECODE: CREATE3 addresses depend on (factory, salt)
+    ///      alone, so a re-run at a different commit keeps the code that is already there.
+    ///      The console line is what makes an adoption visible in the ceremony's own output.
     function _c3(Create3Factory c3, bytes32 salt, bytes memory initcode) internal returns (address deployed) {
         deployed = _predict(c3, salt);
-        if (deployed.code.length != 0) return deployed;
+        if (deployed.code.length != 0) {
+            console.log("CREATE3 ADOPTED (not minted by this run, bytecode not re-checked): %s", deployed);
+            return deployed;
+        }
         require(c3.deploy(salt, initcode) == deployed, "CREATE3 address mismatch");
     }
 

@@ -316,22 +316,23 @@ These carry test-fixture values and are the open items of this review. None may
 be zero, and none has a runtime override, so shipping them unreviewed means
 shipping the fixture.
 
-**`ASSET_FEED_MAX_DELAY` (`:54`, currently `1 days`).** Sized against the
-governor's actual `votingPeriod + reviewPeriod + executionWindow` — the approve
-quorum RE-READS the asset feed at execute time, so a bound shorter than the
-lifecycle kills fully-covered proposals at execute with `StalePrice`. At the
-factory defaults that lifecycle is 3 days, which `1 days` does not clear. It is
-also the only control standing in for the sequencer-uptime feed 4663 does not
-publish (§5 of the runbook), so it is bounded from below by the lifecycle and
-from above by "a plausible outage must push reads past staleness". Pick inside
-that band deliberately; there is no code-derived single number.
+**`ASSET_FEED_MAX_DELAY` (now `1 days + 2 hours`).** It bounds the AGGREGATOR's own
+`updatedAt` age inside `ExposureLedger.coverageUsd` (`src/ExposureLedger.sol:651-660`),
+which recomputes the age on every read; nothing captures a price at propose and re-checks
+it at execute, so the proposal lifecycle does NOT bound it from below. The heartbeat does:
+4663's Chainlink push feeds publish every 24h, so the previous `1 days` left zero slack and
+a feed publishing a second late made every covered proposal unexecutable. It is also the
+only control standing in for the sequencer-uptime feed 4663 does not publish (§5 of the
+runbook), so it is bounded from above by "a plausible outage must push reads past
+staleness". `24h + 2h` is the smallest value that clears the heartbeat with margin; Ana to
+confirm the margin.
 
 **`COVERED_TVL_CAP_USD18` (`:56`, currently `1_000_000e18`).** The per-vault
 covered-TVL ceiling, USD-18. Zero is fail-closed and bricks all proposing, which
 a Plan B pre-flight refuses. The number is a risk-appetite call — how much of one
 vault the guardian cohort is willing to underwrite — not a derivation.
 
-**`WOOD_PRICE_CAP_X8` (`:58`, currently `5e7` = $0.50).** The manipulation
+**`WOOD_PRICE_CAP_X8` (now `5e5` = $0.005).** The manipulation
 ceiling: `min(market, cap)`, never served as a price. It SHALL sit ABOVE market,
 and the ceremony refuses any value outside `[1.25x, 2x]` the spot it derives from
 the live WOOD/WETH pair.
@@ -339,9 +340,9 @@ the live WOOD/WETH pair.
 - **Measured 2026-09-16** against `https://rpc.mainnet.chain.robinhood.com`:
   WOOD/USD spot `325057` x8 ($0.00325). The admissible band that day was
   **`406_321 … 650_114`** x8.
-- The shipped `5e7` is ~154x spot, so **the Mainnet run refuses today**. That is
-  the gate working, not a bug — but it means the ceremony is blocked on this
-  number, not merely documented as a TODO.
+- The former `5e7` was ~154x spot and **the Mainnet run refused it**; `5e5` is
+  ~1.54x, inside that day's band. A fork run no longer takes this constant at all:
+  it derives its cap as 1.5x its own spot, so both postures clear the same band.
 - Re-measure before the run: the band moves with spot, and a cap set from a
   month-old measurement can be outside it by the time the ceremony happens.
 - Review monthly thereafter. A drifted-high cap simply stops binding; a cap that

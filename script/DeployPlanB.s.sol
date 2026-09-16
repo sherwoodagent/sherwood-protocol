@@ -7,6 +7,7 @@ import {DeploySalts} from "./DeploySalts.sol";
 import {RobinhoodParams} from "./robinhood-mainnet/RobinhoodParams.sol";
 import {Create3Factory} from "./utils/Create3Factory.sol";
 import {ExposureLedger} from "../src/ExposureLedger.sol";
+import {IExposureLedger} from "../src/interfaces/IExposureLedger.sol";
 import {ProposerBondEscrow} from "../src/ProposerBondEscrow.sol";
 import {ISyndicateFactory} from "../src/interfaces/ISyndicateFactory.sol";
 import {IGuardianRegistry} from "../src/interfaces/IGuardianRegistry.sol";
@@ -41,18 +42,12 @@ interface IProtocolConfigAdmin {
  *         params, the four pointer slots, the duration ceiling, then the post-flights
  *         that read the wiring back.
  *
- * @dev Idempotent: every mint is `_c3` (adopt-if-present) and every write is guarded on
- *      the value already there, so a resumed run makes no state-changing call. A pointer
- *      slot holding a FOREIGN address is refused, never repointed.
- * @dev PRE-FLIGHT 1 was removed (ADR 2026-07-26): it demanded a 42d sWOOD cooldown that
- *      `setCooldownPeriod`'s own 30d cap made unreachable. Pre-flight 3 replaces it and is
- *      strictly stronger. PRE-FLIGHT 10 (the ledger owner is a Safe) moved to DeployAll's
- *      post-handoff validate, where `pendingOwner()` is the thing to read. PRE-FLIGHT 11
- *      (a bound on this file's own constant) is deleted.
- *
- *      Ownership: the deployer owns the ledger and must ALREADY own sWOOD, the registry,
- *      the factory and the ProtocolConfig — every setter below is `onlyOwner`. Pre-flights
- *      2b and 6b check the two that are not otherwise read.
+ * @dev Idempotent: every mint is `_c3` (adopt-if-present) and every write is guarded on the
+ *      value already there, so a resumed run sends only what is still missing. A pointer slot
+ *      holding a FOREIGN address is refused, never repointed.
+ * @dev Ownership: the deployer must own the ledger, sWOOD, the registry, the factory and the
+ *      ProtocolConfig — every setter here is `onlyOwner`, and a resume after the handoff is
+ *      refused by name rather than left to revert `OwnableUnauthorizedAccount` mid-broadcast.
  */
 abstract contract DeployPlanB is ScriptBase {
     /// @dev Mirror of `ProtocolConfig.MIN_PROTOCOL_MAX_STRATEGY_DURATION`. Mirrored so the
@@ -131,6 +126,13 @@ abstract contract DeployPlanB is ScriptBase {
                 )
             )
         );
+        // Every ledger setter below is `onlyOwner`. On a resume after the handoff the owner is
+        // the Safe, and an unguarded write reverts `OwnableUnauthorizedAccount` mid-broadcast.
+        require(
+            ledger.owner() == deployer,
+            "PRE-FLIGHT: EXPOSURE_LEDGER is no longer owned by the broadcaster -- the handoff has "
+            "already run. Finish this phase from the Safe, or redeploy under fresh salts."
+        );
         // Drift guard: the cooldown pre-flights above are checked against this bound.
         require(
             ledger.challengeWindow() == RobinhoodParams.EXPECTED_CHALLENGE_WINDOW,
@@ -158,10 +160,9 @@ abstract contract DeployPlanB is ScriptBase {
         if (book.woodUsdFeed != address(0) && !_woodFeedAnswers(address(ledger))) {
             ledger.setWoodFeed(book.woodUsdFeed, book.woodFeedMaxDelay);
         }
-        // `feedMaxDelay` is LOAD-BEARING: the §3.3a approve quorum re-reads this feed at
-        // EXECUTE time, a whole lifecycle after propose. Too short and covered proposals
-        // die with `StalePrice`.
-        if (!_assetFeedAnswers(address(ledger), book.usdg)) {
+        // `feedMaxDelay` bounds the AGGREGATOR's own `updatedAt` age on every `coverageUsd`
+        // read; below the feed's heartbeat every covered proposal reverts `StalePrice`.
+        if (!_assetFeedConfigured(address(ledger), book.usdg)) {
             ledger.setAssetFeed(book.usdg, book.usdgFeed, book.feedMaxDelay);
         }
         if (ledger.guardianRegistry() != registry) {
@@ -439,11 +440,14 @@ abstract contract DeployPlanB is ScriptBase {
         return ok && ret.length >= 32 && abi.decode(ret, (uint256)) != 0;
     }
 
-    /// @dev Same shape for an asset feed: `coverageUsd` reverts `FeedNotConfigured` when the
-    ///      slot is empty and `StalePrice` when it is wired but dead.
-    function _assetFeedAnswers(address ledger, address asset) internal view returns (bool) {
-        (bool ok,) = ledger.staticcall(abi.encodeWithSignature("coverageUsd(address,uint256)", asset, uint256(0)));
-        return ok;
+    /// @dev "Is the slot WRITTEN?", not "is it live": `coverageUsd` reverts `FeedNotConfigured`
+    ///      only on an empty slot, and a wired-but-stale feed reverts `StalePrice`. Conflating
+    ///      the two makes a resumed run re-send `setAssetFeed` over a feed that is merely dead.
+    function _assetFeedConfigured(address ledger, address asset) internal view returns (bool) {
+        (bool ok, bytes memory ret) =
+            ledger.staticcall(abi.encodeWithSignature("coverageUsd(address,uint256)", asset, uint256(0)));
+        if (ok) return true;
+        return !(ret.length >= 4 && bytes4(ret) == IExposureLedger.FeedNotConfigured.selector);
     }
 
     /// @dev True when `swood` answers `delegationEnabled()` with a non-zero word. A

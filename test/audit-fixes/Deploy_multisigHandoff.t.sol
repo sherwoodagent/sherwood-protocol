@@ -102,6 +102,10 @@ contract DeployMultisigHandoffTest is DeployAllFixture {
             assertEq(
                 reason, "Fork posture never hands off: remove OWNER_MULTISIG from this chain's address book", reason
             );
+        } catch (bytes memory raw) {
+            // A panic or custom error would otherwise leave the staged book on disk.
+            vm.removeFile(path);
+            assertEq(raw.length, 0, "run() reverted without a reason string");
         }
     }
 

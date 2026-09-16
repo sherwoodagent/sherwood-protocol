@@ -76,10 +76,9 @@ contract DeployConcentratedLiquidityStrategyTest is Test {
         harness.exposed_requireFactoryVouchedBy(makeAddr("notARegistry"), uniswapFactory);
     }
 
-    /// @notice The ONE tolerated skip: the core phase never ran, so there is no
-    ///         registry to ask. Tolerated because it cannot be evaluated, not
-    ///         because it is inconvenient.
-    function test_gate_skipsWhenTheBookNamesNoRegistry() public view {
+    /// @notice A zero registry is refused, not skipped: the ceremony always has one by here.
+    function test_gate_failsWhenTheBookNamesNoRegistry() public {
+        vm.expectRevert(bytes("TIER_REGISTRY is zero: the core phase has not run"));
         harness.exposed_requireFactoryVouchedBy(address(0), uniswapFactory);
     }
 

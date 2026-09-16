@@ -35,13 +35,9 @@ abstract contract DeployConcentratedLiquidityStrategy is ScriptBase {
     /// @dev A DEPLOY-TIME ASSERTION, NOT A RUNBOOK LINE. `ConcentratedLiquidityStrategy._initialize`
     ///      binds the proposer-supplied `uniswapFactory` through the tier registry, so an unlisted
     ///      factory does not degrade the template — it makes every clone-init revert.
-    ///      A registry that cannot be asked has not vouched; `registry == 0` means no core phase yet.
+    ///      A registry that cannot be asked has not vouched, so a zero one is refused, never skipped.
     function _requireFactoryVouchedBy(address registry, address uniswapFactory) internal view {
-        if (registry == address(0)) {
-            console.log("RUNBOOK: no TIER_REGISTRY - cannot verify the factory allowlist here.");
-            console.log("RUNBOOK: before any CL proposal, the owner must setCounterpartyAllowed(factory, true).");
-            return;
-        }
+        require(registry != address(0), "TIER_REGISTRY is zero: the core phase has not run");
 
         (bool ok, bytes memory ret) =
             registry.staticcall(abi.encodeCall(ITierRegistry.isCounterpartyAllowed, (uniswapFactory)));

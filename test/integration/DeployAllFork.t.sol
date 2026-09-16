@@ -37,8 +37,10 @@ contract DeployAllForkHarness is DeployAll {
  *         two reasons: the pools stop trading at the fork point, so the mainnet WoodPoolFeed
  *         would refuse its own idle-pair pre-flight, and `ForkWoodFeedFixture` refuses 4663
  *         outright. The fixture's price is still DERIVED from the fork's own reserves.
- * @dev    Skips without ROBINHOOD_RPC_URL (shared fork-test convention). The public RPC is
- *         pruned, so this forks at LATEST unless ROBINHOOD_FORK_BLOCK pins an archive block.
+ * @dev    Skips without ROBINHOOD_RPC_URL (shared fork-test convention). UNPINNED BY NECESSITY:
+ *         the public RPC serves roughly the last thousand blocks (measured 2026-09-16), so a pinned
+ *         constant would go stale within the hour; ROBINHOOD_FORK_BLOCK pins it on an archive node.
+ *         The run therefore PRINTS its fork block, and every assertion below is price-independent.
  */
 contract DeployAllForkTest is Test {
     uint256 internal constant FORK_CHAIN_ID = 9_994_663;
@@ -56,6 +58,9 @@ contract DeployAllForkTest is Test {
         uint256 forkBlock = vm.envOr("ROBINHOOD_FORK_BLOCK", uint256(0));
         if (forkBlock == 0) vm.createSelectFork(rpc);
         else vm.createSelectFork(rpc, forkBlock);
+        // Two runs of this file at the same commit read different live prices; without this line
+        // the reading they disagreed on cannot be traced back to the state it came from.
+        console2.log("fork block:", block.number);
 
         book = vm.readFile(string.concat(vm.projectRoot(), "/chains/", vm.toString(FORK_CHAIN_ID), ".json"));
         // The fork carries 4663's state under the fork book's chain id.
@@ -202,6 +207,10 @@ contract DeployAllForkTest is Test {
         // Priced off the FORK's own reserves x the live ETH/USD feed — never an invented number.
         assertGt(ledger.woodPriceX8(), 0, "WOOD is priceable");
         console2.log("fork WOOD/USD x8 (haircut applied):", ledger.woodPriceX8());
+        // The cap a fork seats is derived from its OWN spot, so it clears the same [1.25x, 2x]
+        // band Mainnet is pre-flighted against instead of shipping a cap Mainnet would refuse.
+        assertEq(ledger.woodUsdPriceX8(), s.woodPriceCapX8, "the seated cap is the derived one");
+        assertGt(s.woodPriceCapX8, 0, "a fork must derive a cap, not leave it zero");
         assertEq(
             ProtocolConfig(s.core.protocolConfig).maxStrategyDuration(),
             RobinhoodParams.MAX_STRATEGY_DURATION,

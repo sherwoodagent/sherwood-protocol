@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Post-deploy validation for the Robinhood ceremony, either posture.
 #
-# Re-DERIVES every protocol address from the CREATE3 factory
-# (`addressOf(keccak256("sherwood.robinhood.v1.<name>"))`) instead of trusting
-# chains/<chainid>.json, then asserts on-chain every invariant the deployment
+# Re-DERIVES every protocol address — the CREATE3 factory from its CREATE2 initcode,
+# everything else from `addressOf(keccak256("sherwood.robinhood.v1.<name>"))` — instead
+# of trusting chains/<chainid>.json, then asserts on-chain every invariant the deployment
 # spec's "Post-deploy validation reads" scenario names, plus the Plan B / Plan D
 # / TokenCourt wiring. A book key that disagrees with the derivation is itself a
 # failure: the book is a record, the salts are the truth.
@@ -17,6 +17,9 @@
 #
 # Required env:
 #   RPC   the endpoint (a public RPC is enough — every call here is a read)
+#
+# Needs `forge` on PATH: the CREATE3 factory's address is derived from its compiled
+# initcode rather than read out of the book it is supposed to be checking.
 #
 # Usage:
 #   RPC=https://rpc.mainnet.chain.robinhood.com ./script/verify-robinhood.sh 4663
@@ -45,14 +48,28 @@ check() {
 call() { cast call "$1" "$2" --rpc-url "$RPC" 2>/dev/null | head -1 | awk '{print $1}'; }
 call1() { cast call "$1" "$2" "$3" --rpc-url "$RPC" 2>/dev/null | head -1 | awk '{print $1}'; }
 
-C3=$(a CREATE3_FACTORY)
-[ -n "$C3" ] || { echo "$BOOK carries no CREATE3_FACTORY — nothing to derive from"; exit 1; }
+# The factory address is DERIVED, not read: taking it from the book would make every
+# derivation below self-consistent against whatever factory the book happens to name.
+# initcode = Create3Factory creationCode ++ abi.encode(DEPLOYER), minted through CREATE2.
+DEPLOYER=$(a DEPLOYER)
+[ -n "$DEPLOYER" ] || { echo "$BOOK carries no DEPLOYER — the factory address cannot be derived"; exit 1; }
+CREATE2_DEPLOYER=0x4e59b44847b379578588920cA78FbF26c0B4956C
+C3_INIT=$(cast concat-hex \
+  "$(forge inspect Create3Factory bytecode 2>/dev/null)" \
+  "$(cast abi-encode 'x(address)' "$DEPLOYER")")
+[ "${#C3_INIT}" -gt 100 ] || { echo "could not compile Create3Factory — run this from a built repo"; exit 1; }
+C3_SALT=$(cast keccak "${NS}create3-factory")
+C3="0x$(cast keccak "$(cast concat-hex 0xff "$CREATE2_DEPLOYER" "$C3_SALT" "$(cast keccak "$C3_INIT")")" | cut -c27-)"
+BOOK_C3=$(a CREATE3_FACTORY)
+[ -z "$BOOK_C3" ] || check "CREATE3_FACTORY (book == derived)" "$BOOK_C3" "$C3"
 # derive <salt name> — the ceremony's address for that salt, straight from the factory.
 derive() { call1 "$C3" 'addressOf(bytes32)(address)' "$(cast keccak "${NS}$1")"; }
-# book_matches <label> <bookKey> <derived> — a recorded key must equal the derivation.
+# book_matches <label> <bookKey> <derived> — a recorded key must equal the derivation. An
+# ABSENT key is a FAILURE: `_persist` writes every one of them, so a gap means the book is
+# not the book this deployment wrote, and scoring it a pass made an empty book all-green.
 book_matches() {
   local got; got=$(a "$2")
-  if [ -z "$got" ]; then ok "$1 (not recorded)" "$3"; else check "$1" "$got" "$3"; fi
+  if [ -z "$got" ]; then bad "$1" "not recorded in $BOOK (expected $3)"; else check "$1" "$got" "$3"; fi
 }
 
 echo "chain id: $(cast chain-id --rpc-url "$RPC")  (expect $CHAIN_ID)"

@@ -32,8 +32,8 @@ struct Inputs {
     address woodWethSushiV2Pair;
 }
 
-/// @notice Everything the ceremony mints or adopts, filled phase by phase.
-///         Every field is `Create3.addressOf(create3Factory, <DeploySalts constant>)`.
+/// @notice Everything the ceremony mints or adopts, filled phase by phase. Every address
+///         field is `Create3.addressOf(create3Factory, <DeploySalts constant>)`.
 struct Stack {
     DeploySherwood.Deployed core;
     address create3Factory;
@@ -47,4 +47,7 @@ struct Stack {
     address proposerBondEscrow;
     address challengeGame;
     address tokenCourt;
+    // The WOOD manipulation ceiling this run seats. Mainnet takes the reviewed constant; a fork
+    // derives it from its own spot, so both postures clear the same [1.25x, 2x] band.
+    uint256 woodPriceCapX8;
 }

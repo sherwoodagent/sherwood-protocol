@@ -7,6 +7,10 @@ optimizer = true
 optimizer_runs = 50
 via_ir = true
 ffi = false
+# No CBOR metadata: it hashes the SOURCE, so a comment edit anywhere in a CREATE3
+# contract's compilation unit would move its initcode hash and its deployed address.
+bytecode_hash = "none"
+cbor_metadata = false
 # storageLayout in every artifact: the upgradeable contracts' layout goldens run
 # `forge inspect <probe> storageLayout` after incremental builds — without this, a
 # partial rebuild drops the layout from cached artifacts and inspect fails spuriously.

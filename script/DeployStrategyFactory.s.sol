@@ -59,7 +59,9 @@ abstract contract DeployStrategyFactory is ScriptBase {
             )
         );
         for (uint256 i; i < templates.length; ++i) {
-            require(templates[i] != address(0), "zero template");
+            // Code, not non-zero: `_predictAll` fills the template addresses before any phase
+            // runs, so a zero check cannot catch this phase being ordered ahead of them.
+            require(templates[i].code.length != 0, "template holds no code: run the template phases first");
             if (!sf.approvedTemplate(templates[i])) sf.setTemplateApproval(templates[i], true);
         }
 

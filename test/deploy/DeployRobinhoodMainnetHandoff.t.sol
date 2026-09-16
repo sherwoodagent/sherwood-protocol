@@ -36,10 +36,6 @@ contract MockOwned2Step {
 ///         three internals the ceremony's correctness lives in into reach. The whole-ceremony
 ///         entry point is `DeployAll.run()`, driven by its own suite.
 contract DeployRobinhoodMainnetHarness is DeployRobinhoodMainnet {
-    function exposed_handoff(Deployed memory d, address ownerMultisig) external {
-        _handoffRobinhood(d, ownerMultisig);
-    }
-
     function exposed_seatOwnerWrites(Deployed memory d, address deployer) external {
         _seatOwnerWrites(d, deployer);
     }
@@ -199,30 +195,9 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
     // ── The mainnet posture ──
 
     function test_validate_passesAfterTheFullHandoff() public {
-        vm.prank(address(harness));
-        harness.exposed_handoff(d, address(multisig));
+        _handoffCoreRoles();
 
         harness.exposed_validate(d, address(harness), address(multisig), address(wood));
-    }
-
-    /// @dev DEFECT 2, pinned. The one-step contracts move immediately; the
-    ///      `Ownable2Step` pair does NOT. An assert expecting `owner() ==
-    ///      multisig` on ProtocolConfig — which is what shipped — can never pass.
-    function test_handoff_movesOneStepOwnersButOnlyArmsTheTwoStepPair() public {
-        vm.prank(address(harness));
-        harness.exposed_handoff(d, address(multisig));
-
-        assertEq(Ownable(d.beacon).owner(), address(multisig), "beacon is one-step");
-        assertEq(Ownable(d.factoryProxy).owner(), address(multisig), "factory is one-step");
-        assertEq(Ownable(d.registryProxy).owner(), address(multisig), "registry is one-step");
-        assertEq(Ownable(d.swoodProxy).owner(), address(multisig), "swood is one-step");
-
-        assertEq(Ownable(d.protocolConfig).owner(), address(harness), "ProtocolConfig owner must NOT have moved");
-        assertEq(
-            Ownable2Step(d.protocolConfig).pendingOwner(), address(multisig), "ProtocolConfig transfer must be armed"
-        );
-        assertEq(Ownable(d.tierRegistry).owner(), address(harness), "TierRegistry owner must NOT have moved");
-        assertEq(Ownable2Step(d.tierRegistry).pendingOwner(), address(multisig), "TierRegistry transfer must be armed");
     }
 
     /// @dev DEFECT 1, pinned. Replays the exact handoff that shipped — the five
@@ -262,13 +237,26 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
     ///      handed-off registry, so `factory.tierRegistry` is the only thing
     ///      left to fail, and assert that exact string.
     function test_validate_pinsTheFactoryToTheHandedOffTierRegistry() public {
-        vm.prank(address(harness));
-        harness.exposed_handoff(d, address(multisig));
+        _handoffCoreRoles();
 
         DeploySherwood.Deployed memory decoy = d;
         decoy.tierRegistry = address(new MockOwned2Step(address(harness), address(multisig)));
 
         vm.expectRevert(bytes("factory.tierRegistry mismatch"));
         harness.exposed_validate(decoy, address(harness), address(multisig), address(wood));
+    }
+
+    /// @notice The six core-role transfers `DeployAll._handoffAll` makes, replayed locally.
+    /// @dev This mixin carries no handoff of its own: `_handoffRobinhood` was deleted as dead
+    ///      (its only caller was this harness), so the validation tests stage the state directly.
+    function _handoffCoreRoles() internal {
+        vm.startPrank(address(harness));
+        Ownable(d.beacon).transferOwnership(address(multisig));
+        Ownable(d.factoryProxy).transferOwnership(address(multisig));
+        Ownable(d.registryProxy).transferOwnership(address(multisig));
+        Ownable(d.swoodProxy).transferOwnership(address(multisig));
+        Ownable2Step(d.protocolConfig).transferOwnership(address(multisig));
+        Ownable2Step(d.tierRegistry).transferOwnership(address(multisig));
+        vm.stopPrank();
     }
 }

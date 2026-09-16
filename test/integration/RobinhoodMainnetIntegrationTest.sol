@@ -46,7 +46,8 @@ interface IAggregatorV3Clock {
  *           - USDG (6 dec) is the canonical stable — there is no USDC.
  *           - Official Uniswap v3 (SwapRouter02 + QuoterV2).
  *           - Chainlink push feeds (AggregatorV3, 8 dec, 24h heartbeat).
- *           - No ENS / ERC-8004 → factory gets address(0) for both.
+ *           - No ENS. The canonical ERC-8004 IdentityRegistry IS live on 4663,
+ *             but v1 leaves identity gating off: address(0) for both registrars.
  *
  * @dev Skips if ROBINHOOD_RPC_URL is not set (shared fork-test convention).
  *
@@ -70,8 +71,8 @@ interface IAggregatorV3Clock {
  *        ROBINHOOD_RPC_URL       required; empty → the suite skips.
  *        ROBINHOOD_FORK_BLOCK    default 0 = fork at LATEST. Set to pin.
  *        ROBINHOOD_FORK_CHAIN_ID default 4663. Set 9994663 for the Tenderly vnet.
- *      (`script/robinhood-mainnet/Deploy.s.sol` uses the same
- *      ROBINHOOD_FORK_CHAIN_ID convention.)
+ *      (The ceremony scripts read NO environment variable at all — posture comes
+ *      from `block.chainid`. This convention is this suite's own.)
  *
  *      Run explicitly:
  *        set -a; source .env; set +a

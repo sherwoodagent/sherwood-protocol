@@ -49,13 +49,16 @@ library RobinhoodParams {
     // `updatedAt` rolls at most once per window, so the bound must clear a window plus the keeper cadence.
     uint256 internal constant WOOD_FEED_MAX_DELAY = TWAP_WINDOW + KEEPER_CADENCE_SLACK + 1;
 
-    // PLACEHOLDER - Ana to confirm. Test-fixture value; must exceed votingPeriod + reviewPeriod +
-    // executionWindow (3 days at the factory defaults) or fully-covered proposals die at execute with StalePrice.
-    uint256 internal constant ASSET_FEED_MAX_DELAY = 1 days;
+    // PLACEHOLDER - Ana to confirm. Bounds the AGGREGATOR's own updatedAt age inside
+    // `ExposureLedger.coverageUsd`, not the proposal lifecycle: 4663 Chainlink feeds heartbeat at
+    // 24h, so a bound at exactly 24h makes every covered read revert `StalePrice` on a late publish.
+    uint256 internal constant ASSET_FEED_MAX_DELAY = 1 days + 2 hours;
     // PLACEHOLDER - Ana to confirm. Test-fixture value; per-vault covered-TVL ceiling, USD-18.
     uint256 internal constant COVERED_TVL_CAP_USD18 = 1_000_000e18;
-    // PLACEHOLDER - Ana to confirm. Test-fixture value ($0.50); pre-flight bounds it to [1.25x, 2x] spot.
-    uint256 internal constant WOOD_PRICE_CAP_X8 = 5e7;
+    // PLACEHOLDER - Ana to RE-MEASURE on the deploy day: the pre-flight refuses anything outside
+    // [1.25x, 2x] the live pool spot, and the band moves with the price. 5e5 = $0.005, ~1.54x the
+    // 325_057 x8 spot measured 2026-09-16 (docs/pre-deployment-parameter-review.md).
+    uint256 internal constant WOOD_PRICE_CAP_X8 = 5e5;
 
     /// @notice TierRegistry launch set. Every CHAINLINK_<SYM>_USD_FEED and <SYM> (WETH for ETH) book key is
     ///         REQUIRED. A Solidity constant cannot hold an array, hence a pure accessor.

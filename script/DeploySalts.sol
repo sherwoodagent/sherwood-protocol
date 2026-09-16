@@ -2,24 +2,16 @@
 pragma solidity 0.8.28;
 
 /// @notice CREATE3 salts for the Robinhood v1 ceremony. Every address is f(DEPLOYER, salt).
-///         Bump `NS` to redeploy the whole set; bump one name (e.g. "vault-impl.2") to redeploy one.
+///         Each salt is a spelled-out literal (`abi.encodePacked` is not a constant expression),
+///         so redeploying means editing the NAMES here — there is no namespace knob to turn.
 library DeploySalts {
-    string internal constant NS = "sherwood.robinhood.v1.";
-
-    /// @dev Every constant below equals `salt(<name>)`; the literals are spelled out because
-    ///      `abi.encodePacked` is not a compile-time constant expression.
-    function salt(string memory name) internal pure returns (bytes32) {
-        return keccak256(abi.encodePacked(NS, name));
-    }
-
     // CREATE2 salt through CREATE2_DEPLOYER (0x4e59...); initcode = Create3Factory ++ abi.encode(deployer).
     bytes32 internal constant CREATE3_FACTORY = keccak256("sherwood.robinhood.v1.create3-factory");
     // keccak256(type(Create3Factory).creationCode) under the pinned toolchain (solc 0.8.28, via_ir,
-    // 50 runs); asserted in _c3Factory so a compiler drift fails loudly instead of moving every address.
-    // The trailing CBOR metadata hashes the SOURCE, so any edit to Create3Factory.sol or Create3.sol —
-    // a comment included — moves this value and with it every CREATE3 address. Re-record it here.
+    // 50 runs, metadata off); asserted in `_c3Factory`, so a toolchain drift fails loudly instead of
+    // moving every CREATE3 address. Re-record it here when Create3Factory.sol or Create3.sol changes.
     bytes32 internal constant CREATE3_FACTORY_INITCODE_HASH =
-        0x44bc4edbbea879077cdecb78ef2f04be06eb9659cd79302d514d8b16c7a3db5a;
+        0x099a810d758171f2cc9bc4622d896f7b93d82e53c79bc3e1c847882df0e63d54;
 
     // Core
     bytes32 internal constant EXECUTOR = keccak256("sherwood.robinhood.v1.batch-executor-lib");

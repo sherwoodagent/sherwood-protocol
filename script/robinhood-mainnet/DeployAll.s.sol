@@ -130,6 +130,7 @@ contract DeployAll is
         _deployStrategyFactory(s);
 
         if (i.posture == Posture.Mainnet) {
+            s.woodPriceCapX8 = RobinhoodParams.WOOD_PRICE_CAP_X8;
             s.woodUsdFeed = address(deploy(_feedParams(i)));
         } else {
             _deployForkFeed(s, i);
@@ -219,6 +220,10 @@ contract DeployAll is
     ///      mainnet feed's idle pre-flight would refuse the very chain this exists for.
     function _deployForkFeed(Stack memory s, Inputs memory i) internal {
         uint256 spotX8 = _spotWoodUsdX8(_feedParams(i), i.woodWethV2Pair);
+        // The cap is DERIVED here, not taken from the constant: a fork that seeded a cap Mainnet
+        // would refuse is a ceremony rehearsal that never exercised the band.
+        s.woodPriceCapX8 = (spotX8 * 150) / 100;
+        _requireCapAboveSpot(s.woodPriceCapX8, spotX8);
         s.woodUsdFeed = _c3(
             Create3Factory(s.create3Factory),
             DeploySalts.FORK_WOOD_FEED,
@@ -252,13 +257,20 @@ contract DeployAll is
         // is worse (it folds the leg into the agent's remainder silently), so they are seeded.
         console.log("RUNBOOK: then, from the Safe, setProtocolFeeRecipient(treasury) and");
         console.log("RUNBOOK: setGuardiansFeeRecipient(guardian payout address).");
+        // NOT handed off: `Create3Factory.deploy` is `onlyOwner`, so the deployer key keeps the
+        // right to mint at any UNUSED salt in this namespace. Used salts already hold code.
+        console.log("RUNBOOK: the deployer key KEEPS Create3Factory ownership: %s", s.create3Factory);
     }
 
+    /// @dev A typed `owner()` into an address with no code reverts with empty returndata, which
+    ///      reports an ordering slip in this function as a bare revert naming no slot.
     function _giveOneStep(address target, address ownerMultisig) private {
+        require(target.code.length != 0, "handoff: one-step target holds no code");
         if (Ownable(target).owner() != ownerMultisig) Ownable(target).transferOwnership(ownerMultisig);
     }
 
     function _giveTwoStep(address target, address ownerMultisig) private {
+        require(target.code.length != 0, "handoff: two-step target holds no code");
         if (Ownable(target).owner() == ownerMultisig) return;
         if (Ownable2Step(target).pendingOwner() != ownerMultisig) {
             Ownable2Step(target).transferOwnership(ownerMultisig);
@@ -332,7 +344,7 @@ contract DeployAll is
             usdg: i.usdg,
             usdgFeed: i.usdgFeed,
             feedMaxDelay: RobinhoodParams.ASSET_FEED_MAX_DELAY,
-            woodPriceCapX8: RobinhoodParams.WOOD_PRICE_CAP_X8,
+            woodPriceCapX8: s.woodPriceCapX8,
             woodHaircutBps: RobinhoodParams.WOOD_HAIRCUT_BPS,
             coveredTvlCapUsd: RobinhoodParams.COVERED_TVL_CAP_USD18,
             protocolConfig: s.core.protocolConfig,

@@ -199,23 +199,10 @@ abstract contract DeploySherwood is ScriptBase {
         );
     }
 
-    /// @dev The chain-constant half of the TierRegistry launch set, applied while the deployer
-    ///      still owns the registry.
-    ///
-    ///      WHY HERE. Every strategy template refuses to initialize against an unattested
-    ///      dependency: `PortfolioStrategy` checks each Chainlink aggregator AND its pairing to the
-    ///      slot's token, `MorphoSupplyStrategy` checks `isCounterpartyAllowed(morpho)`,
-    ///      `ConcentratedLiquidityStrategy` checks the position manager, Morpho and the Uniswap v3
-    ///      factory. A fresh registry answers false to all of them, so without this the first
-    ///      proposal on a new chain reverts naming a role (`PriceSourceNotAllowed`) rather than the
-    ///      missing deploy step.
-    ///
-    ///      WHY ONLY THIS HALF. Seeded here is what is already a constant of the chain — third-party
-    ///      addresses read from the address book. Addresses this ceremony MINTS (the swap adapter,
-    ///      the templates) do not exist yet; their phases seed themselves the same way, which the
-    ///      two-step handoff leaves room for.
-    ///
-    ///      Every feed key is REQUIRED: a missing one used to narrow the attestation set silently.
+    /// @dev The chain-constant half of the TierRegistry launch set, seeded while the deployer still
+    ///      owns the registry: every template refuses to initialize against an unattested dependency,
+    ///      so an unseeded registry makes the first proposal revert naming a role, not the deploy step.
+    ///      Addresses this ceremony MINTS are seeded by their own phases; every feed key is REQUIRED.
     function _seedTierRegistry(address deployer, address tierRegistry) internal {
         console.log("\n=== Seeding TierRegistry launch set ===");
         // These writes are `onlyOwner` and have exactly one window. Refusing beats skipping: a
@@ -249,9 +236,8 @@ abstract contract DeploySherwood is ScriptBase {
     ///      bare aggregator widened to bytes32 — the exact normalization
     ///      `PortfolioStrategy._initialize` applies before `_requirePairedPriceSource`. Any other
     ///      encoding produces an attestation that is never consulted.
-    ///      The feed key is required; the TOKEN key is not, because a symbol whose feed exists but
-    ///      whose token does not (USDC/BTC/LINK on Robinhood) has nothing to pair to. The pairing is
-    ///      what gates a slot, so an unpaired allowlist entry stays inert until someone attests it.
+    ///      Both keys are REQUIRED except for the three symbols 4663 has no token for, which are
+    ///      enumerated in `_hasNoTokenOnRobinhood` — a per-symbol decision, not a blanket tolerance.
     function _seedPriceSource(address tierRegistry, string memory symbol) internal {
         string memory feedKey = string.concat("CHAINLINK_", symbol, "_USD_FEED");
         address feed = _readAddress(feedKey);
@@ -261,9 +247,14 @@ abstract contract DeploySherwood is ScriptBase {
         }
 
         // ETH's feed prices the wrapped token; every other symbol's token key is the symbol itself.
-        address token = _optionalAddress(keccak256(bytes(symbol)) == keccak256("ETH") ? "WETH" : symbol);
+        string memory tokenKey = keccak256(bytes(symbol)) == keccak256("ETH") ? "WETH" : symbol;
+        address token = _optionalAddress(tokenKey);
         if (token == address(0)) {
-            console.log("  feed allowlisted, NO token pairing (token not on this chain):", symbol, feed);
+            require(
+                _hasNoTokenOnRobinhood(symbol),
+                string.concat("launch set: ", tokenKey, " is missing from the address book")
+            );
+            console.log("  feed allowlisted, NO token pairing (no such token on this chain):", symbol, feed);
             return;
         }
         bytes32 priceSource = bytes32(uint256(uint160(feed)));
@@ -271,6 +262,13 @@ abstract contract DeploySherwood is ScriptBase {
             TierRegistry(tierRegistry).setPriceSourceForToken(token, priceSource, true);
         }
         console.log("  feed allowlisted + paired:", symbol, feed);
+    }
+
+    /// @dev The launch-set symbols 4663 prices but does not carry a token for. An allowlisted
+    ///      aggregator with nothing paired to it is inert, which is why these are tolerated at all.
+    function _hasNoTokenOnRobinhood(string memory symbol) internal pure returns (bool) {
+        bytes32 h = keccak256(bytes(symbol));
+        return h == keccak256("USDC") || h == keccak256("BTC") || h == keccak256("LINK");
     }
 
     function _validateBeacon(address expectedOwner, address beaconAddr) internal view {

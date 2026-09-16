@@ -39,20 +39,12 @@ interface ILedgerOwner {
  *
  * @dev Idempotent: the mint is `_c3` (adopt-if-present) and every write is guarded on the
  *      value already there. A role naming a FOREIGN holder is refused, never rotated.
- * @dev PRE-FLIGHT 1 (three role slots): each must be unset or already name THIS game.
- *      All three are single-holder slots whose setters overwrite silently, so clobbering
- *      one leaves the live holder unable to freeze, demote or slash.
- * @dev PRE-FLIGHT 2 (review B4): `swood.exposureLedger()` must be the ledger the game is
- *      constructed against. A split (or a zero, where the exit gate fails open by design)
- *      lets an accused approver unstake before `resolve` and be convicted for nothing —
- *      no revert, no distinguishing event, zero recovered.
- * @dev PRE-FLIGHT 3: `file()` reverts `WoodPriceUnset()` on a zero COMPOSED price, so an
- *      unpriced ledger deploys a game where nothing can be challenged. Probed, not called
- *      typed: `woodPriceX8()` REVERTS when no source can price WOOD, and to the game a
- *      revert and a zero are the same problem (review F16).
- *
- *      Ownership: the deployer owns the game and must ALREADY own the ledger, the tier
- *      registry and sWOOD — all three grant setters are `onlyOwner`.
+ * @dev PRE-FLIGHT 1: each of the three role slots is unset or already names THIS game —
+ *      their setters overwrite silently, stranding the live holder (review B4, F16).
+ * @dev PRE-FLIGHT 2: `swood.exposureLedger()` is the ledger this game is built against;
+ *      a split lets an accused approver unstake before `resolve` and be convicted for nothing.
+ * @dev PRE-FLIGHT 3: WOOD must be priceable, or `file()` reverts `WoodPriceUnset()` and
+ *      nothing can be challenged. The deployer must already own ledger, tiers and sWOOD.
  */
 abstract contract DeployPlanD is ScriptBase {
     /// @notice The Plan D inputs. Named `PlanDBook` because `DeployAll` inherits this

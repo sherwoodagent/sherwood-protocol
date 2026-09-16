@@ -37,8 +37,10 @@ Nothing is read from the environment. Every number comes from
 
 1. **Fill the inputs.** Confirm the three econ constants in `RobinhoodParams.sol`
    still marked `PLACEHOLDER` (`ASSET_FEED_MAX_DELAY`, `COVERED_TVL_CAP_USD18`,
-   `WOOD_PRICE_CAP_X8`), and add `DEPLOYER`, `OWNER_MULTISIG` and
-   `WOOD_WETH_SUSHI_V2_PAIR` to `chains/4663.json`. All three book keys are
+   `WOOD_PRICE_CAP_X8` — re-measure the cap's `[1.25x, 2x]` band on the day), and
+   add `WOOD_WETH_SUSHI_V2_PAIR` to `chains/4663.json`. `DEPLOYER` and
+   `OWNER_MULTISIG` are already recorded there; the pair key is the one still
+   outstanding, and no second WOOD/WETH pair exists on 4663 yet. All three keys are
    REQUIRED and the run refuses by name without them.
 2. **First run.**
    ```bash
@@ -174,5 +176,7 @@ Stated here because an operator has to see them, not only the source natspec.
   no such ceiling.
 - **Chain 4663 publishes no sequencer-uptime feed**, so the usual
   staleness-plus-grace-period gate cannot be built. `ASSET_FEED_MAX_DELAY` is the
-  only control: size it tightly enough that a plausible outage pushes reads past
-  staleness, while still covering a full vote + review + execute lifecycle.
+  only control, and it bounds the AGGREGATOR's own `updatedAt` age on every
+  `ExposureLedger.coverageUsd` read — not the proposal lifecycle. Size it above the
+  feed's 24h heartbeat (else every covered read reverts `StalePrice`) and tightly
+  enough that a plausible outage still pushes reads past staleness.
