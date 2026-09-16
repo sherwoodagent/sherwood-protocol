@@ -629,9 +629,23 @@ contract SyndicateVault is
             _highWaterPricePerShare = 0;
         }
 
-        if (to != address(0) && delegates(to) == address(0)) {
+        // Self-delegation is total: a receiver whose delegate is anything but itself is corrected.
+        if (to != address(0) && delegates(to) != to) {
             _delegate(to, to);
         }
+    }
+
+    /// @dev Delegation is refused: `_update` self-delegates every receiver, so a holder's
+    ///      votes always equal its balance and the veto electorate and the weight castable
+    ///      against it are one and the same set.
+    function delegate(address) public pure override {
+        revert DelegationDisabled();
+    }
+
+    /// @dev Refused for the reason above; the revert is the whole body, so it precedes
+    ///      every signature and nonce check.
+    function delegateBySig(address, uint256, uint256, uint8, bytes32, bytes32) public pure override {
+        revert DelegationDisabled();
     }
 
     /// @dev Use timestamp-based voting checkpoints instead of block numbers
