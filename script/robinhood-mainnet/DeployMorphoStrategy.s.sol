@@ -21,6 +21,7 @@ import {MorphoSupplyStrategy} from "../../src/strategies/MorphoSupplyStrategy.so
 abstract contract DeployMorphoStrategy is ScriptBase {
     function _deployMorpho(Stack memory s) internal {
         s.morphoSupplyTemplate = address(deploy());
+        _checkAddr("morphoTemplate.create3Factory", address(_c3Factory(msg.sender)), s.create3Factory);
     }
 
     /// @notice Mint (or adopt) the template. Public so tests drive the real thing.

@@ -60,6 +60,7 @@ C3_INIT=$(cast concat-hex \
 [ "${#C3_INIT}" -gt 100 ] || { echo "could not compile Create3Factory — run this from a built repo"; exit 1; }
 C3_SALT=$(cast keccak "${NS}create3-factory")
 C3="0x$(cast keccak "$(cast concat-hex 0xff "$CREATE2_DEPLOYER" "$C3_SALT" "$(cast keccak "$C3_INIT")")" | cut -c27-)"
+echo "create3 factory (derived): $C3"
 BOOK_C3=$(a CREATE3_FACTORY)
 [ -z "$BOOK_C3" ] || check "CREATE3_FACTORY (book == derived)" "$BOOK_C3" "$C3"
 # derive <salt name> — the ceremony's address for that salt, straight from the factory.

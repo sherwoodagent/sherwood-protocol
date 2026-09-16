@@ -136,6 +136,8 @@ contract DeployAll is
             _deployForkFeed(s, i);
         }
 
+        _requireNoPredictionDrift(c3, s, i.posture);
+
         // ── STAGE GATE. Plan B's ledger is unusable while WOOD cannot be priced, so the
         //    ceremony stops BEFORE minting it rather than after wiring a dead feed.
         if (!_feedAnswers(s.woodUsdFeed)) {
@@ -151,9 +153,31 @@ contract DeployAll is
         _deployCourt(s);
         _wireCourt(s);
 
+        _requireNoPredictionDrift(c3, s, i.posture);
+
         // LAST, and only on Mainnet: every phase above is `onlyOwner` on something.
         if (i.posture == Posture.Mainnet) _handoffAll(s, i.ownerMultisig);
         cp = Checkpoint.Complete;
+    }
+
+    /// @dev Each phase re-derives its own address, and only the eight core fields are checked
+    ///      against the prediction table above. Without this the other eleven are pinned by
+    ///      nothing, and `stageOf`/`_persist` would read slots nothing was minted at.
+    function _requireNoPredictionDrift(Create3Factory c3, Stack memory s, Posture posture) internal pure {
+        _checkAddr("swapAdapter", s.uniswapSwapAdapter, _predict(c3, DeploySalts.UNISWAP_SWAP_ADAPTER));
+        _checkAddr("portfolioTemplate", s.portfolioTemplate, _predict(c3, DeploySalts.PORTFOLIO_TEMPLATE));
+        _checkAddr("morphoTemplate", s.morphoSupplyTemplate, _predict(c3, DeploySalts.MORPHO_SUPPLY_TEMPLATE));
+        _checkAddr("clTemplate", s.concentratedLiquidityTemplate, _predict(c3, DeploySalts.CL_TEMPLATE));
+        _checkAddr("strategyFactory", s.strategyFactory, _predict(c3, DeploySalts.STRATEGY_FACTORY));
+        _checkAddr(
+            "woodUsdFeed",
+            s.woodUsdFeed,
+            _predict(c3, posture == Posture.Mainnet ? DeploySalts.WOOD_USD_FEED : DeploySalts.FORK_WOOD_FEED)
+        );
+        _checkAddr("exposureLedger", s.exposureLedger, _predict(c3, DeploySalts.EXPOSURE_LEDGER));
+        _checkAddr("bondEscrow", s.proposerBondEscrow, _predict(c3, DeploySalts.PROPOSER_BOND_ESCROW));
+        _checkAddr("challengeGame", s.challengeGame, _predict(c3, DeploySalts.CHALLENGE_GAME));
+        _checkAddr("tokenCourt", s.tokenCourt, _predict(c3, DeploySalts.TOKEN_COURT));
     }
 
     /// @notice Every address this ceremony will mint, before a single transaction.
