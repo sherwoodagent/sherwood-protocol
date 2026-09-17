@@ -267,7 +267,7 @@ Asserted inside the handler that performs the call.
 - [ ] **SP-29** `SHOULD-HOLD` — shares acquired at or after a proposal's
   `snapshotTimestamp` contribute zero weight to that proposal
   (`syndicate-governor/spec.md`: `snapshotTimestamp = block.timestamp - 1`
-  "closing the same-block flash-delegate window").
+  "closing the same-block acquisition window").
 - [ ] **SP-30** `SHOULD-HOLD` — a review's block-quorum denominator and threshold are
   snapshotted at open and never re-read live at resolution.
 - [ ] **SP-31** `EXPLORATORY` — the veto denominator is frozen at Pending-entry; a

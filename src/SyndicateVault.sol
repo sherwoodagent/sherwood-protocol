@@ -636,8 +636,7 @@ contract SyndicateVault is
     }
 
     /// @dev Delegation is refused: `_update` self-delegates every receiver, so a holder's
-    ///      votes always equal its balance and the veto electorate and the weight castable
-    ///      against it are one and the same set.
+    ///      votes always equal its balance.
     function delegate(address) public pure override {
         revert DelegationDisabled();
     }

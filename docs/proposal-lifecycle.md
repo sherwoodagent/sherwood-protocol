@@ -43,7 +43,7 @@ stateDiagram-v2
 Deadlines derived at proposal creation (`src/SyndicateGovernor.sol:1067-1093`):
 
 ```
-snapshotTimestamp = now − 1            // closes same-block flash-delegate
+snapshotTimestamp = now − 1            // closes same-block acquisition
 voteEnd   = now + votingPeriod
 reviewEnd = voteEnd + registry.reviewPeriod()
 executeBy = reviewEnd + executionWindow
