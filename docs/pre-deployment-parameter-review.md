@@ -324,13 +324,17 @@ it at execute, so the proposal lifecycle does NOT bound it from below. The heart
 a feed publishing a second late made every covered proposal unexecutable. It is also the
 only control standing in for the sequencer-uptime feed 4663 does not publish (§5 of the
 runbook), so it is bounded from above by "a plausible outage must push reads past
-staleness". `24h + 2h` is the smallest value that clears the heartbeat with margin; Ana to
-confirm the margin.
+staleness". `24h + 2h` is the smallest value that clears the heartbeat with margin, and is the
+same allowance `PortfolioStrategy.MAX_PUSH_PRICE_AGE` already uses against the same
+24h heartbeat. Confirmed 2026-09-17.
 
-**`COVERED_TVL_CAP_USD18` (`:56`, currently `1_000_000e18`).** The per-vault
-covered-TVL ceiling, USD-18. Zero is fail-closed and bricks all proposing, which
-a Plan B pre-flight refuses. The number is a risk-appetite call — how much of one
-vault the guardian cohort is willing to underwrite — not a derivation.
+**`COVERED_TVL_CAP_USD18` (`1_000_000e18`, confirmed 2026-09-17).** Ceiling on ONE
+proposal's coverage, USD-18, checked at `propose` — not a running total across open
+proposals. Zero is fail-closed and bricks all proposing, which a Plan B pre-flight
+refuses. The number is a risk-appetite call — how much of one vault the guardian
+cohort is willing to underwrite in a single approval — not a derivation. Owner-settable
+with no bounds and read live on every propose, so it is a starting point: lowering it
+after launch is one Safe transaction and takes effect on the next proposal.
 
 **`WOOD_PRICE_CAP_X8` (now `5e5` = $0.005).** The manipulation
 ceiling: `min(market, cap)`, never served as a price. It SHALL sit ABOVE market,

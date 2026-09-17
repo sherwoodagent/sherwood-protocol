@@ -57,7 +57,8 @@ library RobinhoodParams {
     // covered read revert `StalePrice` on a late publish. Same 2h allowance, and the same
     // reasoning, as `PortfolioStrategy.MAX_PUSH_PRICE_AGE` (26h). Owner-settable per asset.
     uint256 internal constant ASSET_FEED_MAX_DELAY = 1 days + 2 hours;
-    // PLACEHOLDER - Ana to confirm. Test-fixture value; per-vault covered-TVL ceiling, USD-18.
+    // Per-vault ceiling on ONE proposal's coverage, USD-18, checked at `propose`. Not a running
+    // total. Owner-settable and read live, so the launch value is a starting point, not a lock.
     uint256 internal constant COVERED_TVL_CAP_USD18 = 1_000_000e18;
     // PLACEHOLDER - Ana to RE-MEASURE on the deploy day: the pre-flight refuses anything outside
     // [1.25x, 2x] the live pool spot, and the band moves with the price. 5e5 = $0.005, ~1.54x the
