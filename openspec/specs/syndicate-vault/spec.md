@@ -49,7 +49,7 @@ The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`
 #### Scenario: Delegation is refused
 - **WHEN** any caller invokes `delegate` or `delegateBySig` on the vault share token
 - **THEN** the call reverts `DelegationDisabled`, so every holder's checkpointed votes
-  equal its own balance and no share can sit in the supply without a vote behind it
+  equal its own balance
 
 ### Requirement: Instant deposit flow
 

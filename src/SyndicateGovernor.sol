@@ -1042,22 +1042,10 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     // ==================== INTERNAL ====================
 
-    /// @dev The veto electorate for the direct path, read live at `propose`:
-    ///      every share that exists minus the ones parked in the withdrawal
-    ///      queue, which cannot vote. Live on both terms because instant redeem
-    ///      is open right up to this call, so a redeem ordered ahead of it in
-    ///      the same block is already reflected.
-    function _votableSupplyOf(address vault) private view returns (uint256) {
-        uint256 supply = IERC20(vault).totalSupply();
-        address queue = ISyndicateVault(vault).withdrawalQueue();
-        if (queue == address(0)) return supply;
-        uint256 queued = IERC20(vault).balanceOf(queue);
-        return supply > queued ? supply - queued : 0;
-    }
-
-    /// @dev The collaborative stamp reads both terms at the snapshot instant, so
-    ///      a queued redeem in the approve block sits inside the recorded set
-    ///      exactly as its holder's weight does. The vault auto-delegates the queue to itself.
+    /// @dev The veto electorate on both paths: every share checkpointed at the
+    ///      snapshot instant minus the queue's votes at that same instant, which
+    ///      cannot be cast. One instant on both terms, so the recorded set is the
+    ///      weight `getPastVotes` will hand out. The vault auto-delegates the queue.
     function _votableSupplyAt(address vault, uint256 at) private view returns (uint256) {
         uint256 supply = IVotes(vault).getPastTotalSupply(at);
         address queue = ISyndicateVault(vault).withdrawalQueue();
@@ -1071,9 +1059,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
     ///      Reads `vault` from storage (already written by caller) to keep
     ///      the call-site arg count to two.
     function _initPendingProposal(StrategyProposal storage p, uint256 reviewPeriod_) private {
-        // -1 closes the same-block flash-delegate window.
+        // -1 closes the same-block acquisition window, on both terms below.
         p.snapshotTimestamp = block.timestamp - 1;
-        p.votableSupply = _votableSupplyOf(p.vault);
+        p.votableSupply = _votableSupplyAt(p.vault, p.snapshotTimestamp);
         p.voteEnd = block.timestamp + _params.votingPeriod;
         p.reviewEnd = p.voteEnd + reviewPeriod_;
         p.executeBy = p.reviewEnd + _params.executionWindow;
