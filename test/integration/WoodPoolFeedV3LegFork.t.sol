@@ -48,11 +48,15 @@ contract WoodPoolFeedV3LegForkTest is Test {
     ///      of whatever it carried at the fork point. The ETH leg's staleness
     ///      gate is exercised in the unit suite, where the clock is ours.
     uint256 constant ETH_USD_MAX_AGE = 3 days;
-    /// @dev What the ceremony's `GrowV3Cardinality` step asks for: the uint16
-    ///      ceiling, which is what a 24h window at 1s blocks derives to.
-    uint16 constant GROWN_CARDINALITY = 65_535;
-    /// @dev Robinhood blocks are ~1s, so the warp below is also this many blocks.
-    uint256 constant AVG_BLOCK_TIME = 1;
+    /// @dev What the ceremony's `GrowV3Cardinality` step asks for. Every new slot
+    ///      is initialised inside the call, so this is also ~4.5M gas of real
+    ///      work: a ring sized from the pool's ~880s write cadence, not from its
+    ///      uint16 index.
+    uint16 constant GROWN_CARDINALITY = 200;
+    /// @dev Only shapes `vm.roll`, so the block number advances with the clock.
+    ///      Nothing under test reads a block number — the observation ring and
+    ///      both accumulators are keyed on timestamps.
+    uint256 constant ROLL_SECONDS_PER_BLOCK = 1;
 
     WoodPoolFeed internal feed;
     bool internal woodIsToken0V2;
@@ -122,6 +126,9 @@ contract WoodPoolFeedV3LegForkTest is Test {
         // `observationCardinality` does not move here and would not move on
         // mainnet either until the pool is written to.
         IUniswapV3Pool(V3_POOL).increaseObservationCardinalityNext(GROWN_CARDINALITY);
+        (,,, uint16 again, uint16 againNext,,) = IUniswapV3Pool(V3_POOL).slot0();
+        assertEq(againNext, grownNext, "a repeat at the standing target changes nothing");
+        assertEq(again, grown, "and the ring itself still has not filled");
     }
 
     // ── The feed itself ──
@@ -157,14 +164,16 @@ contract WoodPoolFeedV3LegForkTest is Test {
         feed.latestRoundData();
 
         uint256 c0 = _v2Cumulative();
-        uint32 t0 = uint32(block.timestamp);
+        // `vm.getBlockTimestamp()`, never a cached `block.timestamp`: the two
+        // reads straddle a warp and the optimizer folds them into one.
+        uint256 t0 = vm.getBlockTimestamp();
 
-        vm.warp(block.timestamp + WINDOW + 1);
-        vm.roll(block.number + (WINDOW + 1) / AVG_BLOCK_TIME);
+        vm.warp(vm.getBlockTimestamp() + WINDOW + 1);
+        vm.roll(block.number + (WINDOW + 1) / ROLL_SECONDS_PER_BLOCK);
         feed.update();
 
         uint256 c1 = _v2Cumulative();
-        uint32 t1 = uint32(block.timestamp);
+        uint256 t1 = vm.getBlockTimestamp();
 
         uint256 v2X112;
         // The pair's accumulator wraps at 2^256; the wrapping difference is the
@@ -181,8 +190,8 @@ contract WoodPoolFeedV3LegForkTest is Test {
         // SEPARATE THE TWO LEGS IN TIME. Reading in the same second as the second
         // snapshot would make the `updatedAt` assertion below vacuous: the V3
         // leg's stamp is `block.timestamp`, which would equal the V2 snapshot's.
-        vm.warp(block.timestamp + 30);
-        vm.roll(block.number + 30 / AVG_BLOCK_TIME);
+        vm.warp(vm.getBlockTimestamp() + 30);
+        vm.roll(block.number + 30 / ROLL_SECONDS_PER_BLOCK);
 
         (, int256 answer,, uint256 updatedAt,) = feed.latestRoundData();
         assertGt(answer, 0, "the feed answers");
@@ -197,14 +206,17 @@ contract WoodPoolFeedV3LegForkTest is Test {
             5e14,
             "the answer is the LOWER leg, converted through ETH/USD"
         );
-        // Exact on this side: the V2 leg is the pair's own accumulator delta.
+        // IMPLIED BY `min`, not a second measurement: this holds even if the V3
+        // leg were deleted. The discriminating claim is the approximate equality
+        // above, which pins WHICH leg was taken — the two differ by ~0.06%, so
+        // `min` and `max` are distinguishable there and not here.
         assertLe(uint256(answer), Math.mulDiv(v2X112, ethUsdX8, Q112), "above the V2 leg");
 
         // The live V3 leg never dates the reading forward: `updatedAt` is the
         // OLDER of the two legs, i.e. the V2 snapshot the keeper rolled 30s ago,
         // not the V3 leg's `block.timestamp`.
         assertEq(updatedAt, t1, "updatedAt is the V2 snapshot");
-        assertLt(updatedAt, block.timestamp, "control: the two legs' stamps are distinguishable");
+        assertLt(updatedAt, vm.getBlockTimestamp(), "control: the two legs' stamps are distinguishable");
 
         // Both legs price the same asset in the same units. An orientation or
         // scale error in either shows up as orders of magnitude here, long
