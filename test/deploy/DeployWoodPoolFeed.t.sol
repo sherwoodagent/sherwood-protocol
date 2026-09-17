@@ -8,6 +8,7 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
 import {MockUniswapV2Pair} from "../mocks/MockUniswapV2Pair.sol";
 import {MockUniswapV3Pool} from "../mocks/MockUniswapV3Pool.sol";
+import {MockUniswapV3Factory} from "../mocks/MockUniswapV3Factory.sol";
 
 /// @notice Drives the REAL `DeployWoodPoolFeed` against a real `WoodPoolFeed`,
 ///         the verbatim-accumulator V2 pair mock, a Uniswap V3 pool mock and a
@@ -21,6 +22,7 @@ contract DeployWoodPoolFeedTest is Test {
     ERC20Mock internal weth;
     MockUniswapV2Pair internal uniPair; // WOOD is token0
     MockUniswapV3Pool internal v3Pool; // WOOD is token0
+    MockUniswapV3Factory internal v3Factory;
     MockAggregatorV3 internal ethUsdFeed;
     DeployWoodPoolFeed internal script;
 
@@ -41,6 +43,11 @@ contract DeployWoodPoolFeedTest is Test {
     ///      deliberately NOT the mark: the spot the script prints and the USD
     ///      answer both stay the V2 pair's.
     int24 constant V3_TWAP_TICK = -122475;
+    uint24 constant V3_FEE = 3000;
+    /// @dev The largest N `GrowV3Cardinality` will broadcast, and the ceiling
+    ///      `requiredCardinality` reports against: every slot is initialised
+    ///      inside the call, so a bigger ask cannot fit in one transaction.
+    uint16 constant MAX_GROW_PER_TX = 1_400;
 
     function setUp() public {
         // A real chain time: near zero every idle and staleness check clamps.
@@ -49,6 +56,7 @@ contract DeployWoodPoolFeedTest is Test {
         wood = new ERC20Mock("WOOD", "WOOD", 18);
         weth = new ERC20Mock("WETH", "WETH", 18);
         uniPair = new MockUniswapV2Pair(address(wood), address(weth), WOOD_RESERVE, WETH_RESERVE);
+        v3Factory = new MockUniswapV3Factory();
         v3Pool = _newV3Pool(address(wood), address(weth), V3_TWAP_TICK);
         ethUsdFeed = new MockAggregatorV3(8, ETH_USD_X8);
         script = new DeployWoodPoolFeed();
@@ -183,30 +191,82 @@ contract DeployWoodPoolFeedTest is Test {
         script.deploy(p);
     }
 
-    // ── The cardinality derivation and its ceiling ──
+    /// @dev THE WRONG-DEPLOYMENT CASE. Chain 4663 carries two Uniswap V3
+    ///      deployments, and the canonical factory's WOOD/WETH pools are empty.
+    ///      Booking a pool from one deployment against the other factory is an
+    ///      operator error no shape check catches — and picking the wrong venue
+    ///      silently removes the two-leg `min` the feed leans on.
+    function test_preflight_bites_whenTheFactoryDoesNotVouchForTheBookedPool() public {
+        MockUniswapV3Factory other = new MockUniswapV3Factory();
+        MockUniswapV3Pool otherPool = new MockUniswapV3Pool(address(wood), address(weth), V3_FEE, 60, address(other));
+        other.register(address(wood), address(weth), V3_FEE, address(otherPool));
 
-    /// @dev A 24h window at 1s blocks needs 86,410 observations, which a uint16
-    ///      ring cannot hold. The script reports the CEILING and says so, rather
-    ///      than truncating 86,410 to 20,874 and presenting it as sufficient.
-    function test_requiredCardinality_capsAtTheUint16CeilingAndSaysSo() public view {
+        DeployWoodPoolFeed.Params memory p = _params();
+        p.v3Factory = address(other);
+        vm.expectRevert(bytes("PRE-FLIGHT: WOOD_WETH_UNISWAP_V3_POOL is not the factory's pool for (WOOD, WETH, fee)"));
+        script.deploy(p);
+    }
+
+    /// @dev And the other direction: a pool the factory vouches for but which
+    ///      names someone else as its own factory is the same disagreement.
+    function test_preflight_bites_whenThePoolNamesADifferentFactory() public {
+        v3Pool.setFactory(makeAddr("someOtherDeployment"));
+        vm.expectRevert(bytes("PRE-FLIGHT: V3 pool does not name WOOD_WETH_UNISWAP_V3_FACTORY as its factory"));
+        script.deploy(_params());
+    }
+
+    function test_preflight_bites_whenTheV3FactoryKeyIsMissing() public {
+        DeployWoodPoolFeed.Params memory p = _params();
+        p.v3Factory = address(0);
+        vm.expectRevert(bytes("PRE-FLIGHT: WOOD_WETH_UNISWAP_V3_FACTORY unset"));
+        script.deploy(p);
+    }
+
+    /// @dev A ring of length one answers `observe` with SPOT rather than
+    ///      reverting, so the window check alone passes on a pool with no history
+    ///      at all. The gate is on the CURRENT cardinality, which is why the
+    ///      ceremony grows the ring and then waits for writes.
+    function test_preflight_bites_whenTheV3RingHoldsOnlyTheLiveObservation() public {
+        v3Pool.setObservationCardinality(1);
+        vm.expectRevert(
+            bytes("PRE-FLIGHT: V3 pool has no observation history (cardinality < 2); grow the ring and wait for writes")
+        );
+        script.deploy(_params());
+    }
+
+    // ── The cardinality derivation and its per-transaction bound ──
+
+    /// @dev The knob is SECONDS BETWEEN WRITES, not seconds per block: the ring
+    ///      advances only in blocks that touch the pool. At the measured ~880s
+    ///      cadence a 24h window needs 99 observations, not 86,400.
+    function test_requiredCardinality_countsWritesAndNotBlocks() public view {
+        (uint16 n, bool capped) = script.requiredCardinality(24 hours, 880);
+        assertEq(n, 109, "ceil(86400/880) = 99, plus 10 slack");
+        assertFalse(capped, "well inside one transaction");
+    }
+
+    /// @dev A ring longer than one transaction can initialise is capped and SAID
+    ///      SO, because it is a different claim: the remedy is several grows, not
+    ///      a smaller ring. An uncapped 86,410 is ~1.47e9 gas and reverts.
+    function test_requiredCardinality_capsAtWhatOneTransactionCanInitialise() public view {
         (uint16 n, bool capped) = script.requiredCardinality(24 hours, 1);
-        assertEq(n, 65_535, "the uint16 ceiling");
-        assertTrue(capped, "the ceiling is flagged as a different claim");
+        assertEq(n, MAX_GROW_PER_TX, "the per-transaction bound");
+        assertTrue(capped, "the bound is flagged as a different claim");
     }
 
     function test_requiredCardinality_isCeilingDivisionPlusSlack() public view {
-        (uint16 n, bool capped) = script.requiredCardinality(24 hours, 2);
-        assertEq(n, 43_210, "86400/2 + 10 slack");
-        assertFalse(capped, "well inside the ring");
+        (uint16 n, bool capped) = script.requiredCardinality(24 hours, 100);
+        assertEq(n, 874, "86400/100 + 10 slack");
+        assertFalse(capped, "well inside one transaction");
 
-        // Ceiling, not truncation: 86400/7 is 12342.86, and a ring of 12342
-        // observations is one block short of the window.
-        (uint16 odd,) = script.requiredCardinality(24 hours, 7);
-        assertEq(odd, 12_353, "ceil(86400/7) + 10 slack");
+        // Ceiling, not truncation: 86400/70 is 1234.28, and a ring of 1234
+        // observations is one write short of the window.
+        (uint16 odd,) = script.requiredCardinality(24 hours, 70);
+        assertEq(odd, 1_245, "ceil(86400/70) + 10 slack");
     }
 
-    function test_requiredCardinality_refusesAZeroBlockTime() public {
-        vm.expectRevert(bytes("PRE-FLIGHT: AVG_BLOCK_TIME_SECONDS zero"));
+    function test_requiredCardinality_refusesAZeroWriteInterval() public {
+        vm.expectRevert(bytes("PRE-FLIGHT: V3_WRITE_INTERVAL_SECONDS zero"));
         script.requiredCardinality(24 hours, 0);
     }
 
@@ -235,12 +295,12 @@ contract DeployWoodPoolFeedTest is Test {
     function test_grow_raisesTheTargetAndNotTheRingItself() public {
         GrowV3Cardinality grower = new GrowV3Cardinality();
         (,,, uint16 ringBefore, uint16 targetBefore,,) = v3Pool.slot0();
-        assertLt(targetBefore, 65_535, "control: the target really was below");
+        assertLt(targetBefore, 200, "control: the target really was below");
 
-        grower.grow(address(v3Pool), 65_535);
+        grower.grow(address(v3Pool), 200);
 
         (,,, uint16 ring, uint16 target,,) = v3Pool.slot0();
-        assertEq(target, 65_535, "the growth target rose");
+        assertEq(target, 200, "the growth target rose");
         assertEq(ring, ringBefore, "the ring itself did NOT grow: it fills as the pool is traded");
     }
 
@@ -250,7 +310,7 @@ contract DeployWoodPoolFeedTest is Test {
     ///      indistinguishable from "not called" by state alone.
     function test_grow_isANoOpWhenTheTargetIsAlreadyThatHigh() public {
         GrowV3Cardinality grower = new GrowV3Cardinality();
-        grower.grow(address(v3Pool), 65_535);
+        grower.grow(address(v3Pool), 1_000);
         assertEq(v3Pool.cardinalityGrowCalls(), 1, "the first ask reached the pool");
 
         grower.grow(address(v3Pool), 600);
@@ -275,6 +335,22 @@ contract DeployWoodPoolFeedTest is Test {
         grower.grow(address(v3Pool), 65_536);
     }
 
+    /// @dev THE BOUND THAT ACTUALLY BINDS. Every new slot is initialised inside
+    ///      `increaseObservationCardinalityNext` at ~22.4k gas, so the grower pays
+    ///      the whole ring up front and a 65,535 ask is ~1.47e9 gas: a
+    ///      transaction no node will accept. The script refuses it here rather
+    ///      than printing it as a remedy.
+    function test_grow_refusesATargetOneTransactionCannotInitialise() public {
+        GrowV3Cardinality grower = new GrowV3Cardinality();
+        grower.grow(address(v3Pool), MAX_GROW_PER_TX); // control: the bound is inclusive
+        assertEq(v3Pool.cardinalityGrowCalls(), 1, "the bound itself is broadcast");
+
+        vm.expectRevert(
+            bytes("PRE-FLIGHT: V3_CARDINALITY above what one transaction can initialise (1400); grow in steps")
+        );
+        grower.grow(address(v3Pool), uint256(MAX_GROW_PER_TX) + 1);
+    }
+
     function test_grow_refusesAnUnsetTargetOrPool() public {
         GrowV3Cardinality grower = new GrowV3Cardinality();
 
@@ -290,10 +366,14 @@ contract DeployWoodPoolFeedTest is Test {
 
     // ─────────────────────────────── helpers ───────────────────────────────
 
+    /// @dev Built AND vouched for: the pre-flight resolves provenance through the
+    ///      factory's `getPool`, so a pool that is not registered is exactly the
+    ///      wrong-deployment case rather than a fixture oversight.
     function _newV3Pool(address token0, address token1, int24 twapTick) internal returns (MockUniswapV3Pool p) {
-        p = new MockUniswapV3Pool(token0, token1, 3000, 60, makeAddr("v3Factory"));
+        p = new MockUniswapV3Pool(token0, token1, V3_FEE, 60, address(v3Factory));
         p.setLiquidity(V3_LIQUIDITY);
         p.setTicks(twapTick, twapTick);
+        v3Factory.register(token0, token1, V3_FEE, address(p));
     }
 
     /// @dev The keeper's job: one full window later, with the pair trading, a
@@ -313,6 +393,7 @@ contract DeployWoodPoolFeedTest is Test {
         return DeployWoodPoolFeed.Params({
             uniPair: address(uniPair),
             v3Pool: address(v3Pool),
+            v3Factory: address(v3Factory),
             wood: address(wood),
             weth: address(weth),
             ethUsdFeed: address(ethUsdFeed),
