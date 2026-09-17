@@ -150,7 +150,8 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     uint256 internal constant MAX_SCAN_BUCKETS = 16;
 
     /// @dev Mirrors `GuardianRegistry.MAX_APPROVERS_PER_PROPOSAL`; keep in step.
-    uint256 internal constant APPROVER_SLOTS = 100;
+    ///      Public so the two constants can be asserted equal across contracts.
+    uint256 public constant APPROVER_SLOTS = 100;
 
     /// @dev Floor on `woodHaircutBps`. Valuing bonds below half of market is a
     ///      mis-set parameter, not a conservatism policy.
@@ -710,7 +711,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      unpriced — lock and budget are both WOOD, so no feed can move the
     ///      capacity question. Only the slot floor below is priced, and it is a
     ///      floor: a starved or inflated feed can refuse a slot, never enlarge
-    ///      one, and an unpriceable vault asset returns before it is reached.
+    ///      one.
+    ///
+    ///      ALL OR NOTHING. Past the idempotent re-entry, an Approve either
+    ///      books a lock the coverage quorum will count or reverts, so a vote
+    ///      can never seat an approver the ledger carries nothing for.
     ///
     ///      NO COHORT CAP, DELIBERATELY. The lock is NOT clamped to the proposal's
     ///      requirement or to the still-uncovered remainder. Clamping to the
@@ -743,17 +748,11 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         ILedgerGovernorMinimal gov = ILedgerGovernorMinimal(governor);
         ILedgerGovernorMinimal.ProposalViewLite memory pv = gov.getProposalView(proposalId);
         (address asset, uint256 requiredCoverage, bool resolved) = _tryResolveCoverageInputs(gov, proposalId, pv.vault);
-        if (!resolved) return; // unreadable right now: lock nothing, let the quorum decide
-        //
-        // Called externally so the revert can be caught; `coverageUsd` is a view
-        // on this same contract, and a same-contract call cannot be wrapped.
-        uint256 needUsd;
-        try this.coverageUsd(asset, requiredCoverage) returns (uint256 v) {
-            needUsd = v;
-        } catch {
-            return; // unpriceable right now: lock nothing, let the quorum decide
-        }
-        if (needUsd == 0) return; // zero-coverage: nothing to underwrite
+        if (!resolved) revert CoverageInputsUnreadable();
+        // Unwrapped: `StalePrice` / `FeedNotConfigured` bubble with their own
+        // reason and take the vote with them, rather than seating a slot the
+        // coverage quorum will never see.
+        uint256 needUsd = coverageUsd(asset, requiredCoverage);
 
         // Free budget = k * stake - open exposure, in WOOD. Zero free budget is
         // the batching attack's boundary: this guardian's stake is already fully
@@ -782,7 +781,7 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         // brace.
         if (lock > type(uint128).max) revert InvalidParameter();
         (uint256 epoch, bool withinHorizon) = _coverageEpochOrSkip(pv);
-        if (!withinHorizon) return;
+        if (!withinHorizon) revert CoverageHorizonExceeded();
         _buckets[guardian][epoch] += lock;
         // lock bounded to uint128 above; epoch = elapsed / epochLength cannot
         // approach 2^64 on any realistic timescale.
@@ -1072,8 +1071,9 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
 
     /// @dev Bucket containing `t`, clamped to the last bucket `openExposure`
     ///      scans — a target past the horizon would silently un-count the lock.
-    ///      Unlike `recordApproval` (which books nothing past the horizon), the
-    ///      alternative here is not moving, which expires the lock even earlier.
+    ///      Unlike `recordApproval` (which refuses a settlement past the
+    ///      horizon), the alternative here is not moving, which expires the lock
+    ///      even earlier.
     function _horizonClampedEpochOf(uint256 t) internal view returns (uint256) {
         uint256 edge = (block.timestamp - epochGenesis + MAX_COVERAGE_HORIZON) / epochLength;
         uint256 e = t <= epochGenesis ? 0 : (t - epochGenesis) / epochLength;
