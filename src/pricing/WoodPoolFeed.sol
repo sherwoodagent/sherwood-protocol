@@ -204,9 +204,15 @@ contract WoodPoolFeed {
 
     /// @dev Read live off the pool's observation ring, so this leg is as fresh as
     ///      the block. A ring that cannot serve `window` is unavailability, never
-    ///      a silent fall back to spot.
+    ///      a silent fall back to spot: the cardinality gate below is what makes
+    ///      that true, because `observe` alone does not answer for it.
     function _poolTwapX112() internal view returns (uint256 avgX112, uint32 updatedAt) {
         if (IUniswapV3Pool(pool).liquidity() < minV3Liquidity) revert PriceUnavailable();
+
+        // A ring of length one holds only the current observation, so it has no
+        // history: `observe` synthesises the far endpoint and answers with spot.
+        (,,, uint16 cardinality,,,) = IUniswapV3Pool(pool).slot0();
+        if (cardinality < 2) revert PriceUnavailable();
 
         uint32[] memory secondsAgos = new uint32[](2);
         // `window` is bounded by `MAX_SNAPSHOT_SPAN` at construction.

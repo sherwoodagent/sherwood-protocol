@@ -23,6 +23,7 @@ abstract contract WoodPoolFeedFixture is Test {
     uint128 internal constant MIN_V3_LIQUIDITY = 1e22;
     uint128 internal constant V3_LIQUIDITY = 2e22;
     uint256 internal constant WINDOW = 24 hours;
+    uint256 internal constant MAX_SNAPSHOT_SPAN_SECONDS = 7 days;
     uint256 internal constant ETH_MAX_AGE = 24 hours;
     int256 internal constant ETH_USD_X8 = 3000e8;
 
@@ -236,6 +237,33 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
         feed.latestRoundData();
     }
 
+    /// @notice A ring of length one has no history: upstream's `observe`
+    ///         synthesises the far endpoint from the current tick and answers
+    ///         with spot rather than reverting. The leg refuses it explicitly.
+    function test_aCardinalityOneRingMakesTheFeedUnavailable() public {
+        _prime();
+        _answer(); // control: the fixture pool's ring is long enough
+
+        // The idle-pool shape: `observe` still answers, and what it answers is
+        // spot. Only the cardinality read distinguishes it.
+        v3.setObservationCardinality(1);
+        vm.expectRevert(WoodPoolFeed.PriceUnavailable.selector);
+        feed.latestRoundData();
+    }
+
+    /// @notice Above tick 443,637 the square of `sqrtRatioX96` no longer fits in
+    ///         256 bits, and the wide branch is what keeps that arithmetic in
+    ///         range instead of panicking.
+    function test_aTickAboveTheSquaringBoundIsPricedThroughTheWideBranch() public {
+        _prime();
+        int56 span = int56(uint56(WINDOW));
+
+        v3.setTickCumulatives(0, int56(500_000) * span);
+        // Such a tick prices WOOD far above the V2 pair, so `min` still marks the
+        // pair; the claim here is that the V3 leg returns at all.
+        assertApproxEqRel(_answer(), V2_ANSWER_X8, 1e13, "the wide branch prices a tick past the squaring bound");
+    }
+
     /// @notice A pool that answers the selector but not the contract — here a
     ///         one-element array — is unavailability too, not a decode panic.
     function test_aMalformedObserveResponseMakesTheFeedUnavailable() public {
@@ -386,6 +414,18 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
 
         _advance(WINDOW - 1 hours);
         feed.update(); // too early: the window has not elapsed
+        vm.expectRevert(WoodPoolFeed.PriceUnavailable.selector);
+        feed.latestRoundData();
+    }
+
+    /// @notice Two snapshots further apart than `MAX_SNAPSHOT_SPAN` are too
+    ///         stale an average to serve, even though the window is satisfied
+    ///         and each snapshot is individually well formed.
+    function test_aSnapshotSpanAboveTheCeilingMakesTheFeedUnavailable() public {
+        feed.update();
+        _advance(MAX_SNAPSHOT_SPAN_SECONDS + 1);
+        feed.update();
+
         vm.expectRevert(WoodPoolFeed.PriceUnavailable.selector);
         feed.latestRoundData();
     }
