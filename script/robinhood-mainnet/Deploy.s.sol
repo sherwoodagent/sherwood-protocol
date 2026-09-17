@@ -12,9 +12,17 @@ import {DeploySherwood} from "../Deploy.s.sol";
 /**
  * @notice Deploy the Sherwood core stack to Robinhood Chain mainnet (chain 4663).
  *
- *         Robinhood Chain is an Arbitrum Orbit L2 with no ENS/Durin registrar
- *         and no ERC-8004 agent-identity registry, so the factory is deployed
- *         with address(0) for both (identity + subname registration disabled).
+ *         Robinhood Chain is an Arbitrum Orbit L2 with no ENS/Durin registrar,
+ *         so the factory takes address(0) there (subname registration disabled).
+ *
+ *         The agent registry is address(0) for a DIFFERENT reason. The canonical
+ *         ERC-8004 IdentityRegistry (0x8004A169FB4a3325136EB29fA0ceB6D2e539a432)
+ *         IS live on 4663 — it is where every Sherwood agent mints its identity,
+ *         whatever chain its fund runs on. Passing address(0) is a deliberate v1
+ *         choice: identity gating stays OFF, so `createSyndicate` /
+ *         `registerAgent` do not verify NFT ownership on-chain. The factory has
+ *         no setter for it, so enabling the gate is a later, deliberate change —
+ *         and it must never be pointed at a fork/vnet registry.
  *
  *         Inherits the canonical `DeploySherwood` and delegates the core
  *         ceremony to its `deployCore` (CREATE3-salted, insertion-order-
@@ -35,7 +43,8 @@ import {DeploySherwood} from "../Deploy.s.sol";
  *       --rpc-url robinhood --account sherwood-deployer --broadcast --slow
  */
 contract DeployRobinhoodMainnet is DeploySherwood {
-    // No ENS or ERC-8004 on Robinhood Chain.
+    // No ENS on Robinhood Chain; ERC-8004 identity gating deliberately off at v1
+    // (the registry exists on 4663 — see the notice above).
     address constant L2_REGISTRAR = address(0);
     address constant AGENT_REGISTRY = address(0);
 
