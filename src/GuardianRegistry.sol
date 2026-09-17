@@ -496,15 +496,6 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      so paying on that would let an approver who locked no coverage earn
     ///      beside one who locked its whole free budget.
     ///
-    ///      The divergence is reachable: `recordApproval` deliberately locks
-    ///      nothing and does not revert when the guardian declared zero, has no
-    ///      free budget, the asset feed is unpriceable, coverage is zero, or
-    ///      settlement is beyond the coverage horizon. The registry still pushes
-    ///      the voter into `_approvers` before the ledger hook runs, so a
-    ///      guardian can spend its whole budget on one proposal and keep
-    ///      approving everything else at full stake weight, underwriting nothing
-    ///      further.
-    ///
     ///      Returns the ledger's `coverageUsdOf` — `min(lock, slashable stake)`
     ///      at the live WOOD price, UNCAPPED at the proposal's need. A guardian
     ///      who locked more took more risk (its whole lock burns on conviction)
@@ -550,13 +541,17 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
     ///      computed at `resolveReview` (see `_severityBps`).
     /// @dev `lockWood` IS THE APPROVER'S DECLARATION — the WOOD it puts behind
     ///      this proposal — forwarded verbatim to `ExposureLedger.recordApproval`,
-    ///      which clamps it to the guardian's free budget and never rejects it.
-    ///      Ignored on a Block vote: a blocker underwrites nothing. A zero on an
-    ///      Approve vote is legal and locks nothing (the vote still counts toward
-    ///      the review tally; it simply contributes no coverage to the
-    ///      execute-time quorum). THE SINGLE ENTRY: there is deliberately no
-    ///      overload without the amount, so no caller can approve without having
-    ///      stated what it is willing to lose.
+    ///      which books `min(lockWood, free budget)` and reverts
+    ///      `ApproveLockBelowFloor` when what it books is worth less than the
+    ///      smaller of one slot's share of the need and the guardian's
+    ///      whole-budget valuation, or when that valuation is zero. It also
+    ///      reverts when the need cannot be read or priced, or when settlement
+    ///      lies beyond the coverage horizon. Every one of those takes this vote
+    ///      with it, so no approver slot is seated without a lock behind it.
+    ///      Ignored on a Block vote: a blocker underwrites nothing. THE SINGLE
+    ///      ENTRY: there is deliberately no overload without the amount, so no
+    ///      caller can approve without having stated what it is willing to
+    ///      lose.
     function voteOnProposal(address governor, uint256 proposalId, GuardianVoteType support, uint256 lockWood)
         external
         whenNotPaused

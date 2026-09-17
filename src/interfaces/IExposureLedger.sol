@@ -30,6 +30,9 @@ interface IExposureLedger {
     /// @notice The booked lock carries less than one slot's share of the need.
     error ApproveLockBelowFloor();
 
+    /// @notice The proposal's vault asset or required coverage could not be read.
+    error CoverageInputsUnreadable();
+
     error NotGuardianRegistry();
     error FeedNotConfigured();
     error StalePrice();
@@ -108,10 +111,12 @@ interface IExposureLedger {
     ///         whole budget — the registry's approver array is bounded, so a
     ///         slot has to be paid for, while a guardian too small to carry a
     ///         hundredth keeps its voice by committing all it has at risk.
-    ///         Zero required coverage, an unresolvable or unpriceable vault
-    ///         asset, and settlement beyond the coverage horizon still lock
-    ///         nothing and return, so the approve vote lands and the shortfall
-    ///         surfaces at the execute-time quorum. There is no cohort cap:
+    ///         Also reverts when the coverage inputs cannot be read
+    ///         (`CoverageInputsUnreadable`), when the vault asset cannot be
+    ///         priced (`StalePrice` / `FeedNotConfigured`), and when settlement
+    ///         lands beyond the booking horizon (`CoverageHorizonExceeded`): the
+    ///         approver array is bounded, so a vote that books nothing must roll
+    ///         back rather than take a slot. There is no cohort cap:
     ///         locks across a proposal's approvers may sum above its
     ///         requirement, and nothing reduces a lock other than
     ///         `releaseApproval`/`retireApproval`.

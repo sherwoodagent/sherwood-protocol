@@ -1071,6 +1071,77 @@ contract CoverageEndToEndTest is Test {
         assertEq(_state(govA, pid), uint256(ISyndicateGovernor.ProposalState.Executed), "executes on real coverage");
     }
 
+    /// @notice The cheapest door to the squat was an ordinary feed heartbeat
+    ///         lapse: the ledger could not price the need, booked nothing, and
+    ///         the registry kept the approver slot it had already pushed. The
+    ///         price the ledger cannot read now takes the vote with it, so the
+    ///         slot stays open for whoever can underwrite once the feed is back.
+    function test_approveSlot_staleAssetFeedIsRefused() public {
+        uint256 pid = _propose(govA, address(vaultA), agentA);
+        _openReview(govA, pid);
+
+        // A heartbeat lapse, expressed as the bound the operator set: the
+        // fixture's feed was stamped at construction and is now past it.
+        vm.prank(ledgerOwner);
+        ledger.setAssetFeed(address(usdg), address(feed), 1);
+        vm.expectRevert(IExposureLedger.StalePrice.selector);
+        ledger.coverageUsd(address(usdg), MAX_CAPITAL);
+
+        vm.prank(g2);
+        vm.expectRevert(IExposureLedger.StalePrice.selector);
+        registry.voteOnProposal(address(govA), pid, IGuardianRegistry.GuardianVoteType.Approve, COVERAGE_WOOD);
+
+        (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pid);
+        assertEq(approvers.length, 0, "a feed lapse seats no approver");
+        (address[] memory listed,) = ledger.approversOf(address(govA), pid);
+        assertEq(listed.length, 0, "and books no coverage");
+
+        // The feed publishes again and the same vote lands, carrying real
+        // coverage — the liveness cost is the outage, not the proposal.
+        feed.set(1e8);
+        _vote(govA, pid, g1, IGuardianRegistry.GuardianVoteType.Approve);
+        (address[] memory honest,,) = registry.getApproverWeights(address(govA), pid);
+        assertEq(honest.length, 1, "the slot was still open");
+        assertEq(ledger.openExposure(g1), COVERAGE_WOOD, "and carries real coverage");
+    }
+
+    /// @notice The floor gates the vote-CHANGE call site too, and a refusal
+    ///         there rolls the change back whole: a guardian that blocked and
+    ///         then finds its budget spent elsewhere keeps its Block rather than
+    ///         moving to an approver slot it cannot underwrite.
+    function test_blockThenApproveIsRefusedByTheFloorAndKeepsTheBlock() public {
+        uint256 pidA = _propose(govA, address(vaultA), agentA);
+        uint256 pidB = _propose(govB, address(vaultB), agentB);
+        _openReview(govA, pidA);
+        _openReview(govB, pidB);
+
+        // g1 blocks A -- alone it carries the block quorum.
+        _vote(govA, pidA, g1, IGuardianRegistry.GuardianVoteType.Block);
+
+        // ...then spends its whole budget underwriting B.
+        _voteLock(govB, pidB, g1, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+        uint256 spent = ledger.openExposure(g1);
+        assertGt(spent, 0, "fixture: the budget really is committed to B");
+
+        // Changing to Approve on A would seat an approver with nothing left to
+        // pledge, so the ledger refuses and the change never happens.
+        vm.prank(g1);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        registry.voteOnProposal(address(govA), pidA, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+
+        (address[] memory approvers,,) = registry.getApproverWeights(address(govA), pidA);
+        assertEq(approvers.length, 0, "no slot taken on the change");
+        assertEq(ledger.openExposure(g1), spent, "and nothing moved on B");
+
+        // The Block weight survived the refusal: A is still blocked.
+        _pastReview(govA, pidA);
+        assertEq(
+            uint256(registry.outcomeOf(address(govA), pidA)),
+            uint256(IGuardianRegistry.ReviewOutcome.Blocked),
+            "the Block vote and its weight are intact"
+        );
+    }
+
     // ── 3. Cold start: a thin cohort BLOCKS execution, it does not force it ──
 
     /// @notice Spec §3.3a cold-start. The guardian cohort collapses to a single
