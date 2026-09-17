@@ -336,17 +336,21 @@ cohort is willing to underwrite in a single approval — not a derivation. Owner
 with no bounds and read live on every propose, so it is a starting point: lowering it
 after launch is one Safe transaction and takes effect on the next proposal.
 
-**`WOOD_PRICE_CAP_X8` (now `5e5` = $0.005).** The manipulation
-ceiling: `min(market, cap)`, never served as a price. It SHALL sit ABOVE market,
-and the ceremony refuses any value outside `[1.25x, 2x]` the spot it derives from
-the live WOOD/WETH pair.
+**`CAP_OVER_SPOT_BPS` (`15_000` = 1.5x).** No WOOD price is committed. BOTH postures
+DERIVE the cap at deploy time as `spot * CAP_OVER_SPOT_BPS / 10_000` from the live
+WOOD/WETH pair and the ETH/USD feed, and the ceremony still refuses anything outside
+`[1.25x, 2x]` of that same spot. The cap is the manipulation ceiling: `min(market,
+cap)`, never served as a price, and it SHALL sit ABOVE market.
 
-- **Measured 2026-09-16** against `https://rpc.mainnet.chain.robinhood.com`:
-  WOOD/USD spot `325057` x8 ($0.00325). The admissible band that day was
-  **`406_321 … 650_114`** x8.
-- The former `5e7` was ~154x spot and **the Mainnet run refused it**; `5e5` is
-  ~1.54x, inside that day's band. A fork run no longer takes this constant at all:
-  it derives its cap as 1.5x its own spot, so both postures clear the same band.
+- Committing a measured price is the shape this replaces, and it does not survive
+  contact with time. `5e7` was ~154x spot and the Mainnet run refused it; the `5e5`
+  that replaced it was ~1.54x of the `325057` x8 spot measured 2026-09-16 and would
+  have drifted out of its own band as WOOD moved, turning a stale constant into a
+  refused ceremony on the day.
+- What deriving costs: the SEEDED VALUE now depends on the block the ceremony runs
+  in. Addresses stay a function of `(DEPLOYER, salt)`. It is the same live-market
+  dependency the feed's own pre-flights and the `AwaitingWoodFeed` gate already
+  carry, and the Safe can reset the cap at any time.
 - Re-measure before the run: the band moves with spot, and a cap set from a
   month-old measurement can be outside it by the time the ceremony happens.
 - Review monthly thereafter. A drifted-high cap simply stops binding; a cap that

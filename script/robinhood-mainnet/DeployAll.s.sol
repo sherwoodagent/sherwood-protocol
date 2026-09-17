@@ -130,8 +130,13 @@ contract DeployAll is
         _deployStrategyFactory(s);
 
         if (i.posture == Posture.Mainnet) {
-            s.woodPriceCapX8 = RobinhoodParams.WOOD_PRICE_CAP_X8;
-            s.woodUsdFeed = address(deploy(_feedParams(i)));
+            // DERIVED from the live pool, like the fork's: a committed constant is only inside
+            // the [1.25x, 2x] band on the day it was measured, and the band moves with the price.
+            Params memory fp = _feedParams(i);
+            uint256 spotX8 = _spotWoodUsdX8(fp, fp.uniPair);
+            s.woodPriceCapX8 = (spotX8 * RobinhoodParams.CAP_OVER_SPOT_BPS) / 10_000;
+            _requireCapAboveSpot(s.woodPriceCapX8, spotX8);
+            s.woodUsdFeed = address(deploy(fp));
         } else {
             _deployForkFeed(s, i);
         }
@@ -247,7 +252,7 @@ contract DeployAll is
         uint256 spotX8 = _spotWoodUsdX8(_feedParams(i), i.woodWethV2Pair);
         // The cap is DERIVED here, not taken from the constant: a fork that seeded a cap Mainnet
         // would refuse is a ceremony rehearsal that never exercised the band.
-        s.woodPriceCapX8 = (spotX8 * 150) / 100;
+        s.woodPriceCapX8 = (spotX8 * RobinhoodParams.CAP_OVER_SPOT_BPS) / 10_000;
         _requireCapAboveSpot(s.woodPriceCapX8, spotX8);
         s.woodUsdFeed = _c3(
             Create3Factory(s.create3Factory),
@@ -415,7 +420,6 @@ contract DeployAll is
         if (i.posture == Posture.Mainnet) {
             Params memory p = _feedParams(i);
             _preflight(p);
-            _requireCapAboveSpot(RobinhoodParams.WOOD_PRICE_CAP_X8, _spotWoodUsdX8(p, p.uniPair));
         }
     }
 

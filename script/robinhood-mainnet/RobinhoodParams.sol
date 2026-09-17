@@ -60,10 +60,10 @@ library RobinhoodParams {
     // Per-vault ceiling on ONE proposal's coverage, USD-18, checked at `propose`. Not a running
     // total. Owner-settable and read live, so the launch value is a starting point, not a lock.
     uint256 internal constant COVERED_TVL_CAP_USD18 = 1_000_000e18;
-    // PLACEHOLDER - Ana to RE-MEASURE on the deploy day: the pre-flight refuses anything outside
-    // [1.25x, 2x] the live pool spot, and the band moves with the price. 5e5 = $0.005, ~1.54x the
-    // 325_057 x8 spot measured 2026-09-16 (docs/pre-deployment-parameter-review.md).
-    uint256 internal constant WOOD_PRICE_CAP_X8 = 5e5;
+    // How far above live spot the WOOD price cap is seated, bps. Both postures DERIVE the cap
+    // from the pool at deploy time, so no measured price is ever committed here. Must land
+    // inside the ceremony's [1.25x, 2x] band; the Safe re-reviews the cap monthly after launch.
+    uint256 internal constant CAP_OVER_SPOT_BPS = 15_000;
 
     /// @notice TierRegistry launch set. Every CHAINLINK_<SYM>_USD_FEED and <SYM> (WETH for ETH) book key is
     ///         REQUIRED. A Solidity constant cannot hold an array, hence a pure accessor.

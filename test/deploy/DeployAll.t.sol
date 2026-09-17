@@ -91,8 +91,8 @@ abstract contract DeployAllFixture is Test {
     uint256 internal constant SCRATCH_CHAIN_ID_2 = 4_242_425;
     uint256 internal constant MAINNET_CHAIN_ID = RobinhoodParams.MAINNET_CHAIN_ID;
 
-    // WOOD/WETH = 1e-6 against ETH at $3,000 puts spot at 3e5 x8 ($0.003), so the shipped
-    // WOOD_PRICE_CAP_X8 (5e5) lands at 1.67x spot — inside the pre-flight's [1.25x, 2x] band.
+    // WOOD/WETH = 1e-6 against ETH at $3,000 puts spot at 3e5 x8 ($0.003). Both postures derive
+    // the WOOD price cap as CAP_OVER_SPOT_BPS of whatever spot is, so no fixture depends on it.
     uint112 internal constant WETH_RESERVE = 100e18;
     uint112 internal constant WOOD_RESERVE = 100_000_000e18;
     int256 internal constant ETH_USD_X8 = 3000e8;
@@ -520,17 +520,26 @@ contract DeployAllTest is DeployAllFixture {
         script.exposed_preflight(i);
     }
 
-    /// @notice The cap the ledger bounds the governance WOOD price with is sized off live spot.
-    function test_preflight_boundsThePriceCapAgainstLiveSpot() public {
+    /// @notice The Mainnet WOOD price cap tracks live spot instead of a committed number.
+    function test_mainnet_derivesThePriceCapFromLiveSpot() public {
         vm.chainId(MAINNET_CHAIN_ID);
-        Inputs memory i = _inputs(Posture.Mainnet);
-        script.exposed_preflight(i);
 
-        // Ten times the depth makes spot 3e4, so the shipped 5e5 cap is far above 2x.
+        (Stack memory atSpot,) = _runCeremony(Posture.Mainnet);
+        uint256 spotX8 = (uint256(uint112(WETH_RESERVE)) * uint256(ETH_USD_X8)) / uint256(uint112(WOOD_RESERVE));
+        assertEq(
+            atSpot.woodPriceCapX8,
+            (spotX8 * RobinhoodParams.CAP_OVER_SPOT_BPS) / 10_000,
+            "cap is CAP_OVER_SPOT_BPS of spot"
+        );
+        // The band the ceremony enforces, restated here so a multiplier edit cannot drift out of it.
+        assertGe(atSpot.woodPriceCapX8, (spotX8 * 125) / 100, "cap above 1.25x spot");
+        assertLe(atSpot.woodPriceCapX8, spotX8 * 2, "cap below 2x spot");
+
+        // Ten times the depth is a tenth of the price. A committed cap would not move; this does.
         uniPair.setReserves(WOOD_RESERVE * 10, WETH_RESERVE);
         sushiPair.setReserves(WETH_RESERVE, WOOD_RESERVE * 10);
-        vm.expectRevert(bytes("PRE-FLIGHT: WOOD_PRICE_CAP_X8 is above 2x spot"));
-        script.exposed_preflight(i);
+        (Stack memory atTenth,) = _runCeremony(Posture.Mainnet);
+        assertEq(atTenth.woodPriceCapX8, atSpot.woodPriceCapX8 / 10, "cap followed spot down");
     }
 
     // ── Case 7: source hygiene ──

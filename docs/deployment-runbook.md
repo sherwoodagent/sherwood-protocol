@@ -35,13 +35,12 @@ Nothing is read from the environment. Every number comes from
 
 **Mainnet (4663) — two runs.**
 
-1. **Fill the inputs.** Confirm the three econ constants in `RobinhoodParams.sol`
-   still marked `PLACEHOLDER` (`ASSET_FEED_MAX_DELAY`, `COVERED_TVL_CAP_USD18`,
-   `WOOD_PRICE_CAP_X8` — re-measure the cap's `[1.25x, 2x]` band on the day), and
-   add `WOOD_WETH_SUSHI_V2_PAIR` to `chains/4663.json`. `DEPLOYER` and
-   `OWNER_MULTISIG` are already recorded there; the pair key is the one still
-   outstanding, and no second WOOD/WETH pair exists on 4663 yet. All three keys are
-   REQUIRED and the run refuses by name without them.
+1. **Fill the inputs.** Every econ constant in `RobinhoodParams.sol` is now confirmed
+   and no `PLACEHOLDER` remains: the WOOD price cap is derived from live spot at run
+   time, so there is nothing to re-measure on the day. What is still outstanding is
+   `WOOD_WETH_SUSHI_V2_PAIR` in `chains/4663.json`. `DEPLOYER` and
+   `OWNER_MULTISIG` are already recorded there. No second WOOD/WETH pair exists on
+   4663 yet (SHE-291), and the run refuses by name without it.
 2. **First run.**
    ```bash
    forge script script/robinhood-mainnet/DeployAll.s.sol:DeployAll \
