@@ -92,7 +92,7 @@ Both are seeded to the DEPLOYER as a placeholder, never as the destination. The 
 
 #### Scenario: Post-deploy validation reads
 - **WHEN** `deployAll` returns `Checkpoint.Complete`
-- **THEN** the operator verifies `factory.beacon/protocolConfig`, `swood.wood == WOOD`, `swood.registry == registry`, `registry.reviewPeriod == 86400`, `registry.blockQuorumBps == 3000`, `strategyFactory.approvedTemplate(PORTFOLIO) == true`, and `governorImpl.MIN_VOTING_PERIOD() == 86400`
+- **THEN** the operator verifies `factory.beacon/protocolConfig`, `swood.wood == WOOD`, `swood.registry == registry`, `registry.reviewPeriod == 86400`, `registry.blockQuorumBps == 3000`, `strategyFactory.approvedTemplate(PORTFOLIO) == true`, and `governorImpl.MIN_VOTING_PERIOD() == 3600`
 
 #### Scenario: Mainnet ceremony with EOA multisig refused
 - **WHEN** `OWNER_MULTISIG` is an EOA on Mainnet posture
@@ -184,7 +184,7 @@ The direct-storage route remains the DOCUMENTED FALLBACK for a vnet or token whe
 - **THEN** the RPC returns `-32602`; the positional form succeeds
 
 ### Requirement: Mainnet-faithful parameters are not accelerated
-The fork deploy SHALL bake the real mainnet parameters and the operator SHALL NOT accelerate them for guardian sims (advance time with `evm_increaseTime` instead): `MIN_VOTING_PERIOD` 24h and `MIN_COOLDOWN_PERIOD` 1h (governor impl constructor immutables), `reviewPeriod` 24h and `blockQuorumBps` 30% (registry init), `MIN_COHORT_STAKE_AT_OPEN` 50,000 WOOD (registry constant), `minGuardianStake`/`minOwnerStake` 10,000 WOOD each, `coolDownPeriod` 7 days, `minSlashBps`/`maxSlashBps` 10%/100% (sWOOD init), and the 200 bps management fee stamped per vault. Every one of these is a committed constant in `script/robinhood-mainnet/RobinhoodParams.sol` — the same values on Mainnet and Fork posture, with no runtime override. (The 46630 testnet's 600s-floor governor upgrade is explicitly NOT applied to the fork.)
+The fork deploy SHALL bake the real mainnet parameters and the operator SHALL NOT accelerate them for guardian sims (advance time with `evm_increaseTime` instead): `MIN_VOTING_PERIOD` 1h and `MIN_COOLDOWN_PERIOD` 1h (governor impl constructor immutables, held at the per-vault floor so they can never bind tighter than the setters; the 24h operating value is the factory's per-vault default), `reviewPeriod` 24h and `blockQuorumBps` 30% (registry init), `MIN_COHORT_STAKE_AT_OPEN` 50,000 WOOD (registry constant), `minGuardianStake`/`minOwnerStake` 10,000 WOOD each, `coolDownPeriod` 7 days, `minSlashBps`/`maxSlashBps` 10%/100% (sWOOD init), and the 200 bps management fee stamped per vault. Every one of these is a committed constant in `script/robinhood-mainnet/RobinhoodParams.sol` — the same values on Mainnet and Fork posture, with no runtime override. (The 46630 testnet's 600s-floor governor upgrade is explicitly NOT applied to the fork.)
 
 #### Scenario: Governance window traversal
 - **WHEN** a proposal must pass the 24h vote + 24h review windows

@@ -16,7 +16,10 @@ library RobinhoodParams {
 
     // Factory / governor. 200 bps is the guardian-budget floor, stamped once per vault at initialize.
     uint256 internal constant MANAGEMENT_FEE_BPS = 200;
-    uint256 internal constant MIN_VOTING_PERIOD = 24 hours;
+    // Governor-impl IMMUTABLE, so this deploy is the only chance to set it. Held at the
+    // per-vault floor (SHE-234) so it can never bind tighter than `setVotingPeriod` itself;
+    // the operating value is the factory's 24h default, which owners may now lower.
+    uint256 internal constant MIN_VOTING_PERIOD = 1 hours;
     uint256 internal constant MIN_COOLDOWN_PERIOD = 1 hours;
     uint256 internal constant MIN_REVIEW_PERIOD = 6 hours;
     uint256 internal constant MAX_STRATEGY_DURATION = 30 days;
@@ -49,9 +52,10 @@ library RobinhoodParams {
     // `updatedAt` rolls at most once per window, so the bound must clear a window plus the keeper cadence.
     uint256 internal constant WOOD_FEED_MAX_DELAY = TWAP_WINDOW + KEEPER_CADENCE_SLACK + 1;
 
-    // PLACEHOLDER - Ana to confirm. Bounds the AGGREGATOR's own updatedAt age inside
-    // `ExposureLedger.coverageUsd`, not the proposal lifecycle: 4663 Chainlink feeds heartbeat at
-    // 24h, so a bound at exactly 24h makes every covered read revert `StalePrice` on a late publish.
+    // Bounds the AGGREGATOR's own updatedAt age inside `ExposureLedger.coverageUsd`, not the
+    // proposal lifecycle: 4663 Chainlink feeds heartbeat at 24h, so exactly 24h makes every
+    // covered read revert `StalePrice` on a late publish. Same 2h allowance, and the same
+    // reasoning, as `PortfolioStrategy.MAX_PUSH_PRICE_AGE` (26h). Owner-settable per asset.
     uint256 internal constant ASSET_FEED_MAX_DELAY = 1 days + 2 hours;
     // PLACEHOLDER - Ana to confirm. Test-fixture value; per-vault covered-TVL ceiling, USD-18.
     uint256 internal constant COVERED_TVL_CAP_USD18 = 1_000_000e18;

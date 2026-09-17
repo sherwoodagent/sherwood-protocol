@@ -289,7 +289,7 @@ commit; re-derive them if it moves. Values not listed here are read from
 |---|---|---|---|
 | `ROBINHOOD_MAX_CODE_SIZE` | `:9` | 98,304 | CL template size gate |
 | `MANAGEMENT_FEE_BPS` | `:18` | 200 | `deployCore` → factory, stamped per vault |
-| `MIN_VOTING_PERIOD` | `:19` | 24h | governor impl immutable |
+| `MIN_VOTING_PERIOD` | `:22` | 1h | governor impl immutable; the per-vault floor (SHE-234), not the operating value |
 | `MIN_COOLDOWN_PERIOD` | `:20` | 1h | governor impl immutable |
 | `MIN_REVIEW_PERIOD` | `:21` | 6h | governor impl immutable |
 | `MAX_STRATEGY_DURATION` | `:22` | 30d | `ProtocolConfig.setMaxStrategyDuration`, seated only when zero |
