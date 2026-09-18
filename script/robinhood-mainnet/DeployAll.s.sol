@@ -348,10 +348,15 @@ contract DeployAll is
         i.uniswapV4Quoter = _required("UNISWAP_V4_QUOTER", "UNISWAP_V4_QUOTER missing from the address book");
         i.morphoBlue = _required("MORPHO_BLUE", "MORPHO_BLUE missing from the address book");
         i.woodWethV2Pair = _required("WOOD_WETH_V2_PAIR", "WOOD_WETH_V2_PAIR missing from the address book");
-        i.woodWethSushiV2Pair = _required(
-            "WOOD_WETH_SUSHI_V2_PAIR",
-            "WOOD_WETH_SUSHI_V2_PAIR missing from the address book: WoodPoolFeed needs two distinct WOOD/WETH pairs"
+        // The feed's second leg is a V3 pool, not a second V2 pair. 4663 carries two V3
+        // deployments and the booked pool belongs to the non-canonical one, so the factory
+        // is booked alongside it and the pre-flight checks provenance both ways.
+        i.woodWethUniswapV3Pool = _required(
+            "WOOD_WETH_UNISWAP_V3_POOL",
+            "WOOD_WETH_UNISWAP_V3_POOL missing from the address book: WoodPoolFeed needs a second WOOD/WETH venue"
         );
+        i.woodWethUniswapV3Factory =
+            _required("WOOD_WETH_UNISWAP_V3_FACTORY", "WOOD_WETH_UNISWAP_V3_FACTORY missing from the address book");
     }
 
     function _required(string memory key, string memory why) internal view returns (address a) {
@@ -362,13 +367,15 @@ contract DeployAll is
     function _feedParams(Inputs memory i) internal pure returns (Params memory) {
         return Params({
             uniPair: i.woodWethV2Pair,
-            sushiPair: i.woodWethSushiV2Pair,
+            v3Pool: i.woodWethUniswapV3Pool,
+            v3Factory: i.woodWethUniswapV3Factory,
             wood: i.wood,
             weth: i.weth,
             ethUsdFeed: i.ethUsdFeed,
             window: RobinhoodParams.TWAP_WINDOW,
             ethUsdMaxAge: RobinhoodParams.ETH_USD_MAX_AGE,
-            minWethReserve: RobinhoodParams.MIN_WETH_RESERVE
+            minWethReserve: RobinhoodParams.MIN_WETH_RESERVE,
+            minV3Liquidity: toMinV3Liquidity(RobinhoodParams.MIN_V3_LIQUIDITY)
         });
     }
 

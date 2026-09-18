@@ -47,6 +47,14 @@ library RobinhoodParams {
     uint256 internal constant TWAP_WINDOW = 24 hours;
     uint256 internal constant ETH_USD_MAX_AGE = 1 days;
     uint256 internal constant MIN_WETH_RESERVE = 10e18;
+    // The V3 leg's depth floor, in in-range liquidity: half of what the live WOOD/WETH V3 pool carries.
+    uint256 internal constant MIN_V3_LIQUIDITY = 1e22;
+    // Average seconds between WRITES to the V3 pool's observation ring (one per block in which
+    // the pool is touched, not one per block), measured 2026-09-16. DERIVATION INPUT for the
+    // cardinality the feed script prints; nothing is enforced against it. RE-MEASURE before the
+    // ceremony: binary-search `observe([S, 0])` for the largest S that does not revert OLD, then
+    // divide by the pool's current cardinality.
+    uint256 internal constant V3_WRITE_INTERVAL_SECONDS = 880;
     uint256 internal constant MAX_PAIR_IDLE = 5 minutes;
     uint256 internal constant KEEPER_CADENCE_SLACK = 2 hours;
     // `updatedAt` rolls at most once per window, so the bound must clear a window plus the keeper cadence.

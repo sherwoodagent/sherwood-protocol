@@ -28,6 +28,8 @@ import {IGuardianRegistry} from "../../src/interfaces/IGuardianRegistry.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
 import {MockUniswapV2Pair} from "../mocks/MockUniswapV2Pair.sol";
+import {MockUniswapV3Pool} from "../mocks/MockUniswapV3Pool.sol";
+import {MockUniswapV3Factory} from "../mocks/MockUniswapV3Factory.sol";
 import {MockPositionManager} from "../mocks/MockPositionManager.sol";
 
 /// @notice `DeployAll` is concrete; this only reaches the internals `run()` would.
@@ -105,7 +107,8 @@ abstract contract DeployAllFixture is Test {
     ERC20Mock internal weth;
     ERC20Mock internal usdg;
     MockUniswapV2Pair internal uniPair;
-    MockUniswapV2Pair internal sushiPair;
+    MockUniswapV3Pool internal woodWethV3Pool;
+    MockUniswapV3Factory internal woodWethV3Factory;
     MockAggregatorV3 internal ethUsdFeed;
     MockAggregatorV3 internal usdgFeed;
     MockPositionManager internal positionManager;
@@ -128,7 +131,13 @@ abstract contract DeployAllFixture is Test {
         weth = new ERC20Mock("WETH", "WETH", 18);
         usdg = new ERC20Mock("USDG", "USDG", 6);
         uniPair = new MockUniswapV2Pair(address(wood), address(weth), WOOD_RESERVE, WETH_RESERVE);
-        sushiPair = new MockUniswapV2Pair(address(weth), address(wood), WETH_RESERVE, WOOD_RESERVE);
+        // The feed's second leg. Its tick sits ABOVE the V2 pair's spot, so the two-leg `min`
+        // keeps serving the V2 price and the cap the ceremony derives stays the pair's.
+        woodWethV3Factory = new MockUniswapV3Factory();
+        woodWethV3Pool = new MockUniswapV3Pool(address(wood), address(weth), 3000, 60, address(woodWethV3Factory));
+        woodWethV3Pool.setLiquidity(2.128e22);
+        woodWethV3Pool.setTicks(-122475, -122475);
+        woodWethV3Factory.register(address(wood), address(weth), 3000, address(woodWethV3Pool));
         ethUsdFeed = new MockAggregatorV3(8, ETH_USD_X8);
         usdgFeed = new MockAggregatorV3(8, 1e8);
 
@@ -159,7 +168,8 @@ abstract contract DeployAllFixture is Test {
         i.uniswapV4Quoter = _bookAddr("UNISWAP_V4_QUOTER");
         i.morphoBlue = morphoBlue;
         i.woodWethV2Pair = address(uniPair);
-        i.woodWethSushiV2Pair = address(sushiPair);
+        i.woodWethUniswapV3Pool = address(woodWethV3Pool);
+        i.woodWethUniswapV3Factory = address(woodWethV3Factory);
     }
 
     function _runCeremony(Posture posture) internal returns (Stack memory s, Checkpoint cp) {
@@ -172,7 +182,6 @@ abstract contract DeployAllFixture is Test {
     ///      both Chainlink legs re-published.
     function _refreshMarkets() internal {
         uniPair.sync();
-        sushiPair.sync();
         ethUsdFeed.setUpdatedAt(vm.getBlockTimestamp());
         usdgFeed.setUpdatedAt(vm.getBlockTimestamp());
     }
@@ -537,7 +546,6 @@ contract DeployAllTest is DeployAllFixture {
 
         // Ten times the depth is a tenth of the price. A committed cap would not move; this does.
         uniPair.setReserves(WOOD_RESERVE * 10, WETH_RESERVE);
-        sushiPair.setReserves(WETH_RESERVE, WOOD_RESERVE * 10);
         (Stack memory atTenth,) = _runCeremony(Posture.Mainnet);
         assertEq(atTenth.woodPriceCapX8, atSpot.woodPriceCapX8 / 10, "cap followed spot down");
     }
@@ -568,7 +576,7 @@ contract DeployAllTest is DeployAllFixture {
     function _isOneOffScript(string memory path) internal pure returns (bool) {
         return vm.contains(path, "CheckSyndicateParams") || vm.contains(path, "DeployWood.s.sol")
             || vm.contains(path, "DeployVestingFactory") || vm.contains(path, "DeployEAS")
-            || vm.contains(path, "SeedAttestations");
+            || vm.contains(path, "SeedAttestations") || vm.contains(path, "GrowV3Cardinality");
     }
 
     // ─────────────────────────────── helpers ───────────────────────────────

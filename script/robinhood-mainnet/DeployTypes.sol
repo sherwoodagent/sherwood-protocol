@@ -29,7 +29,8 @@ struct Inputs {
     address uniswapV4Quoter;
     address morphoBlue;
     address woodWethV2Pair;
-    address woodWethSushiV2Pair;
+    address woodWethUniswapV3Pool;
+    address woodWethUniswapV3Factory;
 }
 
 /// @notice Everything the ceremony mints or adopts, filled phase by phase. Every address

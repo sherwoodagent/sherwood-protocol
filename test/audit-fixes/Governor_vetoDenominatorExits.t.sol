@@ -70,12 +70,16 @@ contract GovernorVetoDenominatorExitsTest is Test {
         vm.mockCall(address(this), abi.encodeWithSignature("priceRouter()"), abi.encode(address(0)));
     }
 
-    function _deposit(address who, uint256 amount) internal {
+    function _depositNoWarp(address who, uint256 amount) internal {
         usdc.mint(who, amount);
         vm.startPrank(who);
         usdc.approve(address(vault), amount);
         vault.deposit(amount, who);
         vm.stopPrank();
+    }
+
+    function _deposit(address who, uint256 amount) internal {
+        _depositNoWarp(who, amount);
         vm.warp(vm.getBlockTimestamp() + 1); // snapshot is `timestamp - 1`
     }
 
@@ -101,6 +105,35 @@ contract GovernorVetoDenominatorExitsTest is Test {
             none
         );
         vm.warp(vm.getBlockTimestamp() + 1);
+    }
+
+    /// @dev The collaborative path: a Draft that stamps its electorate at the co-agent's approval.
+    function _proposeCollab(address coAgent) internal returns (uint256 pid) {
+        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
+        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](1);
+        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent, splitBps: 2000});
+        vm.prank(agent);
+        pid = governor.propose(
+            address(vault),
+            address(0),
+            "she282-collab",
+            7 days,
+            env,
+            _calls(1),
+            GovEnvelope.defaultCaps(env.maxCapital, 1),
+            _calls(0),
+            GovEnvelope.defaultCaps(env.maxCapital, 1),
+            coProps
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+    }
+
+    function _registerCoAgent(address who) internal {
+        // startPrank, not prank: `agentReg.mint` sits in argument position and is evaluated
+        // first, so a one-shot prank would be consumed by the mint.
+        vm.startPrank(owner);
+        vault.registerAgent(agentReg.mint(who), who);
+        vm.stopPrank();
     }
 
     function _endVote() internal {
@@ -181,9 +214,9 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(uint256(_resolveWithAgainst(80_000e6 - 1)), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 
-    /// @notice A redeem ordered ahead of propose in its block is in the snapshot but gone from
-    ///         the supply recorded as the electorate, so 100% of that electorate Against rejects.
-    function test_sameBlockPreProposeRedeemCannotInflateTheVetoBar() public {
+    /// @notice A redeem ordered ahead of propose in its block moves neither term of the electorate,
+    ///         which stays the 300k snapshot supply, so lp1's 100k Against is 33% and falls short.
+    function test_sameBlockPreProposeRedeemCannotDeflateTheVetoBar() public {
         _deposit(lp1, 100_000e6);
         _deposit(attacker, 200_000e6); // block N-1; the fixture then warps to block N
         uint256 lp1Shares = vault.balanceOf(lp1);
@@ -194,10 +227,11 @@ contract GovernorVetoDenominatorExitsTest is Test {
         uint256 snapshot = vault.getPastTotalSupply(governor.getProposal(pid).snapshotTimestamp);
         assertEq(snapshot, lp1Shares + attackerShares, "attacker's shares are in the snapshot");
         assertEq(vault.totalSupply(), lp1Shares, "and gone from the live supply");
+        assertEq(governor.getProposal(pid).votableSupply, snapshot, "the electorate is the snapshot, not the live read");
         vm.prank(lp1);
         governor.vote(pid, ISyndicateGovernor.VoteType.Against);
         _endVote();
-        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Rejected));
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 
     /// @notice Control: with nothing leaving in the propose block the recorded electorate equals
@@ -273,11 +307,9 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 
-    /// @notice THE SHE-282 REPRO. 100k parked in the queue, 200k redeemed ahead of propose in
-    ///         the same block: `min(snapshot - queueVotes, totalSupply())` read 200k and set the
-    ///         bar at 80k, while the electorate that could actually vote was 100k. 45k Against —
-    ///         45% of the real electorate — cleared the true 40k bar and missed the inflated one,
-    ///         so the veto failed. The recorded votable set is 100k, so it now rejects.
+    /// @notice 400k of supply with 100k parked in the queue and 200k redeemed ahead of propose in
+    ///         the same block: the parked shares are out, the exit moves neither term, so the
+    ///         electorate is 300k and lp1's 45k Against is 15% — short of the 40% bar.
     function test_parkedQueueAndSameBlockRedeemCannotInflateTheVetoBar() public {
         address lp3 = makeAddr("lp3");
         _deposit(lp1, 45_000e6);
@@ -301,22 +333,26 @@ contract GovernorVetoDenominatorExitsTest is Test {
         vault.redeem(attackerShares, attacker, attacker); // ahead of propose, same block
         uint256 pid = _propose();
 
-        uint256 electorate = vault.balanceOf(lp1) + vault.balanceOf(lp3);
-        assertEq(governor.getProposal(pid).votableSupply, electorate, "electorate is the two live LPs");
-        assertEq(vault.totalSupply(), electorate + lp2Shares, "the parked shares still exist");
+        uint256 s = governor.getProposal(pid).snapshotTimestamp;
+        uint256 electorate = governor.getProposal(pid).votableSupply;
+        assertEq(vault.getPastVotes(lp2, s), 0, "the parked shares carry no castable weight");
+        assertEq(
+            electorate,
+            vault.getPastVotes(lp1, s) + vault.getPastVotes(lp3, s) + vault.getPastVotes(attacker, s),
+            "electorate is exactly the castable weight"
+        );
+        assertEq(electorate, vault.getPastTotalSupply(s) - lp2Shares, "400k of snapshot supply less the 100k parked");
+        assertEq(vault.totalSupply(), vault.balanceOf(lp1) + vault.balanceOf(lp3) + lp2Shares, "attacker really exited");
 
-        // 45% of the electorate Against: over the true 40% bar, under the old inflated one.
+        // 15% of the electorate Against: short of the 40% bar.
         vm.prank(lp1);
         governor.vote(pid, ISyndicateGovernor.VoteType.Against);
         _endVote();
-        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Rejected));
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 
     /// @notice Queued shares are outside the electorate: 200k of supply with 100k parked gives a
-    ///         100k votable set, not 200k. Deliberately does NOT distinguish the live-at-propose
-    ///         read from a snapshot read — on the direct path nothing can move shares into the
-    ///         queue between the two instants (`requestRedeem` needs an open proposal, `propose`
-    ///         needs none), so both reads agree here. See `design.md` Decision 1.
+    ///         100k votable set, not 200k.
     function test_queuedSharesAreOutsideTheVetoElectorate() public {
         _deposit(lp1, 100_000e6);
         _deposit(lp2, 100_000e6);
@@ -344,33 +380,13 @@ contract GovernorVetoDenominatorExitsTest is Test {
     ///         100k, and 30% falls short of the 40% threshold.
     function test_collab_queuedRedeemInTheApproveBlockCannotShrinkTheVetoBar() public {
         address coAgent = makeAddr("coAgent");
-        // startPrank, not prank: `agentReg.mint` sits in argument position and is evaluated
-        // first, so a one-shot prank would be consumed by the mint.
-        vm.startPrank(owner);
-        vault.registerAgent(agentReg.mint(coAgent), coAgent);
-        vm.stopPrank();
+        _registerCoAgent(coAgent);
 
         _deposit(lp1, 70_000e6);
         _deposit(lp2, 30_000e6);
         uint256 supply = vault.totalSupply();
 
-        ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
-        ISyndicateGovernor.CoProposer[] memory coProps = new ISyndicateGovernor.CoProposer[](1);
-        coProps[0] = ISyndicateGovernor.CoProposer({agent: coAgent, splitBps: 2000});
-        vm.prank(agent);
-        uint256 pid = governor.propose(
-            address(vault),
-            address(0),
-            "she282-collab",
-            7 days,
-            env,
-            _calls(1),
-            GovEnvelope.defaultCaps(env.maxCapital, 1),
-            _calls(0),
-            GovEnvelope.defaultCaps(env.maxCapital, 1),
-            coProps
-        );
-        vm.warp(vm.getBlockTimestamp() + 1);
+        uint256 pid = _proposeCollab(coAgent);
 
         assertEq(
             uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Draft), "still a Draft"
@@ -393,6 +409,146 @@ contract GovernorVetoDenominatorExitsTest is Test {
         governor.vote(pid, ISyndicateGovernor.VoteType.Against);
         _endVote();
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    /// @notice Both delegation entrypoints are refused whatever the target, and `delegateBySig`
+    ///         reverts before it ever looks at the signature (zeros get the same revert).
+    function test_delegate_isRefused() public {
+        _deposit(lp1, 60_000e6);
+        _deposit(lp2, 40_000e6);
+        vm.startPrank(lp1);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegate(address(0));
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegate(lp2);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegate(lp1);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegateBySig(lp2, 0, type(uint256).max, 0, bytes32(0), bytes32(0));
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegateBySig(address(0), 0, 0, 0, bytes32(0), bytes32(0));
+        vm.stopPrank();
+        assertEq(vault.delegates(lp1), lp1, "the receipt self-delegated and nothing could move it");
+        assertEq(vault.getVotes(lp1), vault.balanceOf(lp1), "votes equal balance");
+    }
+
+    /// @notice THE ATTACK SHAPE. The attacker holds X == 2G, twice the honest float, and tries to
+    ///         walk its votes out of the electorate one block before the approval stamps it:
+    ///         `getPastTotalSupply` would still count the shares while `getPastVotes` no longer
+    ///         did, so the bar would be b*(G+X) over an electorate of only G — unreachable. The
+    ///         vault refuses, so the recorded electorate is exactly the weight that can be cast.
+    function test_undelegationCannotInflateTheVetoBar() public {
+        address coAgent = makeAddr("coAgent");
+        _registerCoAgent(coAgent);
+
+        _deposit(lp1, 60_000e6);
+        _deposit(lp2, 40_000e6);
+        uint256 honest = vault.totalSupply(); // G
+        _deposit(attacker, 200_000e6);
+        uint256 attackerShares = vault.balanceOf(attacker); // X
+        assertEq(attackerShares, 2 * honest, "the attacker holds twice the honest float");
+
+        uint256 pid = _proposeCollab(coAgent);
+
+        // The Draft already holds the redeem lock, so the queue is the only exit. lp2 takes it
+        // before the stamp, putting real weight on the excluded side of the electorate.
+        // Hoisted: `balanceOf` in argument position would eat the one-shot prank.
+        uint256 lp2Shares = vault.balanceOf(lp2);
+        vm.prank(lp2);
+        vault.requestRedeem(lp2Shares, lp2);
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        // At the snapshot instant itself, the tightest the exit could be timed.
+        vm.prank(attacker);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegate(address(0));
+        vm.warp(vm.getBlockTimestamp() + 1);
+
+        vm.prank(coAgent);
+        governor.approveCollaboration(pid);
+
+        uint256 s = governor.getProposal(pid).snapshotTimestamp;
+        uint256 queued = vault.getPastVotes(address(queue), s);
+        assertEq(queued, lp2Shares, "lp2's escrowed shares are the queue's snapshot votes");
+        assertEq(
+            governor.getProposal(pid).votableSupply, honest + attackerShares - queued, "electorate is G + X - queued"
+        );
+        assertEq(governor.getVoteWeight(pid, attacker), attackerShares, "capital at risk still buys a vote");
+        // Every share's votes are somewhere -- no holder walked out of the snapshot...
+        assertEq(
+            vault.getPastVotes(lp1, s) + vault.getPastVotes(lp2, s) + vault.getPastVotes(attacker, s) + queued,
+            vault.getPastTotalSupply(s),
+            "sum over every holder equals the snapshot supply"
+        );
+        // ...and the electorate is that sum less the queue's, which cannot vote.
+        assertEq(
+            governor.getProposal(pid).votableSupply,
+            vault.getPastVotes(lp1, s) + vault.getPastVotes(lp2, s) + vault.getPastVotes(attacker, s),
+            "the electorate is exactly the castable weight outside the queue"
+        );
+    }
+
+    /// @notice The same invariant on the direct path: `delegate(queue)` would walk weight out of
+    ///         the electorate's second term, and it is refused alongside `delegate(0)`.
+    function test_directPath_votableSupplyEqualsTheCastableWeight() public {
+        _deposit(lp1, 60_000e6);
+        _deposit(lp2, 40_000e6);
+        _deposit(attacker, 200_000e6);
+
+        vm.startPrank(attacker);
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegate(address(0));
+        vm.expectRevert(ISyndicateVault.DelegationDisabled.selector);
+        vault.delegate(address(queue));
+        vm.stopPrank();
+
+        uint256 pid = _propose();
+        uint256 s = governor.getProposal(pid).snapshotTimestamp;
+        assertEq(vault.balanceOf(address(queue)), 0, "nothing is parked, so the electorate is the whole supply");
+        assertEq(governor.getProposal(pid).votableSupply, vault.totalSupply(), "300k of shares, 300k of electorate");
+        assertEq(
+            governor.getProposal(pid).votableSupply,
+            vault.getPastVotes(lp1, s) + vault.getPastVotes(lp2, s) + vault.getPastVotes(attacker, s),
+            "the electorate is exactly the castable weight"
+        );
+    }
+
+    /// @notice SHE-292: a deposit ordered ahead of `propose` in the same block carries no snapshot
+    ///         weight, so it must stay outside the recorded electorate too.
+    function test_sameBlockDepositIsOutsideTheVetoElectorate() public {
+        _deposit(lp1, 100_000e6);
+        _depositNoWarp(attacker, 200_000e6); // same block as propose, ordered first
+
+        uint256 pid = _propose();
+        uint256 s = governor.getProposal(pid).snapshotTimestamp;
+
+        assertEq(vault.getPastVotes(attacker, s), 0, "funded after the snapshot, so no castable weight");
+        assertEq(
+            governor.getProposal(pid).votableSupply,
+            vault.getPastVotes(lp1, s) + vault.getPastVotes(attacker, s),
+            "electorate is exactly the castable weight"
+        );
+    }
+
+    /// @notice SHE-292: an exit ordered ahead of `propose` in the same block keeps its snapshot
+    ///         weight, so it must stay inside the recorded electorate.
+    function test_directPathElectorateEqualsTheCastableWeight() public {
+        _deposit(lp1, 100_000e6);
+        _deposit(attacker, 200_000e6);
+
+        uint256 attackerShares = vault.balanceOf(attacker);
+        vm.prank(attacker);
+        vault.redeem(attackerShares, attacker, attacker); // same block as propose, ordered first
+
+        uint256 pid = _propose();
+        uint256 s = governor.getProposal(pid).snapshotTimestamp;
+
+        assertEq(governor.getVoteWeight(pid, attacker), attackerShares, "the exit keeps its snapshot weight");
+        assertEq(
+            governor.getProposal(pid).votableSupply,
+            vault.getPastVotes(lp1, s) + vault.getPastVotes(attacker, s),
+            "electorate is exactly the castable weight"
+        );
     }
 
     function _resolveWithAgainst(uint256 againstAssets) internal returns (ISyndicateGovernor.ProposalState) {

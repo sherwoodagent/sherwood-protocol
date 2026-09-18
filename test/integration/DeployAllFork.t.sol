@@ -120,9 +120,10 @@ contract DeployAllForkTest is Test {
         i.uniswapV4Quoter = _bookAddr("UNISWAP_V4_QUOTER");
         i.morphoBlue = _bookAddr("MORPHO_BLUE");
         i.woodWethV2Pair = _bookAddr("WOOD_WETH_V2_PAIR");
-        // Only the mainnet WoodPoolFeed reads a second pair; the fork fixture prices off
-        // `woodWethV2Pair` alone, and 4663 has no second WOOD/WETH pair to name.
-        i.woodWethSushiV2Pair = i.woodWethV2Pair;
+        // Only the mainnet WoodPoolFeed reads the second leg; the fork fixture prices off
+        // `woodWethV2Pair` alone.
+        i.woodWethUniswapV3Pool = _bookAddr("WOOD_WETH_UNISWAP_V3_POOL");
+        i.woodWethUniswapV3Factory = _bookAddr("WOOD_WETH_UNISWAP_V3_FACTORY");
     }
 
     function _bookAddr(string memory key) internal view returns (address) {
