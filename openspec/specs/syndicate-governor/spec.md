@@ -63,7 +63,7 @@ The governor SHALL bind at most one non-terminal proposal lifecycle to its vault
 - **THEN** that proposal's settlement SHALL use the rates and recipients snapshotted at propose time, not the changed values
 
 ### Requirement: Voting timeline and vote snapshot
-A non-collaborative proposal SHALL enter `Pending` immediately at propose; a collaborative proposal enters `Pending` on the final co-proposer approval. On entering Pending the governor SHALL set: `snapshotTimestamp = block.timestamp - 1` (closing the same-block flash-delegate window), `voteEnd = now + votingPeriod`, `reviewEnd = voteEnd + reviewPeriod` (read from the guardian registry), and `executeBy = reviewEnd + executionWindow`. When `reviewEnd > voteEnd` the governor SHALL push the review window to the guardian registry via `registerReview` under exactly that predicate; a collapsed window (`reviewPeriod == 0`) is treated as no review configured.
+A non-collaborative proposal SHALL enter `Pending` immediately at propose; a collaborative proposal enters `Pending` on the final co-proposer approval. On entering Pending the governor SHALL set: `snapshotTimestamp = block.timestamp - 1` (closing the same-block acquisition window), `votableSupply` (below), `voteEnd = now + votingPeriod`, `reviewEnd = voteEnd + reviewPeriod` (read from the guardian registry), and `executeBy = reviewEnd + executionWindow`. When `reviewEnd > voteEnd` the governor SHALL push the review window to the guardian registry via `registerReview` under exactly that predicate; a collapsed window (`reviewPeriod == 0`) is treated as no review configured.
 
 #### Scenario: Vote weight from checkpointed shares
 - **WHEN** a shareholder votes on a Pending proposal
@@ -78,14 +78,18 @@ A non-collaborative proposal SHALL enter `Pending` immediately at propose; a col
 - **THEN** the call SHALL revert with `NotWithinVotingPeriod`
 
 ### Requirement: Optimistic passage with veto threshold
-The governor SHALL use optimistic governance: no FOR-vote quorum exists. At `voteEnd`, a Pending proposal SHALL be `Rejected` if and only if `votesAgainst >= pastTotalSupply * vetoThresholdBps / 10_000`, where `vetoThresholdBps` is the per-proposal snapshot taken when the proposal entered Pending (a mid-vote parameter change cannot move the bar) and `pastTotalSupply` is the vault supply at `snapshotTimestamp`. When `pastTotalSupply == 0`, the veto check SHALL be skipped (otherwise the threshold collapses to zero and every proposal auto-rejects). A proposal not vetoed at voteEnd proceeds into guardian review.
+The governor SHALL use optimistic governance: no FOR-vote quorum exists. At `voteEnd`, a Pending proposal SHALL be `Rejected` if and only if `votesAgainst >= votableSupply * vetoThresholdBps / 10_000`, where `vetoThresholdBps` is the per-proposal snapshot taken when the proposal entered Pending (a mid-vote parameter change cannot move the bar) and `votableSupply` is the electorate recorded on entering Pending. On BOTH paths `votableSupply` SHALL be `getPastTotalSupply(snapshotTimestamp) - getPastVotes(withdrawalQueue, snapshotTimestamp)`, clamped at zero and skipping the subtraction when no queue is wired: both terms read at the one snapshot instant, never live at propose, so the recorded electorate is exactly the weight `getPastVotes` will hand out. A holder who acquires shares in the propose block is outside both the electorate and the vote; a holder who exits in the propose block remains inside both. When `votableSupply == 0`, the veto check SHALL be skipped (otherwise the threshold collapses to zero and every proposal auto-rejects). A proposal not vetoed at voteEnd proceeds into guardian review.
 
 #### Scenario: Veto threshold reached
-- **WHEN** voting ends with `votesAgainst` at or above the snapshotted veto threshold of past total supply
+- **WHEN** voting ends with `votesAgainst` at or above the snapshotted veto threshold of the recorded `votableSupply`
 - **THEN** the proposal SHALL resolve to `Rejected` without traversing guardian review, and no registry economic commit SHALL fire for it
 
+#### Scenario: Share flow in the propose block moves neither term
+- **WHEN** a deposit or an instant redeem is ordered ahead of `propose` in the same block
+- **THEN** the recorded `votableSupply` SHALL equal the sum of every non-queue holder's `getPastVotes(holder, snapshotTimestamp)` — the deposit is outside both, the exit is inside both
+
 #### Scenario: Silence passes the vote
-- **WHEN** voting ends with zero votes cast and a nonzero past total supply
+- **WHEN** voting ends with zero votes cast and a nonzero `votableSupply`
 - **THEN** the proposal SHALL proceed to `GuardianReview` (or directly toward Approved if no review window is configured)
 
 ### Requirement: Guardian review gate and economic commit

@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
+import {GuardianRegistry} from "src/GuardianRegistry.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
 import {MockCoverageFreezer} from "test/mocks/MockCoverageFreezer.sol";
 
@@ -103,7 +104,16 @@ contract MockGovernorForLedger {
         coverage = coverage_;
     }
 
+    /// @dev When set, `getRequiredCoverage` reverts, so the ledger cannot
+    ///      resolve the coverage inputs at all.
+    bool public coverageUnreadable;
+
+    function setCoverageUnreadable(bool v) external {
+        coverageUnreadable = v;
+    }
+
     function getRequiredCoverage(uint256) external view returns (uint256) {
+        if (coverageUnreadable) revert("governor view down");
         return coverage;
     }
 
@@ -270,6 +280,18 @@ contract ExposureLedgerTest is Test {
     ///      now declares `_wood(X)` and asserts the same figure in WOOD.
     function _wood(uint256 usd18) internal pure returns (uint256) {
         return (usd18 * 1e8) / MARKET_X8;
+    }
+
+    /// @dev The smallest WOOD lock `recordApproval` will grant a slot for, at
+    ///      the live price and against a non-binding slash basis. Derived from
+    ///      the LEDGER's own divisor (via the harness) so the boundary tracks
+    ///      the contract, and rounded up at each step so it is the true minimum:
+    ///      both sides of it are asserted at the call sites.
+    function _slotFloorWood(uint256 needUsd) internal view returns (uint256) {
+        uint256 slots = ledger.APPROVER_SLOTS();
+        uint256 shareUsd = (needUsd + slots - 1) / slots;
+        uint256 priceX8 = ledger.woodPriceX8();
+        return (shareUsd * 1e8 + priceX8 - 1) / priceX8;
     }
 
     MockFeed internal marketFeed;
@@ -572,13 +594,14 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposure(guardian), 100_000e18, "re-approve locks again");
     }
 
-    /// @notice M3 — the registry hook fires for EVERY authorized governor once
-    ///         the ledger is wired, including vaults whose asset has no feed.
-    ///         Reverting there made approve votes impossible on those vaults
-    ///         while Block votes still worked, so reviews became block-only.
-    ///         Booking nothing is the conservative half; failing the vote was
-    ///         the harmful half.
-    function test_recordApproval_unfedAssetBooksNothingInsteadOfReverting() public {
+    /// @notice The registry hook fires for EVERY authorized governor once the
+    ///         ledger is wired, including vaults whose asset has no feed. A need
+    ///         that cannot be priced cannot be underwritten, so the vote is
+    ///         refused with the wiring error rather than seating an approver the
+    ///         coverage quorum will never see. Approve-side liveness on an
+    ///         unfed vault is given up deliberately: its execute-time quorum
+    ///         prices through the same feed.
+    function test_recordApproval_unfedAssetIsRefused() public {
         _wireRecording();
         // Point the governor at a vault whose asset was never given a feed.
         MockVaultForLedger unfed = new MockVaultForLedger(makeAddr("unfedAsset"));
@@ -586,8 +609,11 @@ contract ExposureLedgerTest is Test {
         gov2.set(1_000e6);
 
         vm.prank(registry);
-        ledger.recordApproval(address(gov2), 1, guardian, LOCK_ALL); // must not revert
-        assertEq(ledger.openExposure(guardian), 0, "nothing booked, but the vote survives");
+        vm.expectRevert(IExposureLedger.FeedNotConfigured.selector);
+        ledger.recordApproval(address(gov2), 1, guardian, LOCK_ALL);
+        assertEq(ledger.openExposure(guardian), 0, "nothing booked");
+        (address[] memory none,) = ledger.approversOf(address(gov2), 1);
+        assertEq(none.length, 0, "and no slot taken");
     }
 
     /// @notice THE TRUST MODEL, PINNED. This contract imposes NO rate limit and
@@ -706,27 +732,25 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposure(guardian), 0, "released once the risk window has closed");
     }
 
-    /// @notice N4 — an over-horizon settlement books NOTHING; it does not
-    ///         revert the vote. Reverting here took `voteOnProposal` with it,
-    ///         leaving a block-only review in which guardians can veto but never
-    ///         endorse — the third trigger for the shape M3 was filed for, and
-    ///         the only one reachable at defaults, since
-    ///         `ProtocolConfig.maxStrategyDuration` ships unset.
-    ///
-    ///         The refusal moved to `propose`, where it lands on the proposer
-    ///         who chose the duration rather than on a cohort that cannot
-    ///         change it.
-    function test_recordApproval_beyondHorizonBooksNothingAndProposeRejects() public {
+    /// @notice An over-horizon settlement is REFUSED, with the same error the
+    ///         proposer meets at propose. Booking nothing and returning left the
+    ///         registry's approver slot taken with no lock behind it, which is
+    ///         the squat the floor exists to stop; the first line of defence is
+    ///         still `propose`, where the error lands on whoever chose the
+    ///         duration rather than on a cohort that cannot change it.
+    function test_recordApproval_beyondHorizonIsRefused() public {
         _wireRecording();
         mgov.setSchedule(block.timestamp + 1 days, 365 days); // far past the horizon
         mgov.set(1_000e6);
 
-        // The vote survives and books nothing.
         vm.prank(registry);
+        vm.expectRevert(IExposureLedger.CoverageHorizonExceeded.selector);
         ledger.recordApproval(address(mgov), 1, guardian, LOCK_ALL);
-        assertEq(ledger.openExposure(guardian), 0, "nothing booked, vote intact");
+        assertEq(ledger.openExposure(guardian), 0, "nothing booked");
+        (address[] memory none,) = ledger.approversOf(address(mgov), 1);
+        assertEq(none.length, 0, "and no slot taken");
 
-        // ...and propose refuses it outright.
+        // ...and propose refuses it outright, with the same error.
         vm.expectRevert(IExposureLedger.CoverageHorizonExceeded.selector);
         ledger.requireWithinCoverageHorizon(block.timestamp + 1 days, 365 days);
 
@@ -757,12 +781,14 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.woodHaircutBps(), 5_000);
     }
 
-    /// @notice M3 — a STALE feed must not kill the approve vote. Closing only
-    ///         the missing-feed case left the more reachable half live: a stale
-    ///         oracle is an operational condition, not a wiring mistake, and it
-    ///         made reviews block-only — guardians able to veto but not endorse,
-    ///         with the proposal passing optimistically anyway.
-    function test_recordApproval_staleFeedBooksNothingInsteadOfReverting() public {
+    /// @notice A stale asset feed REFUSES the approve rather than booking
+    ///         nothing and letting the vote land. A heartbeat lapse is the
+    ///         cheapest way to reach a path that seats an approver carrying no
+    ///         coverage, so the price the ledger cannot read takes the vote with
+    ///         it; approve-side liveness through a feed outage is given up
+    ///         deliberately, since the execute-time quorum prices through the
+    ///         same feed and could not have run either.
+    function test_recordApproval_staleFeedRefusesTheVote() public {
         _wireRecording();
         mgov.set(1_000e6);
 
@@ -774,14 +800,17 @@ contract ExposureLedgerTest is Test {
         ledger.setAssetFeed(usdgAsset, address(tight), 1);
         skip(2 days);
 
-        // The read itself genuinely reverts...
+        // The read genuinely reverts...
         vm.expectRevert(IExposureLedger.StalePrice.selector);
         ledger.coverageUsd(usdgAsset, 1_000e6);
 
-        // ...but the hook books nothing rather than taking the vote with it.
+        // ...and so does the hook, with the feed's own reason.
         vm.prank(registry);
+        vm.expectRevert(IExposureLedger.StalePrice.selector);
         ledger.recordApproval(address(mgov), 1, guardian, LOCK_ALL);
-        assertEq(ledger.openExposure(guardian), 0, "unpriceable: booked nothing, vote survives");
+        assertEq(ledger.openExposure(guardian), 0, "booked nothing");
+        (address[] memory none,) = ledger.approversOf(address(mgov), 1);
+        assertEq(none.length, 0, "and took no slot");
     }
 
     /// @notice M1 gap 1 — wiring order was a bypass. `setChallengeWindow` skips
@@ -949,7 +978,11 @@ contract ExposureLedgerTest is Test {
         assertTrue(ledger.hasFrozenCoverage(guardian), "still under accusation");
         assertEq(ledger.openExposure(guardian), 100_000e18, "the frozen lock still counts against capacity");
 
+        // SHE-240 re-aim: no free budget is now a refusal rather than a silent
+        // zero booking. What SHE-213 pins is unchanged — B cannot re-lock the
+        // WOOD the frozen A still holds.
         vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
         ledger.recordApproval(address(mgov), 2, guardian, LOCK_ALL);
         assertEq(ledger.lockOf(address(mgov), 2, guardian), 0, "no budget is free while A is frozen");
         assertEq(ledger.openExposure(guardian), 100_000e18, "B did not overlap A");
@@ -973,7 +1006,9 @@ contract ExposureLedgerTest is Test {
         assertTrue(ledger.hasFrozenCoverage(guardian), "still pinned");
         assertEq(ledger.openExposure(guardian), 100_000e18, "the pinned lock still counts against capacity");
 
+        // SHE-240 re-aim: see the freeze variant above.
         vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
         ledger.recordApproval(address(mgov), 2, guardian, LOCK_ALL);
         assertEq(ledger.lockOf(address(mgov), 2, guardian), 0, "no budget is free while A is pinned");
         assertEq(ledger.openExposure(guardian), 100_000e18, "B did not overlap A");
@@ -1051,7 +1086,9 @@ contract ExposureLedgerTest is Test {
         vm.warp(genesis + 71 days);
         assertTrue(ledger.hasFrozenCoverage(guardian));
         assertEq(ledger.openExposure(guardian), 100_000e18, "counted through the second filing's clock");
+        // SHE-240 re-aim: no free budget is a refusal, not a silent zero booking.
         vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
         ledger.recordApproval(address(mgov), 2, guardian, LOCK_ALL);
         assertEq(ledger.lockOf(address(mgov), 2, guardian), 0, "no budget is free");
     }
@@ -1751,21 +1788,16 @@ contract ExposureLedgerTest is Test {
         assertEq(requiredCoverageUsd, 3_000e18);
     }
 
-    // EARLY-EXIT INTENDED: `recordApproval`'s no-free-budget return. This test IS
-    // that exit — the second approval books nothing and the guardian is never
-    // listed for proposal 2, which is the asserted behaviour rather than a
-    // fixture that lost an approver by accident. (A stale line here used to claim
-    // the opposite, "an approve reverts outright"; N1 replaced that revert with
-    // this return.)
-    /// @notice N1 — a spent budget books NOTHING; it does not revert. Reverting
-    ///         took `voteOnProposal` down with it, so a guardian whose budget
-    ///         went on an earlier proposal could not cast an approve vote at
-    ///         all — approve-side silence while Block still worked.
+    /// @notice SHE-240 (re-aimed from the N1 "books nothing without reverting"
+    ///         pin). A guardian whose budget is entirely spent elsewhere has
+    ///         nothing left to put behind a second proposal, so `free` is zero
+    ///         and the clamped lock is zero: it is refused rather than seated
+    ///         as an approver carrying no coverage.
     ///
-    ///         The cap still binds: nothing is committed, so the same bond
-    ///         cannot back two drains. Enforcement moves to the execute-time
-    ///         quorum, which is already the enforcement point.
-    function test_recordApproval_noFreeBudgetBooksNothingWithoutReverting() public {
+    ///         The cap still binds exactly as it did — the same bond cannot
+    ///         back two drains — but the refusal is now loud, and the approver
+    ///         slot the guardian would have taken stays available.
+    function test_recordApproval_noFreeBudgetIsRefused() public {
         _wireRecording();
         mgov.set(5_000e6);
         vm.prank(registry);
@@ -1773,7 +1805,8 @@ contract ExposureLedgerTest is Test {
         assertEq(ledger.openExposure(guardian), 100_000e18);
 
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), 2, guardian, LOCK_ALL); // must not revert
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        ledger.recordApproval(address(mgov), 2, guardian, LOCK_ALL);
 
         // Nothing extra locked -- the cap is intact.
         assertEq(ledger.openExposure(guardian), 100_000e18, "no second drain backed by the same stake");
@@ -1807,9 +1840,12 @@ contract ExposureLedgerTest is Test {
         // this fuzz generates, so the clamp never binds and the lock IS the
         // declaration.
         swood.setStake(guardian, type(uint96).max);
-        uint256 l1 = uint256(w1) % 1_000_000e18 + 1;
-        uint256 l2 = uint256(w2) % 1_000_000e18 + 1;
         mgov.set(1_000e6);
+        // SHE-240: every declaration must clear the slot floor, or it buys no
+        // slot to account for. The conservation property is unchanged above it.
+        uint256 floorWood = _slotFloorWood(ledger.coverageUsd(usdgAsset, 1_000e6));
+        uint256 l1 = floorWood + uint256(w1) % 1_000_000e18;
+        uint256 l2 = floorWood + uint256(w2) % 1_000_000e18;
         vm.prank(registry);
         ledger.recordApproval(address(mgov), 1, guardian, l1);
         vm.prank(registry);
@@ -2248,17 +2284,18 @@ contract ExposureLedgerTest is Test {
         ledger.woodPriceX8();
     }
 
-    /// @notice THE LOAD-BEARING ROW, INVERTED BY DECLARED LOCKS. `recordApproval`
-    ///         reads NO WOOD price, so a total WOOD outage does not touch it:
-    ///         the lock is WOOD and the cap is WOOD, and the declaration lands
-    ///         in full (spec: "Unpriceable WOOD at vote time").
+    /// @notice SHE-240 re-aim, and the sharpest cost of the slot floor: the
+    ///         approve side is no longer independent of the WOOD price. The
+    ///         floor is measured in the same USD terms as the quorum, so a
+    ///         total WOOD outage makes the share unprovable and `NoWoodPrice`
+    ///         propagates to the voter.
     ///
-    /// @dev    The old row had `recordApproval` CATCH `NoWoodPrice` and book
-    ///         nothing, which kept the vote alive but left the proposal
-    ///         unbacked through every outage. There is now nothing to catch.
-    ///         The price is consulted exactly once for coverage — at the
-    ///         execute-time quorum, where reverting is the safe direction.
-    function test_recordApproval_locksThroughAWoodPriceOutage() public {
+    /// @dev    Fails CLOSED, which is the safe direction: a slot that cannot be
+    ///         shown to carry its share is refused rather than granted on an
+    ///         unvalued lock. The approve side resumes, unchanged and with no
+    ///         re-vote needed for anyone already booked, as soon as a price is
+    ///         back. Block votes are untouched throughout.
+    function test_recordApproval_refusesThroughAWoodPriceOutage() public {
         _wireRecording();
         mgov.set(1_000e6);
         _killAllPriceSources();
@@ -2266,22 +2303,21 @@ contract ExposureLedgerTest is Test {
         ledger.slashableBondUsd(guardian); // control: nothing can price WOOD right now
 
         vm.prank(registry);
+        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
         ledger.recordApproval(address(mgov), 1, guardian, _wood(1_000e18));
 
-        assertEq(ledger.lockOf(address(mgov), 1, guardian), 20_000e18, "unpriceable WOOD: the lock still lands");
-        assertEq(ledger.openExposure(guardian), 20_000e18, "and the bucket carries it");
+        assertEq(ledger.lockOf(address(mgov), 1, guardian), 0, "nothing books through the outage");
+        assertEq(ledger.openExposure(guardian), 0, "and the bucket stays empty");
         (address[] memory gs,) = ledger.approversOf(address(mgov), 1);
-        assertEq(gs.length, 1, "and the guardian is listed as a covering approver");
+        assertEq(gs.length, 0, "no slot is granted on an unvalued lock");
 
-        // Execution still halts while nothing can price the lock...
-        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
-        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
-
-        // ...and passes the moment a price is back, on the lock recorded
-        // during the outage. No re-vote needed.
+        // The moment a price is back the same declaration books in full.
         marketFeed.set(int256(MARKET_X8));
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian, _wood(1_000e18));
+        assertEq(ledger.lockOf(address(mgov), 1, guardian), 20_000e18, "and lands once priced");
         (uint256 raised,) = ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
-        assertEq(raised, 1_000e18, "the outage-time lock covers the need once priced");
+        assertEq(raised, 1_000e18, "covering the need");
     }
 
     /// @notice EXECUTION HALTS, and that is correct: no price means no proof of
@@ -2522,22 +2558,272 @@ contract ExposureLedgerTest is Test {
         assertEq(listed.length, 1, "listed once");
     }
 
-    /// @notice A zero declaration locks nothing and is never listed: it is a
-    ///         vote on the merits without underwriting, and a guardian who
-    ///         locked nothing owes 0 bps — which here means it is not in the
-    ///         slash set at all.
-    function test_recordApproval_zeroDeclarationLocksNothingAndIsNotListed() public {
+    /// @notice SHE-240 (re-aimed from the "zero declaration locks nothing and
+    ///         is not listed" pin). A zero declaration is refused outright once
+    ///         the need is priceable and non-zero: an approver slot is a scarce
+    ///         resource, so it is not handed to a guardian underwriting nothing.
+    ///         Nothing is booked and the guardian never reaches the slash set.
+    function test_recordApproval_zeroLockIsRefused() public {
         _wireRecording();
         mgov.set(1_000e6);
+        assertEq(ledger.coverageUsd(usdgAsset, 1_000e6), 1_000e18, "need is priceable and non-zero");
+
         vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
         ledger.recordApproval(address(mgov), 1, guardian, 0);
+
         assertEq(ledger.lockOf(address(mgov), 1, guardian), 0);
         assertEq(ledger.openExposure(guardian), 0);
+        (address[] memory approvers,) = ledger.approversOf(address(mgov), 1);
+        assertEq(approvers.length, 0, "no slot taken");
         (address[] memory listed, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
         assertEq(listed.length, 0, "not in the slash set");
         assertEq(bps.length, 0);
         vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
         ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
+    }
+
+    /// @notice SHE-240 — the floor is RELATIVE: the booked lock must be worth at
+    ///         least `needUsd / 100`, valued exactly as `requireApproveQuorum`
+    ///         values it. Both sides of the boundary are asserted, so a floor
+    ///         that drifted off the need would show up here.
+    ///
+    /// @dev    Fixture arithmetic: need = $5,000; a slot's share is $50; at the
+    ///         fixture's $0.05 that is 1,000 WOOD. The basis (100,000 WOOD
+    ///         staked) never binds at these sizes, so `_recoverableUsd` reduces
+    ///         to `lock x priceX8 / 1e8`.
+    function test_recordApproval_lockBelowSlotShareIsRefused() public {
+        _wireRecording();
+        mgov.set(5_000e6);
+        uint256 needUsd = ledger.coverageUsd(usdgAsset, 5_000e6);
+        assertEq(needUsd, 5_000e18);
+
+        uint256 floorWood = _slotFloorWood(needUsd);
+        assertEq(floorWood, 1_000e18, "fixture sanity: a slot's share is 1,000 WOOD");
+
+        // One wei short of the share: refused, and no slot is taken.
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        ledger.recordApproval(address(mgov), 1, guardian, floorWood - 1);
+        (address[] memory none,) = ledger.approversOf(address(mgov), 1);
+        assertEq(none.length, 0, "below the floor buys no slot");
+        assertEq(ledger.openExposure(guardian), 0);
+
+        // Exactly the share: booked, listed, and the budget moves.
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian, floorWood);
+        assertEq(ledger.lockOf(address(mgov), 1, guardian), floorWood, "the floor itself books");
+        (address[] memory listed,) = ledger.approversOf(address(mgov), 1);
+        assertEq(listed.length, 1, "and takes exactly one slot");
+        assertEq(listed[0], guardian);
+        assertEq(ledger.openExposure(guardian), floorWood);
+    }
+
+    /// @notice SHE-240 — the invariant the floor buys: filling every one of the
+    ///         registry's `MAX_APPROVERS_PER_PROPOSAL` slots with locks at the
+    ///         ledger's own floor covers the need in full, so a full approver
+    ///         array can no longer be an uncovered proposal. Raising the
+    ///         ledger's divisor above the registry's cap breaks this.
+    function test_recordApproval_hundredFullSlotsCoverTheNeed() public {
+        _wireRecording();
+        mgov.set(5_000e6);
+        uint256 needUsd = ledger.coverageUsd(usdgAsset, 5_000e6);
+        // The floor follows the LEDGER's divisor; the loop bound is the
+        // REGISTRY's cap. The two must agree or the coverage falls short.
+        uint256 floorWood = _slotFloorWood(needUsd);
+
+        for (uint256 i = 0; i < ledger.APPROVER_SLOTS(); i++) {
+            address g = address(uint160(0xA11CE0000 + i));
+            swood.setStake(g, floorWood);
+            vm.prank(registry);
+            ledger.recordApproval(address(mgov), 1, g, floorWood);
+        }
+        (address[] memory listed,) = ledger.approversOf(address(mgov), 1);
+        assertEq(listed.length, ledger.APPROVER_SLOTS(), "every slot is filled by a real underwriter");
+
+        (uint256 raisedUsd, uint256 requiredUsd) = ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6);
+        assertEq(requiredUsd, needUsd);
+        assertGe(raisedUsd, requiredUsd, "a full approver set is a fully covered proposal");
+
+        // THE INVARIANT IS PER-SLOT AND AT THE VOTE INSTANT: the quorum re-values
+        // at execute, so a WOOD decline in between can leave the cohort short.
+        // What survives any decline is the durable property the floor buys --
+        // every slot-holder carries a NONZERO lock, so the zero-aggregate revert
+        // is unreachable from a full array and execution scales instead of
+        // bricking.
+        marketFeed.set(int256(MARKET_X8 / 2));
+        (uint256 halvedUsd, uint256 stillRequiredUsd) =
+            ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 5_000e6);
+        assertEq(stillRequiredUsd, needUsd, "the requirement is unmoved by the WOOD price");
+        assertGt(halvedUsd, 0, "a full array never takes the zero-aggregate revert");
+        assertLt(halvedUsd, stillRequiredUsd, "but it is a shortfall now, reported rather than reverted");
+    }
+
+    /// @notice SHE-240 liveness. The floor is the SMALLER of one slot's share
+    ///         and the guardian's whole budget, so a guardian too small to carry
+    ///         a hundredth of the need keeps its voice by committing everything.
+    ///         Without this, a large need shuts every minimum-stake guardian out
+    ///         of the approve side and the proposal bricks instead of executing
+    ///         at scaled capital.
+    function test_recordApproval_wholeBudgetBelowSlotShareIsAdmitted() public {
+        _wireRecording();
+        mgov.set(5_000e6);
+        uint256 needUsd = ledger.coverageUsd(usdgAsset, 5_000e6);
+        uint256 shareWood = _slotFloorWood(needUsd);
+
+        // A guardian whose ENTIRE budget is under one slot's share.
+        address small = makeAddr("smallGuardian");
+        uint256 budget = shareWood / 4;
+        swood.setStake(small, budget);
+        assertLt(
+            (budget * ledger.woodPriceX8()) / 1e8,
+            needUsd / ledger.APPROVER_SLOTS(),
+            "fixture: the whole budget really is under a slot's share"
+        );
+
+        // One wei short of everything: still refused -- holding budget back is
+        // exactly what buys a slot cheaply.
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        ledger.recordApproval(address(mgov), 1, small, budget - 1);
+        (address[] memory none,) = ledger.approversOf(address(mgov), 1);
+        assertEq(none.length, 0, "a held-back declaration buys no slot");
+
+        // Everything: admitted, and the lock is the whole budget.
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, small, budget);
+        assertEq(ledger.lockOf(address(mgov), 1, small), budget, "the whole budget books");
+        (address[] memory listed,) = ledger.approversOf(address(mgov), 1);
+        assertEq(listed.length, 1, "and takes a slot");
+        assertEq(listed[0], small);
+    }
+
+    /// @notice SHE-240. The whole-budget arm is an admission for the SMALL, not
+    ///         for the empty: a guardian whose entire budget values to nothing at
+    ///         this instant has nothing at risk, so `min(share, budget)` would be
+    ///         a floor of zero and any dust lock would clear it. That is refused.
+    ///
+    /// @dev    Reachable without mocks: one wei of WOOD at the fixture's $0.05
+    ///         truncates to $0 in `_recoverableUsd` (`1 x 5e6 / 1e8 == 0`), so
+    ///         the guardian holds a non-zero cap, a non-zero free budget and a
+    ///         non-zero clamped lock while every USD figure on the path is zero.
+    function test_recordApproval_zeroValuedBudgetIsRefused() public {
+        _wireRecording();
+        mgov.set(5_000e6);
+
+        address dust = makeAddr("dustGuardian");
+        swood.setStake(dust, 1); // one wei of WOOD
+        assertEq(ledger.slashableBondUsd(dust), 0, "fixture: the whole budget values to $0");
+
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        ledger.recordApproval(address(mgov), 1, dust, LOCK_ALL);
+
+        assertEq(ledger.lockOf(address(mgov), 1, dust), 0, "nothing books");
+        assertEq(ledger.openExposure(dust), 0);
+        (address[] memory listed,) = ledger.approversOf(address(mgov), 1);
+        assertEq(listed.length, 0, "and a worthless budget buys no slot");
+    }
+
+    /// @notice SHE-240. The whole-budget admission is measured against the
+    ///         guardian's FULL cap, never the remainder after its other open
+    ///         locks. Otherwise a squatter parks its stake on a benign
+    ///         self-proposal, drives the remainder to dust, and buys every
+    ///         further slot for nothing.
+    function test_recordApproval_otherOpenLocksDoNotShrinkTheFloor() public {
+        _wireRecording();
+        mgov.set(5_000e6);
+        uint256 needUsd = ledger.coverageUsd(usdgAsset, 5_000e6);
+        uint256 shareWood = _slotFloorWood(needUsd);
+
+        address g = makeAddr("parker");
+        uint256 budget = shareWood * 2;
+        swood.setStake(g, budget);
+
+        // Park most of the budget elsewhere, leaving a remainder under the share.
+        uint256 parked = budget - (shareWood / 4);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, g, parked);
+        assertEq(ledger.lockOf(address(mgov), 1, g), parked, "the parking lock stands");
+
+        // The remainder is neither a slot's share nor the whole budget: refused.
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        ledger.recordApproval(address(mgov), 2, g, LOCK_ALL);
+        (address[] memory stillNone,) = ledger.approversOf(address(mgov), 2);
+        assertEq(stillNone.length, 0, "a dust remainder buys no second slot");
+
+        // Releasing the parked lock restores the whole budget, and with it the
+        // guardian's ability to take the slot.
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 1, g);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 2, g, LOCK_ALL);
+        assertEq(ledger.lockOf(address(mgov), 2, g), budget, "the whole budget books once it is free");
+        (address[] memory seated,) = ledger.approversOf(address(mgov), 2);
+        assertEq(seated.length, 1, "and the slot is granted");
+    }
+
+    /// @notice Coverage inputs the ledger cannot read are refused, not waved
+    ///         through: a governor view that reverts leaves the need unknown, so
+    ///         there is no figure to size a slot against.
+    function test_recordApproval_unreadableInputsAreRefused() public {
+        _wireRecording();
+        mgov.set(5_000e6);
+        mgov.setCoverageUnreadable(true);
+
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.CoverageInputsUnreadable.selector);
+        ledger.recordApproval(address(mgov), 1, guardian, LOCK_ALL);
+        (address[] memory none,) = ledger.approversOf(address(mgov), 1);
+        assertEq(none.length, 0, "an unreadable need takes no slot");
+
+        // Readable again: the same declaration books.
+        mgov.setCoverageUnreadable(false);
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian, LOCK_ALL);
+        (address[] memory listed,) = ledger.approversOf(address(mgov), 1);
+        assertEq(listed.length, 1, "and the slot is granted once it can be read");
+    }
+
+    /// @notice A zero need is not a free slot. The share arm collapses to zero,
+    ///         so the floor reduces to "a lock that is worth something", and the
+    ///         guardian books it like any other — the lock is released at settle
+    ///         exactly as a priced one is.
+    function test_recordApproval_zeroNeedStillBooksANonzeroLock() public {
+        _wireRecording();
+        mgov.set(0); // nothing to underwrite
+        assertEq(ledger.coverageUsd(usdgAsset, 0), 0, "fixture: the need really is zero");
+
+        // A declaration worth nothing is still refused: the budget arm stands.
+        vm.prank(registry);
+        vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+        ledger.recordApproval(address(mgov), 1, guardian, 0);
+
+        vm.prank(registry);
+        ledger.recordApproval(address(mgov), 1, guardian, 1_000e18);
+        assertEq(ledger.lockOf(address(mgov), 1, guardian), 1_000e18, "the lock books against a zero need");
+        (address[] memory listed,) = ledger.approversOf(address(mgov), 1);
+        assertEq(listed.length, 1, "and the slot is paid for");
+
+        // Released like any other commitment.
+        vm.prank(registry);
+        ledger.releaseApproval(address(mgov), 1, guardian);
+        assertEq(ledger.openExposure(guardian), 0, "released at settle like a priced lock");
+    }
+
+    /// @notice The floor's denominator and the registry's approver cap are one
+    ///         number living in two contracts. Asserted equal against the real
+    ///         registry constant rather than restated as a literal here, so a
+    ///         change to either side fails loudly.
+    function test_approverSlots_matchTheRegistryApproverCap() public {
+        // Constants need no initialization; a bare implementation answers.
+        GuardianRegistry impl = new GuardianRegistry(6 hours);
+        assertEq(
+            ledger.APPROVER_SLOTS(),
+            impl.MAX_APPROVERS_PER_PROPOSAL(),
+            "the ledger's slot divisor is the registry's approver cap"
+        );
     }
 
     /// @notice Spec: "Rate priced on the lock" — `ceil(lock x 10_000 / basis)`,
@@ -2568,23 +2854,34 @@ contract ExposureLedgerTest is Test {
     }
 
     /// @notice Spec: "Negligible declaration still pays the floor" — the RATE
-    ///         half. A 1-wei lock rounds UP to 1 bps rather than down to zero,
-    ///         so the staking envelope has a non-zero rate to floor at
-    ///         `minSlashBps`. (The floor itself is `StakedWood`'s; the
+    ///         half. The smallest bookable lock rounds UP to 1 bps rather than
+    ///         down to zero, so the staking envelope has a non-zero rate to
+    ///         floor at `minSlashBps`. (The floor itself is `StakedWood`'s; the
     ///         registry-path test proves it on real balances.)
-    function test_slashBpsFor_oneWeiLockRoundsUpToOneBps() public {
+    ///
+    /// @dev    SHE-240 re-aim: a 1-wei lock no longer books, so the negligible
+    ///         declaration is now the slot floor on the smallest need this
+    ///         fixture can express ($1 → $0.01 a slot → 0.2 WOOD). That is
+    ///         0.02 bps of the 100,000 WOOD basis, so it still exercises the
+    ///         round-UP: 0.02 becomes 1, not 0.
+    function test_slashBpsFor_negligibleLockRoundsUpToOneBps() public {
         _wireRecording();
-        mgov.set(1_000e6);
+        mgov.set(1e6);
+        uint256 floorWood = _slotFloorWood(ledger.coverageUsd(usdgAsset, 1e6));
+        assertEq(floorWood, 0.2e18, "fixture sanity: a slot's share of $1 is 0.2 WOOD");
+
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), 1, guardian, 1);
-        assertEq(ledger.lockOf(address(mgov), 1, guardian), 1, "a 1-wei lock is recorded");
+        ledger.recordApproval(address(mgov), 1, guardian, floorWood);
+        assertEq(ledger.lockOf(address(mgov), 1, guardian), floorWood, "the smallest bookable lock is recorded");
         (address[] memory approvers, uint256[] memory bps) = ledger.slashBpsFor(address(mgov), 1);
         assertEq(approvers.length, 1, "and listed");
-        assertEq(bps[0], 1, "1 wei over 100,000e18 rounds up to 1 bps, not down to 0");
-        // It buys nothing at the quorum: 1 wei at $0.05 is 0 USD-18... which
-        // is a zero aggregate, the always-revert case.
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
-        ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1_000e6);
+        assertEq(bps[0], 1, "0.2e18 over 100,000e18 rounds up to 1 bps, not down to 0");
+
+        // It buys exactly one slot's share at the quorum -- a hundredth of the
+        // need -- which is reported as a shortfall rather than reverting.
+        (uint256 raisedUsd, uint256 requiredUsd) = ledger.requireApproveQuorum(address(mgov), 1, usdgAsset, 1e6);
+        assertEq(requiredUsd, 1e18);
+        assertEq(raisedUsd, requiredUsd / ledger.APPROVER_SLOTS(), "one slot, one share");
     }
 
     /// @notice Spec: "Post-drain top-up does not dilute the burn". The rate is

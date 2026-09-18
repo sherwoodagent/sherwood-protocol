@@ -69,6 +69,9 @@ interface ISyndicateVault {
     /// @notice A governor batch called `asset()` with fewer than 36 bytes of calldata: no first
     ///         argument to treat as a spender, so the call cannot be admitted as allowance-shaped.
     error MalformedAssetCall(bytes4 selector);
+    /// @notice `delegate` or `delegateBySig` was called. The vault self-delegates every
+    ///         receiver, so delegation is fixed and both entrypoints are refused.
+    error DelegationDisabled();
 
     // ── Init Params ──
     struct InitParams {
