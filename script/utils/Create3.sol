@@ -13,7 +13,8 @@ library Create3 {
 
     /// @dev Trampoline runtime bytecode.
     ///      Copies calldata (the init code) to memory and CREATEs a contract from it.
-    ///      Bytecode: CALLDATASIZE DUP1 PUSH1(0) CALLDATACOPY PUSH1(0) DUP2 CREATE PUSH1(0) MSTORE PUSH1(20) PUSH1(12) RETURN
+    ///      Bytecode: CALLDATASIZE DUP1 PUSH1(0) CALLDATACOPY PUSH1(0) DUP2 CREATE PUSH1(0) MSTORE PUSH1(8) PUSH1(24) RETURN
+    ///      (the return data is the low 8 bytes of the CREATE result and is ignored; callers read the address back with `addressOf`)
     ///      Hex:      36 3d 3d 37 36 3d 34 f0 3d 52 60 08 60 18 f3
     ///      Wrapped as creation code: PUSH15(<runtime>) PUSH1(0) MSTORE PUSH1(15) PUSH1(17) RETURN
     bytes private constant _TRAMPOLINE_CREATION_CODE = hex"6e363d3d37363d34f03d5260086018f3600052600f6011f3";

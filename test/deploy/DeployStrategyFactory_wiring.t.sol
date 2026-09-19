@@ -21,25 +21,14 @@ import {MockRegistryMinimal} from "../mocks/MockRegistryMinimal.sol";
 import {MockStrategy} from "../mocks/MockStrategy.sol";
 import {MockStrategyAdapter} from "../mocks/MockStrategyAdapter.sol";
 
-/// @dev Forwarder etched at `DEFAULT_SENDER` so the script's `msg.sender` is the
-///      broadcaster (see `DeployPlanBPreflight.t.sol` for why a prank cannot do this).
-contract SfScriptCaller {
-    function fwd(address target, bytes calldata data) external returns (bytes memory ret) {
-        bool ok;
-        (ok, ret) = target.call(data);
-        if (!ok) {
-            assembly {
-                revert(add(ret, 0x20), mload(ret))
-            }
-        }
-    }
-}
+/// @dev The mixin is abstract; this makes it concrete.
+contract SfHarness is DeployStrategyFactory {}
 
 /// @notice The StrategyFactory phase leaves `TierRegistry.strategyFactory()` pointing at the
 ///         factory it minted, and a proposal flows afterwards. Without the wiring every
 ///         `propose` reverts `StrategyNotRegistered`, so the ceremony refuses to skip it.
 contract DeployStrategyFactoryWiringTest is Test {
-    DeployStrategyFactory script;
+    SfHarness script;
     TierRegistry tierRegistry;
     SyndicateGovernor governor;
     SyndicateVault vault;
@@ -51,10 +40,11 @@ contract DeployStrategyFactoryWiringTest is Test {
     address lp = makeAddr("lp");
 
     function setUp() public {
-        vm.etch(DEFAULT_SENDER, address(new SfScriptCaller()).code);
-        script = new DeployStrategyFactory();
+        script = new SfHarness();
         template = new MockStrategy();
-        tierRegistry = new TierRegistry(DEFAULT_SENDER);
+        // `deploy()` bootstraps the Create3Factory at `msg.sender` and then calls `c3.deploy`
+        // as the SCRIPT, so the script address is the broadcaster stand-in throughout.
+        tierRegistry = new TierRegistry(address(script));
 
         usdc = new ERC20Mock("USDC", "USDC", 6);
         MockAgentRegistry agentRegistry = new MockAgentRegistry();
@@ -113,19 +103,11 @@ contract DeployStrategyFactoryWiringTest is Test {
         vm.warp(vm.getBlockTimestamp() + 1);
     }
 
-    /// @dev The raw forwarded call, so a refusal test can arm `expectRevert` on it directly.
-    function _deployRaw(address registry) internal returns (bytes memory) {
+    function _deploy(address registry) internal returns (StrategyFactory) {
         address[] memory templates = new address[](1);
         templates[0] = address(template);
-        return SfScriptCaller(DEFAULT_SENDER)
-            .fwd(
-                address(script),
-                abi.encodeCall(DeployStrategyFactory.deploy, (address(this), registry, templates, address(0)))
-            );
-    }
-
-    function _deploy(address registry) internal returns (StrategyFactory) {
-        return StrategyFactory(abi.decode(_deployRaw(registry), (address)));
+        vm.prank(address(script));
+        return script.deploy(address(this), registry, templates);
     }
 
     function test_ceremonyWiresTheFactoryAndAProposalFlows() public {
@@ -133,7 +115,7 @@ contract DeployStrategyFactoryWiringTest is Test {
 
         assertEq(tierRegistry.strategyFactory(), address(sf), "registry points at the minted factory");
         assertTrue(sf.approvedTemplate(address(template)), "template allowlisted");
-        assertEq(sf.owner(), DEFAULT_SENDER, "handoff skipped: deployer keeps the factory");
+        assertEq(sf.owner(), address(script), "the deployer keeps the factory; DeployAll._handoffAll moves it");
 
         MockStrategyAdapter s = new MockStrategyAdapter();
         sf.registerStrategy(address(s));
@@ -164,12 +146,32 @@ contract DeployStrategyFactoryWiringTest is Test {
                 "TIER_REGISTRY owner is not the deployer: run this phase BEFORE the multisig accepts TierRegistry ownership (unwired, every propose reverts StrategyNotRegistered)"
             )
         );
-        _deployRaw(address(handedOff));
+        _deploy(address(handedOff));
         assertEq(tierRegistry.strategyFactory(), address(0), "nothing wired anywhere");
     }
 
     function test_ceremonyRefusesAMissingRegistry() public {
         vm.expectRevert(bytes("TIER_REGISTRY missing from the address book: run Deploy first"));
-        _deployRaw(address(0));
+        _deploy(address(0));
+    }
+
+    /// @notice A registry already pointing at some other factory is refused, not overwritten:
+    ///         re-pointing a live registry strands every strategy registered on the old one.
+    function test_ceremonyRefusesAForeignStrategyFactoryPointer() public {
+        StrategyFactory foreign = new StrategyFactory(address(this), address(this));
+        vm.prank(address(script));
+        tierRegistry.setStrategyFactory(address(foreign));
+
+        vm.expectRevert(bytes("TIER_REGISTRY already points at a foreign StrategyFactory"));
+        _deploy(address(tierRegistry));
+    }
+
+    /// @notice Re-running the phase adopts the same factory and sends no second wiring write.
+    function test_secondRunAdoptsTheSameFactory() public {
+        StrategyFactory first = _deploy(address(tierRegistry));
+        StrategyFactory second = _deploy(address(tierRegistry));
+
+        assertEq(address(second), address(first), "CREATE3 address is stable across runs");
+        assertEq(tierRegistry.strategyFactory(), address(first), "registry still points at it");
     }
 }
