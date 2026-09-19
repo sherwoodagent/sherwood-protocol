@@ -1,4 +1,19 @@
-# Pre-deployment parameter review — the three inert defaults
+# Pre-deployment parameter review
+
+Two families of number have to be settled before launch, and they are settled in
+different places.
+
+**§1–§5 — the three inert per-syndicate defaults.** They live on the governor and
+vault that `createSyndicate` mints, after every script has finished, so no deploy
+script can seed them and an operator has to.
+
+**§6 — the ceremony constants.** They live in
+`script/robinhood-mainnet/RobinhoodParams.sol`, are committed, and are reviewed
+in the PR that changes them. There is no runtime override: the ceremony reads no
+environment variable at all, so a wrong number is a code review failure rather
+than an operator error.
+
+---
 
 Three risk parameters ship with a default that **does not bind**. None of them
 is seeded by any deploy script, because all three live on contracts the core
@@ -261,3 +276,83 @@ quorum.
 
 What is *missing* is a hard, guardian-independent ceiling on how much of one
 vault a single approved proposal can put at risk. That is what §1 and §2 are.
+
+---
+
+## 6. Ceremony constants (`script/robinhood-mainnet/RobinhoodParams.sol`)
+
+Every numeric input of `DeployAll`. Line numbers are against that file at this
+commit; re-derive them if it moves. Values not listed here are read from
+`chains/{chainId}.json`, never from the environment.
+
+| Constant | Line | Value | Where it lands |
+|---|---|---|---|
+| `ROBINHOOD_MAX_CODE_SIZE` | `:9` | 98,304 | CL template size gate |
+| `MANAGEMENT_FEE_BPS` | `:18` | 200 | `deployCore` → factory, stamped per vault |
+| `MIN_VOTING_PERIOD` | `:22` | 1h | governor impl immutable; the per-vault floor (SHE-234), not the operating value |
+| `MIN_COOLDOWN_PERIOD` | `:20` | 1h | governor impl immutable |
+| `MIN_REVIEW_PERIOD` | `:21` | 6h | governor impl immutable |
+| `MAX_STRATEGY_DURATION` | `:22` | 30d | `ProtocolConfig.setMaxStrategyDuration`, seated only when zero |
+| `REVIEW_PERIOD` | `:25` | 24h | `GuardianRegistry.initialize` |
+| `BLOCK_QUORUM_BPS` | `:26` | 3000 | `GuardianRegistry.initialize` |
+| `MIN_GUARDIAN_STAKE` / `MIN_OWNER_STAKE` | `:29`, `:30` | 10,000 WOOD | `StakedWood.initialize` |
+| `COOLDOWN` | `:31` | 7d | `StakedWood.initialize` |
+| `MIN_SLASH_BPS` / `MAX_SLASH_BPS` | `:32`, `:33` | 1000 / 10,000 | `StakedWood.initialize`; Plan B pre-flight requires the 10,000 ceiling |
+| `AGE_FLOOR_BPS` | `:34` | 2500 | `StakedWood.initialize`; court pre-flight 4 compares against it |
+| `MATURATION` | `:35` | 30d | `StakedWood.initialize` |
+| `EPOCH_LENGTH` | `:38` | 28d | `ExposureLedger` constructor, immutable |
+| `EXPECTED_CHALLENGE_WINDOW` | `:39` | 14d | Plan B / Plan D drift guard |
+| `WOOD_HAIRCUT_BPS` | `:41` | 5000 | `setWoodHaircutBps`; sits ON the ledger's `MIN_WOOD_HAIRCUT_BPS` floor |
+| `TWAP_WINDOW` | `:44` | 24h | `WoodPoolFeed` constructor |
+| `ETH_USD_MAX_AGE` | `:45` | 1d | `WoodPoolFeed` constructor |
+| `MIN_WETH_RESERVE` | `:46` | 10 WETH | `WoodPoolFeed` depth floor |
+| `MAX_PAIR_IDLE` | `:47` | 5 min | feed pre-flight: a pair idle past this never snapshots |
+| `KEEPER_CADENCE_SLACK` | `:48` | 2h | feeds `WOOD_FEED_MAX_DELAY` |
+| `WOOD_FEED_MAX_DELAY` | `:50` | window + 2h + 1 | `ledger.setWoodFeed` |
+
+### The three still marked `PLACEHOLDER — Ana to confirm`
+
+These carry test-fixture values and are the open items of this review. None may
+be zero, and none has a runtime override, so shipping them unreviewed means
+shipping the fixture.
+
+**`ASSET_FEED_MAX_DELAY` (now `1 days + 2 hours`).** It bounds the AGGREGATOR's own
+`updatedAt` age inside `ExposureLedger.coverageUsd` (`src/ExposureLedger.sol:651-660`),
+which recomputes the age on every read; nothing captures a price at propose and re-checks
+it at execute, so the proposal lifecycle does NOT bound it from below. The heartbeat does:
+4663's Chainlink push feeds publish every 24h, so the previous `1 days` left zero slack and
+a feed publishing a second late made every covered proposal unexecutable. It is also the
+only control standing in for the sequencer-uptime feed 4663 does not publish (§5 of the
+runbook), so it is bounded from above by "a plausible outage must push reads past
+staleness". `24h + 2h` is the smallest value that clears the heartbeat with margin, and is the
+same allowance `PortfolioStrategy.MAX_PUSH_PRICE_AGE` already uses against the same
+24h heartbeat. Confirmed 2026-09-17.
+
+**`COVERED_TVL_CAP_USD18` (`1_000_000e18`, confirmed 2026-09-17).** Ceiling on ONE
+proposal's coverage, USD-18, checked at `propose` — not a running total across open
+proposals. Zero is fail-closed and bricks all proposing, which a Plan B pre-flight
+refuses. The number is a risk-appetite call — how much of one vault the guardian
+cohort is willing to underwrite in a single approval — not a derivation. Owner-settable
+with no bounds and read live on every propose, so it is a starting point: lowering it
+after launch is one Safe transaction and takes effect on the next proposal.
+
+**`CAP_OVER_SPOT_BPS` (`15_000` = 1.5x).** No WOOD price is committed. BOTH postures
+DERIVE the cap at deploy time as `spot * CAP_OVER_SPOT_BPS / 10_000` from the live
+WOOD/WETH pair and the ETH/USD feed, and the ceremony still refuses anything outside
+`[1.25x, 2x]` of that same spot. The cap is the manipulation ceiling: `min(market,
+cap)`, never served as a price, and it SHALL sit ABOVE market.
+
+- Committing a measured price is the shape this replaces, and it does not survive
+  contact with time. `5e7` was ~154x spot and the Mainnet run refused it; the `5e5`
+  that replaced it was ~1.54x of the `325057` x8 spot measured 2026-09-16 and would
+  have drifted out of its own band as WOOD moved, turning a stale constant into a
+  refused ceremony on the day.
+- What deriving costs: the SEEDED VALUE now depends on the block the ceremony runs
+  in. Addresses stay a function of `(DEPLOYER, salt)`. It is the same live-market
+  dependency the feed's own pre-flights and the `AwaitingWoodFeed` gate already
+  carry, and the Safe can reset the cap at any time.
+- Re-measure before the run: the band moves with spot, and a cap set from a
+  month-old measurement can be outside it by the time the ceremony happens.
+- Review monthly thereafter. A drifted-high cap simply stops binding; a cap that
+  drifts BELOW market binds permanently and pins every bond, which
+  `woodPriceDetail().capBinding` is the way to notice.

@@ -21,47 +21,78 @@ takes `address(0)` for `ensRegistrar` and `agentRegistry` — a deploy decision
 
 ## 1. Ceremony order
 
-Each step is a separate broadcast. CREATE3 makes the core addresses
-order-independent, but the phases below hand each other addresses through
-`chains/{chainId}.json`, so the order is real.
+One script, one broadcast: `script/robinhood-mainnet/DeployAll.s.sol:DeployAll`.
+Its phases run in a fixed order inside that broadcast — Create3Factory bootstrap,
+core (executor lib, vault impl, ProtocolConfig, governor beacon, sWOOD,
+GuardianRegistry, factory, TierRegistry + the launch set), UniswapSwapAdapter and
+the three strategy templates, StrategyFactory, the WOOD price source, Plan B,
+Plan D, TokenCourt, handoff. Every address is `f(DEPLOYER, salt)` under CREATE3,
+so a re-run adopts what is already there instead of minting a second copy.
 
-| # | Script | Produces |
-|---|--------|----------|
-| 1 | `script/robinhood-mainnet/Deploy.s.sol:DeployRobinhoodMainnet` | core: executor lib, vault impl, ProtocolConfig, governor beacon, sWOOD, GuardianRegistry, factory, TierRegistry |
-| 2 | `script/robinhood-mainnet/DeployPortfolioStrategy.s.sol` | UniswapSwapAdapter (v3+v4) + Portfolio template |
-| 3 | `script/robinhood-mainnet/DeployMorphoStrategy.s.sol` | MorphoSupplyStrategy template |
-| 4 | `script/robinhood-mainnet/DeployConcentratedLiquidityStrategy.s.sol` | ConcentratedLiquidity template |
-| 5 | `script/DeployStrategyFactory.s.sol` | keyless-clone StrategyFactory + template approvals |
-| 6 | `script/DeployWoodPoolFeed.s.sol` | `WOOD_USD_FEED` — Plan B pre-flight 8 refuses a ledger with no live WOOD price source |
-| 7 | `script/DeployPlanB.s.sol` | ExposureLedger + ProposerBondEscrow, seeded and wired |
-| 8 | `script/DeployPlanD.s.sol` | ChallengeGame + its four role wirings |
-| 9 | `script/DeployTokenCourt.s.sol`, then `WireTokenCourt` | TokenCourt, then its authority over the game |
+Nothing is read from the environment. Every number comes from
+`script/robinhood-mainnet/RobinhoodParams.sol`; every address comes from
+`chains/{chainId}.json`.
 
-Step 9 is specific to this branch. `post-audit-v2` deletes `TokenCourt` in
-favour of resolving challenges by guardian vote (SHE-269), and the phase goes
-with it — drop the row when that line becomes the deploy base.
+**Mainnet (4663) — two runs.**
 
-Between 6 and 7, run `WoodPoolFeed.update()` until `latestRoundData()` answers:
-each pool only snapshots once `window` (24h minimum) has elapsed, and Plan B's
-pre-flight reads a price, not a deployment.
+1. **Fill the inputs.** Every econ constant in `RobinhoodParams.sol` is now confirmed
+   and no `PLACEHOLDER` remains: the WOOD price cap is derived from live spot at run
+   time, so there is nothing to re-measure on the day. What is still outstanding is
+   `WOOD_WETH_SUSHI_V2_PAIR` in `chains/4663.json`. `DEPLOYER` and
+   `OWNER_MULTISIG` are already recorded there. No second WOOD/WETH pair exists on
+   4663 yet (SHE-291), and the run refuses by name without it.
+2. **First run.**
+   ```bash
+   forge script script/robinhood-mainnet/DeployAll.s.sol:DeployAll \
+     --rpc-url robinhood --account <key> --broadcast --slow \
+     --gas-estimate-multiplier 200
+   ```
+   It stops at `Checkpoint.AwaitingWoodFeed`: `WoodPoolFeed` is minted, nothing
+   of Plan B is, and **no ownership has moved**.
+3. **Prime the feed.** Call `WoodPoolFeed.update()` on a keeper until
+   `latestRoundData()` answers — at least one `window`, 24h minimum. The deployer
+   key owns every contract for this whole interval; that is the cost of the
+   warm-up, and it is why step 2 hands nothing off.
+4. **Second run.** The same command. The stage gate passes, Plan B / Plan D /
+   TokenCourt deploy, the handoff runs, and `deployAll` returns
+   `Checkpoint.Complete`. Addresses are written to `chains/4663.json` last.
+5. **The Safe's turn.** `acceptOwnership()` on `ProtocolConfig`, `TierRegistry`,
+   `ExposureLedger`, `ChallengeGame` and `TokenCourt` (the one-step contracts —
+   beacon, factory, GuardianRegistry, sWOOD, StrategyFactory — are already
+   transferred). Then re-point `setProtocolFeeRecipient` and
+   `setGuardiansFeeRecipient` off the deployer placeholder, seed the slash-appeal
+   reserve (`approve` + `registry.fundSlashAppealReserve`), and configure the
+   Zodiac Delay module with the asymmetry the spec requires: raises delayed,
+   drops immediate.
+6. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` — it re-derives every
+   address from the book's `CREATE3_FACTORY` and fails on any disagreement.
 
-`DeployWood` is skipped on 4663 and on the fork: WOOD is already live at
-`0xf8bc08092c06db6148114dcf82af881f1085f92b`.
+**Fork — one run.** Chain 9994663, `chains/9994663.json` committed. Same command
+with `--unlocked --sender 0x5A00afAecE9CF61A768E2AE2713084C8d354DF94` instead of
+`--account`. Posture is derived from the chain id, so there is no flag: the fork
+mints `ForkWoodFeedFixture` (priced off the fork's own pair reserves x the live
+ETH/USD answer) instead of `WoodPoolFeed`, and completes in one run. A fork owns
+itself: the handoff still runs, with the deployer as its own target, so it changes
+nothing. A fork book may name `OWNER_MULTISIG` only when it equals `DEPLOYER`,
+which keeps a mainnet Safe from being handed a fork by a copied book.
+Verify with `./script/verify-robinhood.sh 9994663`.
 
-**Fork differences.** `ROBINHOOD_FORK_CHAIN_ID=9994663` and
-`SKIP_MULTISIG_HANDOFF=true`; the deployer is impersonated (`--unlocked
---sender`), and step 6 needs a fixture feed instead, because a vnet cannot
-accumulate a 24h TWAP. `SKIP_MULTISIG_HANDOFF` is never used on 4663, and
-`OWNER_MULTISIG` must be a Safe, not an EOA.
+`DeployWood` is skipped on both: WOOD is already live at
+`0xf8bc08092c06db6148114dcf82af881f1085f92b`, and `DeployWood` now refuses chain
+4663 outright.
 
-The spec's fork section still names `script/fork/DeployForkWoodUsdFeed.s.sol` and
-a `DeployWoodTwapOracle` phase; neither is in tree on `v1-deploy` — the WOOD
-price source is `src/pricing/WoodPoolFeed.sol`, wired with `setWoodFeed`. Re-read
-the spec against the scripts before a fork run.
+**TokenCourt is branch-specific.** The `_deployCourt` / `_wireCourt` phases exist
+on the branch that ships `src/TokenCourt.sol`. `post-audit-v2` resolves disputed
+challenges by guardian vote (SHE-269) and drops both together — but as of
+2026-09-16 `origin/post-audit-v2` (188941b6) has `TokenCourt` RESTORED by
+721d8775, so re-fetch and read the branch before assuming either shape.
 
-**Ownership.** ProtocolConfig and TierRegistry are `Ownable2Step`: the ceremony
-asserts `pendingOwner == multisig`, and the multisig still has to call
-`acceptOwnership()`. Until it does, those two contracts have no live owner.
+**A comment moves every address.** The Create3Factory initcode hash is pinned in
+`script/DeploySalts.sol`. solc's CBOR metadata hashes the source and
+`foundry.toml` pins no `bytecode_hash`, so editing `script/utils/Create3.sol` or
+`Create3Factory.sol` — comments included — changes the hash, moves the whole
+address table, and trips the `Create3Factory initcode hash drift` pre-flight.
+Re-record the constant deliberately; never to get a build green.
 
 ---
 
@@ -145,5 +176,7 @@ Stated here because an operator has to see them, not only the source natspec.
   no such ceiling.
 - **Chain 4663 publishes no sequencer-uptime feed**, so the usual
   staleness-plus-grace-period gate cannot be built. `ASSET_FEED_MAX_DELAY` is the
-  only control: size it tightly enough that a plausible outage pushes reads past
-  staleness, while still covering a full vote + review + execute lifecycle.
+  only control, and it bounds the AGGREGATOR's own `updatedAt` age on every
+  `ExposureLedger.coverageUsd` read — not the proposal lifecycle. Size it above the
+  feed's 24h heartbeat (else every covered read reverts `StalePrice`) and tightly
+  enough that a plausible outage still pushes reads past staleness.

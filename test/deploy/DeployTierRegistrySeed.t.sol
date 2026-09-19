@@ -26,7 +26,7 @@ contract SeedHarness is DeploySherwood {
 ///
 /// @dev    These attestations are `onlyOwner`, so they are only writable in the
 ///         window before the multisig handoff. That ordering is the thing most
-///         at risk from a later refactor — `test_seed_isSkippedOnceOwnershipHasMoved`
+///         at risk from a later refactor — `test_seed_revertsOnceOwnershipHasMoved`
 ///         is what fails if the seed call migrates below the handoff.
 ///
 ///         Fixed to chain 4663 on purpose: the seeding walks `chains/4663.json`,
@@ -124,22 +124,21 @@ contract DeployTierRegistrySeedTest is Test {
 
     // ── The ordering constraint ──
 
-    /// @dev The seed writes are `onlyOwner`. If a refactor moves the call below
-    ///      `_handoffOwnership`, every write reverts — so the script checks
-    ///      ownership first and degrades to a runbook line instead of aborting
-    ///      a deploy that has already broadcast. This pins that it NOTICES,
-    ///      rather than seeding into a registry it no longer controls.
-    function test_seed_isSkippedOnceOwnershipHasMoved() public {
+    /// @notice Seeding a registry the deployer no longer owns is refused, not skipped.
+    /// @dev A skip made a ceremony that ships an empty registry look clean; every write here is
+    ///      `onlyOwner`, so the refusal is what a refactor moving this below the handoff hits.
+    function test_seed_revertsOnceOwnershipHasMoved() public {
         vm.prank(deployer);
         registry.transferOwnership(multisig);
         vm.prank(multisig);
         registry.acceptOwnership();
 
-        // Must not revert — a post-handoff deploy still completes.
+        vm.expectRevert(
+            bytes("PRE-FLIGHT: TIER_REGISTRY owner is not the deployer - seed the launch set before the Safe accepts")
+        );
         _seed();
 
         assertFalse(registry.isCounterpartyAllowed(UNISWAP_V3_FACTORY), "seeded a registry it no longer owns");
-        assertFalse(registry.isCounterpartyAllowed(MORPHO_BLUE), "seeded a registry it no longer owns");
     }
 
     /// @dev Ownable2Step: `transferOwnership` alone only sets `pendingOwner`,
@@ -160,13 +159,13 @@ contract DeployTierRegistrySeedTest is Test {
 
     // ── Chains without the entries ──
 
-    /// @dev The address book is a different shape on every chain. A chain with
-    ///      no book at all must not abort the deploy — it gets no attestations
-    ///      and says so.
-    function test_seed_isInertOnAChainWithNoAddressBook() public {
+    /// @notice A chain with no address book is refused, not silently left unattested.
+    /// @dev The launch set is strict: a missing key used to narrow the attestation set in silence,
+    ///      which is indistinguishable on chain from a chain that has nothing to attest.
+    function test_seed_revertsOnAChainWithNoAddressBook() public {
         vm.chainId(31337);
+        vm.expectRevert();
         _seed();
         assertFalse(registry.isCounterpartyAllowed(UNISWAP_V3_FACTORY), "attested from a nonexistent book");
-        assertFalse(registry.isCounterpartyAllowed(MORPHO_BLUE), "attested from a nonexistent book");
     }
 }

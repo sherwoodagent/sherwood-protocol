@@ -1,286 +1,171 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+
 import {DeploySherwood} from "../../script/Deploy.s.sol";
-import {Create3Factory} from "../../script/utils/Create3Factory.sol";
-import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
-import {StakedWood} from "../../src/StakedWood.sol";
-import {SyndicateGovernor} from "../../src/SyndicateGovernor.sol";
-import {GovernorBeacon} from "../../src/GovernorBeacon.sol";
-import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
-import {TierRegistry} from "../../src/TierRegistry.sol";
-import {ISyndicateGovernor} from "../../src/interfaces/ISyndicateGovernor.sol";
-import {ERC20Mock} from "../mocks/ERC20Mock.sol";
-import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
+import {Posture, Inputs, Stack} from "../../script/robinhood-mainnet/DeployTypes.sol";
+import {DeployAllFixture} from "../deploy/DeployAll.t.sol";
 
-/// @notice Trivial contract used as a stand-in for a Gnosis Safe in tests.
-///         The deploy script's only check is `code.length > 0` — anything with
-///         deployed bytecode satisfies it.
-contract MockMultisig {
-    receive() external payable {}
-}
-
-/// @notice Test-only subclass that exposes `_handoffOwnership` so we can
-///         exercise the post-deploy ceremony in isolation without re-running
-///         the full broadcast flow.
-contract DeploySherwoodHarness is DeploySherwood {
-    function exposed_handoffOwnership(
-        address governorAddr,
-        address factoryAddr,
-        address registryAddr,
-        address swoodProxy,
-        address protocolConfig,
-        address ownerMultisig
-    ) external {
-        _handoffOwnership(governorAddr, factoryAddr, registryAddr, swoodProxy, protocolConfig, ownerMultisig);
-    }
-}
+/// @notice `DeploySherwood` is an abstract mixin; this makes it concrete.
+contract DeploySherwoodHarness is DeploySherwood {}
 
 /// @title Deploy_multisigHandoff — MS-H5 regression
-/// @notice Confirms that:
-///         1. The deploy script transfers ownership of Governor + Factory +
-///            GuardianRegistry to the configured `OWNER_MULTISIG` after init,
-///            so a deployer-key compromise post-deploy cannot take over the
-///            protocol.
-///         2. The script's env-var preconditions reject `address(0)` and
-///            EOA owners (a trivial test would forget the `code.length > 0`
-///            guard and ship a single-EOA-owner deployment).
 ///
-/// @dev    Driving the full `forge script` from a unit test is brittle (chain
-///         id / chains.json IO / broadcast plumbing). Instead we:
-///           - Replicate the same deploy sequence the script uses, then
-///           - Call the harness-exposed `_handoffOwnership` and
-///           - Assert all three proxies report `owner() == multisig`.
-///
-///         The `OWNER_MULTISIG` validation is exercised by spawning a fresh
-///         `DeploySherwood` and calling `run()` with `vm.setEnv`/`vm.expectRevert`.
-///         For the address(0) and EOA paths, `run()` reverts before any deploy
-///         happens, so we don't need WOOD_TOKEN / chains.json plumbing. The
-///         management-fee pre-flight is reached through its pure helper instead,
-///         since `vm.setEnv` writes OS state the parallel sibling tests share.
-contract DeployMultisigHandoffTest is Test {
-    bytes32 constant SALT_GOVERNOR_IMPL = keccak256("sherwood.deploy.governor-impl.2");
-    bytes32 constant SALT_GOVERNOR_PROXY = keccak256("sherwood.deploy.governor-proxy.2");
-    bytes32 constant SALT_FACTORY_IMPL = keccak256("sherwood.deploy.factory-impl.2");
-    bytes32 constant SALT_FACTORY_PROXY = keccak256("sherwood.deploy.factory-proxy.2");
-    bytes32 constant SALT_REGISTRY_IMPL = keccak256("sherwood.deploy.guardian-registry-impl.1");
-    bytes32 constant SALT_REGISTRY_PROXY = keccak256("sherwood.deploy.guardian-registry-proxy.1");
-
-    DeploySherwoodHarness internal harness;
-    MockMultisig internal multisig;
-    address internal deployer;
+/// @notice The handoff moved out of `Deploy.s.sol` into `DeployAll._handoffAll`, and the
+///         `OWNER_MULTISIG` preconditions moved out of env into the committed address book.
+///         The MS-H5 scenarios are restated against those entry points here.
+contract DeployMultisigHandoffTest is DeployAllFixture {
+    /// @dev Staged Fork books, both gitignored. Distinct chain ids because the tests in one
+    ///      suite share the filesystem and run concurrently; one path would race.
+    uint256 internal constant STAGED_FORK_CHAIN_ID = 424_242;
+    uint256 internal constant STAGED_SELF_OWNED_CHAIN_ID = 424_243;
 
     function setUp() public {
-        harness = new DeploySherwoodHarness();
-        multisig = new MockMultisig();
-        deployer = address(this);
-        // `vm.setEnv` writes to the real OS environment and is NOT reverted
-        // between tests. Reset every env var the deploy script reads so each
-        // test starts from a known baseline regardless of run order.
-        _clearDeployEnv();
+        _stageCeremony();
     }
 
-    function _clearDeployEnv() internal {
-        vm.setEnv("OWNER_MULTISIG", "0x0000000000000000000000000000000000000000");
-        vm.setEnv("SKIP_MULTISIG_HANDOFF", "false");
-        vm.setEnv("WOOD_TOKEN", "0x0000000000000000000000000000000000000000");
-    }
-
-    /// @notice The management-fee pre-flight refuses a value the factory would
-    ///         reject anyway, before anything is broadcast. Driven through the
-    ///         pure helper `run()` calls, so this test mutates no process-global
-    ///         env that a sibling test running alongside it would read. That
-    ///         `run()` calls the helper is not asserted here.
+    /// @notice The management-fee pre-flight refuses a value the factory would reject anyway,
+    ///         before anything is broadcast.
     function test_run_rejectsManagementFeeAboveTheFactoryCap() public {
-        DeploySherwood s = new DeploySherwood();
+        DeploySherwoodHarness s = new DeploySherwoodHarness();
         vm.expectRevert(bytes("PRE-FLIGHT: MANAGEMENT_FEE above MAX_MANAGEMENT_FEE_BPS (300)"));
         s.requireManagementFeeUnderCap(301);
         // Exactly at the cap is not over it.
         s.requireManagementFeeUnderCap(300);
     }
 
-    /// @notice MS-H5 (C-1): after `_handoffOwnership`, all four proxies
-    ///         (Governor, Factory, GuardianRegistry, sWOOD) must report
-    ///         `owner() == multisig`. The deployer EOA must be unable to call
-    ///         any `onlyOwner` function.
+    /// @notice A fork owns itself, so a Fork book whose `OWNER_MULTISIG` IS its `DEPLOYER` is
+    ///         accepted and the handoff it runs changes nothing.
+    function test_run_acceptsAForkBookWhoseOwnerMultisigIsTheDeployer() public {
+        string memory path =
+            string.concat(vm.projectRoot(), "/chains/", vm.toString(STAGED_SELF_OWNED_CHAIN_ID), ".json");
+        vm.writeFile(
+            path,
+            string.concat(
+                '{"DEPLOYER":"',
+                vm.toString(deployer),
+                '","OWNER_MULTISIG":"',
+                vm.toString(deployer),
+                '","chainId":',
+                vm.toString(STAGED_SELF_OWNED_CHAIN_ID),
+                "}"
+            )
+        );
+
+        vm.chainId(STAGED_SELF_OWNED_CHAIN_ID);
+        vm.prank(deployer);
+        try script.run() {
+            vm.removeFile(path);
+            revert("the staged book is missing every external, so run() cannot have succeeded");
+        } catch Error(string memory reason) {
+            vm.removeFile(path);
+            // Past the posture gate: it now fails on the first missing external, not on the owner.
+            assertEq(reason, "WOOD_TOKEN missing from the address book", reason);
+        } catch (bytes memory) {
+            vm.removeFile(path);
+            revert("expected a named pre-flight string");
+        }
+    }
+
+    /// @notice Handing the protocol to address(0) is unrecoverable, so the handoff refuses it.
+    function test_handoffAll_refusesAnUnsetTarget() public {
+        vm.chainId(FORK_CHAIN_ID);
+        (Stack memory s,) = _runCeremony(Posture.Fork);
+
+        vm.expectRevert(bytes("handoff target unset"));
+        script.exposed_handoffAll(s, address(0));
+    }
+
+    /// @notice MS-H5 (C-1): the handoff moves all five one-step owners, arms the five two-step
+    ///         ones and locks the deployer out.
     function test_handoffTransfersAllProxies() public {
-        (address governor, address factory, address registry, address swood) = _deployTriangle();
+        vm.chainId(FORK_CHAIN_ID);
+        (Stack memory s,) = _runCeremony(Posture.Fork);
+        _assertOneStepOwners(s, deployer);
 
-        // Sanity: pre-handoff, all four are owned by the deployer (the test
-        // contract itself, since it deployed via this contract's `address(this)`).
-        assertEq(Ownable(governor).owner(), deployer, "pre: governor owned by deployer");
-        assertEq(Ownable(factory).owner(), deployer, "pre: factory owned by deployer");
-        assertEq(Ownable(registry).owner(), deployer, "pre: registry owned by deployer");
-        assertEq(Ownable(swood).owner(), deployer, "pre: swood owned by deployer");
+        script.exposed_handoffAll(s, address(safe));
 
-        // Stage the harness as the temporary owner so it can exercise the
-        // real `_handoffOwnership` implementation (which calls
-        // `transferOwnership` from its own `msg.sender`). This is exactly what
-        // the deploy script does: the deployer EOA owns the proxies post-init,
-        // then the same EOA calls `_handoffOwnership` inside `vm.broadcast`.
-        Ownable(governor).transferOwnership(address(harness));
-        Ownable(factory).transferOwnership(address(harness));
-        Ownable(registry).transferOwnership(address(harness));
-        Ownable(swood).transferOwnership(address(harness));
+        _assertOneStepOwners(s, address(safe));
+        // A two-step transfer never moves `owner()`; the Safe must accept.
+        assertEq(Ownable(s.core.protocolConfig).owner(), deployer, "protocolConfig.owner unmoved");
+        assertEq(Ownable(s.core.tierRegistry).owner(), deployer, "tierRegistry.owner unmoved");
+        assertEq(Ownable(s.exposureLedger).owner(), deployer, "ledger.owner unmoved");
+        _assertTwoStepPending(s, address(safe));
 
-        // C1: ProtocolConfig (Ownable2Step) is part of the handoff — stage the
-        // harness as its owner too so the two-step transfer starts from it.
-        ProtocolConfig protocolConfig = new ProtocolConfig(address(this));
-        protocolConfig.transferOwnership(address(harness));
-        vm.prank(address(harness));
-        protocolConfig.acceptOwnership();
+        // The deployer key is out of the one-step half immediately.
+        vm.prank(deployer);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, deployer));
+        Ownable(s.core.factoryProxy).transferOwnership(deployer);
 
-        // Hand off via the harness-exposed entrypoint — exercises the real
-        // `_handoffOwnership` body in `Deploy.s.sol`.
-        harness.exposed_handoffOwnership(governor, factory, registry, swood, address(protocolConfig), address(multisig));
-
-        // Post-handoff: all four single-step proxies owned by the multisig.
-        assertEq(Ownable(governor).owner(), address(multisig), "post: governor owned by multisig");
-        assertEq(Ownable(factory).owner(), address(multisig), "post: factory owned by multisig");
-        assertEq(Ownable(registry).owner(), address(multisig), "post: registry owned by multisig");
-        assertEq(Ownable(swood).owner(), address(multisig), "post: swood owned by multisig");
-
-        // C1: ProtocolConfig ownership is PENDING the multisig (Ownable2Step) —
-        // deployer/harness still owns it until the multisig accepts.
-        assertEq(protocolConfig.pendingOwner(), address(multisig), "protocolConfig pending -> multisig");
-        assertEq(protocolConfig.owner(), address(harness), "protocolConfig still harness-owned pre-accept");
-        // After the multisig accepts, control fully transfers.
-        vm.prank(address(multisig));
-        protocolConfig.acceptOwnership();
-        assertEq(protocolConfig.owner(), address(multisig), "protocolConfig owned by multisig post-accept");
-
-        // Deployer EOA must no longer be authorized for any onlyOwner call.
-        // (governor == the beacon here; its owner-gated surface is upgradeTo.)
-        vm.expectRevert();
-        GovernorBeacon(governor).upgradeTo(address(0xdead));
-
-        vm.expectRevert();
-        SyndicateFactory(factory).setManagementFeeBps(100);
-
-        vm.expectRevert();
-        GuardianRegistry(registry).setReviewPeriod(2 days);
-
-        vm.expectRevert();
-        StakedWood(swood).setCooldownPeriod(14 days);
+        safe.accept(s.core.tierRegistry);
+        assertEq(Ownable(s.core.tierRegistry).owner(), address(safe), "tierRegistry accepted");
     }
 
-    /// @notice MS-H5: `run()` must reject both `address(0)` and EOA values for
-    ///         `OWNER_MULTISIG`. Combined into a single test because Foundry's
-    ///         `vm.setEnv` writes to OS env (shared state) and the visibility
-    ///         of those writes across test boundaries is implementation-defined
-    ///         — keeping both assertions in one test ensures deterministic
-    ///         ordering of the env mutations relative to the `run()` calls.
+    /// @notice MS-H5: an `OWNER_MULTISIG` that is not a live contract is refused before any
+    ///         deploy — an EOA key, or a Safe that was never deployed on this chain.
     function test_run_rejectsBadOwnerMultisig() public {
-        DeploySherwood s = new DeploySherwood();
-        ERC20Mock wood = new ERC20Mock("WOOD", "WOOD", 18);
-        vm.setEnv("WOOD_TOKEN", vm.toString(address(wood)));
-        vm.setEnv("SKIP_MULTISIG_HANDOFF", "false");
+        vm.chainId(MAINNET_CHAIN_ID);
+        Inputs memory i = _inputs(Posture.Mainnet);
+        // The Safe the committed book names, on a chain where it was never deployed.
+        i.ownerMultisig = _bookAddr("OWNER_MULTISIG");
+        assertEq(i.ownerMultisig.code.length, 0, "no Safe at that address in this EVM");
 
-        // Case 1: OWNER_MULTISIG unset / address(0).
-        vm.setEnv("OWNER_MULTISIG", "0x0000000000000000000000000000000000000000");
-        vm.expectRevert(bytes("OWNER_MULTISIG required (or set SKIP_MULTISIG_HANDOFF=true)"));
-        s.run();
-
-        // Case 2: OWNER_MULTISIG is an EOA (no deployed bytecode).
-        // Hardcoded string (not `vm.toString(address(0xCAFE))`) so we don't
-        // depend on Foundry's address-checksum encoding for the env round-trip.
-        vm.setEnv("OWNER_MULTISIG", "0x000000000000000000000000000000000000cafe");
         vm.expectRevert(bytes("OWNER_MULTISIG must be a contract (Safe), not an EOA"));
-        s.run();
+        script.exposed_preflight(i);
+
+        // Non-vacuity: the SAME inputs clear the pre-flight once the Safe holds code.
+        vm.etch(i.ownerMultisig, address(safe).code);
+        script.exposed_preflight(i);
     }
 
-    /// @notice The `SKIP_MULTISIG_HANDOFF=true` escape hatch is intentionally
-    ///         supported for ephemeral testnet/fork deploys — without it the
-    ///         deploy can't proceed. Confirm that without invoking the handoff
-    ///         the deployer remains the owner (i.e. no implicit handoff).
+    /// @notice A fork owns itself, so a Fork book naming an `OWNER_MULTISIG` other than its
+    ///         own `DEPLOYER` is refused rather than handing the fork to a mainnet Safe.
+    function test_run_rejectsAForkBookNamingAForeignOwnerMultisig() public {
+        string memory path = string.concat(vm.projectRoot(), "/chains/", vm.toString(STAGED_FORK_CHAIN_ID), ".json");
+        vm.writeFile(
+            path,
+            string.concat(
+                '{"DEPLOYER":"',
+                vm.toString(deployer),
+                '","OWNER_MULTISIG":"',
+                vm.toString(address(safe)),
+                '","chainId":',
+                vm.toString(STAGED_FORK_CHAIN_ID),
+                "}"
+            )
+        );
+
+        vm.chainId(STAGED_FORK_CHAIN_ID);
+        vm.prank(deployer);
+        try script.run() {
+            vm.removeFile(path);
+            revert("a Fork book naming a foreign OWNER_MULTISIG was accepted");
+        } catch Error(string memory reason) {
+            vm.removeFile(path);
+            assertEq(
+                reason,
+                "Fork posture hands off to the deployer: OWNER_MULTISIG must be absent or equal DEPLOYER",
+                reason
+            );
+        } catch (bytes memory raw) {
+            // A panic or custom error would otherwise leave the staged book on disk.
+            vm.removeFile(path);
+            assertEq(raw.length, 0, "run() reverted without a reason string");
+        }
+    }
+
+    /// @notice Fork posture: with no Safe to hand off to, the deployer stays the owner.
     function test_handoff_skipped_leavesDeployerAsOwner() public {
-        (address governor, address factory, address registry, address swood) = _deployTriangle();
-        // Without calling `_handoffOwnership`, the proxies stay deployer-owned.
-        assertEq(Ownable(governor).owner(), deployer);
-        assertEq(Ownable(factory).owner(), deployer);
-        assertEq(Ownable(registry).owner(), deployer);
-        assertEq(Ownable(swood).owner(), deployer);
-    }
+        vm.chainId(FORK_CHAIN_ID);
+        (Stack memory s,) = _runCeremony(Posture.Fork);
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
-
-    /// @dev Replicates the (governor, registry, factory) CREATE3 triangle from
-    ///      `Deploy.s.sol::deployCore`. Skips executor / vault impl / seeding /
-    ///      `setFactory` — none of that is relevant to the handoff assertion.
-    ///      Mirrors `DeployScript.t.sol` so the two stay in sync.
-    function _deployTriangle() internal returns (address governor, address factory, address registry, address swood) {
-        ERC20Mock wood = new ERC20Mock("WOOD", "WOOD", 18);
-        Create3Factory c3 = new Create3Factory(deployer);
-
-        address predictedRegistryProxy = c3.addressOf(SALT_REGISTRY_PROXY);
-        address predictedFactoryProxy = c3.addressOf(SALT_FACTORY_PROXY);
-
-        // Per-vault design: the handoff unit is the GovernorBeacon (Ownable),
-        // not a governor proxy — governors are per-vault BeaconProxies with no
-        // Ownable surface (owner resolves live from the vault).
-        address govImpl = c3.deploy(
-            SALT_GOVERNOR_IMPL,
-            abi.encodePacked(type(SyndicateGovernor).creationCode, abi.encode(uint256(24 hours), uint256(1 hours)))
-        );
-        governor = address(new GovernorBeacon(govImpl, deployer));
-
-        // sWOOD — sole WOOD custodian post-split. Plain deploy (not part of the
-        // handoff assertion, so no Create3 needed); the registry's slimmed
-        // 6-arg `initialize` takes its address.
-        StakedWood swoodImpl = new StakedWood();
-        bytes memory swoodInit = abi.encodeCall(
-            StakedWood.initialize,
-            (StakedWood.InitParams({
-                    owner: deployer,
-                    wood: address(wood),
-                    factory: predictedFactoryProxy,
-                    minGuardianStake: 10_000e18,
-                    coolDownPeriod: 7 days,
-                    minOwnerStake: 10_000e18,
-                    minSlashBps: 1000,
-                    maxSlashBps: 9999,
-                    ageFloorBps: 2500,
-                    maturationPeriod: 30 days
-                }))
-        );
-        swood = address(new ERC1967Proxy(address(swoodImpl), swoodInit));
-
-        // Registry (predicted factory address) — slimmed 6-arg initialize.
-        address registryImpl = c3.deploy(
-            SALT_REGISTRY_IMPL, abi.encodePacked(type(GuardianRegistry).creationCode, abi.encode(uint256(6 hours)))
-        );
-        bytes memory regInit =
-            abi.encodeCall(GuardianRegistry.initialize, (deployer, predictedFactoryProxy, swood, 24 hours, 3000));
-        registry = c3.deploy(
-            SALT_REGISTRY_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(registryImpl, regInit))
-        );
-        require(registry == predictedRegistryProxy, "registry addr mismatch");
-
-        // Factory.
-        address factoryImpl = c3.deploy(SALT_FACTORY_IMPL, abi.encodePacked(type(SyndicateFactory).creationCode));
-        bytes memory facInit = abi.encodeCall(
-            SyndicateFactory.initialize,
-            (SyndicateFactory.InitParams({
-                    owner: deployer,
-                    executorImpl: address(0xE1), // unused by handoff test
-                    vaultImpl: address(0xE2),
-                    ensRegistrar: address(0),
-                    agentRegistry: address(0),
-                    beacon: governor, // the GovernorBeacon deployed above
-                    protocolConfig: address(new ProtocolConfig(deployer)),
-                    managementFeeBps: 50,
-                    guardianRegistry: registry,
-                    // Mandatory since pashov finding #1. Factory proxy is
-                    // CREATE3, so the extra nonce moves no prediction.
-                    tierRegistry: address(new TierRegistry(deployer))
-                }))
-        );
-        factory = c3.deploy(
-            SALT_FACTORY_PROXY, abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(factoryImpl, facInit))
-        );
-        require(factory == predictedFactoryProxy, "factory addr mismatch");
+        _assertOneStepOwners(s, deployer);
+        _assertTwoStepPending(s, address(0));
+        assertEq(Ownable(s.core.protocolConfig).owner(), deployer, "protocolConfig.owner");
+        assertEq(Ownable(s.core.tierRegistry).owner(), deployer, "tierRegistry.owner");
+        assertEq(Ownable(s.exposureLedger).owner(), deployer, "ledger.owner");
+        assertEq(Ownable(s.challengeGame).owner(), deployer, "game.owner");
+        assertEq(Ownable(s.tokenCourt).owner(), deployer, "court.owner");
     }
 }
