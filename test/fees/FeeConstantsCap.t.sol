@@ -25,8 +25,8 @@ contract FeeConstantsCapTest is Test {
 
     // ── The ceiling itself ──
 
-    function test_performanceFeeCeilingIsThirtyPercent() public pure {
-        assertEq(FeeConstants.MAX_PERFORMANCE_FEE_BPS, 3000, "protocol ceiling should be 30%");
+    function test_performanceFeeCeilingIsTwentyFivePercent() public pure {
+        assertEq(FeeConstants.MAX_PERFORMANCE_FEE_BPS, 2500, "protocol ceiling should be 25%");
     }
 
     function test_ceilingPropagatesToVaultAgentFeeCap() public view {
@@ -67,7 +67,7 @@ contract FeeConstantsCapTest is Test {
 
     /// @dev Fail-closed: the settle-time clamp resolves an over-ceiling rate
     ///      silently, so a new vault must start below the protocol ceiling.
-    ///      Equality here would let an owner charge 30% on day one unopposed.
+    ///      Equality here would let an owner charge 25% on day one unopposed.
     function test_defaultPerVaultCeilingSitsStrictlyBelowTheProtocolCeiling() public pure {
         assertLt(
             FeeConstants.DEFAULT_MAX_PERFORMANCE_FEE_BPS,

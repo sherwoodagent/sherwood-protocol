@@ -5,6 +5,8 @@ import {Test} from "forge-std/Test.sol";
 import {Vm} from "forge-std/Vm.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {DeployPlanD} from "../../script/DeployPlanD.s.sol";
+import {DeploySalts} from "../../script/DeploySalts.sol";
+import {Create3} from "../../script/utils/Create3.sol";
 import {ChallengeGame} from "../../src/ChallengeGame.sol";
 import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
@@ -13,66 +15,52 @@ import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
 import {MockCoverageFreezer} from "../mocks/MockCoverageFreezer.sol";
 
-/// @dev See `DeployTokenCourtPreflight.t.sol`'s copy of this contract for the
-///      full explanation: `vm.startBroadcast` runs the script's calls as
-///      `DEFAULT_SENDER` while `deployer = msg.sender` is whoever called
-///      `run()`, and `vm.prank` cannot bridge the gap (foundry refuses to
-///      broadcast under an active prank). Etching a forwarder at
-///      `DEFAULT_SENDER` and calling `run()` through it is the only way to
-///      make the two the same address, as they are on a real deployment.
-contract PlanDScriptCaller {
-    function fwd(address target, bytes calldata data) external {
-        (bool ok, bytes memory ret) = target.call(data);
-        if (!ok) {
-            assembly {
-                revert(add(ret, 0x20), mload(ret))
-            }
-        }
+/// @dev The mixin is abstract, and `Create3Factory.deploy` is `onlyOwner`, so the harness
+///      must be both the deployer the fixtures are owned by and the caller of `deploy` —
+///      hence `vm.prank(address(script))` everywhere instead of a forwarder.
+contract DeployPlanDHarness is DeployPlanD {
+    function c3Factory(address deployer) external returns (address) {
+        return address(_c3Factory(deployer));
     }
 }
 
-/// @notice Drives the REAL `DeployPlanD` script against a REAL `StakedWood`,
-///         `ExposureLedger` and `TierRegistry` (no
-///         stubs), from the state Plan B + Plan C actually leave behind, then
-///         breaks one piece of that state at a time and proves the pre-flight
-///         refuses. Simulation only — no `--broadcast`.
+/// @notice Drives the REAL Plan D phase against a REAL `StakedWood`, `ExposureLedger` and
+///         `TierRegistry` from the state Plan B leaves behind, then breaks one piece of
+///         that state at a time and proves the pre-flight refuses.
 ///
 ///         Two reviews are pinned here:
-///           B4 — the script never checked `swood.exposureLedger()` at all, so
-///                the game could freeze commitments on a ledger the exit gate
-///                does not read. An accused approver then unstakes inside
-///                `autoSlashDelay`, `_slashOne` recovers 0, and `_settle`
-///                still marks `_convicted` — no revert, no distinguishing
-///                event, nothing recovered, and the proposal can never be
-///                re-challenged.
-///           M3 — the freeze role was granted FIRST and the settle pointer
-///                LAST, across four separate multisig transactions. A
-///                permissionless `file()` in that window freezes a key, which
-///                makes `ExposureLedger.setCoverageFreezer` revert
-///                `CoverageFrozen` from then on — so pre-flight 1 becomes
-///                permanently unsatisfiable and the deploy cannot be re-run to
-///                repair itself.
+///           B4 — the phase never checked `swood.exposureLedger()`, so the game could
+///                freeze commitments on a ledger the exit gate does not read. An accused
+///                approver then unstakes inside `autoSlashDelay`, `_slashOne` recovers 0,
+///                and `_settle` still marks `_convicted`.
+///           M3 — the freeze role was granted FIRST and the settle pointer LAST. A
+///                permissionless `file()` in that window freezes a key, which makes
+///                `setCoverageFreezer` revert `CoverageFrozen` from then on.
 contract DeployPlanDPreflightTest is Test {
     ERC20Mock internal wood;
     StakedWood internal swood;
     ExposureLedger internal ledger;
     TierRegistry internal tiers;
 
-    DeployPlanD internal script;
+    DeployPlanDHarness internal script;
+    address internal deployer;
 
-    /// @dev The price CAP, $0.50 — never served as a price. The market sits
-    ///      below it, so the cap does not bind (the production shape).
+    /// @dev The price CAP, $0.50 — never served as a price. The market sits below it, so
+    ///      the cap does not bind (the production shape).
     uint256 internal constant WOOD_PRICE_CAP_X8 = 5e7;
     uint256 internal constant WOOD_MARKET_X8 = 2.5e7; // $0.25, 8-dec
 
     function setUp() public {
+        script = new DeployPlanDHarness();
+        deployer = address(script);
+
         wood = new ERC20Mock("WOOD", "WOOD", 18);
 
         StakedWood swoodImpl = new StakedWood();
         bytes memory swoodInit = abi.encodeCall(
             StakedWood.initialize,
             (StakedWood.InitParams({
-                    owner: DEFAULT_SENDER,
+                    owner: deployer,
                     wood: address(wood),
                     factory: address(this),
                     minGuardianStake: 10_000e18,
@@ -86,27 +74,20 @@ contract DeployPlanDPreflightTest is Test {
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
-        ledger = new ExposureLedger(DEFAULT_SENDER, address(swood), 28 days);
-        tiers = new TierRegistry(DEFAULT_SENDER);
+        ledger = new ExposureLedger(deployer, address(swood), 28 days);
+        tiers = new TierRegistry(deployer);
 
-        // The state Plan B and Plan C leave behind, and which this script
-        // presumes to find. Plan B's `swood.setExposureLedger` is part of it —
-        // `DeployPlanB` now makes that call inside its own broadcast.
-        // Design revision 2: the scalar is a CAP, never a price, so Plan B also
-        // leaves a live market source behind. Without one the ledger cannot
-        // price WOOD at all and pre-flight 3 refuses — which is the state
-        // `test_preflight_bites_whenTheLedgerIsUnpriced` provokes deliberately.
+        // The state Plan B leaves behind: the exit gate armed, the price CAP seeded and a
+        // live market source under it. Without the source the ledger cannot price WOOD at
+        // all and pre-flight 3 refuses.
         MockAggregatorV3 woodFeed = new MockAggregatorV3(8, int256(WOOD_MARKET_X8));
-        vm.startPrank(DEFAULT_SENDER);
+        vm.startPrank(deployer);
         ledger.setWoodUsdPrice(WOOD_PRICE_CAP_X8);
-        // The mock publishes one round at construction and these suites warp far
-        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        // The mock publishes one round at construction and these suites warp far past it;
+        // staleness is exercised in test/ExposureLedger.t.sol.
         ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         swood.setExposureLedger(address(ledger));
         vm.stopPrank();
-
-        script = new DeployPlanD();
-        vm.etch(DEFAULT_SENDER, address(new PlanDScriptCaller()).code);
     }
 
     // ─────────────────────────── the happy path ───────────────────────────
@@ -121,13 +102,20 @@ contract DeployPlanDPreflightTest is Test {
         assertEq(address(game.exposureLedger()), address(ledger), "game.exposureLedger");
     }
 
-    /// @dev M3: THE ORDER IS THE FIX, so assert the order and not merely the
-    ///      end state. `setCoverageFreezer` must be the LAST of the four, and
-    ///      in particular must come after `game.setStakedWood` — until that
-    ///      pointer exists `_settle` reverts `ZeroAddress`, and a challenge
-    ///      filed in between freezes a key that makes `setCoverageFreezer`
-    ///      itself permanently un-callable. Log ordering is the only way to
-    ///      see this: the end state is identical either way.
+    /// @notice The game lands at the address CREATE3 predicts from the salt alone — which
+    ///         is what lets pre-flight 1 run BEFORE anything is minted.
+    function test_deploy_mintsAtThePredictedCreate3Address() public {
+        address predicted = _predictGame();
+
+        ChallengeGame game = _run();
+
+        assertEq(address(game), predicted, "the game must mint at its salt");
+    }
+
+    /// @dev M3: THE ORDER IS THE FIX, so assert the order and not merely the end state.
+    ///      `setCoverageFreezer` must come after `game.setStakedWood` — until that pointer
+    ///      exists `_settle` reverts `ZeroAddress`, and a challenge filed in between
+    ///      freezes a key that makes `setCoverageFreezer` itself permanently un-callable.
     function test_deploy_grantsTheFreezeRoleLast() public {
         vm.recordLogs();
         _run();
@@ -147,36 +135,49 @@ contract DeployPlanDPreflightTest is Test {
         assertLt(stakedWoodSetAt, freezerSetAt, "the ability to settle must exist BEFORE the ability to freeze");
     }
 
+    /// @notice A SECOND RUN ADOPTS AND WRITES NOTHING. Pre-flight 1 passes because every
+    ///         role already names the PREDICTED game, which is the resume case — the same
+    ///         read that refuses a foreign holder.
+    function test_deploy_secondCallAdoptsTheGameAndMintsNothing() public {
+        ChallengeGame game = _run();
+        bytes32 gameHash = address(game).codehash;
+
+        vm.recordLogs();
+        ChallengeGame again = _run();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(address(again), address(game), "the second run must adopt the same game");
+        assertEq(address(game).codehash, gameHash, "nothing may be re-minted over it");
+        assertEq(logs.length, 0, "a resumed run must send no state-changing call");
+    }
+
     // ──────────────────────── the pre-flights bite ────────────────────────
 
-    /// @dev B4 (a): sWOOD's pointer unset. This is the documented FAIL-OPEN
-    ///      state of `claimUnstakeGuardian` — nothing reverts, the gate is
-    ///      simply skipped, and the whole conviction path recovers zero.
+    /// @dev B4 (a): sWOOD's pointer unset. This is the documented FAIL-OPEN state of
+    ///      `claimUnstakeGuardian` — nothing reverts, the gate is simply skipped, and the
+    ///      whole conviction path recovers zero.
     function test_preflight_bites_whenTheExitGateIsUnwired() public {
-        vm.prank(DEFAULT_SENDER);
+        vm.prank(deployer);
         swood.setExposureLedger(address(0));
         _runExpecting("PRE-FLIGHT: StakedWood.exposureLedger != EXPOSURE_LEDGER");
     }
 
-    /// @dev B4 (b): sWOOD points at a DIFFERENT ledger. The reason the check is
-    ///      an identity and not `!= address(0)`: a stale pointer from an
-    ///      earlier deployment passes a non-zero test while holding none of
-    ///      this deployment's frozen commitments, so the gate reads zero
-    ///      exposure for an accused approver and lets it out.
+    /// @dev B4 (b): sWOOD points at a DIFFERENT ledger. The reason the check is an
+    ///      identity and not `!= address(0)`: a stale pointer passes a non-zero test while
+    ///      holding none of this deployment's bookings.
     function test_preflight_bites_whenTheExitGateReadsADifferentLedger() public {
-        ExposureLedger other = new ExposureLedger(DEFAULT_SENDER, address(swood), 28 days);
-        vm.prank(DEFAULT_SENDER);
+        ExposureLedger other = new ExposureLedger(deployer, address(swood), 28 days);
+        vm.prank(deployer);
         swood.setExposureLedger(address(other));
 
         assertTrue(swood.exposureLedger() != address(0), "a non-zero check would have passed this state");
         _runExpecting("PRE-FLIGHT: StakedWood.exposureLedger != EXPOSURE_LEDGER");
     }
 
-    /// @dev B4 (c): the refusal must be TOTAL — no role granted. A half-wired
-    ///      Plan D is worse than none: the freeze role alone is what makes
-    ///      pre-flight 1 unsatisfiable on a re-run.
+    /// @dev B4 (c): the refusal must be TOTAL — no role granted. A half-wired Plan D is
+    ///      worse than none: the freeze role alone makes pre-flight 1 unsatisfiable.
     function test_preflight_leavesEveryRoleUnwired_whenTheExitGateIsUnwired() public {
-        vm.prank(DEFAULT_SENDER);
+        vm.prank(deployer);
         swood.setExposureLedger(address(0));
         _runExpecting("PRE-FLIGHT: StakedWood.exposureLedger != EXPOSURE_LEDGER");
 
@@ -185,59 +186,71 @@ contract DeployPlanDPreflightTest is Test {
         assertEq(swood.authorizedSlasher(), address(0), "authorizedSlasher must be untouched");
     }
 
-    /// @dev PRE-FLIGHT 1: never silently steal a live role. Proven on the
-    ///      freeze role specifically, because that is the one M3's reorder is
-    ///      protecting: once a filing freezes a key the ledger refuses
-    ///      `setCoverageFreezer` outright, and a script that clobbered instead
-    ///      of refusing would have left no way back.
+    /// @dev PRE-FLIGHT 1: a role held by a FOREIGN address is refused, not rotated. Proven
+    ///      on the freeze role, the one M3's reorder protects: once a filing freezes a key
+    ///      the ledger refuses `setCoverageFreezer` outright.
     function test_preflight_bites_whenCoverageFreezerIsAlreadyHeld() public {
         // Hoisted: a call in argument position would consume the prank.
         address stub = address(new MockCoverageFreezer(ledger.challengeWindow()));
-        vm.prank(DEFAULT_SENDER);
+        vm.prank(deployer);
         ledger.setCoverageFreezer(stub);
         _runExpecting("PRE-FLIGHT: ExposureLedger.coverageFreezer already set.");
     }
 
-    /// @dev PRE-FLIGHT 3: an unpriced ledger makes every `file()` revert, so
-    ///      the game would deploy into a state where nothing can be challenged.
-    ///      Zero stays settable on the ledger (it is the emergency stop), so no
-    ///      storage poke is needed.
+    /// @dev PRE-FLIGHT 3: an unpriced ledger makes every `file()` revert, so the game
+    ///      would deploy into a state where nothing can be challenged. Zero stays settable
+    ///      on the ledger (it is the emergency stop), so no storage poke is needed.
     function test_preflight_bites_whenTheLedgerIsUnpriced() public {
-        // No warp needed: `setWoodUsdPrice` is no longer rate-limited (issue
-        // #89 moved that to a Zodiac module on the owner Safe), so a second
-        // move in the same block `setUp` already used simply lands.
-        vm.prank(DEFAULT_SENDER);
+        vm.prank(deployer);
         ledger.setWoodUsdPrice(0);
         _runExpecting("PRE-FLIGHT: ExposureLedger.woodPriceX8 is 0");
     }
 
+    /// @notice PRE-FLIGHT 4: a deployer that does not own the ledger cannot grant the
+    ///         freeze role, and the refusal lands BEFORE the game is minted rather than as
+    ///         a mid-run `OwnableUnauthorizedAccount`.
+    function test_preflight_bites_whenTheDeployerDoesNotOwnTheLedger() public {
+        address predicted = _predictGame();
+
+        vm.prank(deployer);
+        ledger.transferOwnership(address(0xBEEF)); // Ownable2Step: owner() does not move yet
+        vm.prank(address(0xBEEF));
+        ledger.acceptOwnership();
+
+        _runExpecting("PRE-FLIGHT: broadcaster does not own EXPOSURE_LEDGER");
+
+        assertEq(predicted.code.length, 0, "refused BEFORE the mint: nothing was deployed");
+        assertEq(swood.authorizedSlasher(), address(0), "and no role was granted");
+    }
+
     // ─────────────────────────────── helpers ───────────────────────────────
 
-    /// @dev THE ADDRESS BOOK IS PASSED, NOT SET IN THE ENVIRONMENT. `run()`'s
-    ///      only job is to read `vm.envAddress` into this struct, and
-    ///      `vm.setEnv` writes the PROCESS environment — one shared mutable
-    ///      global that forge does not roll back between tests and that every
-    ///      parallel suite writes to. Driving the script through `run()` here
-    ///      would race `DeployPlanBPreflight` and `DeployTokenCourtPreflight`
-    ///      over `STAKED_WOOD` and lose non-deterministically. `deploy()` takes
-    ///      the book directly, so nothing here is shared.
-    function _book() internal view returns (DeployPlanD.AddressBook memory) {
-        return DeployPlanD.AddressBook({
+    /// @dev THE ADDRESS BOOK IS PASSED, NOT SET IN THE ENVIRONMENT. `vm.setEnv` writes one
+    ///      shared mutable global that forge does not roll back between tests, so an
+    ///      env-driven suite races every sibling that seeds the same keys.
+    function _book() internal view returns (DeployPlanD.PlanDBook memory) {
+        return DeployPlanD.PlanDBook({
             swood: address(swood), wood: address(wood), ledger: address(ledger), tierRegistry: address(tiers)
         });
     }
 
-    /// @dev Recovers the deployed game from `ledger.coverageFreezer()` — the
-    ///      script returns nothing, and deriving the CREATE address would
-    ///      encode an assumption about how broadcast interacts with nonces.
+    function _predictGame() internal returns (address) {
+        return Create3.addressOf(script.c3Factory(deployer), DeploySalts.CHALLENGE_GAME);
+    }
+
+    /// @dev The book is hoisted out of argument position: an external call there is
+    ///      evaluated first and would eat the pending `vm.prank`.
     function _run() internal returns (ChallengeGame game) {
-        PlanDScriptCaller(DEFAULT_SENDER).fwd(address(script), abi.encodeCall(DeployPlanD.deploy, (_book())));
-        game = ChallengeGame(ledger.coverageFreezer());
+        DeployPlanD.PlanDBook memory book = _book();
+        vm.prank(deployer);
+        game = ChallengeGame(script.deploy(book));
         require(address(game) != address(0), "the deploy script did not wire a game");
     }
 
     function _runExpecting(string memory prefix) internal {
-        try PlanDScriptCaller(DEFAULT_SENDER).fwd(address(script), abi.encodeCall(DeployPlanD.deploy, (_book()))) {
+        DeployPlanD.PlanDBook memory book = _book();
+        vm.prank(deployer);
+        try script.deploy(book) {
             revert("pre-flight did not bite");
         } catch Error(string memory reason) {
             _assertPrefix(reason, prefix);

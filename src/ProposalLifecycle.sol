@@ -3,9 +3,6 @@ pragma solidity 0.8.28;
 
 import {ISyndicateGovernor} from "./interfaces/ISyndicateGovernor.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
-import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
-import {IVotes} from "@openzeppelin/contracts/governance/utils/IVotes.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title ProposalLifecycle
 /// @notice Abstract base owning the proposal lifecycle (propose -> vote ->
@@ -71,22 +68,20 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             if (block.timestamp <= p.voteEnd) return (ProposalState.Pending, false);
 
             // Voting ended — optimistic: approved unless AGAINST votes reach the veto threshold.
-            // Skip the veto check when liveSupply == 0, else the bar collapses to 0 and everything auto-rejects.
+            // Skip the veto check when the electorate is 0, else the bar collapses to 0 and everything auto-rejects.
             // vetoThresholdBps is the Draft -> Pending snapshot, so mid-vote finalizes don't move the bar.
-            // Votable set at the snapshot = supply minus the queue (queued shares keep snapshot weight).
-            // Cap it at totalSupply(): bounds the inflation side only. A holder who redeemed ahead of
-            // propose in the same block keeps snapshot vote weight against this live-capped bar.
-            uint256 pastTotalSupply = IVotes(p.vault).getPastTotalSupply(p.snapshotTimestamp);
-            address queue = ISyndicateVault(p.vault).withdrawalQueue();
-            uint256 queueVotes = queue == address(0) ? 0 : IVotes(p.vault).getPastVotes(queue, p.snapshotTimestamp);
-            uint256 liveSupply = pastTotalSupply > queueVotes ? pastTotalSupply - queueVotes : 0;
-            uint256 nowTotalSupply = IERC20(p.vault).totalSupply();
-            if (nowTotalSupply < liveSupply) liveSupply = nowTotalSupply;
-            if (liveSupply > 0) {
-                uint256 vetoThreshold = (liveSupply * p.vetoThresholdBps) / BPS_DENOMINATOR;
+            // The electorate is RECORDED at the Draft -> Pending transition, never
+            // reconstructed here: `totalSupply()` does not say whether a burn was a voter's
+            // redemption or a queued one, so no mix of a snapshot read and a live read is
+            // exact for both. See openspec/changes/veto-votable-supply/design.md.
+            // Zero also means "stamped before this field existed" — veto skipped, which is
+            // unreachable today (fresh lineage: no proposal predates the field).
+            uint256 votableSupply = p.votableSupply;
+            if (votableSupply > 0) {
+                uint256 vetoThreshold = (votableSupply * p.vetoThresholdBps) / BPS_DENOMINATOR;
                 // FLOOR AT ONE VOTE. Integer division sends the threshold to
                 // zero for any electorate small enough that
-                // `liveSupply * bps < BPS_DENOMINATOR`, and `votesAgainst >= 0`
+                // `votableSupply * bps < BPS_DENOMINATOR`, and `votesAgainst >= 0`
                 // is vacuously true -- so a proposal nobody voted on would be
                 // Rejected. A veto must always cost at least one vote against.
                 if (vetoThreshold == 0) vetoThreshold = 1;

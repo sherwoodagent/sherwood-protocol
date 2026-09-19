@@ -437,8 +437,9 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_commitState(proposal) != ProposalState.Pending) revert NotWithinVotingPeriod();
         if (_hasVoted[proposalId][msg.sender]) revert AlreadyVoted();
 
-        // Snapshot weight is final: no share is minted or burned while the
-        // proposal is open (`SyndicateVault.redemptionsLocked`), so no live cap.
+        // Snapshot weight is final: no share is minted or burned while the proposal
+        // is open (`SyndicateVault.redemptionsLocked`), so no live cap. The one gap is
+        // the stamping block itself — see design.md Decision 2 (phantom weight).
         uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, proposal.snapshotTimestamp);
         if (weight == 0) revert NoVotingPower();
 
@@ -806,6 +807,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             _transition(proposal, ProposalState.Pending);
             // -1: see propose().
             proposal.snapshotTimestamp = block.timestamp - 1;
+            proposal.votableSupply = _votableSupplyAt(proposal.vault, proposal.snapshotTimestamp);
             // Timing comes from the propose-time snapshot, not live
             // `_params.*`. Single SLOAD; bit-shift to unpack.
             uint256 packed = _draftTimingSnap[proposalId];
@@ -1040,13 +1042,26 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     // ==================== INTERNAL ====================
 
+    /// @dev The veto electorate on both paths: every share checkpointed at the
+    ///      snapshot instant minus the queue's votes at that same instant, which
+    ///      cannot be cast. One instant on both terms, so the recorded set is the
+    ///      weight `getPastVotes` will hand out. The vault auto-delegates the queue.
+    function _votableSupplyAt(address vault, uint256 at) private view returns (uint256) {
+        uint256 supply = IVotes(vault).getPastTotalSupply(at);
+        address queue = ISyndicateVault(vault).withdrawalQueue();
+        if (queue == address(0)) return supply;
+        uint256 queued = IVotes(vault).getPastVotes(queue, at);
+        return supply > queued ? supply - queued : 0;
+    }
+
     /// @dev Hoisted out of `propose` to keep that function under Yul's
     ///      stack budget when `forge coverage` runs (optimizer + viaIR off).
     ///      Reads `vault` from storage (already written by caller) to keep
     ///      the call-site arg count to two.
     function _initPendingProposal(StrategyProposal storage p, uint256 reviewPeriod_) private {
-        // -1 closes the same-block flash-delegate window.
+        // -1 closes the same-block acquisition window, on both terms below.
         p.snapshotTimestamp = block.timestamp - 1;
+        p.votableSupply = _votableSupplyAt(p.vault, p.snapshotTimestamp);
         p.voteEnd = block.timestamp + _params.votingPeriod;
         p.reviewEnd = p.voteEnd + reviewPeriod_;
         p.executeBy = p.reviewEnd + _params.executionWindow;
