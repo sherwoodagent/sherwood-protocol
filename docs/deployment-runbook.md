@@ -25,8 +25,9 @@ One script, one broadcast: `script/robinhood-mainnet/DeployAll.s.sol:DeployAll`.
 Its phases run in a fixed order inside that broadcast — Create3Factory bootstrap,
 core (executor lib, vault impl, ProtocolConfig, governor beacon, sWOOD,
 GuardianRegistry, factory, TierRegistry + the launch set), UniswapSwapAdapter and
-the three strategy templates, StrategyFactory, the WOOD price source, Plan B,
-Plan D, TokenCourt, handoff. Every address is `f(DEPLOYER, salt)` under CREATE3,
+the three strategy templates, StrategyFactory, the WOOD price source
+(`WoodPoolFeed`, reading the WOOD/WETH V2 pair and the V3 pool booked beside it),
+Plan B, Plan D, TokenCourt, handoff. Every address is `f(DEPLOYER, salt)` under CREATE3,
 so a re-run adopts what is already there instead of minting a second copy.
 
 Nothing is read from the environment. Every number comes from
@@ -35,13 +36,27 @@ Nothing is read from the environment. Every number comes from
 
 **Mainnet (4663) — two runs.**
 
-1. **Fill the inputs.** Every econ constant in `RobinhoodParams.sol` is now confirmed
-   and no `PLACEHOLDER` remains: the WOOD price cap is derived from live spot at run
-   time, so there is nothing to re-measure on the day. What is still outstanding is
-   `WOOD_WETH_SUSHI_V2_PAIR` in `chains/4663.json`. `DEPLOYER` and
-   `OWNER_MULTISIG` are already recorded there. No second WOOD/WETH pair exists on
-   4663 yet (SHE-291), and the run refuses by name without it.
-2. **First run.**
+1. **Check the inputs.** Every econ constant in `RobinhoodParams.sol` is confirmed and
+   no `PLACEHOLDER` remains: the WOOD price cap is derived from live spot at run time,
+   so there is nothing to re-measure on the day. `chains/4663.json` carries every key
+   the run requires, the launch set included — `USDC`, `BTC` and `LINK` are feed-only
+   by decision (`_hasNoTokenOnRobinhood`), not gaps. `CREATE3_FACTORY` and
+   `WOOD_USD_FEED` are written BY the run, not read.
+2. **Grow the V3 observation ring — before anything is deployed.** The feed's second
+   leg is a Uniswap V3 pool (SHE-291), and `DeployWoodPoolFeed` refuses a pool whose
+   ring cannot span `TWAP_WINDOW`. The call is permissionless, monotonic and safe to
+   repeat, so it can run well ahead of the ceremony:
+   ```bash
+   V3_CARDINALITY=<N> forge script script/GrowV3Cardinality.s.sol:GrowV3Cardinality \
+     --rpc-url robinhood --account <key> --broadcast --slow
+   ```
+   Size `N` from the `required for a <window> s window` line the feed phase prints;
+   above 1,400 the ring is grown in repeated steps, because every new slot is
+   initialised inside the call at ~22.4k gas paid by the CALLER. **The growth is not
+   instant.** The call raises a TARGET (`observationCardinalityNext`); the ring
+   reaches it one observation at a time, as the pool is traded. Wait for
+   `observationCardinality` itself — the `next` value is not what `observe` serves.
+3. **First run.**
    ```bash
    forge script script/robinhood-mainnet/DeployAll.s.sol:DeployAll \
      --rpc-url robinhood --account <key> --broadcast --slow \
@@ -49,14 +64,14 @@ Nothing is read from the environment. Every number comes from
    ```
    It stops at `Checkpoint.AwaitingWoodFeed`: `WoodPoolFeed` is minted, nothing
    of Plan B is, and **no ownership has moved**.
-3. **Prime the feed.** Call `WoodPoolFeed.update()` on a keeper until
+4. **Prime the feed.** Call `WoodPoolFeed.update()` on a keeper until
    `latestRoundData()` answers — at least one `window`, 24h minimum. The deployer
    key owns every contract for this whole interval; that is the cost of the
-   warm-up, and it is why step 2 hands nothing off.
-4. **Second run.** The same command. The stage gate passes, Plan B / Plan D /
+   warm-up, and it is why step 3 hands nothing off.
+5. **Second run.** The same command. The stage gate passes, Plan B / Plan D /
    TokenCourt deploy, the handoff runs, and `deployAll` returns
    `Checkpoint.Complete`. Addresses are written to `chains/4663.json` last.
-5. **The Safe's turn.** `acceptOwnership()` on `ProtocolConfig`, `TierRegistry`,
+6. **The Safe's turn.** `acceptOwnership()` on `ProtocolConfig`, `TierRegistry`,
    `ExposureLedger`, `ChallengeGame` and `TokenCourt` (the one-step contracts —
    beacon, factory, GuardianRegistry, sWOOD, StrategyFactory — are already
    transferred). Then re-point `setProtocolFeeRecipient` and
@@ -64,7 +79,7 @@ Nothing is read from the environment. Every number comes from
    reserve (`approve` + `registry.fundSlashAppealReserve`), and configure the
    Zodiac Delay module with the asymmetry the spec requires: raises delayed,
    drops immediate.
-6. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` — it re-derives every
+7. **Verify.** `RPC=<url> ./script/verify-robinhood.sh 4663` — it re-derives every
    address from the book's `CREATE3_FACTORY` and fails on any disagreement.
 
 **Fork — one run.** Chain 9994663, `chains/9994663.json` committed. Same command
