@@ -337,6 +337,20 @@ abstract contract DeployWoodPoolFeed is ScriptBase {
         require(capX8 <= spotX8 * 2, "PRE-FLIGHT: WOOD_PRICE_CAP_X8 is above 2x spot");
     }
 
+    /// @notice The cap is sized off manipulable spot; this vouches that spot against the
+    ///         24h TWAP it will bound. Run 1 mints a feed that does not answer yet and
+    ///         discards its cap at the stage gate, so the no-answer case is a no-op.
+    function _requireSpotNearFeed(address feed, uint256 spotX8) internal view {
+        if (!_feedAnswers(feed)) return;
+        (, int256 answer,,,) = IAggregatorMinimal(feed).latestRoundData();
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 twapX8 = uint256(answer);
+        require(
+            spotX8 <= twapX8 * 2 && twapX8 <= spotX8 * 2,
+            "PRE-FLIGHT: WOOD spot diverges more than 2x from the feed TWAP"
+        );
+    }
+
     // ── Helpers ──
 
     /// @notice The stage gate: does this feed price yet? A freshly minted `WoodPoolFeed`

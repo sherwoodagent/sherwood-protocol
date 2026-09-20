@@ -137,6 +137,7 @@ contract DeployAll is
             s.woodPriceCapX8 = (spotX8 * RobinhoodParams.CAP_OVER_SPOT_BPS) / 10_000;
             _requireCapAboveSpot(s.woodPriceCapX8, spotX8);
             s.woodUsdFeed = address(deploy(fp));
+            _requireSpotNearFeed(s.woodUsdFeed, spotX8);
         } else {
             _deployForkFeed(s, i);
         }
