@@ -160,12 +160,9 @@ interface ISyndicateGovernor {
         ///         written on EVERY execute path, so a stored zero never means
         ///         unset on an `Executed` proposal.
         uint256 effectiveMaxCapital;
-        /// @notice Shares that can vote on this proposal: `totalSupply()` minus
-        ///         the withdrawal queue's balance, both read LIVE at the
-        ///         Draft -> Pending transition, after any same-block burns.
-        ///         The veto bar is a fraction of this. Reconstructing it later
-        ///         from a snapshot cannot be exact — `totalSupply()` does not
-        ///         say whether a burn was a voter's redemption or a queued one.
+        /// @notice Shares that can vote, recorded on entering Pending: supply less the
+        ///         withdrawal queue, each term the MIN of its snapshot and live value —
+        ///         a same-block exit shrinks it, a same-block entry cannot raise it.
         uint256 votableSupply;
     }
 

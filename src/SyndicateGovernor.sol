@@ -1042,16 +1042,21 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
 
     // ==================== INTERNAL ====================
 
-    /// @dev The veto electorate on both paths: every share checkpointed at the
-    ///      snapshot instant minus the queue's votes at that same instant, which
-    ///      cannot be cast. One instant on both terms, so the recorded set is the
-    ///      weight `getPastVotes` will hand out. The vault auto-delegates the queue.
+    /// @dev Each electorate term clamped at its live value: an exit ahead of the stamp shrinks
+    ///      the bar, an entry after `at` cannot inflate it. The live queue term is capped at the
+    ///      snapshot's so only escrows made before `at` leave twice (NM 6.4-F2; design.md Dec. 3).
     function _votableSupplyAt(address vault, uint256 at) private view returns (uint256) {
         uint256 supply = IVotes(vault).getPastTotalSupply(at);
+        uint256 live = IERC20(vault).totalSupply();
         address queue = ISyndicateVault(vault).withdrawalQueue();
-        if (queue == address(0)) return supply;
-        uint256 queued = IVotes(vault).getPastVotes(queue, at);
-        return supply > queued ? supply - queued : 0;
+        if (queue != address(0)) {
+            uint256 queued = IVotes(vault).getPastVotes(queue, at);
+            supply = supply > queued ? supply - queued : 0;
+            uint256 liveQueued = IERC20(vault).balanceOf(queue);
+            if (liveQueued > queued) liveQueued = queued;
+            live = live > liveQueued ? live - liveQueued : 0;
+        }
+        return supply < live ? supply : live;
     }
 
     /// @dev Hoisted out of `propose` to keep that function under Yul's

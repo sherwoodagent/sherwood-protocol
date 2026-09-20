@@ -18,7 +18,9 @@ the earlier attempts.
 
 Recording the number at propose removes the reconstruction entirely: at that
 instant both facts are directly observable, and neither has to be inferred from
-the other.
+the other. (Decision 3's shipped clamp resolves the ambiguity above: a queue claim
+drops live supply and the live queue balance by the same amount, so subtracting
+`min(snapshotQueued, liveQueued)` never double-counts it.)
 
 ## Decision 1: the queue term is read live at propose, not at the snapshot
 
@@ -134,3 +136,8 @@ whole collaboration window — a product change — to buy what (c) buys with a
 different read at the same instant. (b) leaves a repeatable griefing vector
 open. Decision 2's residual is a different instant pair (vote weight vs.
 electorate on the direct path) and stays open.
+
+**SHIPPED: (c) plus a live clamp (v1 audit F1).** (c) alone let a redeem ordered
+ahead of the stamp raise the bar above every share still in the vault, re-opening
+NM 6.4-F2. Each term is now `min(snapshot, live)`, with the live queue term capped
+at the snapshot's so the front-run (c) closed stays closed.
