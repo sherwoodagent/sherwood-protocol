@@ -91,7 +91,11 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         reg.openEmergency(proposalId, h, calls);
 
         uint256 posted = reg.ownerStake(p.vault);
-        if (posted == 0 || posted < reg.requiredOwnerBond(p.vault)) revert OwnerBondInsufficient();
+        // Liveness is one predicate protocol-wide (SHE-215): a slot with an exit in
+        // flight is not a bond, whatever it still holds. Added to the amount gates, not replacing them.
+        if (!reg.ownerBondLive(p.vault) || posted == 0 || posted < reg.requiredOwnerBond(p.vault)) {
+            revert OwnerBondInsufficient();
+        }
         emit EmergencySettleProposed(proposalId, msg.sender, h, uint64(block.timestamp + reg.reviewPeriod()));
     }
 
@@ -117,7 +121,7 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         (bool blocked, BatchExecutorLib.Call[] memory calls) = reg.finalizeEmergency(proposalId);
         if (blocked) revert EmergencySettleBlocked();
 
-        if (reg.ownerStake(p.vault) == 0) revert OwnerBondInsufficient();
+        if (!reg.ownerBondLive(p.vault) || reg.ownerStake(p.vault) == 0) revert OwnerBondInsufficient();
 
         // The one settle path with an egress budget: an owner unwind may need to fund a repay
         // from the vault to free stuck collateral. Guardian-reviewed and owner-bonded for it.
