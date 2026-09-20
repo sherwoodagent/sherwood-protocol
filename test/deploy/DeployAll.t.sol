@@ -576,7 +576,7 @@ contract DeployAllTest is DeployAllFixture {
     function _isOneOffScript(string memory path) internal pure returns (bool) {
         return vm.contains(path, "CheckSyndicateParams") || vm.contains(path, "DeployWood.s.sol")
             || vm.contains(path, "DeployVestingFactory") || vm.contains(path, "DeployEAS")
-            || vm.contains(path, "SeedAttestations") || vm.contains(path, "GrowV3Cardinality");
+            || vm.contains(path, "SeedAttestations");
     }
 
     // ─────────────────────────────── helpers ───────────────────────────────
