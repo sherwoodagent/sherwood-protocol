@@ -161,10 +161,9 @@ two_step "ledger" "$LEDGER"
 two_step "game" "$GAME"
 [ -z "$COURT" ] || two_step "court" "$COURT"
 
-echo; echo "── Fee recipients (both legs seated; a zero leg silently pays the proposer) ──"
+echo; echo "── Fee recipients (both legs move with the owner; an EOA leg pays a key, not the Safe) ──"
 for leg in protocolFeeRecipient guardiansFeeRecipient; do
-  R=$(call "$CONFIG" "$leg()(address)")
-  if [ -n "$R" ] && [ "$R" != "$ZERO" ]; then ok "config.$leg non-zero" "$R"; else bad "config.$leg non-zero" "$R"; fi
+  check "config.$leg" "$(call "$CONFIG" "$leg()(address)")" "$FINAL"
 done
 
 echo; echo "── Strategy templates (the allowlist IS _templateKeys) ──"

@@ -58,13 +58,13 @@ abstract contract DeployRobinhoodMainnet is DeploySherwood {
         _checkAddr("tierRegistry.owner", Ownable(d.tierRegistry).owner(), deployer);
         _checkAddr("tierRegistry.pendingOwner", Ownable2Step(d.tierRegistry).pendingOwner(), expectedPending);
 
-        // BOTH RECIPIENTS, because a zero one folds its leg into the agent's
-        // remainder rather than failing. Asserting only the protocol leg would
-        // leave the guardian budget — the whole reason MANAGEMENT_FEE_BPS is
-        // 200 — silently payable to the proposer.
+        // BOTH LEGS, against the END STATE: a zero recipient folds its leg into the agent's
+        // remainder rather than failing, and `_handoffAll` moves both with the owner — so a
+        // handed-off ceremony still naming the deployer EOA is refused here, not accepted.
         ProtocolConfig protocolConfig = ProtocolConfig(d.protocolConfig);
-        _checkAddr("protocolConfig.protocolFeeRecipient", protocolConfig.protocolFeeRecipient(), deployer);
-        _checkAddr("protocolConfig.guardiansFeeRecipient", protocolConfig.guardiansFeeRecipient(), deployer);
+        address feeRecipient = handedOff ? ownerMultisig : deployer;
+        _checkAddr("protocolConfig.protocolFeeRecipient", protocolConfig.protocolFeeRecipient(), feeRecipient);
+        _checkAddr("protocolConfig.guardiansFeeRecipient", protocolConfig.guardiansFeeRecipient(), feeRecipient);
 
         _checkAddr("factory.beacon", factory.beacon(), d.beacon);
         // `tier2CallCapBps` has no subject here: it is per-governor and governors are minted at

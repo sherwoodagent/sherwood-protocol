@@ -21,6 +21,7 @@ import {ForkWoodFeedFixture} from "./ForkWoodFeedFixture.sol";
 import {RobinhoodParams} from "./RobinhoodParams.sol";
 import {Posture, Inputs, Stack} from "./DeployTypes.sol";
 
+import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {ExposureLedger} from "../../src/ExposureLedger.sol";
 import {ChallengeGame} from "../../src/ChallengeGame.sol";
 import {TokenCourt} from "../../src/TokenCourt.sol";
@@ -272,6 +273,12 @@ contract DeployAll is
         // Handing the protocol to address(0) is unrecoverable, and every caller that skips
         // `_readInputs` (tests, a future phase) can reach here with an unset field.
         require(ownerMultisig != address(0), "handoff target unset");
+        // BOTH FEE LEGS MOVE WITH THE OWNER. The deployer seed is a placeholder, not an end
+        // state, and a RUNBOOK line is not a gate; ProtocolConfig is still deployer-owned here.
+        ProtocolConfig cfg = ProtocolConfig(s.core.protocolConfig);
+        if (cfg.protocolFeeRecipient() != ownerMultisig) cfg.setProtocolFeeRecipient(ownerMultisig);
+        if (cfg.guardiansFeeRecipient() != ownerMultisig) cfg.setGuardiansFeeRecipient(ownerMultisig);
+
         _giveOneStep(s.core.beacon, ownerMultisig);
         _giveOneStep(s.core.factoryProxy, ownerMultisig);
         _giveOneStep(s.core.registryProxy, ownerMultisig);
@@ -286,9 +293,8 @@ contract DeployAll is
 
         console.log("RUNBOOK: the multisig MUST call acceptOwnership() on ProtocolConfig, TierRegistry,");
         console.log("RUNBOOK: ExposureLedger, ChallengeGame AND TokenCourt.");
-        // BOTH FEE LEGS PAY THE DEPLOYER KEY until the Safe re-points them: a zero recipient
-        // is worse (it folds the leg into the agent's remainder silently), so they are seeded.
-        console.log("RUNBOOK: then, from the Safe, setProtocolFeeRecipient(treasury) and");
+        // Both fee legs already name the Safe; these moves are optional re-points, not a gate.
+        console.log("RUNBOOK: optionally, from the Safe, setProtocolFeeRecipient(treasury) and");
         console.log("RUNBOOK: setGuardiansFeeRecipient(guardian payout address).");
         // NOT handed off: `Create3Factory.deploy` is `onlyOwner`, so the deployer key keeps the
         // right to mint at any UNUSED salt in this namespace. Used salts already hold code.
@@ -433,8 +439,8 @@ contract DeployAll is
     // ── Post-broadcast validation ──
 
     /// @dev Stage-aware, because run 1 of a Mainnet ceremony legitimately ends with no
-    ///      ledger, no game and no handoff — asserting the finished table there would fail
-    ///      a correct run AFTER the broadcast, with the transactions already sent.
+    ///      ledger, no game and no handoff — asserting the finished table there would refuse
+    ///      a correct run. The refusal lands in local simulation, so nothing is broadcast.
     function _validateAll(Stack memory s, Inputs memory i, Checkpoint cp) internal view {
         address deployer = s.core.deployer;
         bool handedOff = cp == Checkpoint.Complete && i.posture == Posture.Mainnet;

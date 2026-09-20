@@ -246,11 +246,13 @@ contract DeployRobinhoodMainnetHandoffTest is Test {
         harness.exposed_validate(decoy, address(harness), address(multisig), address(wood));
     }
 
-    /// @notice The six core-role transfers `DeployAll._handoffAll` makes, replayed locally.
+    /// @notice The core-role transfers and fee re-points `DeployAll._handoffAll` makes, replayed.
     /// @dev This mixin carries no handoff of its own: `_handoffRobinhood` was deleted as dead
     ///      (its only caller was this harness), so the validation tests stage the state directly.
     function _handoffCoreRoles() internal {
         vm.startPrank(address(harness));
+        ProtocolConfig(d.protocolConfig).setProtocolFeeRecipient(address(multisig));
+        ProtocolConfig(d.protocolConfig).setGuardiansFeeRecipient(address(multisig));
         Ownable(d.beacon).transferOwnership(address(multisig));
         Ownable(d.factoryProxy).transferOwnership(address(multisig));
         Ownable(d.registryProxy).transferOwnership(address(multisig));
