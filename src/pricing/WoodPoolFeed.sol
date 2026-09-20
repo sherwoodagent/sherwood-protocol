@@ -23,14 +23,14 @@ interface IAggregatorMinimal {
  * @title  WoodPoolFeed
  * @notice WOOD/USD on the `AggregatorV3` read surface, 8 decimals: the LOWER of
  *         two WOOD/WETH pool TWAPs over a window of at least 24h, each pool held
- *         to a depth floor. One leg is a Uniswap-V2-style pair, snapshotted here
- *         and synced before every snapshot so tails are zero; the other is a
- *         Uniswap V3 pool, read live from its own observation ring.
+ *         to a depth floor. One leg is a Uniswap-V2-style pair, synced before
+ *         every snapshot so tails are zero; the other is a Uniswap V3 pool. Both
+ *         legs are averaged from accumulators this contract snapshots itself.
  */
 contract WoodPoolFeed {
     error InvalidParameter();
-    /// @notice No window spanned yet, a pool below its depth floor, a V3 ring
-    ///         that cannot serve the window, or an unusable ETH/USD leg.
+    /// @notice No window spanned yet, a pool below its depth floor, or an
+    ///         unusable ETH/USD leg.
     error PriceUnavailable();
 
     event SnapshotRecorded(uint256 cumulative, uint32 timestamp, uint32 spanFromPrevious);
@@ -44,6 +44,11 @@ contract WoodPoolFeed {
 
     struct Observation {
         uint256 cumulative;
+        uint32 timestamp;
+    }
+
+    struct PoolObservation {
+        int56 tickCumulative;
         uint32 timestamp;
     }
 
@@ -69,6 +74,8 @@ contract WoodPoolFeed {
 
     Observation public previousObservation;
     Observation public latestObservation;
+    PoolObservation public previousPoolObservation;
+    PoolObservation public latestPoolObservation;
 
     constructor(
         address pairA_,
@@ -109,10 +116,9 @@ contract WoodPoolFeed {
         minV3Liquidity = minV3Liquidity_;
     }
 
-    /// @notice Roll the V2 pair's snapshot pair forward once `window` has
-    ///         elapsed. Permissionless, and a no-op rather than a revert when the
-    ///         pair is early, empty or below the depth floor. The V3 leg stores
-    ///         nothing and needs no keeper.
+    /// @notice Roll both legs' snapshots forward once `window` has elapsed.
+    ///         Permissionless, and a no-op rather than a revert when the pair is
+    ///         early, empty or below the depth floor.
     /// @dev    The pair is synced first. `sync()` is permissionless and books the
     ///         standing price over the elapsed span, so an untraded pair still snapshots.
     function update() external {
@@ -157,10 +163,12 @@ contract WoodPoolFeed {
     function _update() internal {
         (uint256 cumulative, uint32 nowTs, bool ok) = _currentCumulative();
         if (!ok) return;
+        int56 tickCumulative = _currentTickCumulative();
 
         Observation memory latest = latestObservation;
         if (latest.timestamp == 0) {
             latestObservation = Observation({cumulative: cumulative, timestamp: nowTs});
+            latestPoolObservation = PoolObservation({tickCumulative: tickCumulative, timestamp: nowTs});
             emit SnapshotRecorded(cumulative, nowTs, 0);
             return;
         }
@@ -175,6 +183,8 @@ contract WoodPoolFeed {
 
         previousObservation = latest;
         latestObservation = Observation({cumulative: cumulative, timestamp: nowTs});
+        previousPoolObservation = latestPoolObservation;
+        latestPoolObservation = PoolObservation({tickCumulative: tickCumulative, timestamp: nowTs});
         emit SnapshotRecorded(cumulative, nowTs, span);
     }
 
@@ -202,42 +212,41 @@ contract WoodPoolFeed {
         return (avgX112, latest.timestamp);
     }
 
-    /// @dev Read live off the pool's observation ring, so this leg is as fresh as
-    ///      the block. A ring that cannot serve `window` is unavailability, never
-    ///      a silent fall back to spot: the cardinality gate below is what makes
-    ///      that true, because `observe` alone does not answer for it.
+    /// @dev Priced off the accumulator readings `update()` stored, so a ring the
+    ///      market writes cannot make this leg unavailable; live liquidity is
+    ///      read as a depth gate, never as a price.
     function _poolTwapX112() internal view returns (uint256 avgX112, uint32 updatedAt) {
         if (IUniswapV3Pool(pool).liquidity() < minV3Liquidity) revert PriceUnavailable();
 
-        // A ring of length one holds only the current observation, so it has no
-        // history: `observe` synthesises the far endpoint and answers with spot.
-        (,,, uint16 cardinality,,,) = IUniswapV3Pool(pool).slot0();
-        if (cardinality < 2) revert PriceUnavailable();
+        PoolObservation memory previous = previousPoolObservation;
+        PoolObservation memory latest = latestPoolObservation;
+        if (previous.timestamp == 0 || latest.timestamp == 0) revert PriceUnavailable();
 
-        uint32[] memory secondsAgos = new uint32[](2);
-        // `window` is bounded by `MAX_SNAPSHOT_SPAN` at construction.
-        // forge-lint: disable-next-line(unsafe-typecast)
-        secondsAgos[0] = uint32(window);
-
-        try IUniswapV3Pool(pool).observe(secondsAgos) returns (int56[] memory cumulatives, uint160[] memory) {
-            if (cumulatives.length != 2) revert PriceUnavailable();
-            avgX112 = _tickToX112(_meanTick(cumulatives));
-        } catch {
-            revert PriceUnavailable();
+        uint32 span;
+        unchecked {
+            span = latest.timestamp - previous.timestamp;
         }
+        if (span < window || span > MAX_SNAPSHOT_SPAN) revert PriceUnavailable();
+
+        avgX112 = _tickToX112(_meanTick(previous.tickCumulative, latest.tickCumulative, span));
         if (avgX112 == 0) revert PriceUnavailable();
-        // forge-lint: disable-next-line(unsafe-typecast)
-        return (avgX112, uint32(block.timestamp));
+        return (avgX112, latest.timestamp);
     }
 
-    /// @dev Arithmetic-mean tick over `window`, rounded toward NEGATIVE INFINITY:
-    ///      truncating division rounds a negative delta up, which would report a
-    ///      WOOD price one tick better than the pool actually held.
-    function _meanTick(int56[] memory cumulatives) internal view returns (int24) {
-        // `window` is bounded by `MAX_SNAPSHOT_SPAN` at construction.
-        // forge-lint: disable-next-line(unsafe-typecast)
-        int256 span = int256(window);
-        int256 delta = int256(cumulatives[1]) - int256(cumulatives[0]);
+    /// @dev `observe([0])` reads the LIVE accumulator: it is synthesised from the
+    ///      newest observation, so no eviction of older ring slots can starve it.
+    function _currentTickCumulative() internal view returns (int56) {
+        uint32[] memory secondsAgos = new uint32[](1);
+        (int56[] memory cumulatives,) = IUniswapV3Pool(pool).observe(secondsAgos);
+        return cumulatives[0];
+    }
+
+    /// @dev Arithmetic-mean tick over the snapshots' span, rounded toward
+    ///      NEGATIVE INFINITY: truncating division rounds a negative delta up,
+    ///      which would report a WOOD price one tick better than the pool held.
+    function _meanTick(int56 previous, int56 latest, uint32 spanSeconds) internal pure returns (int24) {
+        int256 span = int256(uint256(spanSeconds));
+        int256 delta = int256(latest) - int256(previous);
         int256 mean = delta / span;
         if (delta < 0 && delta % span != 0) --mean;
         if (mean < TickMath.MIN_TICK || mean > TickMath.MAX_TICK) revert PriceUnavailable();
