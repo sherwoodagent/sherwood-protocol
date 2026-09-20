@@ -1242,8 +1242,8 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      would burn more than the basis; saturating at 10_000 is a constant
     ///      no role controls. Per element, never hoisted: the envelope is a
     ///      per-guardian bound, and one approver's rate must not set everyone's.
-    ///      `slashVerdict` keeps its full live clamp; its caller has no at-open
-    ///      snapshot to floor against.
+    ///      `slashVerdict` follows the SAME rule: `ChallengeGame` pins the
+    ///      envelope onto the challenge at filing and clamps against that pin.
     /// @dev `minSlashBps` REMAINS THE SINGLE DETERRENCE FLOOR OF THE LOCK MODEL —
     ///      applied upstream by `GuardianRegistry._reviewSlashRates` from the
     ///      at-open snapshot. An approver who locked 1 wei behind a blocked
@@ -1298,14 +1298,9 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @dev Reuses the SAME per-approver own-stake leg as the review path
     ///      (`_slashOne`) AND the same sink; the two paths differ only in who may
     ///      drive them. The slash pays no one.
-    /// @dev SEVERITY ENVELOPE. Every element of `slashBpsPer` is clamped to
-    ///      `[minSlashBps, maxSlashBps]` here, so the verdict path enforces the
-    ///      SAME envelope as the review path. Without the clamp this would be the
-    ///      one entrypoint that takes severity straight from its caller, letting a
-    ///      compromised `authorizedSlasher` exceed a ceiling governance set. The
-    ///      envelope binds per VERDICT, not per call: `_verdictSlashed` gives each
-    ///      (caseKey, approver) pair exactly one slash, so the ceiling cannot be
-    ///      compounded past by splitting one verdict across transactions.
+    /// @dev SEVERITY ENVELOPE — NOT LIVE. The caller pins it at filing (`Challenge.*SlashBpsAtFiling`) and clamps
+    ///      there, as the registry does at `openReview` (#293); only the arithmetic 10_000 cap lives here. Binds
+    ///      per VERDICT, not per call, via `_verdictSlashed`.
     /// @dev THE RATE IS THE LOCK. `ExposureLedger.slashBpsFor` supplies each
     ///      approver's WOOD lock for the case over its slash basis
     ///      (`slashableStakeAt(approver, openedAt)` — the same `_slashableAt`
@@ -1319,7 +1314,8 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     ///      small lock while holding a large bond: it loses the lock, and never
     ///      less than the floor below.
     /// @dev `minSlashBps` IS A PUNITIVE FLOOR, NOT A PROPORTIONALITY RULE — AND
-    ///      THE SINGLE DETERRENCE FLOOR OF THE LOCK MODEL. Any non-zero derived
+    ///      THE SINGLE DETERRENCE FLOOR OF THE LOCK MODEL — applied upstream by
+    ///      `ChallengeGame._settle` from the at-filing pin. Any non-zero derived
     ///      rate is raised to it, so an approver who locked 1 wei behind a
     ///      convicted proposal (rate rounds up to 1 bps) still pays `minSlashBps`
     ///      of everything it holds. A token declaration buys no quorum weight and
@@ -1343,11 +1339,9 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
     /// @param openedAt The verdict's open timestamp — the at-open anchor the
     ///        own-stake leg is sized against.
     /// @param approvers The approver addresses to slash.
-    /// @param slashBpsPer Per-approver slash fractions in bps, positionally aligned
-    ///        with `approvers` and each clamped independently. The array stays
-    ///        per-approver even though the production feed supplies one uniform
-    ///        rate: the clamp is a PER-GUARDIAN envelope, and zero remains
-    ///        meaningful as this-approver-underwrote-nothing.
+    /// @param slashBpsPer Per-approver slash fractions in bps, positionally aligned with `approvers` and already
+    ///        clamped by the caller into the at-filing envelope; saturated at 10_000 here, never the live slots.
+    ///        Stays per-approver because the envelope is PER-GUARDIAN and zero means this-approver-owes-nothing.
     /// @return total  Total WOOD burned across all approvers.
     function slashVerdict(
         bytes32 caseKey,
@@ -1395,12 +1389,9 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
         }
 
         for (uint256 i = 0; i < approvers.length; i++) {
-            // ZERO IS NOT A SEVERITY — it is the absence of liability, so it skips
-            // the envelope entirely. `minSlashBps` is a floor on how hard a guilty
-            // approver is hit, NOT a statement that everyone named in the batch owes
-            // something: running 0 through the clamp would slash a guardian whose
-            // commitment was released by a vote change, or whose approval landed
-            // after coverage was already met.
+            // ZERO IS NOT A SEVERITY — see the natspec. The caller's at-filing
+            // floor skips it too, so a guardian whose commitment was released by a
+            // vote change is named in the batch and owes nothing.
             uint256 requested = slashBpsPer[i];
             if (requested == 0) continue;
             // PERSISTENT DEDUP. The pairwise scan above bounds one array;
@@ -1408,11 +1399,9 @@ contract StakedWood is ReentrancyGuardTransient, OwnableUpgradeable, UUPSUpgrade
             // purpose: a zero rate takes nothing, so it must not consume the
             // approver's one slash and block a later real one.
             if (_verdictSlashed[caseKey][approvers[i]]) revert ApproverAlreadySlashed();
-            // Clamped per element, not once for the batch: the envelope is a
-            // per-guardian ceiling/floor on severity, so it has to bind each
-            // approver's own rate. Hoisting it would let one approver's rate set
-            // the envelope for everyone.
-            uint256 bps = Math.min(Math.max(requested, minSlashBps), maxSlashBps);
+            // NO LIVE ENVELOPE: the caller pins and clamps it at filing (#293).
+            // Only the arithmetic cap is kept here.
+            uint256 bps = Math.min(requested, 10_000);
             uint256 amt = _slashOne(slashKey, lookupAnchor, approvers[i], bps);
             if (amt == 0) continue;
             _verdictSlashed[caseKey][approvers[i]] = true;

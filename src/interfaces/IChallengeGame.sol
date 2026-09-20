@@ -185,6 +185,11 @@ interface IChallengeGame {
         uint256 defenceWeight;
         /// @dev When that own defence reached the pool's target; zero means never.
         uint256 defendedAt;
+        /// @dev The sWOOD slash envelope in force at filing, pinned for the same
+        ///      reason as every other `*AtFiling` term: the verdict lands up to
+        ///      `disputeTimeout` later. Appended for tuple stability.
+        uint256 minSlashBpsAtFiling;
+        uint256 maxSlashBpsAtFiling;
     }
 
     // ── Errors ──

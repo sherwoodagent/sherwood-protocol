@@ -355,6 +355,7 @@ contract MockChallengeTierRegistry {
 ///      that the compensation case is pinned to `executedAt - 1` (D6) and the
 ///      verdict anchored at `filedAt`, which are the two easiest to get wrong.
 contract MockChallengeStakedWood {
+    uint256 public minSlashBps;
     uint256 public maxSlashBps = 10_000;
     uint256 public callCount;
     bytes32 public lastCaseKey;
@@ -368,6 +369,10 @@ contract MockChallengeStakedWood {
     }
 
     uint256 internal _nextTotal = 1_000e18;
+
+    function setMinSlashBps(uint256 v) external {
+        minSlashBps = v;
+    }
 
     function setMaxSlashBps(uint256 v) external {
         maxSlashBps = v;

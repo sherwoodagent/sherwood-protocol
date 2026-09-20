@@ -700,6 +700,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         uint256 bondWood = (((coverageUsd * challengerBondBps) / BPS_DENOMINATOR) * 1e8) / priceX8;
         if (bondWood == 0) revert BondTooSmall();
 
+        // Unwired sWOOD pins the widest envelope; `_settle` fails closed on it
+        // anyway (`ZeroAddress`), so this branch can never widen a real verdict.
+        IStakedWood swoodAtFiling = stakedWood;
+        uint256 minBpsAtFiling;
+        uint256 maxBpsAtFiling = BPS_DENOMINATOR;
+        if (address(swoodAtFiling) != address(0)) {
+            minBpsAtFiling = swoodAtFiling.minSlashBps();
+            maxBpsAtFiling = swoodAtFiling.maxSlashBps();
+        }
+
         challengeId = ++challengeCount;
         _challenges[challengeId] = Challenge({
             governor: governor,
@@ -750,7 +760,12 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // this pin, not the live `court`.
             courtAtFiling: court,
             defenceWeight: 0,
-            defendedAt: 0
+            defendedAt: 0,
+            // Pinned like every other `*AtFiling` term: read live at settle, the
+            // owner zeroes the ceiling mid-dispute and the decided burn is
+            // nullified (#293 closed the same hole on the review path).
+            minSlashBpsAtFiling: minBpsAtFiling,
+            maxSlashBpsAtFiling: maxBpsAtFiling
         });
         _lastChallenge[key] = challengeId;
         _liveByChallenger[challengerKey] = challengeId;
@@ -1051,6 +1066,17 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // are pinned onto the challenge at filing rather than re-read here, so
         // a governor mutating either afterwards cannot move the verdict.
         (address[] memory approvers, uint256[] memory slashBpsPer) = _accusedWithRates(governor, proposalId);
+        // The envelope binds at FILING, not here: sWOOD keeps only the arithmetic
+        // cap. Zero is skipped — it is the absence of liability, not a severity.
+        uint256 minBps = c.minSlashBpsAtFiling;
+        uint256 maxBps = c.maxSlashBpsAtFiling;
+        for (uint256 i = 0; i < slashBpsPer.length; i++) {
+            uint256 r = slashBpsPer[i];
+            if (r == 0) continue;
+            if (r < minBps) r = minBps;
+            if (r > maxBps) r = maxBps;
+            slashBpsPer[i] = r;
+        }
 
         uint256 bond = c.bondWood;
         c.status = Status.Settled;

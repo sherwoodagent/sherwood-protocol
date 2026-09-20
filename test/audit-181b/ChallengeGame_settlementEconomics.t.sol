@@ -152,6 +152,8 @@ contract MockTierRegistrySE {
 ///      anything to make the challenger-side economics under test land.
 contract MockStakedWoodSE {
     address public authorizedSlasher;
+    uint256 public minSlashBps;
+    uint256 public maxSlashBps = 10_000;
 
     function setAuthorizedSlasher(address a) external {
         authorizedSlasher = a;
