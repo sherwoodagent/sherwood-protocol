@@ -608,20 +608,28 @@ Step 3 is what **replaces `setAdapterAllowed(clone, true)` per proposal**.
 **Certification review invariant (SHE-209).** Class membership admits *every*
 clone of the template as a batch recipient — including clones minted with a
 bare `Clones.clone` outside `StrategyFactory` and initialized permissionlessly,
-which bypass `StrategyFactory.approvedTemplate` entirely. `SyndicateVault`
-binds each member to the paying vault (`vault() == vault`, reverting
-`AdapterVaultMismatch` otherwise), which neutralizes a hostile clone **only
-if** the template derives its fund destination and its counterparty allowlist
-from `vault()` and exposes no payout / recipient / router address settable
-from `initialize` or `updateParams` data. Nothing on-chain checks this. Before
-step 1, the reviewer must confirm it for the template being certified
-(`BaseStrategy._pushToVault` and the shipped templates satisfy it; grep the
-template for `recipient` / `receiver` / `dest` / `beneficiary` params).
+which bypass `StrategyFactory.approvedTemplate` entirely, and including clones
+bound to a **different** vault. The protocol checks code identity and factory
+provenance; it does not read the clone's `vault()`. (It once did — the class
+vault-binding probe and `AdapterVaultMismatch` were deleted by the
+`structural-batch-rules` change, which reduced the batch guard to four
+structural rules.)
 
-Note that the vault binding applies to every class member, **including a clone
-the owner also granted per-address** with `setAdapterAllowed(clone, true)` —
-the explicit grant vets the address, the binding pins that it still pays this
-vault. The exemption is "not a class member", not "explicitly granted".
+What keeps one vault's capital out of another vault's clone is therefore a
+**template** invariant, not a protocol guard: every value-moving entrypoint is
+`onlyVault`, and the template derives its fund destination and its counterparty
+allowlist from `vault()`, exposing no payout / recipient / router address
+settable from `initialize` or `updateParams` data. Nothing on-chain checks
+this. Before step 1, the reviewer must confirm it for the template being
+certified (`BaseStrategy._pushToVault` and the shipped templates satisfy it;
+grep the template for `recipient` / `receiver` / `dest` / `beneficiary` params,
+and for `external` value-moving functions that are not `onlyVault` —
+`ConcentratedLiquidityStrategy.rerange` and `PortfolioStrategy.rebalanceDelta`
+are the shipped examples, both moving value only *within* the clone).
+
+`test/vault/ClassCloneVaultBinding.t.sol` pins both halves: a foreign-bound
+clone is admitted and priced at the class tier, and a template that drops
+`onlyVault` does move the paying vault's capital to its own `vault()`.
 
 ### Verification reads
 
