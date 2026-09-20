@@ -376,27 +376,21 @@ contract TierRegistryClassCertificationTest is Test {
         registry.setStrategyFactory(address(syndicateRegistry));
     }
 
-    /// @notice Re-pointing the registry at a different factory takes the tier
-    ///         and funds axes from clones the old factory minted, but NOT the
-    ///         callee axis: the vault must still be able to call in and reclaim
-    ///         capital the clone is holding. Pointing back restores all three.
-    function test_repointingTheFactoryClosesTheClassTierUntilPointedBack() public {
+    /// @notice The pointer is set once, so a live class cannot be re-pointed out from under
+    ///         the clones the certified factory minted.
+    function test_setStrategyFactory_isSetOnce() public {
         _certifyAndAllowClass(address(template));
         address clone = _cloneViaFactory();
         (uint8 tier0,) = registry.tierOf(clone, SEL);
         assertEq(tier0, TIER_1, "precondition: certified tier");
 
-        StrategyFactory replacement = new StrategyFactory(address(syndicateRegistry), address(this));
+        address replacement = address(new StrategyFactory(address(syndicateRegistry), address(this)));
         vm.prank(owner);
-        registry.setStrategyFactory(address(replacement));
+        vm.expectRevert(TierRegistry.StrategyFactoryAlreadySet.selector);
+        registry.setStrategyFactory(replacement);
 
         (uint8 tier1,) = registry.tierOf(clone, SEL);
-        assertEq(tier1, 2, "and the tier falls back to the uncertified default");
-
-        vm.prank(owner);
-        registry.setStrategyFactory(address(factory));
-        (uint8 tier2,) = registry.tierOf(clone, SEL);
-        assertEq(tier2, TIER_1, "and the certified tier");
+        assertEq(tier1, TIER_1, "the class tier is untouched");
     }
 
     /// @notice A factory whose code stops answering `cloneTemplate` degrades

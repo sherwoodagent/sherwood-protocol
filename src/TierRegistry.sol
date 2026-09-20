@@ -784,6 +784,7 @@ contract TierRegistry is Ownable2Step {
     error ClassNotCertified();
     error NoPendingClassCertification();
     error InvalidStrategyFactory();
+    error StrategyFactoryAlreadySet();
     /// @notice The certified template's live codehash no longer matches the
     ///         snapshot taken at certification.
     error TemplateCodehashChanged();
@@ -812,6 +813,9 @@ contract TierRegistry is Ownable2Step {
 
     /// @notice Points class membership at a contract that answers `cloneTemplate(0)`
     ///         with `address(0)`; reverts on any other answer, including none. `onlyOwner`.
+    /// @dev    Set once: the batch guard reads this pointer live on every execute and
+    ///         settle, so a re-point under a live position strands its settlement
+    ///         (v1 audit F7; `DeployStrategyFactory.s.sol:70-73`).
     function setStrategyFactory(address factory) external onlyOwner {
         if (factory.code.length == 0) revert InvalidStrategyFactory();
         try IStrategyFactory(factory).cloneTemplate(address(0)) returns (address t) {
@@ -819,6 +823,7 @@ contract TierRegistry is Ownable2Step {
         } catch {
             revert InvalidStrategyFactory();
         }
+        if (strategyFactory != address(0)) revert StrategyFactoryAlreadySet();
         strategyFactory = factory;
     }
 
