@@ -732,10 +732,10 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
     ///      Consequence: an under-bonded guardian books what it can, and the
     ///      proposal fails the execute-time quorum unless other approvers make
     ///      up the rest. A guardian small next to the need keeps its voice by
-    ///      putting its WHOLE budget on one proposal. What nobody may do is take
-    ///      a slot for less than both — `1/APPROVER_SLOTS` of the need and its
-    ///      own budget — so the registry's bounded approver array cannot be
-    ///      filled by underwriters who carry nothing.
+    ///      putting its WHOLE budget on one proposal, but only while fewer than
+    ///      half the slots are booked; past that a slot costs `1/APPROVER_SLOTS`
+    ///      of the need outright, so a cohort of sub-share underwriters cannot
+    ///      fill the registry's bounded approver array.
     function recordApproval(address governor, uint256 proposalId, address guardian, uint256 lockWood)
         external
         onlyRegistry
@@ -765,13 +765,14 @@ contract ExposureLedger is Ownable2Step, IExposureLedger {
         uint256 free = open >= cap ? 0 : cap - open;
 
         uint256 lock = lockWood < free ? lockWood : free;
-        // A slot costs a lock carrying its share of the need, or a guardian's
-        // WHOLE budget when that is smaller, valued here exactly as the quorum
-        // values it; a budget worth nothing at this instant buys no slot at all.
+        // A slot costs its share of the need. A guardian whose WHOLE budget is
+        // smaller may pay with all of it for half the slots only; the rest cost
+        // a share outright, so no min-stake cohort fills it (v1 audit F3).
         uint256 priceX8 = woodPriceX8();
         uint256 shareUsd = (needUsd + APPROVER_SLOTS - 1) / APPROVER_SLOTS;
         uint256 budgetUsd = _recoverableUsd(guardian, cap, priceX8, block.timestamp);
-        uint256 floorUsd = shareUsd < budgetUsd ? shareUsd : budgetUsd;
+        uint256 floorUsd =
+            (shareUsd < budgetUsd || _approversOf[key].length >= APPROVER_SLOTS / 2) ? shareUsd : budgetUsd;
         if (lock == 0 || budgetUsd == 0 || _recoverableUsd(guardian, lock, priceX8, block.timestamp) < floorUsd) {
             revert ApproveLockBelowFloor();
         }

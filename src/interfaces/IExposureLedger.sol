@@ -107,10 +107,11 @@ interface IExposureLedger {
     ///         `guardian`. Idempotent per (proposal, guardian). Reverts
     ///         `ApproveLockBelowFloor` when the booked lock is zero, when the
     ///         guardian's whole budget values to zero at this instant, or when
-    ///         the lock is worth less than BOTH a hundredth of the need and that
-    ///         whole budget — the registry's approver array is bounded, so a
-    ///         slot has to be paid for, while a guardian too small to carry a
-    ///         hundredth keeps its voice by committing all it has at risk.
+    ///         the lock is worth less than a hundredth of the need — the
+    ///         registry's approver array is bounded, so a slot has to be paid
+    ///         for. A guardian too small to carry a hundredth may instead commit
+    ///         all it has at risk, but only while fewer than half the slots are
+    ///         booked; the remaining slots cost a hundredth unconditionally.
     ///         Also reverts when the coverage inputs cannot be read
     ///         (`CoverageInputsUnreadable`), when the vault asset cannot be
     ///         priced (`StalePrice` / `FeedNotConfigured`), and when settlement
@@ -121,9 +122,10 @@ interface IExposureLedger {
     ///         requirement, and nothing reduces a lock other than
     ///         `releaseApproval`/`retireApproval`.
     /// @param  lockWood The WOOD the guardian declares. Clamped to the free
-    ///         budget, then refused when what it books is worth less than the
-    ///         smaller of one slot's share of the need and the guardian's
-    ///         whole-budget valuation, or when that valuation is zero.
+    ///         budget, then refused when what it books is worth less than one
+    ///         slot's share of the need — or, while fewer than half the slots
+    ///         are booked, less than the guardian's whole-budget valuation — or
+    ///         when that valuation is zero.
     function recordApproval(address governor, uint256 proposalId, address guardian, uint256 lockWood) external;
     function releaseApproval(address governor, uint256 proposalId, address guardian) external;
 
