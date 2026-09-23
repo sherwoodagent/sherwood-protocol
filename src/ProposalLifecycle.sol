@@ -73,14 +73,17 @@ abstract contract ProposalLifecycle is ISyndicateGovernor {
             // Voting ended — optimistic: approved unless AGAINST votes reach the veto threshold.
             // Skip the veto check when liveSupply == 0, else the bar collapses to 0 and everything auto-rejects.
             // vetoThresholdBps is the Draft -> Pending snapshot, so mid-vote finalizes don't move the bar.
-            // Votable set at the snapshot = supply minus the queue (queued shares keep snapshot weight).
-            // Cap it at totalSupply(): bounds the inflation side only. A holder who redeemed ahead of
-            // propose in the same block keeps snapshot vote weight against this live-capped bar.
+            // Votable set = min(snapshot, live), each side supply minus the queue, so a same-block exit
+            // ahead of propose shrinks the bar. The live queue term is capped at the snapshot's: shares
+            // queued after the snapshot keep their snapshot weight (NM 6.4; matches v1-deploy #342).
             uint256 pastTotalSupply = IVotes(p.vault).getPastTotalSupply(p.snapshotTimestamp);
             address queue = ISyndicateVault(p.vault).withdrawalQueue();
             uint256 queueVotes = queue == address(0) ? 0 : IVotes(p.vault).getPastVotes(queue, p.snapshotTimestamp);
             uint256 liveSupply = pastTotalSupply > queueVotes ? pastTotalSupply - queueVotes : 0;
+            uint256 liveQueued = queue == address(0) ? 0 : IERC20(p.vault).balanceOf(queue);
+            if (liveQueued > queueVotes) liveQueued = queueVotes;
             uint256 nowTotalSupply = IERC20(p.vault).totalSupply();
+            nowTotalSupply = nowTotalSupply > liveQueued ? nowTotalSupply - liveQueued : 0;
             if (nowTotalSupply < liveSupply) liveSupply = nowTotalSupply;
             if (liveSupply > 0) {
                 uint256 vetoThreshold = (liveSupply * p.vetoThresholdBps) / BPS_DENOMINATOR;

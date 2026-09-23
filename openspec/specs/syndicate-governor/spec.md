@@ -78,10 +78,10 @@ A non-collaborative proposal SHALL enter `Pending` immediately at propose; a col
 - **THEN** the call SHALL revert with `NotWithinVotingPeriod`
 
 ### Requirement: Optimistic passage with veto threshold
-The governor SHALL use optimistic governance: no FOR-vote quorum exists. At `voteEnd`, a Pending proposal SHALL be `Rejected` if and only if `votesAgainst >= pastTotalSupply * vetoThresholdBps / 10_000`, where `vetoThresholdBps` is the per-proposal snapshot taken when the proposal entered Pending (a mid-vote parameter change cannot move the bar) and `pastTotalSupply` is the vault supply at `snapshotTimestamp`. When `pastTotalSupply == 0`, the veto check SHALL be skipped (otherwise the threshold collapses to zero and every proposal auto-rejects). A proposal not vetoed at voteEnd proceeds into guardian review.
+The governor SHALL use optimistic governance: no FOR-vote quorum exists. At `voteEnd`, a Pending proposal SHALL be `Rejected` if and only if `votesAgainst >= votableSupply * vetoThresholdBps / 10_000`, where `vetoThresholdBps` is the per-proposal snapshot taken when the proposal entered Pending (a mid-vote parameter change cannot move the bar) and `votableSupply = min(snapshotSupply - snapshotQueued, totalSupply() - min(balanceOf(withdrawalQueue), snapshotQueued))`, with `snapshotSupply` and `snapshotQueued` the vault supply and the queue's votes at `snapshotTimestamp` and every subtraction clamped at zero, so the bar never counts shares that left the vault or were queued by the snapshot. When `votableSupply == 0`, the veto check SHALL be skipped (otherwise the threshold collapses to zero and every proposal auto-rejects). A proposal not vetoed at voteEnd proceeds into guardian review.
 
 #### Scenario: Veto threshold reached
-- **WHEN** voting ends with `votesAgainst` at or above the snapshotted veto threshold of past total supply
+- **WHEN** voting ends with `votesAgainst` at or above the snapshotted veto threshold of `votableSupply`
 - **THEN** the proposal SHALL resolve to `Rejected` without traversing guardian review, and no registry economic commit SHALL fire for it
 
 #### Scenario: Silence passes the vote

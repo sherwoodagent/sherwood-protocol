@@ -266,6 +266,57 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 
+    /// @notice Queue `shares` under a proposal that settles (stamping the request), never claim it,
+    ///         and stop at the block of the next propose.
+    function _parkStamped(address who, uint256 shares) internal {
+        uint256 pid0 = _propose();
+        vm.prank(who);
+        vault.requestRedeem(shares, who);
+        _endVote();
+        governor.executeProposal(pid0);
+        _settle(pid0);
+        vm.warp(governor.getCooldownEnd());
+    }
+
+    /// @notice 200k parked and 200k redeemed ahead of propose in its block: live supply still counts
+    ///         the parked 200k, so only dropping them too leaves lp1's 100k as the electorate and
+    ///         100% of it Against rejects.
+    function test_parkedQueueSharesCannotHideASameBlockPreProposeRedeem() public {
+        _deposit(lp1, 100_000e6);
+        _deposit(attacker, 400_000e6);
+        uint256 parked = vault.balanceOf(attacker) / 2;
+        _parkStamped(attacker, parked);
+        uint256 redeemed = vault.balanceOf(attacker);
+        vm.prank(attacker);
+        vault.redeem(redeemed, attacker, attacker); // same block, ahead of propose
+        uint256 pid = _propose();
+        uint256 snap = governor.getProposal(pid).snapshotTimestamp;
+        assertEq(vault.getPastVotes(address(queue), snap), parked, "the parked shares are the queue's snapshot term");
+        assertEq(vault.getPastTotalSupply(snap) - parked, vault.balanceOf(lp1) + redeemed, "snapshot holds the exit");
+        assertEq(vault.totalSupply(), vault.balanceOf(lp1) + parked, "live supply holds the parked shares");
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Rejected));
+    }
+
+    /// @notice 100k parked, then lp2 queues his 39k after the snapshot and votes with snapshot weight:
+    ///         the live queue term is capped at the parked 100k, so the bar stays 40k and 39% approves.
+    function test_sharesQueuedAfterTheSnapshotAreNotSubtractedOnTopOfParkedOnes() public {
+        _deposit(lp1, 61_000e6);
+        _deposit(lp2, 39_000e6);
+        _deposit(attacker, 100_000e6);
+        _parkStamped(attacker, vault.balanceOf(attacker));
+        uint256 pid = _propose();
+        uint256 lp2Shares = vault.balanceOf(lp2);
+        vm.startPrank(lp2);
+        vault.requestRedeem(lp2Shares, lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        vm.stopPrank();
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
     function _resolveWithAgainst(uint256 againstAssets) internal returns (ISyndicateGovernor.ProposalState) {
         _deposit(lp1, againstAssets);
         _deposit(lp2, 120_000e6 - againstAssets);
