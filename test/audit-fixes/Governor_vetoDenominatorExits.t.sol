@@ -595,6 +595,41 @@ contract GovernorVetoDenominatorExitsTest is Test {
         );
     }
 
+    /// @notice Queue `shares` under a proposal that settles (stamping the request), never claim it,
+    ///         and stop at the block of the next propose.
+    function _parkStamped(address who, uint256 shares) internal {
+        uint256 pid0 = _propose();
+        vm.prank(who);
+        vault.requestRedeem(shares, who);
+        _endVote();
+        governor.executeProposal(pid0);
+        _settle(pid0);
+        vm.warp(governor.getCooldownEnd());
+    }
+
+    /// @notice 200k parked (stamped, unclaimed) and an exit of R <= P ahead of propose in its block:
+    ///         the live supply still counts the parked 200k, so only dropping them from the live side
+    ///         too leaves lp1's 100k as the electorate and 100% of it Against rejects (NM 6.4 residual).
+    function test_stampedParkedSharesCannotHideASameBlockPreProposeRedeem() public {
+        _deposit(lp1, 100_000e6);
+        _deposit(attacker, 400_000e6);
+        uint256 parked = vault.balanceOf(attacker) / 2;
+        _parkStamped(attacker, parked);
+        uint256 redeemed = vault.balanceOf(attacker);
+        vm.prank(attacker);
+        vault.redeem(redeemed, attacker, attacker); // same block, ahead of propose
+        uint256 pid = _propose();
+        uint256 snap = governor.getProposal(pid).snapshotTimestamp;
+        assertEq(vault.getPastVotes(address(queue), snap), parked, "the parked shares are the queue's snapshot term");
+        assertEq(vault.getPastTotalSupply(snap) - parked, vault.balanceOf(lp1) + redeemed, "snapshot holds the exit");
+        assertEq(vault.totalSupply(), vault.balanceOf(lp1) + parked, "live supply holds the parked shares");
+        assertEq(governor.getProposal(pid).votableSupply, vault.balanceOf(lp1), "electorate is lp1 alone");
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Rejected));
+    }
+
     function _vetoBar(uint256 pid) internal view returns (uint256) {
         ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(pid);
         return (p.votableSupply * p.vetoThresholdBps) / 10_000;
