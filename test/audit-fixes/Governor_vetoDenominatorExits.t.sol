@@ -77,6 +77,11 @@ contract GovernorVetoDenominatorExitsTest is Test {
     }
 
     function _propose() internal returns (uint256 pid) {
+        pid = _proposeNoWarp();
+        vm.warp(vm.getBlockTimestamp() + 1);
+    }
+
+    function _proposeNoWarp() internal returns (uint256 pid) {
         ISyndicateGovernor.RiskEnvelope memory env = GovEnvelope.permissive(address(vault));
         ISyndicateGovernor.CoProposer[] memory none;
         vm.prank(agent);
@@ -92,7 +97,6 @@ contract GovernorVetoDenominatorExitsTest is Test {
             GovEnvelope.defaultCaps(env.maxCapital, 1),
             none
         );
-        vm.warp(vm.getBlockTimestamp() + 1);
     }
 
     function _endVote() internal {
@@ -264,6 +268,143 @@ contract GovernorVetoDenominatorExitsTest is Test {
         governor.vote(pid1, ISyndicateGovernor.VoteType.Against);
         _endVote();
         assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    /// @notice Queue `shares` under a proposal that settles (stamping the request), never claim it,
+    ///         and stop at the block of the next propose.
+    function _parkStamped(address who, uint256 shares) internal {
+        uint256 pid0 = _propose();
+        vm.prank(who);
+        vault.requestRedeem(shares, who);
+        _endVote();
+        governor.executeProposal(pid0);
+        _settle(pid0);
+        vm.warp(governor.getCooldownEnd());
+    }
+
+    /// @notice 200k parked and 200k redeemed ahead of propose in its block: live supply still counts
+    ///         the parked 200k, so only dropping them too leaves lp1's 100k as the electorate and
+    ///         100% of it Against rejects.
+    function test_parkedQueueSharesCannotHideASameBlockPreProposeRedeem() public {
+        _deposit(lp1, 100_000e6);
+        _deposit(attacker, 400_000e6);
+        uint256 parked = vault.balanceOf(attacker) / 2;
+        _parkStamped(attacker, parked);
+        uint256 redeemed = vault.balanceOf(attacker);
+        vm.prank(attacker);
+        vault.redeem(redeemed, attacker, attacker); // same block, ahead of propose
+        uint256 pid = _propose();
+        uint256 snap = governor.getProposal(pid).snapshotTimestamp;
+        assertEq(vault.getPastVotes(address(queue), snap), parked, "the parked shares are the queue's snapshot term");
+        assertEq(vault.getPastTotalSupply(snap) - parked, vault.balanceOf(lp1) + redeemed, "snapshot holds the exit");
+        assertEq(vault.totalSupply(), vault.balanceOf(lp1) + parked, "live supply holds the parked shares");
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Rejected));
+    }
+
+    /// @notice 100k parked, then lp2 queues his 39k after the snapshot and votes with snapshot weight:
+    ///         the live queue term is capped at the parked 100k, so the bar stays 40k and 39% approves.
+    function test_sharesQueuedAfterTheSnapshotAreNotSubtractedOnTopOfParkedOnes() public {
+        _deposit(lp1, 61_000e6);
+        _deposit(lp2, 39_000e6);
+        _deposit(attacker, 100_000e6);
+        _parkStamped(attacker, vault.balanceOf(attacker));
+        uint256 pid = _propose();
+        uint256 lp2Shares = vault.balanceOf(lp2);
+        vm.startPrank(lp2);
+        vault.requestRedeem(lp2Shares, lp2);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        vm.stopPrank();
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    /// @notice lp2 queues his 39k in the propose second, after propose, and votes with snapshot weight:
+    ///         the queue term is capped at the snapshot's (zero), so the bar stays 40k and 39% approves.
+    function test_sharesQueuedInTheProposeSecondAreNotSubtractedFromTheLiveSide() public {
+        _deposit(lp1, 61_000e6);
+        _deposit(lp2, 39_000e6);
+        uint256 pid = _proposeNoWarp();
+        uint256 lp2Shares = vault.balanceOf(lp2);
+        vm.startPrank(lp2);
+        vault.requestRedeem(lp2Shares, lp2); // same second as propose
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        vm.stopPrank();
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    /// @notice lp3's stamped 50k park is claimed by the attacker in the propose second, ahead of propose.
+    function _parkClaimedInTheProposeSecond() internal returns (uint256 pid1) {
+        address lp3 = makeAddr("lp3");
+        _deposit(lp1, 60_000e6);
+        _deposit(attacker, 30_000e6);
+        _deposit(lp3, 50_000e6);
+        uint256 lp3Shares = vault.balanceOf(lp3);
+        uint256 pid0 = _propose();
+        vm.prank(lp3);
+        uint256 req = vault.requestRedeem(lp3Shares, lp3);
+        _endVote();
+        governor.executeProposal(pid0);
+        _settle(pid0);
+        vm.warp(governor.getCooldownEnd());
+        vm.prank(attacker);
+        queue.claim(req);
+        pid1 = _propose();
+    }
+
+    /// @notice A post-snapshot request cannot refill the queue headroom a propose-second claim left:
+    ///         the bar stays 40% of 90k, so the attacker's 30k Against falls short.
+    function test_requestsAfterAProposeSecondClaimDoNotLowerTheVetoBar() public {
+        uint256 pid1 = _parkClaimedInTheProposeSecond();
+        uint256 atk = vault.balanceOf(attacker);
+        vm.startPrank(attacker);
+        vault.requestRedeem(atk, attacker);
+        governor.vote(pid1, ISyndicateGovernor.VoteType.Against);
+        vm.stopPrank();
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    /// @notice The veto outcome is fixed at voteEnd: a requestRedeem after it does not flip Approved.
+    function test_requestRedeemAfterVoteEndDoesNotMoveTheOutcome() public {
+        uint256 pid1 = _parkClaimedInTheProposeSecond();
+        vm.prank(attacker);
+        governor.vote(pid1, ISyndicateGovernor.VoteType.Against);
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Approved));
+        uint256 atk = vault.balanceOf(attacker);
+        vm.prank(attacker);
+        vault.requestRedeem(atk, attacker);
+        assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    /// @notice An unstamped (cancelled-pid) park cancelled after voteEnd cannot un-reject: 50k of a 100k
+    ///         electorate Against stays Rejected.
+    function test_cancellingAnUnstampedParkAfterVoteEndDoesNotUnReject() public {
+        _deposit(lp1, 50_000e6);
+        _deposit(lp2, 50_000e6);
+        _deposit(attacker, 200_000e6);
+        uint256 pid0 = _propose();
+        uint256 half = vault.balanceOf(attacker) / 2;
+        vm.prank(attacker);
+        uint256 req = vault.requestRedeem(half, attacker);
+        vm.prank(agent);
+        governor.cancelProposal(pid0);
+        vm.warp(governor.getCooldownEnd());
+        uint256 rest = vault.balanceOf(attacker);
+        vm.prank(attacker);
+        vault.redeem(rest, attacker, attacker); // same second, ahead of propose
+        uint256 pid1 = _propose();
+        vm.prank(lp1);
+        governor.vote(pid1, ISyndicateGovernor.VoteType.Against);
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Rejected));
+        vm.prank(attacker);
+        queue.cancel(req);
+        assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Rejected));
     }
 
     function _resolveWithAgainst(uint256 againstAssets) internal returns (ISyndicateGovernor.ProposalState) {
