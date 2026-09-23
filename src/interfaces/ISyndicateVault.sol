@@ -69,6 +69,9 @@ interface ISyndicateVault {
     /// @notice A governor batch called `asset()` with fewer than 36 bytes of calldata: no first
     ///         argument to treat as a spender, so the call cannot be admitted as allowance-shaped.
     error MalformedAssetCall(bytes4 selector);
+    /// @notice `delegate` or `delegateBySig` was called. The vault self-delegates every
+    ///         receiver, so delegation is fixed and both entrypoints are refused.
+    error DelegationDisabled();
 
     // ── Init Params ──
     struct InitParams {
@@ -145,7 +148,7 @@ interface ISyndicateVault {
     function agentFeeBps() external view returns (uint256);
     /// @notice Set the agent performance fee (owner only). Capped at
     ///         `MAX_AGENT_FEE_BPS`, which aliases
-    ///         `FeeConstants.MAX_PERFORMANCE_FEE_BPS` (3000 = 30%). Reverts with
+    ///         `FeeConstants.MAX_PERFORMANCE_FEE_BPS` (2500 = 25%). Reverts with
     ///         `AgentFeeTooHigh` above.
     function setAgentFeeBps(uint256 bps) external;
     /// @notice Idle-liquidity floor in basis points of the pre-batch float.

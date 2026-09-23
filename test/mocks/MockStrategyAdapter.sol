@@ -24,8 +24,9 @@ contract MockStrategyAdapter is IStrategy {
         return address(0);
     }
 
+    /// @dev False: the stub holds no capital, so it never trips `settleProposal`'s unwind check.
     function executed() external pure returns (bool) {
-        return true;
+        return false;
     }
 
     function name() external pure returns (string memory) {

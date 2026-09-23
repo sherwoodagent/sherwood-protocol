@@ -160,11 +160,12 @@ contract GovernorParametersTest is Test {
         assertEq(governor.getGovernorParams().maxPerformanceFeeBps, newVal);
     }
 
+    /// @dev 2501, written out: one bps over the 2500 ceiling, so this stays
+    ///      red if the constant is raised.
     function test_setMaxPerformanceFeeBps_aboveCap_reverts() public {
-        uint256 aboveCap = governor.MAX_PERFORMANCE_FEE_CAP() + 1;
         vm.prank(owner);
         vm.expectRevert(ISyndicateGovernor.InvalidMaxPerformanceFeeBps.selector);
-        governor.setMaxPerformanceFeeBps(aboveCap);
+        governor.setMaxPerformanceFeeBps(2501);
     }
 
     // ==================== setMinStrategyDuration ====================

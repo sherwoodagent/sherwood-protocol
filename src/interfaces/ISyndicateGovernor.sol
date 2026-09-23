@@ -160,6 +160,13 @@ interface ISyndicateGovernor {
         ///         written on EVERY execute path, so a stored zero never means
         ///         unset on an `Executed` proposal.
         uint256 effectiveMaxCapital;
+        /// @notice Shares that can vote on this proposal: `totalSupply()` minus
+        ///         the withdrawal queue's balance, both read LIVE at the
+        ///         Draft -> Pending transition, after any same-block burns.
+        ///         The veto bar is a fraction of this. Reconstructing it later
+        ///         from a snapshot cannot be exact — `totalSupply()` does not
+        ///         say whether a burn was a voter's redemption or a queued one.
+        uint256 votableSupply;
     }
 
     struct CoProposer {
@@ -302,6 +309,8 @@ interface ISyndicateGovernor {
     ///         what may be FROZEN as the price every queued deposit and redeem is
     ///         paid at; not waivable by the declared drawdown.
     error SettlePriceBelowFloor(uint256 ppsNow, uint256 ppsFloor);
+    /// @notice `settleProposal` ran a leg that left the proposal's strategy still `Executed`.
+    error StrategyNotSettled(address strategy);
     /// @notice Revert if `claimUnclaimedFees` is called for a vault whose
     ///         proposal is currently Executed. An escrowed fee leaving the
     ///         vault mid-strategy is indistinguishable from a strategy loss to

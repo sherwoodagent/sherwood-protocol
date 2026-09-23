@@ -710,6 +710,11 @@ contract GovernorCoverageGatesTest is Test {
     ///         and accepted (design D5): execution still proceeds (there IS an
     ///         identified, nonzero-bonded signer, so the R1 floor is met), but
     ///         the batch's net-outflow ceiling is 0.
+    ///
+    /// @dev    SHE-240 keeps this reachable: the slot floor is the SMALLER of
+    ///         one slot's share of the need and the guardian's whole budget, so
+    ///         a guardian this small still takes a slot by committing all of it.
+    ///         What it may not do is take a slot while holding budget back.
     function test_execute_dustCoverage_floorsEffectiveMaxCapitalToZero() public {
         uint256 pid = _proposeSolo(governor, address(vault), agent, 1_000e6);
         address[] memory gs = new address[](1);

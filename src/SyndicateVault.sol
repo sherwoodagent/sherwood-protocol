@@ -629,9 +629,22 @@ contract SyndicateVault is
             _highWaterPricePerShare = 0;
         }
 
-        if (to != address(0) && delegates(to) == address(0)) {
+        // Self-delegation is total: a receiver whose delegate is anything but itself is corrected.
+        if (to != address(0) && delegates(to) != to) {
             _delegate(to, to);
         }
+    }
+
+    /// @dev Delegation is refused: `_update` self-delegates every receiver, so a holder's
+    ///      votes always equal its balance.
+    function delegate(address) public pure override {
+        revert DelegationDisabled();
+    }
+
+    /// @dev Refused for the reason above; the revert is the whole body, so it precedes
+    ///      every signature and nonce check.
+    function delegateBySig(address, uint256, uint256, uint8, bytes32, bytes32) public pure override {
+        revert DelegationDisabled();
     }
 
     /// @dev Use timestamp-based voting checkpoints instead of block numbers
@@ -660,8 +673,9 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev Same predicate as `redemptionsLocked`: a proposal settles only when
-    ///      its strategy holds nothing, so no receivable is ever priced.
+    /// @dev Same predicate as `redemptionsLocked`. `totalAssets` counts idle balance only: `settleProposal`
+    ///      and `unstick` refuse a strategy still `Executed`, but `finalizeEmergencySettle` can leave
+    ///      capital on the clone, priced as a loss until a later batch settles it.
     function depositsLocked() public view returns (bool) {
         return redemptionsLocked();
     }
