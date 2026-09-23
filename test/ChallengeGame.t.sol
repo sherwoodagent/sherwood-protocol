@@ -5048,6 +5048,33 @@ contract ChallengeGameTest is Test {
         _assertLiveBondsBacked();
     }
 
+    /// @notice A filing that lands after the pool completed, in the same second, is not answered by it.
+    function test_filingAfterPoolCompletedInTheSameSecondIsNotAnswered() public {
+        uint256 a = _fileStandard(PROPOSAL);
+        _completePool(a);
+        (,,, uint256 completedAt,) = game.counterBondPoolOf(a);
+
+        address laterFiler = makeAddr("laterFiler");
+        _fund(laterFiler);
+        uint256 b = _fileStandardFrom(laterFiler, PROPOSAL);
+        assertEq(_filedAt(b), completedAt, "fixture: B shares the completion's timestamp");
+        assertEq(uint8(game.challengeOf(a).status), uint8(IChallengeGame.Status.Disputed), "A was open when it paid");
+        assertEq(uint8(game.challengeOf(b).status), uint8(IChallengeGame.Status.Filed), "B was not");
+
+        // B can buy its own defence...
+        uint256 snap = vm.snapshotState();
+        vm.prank(guardianB);
+        game.dispute(b, type(uint256).max);
+        assertEq(uint8(game.challengeOf(b).status), uint8(IChallengeGame.Status.Disputed), "B's own defence");
+        vm.revertToState(snap);
+
+        // ...and without one, silence convicts.
+        vm.warp(_filedAt(b) + game.autoSlashDelay());
+        game.resolve(b);
+        assertEq(uint8(game.challengeOf(b).status), uint8(IChallengeGame.Status.Settled), "silence convicts B");
+        assertEq(swood.callCount(), 1, "the silence IS the verdict");
+    }
+
     /// @notice A FORFEIT IS SPLIT AS IT STOOD WHEN IT WAS BOOKED. The round's
     ///         raised total no longer freezes at the shared completion — an
     ///         own defence keeps growing it while other challenges are live —

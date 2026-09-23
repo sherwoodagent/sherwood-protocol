@@ -5,6 +5,7 @@ import {ISyndicateVault} from "./interfaces/ISyndicateVault.sol";
 import {IGuardianRegistry} from "./interfaces/IGuardianRegistry.sol";
 import {BatchExecutorLib} from "./BatchExecutorLib.sol";
 import {ProposalLifecycle} from "./ProposalLifecycle.sol";
+import {IStrategy} from "./interfaces/IStrategy.sol";
 
 /// @title GovernorEmergency
 /// @notice Abstract — emergency settlement paths extracted for bytecode headroom.
@@ -68,6 +69,10 @@ abstract contract GovernorEmergency is ProposalLifecycle {
         // Same batch, same zero egress budget as `settleProposal`.
         ISyndicateVault(p.vault)
             .executeGovernorBatch(_getSettlementCalls(proposalId), _getEffectiveSettlementCallCaps(proposalId), 0);
+        // Same unwind check as `settleProposal`. A strategy that cannot unwind exits through the
+        // guardian-reviewed, bonded `finalizeEmergencySettle`, which is exempt.
+        (bool ok, bytes memory ret) = p.strategy.staticcall(abi.encodeCall(IStrategy.executed, ()));
+        if (ok && ret.length == 32 && abi.decode(ret, (bool))) revert StrategyNotSettled(p.strategy);
         _requireSettlePriceAboveFloorHook(proposalId, p, true);
         _finishSettlementHook(proposalId, p);
     }
