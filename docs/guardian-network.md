@@ -128,9 +128,9 @@ it. Full detail: [coverage.md](coverage.md).
 - **Approve is underwriting:** `voteOnProposal(…, lockWood)` →
   `recordApproval(governor, proposalId, guardian, lockWood)`. The ledger locks
   `min(lockWood, free budget)` WOOD, where free budget is
-  `kNumerator × slashableStake − openExposure(guardian)` — no price is read. A
-  guardian with no free budget is not rejected at vote time; the cap is enforced
-  by locking zero, and the vote still counts as weight.
+  `kNumerator × slashableStake − openExposure(guardian)`. The vote reverts
+  `ApproveLockBelowFloor` when that lock is worth less than one slot's share of
+  the need (see `coverage.md`), so an approver slot always carries a lock.
 - **Approve quorum at execute:** `requireApproveQuorum` is a coverage
   **measurement**, not an all-or-nothing gate. It values each approver's lock
   live — `Σ min(lock_i, live stake_i) × woodPriceX8()` — and returns
