@@ -353,6 +353,55 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
         // Whole-tx revert: the first call's ratchet flip rolled back too.
         assertEq(uint256(clone.state()), uint256(BaseStrategy.State.Pending));
     }
+
+    // ── settle requires unwind (NM fix review) ──
+
+    /// @notice A settlement leg that never calls `settle()` cannot close the proposal through
+    ///         `settleProposal`, and the owner's `unstick` still can.
+    function test_settleLegSkippingStrategySettle_reverts_unstickStillCloses() public {
+        MockFundedStrategy clone = MockFundedStrategy(Clones.clone(address(new MockFundedStrategy())));
+        uint256 amount = 10_000e6;
+        clone.initialize(address(vault), agent, abi.encode(address(usdc), amount));
+
+        BatchExecutorLib.Call[] memory executeCalls = new BatchExecutorLib.Call[](2);
+        executeCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), value: 0, data: abi.encodeCall(IERC20.approve, (address(clone), amount))
+        });
+        executeCalls[1] =
+            BatchExecutorLib.Call({target: address(clone), value: 0, data: abi.encodeCall(BaseStrategy.execute, ())});
+        uint256[] memory executeCaps = new uint256[](2);
+        executeCaps[1] = amount;
+        BatchExecutorLib.Call[] memory settlementCalls = _benignCalls();
+
+        ISyndicateGovernor.RiskEnvelope memory env = _permissiveEnv();
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(clone),
+            "ipfs://p",
+            STRATEGY_DURATION,
+            env,
+            executeCalls,
+            executeCaps,
+            settlementCalls,
+            new uint256[](1),
+            _noCoProposers()
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(voter);
+        governor.vote(pid, ISyndicateGovernor.VoteType.For);
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(pid);
+
+        vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.StrategyNotSettled.selector, address(clone)));
+        governor.settleProposal(pid);
+
+        vm.prank(owner);
+        governor.unstick(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
+        assertEq(usdc.balanceOf(address(clone)), amount, "emergency close leaves the clone's capital in place");
+    }
 }
 
 /// @title Strategy_cloneRatchetBinding — unit pins

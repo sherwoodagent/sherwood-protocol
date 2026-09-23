@@ -137,6 +137,10 @@ After a passed vote the proposal SHALL sit in `GuardianReview` until `reviewEnd`
 - **WHEN** depositors add or remove principal while a strategy is live
 - **THEN** the settlement P&L SHALL exclude that interim net flow, so fees are charged only on strategy performance
 
+#### Scenario: Settlement leg that does not unwind the strategy
+- **WHEN** the settlement calls leave the proposal's strategy answering `executed() == true`
+- **THEN** `settleProposal` SHALL revert with `StrategyNotSettled`; `unstick` and `finalizeEmergencySettle` do not apply this check
+
 ### Requirement: Fee distribution waterfall
 On a positive P&L, unless the proposal's snapshotted `selfManagesFees` flag is true (which skips the entire governor fee waterfall), the governor SHALL distribute, in order: (1) protocol fee = gross profit × snapshotted `protocolFeeBps` to the snapshotted protocol recipient; (2) guardian fee = gross profit × snapshotted `guardianFeeBps` to the snapshotted guardians recipient, emitting `GuardianFeeAccrued` only when the transfer actually delivers; (3) agent performance fee = net profit × the propose-time performance fee, re-clamped at settle to the live `maxPerformanceFeeBps` (emitting `FeeClamped` when the clamp fires), split across active co-proposers by their `splitBps` with the remainder to the lead proposer; (4) management fee = remaining net × the vault's live `managementFeeBps` to the vault owner. Any individual fee transfer that reverts (e.g. a blacklisted recipient) SHALL be escrowed against `(vault, recipient, token)` instead of reverting settlement, emitting `FeeTransferFailed`; recipients pull escrowed amounts later via `claimUnclaimedFees`, which SHALL zero the escrow slot before transferring and only pay from the vault that owes it.
 
