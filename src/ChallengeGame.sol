@@ -482,11 +482,14 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
     ///        THAT challenge's own silence window - see `_poolBacked`.
     /// @param outcome Burned by a conviction, released by the last live
     ///        challenge terminating without one.
+    /// @param completedThroughId `challengeCount` at completion: a filing later in
+    ///        the same second shares `completedAt` but was not open when it paid.
     struct CounterBondPool {
         uint256 target;
         uint256 weight;
         uint256 completedAt;
         PoolOutcome outcome;
+        uint256 completedThroughId;
     }
 
     /// @dev Keyed by `(reviewKey, round)`, never by challenge - see
@@ -816,10 +819,16 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         return keccak256(abi.encode("counterBondPool", key, _poolRound[key]));
     }
 
-    function _poolBacked(Challenge storage c, CounterBondPool storage p) private view returns (bool) {
+    function _poolBacked(uint256 challengeId, Challenge storage c, CounterBondPool storage p)
+        private
+        view
+        returns (bool)
+    {
         if (c.defendedAt != 0) return true;
         uint256 completedAt = p.completedAt;
-        return completedAt != 0 && completedAt >= c.filedAt && completedAt < c.filedAt + c.autoSlashDelayAtFiling;
+        return
+            completedAt != 0 && challengeId <= p.completedThroughId
+                && completedAt < c.filedAt + c.autoSlashDelayAtFiling;
     }
 
     // ── Dispute ──
@@ -879,7 +888,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // A completed pool answers only what it was raised against; a challenge
         // it does not answer buys its OWN defence at the same target.
         bool own = p.completedAt != 0;
-        if (own && _poolBacked(c, p)) revert WrongStatus();
+        if (own && _poolBacked(challengeId, c, p)) revert WrongStatus();
         // The window this challenge received, not whatever governance
         // currently prefers.
         if (block.timestamp >= c.filedAt + c.autoSlashDelayAtFiling) revert WindowClosed();
@@ -905,6 +914,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             // own silence window still contains this instant becomes disputed by
             // derivation. See `_poolBacked` for why that is not a loop.
             p.completedAt = block.timestamp;
+            p.completedThroughId = challengeCount;
         }
         _bookContribution(challengeId, c.courtAtFiling, poolKey, amount, pool, complete);
     }
@@ -983,7 +993,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         // through to `WrongStatus`.
         if (c.status != Status.Filed) revert WrongStatus();
         bytes32 poolKey = _poolOf[challengeId];
-        if (!_poolBacked(c, _pools[poolKey])) {
+        if (!_poolBacked(challengeId, c, _pools[poolKey])) {
             if (block.timestamp < c.filedAt + c.autoSlashDelayAtFiling) revert DelayNotElapsed();
             if (block.timestamp >= c.filedAt + c.disputeTimeoutAtFiling) {
                 // Stale: past the hard end. Unwind, never convict.
@@ -1021,7 +1031,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
         if (msg.sender != court) revert NotCourt();
         Challenge storage c = _challenges[challengeId];
         bytes32 poolKey = _poolOf[challengeId];
-        if (c.status != Status.Filed || !_poolBacked(c, _pools[poolKey])) revert WrongStatus();
+        if (c.status != Status.Filed || !_poolBacked(challengeId, c, _pools[poolKey])) revert WrongStatus();
         if (c.courtAtFiling == address(0)) revert NotCourt();
         // Hard deadline - see the natspec. Checked AFTER the status/court gates
         // so a terminal challenge still reports `WrongStatus` to the court.
@@ -1125,7 +1135,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             emit ChallengerBondBurned(challengeId, burned);
         }
         wood.safeTransfer(c.challenger, bond - burned);
-        if (_poolBacked(c, _pools[poolKey])) {
+        if (_poolBacked(challengeId, c, _pools[poolKey])) {
             _burnPool(key, poolKey, challengeId);
         } else {
             _releasePoolIfLast(key, poolKey, challengeId);
@@ -1332,7 +1342,7 @@ contract ChallengeGame is Ownable2Step, IChallengeGame {
             Challenge storage c = _challenges[challengeId];
             CounterBondPool storage p = _pools[_poolOf[challengeId]];
             m.counterBondWood = p.weight;
-            if (_poolBacked(c, p)) m.status = Status.Disputed;
+            if (_poolBacked(challengeId, c, p)) m.status = Status.Disputed;
         }
         return m;
     }
