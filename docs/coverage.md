@@ -118,11 +118,44 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
 - **WOOD is priced by one feed, capped by governance.** `woodPriceX8()` reads a
   single `AggregatorV3`-shaped WOOD/USD feed, takes `min(feed, woodUsdPriceX8)`
   — the cap is never served as a price — and applies `woodHaircutBps`. On chain
-  4663 that feed is `WoodPoolFeed`: the lower of the Uniswap and Sushiswap
-  WOOD/WETH pools' TWAPs over a window of at least 24h, converted through
-  ETH/USD; every snapshot syncs both pairs first, so there is no idle tail, and
-  each pool is held to a WETH depth floor. A stale or shallow reading yields no
-  price at all — `NoWoodPrice` — rather than a wrong one.
+  4663 that feed is `WoodPoolFeed`: the lower of two WOOD/WETH TWAPs over a
+  window of at least 24h, converted through ETH/USD. One leg is the Uniswap V2
+  pair, snapshotted by the keeper and synced before each snapshot so there is no
+  idle tail, held to a WETH reserve floor; the other is the Uniswap V3 pool
+  `0xF683…1C69`, read live from its own observation ring via `observe`, held to
+  an in-range `liquidity()` floor instead. **The V3 leg answers only if that ring
+  can span the window** — the live pool's `observationCardinality` is 1, which
+  cannot, so growing it with the permissionless
+  `increaseObservationCardinalityNext` is a named deploy step
+  (`GrowV3Cardinality`) and `DeployWoodPoolFeed` refuses to deploy against a pool
+  whose `observe(window)` reverts or whose ring holds fewer than two observations
+  (a ring of one has no history and `observe` answers it with spot). The ring
+  stores one observation per block in which the pool is TOUCHED, not per block:
+  at the pool's measured ~880s write cadence a 24h window needs ~99 slots, and
+  the bound that binds is the transaction, not the uint16 index — every new slot
+  is initialised inside `increaseObservationCardinalityNext` at ~22.4k gas, so
+  one call carries at most ~1,400 of them and a longer ring is grown in repeated
+  steps. The pre-flight asks the pool rather than trusting the derivation.
+  **`min` means the SHALLOWER venue binds**, and today that is the V3 pool
+  (~$122k of notional against the V2 pair's ~$330k), so the cost of pushing the
+  reported price DOWN is set by the V3 pool's depth and `woodHaircutBps` should
+  be sized against it rather than against the pair. **The V3 pool's liquidity is
+  a single full-range position**, so `MIN_V3_LIQUIDITY` is also the point at
+  which that one LP burning below it halts WOOD pricing protocol-wide
+  (`NoWoodPrice`, so nothing proposes and nothing executes); the deploy default
+  of `1e22` leaves only 2.1x headroom today and is a launch parameter to size
+  deliberately against what the protocol is willing to halt for. The two depth
+  floors also bind at different times: the V2 leg's WETH floor is checked at
+  SNAPSHOT time as well as at read time, so a pair that was thin during the
+  averaged span never enters the average, while the V3 leg's `liquidity()` floor
+  is checked only at read time — a live-read leg has no snapshot instant to bind
+  at — so a pool thin for most of the window but topped up just before the read
+  passes it. Accepted: the V3 leg carries no staleness gate of its own,
+  so a pool that stops trading keeps answering at its last tick, symmetric with
+  the V2 leg, which keeps averaging its last synced spot. `updatedAt` is the V2
+  snapshot's — the older of the two legs — so `WOOD_FEED_MAX_DELAY` at the ledger
+  is what bounds the whole feed's age. A stale or shallow reading yields no price
+  at all — `NoWoodPrice` — rather than a wrong one.
 - **Cohort liability is the lock sum, capped at need.**
   `liabilityUsd(governor, proposalId)` returns
   `min(needUsd, Σ min(lock_i, live stake_i) × woodPriceX8())`;

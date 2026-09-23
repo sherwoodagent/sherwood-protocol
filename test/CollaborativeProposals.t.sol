@@ -347,6 +347,27 @@ contract CollaborativeProposalsTest is Test {
         assertEq(uint256(p.state), uint256(ISyndicateGovernor.ProposalState.Pending));
     }
 
+    /// @notice The collaborative path stamps the veto ELECTORATE as well as the
+    ///         snapshot. Without it `votableSupply` is zero, `_computeState` skips
+    ///         the veto branch, and no Against vote can ever reject a collaborative
+    ///         proposal. lp1 holds 60% of supply against a 40% bar.
+    function test_approveCollaboration_stampsTheVetoElectorate() public {
+        uint256 proposalId = _createApprovedCollabProposal();
+
+        ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(proposalId);
+        assertEq(p.votableSupply, vault.totalSupply(), "electorate not stamped at the transition");
+
+        vm.prank(lp1);
+        governor.vote(proposalId, ISyndicateGovernor.VoteType.Against);
+        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+
+        assertEq(
+            uint256(governor.getProposalState(proposalId)),
+            uint256(ISyndicateGovernor.ProposalState.Rejected),
+            "veto did not reject a collaborative proposal"
+        );
+    }
+
     /// @notice G-C1: approveCollaboration() must also stamp the snapshot at
     ///         block.timestamp - 1 when Draft -> Pending transition fires, so
     ///         a same-block delegation cannot be counted. Mirrors propose().

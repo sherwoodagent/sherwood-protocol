@@ -397,23 +397,20 @@ contract SyndicateGovernorTest is Test {
         assertEq(p.snapshotTimestamp, tsBefore - 1);
     }
 
-    /// @notice G-C1: a delegation that lands in the same block as propose()
-    ///         must NOT count toward voting weight. Exercises the full path
-    ///         via governor.vote(): the voter holds shares but only delegates
-    ///         in the propose block, so getPastVotes at snapshotTimestamp
-    ///         (= block.timestamp - 1) returns 0 and the vote reverts as
-    ///         NoVotingPower.
+    /// @notice G-C1: a delegation checkpoint that lands in the same block as
+    ///         propose() must NOT count toward voting weight. Exercises the full
+    ///         path via governor.vote(): flashVoter's shares -- and with them the
+    ///         vault's auto-self-delegation -- arrive in the propose block, so
+    ///         getPastVotes at snapshotTimestamp (= block.timestamp - 1) returns 0
+    ///         and the vote reverts as NoVotingPower.
     function test_flashDelegate_sameBlock_notCounted() public {
         address flashVoter = makeAddr("flashVoter");
 
-        // flashVoter receives shares via transfer so auto-delegation in
-        // _deposit() does not fire -- delegates(flashVoter) stays at zero.
+        // Same block as propose. The transfer writes flashVoter's first delegation
+        // checkpoint: _update self-delegates any delegate-less receiver. Receipt is
+        // the only way in -- the vault refuses an explicit delegate().
         vm.prank(lp1);
         vault.transfer(flashVoter, 10_000e6);
-
-        // Same block: flashVoter delegates to self AND agent proposes.
-        vm.prank(flashVoter);
-        vault.delegate(flashVoter);
 
         vm.prank(agent);
         uint256 proposalId = governor.propose(
@@ -429,7 +426,7 @@ contract SyndicateGovernorTest is Test {
             _emptyCoProposers()
         );
 
-        // Snapshot is block.timestamp - 1; delegation checkpoint was written
+        // Snapshot is block.timestamp - 1; the delegation checkpoint was written
         // at block.timestamp, so getPastVotes returns 0 and vote() reverts.
         vm.prank(flashVoter);
         vm.expectRevert(ISyndicateGovernor.NoVotingPower.selector);
@@ -1118,6 +1115,11 @@ contract SyndicateGovernorTest is Test {
         uint256 gain799 = usdc.balanceOf(agent) - agentBalBefore;
         assertGt(gain799, 0, "settle clamps to lowered cap");
         assertLt(gain799, 1_000e6, "bounded by the LOWERED 10% cap, not the vault's 15%");
+    }
+
+    /// @notice Launch cap: the protocol performance-fee ceiling is 25%.
+    function test_launchCap_performanceFeeCeilingIsTwentyFivePercent() public view {
+        assertEq(governor.MAX_PERFORMANCE_FEE_CAP(), 2500, "25% performance ceiling");
     }
 
     /// @notice M5: the vault's hard cap must equal the governor's

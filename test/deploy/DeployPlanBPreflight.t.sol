@@ -3,8 +3,17 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {DeployPlanB} from "../../script/DeployPlanB.s.sol";
+import {Checkpoint} from "../../script/robinhood-mainnet/DeployAll.s.sol";
+import {Posture, Inputs, Stack} from "../../script/robinhood-mainnet/DeployTypes.sol";
+import {DeployAllFixture} from "./DeployAll.t.sol";
+import {DeploySalts} from "../../script/DeploySalts.sol";
+import {RobinhoodParams} from "../../script/robinhood-mainnet/RobinhoodParams.sol";
+import {Create3} from "../../script/utils/Create3.sol";
 import {ExposureLedger} from "../../src/ExposureLedger.sol";
+import {IExposureLedger} from "../../src/interfaces/IExposureLedger.sol";
 import {StakedWood} from "../../src/StakedWood.sol";
 import {GuardianRegistry} from "../../src/GuardianRegistry.sol";
 import {SyndicateFactory} from "../../src/SyndicateFactory.sol";
@@ -17,35 +26,19 @@ import {ProtocolConfig} from "../../src/ProtocolConfig.sol";
 import {ERC20Mock} from "../mocks/ERC20Mock.sol";
 import {MockAggregatorV3} from "../mocks/MockAggregatorV3.sol";
 
-/// @dev THE ONLY WAY TO RUN A SCRIPT AS ITS OWN BROADCASTER FROM A TEST.
-///      `vm.startBroadcast()` executes the script's calls as forge's
-///      `DEFAULT_SENDER`, while the script's `deployer = msg.sender` is
-///      whoever called `run()`. In production those are the same address
-///      (`--sender`); in a test they are not, and `DeployPlanB` would then
-///      deploy a ledger owned by one address while calling four owner-only
-///      setters as another. `vm.prank` cannot bridge the gap — foundry
-///      refuses to broadcast while a prank is active. So this etches a
-///      forwarder at `DEFAULT_SENDER` and calls `run()` THROUGH it. Same
-///      idiom, and the same reason, as `DeployTokenCourtPreflight.t.sol`.
-contract PlanBScriptCaller {
-    function fwd(address target, bytes calldata data) external {
-        (bool ok, bytes memory ret) = target.call(data);
-        if (!ok) {
-            assembly {
-                revert(add(ret, 0x20), mload(ret))
-            }
-        }
+/// @dev The mixin is abstract, and `Create3Factory.deploy` is `onlyOwner`, so the harness
+///      must be both the deployer the fixtures are owned by and the caller of `deploy` —
+///      hence `vm.prank(address(script))` everywhere instead of a forwarder.
+contract DeployPlanBHarness is DeployPlanB {
+    function c3Factory(address deployer) external returns (address) {
+        return address(_c3Factory(deployer));
     }
 }
 
-/// @dev A sWOOD that answers every read `DeployPlanB` makes and SILENTLY
-///      SWALLOWS `setExposureLedger`. There is no way to make the real
-///      `StakedWood` drop that call — it is a plain storage write — so the
-///      only way to prove the exit-gate assertion actually bites is to give
-///      the script a sWOOD that does not take the wiring. This stands in for
-///      every real cause of the same end state: a proxy pointed at an impl
-///      without the setter, a multisig that dropped the last call of a batch,
-///      a `setExposureLedger(0)` that lands right afterwards.
+/// @dev A sWOOD that answers every read and SILENTLY SWALLOWS `setExposureLedger`. The
+///      real `StakedWood` cannot drop that write, so this is the only way to prove the
+///      exit-gate post-flight bites. Stands in for a proxy on an impl without the setter,
+///      a multisig that dropped the last call of a batch, a `setExposureLedger(0)` after.
 contract DeafStakedWood {
     address public owner;
     address public exposureLedger;
@@ -62,8 +55,6 @@ contract DeafStakedWood {
         return 10_000;
     }
 
-    /// @dev Pre-flight 1c reads this too; a stub without it fails the typed
-    ///      call with no data, before the assertion this suite is pinning.
     function minSlashBps() external pure returns (uint256) {
         return 500;
     }
@@ -72,9 +63,8 @@ contract DeafStakedWood {
     function setExposureLedger(address) external {}
 }
 
-/// @dev A GuardianRegistry that answers `reviewPeriod()` (which
-///      `ExposureLedger.setGuardianRegistry` reads) and swallows
-///      `setExposureLedger`. Same rationale as `DeafStakedWood`.
+/// @dev A GuardianRegistry that answers `reviewPeriod()` (read by
+///      `ExposureLedger.setGuardianRegistry`) and swallows `setExposureLedger`.
 contract DeafGuardianRegistry {
     address public exposureLedger;
 
@@ -85,14 +75,12 @@ contract DeafGuardianRegistry {
     function setExposureLedger(address) external {}
 }
 
-/// @dev A SyndicateFactory that swallows both wiring calls the script makes on
-///      it. Same rationale as `DeafStakedWood`.
+/// @dev A SyndicateFactory that swallows both wiring calls. A zero count keeps pre-flight
+///      5 out of the way, so this stub stays about the wiring post-flight.
 contract DeafSyndicateFactory {
     address public exposureLedger;
     address public bondEscrow;
 
-    /// @dev Fresh: pre-flight 5 skips the beacon probe entirely at a zero count,
-    ///      so this stub stays about the wiring assertion it was written for.
     function syndicateCount() external pure returns (uint256) {
         return 0;
     }
@@ -102,13 +90,10 @@ contract DeafSyndicateFactory {
     function setBondEscrow(address) external {}
 }
 
-/// @dev A factory with a DECLARED syndicate count and beacon — the two inputs
-///      pre-flight 5 reads — plus real storage for the two wiring setters, so a
-///      PERMITTED run still reaches and passes the post-broadcast wiring
-///      assertions. The real `SyndicateFactory` cannot stand in here: reaching
-///      `syndicateCount != 0` through it means driving `createSyndicate`, which
-///      needs the whole ENS / agent-registry / owner-stake apparatus, and the
-///      state under test is the COUNT and the BEACON, not how they were reached.
+/// @dev A factory with a DECLARED count and beacon — pre-flight 5's two inputs — plus real
+///      storage for the wiring setters, so a PERMITTED run still reaches the post-flights.
+///      Reaching `syndicateCount != 0` through the real factory means driving
+///      `createSyndicate`, and the state under test is the count, not how it was reached.
 contract CountingSyndicateFactory {
     uint256 public syndicateCount;
     address public beacon;
@@ -129,34 +114,16 @@ contract CountingSyndicateFactory {
     }
 }
 
-/// @dev A governor implementation from BEFORE Plan B: no `exposureLedger()` and
-///      no `bondEscrow()` selector, and no fallback to fake one. This is the
-///      shape a legacy chain's beacon actually serves — Robinhood testnet 46630
-///      has 9 live governor proxies on such a beacon — and it is the state
-///      pre-flight 5 must refuse, because the beacon upgrade that would make
-///      Plan B reachable is exactly what the layout re-baseline forbids.
+/// @dev A governor implementation from BEFORE Plan B: neither `exposureLedger()` nor
+///      `bondEscrow()`, and no fallback to fake one. Robinhood testnet 46630 serves
+///      exactly this shape behind a beacon with 9 live proxies.
 contract PrePlanBGovernor {
     address public vault;
 }
 
-/// @notice Drives the REAL `DeployPlanB` script against a REAL `StakedWood`,
-///         `GuardianRegistry` and `SyndicateFactory`, from the state a FIRST
-///         deploy actually starts in — `swood.exposureLedger() == 0` — then
-///         breaks one piece of that state at a time and proves the
-///         corresponding pre-flight refuses. Simulation only: no `--broadcast`
-///         is ever involved, the script's own `vm.startBroadcast` runs against
-///         this test's EVM state.
-///
-///         The two properties under test are the two halves of review B3:
-///           1. THE SCRIPT MUST RUN FROM A VIRGIN STATE. The pre-flight this
-///              replaces demanded a pointer to a ledger that does not exist
-///              until step 2 of this very script, so `run()` aborted after
-///              `vm.stopBroadcast()` on every first deploy.
-///           2. THE CHECK MUST BE AN IDENTITY, NOT A NON-ZERO. A non-zero test
-///              is passed by the exact workaround the old message told
-///              operators to perform — hand-deploy a ledger, wire sWOOD to it,
-///              re-run — which leaves sWOOD reading a ledger holding none of
-///              this deployment's bookings.
+/// @notice Drives the REAL Plan B phase against a REAL `StakedWood`, `GuardianRegistry`
+///         and `SyndicateFactory` from the state a first deploy starts in —
+///         `swood.exposureLedger() == 0` — then breaks one piece of that state at a time.
 contract DeployPlanBPreflightTest is Test {
     ERC20Mock internal wood;
     ERC20Mock internal usdg;
@@ -166,50 +133,38 @@ contract DeployPlanBPreflightTest is Test {
     SyndicateFactory internal factory;
     ProtocolConfig internal protocolConfig;
 
-    DeployPlanB internal script;
+    DeployPlanBHarness internal script;
+    /// @dev The harness address: it owns every fixture AND calls `deploy`, because the
+    ///      CREATE3 factory it bootstraps only takes mints from its own owner.
+    address internal deployer;
 
     uint256 internal constant FEED_MAX_DELAY = 1 days;
-    /// @dev The price CAP, $0.50. It is NOT a price — pre-flight 8 requires it
-    ///      non-zero, and the market sits BELOW it (see `WOOD_MARKET_X8`), which
-    ///      is the configuration production ships.
+    /// @dev The price CAP, $0.50 — not a price. The market sits BELOW it (see
+    ///      `WOOD_MARKET_X8`), which is the configuration production ships.
     uint256 internal constant WOOD_PRICE_CAP_X8 = 5e7;
-    /// @dev What the TWAP oracle reports, $0.25 — half the cap, so the cap is
-    ///      non-binding and the deployed ledger prices off the market.
+    /// @dev What the feed reports, $0.25 — half the cap, so the cap is non-binding.
     uint256 internal constant WOOD_MARKET_X8 = 2.5e7;
     uint256 internal constant COVERED_TVL_CAP = 1_000_000e18;
 
-    // The address book the next script run should see. See `_book`.
+    // The address book the next run should see. See `_book`.
     address internal bookSwood;
     address internal bookRegistry;
     address internal bookFactory;
     uint256 internal bookCap = COVERED_TVL_CAP;
-    // Seeded in `setUp` from `script.DEFAULT_MAX_STRATEGY_DURATION()` — the
-    // value an UNSET `MAX_STRATEGY_DURATION` produces in `run()`. See
-    // `test_deploy_seatsTheProtocolDurationCeiling`.
-    uint256 internal bookMaxStrategyDuration;
-    /// @dev The price CAP the next run should seed. A test that wants
-    ///      pre-flight 8's first assert zeroes it.
+    uint256 internal bookMaxStrategyDuration = RobinhoodParams.MAX_STRATEGY_DURATION;
     uint256 internal bookCapPriceX8 = WOOD_PRICE_CAP_X8;
-    /// @dev The haircut the next run should seed. Seeded in `setUp` from the
-    ///      script's own default so this suite asserts against exactly what an
-    ///      unset `WOOD_HAIRCUT_BPS` produces; a test that wants pre-flight 9
-    ///      raises it to the ledger's 10,000 no-allowance default.
-    uint256 internal bookHaircutBps;
-    /// @dev Pre-flight 10's fork bypass. FALSE here on purpose: the default is
-    ///      the mainnet posture, so every other test in this suite still runs
-    ///      against the refusing branch and `test_preflight10_bites_*` keeps
-    ///      meaning what it meant. Only the bypass test raises it.
-    bool internal bookAllowEoaLedgerOwner;
-    /// @dev THE live WOOD price source. The deployed ledger CANNOT price a bond
-    ///      without one — `woodUsdPriceX8` is a cap, never a price — so a book
-    ///      with a zero here is a book pre-flight 8 refuses. Seeded in `setUp`;
-    ///      a test that wants the refusal clears it.
+    uint256 internal bookHaircutBps = RobinhoodParams.WOOD_HAIRCUT_BPS;
+    /// @dev THE live WOOD price source. The ledger cannot price a bond without one —
+    ///      `woodUsdPriceX8` is a cap, never a price. A test that wants the refusal
+    ///      clears it.
     address internal bookWoodUsdFeed;
-    /// @dev Its staleness bound. Paired with the field above — pre-flight 12
-    ///      refuses one without the other.
+    /// @dev Its staleness bound. Paired with the field above by pre-flight 12.
     uint256 internal bookWoodFeedMaxDelay;
 
     function setUp() public {
+        script = new DeployPlanBHarness();
+        deployer = address(script);
+
         wood = new ERC20Mock("WOOD", "WOOD", 18);
         usdg = new ERC20Mock("USDG", "USDG", 6);
         usdgFeed = new MockAggregatorV3(8, 1e8);
@@ -220,15 +175,14 @@ contract DeployPlanBPreflightTest is Test {
         bytes memory swoodInit = abi.encodeCall(
             StakedWood.initialize,
             (StakedWood.InitParams({
-                    owner: DEFAULT_SENDER,
+                    owner: deployer,
                     wood: address(wood),
                     factory: address(this),
                     minGuardianStake: 10_000e18,
                     coolDownPeriod: 7 days,
                     minOwnerStake: 10_000e18,
                     minSlashBps: 1_000,
-                    // Pre-flight 1b demands exactly this. Seated here so the
-                    // fixture is a deployment the script is willing to touch.
+                    // Pre-flight 1b demands exactly this.
                     maxSlashBps: 10_000,
                     ageFloorBps: 2_500,
                     maturationPeriod: 30 days
@@ -236,25 +190,23 @@ contract DeployPlanBPreflightTest is Test {
         );
         swood = StakedWood(address(new ERC1967Proxy(address(swoodImpl), swoodInit)));
 
-        // The registry's `factory` is a placeholder: this script exercises none
-        // of the factory-gated paths, and wiring the real circular pair would
-        // need the CREATE3 prediction dance `DeployScript.t.sol` already covers.
+        // The registry's `factory` is a placeholder: this phase exercises none of the
+        // factory-gated paths.
         GuardianRegistry registryImpl = new GuardianRegistry(6 hours);
-        bytes memory registryInit = abi.encodeCall(
-            GuardianRegistry.initialize, (DEFAULT_SENDER, address(this), address(swood), 24 hours, 3_000)
-        );
+        bytes memory registryInit =
+            abi.encodeCall(GuardianRegistry.initialize, (deployer, address(this), address(swood), 24 hours, 3_000));
         registry = GuardianRegistry(address(new ERC1967Proxy(address(registryImpl), registryInit)));
 
-        // Owned by DEFAULT_SENDER: the script SEATS `maxStrategyDuration` on it
-        // (pre-flight 6), and pre-flight 6b refuses the run otherwise.
-        protocolConfig = new ProtocolConfig(DEFAULT_SENDER);
+        // Owned by the deployer: the phase SEATS `maxStrategyDuration` on it (pre-flight
+        // 6), and pre-flight 6b refuses the run otherwise.
+        protocolConfig = new ProtocolConfig(deployer);
         address govImpl = address(new SyndicateGovernor(24 hours, 1 hours));
-        GovernorBeacon beacon = new GovernorBeacon(govImpl, DEFAULT_SENDER);
+        GovernorBeacon beacon = new GovernorBeacon(govImpl, deployer);
         SyndicateFactory factoryImpl = new SyndicateFactory();
         bytes memory factoryInit = abi.encodeCall(
             SyndicateFactory.initialize,
             (SyndicateFactory.InitParams({
-                    owner: DEFAULT_SENDER,
+                    owner: deployer,
                     executorImpl: address(new BatchExecutorLib()),
                     vaultImpl: address(new SyndicateVault()),
                     ensRegistrar: address(0),
@@ -264,32 +216,18 @@ contract DeployPlanBPreflightTest is Test {
                     managementFeeBps: 50,
                     guardianRegistry: address(registry),
                     // Mandatory since pashov finding #1.
-                    tierRegistry: address(new TierRegistry(DEFAULT_SENDER))
+                    tierRegistry: address(new TierRegistry(deployer))
                 }))
         );
         factory = SyndicateFactory(address(new ERC1967Proxy(address(factoryImpl), factoryInit)));
-
-        script = new DeployPlanB();
-        // Hoisted out of the `_setBook` argument list: an external call sitting
-        // in argument position is evaluated FIRST and would eat any pending
-        // one-shot cheatcode. Nothing is armed here today; the habit is what
-        // stops the next edit from being the one that breaks.
-        bookMaxStrategyDuration = script.DEFAULT_MAX_STRATEGY_DURATION();
-        bookHaircutBps = script.DEFAULT_WOOD_HAIRCUT_BPS();
-        // OWNED BY `DEFAULT_SENDER`, not the test contract — see
-        // `PlanBScriptCaller`'s own natspec for why.
-        vm.etch(DEFAULT_SENDER, address(new PlanBScriptCaller()).code);
 
         _setBook(address(swood), address(registry), address(factory));
     }
 
     // ─────────────────────────── the happy path ───────────────────────────
 
-    /// @dev B3 (1): A FIRST DEPLOY MUST RUN. This is the exact state the old
-    ///      pre-flight could not be satisfied from — sWOOD's pointer is zero
-    ///      and the only ledger this deployment will ever have does not exist
-    ///      yet. The script now wires it inside the broadcast, so the run
-    ///      completes and leaves the gate armed.
+    /// @notice A FIRST DEPLOY MUST RUN from the state where sWOOD's pointer is zero and
+    ///         the only ledger this deployment will have does not exist yet.
     function test_deploy_armsTheExitGateFromAVirginState() public {
         assertEq(swood.exposureLedger(), address(0), "fixture must start with the gate unarmed");
 
@@ -301,40 +239,65 @@ contract DeployPlanBPreflightTest is Test {
         assertEq(factory.exposureLedger(), ledger, "factory must issue against the same ledger");
         assertTrue(factory.bondEscrow() != address(0), "bond escrow must be wired");
 
-        // The ledger really is this run's, not something pre-existing.
-        assertEq(ExposureLedger(ledger).owner(), DEFAULT_SENDER, "ledger owner");
+        assertEq(ExposureLedger(ledger).owner(), deployer, "ledger owner");
         assertEq(ExposureLedger(ledger).coveredTvlCapUsd(), COVERED_TVL_CAP, "ledger cap");
     }
 
-    /// @dev B3 (2): THE OLD REMEDY'S END STATE MUST NOT SURVIVE. Reproduce it
-    ///      exactly — an operator hand-deploys a ledger and points sWOOD at it
-    ///      to get past a `!= address(0)` check — and prove the script no
-    ///      longer leaves sWOOD reading that stale contract while the registry
-    ///      and the factory book into a second one. Under the old code this
-    ///      state PASSED, and every guardian then read `openExposure == 0`
-    ///      from a ledger holding none of this deployment's bookings.
-    function test_deploy_repointsSwoodAwayFromAStaleLedger() public {
-        ExposureLedger stale = new ExposureLedger(DEFAULT_SENDER, address(swood), 28 days);
-        vm.prank(DEFAULT_SENDER);
-        swood.setExposureLedger(address(stale));
+    /// @notice Both contracts land at the address CREATE3 predicts from the salt alone —
+    ///         which is what lets the pointer pre-flights run BEFORE anything is minted.
+    function test_deploy_mintsAtThePredictedCreate3Addresses() public {
+        address c3 = script.c3Factory(deployer);
+        address predictedLedger = Create3.addressOf(c3, DeploySalts.EXPOSURE_LEDGER);
+        address predictedEscrow = Create3.addressOf(c3, DeploySalts.PROPOSER_BOND_ESCROW);
 
         _run();
 
+        assertEq(swood.exposureLedger(), predictedLedger, "the ledger must mint at its salt");
+        assertEq(factory.bondEscrow(), predictedEscrow, "the escrow must mint at its salt");
+        assertTrue(predictedLedger != predictedEscrow, "distinct salts, distinct addresses");
+    }
+
+    /// @notice A SECOND RUN ADOPTS AND WRITES NOTHING. Every mint is skip-if-code and
+    ///         every write is guarded on the value already there, so a resumed ceremony
+    ///         is a no-op rather than a second ledger.
+    function test_deploy_secondCallMintsNothing() public {
+        _run();
         address ledger = swood.exposureLedger();
-        assertTrue(ledger != address(stale), "sWOOD must not be left on the stale ledger");
-        assertEq(address(registry.exposureLedger()), ledger, "the three pointers must agree");
-        assertEq(factory.exposureLedger(), ledger, "the three pointers must agree");
+        address escrow = factory.bondEscrow();
+        bytes32 ledgerHash = ledger.codehash;
+
+        _run();
+
+        assertEq(swood.exposureLedger(), ledger, "the second run must adopt the same ledger");
+        assertEq(factory.bondEscrow(), escrow, "and the same escrow");
+        assertEq(ledger.codehash, ledgerHash, "nothing may be re-minted over it");
+        assertEq(ExposureLedger(ledger).woodHaircutBps(), RobinhoodParams.WOOD_HAIRCUT_BPS, "params unchanged");
+    }
+
+    /// @notice A POINTER ALREADY NAMING A FOREIGN LEDGER IS REFUSED, not repointed. This
+    ///         is the end state the old "hand-deploy a ledger, wire sWOOD, re-run" remedy
+    ///         produced; repointing it silently would leave the operator believing the
+    ///         first ledger's bookings still count.
+    function test_deploy_refusesAForeignLedgerPointer() public {
+        address c3 = script.c3Factory(deployer);
+        address predicted = Create3.addressOf(c3, DeploySalts.EXPOSURE_LEDGER);
+
+        ExposureLedger stale = new ExposureLedger(deployer, address(swood), 28 days);
+        vm.prank(deployer);
+        swood.setExposureLedger(address(stale));
+
+        _runExpecting("WIRING: StakedWood.exposureLedger already names a foreign address");
+
+        assertEq(predicted.code.length, 0, "refused BEFORE the mint: nothing was deployed");
+        assertEq(swood.exposureLedger(), address(stale), "and the live slot was left alone");
     }
 
     // ──────────────────────── the pre-flights bite ────────────────────────
 
-    /// @dev PRE-FLIGHT 2b: the broadcaster must own sWOOD, or it cannot make
-    ///      the `setExposureLedger` call the fix relies on. Checked BEFORE the
-    ///      broadcast, so the refusal costs nothing and names the remedy
-    ///      instead of surfacing as an opaque `OwnableUnauthorizedAccount`
-    ///      from inside a half-finished deployment.
+    /// @notice PRE-FLIGHT 2b: the deployer must own sWOOD, or it cannot make the
+    ///         `setExposureLedger` call the exit gate depends on.
     function test_preflight_bites_whenBroadcasterDoesNotOwnStakedWood() public {
-        vm.prank(DEFAULT_SENDER);
+        vm.prank(deployer);
         swood.transferOwnership(address(0xBEEF)); // plain Ownable: immediate
 
         _runExpecting("PRE-FLIGHT: broadcaster does not own STAKED_WOOD");
@@ -343,74 +306,59 @@ contract DeployPlanBPreflightTest is Test {
         assertEq(address(registry.exposureLedger()), address(0), "a refused deploy must not have wired anything");
     }
 
-    /// @dev PRE-FLIGHT 1b (declared coverage locks): a guardian's lock may
-    ///      equal its whole live stake and must burn in full on conviction, so
-    ///      a slash ceiling below 10_000 would cap every fully-locked burn
-    ///      beneath the lock. `setMaxSlashBps` accepts 9_999, so no storage
-    ///      poke is needed to reach the violating state. The message is pinned
-    ///      past its prefix because the rationale changed with the model: an
-    ///      operator reading it must be told about the LOCK, not the old
-    ///      allocation.
+    /// @notice PRE-FLIGHT 1b: a slash ceiling below 10_000 clips every fully-locked burn
+    ///         beneath the lock. `setMaxSlashBps(9_999)` is legal, so no storage poke.
     function test_preflight_bites_whenMaxSlashBpsIsBelowTheCeiling() public {
-        vm.prank(DEFAULT_SENDER);
+        vm.prank(deployer);
         swood.setMaxSlashBps(9_999);
         _runExpecting("PRE-FLIGHT: sWOOD maxSlashBps != 10000 -- a lock may equal the whole stake and must");
         assertEq(address(registry.exposureLedger()), address(0), "a refused deploy must not have wired anything");
     }
 
-    /// @dev PRE-FLIGHT 1c (declared coverage locks): `minSlashBps` is the single
-    ///      deterrence floor — the least any convicted approver loses, as a
-    ///      fraction of everything they hold, whatever they declared. A zero
-    ///      floor would let a guardian declare a token lock and face a token
-    ///      penalty. `setMinSlashBps(0)` is legal on sWOOD (it only checks
-    ///      `v <= maxSlashBps`), so the violating state needs no storage poke.
+    /// @notice PRE-FLIGHT 1c: a zero `minSlashBps` disarms the single deterrence floor, so
+    ///         a token lock would buy a token penalty.
     function test_preflight_bites_whenMinSlashBpsIsZero() public {
-        vm.prank(DEFAULT_SENDER);
+        vm.prank(deployer);
         swood.setMinSlashBps(0);
         assertEq(swood.minSlashBps(), 0, "precondition: the floor really is zero");
         _runExpecting("PRE-FLIGHT: sWOOD minSlashBps == 0 -- it is the single deterrence floor");
         assertEq(address(registry.exposureLedger()), address(0), "a refused deploy must not have wired anything");
     }
 
-    /// @dev Control for 1c: the fixture's shipped 1_000-bps floor passes, so the
-    ///      pre-flight refuses ZERO specifically rather than any small value —
-    ///      the launch value is a governance decision, not a code default.
+    /// @notice Control for 1c: the fixture's 1_000-bps floor passes, so the pre-flight
+    ///         refuses ZERO and not any small value — the launch value is governance's.
     function test_preflight_passes_atANonZeroMinSlashBps() public {
         assertEq(swood.minSlashBps(), 1_000, "fixture floor");
         _run();
         assertTrue(swood.exposureLedger() != address(0), "deployed and wired");
     }
 
-    /// @dev PRE-FLIGHT 2: a zero covered-TVL cap is fail-closed — wired into a
-    ///      governor, nothing could be proposed at all.
+    /// @notice PRE-FLIGHT 2: a zero covered-TVL cap is fail-closed — wired into a
+    ///         governor, nothing could be proposed at all.
     function test_preflight_bites_whenCoveredTvlCapIsZero() public {
         bookCap = 0;
         _runExpecting("PRE-FLIGHT: COVERED_TVL_CAP_USD18 is 0");
     }
 
-    /// @dev PRE-FLIGHT 3 (sWOOD leg) — THE SECURITY GATE. The wiring call now
-    ///      happens inside the broadcast, so the only way it fails to land is a
-    ///      sWOOD that does not take it; `DeafStakedWood` makes that state
-    ///      reachable. Without this assertion the deployment looks entirely
-    ///      healthy while `claimUnstakeGuardian` fails open.
+    /// @notice PRE-FLIGHT 3 (sWOOD leg) — THE SECURITY GATE. The wiring call happens in
+    ///         the run, so the only way it fails to land is a sWOOD that swallows it;
+    ///         without this the deployment looks healthy while the exit gate fails open.
     function test_wiringCheck_bites_whenTheExitGateDidNotLand() public {
-        DeafStakedWood deaf = new DeafStakedWood(DEFAULT_SENDER);
+        DeafStakedWood deaf = new DeafStakedWood(deployer);
         _setBook(address(deaf), address(registry), address(factory));
         _runExpecting("PRE-FLIGHT: sWOOD exposureLedger != the ledger just deployed");
     }
 
-    /// @dev PRE-FLIGHT 3 (registry leg). Asserted in the SAME block as the
-    ///      sWOOD leg because booking and gating are one mechanism: a registry
-    ///      that books into a different ledger than sWOOD reads is the same
-    ///      hole approached from the other side.
+    /// @notice PRE-FLIGHT 3 (registry leg): booking and gating are one mechanism, so a
+    ///         registry on a different ledger is the same hole from the other side.
     function test_wiringCheck_bites_whenTheRegistryDidNotTakeTheLedger() public {
         DeafGuardianRegistry deaf = new DeafGuardianRegistry();
         _setBook(address(swood), address(deaf), address(factory));
         _runExpecting("WIRING: GuardianRegistry.exposureLedger != the ledger just deployed");
     }
 
-    /// @dev PRE-FLIGHT 3 (factory leg). New syndicates would be issued against
-    ///      a different ledger than the one the exit gate reads.
+    /// @notice PRE-FLIGHT 3 (factory leg): new syndicates would be issued against a
+    ///         different ledger than the exit gate reads.
     function test_wiringCheck_bites_whenTheFactoryDidNotTakeTheLedger() public {
         DeafSyndicateFactory deaf = new DeafSyndicateFactory();
         _setBook(address(swood), address(registry), address(deaf));
@@ -419,36 +367,23 @@ contract DeployPlanBPreflightTest is Test {
 
     // ───────────── pre-flight 5: the beacon guard (review M5) ─────────────
 
-    /// @dev THE GUARD BITES. A factory reporting live governor proxies whose
-    ///      beacon still serves a PRE-Plan B governor is refused outright.
-    ///
-    ///      This is not hypothetical: Robinhood testnet (46630) has 9
-    ///      `SyndicateCreated` events on factory 0xB9E7..7cce, and a sampled
-    ///      governor's ERC-1967 beacon slot reads the recorded beacon
-    ///      0x11B726c49E0bAc95bEafF8d648cf3030Dc11B73a. Before this guard the
-    ///      script printed "MANUAL NEXT: governor beacon upgrade,
-    ///      factory.pushWiring(<each existing governor>)" unconditionally — an
-    ///      instruction that on that chain re-points 9 live proxies at an impl
-    ///      where every field moved (`vault` 0 -> 15, `_guardianRegistry`
-    ///      43 -> 0, `_tierRegistry` 48 -> 58).
+    /// @notice THE GUARD BITES: live governor proxies on a PRE-Plan B beacon are refused,
+    ///         because the upgrade that would make Plan B reachable is the one the layout
+    ///         re-baseline forbids. Robinhood testnet 46630 is exactly this shape.
     function test_preflight_bites_whenLiveGovernorsSitOnAPrePlanBBeacon() public {
-        GovernorBeacon legacyBeacon = new GovernorBeacon(address(new PrePlanBGovernor()), DEFAULT_SENDER);
+        GovernorBeacon legacyBeacon = new GovernorBeacon(address(new PrePlanBGovernor()), deployer);
         CountingSyndicateFactory legacyFactory = new CountingSyndicateFactory(9, address(legacyBeacon));
         _setBook(address(swood), address(registry), address(legacyFactory));
 
         _runExpecting("PRE-FLIGHT: SYNDICATE_FACTORY has live governor proxies on a PRE-PLAN-B governor");
 
-        // Refused BEFORE the broadcast: nothing was deployed and nothing wired.
         assertEq(swood.exposureLedger(), address(0), "a refused deploy must not have wired anything");
         assertEq(address(registry.exposureLedger()), address(0), "a refused deploy must not have wired anything");
         assertEq(legacyFactory.exposureLedger(), address(0), "a refused deploy must not have wired anything");
     }
 
-    /// @dev THE PROBE IS FAIL-CLOSED. An unreadable beacon (here: no code at
-    ///      all, standing in for a mis-recorded address, a self-destructed
-    ///      beacon, or anything that is not an `UpgradeableBeacon`) counts as
-    ///      "not Plan B-capable" and is refused, rather than being waved
-    ///      through on an unanswered question.
+    /// @notice THE PROBE IS FAIL-CLOSED: an unreadable beacon counts as "not Plan
+    ///         B-capable" rather than being waved through on an unanswered question.
     function test_preflight_bites_whenTheBeaconCannotBeProbed() public {
         address notABeacon = address(0xB3AC0);
         assertEq(notABeacon.code.length, 0, "fixture must be code-less");
@@ -459,15 +394,11 @@ contract DeployPlanBPreflightTest is Test {
         _runExpecting("PRE-FLIGHT: SYNDICATE_FACTORY has live governor proxies on a PRE-PLAN-B governor");
     }
 
-    /// @dev AND IT DOES NOT OVER-REFUSE. Having syndicates is not by itself the
-    ///      problem — a chain whose beacon ALREADY serves a Plan B-capable
-    ///      governor needs no upgrade at all, so `pushWiring` finishes the job
-    ///      and the run must proceed. This is the ordinary "Plan A from this
-    ///      stack, then Plan B" path; refusing it would gate legitimate work on
-    ///      a condition that has nothing to do with the hazard.
+    /// @notice AND IT DOES NOT OVER-REFUSE: a beacon already serving a Plan B-capable
+    ///         governor needs no upgrade, so `pushWiring` finishes the job and the run
+    ///         must proceed. This is the ordinary "Plan A from this stack, then Plan B".
     function test_deploy_allowedWhenLiveGovernorsSitOnAPlanBCapableBeacon() public {
-        GovernorBeacon capableBeacon =
-            new GovernorBeacon(address(new SyndicateGovernor(24 hours, 1 hours)), DEFAULT_SENDER);
+        GovernorBeacon capableBeacon = new GovernorBeacon(address(new SyndicateGovernor(24 hours, 1 hours)), deployer);
         CountingSyndicateFactory populated = new CountingSyndicateFactory(9, address(capableBeacon));
         _setBook(address(swood), address(registry), address(populated));
 
@@ -479,15 +410,11 @@ contract DeployPlanBPreflightTest is Test {
         assertTrue(populated.bondEscrow() != address(0), "bond escrow must be wired");
     }
 
-    /// @dev A ZERO COUNT DOES NOT TRIGGER THE GUARD, and specifically does not
-    ///      trigger it even behind a PRE-Plan B beacon. That pairing is the
-    ///      point: with no live proxies there is nothing an impl swap can
-    ///      corrupt, so the beacon's current implementation is irrelevant and
-    ///      the probe is skipped entirely. A guard keyed on the beacon alone
-    ///      would refuse this — the state every fresh chain, mainnet 4663
-    ///      included, actually deploys from.
+    /// @notice A ZERO COUNT SKIPS THE PROBE, even behind a PRE-Plan B beacon: with no live
+    ///         proxies there is nothing an impl swap can corrupt. That pairing is the
+    ///         state every fresh chain — 4663 included — deploys from.
     function test_preflight_passes_whenTheFactoryHasNoSyndicates() public {
-        GovernorBeacon legacyBeacon = new GovernorBeacon(address(new PrePlanBGovernor()), DEFAULT_SENDER);
+        GovernorBeacon legacyBeacon = new GovernorBeacon(address(new PrePlanBGovernor()), deployer);
         CountingSyndicateFactory freshFactory = new CountingSyndicateFactory(0, address(legacyBeacon));
         _setBook(address(swood), address(registry), address(freshFactory));
 
@@ -498,18 +425,9 @@ contract DeployPlanBPreflightTest is Test {
 
     // ───── pre-flights 6 and 7: the two seated invariants (issue #32) ─────
 
-    /// @dev PRE-FLIGHT 6, DEFAULT RUN. The ceiling is SEATED by the deploy, not
-    ///      left to a follow-up transaction — a `maxStrategyDuration` an operator
-    ///      is merely told to set afterwards is one that ships at 0, and 0 means
-    ///      NO ceiling: a vault owner could then seat their own
-    ///      `maxStrategyDuration` up to `ABSOLUTE_MAX_STRATEGY_DURATION` (3,650
-    ///      days) and bind the approving guardians for a decade per approval.
-    ///
-    ///      `bookMaxStrategyDuration` holds exactly what an UNSET
-    ///      `MAX_STRATEGY_DURATION` yields in `run()` (`vm.envOr` falls back to
-    ///      this constant), so this is the default run. The env read itself stays
-    ///      untested here for the reason the whole suite avoids `run()` — see
-    ///      `_setBook`.
+    /// @notice PRE-FLIGHT 6: the ceiling is SEATED by the run. Left to a follow-up it
+    ///         ships at 0, and 0 means a vault owner may bind approving guardians for up
+    ///         to `ABSOLUTE_MAX_STRATEGY_DURATION` per approval.
     function test_deploy_seatsTheProtocolDurationCeiling() public {
         assertEq(protocolConfig.maxStrategyDuration(), 0, "fixture must start with no ceiling");
         assertEq(bookMaxStrategyDuration, 30 days, "the documented default");
@@ -519,12 +437,9 @@ contract DeployPlanBPreflightTest is Test {
         assertEq(protocolConfig.maxStrategyDuration(), 30 days, "the deploy must seat the ceiling");
     }
 
-    /// @dev PRE-FLIGHT 6, ZERO OVERRIDE. 0 is a LEGAL argument to
-    ///      `setMaxStrategyDuration` — it is how the parameter is unset — so
-    ///      without this check an operator could route an explicit "no ceiling"
-    ///      through the very script that exists to prevent one, and it would read
-    ///      as a deliberate configuration rather than as the omission it
-    ///      reproduces. Refused BEFORE the broadcast, so it costs nothing.
+    /// @notice PRE-FLIGHT 6, ZERO OVERRIDE: 0 is how the parameter is UNSET, so without
+    ///         this an operator could route "no ceiling" through the script that exists to
+    ///         prevent one, and it would read as a configuration rather than an omission.
     function test_preflight_bites_whenTheDurationCeilingIsZero() public {
         bookMaxStrategyDuration = 0;
 
@@ -534,32 +449,18 @@ contract DeployPlanBPreflightTest is Test {
         assertEq(protocolConfig.maxStrategyDuration(), 0, "a refused deploy must not have seated anything");
     }
 
-    /// @dev PRE-FLIGHT 7 BITES. `StakedWood` no longer HAS `delegationEnabled()`
-    ///      — the `StakedWoodDelegation` base was removed pre-mainnet — so the
-    ///      state under test is not reachable through the current contract at
-    ///      all. It is still the state this script must refuse: `DeployPlanB`
-    ///      runs against an EXISTING sWOOD proxy, and a chain still serving a
-    ///      pre-removal implementation answers this selector for real.
-    ///
-    ///      Mocked rather than stubbed on purpose. A stub sWOOD would have to
-    ///      re-implement everything the script reads and writes, and the
-    ///      resulting test would prove the assertion fires on a contract that is
-    ///      not `StakedWood`. Mocking one selector onto the REAL fixture makes
-    ///      the claim the sharp one: the same deployment that passes every other
-    ///      test in this file is refused the moment that selector answers true.
+    /// @notice PRE-FLIGHT 7 BITES. The current `StakedWood` has no `delegationEnabled()`,
+    ///         but this phase runs against an EXISTING proxy and a chain still serving a
+    ///         pre-removal impl answers it for real. Mocked onto the REAL fixture so the
+    ///         claim is sharp: the same deployment every other test passes is refused.
     function test_preflight_bites_whenDelegationIsOn() public {
         vm.mockCall(address(swood), abi.encodeWithSignature("delegationEnabled()"), abi.encode(true));
 
         _runExpecting("PRE-FLIGHT: sWOOD reports delegationEnabled == true");
     }
 
-    /// @dev PRE-FLIGHT 7 DOES NOT OVER-REFUSE. A sWOOD answering `false` runs
-    ///      normally. The OTHER passing shape — no such selector at all, which is
-    ///      what every current `StakedWood` presents and what every other passing
-    ///      test in this suite therefore exercises — is asserted here too, since
-    ///      the probe treats an absent selector as "off": code that does not
-    ///      exist cannot be enabled, which is strictly stronger than a flag
-    ///      reading false.
+    /// @notice PRE-FLIGHT 7 DOES NOT OVER-REFUSE. The other passing shape — no selector at
+    ///         all, which every current `StakedWood` presents — is asserted here too.
     function test_deploy_allowedWhenDelegationIsOff() public {
         (bool answered,) = address(swood).staticcall(abi.encodeWithSignature("delegationEnabled()"));
         assertFalse(answered, "current StakedWood must not carry the selector at all");
@@ -574,111 +475,89 @@ contract DeployPlanBPreflightTest is Test {
 
     // ── PRE-FLIGHT 8: the WOOD price must actually resolve ─────────────────
     //
-    // Finding 2. Under design revision 2 `woodUsdPriceX8` is a CAP that is
-    // never served as a price, so a deployment can be misconfigured in two
-    // independent ways that both leave every price read reverting
-    // `NoWoodPrice` — nothing proposable, executable or challengeable — while
-    // every other pre-flight in this file passes. Each gets its own assert, and
-    // each gets its own test, because the operator's remedy differs.
+    // `woodUsdPriceX8` is a CAP that is never served as a price, so a deployment can be
+    // misconfigured in two independent ways that both leave every price read reverting
+    // `NoWoodPrice`. Each gets its own assert and its own test: the remedies differ.
 
-    /// @dev (a) The CAP is unset. A zero cap is not "uncapped"; it is a revert.
+    /// @notice (a) The CAP is unset. A zero cap is not "uncapped"; it is a revert.
     function test_preflight_bites_whenTheWoodPriceCapIsZero() public {
         bookCapPriceX8 = 0;
         _runExpecting("PRE-FLIGHT: ExposureLedger.woodUsdPriceX8 is 0");
     }
 
-    /// @dev (b) The CAP is set but nothing prices under it. This is the shape a
-    ///      cap-only check would MISS: `woodUsdPriceX8 != 0` proves the ceiling
-    ///      is configured and says nothing about whether anything is priced
-    ///      beneath it. The feed is the ledger's only source, so with none wired
-    ///      it has no source at all.
+    /// @notice (b) The CAP is set but nothing prices under it — the shape a cap-only check
+    ///         misses. The feed is the ledger's only source.
     function test_preflight_bites_whenNoWoodPriceSourceIsWired() public {
         bookWoodUsdFeed = address(0);
         bookWoodFeedMaxDelay = 0;
         _runExpecting("PRE-FLIGHT: WOOD_USD_FEED is unset");
     }
 
-    /// @dev (c) The feed is wired but is not answering — a `WoodPoolFeed` with
-    ///      no completed window yet is exactly this shape, and it is the
-    ///      operationally likely mistake. Refused, which is what forces the
-    ///      deploy-and-prime-first ordering.
+    /// @notice (c) The feed is wired but not answering — a `WoodPoolFeed` with no
+    ///         completed window yet is exactly this, and it forces the prime-first order.
     function test_preflight_bites_whenTheFeedIsNotAnswering() public {
         MockAggregatorV3(bookWoodUsdFeed).setAnswer(0);
         _runExpecting("PRE-FLIGHT: ExposureLedger.woodPriceX8() does not resolve");
     }
 
-    /// @dev The passing shape, asserted on the DEPLOYED state rather than on
-    ///      the book: the cap landed and the composed price is the MARKET —
-    ///      proving the cap was seeded above it and is not binding, which is the
-    ///      configuration production ships.
+    /// @notice The passing shape, asserted on the DEPLOYED state: the cap landed and the
+    ///         composed price is the MARKET, so the cap sits above it and is not binding.
     function test_deploy_wiresTheFeedAndPricesOffTheMarket() public {
         _run();
 
         ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
         assertEq(ledger.woodUsdPriceX8(), WOOD_PRICE_CAP_X8, "the cap must land");
-        // Market-priced, THEN discounted by the seated allowance. The cap sits
-        // above the market and so plays no part in the number.
         assertEq(
             ledger.woodPriceX8(),
-            (WOOD_MARKET_X8 * DeployPlanB(script).DEFAULT_WOOD_HAIRCUT_BPS()) / 10_000,
+            (WOOD_MARKET_X8 * RobinhoodParams.WOOD_HAIRCUT_BPS) / 10_000,
             "priced off the market, with the cap above it and the haircut applied"
         );
     }
 
     // ── PRE-FLIGHT 12: the WOOD/USD feed and its delay move together ───────
 
-    /// @dev A feed named with no staleness bound. `setWoodFeed` would revert
-    ///      `InvalidParameter` for this, but only from INSIDE the broadcast,
-    ///      after the ledger and escrow are already deployed and four setters
-    ///      have already run. Pre-flight 12 turns that half-applied run into a
-    ///      refusal that costs nothing.
+    /// @notice A feed named with no staleness bound. `setWoodFeed` would revert too, but
+    ///         only from inside the run, after the ledger and escrow are already minted.
     function test_preflight12_bites_whenTheFeedHasNoDelay() public {
         bookWoodUsdFeed = address(new MockAggregatorV3(8, int256(WOOD_MARKET_X8)));
         bookWoodFeedMaxDelay = 0;
         _runExpecting("PRE-FLIGHT: WOOD_USD_FEED and WOOD_FEED_MAX_DELAY must be set together");
     }
 
-    /// @dev The mirror slip: the operator set the delay and forgot the address.
-    ///      Nothing downstream would notice — the ledger would simply ship
-    ///      TWAP-only while the environment claims a feed was configured.
+    /// @notice The mirror slip: the delay is set and the address forgotten. Nothing
+    ///         downstream would notice — the ledger would simply ship with no source.
     function test_preflight12_bites_whenTheDelayHasNoFeed() public {
         bookWoodUsdFeed = address(0);
         bookWoodFeedMaxDelay = 1 hours;
         _runExpecting("PRE-FLIGHT: WOOD_USD_FEED and WOOD_FEED_MAX_DELAY must be set together");
     }
 
-    /// @dev A typo'd address that happens to hold no code. `setWoodFeed` calls
-    ///      `decimals()` on it, so this would surface mid-broadcast as an
-    ///      undecodable EVM revert rather than as the thing it is.
+    /// @notice A typo'd address holding no code. `setWoodFeed` calls `decimals()` on it,
+    ///         so this would otherwise surface as an undecodable mid-run revert.
     function test_preflight12_bites_whenTheFeedHoldsNoCode() public {
         bookWoodUsdFeed = address(0xFEED);
         bookWoodFeedMaxDelay = 1 hours;
         _runExpecting("PRE-FLIGHT: WOOD_USD_FEED holds no code");
     }
 
-    /// @dev A pool feed republishes `updatedAt` only when a snapshot ROLLS, at
-    ///      most once per averaging window. A `maxDelay` that does not clear the
-    ///      window plus the keeper's cadence therefore halts every price read
-    ///      BETWEEN rolls — the protocol stops for up to a window, and reads as
-    ///      a stale feed rather than as the mis-set bound it is. Seeded exactly
-    ///      at the boundary, which is the value an operator would pick.
+    /// @notice A pool feed rolls `updatedAt` at most once per window, so a bound that does
+    ///         not clear window + cadence halts every read BETWEEN rolls. Seeded exactly
+    ///         at the boundary, which is the value an operator would pick.
     function test_preflight12_bites_whenTheDelayDoesNotClearThePoolFeedsWindow() public {
         bookWoodUsdFeed = address(new MockWindowedFeed(8, int256(WOOD_MARKET_X8), 24 hours));
         bookWoodFeedMaxDelay = 24 hours + 2 hours;
         _runExpecting("PRE-FLIGHT: WOOD_FEED_MAX_DELAY must EXCEED the feed's averaging window plus the");
     }
 
-    /// @dev The paired passing case, so the bound is pinned from both sides
-    ///      rather than only proven to fire eventually.
+    /// @notice The paired passing case, so the bound is pinned from both sides.
     function test_preflight12_passes_whenTheDelayClearsTheWindowAndTheCadence() public {
         bookWoodUsdFeed = address(new MockWindowedFeed(8, int256(WOOD_MARKET_X8), 24 hours));
         bookWoodFeedMaxDelay = 24 hours + 2 hours + 1;
         _run();
     }
 
-    /// @dev The book's feed is what the deployed ledger prices off, whatever it
-    ///      is. Seeded deliberately away from `WOOD_MARKET_X8` so the assertion
-    ///      reads the wired feed rather than passing on a coincidence.
+    /// @notice The ledger prices off whichever feed the book names. Seeded away from
+    ///         `WOOD_MARKET_X8` so the assertion reads the wired feed, not a coincidence.
     function test_deploy_pricesOffWhicheverFeedTheBookNames() public {
         uint256 feedPriceX8 = WOOD_MARKET_X8 / 2;
         bookWoodUsdFeed = address(new MockAggregatorV3(8, int256(feedPriceX8)));
@@ -689,204 +568,72 @@ contract DeployPlanBPreflightTest is Test {
         ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
         assertEq(
             ledger.woodPriceX8(),
-            (feedPriceX8 * DeployPlanB(script).DEFAULT_WOOD_HAIRCUT_BPS()) / 10_000,
+            (feedPriceX8 * RobinhoodParams.WOOD_HAIRCUT_BPS) / 10_000,
             "the composed price must come from the feed the book named"
         );
     }
 
     // ── PRE-FLIGHT 9: a real haircut allowance must exist ──────────────────
 
-    /// @dev THE LEDGER'S OWN DEFAULT IS THE FAILING VALUE, which is what makes
-    ///      this check worth having. `woodHaircutBps` ships at 10,000 — no
-    ///      haircut — and the ledger's setter ACCEPTS 10,000 as a legal value,
-    ///      so nothing else in the stack refuses the one configuration with
-    ///      zero allowance against the accepted overstatements. Left unchecked
-    ///      it ships silently and looks entirely healthy.
+    /// @notice THE LEDGER'S OWN DEFAULT IS THE FAILING VALUE: `woodHaircutBps` ships at
+    ///         10,000 — no haircut — and the setter accepts it, so nothing else in the
+    ///         stack refuses the one configuration with zero allowance.
     function test_preflight_bites_whenTheHaircutLeavesNoAllowance() public {
         bookHaircutBps = 10_000;
         _runExpecting("PRE-FLIGHT: ExposureLedger.woodHaircutBps is 10000");
     }
 
-    /// @dev The shipped value, asserted on the DEPLOYED state and pinned to the
-    ///      script's own constant so the two cannot drift. 7,000 is a 30%
-    ///      allowance; 5,000 (the ledger floor) was rejected as too costly to
-    ///      guardian return on equity.
+    /// @notice The shipped value, asserted on the DEPLOYED state and pinned to the
+    ///         ceremony constant so the two cannot drift.
     function test_deploy_seatsTheShippedHaircut() public {
-        assertEq(script.DEFAULT_WOOD_HAIRCUT_BPS(), 7_000, "the shipped haircut is 7,000 -- a 30% allowance");
+        assertEq(RobinhoodParams.WOOD_HAIRCUT_BPS, 5_000, "the shipped haircut equals the ledger floor (5,000)");
 
         _run();
 
         ExposureLedger ledger = ExposureLedger(swood.exposureLedger());
-        assertEq(ledger.woodHaircutBps(), 7_000, "the haircut must be seated by the script, not left at 10,000");
-
-        // It is a real discount on a real valuation, not a stored number: the
-        // composed price is 70% of what the market source reports.
-        assertEq(ledger.woodPriceX8(), (WOOD_MARKET_X8 * 7_000) / 10_000, "the allowance reaches the price");
+        assertEq(ledger.woodHaircutBps(), 5_000, "the haircut must be seated by the script, not left at 10,000");
+        // A real discount on a real valuation: the composed price is 50% of the source.
+        assertEq(ledger.woodPriceX8(), (WOOD_MARKET_X8 * 5_000) / 10_000, "the allowance reaches the price");
     }
 
-    /// @dev An operator override is honoured, and the floor still binds. The
-    ///      ledger's own setter rejects anything under 5,000 mid-broadcast, so
-    ///      this proves the script does not quietly widen the range.
+    /// @notice An override above the default is honoured; the floor branch is pinned by
+    ///         `test_deploy_refusesAHaircutBelowTheLedgerFloor`.
     function test_deploy_honoursAHaircutOverrideAndRespectsTheFloor() public {
         bookHaircutBps = 6_000;
         _run();
         assertEq(ExposureLedger(swood.exposureLedger()).woodHaircutBps(), 6_000, "an override must be seated");
     }
 
-    // ─────────────── pre-flight 10: the ledger owner (issue #89) ───────────────
-    //
-    // WHAT THESE TWO TESTS ESTABLISH, AND WHAT THEY DELIBERATELY DO NOT.
-    //
-    // Issue #89 deleted the in-contract rate limit on `setWoodUsdPrice` and
-    // `setWoodHaircutBps` and moved it to a Zodiac Delay/Roles module on the
-    // owner Safe. Pre-flight 10 is the only on-chain trace of that requirement,
-    // and it checks exactly one thing: the ledger owner is a CONTRACT, not a
-    // bare EOA. These tests pin that, and nothing more.
-    //
-    // DO NOT "IMPROVE" THIS INTO A MODULE PROBE. That was considered and
-    // rejected on the merged design, and `openspec/specs/deployment-docs/spec.md`
-    // records the reasoning: pre-flight 10
-    //
-    //   "deliberately does not probe for modules: enumerating a Safe's modules
-    //    would prove only that *some* module is attached, not that the delay is
-    //    asymmetric, and a probe that appears to verify the requirement while
-    //    verifying something weaker is worse than none."
-    //
-    // The property that actually matters — the delay must be ASYMMETRIC, raises
-    // delayed and drops immediate — is not expressible on chain at all, because
-    // a Roles modifier cannot compare an argument against current on-chain
-    // state. It stays a runbook obligation verified by a human before launch.
-    // A test asserting `getModulesPaginated` returns a non-empty page would look
-    // like coverage of the Zodiac requirement while covering something strictly
-    // weaker, which is the failure mode the spec is warning about.
-
-    /// @dev THE PASSING BRANCH. The harness etches a forwarder at
-    ///      `DEFAULT_SENDER` (see `PlanBScriptCaller`), so the broadcaster — and
-    ///      therefore the ledger owner — genuinely has code, which is the shape
-    ///      pre-flight 10 is built to accept.
-    ///
-    ///      This test also PINS THE CREATE PREDICTION that the EOA test below
-    ///      depends on. The ledger is the first contract the broadcaster creates
-    ///      inside `vm.startBroadcast` (`DeployPlanB.s.sol:531`), so its address
-    ///      is `computeCreateAddress(DEFAULT_SENDER, nonce)`. Asserting it here
-    ///      means a broken prediction is diagnosed by THIS test, rather than
-    ///      surfacing as a mysteriously silent mock in the next one.
-    function test_preflight10_passes_whenTheLedgerOwnerIsAContract() public {
-        address predicted = vm.computeCreateAddress(DEFAULT_SENDER, vm.getNonce(DEFAULT_SENDER));
-
-        _run();
-
-        address ledger = swood.exposureLedger();
-        assertEq(ledger, predicted, "ledger must be the broadcaster's first CREATE -- the EOA test relies on it");
-        assertEq(ExposureLedger(ledger).owner(), DEFAULT_SENDER, "the broadcaster owns the ledger it deployed");
-        assertTrue(DEFAULT_SENDER.code.length != 0, "pre-flight 10's condition: the owner is a contract");
+    /// @notice ONE BPS BELOW THE SHIPPED VALUE. The ceremony haircut equals the ledger's
+    ///         `MIN_WOOD_HAIRCUT_BPS`, so the default sits on the revert boundary: the
+    ///         refusal comes from the ledger's own setter, mid-run, which is why the
+    ///         script mirrors the floor and asserts it afterwards as well.
+    function test_deploy_refusesAHaircutBelowTheLedgerFloor() public {
+        bookHaircutBps = 4_999;
+        DeployPlanB.PlanBBook memory book = _book();
+        vm.prank(deployer);
+        vm.expectRevert(IExposureLedger.InvalidParameter.selector);
+        script.deploy(book);
     }
 
-    /// @dev THE REFUSING BRANCH, and the state a real deployment starts in:
-    ///      `DeployPlanB` deploys the ledger owned by the broadcaster, so a run
-    ///      from a plain deployer key leaves an EOA owning both price levers.
-    ///      With the in-contract limit gone that deployment carries NEITHER the
-    ///      on-chain control nor the off-chain one — and nothing in the source
-    ///      would hint anything is missing. Hence the refusal.
-    ///
-    ///      THE OWNER IS THE BROADCASTER, so this makes the broadcaster a
-    ///      genuine EOA rather than faking the read. The forwarder the other
-    ///      tests need exists only to make `deployer == msg.sender` equal the
-    ///      broadcast sender; here both are `DEFAULT_SENDER` already, so its
-    ///      code can be stripped and the call pranked from that same address —
-    ///      the owner-gated setters in the broadcast still run as the owner,
-    ///      and the run reaches the pre-flight for the right reason.
-    ///
-    ///      Mocking the ledger's `owner()` instead does NOT work, and the reason
-    ///      is worth recording: `vm.mockCall` gives the target account code, so
-    ///      mocking the not-yet-deployed ledger address makes the script's
-    ///      `new ExposureLedger(...)` collide with it and revert with no reason
-    ///      string — a failure that looks nothing like the refusal under test.
-    function test_preflight10_bites_whenTheLedgerOwnerIsABareEOA() public {
-        address predicted = vm.computeCreateAddress(DEFAULT_SENDER, vm.getNonce(DEFAULT_SENDER));
-        address eoa = address(0xE0A);
-        assertEq(eoa.code.length, 0, "the fixture must be a genuine EOA for this to mean anything");
-
-        vm.mockCall(predicted, abi.encodeWithSignature("owner()"), abi.encode(eoa));
-        // `vm.mockCall` gives the target account code, which would make the
-        // script's `new ExposureLedger(...)` collide with this very address and
-        // revert with no reason string (EIP-684). Clear the code again: the mock
-        // registration survives, so the CREATE lands and the pre-flight still
-        // reads the EOA.
-        vm.etch(predicted, "");
-
-        _runExpecting("PRE-FLIGHT: ExposureLedger owner is an EOA, not a contract.");
-    }
-
-    /// @dev THE FORK BYPASS. A Tenderly vnet has no Safe and its deployer is an
-    ///      impersonated EOA, so pre-flight 10 makes the fork ceremony in
-    ///      openspec/specs/deployment-docs/spec.md unrunnable. `ALLOW_EOA_LEDGER_OWNER`
-    ///      (surfaced here as `book.allowEoaLedgerOwner`) waives it.
-    ///
-    ///      SAME FIXTURE AS THE REFUSING TEST ABOVE, deliberately: identical
-    ///      setup, one flag flipped, so what this pins is the flag and nothing
-    ///      else. If the bypass ever stops covering exactly the branch that test
-    ///      exercises, one of the two fails.
-    ///
-    ///      The flag rides in the `AddressBook` rather than being read from the
-    ///      process environment inside `deploy()`. `vm.setEnv` writes one shared
-    ///      mutable global that forge does not roll back between tests, so an
-    ///      env-based bypass set here would leak into the sibling suites and
-    ///      could turn the refusing test above green for the wrong reason.
-    function test_preflight10_bypassedWhenTheForkFlagIsSet() public {
-        address predicted = vm.computeCreateAddress(DEFAULT_SENDER, vm.getNonce(DEFAULT_SENDER));
-        address eoa = address(0xE0A);
-        assertEq(eoa.code.length, 0, "the fixture must be a genuine EOA for this to mean anything");
-
-        vm.mockCall(predicted, abi.encodeWithSignature("owner()"), abi.encode(eoa));
-        vm.etch(predicted, "");
-
-        bookAllowEoaLedgerOwner = true;
-        _run();
-
-        assertEq(swood.exposureLedger(), predicted, "the run must complete and wire the exit gate");
-    }
-
-    /// @dev THE BYPASS CANNOT REACH PRODUCTION. An env var is not fork-only by
-    ///      virtue of a comment saying so — it survives shell history, CI
-    ///      secrets and copied command lines, and the deployment it produces
-    ///      looks clean while carrying NEITHER the on-chain rate limit nor the
-    ///      off-chain Zodiac one. Chain 4663 refuses it outright, which is what
-    ///      lets the sibling test above stay green on 31337.
-    function test_preflight10_bypassIsRefusedOnRobinhoodMainnet() public {
-        address predicted = vm.computeCreateAddress(DEFAULT_SENDER, vm.getNonce(DEFAULT_SENDER));
-        vm.mockCall(predicted, abi.encodeWithSignature("owner()"), abi.encode(address(0xE0A)));
-        vm.etch(predicted, "");
-
-        bookAllowEoaLedgerOwner = true;
-        vm.chainId(4663);
-
-        _runExpecting("ALLOW_EOA_LEDGER_OWNER is a fork/vnet escape hatch and MUST NOT be set on Robinhood");
-    }
+    // Pre-flight 10 (the ledger owner, issue #89) is no longer a phase pre-flight — this
+    // mixin runs BEFORE the handoff. It lives in `DeployAll._validateAll`; the three cases
+    // are `DeployPlanBPreflight10Test` at the bottom of this file.
 
     // ─────────────────────────────── helpers ───────────────────────────────
 
-    /// @dev THE ADDRESS BOOK IS PASSED, NOT SET IN THE ENVIRONMENT. `run()`'s
-    ///      only job is to read `vm.envAddress`/`vm.envUint` into this struct,
-    ///      and `vm.setEnv` writes the PROCESS environment — one shared mutable
-    ///      global that forge does not roll back between tests and that every
-    ///      parallel suite writes to. Driving the script through `run()` here
-    ///      would race `DeployTokenCourtPreflight` and `DeployPlanDPreflight`
-    ///      over `STAKED_WOOD` and lose (observed: all 9 of this suite's tests
-    ///      failing on an address a sibling suite had just written, with an
-    ///      undecodable `EvmError: Revert` from calling a code-less address).
-    ///      `deploy()` takes the book directly, so nothing here is shared.
+    /// @dev THE ADDRESS BOOK IS PASSED, NOT SET IN THE ENVIRONMENT. `vm.setEnv` writes one
+    ///      shared mutable global that forge does not roll back between tests, so an
+    ///      env-driven suite races every sibling that seeds the same keys.
     function _setBook(address swood_, address registry_, address factory_) internal {
         bookSwood = swood_;
         bookRegistry = registry_;
         bookFactory = factory_;
     }
 
-    /// @dev Field-by-field rather than one struct literal. The literal form put
-    ///      all sixteen values live on the stack at once and tripped solc's
-    ///      "1 too deep" under the default (non-IR) pipeline; assigning into an
-    ///      already-allocated memory struct keeps only one at a time.
-    function _book() internal view returns (DeployPlanB.AddressBook memory book) {
+    /// @dev Field-by-field rather than one struct literal: the literal form holds every
+    ///      value live on the stack at once and trips solc's "1 too deep".
+    function _book() internal view returns (DeployPlanB.PlanBBook memory book) {
         book.swood = bookSwood;
         book.factory = bookFactory;
         book.registry = bookRegistry;
@@ -901,15 +648,20 @@ contract DeployPlanBPreflightTest is Test {
         book.maxStrategyDuration = bookMaxStrategyDuration;
         book.woodUsdFeed = bookWoodUsdFeed;
         book.woodFeedMaxDelay = bookWoodFeedMaxDelay;
-        book.allowEoaLedgerOwner = bookAllowEoaLedgerOwner;
     }
 
+    /// @dev The book is hoisted out of argument position: an external call there is
+    ///      evaluated first and would eat the pending `vm.prank`.
     function _run() internal {
-        PlanBScriptCaller(DEFAULT_SENDER).fwd(address(script), abi.encodeCall(DeployPlanB.deploy, (_book())));
+        DeployPlanB.PlanBBook memory book = _book();
+        vm.prank(deployer);
+        script.deploy(book);
     }
 
     function _runExpecting(string memory prefix) internal {
-        try PlanBScriptCaller(DEFAULT_SENDER).fwd(address(script), abi.encodeCall(DeployPlanB.deploy, (_book()))) {
+        DeployPlanB.PlanBBook memory book = _book();
+        vm.prank(deployer);
+        try script.deploy(book) {
             revert("pre-flight did not bite");
         } catch Error(string memory reason) {
             _assertPrefix(reason, prefix);
@@ -928,12 +680,84 @@ contract DeployPlanBPreflightTest is Test {
     }
 }
 
-/// @dev What a `WoodPoolFeed` looks like to pre-flight 12's probe: an ordinary
-///      aggregator that also reports the window its `updatedAt` advances on.
+/// @dev What a `WoodPoolFeed` looks like to pre-flight 12's probe: an ordinary aggregator
+///      that also reports the window its `updatedAt` advances on.
 contract MockWindowedFeed is MockAggregatorV3 {
     uint256 public immutable window;
 
     constructor(uint8 decimals_, int256 answer_, uint256 window_) MockAggregatorV3(decimals_, answer_) {
         window = window_;
+    }
+}
+
+/**
+ * @notice Pre-flight 10 in its new home: the ledger's owner is the slashing and freeze
+ *         authority, so on Mainnet it must end up at a CONTRACT — and a two-step transfer
+ *         leaves that in `pendingOwner` until the Safe accepts.
+ *
+ * @dev DO NOT "IMPROVE" ANY OF THESE INTO A ZODIAC MODULE PROBE.
+ *      `openspec/specs/deployment-docs/spec.md` records why: enumerating a Safe's modules
+ *      proves only that SOME module is attached, never that the delay is ASYMMETRIC, and a
+ *      probe that appears to verify the requirement while verifying something weaker is
+ *      worse than none.
+ */
+contract DeployPlanBPreflight10Test is DeployAllFixture {
+    function setUp() public {
+        _stageCeremony();
+    }
+
+    /// @notice A finished Mainnet ceremony leaves the ledger armed for the Safe.
+    function test_preflight10_mainnetPendingOwnerIsTheSafe() public {
+        Stack memory s = _completeMainnetCeremony();
+        Inputs memory i = _inputs(Posture.Mainnet);
+
+        assertEq(Ownable2Step(s.exposureLedger).pendingOwner(), address(safe), "ledger armed for the Safe");
+        script.exposed_validateAll(s, i, Checkpoint.Complete);
+    }
+
+    /// @notice An EOA `OWNER_MULTISIG` that slipped past the pre-flight is caught after the
+    ///         handoff, where the ledger's pending owner is read back.
+    function test_preflight10_mainnetRefusesAnEoaPendingOwner() public {
+        address eoa = address(0xA11CE);
+        Stack memory s = _completeMainnetCeremony(eoa);
+        Inputs memory i = _inputs(Posture.Mainnet);
+        i.ownerMultisig = eoa;
+
+        assertEq(Ownable2Step(s.exposureLedger).pendingOwner(), eoa, "armed for an EOA");
+        vm.expectRevert(bytes("OWNER_MULTISIG must be a contract (Safe), not an EOA"));
+        script.exposed_validateAll(s, i, Checkpoint.Complete);
+    }
+
+    /// @notice A fork hands off to the deployer, so the Safe-is-a-contract check has no
+    ///         subject: the deployer keeps the ledger and nothing is armed.
+    function test_preflight10_forkPostureSkipsTheOwnerCheck() public {
+        vm.chainId(FORK_CHAIN_ID);
+        (Stack memory s,) = _runCeremony(Posture.Fork);
+        Inputs memory i = _inputs(Posture.Fork);
+
+        assertEq(Ownable(s.exposureLedger).owner(), deployer, "ledger still the deployer's");
+        assertEq(Ownable2Step(s.exposureLedger).pendingOwner(), address(0), "nothing armed");
+        script.exposed_validateAll(s, i, Checkpoint.Complete);
+    }
+
+    // ─────────────────────────────── helpers ───────────────────────────────
+
+    function _completeMainnetCeremony() internal returns (Stack memory) {
+        return _completeMainnetCeremony(address(safe));
+    }
+
+    /// @dev Two runs: the first mints the WOOD feed and stops, the keeper primes it, the
+    ///      second completes and hands off.
+    function _completeMainnetCeremony(address ownerMultisig) internal returns (Stack memory s) {
+        vm.chainId(MAINNET_CHAIN_ID);
+        Inputs memory i = _inputs(Posture.Mainnet);
+        i.ownerMultisig = ownerMultisig;
+
+        vm.prank(deployer);
+        (Stack memory first,) = script.deployAll(i);
+        _primeWoodFeed(first.woodUsdFeed);
+
+        vm.prank(deployer);
+        (s,) = script.deployAll(i);
     }
 }

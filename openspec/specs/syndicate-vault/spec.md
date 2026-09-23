@@ -36,19 +36,20 @@ SHALL equal the asset's `decimals()`, cached once at initialization.
 - **THEN** the virtual-shares offset is 6, yielding 12-decimal shares
 
 ### Requirement: Vote checkpointing and auto-delegation
-The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`clock()` returns `block.timestamp`; `CLOCK_MODE()` is `mode=timestamp`). On every share receipt (mint or transfer, including zero-value transfers), the vault SHALL auto-delegate an undelegated recipient to itself, after balances update, so checkpointed voting power tracks balance for every holder that has not explicitly delegated elsewhere.
+The vault share token SHALL implement ERC20Votes with a timestamp-based clock (`clock()` returns `block.timestamp`; `CLOCK_MODE()` is `mode=timestamp`). On every share receipt (mint or transfer, including zero-value transfers), the vault SHALL delegate to itself any recipient that is not already self-delegated, after balances update, so checkpointed voting power tracks balance for every holder.
 
 #### Scenario: Recipient auto-delegates on receipt
-- **WHEN** shares are transferred or minted to an address whose delegate is unset
+- **WHEN** shares are transferred or minted to an address that is not delegated to itself
 - **THEN** the recipient is delegated to itself and its post-receipt balance is checkpointed
 
 #### Scenario: Permissionless heal via zero-value transfer
-- **WHEN** anyone transfers 0 shares to an undelegated legacy holder
+- **WHEN** anyone transfers 0 shares to a holder that is not self-delegated
 - **THEN** that holder becomes self-delegated and checkpointed from that moment
 
-#### Scenario: Explicit delegation preserved
-- **WHEN** shares arrive at a holder that has already delegated to another address
-- **THEN** the existing delegation choice is unchanged
+#### Scenario: Delegation is refused
+- **WHEN** any caller invokes `delegate` or `delegateBySig` on the vault share token
+- **THEN** the call reverts `DelegationDisabled`, so every holder's checkpointed votes
+  equal its own balance
 
 ### Requirement: Instant deposit flow
 
@@ -304,7 +305,7 @@ The self-transfer fast-path (destination decodes to the vault itself) SHALL appl
 - **THEN** the destination guard's fast-path exempts it exactly as before, since `asset()` is the token the outer net-outflow meter independently verifies
 
 ### Requirement: Fee parameters
-The vault SHALL expose an initialization-time `managementFeeBps` and an owner-settable agent performance fee `agentFeeBps`. The agent fee SHALL default to `FeeConstants.DEFAULT_AGENT_FEE_BPS` (2000 bps, 20%) until explicitly set, SHALL distinguish an explicit 0% from unset, SHALL be capped at `MAX_AGENT_FEE_BPS` (3000 bps, 30% — an alias of the protocol performance-fee ceiling `FeeConstants.MAX_PERFORMANCE_FEE_BPS`; `AgentFeeTooHigh` above), and SHALL emit `AgentFeeUpdated` on change. The fee is snapshotted onto a proposal at propose time and clamped to the governor's configured maximum at settlement. `transferPerformanceFee(asset, to, amount)` SHALL be governor-only, restricted to the vault's own underlying asset (`InvalidAsset` otherwise), to a nonzero recipient, and to at most the vault's balance (`AmountExceedsBalance`).
+The vault SHALL expose an initialization-time `managementFeeBps` and an owner-settable agent performance fee `agentFeeBps`. The agent fee SHALL default to `FeeConstants.DEFAULT_AGENT_FEE_BPS` (2000 bps, 20%) until explicitly set, SHALL distinguish an explicit 0% from unset, SHALL be capped at `MAX_AGENT_FEE_BPS` (2500 bps, 25% — an alias of the protocol performance-fee ceiling `FeeConstants.MAX_PERFORMANCE_FEE_BPS`; `AgentFeeTooHigh` above), and SHALL emit `AgentFeeUpdated` on change. The fee is snapshotted onto a proposal at propose time and clamped to the governor's configured maximum at settlement. `transferPerformanceFee(asset, to, amount)` SHALL be governor-only, restricted to the vault's own underlying asset (`InvalidAsset` otherwise), to a nonzero recipient, and to at most the vault's balance (`AmountExceedsBalance`).
 
 #### Scenario: Default agent fee
 - **WHEN** the owner has never called `setAgentFeeBps`
