@@ -660,9 +660,9 @@ contract SyndicateVault is
     }
 
     /// @inheritdoc ISyndicateVault
-    /// @dev Same predicate as `redemptionsLocked`. `totalAssets` counts idle balance only:
-    ///      `settleProposal` refuses a strategy still `Executed`, but an emergency close can
-    ///      leave capital on the clone, priced as a loss until a later batch settles it.
+    /// @dev Same predicate as `redemptionsLocked`. `totalAssets` counts idle balance only: `settleProposal`
+    ///      and `unstick` refuse a strategy still `Executed`, but `finalizeEmergencySettle` can leave
+    ///      capital on the clone, priced as a loss until a later batch settles it.
     function depositsLocked() public view returns (bool) {
         return redemptionsLocked();
     }

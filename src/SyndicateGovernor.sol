@@ -526,7 +526,7 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
             .executeGovernorBatch(
                 _loadCalls(_settlementCalls, proposalId), _loadCaps(_effectiveSettlementCallCaps, proposalId), 0
             );
-        // A leg that skips `strategy.settle()` would leave capital on the clone; only emergency paths may.
+        // A leg that skips `strategy.settle()` would leave capital on the clone (`unstick` refuses it too).
         // No answer skips the check: registration already required `executed()` to answer.
         (bool ok, bytes memory ret) = proposal.strategy.staticcall(abi.encodeCall(IStrategy.executed, ()));
         if (ok && ret.length == 32 && abi.decode(ret, (bool))) revert StrategyNotSettled(proposal.strategy);

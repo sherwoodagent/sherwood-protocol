@@ -356,9 +356,9 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
 
     // ── settle requires unwind (NM fix review) ──
 
-    /// @notice A settlement leg that never calls `settle()` cannot close the proposal through
-    ///         `settleProposal`, and the owner's `unstick` still can.
-    function test_settleLegSkippingStrategySettle_reverts_unstickStillCloses() public {
+    /// @notice A settlement leg that never calls `settle()` closes the proposal through neither
+    ///         `settleProposal` nor the owner's `unstick`, which replays the same leg.
+    function test_settleLegSkippingStrategySettle_reverts_onSettleAndUnstick() public {
         MockFundedStrategy clone = MockFundedStrategy(Clones.clone(address(new MockFundedStrategy())));
         uint256 amount = 10_000e6;
         clone.initialize(address(vault), agent, abi.encode(address(usdc), amount));
@@ -398,9 +398,19 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
         governor.settleProposal(pid);
 
         vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.StrategyNotSettled.selector, address(clone)));
         governor.unstick(pid);
-        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Settled));
-        assertEq(usdc.balanceOf(address(clone)), amount, "emergency close leaves the clone's capital in place");
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+
+        // The vault stays locked, so nobody deposits at a price that books the clone as a loss.
+        assertTrue(vault.depositsLocked(), "no deposit at the understated price");
+        address depositor = makeAddr("depositor");
+        usdc.mint(depositor, 30_000e6);
+        vm.startPrank(depositor);
+        usdc.approve(address(vault), 30_000e6);
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(30_000e6, depositor);
+        vm.stopPrank();
     }
 }
 
@@ -602,13 +612,27 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
         assertEq(uint256(clone.state()), uint256(BaseStrategy.State.Executed));
         assertEq(usdc.balanceOf(address(clone)), amount, "clone holds the pulled funds");
 
-        // Owner rescues the STUCK proposal via `unstick` (GovernorEmergency)
-        // after `strategyDuration` elapses — runs the pre-committed
-        // settlement calls (the benign one above), which never touch the
-        // clone. The proposal reaches Settled; the clone is now orphaned.
+        // Owner force-settles through the reviewed emergency path with calls that never touch the
+        // clone (`unstick` would refuse, the clone is still Executed). The clone is now orphaned.
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
-        vm.prank(owner);
-        governor.unstick(pid1);
+        vm.mockCall(address(guardianRegistry), abi.encodeWithSelector(guardianRegistry.openEmergency.selector), "");
+        vm.mockCall(
+            address(guardianRegistry), abi.encodeWithSelector(guardianRegistry.ownerStake.selector), abi.encode(1)
+        );
+        vm.mockCall(
+            address(guardianRegistry),
+            abi.encodeWithSelector(guardianRegistry.requiredOwnerBond.selector),
+            abi.encode(1)
+        );
+        vm.mockCall(
+            address(guardianRegistry),
+            abi.encodeWithSelector(guardianRegistry.finalizeEmergency.selector),
+            abi.encode(false, settlementCalls)
+        );
+        vm.startPrank(owner);
+        governor.emergencySettleWithCalls(pid1, settlementCalls);
+        governor.finalizeEmergencySettle(pid1);
+        vm.stopPrank();
         assertEq(
             uint256(governor.getProposal(pid1).state), uint256(ISyndicateGovernor.ProposalState.Settled), "unstuck"
         );
@@ -634,7 +658,7 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
         // live maxCapital ceiling.
         env.maxCapital = vault.totalAssets();
 
-        vm.warp(governor.getCooldownEnd()); // propose honours the settle cooldown `unstick` stamped
+        vm.warp(governor.getCooldownEnd()); // propose honours the settle cooldown the emergency close stamped
         vm.prank(agent);
         uint256 pid2 = governor.propose(
             address(vault),
