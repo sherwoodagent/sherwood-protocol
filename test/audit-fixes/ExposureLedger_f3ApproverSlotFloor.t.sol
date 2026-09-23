@@ -257,4 +257,47 @@ contract ExposureLedgerF3ApproverSlotFloorTest is Test {
         vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
         registry.voteOnProposal(address(gov), 2, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
     }
+
+    /// @notice NM fix review: 100 min-stake guardians approving with a zero lock
+    ///         each revert, take no registry slot and no approve weight, so an
+    ///         honest approver still seats and covers the proposal.
+    function test_NM_zeroLockCohortTakesNoApproverSlot() public {
+        for (uint256 i = 0; i < SQUAT; i++) {
+            vm.prank(_squatter(i));
+            vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+            registry.voteOnProposal(address(gov), PID, IGuardianRegistry.GuardianVoteType.Approve, 0);
+        }
+        (address[] memory seated,, uint128 approveWeight) = registry.getApproverWeights(address(gov), PID);
+        assertEq(seated.length, 0, "the registry's pre-ledger push unwound with the revert");
+        assertEq(approveWeight, 0, "and no approve weight landed");
+
+        _approve(whale, PID);
+        (seated,,) = registry.getApproverWeights(address(gov), PID);
+        assertEq(seated.length, 1);
+        assertEq(seated[0], whale);
+        (uint256 raisedUsd, uint256 requiredUsd) =
+            ledger.requireApproveQuorum(address(gov), PID, address(asset), REQUIRED_COVERAGE);
+        assertGe(raisedUsd, requiredUsd, "the honest approver covers the proposal");
+    }
+
+    /// @notice NM fix review: the same cohort committing its whole budget holds
+    ///         half the registry's slots, not all of them.
+    function test_NM_wholeBudgetCohortHoldsHalfTheRegistrySlots() public {
+        uint256 half = registry.MAX_APPROVERS_PER_PROPOSAL() / 2;
+        assertEq(ledger.APPROVER_SLOTS(), 2 * half, "the ledger ration mirrors the registry cap");
+        for (uint256 i = 0; i < half; i++) {
+            _approve(_squatter(i), PID);
+        }
+        for (uint256 i = half; i < SQUAT; i++) {
+            vm.prank(_squatter(i));
+            vm.expectRevert(IExposureLedger.ApproveLockBelowFloor.selector);
+            registry.voteOnProposal(address(gov), PID, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+        }
+        (address[] memory seated,,) = registry.getApproverWeights(address(gov), PID);
+        assertEq(seated.length, half, "the squat stops at 50 registry slots");
+
+        _approve(whale, PID);
+        (seated,,) = registry.getApproverWeights(address(gov), PID);
+        assertEq(seated[seated.length - 1], whale, "an honest approver still seats");
+    }
 }
