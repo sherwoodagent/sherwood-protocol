@@ -63,6 +63,44 @@ contract FoundryTester is Test, Handlers {
         }
     }
 
+    /// @notice M3 vacuity guard, measured rather than argued. The dispatcher
+    ///         draws declarations from `[0, 2 x guardianStake + 1]` and the
+    ///         handler now counts what the ledger did with them. If the slot
+    ///         floor refused every draw, every coverage invariant in this suite
+    ///         would silently stop testing anything and still pass.
+    ///
+    /// @dev    Replays the dispatcher's own `recordApproval` branch (selector 3)
+    ///         over a spread of seeds, interleaved with its release branch so
+    ///         the same guardian/proposal pair is reached in both states rather
+    ///         than latching on its first booking. Prints the ratio.
+    function test_fizz_recordApprovalStillBooksUnderTheFuzzDistribution() public {
+        syndicateGovernor_propose_clamped(1 days, 1_000e6);
+        require(governor.proposalCount() != 0, "setup: no proposal to underwrite");
+
+        uint256 pid = governor.proposalCount();
+        for (uint256 i = 0; i < 90; i++) {
+            uint256 seed = uint256(keccak256(abi.encode(i)));
+            // Release first, so every draw is a genuine attempt rather than an
+            // idempotent return onto a lock an earlier draw already booked.
+            exposureLedger_secondary(4, 1, seed, i);
+            exposureLedger_secondary(3, 1, seed, i);
+        }
+        console.log("dispatcher draw  booked / refused", approveBooked, approveRefused);
+
+        // Ten deliberate dust declarations, so the refusal counter is proven
+        // live rather than merely zero: the dispatcher draws its declaration
+        // from a range so wide that a below-floor one is vanishingly rare.
+        for (uint256 i = 0; i < 10; i++) {
+            address g = toGuardian(i);
+            _exposureLedger_releaseApproval(address(governor), pid, g);
+            _exposureLedger_recordApproval(address(governor), pid, g, 1);
+        }
+        console.log("after dust draws booked / refused", approveBooked, approveRefused);
+
+        assertGt(approveBooked, 0, "fuzz never booked a lock");
+        assertGt(approveRefused, 0, "the refusal counter never moved");
+    }
+
     /// @notice Triage for the GL-16 campaign violation.
     /// @dev Hypothesis: `stateOf` is a TRUE VIEW that reports Expired as soon
     ///      as it is determinable, while `_openProposalCount` only decrements

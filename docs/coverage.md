@@ -52,13 +52,13 @@ The ledger locks `min(lockWood, free budget)` WOOD, where
 free budget = kNumerator * slashableStake(guardian) − openExposure(guardian)
 ```
 
-all in WOOD. Nothing is converted to USD on this path and no price is read. A
-guardian with no free budget is **not rejected at vote time** — the ledger locks
-zero, the vote still counts as weight, and the cap shows up as an execute-time
-shortfall rather than a reverted vote. An asset-feed outage likewise locks
-nothing rather than reverting, so Block votes cannot keep working while Approve
-votes fail; a WOOD-feed outage is not a failure case at all, because the lock
-needs no price.
+all in WOOD. **An Approve books a lock or reverts** (SHE-240): the vote is
+refused `ApproveLockBelowFloor` when the booked lock is worth less than
+`1/APPROVER_SLOTS` of the need — or, for a guardian whose whole budget is below
+that share, less than that whole budget, admitted only while fewer than half the
+slots are booked (v1 audit F3). An unreadable or unpriceable need and a
+settlement past the horizon also revert. The registry's approver push unwinds
+with the revert, so no slot is held without a lock behind it.
 
 `releaseApproval` unwinds Approve → Block (`CoverageFrozen` while a challenge
 is live); `retireApproval` clears a lock once its proposal is past
