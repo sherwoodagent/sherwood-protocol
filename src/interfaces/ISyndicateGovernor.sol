@@ -309,6 +309,8 @@ interface ISyndicateGovernor {
     ///         what may be FROZEN as the price every queued deposit and redeem is
     ///         paid at; not waivable by the declared drawdown.
     error SettlePriceBelowFloor(uint256 ppsNow, uint256 ppsFloor);
+    /// @notice `settleProposal` ran a leg that left the proposal's strategy still `Executed`.
+    error StrategyNotSettled(address strategy);
     /// @notice Revert if `claimUnclaimedFees` is called for a vault whose
     ///         proposal is currently Executed. An escrowed fee leaving the
     ///         vault mid-strategy is indistinguishable from a strategy loss to
