@@ -653,6 +653,77 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Rejected));
     }
 
+    /// @notice lp3's stamped 50k park is claimed by the attacker in the propose second, ahead of propose.
+    function _parkClaimedInTheProposeSecond() internal returns (uint256 pid1) {
+        address lp3 = makeAddr("lp3");
+        _deposit(lp1, 60_000e6);
+        _deposit(attacker, 30_000e6);
+        _deposit(lp3, 50_000e6);
+        uint256 lp3Shares = vault.balanceOf(lp3);
+        uint256 pid0 = _propose();
+        vm.prank(lp3);
+        uint256 req = vault.requestRedeem(lp3Shares, lp3);
+        _endVote();
+        governor.executeProposal(pid0);
+        _settle(pid0);
+        vm.warp(governor.getCooldownEnd());
+        vm.prank(attacker);
+        queue.claim(req);
+        pid1 = _propose();
+    }
+
+    /// @notice A post-snapshot request cannot refill the queue headroom a propose-second claim left:
+    ///         the bar stays 40% of 90k, so the attacker's 30k Against falls short.
+    function test_requestsAfterAProposeSecondClaimDoNotLowerTheVetoBar() public {
+        uint256 pid1 = _parkClaimedInTheProposeSecond();
+        uint256 atk = vault.balanceOf(attacker);
+        vm.startPrank(attacker);
+        vault.requestRedeem(atk, attacker);
+        governor.vote(pid1, ISyndicateGovernor.VoteType.Against);
+        vm.stopPrank();
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    /// @notice The veto outcome is fixed at voteEnd: a requestRedeem after it does not flip Approved.
+    function test_requestRedeemAfterVoteEndDoesNotMoveTheOutcome() public {
+        uint256 pid1 = _parkClaimedInTheProposeSecond();
+        vm.prank(attacker);
+        governor.vote(pid1, ISyndicateGovernor.VoteType.Against);
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Approved));
+        uint256 atk = vault.balanceOf(attacker);
+        vm.prank(attacker);
+        vault.requestRedeem(atk, attacker);
+        assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    /// @notice An unstamped (cancelled-pid) park cancelled after voteEnd cannot un-reject: 50k of a 100k
+    ///         electorate Against stays Rejected.
+    function test_cancellingAnUnstampedParkAfterVoteEndDoesNotUnReject() public {
+        _deposit(lp1, 50_000e6);
+        _deposit(lp2, 50_000e6);
+        _deposit(attacker, 200_000e6);
+        uint256 pid0 = _propose();
+        uint256 half = vault.balanceOf(attacker) / 2;
+        vm.prank(attacker);
+        uint256 req = vault.requestRedeem(half, attacker);
+        vm.prank(agent);
+        governor.cancelProposal(pid0);
+        vm.warp(governor.getCooldownEnd());
+        uint256 rest = vault.balanceOf(attacker);
+        vm.prank(attacker);
+        vault.redeem(rest, attacker, attacker); // same second, ahead of propose
+        uint256 pid1 = _propose();
+        vm.prank(lp1);
+        governor.vote(pid1, ISyndicateGovernor.VoteType.Against);
+        _endVote();
+        assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Rejected));
+        vm.prank(attacker);
+        queue.cancel(req);
+        assertEq(uint256(governor.getProposalState(pid1)), uint256(ISyndicateGovernor.ProposalState.Rejected));
+    }
+
     function _vetoBar(uint256 pid) internal view returns (uint256) {
         ISyndicateGovernor.StrategyProposal memory p = governor.getProposal(pid);
         return (p.votableSupply * p.vetoThresholdBps) / 10_000;
