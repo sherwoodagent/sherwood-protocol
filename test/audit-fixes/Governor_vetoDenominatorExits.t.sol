@@ -595,6 +595,29 @@ contract GovernorVetoDenominatorExitsTest is Test {
         );
     }
 
+    /// @notice A request escrowed before the snapshot and cancelled in the approve block: lp2 has no
+    ///         snapshot weight, so the electorate is min(S - Q, L - min(Q, lq)) = 100k, not 300k.
+    function test_collab_preSnapshotRequestCancelledInTheApproveBlockStaysOutOfTheElectorate() public {
+        address coAgent = makeAddr("coAgent");
+        _registerCoAgent(coAgent);
+        _deposit(lp1, 100_000e6);
+        _deposit(lp2, 200_000e6);
+        uint256 pid = _proposeCollab(coAgent);
+        uint256 lp2Shares = vault.balanceOf(lp2);
+        vm.prank(lp2);
+        uint256 req = vault.requestRedeem(lp2Shares, lp2); // at the coming snapshot instant
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(lp2);
+        queue.cancel(req); // same block as the approval that stamps
+        vm.prank(coAgent);
+        governor.approveCollaboration(pid);
+        uint256 s = governor.getProposal(pid).snapshotTimestamp;
+        assertEq(vault.getPastVotes(address(queue), s), lp2Shares, "Q: escrowed at the snapshot");
+        assertEq(vault.balanceOf(address(queue)), 0, "lq: cancelled since");
+        assertEq(vault.getPastVotes(lp2, s), 0, "lp2 has no snapshot weight");
+        assertEq(governor.getProposal(pid).votableSupply, vault.balanceOf(lp1), "electorate is lp1 alone");
+    }
+
     /// @notice Queue `shares` under a proposal that settles (stamping the request), never claim it,
     ///         and stop at the block of the next propose.
     function _parkStamped(address who, uint256 shares) internal {

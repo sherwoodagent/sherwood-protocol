@@ -139,5 +139,5 @@ electorate on the direct path) and stays open.
 
 **SHIPPED: (c) plus a live clamp (v1 audit F1).** (c) alone let a redeem ordered
 ahead of the stamp raise the bar above every share still in the vault, re-opening
-NM 6.4-F2. Each term is now `min(snapshot, live)`, with the live queue term capped
-at the snapshot's so the front-run (c) closed stays closed.
+NM 6.4-F2. The electorate is now `min(S - Q, L - min(Q, lq))` (snapshot vs live, each less
+its queue), with the live queue term capped at the snapshot's so the front-run (c) closed stays closed.

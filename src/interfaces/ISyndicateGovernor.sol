@@ -160,9 +160,9 @@ interface ISyndicateGovernor {
         ///         written on EVERY execute path, so a stored zero never means
         ///         unset on an `Executed` proposal.
         uint256 effectiveMaxCapital;
-        /// @notice Shares that can vote, recorded on entering Pending: supply less the
-        ///         withdrawal queue, each term the MIN of its snapshot and live value —
-        ///         a same-block exit shrinks it, a same-block entry cannot raise it.
+        /// @notice Shares that can vote, recorded on entering Pending: min(S - Q, L - min(Q, lq)),
+        ///         snapshot supply/queue votes vs live supply/queue balance — a same-block exit
+        ///         shrinks it, a same-block entry cannot raise it.
         uint256 votableSupply;
     }
 
