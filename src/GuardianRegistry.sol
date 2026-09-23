@@ -703,7 +703,10 @@ contract GuardianRegistry is IGuardianRegistry, ReentrancyGuardTransient, Ownabl
         if (er.reviewEnd > 0 && _effNow(er.clockShiftAtOpen) < er.reviewEnd) revert EmergencyAlreadyOpen();
         if (er.callsHash != bytes32(0) && !er.resolved) _resolveEmergency(eKey, proposalId, er);
         IStakedWood sw = swood;
-        uint256 ts1 = block.timestamp - 1;
+        // Electorate and blocker weights read at the propose-time `snapshotAt`, not an instant the owner picks.
+        // Zero only for a review registered before that field existed: keep the old open-time read.
+        uint256 ts1 = _reviews[eKey].snapshotAt;
+        if (ts1 == 0) ts1 = block.timestamp - 1;
         uint256 gs = sw.getPastTotalVotes(ts1);
 
         er.governor = msg.sender; // stored before any external calls
