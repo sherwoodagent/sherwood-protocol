@@ -782,8 +782,8 @@ contract SyndicateGovernorTest is Test {
     /// @notice A settle driven from inside a flash loan that empties Morpho's
     ///         idle balance cannot freeze a depressed price: the strategy is
     ///         all-or-revert (SHE-255) so nothing is delivered partially, and a
-    ///         strategy that delivers nothing still meets the price floor. The
-    ///         honest retry after the frame settles at par.
+    ///         leg that never unwinds the strategy is refused. The honest retry
+    ///         after the frame settles at par.
     function test_flashLoanedSettleRevertsInsteadOfFreezingADepressedPrice() public {
         MockIrm irm = new MockIrm();
         MockMorpho morpho = new MockMorpho();
@@ -844,10 +844,10 @@ contract SyndicateGovernorTest is Test {
         governor.settleProposal(pid);
         assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
 
-        // Frame 2: a strategy that delivers NOTHING (the pre-SHE-255 clamp
-        // shape) is stopped by the price floor alone.
+        // Frame 2: a leg whose `settle()` delivers NOTHING (the pre-SHE-255 clamp
+        // shape) leaves the strategy Executed and is refused before the price floor.
         vm.mockCall(address(strat), abi.encodeCall(strat.settle, ()), "");
-        vm.expectPartialRevert(ISyndicateGovernor.SettlePriceBelowFloor.selector);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.StrategyNotSettled.selector, address(strat)));
         governor.settleProposal(pid);
         vm.clearMockedCalls(); // also drops setUp's `governorOf` mock; re-arm it
         vm.mockCall(address(this), abi.encodeWithSignature("governorOf(address)"), abi.encode(address(governor)));
