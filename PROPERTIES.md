@@ -70,10 +70,6 @@ Checked after every call sequence.
   blocker set of the same review. Explicitly marked LOAD-BEARING in source.
 - [x] **GL-20** `SHOULD-HOLD` — approver-array length == count of guardians whose
   recorded vote is Approve (and the blocker mirror).
-- [ ] **GL-20a** `SHOULD-HOLD` (candidate, no harness yet) — a guardian whose
-  budget covers a full `1/APPROVER_SLOTS` share can always seat while the
-  approver array is below cap. v1 audit F3: the sub-share arm of the approve
-  floor is rationed to half the slots so a min-stake cohort cannot fill them.
 - [x] **GL-21** `SHOULD-HOLD` — at most one live challenge per (review key, challenger) (x-ray G-44).
 - [ ] **GL-22** `SHOULD-HOLD` — `registry.paused()` is false iff `pausedAt == 0`.
   A drifted `pausedAt` corrupts the next cycle's deadman delay.
