@@ -180,6 +180,15 @@ Not one-time steps. Nothing below is enforced on-chain.
 - **A keeper must open guardian reviews.** An unopened review is not a skipped
   review — the governor settles it inline as not-blocked and the proposal
   executes unreviewed.
+- **Adding a stock to a live registry.** A token can enter a Portfolio basket only
+  once the registry pairs it with its feed. Add `<SYM>` and
+  `CHAINLINK_<SYM>_USD_FEED` to the book and the symbol to
+  `RobinhoodParams.launchSetSymbols()`, then run `SeedPriceSources`. Run by
+  the owner, it broadcasts only the missing writes. Run by anyone else, it
+  prints them as target and calldata for the Safe:
+  ```bash
+  forge script script/SeedPriceSources.s.sol:SeedPriceSources --rpc-url robinhood
+  ```
 
 ## 5. Accepted oracle risks (v1)
 

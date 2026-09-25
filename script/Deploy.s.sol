@@ -217,7 +217,7 @@ abstract contract DeploySherwood is ScriptBase {
         _seedCounterparty(tierRegistry, "UNISWAP_V3_FACTORY");
         _seedCounterparty(tierRegistry, "MORPHO_BLUE");
 
-        string[16] memory symbols = RobinhoodParams.launchSetSymbols();
+        string[30] memory symbols = RobinhoodParams.launchSetSymbols();
         for (uint256 i; i < symbols.length; ++i) {
             _seedPriceSource(tierRegistry, symbols[i]);
         }
