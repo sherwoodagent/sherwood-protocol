@@ -63,8 +63,8 @@ abstract contract WoodPoolFeedFixture is Test {
     }
 
     /// @dev Move time forward with the V2 pool trading and the ETH leg fresh: the
-    ///      ordinary background against which a snapshot is taken. The V3 leg is
-    ///      read live and has nothing to advance.
+    ///      ordinary background against which a snapshot is taken. The V3 pool's
+    ///      accumulator advances with the clock on its own.
     function _advance(uint256 dt) internal {
         vm.warp(vm.getBlockTimestamp() + dt);
         uni.sync();
@@ -85,6 +85,23 @@ abstract contract WoodPoolFeedFixture is Test {
         other.update();
         _advance(WINDOW + 1);
         other.update();
+    }
+
+    /// @dev Roll `other` one window on with `p`'s accumulator advanced by exactly
+    ///      `delta`, so the V3 leg's next average is `delta / WINDOW` — the only
+    ///      way to hand the leg a quotient with a remainder.
+    function _rollV3Delta(WoodPoolFeed other, MockUniswapV3Pool p, int56 delta) internal {
+        (int56 latest,) = other.latestPoolObservation();
+        _advance(WINDOW);
+        p.setTickCumulative(latest + delta);
+        other.update();
+    }
+
+    /// @dev `_prime()` with the V3 leg's averaged delta chosen outright.
+    function _primeV3Delta(WoodPoolFeed other, MockUniswapV3Pool p, int56 delta) internal {
+        p.setTickCumulative(0);
+        other.update();
+        _rollV3Delta(other, p, delta);
     }
 
     function _answer() internal view returns (uint256) {
@@ -167,12 +184,16 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
     }
 
     /// @notice The V3 leg manipulated alone cannot raise the answer AT ALL, even
-    ///         at 100x: the answer is the LOWER of the two legs.
+    ///         at 100x held for a WHOLE window: the answer is the LOWER of the
+    ///         two legs.
     function test_theV3LegManipulatedAloneCannotRaiseTheAnswer() public {
         _prime();
         uint256 before = _answer();
 
         v3.setTicks(0, 0); // 1 WETH per WOOD, ~400,000x the real price
+        _advance(WINDOW + 1);
+        feed.update(); // the manipulated average is snapshotted in full
+
         assertEq(_answer(), before, "the cheaper leg sets the mark");
     }
 
@@ -198,13 +219,14 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
         assertApproxEqRel(_answer(), V2_ANSWER_X8, 1e13, "control: the V2 pair is the mark");
 
         v3.setTicks(TICK_QUARTER_V2, TICK_QUARTER_V2);
+        _advance(WINDOW + 1);
+        feed.update();
 
         assertApproxEqRel(_answer(), QUARTER_ANSWER_X8, 1e15, "the lower leg is what the mark follows");
     }
 
-    /// @notice The V3 leg is averaged over the CONFIGURED window. The pool's
-    ///         cumulatives scale with the span asked for, so observing over a
-    ///         different span recovers a different tick and a different price.
+    /// @notice The V3 leg is averaged over the span between the two snapshots,
+    ///         which `update()` rolls no sooner than a whole window apart.
     function test_theV3LegIsAveragedOverExactlyTheConfiguredWindow() public {
         assertEq(feed.window(), feed.MIN_WINDOW(), "this fixture sits exactly on the minimum window");
 
@@ -225,52 +247,29 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
         feed.latestRoundData();
     }
 
-    /// @notice An `observe` the ring cannot serve — cardinality too low for the
-    ///         window, or a pool that has stopped answering — is unavailability.
-    ///         It is NEVER a silent fall back to the pool's spot tick.
-    function test_anObserveThatRevertsMakesTheFeedUnavailable() public {
+    /// @notice An `observe` the pool refuses cannot take the price down: reads
+    ///         are served from stored snapshots, so only the NEXT snapshot is
+    ///         lost, and losing it is a loud revert in `update()` (v1 audit F2).
+    function test_anObserveThatRevertsCannotMakeTheFeedUnavailable() public {
         _prime();
-        _answer(); // control
+        uint256 before = _answer();
 
         v3.setObserveReverts(true);
-        vm.expectRevert(WoodPoolFeed.PriceUnavailable.selector);
-        feed.latestRoundData();
-    }
+        assertEq(_answer(), before, "the stored snapshots still price WOOD");
 
-    /// @notice A ring of length one has no history: upstream's `observe`
-    ///         synthesises the far endpoint from the current tick and answers
-    ///         with spot rather than reverting. The leg refuses it explicitly.
-    function test_aCardinalityOneRingMakesTheFeedUnavailable() public {
-        _prime();
-        _answer(); // control: the fixture pool's ring is long enough
-
-        // The idle-pool shape: `observe` still answers, and what it answers is
-        // spot. Only the cardinality read distinguishes it.
-        v3.setObservationCardinality(1);
-        vm.expectRevert(WoodPoolFeed.PriceUnavailable.selector);
-        feed.latestRoundData();
+        _advance(WINDOW + 1);
+        vm.expectRevert(bytes("OLD"));
+        feed.update();
     }
 
     /// @notice Above tick 443,637 the square of `sqrtRatioX96` no longer fits in
     ///         256 bits, and the wide branch is what keeps that arithmetic in
     ///         range instead of panicking.
     function test_aTickAboveTheSquaringBoundIsPricedThroughTheWideBranch() public {
-        _prime();
-        int56 span = int56(uint56(WINDOW));
-
-        v3.setTickCumulatives(0, int56(500_000) * span);
+        _primeV3Delta(feed, v3, int56(500_000) * int56(uint56(WINDOW)));
         // Such a tick prices WOOD far above the V2 pair, so `min` still marks the
         // pair; the claim here is that the V3 leg returns at all.
         assertApproxEqRel(_answer(), V2_ANSWER_X8, 1e13, "the wide branch prices a tick past the squaring bound");
-    }
-
-    /// @notice A pool that answers the selector but not the contract — here a
-    ///         one-element array — is unavailability too, not a decode panic.
-    function test_aMalformedObserveResponseMakesTheFeedUnavailable() public {
-        _prime();
-        v3.setObserveShortArray(true);
-        vm.expectRevert(WoodPoolFeed.PriceUnavailable.selector);
-        feed.latestRoundData();
     }
 
     /// @notice A NEGATIVE mean tick with a remainder rounds toward NEGATIVE
@@ -278,17 +277,16 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
     ///         division rounds it up instead, reporting WOOD one whole tick more
     ///         expensive than the pool actually held it.
     function test_aNegativeMeanTickRoundsTowardNegativeInfinity() public {
-        _prime();
         int56 span = int56(uint56(WINDOW));
 
-        v3.setTickCumulatives(0, int56(TICK_HALF_V2) * span);
+        _primeV3Delta(feed, v3, int56(TICK_HALF_V2) * span);
         uint256 atTick = _answer();
 
         // One below an exact multiple: the quotient is inexact and negative.
-        v3.setTickCumulatives(0, int56(TICK_HALF_V2) * span - 1);
+        _rollV3Delta(feed, v3, int56(TICK_HALF_V2) * span - 1);
         uint256 justBelow = _answer();
 
-        v3.setTickCumulatives(0, int56(TICK_HALF_V2 - 1) * span);
+        _rollV3Delta(feed, v3, int56(TICK_HALF_V2 - 1) * span);
         uint256 atTickBelow = _answer();
 
         assertEq(justBelow, atTickBelow, "a negative remainder is a whole tick down");
@@ -308,12 +306,11 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
         WoodPoolFeed flippedFeed = new WoodPoolFeed(
             address(uni), address(flipped), WOOD, WETH, address(ethUsd), ETH_MAX_AGE, WINDOW, MIN_WETH, MIN_V3_LIQUIDITY
         );
-        _primeOther(flippedFeed);
 
-        flipped.setTickCumulatives(0, int56(-TICK_HALF_V2) * span);
+        _primeV3Delta(flippedFeed, flipped, int56(-TICK_HALF_V2) * span);
         (, int256 atTick,,,) = flippedFeed.latestRoundData();
 
-        flipped.setTickCumulatives(0, int56(-TICK_HALF_V2) * span + 1);
+        _rollV3Delta(flippedFeed, flipped, int56(-TICK_HALF_V2) * span + 1);
         (, int256 justAbove,,,) = flippedFeed.latestRoundData();
 
         assertEq(uint256(justAbove), uint256(atTick), "a positive remainder truncates, it is not pushed a tick down");
@@ -369,9 +366,9 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
         assertEq(_answer(), before, "so its price never entered the average");
     }
 
-    /// @notice `updatedAt` is the OLDER of the two legs. The V3 leg is read live
-    ///         and is always as fresh as the block, so the V2 snapshot is what
-    ///         dates the reading — a consumer's staleness bound binds on it.
+    /// @notice `updatedAt` is the OLDER of the two legs. Both roll together, so
+    ///         the snapshot is what dates the reading — a consumer's staleness
+    ///         bound binds on it, never on the block.
     function test_updatedAtIsTheOlderOfTheTwoLegs() public {
         _prime();
         uint256 snapshotAt = vm.getBlockTimestamp();
@@ -380,7 +377,7 @@ contract WoodPoolFeedTest is WoodPoolFeedFixture {
         vm.warp(vm.getBlockTimestamp() + 6 hours);
         ethUsd.setUpdatedAt(vm.getBlockTimestamp());
 
-        assertEq(_updatedAt(), snapshotAt, "the live V3 leg never dates the reading forward");
+        assertEq(_updatedAt(), snapshotAt, "an unrolled leg never dates the reading forward");
         assertLt(_updatedAt(), vm.getBlockTimestamp(), "and it is genuinely behind the block");
     }
 
@@ -570,13 +567,14 @@ contract WoodPoolFeedLedgerTest is WoodPoolFeedFixture {
         ledger.woodPriceX8();
     }
 
-    /// @notice A V3 pool whose observation ring cannot serve the window halts the
-    ///         same path: the ledger sees no price at all, never a spot fallback.
-    function test_aV3RingThatCannotServeTheWindowHaltsTheProposePath() public {
+    /// @notice A V3 pool whose observation ring can no longer serve the window
+    ///         does NOT halt the propose path: the leg is priced off snapshots
+    ///         the feed already took, so the ring cannot starve it (v1 audit F2).
+    function test_aV3RingThatCannotServeTheWindowDoesNotHaltTheProposePath() public {
         v3.setObserveReverts(true);
 
-        vm.expectRevert(IExposureLedger.NoWoodPrice.selector);
-        ledger.woodPriceX8();
+        assertApproxEqRel(ledger.woodPriceX8(), V2_ANSWER_X8, 1e13, "the ring cannot take the price down");
+        assertGt(ledger.proposerBondWood(usdgAsset, 1_000e6), 0, "and the propose path still sizes a bond");
     }
 
     /// @notice A reading older than the ledger's own `maxDelay` is rejected

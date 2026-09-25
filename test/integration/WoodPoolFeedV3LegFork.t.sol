@@ -3,35 +3,17 @@ pragma solidity 0.8.28;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {WoodPoolFeed, IUniswapV2PairMinimal, IAggregatorMinimal} from "../../src/pricing/WoodPoolFeed.sol";
 import {IUniswapV3Pool} from "../../src/vendor/uniswap/IUniswapV3Pool.sol";
-import {TickMath} from "../../src/vendor/uniswap/TickMath.sol";
-
-/// @notice The one mutating pool call this suite needs, declared HERE rather than
-///         added to the vendored `IUniswapV3Pool`.
-/// @dev    `src/` reads the pool and never trades against it, so putting `swap`
-///         in the vendored surface would widen it for no consumer. The test
-///         needs it because growing `observationCardinalityNext` on a frozen
-///         fork writes nothing: only a real write advances the ring.
-interface IUniswapV3PoolSwap {
-    function swap(
-        address recipient,
-        bool zeroForOne,
-        int256 amountSpecified,
-        uint160 sqrtPriceLimitX96,
-        bytes calldata data
-    ) external returns (int256 amount0, int256 amount1);
-}
 
 /**
  * @title WoodPoolFeedV3LegForkTest
  * @notice `WoodPoolFeed` against the LIVE WOOD/WETH venues on Robinhood Chain
  *         mainnet (4663): the Uniswap V2 pair it snapshots and the Uniswap V3
- *         pool it reads through `observe`. The claim under test is the one the
- *         unit suite cannot make — that the two legs, read off real accumulators
- *         and a real observation ring, meet in the same scale, so `min` compares
- *         prices rather than units.
+ *         pool whose tick accumulator it snapshots. The claim under test is the
+ *         one the unit suite cannot make — that the two legs, read off real
+ *         accumulators, meet in the same scale, so `min` compares prices rather
+ *         than units.
  *
  *         Both legs are recomputed HERE without reusing the feed's arithmetic —
  *         the pair's own cumulative-price delta, and the pool's own
@@ -41,7 +23,7 @@ interface IUniswapV3PoolSwap {
  *
  *         On-chain facts (probed 2026-09-16): the V3 pool is fee 3000 /
  *         tickSpacing 60, liquidity 2.128e22, and reports `observationCardinality`
- *         1 — which is why the deploy ceremony grows it.
+ *         1 — which the snapshotting V3 leg does not care about.
  *
  * @dev Skips when ROBINHOOD_RPC_URL is unset (shared fork-test convention);
  *      excluded from default CI via the `test/integration/**` path filter.
@@ -66,19 +48,10 @@ contract WoodPoolFeedV3LegForkTest is Test {
     ///      of whatever it carried at the fork point. The ETH leg's staleness
     ///      gate is exercised in the unit suite, where the clock is ours.
     uint256 constant ETH_USD_MAX_AGE = 3 days;
-    /// @dev What the ceremony's `GrowV3Cardinality` step asks for. Every new slot
-    ///      is initialised inside the call, so this is also ~4.5M gas of real
-    ///      work: a ring sized from the pool's ~880s write cadence, not from its
-    ///      uint16 index.
-    uint16 constant GROWN_CARDINALITY = 200;
     /// @dev Only shapes `vm.roll`, so the block number advances with the clock.
     ///      Nothing under test reads a block number — the observation ring and
     ///      both accumulators are keyed on timestamps.
     uint256 constant ROLL_SECONDS_PER_BLOCK = 1;
-    /// @dev WETH paid into the pool to force ONE observation write. Sized to be
-    ///      a write and not a price event — against 24.94 WETH of depth this is a
-    ///      ~1e-5 relative move, well under one tick.
-    uint256 constant SWAP_WETH_IN = 1e15;
 
     WoodPoolFeed internal feed;
     bool internal woodIsToken0V2;
@@ -131,28 +104,6 @@ contract WoodPoolFeedV3LegForkTest is Test {
         assertGe(IUniswapV3Pool(V3_POOL).liquidity(), MIN_V3_LIQUIDITY, "the live V3 pool is below MIN_V3_LIQUIDITY");
     }
 
-    /// @dev The ceremony's remedy, exercised as the ceremony runs it: NO PRANK,
-    ///      no owner, no allowlist — anyone may pay to lengthen the ring.
-    function test_theCardinalityRemedyIsPermissionlessAndMonotonic() public {
-        (,,, uint16 cardinality, uint16 cardinalityNext,,) = IUniswapV3Pool(V3_POOL).slot0();
-        console2.log("live observationCardinality:     %s", cardinality);
-        console2.log("live observationCardinalityNext: %s", cardinalityNext);
-
-        IUniswapV3Pool(V3_POOL).increaseObservationCardinalityNext(GROWN_CARDINALITY);
-
-        (,,, uint16 grown, uint16 grownNext,,) = IUniswapV3Pool(V3_POOL).slot0();
-        assertGe(grownNext, GROWN_CARDINALITY, "the ring target did not rise");
-        assertGe(grown, cardinality, "the ring shrank");
-
-        // AND IT IS A TARGET, NOT A FILLED RING: nothing trades on a fork, so
-        // `observationCardinality` does not move here and would not move on
-        // mainnet either until the pool is written to.
-        IUniswapV3Pool(V3_POOL).increaseObservationCardinalityNext(GROWN_CARDINALITY);
-        (,,, uint16 again, uint16 againNext,,) = IUniswapV3Pool(V3_POOL).slot0();
-        assertEq(againNext, grownNext, "a repeat at the standing target changes nothing");
-        assertEq(again, grown, "and the ring itself still has not filled");
-    }
-
     // ── The feed itself ──
 
     /// @dev THE POINT OF THE SUITE. Both legs are recomputed from the venues'
@@ -160,23 +111,13 @@ contract WoodPoolFeedV3LegForkTest is Test {
     ///      neither of them the feed's own machinery — and the answer is asserted
     ///      to be the LOWER one.
     ///
-    ///      WHAT THAT DOES AND DOES NOT ESTABLISH. The ring is brought to a
-    ///      usable state the way the ceremony brings it: grow the target, then
-    ///      let a write land. A frozen fork produces no writes of its own, so the
-    ///      test makes one. `observe` then answers partly because the fork is
-    ///      frozen — the whole window post-dates the pool's previous touch, so
-    ///      both samples sit at the standing tick. That is a property of a fork,
-    ///      NOT evidence that a given pool serves a 24h window on a trading chain
-    ///      — the deploy pre-flight asks the live pool, which is the only place
-    ///      that question can be answered. For the same reason BOTH
+    ///      WHAT THAT DOES AND DOES NOT ESTABLISH. The fork is frozen, so BOTH
     ///      legs here report the standing price rather than an average over live
     ///      history: what this suite pins is that the two machineries agree on
     ///      SCALE AND ORIENTATION against real venues, so `min` compares prices
     ///      and not units. Averaging behaviour is the unit suite's claim, where
     ///      the price history is ours to write.
     function test_theFeedAnswersTheLowerOfTheTwoLiveLegsOnceTheWindowIsSpanned() public {
-        IUniswapV3Pool(V3_POOL).increaseObservationCardinalityNext(GROWN_CARDINALITY);
-
         feed = new WoodPoolFeed(
             V2_PAIR, V3_POOL, WOOD, WETH, ETH_USD_FEED, ETH_USD_MAX_AGE, WINDOW, MIN_WETH_RESERVE, MIN_V3_LIQUIDITY
         );
@@ -205,27 +146,14 @@ contract WoodPoolFeedV3LegForkTest is Test {
         unchecked {
             v2X112 = (c1 - c0) / (t1 - t0);
         }
-        // READ THE V3 EXPECTATION BEFORE THE SWAP, because the swap moves the
-        // price. The observation the swap writes carries the PRE-swap tick —
-        // upstream books it before the tick moves — so the window's mean tick is
-        // still the standing tick this `sqrtPriceX96` came from.
         uint256 v3X112 = _v3SpotX112();
-
-        // A frozen fork never writes to the ring, so `next` alone leaves
-        // `observationCardinality` at 1 and the feed's history gate refuses. One
-        // real write is what advances it.
-        _writeOneObservation();
-        (,,, uint16 ringAfterWrite,,,) = IUniswapV3Pool(V3_POOL).slot0();
-        assertGe(ringAfterWrite, 2, "the swap did not advance the observation ring");
-
         uint256 ethUsdX8 = _ethUsdX8();
 
         console2.log("V2 leg (WETH per WOOD, x8): %s", Math.mulDiv(v2X112, ethUsdX8, Q112));
         console2.log("V3 leg (WETH per WOOD, x8): %s", Math.mulDiv(v3X112, ethUsdX8, Q112));
 
-        // SEPARATE THE TWO LEGS IN TIME. Reading in the same second as the second
-        // snapshot would make the `updatedAt` assertion below vacuous: the V3
-        // leg's stamp is `block.timestamp`, which would equal the V2 snapshot's.
+        // READ LATER THAN THE SNAPSHOT, so `updatedAt` is distinguishable from
+        // the block it is read in.
         vm.warp(vm.getBlockTimestamp() + 30);
         vm.roll(block.number + 30 / ROLL_SECONDS_PER_BLOCK);
 
@@ -248,10 +176,9 @@ contract WoodPoolFeedV3LegForkTest is Test {
         // `min` and `max` are distinguishable there and not here.
         assertLe(uint256(answer), Math.mulDiv(v2X112, ethUsdX8, Q112), "above the V2 leg");
 
-        // The live V3 leg never dates the reading forward: `updatedAt` is the
-        // OLDER of the two legs, i.e. the V2 snapshot the keeper rolled 30s ago,
-        // not the V3 leg's `block.timestamp`.
-        assertEq(updatedAt, t1, "updatedAt is the V2 snapshot");
+        // `updatedAt` is the OLDER of the two legs, i.e. the snapshot the keeper
+        // rolled 30s ago, never the block the read happens in.
+        assertEq(updatedAt, t1, "updatedAt is the snapshot");
         assertLt(updatedAt, vm.getBlockTimestamp(), "control: the two legs' stamps are distinguishable");
 
         // Both legs price the same asset in the same units. An orientation or
@@ -274,16 +201,12 @@ contract WoodPoolFeedV3LegForkTest is Test {
     ///      from `observe`, `TickMath` and a mean-tick calculation, which would
     ///      only be the feed's own arithmetic written twice.
     ///
-    ///      Legitimate here precisely because the fork is frozen: with the whole
-    ///      window post-dating the pool's previous touch, both `observe` samples
-    ///      sit at the standing tick — including the observation the test's own
-    ///      write books, which upstream stamps with the PRE-swap tick — so the
-    ///      window's mean tick IS the standing tick and its price is `slot0`'s.
-    ///      MUST therefore be read BEFORE that write. The
-    ///      remaining gap is sub-tick — `sqrtPriceX96` sits inside the tick, the
-    ///      feed prices the tick's own boundary — which is why the caller asserts
-    ///      approximately. On a chain where the pool is trading this derivation
-    ///      would NOT hold, and neither would this suite's freeze.
+    ///      Legitimate here precisely because the fork is frozen: nothing trades,
+    ///      so both accumulator readings sit at the standing tick and the span's
+    ///      mean tick IS that tick. The remaining gap is sub-tick —
+    ///      `sqrtPriceX96` sits inside the tick, the feed prices the tick's own
+    ///      boundary — which is why the caller asserts approximately. On a chain
+    ///      where the pool is trading this derivation would NOT hold.
     function _v3SpotX112() internal view returns (uint256) {
         (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(V3_POOL).slot0();
         assertGt(sqrtPriceX96, 0, "the live V3 pool reports no price");
@@ -293,28 +216,6 @@ contract WoodPoolFeedV3LegForkTest is Test {
         uint256 token1PerToken0X112 = Math.mulDiv(Math.mulDiv(sqrtPriceX96, sqrtPriceX96, 1 << 96), Q112, 1 << 96);
         // WETH per WOOD, in the V2 leg's orientation.
         return woodIsToken0Pool ? token1PerToken0X112 : Math.mulDiv(Q112, Q112, token1PerToken0X112);
-    }
-
-    /// @dev A swap small enough to be a WRITE and not a price event: ~1e15 wei of
-    ///      WETH in, a ~1e-5 relative move, three orders of magnitude inside the
-    ///      5e14 tolerance the answer is asserted to.
-    function _writeOneObservation() internal {
-        // Selling WETH pushes the pool in whichever direction WETH sorts.
-        bool zeroForOne = !woodIsToken0Pool;
-        uint160 limit = zeroForOne
-            ? TickMath.getSqrtRatioAtTick(TickMath.MIN_TICK) + 1
-            : TickMath.getSqrtRatioAtTick(TickMath.MAX_TICK) - 1;
-
-        deal(WETH, address(this), SWAP_WETH_IN);
-        IUniswapV3PoolSwap(V3_POOL).swap(address(this), zeroForOne, int256(SWAP_WETH_IN), limit, "");
-    }
-
-    /// @dev The pool asks for the token it is owed; a negative delta is what it
-    ///      pays out. Only the positive side is settled.
-    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
-        require(msg.sender == V3_POOL, "callback from a contract that is not the booked pool");
-        if (amount0Delta > 0) IERC20(IUniswapV3Pool(V3_POOL).token0()).transfer(V3_POOL, uint256(amount0Delta));
-        if (amount1Delta > 0) IERC20(IUniswapV3Pool(V3_POOL).token1()).transfer(V3_POOL, uint256(amount1Delta));
     }
 
     function _ethUsdX8() internal view returns (uint256) {

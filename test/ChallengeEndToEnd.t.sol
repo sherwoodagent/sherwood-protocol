@@ -25,6 +25,9 @@ import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
 import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
 import {deployTierRegistry, PermissiveStrategyFactory} from "./helpers/TierRegistryFixture.sol";
+import {WoodPoolFeed} from "../src/pricing/WoodPoolFeed.sol";
+import {MockUniswapV2Pair} from "./mocks/MockUniswapV2Pair.sol";
+import {MockUniswapV3PoolRing} from "./mocks/MockUniswapV3PoolRing.sol";
 
 /// @dev Chainlink-shaped USD feed for the vault asset.
 contract ChallengeE2EFeed {
@@ -1659,5 +1662,77 @@ contract ChallengeEndToEndTest is Test {
         vm.prank(g1);
         game.dispute(cid, type(uint256).max);
         assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Disputed), "fixture: backed");
+    }
+
+    // ── v1 audit F2: the WOOD feed's V3 observation ring ──
+
+    address internal constant F2_WETH = address(uint160(0xE7E7));
+    /// @dev ~2x the pair's price, so `min` marks the pair and the filing is
+    ///      priced off a leg the attacker is not touching.
+    int24 internal constant F2_V3_TICK = -103_094;
+    uint16 internal constant F2_CARDINALITY = 109;
+    uint256 internal constant F2_WRITE_INTERVAL = 880;
+
+    MockUniswapV2Pair internal f2Pair;
+    MockUniswapV3PoolRing internal f2Pool;
+    MockAggregatorV3 internal f2EthUsd;
+    int24 internal f2Wiggle;
+
+    function _f2Swap(uint256 dt) internal {
+        vm.warp(vm.getBlockTimestamp() + dt);
+        f2Pair.sync();
+        f2EthUsd.setUpdatedAt(vm.getBlockTimestamp());
+        f2Wiggle = f2Wiggle == 0 ? int24(1) : int24(0);
+        f2Pool.swap(F2_V3_TICK + f2Wiggle);
+    }
+
+    /// @dev Swaps the fixture's aggregator for the production `WoodPoolFeed`
+    ///      over a real V3 observation ring, filled at the measured cadence.
+    function _f2SeatPoolFeed() internal {
+        f2Pair = new MockUniswapV2Pair(address(wood), F2_WETH, 1e26, 1_666_666_666_666_666_666_666);
+        f2Pool = new MockUniswapV3PoolRing(address(wood), F2_WETH, F2_V3_TICK, 2e22);
+        f2Pool.increaseObservationCardinalityNext(F2_CARDINALITY);
+        f2EthUsd = new MockAggregatorV3(8, 3000e8);
+        f2EthUsd.setUpdatedAt(vm.getBlockTimestamp());
+        WoodPoolFeed poolFeed = new WoodPoolFeed(
+            address(f2Pair), address(f2Pool), address(wood), F2_WETH, address(f2EthUsd), 24 hours, 24 hours, 10e18, 1e22
+        );
+
+        poolFeed.update();
+        for (uint256 i = 0; i < 130; i++) {
+            _f2Swap(F2_WRITE_INTERVAL);
+        }
+        poolFeed.update();
+
+        vm.prank(ledgerOwner);
+        ledger.setWoodFeed(address(poolFeed), type(uint64).max);
+    }
+
+    /// @notice v1 audit F2. Dust swaps evict the V3 pool's observation ring, so
+    ///         a ring-backed `observe(window)` dies — and the watchtower can
+    ///         still accuse, because the leg is priced off stored snapshots.
+    function test_f2_evictingTheV3RingDoesNotBlockChallengeFiling() public {
+        uint256 pid = _proposeApproveExecute();
+        _f2SeatPoolFeed();
+        wood.mint(challenger, 100 * _challengerBond()); // the pool prices WOOD, not the fixture's $0.05
+
+        // 109 dust swaps, one per second. No privileges, no size.
+        uint256 writesBefore = f2Pool.writes();
+        for (uint256 i = 0; i < F2_CARDINALITY; i++) {
+            _f2Swap(1);
+        }
+        assertEq(f2Pool.writes() - writesBefore, F2_CARDINALITY, "109 swaps, 109 observations");
+
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = 24 hours;
+        vm.expectRevert(bytes("OLD"));
+        f2Pool.observe(secondsAgos);
+
+        assertLt(vm.getBlockTimestamp(), gov.getProposal(pid).executedAt + game.challengeWindow(), "inside the window");
+        vm.prank(challenger);
+        uint256 cid = game.file(
+            address(gov), pid, IChallengeGame.Predicate.OutOfAdapterOutflow, address(adapter), adapter.poke.selector, ""
+        );
+        assertEq(cid, 1, "the accusation lands");
     }
 }

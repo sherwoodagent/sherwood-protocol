@@ -14,7 +14,9 @@ pragma solidity 0.8.28;
 ///
 ///         `observe` synthesises the cumulative pair from `twapTick` so that
 ///         `(c[1] - c[0]) / window == twapTick` exactly, which is what the
-///         strategy divides.
+///         strategy divides. `observe([0])` instead reports a REAL accumulator,
+///         advancing at `twapTick` per second, because a consumer that
+///         snapshots it twice has to recover the time-weighted tick from it.
 contract MockUniswapV3Pool {
     address public token0;
     address public token1;
@@ -64,16 +66,14 @@ contract MockUniswapV3Pool {
     ///         for a pool that answers the selector but not the contract.
     bool public observeShortArray;
 
-    /// @notice Raw tick cumulatives, returned verbatim instead of the pair
-    ///         synthesised from `twapTick`.
-    /// @dev    The synthesised pair always divides EXACTLY by the requested
-    ///         window, which is what makes it useless for testing how a consumer
-    ///         rounds an inexact quotient. Seating the two numbers directly is
-    ///         the only way to hand a consumer a delta with a remainder — and a
-    ///         real pool's cumulatives carry one almost always.
-    bool public rawCumulatives;
-    int56 public tickCumulative0;
-    int56 public tickCumulative1;
+    /// @notice The tick accumulator `observe([0])` reports, as of `lastAccrual`.
+    /// @dev    A synthesised pair always divides EXACTLY by the span, which is
+    ///         what makes it useless for testing how a consumer rounds an
+    ///         inexact quotient. Seating this number directly is how a test
+    ///         hands a consumer a delta with a remainder — and a real pool's
+    ///         cumulatives carry one almost always.
+    int56 public tickCumulativeStored;
+    uint32 public lastAccrual;
 
     constructor(address token0_, address token1_, uint24 fee_, int24 tickSpacing_, address factory_) {
         token0 = token0_;
@@ -81,16 +81,20 @@ contract MockUniswapV3Pool {
         fee = fee_;
         tickSpacing = tickSpacing_;
         factory = factory_;
+        lastAccrual = uint32(block.timestamp);
     }
 
     function setLiquidity(uint128 l) external {
         liquidity = l;
     }
 
+    /// @dev The elapsed span is booked at the OLD tick before the switch, so a
+    ///      tick change never rewrites accumulated history.
     function setTicks(int24 spot, int24 twap) external {
+        tickCumulativeStored = _liveTickCumulative();
+        lastAccrual = uint32(block.timestamp);
         spotTick = spot;
         twapTick = twap;
-        rawCumulatives = false;
     }
 
     /// @notice Seat the ring's ACTUAL length, i.e. simulate the pool having been
@@ -110,12 +114,14 @@ contract MockUniswapV3Pool {
         observeShortArray = v;
     }
 
-    /// @notice Return `c0` and `c1` verbatim from `observe`, whatever window is
-    ///         asked for. Undone by `setTicks`.
-    function setTickCumulatives(int56 c0, int56 c1) external {
-        rawCumulatives = true;
-        tickCumulative0 = c0;
-        tickCumulative1 = c1;
+    /// @notice Seat the live accumulator at `c`, as of this block.
+    function setTickCumulative(int56 c) external {
+        tickCumulativeStored = c;
+        lastAccrual = uint32(block.timestamp);
+    }
+
+    function _liveTickCumulative() internal view returns (int56) {
+        return tickCumulativeStored + int56(twapTick) * int56(uint56(uint32(block.timestamp) - lastAccrual));
     }
 
     function setFactory(address f) external {
@@ -144,6 +150,15 @@ contract MockUniswapV3Pool {
     {
         require(!observeReverts, "OLD");
 
+        // `observe([0])` is the live accumulator: one element in, one out.
+        if (secondsAgos.length == 1) {
+            uint256 n = observeShortArray ? 0 : 1;
+            tickCumulatives = new int56[](n);
+            secondsPerLiquidityCumulativeX128s = new uint160[](n);
+            if (n == 1) tickCumulatives[0] = _liveTickCumulative();
+            return (tickCumulatives, secondsPerLiquidityCumulativeX128s);
+        }
+
         if (observeShortArray) {
             tickCumulatives = new int56[](1);
             secondsPerLiquidityCumulativeX128s = new uint160[](1);
@@ -152,12 +167,6 @@ contract MockUniswapV3Pool {
 
         tickCumulatives = new int56[](2);
         secondsPerLiquidityCumulativeX128s = new uint160[](2);
-
-        if (rawCumulatives) {
-            tickCumulatives[0] = tickCumulative0;
-            tickCumulatives[1] = tickCumulative1;
-            return (tickCumulatives, secondsPerLiquidityCumulativeX128s);
-        }
 
         // c[1] - c[0] == twapTick * window, so the strategy's division recovers
         // `twapTick` with no remainder and no floor-correction ambiguity. The

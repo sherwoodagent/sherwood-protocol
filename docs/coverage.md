@@ -120,22 +120,17 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   — the cap is never served as a price — and applies `woodHaircutBps`. On chain
   4663 that feed is `WoodPoolFeed`: the lower of two WOOD/WETH TWAPs over a
   window of at least 24h, converted through ETH/USD. One leg is the Uniswap V2
-  pair, snapshotted by the keeper and synced before each snapshot so there is no
-  idle tail, held to a WETH reserve floor; the other is the Uniswap V3 pool
-  `0xF683…1C69`, read live from its own observation ring via `observe`, held to
-  an in-range `liquidity()` floor instead. **The V3 leg answers only if that ring
-  can span the window** — the live pool's `observationCardinality` is 1, which
-  cannot, so growing it with the permissionless
-  `increaseObservationCardinalityNext` is a named deploy step
-  (`GrowV3Cardinality`) and `DeployWoodPoolFeed` refuses to deploy against a pool
-  whose `observe(window)` reverts or whose ring holds fewer than two observations
-  (a ring of one has no history and `observe` answers it with spot). The ring
-  stores one observation per block in which the pool is TOUCHED, not per block:
-  at the pool's measured ~880s write cadence a 24h window needs ~99 slots, and
-  the bound that binds is the transaction, not the uint16 index — every new slot
-  is initialised inside `increaseObservationCardinalityNext` at ~22.4k gas, so
-  one call carries at most ~1,400 of them and a longer ring is grown in repeated
-  steps. The pre-flight asks the pool rather than trusting the derivation.
+  pair, synced before each snapshot so there is no idle tail, held to a WETH
+  reserve floor; the other is the Uniswap V3 pool `0xF683…1C69`, held to an
+  in-range `liquidity()` floor instead. **Both legs are averaged from
+  accumulator readings the keeper snapshots** — the pair's cumulative price and
+  the pool's `observe([0])` tick cumulative — so neither leg depends on history
+  anyone else stores. A backward `observe([window])` would: the observation ring
+  is written by ANY swapper, one slot per SECOND in which the pool is touched,
+  and `observationCardinality` is a `uint16`, so the longest ring anyone can pay
+  for reaches 18h12m against a per-second writer and no ring size can serve a 24h
+  window (v1 audit F2). `DeployWoodPoolFeed` pre-flights only that the pool
+  serves `observe([0])`, which any initialised pool does.
   **`min` means the SHALLOWER venue binds**, and today that is the V3 pool
   (~$122k of notional against the V2 pair's ~$330k), so the cost of pushing the
   reported price DOWN is set by the V3 pool's depth and `woodHaircutBps` should
@@ -148,14 +143,14 @@ run (SHE-212, SHE-225) and is gone; the following properties replace it.
   floors also bind at different times: the V2 leg's WETH floor is checked at
   SNAPSHOT time as well as at read time, so a pair that was thin during the
   averaged span never enters the average, while the V3 leg's `liquidity()` floor
-  is checked only at read time — a live-read leg has no snapshot instant to bind
-  at — so a pool thin for most of the window but topped up just before the read
-  passes it. Accepted: the V3 leg carries no staleness gate of its own,
-  so a pool that stops trading keeps answering at its last tick, symmetric with
-  the V2 leg, which keeps averaging its last synced spot. `updatedAt` is the V2
-  snapshot's — the older of the two legs — so `WOOD_FEED_MAX_DELAY` at the ledger
-  is what bounds the whole feed's age. A stale or shallow reading yields no price
-  at all — `NoWoodPrice` — rather than a wrong one.
+  is checked only at read time, so a pool thin for most of the window but topped
+  up just before the read passes it. Accepted: neither leg carries a staleness
+  gate of its own, so a pool that stops trading keeps averaging its last tick,
+  and the pair keeps averaging its last synced spot. `updatedAt` is the
+  snapshot's — the older of the two legs, which roll together — so
+  `WOOD_FEED_MAX_DELAY` at the ledger is what bounds the whole feed's age. A
+  stale or shallow reading yields no price at all — `NoWoodPrice` — rather than
+  a wrong one.
 - **Cohort liability is the lock sum, capped at need.**
   `liabilityUsd(governor, proposalId)` returns
   `min(needUsd, Σ min(lock_i, live stake_i) × woodPriceX8())`;
