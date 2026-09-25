@@ -75,7 +75,12 @@ library RobinhoodParams {
 
     /// @notice TierRegistry launch set. Every CHAINLINK_<SYM>_USD_FEED and <SYM> (WETH for ETH) book key is
     ///         REQUIRED. A Solidity constant cannot hold an array, hence a pure accessor.
-    function launchSetSymbols() internal pure returns (string[16] memory) {
+    /// @dev    The stock slots are the Robinhood Stock Tokens that have BOTH a published Chainlink feed
+    ///         (reference-data-directory `feeds-robinhood-mainnet.json`) and a Uniswap v3 USDG pool
+    ///         that round-trips 300 USDG for under 3%, checked on 4663 on 2026-09-25. A token without
+    ///         a feed cannot enter a Portfolio basket at all; one without a pool would pass init and
+    ///         then revert at execute. `SeedPriceSources.s.sol` applies this list to a live registry.
+    function launchSetSymbols() internal pure returns (string[30] memory) {
         return [
             "ETH",
             "USDG",
@@ -92,7 +97,21 @@ library RobinhoodParams {
             "TSLA",
             "QQQ",
             "SPY",
-            "SLV"
+            "SLV",
+            "ASML",
+            "BABA",
+            "CRCL",
+            "DELL",
+            "GME",
+            "INTC",
+            "MSTR",
+            "MU",
+            "PLTR",
+            "SNDK",
+            "SPCX",
+            "TSM",
+            "USAR",
+            "USO"
         ];
     }
 }

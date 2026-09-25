@@ -4,6 +4,8 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 
 import {DeploySherwood} from "../../script/Deploy.s.sol";
+import {SeedPriceSources} from "../../script/SeedPriceSources.s.sol";
+import {RobinhoodParams} from "../../script/robinhood-mainnet/RobinhoodParams.sol";
 import {TierRegistry} from "../../src/TierRegistry.sol";
 
 /// @dev `_seedTierRegistry` and its three helpers are `internal` on the deploy
@@ -11,6 +13,17 @@ import {TierRegistry} from "../../src/TierRegistry.sol";
 contract SeedHarness is DeploySherwood {
     function exposed_seedTierRegistry(address deployer, address tierRegistry) external {
         _seedTierRegistry(deployer, tierRegistry);
+    }
+}
+
+/// @dev Lifts the post-deploy pairing script's internals into reach, same as `SeedHarness`.
+contract SeedPriceSourcesHarness is SeedPriceSources {
+    function exposed_plan(address tierRegistry) external view returns (uint256) {
+        return _plan(TierRegistry(tierRegistry), RobinhoodParams.launchSetSymbols());
+    }
+
+    function exposed_seedPriceSource(address tierRegistry, string memory symbol) external {
+        _seedPriceSource(tierRegistry, symbol);
     }
 }
 
@@ -167,5 +180,65 @@ contract DeployTierRegistrySeedTest is Test {
         vm.expectRevert();
         _seed();
         assertFalse(registry.isCounterpartyAllowed(UNISWAP_V3_FACTORY), "attested from a nonexistent book");
+    }
+
+    // ── Stock coverage ──
+
+    /// @notice Every launch-set symbol with a token in the book ends up paired to its own feed.
+    /// @dev Walks the list rather than pinning one ticker, so a symbol added to
+    ///      `launchSetSymbols()` without its book keys fails here, not at clone-init.
+    function test_seed_pairsEveryLaunchSetSymbolThatHasAToken() public {
+        _seed();
+        string[30] memory symbols = RobinhoodParams.launchSetSymbols();
+        for (uint256 i; i < symbols.length; ++i) {
+            address feed = _book(string.concat("CHAINLINK_", symbols[i], "_USD_FEED"));
+            assertTrue(registry.isCounterpartyAllowed(feed), string.concat(symbols[i], " feed not allowlisted"));
+            string memory tokenKey = keccak256(bytes(symbols[i])) == keccak256("ETH") ? "WETH" : symbols[i];
+            if (!vm.keyExistsJson(_bookJson(), string.concat(".", tokenKey))) continue;
+            assertTrue(
+                registry.isPriceSourceForToken(_book(tokenKey), bytes32(uint256(uint160(feed)))),
+                string.concat(symbols[i], " feed not paired to its token")
+            );
+        }
+    }
+
+    // ── SeedPriceSources: the post-deploy path ──
+
+    /// @notice A registry seeded with the original 16-symbol set is missing exactly the 14 added
+    ///         stocks, two writes each, and the script's own seeding closes all of them.
+    function test_seedPriceSources_findsAndClosesOnlyTheNewStocks() public {
+        SeedPriceSourcesHarness s = new SeedPriceSourcesHarness();
+        TierRegistry r = new TierRegistry(address(s));
+        string[30] memory symbols = RobinhoodParams.launchSetSymbols();
+        // The first 16 are the launch set before the 14-stock expansion; the rest are the additions.
+        for (uint256 i; i < 16; ++i) {
+            s.exposed_seedPriceSource(address(r), symbols[i]);
+        }
+
+        assertEq(s.exposed_plan(address(r)), 28, "14 new stocks x (allowlist + pair)");
+
+        for (uint256 i = 16; i < symbols.length; ++i) {
+            s.exposed_seedPriceSource(address(r), symbols[i]);
+        }
+        assertEq(s.exposed_plan(address(r)), 0, "writes still missing after seeding");
+        assertTrue(
+            r.isPriceSourceForToken(_book("MU"), bytes32(uint256(uint160(_book("CHAINLINK_MU_USD_FEED"))))),
+            "MU not paired"
+        );
+    }
+
+    /// @notice After the ceremony's own seeding, the pairing script has nothing left to do.
+    function test_seedPriceSources_isANoOpOnACeremonySeededRegistry() public {
+        _seed();
+        SeedPriceSourcesHarness s = new SeedPriceSourcesHarness();
+        assertEq(s.exposed_plan(address(registry)), 0, "ceremony and script disagree on the launch set");
+    }
+
+    function _bookJson() internal view returns (string memory) {
+        return vm.readFile(string.concat(vm.projectRoot(), "/chains/4663.json"));
+    }
+
+    function _book(string memory key) internal view returns (address) {
+        return vm.parseJsonAddress(_bookJson(), string.concat(".", key));
     }
 }
