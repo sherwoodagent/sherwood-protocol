@@ -170,6 +170,7 @@ contract FeeBlacklistResilienceTest is Test {
             governor.approveCollaboration(proposalId);
         }
 
+        vm.warp(vm.getBlockTimestamp() + 1); // votes open the second after propose
         vm.prank(lp1);
         governor.vote(proposalId, ISyndicateGovernor.VoteType.For);
         vm.prank(lp2);

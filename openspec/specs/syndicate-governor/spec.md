@@ -67,7 +67,7 @@ A non-collaborative proposal SHALL enter `Pending` immediately at propose; a col
 
 #### Scenario: Vote weight from checkpointed shares
 - **WHEN** a shareholder votes on a Pending proposal
-- **THEN** their vote weight SHALL be `getPastVotes(voter, snapshotTimestamp)` from the vault's ERC20Votes checkpoints, and a zero weight SHALL revert with `NoVotingPower`
+- **THEN** their vote weight SHALL be the lesser of `getPastVotes(voter, snapshotTimestamp)` and `getPastVotes(voter, snapshotTimestamp + 1)` (the end of the propose second), so shares redeemed ahead of `propose` in its second carry no weight; a vote inside the propose second SHALL revert with `NotWithinVotingPeriod`, and a zero weight SHALL revert with `NoVotingPower`
 
 #### Scenario: One vote per address
 - **WHEN** an address that has already voted on a proposal votes again
