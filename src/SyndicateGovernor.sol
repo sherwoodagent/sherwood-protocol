@@ -438,9 +438,13 @@ contract SyndicateGovernor is GovernorParameters, GovernorEmergency, Initializab
         if (_commitState(proposal) != ProposalState.Pending) revert NotWithinVotingPeriod();
         if (_hasVoted[proposalId][msg.sender]) revert AlreadyVoted();
 
-        // Snapshot weight is final: no share is minted or burned while the
-        // proposal is open (`SyndicateVault.redemptionsLocked`), so no live cap.
-        uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, proposal.snapshotTimestamp);
+        // Weight is capped at the end of the propose second, so shares redeemed ahead of `propose`
+        // in it carry no veto; that checkpoint is readable only once the second has ended.
+        uint256 snap = proposal.snapshotTimestamp;
+        if (block.timestamp <= snap + 1) revert NotWithinVotingPeriod();
+        uint256 weight = IVotes(proposal.vault).getPastVotes(msg.sender, snap);
+        uint256 atPropose = IVotes(proposal.vault).getPastVotes(msg.sender, snap + 1);
+        if (atPropose < weight) weight = atPropose;
         if (weight == 0) revert NoVotingPower();
 
         _hasVoted[proposalId][msg.sender] = true;

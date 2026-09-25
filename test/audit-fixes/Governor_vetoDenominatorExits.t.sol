@@ -321,19 +321,46 @@ contract GovernorVetoDenominatorExitsTest is Test {
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
     }
 
-    /// @notice lp2 queues his 39k in the propose second, after propose, and votes with snapshot weight:
-    ///         the queue term is capped at the snapshot's (zero), so the bar stays 40k and 39% approves.
+    /// @notice lp2 queues 39k in the propose second: it leaves the voters but not the bar (queue term capped
+    ///         at the snapshot's zero), so the bar stays 40k and lp3's 30k Against falls short.
     function test_sharesQueuedInTheProposeSecondAreNotSubtractedFromTheLiveSide() public {
-        _deposit(lp1, 61_000e6);
+        address lp3 = makeAddr("lp3");
+        _deposit(lp1, 31_000e6);
         _deposit(lp2, 39_000e6);
+        _deposit(lp3, 30_000e6);
         uint256 pid = _proposeNoWarp();
         uint256 lp2Shares = vault.balanceOf(lp2);
-        vm.startPrank(lp2);
+        vm.prank(lp2);
         vault.requestRedeem(lp2Shares, lp2); // same second as propose
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(lp2);
+        vm.expectRevert(ISyndicateGovernor.NoVotingPower.selector);
         governor.vote(pid, ISyndicateGovernor.VoteType.Against);
-        vm.stopPrank();
+        vm.prank(lp3);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
         _endVote();
         assertEq(uint256(governor.getProposalState(pid)), uint256(ISyndicateGovernor.ProposalState.Approved));
+    }
+
+    /// @notice NM fix review 25-09: shares redeemed ahead of `propose` in its second carry no veto weight,
+    ///         and no vote is taken inside the propose second.
+    function test_redeemAheadOfProposeInItsSecondCarriesNoVetoWeight() public {
+        _deposit(lp1, 100_000e6);
+        _deposit(attacker, 200_000e6);
+        uint256 attackerShares = vault.balanceOf(attacker);
+        vm.prank(attacker);
+        vault.redeem(attackerShares, attacker, attacker); // propose second, ahead of propose
+        uint256 pid = _proposeNoWarp();
+        vm.prank(lp1);
+        vm.expectRevert(ISyndicateGovernor.NotWithinVotingPeriod.selector);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(attacker);
+        vm.expectRevert(ISyndicateGovernor.NoVotingPower.selector);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        vm.prank(lp1);
+        governor.vote(pid, ISyndicateGovernor.VoteType.Against);
+        assertEq(governor.getProposal(pid).votesAgainst, vault.balanceOf(lp1), "an untouched holder votes in full");
     }
 
     /// @notice lp3's stamped 50k park is claimed by the attacker in the propose second, ahead of propose.
