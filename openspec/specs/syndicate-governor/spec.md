@@ -33,7 +33,7 @@ The governor SHALL maintain exactly one authoritative state per proposal, drawn 
 - **THEN** no lifecycle entrypoint SHALL transition it to any other state
 
 ### Requirement: Single open proposal per vault
-The governor SHALL bind at most one non-terminal proposal lifecycle to its vault at a time. Both collaborative Drafts and Pending proposals count as binding the vault. The open-proposal count SHALL be incremented when a proposal enters Draft or Pending, and decremented exactly once when it reaches a terminal state (or Settled), with every decrement also stamping the settlement clock so lazily-expired proposals cannot dodge the execute cooldown.
+The governor SHALL bind at most one non-terminal proposal lifecycle to its vault at a time. Both collaborative Drafts and Pending proposals count as binding the vault. The open-proposal count SHALL be incremented when a proposal enters Draft or Pending, and decremented exactly once when it reaches a terminal state (or Settled), with every decrement also stamping the settlement clock so lazily-expired proposals cannot dodge the propose cooldown.
 
 #### Scenario: Second proposal blocked
 - **WHEN** an agent calls `propose` while the vault has any non-terminal proposal (Draft, Pending, GuardianReview, Approved, or Executed)
@@ -67,7 +67,7 @@ A non-collaborative proposal SHALL enter `Pending` immediately at propose; a col
 
 #### Scenario: Vote weight from checkpointed shares
 - **WHEN** a shareholder votes on a Pending proposal
-- **THEN** their vote weight SHALL be `getPastVotes(voter, snapshotTimestamp)` from the vault's ERC20Votes checkpoints, and a zero weight SHALL revert with `NoVotingPower`
+- **THEN** their vote weight SHALL be the lesser of `getPastVotes(voter, snapshotTimestamp)` and `getPastVotes(voter, snapshotTimestamp + 1)` (the end of the propose second), so shares redeemed ahead of `propose` in its second carry no weight; a vote inside the propose second SHALL revert with `NotWithinVotingPeriod`, and a zero weight SHALL revert with `NoVotingPower`
 
 #### Scenario: One vote per address
 - **WHEN** an address that has already voted on a proposal votes again
@@ -78,10 +78,10 @@ A non-collaborative proposal SHALL enter `Pending` immediately at propose; a col
 - **THEN** the call SHALL revert with `NotWithinVotingPeriod`
 
 ### Requirement: Optimistic passage with veto threshold
-The governor SHALL use optimistic governance: no FOR-vote quorum exists. At `voteEnd`, a Pending proposal SHALL be `Rejected` if and only if `votesAgainst >= pastTotalSupply * vetoThresholdBps / 10_000`, where `vetoThresholdBps` is the per-proposal snapshot taken when the proposal entered Pending (a mid-vote parameter change cannot move the bar) and `pastTotalSupply` is the vault supply at `snapshotTimestamp`. When `pastTotalSupply == 0`, the veto check SHALL be skipped (otherwise the threshold collapses to zero and every proposal auto-rejects). A proposal not vetoed at voteEnd proceeds into guardian review.
+The governor SHALL use optimistic governance: no FOR-vote quorum exists. At `voteEnd`, a Pending proposal SHALL be `Rejected` if and only if `votesAgainst >= votableSupply * vetoThresholdBps / 10_000`, where `vetoThresholdBps` is the per-proposal snapshot taken when the proposal entered Pending (a mid-vote parameter change cannot move the bar) and `votableSupply = min(snapshotSupply - snapshotQueued, proposeSupply - min(proposeQueued, snapshotQueued))`, with `snapshotSupply` and `snapshotQueued` the vault supply and the queue's votes at `snapshotTimestamp`, `proposeSupply` and `proposeQueued` the same two read at the end of the propose second (`snapshotTimestamp + 1`), and every subtraction clamped at zero, so the bar never counts shares that left the vault or were queued by the snapshot, and nothing after the propose second moves it. When `votableSupply == 0`, the veto check SHALL be skipped (otherwise the threshold collapses to zero and every proposal auto-rejects). A proposal not vetoed at voteEnd proceeds into guardian review.
 
 #### Scenario: Veto threshold reached
-- **WHEN** voting ends with `votesAgainst` at or above the snapshotted veto threshold of past total supply
+- **WHEN** voting ends with `votesAgainst` at or above the snapshotted veto threshold of `votableSupply`
 - **THEN** the proposal SHALL resolve to `Rejected` without traversing guardian review, and no registry economic commit SHALL fire for it
 
 #### Scenario: Silence passes the vote
@@ -104,10 +104,10 @@ After a passed vote the proposal SHALL sit in `GuardianReview` until `reviewEnd`
 - **THEN** the governor SHALL best-effort cancel the registry review so approvers of a proposal that can never execute cannot later be slashed; a review that refuses to cancel (block quorum reached or window elapsed) SHALL NOT brick the terminal transition
 
 ### Requirement: Execution safety guards
-`executeProposal` SHALL be permissionless but SHALL only run when the resolved state is `Approved`, no other proposal is actively executing, and the cooldown has elapsed (`block.timestamp >= lastSettledAt + cooldownPeriod`, skipped when nothing ever settled). Before executing it SHALL: snapshot the vault's asset balance as the capital snapshot; mark the proposal `Executed` and set `executedAt` before any external call (CEI); re-resolve tier and coverage from the stored calls and revert with `TierRegressed` if the live tier exceeds the propose-time `envelopeTier`, or `CoverageRegressed` if the live coverage exceeds the propose-time `requiredCoverage`; and, when an exposure ledger is wired and `requiredCoverage != 0` and the tier is at or above the ledger's quorum tier threshold, require a bond-encumbered approve quorum via `requireApproveQuorum` (fail-closed: silence does not execute a coverage-consuming proposal). The opening batch SHALL run via the vault's `executeGovernorBatch` under the proposal's `maxCapital` net-outflow cap. All execute/settle/cancel entrypoints SHALL be protected by a shared reentrancy lock.
+`executeProposal` SHALL be permissionless but SHALL only run when the resolved state is `Approved` and no other proposal is actively executing. The settle cooldown is enforced at `propose` (below), and since `cooldownPeriod` is frozen while a proposal is open it cannot be the first gate to fail at execute. Before executing it SHALL: snapshot the vault's asset balance as the capital snapshot; mark the proposal `Executed` and set `executedAt` before any external call (CEI); re-resolve tier and coverage from the stored calls and revert with `TierRegressed` if the live tier exceeds the propose-time `envelopeTier`, or `CoverageRegressed` if the live coverage exceeds the propose-time `requiredCoverage`; and, when an exposure ledger is wired and `requiredCoverage != 0` and the tier is at or above the ledger's quorum tier threshold, require a bond-encumbered approve quorum via `requireApproveQuorum` (fail-closed: silence does not execute a coverage-consuming proposal). The opening batch SHALL run via the vault's `executeGovernorBatch` under the proposal's `maxCapital` net-outflow cap. All execute/settle/cancel entrypoints SHALL be protected by a shared reentrancy lock.
 
 #### Scenario: Cooldown between strategies
-- **WHEN** `executeProposal` is called before `lastSettledAt + cooldownPeriod` has elapsed
+- **WHEN** `propose` is called before the cooldown deadline stamped at the last terminal event (`terminalAt + cooldownPeriod` as of that event; nothing ever settled: no cooldown)
 - **THEN** the call SHALL revert with `CooldownNotElapsed`, giving depositors an exit window between strategies
 
 #### Scenario: Stale certification blocks execution
@@ -136,6 +136,10 @@ After a passed vote the proposal SHALL sit in `GuardianReview` until `reviewEnd`
 #### Scenario: Interim LP flow excluded from P&L
 - **WHEN** depositors add or remove principal while a strategy is live
 - **THEN** the settlement P&L SHALL exclude that interim net flow, so fees are charged only on strategy performance
+
+#### Scenario: Settlement leg that does not unwind the strategy
+- **WHEN** the settlement calls leave the proposal's strategy answering `executed() == true`
+- **THEN** `settleProposal` and `unstick` SHALL revert with `StrategyNotSettled`; only the guardian-reviewed, owner-bonded `finalizeEmergencySettle` MAY close the proposal with the strategy still executed
 
 ### Requirement: Fee distribution waterfall
 On a positive P&L, unless the proposal's snapshotted `selfManagesFees` flag is true (which skips the entire governor fee waterfall), the governor SHALL distribute, in order: (1) protocol fee = gross profit × snapshotted `protocolFeeBps` to the snapshotted protocol recipient; (2) guardian fee = gross profit × snapshotted `guardianFeeBps` to the snapshotted guardians recipient, emitting `GuardianFeeAccrued` only when the transfer actually delivers; (3) agent performance fee = net profit × the propose-time performance fee, re-clamped at settle to the live `maxPerformanceFeeBps` (emitting `FeeClamped` when the clamp fires), split across active co-proposers by their `splitBps` with the remainder to the lead proposer; (4) management fee = remaining net × the vault's live `managementFeeBps` to the vault owner. Any individual fee transfer that reverts (e.g. a blacklisted recipient) SHALL be escrowed against `(vault, recipient, token)` instead of reverting settlement, emitting `FeeTransferFailed`; recipients pull escrowed amounts later via `claimUnclaimedFees`, which SHALL zero the escrow slot before transferring and only pay from the vault that owes it.

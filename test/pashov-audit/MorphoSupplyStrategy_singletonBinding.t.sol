@@ -111,26 +111,18 @@ contract BindingTierRegistry {
         allowed[a] = v;
     }
 
-    function isAdapterAllowed(address a) external view returns (bool) {
+    function isCounterpartyAllowed(address a) external view returns (bool) {
         return allowed[a];
     }
 
-    /// @dev The CALLEE axis (`_guardBatchCalls` PART 2a), split out of
-    ///      `isAdapterAllowed` per pashov finding #14. Mirrors the adapter axis:
-    ///      the demotion asymmetry is exercised against the real registry in
-    ///      `test/pashov-final/Registry_demoteKeepsCalleeStanding.t.sol`, so
-    ///      mirroring keeps every binding case here unchanged.
-    ///
-    ///      Present at all because the vault's PART 2a call is TYPED: a stand-in
-    ///      missing this selector reverts in the CALLER's frame with empty
-    ///      returndata. `MuteTierRegistry` below deliberately stays bare — being
-    ///      unable to answer is the whole point of that fixture.
-    function isCallableTarget(address a) external view returns (bool) {
-        return allowed[a];
+    /// @dev SHE-209: no class concept in this stand-in — every address is a
+    ///      non-member, so the vault's class-binding check never fires.
+    function classOf(address) external pure returns (bytes32) {
+        return bytes32(0);
     }
 }
 
-/// @notice A registry with code but no `isAdapterAllowed` selector: RESOLVED
+/// @notice A registry with code but no `isCounterpartyAllowed` selector: RESOLVED
 ///         but unable to vouch. Must fail CLOSED.
 contract MuteTierRegistry {
     function ping() external pure returns (uint256) {
@@ -150,7 +142,7 @@ contract MuteTierRegistry {
  *
  *         The fix binds `morpho_` to the governance-owned `TierRegistry` through
  *         the same `vault() -> governor() -> tierRegistry() ->
- *         isAdapterAllowed` walk `PortfolioStrategy` uses for its swap adapter,
+ *         isCounterpartyAllowed` walk `PortfolioStrategy` uses for its swap adapter,
  *         at `_initialize` and again at `_execute`.
  */
 contract MorphoSupplyStrategy_singletonBindingTest is Test {
@@ -280,7 +272,7 @@ contract MorphoSupplyStrategy_singletonBindingTest is Test {
         assertEq(address(s.morpho()), address(realMorpho));
     }
 
-    /// @notice A RESOLVED registry that cannot answer `isAdapterAllowed` fails
+    /// @notice A RESOLVED registry that cannot answer `isCounterpartyAllowed` fails
     ///         CLOSED — a registry that cannot vouch has not vouched.
     function test_init_failsClosedWhenResolvedRegistryCannotAnswer() public {
         MuteTierRegistry mute = new MuteTierRegistry();

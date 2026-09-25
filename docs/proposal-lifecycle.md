@@ -84,6 +84,13 @@ Cross-contract timing invariants (all enforced at the setters):
 
 - **Caller:** registered agent of the vault (`vault.isAgent(msg.sender)`).
 - Only one open proposal per vault (`_openProposalCount == 0`).
+- **Owner bond must be live** (`registry.ownerBondLive(vault)` → sWOOD
+  `owner != 0 && unstakeRequestedAt == 0`). Refused with `OwnerBondNotLive` when the
+  vault's owner-stake slot is unbound, claimed, slashed, or inside its unstake
+  cooldown — the grace period `StakedWood.claimUnstakeOwner` documents. A vault
+  created under the `minOwnerStake == 0` open-onboarding sentinel holds a bound
+  zero-amount slot and is **not** affected. Way back in: `cancelUnstakeOwner` while
+  the exit is still in flight, otherwise `rotateOwner` → `transferOwnerStakeSlot`.
 - Fee splits snapshotted from `ProtocolConfig`; performance fee clamped against the
   governor cap (see [fees.md](fees.md)).
 - **Proposer bond** pulled into `ProposerBondEscrow`:
@@ -129,6 +136,10 @@ Cross-contract timing invariants (all enforced at the setters):
 ### 3. Execute (`executeProposal`, `src/SyndicateGovernor.sol:402`)
 
 - **Caller:** anyone (permissionless), while `Approved` and before `executeBy`.
+- The **owner-bond gate above is re-asserted here**, not only at propose: the vote and
+  the review period sit in between, and `requestUnstakeOwner` only refuses while a
+  proposal is open, so a bond can start leaving before the proposal that moves capital
+  exists. Same `OwnerBondNotLive`.
 - Gates, in order: cooldown elapsed → `executedAt` stamped → tier/coverage
   regression re-check (`TierRegressed` / `CoverageRegressed` if a certification was
   demoted since propose) → guardian **approve-quorum** on the exposure ledger
@@ -186,7 +197,7 @@ prosecutor fee (default 5%, ≤ 20%) to the challenger, remainder burned.
 | `vote` | LPs with snapshot voting power |
 | `vetoProposal`, `emergencyCancel`, `unstick`, emergency settle | vault owner |
 | guardian `voteOnProposal` | active staked guardians |
-| `openReview`, `resolveReview`, `executeProposal`, `settleProposal` (post-duration), `resolveProposalState`, `reclaimProposerBond`, `settleCoverage` | **anyone** (permissionless keepers) |
+| `openReview`, `resolveReview`, `executeProposal`, `settleProposal` (post-duration), `resolveProposalState`, `reclaimProposerBond` | **anyone** (permissionless keepers) |
 | parameter setters | vault owner, frozen while a proposal is open |
 
 ## Failure modes
@@ -207,5 +218,5 @@ prosecutor fee (default 5%, ≤ 20%) to the challenger, remainder burned.
 - **Registry paused mid-review** — proposal stays in `GuardianReview` until unpause
   (anyone can unpause after the 7-d dead-man delay).
 - **Unresolvable review** — governor/registry disagreement → terminal `Expired`.
-- Every non-executed terminal state leaves vault funds untouched; `_lastSettledAt`
+- Every non-executed terminal state leaves vault funds untouched; `_cooldownEndsAt`
   still stamps, so propose-cancel-propose spam is rate-limited by the cooldown.

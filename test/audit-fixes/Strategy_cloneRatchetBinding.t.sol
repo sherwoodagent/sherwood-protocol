@@ -22,7 +22,7 @@ import {MockProposalStatus} from "../mocks/MockProposalStatus.sol";
 import {deployTierRegistry} from "../helpers/TierRegistryFixture.sol";
 
 /// @notice `StrategyFactory.syndicateFactory` stand-in: reports every vault as
-///         registered so the factory's `_authClone` gate passes.
+///         registered so the factory's vault check passes.
 contract MockSyndicateRegistry {
     function vaultToSyndicate(address) external pure returns (uint256) {
         return 1;
@@ -213,7 +213,7 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
     function _benignCalls() internal view returns (BatchExecutorLib.Call[] memory calls) {
         calls = new BatchExecutorLib.Call[](1);
         calls[0] = BatchExecutorLib.Call({
-            target: address(usdc), value: 0, data: abi.encodeCall(usdc.balanceOf, (address(vault)))
+            target: address(usdc), value: 0, data: abi.encodeCall(usdc.approve, (address(vault), 0))
         });
     }
 
@@ -267,8 +267,8 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
     /// @dev Pushes `proposalId` (currently Approved, unexecuted) past its
     ///      `executeBy` deadline and flushes the lazy Expired transition, so
     ///      `openProposalCount` releases and a new proposal can be raised.
-    ///      Also stamps `_lastSettledAt`, so callers must additionally clear
-    ///      `cooldownPeriod` before the NEXT proposal can `executeProposal`.
+    ///      Also stamps `_cooldownEndsAt`, so callers must additionally clear
+    ///      `cooldownPeriod` before the NEXT proposal can be raised.
     function _expireAndRelease(uint256 proposalId) internal {
         vm.warp(vm.getBlockTimestamp() + EXECUTION_WINDOW + 1);
         governor.resolveProposalState(proposalId);
@@ -307,7 +307,7 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
         assertEq(cloneB.executeCount(), 0, "clone B's _execute() never ran");
 
         _expireAndRelease(pid1);
-        // `_expireAndRelease` stamped `_lastSettledAt` — clear the cooldown
+        // `_expireAndRelease` stamped `_cooldownEndsAt` — clear the cooldown
         // before the next `executeProposal`.
         vm.warp(vm.getBlockTimestamp() + COOLDOWN_PERIOD + 1);
 
@@ -352,6 +352,65 @@ contract Strategy_cloneRatchetBinding_LifecycleTest is Test {
 
         // Whole-tx revert: the first call's ratchet flip rolled back too.
         assertEq(uint256(clone.state()), uint256(BaseStrategy.State.Pending));
+    }
+
+    // ── settle requires unwind (NM fix review) ──
+
+    /// @notice A settlement leg that never calls `settle()` closes the proposal through neither
+    ///         `settleProposal` nor the owner's `unstick`, which replays the same leg.
+    function test_settleLegSkippingStrategySettle_reverts_onSettleAndUnstick() public {
+        MockFundedStrategy clone = MockFundedStrategy(Clones.clone(address(new MockFundedStrategy())));
+        uint256 amount = 10_000e6;
+        clone.initialize(address(vault), agent, abi.encode(address(usdc), amount));
+
+        BatchExecutorLib.Call[] memory executeCalls = new BatchExecutorLib.Call[](2);
+        executeCalls[0] = BatchExecutorLib.Call({
+            target: address(usdc), value: 0, data: abi.encodeCall(IERC20.approve, (address(clone), amount))
+        });
+        executeCalls[1] =
+            BatchExecutorLib.Call({target: address(clone), value: 0, data: abi.encodeCall(BaseStrategy.execute, ())});
+        uint256[] memory executeCaps = new uint256[](2);
+        executeCaps[1] = amount;
+        BatchExecutorLib.Call[] memory settlementCalls = _benignCalls();
+
+        ISyndicateGovernor.RiskEnvelope memory env = _permissiveEnv();
+        vm.prank(agent);
+        uint256 pid = governor.propose(
+            address(vault),
+            address(clone),
+            "ipfs://p",
+            STRATEGY_DURATION,
+            env,
+            executeCalls,
+            executeCaps,
+            settlementCalls,
+            new uint256[](1),
+            _noCoProposers()
+        );
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(voter);
+        governor.vote(pid, ISyndicateGovernor.VoteType.For);
+        vm.warp(vm.getBlockTimestamp() + VOTING_PERIOD + 1);
+        governor.executeProposal(pid);
+
+        vm.warp(vm.getBlockTimestamp() + STRATEGY_DURATION + 1);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.StrategyNotSettled.selector, address(clone)));
+        governor.settleProposal(pid);
+
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(ISyndicateGovernor.StrategyNotSettled.selector, address(clone)));
+        governor.unstick(pid);
+        assertEq(uint256(governor.getProposal(pid).state), uint256(ISyndicateGovernor.ProposalState.Executed));
+
+        // The vault stays locked, so nobody deposits at a price that books the clone as a loss.
+        assertTrue(vault.depositsLocked(), "no deposit at the understated price");
+        address depositor = makeAddr("depositor");
+        usdc.mint(depositor, 30_000e6);
+        vm.startPrank(depositor);
+        usdc.approve(address(vault), 30_000e6);
+        vm.expectRevert(ISyndicateVault.DepositsLocked.selector);
+        vault.deposit(30_000e6, depositor);
+        vm.stopPrank();
     }
 }
 
@@ -520,7 +579,7 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
         // the clone in `Executed`.
         BatchExecutorLib.Call[] memory settlementCalls = new BatchExecutorLib.Call[](1);
         settlementCalls[0] = BatchExecutorLib.Call({
-            target: address(usdc), value: 0, data: abi.encodeCall(usdc.balanceOf, (address(vault)))
+            target: address(usdc), value: 0, data: abi.encodeCall(usdc.approve, (address(vault), 0))
         });
 
         // executeCalls[0] (approve) moves no vault asset, so a zero cap is
@@ -553,13 +612,27 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
         assertEq(uint256(clone.state()), uint256(BaseStrategy.State.Executed));
         assertEq(usdc.balanceOf(address(clone)), amount, "clone holds the pulled funds");
 
-        // Owner rescues the STUCK proposal via `unstick` (GovernorEmergency)
-        // after `strategyDuration` elapses — runs the pre-committed
-        // settlement calls (the benign one above), which never touch the
-        // clone. The proposal reaches Settled; the clone is now orphaned.
+        // Owner force-settles through the reviewed emergency path with calls that never touch the
+        // clone (`unstick` would refuse, the clone is still Executed). The clone is now orphaned.
         vm.warp(vm.getBlockTimestamp() + 7 days + 1);
-        vm.prank(owner);
-        governor.unstick(pid1);
+        vm.mockCall(address(guardianRegistry), abi.encodeWithSelector(guardianRegistry.openEmergency.selector), "");
+        vm.mockCall(
+            address(guardianRegistry), abi.encodeWithSelector(guardianRegistry.ownerStake.selector), abi.encode(1)
+        );
+        vm.mockCall(
+            address(guardianRegistry),
+            abi.encodeWithSelector(guardianRegistry.requiredOwnerBond.selector),
+            abi.encode(1)
+        );
+        vm.mockCall(
+            address(guardianRegistry),
+            abi.encodeWithSelector(guardianRegistry.finalizeEmergency.selector),
+            abi.encode(false, settlementCalls)
+        );
+        vm.startPrank(owner);
+        governor.emergencySettleWithCalls(pid1, settlementCalls);
+        governor.finalizeEmergencySettle(pid1);
+        vm.stopPrank();
         assertEq(
             uint256(governor.getProposal(pid1).state), uint256(ISyndicateGovernor.ProposalState.Settled), "unstuck"
         );
@@ -574,7 +647,7 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
         uint256 vaultBalBefore = usdc.balanceOf(address(vault));
         BatchExecutorLib.Call[] memory recoveryExecute = new BatchExecutorLib.Call[](1);
         recoveryExecute[0] = BatchExecutorLib.Call({
-            target: address(usdc), value: 0, data: abi.encodeCall(usdc.balanceOf, (address(vault)))
+            target: address(usdc), value: 0, data: abi.encodeCall(usdc.approve, (address(vault), 0))
         });
         BatchExecutorLib.Call[] memory recoverySettle = new BatchExecutorLib.Call[](1);
         recoverySettle[0] =
@@ -585,6 +658,7 @@ contract Strategy_cloneRatchetBinding_UnitTest is Test {
         // live maxCapital ceiling.
         env.maxCapital = vault.totalAssets();
 
+        vm.warp(governor.getCooldownEnd()); // propose honours the settle cooldown the emergency close stamped
         vm.prank(agent);
         uint256 pid2 = governor.propose(
             address(vault),

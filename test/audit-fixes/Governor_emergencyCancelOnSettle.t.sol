@@ -196,6 +196,8 @@ contract Governor_emergencyCancelOnSettle_Test is Test {
         wood.approve(address(swood), type(uint256).max);
         vm.prank(guardianB);
         swood.stakeAsGuardian(GUARDIAN_STAKE, 2);
+        // The emergency electorate is read at the propose-time snapshot (`t - 1`).
+        vm.warp(vm.getBlockTimestamp() + 1);
     }
 
     function _emptyCoProposers() internal pure returns (ISyndicateGovernor.CoProposer[] memory) {

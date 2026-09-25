@@ -68,7 +68,7 @@ contract ProposalBleedHandler is Test {
         // Skip if this guardian already voted under (gov, pid) or the window closed.
         if (approvedUnder[address(gov)][pid][g]) return;
         vm.prank(g);
-        try registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve) {
+        try registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max) {
             approvedUnder[address(gov)][pid][g] = true;
         } catch {}
     }

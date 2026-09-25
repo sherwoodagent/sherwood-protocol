@@ -3,20 +3,37 @@ pragma solidity >=0.6.2 <0.9.0;
 
 import "../Base.sol";
 import {Properties} from "../Properties.sol";
+import {IExposureLedger} from "../../../src/interfaces/IExposureLedger.sol";
 
 /// @notice Handles the interaction with ExposureLedger
 ///
-/// @dev This is where the campaign's highest-value invariants live. I-5 (the
-///      six coverage accumulators move in lockstep) and X-8 (a guardian's
-///      aggregate booked coverage never exceeds their slashable bond) are both
-///      maintained purely by construction across `recordApproval`,
-///      `_unwindApproval` and `_rebook`, with no on-chain assertion anywhere.
-///      `recordApproval` / `releaseApproval` are registry-gated and
-///      `freeze`/`unfreeze`/`pin` are freezer-gated, so the dispatcher pranks
-///      those roles directly — otherwise the fuzzer could only reach them
-///      through a full propose→vote lifecycle and would almost never
-///      interleave them adversarially.
+/// @dev This is where the campaign's highest-value invariants live. The ledger
+///      keeps ONE figure per (proposal, guardian) — the WOOD lock — plus the
+///      per-guardian epoch buckets `openExposure` sums. GL-12/GL-52 (buckets
+///      agree with the live locks) and GL-49 (open exposure stays within
+///      `kNumerator x guardianStake`) are maintained purely by construction
+///      across `recordApproval` and `_unwindApproval`, with no on-chain
+///      assertion anywhere. `recordApproval` / `releaseApproval` are
+///      registry-gated and `freeze`/`unfreeze`/`pin` are freezer-gated, so the
+///      dispatcher pranks those roles directly — otherwise the fuzzer could
+///      only reach them through a full propose→vote lifecycle and would almost
+///      never interleave them adversarially.
+///
+///      `recordApproval` takes the guardian's DECLARED lock and clamps it to
+///      the free budget. The dispatcher draws the declaration from
+///      `[0, 2 x guardianStake + 1]` so zero, partial, exactly-full and
+///      over-budget (clamped) declarations are all reached. Since SHE-240 a
+///      booked lock worth under one approver slot's share of the need buys no
+///      slot and reverts `ApproveLockBelowFloor`; the wrapper below treats that
+///      as the specified answer and lets every other revert surface.
 abstract contract ExposureLedgerHandler is Properties {
+    /// @dev Vacuity guard for the approve path: a campaign in which every draw
+    ///      is refused stops exercising every coverage invariant that depends
+    ///      on a booked lock, and would still pass. Read by the suite so the
+    ///      ratio is measured rather than assumed.
+    uint256 public approveBooked;
+    uint256 public approveRefused;
+
     // ―――――――――――――――――― Challenge economics (GL-51) ―――――――――――――――――
     // The fourth input to `ChallengeGame.honestFilingNetPayoffBps`. It lives
     // here rather than on the game, which is exactly why no single setter can
@@ -35,17 +52,11 @@ abstract contract ExposureLedgerHandler is Properties {
         exposureLedger_retireApproval(address(governor), clampBetween(proposalId, 1, count), toGuardian(guardianSeed));
     }
 
-    function exposureLedger_settleCoverage_clamped(uint256 proposalId) public {
-        uint256 count = governor.proposalCount();
-        if (count == 0) return;
-        exposureLedger_settleCoverage(address(governor), clampBetween(proposalId, 1, count));
-    }
-
     function exposureLedger_secondary(uint8 selector, uint256 arg0, uint256 arg1, uint256 guardianSeed) public {
         uint256 count = governor.proposalCount();
         uint256 proposalId = count == 0 ? 0 : clampBetween(arg0, 1, count);
 
-        selector = uint8(selector % 12);
+        selector = uint8(selector % 11);
         if (selector == 0) {
             if (count == 0) return;
             _exposureLedger_freezeCoverage(address(governor), proposalId);
@@ -59,7 +70,11 @@ abstract contract ExposureLedgerHandler is Properties {
             );
         } else if (selector == 3) {
             if (count == 0) return;
-            _exposureLedger_recordApproval(address(governor), proposalId, toGuardian(guardianSeed));
+            // Declared lock spans zero / partial / full / over-budget (see header).
+            address guardian = toGuardian(guardianSeed);
+            _exposureLedger_recordApproval(
+                address(governor), proposalId, guardian, clampBetween(arg1, 0, 2 * swood.guardianStake(guardian) + 1)
+            );
         } else if (selector == 4) {
             if (count == 0) return;
             _exposureLedger_releaseApproval(address(governor), proposalId, toGuardian(guardianSeed));
@@ -73,8 +88,6 @@ abstract contract ExposureLedgerHandler is Properties {
         } else if (selector == 8) {
             _exposureLedger_setProposerBondBps(clampBetween(arg1, 0, 10_000));
         } else if (selector == 9) {
-            _exposureLedger_setQuorumTierThreshold(uint8(arg1 % 3));
-        } else if (selector == 10) {
             // I-7: bounded [MIN_WOOD_HAIRCUT_BPS, 10000].
             _exposureLedger_setWoodHaircutBps(clampBetween(arg1, 5_000, 10_000));
         } else {
@@ -90,15 +103,34 @@ abstract contract ExposureLedgerHandler is Properties {
         ledger.retireApproval(governor_, proposalId, guardian);
     }
 
-    function exposureLedger_settleCoverage(address governor_, uint256 proposalId) public asActor {
-        ledger.settleCoverage(governor_, proposalId);
-    }
-
     // ── Secondary: registry-gated ──
 
-    function _exposureLedger_recordApproval(address governor_, uint256 proposalId, address guardian) internal {
+    function _exposureLedger_recordApproval(address governor_, uint256 proposalId, address guardian, uint256 lockWood)
+        internal
+    {
+        // Read BEFORE: a call that lands on a live lock returns idempotently,
+        // and counting that as a booking would let an all-refusals campaign
+        // still report coverage.
+        uint256 lockBefore = ledger.lockOf(governor_, proposalId, guardian);
         vm.prank(address(registry));
-        ledger.recordApproval(governor_, proposalId, guardian);
+        try ledger.recordApproval(governor_, proposalId, guardian, lockWood) {
+            if (lockBefore == 0 && ledger.lockOf(governor_, proposalId, guardian) != 0) approveBooked++;
+        } catch (bytes memory err) {
+            bytes4 sel = bytes4(err);
+            // Below-floor declarations are REFUSED, by design — the campaign
+            // draws plenty of them — and so is every state in which the ledger
+            // cannot size or book a lock: an approve either books coverage or
+            // reverts, so the registry never seats a slot with nothing behind
+            // it. Any OTHER revert is a finding and must not be swallowed here.
+            require(
+                sel == IExposureLedger.ApproveLockBelowFloor.selector || sel == IExposureLedger.NoWoodPrice.selector
+                    || sel == IExposureLedger.StalePrice.selector || sel == IExposureLedger.FeedNotConfigured.selector
+                    || sel == IExposureLedger.CoverageHorizonExceeded.selector
+                    || sel == IExposureLedger.CoverageInputsUnreadable.selector,
+                "recordApproval reverted for a reason other than a specified refusal"
+            );
+            approveRefused++;
+        }
     }
 
     function _exposureLedger_releaseApproval(address governor_, uint256 proposalId, address guardian) internal {
@@ -110,7 +142,7 @@ abstract contract ExposureLedgerHandler is Properties {
 
     function _exposureLedger_freezeCoverage(address governor_, uint256 proposalId) internal {
         vm.prank(address(game));
-        ledger.freezeCoverage(governor_, proposalId);
+        ledger.freezeCoverage(governor_, proposalId, block.timestamp + 30 days);
     }
 
     function _exposureLedger_unfreezeCoverage(address governor_, uint256 proposalId) internal {
@@ -139,10 +171,6 @@ abstract contract ExposureLedgerHandler is Properties {
 
     function _exposureLedger_setProposerBondBps(uint256 newBps) internal asAdmin {
         ledger.setProposerBondBps(newBps);
-    }
-
-    function _exposureLedger_setQuorumTierThreshold(uint8 newThreshold) internal asAdmin {
-        ledger.setQuorumTierThreshold(newThreshold);
     }
 
     function _exposureLedger_setWoodHaircutBps(uint256 newBps) internal asAdmin {

@@ -79,7 +79,7 @@ contract MockRegistryMinimal is IGuardianRegistry {
     // Not modeled — revert loudly. Interface conformance stubs only.
     // ─────────────────────────────────────────────────────────────────────
 
-    function voteOnProposal(address, uint256, GuardianVoteType) external pure {
+    function voteOnProposal(address, uint256, GuardianVoteType, uint256) external pure {
         revert NotImplemented();
     }
 
@@ -192,6 +192,19 @@ contract MockRegistryMinimal is IGuardianRegistry {
 
     function ownerStake(address) external pure returns (uint256) {
         revert NotImplemented();
+    }
+
+    /// @dev Permissive by default, unlike the reverting stubs around it: the
+    ///      governor reads this on every propose and execute, so `NotImplemented`
+    ///      would fail every governor fixture (SHE-215).
+    bool internal _ownerBondLive = true;
+
+    function setOwnerBondLive(bool live) external {
+        _ownerBondLive = live;
+    }
+
+    function ownerBondLive(address) external view returns (bool) {
+        return _ownerBondLive;
     }
 
     function minOwnerStake() external pure returns (uint256) {

@@ -4,7 +4,8 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {ExposureLedger} from "src/ExposureLedger.sol";
 import {IExposureLedger} from "src/interfaces/IExposureLedger.sol";
-import {MockWoodTwapOracle} from "test/mocks/MockWoodTwapOracle.sol";
+import {MockAggregatorV3} from "test/mocks/MockAggregatorV3.sol";
+import {MockCoverageFreezer} from "test/mocks/MockCoverageFreezer.sol";
 
 /// @dev Minimal sWOOD stub, but UNLIKE `test/ExposureLedger.t.sol`'s
 ///      `MockSwood`, this one mirrors `StakedWood.slashableStakeAt`'s ACTUAL
@@ -136,29 +137,33 @@ contract MockGovernorForLedger {
 ///         `block.timestamp`, matching the verdict's basis for a proposal
 ///         executing this same block.
 ///
-///         FINDING 11 (`test_retireApproval_...`): `_liveBookedUsd` /
-///         `_livePledgedUsd` — the shared-stake denominators every
-///         `_sharedSlashableUsd` call divides by — are cleared ONLY by
+///         FINDING 11 (`test_retireApproval_...`): a lock is cleared ONLY by
 ///         `releaseApproval`, whose one caller (`GuardianRegistry
 ///         .voteOnProposal`'s Approve->Block branch) is gated on the review
 ///         still being open. A commitment that survives its own review has NO
-///         release path, so it keeps diluting every OTHER proposal the same
-///         guardian later backs, forever, even once its own challenge window
-///         has long closed and it carries no collectable liability at all.
-///         Fixed by `retireApproval`, a permissionless sweep gated on the
-///         booked epoch's challenge window having elapsed, the key being
-///         unfrozen, and the guardian holding no active `pinCoverageUntil`.
+///         release path, so its record and its approver listing — which the
+///         freeze/pin walks and every accused-set derivation read — outlive
+///         the window in which it could still be collected on. Fixed by
+///         `retireApproval`, a permissionless sweep gated on the booked
+///         epoch's challenge window having elapsed, the key being unfrozen,
+///         and the guardian holding no active `pinCoverageUntil`. (Under the
+///         original booking/pledge model the stale record ALSO diluted every
+///         other proposal the guardian backed through a shared-stake
+///         denominator; declared coverage locks removed that denominator, so
+///         the sweep now bounds list length rather than repairing coverage.)
 contract ExposureLedgerAnchorAndRetireTest is Test {
     ExposureLedger internal ledger;
     MockSwoodAnchored internal swood;
-    MockWoodTwapOracle internal twap;
+    MockAggregatorV3 internal woodFeed;
     MockGovernorForLedger internal mgov;
     address internal usdgAsset;
 
     address internal owner = makeAddr("owner");
     address internal guardian = makeAddr("guardian");
     address internal registry = makeAddr("registry");
-    address internal freezer = makeAddr("freezer");
+    // SHE-214: a freezer must answer `challengeWindow()` to wire; a low window so
+    // no test that lowers the ledger's window trips the game-side floor.
+    address internal freezer = address(new MockCoverageFreezer(1 days));
 
     // $2.00 market, cap 2x above (non-binding) — matches finding 4's own
     // worked example (guardian at $2.00/WOOD, price falls to $1.00).
@@ -168,7 +173,7 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
     function setUp() public {
         swood = new MockSwoodAnchored();
         ledger = new ExposureLedger(owner, address(swood), 28 days);
-        twap = new MockWoodTwapOracle(MARKET_X8);
+        woodFeed = new MockAggregatorV3(8, int256(MARKET_X8));
 
         usdgAsset = makeAddr("usdgAsset");
         vm.mockCall(usdgAsset, abi.encodeWithSignature("decimals()"), abi.encode(uint8(6)));
@@ -178,7 +183,9 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
 
         vm.startPrank(owner);
         ledger.setWoodUsdPrice(CAP_X8);
-        ledger.setWoodTwapOracle(address(twap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         ledger.setAssetFeed(usdgAsset, address(feed), 365 days);
         ledger.setGuardianRegistry(registry);
         ledger.setCoverageFreezer(freezer);
@@ -191,6 +198,18 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
     ///      flat $1.00 asset feed.
     function _requiredCoverage6(uint256 usd18) internal pure returns (uint256) {
         return usd18 / 1e12;
+    }
+
+    /// @dev SHE-240. The approve-side slot floor values the declared lock at
+    ///      the SAME anchored basis `requireApproveQuorum` uses, and
+    ///      `slashableStakeAt` deliberately excludes a checkpoint pushed in the
+    ///      anchor's own instant (see `MockSwoodAnchored`). A guardian's stake
+    ///      therefore has to predate the vote it underwrites — which it always
+    ///      does in production, where the registry reads `getPastStake` at a
+    ///      review snapshot strictly earlier than the vote.
+    function _stakeAheadOfTheVote(uint256 amount) internal {
+        swood.setStake(guardian, amount);
+        vm.warp(vm.getBlockTimestamp() + 1);
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -207,12 +226,13 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
     ///         Before the fix, `requireApproveQuorum` read live stake
     ///         (`anchor = 0`) and would have seen $1,000,000 — passing a gate
     ///         a conviction could only ever collect $500,000 against. This
-    ///         test asserts the FIXED behaviour: the gate must revert, because
-    ///         `min(max(500_000e18, 500_000e18), 1_000_000e18) = 500,000e18`
-    ///         is short of the $1,000,000 requirement.
+    ///         test asserts the FIXED behaviour: the gate must report only
+    ///         `min(max(500_000e18, 500_000e18), 1_000_000e18) = 500,000e18`,
+    ///         short of the $1,000,000 requirement.
     ///
-    ///         Fails against the pre-fix code (which returns normally here —
-    ///         `vm.expectRevert` would see no revert), passes against the fix.
+    ///         Fails against the pre-fix code, which reads live stake and so
+    ///         certifies the full $1,000,000 — the `assertEq(raised, 500_000e18)`
+    ///         below is what catches it.
     function test_requireApproveQuorum_sameBlockTopUp_doesNotCertifyPhantomCoverage() public {
         uint256 proposalId = 1;
         uint256 needUsd = 1_000_000e18;
@@ -220,31 +240,42 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
 
         // 500,000e18 WOOD @ $2.00 = $1,000,000 slashable — exactly enough to
         // reserve the whole requirement.
-        swood.setStake(guardian, 500_000e18);
+        _stakeAheadOfTheVote(500_000e18);
         mgov.set(requiredCoverage6);
 
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), proposalId, guardian);
+        ledger.recordApproval(address(mgov), proposalId, guardian, type(uint256).max);
 
-        // Sanity: the reservation is exactly the full requirement, so any
-        // shortfall below is attributable to the anchor basis, not to
-        // under-reservation.
-        (, uint256[] memory pledged) = ledger.pledgedOf(address(mgov), proposalId);
-        assertEq(pledged.length, 1, "guardian must have booked into the approver list");
-        assertEq(pledged[0], needUsd, "reservation must equal the full requirement");
+        // Sanity: the lock is the guardian's whole 500,000e18 stake (worth the
+        // full requirement at $2.00), so any shortfall below is attributable
+        // to the anchor basis, not to under-locking.
+        (, uint256[] memory locked) = ledger.pledgedOf(address(mgov), proposalId);
+        assertEq(locked.length, 1, "guardian must have locked into the approver list");
+        assertEq(locked[0], 500_000e18, "lock must be the whole stake");
+        assertEq(ledger.coverageUsdOf(address(mgov), proposalId, guardian), needUsd, "worth the full requirement");
 
         // WOOD crashes to $1.00 ...
-        twap.setPrice(1e8);
+        woodFeed.setAnswer(1e8);
         // ... and in the SAME block, the guardian tops up its stake. No time
         // passes between the crash, the top-up, and the gate check below —
         // this is the exact same-block sequence the finding describes.
         swood.setStake(guardian, 1_000_000e18);
 
-        // The gate must now revert: the anchored basis excludes the top-up,
+        // The gate must not certify the top-up: the anchored basis excludes it,
         // so the covering approver can only be shown to back $500,000 of the
-        // $1,000,000 requirement.
-        vm.expectRevert(IExposureLedger.InsufficientApproveCoverage.selector);
-        ledger.requireApproveQuorum(address(mgov), proposalId, usdgAsset, requiredCoverage6);
+        // $1,000,000 requirement, and that shortfall is what the gate reports.
+        //
+        // SHE-240 note: this assertion used to be `expectRevert`, and it held
+        // for the wrong reason — the guardian's only checkpoint sat at the
+        // anchor instant, so the anchored basis read 0 and the gate took its
+        // zero-aggregate revert. Staking one second earlier (the shape the
+        // sibling test below already uses, and the only shape the approve-side
+        // slot floor can book at all) exposes the real anchored figure.
+        (uint256 raisedUsd, uint256 requiredUsd) =
+            ledger.requireApproveQuorum(address(mgov), proposalId, usdgAsset, requiredCoverage6);
+        assertEq(requiredUsd, needUsd, "the requirement is the full $1,000,000");
+        assertEq(raisedUsd, 500_000e18, "and only the PRE-top-up $500,000 is certified");
+        assertLt(raisedUsd, requiredUsd, "the gate reports a shortfall, it does not certify the top-up");
     }
 
     /// @notice The other half of the same property: the gate DOES pass when
@@ -257,10 +288,10 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
         uint256 fullNeedUsd = 1_000_000e18;
         uint256 anchoredNeedUsd = 500_000e18;
 
-        swood.setStake(guardian, 500_000e18);
+        _stakeAheadOfTheVote(500_000e18);
         mgov.set(_requiredCoverage6(fullNeedUsd));
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), proposalId, guardian);
+        ledger.recordApproval(address(mgov), proposalId, guardian, type(uint256).max);
 
         // Advance one second so the ORIGINAL 500,000e18 checkpoint lands
         // strictly BEFORE the "current" block the crash + top-up below
@@ -275,7 +306,7 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
         // the same-block crash-and-top-up sequence.
         vm.warp(vm.getBlockTimestamp() + 1);
 
-        twap.setPrice(1e8);
+        woodFeed.setAnswer(1e8);
         swood.setStake(guardian, 1_000_000e18);
 
         // Sized to the anchored, pre-top-up value: must pass.
@@ -287,30 +318,31 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
     // shared-stake denominator
     // ══════════════════════════════════════════════════════════════════
 
-    /// @notice A guardian's stale, long-expired approval on one proposal must
-    ///         not permanently dilute the shared-stake basis of a completely
-    ///         unrelated, later proposal. Before `retireApproval` existed
-    ///         there was no way to ever clear it; this test proves the sweep
-    ///         restores the guardian's full, undiluted contribution.
+    /// @notice A guardian's stale, long-expired approval on one proposal keeps
+    ///         its lock record and its approver listing alive with no release
+    ///         path; `retireApproval` is what clears them. Declared coverage
+    ///         locks removed the shared-stake denominator the original finding
+    ///         was about, so a fresh proposal the same guardian later backs is
+    ///         whole BEFORE the sweep as well as after — pinned here so the
+    ///         sweep is understood as list hygiene, not coverage repair.
     ///
-    ///         Fails against the pre-fix code (no `retireApproval` exists, so
-    ///         the second `requireApproveQuorum` call stays permanently
-    ///         under-covered), passes against the fix.
-    function test_retireApproval_restoresFreshProposalQuorumAfterChallengeWindowElapses() public {
+    ///         Fails against a ledger with no `retireApproval` (the listing can
+    ///         never be cleared), passes against the fix.
+    function test_retireApproval_sweepsADeadLockAndLeavesTheFreshProposalWhole() public {
         uint256 p1 = 10;
         uint256 p2 = 20;
 
         // 500,000e18 WOOD @ $2.00 = $1,000,000 slashable, held flat through
         // the whole test — no top-up, no crash. Only wall-clock and the sweep
         // move anything.
-        swood.setStake(guardian, 500_000e18);
+        _stakeAheadOfTheVote(500_000e18);
 
-        // P1 reserves half the guardian's bond and is never touched again.
+        // P1 locks half the guardian's stake and is never touched again.
         mgov.set(_requiredCoverage6(500_000e18));
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), p1, guardian);
-        (, uint256[] memory p1Pledged) = ledger.pledgedOf(address(mgov), p1);
-        assertEq(p1Pledged[0], 500_000e18, "P1 must book $500,000");
+        ledger.recordApproval(address(mgov), p1, guardian, 250_000e18);
+        (, uint256[] memory p1Locked) = ledger.pledgedOf(address(mgov), p1);
+        assertEq(p1Locked[0], 250_000e18, "P1 must lock 250,000 WOOD");
 
         // Advance past P1's bucket's challenge-window expiry
         // (genesis + (epoch + 1) * epochLength + challengeWindow; P1 booked
@@ -320,57 +352,41 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
         vm.warp(expiry + 1);
 
         // P1 is now provably dead: its bucket has aged out of the batching-cap
-        // scan, and no `ChallengeGame.file` could reach it any more.
-        assertEq(ledger.openExposureUsd(guardian), 0, "P1's bucket must have aged out of the batching cap");
+        // scan, and no `ChallengeGame.file` could reach it any more. Its LOCK
+        // RECORD, however, is still there.
+        assertEq(ledger.openExposure(guardian), 0, "P1's bucket must have aged out of the batching cap");
+        assertEq(ledger.lockOf(address(mgov), p1, guardian), 250_000e18, "...but its lock record persists");
 
-        // P2 reserves the guardian's WHOLE bond — its own requirement is
-        // $1,000,000, exactly the guardian's full slashable stake.
+        // P2 locks the guardian's WHOLE stake — the budget recycled with the
+        // bucket, so the full 500,000e18 is free again.
         mgov.set(_requiredCoverage6(1_000_000e18));
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), p2, guardian);
-        (, uint256[] memory p2Pledged) = ledger.pledgedOf(address(mgov), p2);
-        assertEq(p2Pledged[0], 1_000_000e18, "P2 must book the full $1,000,000");
+        ledger.recordApproval(address(mgov), p2, guardian, type(uint256).max);
+        (, uint256[] memory p2Locked) = ledger.pledgedOf(address(mgov), p2);
+        assertEq(p2Locked[0], 500_000e18, "P2 must lock the whole stake");
 
-        // BEFORE the sweep: P1's dead $500,000 is still summed into the
-        // shared-stake denominator alongside P2's own $1,000,000, so P2's
-        // share is diluted to 1,000,000 * 1,000,000 / 1,500,000 = ~666,667,
-        // short of its own $1,000,000 requirement.
-        //
-        // Post-issue #27 ("coverage-proportional effective capital"),
-        // requireApproveQuorum no longer reverts on a partial shortfall — it
-        // reports the raised aggregate and the caller decides how to size
-        // execution to it (a genuinely ZERO aggregate is still an error, the
-        // identified-bonded-signer floor). So the proof here is on the
-        // VALUE it reports, not on a revert: pre-sweep it must be short of
-        // what P2 needs, by exactly the dilution P1's dead booking causes.
-        // uint256 locals, not a literal expression: Solidity evaluates constant
-        // arithmetic as an EXACT rational, and 2e24/3 is not an integer, so the
-        // all-literal form fails to compile (error 4486). Going through
-        // variables gives the truncating integer division the contract does.
-        uint256 slashableUsd = 1_000_000e18;
-        uint256 reservedUsd = 1_000_000e18;
-        uint256 liveTotalUsd = 1_500_000e18;
-        uint256 dilutedUsd = (slashableUsd * reservedUsd) / liveTotalUsd;
+        // BEFORE the sweep: P2 is already whole. There is no shared-stake
+        // denominator for P1's dead record to dilute — the quorum reads
+        // `min(lock, stake) x price` for P2 alone.
         (uint256 raisedBeforeUsd, uint256 requiredUsd) =
             ledger.requireApproveQuorum(address(mgov), p2, usdgAsset, _requiredCoverage6(1_000_000e18));
         assertEq(requiredUsd, 1_000_000e18, "requirement must be P2's own full $1,000,000");
-        assertEq(raisedBeforeUsd, dilutedUsd, "P1's dead booking must still dilute P2's share pre-sweep");
-        assertLt(raisedBeforeUsd, requiredUsd, "diluted share must fall short of P2's requirement");
+        assertEq(raisedBeforeUsd, requiredUsd, "a dead lock elsewhere does not dilute a fresh proposal");
 
         // Sweep P1 — anyone may call this, no registry/freezer role needed.
         ledger.retireApproval(address(mgov), p1, guardian);
 
-        // P1 must be fully gone: no longer listed, no longer pledged.
+        // P1 must be fully gone: no longer listed, no longer locked.
         (address[] memory p1Approvers,) = ledger.pledgedOf(address(mgov), p1);
         assertEq(p1Approvers.length, 0, "retireApproval must remove the guardian from P1's approver list");
+        assertEq(ledger.lockOf(address(mgov), p1, guardian), 0, "and clear the lock record");
 
-        // AFTER the sweep: P2 alone occupies the denominator, so it now
-        // reads its own full, undiluted $1,000,000 - retiring P1 must
-        // actually RESTORE the guardian's full contribution, not merely stop
-        // reverting.
+        // AFTER the sweep: P2 is exactly as whole as before — the sweep touched
+        // P1's record only.
         (uint256 raisedAfterUsd,) =
             ledger.requireApproveQuorum(address(mgov), p2, usdgAsset, _requiredCoverage6(1_000_000e18));
-        assertEq(raisedAfterUsd, requiredUsd, "retiring P1 must restore P2's full, undiluted coverage");
+        assertEq(raisedAfterUsd, requiredUsd, "P2 unchanged by retiring P1");
+        assertEq(ledger.lockOf(address(mgov), p2, guardian), 500_000e18, "P2's lock untouched");
     }
 
     /// @notice `retireApproval` must revert while the key is still frozen by a
@@ -380,13 +396,13 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
     ///         have aged out.
     function test_retireApproval_revertsWhileFrozen() public {
         uint256 p1 = 30;
-        swood.setStake(guardian, 500_000e18);
+        _stakeAheadOfTheVote(500_000e18);
         mgov.set(_requiredCoverage6(500_000e18));
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), p1, guardian);
+        ledger.recordApproval(address(mgov), p1, guardian, type(uint256).max);
 
         vm.prank(freezer);
-        ledger.freezeCoverage(address(mgov), p1);
+        ledger.freezeCoverage(address(mgov), p1, block.timestamp + 30 days);
 
         uint256 expiry = ledger.epochGenesis() + ledger.epochLength() + ledger.challengeWindow();
         vm.warp(expiry + 1);
@@ -405,10 +421,10 @@ contract ExposureLedgerAnchorAndRetireTest is Test {
     ///         early would release capital a conviction could still reach.
     function test_retireApproval_revertsBeforeChallengeWindowElapses() public {
         uint256 p1 = 40;
-        swood.setStake(guardian, 500_000e18);
+        _stakeAheadOfTheVote(500_000e18);
         mgov.set(_requiredCoverage6(500_000e18));
         vm.prank(registry);
-        ledger.recordApproval(address(mgov), p1, guardian);
+        ledger.recordApproval(address(mgov), p1, guardian, type(uint256).max);
 
         uint256 expiry = ledger.epochGenesis() + ledger.epochLength() + ledger.challengeWindow();
         vm.warp(expiry); // exactly at expiry, not yet past it

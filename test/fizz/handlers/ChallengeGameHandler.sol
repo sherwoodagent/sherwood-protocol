@@ -32,6 +32,21 @@ abstract contract ChallengeGameHandler is Properties {
         game.setProsecutorFeeBps(clampBetween(bps, 0, game.MAX_PROSECUTOR_FEE_BPS()));
     }
 
+    /// @dev What a contribution can still buy for this challenge. The pool is
+    ///      keyed per PROPOSAL, so the headroom is the pool's own target/raised
+    ///      until it completes; after that the pool answers only what it was
+    ///      raised against, and a `Filed` challenge it does not answer buys its
+    ///      own defence up to the same target.
+    function _counterBondHeadroom(uint256 challengeId) internal view returns (uint256) {
+        (, uint256 target, uint256 raised, uint256 completedAt,) = game.counterBondPoolOf(challengeId);
+        if (completedAt != 0) {
+            IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
+            if (c.status != IChallengeGame.Status.Filed) return 0;
+            raised = c.defenceWeight;
+        }
+        return target > raised ? target - raised : 0;
+    }
+
     // ――――――――――――――――――――――――― Clamped ――――――――――――――――――――――――――
 
     /// @dev `challengeId` is 1-indexed and `challengeCount` is the high-water
@@ -54,12 +69,7 @@ abstract contract ChallengeGameHandler is Properties {
         // reverts in the transfer rather than in the game.
         uint256 bal = wood.balanceOf(actor);
         if (bal == 0) return;
-        IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
-        // The pool is keyed per PROPOSAL now (pashov 2026-08 finding #10), so
-        // the remaining headroom comes from the pool's own target/raised rather
-        // than from this challenge's stale per-challenge field.
-        (, uint256 target, uint256 raised,,) = game.counterBondPoolOf(challengeId);
-        uint256 remaining = target > raised ? target - raised : 0;
+        uint256 remaining = _counterBondHeadroom(challengeId);
         if (remaining == 0) return;
         amountWood = clampBetween(amountWood, 1, remaining < bal ? remaining : bal);
 
@@ -74,12 +84,7 @@ abstract contract ChallengeGameHandler is Properties {
         if (count == 0) return;
         challengeId = clampBetween(challengeId, 1, count);
 
-        IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
-        // The pool is keyed per PROPOSAL now (pashov 2026-08 finding #10), so
-        // the remaining headroom comes from the pool's own target/raised rather
-        // than from this challenge's stale per-challenge field.
-        (, uint256 target, uint256 raised,,) = game.counterBondPoolOf(challengeId);
-        uint256 remaining = target > raised ? target - raised : 0;
+        uint256 remaining = _counterBondHeadroom(challengeId);
         if (remaining == 0 || wood.balanceOf(actor) < remaining) return;
 
         challengeGame_dispute(challengeId, remaining);
@@ -107,14 +112,27 @@ abstract contract ChallengeGameHandler is Properties {
     ///      point is to perturb E-4's economics, not to re-test the bounds.
     function challengeGame_secondary(uint8 selector, uint256 arg0) public {
         selector = uint8(selector % 8);
-        if (selector == 0) _challengeGame_setAutoSlashDelay(clampBetween(arg0, 1 hours, game.disputeTimeout() - 1));
-        else if (selector == 1) _challengeGame_setChallengerBondBps(clampBetween(arg0, 1, 10_000));
-        else if (selector == 2) _challengeGame_setDisputeTimeout(clampBetween(arg0, game.autoSlashDelay() + 1, 90 days));
-        else if (selector == 3) _challengeGame_setFilingsPaused(arg0 % 2 == 0);
-        else if (selector == 4) _challengeGame_setForfeitBurnBps(clampBetween(arg0, 0, 10_000));
-        else if (selector == 5) _challengeGame_setInconclusiveBurnBps(clampBetween(arg0, 0, 10_000));
-        else if (selector == 6) _challengeGame_setProsecutorFeeBps(clampBetween(arg0, 0, 2_000));
-        else _challengeGame_setSettleBurnBps(clampBetween(arg0, 0, 10_000));
+        if (selector == 0) {
+            _challengeGame_setAutoSlashDelay(
+                clampBetween(arg0, 1 hours, game.disputeTimeout() - game.MIN_SETTLE_WINDOW())
+            );
+        } else if (selector == 1) {
+            _challengeGame_setChallengerBondBps(clampBetween(arg0, 1, 10_000));
+        } else if (selector == 2) {
+            _challengeGame_setDisputeTimeout(
+                clampBetween(arg0, game.autoSlashDelay() + game.MIN_SETTLE_WINDOW(), 90 days)
+            );
+        } else if (selector == 3) {
+            _challengeGame_setFilingsPaused(arg0 % 2 == 0);
+        } else if (selector == 4) {
+            _challengeGame_setForfeitBurnBps(clampBetween(arg0, 0, 10_000));
+        } else if (selector == 5) {
+            _challengeGame_setInconclusiveBurnBps(clampBetween(arg0, 0, 10_000));
+        } else if (selector == 6) {
+            _challengeGame_setProsecutorFeeBps(clampBetween(arg0, 0, 2_000));
+        } else {
+            _challengeGame_setSettleBurnBps(clampBetween(arg0, 0, 10_000));
+        }
     }
 
     // ―――――――――――――――――――― Lifecycle composite ――――――――――――――――――――
@@ -184,12 +202,7 @@ abstract contract ChallengeGameHandler is Properties {
         // Fund the counter-bond to exactly its target. `Disputed` requires
         // `counterBondWood == bondWood`; a short pool leaves the challenge in
         // Filed and `refer` reverts, so partial funding is not enough.
-        IChallengeGame.Challenge memory c = game.challengeOf(challengeId);
-        // The pool is keyed per PROPOSAL now (pashov 2026-08 finding #10), so
-        // the remaining headroom comes from the pool's own target/raised rather
-        // than from this challenge's stale per-challenge field.
-        (, uint256 target, uint256 raised,,) = game.counterBondPoolOf(challengeId);
-        uint256 remaining = target > raised ? target - raised : 0;
+        uint256 remaining = _counterBondHeadroom(challengeId);
         for (uint256 i; i < actors.length && remaining != 0; i++) {
             address d = _nonGuardian(i);
             if (d == challenger) continue;
@@ -249,16 +262,18 @@ abstract contract ChallengeGameHandler is Properties {
     ///      `TokenCourt._recordAccused`. That landed AFTER this helper did, so
     ///      the two silently diverged.
     ///
-    ///      The divergence is one-directional and quiet, which is why it is
-    ///      worth a comment rather than just a fix. GL-13 pins
-    ///      `pledged >= recorded`, so a booking-based check can only ever be
-    ///      too STRICT: it skips proposals `file` would accept, never picks one
-    ///      `file` would reject. The failure mode is therefore lost
-    ///      reachability, not a reverting handler — the composite quietly stops
-    ///      finding targets and adjudication coverage decays, with nothing
-    ///      failing to point at it. `settleCoverage` is permissionless,
-    ///      re-runnable and not freeze-gated, and rebooking recorded down to
-    ///      zero while the pledge stands is exactly the state that triggers it.
+    ///      The divergence was one-directional and quiet, which is why it is
+    ///      worth a comment rather than just a fix. The booking never exceeded
+    ///      the pledge, so a booking-based check could only ever be too STRICT:
+    ///      it skipped proposals `file` would accept, never picked one `file`
+    ///      would reject. The failure mode was therefore lost reachability, not
+    ///      a reverting handler — the composite quietly stopped finding targets
+    ///      and adjudication coverage decayed, with nothing failing to point at
+    ///      it. Declared coverage locks collapsed booking and pledge into ONE
+    ///      lock (`approversOf` and `pledgedOf` now read the same storage — GL-20
+    ///      pins their agreement) and deleted `settleCoverage`, so the drift can
+    ///      no longer arise; this helper keeps reading the gate's own selector
+    ///      so a future re-split cannot re-open it silently.
     ///
     ///      ALSO MODELS THE TWO GATES THE COMPOSITE ITSELF MANUFACTURES, which
     ///      are the same drift in the OPPOSITE and worse direction. A predictor

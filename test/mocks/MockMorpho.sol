@@ -13,6 +13,15 @@ interface IMockOracle {
 
 uint256 constant ORACLE_PRICE_SCALE = 1e36;
 
+/// @notice Settable Morpho oracle; defaults to par (one collateral unit = one loan unit).
+contract MockMorphoOracle is IMockOracle {
+    uint256 public price = ORACLE_PRICE_SCALE;
+
+    function setPrice(uint256 price_) external {
+        price = price_;
+    }
+}
+
 /// @notice Settable per-second borrow rate (WAD), with a revert switch so
 ///         adapter tests can prove the fail-closed path on IRM failure.
 contract MockIrm is IIrm {
@@ -78,6 +87,12 @@ contract MockMorpho is IMorpho {
     function setCollateralWithdrawCap(uint256 cap) external {
         collateralWithdrawCap = cap;
     }
+
+    /// @notice Call counters, so a test can pin how many legs a settlement took.
+    uint256 public repayCalls;
+    uint256 public withdrawCollateralCalls;
+    /// @notice How many `withdrawCollateral` calls ran the debt-open health check.
+    uint256 public healthChecks;
 
     // ── Market administration (test-side) ──
 
@@ -254,6 +269,7 @@ contract MockMorpho is IMorpho {
         require(_market[id].lastUpdate != 0, "MockMorpho: market not created");
         require(msg.sender == onBehalf, "MockMorpho: not authorized");
         require(assets <= collateralWithdrawCap, "MockMorpho: withdraw capped");
+        withdrawCollateralCalls++;
 
         _accrue(marketParams, id);
         MorphoPosition storage pos = _position[id][onBehalf];
@@ -267,6 +283,7 @@ contract MockMorpho is IMorpho {
         // assumption the strategy bug was made of, so a fix could not be
         // observed through it. Zero-debt behaviour is unchanged.
         if (pos.borrowShares != 0) {
+            healthChecks++;
             Market storage m = _market[id];
             uint256 borrowed = m.totalBorrowShares == 0
                 ? 0
@@ -315,6 +332,7 @@ contract MockMorpho is IMorpho {
         Id id = marketParams.id();
         require(_market[id].lastUpdate != 0, "MockMorpho: market not created");
         require((assets != 0) != (shares != 0), "MockMorpho: inconsistent input");
+        repayCalls++;
 
         _accrue(marketParams, id);
         Market storage m = _market[id];

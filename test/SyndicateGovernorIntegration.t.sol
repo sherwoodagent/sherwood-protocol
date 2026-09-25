@@ -214,7 +214,7 @@ contract SyndicateGovernorIntegrationTest is Test {
         governor.executeProposal(proposalId);
         assertEq(uint256(governor.getProposalState(proposalId)), uint256(ISyndicateGovernor.ProposalState.Executed));
         assertTrue(vault.redemptionsLocked());
-        assertEq(usdc.allowance(address(vault), address(targetToken)), 50_000e6);
+        assertEq(usdc.allowance(address(vault), address(targetToken)), 0, "no allowance outlives the batch");
 
         // While the proposal is active `maxWithdraw == 0` so OZ's standard
         // pre-check produces the canonical EIP-4626 revert.

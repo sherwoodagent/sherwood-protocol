@@ -23,9 +23,9 @@ import {ProtocolConfig} from "../src/ProtocolConfig.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ERC20Mock} from "./mocks/ERC20Mock.sol";
 import {MockAgentRegistry} from "./mocks/MockAgentRegistry.sol";
-import {MockWoodTwapOracle} from "./mocks/MockWoodTwapOracle.sol";
+import {MockAggregatorV3} from "./mocks/MockAggregatorV3.sol";
 import {GovEnvelope} from "./helpers/GovEnvelope.sol";
-import {deployTierRegistry} from "./helpers/TierRegistryFixture.sol";
+import {deployTierRegistry, PermissiveStrategyFactory} from "./helpers/TierRegistryFixture.sol";
 
 /// @dev Chainlink-shaped USD feed for the vault asset. Mirrors
 ///      `ChallengeEndToEndTest`'s own `ChallengeE2EFeed`.
@@ -171,6 +171,7 @@ contract TokenCourtEndToEndTest is Test {
         protocolConfig = new ProtocolConfig(owner);
         adapter = new TCE2EAdapter();
         tierRegistry = new TierRegistry(address(this));
+        tierRegistry.setStrategyFactory(address(new PermissiveStrategyFactory()));
 
         // ── sWOOD (sole WOOD custodian). The test contract is the factory.
         StakedWood swoodImpl = new StakedWood();
@@ -203,6 +204,7 @@ contract TokenCourtEndToEndTest is Test {
         // ── Real vault + real governor; the test contract is their factory.
         _deploySyndicate();
         registry.addGovernor(address(gov), address(vault));
+        _bondVaultOwner(address(vault));
         vm.mockCall(
             address(this), abi.encodeWithSignature("governorOf(address)", address(vault)), abi.encode(address(gov))
         );
@@ -223,12 +225,14 @@ contract TokenCourtEndToEndTest is Test {
         ledger = new ExposureLedger(ledgerOwner, address(swood), EPOCH_LENGTH);
         feed = new TCE2EFeed(1e8, 8); // $1.00, 8-dec
         // Design revision 2: `woodUsdPriceX8` is a CAP, never a price. WOOD is
-        // valued from the TWAP oracle at $0.05, with the cap 2x ABOVE it and
+        // valued from the WOOD/USD feed at $0.05, with the cap 2x ABOVE it and
         // therefore NOT binding — the configuration production ships.
-        MockWoodTwapOracle woodTwap = new MockWoodTwapOracle(0.05e8);
+        MockAggregatorV3 woodFeed = new MockAggregatorV3(8, 0.05e8);
         vm.startPrank(ledgerOwner);
         ledger.setWoodUsdPrice(0.1e8);
-        ledger.setWoodTwapOracle(address(woodTwap));
+        // The mock publishes one round at construction and these suites warp far
+        // past it; staleness is exercised in test/ExposureLedger.t.sol.
+        ledger.setWoodFeed(address(woodFeed), type(uint64).max);
         ledger.setAssetFeed(address(usdg), address(feed), 365 days);
         ledger.setCoveredTvlCapUsd(10_000_000e18);
         ledger.setGuardianRegistry(address(registry));
@@ -272,15 +276,6 @@ contract TokenCourtEndToEndTest is Test {
         );
         vm.warp(vm.getBlockTimestamp() + tierRegistry.certifyDelay());
         tierRegistry.certify(address(adapter), adapter.poke.selector);
-        // issue #166: certifying a (target, selector) prices it for tiering
-        // but does NOT make `target` batch-callable at all — that is a
-        // SEPARATE allowlist (`isAdapterAllowed`) `SyndicateVault._guardBatchCalls`
-        // PART 2a now enforces on every batch callee. `adapter` is this
-        // suite's real, benign (fund-neutral) production-shaped adapter, not
-        // an attacker probe — it must be explicitly allowlisted here or every
-        // proposal touching it (execute AND settlement calls) is refused with
-        // `DisallowedBatchCallee` before any challenge/court mechanics run.
-        tierRegistry.setAdapterAllowed(address(adapter), true);
 
         // ── WOOD for the proposer's bond, both challengers' bonds, and g1's
         //    counter-bond pool contributions (sized generously: some arcs have
@@ -419,8 +414,8 @@ contract TokenCourtEndToEndTest is Test {
         vm.warp(gov.getProposal(pid).voteEnd + 1);
         registry.openReview(address(gov), pid);
         vm.prank(g1);
-        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve);
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "g1 backs the whole coverage");
+        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+        assertEq(ledger.openExposure(g1), G1_STAKE, "g1 locks its whole stake behind the coverage");
 
         vm.warp(gov.getProposal(pid).reviewEnd + 1);
         gov.executeProposal(pid);
@@ -1169,24 +1164,24 @@ contract TokenCourtEndToEndTest is Test {
 
     // ── 6. Issue #83: a concurrent conviction must not lift the voting bar ──
 
-    /// @dev TWO covering approvers, not the fixture's usual one. The arc below
-    ///      needs `settleCoverage` to actually REACH `_rebook` for g1, and with
-    ///      g1 alone on the key its emptied bond makes `_effectiveReservedTotal`
-    ///      zero — which `settleCoverage` early-returns on before rebooking
-    ///      anything. g2 keeps the cohort's effective total non-zero, so the
-    ///      pass runs and books g1 at zero: the state the whole issue turns on.
-    ///      g2 is consequently accused here too; nothing below depends on the
-    ///      size of the accused set, only on whether g1 is in it.
+    /// @dev TWO covering approvers, not the fixture's usual one. Kept from the
+    ///      arc's original shape (where a second solvent approver was what let
+    ///      the since-deleted `settleCoverage` write g1's booking to zero): g2
+    ///      keeps the cohort's recoverable liability non-zero after g1 is
+    ///      emptied, so the challenge below is still fileable and the case still
+    ///      has something to convict on. g2 is consequently accused here too;
+    ///      nothing below depends on the size of the accused set, only on
+    ///      whether g1 is in it.
     function _proposeApproveExecuteTwoApprovers() internal returns (uint256 pid) {
         pid = _propose();
         vm.warp(gov.getProposal(pid).voteEnd + 1);
         registry.openReview(address(gov), pid);
         vm.prank(g1);
-        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve);
+        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
         vm.prank(g2);
-        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve);
-        assertEq(ledger.openExposureUsd(g1), COVERAGE_USD, "g1 reserved the whole coverage");
-        assertEq(ledger.openExposureUsd(g2), COVERAGE_USD, "g2 reserved the whole coverage");
+        registry.voteOnProposal(address(gov), pid, IGuardianRegistry.GuardianVoteType.Approve, type(uint256).max);
+        assertEq(ledger.openExposure(g1), G1_STAKE, "g1 locked its whole stake");
+        assertEq(ledger.openExposure(g2), FILLER_STAKE, "g2 locked its whole stake");
 
         vm.warp(gov.getProposal(pid).reviewEnd + 1);
         gov.executeProposal(pid);
@@ -1195,8 +1190,9 @@ contract TokenCourtEndToEndTest is Test {
 
     /// @notice ISSUE #83, the whole chain on the real stack: an approver
     ///         convicted on a SEPARATE, CONCURRENT challenge must still be
-    ///         barred from voting on THIS one, even though a permissionless
-    ///         `settleCoverage` has since booked its coverage at zero.
+    ///         barred from voting on THIS one, even though its stake — and with
+    ///         it everything a conviction here could still recover from it —
+    ///         has since gone to zero.
     ///
     /// @dev    Every step is either ordinary protocol operation or a call
     ///         anyone may make — no attacker capital and no privileged role:
@@ -1208,11 +1204,18 @@ contract TokenCourtEndToEndTest is Test {
     ///              10,000 (the Plan B pre-flight requires it), so `_slashOne`
     ///              takes the whole live balance and `guardianStake(g1)` lands
     ///              on exactly zero rather than on dust.
-    ///           4. A stranger calls `settleCoverage` on P's key. g1's
-    ///              slashable bond is now zero, so `_rebook` writes its live
-    ///              booking down to zero. The PLEDGE is untouched.
-    ///           5. `refer` runs. This is the step the fix changes: reading the
-    ///              booking, g1 fell out of the accused set entirely.
+    ///           4. Nothing moves g1's LOCK. Under declared coverage locks the
+    ///              lock is the one figure per (proposal, guardian) — booking,
+    ///              pledge and slash base at once — written by `recordApproval`
+    ///              and erased only by release (blocked by the freeze) or
+    ///              retirement (refused while frozen). The permissionless
+    ///              `settleCoverage` pass that used to write a zeroed-bond
+    ///              guardian's BOOKING down to zero no longer exists, so the
+    ///              divergence #83 was filed on cannot be expressed; what this
+    ///              arc pins now is that a zero STAKE is not an acquittal
+    ///              either.
+    ///           5. `refer` runs. `_recordAccused` reads `pledgedOf`, which
+    ///              still names g1 at its full lock.
     ///           6. g1 votes. Its ballot weighs `getPastVotes(g1, executedAt-1)`
     ///              — the FULL PRE-SLASH amount, because checkpoints are
     ///              append-only and a later slash cannot reach back past a
@@ -1226,11 +1229,11 @@ contract TokenCourtEndToEndTest is Test {
     ///         proposal-and-challenge lifecycle reaches the identical state
     ///         (`stakedAmount == 0`) through much more fixture and proves
     ///         nothing extra about the court.
-    function test_arc_convictedElsewhereThenSettledToZero_isStillAccused() public {
+    function test_arc_convictedElsewhereToZeroStake_isStillAccused() public {
         uint256 pid = _proposeApproveExecuteTwoApprovers();
         uint256 executedAt = gov.getProposal(pid).executedAt;
 
-        // 2. The filing. Sized off the live bookings, which are still intact.
+        // 2. The filing. Sized off the locks at live value, capped at the need.
         vm.prank(challenger);
         uint256 cid = game.file(
             address(gov),
@@ -1257,26 +1260,25 @@ contract TokenCourtEndToEndTest is Test {
         swood.slashVerdict(keccak256("issue-83.concurrent-challenge"), executedAt - 1, convicted, fullRate);
         assertEq(swood.guardianStake(g1), 0, "a 100% conviction lands on exactly zero, not on dust");
 
-        // 4. Anyone settles. g1's slashable bond is gone, so its booking goes
-        //    to zero; g2's live bond keeps the cohort's effective total
-        //    non-zero, so the pass actually runs rather than early-returning.
-        vm.prank(stranger);
-        ledger.settleCoverage(address(gov), pid);
-        (address[] memory bookedWho, uint256[] memory bookedUsd) = ledger.approversOf(address(gov), pid);
-        (address[] memory pledgedWho, uint256[] memory pledgedUsd) = ledger.pledgedOf(address(gov), pid);
-        assertEq(_usdFor(bookedWho, bookedUsd, g1), 0, "the live booking was written down to nothing");
-        assertEq(
-            _usdFor(pledgedWho, pledgedUsd, g1),
-            COVERAGE_USD,
-            "the pledge is untouched: g1 did underwrite this proposal"
-        );
+        // 4. g1's LOCK is untouched by the conviction elsewhere: the ledger
+        //    holds one figure per (proposal, guardian) and nothing but a
+        //    release or a retirement — both refused while the filing above
+        //    keeps the key frozen — can move it. What a conviction HERE could
+        //    still recover from g1 is now zero (`min(lock, basis)` with a zero
+        //    basis), and that is deliberately not the accused predicate.
+        (address[] memory lockedWho, uint256[] memory lockedWood) = ledger.approversOf(address(gov), pid);
+        (address[] memory pledgedWho, uint256[] memory pledgedWood) = ledger.pledgedOf(address(gov), pid);
+        assertEq(_usdFor(lockedWho, lockedWood, g1), G1_STAKE, "the lock stands at what g1 declared");
+        assertEq(_usdFor(pledgedWho, pledgedWood, g1), G1_STAKE, "and `pledgedOf` reports that same lock");
+        assertEq(ledger.coverageUsdOf(address(gov), pid, g1), 0, "while its recoverable coverage is now nothing");
+        (address[] memory rated, uint256[] memory rates) = ledger.slashBpsFor(address(gov), pid);
+        assertEq(_usdFor(rated, rates, g1), 10_000, "and its rate saturates: the lock exceeds a zero basis");
 
-        // 5. Refer. Before the fix, `_recordAccused` read the booking above and
-        //    dropped g1 here.
+        // 5. Refer. `_recordAccused` reads the lock set, and g1 is in it.
         _disputeFull(cid);
         uint256 caseId = court.caseOfChallenge(address(game), cid);
         assertTrue(caseId != 0, "the pool-completing auto-referral landed a real case");
-        assertTrue(court.isAccused(caseId, g1), "ISSUE #83: a settled-to-zero booking is not an acquittal");
+        assertTrue(court.isAccused(caseId, g1), "ISSUE #83: a stake slashed to zero is not an acquittal");
 
         // Its stake is also back in `accusedWeight`, which the participation
         // floor's base subtracts. This half of the harm needs nothing further
@@ -1335,5 +1337,67 @@ contract TokenCourtEndToEndTest is Test {
             if (who[i] == guardian) return usd[i];
         }
         revert("guardian is not a listed approver");
+    }
+
+    /// @dev SHE-215: `SyndicateGovernor.propose` / `executeProposal` now refuse
+    ///      a vault whose owner-stake slot is unbound, claimed, slashed, or
+    ///      exiting. `SyndicateFactory.createSyndicate` ALWAYS binds that slot,
+    ///      so a hand-built syndicate that skips it models a vault the real
+    ///      factory cannot produce. Binding here restores the fixture to a
+    ///      state the protocol can actually reach.
+    function _bondVaultOwner(address vault_) internal {
+        uint256 bond = swood.minOwnerStake();
+        wood.mint(owner, bond);
+        vm.startPrank(owner);
+        wood.approve(address(swood), bond);
+        swood.prepareOwnerStake(bond);
+        vm.stopPrank();
+        // The test contract is sWOOD's factory.
+        swood.bindOwnerStake(owner, vault_);
+    }
+
+    /// @notice SHE-246: A LATE `finalize` CANNOT CONVICT. `refer` guarantees an
+    ///         honest finalize fits before `filedAt + disputeTimeoutAtFiling`;
+    ///         one that arrives at or after it finds `rule` shut (`WindowClosed`
+    ///         bubbles - the case is left intact, nothing swallowed), and the
+    ///         challenge's own clock then times it out to the accused. The case
+    ///         closes afterwards through the swallowed `WrongStatus`, verdict
+    ///         recorded but undelivered - bookkeeping, not a slash.
+    function test_arc_lateFinalize_cannotConvictPastTheDisputeDeadline() public {
+        uint256 pid = _proposeApproveExecute();
+        uint256 stakeBefore = swood.guardianStake(g1);
+
+        vm.prank(challenger);
+        uint256 cid = game.file(
+            address(gov),
+            pid,
+            IChallengeGame.Predicate.OutOfAdapterOutflow,
+            address(adapter),
+            adapter.poke.selector,
+            "ipfs://evidence/late"
+        );
+        _disputeFull(cid);
+        uint256 caseId = court.caseOfChallenge(address(game), cid);
+        assertTrue(caseId != 0, "fixture: referred");
+        vm.prank(g2);
+        court.vote(caseId, true); // a guilty majority that will never land
+
+        IChallengeGame.Challenge memory c = game.challengeOf(cid);
+        uint256 deadline = c.filedAt + c.disputeTimeoutAtFiling;
+        ITokenCourt.Case memory k = court.caseOf(caseId);
+        assertLe(k.referredAt + k.voteWindowAtReferral, deadline, "fixture: the vote closed before the deadline");
+
+        vm.warp(deadline);
+        vm.expectRevert(IChallengeGame.WindowClosed.selector);
+        court.finalize(caseId);
+        assertEq(uint256(court.caseOf(caseId).phase), uint256(ITokenCourt.Phase.Voting), "case left intact");
+
+        game.resolve(cid);
+        assertEq(uint256(game.challengeOf(cid).status), uint256(IChallengeGame.Status.Failed), "timed out");
+        assertEq(swood.guardianStake(g1), stakeBefore, "the late verdict never slashed");
+
+        court.finalize(caseId); // `WrongStatus` swallowed: bookkeeping only
+        assertEq(uint256(court.caseOf(caseId).phase), uint256(ITokenCourt.Phase.Resolved), "case closed");
+        assertEq(swood.guardianStake(g1), stakeBefore, "still not slashed");
     }
 }
