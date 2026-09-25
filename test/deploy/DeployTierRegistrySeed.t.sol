@@ -210,6 +210,7 @@ contract DeployTierRegistrySeedTest is Test {
         SeedPriceSourcesHarness s = new SeedPriceSourcesHarness();
         TierRegistry r = new TierRegistry(address(s));
         string[30] memory symbols = RobinhoodParams.launchSetSymbols();
+        // The first 16 are the launch set before the 14-stock expansion; the rest are the additions.
         for (uint256 i; i < 16; ++i) {
             s.exposed_seedPriceSource(address(r), symbols[i]);
         }
